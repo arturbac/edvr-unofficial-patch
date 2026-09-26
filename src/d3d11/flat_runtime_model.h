@@ -361,7 +361,7 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
     if (!t->writes.draws) t->writes = current;
     else { ++t->writes.draws; t->writes.last = q; t->writes.lastInstances = d.instances;
         if (k.camera) { t->writes.lastWriteEpoch = k.writeEpoch; t->writes.lastWriteSeq = k.writeSeq; } }
-    if (k.format != 9 && k.vs == kToneVs && k.ps == kTonePs) { ++t->tones; t->tone = current; }
+    if (k.format != 9 && toneHdrSlot(k.vs, k.ps) != ~0u) { ++t->tones; t->tone = current; }
     if (d.supported && k.depth && k.kind == kFlatContractPool) {
         FlatContractRecord* source = nullptr;
         for (uint32_t i = 0; i < p.sourcesUsed; ++i) if (p.sources[i].key.depth == k.depth && sameCamera(p.sources[i], current)) { source = &p.sources[i]; break; }

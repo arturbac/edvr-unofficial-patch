@@ -622,18 +622,54 @@ void testMonoFrameSelection() {
         MonoFixture::setCamera(f.handoff[0], invalid);
         MonoFixture::setCamera(f.handoff[1], invalid);
     }, "malformed fullscreen camera bytes are irrelevant to texture-only passes");
+    auto hdrAtPs0 = [](MonoFixture& f) {
+        // The HDR moves to PS0; PS1 becomes the variant's blur/bloom with its
+        // own tokens, so a wrong-slot read cannot pass as the HDR.
+        auto& k = f.handoff[0].key;
+        k.srvView[0] = MonoFixture::token(0x2602); k.srvResource[0] = MonoFixture::token(0x2600);
+        k.srvView[1] = MonoFixture::token(0x2B12); k.srvResource[1] = MonoFixture::token(0x2B10);
+    };
     {   // Epic 20260926_073622, all settings maxed: the DoF-composite tone
         // variant is the same tone VS with a different PS, and it binds the
         // HDR at PS0 (its PS1 is the quarter-res DoF blur). The chain's role
         // and ordering checks are unchanged.
         MonoFixture f;
         f.handoff[0].key.ps = flat_mono_detail::kToneDofCompositePs;
-        f.handoff[0].key.srvView[0] = f.handoff[0].key.srvView[1];
-        f.handoff[0].key.srvResource[0] = f.handoff[0].key.srvResource[1];
+        hdrAtPs0(f);
         const auto out = flatSelectMonoFrame(f.input);
         check(out.selected() && out.hdr == MonoFixture::token(0x2600) &&
               out.toneSequence == 511u,
             "DoF-composite tone variant selects with its HDR lineage at PS0");
+    }
+    {   // Epic 20260926_124418 frame 33504 (EDHM chained): the settings-tier
+        // tone rides the no-constant passthrough VS with the bloom-composite
+        // PS; its HDR lineage is at PS0.
+        MonoFixture f;
+        f.handoff[0].key.vs = flat_mono_detail::kToneVsNoConst;
+        f.handoff[0].key.ps = flat_mono_detail::kToneBloomCompositePs;
+        hdrAtPs0(f);
+        const auto out = flatSelectMonoFrame(f.input);
+        check(out.selected() && out.hdr == MonoFixture::token(0x2600) &&
+              out.toneSequence == 511u,
+            "bloom-composite tier tone selects with its HDR lineage at PS0");
+    }
+    {   // Epic 20260926_124418 frame 33939 (EDHM chained): EDHM's recolor
+        // grade PS rides the stock tone VS; the HDR stays at PS1.
+        MonoFixture f;
+        f.handoff[0].key.ps = flat_mono_detail::kToneEdhmGradePs;
+        const auto out = flatSelectMonoFrame(f.input);
+        check(out.selected() && out.hdr == MonoFixture::token(0x2600) &&
+              out.toneSequence == 511u,
+            "EDHM-grade tone selects with its HDR lineage at PS1");
+    }
+    {   // Epic 20260926_075702 frame 32865: the same grade PS with the cb2-z
+        // passthrough VS -- the observed frames mix tone VS against tone PS.
+        MonoFixture f;
+        f.handoff[0].key.vs = flat_mono_detail::kToneVsCbZ;
+        f.handoff[0].key.ps = flat_mono_detail::kToneEdhmGradePs;
+        const auto out = flatSelectMonoFrame(f.input);
+        check(out.selected() && out.hdr == MonoFixture::token(0x2600),
+            "tone VS variants are interchangeable against a known tone PS");
     }
     for (uint32_t width : {960u, 1280u}) {
         MonoFixture f(width); f.applyEpic63521CameraWords();
@@ -659,6 +695,10 @@ void testMonoFrameSelection() {
         "distinct output-copy records are ambiguous even when their sources agree");
     reject([](auto& f) { f.handoff[0].draws = 2; f.handoff[0].last++; }, FlatMonoReason::AmbiguousTonePass,
         "coalesced repeated tone pass is not unique");
+    reject([](auto& f) { f.handoff[0].key.ps = 0x0BAD0BAD0BAD0BADull; }, FlatMonoReason::NoTonePass,
+        "an unreviewed tone PS remains refused");
+    reject([](auto& f) { f.handoff[0].key.vs = 0x0BAD0BAD0BAD0BADull; }, FlatMonoReason::NoTonePass,
+        "an unreviewed tone VS remains refused");
     reject([](auto& f) { f.handoff[1].key.viewport[0] = .25f; }, FlatMonoReason::InvalidOutputCopy,
         "fractional output viewport offset is not fullscreen");
     reject([](auto& f) { f.handoff[0].key.viewportCount = 2; }, FlatMonoReason::InvalidTonePass,

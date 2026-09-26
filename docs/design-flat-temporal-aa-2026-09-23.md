@@ -31,6 +31,13 @@
   Section 59 pins those pairs to EDHM's patched pixel shaders (the 21:08
   no-EDHM control accumulates normally at the same main menu) and adds their
   exact recipes; mod-patched shader populations remain an open coverage class.
+  Section 62 ships the generic scene-pair classifier answering that class.
+  Section 63 (2026-09-26): the main-menu EDHM flight it enabled found every
+  frame refusing `no-known-tone-pass` instead -- the tone slot alternates
+  writers the exact table never knew, on both the VS and PS axes. Tone
+  admission now decouples a tone VS set from a per-PS HDR-slot table, with a
+  latent PS0 hdr-routing fix; BUILT and INSTALLED on Epic, NOT FLOWN. The
+  generic tone-slot admission is the recorded systemic follow-up.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -48,8 +55,11 @@
 - **Next:** fly the Epic install on foot in the hangar and concourse. The
   section-57 admission should end the hdr-camera-changed refusal cascade;
   confirm treated streaks resume on foot, watch the weapon itself for local
-  rejection crawl. Section 59's EDHM recipes want one main-menu flight with
-  EDHM chained: confirm zero unknown-pair captures and resuming streaks.
+  rejection crawl. The section-59 main-menu flight happened (section 63):
+  zero unknown-pair captures held, but the tone slot refused every frame;
+  the widened tone admission wants one main-menu flight at current settings
+  with EDHM chained -- expect `treated-jittered` with growing streaks and no
+  `no-known-tone-pass`.
   Existing evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
   PS91/BFE or stale-resize hypotheses. The separate menu hangar-floor P1
@@ -3747,3 +3757,57 @@ five-line signature as the 2026-09-14 doc's 21:16 not-a-flight case, and
 the process was killed before hook confirm, so the next session ran
 sentinel-disabled and looked worse. His flat problem was the section-58
 storm; his VR edition choice was the wrong tree entirely.
+
+## 63. The tone chain joins the variant treadmill (2026-09-26)
+
+Sean's main-menu Epic flight with EDHM chained (`edvr_gfx_20260926_124418.log`,
+build `bf7a3e18` -- the section-62 tree) cycled every F8 AA mode with no
+visible change. The scene side is healthy: zero unknown-pair captures all
+session, the generic classifier preparing EDHM's patched scene pairs
+(AACF/CAD1 et al). The failure is the handoff chain: every frame refuses
+`no-known-tone-pass` (treated=0, streaks 0; `request=` follows the F8
+cycling, so the request path is live). The 07:57 session on `0a3dc038` --
+the build with the section-61 DoF-composite admission -- shows the same
+chain and also never treated, so this tier predates the flight that
+reported it.
+
+The chain dumps name the cause. Frame 33504: the tone target written at
+q=156 by VS `CFA91824129ECBBC` / PS `9270C355389DA302`. Frame 33939: the
+SAME target written at q=948 by the known tone VS `F9CFC798F21E9AEA` with
+PS `EAA5F18F10533BD1`. The selector knew one VS and two PS hashes; the tone
+slot in fact alternates writers across frames, and the known output copy
+(20F3/DED879) sits after both. Bytecode reviews (build/flat-audit-menu):
+9270 is a tonemap with the bloom composite folded in -- t0 HDR and t1 bloom,
+both sampled at unchanged UV, no depth texture, SV_Position or matrix -- HDR
+at PS0, the DoF-composite's class. EAA5 is EDHM's recolor grade folded into
+the tone -- t1 HDR and t2 bloom at unchanged UV, a grade LUT (t0) applied
+after tonemapping, t120 the mod's config table -- HDR at PS1, the stock's
+class. All three tone VS are camera-free fullscreen passthroughs (CFA9
+no-const, F9CF sampling t0 for its varying z, 43CA reading cb2[2].y),
+interchangeable in the role; the frames mix them against the PS variants.
+`ps_EBE0E51C47113BE7` is EDHM's recolor running as a post-copy output draw
+-- the section-61 benign class, no admission needed.
+
+Change: tone admission decouples the axes -- a tone VS set (kToneVs,
+kToneVsNoConst, kToneVsCbZ) against a per-PS HDR-slot table (kTonePs and
+kToneEdhmGradePs at PS1; kToneDofCompositePs and kToneBloomCompositePs at
+PS0) via `toneHdrSlot()`. The draw scope's SRV capture and the runtime
+model's tone counting use the same helper; both were exact-stock-pair, so an
+admitted variant would have selected with empty SRV bindings and counted no
+tone. Latent fix: `FlatMonoFrame::hdr` hardcoded `srvResource[1]` -- wrong
+for every PS0 variant, never exercised because none had selected live -- now
+routes the variant's slot, and the DoF rig fixture gained distinct per-slot
+tokens to pin it. Rig coverage: the four observed accept shapes (DoF, bloom
+tier, EDHM grade, mixed VS) plus unknown-VS/unknown-PS refusals.
+
+Open: the tone chain is now on the treadmill section 62 retired for scene
+pairs -- four tone PS variants in one day, and an EDHM or settings change
+mints the next one. The systemic step is a generic tone-slot admission:
+structural position (a single fullscreen format-27 draw writing the copy's
+exact source, immediately before the known copy) plus the bytecode safety
+class (unchanged-UV sampling, no depth texture/SV_Position/matrix), the HDR
+slot proved by which bound resource carries conforming format-26 records
+rather than by hash. That wants its own qualification; unreviewed variants
+keep refusing and dumping. Next flight: this install's Epic main menu with
+EDHM at current settings -- expect `treated-jittered` with growing streaks
+and no `no-known-tone-pass`; the section-57 on-foot flight stands after it.

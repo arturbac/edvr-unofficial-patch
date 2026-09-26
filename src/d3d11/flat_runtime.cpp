@@ -1260,7 +1260,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     }
     d.supported = engineVelocityPoolFamilyPair(k.vs, k.ps); d.instances = instances;
     k.kind = flatContractKind(d.supported, k.color, k.depth, k.width, k.height, k.format, s.prefix.width, s.prefix.height, k.color == s.prefix.output);
-    const bool tone = k.vs == flat_mono_detail::kToneVs && k.ps == flat_mono_detail::kTonePs;
+    const bool tone = flat_mono_detail::toneHdrSlot(k.vs, k.ps) != ~0u;
     const bool copy = k.vs == flat_mono_detail::kCopyVs && k.ps == flat_mono_detail::kCopyPs && k.color == s.prefix.output;
     if(!copy && s.drawCapture.active()) {
         FlatComputeInternalScope guard;
