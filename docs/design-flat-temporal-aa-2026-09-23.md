@@ -40,9 +40,9 @@
   the EDHM main menu, one startup `no-known-tone-pass` all session. FSR/DLSS
   that flight were a build-environment gap (no SDKs in the dev build), not
   code; both pinned SDKs are now on the machine and a full-pass SDK build is
-  installed. The generic tone-slot admission and the launch-time
-  conflicting-hdr storm (cleared itself; qualify the alias if it recurs in
-  steady states) are the recorded follow-ups.
+  installed. The generic tone-slot admission is a recorded follow-up; the
+  launch-time conflicting-hdr storm is section 65's online-model HDR-slot
+  bug, fixed there pending the Windows build.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -64,8 +64,8 @@
   zero unknown-pair captures held, but the tone slot refused every frame;
   the widened tone admission is FLOWN for TAA (section 64); the SDK-full
   install now on Epic wants the same main-menu cycling to confirm DLSS and
-  FSR engage where TAA did, watching for the launch-time conflicting-hdr
-  storm recurring in steady states.
+  FSR engage where TAA did. Section 65 re-attributes the storm to the
+  online-model slot bug; next flight confirms DE65/9270 frames treat.
   Existing evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
   PS91/BFE or stale-resize hypotheses. The separate menu hangar-floor P1
@@ -3848,3 +3848,68 @@ provenance is unprovable, at the price of AA standing down in those states.
 If it recurs in steady menu or flight states, qualify the alias (extent
 mismatch, ordering) instead of refusing; do not loosen the guard on
 unmeasured evidence.
+
+## 65. Tone HDR slot in the online model; section 64's storm re-attributed (2026-09-26)
+
+Commit 8103620 taught `flatSelectMonoFrame` a per-variant tone HDR slot via
+`flat_mono_detail::toneHdrSlot(vs, ps)`: PS1 for the stock tone and the EDHM
+grade, PS0 for the DoF composite (`kToneDofCompositePs`, DE65) and the bloom
+composite (`kToneBloomCompositePs`, 9270). The online runtime model never got
+it: `flatRuntimeObserve`'s copy branch (flat_runtime_model.h, two
+`srvResource[1]` reads) and three sites in flat_runtime.cpp (a UAV-write guard,
+two log lines) still hardcoded slot 1, so a PS0 variant's own PS1 blur/bloom
+read as its HDR and every frame refused.
+
+Fix: `flat_mono_detail::toneHdrInput(key)` (flat_mono_frame.h) returns the
+recorded (vs, ps)'s actual slot, or null; all five sites now go through it.
+
+Evidence: a Linux replay of the rig's `MonoFixture` through
+`flatRuntimeObserve` on HEAD `3d12d97`. Unfixed: stock and EDHM grade (PS1)
+select; DoF composite (DE65) and bloom composite (9270) refuse
+`no-observed-hdr-writes`, and `conflicting-hdr-target-or-camera` once their own
+blur/bloom chain (`129F602B2A9CA439`/`8826CACC6382C78D`) writes their PS1
+texture. Fixed: all six cases, with and without the chain, at both render
+extents, select with `hdr` at the true HDR token.
+
+- ruled out: the section-64 conflicting-hdr storm is an HDR alias to qualify,
+  because the online model read the variant's PS1 (the DoF blur the 129F/8826
+  chain writes) as the HDR; it is this slot bug.
+
+The rig missed it because its slot-0 fixtures (section 61) only ran through
+`flatSelectMonoFrame`, which 8103620 already fixed; nothing exercised those
+variants through the separate online model.
+
+This matches Sean's report -- main menu works with DoF off (slot 1,
+unaffected), no visible AA change with DoF on at the main menu or in game (slot
+0, refused every frame) -- but the in-game attribution still needs the flight
+log's `flat runtime refusal 5s` reasons; this is a model replay, not a captured
+frame.
+
+Status: built and tested only in a Linux model replay, NOT through `build.bat`;
+the Windows full build must pass before merge. Next flight: DoF on, main menu
+and in game; expect no `conflicting-hdr-target-or-camera` /
+`no-observed-hdr-writes` while DE65/9270 write the tone slot.
+
+### Generic classifier review (same session)
+
+Verified findings on the generic shader-pair classifier
+(flat_shader_classifier.h), recorded so later sessions don't lose them:
+
+- any opcode missing from `operandCount` (resinfo/GetDimensions, case, lod,
+  gather4_c/po, sample_info, bufinfo) refuses the whole shader
+  (flat_shader_classifier.h:1105 PS, :848 VS);
+- the >=3-rows-of-one-cb and cb x cb product rules ignore coefficients (tint x
+  colour and three-colour sums refuse), contrary to the header's own rule;
+- "anywhere" checks inspect final register states only (the same computation
+  flips Clean/Consumer on register reuse);
+- min/max drop their first operand (share movc's indices 2/3);
+- the SV_Depth refusal is dead (oDepth is declared by dcl_output, opcode 101;
+  the walker checks 102/103);
+- the div rule only matches a literal div of two varyings; the rig's decal A/B
+  refusals come from an indexable temp (6FD4) and the 3-row rule (06AA), not
+  the div rule;
+- the 64-pair memo and the 2048-shader/16 MiB bytecode cache fail silently;
+  verdicts are logged only under F10.
+
+Evidence: Linux harness over the 34 fixtures plus hand-assembled ps_5_0
+programs.

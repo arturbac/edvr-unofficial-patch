@@ -554,7 +554,7 @@ void captureCopyProvenance(State& s, ID3D11DeviceContext* ctx, const FlatRuntime
             writes.key.rtv,writes.key.depth,writes.key.dsv,writes.key.b1,(unsigned long long)writes.key.cameraHash,
             writes.key.camera?1u:0u,(unsigned long long)writes.firstWriteEpoch,writes.firstWriteSeq,
             (unsigned long long)writes.lastWriteEpoch,writes.lastWriteSeq,target->hdrBad?1u:0u,target->imageSourceBad?1u:0u,
-            flatRuntimeConflictName(target->firstBad.cause),target->tones,target->tone.key.srvResource[1]);
+            flatRuntimeConflictName(target->firstBad.cause),target->tones,flat_mono_detail::toneHdrInput(target->tone.key));
     }
 }
 struct LocalRows { bool pixel; UINT slot, row, count; const char* name; };
@@ -1214,9 +1214,10 @@ FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
         flatRuntimeComputeWritten(s.prefix,u.Get());
         for (uint32_t i = 0; i < s.prefix.targetsUsed; ++i) {
             auto& target = s.prefix.targets[i];
+            const void* const hdrInput = flat_mono_detail::toneHdrInput(target.tone.key);
             // Lighting legitimately writes HDR before tone. Any GPU write
             // into the completed handoff or its HDR input afterwards refuses.
-            if (target.tones && (target.resource == u.Get() || target.tone.key.srvResource[1] == u.Get())) s.prefix.uncertain = true;
+            if (target.tones && (target.resource == u.Get() || (hdrInput && hdrInput == u.Get()))) s.prefix.uncertain = true;
         }
         for (uint32_t i = 0; i < s.prefix.sourcesUsed; ++i) if (s.prefix.sources[i].key.depth == u.Get()) s.prefix.uncertain = true;
     }
@@ -1408,7 +1409,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
             if(k.srvResource[0])for(uint32_t t=0;t<s.prefix.targetsUsed;++t)
                 if(s.prefix.targets[t].resource==k.srvResource[0]) {
                     toneInput=s.prefix.targets[t].resource;
-                    candidateHdr=s.prefix.targets[t].tone.key.srvResource[1];break;
+                    candidateHdr=flat_mono_detail::toneHdrInput(s.prefix.targets[t].tone.key);break;
                 }
             Log::get().note("flat local projection handoff-model: pair=%u attempt=%u frame=%llu copy-seq=%u reason=%s sampled-rt=%p sampled-dsv-depth=%p tone-output=%p candidate-hdr=%p model-selected-hdr=%p model-selected-depth=%p rt-is-candidate=%u rt-is-selected=%u depth-is-selected=%u; actual copy handoff validation follows this observer decision",
                 pair,i+1,(unsigned long long)s.prefix.frame,s.prefix.sequence,s.reason,

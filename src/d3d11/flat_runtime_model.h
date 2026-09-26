@@ -163,12 +163,13 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
         FlatRuntimeTarget* tone = nullptr;
         for (uint32_t i = 0; i < p.targetsUsed; ++i) if (p.targets[i].resource == k.srvResource[0]) tone = &p.targets[i];
         if (!tone || tone->tones != 1 || tone->tone.last != tone->writes.last) { out.reason = FlatMonoReason::NoTonePass; return out; }
+        const void* const hdrInput = toneHdrInput(tone->tone.key);
         FlatContractRecord records[36]{}; uint32_t n = 0;
         // Reuse the proven completed-frame selector on this exact prefix. Only
         // HDR aggregates, supported sources and tone/copy enter the fixture.
         for (uint32_t i = 0; i < p.targetsUsed; ++i) {
             const auto& t = p.targets[i];
-            if (t.resource == tone->tone.key.srvResource[1] && t.writes.key.format == 26 && t.writes.draws) {
+            if (hdrInput && t.resource == hdrInput && t.writes.key.format == 26 && t.writes.draws) {
                 if (t.hdrBad) { p.selectedConflict = t.firstBad; out.reason = FlatMonoReason::ConflictingHdr; return out; }
                 records[n] = t.writes; records[n].key.camera = nullptr; records[n++].key.kind = kFlatContractScreen;
                 if (t.hdrCamera) { records[n] = t.tone; records[n++].key.kind = kFlatContractScreen; }
@@ -184,7 +185,7 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
         if (out.reason == FlatMonoReason::ConflictingHdr) {
             for (uint32_t i = 0; i < p.targetsUsed; ++i) {
                 const auto& t = p.targets[i];
-                if (t.resource != tone->tone.key.srvResource[1] || !t.writes.draws) continue;
+                if (!hdrInput || t.resource != hdrInput || !t.writes.draws) continue;
                 auto& w = p.selectedConflict;
                 w.hdr = t.resource; w.sequence = t.hdrCamera ? t.tone.first : t.writes.first;
                 w.reference = flatRuntimeWitnessDraw(t.writes);
