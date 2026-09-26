@@ -3709,3 +3709,41 @@ settings should select and treat; what remains open after it is the
 visual qualification of the post-copy composite and motion blur (the
 temporal contract does not reproject via the game's motion blur), plus
 the 1920x1080 chain's blobs if their classification is ever needed.
+
+## 62. Generic shader-pair admission by bytecode classification (2026-09-26)
+
+Exact-hash recipes cannot keep pace with mod-patched or settings-tier shader
+populations -- the EDHM storm (section 58), the maxed-settings variants
+(sections 60-61) and the supporter's stock-pair storm all say so. The flat
+runtime now classifies an unreciped scene pair's actual creation bytecode
+once per (vs,ps) pair per session (64-entry memo, no allocation on the draw
+path) and admits provably-safe pairs through the identical qualifyProjection
+flow: a VS the analyzer can prove is a forward column-sum or dp4 clip idiom
+with NO second matrix use, branch or inverse consumer, paired with a PS that
+has no depth output, no vPos float path beyond integer tile/pixel-grid
+lookups, no clip-varying depth-UV idiom, no multi-row cb combine and no
+unanalyzable involvement. Inert-no-CB VS + clean PS joins the unchanged
+class. Audit outcomes 105/106 name generic admissions; everything unproven
+keeps the capture+failPhase path unchanged.
+
+The walker is length-safe (advances by the instruction-length field only);
+corpus sweep over 340 captured blobs: zero desyncs, all 58 exact-table
+forward recipes cross-matched on slot/layout/row, and every known
+inverse/special family (sky, deferred ray, screen ray) and consumer PS
+(7EAC, 8DEF, the decal companions) refuses. Known under-coverage, all
+conservative: light-space-matrix lighting PSs (the gobo/deferred variants
+from section 60) and clip-varying depth-UV decal pairs refuse generically --
+the exact table covers their stock cases, and their EDHM rehashes would
+refuse and capture. The two-conditional-matrix and inverse families stay
+exact-hash territory.
+
+This is also the supporter-bundle answer for stock-pair storms (his glare
+and world-blend pairs need no blobs from him once this ships). Separately,
+the supporter's second bundle shows a different failure class entirely:
+after switching to the VR edition his sessions die at
+`module_startup,graphics_unavailable=80004002` with no `runtime,` line --
+the OpenXR runtime never answered (no active headset/runtime), the same
+five-line signature as the 2026-09-14 doc's 21:16 not-a-flight case, and
+the process was killed before hook confirm, so the next session ran
+sentinel-disabled and looked worse. His flat problem was the section-58
+storm; his VR edition choice was the wrong tree entirely.
