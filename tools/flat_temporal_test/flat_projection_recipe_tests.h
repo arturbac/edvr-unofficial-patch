@@ -431,6 +431,47 @@ inline int flatProjectionRecipeTests() {
             expect(pair.vs!=epicMaxed[j].vs || pair.ps!=epicMaxed[j].ps,
                 "maxed-settings census has no duplicate exact pairs");
     }
+    // Epic 20260926_134640 in-flight under the EDHM chain: mod-patched and
+    // settings-tier variants of mapped VS families, plus the mod-patched
+    // 7F89 glare VS, classified from captured bytecode in build/flat-audit-menu.
+    const ObservedPair epicFlight[] = {
+        {0x33A5025C48FC8259ull,0x7AA0441EE0E88667ull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0x617C6E44A034E0C2ull,0x057F8E2778A5AAEDull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0xA6A39338C06E03A1ull,0x1AE6AB9A94C0456Eull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0xA8E4D93B8B294505ull,0x988711D4745DC5C7ull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0x5559BD94B6852E83ull,0xA8570CC2875ECC7Cull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0x5559BD94B6852E83ull,0xA8A8C196617726EAull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0x7F894EB5B6BA82A1ull,0x095030F27D2C362Aull,0,FlatProjectionPatchLayout::ForwardDp4,4},
+        {0x81216C77F90DEDD6ull,0x16F88966C091FC55ull,0,FlatProjectionPatchLayout::ForwardDp4,4},
+        {0xB7790CBFC6554097ull,0xB1CA8D8EEF7C886Dull,0,FlatProjectionPatchLayout::ForwardDp4,4},
+        {0xE508648660A352B2ull,0x62FB9466E5F672F3ull,0,FlatProjectionPatchLayout::ForwardDp4,4},
+        {0x5453D19B6D362364ull,0x289C3EA6EA3EFAF9ull,2,FlatProjectionPatchLayout::ForwardColumns,6},
+        {0xB932058F26B76691ull,0x0FAE3495E01DE787ull,2,FlatProjectionPatchLayout::ForwardColumns,6},
+        {0xDF3503CD07F9B10Cull,0x76BF170A625F18E3ull,2,FlatProjectionPatchLayout::ForwardColumns,6},
+        {0x9611A454527F7FEBull,0x5270C41523EAF95Aull,2,FlatProjectionPatchLayout::ForwardColumns,7},
+        {0xA2C2D5510BF1926Dull,0x4F39912FEED610E2ull,2,FlatProjectionPatchLayout::ForwardColumns,7},
+        {0x9B34C331902DC1EDull,0x9FDA9FAB05B654BDull,2,FlatProjectionPatchLayout::ForwardColumns,8},
+    };
+    expect(sizeof(epicFlight)/sizeof(epicFlight[0])==16,
+        "flight census complete");
+    for (size_t i=0;i<sizeof(epicFlight)/sizeof(epicFlight[0]);++i) {
+        const auto& pair=epicFlight[i];
+        const auto recipe=flatProjectionDrawRecipes(pair.vs,pair.ps);
+        expect(recipe.count==1 && recipe.requests[0].stage==FlatProjectionStage::Vertex &&
+            recipe.requests[0].slot==pair.slot && recipe.requests[0].patchCount==1 &&
+            recipe.requests[0].patches[0].layout==pair.layout &&
+            recipe.requests[0].patches[0].byteOffset==pair.row*16,
+            "flight exact pair patches only the measured vertex matrix span");
+        expect(flatProjectionDrawRecipes(pair.vs,pair.ps^1ull).count==0 &&
+            flatProjectionDrawRecipes(pair.vs^1ull,pair.ps).count==0 &&
+            flatProjectionDrawRecipes(pair.vs,0).count==0,
+            "flight projection requires both captured shader identities");
+        expect(!flatProjectionDrawUnchanged(pair.vs,pair.ps),
+            "flight projected geometry cannot bypass jitter");
+        for (size_t j=0;j<i;++j)
+            expect(pair.vs!=epicFlight[j].vs || pair.ps!=epicFlight[j].ps,
+                "flight census has no duplicate exact pairs");
+    }
     const auto screenRay=flatProjectionDrawRecipes(0x4AEC439CEC7FFDCEull,0x87EF79B19297B8C4ull);
     expect(screenRay.count==1 && screenRay.requests[0].stage==FlatProjectionStage::Vertex &&
         screenRay.requests[0].slot==1 && screenRay.requests[0].patchCount==1 &&
