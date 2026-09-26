@@ -12,6 +12,11 @@ enum class FlatMonoResolveMode { Taa, Dlaa, Dlss, Fsr };
 struct FlatMonoResolveFrame {
     ID3D11ShaderResourceView* color = nullptr;
     ID3D11ShaderResourceView* depth = nullptr;
+    // Partial temporal AA's per-frame reject mask (render-resolution, R8_UNORM),
+    // or null when nothing was stamped this frame. Borrowed like color/depth;
+    // bound at t9 for prep()/taa()/finish() only -- flatMonoResolveSpatialFallback
+    // and spatial() never reference it.
+    ID3D11ShaderResourceView* localReject = nullptr;
     uint32_t renderWidth = 0, renderHeight = 0, outputWidth = 0, outputHeight = 0;
     float camera[6][4] = {}, previousCamera[6][4] = {}; // unjittered b1[270..275]
     // Actual raster phases in render pixels, positive right/down. Camera rows

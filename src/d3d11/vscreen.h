@@ -122,6 +122,19 @@ void vScreenSetRenderTargetsRaw(ID3D11DeviceContext* ctx, uint32_t n,
 // never see it. Every one null-safe before the hooks are installed (no-op),
 // same as vScreenSetRenderTargetsRaw above.
 void vScreenDrawRaw(ID3D11DeviceContext* ctx, uint32_t vertexCount, uint32_t startVertex);
+// The same bypass for the other three draw kinds a scene draw can be: partial
+// temporal AA's local refusal (flat_runtime.cpp) re-issues exactly one of the
+// four with EDVR's own stamp pixel shader, past the hook, so the draw census,
+// the eye-draw gate, engine-record velocity and the temporal pass never see
+// the extra draw. Every one null-safe before the hooks are installed (no-op),
+// same as vScreenDrawRaw above.
+void vScreenDrawIndexedRaw(ID3D11DeviceContext* ctx, uint32_t indexCount,
+                           uint32_t startIndex, int32_t baseVertex);
+void vScreenDrawInstancedRaw(ID3D11DeviceContext* ctx, uint32_t vertexCountPerInstance,
+                             uint32_t instanceCount, uint32_t startVertex, uint32_t startInstance);
+void vScreenDrawIndexedInstancedRaw(ID3D11DeviceContext* ctx, uint32_t indexCountPerInstance,
+                                    uint32_t instanceCount, uint32_t startIndex,
+                                    int32_t baseVertex, uint32_t startInstance);
 void vScreenVSSetShaderRaw(ID3D11DeviceContext* ctx, ID3D11VertexShader* vs,
                            ID3D11ClassInstance* const* classInstances, uint32_t numClassInstances);
 void vScreenPSSetShaderRaw(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps,

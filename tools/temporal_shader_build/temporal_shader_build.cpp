@@ -66,6 +66,9 @@ struct Variant {
     const D3D_SHADER_MACRO* macros;
     std::vector<unsigned char> bytes;
     bool flat = false;
+    // Every variant so far is a compute shader; partial temporal AA's stamp
+    // pixel shader (flat_runtime.cpp's re-issued draw) is the first exception.
+    const char* profile = "cs_5_0";
 };
 
 static bool compile(CompileFn fn, const char* source, Variant& v, bool quiet = false) {
@@ -73,7 +76,7 @@ static bool compile(CompileFn fn, const char* source, Variant& v, bool quiet = f
     ComPtr<ID3DBlob> code, errors;
     const ULONGLONG start = GetTickCount64();
     const HRESULT hr = fn(source, std::strlen(source), v.sourceName, v.macros,
-                          nullptr, v.entry, "cs_5_0", 0, 0, &code, &errors);
+                          nullptr, v.entry, v.profile, 0, 0, &code, &errors);
     if (errors && !quiet) {
         const int size = static_cast<int>(std::min<SIZE_T>(errors->GetBufferSize(), 4096));
         std::fprintf(stderr, "%s: %.*s\n", v.sourceName, size,
@@ -125,6 +128,7 @@ static std::string sourceKey(const char* source, const std::vector<Variant>& var
         key.add(v.sourceName);
         key.add(v.entry);
         key.add(v.flat ? "flat" : "stereo");
+        key.add(v.profile);
         for (const D3D_SHADER_MACRO* m = v.macros; m && m->Name; ++m) {
             key.add(m->Name);
             key.add(m->Definition);
@@ -262,7 +266,8 @@ static int generate(const Options& o) {
         {"kFlatMonoPrepBytecode", "flat_mono_prep_cs", "prep", nullptr, {}, true},
         {"kFlatMonoTaaBytecode", "flat_mono_taa_cs", "taa", nullptr, {}, true},
         {"kFlatMonoFinishBytecode", "flat_mono_finish_cs", "finish", nullptr, {}, true},
-        {"kFlatMonoSpatialBytecode", "flat_mono_spatial_cs", "spatial", nullptr, {}, true}
+        {"kFlatMonoSpatialBytecode", "flat_mono_spatial_cs", "spatial", nullptr, {}, true},
+        {"kFlatStampBytecode", "flat_mono_stamp_ps", "stamp", nullptr, {}, true, "ps_5_0"}
     };
     const std::string core = extractCore(edvr::kTemporalCsHlsl);   // throws on a broken core before any work
     const std::string flat = core + edvr::kFlatMonoShaderSource;
@@ -338,8 +343,12 @@ static void selfTest() {
           "a missing, reordered or doubled marker, or a resource inside, fails the build");
     const std::string production = extractCore(edvr::kTemporalCsHlsl);
     const std::string flat = production + edvr::kFlatMonoShaderSource;
-    for (const char* entry : {"prep", "taa", "finish", "spatial"}) {
-        Variant mono{"kFlatSelfTest", "flat_mono_self_test", entry, nullptr, {}, true};
+    static const struct { const char* entry; const char* profile; } flatEntries[] = {
+        {"prep", "cs_5_0"}, {"taa", "cs_5_0"}, {"finish", "cs_5_0"}, {"spatial", "cs_5_0"},
+        {"stamp", "ps_5_0"},
+    };
+    for (const auto& fe : flatEntries) {
+        Variant mono{"kFlatSelfTest", "flat_mono_self_test", fe.entry, nullptr, {}, true, fe.profile};
         check(compile(compiler.fn, flat.c_str(), mono), "production flat mono shader compilation");
     }
     check(production.find("bool engineReprojectRows(") != std::string::npos &&
