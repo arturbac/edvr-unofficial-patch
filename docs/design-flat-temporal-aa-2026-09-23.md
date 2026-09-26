@@ -40,9 +40,13 @@
   the EDHM main menu, one startup `no-known-tone-pass` all session. FSR/DLSS
   that flight were a build-environment gap (no SDKs in the dev build), not
   code; both pinned SDKs are now on the machine and a full-pass SDK build is
-  installed. The generic tone-slot admission is a recorded follow-up; the
-  launch-time conflicting-hdr storm is section 65's online-model HDR-slot
-  bug, fixed there pending the Windows build.
+  installed. Section 65 (2026-09-26): flight states reset-stormed on 16 unknown
+  scene pairs -- EDHM/tier PS variants of mapped VS families plus the
+  mod-patched E904 glare VS, all bytecode-reviewed and exact-reciped, INSTALLED
+  on Epic, NOT FLOWN. Section 66: the launch and menu-to-flight conflicting-hdr
+  storm matches the online model's hardcoded PS1 tone-HDR read (DE65/9270 bind
+  their HDR at PS0) -- fixed in `989f6fd`, NOT BUILT on Windows. The generic
+  tone-slot admission is the recorded follow-up.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -63,9 +67,12 @@
   rejection crawl. The section-59 main-menu flight happened (section 63):
   zero unknown-pair captures held, but the tone slot refused every frame;
   the widened tone admission is FLOWN for TAA (section 64); the SDK-full
-  install now on Epic wants the same main-menu cycling to confirm DLSS and
-  FSR engage where TAA did. Section 65 re-attributes the storm to the
-  online-model slot bug; next flight confirms DE65/9270 frames treat.
+  install confirmed DLSS at the menu (section 65). Next: one in-flight flight
+  with EDHM at current settings on the section-65 recipes plus the section-66
+  slot fix -- expect zero unknown-pair captures, treated streaks, and no
+  conflicting-hdr at launch or menu-to-flight (a storm that survives the fix is
+  a genuine alias; qualify it then); the section-57 on-foot hangar/concourse
+  flight stands behind it.
   Existing evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
   PS91/BFE or stale-resize hypotheses. The separate menu hangar-floor P1
@@ -3849,7 +3856,49 @@ If it recurs in steady menu or flight states, qualify the alias (extent
 mismatch, ordering) instead of refusing; do not loosen the guard on
 unmeasured evidence.
 
-## 65. Tone HDR slot in the online model; section 64's storm re-attributed (2026-09-26)
+## 65. In-flight reset storm: 16 pairs reciped; transition HDR alias open (2026-09-26)
+
+The 13:46 Epic flight on the SDK-full build (`rc.2-14-g8103620f`) treated
+the entire main menu, DLSS included (`treated` past 16k, accepted-history
+~400/5s) -- sections 63-64 closed. In flight states the session
+reset-stormed: 58 `unknown-scene-projection-recipe` refusals, streaks at
+zero. The automatic audit captured 16 distinct pairs with all 32 bytecode
+stages saved, no F10 needed.
+
+Fifteen are known VS families with unseen PS hashes -- the section-59
+pattern at flight scale. Eight are EDHM-patched companions (t120 present;
+the delta against the vetted stock companion is the mod's colour block and
+config branches, instruction-for-instruction otherwise, cb row profiles
+identical). Four are stock settings-tier lighting variants (7AA0, 057F,
+1AE6, 9887) whose profiles match their companions exactly; their single
+svPos use is the companion's own integer tile divide. Three small ones read
+cb2 colour config only. `62FB9466` is EDHM's HUD recolor tree (~990
+instructions of literal t120 region tests) over the 14-instruction stock
+glare PS, sampling t0 at unchanged UV. The sixteenth pair is the
+EDHM-patched E904 glare VS (`7F894EB5`): the mod's t120 block scales glare
+size/alpha upstream of position; SV_Position remains the cb0[4..7] dp4
+idiom, with cb0[9..11] a view-space billboard orientation -- a local
+transform, not a clip consumer.
+
+Change: exact recipes for all 16, mirroring each VS family's measured span
+(the flight census in the recipe rig: admission, wrong-PS/wrong-VS/
+absent-PS refusal, no duplicates). The generic classifier's verdicts were
+the documented conservative refusals -- EDHM t120 loads, billboard second
+matrices, and lighting vPos divides it cannot prove; the exact table
+carries them as designed.
+
+Open: the `conflicting-hdr-target-or-camera` storm is now characterised as
+TRANSITION-phase resource aliasing, launch and menu-to-flight instance
+change, always the same two depthless writers into the tone's HDR resource:
+the 1920x1080 chain's `129F602B2A9CA439/8826CACC6382C78D` and copy-VS
+`20F383BBAC05C031` with an uncaptured PS `BF2302BCC7B434DB`. It clears in
+steady states and selection proceeds; BF23's blob is the missing evidence
+if it ever persists. Next flight: fly with EDHM at current settings --
+expect zero unknown-pair captures and treated streaks once the transition
+settles; if the alias outlives transitions, qualify it by extent mismatch
+instead of refusing.
+
+## 66. Tone HDR slot in the online model; the conflicting-hdr storm re-attributed (2026-09-26)
 
 Commit 8103620 taught `flatSelectMonoFrame` a per-variant tone HDR slot via
 `flat_mono_detail::toneHdrSlot(vs, ps)`: PS1 for the stock tone and the EDHM
@@ -3860,8 +3909,9 @@ it: `flatRuntimeObserve`'s copy branch (flat_runtime_model.h, two
 two log lines) still hardcoded slot 1, so a PS0 variant's own PS1 blur/bloom
 read as its HDR and every frame refused.
 
-Fix: `flat_mono_detail::toneHdrInput(key)` (flat_mono_frame.h) returns the
-recorded (vs, ps)'s actual slot, or null; all five sites now go through it.
+Fix (`989f6fd`): `flat_mono_detail::toneHdrInput(key)` (flat_mono_frame.h)
+returns the recorded (vs, ps)'s actual slot, or null; all five sites now go
+through it.
 
 Evidence: a Linux replay of the rig's `MonoFixture` through
 `flatRuntimeObserve` on HEAD `3d12d97`. Unfixed: stock and EDHM grade (PS1)
@@ -3871,24 +3921,36 @@ blur/bloom chain (`129F602B2A9CA439`/`8826CACC6382C78D`) writes their PS1
 texture. Fixed: all six cases, with and without the chain, at both render
 extents, select with `hdr` at the true HDR token.
 
-- ruled out: the section-64 conflicting-hdr storm is an HDR alias to qualify,
-  because the online model read the variant's PS1 (the DoF blur the 129F/8826
-  chain writes) as the HDR; it is this slot bug.
+Section 65 characterised the same storm as transition-phase aliasing: two
+depthless writers, the 1920x1080 chain's 129F/8826 and 20F3/BF23, into "the
+tone's HDR resource". That resource is what the unfixed model read at PS1. For
+a PS0 tone it is the variant's blur/bloom texture, whose writers are exactly
+such depthless passes; for a PS1 tone (stock or EAA5, the steady menu) it is
+the true HDR, which is why the storm clears in steady states. The next flight
+on this fix discriminates: gone at launch and menu-to-flight means it was this
+bug; still there means a genuine alias of the true HDR, and section 65's
+qualification applies.
+
+- ruled out: qualifying the section 64-65 storm as an HDR alias before a flight
+  on this fix, because the unfixed model read the PS0 variant's PS1 blur/bloom
+  (the texture 129F/8826 and 20F3/BF23 write) as the HDR and the replay
+  reproduces that exact refusal; only a storm that survives the fix is a real
+  alias.
 
 The rig missed it because its slot-0 fixtures (section 61) only ran through
 `flatSelectMonoFrame`, which 8103620 already fixed; nothing exercised those
 variants through the separate online model.
 
-This matches Sean's report -- main menu works with DoF off (slot 1,
-unaffected), no visible AA change with DoF on at the main menu or in game (slot
-0, refused every frame) -- but the in-game attribution still needs the flight
-log's `flat runtime refusal 5s` reasons; this is a model replay, not a captured
-frame.
+With section 65's census, Sean's report splits cleanly: the 13:46 flight's
+in-flight "no AA change" was the 16-pair reset storm, and this bug refuses
+every frame whose tone is DE65 or 9270 (DoF on, and the launch and
+menu-to-flight transitions).
 
 Status: built and tested only in a Linux model replay, NOT through `build.bat`;
 the Windows full build must pass before merge. Next flight: DoF on, main menu
-and in game; expect no `conflicting-hdr-target-or-camera` /
-`no-observed-hdr-writes` while DE65/9270 write the tone slot.
+and in flight; expect no `conflicting-hdr-target-or-camera` /
+`no-observed-hdr-writes` while DE65/9270 write the tone slot, including at
+launch and menu-to-flight.
 
 ### Generic classifier review (same session)
 
@@ -3909,7 +3971,9 @@ Verified findings on the generic shader-pair classifier
   refusals come from an indexable temp (6FD4) and the 3-row rule (06AA), not
   the div rule;
 - the 64-pair memo and the 2048-shader/16 MiB bytecode cache fail silently;
-  verdicts are logged only under F10.
+  verdicts are logged only under F10;
+- measured coverage: section 65's flight census, 0 of 16 in-flight unknown
+  pairs admitted; all 16 needed exact recipes.
 
 Evidence: Linux harness over the 34 fixtures plus hand-assembled ps_5_0
 programs.
