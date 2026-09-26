@@ -4,20 +4,11 @@
 #include "../../src/d3d11/flat_local_reject.h"
 
 inline int flatLocalRejectTests() {
-    using edvr::flatDrawKindStampable;
     using edvr::flatLocalRefusalReason;
     int failures = 0;
     auto expect = [&](bool ok, const char* name) {
         if (!ok) { std::printf("FAIL: local reject %s\n", name); ++failures; }
     };
-
-    expect(flatDrawKindStampable('D') && flatDrawKindStampable('I') &&
-           flatDrawKindStampable('N') && flatDrawKindStampable('X'),
-           "Draw, DrawIndexed, DrawInstanced and DrawIndexedInstanced carry a re-issue recipe");
-    expect(!flatDrawKindStampable('A') && !flatDrawKindStampable('Y') &&
-           !flatDrawKindStampable('Z') && !flatDrawKindStampable('?') &&
-           !flatDrawKindStampable(0),
-           "DrawAuto, both indirect kinds, the ctor default and an unknown kind cannot be stamped");
 
     expect(flatLocalRefusalReason("unknown-scene-projection-recipe") &&
            flatLocalRefusalReason("unchanged-shader-mismatch") &&

@@ -5044,26 +5044,6 @@ void vScreenDrawRaw(ID3D11DeviceContext* ctx, uint32_t vertexCount, uint32_t sta
     g_state->realDraw(ctx, vertexCount, startVertex);
 }
 
-void vScreenDrawIndexedRaw(ID3D11DeviceContext* ctx, uint32_t indexCount,
-                           uint32_t startIndex, int32_t baseVertex) {
-    if (!g_state || !g_state->realDrawIndexed || !ctx) return;
-    g_state->realDrawIndexed(ctx, indexCount, startIndex, baseVertex);
-}
-
-void vScreenDrawInstancedRaw(ID3D11DeviceContext* ctx, uint32_t vertexCountPerInstance,
-                             uint32_t instanceCount, uint32_t startVertex, uint32_t startInstance) {
-    if (!g_state || !g_state->realDrawInstanced || !ctx) return;
-    g_state->realDrawInstanced(ctx, vertexCountPerInstance, instanceCount, startVertex, startInstance);
-}
-
-void vScreenDrawIndexedInstancedRaw(ID3D11DeviceContext* ctx, uint32_t indexCountPerInstance,
-                                    uint32_t instanceCount, uint32_t startIndex,
-                                    int32_t baseVertex, uint32_t startInstance) {
-    if (!g_state || !g_state->realDrawIndexedInstanced || !ctx) return;
-    g_state->realDrawIndexedInstanced(ctx, indexCountPerInstance, instanceCount, startIndex,
-                                      baseVertex, startInstance);
-}
-
 void vScreenVSSetShaderRaw(ID3D11DeviceContext* ctx, ID3D11VertexShader* vs,
                            ID3D11ClassInstance* const* classInstances, uint32_t numClassInstances) {
     if (!g_state || !g_state->realVSSetShader || !ctx) return;

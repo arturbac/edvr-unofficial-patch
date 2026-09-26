@@ -12,8 +12,6 @@
 #include "exposure_fix.h"
 #include "device_hook.h"
 #include "dlaa.h"
-#include "vscreen.h"
-#include "temporal_shader_bytecode.h"
 #include "../common/config.h"
 #include "../common/log.h"
 #include "../common/runtime_profile.h"
@@ -138,55 +136,32 @@ struct State {
     uint64_t phaseCensusFrames=0, phaseCensusFailedFrames=0, phaseCensusTreatedFailedFrames=0;
     bool phaseCensusPending=false, phaseCensusFailed=false;
 
-    // --- Partial temporal AA ("local refusal"): config -----------------------
+    // --- Partial temporal AA ("local refusal"), redesigned per the 2026-09-26
+    // review: one raster phase across shared scene depth/colour. A per-draw-
+    // local refusal invalidates the frame's history and returns the runtime
+    // to observation until a refusal-free frame requalifies the contract;
+    // it is never claimed as treated. See docs/design-flat-temporal-aa-2026-09-23.md.
     bool partialWanted = true;
-    bool stampStartupLogged = false;
-    Ptr<ID3D11PixelShader> stampShader;
-    Ptr<ID3D11BlendState> stampBlendState;
-
-    // --- Partial temporal AA: the per-frame reject mask -----------------------
-    Ptr<ID3D11Texture2D> localRejectTexture;
-    Ptr<ID3D11RenderTargetView> localRejectRtv;
-    Ptr<ID3D11ShaderResourceView> localRejectSrv;
-    uint32_t localRejectWidth = 0, localRejectHeight = 0;
-    // The s.prefix.frame value the mask was last cleared+stamped for. Doubles
-    // as "did this frame stamp anything": the resolve binds the mask only when
-    // this equals the current s.prefix.frame.
-    uint64_t localRejectClearedFrame = ~0ull;
-
-    // --- Partial temporal AA: depth-stencil-state variant cache ---------------
-    // Keyed by the game's own DSS pointer (ref held so the key cannot be
-    // reused by a different object while cached). Bounded, round-robin evicted.
-    struct DssVariant { ID3D11DepthStencilState* key = nullptr; Ptr<ID3D11DepthStencilState> variant; };
-    static constexpr uint32_t kDssVariantCapacity = 16;
-    DssVariant dssVariants[kDssVariantCapacity]{};
-    uint32_t dssVariantsUsed = 0, dssVariantsEvictNext = 0;
-
-    // --- Partial temporal AA: current-draw scratch -----------------------------
-    // Valid only for the duration of one FlatRuntimeDrawScope ctor+dtor pair
-    // (this is a single owner-thread draw at a time, never nested): the ctor's
-    // own kind/count/start/base/startInstance/instances arguments and the
-    // draw's RTV/DSV extent, stashed here because qualifyProjection and
-    // refuseDraw only take State& -- the same convention as s.namedDepth,
-    // s.reason and the rest of this struct's per-draw fields.
-    char drawKind = '?';
-    uint32_t drawCount = 0, drawStart = 0, drawStartInstance = 0, drawInstances = 0;
-    int32_t drawBase = 0;
-    uint32_t drawColorWidth = 0, drawColorHeight = 0;
-    uint32_t drawDepthWidth = 0, drawDepthHeight = 0;
-    const void* drawDepthResource = nullptr;
+    // The returned-to-observation state: set by a per-draw-local refusal,
+    // cleared by a refusal-free frame. While set, frames run unjittered and
+    // the copy-draw treatment is skipped; the contract observation that
+    // requalifies keeps running.
+    bool observing = false;
+    // This frame saw a per-draw-local refusal (for the census close-out).
+    bool covFrameLocallyRefused = false;
+    // The current draw's shader identities, stashed per draw so refuseDraw
+    // (State& only) can name the refused pair in the census -- the same
+    // convention as s.namedDepth and s.reason.
     uint64_t drawVs = 0, drawPs = 0;
-    bool stampPending = false;
-    const char* stampReason = nullptr;
 
     // --- Partial temporal AA: coverage census (Part B), reset every 5s --------
     uint64_t covSceneDraws = 0, covExact = 0, covGeneric = 0, covInert = 0, covUnchanged = 0;
-    uint64_t covLocalRefused = 0, covStamped = 0, covStampFallbackGlobal = 0, covMemoFull = 0;
-    uint64_t covFrames = 0, covFramesWithStamps = 0, covTreatedWithStamps = 0;
-    bool covFrameHadStamp = false;
-    struct CoverageStampedPair { uint64_t vs = 0, ps = 0; const char* reason = ""; uint64_t draws = 0; };
-    CoverageStampedPair covStampedPairs[32]{};
-    uint32_t covStampedPairsUsed = 0;
+    uint64_t covLocalRefused = 0, covMemoFull = 0;
+    uint64_t covFrames = 0, covFramesObserving = 0, covObservationEntries = 0;
+    uint64_t covFramesLocallyRefused = 0;
+    struct CoverageRefusedPair { uint64_t vs = 0, ps = 0; const char* reason = ""; uint64_t draws = 0; };
+    CoverageRefusedPair covRefusedPairs[32]{};
+    uint32_t covRefusedPairsUsed = 0;
 };
 // Driver objects retire on the owner Present; never release under loader lock.
 State& state() { static State* p = new State; return *p; }
@@ -912,39 +887,27 @@ FlatShaderPairClassification classifyFlatProjectionPair(State& s, uint64_t vs, u
     return result;
 }
 // --- Partial temporal AA ("local refusal") --------------------------------
+// Redesigned 2026-09-26 per docs/review-flat-temporal-aa-2026-09-26.md
+// findings 1, 4 and 5: one raster phase across shared scene depth/colour.
 // A scene draw that cannot be jittered for a reason specific to that one
-// draw is left unjittered (no projection plan) and re-issued once, in
-// ~FlatRuntimeDrawScope, with EDVR's own stamp pixel shader into a per-frame
-// reject mask; the resolve treats exactly those pixels as rejected instead
-// of the whole frame's phase failing. experimental.temporal_aa_partial=off
-// is today's behaviour bit-for-bit: refuseDraw always falls back to
-// failPhase. See docs/design-flat-temporal-aa-2026-09-23.md.
+// draw still goes out unjittered (the proxy cannot stop the game's own
+// draw); the frame's history is invalidated and the runtime returns to
+// observation until a refusal-free frame requalifies the contract. It is
+// never claimed as treated. experimental.temporal_aa_partial=off is the
+// previous behaviour: failPhase per frame, retrying every frame.
 
-// (Re)creates the reject mask at width x height if it does not already
-// match. Refuses to resize once this frame has already cleared/stamped it:
-// a later draw at a different extent than an earlier stamped draw this
-// frame falls back to failPhase instead of corrupting the earlier stamps.
-bool ensureLocalRejectMask(State& s, uint32_t width, uint32_t height) {
-    if (s.localRejectSrv && s.localRejectWidth == width && s.localRejectHeight == height) return true;
-    if (!s.device || !width || !height) return false;
-    if (s.localRejectClearedFrame == s.prefix.frame) return false;
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = width; desc.Height = height; desc.MipLevels = 1; desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_R8_UNORM; desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    Ptr<ID3D11Texture2D> texture;
-    Ptr<ID3D11RenderTargetView> rtv;
-    Ptr<ID3D11ShaderResourceView> srv;
-    if (FAILED(s.device->CreateTexture2D(&desc, nullptr, &texture)) ||
-        FAILED(s.device->CreateRenderTargetView(texture.Get(), nullptr, &rtv)) ||
-        FAILED(s.device->CreateShaderResourceView(texture.Get(), nullptr, &srv)))
-        return false;
-    s.localRejectTexture = texture; s.localRejectRtv = rtv; s.localRejectSrv = srv;
-    s.localRejectWidth = width; s.localRejectHeight = height;
-    // The texture's initial contents are undefined; force a fresh clear the
-    // next time this frame's first stamp actually draws.
-    s.localRejectClearedFrame = ~0ull;
-    return true;
+// Part B per-pair breakdown of the top locally refused (VS,PS,reason)
+// triples this window. Overflow past this fixed table only drops out of the
+// top-5 breakdown; the aggregate covLocalRefused counter still counts it.
+void recordLocallyRefusedPair(State& s, uint64_t vs, uint64_t ps, const char* reason) {
+    for (uint32_t i = 0; i < s.covRefusedPairsUsed; ++i) {
+        auto& e = s.covRefusedPairs[i];
+        if (e.vs == vs && e.ps == ps && std::strcmp(e.reason, reason) == 0) { ++e.draws; return; }
+    }
+    if (s.covRefusedPairsUsed < 32) {
+        auto& e = s.covRefusedPairs[s.covRefusedPairsUsed++];
+        e.vs = vs; e.ps = ps; e.reason = reason; e.draws = 1;
+    }
 }
 
 // Local-refusal entry point for a per-draw-local reason on a SCENE DRAW.
@@ -952,86 +915,20 @@ bool ensureLocalRejectMask(State& s, uint32_t width, uint32_t height) {
 // this -- they call failPhase directly, gated on cs at each of its three
 // call sites -- and every other caller here is a scene draw by construction.
 void refuseDraw(State& s, const char* reason) {
-    if (!s.partialWanted || !flatLocalRefusalReason(reason)) { failPhase(s, reason); return; }
+    if (!flatLocalRefusalReason(reason)) { failPhase(s, reason); return; }
     ++s.covLocalRefused;
-    const bool stampable = flatDrawKindStampable(s.drawKind) && s.drawDepthResource &&
-        s.drawDepthWidth && s.drawDepthHeight && s.drawColorWidth && s.drawColorHeight;
-    if (!stampable || !ensureLocalRejectMask(s, s.drawColorWidth, s.drawColorHeight) ||
-        s.drawDepthWidth != s.localRejectWidth || s.drawDepthHeight != s.localRejectHeight) {
-        failPhase(s, reason);
-        ++s.covStampFallbackGlobal;
-        return;
-    }
-    s.stampPending = true;
-    s.stampReason = reason;
-}
-
-// A cached, derived depth-stencil-state variant for the game's currently
-// bound DSS object (nullptr key = D3D11 defaults): DepthWriteMask forced to
-// ZERO (the stamp must never touch the real depth buffer) and StencilEnable
-// forced to FALSE (stencil is irrelevant to which pixels get marked).
-// DepthFunc is EQUAL when the game's own state had depth enabled with writes
-// ALL: the buffer at each covered pixel is now either this draw's own depth
-// (it won the test) or unchanged (it lost, no coverage), so EQUAL stamps
-// exactly the surviving pixels. Otherwise DepthEnable/DepthFunc mirror the
-// game's own state: the buffer is unchanged either way (this draw did not
-// write it), so replaying the identical test reproduces the identical
-// visible coverage.
-ID3D11DepthStencilState* stampDepthStencilVariant(State& s, ID3D11DepthStencilState* gameState) {
-    for (uint32_t i = 0; i < s.dssVariantsUsed; ++i)
-        if (s.dssVariants[i].key == gameState) return s.dssVariants[i].variant.Get();
-    if (!s.device) return nullptr;
-    D3D11_DEPTH_STENCIL_DESC desc{};
-    if (gameState) gameState->GetDesc(&desc);
-    else {
-        desc.DepthEnable = TRUE; desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-        desc.DepthFunc = D3D11_COMPARISON_LESS;
-    }
-    D3D11_DEPTH_STENCIL_DESC variant = desc;
-    variant.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
-    variant.StencilEnable = FALSE;
-    if (desc.DepthEnable && desc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL)
-        variant.DepthFunc = D3D11_COMPARISON_EQUAL;
-    Ptr<ID3D11DepthStencilState> created;
-    if (FAILED(s.device->CreateDepthStencilState(&variant, &created))) return nullptr;
-    uint32_t slot;
-    if (s.dssVariantsUsed < State::kDssVariantCapacity) slot = s.dssVariantsUsed++;
-    else { slot = s.dssVariantsEvictNext; s.dssVariantsEvictNext = (s.dssVariantsEvictNext + 1) % State::kDssVariantCapacity; }
-    if (s.dssVariants[slot].key) s.dssVariants[slot].key->Release();
-    if (gameState) gameState->AddRef();
-    s.dssVariants[slot].key = gameState;
-    s.dssVariants[slot].variant = created;
-    return created.Get();
-}
-
-// Part B per-pair breakdown of the top stamped (VS,PS,reason) triples this
-// window. Overflow past this fixed table only drops out of the top-5
-// breakdown; the aggregate covStamped counter on the main line still counts it.
-void recordStampedPair(State& s, uint64_t vs, uint64_t ps, const char* reason) {
-    for (uint32_t i = 0; i < s.covStampedPairsUsed; ++i) {
-        auto& e = s.covStampedPairs[i];
-        if (e.vs == vs && e.ps == ps && std::strcmp(e.reason, reason) == 0) { ++e.draws; return; }
-    }
-    if (s.covStampedPairsUsed < 32) {
-        auto& e = s.covStampedPairs[s.covStampedPairsUsed++];
-        e.vs = vs; e.ps = ps; e.reason = reason; e.draws = 1;
-    }
-}
-
-// Re-issues the original draw call with its captured arguments, past the
-// vscreen.cpp hook entirely, using the same stored-real-function-pointer
-// mechanism fix.eye_mask's ring and ui_layer.cpp's redirected draw already
-// use (vScreen*Raw): the draw census, the eye-draw gate, engine-record
-// velocity and the temporal pass never see the extra draw.
-void reissueStampDraw(const State& s, ID3D11DeviceContext* ctx) {
-    switch (s.drawKind) {
-    case 'D': vScreenDrawRaw(ctx, s.drawCount, static_cast<uint32_t>(s.drawBase)); break;
-    case 'I': vScreenDrawIndexedRaw(ctx, s.drawCount, s.drawStart, s.drawBase); break;
-    case 'N': vScreenDrawInstancedRaw(ctx, s.drawCount, s.drawInstances,
-                                      static_cast<uint32_t>(s.drawBase), s.drawStartInstance); break;
-    case 'X': vScreenDrawIndexedInstancedRaw(ctx, s.drawCount, s.drawInstances, s.drawStart,
-                                             s.drawBase, s.drawStartInstance); break;
-    default: break;
+    s.covFrameLocallyRefused = true;
+    recordLocallyRefusedPair(s, s.drawVs, s.drawPs, reason);
+    // The current frame fails coherently either way: zero phase when nothing
+    // jittered yet, the spatial fallback otherwise -- never a mixed-phase
+    // temporal evaluation.
+    failPhase(s, reason);
+    if (s.partialWanted && !s.observing) {
+        s.observing = true;
+        ++s.covObservationEntries;
+        Log::get().note("flat coverage: returned to observation at frame=%llu reason=%s VS=%016llX PS=%016llX; treatment resumes after a refusal-free frame",
+            (unsigned long long)s.prefix.frame, reason,
+            (unsigned long long)s.drawVs, (unsigned long long)s.drawPs);
     }
 }
 
@@ -1211,17 +1108,9 @@ void flatRuntimeResize() {
     for (auto& r : s.colors) r.Reset(); for (auto& r : s.depths) r.Reset();
     for (auto& r : s.uavs) r.Reset();
     for (auto& c : s.cameras) c = Camera{}; s.cameraCount = 0;
-    // Partial temporal AA: every device-owned resource is released here too,
-    // same as output/sceneDepth/depthView above -- a device change makes the
-    // mask, the stamp shader/blend state and the DSS variant cache's cached
-    // pointers all invalid.
-    s.localRejectTexture.Reset(); s.localRejectRtv.Reset(); s.localRejectSrv.Reset();
-    s.localRejectWidth = s.localRejectHeight = 0; s.localRejectClearedFrame = ~0ull;
-    s.stampShader.Reset(); s.stampBlendState.Reset(); s.stampStartupLogged = false;
-    for (auto& v : s.dssVariants) { if (v.key) v.key->Release(); v = State::DssVariant{}; }
-    s.dssVariantsUsed = s.dssVariantsEvictNext = 0;
-    s.stampPending = false; s.stampReason = nullptr;
-    s.covFrameHadStamp = false;
+    // Local refusal's observation ends with the contract: a resize or device
+    // change requalifies nothing, but the state itself must not survive.
+    s.observing = false; s.covFrameLocallyRefused = false;
     s.prefix = FlatRuntimePrefix{}; s.context.Reset(); s.device.Reset(); s.thread = 0; s.viewportCount = 0;
 }
 void flatRuntimeBeforePresent() { g_flatRuntimeLive.store(false, std::memory_order_release); }
@@ -1241,8 +1130,9 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // on, independent of jitterWanted/partialWanted -- see the 5s report
     // below.
     ++s.covFrames;
-    if (s.covFrameHadStamp) { ++s.covFramesWithStamps; if (s.treated) ++s.covTreatedWithStamps; }
-    s.covFrameHadStamp = false;
+    if (s.observing) ++s.covFramesObserving;
+    if (s.covFrameLocallyRefused) ++s.covFramesLocallyRefused;
+    s.covFrameLocallyRefused = false;
     const auto mode = Config::get().requestedTemporalMode();
     const bool enabled = temporalModeEnabled(mode);
     const auto model = Config::get().getString("fix.temporal_aa_model", "k");
@@ -1286,23 +1176,13 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // no history reset -- it only gates refuseDraw, checked fresh on every
     // draw from here on.
     s.partialWanted=_stricmp(Config::get().getString("experimental.temporal_aa_partial","on").c_str(),"off")!=0;
-    if (!s.stampStartupLogged) {
-        s.stampStartupLogged = true;
-        const HRESULT shaderHr = s.device->CreatePixelShader(kFlatStampBytecode, sizeof(kFlatStampBytecode),
-                                                              nullptr, &s.stampShader);
-        HRESULT blendHr = S_OK;
-        if (SUCCEEDED(shaderHr)) {
-            D3D11_BLEND_DESC blendDesc{};
-            blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED;
-            blendHr = s.device->CreateBlendState(&blendDesc, &s.stampBlendState);
-        }
-        if (SUCCEEDED(shaderHr) && SUCCEEDED(blendHr))
-            Log::get().note("flat coverage startup: partial=%s stamp-ps=created mask=deferred",
-                s.partialWanted?"on":"off");
-        else
-            Log::get().note("flat coverage startup: partial=%s stamp-ps=failed hr=0x%08lX mask=deferred",
-                s.partialWanted?"on":"off",
-                static_cast<unsigned long>(SUCCEEDED(shaderHr)?blendHr:shaderHr));
+    // Local refusal's observation: a refusal-free frame requalifies the
+    // contract and resumes warm-up. phase.finish() above made this frame's
+    // coverage/failed flags final.
+    if (s.observing && s.frameCoverage && !s.phase.failed) {
+        s.observing = false;
+        Log::get().note("flat coverage: contract requalified at frame=%llu; warm-up resumes",
+            (unsigned long long)frame);
     }
     if(wanted && !s.projection) {
         s.projection.reset(new(std::nothrow) FlatProjectionRuntime);
@@ -1386,7 +1266,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.phaseDepth=static_cast<ID3D11Resource*>(const_cast<void*>(s.previous.depth));
         s.phaseHdr=static_cast<ID3D11Resource*>(const_cast<void*>(s.previous.hdr));
     }
-    s.phase.beginFrame(wanted && s.projection!=nullptr,compatible,s.phaseWidth,s.phaseHeight);
+    s.phase.beginFrame(wanted && !s.observing && s.projection!=nullptr,compatible,s.phaseWidth,s.phaseHeight);
     s.frameCoverage=true;s.temporalAccepted=false;
     s.jitterReason=nonzeroPhase(s)?"live":"warming";
     if(s.projection)s.projection->enableColdReadback(!nonzeroPhase(s));
@@ -1426,26 +1306,26 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             Log::get().note("flat runtime refusal 5s: reason=%s count=%llu", entry.first.c_str(), static_cast<unsigned long long>(entry.second));
         // Part B coverage census: always printed, even when every field is
         // zero -- that is how "code never ran" (line absent) differs from
-        // "ran, nothing to stamp" (stamped=0 on a line that is present).
-        Log::get().note("flat coverage 5s: partial=%s scene-draws=%llu exact=%llu generic=%llu inert=%llu "
-            "unchanged=%llu local-refused=%llu stamped=%llu stamp-fallback-global=%llu frames=%llu "
-            "frames-with-stamps=%llu treated-with-stamps=%llu memo-full=%llu",
-            s.partialWanted?"on":"off",
+        // "ran, nothing refused" (local-refused=0 on a line that is present).
+        Log::get().note("flat coverage 5s: partial=%s observing=%u scene-draws=%llu exact=%llu generic=%llu inert=%llu "
+            "unchanged=%llu local-refused=%llu frames=%llu frames-locally-refused=%llu "
+            "returned-to-observation=%llu frames-observing=%llu memo-full=%llu",
+            s.partialWanted?"on":"off", s.observing?1u:0u,
             static_cast<unsigned long long>(s.covSceneDraws), static_cast<unsigned long long>(s.covExact),
             static_cast<unsigned long long>(s.covGeneric), static_cast<unsigned long long>(s.covInert),
             static_cast<unsigned long long>(s.covUnchanged), static_cast<unsigned long long>(s.covLocalRefused),
-            static_cast<unsigned long long>(s.covStamped), static_cast<unsigned long long>(s.covStampFallbackGlobal),
-            static_cast<unsigned long long>(s.covFrames), static_cast<unsigned long long>(s.covFramesWithStamps),
-            static_cast<unsigned long long>(s.covTreatedWithStamps), static_cast<unsigned long long>(s.covMemoFull));
+            static_cast<unsigned long long>(s.covFrames), static_cast<unsigned long long>(s.covFramesLocallyRefused),
+            static_cast<unsigned long long>(s.covObservationEntries), static_cast<unsigned long long>(s.covFramesObserving),
+            static_cast<unsigned long long>(s.covMemoFull));
         {
             uint32_t order[32];
-            for (uint32_t i=0;i<s.covStampedPairsUsed;++i) order[i]=i;
-            std::sort(order, order+s.covStampedPairsUsed, [&](uint32_t a, uint32_t b) {
-                return s.covStampedPairs[a].draws > s.covStampedPairs[b].draws;
+            for (uint32_t i=0;i<s.covRefusedPairsUsed;++i) order[i]=i;
+            std::sort(order, order+s.covRefusedPairsUsed, [&](uint32_t a, uint32_t b) {
+                return s.covRefusedPairs[a].draws > s.covRefusedPairs[b].draws;
             });
-            for (uint32_t i=0;i<s.covStampedPairsUsed && i<5;++i) {
-                const auto& e = s.covStampedPairs[order[i]];
-                Log::get().note("flat coverage stamped 5s: VS=%016llX PS=%016llX reason=%s draws=%llu",
+            for (uint32_t i=0;i<s.covRefusedPairsUsed && i<5;++i) {
+                const auto& e = s.covRefusedPairs[order[i]];
+                Log::get().note("flat coverage locally-refused 5s: VS=%016llX PS=%016llX reason=%s draws=%llu",
                     static_cast<unsigned long long>(e.vs), static_cast<unsigned long long>(e.ps),
                     e.reason, static_cast<unsigned long long>(e.draws));
             }
@@ -1471,9 +1351,9 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.resetMissingWindow = s.resetGapWindow = s.resetDepthWindow = s.resetColorWindow = s.resetExtentWindow = 0;
         s.conflictWindow.clear();
         s.covSceneDraws = s.covExact = s.covGeneric = s.covInert = s.covUnchanged = 0;
-        s.covLocalRefused = s.covStamped = s.covStampFallbackGlobal = s.covMemoFull = 0;
-        s.covFrames = s.covFramesWithStamps = s.covTreatedWithStamps = 0;
-        s.covStampedPairsUsed = 0;
+        s.covLocalRefused = s.covMemoFull = 0;
+        s.covFrames = s.covFramesObserving = s.covObservationEntries = s.covFramesLocallyRefused = 0;
+        s.covRefusedPairsUsed = 0;
         s.lastReport = now;
     }
     g_flatRuntimeLive.store(true, std::memory_order_release);
@@ -1560,16 +1440,11 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     k.color = rt.resource; k.rtv = bindingGet(BindSlot::Rtv0); k.width = rt.a; k.height = rt.b; k.format = rt.fmt;
     k.depth = ds.resource; k.dsv = bindingGet(BindSlot::Dsv0); k.depthWidth = ds.a; k.depthHeight = ds.b; k.depthFormat = ds.fmt;
     k.vs = bindingShaderHash(BindSlot::Vs); k.ps = bindingShaderHash(BindSlot::Ps);
-    // Partial temporal AA's current-draw scratch (see refuseDraw): this
-    // draw's own re-issue recipe and extent, in case a per-draw reason
-    // refuses it below. Cheap POD stores, done for every draw so
-    // qualifyProjection (State& only) can reach them too.
-    s.drawKind = kind; s.drawCount = count; s.drawStart = start; s.drawBase = base;
-    s.drawStartInstance = startInstance; s.drawInstances = instances;
-    s.drawColorWidth = k.width; s.drawColorHeight = k.height;
-    s.drawDepthWidth = k.depthWidth; s.drawDepthHeight = k.depthHeight; s.drawDepthResource = k.depth;
+    // Partial temporal AA's current-draw identities (see refuseDraw): the
+    // pair a per-draw reason refuses, named in the coverage census. Cheap
+    // POD stores, done for every draw so qualifyProjection (State& only) can
+    // reach them too.
     s.drawVs = k.vs; s.drawPs = k.ps;
-    s.stampPending = false; s.stampReason = nullptr;
     k.b1 = bindingGet(BindSlot::VsCb1); k.viewportCount = s.viewportCount;
     static_assert(sizeof(k.viewport) == sizeof(D3D11_VIEWPORT), "viewport layout"); std::memcpy(k.viewport, &s.viewport, sizeof(k.viewport));
     if (auto* c = camera(static_cast<ID3D11Buffer*>(const_cast<void*>(k.b1)), false)) {
@@ -1720,6 +1595,10 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         else refuseDraw(s,"draw-binding-refused");
     }
     if (!copy) return;
+    // Local refusal's observation: no selection or resolve until a
+    // refusal-free frame requalifies the contract; the contract observation
+    // above (flatRuntimeObserve) is what requalifies, so it keeps running.
+    if (s.observing) return;
     if(nonzeroPhase(s) && !s.phase.applied)failPhase(s,"no-raster-application");
     s.reason = flatMonoReasonName(selected.reason);
     // Close only the two sampled prefix frames against their actual copy
@@ -1770,11 +1649,6 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     }
     FlatMonoResolveFrame f{}; f.color = original; f.depth = s.depthView.Get(); f.renderWidth = selected.renderWidth; f.renderHeight = selected.renderHeight;
     f.outputWidth = selected.outputWidth; f.outputHeight = selected.outputHeight; f.frame = s.prefix.frame; f.mode = s.engine;
-    // Partial temporal AA: bind the reject mask only on a frame that actually
-    // stamped something; otherwise leave it null (prep()/taa()/finish() read
-    // an unbound Texture2D as 0 everywhere, so this is already safe either
-    // way -- explicit for clarity and to avoid binding a stale frame's mask).
-    if (s.localRejectSrv && s.localRejectClearedFrame == s.prefix.frame) f.localReject = s.localRejectSrv.Get();
     nativeScale.store(f.renderWidth >= f.outputWidth && f.renderHeight >= f.outputHeight,
                       std::memory_order_release);
     f.configuredDlssPreset=s.preset;
@@ -1895,87 +1769,5 @@ FlatRuntimeDrawScope::~FlatRuntimeDrawScope() {
     if (replaced) ctx->PSSetShaderResources(0, 1, &original);
     for (auto* target : targets) if (target) target->Release();
     if (depth) depth->Release(); if (original) original->Release();
-    // Partial temporal AA: re-issue this draw once more, with EDVR's own
-    // stamp pixel shader, into the reject mask. After every restore above,
-    // so this capture/restore cycle starts from the game's true original OM
-    // state regardless of what the producer/replaced paths just put back.
-    // IA/VS/GS/rasterizer/viewport/scissor are left exactly as the game set
-    // them -- this draw was never jittered, so its geometry and depth are
-    // already identical to the real draw that just happened.
-    auto& s = state();
-    if (s.stampPending) {
-        s.stampPending = false;
-        const char* reason = s.stampReason ? s.stampReason : "partial-stamp-refused";
-        bool stamped = false;
-        if (s.localRejectRtv && s.stampShader && s.stampBlendState) {
-            ID3D11RenderTargetView* savedRt[8]{};
-            ID3D11DepthStencilView* savedDs = nullptr;
-            ctx->OMGetRenderTargets(8, savedRt, &savedDs);
-            ID3D11BlendState* savedBlend = nullptr; float savedFactor[4]{}; UINT savedMask = 0;
-            ctx->OMGetBlendState(&savedBlend, savedFactor, &savedMask);
-            ID3D11DepthStencilState* savedDss = nullptr; UINT savedRef = 0;
-            ctx->OMGetDepthStencilState(&savedDss, &savedRef);
-            ID3D11PixelShader* savedPs = nullptr;
-            ID3D11ClassInstance* savedClasses[256]{}; UINT savedClassCount = 256;
-            ctx->PSGetShader(&savedPs, savedClasses, &savedClassCount);
-            // No DSV: refuseDraw's own eligibility check already required one
-            // at schedule time, but never trust that nothing changed.
-            if (savedDs) {
-                // A second, independent check against the ACTUAL bound DSV
-                // resource (not just the ctor-time cached width/height):
-                // OMSetRenderTargets requires the RTV and DSV it binds
-                // together to have identical dimensions AND sample counts.
-                // refuseDraw already compared width/height; this also rules
-                // out a multisampled depth buffer, which the R8_UNORM,
-                // single-sample mask could never legally pair with.
-                Ptr<ID3D11Resource> dsResource; savedDs->GetResource(&dsResource);
-                Ptr<ID3D11Texture2D> dsTexture;
-                D3D11_TEXTURE2D_DESC dsDesc{};
-                if (dsResource) dsResource.As(&dsTexture);
-                if (dsTexture) dsTexture->GetDesc(&dsDesc);
-                const bool dsMatchesMask = dsTexture && dsDesc.SampleDesc.Count == 1 &&
-                    dsDesc.Width == s.localRejectWidth && dsDesc.Height == s.localRejectHeight;
-                if (dsMatchesMask) {
-                    if (s.localRejectClearedFrame != s.prefix.frame) {
-                        const float zero[4]{};
-                        ctx->ClearRenderTargetView(s.localRejectRtv.Get(), zero);
-                        s.localRejectClearedFrame = s.prefix.frame;
-                    }
-                    if (ID3D11DepthStencilState* variant = stampDepthStencilVariant(s, savedDss)) {
-                        ID3D11RenderTargetView* maskRtv = s.localRejectRtv.Get();
-                        vScreenSetRenderTargetsRaw(ctx, 1, &maskRtv, savedDs);
-                        const float blendFactor[4]{0, 0, 0, 0};
-                        vScreenOMSetBlendStateRaw(ctx, s.stampBlendState.Get(), blendFactor, 0xFFFFFFFFu);
-                        ctx->OMSetDepthStencilState(variant, 0);
-                        vScreenPSSetShaderRaw(ctx, s.stampShader.Get(), nullptr, 0);
-                        reissueStampDraw(s, ctx);
-                        stamped = true;
-                    }
-                }
-                // Restore exactly what was bound before the stamp, in the
-                // reverse order it was bound.
-                ctx->OMSetDepthStencilState(savedDss, savedRef);
-                vScreenPSSetShaderRaw(ctx, savedPs, savedClasses, savedClassCount);
-                vScreenOMSetBlendStateRaw(ctx, savedBlend, savedFactor, savedMask);
-                vScreenSetRenderTargetsRaw(ctx, 8, savedRt, savedDs);
-            }
-            for (auto* rt : savedRt) if (rt) rt->Release();
-            if (savedDs) savedDs->Release();
-            if (savedBlend) savedBlend->Release();
-            if (savedDss) savedDss->Release();
-            if (savedPs) savedPs->Release();
-            for (UINT i = 0; i < savedClassCount; ++i) if (savedClasses[i]) savedClasses[i]->Release();
-        }
-        if (stamped) {
-            ++s.covStamped; s.covFrameHadStamp = true;
-            recordStampedPair(s, s.drawVs, s.drawPs, reason);
-        } else {
-            // Could not actually stamp (resources unavailable at issue time,
-            // though refuseDraw already checked eligibility at schedule
-            // time): fall back to the pre-partial-AA behaviour for this draw.
-            failPhase(s, reason);
-            ++s.covStampFallbackGlobal;
-        }
-    }
 }
 } // namespace edvr

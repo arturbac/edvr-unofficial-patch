@@ -1,34 +1,30 @@
 #pragma once
 #include <cstring>
 
-// Partial temporal AA ("local refusal"): pure, header-only policy shared by
-// flat_runtime.cpp and tools/flat_temporal_test so the exact stampable-kind
-// and locally-refusable-reason sets are one tested table instead of two
+// Local refusal ("partial" temporal AA), redesigned 2026-09-26 after
+// docs/review-flat-temporal-aa-2026-09-26.md findings 1, 4 and 5: the
+// stamp-mask/mixed-phase form of partial AA never enabled in the flat
+// profile and was unproven where it mixed unjittered geometry into a
+// jittered scene. The semantics now: one raster phase across shared scene
+// depth/colour. A scene draw that cannot be jittered for a reason specific
+// to that one draw still goes out unjittered (the proxy cannot stop the
+// game's own draw); the frame's history is invalidated and the runtime
+// returns to observation until a refusal-free frame requalifies the
+// contract. It is never claimed as treated. Pure, header-only policy shared
+// by flat_runtime.cpp and tools/flat_temporal_test so the exact
+// locally-refusable-reason set is one tested table instead of two
 // hand-matched copies. See docs/design-flat-temporal-aa-2026-09-23.md.
 namespace edvr {
 
-// Kinds vscreen.cpp's hookedDraw/hookedDrawIndexed/hookedDrawInstanced/
-// hookedDrawIndexedInstanced stash a full re-issue recipe for (count, start,
-// base, startInstance, instances -- see FlatRuntimeDrawScope's ctor args at
-// each call site). DrawAuto ('A'), both indirect kinds ('Y' DrawInstanced-
-// Indirect, 'Z' DrawIndexedInstancedIndirect) and the ctor's own '?' default
-// carry no such captured arguments, so a per-draw reason on one of those
-// cannot be locally refused -- it keeps failing the whole frame's phase
-// exactly as before partial AA existed.
-constexpr bool flatDrawKindStampable(char kind) {
-    return kind == 'D' || kind == 'I' || kind == 'N' || kind == 'X';
-}
-
-// The exact per-draw failPhase reasons partial AA may turn into a local
-// refusal (stamp this one draw's pixels into the reject mask and leave the
-// rest of the frame's jitter alone) instead of failing the whole frame's
-// phase. Every other reason stays frame-global by calling failPhase
-// directly: render-extent-changed, invalid-render-extent, scene-projection-
-// depth-unassociated, scene-depth-changed, no-raster-application, anything
-// reached only from the compute/dispatch path (qualifyProjection's cs!=0
-// calls, compute-binding-refused, compute-source-invalidated, unknown-
-// context-state), and every selector/model refusal downstream of the
-// resolve (already-treated-this-frame, producer-source-identity-mismatch,
+// The exact per-draw failPhase reasons local refusal turns into
+// invalidate-and-observe. Every other reason stays frame-global by calling
+// failPhase directly: render-extent-changed, invalid-render-extent,
+// scene-projection-depth-unassociated, scene-depth-changed,
+// no-raster-application, anything reached only from the compute/dispatch
+// path (qualifyProjection's cs!=0 calls, compute-binding-refused,
+// compute-source-invalidated, unknown-context-state), and every
+// selector/model refusal downstream of the resolve
+// (already-treated-this-frame, producer-source-identity-mismatch,
 // actual-handoff-or-depth-view-refused, incomplete-jitter-frame,
 // engine-source-not-ready, and the resolver's own failure reasons).
 inline bool flatLocalRefusalReason(const char* reason) {
