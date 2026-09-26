@@ -2,6 +2,7 @@
 #include "flat_runtime_model.h"
 #include "flat_mono_resolve.h"
 #include "flat_projection_recipes.h"
+#include "flat_shader_classifier.h"
 #include "flat_projection_ownership.h"
 #include "flat_camera_probe.h"
 #include "flat_live_phase.h"
@@ -80,6 +81,15 @@ struct State {
     };
     AuditOutcome projectionOutcomes[256]{}; uint32_t projectionOutcomesUsed = 0;
     uint64_t projectionOutcomeOverflow = 0;
+    // Generic shader classification memo: fixed-size, linear scan, no
+    // allocation on the draw path; classification runs at most once per
+    // (vs,ps) pair per session. Overflow keeps the existing refuse path.
+    struct GenericClassification {
+        uint64_t vs = 0, ps = 0;
+        FlatShaderPairClassification classification{};
+    };
+    GenericClassification genericClassifications[64]{};
+    uint32_t genericClassificationsUsed = 0;
     struct LocalProjectionSample {
         uint64_t firstFrame = 0, frames[2]{};
         const void* color[2]{}, *depth[2]{};
@@ -305,7 +315,7 @@ void reportProjection(State& s, const char* event) {
         (unsigned long long)(s.projectionViewportChecks-s.projectionViewportMismatches),
         (unsigned long long)s.projectionViewportMismatches,(unsigned long long)s.projectionViewportWitnesses,(unsigned long long)s.projectionViewportSuppressed,
         (unsigned long long)s.projectionViewportUnrecorded);
-    Log::get().note("flat projection outcome totals: distinct=%u overflow-observations=%llu unchanged-draws=%llu; result=prepared is reason-code 0, failures retain their code, 101=unknown-recipe, 103=bytecode-unchanged, 104=projection-viewport-mismatch",
+    Log::get().note("flat projection outcome totals: distinct=%u overflow-observations=%llu unchanged-draws=%llu; result=prepared is reason-code 0, failures retain their code, 101=unknown-recipe, 103=bytecode-unchanged, 104=projection-viewport-mismatch, 105=generic-recipe, 106=generic-inert",
         s.projectionOutcomesUsed,(unsigned long long)s.projectionOutcomeOverflow,(unsigned long long)s.projectionUnchanged);
     static const char* outcomeNames[]={"prepared","wrong-thread","no-context1","capacity","unknown-buffer","missing-full-write","unsupported-range","binding-mismatch","invalid-recipe","private-failure","plan-failure"};
     for(uint32_t i=0;i<s.projectionOutcomesUsed;++i) {
@@ -313,7 +323,8 @@ void reportProjection(State& s, const char* event) {
         const char* label=outcome.reason<11?outcomeNames[outcome.reason]:
             outcome.reason==100?"actual-shader-mismatch":outcome.reason==101?"unknown-scene-projection-recipe":
             outcome.reason==102?"invalid-render-extent":outcome.reason==103?"bytecode-unchanged":
-            outcome.reason==104?"projection-viewport-mismatch":"other-refusal";
+            outcome.reason==104?"projection-viewport-mismatch":outcome.reason==105?"generic-recipe":
+            outcome.reason==106?"generic-inert":"other-refusal";
         Log::get().note("flat projection outcome: event=%s VS=%016llX PS=%016llX CS=%016llX result=%s code=%u count=%llu",
             event,(unsigned long long)outcome.vs,(unsigned long long)outcome.ps,(unsigned long long)outcome.cs,
             label,outcome.reason,(unsigned long long)outcome.observations);
@@ -777,6 +788,25 @@ void recordProjectionReference(State& s, State::AuditOutcome& outcome,
         if(result.spatialDepthError>outcome.spatialDepthError)outcome.spatialDepthError=result.spatialDepthError;
         if(result.translationResidual>outcome.translationResidual)outcome.translationResidual=result.translationResidual;
     }
+}
+// Generic admission: classify the actual creation bytecode once per (vs,ps)
+// pair. Missing blobs classify as NoBytecode and keep the existing refuse
+// path; a full memo table also keeps it (no per-draw classification).
+FlatShaderPairClassification classifyFlatProjectionPair(State& s, uint64_t vs, uint64_t ps) {
+    for (uint32_t i = 0; i < s.genericClassificationsUsed; ++i) {
+        const auto& entry = s.genericClassifications[i];
+        if (entry.vs == vs && entry.ps == ps) return entry.classification;
+    }
+    FlatShaderPairClassification result{};
+    if (s.genericClassificationsUsed == 64) return result;
+    const uint8_t* vsBytes = nullptr; size_t vsLen = 0;
+    const uint8_t* psBytes = nullptr; size_t psLen = 0;
+    if (flatProbeShaderLookup('v', vs, &vsBytes, &vsLen) &&
+        flatProbeShaderLookup('p', ps, &psBytes, &psLen))
+        result = classifyFlatShaderPair(vsBytes, vsLen, psBytes, psLen);
+    auto& entry = s.genericClassifications[s.genericClassificationsUsed++];
+    entry.vs = vs; entry.ps = ps; entry.classification = result;
+    return result;
 }
 const FlatProjectionBindingPlan* qualifyProjection(State& s, FlatProjectionRecipes recipes, uint32_t width, uint32_t height,
                        uint64_t vs, uint64_t ps, uint64_t cs, bool owned, bool sceneHdr = false) {
@@ -1306,9 +1336,41 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
                 } else {if(s.projectionFrames) {++s.projectionUnknown;projectionDetail(s,k.vs,k.ps,0,100,"actual-shader-mismatch");}failPhase(s,"unchanged-shader-mismatch");}
             }
             else if(k.depth && (k.depth==s.namedDepth || k.depth==s.phaseDepth.Get())) {
-                captureUnknownProjection(s,k);
-                if(s.projectionFrames) {++s.projectionUnknown;projectionDetail(s,k.vs,k.ps,0,101,"unknown-scene-projection-recipe");}
-                failPhase(s,"unknown-scene-projection-recipe");
+                // Generic admission: classify the actual bytecode once per
+                // pair. Provably forward or inert pairs take the identical
+                // owned/sceneHdr/qualify flow as the exact recipes; anything
+                // unproven keeps the capture+failPhase behavior below.
+                const auto generic=classifyFlatProjectionPair(s,k.vs,k.ps);
+                if((generic.vs==FlatVsProjectionClass::ForwardColumns || generic.vs==FlatVsProjectionClass::ForwardDp4) &&
+                   generic.ps==FlatPsProjectionSafety::Clean) {
+                    FlatProjectionRecipes genericRecipes;
+                    genericRecipes.add(FlatProjectionStage::Vertex,generic.vsSlot,
+                        generic.vs==FlatVsProjectionClass::ForwardColumns?FlatProjectionPatchLayout::ForwardColumns:FlatProjectionPatchLayout::ForwardDp4,
+                        generic.vsRow);
+                    if(s.projectionFrames)projectionDetail(s,k.vs,k.ps,0,105,"generic-recipe");
+                    FlatComputeInternalScope guard;
+                    Ptr<ID3D11DepthStencilView> actualDepth;Ptr<ID3D11Resource> depthResource;
+                    ctx->OMGetRenderTargets(0,nullptr,&actualDepth);
+                    if(actualDepth)actualDepth->GetResource(&depthResource);
+                    const bool owned=depthResource && (depthResource.Get()==s.namedDepth || depthResource.Get()==s.phaseDepth.Get());
+                    if(!owned && k.color==s.phaseHdr.Get())failPhase(s,"scene-projection-depth-unassociated");
+                    if(nonzeroPhase(s) && owned && s.phaseDepth && depthResource.Get()!=s.phaseDepth.Get())failPhase(s,"scene-depth-changed");
+                    const bool sceneHdr=flatRuntimeProjectionHdr(k,s.prefix.output,owned?depthResource.Get():nullptr);
+                    projectionPlan=qualifyProjection(s,genericRecipes,k.width,k.height,k.vs,k.ps,0,owned,sceneHdr);
+                }
+                else if(generic.vs==FlatVsProjectionClass::InertNoCB && generic.ps==FlatPsProjectionSafety::Clean) {
+                    FlatComputeInternalScope guard;
+                    Ptr<ID3D11VertexShader> actualVs;Ptr<ID3D11PixelShader> actualPs;
+                    ctx->VSGetShader(&actualVs,nullptr,nullptr);ctx->PSGetShader(&actualPs,nullptr,nullptr);
+                    if(lookupShaderHash(actualVs.Get())==k.vs && lookupShaderHash(actualPs.Get())==k.ps) {
+                        if(s.projectionFrames) {++s.projectionUnchanged;projectionDetail(s,k.vs,k.ps,0,106,"generic-inert");}
+                    } else {if(s.projectionFrames) {++s.projectionUnknown;projectionDetail(s,k.vs,k.ps,0,100,"actual-shader-mismatch");}failPhase(s,"unchanged-shader-mismatch");}
+                }
+                else {
+                    captureUnknownProjection(s,k);
+                    if(s.projectionFrames) {++s.projectionUnknown;projectionDetail(s,k.vs,k.ps,0,101,"unknown-scene-projection-recipe");}
+                    failPhase(s,"unknown-scene-projection-recipe");
+                }
             }
         }
     }

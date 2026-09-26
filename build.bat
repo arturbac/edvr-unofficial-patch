@@ -1026,6 +1026,7 @@ if not exist "%OBJ%\flattemporaltest" mkdir "%OBJ%\flattemporaltest"
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\flattemporaltest"\ ^
     /Fe"%BUILD%\flat_temporal_test.exe" "tools\flat_temporal_test\flat_temporal_test.cpp" ^
+    "third_party\dxbc_hash\DxilHash.cpp" ^
     /link /INCREMENTAL:NO kernel32.lib
 if errorlevel 1 ( echo [edvr] ERROR: flat temporal test build failed & exit /b 1 )
 "%BUILD%\flat_temporal_test.exe" --self-test || exit /b 1

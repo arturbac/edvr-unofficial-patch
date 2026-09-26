@@ -2109,6 +2109,21 @@ bool captureFlatProbeShader(char stage, uint64_t hash) {
     return result.success;
 }
 
+bool flatProbeShaderLookup(char stage, uint64_t hash, const uint8_t** data, size_t* bytes) {
+    if (!g_state || !hash || !data || !bytes ||
+        (stage != 'v' && stage != 'p' && stage != 'c')) return false;
+    auto& s = *g_state;
+    std::lock_guard<std::mutex> lock(s.flatProbeShaderMutex);
+    const auto found = s.flatProbeShaders.find(std::make_pair(stage, hash));
+    if (found == s.flatProbeShaders.end()) return false;
+    // The map is node-based and entries are never mutated or erased after
+    // insert (budget-capped at creation), so the stored vector's data stays
+    // valid for the returned pointer's lifetime after the lock releases.
+    *data = found->second.data();
+    *bytes = found->second.size();
+    return true;
+}
+
 // The two entries the investigation turns on, named at install. See the header
 // for what they are and why the departure point matters as much as the
 // destination.

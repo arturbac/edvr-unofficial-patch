@@ -9,6 +9,7 @@
 #include "flat_projection_math_tests.h"
 #include "flat_projection_bindings_tests.h"
 #include "flat_projection_recipe_tests.h"
+#include "flat_shader_classifier_tests.h"
 #include "flat_projection_viewport_tests.h"
 #include "flat_projection_ownership_tests.h"
 #include "flat_compute_tests.h"
@@ -1114,8 +1115,10 @@ void flatRuntimeMenuCopyTests() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
+        return flatShaderClassifierSweep(argv[2]);
     if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) {
-        std::puts("usage: flat_temporal_test --self-test");
+        std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir>");
         return 2;
     }
     failures += flatProjectionViewportTests();
@@ -1134,6 +1137,7 @@ int main(int argc, char** argv) {
     failures += flatProjectionMathTests();
     failures += flatProjectionBindingsTests();
     failures += flatProjectionRecipeTests();
+    failures += flatShaderClassifierTests();
     failures += flatProjectionOwnershipTests();
     failures += flatComputeTests();
     failures += flatLightingTests();
