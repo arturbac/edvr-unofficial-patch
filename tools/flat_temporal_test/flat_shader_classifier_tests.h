@@ -62,10 +62,17 @@ inline const char* psSafetyName(edvr::FlatPsProjectionSafety s) {
 inline int tests() {
     using edvr::FlatVsProjectionClass;
     using edvr::FlatPsProjectionSafety;
+    using edvr::FlatClassifierReason;
+    using edvr::FlatVposConsumerSubcode;
     int failures = 0, skipped = 0;
     auto expect = [&](bool ok, const char* what) {
         if (!ok) { std::printf("FAIL: shader classifier %s\n", what); ++failures; }
     };
+    // Extended to also assert the None/non-None invariant on the new reason
+    // fields: a stage that classified successfully must carry reason None,
+    // and a refused stage (VS Unclassified / PS Consumer) must carry a
+    // reason other than None. The specific reason value for named negative
+    // fixtures is pinned separately below via expectReasonPair.
     auto expectPair = [&](const char* vs, const char* ps, FlatVsProjectionClass vc, unsigned slot,
                           unsigned row, FlatPsProjectionSafety psafe, const char* what) {
         const auto r = classifyPair(vs, ps);
@@ -73,10 +80,26 @@ inline int tests() {
         const bool ok = r.c.vs == vc && r.c.ps == psafe &&
                         (vc == FlatVsProjectionClass::ForwardColumns || vc == FlatVsProjectionClass::ForwardDp4
                              ? (r.c.vsSlot == slot && r.c.vsRow == row)
-                             : true);
+                             : true) &&
+                        ((vc == FlatVsProjectionClass::Unclassified) == (r.c.vsReason != FlatClassifierReason::None)) &&
+                        ((psafe == FlatPsProjectionSafety::Consumer) == (r.c.psReason != FlatClassifierReason::None));
         if (!ok) {
-            std::printf("FAIL: shader classifier %s: got %s(%u,%u)+%s\n", what,
-                        vsClassName(r.c.vs), r.c.vsSlot, r.c.vsRow, psSafetyName(r.c.ps));
+            std::printf("FAIL: shader classifier %s: got %s(%u,%u)+%s vsReason=%s psReason=%s\n", what,
+                        vsClassName(r.c.vs), r.c.vsSlot, r.c.vsRow, psSafetyName(r.c.ps),
+                        edvr::flatClassifierReasonName(r.c.vsReason), edvr::flatClassifierReasonName(r.c.psReason));
+            ++failures;
+        }
+    };
+    // Pins the exact reason for a fixture pair already checked by expectPair
+    // above (so presence/skip bookkeeping is not duplicated here).
+    auto expectReasonPair = [&](const char* vs, const char* ps, FlatClassifierReason wantVs,
+                                FlatClassifierReason wantPs, const char* what) {
+        const auto r = classifyPair(vs, ps);
+        if (!r.present) return;
+        const bool ok = r.c.vsReason == wantVs && r.c.psReason == wantPs;
+        if (!ok) {
+            std::printf("FAIL: shader classifier %s: got vsReason=%s psReason=%s\n", what,
+                        edvr::flatClassifierReasonName(r.c.vsReason), edvr::flatClassifierReasonName(r.c.psReason));
             ++failures;
         }
     };
@@ -124,6 +147,7 @@ inline int tests() {
             const auto c = edvr::classifyFlatShaderPair(nullptr, 0, ps.data(), ps.size());
             expect(c.ps == FlatPsProjectionSafety::Clean && c.vs == FlatVsProjectionClass::NoBytecode,
                    "ps_4E4F tile lookup is Clean");
+            expect(c.psReason == FlatClassifierReason::None, "ps_4E4F tile lookup reason is None");
         }
     }
 
@@ -132,11 +156,15 @@ inline int tests() {
         const auto c = edvr::classifyFlatShaderPair(nullptr, 0, nullptr, 0);
         expect(c.vs == FlatVsProjectionClass::NoBytecode && c.ps == FlatPsProjectionSafety::NoBytecode,
                "null inputs are NoBytecode");
+        expect(c.vsReason == FlatClassifierReason::NoBytecode && c.psReason == FlatClassifierReason::NoBytecode,
+               "null inputs reason is NoBytecode for both stages");
         std::vector<uint8_t> vs;
         if (loadFixture("vs_0357BBB2DEE43C1F", vs)) {
             const auto v = edvr::classifyFlatShaderPair(vs.data(), vs.size(), nullptr, 0);
             expect(v.vs == FlatVsProjectionClass::ForwardDp4 && v.ps == FlatPsProjectionSafety::NoBytecode,
                    "missing PS blob is NoBytecode, VS still classified");
+            expect(v.vsReason == FlatClassifierReason::None && v.psReason == FlatClassifierReason::NoBytecode,
+                   "missing PS blob: vsReason None (classified), psReason NoBytecode");
         }
     }
 
@@ -149,6 +177,10 @@ inline int tests() {
         else {
             const auto c = edvr::classifyFlatShaderPair(nullptr, 0, ps.data(), ps.size());
             expect(c.ps == FlatPsProjectionSafety::Consumer, "ps_7EAC vPos/cb-ray reconstruction is Consumer");
+            // The PS-side multi-row cb combine (facts checked before any
+            // taint analysis) preempts the vPos/div idiom the fixture was
+            // named for -- verified by running, not assumed from the note.
+            expect(c.psReason == FlatClassifierReason::MultiRowTemp, "ps_7EAC reason is MultiRowTemp");
         }
     }
     // 8DEF instruction 0: div r0.xy, v1.xyxx, v1.zzzz -- clip-varying depth-UV.
@@ -158,12 +190,19 @@ inline int tests() {
         else {
             const auto c = edvr::classifyFlatShaderPair(nullptr, 0, ps.data(), ps.size());
             expect(c.ps == FlatPsProjectionSafety::Consumer, "ps_8DEF clip-varying depth-UV is Consumer");
+            expect(c.psReason == FlatClassifierReason::VposConsumer, "ps_8DEF reason is VposConsumer");
+            expect(c.psConsumerSubcode == FlatVposConsumerSubcode::DivOrigin,
+                   "ps_8DEF subcode is DivOrigin (div of two Input-origin operands)");
         }
     }
     // vs_7E38 (deferred inverse-ray): position is a passthrough mov; the
     // cb2[14..16] dp3 ray sits outside any position pattern.
     expectPair("vs_7E38A6AA1269C901", "ps_81812EF97FB4A361",
                FlatVsProjectionClass::Unclassified, 0, 0, FlatPsProjectionSafety::Clean, "vs_7E38 deferred ray refuses");
+    // Position is a passthrough mov of an input: the form never matches
+    // either forward idiom in the first place (the dp3 ray sits elsewhere).
+    expectReasonPair("vs_7E38A6AA1269C901", "ps_81812EF97FB4A361",
+                     FlatClassifierReason::NotForward, FlatClassifierReason::None, "vs_7E38 reason is NotForward");
     // vs_F8FA (sky inverse): instructions 0-3 combine cb2[11..14] via
     // mul/mad outside the position slice (the safety rule).
     {
@@ -172,6 +211,12 @@ inline int tests() {
         else {
             const auto c = edvr::classifyFlatShaderPair(vs.data(), vs.size(), nullptr, 0);
             expect(c.vs == FlatVsProjectionClass::Unclassified, "vs_F8FA sky inverse refuses");
+            // Position itself does not match either forward idiom (it is
+            // computed some other way); the cb1[11..14] combine the fixture
+            // was named for sits outside the position slice and the
+            // violation scan that would flag it never runs. Verified by
+            // running: NotForward, not SecondMatrix.
+            expect(c.vsReason == FlatClassifierReason::NotForward, "vs_F8FA sky inverse reason is NotForward");
         }
     }
     // vs_1F17 (conditional two matrices): r3 written under if/else with
@@ -182,56 +227,121 @@ inline int tests() {
         else {
             const auto c = edvr::classifyFlatShaderPair(vs.data(), vs.size(), nullptr, 0);
             expect(c.vs == FlatVsProjectionClass::Unclassified, "vs_1F17 conditional matrices refuse");
+            expect(c.vsReason == FlatClassifierReason::ControlFlow,
+                   "vs_1F17 conditional matrices reason is ControlFlow");
         }
     }
     // vs_BA16 (skinned bone loop): the dp4 source chain reaches ld_structured
     // inside a loop (index-relative addressing) -- not the clean src idiom.
     expectPair("vs_BA16062A2EB66F1F", "ps_33758387B70944A1",
                FlatVsProjectionClass::Unclassified, 0, 0, FlatPsProjectionSafety::Clean, "vs_BA16 skinned loop refuses");
+    // The dp4 idiom's position forms match, but the shared source vector's
+    // slice reaches ld_structured inside a loop -- not the clean-src idiom.
+    expectReasonPair("vs_BA16062A2EB66F1F", "ps_33758387B70944A1",
+                     FlatClassifierReason::SliceNotClean, FlatClassifierReason::None, "vs_BA16 reason is SliceNotClean");
 
     // --- Section-57 corpus: verdicts documented from the classifier ----------
     // (see the sweep table in the change report; the refuse cases below are
     // asserted, the rest is recorded by printing.)
-    struct Documented { const char* vs; const char* ps; bool mustRefuse; const char* note; };
+    // vsReason/psReason are the actual measured values (verified by running
+    // this rig, not assumed from the note): the facts checked before any
+    // taint/form analysis (IndexableTemp, MultiRowTemp) preempt the idiom
+    // each fixture was originally named for in two of the three decals.
+    struct Documented {
+        const char* vs; const char* ps; bool mustRefuse;
+        FlatClassifierReason vsReason; FlatClassifierReason psReason;
+        const char* note;
+    };
     const Documented documented[] = {
         // Decal pairs: their PSs divide the exported clip varying for a
         // depth-texture UV, so the PSs must refuse (the exact table covers
         // these pairs; generic admission would skip the alignment proof).
-        {"vs_0A298DE7DF833A46", "ps_6FD4C38BA927C8C7", true,  "decal A: PS div v7.xy/v7.z refuses"},
-        {"vs_D8FCE3CEA16B9B51", "ps_06AA136E4D58CBA2", true,  "decal B: PS div v6.xy/v6.z refuses"},
-        {"vs_66DE2CADB1F4AE6B", "ps_BBDE4E71FB78528A", true,  "decal D: PS-side cb2[23..26] matrix refuses"},
+        {"vs_0A298DE7DF833A46", "ps_6FD4C38BA927C8C7", true, FlatClassifierReason::None,
+         FlatClassifierReason::IndexableTemp, "decal A: PS div v7.xy/v7.z refuses"},
+        {"vs_D8FCE3CEA16B9B51", "ps_06AA136E4D58CBA2", true, FlatClassifierReason::None,
+         FlatClassifierReason::MultiRowTemp, "decal B: PS div v6.xy/v6.z refuses"},
+        {"vs_66DE2CADB1F4AE6B", "ps_BBDE4E71FB78528A", true, FlatClassifierReason::None,
+         FlatClassifierReason::MultiRowTemp, "decal D: PS-side cb2[23..26] matrix refuses"},
         // Undocumented companions: verdict recorded by the sweep.
-        {"vs_94D5C556DFD6D705", "ps_912477AEF6958379", false, "glare pair: VS position is an integer and(), not a forward idiom"},
-        {"vs_94D5C556DFD6D705", "ps_06332CA168B6DA63", false, "glare VS with the other captured PS"},
+        {"vs_94D5C556DFD6D705", "ps_912477AEF6958379", false, FlatClassifierReason::NotForward,
+         FlatClassifierReason::None, "glare pair: VS position is an integer and(), not a forward idiom"},
+        {"vs_94D5C556DFD6D705", "ps_06332CA168B6DA63", false, FlatClassifierReason::NotForward,
+         FlatClassifierReason::None, "glare VS with the other captured PS"},
     };
     for (const auto& d : documented) {
         const auto r = classifyPair(d.vs, d.ps);
         if (!r.present) { std::printf("SKIP: shader classifier %s (fixtures absent)\n", d.note); ++skipped; continue; }
-        std::printf("classifier: %s + %s -> %s(%u,%u)+%s clipXyw=%u; %s\n", d.vs, d.ps,
+        std::printf("classifier: %s + %s -> %s(%u,%u)+%s clipXyw=%u vsReason=%s psReason=%s; %s\n", d.vs, d.ps,
                     vsClassName(r.c.vs), r.c.vsSlot, r.c.vsRow, psSafetyName(r.c.ps),
-                    r.c.vsExportsClipXyw ? 1u : 0u, d.note);
+                    r.c.vsExportsClipXyw ? 1u : 0u, edvr::flatClassifierReasonName(r.c.vsReason),
+                    edvr::flatClassifierReasonName(r.c.psReason), d.note);
         if (d.mustRefuse)
             expect(!(r.c.ps == FlatPsProjectionSafety::Clean &&
                      (r.c.vs == FlatVsProjectionClass::ForwardColumns || r.c.vs == FlatVsProjectionClass::ForwardDp4 ||
                       r.c.vs == FlatVsProjectionClass::InertNoCB)),
                    d.note);
+        expect(r.c.vsReason == d.vsReason, d.note);
+        expect(r.c.psReason == d.psReason, d.note);
     }
 
     // --- Corrupt blobs: never admission, no crash ------------------------------
+    // Both mutations break parseContainer's own checks (a truncated chunk
+    // table/program header, or the whole-container retail checksum) before
+    // the walker ever runs, so the reason is Container, not Walk.
     {
         std::vector<uint8_t> vs, ps;
         if (loadFixture("vs_0357BBB2DEE43C1F", vs) && loadFixture("ps_81812EF97FB4A361", ps)) {
             std::vector<uint8_t> half(vs.begin(), vs.begin() + vs.size() / 2);
             const auto c = edvr::classifyFlatShaderPair(half.data(), half.size(), ps.data(), ps.size());
             expect(c.vs == FlatVsProjectionClass::Unclassified, "half-cut VS blob refuses");
+            expect(c.vsReason == FlatClassifierReason::Container, "half-cut VS blob reason is Container");
             std::vector<uint8_t> flipped(ps);
             flipped[flipped.size() / 2] ^= 0xFF;
             const auto f = edvr::classifyFlatShaderPair(vs.data(), vs.size(), flipped.data(), flipped.size());
             expect(f.ps == FlatPsProjectionSafety::Consumer, "byte-flipped PS blob refuses");
+            expect(f.psReason == FlatClassifierReason::Container, "byte-flipped PS blob reason is Container");
             const auto both = edvr::classifyFlatShaderPair(half.data(), half.size(), flipped.data(), flipped.size());
             expect(both.vs == FlatVsProjectionClass::Unclassified && both.ps == FlatPsProjectionSafety::Consumer,
                    "corrupt pair refuses both sides");
+            expect(both.vsReason == FlatClassifierReason::Container && both.psReason == FlatClassifierReason::Container,
+                   "corrupt pair reasons are Container on both sides");
         } else { std::printf("SKIP: shader classifier corrupt blobs (fixtures absent)\n"); ++skipped; }
+    }
+
+    // --- Synthetic: unknown opcode (resinfo, 61) is pinned, no file IO --------
+    // Hand-assembled ps_5_0 program (real DXBC container, real retail
+    // checksum via dxbc_container::makeContainer): a texture2d declaration,
+    // then `resinfo r0.xyzw, l(0), t0.xyzw` (opcode 61, unmodeled) and
+    // `mov o0, r0`. Ported from the scratchpad's synthetic-program generator.
+    {
+        using edvr::dxbc_container::Chunk;
+        using edvr::dxbc_container::makeContainer;
+        constexpr uint32_t R_DST = 0x1000F2, R_SRC = 0x100E46, O_DST = 0x1020F2, CB_SRC = 0x208E46;
+        constexpr uint32_t IMM1 = 0x4001, T_DCL = 0x107000, T_SRC = 0x107E46;
+        auto opTok = [](uint32_t o, uint32_t len, uint32_t extra = 0) { return o | extra | (len << 24); };
+        std::vector<uint32_t> prog = {0x00000050u, 0}; // ps_5_0, length placeholder
+        const std::vector<uint32_t> decls = {
+            opTok(89, 4), CB_SRC, 0, 3,              // dcl_constantbuffer cb0[3]
+            opTok(88, 4, 3u << 11), T_DCL, 0, 0x5555, // dcl_resource_texture2d t0
+            opTok(101, 3), O_DST, 0,                  // dcl_output o0.xyzw
+            opTok(104, 2), 1,                          // dcl_temps 1
+        };
+        prog.insert(prog.end(), decls.begin(), decls.end());
+        const std::vector<uint32_t> body = {
+            opTok(61, 7), R_DST, 0, IMM1, 0, T_SRC, 0, // resinfo r0.xyzw, l(0), t0.xyzw
+            opTok(54, 5), O_DST, 0, R_SRC, 0,           // mov o0, r0
+        };
+        prog.insert(prog.end(), body.begin(), body.end());
+        prog.push_back(opTok(62, 1)); // ret
+        prog[1] = static_cast<uint32_t>(prog.size());
+        Chunk shex; shex.tag = 0x58454853u; // SHEX
+        shex.bytes.resize(prog.size() * 4);
+        std::memcpy(shex.bytes.data(), prog.data(), shex.bytes.size());
+        const auto blob = makeContainer({shex});
+        const auto c = edvr::classifyFlatShaderPair(nullptr, 0, blob.data(), blob.size());
+        expect(c.ps == FlatPsProjectionSafety::Consumer, "synthetic resinfo PS refuses");
+        expect(c.psReason == FlatClassifierReason::UnknownOpcode, "synthetic resinfo reason is UnknownOpcode");
+        expect(c.psUnknownOpcode == 61, "synthetic resinfo pins the opcode number (61)");
     }
 
     // --- Walker robustness: every fixture walks exactly ------------------------

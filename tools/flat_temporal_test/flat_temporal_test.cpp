@@ -16,6 +16,7 @@
 #include "flat_lighting_tests.h"
 #include "flat_live_phase_tests.h"
 #include "flat_pixel_capture_tests.h"
+#include "flat_local_reject_tests.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -905,6 +906,87 @@ void flatRuntimePrefixTests() {
         prefix->copies = 0; flatRuntimeWritten(*prefix, selected.color);
         check(!flatRuntimeObserve(*prefix, copy).selected(), "write after tone invalidates current handoff");
     }
+    {   // Epic 20260926_131921: the online model hardcoded the tone pass's
+        // HDR input at PS1. The DoF composite (kToneDofCompositePs) and
+        // bloom composite (kToneBloomCompositePs) bind their HDR at PS0 and
+        // their own blur/bloom at PS1 (129F602B2A9CA439/8826CACC6382C78D);
+        // treating that blur/bloom as the HDR refused every frame.
+        auto blurWrite = [](MonoFixture& f, uint32_t q) {
+            FlatContractRecord r;
+            f.fill(r, kFlatContractScreen, 0x2B10, 26, q, q, 1,
+                0x129F602B2A9CA439ull, 0x8826CACC6382C78Dull, 0, 0, false);
+            r.key.width /= 2; r.key.height /= 2;
+            r.key.viewport[2] /= 2; r.key.viewport[3] /= 2;
+            r.key.depth = r.key.dsv = nullptr;
+            r.key.depthWidth = r.key.depthHeight = r.key.depthFormat = 0;
+            return r;
+        };
+        auto hdrAtPs0Slot = [](MonoFixture& f) {
+            // The HDR moves to PS0; PS1 becomes the variant's blur/bloom with
+            // its own tokens, so a wrong-slot read cannot pass as the HDR.
+            auto& k = f.handoff[0].key;
+            k.srvView[0] = MonoFixture::token(0x2602); k.srvResource[0] = MonoFixture::token(0x2600);
+            k.srvView[1] = MonoFixture::token(0x2B12); k.srvResource[1] = MonoFixture::token(0x2B10);
+        };
+        auto replayTone = [&](MonoFixture& fixture, bool chain) {
+            auto prefix = std::make_unique<FlatRuntimePrefix>();
+            prefix->frame = fixture.input.frame; prefix->output = fixture.input.output;
+            prefix->width = 1280; prefix->height = 720; prefix->format = 28;
+            FlatContractRecord chainRecords[2]{};
+            if (chain) {
+                chainRecords[0] = blurWrite(fixture, fixture.handoff[0].first - 6);
+                chainRecords[1] = blurWrite(fixture, fixture.handoff[0].first - 3);
+            }
+            struct Event { const FlatContractRecord* r; uint32_t q; } events[200]{};
+            uint32_t count = 0;
+            for (uint32_t i = 0; i < fixture.input.worldCount; ++i) {
+                const auto& r = fixture.world[i];
+                for (uint32_t n = 0; n < r.draws; ++n)
+                    events[count++] = {&r, r.first + (r.last-r.first)*n/(r.draws>1?r.draws-1:1)};
+            }
+            if (chain) {
+                events[count++] = {&chainRecords[0], chainRecords[0].first};
+                events[count++] = {&chainRecords[1], chainRecords[1].first};
+            }
+            events[count++] = {&fixture.handoff[0], fixture.handoff[0].first};
+            events[count++] = {&fixture.handoff[1], fixture.handoff[1].first};
+            std::sort(events, events + count, [](const Event& a, const Event& b) { return a.q < b.q; });
+            FlatMonoFrame selected{};
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto& r = *events[i].r; FlatRuntimeDraw d{}; d.key = r.key;
+                std::memcpy(d.camera, r.camera, sizeof(d.camera));
+                d.key.writeEpoch = prefix->frame; d.key.writeSeq = prefix->sequence + 1;
+                d.supported = engine_velocity_family::supportedPair(d.key.vs, d.key.ps);
+                d.instances = r.firstInstances;
+                selected = flatRuntimeObserve(*prefix, d);
+            }
+            return selected;
+        };
+        // Replays fixture.handoff[0] as each tone variant, at both render
+        // extents, and checks the online model selects the HDR at token
+        // 0x2600 rather than refusing or aggregating the blur/bloom.
+        auto toneVariant = [&](const char* message, uint64_t vs, uint64_t ps, bool ps0, bool chain) {
+            for (uint32_t width : {960u, 1280u}) {
+                MonoFixture f(width);
+                f.handoff[0].key.vs = vs; f.handoff[0].key.ps = ps;
+                if (ps0) hdrAtPs0Slot(f);
+                const auto out = replayTone(f, chain);
+                check(out.selected() && out.hdr == MonoFixture::token(0x2600), message);
+            }
+        };
+        toneVariant("stock tone selects its HDR at PS1",
+            flat_mono_detail::kToneVs, flat_mono_detail::kTonePs, false, false);
+        toneVariant("EDHM-grade control selects its HDR at PS1",
+            flat_mono_detail::kToneVs, flat_mono_detail::kToneEdhmGradePs, false, false);
+        toneVariant("DoF-composite tone selects its own PS0 HDR, not its PS1 blur",
+            flat_mono_detail::kToneVs, flat_mono_detail::kToneDofCompositePs, true, false);
+        toneVariant("DoF-composite tone selects its HDR through an active blur chain",
+            flat_mono_detail::kToneVs, flat_mono_detail::kToneDofCompositePs, true, true);
+        toneVariant("bloom-composite tone selects its own PS0 HDR, not its PS1 bloom",
+            flat_mono_detail::kToneVsNoConst, flat_mono_detail::kToneBloomCompositePs, true, false);
+        toneVariant("bloom-composite tone selects its HDR through an active bloom chain",
+            flat_mono_detail::kToneVsNoConst, flat_mono_detail::kToneBloomCompositePs, true, true);
+    }
 }
 
 void flatRuntimeImageCopyTests() {
@@ -1195,6 +1277,7 @@ int main(int argc, char** argv) {
     failures += flatComputeTests();
     failures += flatLightingTests();
     failures += flatLivePhaseTests();
+    failures += flatLocalRejectTests();
     flatRuntimePrefixTests();
     flatRuntimeImageCopyTests();
     flatRuntimeMenuCopyTests();

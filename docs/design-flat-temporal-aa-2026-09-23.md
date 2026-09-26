@@ -40,12 +40,15 @@
   the EDHM main menu, one startup `no-known-tone-pass` all session. FSR/DLSS
   that flight were a build-environment gap (no SDKs in the dev build), not
   code; both pinned SDKs are now on the machine and a full-pass SDK build is
-  installed. Section 65 (2026-09-26): flight states reset-stormed on 16
-  unknown scene pairs -- EDHM/tier PS variants of mapped VS families plus
-  the mod-patched E904 glare VS, all bytecode-reviewed and exact-reciped,
-  INSTALLED on Epic, NOT FLOWN. The generic tone-slot admission and the
-  transition-phase HDR alias (depthless 129F/8826 and 20F3/BF23 writes,
-  clears in steady states) are the recorded follow-ups.
+  installed. Section 65 (2026-09-26): flight states reset-stormed on 16 unknown
+  scene pairs -- EDHM/tier PS variants of mapped VS families plus the
+  mod-patched E904 glare VS, all bytecode-reviewed and exact-reciped, INSTALLED
+  on Epic, NOT FLOWN. Section 66: the launch and menu-to-flight conflicting-hdr
+  storm matches the online model's hardcoded PS1 tone-HDR read (DE65/9270 bind
+  their HDR at PS0) -- fixed in `989f6fd`, NOT BUILT on Windows. Section 67:
+  per-draw refusal with a reject stamp (partial AA), a coverage census and
+  named classifier refusal reasons -- the approved plan's steps 1-2, NOT BUILT,
+  NOT FLOWN.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -66,10 +69,13 @@
   rejection crawl. The section-59 main-menu flight happened (section 63):
   zero unknown-pair captures held, but the tone slot refused every frame;
   the widened tone admission is FLOWN for TAA (section 64); the SDK-full
-  install confirmed DLSS at the menu (section 65). Next: one in-flight
-  flight with EDHM at current settings on the section-65 recipes -- expect
-  zero unknown-pair captures and treated streaks once the transition HDR
-  alias settles; the section-57 on-foot hangar/concourse flight stands
+  install confirmed DLSS at the menu (section 65). Next: the section-67 flight
+  -- EDHM at current settings, supersampling at most 1.0, main menu with DoF on
+  and off, flight and station, then supersampling and resolution changes
+  mid-session; expect treated streaks through each change, stamps instead of
+  unknown-pair phase failures, and no conflicting-hdr at launch or
+  menu-to-flight (a storm that survives the slot fix is a genuine alias;
+  qualify it then). The section-57 on-foot hangar/concourse flight stands
   behind it.
   Existing evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
@@ -3895,3 +3901,148 @@ if it ever persists. Next flight: fly with EDHM at current settings --
 expect zero unknown-pair captures and treated streaks once the transition
 settles; if the alias outlives transitions, qualify it by extent mismatch
 instead of refusing.
+
+## 66. Tone HDR slot in the online model; the conflicting-hdr storm re-attributed (2026-09-26)
+
+Commit 8103620 taught `flatSelectMonoFrame` a per-variant tone HDR slot via
+`flat_mono_detail::toneHdrSlot(vs, ps)`: PS1 for the stock tone and the EDHM
+grade, PS0 for the DoF composite (`kToneDofCompositePs`, DE65) and the bloom
+composite (`kToneBloomCompositePs`, 9270). The online runtime model never got
+it: `flatRuntimeObserve`'s copy branch (flat_runtime_model.h, two
+`srvResource[1]` reads) and three sites in flat_runtime.cpp (a UAV-write guard,
+two log lines) still hardcoded slot 1, so a PS0 variant's own PS1 blur/bloom
+read as its HDR and every frame refused.
+
+Fix (`989f6fd`): `flat_mono_detail::toneHdrInput(key)` (flat_mono_frame.h)
+returns the recorded (vs, ps)'s actual slot, or null; all five sites now go
+through it.
+
+Evidence: a Linux replay of the rig's `MonoFixture` through
+`flatRuntimeObserve` on HEAD `3d12d97`. Unfixed: stock and EDHM grade (PS1)
+select; DoF composite (DE65) and bloom composite (9270) refuse
+`no-observed-hdr-writes`, and `conflicting-hdr-target-or-camera` once their own
+blur/bloom chain (`129F602B2A9CA439`/`8826CACC6382C78D`) writes their PS1
+texture. Fixed: all six cases, with and without the chain, at both render
+extents, select with `hdr` at the true HDR token.
+
+Section 65 characterised the same storm as transition-phase aliasing: two
+depthless writers, the 1920x1080 chain's 129F/8826 and 20F3/BF23, into "the
+tone's HDR resource". That resource is what the unfixed model read at PS1. For
+a PS0 tone it is the variant's blur/bloom texture, whose writers are exactly
+such depthless passes; for a PS1 tone (stock or EAA5, the steady menu) it is
+the true HDR, which is why the storm clears in steady states. The next flight
+on this fix discriminates: gone at launch and menu-to-flight means it was this
+bug; still there means a genuine alias of the true HDR, and section 65's
+qualification applies.
+
+- ruled out: qualifying the section 64-65 storm as an HDR alias before a flight
+  on this fix, because the unfixed model read the PS0 variant's PS1 blur/bloom
+  (the texture 129F/8826 and 20F3/BF23 write) as the HDR and the replay
+  reproduces that exact refusal; only a storm that survives the fix is a real
+  alias.
+
+The rig missed it because its slot-0 fixtures (section 61) only ran through
+`flatSelectMonoFrame`, which 8103620 already fixed; nothing exercised those
+variants through the separate online model.
+
+With section 65's census, Sean's report splits cleanly: the 13:46 flight's
+in-flight "no AA change" was the 16-pair reset storm, and this bug refuses
+every frame whose tone is DE65 or 9270 (DoF on, and the launch and
+menu-to-flight transitions).
+
+Status: built and tested only in a Linux model replay, NOT through `build.bat`;
+the Windows full build must pass before merge. Next flight: DoF on, main menu
+and in flight; expect no `conflicting-hdr-target-or-camera` /
+`no-observed-hdr-writes` while DE65/9270 write the tone slot, including at
+launch and menu-to-flight.
+
+### Generic classifier review (same session)
+
+Verified findings on the generic shader-pair classifier
+(flat_shader_classifier.h), recorded so later sessions don't lose them:
+
+- any opcode missing from `operandCount` (resinfo/GetDimensions, case, lod,
+  gather4_c/po, sample_info, bufinfo) refuses the whole shader
+  (flat_shader_classifier.h:1105 PS, :848 VS);
+- the >=3-rows-of-one-cb and cb x cb product rules ignore coefficients (tint x
+  colour and three-colour sums refuse), contrary to the header's own rule;
+- "anywhere" checks inspect final register states only (the same computation
+  flips Clean/Consumer on register reuse);
+- min/max drop their first operand (share movc's indices 2/3);
+- the SV_Depth refusal is dead (oDepth is declared by dcl_output, opcode 101;
+  the walker checks 102/103);
+- the div rule only matches a literal div of two varyings; the rig's decal A/B
+  refusals come from an indexable temp (6FD4) and the 3-row rule (06AA), not
+  the div rule;
+- the 64-pair memo and the 2048-shader/16 MiB bytecode cache fail silently;
+  verdicts are logged only under F10;
+- measured coverage: section 65's flight census, 0 of 16 in-flight unknown
+  pairs admitted; all 16 needed exact recipes.
+
+Evidence: Linux harness over the 34 fixtures plus hand-assembled ps_5_0
+programs.
+
+## 67. Partial AA: per-draw refusal with a reject stamp; coverage census and classifier reasons (2026-09-26)
+
+Why: sections 54, 59-60 and 65 each lost AA for the whole frame to a new shader
+population -- a display-resolution change, EDHM, settings tiers. One per-frame
+phase flag promotes every per-draw cause (23 distinct reasons) to a frame
+refusal, and coverage is keyed on 13 exact-hash tables. Sean approved the plan
+(2026-09-26): (1) coverage census, (2) local refusal, (3) VS-keyed jitter and
+motion admission with a PS denylist, (4) tone/copy identification by frame
+structure, (5) offline qualification from shader dumps. This change implements
+(1) and (2).
+
+Local refusal (`experimental.temporal_aa_partial`, default on, live; off is the
+previous behaviour): six per-draw reasons no longer fail the frame's phase --
+`unknown-scene-projection-recipe`, `unchanged-shader-mismatch`,
+`actual-shader-mismatch`, `projection-viewport-mismatch`,
+`projection-preparation-refused` and `draw-binding-refused` (draw path only;
+the dispatch path and every other reason stay frame-global). The draw goes out
+unjittered; `~FlatRuntimeDrawScope` re-issues it once through the `vScreen*Raw`
+bypasses with a no-input stamp PS into an R8 render-size reject mask, under a
+variant of the game's depth-stencil state (depth writes and stencil off; EQUAL
+when the game's state wrote depth, else the game's own test). The resolve's
+`prep()` rejects mask pixels, and `taa()`/`finish()` show them as current
+colour sampled at the unjittered uv; the rejection texture already feeds DLSS's
+bias mask and FSR's reactive mask. Indirect and auto draws, a missing DSV, a
+DSV/mask size mismatch or missing resources fall back to `failPhase`.
+
+Census and reasons: `flat coverage 5s:` is printed every window even when zero
+(scene draws by branch, local refusals, stamps, global fallbacks, frames with
+stamps, treated frames with stamps, `memo-full`), with up to five `flat
+coverage stamped 5s:` pairs and a `flat coverage startup:` line per device. The
+generic classifier now names every refusal rule, and `flat generic
+classification:` logs each pair's verdict once (at most 64 per session) with
+unknown opcode numbers and vPos consumer sub-rules; a full memo is logged once.
+
+- ruled out: a stencil tag for refused pixels, because the game reads the scene
+  depth's stencil plane from compute and lighting passes (device_hook.cpp's
+  CS-hook note).
+- ruled out: jittering the camera buffer at its source, because the same VS b1
+  buffer is rewritten with different camera contents within a frame (section
+  57's weapon camera) and the same rows carry per-object matrices (section 25);
+  per-draw binding costs two bind calls per draw once warm.
+
+Known limits: a refused draw whose PS writes SV_Depth is not stamped by the
+EQUAL test; under DLSS/FSR only the 2x2 footprint is forced to current colour,
+so backend smear around stamped objects is possible; the re-bind assumes no PS
+UAVs, as the producer path already does. Open follow-up: supersampling above
+1.0 silently disables DLSS, DLAA and FSR
+(`flat-trained-resolve-cannot-downsample`); fall back to TAA and say so.
+
+Verification is Linux-only: a MinGW build of `flat_temporal_test` run under
+Wine passes (tone-slot replay, local-refusal policy, classifier reasons), MinGW
+syntax checks of flat_runtime.cpp and flat_mono_resolve.cpp pass, and the
+config contract passes. NOT verified: the HLSL (Wine's d3dcompiler cannot
+compile these shaders; build.bat's fxc step is the first compile) and
+vscreen.cpp (MSVC SEH). NOT built with build.bat, NOT flown.
+
+Next flight (Epic, EDHM, current settings, supersampling at most 1.0): main
+menu with DoF on and off, flight, station; then change supersampling and
+display resolution mid-session. Expect treated streaks to continue through each
+change, `stamped` counts where unknown pairs appear instead of
+`unknown-scene-projection-recipe` phase failures, and a `flat generic
+classification:` line naming each refused pair's rule. Watch for crawl where
+stamped and treated surfaces meet, and for DLSS/FSR smear around stamped
+objects. A/B with `experimental.temporal_aa_partial = off` (live).

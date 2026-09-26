@@ -124,6 +124,13 @@ inline uint32_t tonePsHdrSlot(uint64_t ps) {
 inline uint32_t toneHdrSlot(uint64_t vs, uint64_t ps) {
     return knownToneVs(vs) ? tonePsHdrSlot(ps) : ~0u;
 }
+// The resource a recorded tone pass reads its HDR lineage from, or nullptr
+// when (vs,ps) is no known tone variant. Every consumer of the tone's HDR
+// input goes through this; hardcoded slots aggregated the DoF blur as HDR.
+inline const void* toneHdrInput(const FlatContractObservation& k) {
+    const uint32_t slot = toneHdrSlot(k.vs, k.ps);
+    return slot < 2 ? k.srvResource[slot] : nullptr;
+}
 
 inline const FlatContractRecord& record(const FlatMonoFrameInput& in, uint32_t i) {
     return i < in.worldCount ? in.world[i] : in.handoff[i - in.worldCount];

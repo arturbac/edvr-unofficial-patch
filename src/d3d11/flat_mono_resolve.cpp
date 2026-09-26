@@ -328,17 +328,22 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     context->CSSetConstantBuffers(0,3,cb);
     ID3D11ShaderResourceView* prepViews[]={g.color.srv.Get(),f.depth,f.engine.slots,f.engine.pool};
     context->CSSetShaderResources(0,4,prepViews);
+    // Partial temporal AA's reject mask, t9: a free slot in every one of
+    // prep/taa/finish's own resource lists below. Null (this frame stamped
+    // nothing) reads as 0 everywhere prep()/taa()/finish() sample it.
+    context->CSSetShaderResources(9,1,&f.localReject);
     ID3D11UnorderedAccessView* prepOutputs[]={g.depth[index].uav.Get(),g.motion.uav.Get(),g.rejection.uav.Get(),g.expected.uav.Get()};
     context->CSSetUnorderedAccessViews(0,4,prepOutputs,nullptr);
     context->CSSetShader(g.prep.Get(),nullptr,0);
     context->Dispatch((f.renderWidth+7)/8,(f.renderHeight+7)/8,1);
-    ID3D11UnorderedAccessView* nullUavs[5]={};ID3D11ShaderResourceView* nullViews[9]={};
-    context->CSSetUnorderedAccessViews(0,5,nullUavs,nullptr);context->CSSetShaderResources(0,9,nullViews);
+    ID3D11UnorderedAccessView* nullUavs[5]={};ID3D11ShaderResourceView* nullViews[10]={};
+    context->CSSetUnorderedAccessViews(0,5,nullUavs,nullptr);context->CSSetShaderResources(0,10,nullViews);
     bool ok=true;
     if(taa) {
         ID3D11ShaderResourceView* views[]={g.color.srv.Get(),nullptr,nullptr,nullptr,g.motion.srv.Get(),
             g.rejection.srv.Get(),g.expected.srv.Get(),g.output[index^1].srv.Get(),g.depth[index^1].srv.Get()};
         context->CSSetShaderResources(0,9,views);
+        context->CSSetShaderResources(9,1,&f.localReject);
         ID3D11UnorderedAccessView* out=g.output[index].uav.Get();context->CSSetUnorderedAccessViews(4,1,&out,nullptr);
         ID3D11SamplerState* sampler=g.sampler.Get();context->CSSetSamplers(0,1,&sampler);
         context->CSSetShader(g.taa.Get(),nullptr,0);context->Dispatch((f.outputWidth+7)/8,(f.outputHeight+7)/8,1);
@@ -360,6 +365,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         ID3D11ShaderResourceView* views[]={g.color.srv.Get(),nullptr,nullptr,nullptr,nullptr,
             g.rejection.srv.Get(),nullptr,g.output[0].srv.Get()};
         context->CSSetShaderResources(0,8,views);
+        context->CSSetShaderResources(9,1,&f.localReject);
         ID3D11SamplerState* sampler=g.sampler.Get();context->CSSetSamplers(0,1,&sampler);
         ID3D11UnorderedAccessView* out=g.output[1].uav.Get();context->CSSetUnorderedAccessViews(4,1,&out,nullptr);
         context->CSSetShader(g.finish.Get(),nullptr,0);context->Dispatch((f.outputWidth+7)/8,(f.outputHeight+7)/8,1);

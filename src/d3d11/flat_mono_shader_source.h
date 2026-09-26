@@ -20,6 +20,13 @@ Texture2D<float> Rejection : register(t5);
 Texture2D<float> ExpectedDepth : register(t6);
 Texture2D<float4> History : register(t7);
 Texture2D<float> HistoryDepth : register(t8);
+// Partial temporal AA's per-frame reject mask (flat_runtime.cpp's State):
+// >0 where a scene draw that could not be jittered was re-issued with EDVR's
+// own stamp PS. Render-resolution, same size as Color/SceneDepth/Motion/
+// Rejection. Bound only on a frame that actually stamped something; an
+// unbound Texture2D reads 0 everywhere, so every use below is already safe
+// with no stamps this frame.
+Texture2D<float> LocalReject : register(t9);
 SamplerState LinearClamp : register(s0);
 RWTexture2D<float> OutDepth : register(u0);
 RWTexture2D<float2> OutMotion : register(u1);
@@ -88,6 +95,10 @@ void prep(uint3 id:SV_DispatchThreadID) {
             reject=valid?0:1;
         }
     }
+    // A stamped pixel is unjittered content re-issued over the game's own
+    // draw; whatever the per-pixel accepted/rejected test above decided,
+    // treat it as rejected so taa()/finish() show current colour there.
+    if(LocalReject.Load(int3(q,0))>0)reject=1;
     if(reject!=0)motion=0;
     OutDepth[q]=isfinite(depth)?saturate(depth):0;
     OutMotion[q]=motion; OutRejection[q]=reject;
@@ -100,6 +111,11 @@ void taa(uint3 id:SV_DispatchThreadID) {
     float2 rasterUv=uv+jitter.xy/float2(size.xy);
     int2 q=clamp(int2(rasterUv*float2(size.xy)),0,int2(size.xy)-1);
     float4 current=Color.SampleLevel(LinearClamp,rasterUv,0);
+    // A stamped pixel's content is unjittered: sample it at the unjittered uv,
+    // not the raster phase's uv, or current colour would come from the wrong
+    // texel. prep() already forced Rejection!=0 here, so weight below is 0
+    // and this is exactly what OutColor takes for the pixel.
+    if(LocalReject.Load(int3(q,0))>0)current=Color.SampleLevel(LinearClamp,uv,0);
     float2 previous=uv+Motion.Load(int3(q,0))/float2(size.xy);
     float weight=0;
     if(flags.x==0 && Rejection.Load(int3(q,0))==0 && all(previous>=0) && all(previous<=1)) {
@@ -124,10 +140,15 @@ void finish(uint3 id:SV_DispatchThreadID) {
     float2 uv=(float2(id.xy)+.5)/float2(size.zw);
     float2 rasterUv=uv+jitter.xy/float2(size.xy);
     int2 q=int2(floor(rasterUv*float2(size.xy)-.5));
-    float reject=0;
-    [unroll]for(int y=0;y<2;++y)[unroll]for(int x=0;x<2;++x)
-        reject=max(reject,Rejection.Load(int3(clamp(q+int2(x,y),0,int2(size.xy)-1),0)));
-    OutColor[id.xy]=reject>0?Color.SampleLevel(LinearClamp,rasterUv,0):History.Load(int3(id.xy,0));
+    float reject=0,localReject=0;
+    [unroll]for(int y=0;y<2;++y)[unroll]for(int x=0;x<2;++x) {
+        int2 t=clamp(q+int2(x,y),0,int2(size.xy)-1);
+        reject=max(reject,Rejection.Load(int3(t,0)));
+        localReject=max(localReject,LocalReject.Load(int3(t,0)));
+    }
+    // Any stamped texel in the footprint: its current colour is unjittered,
+    // so sample it at uv, same reasoning as taa() above.
+    OutColor[id.xy]=reject>0?Color.SampleLevel(LinearClamp,localReject>0?uv:rasterUv,0):History.Load(int3(id.xy,0));
 }
 // Single-frame recovery after a temporal backend declines already-jittered
 // input. The result lands on the same output grid as the successful backend.
@@ -137,5 +158,12 @@ void spatial(uint3 id:SV_DispatchThreadID) {
     float2 uv=(float2(id.xy)+.5)/float2(size.zw);
     OutColor[id.xy]=Color.SampleLevel(LinearClamp,uv+jitter.xy/float2(size.xy),0);
 }
+// Partial temporal AA's re-issue pass (flat_runtime.cpp's ~FlatRuntimeDrawScope):
+// a scene draw that could not be jittered is re-issued once with this pixel
+// shader bound instead of the game's own, into the reject mask. No input
+// signature at all, so it links with whatever the game's own vertex shader
+// output shape is; the depth-stencil state bound for the re-issue is what
+// actually restricts which pixels this writes.
+float4 stamp() : SV_Target { return 1; }
 )HLSL";
 } // namespace edvr
