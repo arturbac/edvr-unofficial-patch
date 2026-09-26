@@ -40,9 +40,12 @@
   the EDHM main menu, one startup `no-known-tone-pass` all session. FSR/DLSS
   that flight were a build-environment gap (no SDKs in the dev build), not
   code; both pinned SDKs are now on the machine and a full-pass SDK build is
-  installed. The generic tone-slot admission and the launch-time
-  conflicting-hdr storm (cleared itself; qualify the alias if it recurs in
-  steady states) are the recorded follow-ups.
+  installed. Section 65 (2026-09-26): flight states reset-stormed on 16
+  unknown scene pairs -- EDHM/tier PS variants of mapped VS families plus
+  the mod-patched E904 glare VS, all bytecode-reviewed and exact-reciped,
+  INSTALLED on Epic, NOT FLOWN. The generic tone-slot admission and the
+  transition-phase HDR alias (depthless 129F/8826 and 20F3/BF23 writes,
+  clears in steady states) are the recorded follow-ups.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -63,9 +66,11 @@
   rejection crawl. The section-59 main-menu flight happened (section 63):
   zero unknown-pair captures held, but the tone slot refused every frame;
   the widened tone admission is FLOWN for TAA (section 64); the SDK-full
-  install now on Epic wants the same main-menu cycling to confirm DLSS and
-  FSR engage where TAA did, watching for the launch-time conflicting-hdr
-  storm recurring in steady states.
+  install confirmed DLSS at the menu (section 65). Next: one in-flight
+  flight with EDHM at current settings on the section-65 recipes -- expect
+  zero unknown-pair captures and treated streaks once the transition HDR
+  alias settles; the section-57 on-foot hangar/concourse flight stands
+  behind it.
   Existing evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
   PS91/BFE or stale-resize hypotheses. The separate menu hangar-floor P1
@@ -3848,3 +3853,45 @@ provenance is unprovable, at the price of AA standing down in those states.
 If it recurs in steady menu or flight states, qualify the alias (extent
 mismatch, ordering) instead of refusing; do not loosen the guard on
 unmeasured evidence.
+
+## 65. In-flight reset storm: 16 pairs reciped; transition HDR alias open (2026-09-26)
+
+The 13:46 Epic flight on the SDK-full build (`rc.2-14-g8103620f`) treated
+the entire main menu, DLSS included (`treated` past 16k, accepted-history
+~400/5s) -- sections 63-64 closed. In flight states the session
+reset-stormed: 58 `unknown-scene-projection-recipe` refusals, streaks at
+zero. The automatic audit captured 16 distinct pairs with all 32 bytecode
+stages saved, no F10 needed.
+
+Fifteen are known VS families with unseen PS hashes -- the section-59
+pattern at flight scale. Eight are EDHM-patched companions (t120 present;
+the delta against the vetted stock companion is the mod's colour block and
+config branches, instruction-for-instruction otherwise, cb row profiles
+identical). Four are stock settings-tier lighting variants (7AA0, 057F,
+1AE6, 9887) whose profiles match their companions exactly; their single
+svPos use is the companion's own integer tile divide. Three small ones read
+cb2 colour config only. `62FB9466` is EDHM's HUD recolor tree (~990
+instructions of literal t120 region tests) over the 14-instruction stock
+glare PS, sampling t0 at unchanged UV. The sixteenth pair is the
+EDHM-patched E904 glare VS (`7F894EB5`): the mod's t120 block scales glare
+size/alpha upstream of position; SV_Position remains the cb0[4..7] dp4
+idiom, with cb0[9..11] a view-space billboard orientation -- a local
+transform, not a clip consumer.
+
+Change: exact recipes for all 16, mirroring each VS family's measured span
+(the flight census in the recipe rig: admission, wrong-PS/wrong-VS/
+absent-PS refusal, no duplicates). The generic classifier's verdicts were
+the documented conservative refusals -- EDHM t120 loads, billboard second
+matrices, and lighting vPos divides it cannot prove; the exact table
+carries them as designed.
+
+Open: the `conflicting-hdr-target-or-camera` storm is now characterised as
+TRANSITION-phase resource aliasing, launch and menu-to-flight instance
+change, always the same two depthless writers into the tone's HDR resource:
+the 1920x1080 chain's `129F602B2A9CA439/8826CACC6382C78D` and copy-VS
+`20F383BBAC05C031` with an uncaptured PS `BF2302BCC7B434DB`. It clears in
+steady states and selection proceeds; BF23's blob is the missing evidence
+if it ever persists. Next flight: fly with EDHM at current settings --
+expect zero unknown-pair captures and treated streaks once the transition
+settles; if the alias outlives transitions, qualify it by extent mismatch
+instead of refusing.
