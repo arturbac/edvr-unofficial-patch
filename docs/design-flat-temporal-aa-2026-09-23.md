@@ -45,10 +45,16 @@
   mod-patched E904 glare VS, all bytecode-reviewed and exact-reciped, INSTALLED
   on Epic, NOT FLOWN. Section 66: the launch and menu-to-flight conflicting-hdr
   storm matches the online model's hardcoded PS1 tone-HDR read (DE65/9270 bind
-  their HDR at PS0) -- fixed in `989f6fd`, NOT BUILT on Windows. Section 67:
-  per-draw refusal with a reject stamp (partial AA), a coverage census and
-  named classifier refusal reasons -- the approved plan's steps 1-2, NOT BUILT,
-  NOT FLOWN.
+  their HDR at PS0) -- fixed in `989f6fd`, FLOWN THROUGH build.bat here and
+  INSTALLED. Section 67's per-draw stamp form never activated (the flat
+  profile gated its key off) and was unproven by design; section 68
+  (2026-09-26) replaces it with one-raster-phase local refusal per the
+  review's findings 1/4/5: a per-draw-local refusal invalidates history and
+  returns the runtime to observation until a refusal-free frame, the
+  stamp/mask/re-issue machinery removed, census and named classifier reasons
+  kept. INSTALLED on Epic, NOT FLOWN. The review's staged program
+  (three-size routing, FrameContract reducer, cache retirement, family
+  contracts, composition tests) is recorded, not started.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -69,12 +75,13 @@
   rejection crawl. The section-59 main-menu flight happened (section 63):
   zero unknown-pair captures held, but the tone slot refused every frame;
   the widened tone admission is FLOWN for TAA (section 64); the SDK-full
-  install confirmed DLSS at the menu (section 65). Next: the section-67 flight
+  install confirmed DLSS at the menu (section 65). Next: the section-68 flight
   -- EDHM at current settings, supersampling at most 1.0, main menu with DoF on
   and off, flight and station, then supersampling and resolution changes
-  mid-session; expect treated streaks through each change, stamps instead of
-  unknown-pair phase failures, and no conflicting-hdr at launch or
-  menu-to-flight (a storm that survives the slot fix is a genuine alias;
+  mid-session; expect treated streaks through each change, observing=
+  transitions with locally-refused pairs named instead of a reset storm when
+  coverage is incomplete, and no conflicting-hdr at launch or menu-to-flight
+  (a storm that survives the slot fix is a genuine alias; qualify it then).
   qualify it then). The section-57 on-foot hangar/concourse flight stands
   behind it.
   Existing evidence does not justify ignoring the alternate projection.
@@ -4046,3 +4053,44 @@ change, `stamped` counts where unknown pairs appear instead of
 classification:` line naming each refused pair's rule. Watch for crawl where
 stamped and treated surfaces meet, and for DLSS/FSR smear around stamped
 objects. A/B with `experimental.temporal_aa_partial = off` (live).
+
+## 68. Local refusal redesigned to one raster phase (2026-09-26)
+
+Implements the partial-refusal repair from
+[review-flat-temporal-aa-2026-09-26.md](review-flat-temporal-aa-2026-09-26.md)
+(findings 1, 4, 5; its remaining findings route to the staged program
+below). Verified before editing: `runtime_profile.h` never permitted
+`experimental.temporal_aa_partial` in the flat profile, so the key read
+`off` before its default -- the merged stamp-mask partial AA could not have
+activated on Epic at all. Findings 4-5 stand as design constraints: mixed
+unjittered geometry in shared jittered depth/colour cannot be repaired by
+a final mask, and the stamp/replay path carried no ownership guarantees for
+discard, SV_Depth, stencil or mask identity.
+
+Change: the flat profile permits the key. A per-draw-local refusal (the six
+reasons, unchanged) still lets the draw go out unjittered, invalidates the
+frame's history through the existing failPhase coherence -- zero phase
+before any application, the spatial fallback after, never a mixed-phase
+temporal evaluation -- and returns the runtime to observation: frames run
+unjittered and the copy-draw treatment is skipped until a refusal-free
+frame requalifies the contract, when the usual warm-up resumes.
+`experimental.temporal_aa_partial=off` keeps the previous behaviour
+(failPhase retried every frame). Removed: the stamp pixel shader, reject
+mask, DSS-variant cache, re-issue path, resolve t9 plumbing and the three
+raw-draw bypasses (133 insertions, 432 deletions). Kept: the coverage
+census and named classifier reasons, now reporting `observing=`, entries
+into observation, frames spent observing and the top locally refused pairs.
+The reset storm's shape changes with `on`: a persistent unreciped pair now
+holds the runtime calmly in observation (one failPhase on entry, no
+per-frame retry churn) instead of storming; the exact-recipe pipeline
+remains the resolution path, with the census naming candidates.
+
+Deferred to the review's staged program, not started: three-size routing
+and backend negotiation, the FrameContract online/replay reducer, cache
+retirement (the 32-plan/64-pair cliffs), proved shader-family contracts
+with adversarial fixtures (finding 2), and the end-to-end hooked
+composition tests (finding 6). Next flight: EDHM at current settings,
+menu and flight; expect treated streaks, `observing=` transitions with
+locally-refused pairs named instead of a reset storm when coverage is
+incomplete, and no conflicting-hdr at launch or menu-to-flight (a storm
+that survives section 66's slot fix is a genuine alias; qualify it then).
