@@ -36,8 +36,13 @@
   frame refusing `no-known-tone-pass` instead -- the tone slot alternates
   writers the exact table never knew, on both the VS and PS axes. Tone
   admission now decouples a tone VS set from a per-PS HDR-slot table, with a
-  latent PS0 hdr-routing fix; BUILT and INSTALLED on Epic, NOT FLOWN. The
-  generic tone-slot admission is the recorded systemic follow-up.
+  latent PS0 hdr-routing fix; FLOWN 2026-09-26 (section 64): TAA engages at
+  the EDHM main menu, one startup `no-known-tone-pass` all session. FSR/DLSS
+  that flight were a build-environment gap (no SDKs in the dev build), not
+  code; both pinned SDKs are now on the machine and a full-pass SDK build is
+  installed. The generic tone-slot admission and the launch-time
+  conflicting-hdr storm (cleared itself; qualify the alias if it recurs in
+  steady states) are the recorded follow-ups.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -57,9 +62,10 @@
   confirm treated streaks resume on foot, watch the weapon itself for local
   rejection crawl. The section-59 main-menu flight happened (section 63):
   zero unknown-pair captures held, but the tone slot refused every frame;
-  the widened tone admission wants one main-menu flight at current settings
-  with EDHM chained -- expect `treated-jittered` with growing streaks and no
-  `no-known-tone-pass`.
+  the widened tone admission is FLOWN for TAA (section 64); the SDK-full
+  install now on Epic wants the same main-menu cycling to confirm DLSS and
+  FSR engage where TAA did, watching for the launch-time conflicting-hdr
+  storm recurring in steady states.
   Existing evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
   PS91/BFE or stale-resize hypotheses. The separate menu hangar-floor P1
@@ -3811,3 +3817,34 @@ rather than by hash. That wants its own qualification; unreviewed variants
 keep refusing and dumping. Next flight: this install's Epic main menu with
 EDHM at current settings -- expect `treated-jittered` with growing streaks
 and no `no-known-tone-pass`; the section-57 on-foot flight stands after it.
+
+## 64. Tone admission flown; upscalers were a build-environment gap (2026-09-26)
+
+The section-63 tree's first flight (`edvr_gfx_20260926_131921.log`, build
+`rc.2-13-g2bd1a8d0-dirty` -- the pre-commit full build; the promotion had
+failed on the supporter-logs fingerprint, and this section's install
+supersedes it with the clean `rc.2-14-g8103620f`): DoF off, EDHM chained,
+the main menu. The tone admission works: exactly one `no-known-tone-pass`
+all session (a startup frame), and every `mode=on` window from 13:21:07
+treated -- `treated-jittered` with live phases, accepted-history climbing,
+longest streak 446.
+
+FSR and DLSS did not engage, and the cause is not the code: this dev build
+carried neither upscaler SDK (`temporal=this build has no DLSS SDK in it`,
+spatial fallback; the FSR3 banner refused at build time). The machine now
+carries both pinned SDKs (`%LOCALAPPDATA%\EDVR\ngx-sdk` 310.9.1,
+`ffx-dx11` 3.1.2; the FSR port's cmake build needed a portable cmake, now at
+`%LOCALAPPDATA%\EDVR\cmake`). A full-pass rebuild at `8103620f` with both
+SDKs is installed on Epic with the pinned runtime; the next flight should
+see DLSS and FSR engage wherever TAA did.
+
+One open watch item the flight exposed: a ~50 s
+`conflicting-hdr-target-or-camera` storm from launch (the runtime conflict
+lines name `missing-depth-or-dsv` writes into the tone's HDR resource by the
+1920x1080 chain's `129F602B2A9CA439/8826CACC6382C78D` and a copy-variant
+`20F383BBAC05C031/BF2302BCC7B434DB`). It cleared by itself before the first
+treated window; the refusal is the HDR identity guard working while
+provenance is unprovable, at the price of AA standing down in those states.
+If it recurs in steady menu or flight states, qualify the alias (extent
+mismatch, ordering) instead of refusing; do not loosen the guard on
+unmeasured evidence.
