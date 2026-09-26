@@ -65,11 +65,99 @@ namespace edvr {
 enum class FlatVsProjectionClass { NoBytecode, InertNoCB, ForwardColumns, ForwardDp4, Unclassified };
 enum class FlatPsProjectionSafety { NoBytecode, Clean, Consumer };
 
+// Machine-readable reason for a refusal (VS Unclassified / PS Consumer /
+// either stage NoBytecode), set alongside the verdict so the runtime can log
+// "refused because X" once per pair. Observability only: no reason value
+// feeds a classification decision, and a successful verdict always carries
+// None.
+enum class FlatClassifierReason : uint8_t {
+    None = 0,        // classified; also the default for a stage never blamed
+    NoBytecode,      // classifyFlatShaderPair: this stage's bytes were null/empty
+    Container,       // parseContainer (or parseSignature) threw: size/checksum/version/chunks
+    Walk,            // walkProgram failed: an instruction desynced or cf nesting is unbalanced
+    IndexableTemp,   // dcl_indexable_temp is present
+    TempCount,       // declared/used temp register count exceeds kMaxTemps
+    UnknownOpcode,   // an instruction's operand layout is unknown (see unknownOpcode)
+    OperandRange,    // a temp/output register index exceeds its table bound
+    DepthOutput,     // PS: SV_Depth (or ge/le variant) output declared
+    ParseError,      // VS: an instruction's operands did not parse cleanly
+    NoPosition,      // no/ambiguous SV_Position, OSGN vs dcl disagreement, or never written
+    InertNotClean,   // VS has no cb but the position chain is not the clean no-cb idiom
+    NotForward,      // the position forms match neither the columns nor the dp4 idiom
+    ControlFlow,     // the position output's form is tainted by control flow
+    ChainBreak,      // the columns idiom matched but the row-combine chain check failed
+    SliceNotClean,   // the dp4 idiom matched but the shared source vector's slice is not clean
+    SecondMatrix,    // a second, out-of-family row combine exists elsewhere in the VS
+    MultiRowTemp,    // PS: a temp combines >=2 distinct rows of one cb buffer
+    MultiRowOutput,  // PS: an output combines >=2 distinct rows of one cb buffer
+    Unmodelable,     // PS: an unmodelable/parse-error instruction touches cb, vPos or an output
+    VposConsumer,    // PS: a vPos-derived value reaches something other than a texture coordinate
+};
+
+// Sub-cause of a VposConsumer refusal, filled in when the exit site can say
+// cheaply which rule fired. Best-effort: within one instruction, the first
+// rule that trips `consumer` wins, so a second rule tripped by the same
+// instruction is not recorded.
+enum class FlatVposConsumerSubcode : uint8_t {
+    None = 0,
+    MovcCondition,     // movc/swapc select condition itself vPos-tainted
+    DivOrigin,         // div of two Input-origin operands (depth-UV reconstruction idiom)
+    AgedDivRcp,        // rcp/div reached by taint already aged past raw vPos
+    TextureNonCoord,   // texture-fetch non-coordinate operand vPos-tainted
+    OutputWrite,       // a tainted value reaches an output write
+    OtherOp,           // any other instruction a float-tainted value reaches
+};
+
+inline const char* flatClassifierReasonName(FlatClassifierReason r) {
+    switch (r) {
+    case FlatClassifierReason::None: return "none";
+    case FlatClassifierReason::NoBytecode: return "no-bytecode";
+    case FlatClassifierReason::Container: return "container";
+    case FlatClassifierReason::Walk: return "walk";
+    case FlatClassifierReason::IndexableTemp: return "indexable-temp";
+    case FlatClassifierReason::TempCount: return "temp-count";
+    case FlatClassifierReason::UnknownOpcode: return "unknown-opcode";
+    case FlatClassifierReason::OperandRange: return "operand-range";
+    case FlatClassifierReason::DepthOutput: return "depth-output";
+    case FlatClassifierReason::ParseError: return "parse-error";
+    case FlatClassifierReason::NoPosition: return "no-position";
+    case FlatClassifierReason::InertNotClean: return "inert-not-clean";
+    case FlatClassifierReason::NotForward: return "not-forward";
+    case FlatClassifierReason::ControlFlow: return "control-flow";
+    case FlatClassifierReason::ChainBreak: return "chain-break";
+    case FlatClassifierReason::SliceNotClean: return "slice-not-clean";
+    case FlatClassifierReason::SecondMatrix: return "second-matrix";
+    case FlatClassifierReason::MultiRowTemp: return "multi-row-temp";
+    case FlatClassifierReason::MultiRowOutput: return "multi-row-output";
+    case FlatClassifierReason::Unmodelable: return "unmodelable";
+    case FlatClassifierReason::VposConsumer: return "vpos-consumer";
+    }
+    return "unknown";
+}
+
+inline const char* flatVposConsumerSubcodeName(FlatVposConsumerSubcode s) {
+    switch (s) {
+    case FlatVposConsumerSubcode::None: return "none";
+    case FlatVposConsumerSubcode::MovcCondition: return "movc-condition";
+    case FlatVposConsumerSubcode::DivOrigin: return "div-origin";
+    case FlatVposConsumerSubcode::AgedDivRcp: return "aged-div-rcp";
+    case FlatVposConsumerSubcode::TextureNonCoord: return "texture-non-coord";
+    case FlatVposConsumerSubcode::OutputWrite: return "output-write";
+    case FlatVposConsumerSubcode::OtherOp: return "other-op";
+    }
+    return "unknown";
+}
+
 struct FlatShaderPairClassification {
     FlatVsProjectionClass vs = FlatVsProjectionClass::NoBytecode;
     unsigned vsSlot = 0; unsigned vsRow = 0;      // valid when classified
     bool vsExportsClipXyw = false;
     FlatPsProjectionSafety ps = FlatPsProjectionSafety::NoBytecode;
+    FlatClassifierReason vsReason = FlatClassifierReason::None;
+    FlatClassifierReason psReason = FlatClassifierReason::None;
+    uint16_t vsUnknownOpcode = 0;   // valid when vsReason == UnknownOpcode
+    uint16_t psUnknownOpcode = 0;   // valid when psReason == UnknownOpcode
+    FlatVposConsumerSubcode psConsumerSubcode = FlatVposConsumerSubcode::None; // valid when psReason == VposConsumer
 };
 
 namespace flat_shader_classifier_detail {
@@ -285,6 +373,7 @@ struct ProgramFacts {
     bool depthOutput = false;       // PS: SV_Depth (or ge/le variants) output
     int32_t posOutputRegister = -1; // VS: dcl_output_siv position register
     bool sawUnknownOpcode = false;
+    uint16_t firstUnknownOpcode = 0; // opcode number of the first unknown instruction
 };
 
 inline bool isDeclaration(uint32_t op) {
@@ -338,6 +427,7 @@ inline bool walkProgram(const std::vector<uint32_t>& t, std::vector<Instr>& inst
             const int count = operandCount(op);
             if (count < 0) {
                 in.unmodelable = true;
+                if (!facts.sawUnknownOpcode) facts.firstUnknownOpcode = static_cast<uint16_t>(op);
                 facts.sawUnknownOpcode = true;
             } else {
                 in.opCount = static_cast<uint8_t>(count);
@@ -833,10 +923,26 @@ inline bool matchForwardDp4Component(const Form& f, uint32_t comp, uint32_t& slo
     return true;
 }
 
+// Priority among the "position forms matched neither idiom" family of
+// refusal reasons: the higher-ranked reason is the more informative one
+// (we got further before failing), so the columns and dp4 attempts both
+// report through this and the best of the two survives.
+inline int forwardReasonRank(FlatClassifierReason r) {
+    switch (r) {
+    case FlatClassifierReason::ControlFlow: return 1;
+    case FlatClassifierReason::ChainBreak:
+    case FlatClassifierReason::SliceNotClean: return 2;
+    case FlatClassifierReason::SecondMatrix: return 3;
+    default: return 0; // NotForward (the default) and anything else
+    }
+}
+
 struct VsAnalysis {
     FlatVsProjectionClass cls = FlatVsProjectionClass::Unclassified;
     uint32_t slot = 0, row = 0;
     bool exportsClipXyw = false;
+    FlatClassifierReason reason = FlatClassifierReason::None;
+    uint16_t unknownOpcode = 0; // valid when reason == UnknownOpcode
 };
 
 inline VsAnalysis analyzeVs(const std::vector<uint32_t>& t,
@@ -844,27 +950,37 @@ inline VsAnalysis analyzeVs(const std::vector<uint32_t>& t,
     VsAnalysis result;
     std::vector<Instr> instrs;
     ProgramFacts facts;
-    if (!walkProgram(t, instrs, facts)) return result;
-    if (facts.hasIndexableTemp || facts.tempCount > kMaxTemps || facts.sawUnknownOpcode ||
-        facts.operandOutOfRange)
+    if (!walkProgram(t, instrs, facts)) { result.reason = FlatClassifierReason::Walk; return result; }
+    if (facts.hasIndexableTemp) { result.reason = FlatClassifierReason::IndexableTemp; return result; }
+    if (facts.tempCount > kMaxTemps) { result.reason = FlatClassifierReason::TempCount; return result; }
+    if (facts.sawUnknownOpcode) {
+        result.reason = FlatClassifierReason::UnknownOpcode;
+        result.unknownOpcode = facts.firstUnknownOpcode;
         return result;
+    }
+    if (facts.operandOutOfRange) { result.reason = FlatClassifierReason::OperandRange; return result; }
     for (const Instr& in : instrs)
-        if (in.parseError) return result;
+        if (in.parseError) { result.reason = FlatClassifierReason::ParseError; return result; }
     // The SV_Position output register: OSGN system value or name, with the
     // dcl_output_siv declaration as fallback; disagreement is ambiguous.
     int32_t posReg = -1;
     uint32_t posMask = 0;
     for (const auto& e : osgn) {
         if (e.systemValue == kSystemValuePosition || dxbc_container::equalName(e.name, "SV_Position")) {
-            if (posReg >= 0) return result;
+            if (posReg >= 0) { result.reason = FlatClassifierReason::NoPosition; return result; }
             posReg = static_cast<int32_t>(e.registerIndex);
             posMask = e.masks & 15u;
         }
     }
-    if (posReg >= 0 && facts.posOutputRegister >= 0 && facts.posOutputRegister != posReg)
+    if (posReg >= 0 && facts.posOutputRegister >= 0 && facts.posOutputRegister != posReg) {
+        result.reason = FlatClassifierReason::NoPosition;
         return result;
+    }
     if (posReg < 0) { posReg = facts.posOutputRegister; posMask = 0xF; }
-    if (posReg < 0 || posReg >= static_cast<int32_t>(kMaxOutputs)) return result;
+    if (posReg < 0 || posReg >= static_cast<int32_t>(kMaxOutputs)) {
+        result.reason = FlatClassifierReason::NoPosition;
+        return result;
+    }
     if (!posMask) posMask = 0xF;
 
     // def lists for the chain and slice checks
@@ -888,7 +1004,7 @@ inline VsAnalysis analyzeVs(const std::vector<uint32_t>& t,
         const Operand& dest = in.ops[0];
         if (dest.type == kOperandOutput && dest.reg == static_cast<uint32_t>(posReg)) written = true;
     }
-    if (!written) return result;
+    if (!written) { result.reason = FlatClassifierReason::NoPosition; return result; }
 
     // InertNoCB: no constant buffer anywhere and the position chain to the
     // inputs is control-flow free and modelable.
@@ -907,6 +1023,7 @@ inline VsAnalysis analyzeVs(const std::vector<uint32_t>& t,
             }
         }
         if (clean) result.cls = FlatVsProjectionClass::InertNoCB;
+        else result.reason = FlatClassifierReason::InertNotClean;
         return result;
     }
 
@@ -917,14 +1034,22 @@ inline VsAnalysis analyzeVs(const std::vector<uint32_t>& t,
     uint32_t slot = 0, row = 0;
     bool columns = (posMask & 0xBu) == 0xBu;  // x, y, w all present
     bool firstComponent = true;
+    bool columnsCfTainted = false;
     for (uint32_t c = 0; c < 4 && columns; ++c) {
         if (c == 2 || !(posMask & (1u << c))) continue;
         uint32_t s = 0, r = 0;
         if (!matchForwardColumns(outputs.at(posReg, c), s, r)) { columns = false; break; }
-        if (outputs.at(posReg, c).cfTainted) { columns = false; break; }
+        if (outputs.at(posReg, c).cfTainted) { columns = false; columnsCfTainted = true; break; }
         if (firstComponent) { slot = s; row = r; firstComponent = false; }
         else if (s != slot || r != row) { columns = false; break; }
     }
+    // Across both idiom attempts below, keep the most informative refusal
+    // reason (see forwardReasonRank) and report it only if neither succeeds.
+    FlatClassifierReason bestForwardReason = FlatClassifierReason::NotForward;
+    auto noteForwardReason = [&](FlatClassifierReason reason) {
+        if (forwardReasonRank(reason) > forwardReasonRank(bestForwardReason)) bestForwardReason = reason;
+    };
+    if (columnsCfTainted) noteForwardReason(FlatClassifierReason::ControlFlow);
     if (columns) {
         // The chain must be exactly the row-combine idiom: no additive
         // constant or input anywhere between the rows and the position.
@@ -965,6 +1090,9 @@ inline VsAnalysis analyzeVs(const std::vector<uint32_t>& t,
         }
         if (chainOk && !violation) {
             result.cls = FlatVsProjectionClass::ForwardColumns; result.slot = slot; result.row = row;
+        } else {
+            if (!chainOk) noteForwardReason(FlatClassifierReason::ChainBreak);
+            if (violation) noteForwardReason(FlatClassifierReason::SecondMatrix);
         }
     }
     if (result.cls == FlatVsProjectionClass::Unclassified) {
@@ -972,14 +1100,16 @@ inline VsAnalysis analyzeVs(const std::vector<uint32_t>& t,
         uint32_t s = 0, r = 0;
         uint16_t src = 0; uint8_t srcType = 0;
         bool first = true;
+        bool dp4CfTainted = false;
         for (uint32_t c = 0; c < 4 && dp4; ++c) {
             if (c == 2 || !(posMask & (1u << c))) continue;
             uint32_t cs = 0, cr = 0; uint16_t cg = 0; uint8_t ct = 0;
             if (!matchForwardDp4Component(outputs.at(posReg, c), c, cs, cr, cg, ct)) { dp4 = false; break; }
-            if (outputs.at(posReg, c).cfTainted) { dp4 = false; break; }
+            if (outputs.at(posReg, c).cfTainted) { dp4 = false; dp4CfTainted = true; break; }
             if (first) { s = cs; r = cr; src = cg; srcType = ct; first = false; }
             else if (cs != s || cr != r || cg != src || ct != srcType) { dp4 = false; break; }
         }
+        if (dp4CfTainted) noteForwardReason(FlatClassifierReason::ControlFlow);
         if (dp4 && !first) {
             // Each position write is a dp4 (or a mov of one) whose shared
             // source vector traces to inputs through the bounded whitelist.
@@ -1045,11 +1175,18 @@ inline VsAnalysis analyzeVs(const std::vector<uint32_t>& t,
                 }
                 if (!violation) {
                     result.cls = FlatVsProjectionClass::ForwardDp4; result.slot = s; result.row = r;
+                } else {
+                    noteForwardReason(FlatClassifierReason::SecondMatrix);
                 }
+            } else {
+                noteForwardReason(FlatClassifierReason::SliceNotClean);
             }
         }
     }
-    if (result.cls == FlatVsProjectionClass::Unclassified) return result;
+    if (result.cls == FlatVsProjectionClass::Unclassified) {
+        result.reason = bestForwardReason;
+        return result;
+    }
 
     // Another output whose form stays inside the same matrix family exports
     // the clip xyw varying (the decal idiom).
@@ -1098,14 +1235,26 @@ inline bool textureCoordOperand(uint32_t op, uint8_t idx) {
     return idx == 1;
 }
 
-inline bool analyzePs(const std::vector<uint32_t>& t, FlatPsProjectionSafety& safety) {
+struct PsAnalysis {
+    FlatPsProjectionSafety safety = FlatPsProjectionSafety::NoBytecode;
+    FlatClassifierReason reason = FlatClassifierReason::None;
+    uint16_t unknownOpcode = 0; // valid when reason == UnknownOpcode
+    FlatVposConsumerSubcode consumerSubcode = FlatVposConsumerSubcode::None; // valid when reason == VposConsumer
+};
+
+inline bool analyzePs(const std::vector<uint32_t>& t, PsAnalysis& out) {
     std::vector<Instr> instrs;
     ProgramFacts facts;
-    if (!walkProgram(t, instrs, facts)) return false;
-    if (facts.hasIndexableTemp || facts.tempCount > kMaxTemps || facts.sawUnknownOpcode ||
-        facts.operandOutOfRange || facts.depthOutput) {
+    if (!walkProgram(t, instrs, facts)) { out.reason = FlatClassifierReason::Walk; return false; }
+    if (facts.hasIndexableTemp) { out.reason = FlatClassifierReason::IndexableTemp; return false; }
+    if (facts.tempCount > kMaxTemps) { out.reason = FlatClassifierReason::TempCount; return false; }
+    if (facts.sawUnknownOpcode) {
+        out.reason = FlatClassifierReason::UnknownOpcode;
+        out.unknownOpcode = facts.firstUnknownOpcode;
         return false;
     }
+    if (facts.operandOutOfRange) { out.reason = FlatClassifierReason::OperandRange; return false; }
+    if (facts.depthOutput) { out.reason = FlatClassifierReason::DepthOutput; return false; }
     const int32_t vpos = facts.vposRegister;
 
     FormBank temps(facts.tempCount ? facts.tempCount : 1);
@@ -1115,10 +1264,12 @@ inline bool analyzePs(const std::vector<uint32_t>& t, FlatPsProjectionSafety& sa
     // non-literal coefficients is a possible PS-side matrix.
     for (const Form& f : temps.forms)
         if (f.arithMultiRow) {
+            out.reason = FlatClassifierReason::MultiRowTemp;
             return false;
         }
     for (const Form& f : outputs.forms)
         if (f.arithMultiRow) {
+            out.reason = FlatClassifierReason::MultiRowOutput;
             return false;
         }
 
@@ -1152,6 +1303,7 @@ inline bool analyzePs(const std::vector<uint32_t>& t, FlatPsProjectionSafety& sa
                 if (op.type == kOperandInput && static_cast<int32_t>(op.reg) == vpos) involves = true;
             }
             if (involves) {
+                out.reason = FlatClassifierReason::Unmodelable;
                 return false;
             }
             continue;
@@ -1169,6 +1321,14 @@ inline bool analyzePs(const std::vector<uint32_t>& t, FlatPsProjectionSafety& sa
             }
         uint8_t destTaint[4] = {0, 0, 0, 0};
         bool consumer = false;
+        FlatVposConsumerSubcode consumerSubcode = FlatVposConsumerSubcode::None;
+        // First rule to trip `consumer` for this instruction wins the subcode
+        // (cheap, deterministic; a second rule tripped by the same
+        // instruction is not recorded -- see FlatVposConsumerSubcode).
+        auto trip = [&](FlatVposConsumerSubcode sc) {
+            consumer = true;
+            if (consumerSubcode == FlatVposConsumerSubcode::None) consumerSubcode = sc;
+        };
         const uint32_t op = in.opcode;
         const bool transit = op == kOpAdd || op == kOpMul || op == kOpMad || op == kOpMin ||
                              op == kOpMax || op == kOpFrc || op == kOpAnd || op == kOpOr ||
@@ -1179,7 +1339,7 @@ inline bool analyzePs(const std::vector<uint32_t>& t, FlatPsProjectionSafety& sa
             if (op == kOpMov) {
                 tv = srcTaint[1][c];
             } else if (op == kOpMovc || op == kOpSwapc) {
-                if (srcTaint[1][c] >= 2) consumer = true; // select condition is comparison-like
+                if (srcTaint[1][c] >= 2) trip(FlatVposConsumerSubcode::MovcCondition); // select condition is comparison-like
                 tv = taintUnion(srcTaint[2][c], srcTaint[3][c]);
             } else if (op == kOpFtou || op == kOpFtoi || op == kOpRoundNe || op == kOpRoundNi ||
                        op == kOpRoundPi || op == kOpRoundZ) {
@@ -1195,15 +1355,15 @@ inline bool analyzePs(const std::vector<uint32_t>& t, FlatPsProjectionSafety& sa
                 // constant stays jitter-invariant (tile lookups).
                 const uint8_t a = srcTaint[1][c];
                 const uint8_t b = op == kOpDiv ? srcTaint[2][c] : 0;
-                if (a >= 3 || b >= 3) consumer = true;
-                if (op == kOpDiv && srcOrigin[1][c] == 1 && srcOrigin[2][c] == 1) consumer = true;
+                if (a >= 3 || b >= 3) trip(FlatVposConsumerSubcode::AgedDivRcp);
+                if (op == kOpDiv && srcOrigin[1][c] == 1 && srcOrigin[2][c] == 1) trip(FlatVposConsumerSubcode::DivOrigin);
                 tv = taintUnion(a, b);
                 if (tv >= 2) tv = taintNext(tv);
             } else if (opcodeIsTextureFetch(op)) {
                 tv = 0;
             } else if (!transit && tv >= 2) {
                 // Anything else a float-tainted value can reach is a consumer.
-                consumer = true;
+                trip(FlatVposConsumerSubcode::OtherOp);
             }
             if (transit && tv >= 2) tv = taintNext(tv);
             destTaint[c] = tv;
@@ -1214,15 +1374,17 @@ inline bool analyzePs(const std::vector<uint32_t>& t, FlatPsProjectionSafety& sa
             for (uint8_t i = 1; i < in.opCount; ++i) {
                 if (textureCoordOperand(op, i)) continue;
                 for (uint32_t c = 0; c < 4; ++c)
-                    if (srcTaint[i][c] >= 2) consumer = true;
+                    if (srcTaint[i][c] >= 2) trip(FlatVposConsumerSubcode::TextureNonCoord);
             }
             for (uint32_t c = 0; c < 4; ++c) destTaint[c] = 0;
         }
         if (writesOutput) {
             for (uint32_t c = 0; c < 4; ++c)
-                if (destTaint[c] >= 2) consumer = true;
+                if (destTaint[c] >= 2) trip(FlatVposConsumerSubcode::OutputWrite);
         }
         if (consumer) {
+            out.reason = FlatClassifierReason::VposConsumer;
+            out.consumerSubcode = consumerSubcode;
             return false;
         }
         if (destIsTemp || (isTwoDestOpcode(op) && in.ops[1].ok && in.ops[1].type == kOperandTemp &&
@@ -1254,7 +1416,7 @@ inline bool analyzePs(const std::vector<uint32_t>& t, FlatPsProjectionSafety& sa
             }
         }
     }
-    safety = FlatPsProjectionSafety::Clean;
+    out.safety = FlatPsProjectionSafety::Clean;
     return true;
 }
 
@@ -1264,7 +1426,7 @@ inline bool analyzePs(const std::vector<uint32_t>& t, FlatPsProjectionSafety& sa
 
 inline VsAnalysis classifyVsBytes(const void* bytes, size_t len) {
     VsAnalysis result;
-    if (!bytes || !len) return result;
+    if (!bytes || !len) { result.reason = FlatClassifierReason::NoBytecode; return result; }
     try {
         auto chunks = parseContainer(bytes, len, kVs50);
         const std::vector<BYTE>* program = nullptr;
@@ -1273,30 +1435,47 @@ inline VsAnalysis classifyVsBytes(const void* bytes, size_t len) {
             if (chunk.tag == kTagShex || chunk.tag == kTagShdr) program = &chunk.bytes;
             else if (chunk.tag == kTagOsgn) osgn = parseSignature(chunk.bytes);
         }
-        if (!program || program->size() < 8 || (program->size() & 3)) return result;
+        if (!program || program->size() < 8 || (program->size() & 3)) {
+            result.reason = FlatClassifierReason::Container;
+            return result;
+        }
         std::vector<uint32_t> t(program->size() / 4);
         std::memcpy(t.data(), program->data(), t.size() * 4);
         return analyzeVs(t, osgn);
     } catch (...) {
+        result.reason = FlatClassifierReason::Container;
         return result;
     }
 }
 
-inline FlatPsProjectionSafety classifyPsBytes(const void* bytes, size_t len) {
-    if (!bytes || !len) return FlatPsProjectionSafety::NoBytecode;
+inline PsAnalysis classifyPsBytes(const void* bytes, size_t len) {
+    PsAnalysis result;
+    if (!bytes || !len) {
+        result.safety = FlatPsProjectionSafety::NoBytecode;
+        result.reason = FlatClassifierReason::NoBytecode;
+        return result;
+    }
     try {
         auto chunks = parseContainer(bytes, len, kPs50);
         const std::vector<BYTE>* program = nullptr;
         for (const auto& chunk : chunks)
             if (chunk.tag == kTagShex || chunk.tag == kTagShdr) program = &chunk.bytes;
-        if (!program || program->size() < 8 || (program->size() & 3)) return FlatPsProjectionSafety::Consumer;
+        if (!program || program->size() < 8 || (program->size() & 3)) {
+            result.safety = FlatPsProjectionSafety::Consumer;
+            result.reason = FlatClassifierReason::Container;
+            return result;
+        }
         std::vector<uint32_t> t(program->size() / 4);
         std::memcpy(t.data(), program->data(), t.size() * 4);
-        FlatPsProjectionSafety safety = FlatPsProjectionSafety::Consumer;
-        if (!analyzePs(t, safety)) return FlatPsProjectionSafety::Consumer;
-        return safety;
+        if (!analyzePs(t, result)) {
+            result.safety = FlatPsProjectionSafety::Consumer;
+            return result;
+        }
+        return result;
     } catch (...) {
-        return FlatPsProjectionSafety::Consumer;
+        result.safety = FlatPsProjectionSafety::Consumer;
+        result.reason = FlatClassifierReason::Container;
+        return result;
     }
 }
 
@@ -1333,9 +1512,18 @@ inline FlatShaderPairClassification classifyFlatShaderPair(const void* vsBytes, 
         const auto vs = flat_shader_classifier_detail::classifyVsBytes(vsBytes, vsLen);
         out.vs = vs.cls; out.vsSlot = vs.slot; out.vsRow = vs.row;
         out.vsExportsClipXyw = vs.exportsClipXyw;
+        out.vsReason = vs.reason; out.vsUnknownOpcode = vs.unknownOpcode;
+    } else {
+        out.vsReason = FlatClassifierReason::NoBytecode;
     }
-    if (psBytes && psLen)
-        out.ps = flat_shader_classifier_detail::classifyPsBytes(psBytes, psLen);
+    if (psBytes && psLen) {
+        const auto ps = flat_shader_classifier_detail::classifyPsBytes(psBytes, psLen);
+        out.ps = ps.safety;
+        out.psReason = ps.reason; out.psUnknownOpcode = ps.unknownOpcode;
+        out.psConsumerSubcode = ps.consumerSubcode;
+    } else {
+        out.psReason = FlatClassifierReason::NoBytecode;
+    }
     return out;
 }
 
