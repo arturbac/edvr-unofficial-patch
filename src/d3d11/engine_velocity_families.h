@@ -20,7 +20,7 @@ constexpr Family kFamilies[] = {
     // The captured pair is draw-qualified on WARP; VR remains unqualified.
     {0xDE545DC8EE4FBB87ull, "vs_DE545DC8EE4FBB87", {0xE46E3E4832B2FDB0ull, 0xCB429E043DBB2506ull, 0, 0}, false, 0x91F8937EDA723663ull},
     {0xAACFDCF2FB9AD809ull, "vs_AACFDCF2FB9AD809", {0xCF534B32F491561Aull, 0, 0, 0}},
-    {0x66DE2CADB1F4AE6Bull, "vs_66DE2CADB1F4AE6B", {0x864F1F949851B8DEull, 0, 0, 0}},
+    {0x66DE2CADB1F4AE6Bull, "vs_66DE2CADB1F4AE6B", {0x864F1F949851B8DEull, 0xBBDE4E71FB78528Aull, 0, 0}},
     {0x61AE8EB05FDC18DDull, "vs_61AE8EB05FDC18DD", {0xFC43E42710010343ull, 0x451A82D4DD1BA254ull, 0x4504BC268E109C31ull, 0}},
     {0x436193B352A2897Eull, "vs_436193B352A2897E", {0x16940F576006BE65ull, 0x51EE1F922FD220B0ull, 0, 0}},
     {0x889A5279E68F0672ull, "vs_889A5279E68F0672", {0xB46E52A1E0B2F39Cull, 0xEBA95E15B0A66102ull, 0xD31DCAFA7C05CB47ull, 0}},
@@ -42,6 +42,12 @@ struct SelfMarking {
 constexpr SelfMarking kSelfMarking[] = {
     {0x436193B352A2897Eull, 0xBCF75CEA37060EAEull},
     {0x889A5279E68F0672ull, 0x2F924695596C8195ull},
+    // The 15:46 session's remaining stock station draws, each verified
+    // byte-identical in the encoding (2*(v0.x & 0x7fffff)+1, noperspective
+    // position z at o6.y): the seams' light/detail shaders.
+    {0xBBE58E40FE88EC80ull, 0x25CC28229319DFA8ull},
+    {0xAACFDCF2FB9AD809ull, 0xC4835018A5128866ull},
+    {0x61AE8EB05FDC18DDull, 0xC21E17F391CC04AFull},
 };
 constexpr bool selfMarkingPair(uint64_t vs, uint64_t ps) noexcept {
     for (const SelfMarking& p : kSelfMarking)

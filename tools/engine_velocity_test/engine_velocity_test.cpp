@@ -158,6 +158,7 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
         {L"vs_EB5234DB6ADB491D", L"ps_3434972DB5336AA4", false}, {L"vs_5B4D8E894EEDA8B4", L"ps_4375B72964F386CD", true},
         {L"vs_BBE58E40FE88EC80", L"ps_DB3E8D20CF53FBC0", false}, {L"vs_DE545DC8EE4FBB87", L"ps_E46E3E4832B2FDB0", false},
         {L"vs_AACFDCF2FB9AD809", L"ps_CF534B32F491561A", false}, {L"vs_66DE2CADB1F4AE6B", L"ps_864F1F949851B8DE", false},
+        {L"vs_66DE2CADB1F4AE6B", L"ps_BBDE4E71FB78528A", false},   // the 15:46 session's stock station draws
         {L"vs_61AE8EB05FDC18DD", L"ps_FC43E42710010343", false},
         // Eye run 055427 (2026-09-26, parked close to a coriolis port): the
         // family's stock pixel shader at close range -- part of the hull sat
@@ -185,6 +186,11 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
     // while its live owner/coverage is assessed.
     const Pair candidates[] = {
         {L"vs_DE545DC8EE4FBB87", L"ps_A6070F9DD1CFB601", false},
+        // The 15:46 session's stock station draws (eye run 154655's seams and
+        // windows riding the world path), dumped by the same glare run. The
+        // three "target 6 occupied" ones moved to kSelfMarking (verified
+        // byte-identical in the marker encoding).
+        {L"vs_5B4D8E894EEDA8B4", L"ps_BA58469C3D6120A7", true},
     };
     for (const auto& p : candidates) {
         g_softWhy.clear();

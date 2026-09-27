@@ -3352,3 +3352,30 @@ The review's diagnostic caution stands as written: the v3 zero-readings are
 recorded history, not proof of a replay-path root cause; the heal's counters
 (poolShadowHealed / the draw-path census) answer reachability live. The rig:
 1156 gate checks, 1742 with the corpus, on the fixed code.
+
+### 2026-09-27 -- The window-band shaders: three self-marking, one keyed, one refused
+
+The 15:46 session (the heal and the review fixes live): the family lines read
+"self-marked 1639 draws, latched 1471 eye-frames" on vs_4361 and "135, 36" on
+vs_889A -- the seam channel engages live. The dump (eye run 154655) showed the
+hull nearly fully engine-covered and the WINDOW bands still riding the world
+path: they are not the two known seam shaders' draws. Five stock pixel shaders
+drew the station that session, all dumped by the glare run. Disassembled and
+through the harness:
+
+- ps_25CC28229319DFA8 (vs_BBE5), ps_C4835018A5128866 (vs_AACF),
+  ps_C21E17F391CC04AF (vs_61AE): each writes o6 = (2*(v0.x & 0x7fffff)+1,
+  noperspective z) natively -- byte-identical to the seam shaders' encoding.
+  The corpus's selfMarking proof drives each stock on WARP: 4096 covered
+  texels, the marker on each, 0 bad. All three join kSelfMarking.
+- ps_BBDE4E71FB78528A (vs_66DE): keyed (the harness: 40,960 texels, 0
+  mismatches; MRT6 8192, 0 bad).
+- ps_BA58469C3D6120A7 (vs_5B4D): refused by the patcher, "slot input register
+  occupied" -- the UV-only family's slot register is taken in it. Stays stock;
+  its draws ride the world path, which is the camera-rows arc's department.
+
+**What a flight shows at the port now:** the family lines for vs_BBE5/vs_AACF/
+vs_61AE carry "self-marked N draws, latched M eye-frames", vs_66DE patches
+ps_BBDE, the window bands go engine-joined in the dump's path map, and the
+seams hold through motion. What is left on the world path after this: the
+refused ps_BA58's draws and anything the pool does not own at all.

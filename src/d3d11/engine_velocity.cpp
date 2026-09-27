@@ -77,7 +77,9 @@ std::atomic<const ID3D11Resource*> watch[kWatchSlots] = {};
 // while it moved. All three keyed: ps_4504 from the 09-06 dump, ps_51EE and
 // ps_D31D dumped by the 2026-09-27 glare_shader_dump flight at the port; each
 // pair through the corpus identity harness (40,960 texels, 0 mismatches;
-// MRT6 8192 checked, 0 bad).
+// MRT6 8192 checked, 0 bad). ps_BBDE4E71FB78528A (vs_66DE) keyed from the
+// 15:46 session's dumps the same day. ps_BA58469C3D6120A7 (vs_5B4D) stays
+// stock: its input register for the slot is occupied (the harness says so).
 using engine_velocity_family::Family;
 using engine_velocity_family::kFamilies;
 using engine_velocity_family::kFamilyCount;
