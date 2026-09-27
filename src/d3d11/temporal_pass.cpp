@@ -5578,14 +5578,14 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                         // skip unsafe there. The inscribed axis-aligned
                         // rectangle of that true ellipse is exactly safe.
                         const float rz = 0.5f * static_cast<float>(fcw);
-                        const float rw = 0.5f * static_cast<float>(fch);
-                        const float m = rz < rw ? rz : rw;
+                        const float rh = 0.5f * static_cast<float>(fch);
+                        const float m = rz < rh ? rz : rh;
                         const float k = 1.0f - margin / m;
                         if (k > 0.0f) {
                             const float halfX = rz * k * 0.70710678f;
-                            const float halfY = rw * k * 0.70710678f;
+                            const float halfY = rh * k * 0.70710678f;
                             const float ccx = static_cast<float>(fcx) + rz;
-                            const float ccy = static_cast<float>(fcy) + rw;
+                            const float ccy = static_cast<float>(fcy) + rh;
                             sx0 = ccx - halfX; sy0 = ccy - halfY;
                             sx1 = ccx + halfX; sy1 = ccy + halfY;
                         }
