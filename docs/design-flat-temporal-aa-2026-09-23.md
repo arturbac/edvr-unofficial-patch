@@ -4409,3 +4409,26 @@ verify present-not-ok names the value with NO no-previous storm through
 it. The stair-stepped 0.5x look WITHOUT a storm is inherent (stock shows
 it too); FSR's resolve of the canopy at 0.5x during healthy accumulation
 is not yet separately qualified.
+
+Addendum, same day: the 13:00 flight (g0b56952d) ran storm-free --
+present-not-ok=0 in every window, treated streaks past 4000 -- and the
+canopy flicker persisted on both backends, so the storm and the
+structure-localized flicker are separate phenomena. The 12:32 F10
+capture (frames 36808/36823/36838, healthy 0.5x DLSS) shows the
+mechanism directly: the struts are ~1 render pixel at 1080p, and their
+fringe pixels oscillate between frames at |delta|~68/255 while their
+cores sit at ~2 -- jitter moves the sub-pixel structure on and off texel
+centers each phase, the input to either upscaler oscillates there, and
+the temporal logic flickers on exactly those pixels. At 0.65x the struts
+are ~1.7 px, mostly covered every phase, hence stable.
+ruled out: rejection-mask flip-flop, because rejection is stable on 97%
+of the structure's pixels across the three frames.
+ruled out: depth/motion corruption, because depth reads 0.0009+-0.0003
+stable and the menu camera is static.
+ruled out: a backend defect, because both networks flicker identically
+while the shared input oscillates.
+OPEN (parked by Sean 2026-09-27): the live confirmation -- jitter off at
+0.5x should end the flicker (experimental.temporal_aa_jitter is
+hot-reloaded) -- and any policy decision (jitter off below native is a
+quality trade, not a default to take unilaterally). No threshold/clamp
+compensation: the oscillation is real coverage signal.
