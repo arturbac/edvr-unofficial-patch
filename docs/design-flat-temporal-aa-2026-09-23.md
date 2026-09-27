@@ -4430,11 +4430,12 @@ ruled out: depth/motion corruption, because depth reads 0.0009+-0.0003
 stable and the menu camera is static.
 ruled out: a backend defect, because both networks flicker identically
 while the shared input oscillates.
-OPEN (parked by Sean 2026-09-27): the live confirmation -- jitter off at
-0.5x should end the flicker (experimental.temporal_aa_jitter is
-hot-reloaded) -- and any policy decision (jitter off below native is a
-quality trade, not a default to take unilaterally). No threshold/clamp
-compensation: the oscillation is real coverage signal.
+CLOSED (live, 2026-09-27 evening): the parked jitter-off test confirms
+the family -- HUD and canopy scintillation both die with jitter off
+while reprojection keeps running; see section 76 session 3.
+No threshold/clamp compensation: the oscillation is real coverage
+signal. 0.5x's price is flicker or softness; jitter-off is the manual
+escape hatch, not a default.
 
 ## 76. Gate-2 qualification flight matrix: plan and corpus status (2026-09-27)
 
@@ -4532,4 +4533,12 @@ sub-pixel scintillation family on 1px hologram lines at 1080p (same
 resolution floor as the canopy, expected at 0.5x), or a fast-motion
 vector failure this slow-motion capture cannot see. The discriminator is
 the parked jitter-off test: scintillation dies with jitter off; a true
-vector error would persist. OPEN.
+vector error would persist. CLOSED 2026-09-27 evening: Sean flew 0.5x
+with experimental.temporal_aa_jitter=off -- the HUD went low-res (the
+expected trade) and did NOT smear/swim with motion. The resolve still
+reprojects by its motion vectors with jitter off, so a vector error
+would have persisted; it did not. The swimming is the section-75
+scintillation family, confirmed twice over (canopy probe, live HUD
+test); the vectors are right (cockpit capture, locked to the dashboard).
+0.5x's honest price is flicker or softness; jitter-off is the manual
+escape hatch, not a default.
