@@ -204,6 +204,9 @@ def analyze(meta, rois):
                         else:
                             slots_used.add(slot)
                             record = pool[first + slot]
+                            if scene_now.shape[0] <= 276:
+                                raise ValueError(f"scene constants hold {scene_now.shape[0]} rows; "
+                                                 "the freshness stamp needs row 276")
                             token = np.float32(scene_now[276, 0]).view(np.uint32)
                             kind = record_kind(record, token)
                             if kind == "masked":

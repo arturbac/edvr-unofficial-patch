@@ -20,6 +20,7 @@
 #include "flat_live_phase_tests.h"
 #include "flat_pixel_capture_tests.h"
 #include "flat_local_reject_tests.h"
+#include "flat_negotiated_eval_tests.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -1791,6 +1792,7 @@ int main(int argc, char** argv) {
     failures += flatLightingTests();
     failures += flatLivePhaseTests();
     failures += flatLocalRejectTests();
+    failures += flatNegotiatedEvalTests();
     flatRuntimePrefixTests();
     flatRuntimeImageCopyTests();
     flatRuntimeMenuCopyTests();

@@ -3854,8 +3854,17 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // facts the family branch above passes uiLayerDecide, so an after-UI
     // write is governed by the identical rules a real UI draw would be.
     // Counted, named either way.
-    if (!uiLayer && owner && uiLayerWatching())
-        uiLayer = uiLayerNoteOther(self, count, uiLayerVerdictForwards(v), g_state->curveThisDraw);
+    if (!uiLayer && owner && uiLayerWatching()) {
+        // rc-since-rc2 review F4: the retry preserves the original decision's
+        // exclusions -- the shader exclusion (ui_depth's list, as
+        // uiLayerFamilyOf reads it) and the held world-screen identity (the
+        // 2D screen's panel-sized SRV, as uiLayerDecide's kWorldScreen reads
+        // it) -- both lost when the kAfterUi family was taken on its own.
+        const bool afterExcluded = uiDepthIsExcluded(bindingShaderHash(BindSlot::Vs));
+        const bool afterPanelSized = srv0IsPanelSized(g_state, kind, count);
+        uiLayer = uiLayerNoteOther(self, count, uiLayerVerdictForwards(v), g_state->curveThisDraw,
+                                   afterExcluded, afterPanelSized);
+    }
     // The sub-draw probe, which also SWALLOWS the game's draw -- it re-issues
     // the surviving index ranges itself. Before the curve substitution
     // because both swallow, and two swallows would draw the quads twice.

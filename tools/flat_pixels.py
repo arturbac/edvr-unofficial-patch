@@ -201,8 +201,13 @@ def load_manifest(path):
                 if (stride == 0 or size % stride or (first + count) * stride > size or
                         record.get("srv_format") != 0 or record.get("srv_dimension") != 1):
                     raise CaptureError(f"{path}: unsupported pool view/layout")
-            elif stride != 0 or size < 276 * 16 or size % 16:
+            elif stride != 0 or size % 16 or size < 276 * 16:
                 raise CaptureError(f"{path}: invalid {name} constant buffer layout")
+            # The freshness stamp lives at row 276. Legacy 276-row scenes are
+            # accepted only where record interpretation never reads it
+            # (rc-since-rc2 review F6).
+            elif not manifest["reset"] and size < 277 * 16:
+                raise CaptureError(f"{path}: {name} lacks the freshness-stamp row a non-reset capture needs")
             buffer_path = path.parent / filename
             if buffer_path.resolve().parent != path.parent.resolve() or not buffer_path.is_file() or buffer_path.stat().st_size != size:
                 raise CaptureError(f"{path}: missing or unsafe buffer {filename}")
@@ -700,6 +705,25 @@ def self_test():
         stride_meta = load_manifest(v2_path)
         stride_branches = analyze(stride_meta, [("one", (1, 0, 1, 1))])["engine_analysis"]["rois"][0]["branch_counts"]
         assert stride_branches["rejected_pool_stride"] == 1
+        # F6 boundary fixtures: the previous 276-row scene layout. A non-reset
+        # capture reads the stamp row and must be refused at load; a reset
+        # capture never interprets records and stays accepted.
+        legacy = json.loads(json.dumps(complete))
+        legacy_scene = np.zeros((276, 4), dtype="<f4")
+        legacy_scene[270:276] = np.asarray(legacy["camera"], dtype="<f4")
+        for name in ("scene_now", "scene_previous"):
+            (v2_session / f"frame_7_{name}.bin").write_bytes(legacy_scene.tobytes())
+        for record in legacy["buffers"][1:]:
+            record["byte_size"] = legacy_scene.nbytes
+        v2_path.write_text(json.dumps(legacy), encoding="utf-8")
+        try:
+            load_manifest(v2_path)
+            raise AssertionError("a non-reset capture without the stamp row was accepted")
+        except CaptureError:
+            pass
+        legacy["reset"] = True
+        v2_path.write_text(json.dumps(legacy), encoding="utf-8")
+        assert load_manifest(v2_path)["reset"] is True
         del rejection, geometry, meta
         # A small copy of the WARP writer's known pixels checks the fixture
         # verifier itself. The full build checks bytes emitted by the real GPU.

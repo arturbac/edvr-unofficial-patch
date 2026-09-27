@@ -344,6 +344,105 @@ inline int tests() {
         expect(c.psUnknownOpcode == 61, "synthetic resinfo pins the opcode number (61)");
     }
 
+    // --- rc-since-rc2 F2: plain dcl_output depth operands --------------------
+    // SV_Depth / SV_DepthGreaterEqual / SV_DepthLessEqual use the plain output
+    // declaration whose OPERAND carries the depth type (12/38/39), which the
+    // Sgv/Siv-only system-value check never saw. Colour output stays the
+    // control: detected as no depth, not refused.
+    {
+        using edvr::dxbc_container::Chunk;
+        using edvr::dxbc_container::makeContainer;
+        auto opTok = [](uint32_t o, uint32_t len, uint32_t extra = 0) { return o | extra | (len << 24); };
+        constexpr uint32_t IMM1 = 0x4001;
+        auto depthPs = [&](uint32_t operand) {
+            std::vector<uint32_t> prog = {0x00000050u, 0};
+            const std::vector<uint32_t> decls = {opTok(101, 2), operand};
+            prog.insert(prog.end(), decls.begin(), decls.end());
+            const std::vector<uint32_t> body = {opTok(54, 4), operand, IMM1, 0x3F000000u};
+            prog.insert(prog.end(), body.begin(), body.end());
+            prog.push_back(opTok(62, 1));
+            prog[1] = static_cast<uint32_t>(prog.size());
+            Chunk shex; shex.tag = 0x58454853u;
+            shex.bytes.resize(prog.size() * 4);
+            std::memcpy(shex.bytes.data(), prog.data(), shex.bytes.size());
+            const auto blob = makeContainer({shex});
+            return edvr::classifyFlatShaderPair(nullptr, 0, blob.data(), blob.size());
+        };
+        const auto depth = depthPs(0x0000C001u);
+        expect(depth.ps == FlatPsProjectionSafety::Consumer &&
+               depth.psReason == FlatClassifierReason::DepthOutput,
+               "plain dcl_output oDepth refuses as DepthOutput");
+        const auto depthGe = depthPs(0x00026001u);
+        expect(depthGe.ps == FlatPsProjectionSafety::Consumer &&
+               depthGe.psReason == FlatClassifierReason::DepthOutput,
+               "plain dcl_output oDepthGE refuses as DepthOutput");
+        const auto depthLe = depthPs(0x00027001u);
+        expect(depthLe.ps == FlatPsProjectionSafety::Consumer &&
+               depthLe.psReason == FlatClassifierReason::DepthOutput,
+               "plain dcl_output oDepthLE refuses as DepthOutput");
+        std::vector<uint32_t> prog = {0x00000050u, 0};
+        const std::vector<uint32_t> decls = {opTok(101, 3), 0x102012u, 0};  // dcl_output o0.x
+        prog.insert(prog.end(), decls.begin(), decls.end());
+        const std::vector<uint32_t> body = {opTok(54, 5), 0x102012u, 0, IMM1, 0x3F000000u};  // mov o0.x, l(0.5)
+        prog.insert(prog.end(), body.begin(), body.end());
+        prog.push_back(opTok(62, 1));
+        prog[1] = static_cast<uint32_t>(prog.size());
+        Chunk shex; shex.tag = 0x58454853u;
+        shex.bytes.resize(prog.size() * 4);
+        std::memcpy(shex.bytes.data(), prog.data(), shex.bytes.size());
+        const auto blob = makeContainer({shex});
+        const auto control = edvr::classifyFlatShaderPair(nullptr, 0, blob.data(), blob.size());
+        expect(control.ps == FlatPsProjectionSafety::Clean,
+               "a plain colour output is not refused as depth");
+    }
+
+    // --- rc-since-rc2 F1: separate-U/V camera rows reach a texture coordinate
+    // U and V formed by separate dot products against two cb rows: neither
+    // scalar alone combines rows (the old multi-row check passes), but the
+    // sampled coordinate assembles both -- a PS-side projection that must
+    // refuse. The single-row coordinate variant stays the control.
+    {
+        using edvr::dxbc_container::Chunk;
+        using edvr::dxbc_container::makeContainer;
+        constexpr uint32_t R_DST = 0x1000F2, R_SRC = 0x100E46, O_DST = 0x1020F2, CB_SRC = 0x208E46;
+        constexpr uint32_t T_DCL = 0x107000, T_SRC = 0x107E46, V0_SRC = 0x101E46;
+        constexpr uint32_t RX_DST = 0x100012, RY_DST = 0x100022, RXY_SRC = 0x100032;
+        auto opTok = [](uint32_t o, uint32_t len, uint32_t extra = 0) { return o | extra | (len << 24); };
+        auto matrixPs = [&](uint32_t secondRow, bool twoRowCoord) {
+            std::vector<uint32_t> prog = {0x00000050u, 0};
+            const std::vector<uint32_t> decls = {
+                opTok(89, 4), CB_SRC, 1, 272,            // dcl_constantbuffer cb1[272]
+                opTok(88, 4, 3u << 11), T_DCL, 0, 0x5555, // dcl_resource_texture2d t0
+                opTok(90, 2), 0x306000,                   // dcl_sampler s0
+                opTok(101, 3), O_DST, 0,                  // dcl_output o0.xyzw
+                opTok(104, 2), 2,                          // dcl_temps 2
+            };
+            prog.insert(prog.end(), decls.begin(), decls.end());
+            const std::vector<uint32_t> body = {
+                opTok(17, 8), RX_DST, 0, V0_SRC, 0, CB_SRC, 1, 270,        // dp4 r0.x, v0, cb1[270]
+                opTok(17, 8), RY_DST, 0, V0_SRC, 0, CB_SRC, 1, secondRow,  // dp4 r0.y, v0, cb1[row]
+                opTok(69, 9), R_DST, 1, RXY_SRC, 0, T_SRC, 0, 0x306000, 0, // sample r1.xyzw, r0.xy, t0, s0
+                opTok(54, 5), O_DST, 0, R_SRC, 1,                          // mov o0.xyzw, r1.xyzw
+            };
+            prog.insert(prog.end(), body.begin(), body.end());
+            prog.push_back(opTok(62, 1)); // ret
+            prog[1] = static_cast<uint32_t>(prog.size());
+            Chunk shex; shex.tag = 0x58454853u;
+            shex.bytes.resize(prog.size() * 4);
+            std::memcpy(shex.bytes.data(), prog.data(), shex.bytes.size());
+            const auto blob = makeContainer({shex});
+            (void)twoRowCoord;
+            return edvr::classifyFlatShaderPair(nullptr, 0, blob.data(), blob.size());
+        };
+        const auto two = matrixPs(271, true);
+        expect(two.ps == FlatPsProjectionSafety::Consumer &&
+               two.psReason == FlatClassifierReason::MultiRowTexCoord,
+               "separate U/V dot products against two camera rows refuse at the sample");
+        const auto one = matrixPs(270, false);
+        expect(one.psReason != FlatClassifierReason::MultiRowTexCoord,
+               "a coordinate from one camera row alone is not refused as a projection");
+    }
+
     // --- Walker robustness: every fixture walks exactly ------------------------
     {
         static const char* fixtures[] = {

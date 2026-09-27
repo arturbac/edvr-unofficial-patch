@@ -92,6 +92,7 @@ enum class FlatClassifierReason : uint8_t {
     MultiRowOutput,  // PS: an output combines >=2 distinct rows of one cb buffer
     Unmodelable,     // PS: an unmodelable/parse-error instruction touches cb, vPos or an output
     VposConsumer,    // PS: a vPos-derived value reaches something other than a texture coordinate
+    MultiRowTexCoord,// PS: a texture coordinate assembles >=2 distinct rows of one cb across components
 };
 
 // Sub-cause of a VposConsumer refusal, filled in when the exit site can say
@@ -131,6 +132,7 @@ inline const char* flatClassifierReasonName(FlatClassifierReason r) {
     case FlatClassifierReason::MultiRowOutput: return "multi-row-output";
     case FlatClassifierReason::Unmodelable: return "unmodelable";
     case FlatClassifierReason::VposConsumer: return "vpos-consumer";
+    case FlatClassifierReason::MultiRowTexCoord: return "multi-row-texcoord";
     }
     return "unknown";
 }
@@ -187,13 +189,16 @@ constexpr uint32_t kOpSample = 69, kOpSampleL = 72, kOpSampleD = 73, kOpSampleB 
 constexpr uint32_t kOpSqrt = 75, kOpSwitch = 76, kOpSincos = 77, kOpUlt = 79, kOpUge = 80;
 constexpr uint32_t kOpUmul = 81, kOpUmad = 82, kOpUmax = 83, kOpUmin = 84, kOpUshr = 85;
 constexpr uint32_t kOpUtof = 86, kOpXor = 87;
-constexpr uint32_t kOpDclConstantBuffer = 89, kOpDclInputPsSiv = 100, kOpDclOutputSgv = 102;
+constexpr uint32_t kOpDclConstantBuffer = 89, kOpDclInputPsSiv = 100, kOpDclOutput = 101, kOpDclOutputSgv = 102;
 constexpr uint32_t kOpDclOutputSiv = 103, kOpDclTemps = 104, kOpDclIndexableTemp = 105;
 constexpr uint32_t kOpGather4 = 109, kOpDerivRtxCoarse = 122, kOpDerivRtyCoarse = 124;
 constexpr uint32_t kOpRcp = 129, kOpF16tof32 = 131, kOpUbfe = 138, kOpIbfe = 139;
 constexpr uint32_t kOpBfi = 140, kOpSwapc = 142, kOpLdRaw = 165, kOpLdStructured = 167;
 
 constexpr uint32_t kOperandTemp = 0, kOperandInput = 1, kOperandOutput = 2;
+// Depth-writing output operands of the plain dcl_output form (rc-since-rc2
+// review F2): SV_Depth and its greater/less-equal variants.
+constexpr uint32_t kOperandOutputDepth = 12, kOperandOutputDepthGE = 38, kOperandOutputDepthLE = 39;
 constexpr uint32_t kOperandImm32 = 4, kOperandSampler = 6, kOperandResource = 7;
 constexpr uint32_t kOperandCb = 8;
 // D3D_NAME (d3dcommon.h): POSITION = 1, DEPTH = 65, DEPTH_GREATER_EQUAL = 67,
@@ -417,6 +422,13 @@ inline bool walkProgram(const std::vector<uint32_t>& t, std::vector<Instr>& inst
                 facts.tempCount = t[opAt];
             } else if (op == kOpDclInputPsSiv && length >= 4) {
                 if (t[opAt + 2] == kSystemValuePosition) facts.vposRegister = static_cast<int32_t>(t[opAt + 1]);
+            } else if (op == kOpDclOutput && length >= 2) {
+                // The plain output declaration carries depth in its OPERAND:
+                // oDepth / oDepthGE / oDepthLE (rc-since-rc2 review F2) never
+                // reach the Sgv/Siv system-value check below.
+                const uint32_t ot = (t[opAt] >> 12) & 255u;
+                if (ot == kOperandOutputDepth || ot == kOperandOutputDepthGE ||
+                    ot == kOperandOutputDepthLE) facts.depthOutput = true;
             } else if ((op == kOpDclOutputSgv || op == kOpDclOutputSiv) && length >= 4) {
                 const uint32_t sv = t[opAt + 2];
                 if (sv == kSystemValueDepth || sv == 67 || sv == 68) facts.depthOutput = true;
@@ -1272,6 +1284,35 @@ inline bool analyzePs(const std::vector<uint32_t>& t, PsAnalysis& out) {
             out.reason = FlatClassifierReason::MultiRowOutput;
             return false;
         }
+
+    // A texture coordinate assembled from >=2 distinct rows of one cb buffer
+    // ACROSS its used components is a PS-side projection even when every
+    // component alone is single-row (rc-since-rc2 review F1: U and V formed
+    // by separate dot products against two camera rows). The per-component
+    // forms already carry the row provenance.
+    for (const Instr& in : instrs) {
+        if (isDeclaration(in.opcode) || !in.opCount || !opcodeIsTextureFetch(in.opcode)) continue;
+        for (uint8_t i = 1; i < in.opCount; ++i) {
+            if (!textureCoordOperand(in.opcode, i)) continue;
+            const Operand& coord = in.ops[i];
+            if (coord.type != kOperandTemp || coord.reg >= facts.tempCount) continue;
+            Form joined;
+            for (uint32_t c = 0; c < 4; ++c) {
+                if (!(coord.mask & (1u << c))) continue;
+                formUnion(joined, temps.at(coord.reg, sourceComponent(coord, c)));
+            }
+            bool multi = false;
+            for (uint8_t a = 0; a < joined.termCount && !multi; ++a)
+                for (uint8_t b = uint8_t(a + 1); b < joined.termCount && !multi; ++b)
+                    if (joined.terms[a].coefKind == 2 && joined.terms[b].coefKind == 2 &&
+                        joined.terms[a].slot == joined.terms[b].slot &&
+                        joined.terms[a].row != joined.terms[b].row) multi = true;
+            if (multi) {
+                out.reason = FlatClassifierReason::MultiRowTexCoord;
+                return false;
+            }
+        }
+    }
 
     // vPos taint / origin dataflow.
     std::vector<uint8_t> taint(size_t(facts.tempCount ? facts.tempCount : 1) * 4, 0);

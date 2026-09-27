@@ -2239,7 +2239,8 @@ void uiLayerWriteBackEnd(ID3D11DeviceContext* ctx) {
     g_draw.wbActive = false;
 }
 
-bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForwards, bool substituted) {
+bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForwards, bool substituted,
+                      bool excluded, bool panelSized) {
     if (!ctx) return false;
     const void* taken[2] = {nullptr, nullptr};
     for (int e = 0; e < 2; ++e) {
@@ -2324,6 +2325,13 @@ bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForw
             srvH = info.b;
             break;
         }
+    }
+    if (kind == 'W') {
+        // rc-since-rc2 review F4: the retry preserves the original decision's
+        // two exclusions before attempting the take -- the shader exclusion
+        // and the held world-screen identity -- which the kAfterUi family
+        // alone never saw.
+        if (!uiLayerAfterWritePreserved(excluded, g_screenHeld == 1, panelSized)) return false;
     }
     if (uiLayerAfterWriteDecide(eyeSizedInput) == UiAfterWriteDecision::kPostPass) {
         ++g_win.afterPostPass;

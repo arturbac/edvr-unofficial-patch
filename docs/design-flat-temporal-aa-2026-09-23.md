@@ -84,7 +84,11 @@
   confirming flight. Section 76 (2026-09-27): the gate-2 qualification
   flight matrix is staged -- the 0.5x DLSS menu trace admitted to the
   corpus, the eight-step session script recorded; crops remain deferred
-  on the source-rectangle lineage.
+  on the source-rectangle lineage. Section 77 (2026-09-27): all six
+  rc-since-rc2 review findings fixed without a flight -- classifier
+  depth-output and multi-row texcoord detection, the stamp over-read,
+  after-UI exclusion preservation, negotiation-before-eval ordering, and
+  the analyzer's legacy-layout gate.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -4547,3 +4551,51 @@ scintillation family, confirmed twice over (canopy probe, live HUD
 test); the vectors are right (cockpit capture, locked to the dashboard).
 0.5x's honest price is flicker or softness; jitter-off is the manual
 escape hatch, not a default.
+
+## 77. rc-since-rc2 review: all six findings addressed (2026-09-27)
+
+Per [the review](../reviews/rc-since-rc2-review-2026-09-27.md)'s
+F1-F6, all fixed without a flight:
+
+- F1 (generic admission accepts a camera-dependent PS): the classifier
+  now refuses a texture coordinate whose used components carry vector-dot
+  (coefKind=2) terms from >=2 distinct rows of one cb -- the separate-U/V
+  idiom (U=dp4(v,rowA), V=dp4(v,rowB)), reason multi-row-texcoord.
+  Scoped to vector-dot terms so the rect-filter idiom (scale/offset
+  constants) still passes; the inert stock filter ps_F0BAE053476F8730
+  verifies Clean. Rig: synthetic two-row dp4 sample refuses, single-row
+  control passes.
+- F2 (classifier misses legal SV_Depth): the plain dcl_output form's
+  depth operand (oDepth/oDepthGE/oDepthLE, operand types 12/38/39) now
+  sets depthOutput, alongside the Sgv/Siv system-value path. Rig:
+  hand-assembled binaries for all three refuse as depth-output; a plain
+  colour output stays Clean.
+- F3 (12 bytes read past the 4-byte frame stamp): the 16-byte stamp cell
+  now uploads an initialized uint32_t[4]; the S2 lifecycle test checks
+  the whole copied float4 (frame, 0, 0, 0).
+- F4 (after-UI capture bypasses exclusions): the retry preserves the
+  original decision's two exclusions before attempting the take -- the
+  ui_depth shader exclusion and the held world-screen identity
+  (panel-sized SRV while the screen shows the world) -- via
+  uiLayerAfterWritePreserved, facts gathered at the vscreen call site.
+  VR-only path (fix.ui_quality, off by default); flat does not use it.
+  Rig: the test traverses the original kWorldScreen decision and the
+  retry gate together.
+- F5 (negotiated E one frame late): negotiation now completes BEFORE the
+  frame's and the plan's eval override are assigned (flatNegotiatedEval,
+  called post-negotiation in both places), so the first frame of an
+  under-floor contract resolves and preflights at the cut E -- no
+  default-E refusal, no next-frame reallocation. E is also part of
+  sameResolvePlan, so readiness tracks the effective plan. Rig: the
+  gate's truth table (flat_negotiated_eval_tests.h).
+- F6 (276-row captures crash the analyzer): load_manifest refuses
+  non-reset captures whose scene constants lack the freshness-stamp row
+  (a named CaptureError), reset captures on the legacy layout stay
+  accepted, and the engine guards the read with a named failure. Rig:
+  both boundary fixtures in flat_pixels --self-test.
+
+Full build green: mono resolve PASS, collector policy PASS, corpus
+36/36, engine_velocity 1157 checks, ui_quality 254 checks,
+openxr_shutdown 63 checks, flat_pixels self-test passed. One transient
+openxr_shutdown WARP-binding flake in an earlier attempt did not
+reproduce in the two following runs.

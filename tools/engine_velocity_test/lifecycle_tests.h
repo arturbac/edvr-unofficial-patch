@@ -1030,12 +1030,15 @@ inline void run(const Harness& h) {
                 // carries the present-frame clock the snapshot took (g_frame,
                 // the same clock the emit folds into its markers); the
                 // previous frame's copy carries last frame's.
-                uint32_t stampNow = 0, stampBefore = 0;
+                uint32_t stampNow[4] = {}, stampBefore[4] = {};
                 h.check(now.size() >= 277 * 4 && before.size() >= 277 * 4, "S2: the copies hold the stamp's float4");
-                std::memcpy(&stampNow, &now[276 * 4], 4);
-                std::memcpy(&stampBefore, &before[276 * 4], 4);
-                h.check(stampNow == g.frame && stampBefore == g.frame - 1,
+                std::memcpy(stampNow, &now[276 * 4], 16);
+                std::memcpy(stampBefore, &before[276 * 4], 16);
+                h.check(stampNow[0] == g.frame && stampBefore[0] == g.frame - 1,
                         "S2: the NOW copy is stamped with this present frame, the BEFORE copy with last frame's");
+                h.check(stampNow[1] == 0 && stampNow[2] == 0 && stampNow[3] == 0 &&
+                        stampBefore[1] == 0 && stampBefore[2] == 0 && stampBefore[3] == 0,
+                        "S2: the stamp float4's unused words are initialized zero, not adjacent stack bytes");
                 ComPtr<ID3D11Resource> slotsRes;
                 v.slots->GetResource(&slotsRes);
                 UINT w = 0, wd = 0;

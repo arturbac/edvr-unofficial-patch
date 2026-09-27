@@ -10,6 +10,7 @@
 #include "flat_local_reject.h"
 #include "flat_trace.h"
 #include "flat_dlss_negotiate.h"
+#include "flat_negotiated_eval.h"
 #include "binding_shadow.h"
 #include "exposure_fix.h"
 #include "device_hook.h"
@@ -291,7 +292,8 @@ void reportPhaseCensus(State& s,const char* event) {
 }
 bool sameResolvePlan(const FlatMonoResolvePreflight& a,const FlatMonoResolvePreflight& b) {
     return a.renderWidth==b.renderWidth && a.renderHeight==b.renderHeight && a.outputWidth==b.outputWidth &&
-        a.outputHeight==b.outputHeight && a.mode==b.mode && a.colorViewFormat==b.colorViewFormat &&
+        a.outputHeight==b.outputHeight && a.evalWidth==b.evalWidth && a.evalHeight==b.evalHeight &&
+        a.mode==b.mode && a.colorViewFormat==b.colorViewFormat &&
         a.depthViewFormat==b.depthViewFormat && a.colorViewIsTexture2D==b.colorViewIsTexture2D &&
         a.depthViewIsTexture2D==b.depthViewIsTexture2D && a.colorMostDetailedMip==b.colorMostDetailedMip &&
         a.depthMostDetailedMip==b.depthMostDetailedMip && a.colorViewMipLevels==b.colorViewMipLevels &&
@@ -1774,14 +1776,6 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     }
     FlatMonoResolveFrame f{}; f.color = original; f.depth = s.depthView.Get(); f.renderWidth = selected.renderWidth; f.renderHeight = selected.renderHeight;
     f.outputWidth = selected.outputWidth; f.outputHeight = selected.outputHeight; f.frame = s.prefix.frame; f.mode = s.engine;
-    // The negotiated override applies only to the exact contract it was
-    // negotiated for; anything else resolves on the route's default E.
-    const bool negotiatedMatch = s.negotiatedEvalW && s.negotiatedEvalH &&
-        f.mode == s.negotiatedMode && f.renderWidth == s.negotiatedRenderW &&
-        f.renderHeight == s.negotiatedRenderH && f.outputWidth == s.negotiatedOutputW &&
-        f.outputHeight == s.negotiatedOutputH;
-    f.evalWidth = negotiatedMatch ? s.negotiatedEvalW : 0;
-    f.evalHeight = negotiatedMatch ? s.negotiatedEvalH : 0;
     nativeScale.store(f.renderWidth >= f.outputWidth && f.renderHeight >= f.outputHeight,
                       std::memory_order_release);
     f.configuredDlssPreset=s.preset;
@@ -1805,6 +1799,13 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         }
         plan.colorResourceMipLevels=colorDesc.MipLevels;plan.colorArraySize=colorDesc.ArraySize;plan.colorSampleCount=colorDesc.SampleDesc.Count;
         plan.depthResourceMipLevels=depthDesc.MipLevels;plan.depthArraySize=depthDesc.ArraySize;plan.depthSampleCount=depthDesc.SampleDesc.Count;
+        // E is part of the plan identity (rc-since-rc2 review F5): the
+        // standing negotiation answers for this contract, so the comparison
+        // sees an E-only drift as a change too.
+        flatNegotiatedEval(s.negotiatedEvalW, s.negotiatedEvalH, s.negotiatedMode,
+            s.negotiatedRenderW, s.negotiatedRenderH, s.negotiatedOutputW, s.negotiatedOutputH,
+            plan.mode, plan.renderWidth, plan.renderHeight, plan.outputWidth, plan.outputHeight,
+            plan.evalWidth, plan.evalHeight);
         if(!s.haveResolvePlan || !sameResolvePlan(plan,s.plannedResolve)) {
             s.resolvePreflight={};s.resolvePreflightRetryMs=0;
             // Gate 2 discovery: the effective route, logged when the plan
@@ -1848,12 +1849,23 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         }
         // The plan carries the same negotiated E the frame does (gate-2 review
         // F1): preflight allocates at E and the resolve's resource cache keys
-        // on E, so a plan without it would allocate the fallback output at the
-        // route's default size and the first treated frame would reallocate.
-        plan.evalWidth = negotiatedMatch ? s.negotiatedEvalW : 0;
-        plan.evalHeight = negotiatedMatch ? s.negotiatedEvalH : 0;
+        // on E. Computed AFTER the negotiation above (rc-since-rc2 review F5):
+        // the first frame of an under-floor contract preflights at the cut E,
+        // not the route default it would reallocate from next frame.
+        flatNegotiatedEval(s.negotiatedEvalW, s.negotiatedEvalH, s.negotiatedMode,
+            s.negotiatedRenderW, s.negotiatedRenderH, s.negotiatedOutputW, s.negotiatedOutputH,
+            plan.mode, plan.renderWidth, plan.renderHeight, plan.outputWidth, plan.outputHeight,
+            plan.evalWidth, plan.evalHeight);
         s.plannedResolve=plan;s.haveResolvePlan=true;
     }
+    // The frame's override comes from the same post-negotiation state as the
+    // plan's: an under-floor contract resolves at the cut E on its FIRST
+    // frame (rc-since-rc2 review F5), never at the default that the backend
+    // refuses and the next frame reallocates.
+    flatNegotiatedEval(s.negotiatedEvalW, s.negotiatedEvalH, s.negotiatedMode,
+        s.negotiatedRenderW, s.negotiatedRenderH, s.negotiatedOutputW, s.negotiatedOutputH,
+        f.mode, f.renderWidth, f.renderHeight, f.outputWidth, f.outputHeight,
+        f.evalWidth, f.evalHeight);
     std::memcpy(f.camera, selected.camera, sizeof(f.camera));
     const bool resetMissing = !s.havePrevious;
     const bool resetGap = s.havePrevious && s.previous.frame + 1 != selected.frame;

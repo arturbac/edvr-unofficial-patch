@@ -598,6 +598,18 @@ inline UiAfterWriteDecision uiLayerAfterWriteDecide(bool eyeSizedInput) {
     return eyeSizedInput ? UiAfterWriteDecision::kPostPass : UiAfterWriteDecision::kAttempt;
 }
 
+// rc-since-rc2 review F4: the after-UI retry preserves the original
+// decision's two exclusions before attempting a take. The original family
+// path never takes an excluded shader (ui_depth's list, vscreen.cpp's
+// uiLayerFamilyOf) and never takes the world-screen composite while the
+// screen shows the world (uiLayerDecide's kWorldScreen); the retry's
+// kAfterUi family alone saw neither.
+inline bool uiLayerAfterWritePreserved(bool excluded, bool worldScreenHeld, bool panelSized) {
+    if (excluded) return false;
+    if (worldScreenHeld && panelSized) return false;
+    return true;
+}
+
 // THE FAMILY RULE, pure: vscreen.cpp's uiLayerFamilyOf gathers these facts
 // for an owner draw into an eye target, in this order and only as far as the
 // rule reads them, and this decides. The shader hashes are the ones the

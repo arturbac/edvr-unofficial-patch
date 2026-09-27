@@ -821,7 +821,12 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
                 return false;
             }
         }
-        ctx->UpdateSubresource(e.stampCell.Get(), 0, nullptr, &frame, 16, 0);
+        // Whole-subresource upload of the 16-byte cell needs a 16-byte SOURCE:
+        // &frame alone is four bytes and the null box read twelve past it
+        // (rc-since-rc2 review F3). Only the first word is consumed today;
+        // the rest is defined zero rather than adjacent stack storage.
+        const uint32_t stamp[4] = {frame, 0, 0, 0};
+        ctx->UpdateSubresource(e.stampCell.Get(), 0, nullptr, stamp, 16, 0);
         const D3D11_BOX stampBox{0, 0, 0, 16, 1, 1};
         ctx->CopySubresourceRegion(e.scene[slot].Get(), 0, kStampFloat4 * 16u, 0, 0, e.stampCell.Get(), 0, &stampBox);
     }
