@@ -4153,3 +4153,29 @@ the build if a recorded decision ever changes. The corpus starts empty:
 next flights capture stock/EDHM menu and flight traces for commit.
 Gates 2-5 (three-size routing, retirement, family contracts, composition
 tests) are untouched; this gate exists to catch their regressions.
+
+## 71. Second review cycle: observation transitions closed (2026-09-26)
+
+[reviews/flat-temporal-main-review-2026-09-26.md](../reviews/flat-temporal-main-review-2026-09-26.md)
+reviewed the section-68 redesign at `35c7afc6` and found two real
+transition defects, both fixed in `a6ad1ace` and rig-tested as shared
+predicates (flat_local_reject.h):
+
+1. The on->off toggle left observation latched: a persistent refusal kept
+   `observing` set while `partialWanted` flipped, so off's documented
+   per-frame retry never resumed. `flatObservationToggle` now ends
+   observation explicitly at the config read; history is already invalid
+   from the observing frames, and off retries each frame from there.
+2. The exit predicate cleared on any refusal-free frame, including empty
+   ones with no handoff at all, and ignored the uncertain/foreign-work
+   conditions. `flatObservationClears` now requires the copy draw's
+   selector selecting through the contract observation (a positive witness)
+   AND complete coverage (the same trio `phase.finish` uses).
+
+The review's gate-1 guidance -- composed transitions from config through
+observation, copy admission and next-frame history -- belongs to the staged
+program's gate 4 (hooked end-to-end tests); today's rig covers the two
+predicates. Also noted there: the observing copy return skips the old
+spatial recovery for the one compromised frame a late refusal can leave;
+the policy is "invalidate and observe", stated in section 68, and
+recover() stays out of the mixed-phase path.
