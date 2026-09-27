@@ -2,14 +2,13 @@
 
 ## Status
 
-- **State:** PHASE 0, flight 3 read (2026-09-27, Steam, build 4db05397).
-  G-D SETTLED: the families' depth test rejects ~0% of samples, so the
-  seeded depth is a correctness item, not an edge-quality one. G-A final
-  (holo 22-24/f steady; flight HUD 4.8-56/f content-dependent; sprite
-  2-6/f). G-B identity join 100% with families present. G-F measured in
-  flight 2. G-C alone remains open, and it is offline work now
-  (pool\draws_<stamp>.bin from flight 2). Phase 0 is otherwise answered;
-  the Decisions are unblocked.
+- **State:** PHASE 0 COMPLETE (2026-09-27: flights 1-3 plus the offline
+  G-C factorisation of the flight-2 ledgers). Every gate is answered:
+  G-A the families, G-B the tonemap (measured pair + EDHM swap), G-C the
+  jitter is CARRIED by all three families (bit-exact, 7,039/7,039 draws),
+  G-D ~0% depth rejection, G-E exposure behaves, G-F the parity error is
+  zero except the quantified bright-translucent regime. The Decisions are
+  unblocked.
 - **Goal:** composite the cockpit HUD after the upscale, at output
   resolution, out of DLSS/FSR history. That means the holo panels, the
   flight HUD and the target sprite. It should be as sharp at HMD Quality
@@ -26,8 +25,11 @@
   (lines 184-191: "PARKED, not declined"), with one change. It re-issues
   the game's own tonemap draw instead of transcribing it.
 - **Decisions for Sean:** see "Decisions", before Phase 1.
-- **Next step:** G-C's offline factorisation from the flight-2 ledgers
-  (`pool\draws_*.bin`), then the Decisions below, then Phase 1.
+- **Next step:** the Decisions below, then Phase 1 (the holo panels only,
+  behind the key) -- with the Phase-1 jitter-cancel caveat from the G-C
+  entry carried in: the cancel validates visually, because the absolute
+  jitter phase is not anchored from a ledger and the game-applied x slope
+  ran at 94-99% of the naive value.
 
 ## What exists
 
@@ -431,3 +433,39 @@ cap never approached, and the G-D windows printed.
 
 Phase 0 closes with one open item: G-C's factorisation, which needs no
 flight. Every other gate is answered; the Decisions are unblocked.
+
+## Phase 0, G-C settled offline, 2026-09-27 (flight-2 ledgers)
+
+The factorisation ran on the five flight-2 ledgers' EyeDrawSnapshot
+captures (drawstate_<stamp>.bin; extraction and cross-checks in
+analysis/gc_results.md, git-ignored scratch; the raw bins stay in the
+Steam install's edvr_logs\pool). No flight was needed.
+
+- **Verdict: jitter CARRIED -- all three families, both eyes, all five
+  ledgers, every one of 7,039 draws, by construction.** Every family draw
+  binds a 336-row VS b1 whose rows 270..273 are ONE global per-eye camera
+  matrix (within-frame spread across draws: exactly 0.0; layout as
+  object_probe.cpp:956-958 documents, eye origin at row 275). The family's
+  clip transform (cb0 rows 4..7) equals that matrix in its 3x3 part
+  BIT-EXACT in every sampled draw; the w column is the same matrix applied
+  to a per-panel translation. So the HUD projects with the engine-wide
+  per-eye jittered transform, and the doc's BELIEVED "all three carry the
+  eye's jittered projection" is MEASURED. Phase 1's cancel-exactly-once is
+  correct as designed.
+- The camera's centre terms oscillate per frame with EDVR's exact 8-phase
+  Halton jitter (m12 slope = 2/2901 exactly; m02 at 94-99% of 2/3000,
+  small per-phase residuals, likely the game-side tangent round-trip),
+  which is also the proof the matrix is the live jittered one and not a
+  stale copy. The in-sim census's gc dumps from flights 2 and 3 land
+  exactly on the ledger per-frame values -- dump == ledger == one
+  transform, and the layer's eye mapping is confirmed (0 SWAPPED never
+  fired).
+- Caveats carried into Phase 1 (recorded, not blocking): the absolute
+  jitter phase cannot be anchored from a ledger (ledger frame != temporal
+  frameCounter) and the game-applied x jitter runs a few percent under
+  the naive -2*jx/w slope, so a cancel driven by EDVR's own s->shift could
+  leave a few-percent-of-a-pixel residual -- validate visually in the
+  Phase 1 flight. "b1 is the scene camera" rests on the documented layout
+  plus the jitter fingerprint; a direct scene-side confirmation, if ever
+  wanted, is one re-fly with advanced.eye_depth_capture on, comparing the
+  scene pair's b1 rows 270..273.
