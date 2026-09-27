@@ -4230,9 +4230,12 @@ the requested backend, never hide a lower internal resolution).
 Definitions the contract will carry explicitly: R = the game's render
 size (tone target), D = the present size (output), E = the temporal
 evaluation size. Route policy: DLSS/FSR upscale R < D evaluate at E = D;
-native (R == D) evaluates at E = R; R > D evaluates at E = R with a
+native (R == D) evaluates at E = R = D; R > D evaluates at E = R with a
 downsample stage E -> D (DLAA first, FSR Native AA pending its D3D11
-port's support, TAA already conforms). The copy chain's own downsample
+port's support, TAA already conforms). TAA today is a fused display-grid
+resolve at E = D sampling render-sized input (gate-2 review G2-2 -- the
+route now reports that honestly); render-grid TAA at E = R with one
+explicit R -> D conversion is the recorded design step, not yet built. The copy chain's own downsample
 stays in place where it already maps R to D (the game does this at SS >
 100% today); EDVR supplies a conversion only where the game's sampling
 contract does not cover the replacement image's texel mapping.

@@ -286,6 +286,15 @@ FlatProjectionRuntime::Tracked* FlatProjectionRuntime::track(ID3D11Resource* res
     if (!free) for (auto& entry : tracked_) if (!entry.promoted && !entry.mapped && !entry.pending) {
         free = &entry; discard(entry); break;
     }
+    // Buffer pressure (gate-2 review, inherited finding 2): retire plans
+    // before refusing capacity, so an available initial write is never lost
+    // for want of an evictable slot while plans pin the whole bank.
+    if (!free && retirePlan()) {
+        for (auto& entry : tracked_) if (!entry.buffer) { free = &entry; break; }
+        if (!free) for (auto& entry : tracked_) if (!entry.promoted && !entry.mapped && !entry.pending) {
+            free = &entry; discard(entry); break;
+        }
+    }
     if (!free || nextGeneration_ == UINT64_MAX) {
         refuse(FlatProjectionRuntimeRefusal::NoCapacity); return nullptr;
     }
@@ -438,7 +447,7 @@ bool FlatProjectionRuntime::planStale(const CachedPlan& slot) {
 void FlatProjectionRuntime::demotePlanRefs(CachedPlan& slot) {
     for (uint32_t i = 0; i < slot.count; ++i) {
         if (Tracked* entry = find(slot.requests[i].original)) {
-            if (entry->planRefs) --entry->planRefs;
+            if (entry->planRefs) { --entry->planRefs; --status_.planRefsLive; }
             if (!entry->planRefs) entry->promoted = false;
         }
     }
@@ -570,9 +579,16 @@ bool FlatProjectionRuntime::preflight(const FlatProjectionRuntimeRequest* reques
         if (!entry->privateBuffer.prepare(shadows_, r.patches, r.patchCount, jitter, phase))
             return refuseAt(FlatProjectionRuntimeRefusal::InvalidRecipe, "private-patch-preparation", i);
         bindings[i] = entry->privateBuffer.binding(r.stage, r.slot, r.firstConstant, r.constantCount);
-        entry->promoted = true;
     }
-    if (liveRetarget) cached->used = false;
+    if (liveRetarget) {
+        // Transactional retarget (gate-2 review G2-1): the replaced plan's
+        // ownership releases exactly once, whether the retarget below
+        // succeeds or refuses, and before its slot is freed. Promotion is
+        // staged to the commit below, so a failed preflight never pins a
+        // buffer it did not commit to (inherited finding 1).
+        demotePlanRefs(*cached);
+        cached->used = false;
+    }
     if (!(liveRetarget ? cached->plan.retargetPrepared(context_.Get(), bindings, count) :
           cached->used ? cached->plan.refreshPrepared() :
                          cached->plan.initialize(context_.Get(), bindings, count)))
@@ -588,7 +604,7 @@ bool FlatProjectionRuntime::preflight(const FlatProjectionRuntimeRequest* reques
         cached->requests[i] = requests[i];
         if (Tracked* entry = find(requests[i].original)) {
             cached->generations[i] = entry->generation;
-            ++entry->planRefs; entry->promoted = true;
+            ++entry->planRefs; ++status_.planRefsLive; entry->promoted = true;
         }
     }
     cached->usedSerial = nextUseSerial_++;

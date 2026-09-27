@@ -97,6 +97,11 @@ struct State {
     // The memo retires its least-recently-seen entry at 64 rather than
     // refusing ever after; the first eviction of a session is logged once.
     bool genericClassificationOverflowLogged = false;
+    // Verdict-log dedup, independent of the 64-entry memo (gate-2 review):
+    // a pair's verdict logs once per session even across eviction, from a
+    // 256-entry FIFO of pair hashes replaced round-robin.
+    uint64_t classificationLogged[256]{};
+    uint32_t classificationLoggedNext = 0;
     struct LocalProjectionSample {
         uint64_t firstFrame = 0, frames[2]{};
         const void* color[2]{}, *depth[2]{};
@@ -891,23 +896,31 @@ FlatShaderPairClassification classifyFlatProjectionPair(State& s, uint64_t vs, u
     FlatShaderPairClassification result = classifyFlatShaderPair(vsFound ? vsBytes : nullptr, vsFound ? vsLen : 0,
                                     psFound ? psBytes : nullptr, psFound ? psLen : 0);
     slot->vs = vs; slot->ps = ps; slot->classification = result; slot->lastSeenFrame = s.prefix.frame;
-    // Once per pair per session (at most 64 lines): the verdict and the rule
-    // behind it, so a refused pair needs no offline bytecode review to name.
-    const bool clean = result.ps == FlatPsProjectionSafety::Clean;
-    const char* verdict = clean && (result.vs == FlatVsProjectionClass::ForwardColumns ||
-                                    result.vs == FlatVsProjectionClass::ForwardDp4) ? "generic-recipe" :
-                          clean && result.vs == FlatVsProjectionClass::InertNoCB ? "generic-inert" : "refused";
-    char vsExtra[32] = "", psExtra[48] = "";
-    if (result.vsReason == FlatClassifierReason::UnknownOpcode)
-        std::snprintf(vsExtra, sizeof(vsExtra), " vs-opcode=%u", unsigned(result.vsUnknownOpcode));
-    if (result.psReason == FlatClassifierReason::UnknownOpcode)
-        std::snprintf(psExtra, sizeof(psExtra), " ps-opcode=%u", unsigned(result.psUnknownOpcode));
-    else if (result.psReason == FlatClassifierReason::VposConsumer)
-        std::snprintf(psExtra, sizeof(psExtra), " ps-rule=%s", flatVposConsumerSubcodeName(result.psConsumerSubcode));
-    Log::get().note("flat generic classification: frame=%llu VS=%016llX PS=%016llX verdict=%s vs=%s slot=%u row=%u vs-reason=%s%s ps=%s ps-reason=%s%s",
-        (unsigned long long)s.prefix.frame, (unsigned long long)vs, (unsigned long long)ps, verdict,
-        flatVsClassName(result.vs), result.vsSlot, result.vsRow, flatClassifierReasonName(result.vsReason), vsExtra,
-        flatPsSafetyName(result.ps), flatClassifierReasonName(result.psReason), psExtra);
+    // The verdict and the rule behind it, logged once per pair per session
+    // even across memo evictions (the 256-entry FIFO, not the memo, owns
+    // that guarantee) -- a refused pair needs no offline review to name.
+    const uint64_t pairHash = (vs ^ (ps * 1099511628211ull)) | 1ull;
+    bool verdictSeen = false;
+    for (uint32_t i = 0; i < 256; ++i) if (s.classificationLogged[i] == pairHash) { verdictSeen = true; break; }
+    if (!verdictSeen) {
+        s.classificationLogged[s.classificationLoggedNext] = pairHash;
+        s.classificationLoggedNext = (s.classificationLoggedNext + 1) % 256;
+        const bool clean = result.ps == FlatPsProjectionSafety::Clean;
+        const char* verdict = clean && (result.vs == FlatVsProjectionClass::ForwardColumns ||
+                                        result.vs == FlatVsProjectionClass::ForwardDp4) ? "generic-recipe" :
+                              clean && result.vs == FlatVsProjectionClass::InertNoCB ? "generic-inert" : "refused";
+        char vsExtra[32] = "", psExtra[48] = "";
+        if (result.vsReason == FlatClassifierReason::UnknownOpcode)
+            std::snprintf(vsExtra, sizeof(vsExtra), " vs-opcode=%u", unsigned(result.vsUnknownOpcode));
+        if (result.psReason == FlatClassifierReason::UnknownOpcode)
+            std::snprintf(psExtra, sizeof(psExtra), " ps-opcode=%u", unsigned(result.psUnknownOpcode));
+        else if (result.psReason == FlatClassifierReason::VposConsumer)
+            std::snprintf(psExtra, sizeof(psExtra), " ps-rule=%s", flatVposConsumerSubcodeName(result.psConsumerSubcode));
+        Log::get().note("flat generic classification: frame=%llu VS=%016llX PS=%016llX verdict=%s vs=%s slot=%u row=%u vs-reason=%s%s ps=%s ps-reason=%s%s",
+            (unsigned long long)s.prefix.frame, (unsigned long long)vs, (unsigned long long)ps, verdict,
+            flatVsClassName(result.vs), result.vsSlot, result.vsRow, flatClassifierReasonName(result.vsReason), vsExtra,
+            flatPsSafetyName(result.ps), flatClassifierReasonName(result.psReason), psExtra);
+    }
     return result;
 }
 // --- Partial temporal AA ("local refusal") --------------------------------
