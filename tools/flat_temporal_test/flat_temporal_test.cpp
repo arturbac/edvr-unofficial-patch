@@ -688,6 +688,23 @@ void testMonoFrameSelection() {
               std::memcmp(out.camera, f.rows, sizeof(out.camera)) == 0,
               "Epic 63521 changed raw words preserve HDR camera authority at both extents");
     }
+    {   // The gate-2 review's rounded mapping: a 960x540 render at a
+        // 1366x768 output is 0.703x per axis, unequal to 0.75 exactly -- the
+        // lineage band admits it (exact aspect equality refused it before).
+        MonoFixture f;
+        f.input.outputWidth = 1366; f.input.outputHeight = 768;
+        auto& ck = f.handoff[1].key;
+        ck.width = 1366; ck.height = 768; ck.viewport[2] = 1366; ck.viewport[3] = 768;
+        const auto out = flatSelectMonoFrame(f.input);
+        check(out.selected() && out.renderWidth == 960 && out.renderHeight == 540 &&
+              out.outputWidth == 1366 && out.outputHeight == 768,
+            "a rounded render-to-output mapping selects through the lineage band");
+    }
+    reject([](auto& f) { f.input.outputWidth = 2560; f.input.outputHeight = 1440;
+            auto& ck = f.handoff[1].key; ck.width = 2560; ck.height = 1440;
+            ck.viewport[2] = 2560; ck.viewport[3] = 1440; },
+        FlatMonoReason::InvalidTonePass,
+        "a tone under half the output on an axis is outside the band");
     reject([](auto& f) { f.input.worldCount = f.input.handoffCount = 0; }, FlatMonoReason::NoOutputCopy,
         "empty capture reports no copy instead of a selected empty frame");
     reject([](auto& f) { f.handoff[1].key.srvResource[0] = MonoFixture::token(0xBAD); }, FlatMonoReason::NoTonePass,
@@ -1565,6 +1582,31 @@ int flatTraceCheck(const char* path) {
     return 0;
 }
 
+void testFlatScreenBand() {
+    using namespace edvr;
+    // The lineage band (the gate-2 review's rounded/cropped table): a mapping
+    // inside the band is admitted; sub-half chains stay excluded by the floor.
+    struct Row { uint32_t w, h, ow, oh; bool screen; };
+    const Row rows[] = {
+        {1366,768, 1366,768, true},    // native
+        {1708,960, 1366,768, true},    // rounded 1.25x
+        {888,499, 1366,768, true},     // mild crop
+        {320,180, 1280,720, false},    // under the per-axis floor
+        {5760,3240, 3840,2160, true},  // 1.5x supersample
+        {960,540, 3840,2160, false},   // quarter-res blur chain
+        {1024,1024, 1280,720, false},  // square shadow-like target, not a mapping
+        {888,540, 1366,768, false},    // non-uniform crop: waits for rectangle lineage
+        {7680,4320, 3840,2160, true},  // 2x supersample, the cap
+        {7681,4320, 3840,2160, false}, // past the cap
+    };
+    for (const auto& r : rows) {
+        const auto kind = flatContractKind(false, reinterpret_cast<const void*>(1),
+            reinterpret_cast<const void*>(2), r.w, r.h, 26, r.ow, r.oh, false);
+        check((kind == kFlatContractScreen) == r.screen,
+              "the screen band admits rounded scales and crops, not sub-half chains");
+    }
+}
+
 void testFlatResolveRoute() {
     using namespace edvr;
     // Gate 2 discovery (section 72): today's effective route per size pairing,
@@ -1734,6 +1776,7 @@ int main(int argc, char** argv) {
     testContractAdmissionAndReservation();
     testAdmissionAndWindow();
     testMonoFrameSelection();
+    testFlatScreenBand();
     testFlatResolveRoute();
     testFlatDlssNegotiate();
     testProjectionSlices();

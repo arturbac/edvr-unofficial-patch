@@ -241,7 +241,14 @@ inline FlatMonoFrame flatSelectMonoFrame(const FlatMonoFrameInput& in) {
     const uint32_t hdrSlot = toneHdrSlot(tk.vs, tk.ps);
     if (!oneDraw(*tone) || !tk.rtv || tk.format != 27 || tk.depth || tk.dsv ||
         !fullViewport(tk, tk.width, tk.height) ||
-        uint64_t(tk.width) * in.outputHeight != uint64_t(tk.height) * in.outputWidth)
+        // The tone maps to the output by a uniform scale within rounding
+        // (flatUniformScale, not exact aspect equality): a rounded render
+        // size maps; a shadow-like or wild-aspect target does not. Per-axis
+        // bounds mirror the scene band, excluding sub-half chains and
+        // unbounded targets.
+        !flatUniformScale(tk.width, tk.height, in.outputWidth, in.outputHeight) ||
+        tk.width * 2 < in.outputWidth || tk.height * 2 < in.outputHeight ||
+        tk.width > in.outputWidth * 2 || tk.height > in.outputHeight * 2)
         return refuse(FlatMonoReason::InvalidTonePass);
     if (!tk.srvView[hdrSlot] || !tk.srvResource[hdrSlot] || tk.srvResource[hdrSlot] == tk.color ||
         tk.srvResource[hdrSlot] == in.output) return refuse(FlatMonoReason::BrokenLineage);

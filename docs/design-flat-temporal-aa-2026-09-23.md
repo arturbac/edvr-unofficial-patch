@@ -4259,6 +4259,14 @@ Staged implementation:
    now covers aspect-preserving sizes from 0.5x to 2x of output, with the
    conflicting-hdr guard as the loud backstop for full-res depthless
    intermediates; crops/ultrawide stay out of band for the lineage rework.
+   2026-09-27 later: the band is now flatUniformScale -- a uniform render-to-
+   output mapping within integer rounding of each axis (the exact bound of
+   rounding a rational scale to pixels, NOT an arbitrary aspect tolerance).
+   Rounded mappings like 1708x960 at 1366x768 admit; square shadow-like
+   targets and non-uniform crops stay excluded (the last waits for the
+   review's source-rectangle lineage). The selector's tone check uses the
+   same rule. Rig covers native, rounded, mild-crop, sub-half, shadow-like,
+   non-uniform, the 2x cap and past-cap.
    The 04:58 flight FLOWN: DLAA and TAA treat at 5760x3240 with the route
    lines naming each mode; FSR then engaged the same hour via Native AA --
    the 1.0x case of the same upscaler, evaluating at E = R with the game's
