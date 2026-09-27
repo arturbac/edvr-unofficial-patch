@@ -29,6 +29,25 @@ constexpr Family kFamilies[] = {
     {0xBFE51414CC3024B4ull, "vs_BFE51414CC3024B4", {0xDB79AE788E049DFDull, 0, 0, 0}, true},
 };
 constexpr int kFamilyCount = static_cast<int>(sizeof(kFamilies) / sizeof(kFamilies[0]));
+// Pairs whose STOCK pixel shader natively writes EDVR's marker encoding --
+// o6.x = 2 * (DATAID's low 23 bits) + 1, o6.y = noperspective SV_Position.z --
+// into the GAME's own SV_Target6 buffer (the coriolis port faces' seam detail,
+// eye run 095337; docs/kinematic-motion-injection-2026-09-19.md). Unkeyable by
+// construction (their target 6 is occupied by design): no substitution, no
+// shader patch -- the runtime captures the game's target-6 texture for the
+// eye-frame, and the compose reads it beside EDVR's own slot target.
+struct SelfMarking {
+    uint64_t vs, ps;
+};
+constexpr SelfMarking kSelfMarking[] = {
+    {0x436193B352A2897Eull, 0xBCF75CEA37060EAEull},
+    {0x889A5279E68F0672ull, 0x2F924695596C8195ull},
+};
+constexpr bool selfMarkingPair(uint64_t vs, uint64_t ps) noexcept {
+    for (const SelfMarking& p : kSelfMarking)
+        if (p.vs == vs && p.ps == ps) return true;
+    return false;
+}
 inline int familyOfVs(uint64_t hash) noexcept {
     for (int i = 0; i < kFamilyCount; ++i) if (kFamilies[i].vs == hash) return i;
     return -1;

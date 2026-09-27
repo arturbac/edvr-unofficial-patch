@@ -162,12 +162,16 @@ inline bool engineVelocityDrawSubstituted() noexcept {
 // read, and the game's scene constants for this frame and the previous one
 // (registers 270..275 are read). False, with every pointer null, when the eye
 // has no complete engine data this frame -- the compose then keeps the camera
-// term everywhere.
+// term everywhere. gameMark, when set, is the game's OWN target-6 texture,
+// captured this eye-frame at a self-marking pair's draw (kSelfMarking in
+// engine_velocity_families.h): detail shaders that natively write the marker
+// encoding there. The compose reads it as a fallback beside the slot target.
 struct EngineVelocityViews {
     ID3D11ShaderResourceView* slots = nullptr;
     ID3D11ShaderResourceView* pool = nullptr;
     ID3D11Buffer* sceneNow = nullptr;
     ID3D11Buffer* scenePrev = nullptr;
+    ID3D11ShaderResourceView* gameMark = nullptr;
 };
 bool engineVelocityViews(ID3D11DeviceContext*, int eye, ID3D11Texture2D* sceneDepth, EngineVelocityViews* out);
 // The eye-pass capture's GPU time since the last take (the performance

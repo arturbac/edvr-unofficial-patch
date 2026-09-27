@@ -348,6 +348,21 @@ inline void run(const Harness& h) {
     setEs(pxNotRig, 7.0f, kZBg);       // 2*3+1: a real, in-range slot with a garbage marker
     setEs(pxStamp, 9.0f, kZBg);        // 2*4+1: joined, but stamped with an older frame
 
+    // The self-marking fallback (the game's own target-6 channel, G6 t19,
+    // probe.w bit 4096): pxS joins through G6 with ES cleared; pxP has BOTH
+    // marked (ES must win); pxT's G6 depth mismatches the scene (stale).
+    const Px pxS{13, 6}, pxP{13, 10}, pxT{6, 13};
+    setEs(pxP, 5.0f, kZBg);            // ES: 2*2+1, the unmoved joined record
+    std::vector<float> g6Data(size_t(kDim) * kDim * 2, 0.0f);
+    for (int i = 0; i < kDim * kDim; ++i) { g6Data[size_t(i) * 2 + 0] = -1.0f; g6Data[size_t(i) * 2 + 1] = 0.0f; }
+    auto setG6 = [&](Px p, float code, float depth) {
+        const size_t i = size_t(p.y) * kDim + p.x;
+        g6Data[i * 2 + 0] = code; g6Data[i * 2 + 1] = depth;
+    };
+    setG6(pxS, 1.0f, kZBg);            // the game's own write: slot 0, the moving joined record
+    setG6(pxP, 1.0f, kZBg);            // ...also marks pxP (slot 0), where ES says slot 2
+    setG6(pxT, 1.0f, kZBg + 0.25f);    // ...and pxT, at a depth the scene does not have
+
     // -------------------------- resources --------------------------
     auto structuredSrv = [&](const void* src, UINT stride, UINT count, ID3D11ShaderResourceView** srv) {
         D3D11_BUFFER_DESC d{}; d.ByteWidth = stride * count; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -370,9 +385,11 @@ inline void run(const Harness& h) {
     };
     const ComPtr<ID3D11Texture2D> esTex = makeTexture(DXGI_FORMAT_R32G32_FLOAT, D3D11_BIND_SHADER_RESOURCE, esData.data(), UINT(kDim) * 2 * 4);
     const ComPtr<ID3D11Texture2D> zTex = makeTexture(DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, zData.data(), UINT(kDim) * 4);
-    ComPtr<ID3D11ShaderResourceView> esSrv, zSrv;
+    const ComPtr<ID3D11Texture2D> g6Tex = makeTexture(DXGI_FORMAT_R32G32_FLOAT, D3D11_BIND_SHADER_RESOURCE, g6Data.data(), UINT(kDim) * 2 * 4);
+    ComPtr<ID3D11ShaderResourceView> esSrv, zSrv, g6Srv;
     h.check(SUCCEEDED(h.device->CreateShaderResourceView(esTex.Get(), nullptr, &esSrv)), "ES SRV");
     h.check(SUCCEEDED(h.device->CreateShaderResourceView(zTex.Get(), nullptr, &zSrv)), "Z SRV");
+    h.check(SUCCEEDED(h.device->CreateShaderResourceView(g6Tex.Get(), nullptr, &g6Srv)), "G6 SRV");
 
     const ComPtr<ID3D11Texture2D> mvTex = makeTexture(DXGI_FORMAT_R32G32_FLOAT, D3D11_BIND_UNORDERED_ACCESS, nullptr, 0);
     const ComPtr<ID3D11Texture2D> zcTex = makeTexture(DXGI_FORMAT_R32_FLOAT, D3D11_BIND_UNORDERED_ACCESS, nullptr, 0);
@@ -429,6 +446,7 @@ inline void run(const Harness& h) {
     h.context->CSSetShaderResources(2, 1, zSrv.GetAddressOf());
     ID3D11ShaderResourceView* esEp[2] = {esSrv.Get(), epSrv.Get()};   // t21 = ES, t22 = EP
     h.context->CSSetShaderResources(21, 2, esEp);
+    h.context->CSSetShaderResources(19, 1, g6Srv.GetAddressOf());     // t19 = G6 (the game's own self-marked channel)
     ID3D11UnorderedAccessView* uavs[4] = {statsUav.Get(), mvUav.Get(), zcUav.Get(), mkUav.Get()};   // u2..u5
     h.context->CSSetUnorderedAccessViews(2, 4, uavs, nullptr);
 
@@ -453,6 +471,13 @@ inline void run(const Harness& h) {
 
     // 3) The no-engine baseline: same everything, probe.w bit 2048 clear.
     const auto baseline = dispatchAndRead(csDiag.Get(), 0.0f);
+
+    // 4) The self-marking fallback armed: bit 4096 added, G6 (t19) read where
+    //    ES is cleared. Run AFTER the Stats read above: it adds a joined count
+    //    of its own. The plain compile's own run follows for the agreement
+    //    cross-check.
+    const auto g6Armed = dispatchAndRead(csDiag.Get(), 2048.0f + 4096.0f);
+    const auto g6Plain = dispatchAndRead(csPlain.Get(), 2048.0f + 4096.0f);
 
     const std::vector<float>&armedMv = diagArmed.first, &armedMk = diagArmed.second;
     const std::vector<float>&baseMv = baseline.first, &baseMk = baseline.second;
@@ -517,20 +542,78 @@ inline void run(const Harness& h) {
     }
 
     // -------------------------- Stats[50..55]: the diagnostics compile's own counters --------------------------
-    // 50 joined (a, c), 51 masked (b), 52 not-a-rig-record (notRig), 53
-    // stale (e), 54 corrupt (d1 even, d2 fractional), 55 stale stamp (h).
+    // 50 joined (a, c, and pxP's ES marker -- the precedence pixel is a joined
+    // unmoved record through ES), 51 masked (b), 52 not-a-rig-record (notRig),
+    // 53 stale (e), 54 corrupt (d1 even, d2 fractional), 55 stale stamp (h).
     // d3's code 0 fails the ES.x >= 1 gate before the corrupt check runs
     // (kind 0), and kind 0 -- like d3, f and g -- is never tallied by mv's
     // own diagnostics (only engineKind != 0 increments a counter), so none
-    // of those three add to any of the six buckets checked here.
-    h.check(stats[50] == 2, "Stats[50] (JOINED pixels) == 2 (a, c)");
+    // of those three add to any of the six buckets checked here. The G6
+    // pixels read baseline with bit 4096 clear, so they tally nothing either.
+    h.check(stats[50] == 3, "Stats[50] (JOINED pixels) == 3 (a, c, pxP)");
     h.check(stats[51] == 1, "Stats[51] (MASKED pixels) == 1 (b)");
     h.check(stats[52] == 1, "Stats[52] (pool records that are not rig records) == 1 (notRig)");
     h.check(stats[53] == 1, "Stats[53] (STALE pixels) == 1 (e)");
     h.check(stats[54] == 2, "Stats[54] (CORRUPT pixels) == 2 (d1, d2)");
     h.check(stats[55] == 1, "Stats[55] (STALE-STAMP pixels) == 1 (h: a joined marker from an older frame)");
 
-    std::printf("  consumer: %d pixels: joined 2 (worst error %.2e px), masked 1 (sentinel + MK=1), declined 8, counters match\n",
+    // -------------------------- the self-marking fallback (G6 t19, probe.w 4096) --------------------------
+    const std::vector<float>&g6Mv = g6Armed.first;
+    {   // pxS: ES cleared, G6 marked with slot 0's code -- joins through the
+        // game's own channel with the moving record's exact motion, computed
+        // in double as case (a)'s: the pixel's world point carried by the
+        // record's pose delta (identity orientation, scale 1).
+        double ndcSx, ndcSy;
+        pixelToNdc(pxS.x, pxS.y, kDim, ndcSx, ndcSy);
+        const V3 posSNow = solveRel(camRows, ndcSx, ndcSy, zViewEff);
+        const V3 posSPrev = add(sub(posSNow, posANow), posAPrev);
+        const V3 posSPrevF{double(float(posSPrev.x)), double(float(posSPrev.y)), double(float(posSPrev.z))};
+        double before[4];
+        Camera::clip(camRows, posSPrevF, before);
+        double ppX, ppY;
+        clipToPixel(before, kDim, ppX, ppY);
+        const auto mv = mvAt(g6Mv, pxS);
+        const double gotX = double(pxS.x) + double(mv.first), gotY = double(pxS.y) + double(mv.second);
+        const double err = std::max(std::fabs(gotX - ppX), std::fabs(gotY - ppY));
+        worstErr = std::max(worstErr, err);
+        if (err > 1e-3) std::fprintf(stderr, "  case g6-join: GPU previous pixel (%.6f %.6f) vs double reference (%.6f %.6f), error %.2e\n", gotX, gotY, ppX, ppY, err);
+        h.check(err <= 1e-3, "SELF-MARKING: a G6-marked pixel with ES cleared joins with the record's exact motion, within 1e-3 px");
+    }
+    {   // Bit 4096 is the gate: the same pixel in the 2048-only runs keeps the
+        // no-fallback result exactly.
+        const auto mv = mvAt(armedMv, pxS);
+        const auto mvBase = mvAt(baseMv, pxS);
+        h.check(mv.first == mvBase.first && mv.second == mvBase.second,
+                "SELF-MARKING: with bit 4096 clear the G6 channel is not read -- the pixel declines like the baseline");
+    }
+    {   // pxP: ES marked (slot 2, unmoved) and G6 marked (slot 0, moving) --
+        // the substituted draws' channel wins.
+        const auto mv = mvAt(g6Mv, pxP);
+        const auto mvBase = mvAt(baseMv, pxP);
+        h.check(mv.first == mvBase.first && mv.second == mvBase.second,
+                "SELF-MARKING: ES takes precedence over G6 where both are marked (the unmoved record's camera term)");
+    }
+    {   // pxT: G6's depth is not the scene's -- stale, declined like kind 4.
+        const auto mv = mvAt(g6Mv, pxT);
+        const auto mvBase = mvAt(baseMv, pxT);
+        h.check(mv.first == mvBase.first && mv.second == mvBase.second,
+                "SELF-MARKING: a G6 marker whose depth is not the scene's declines exactly like the stale case");
+    }
+    {   // The ES path is unaffected by G6's presence: pxA's exact motion holds.
+        const auto mv = mvAt(g6Mv, pxA);
+        const auto mvArmed = mvAt(armedMv, pxA);
+        h.check(mv.first == mvArmed.first && mv.second == mvArmed.second,
+                "SELF-MARKING: the substituted path is byte-identical with G6 bound");
+    }
+    for (Px p : {pxS, pxP, pxT}) {
+        const auto pv = mvAt(g6Plain.first, p);
+        const auto dv = mvAt(g6Mv, p);
+        h.check(pv.first == dv.first && pv.second == dv.second,
+                "the plain and diagnostics compiles agree at the self-marking pixels too");
+    }
+
+    std::printf("  consumer: %d pixels: joined 3 (worst error %.2e px), masked 1 (sentinel + MK=1), declined 8, "
+                "the self-marking fallback joined/gated/preceded/stale as specified, counters match\n",
                 kDim * kDim, worstErr);
 }
 

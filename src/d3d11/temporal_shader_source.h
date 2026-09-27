@@ -182,6 +182,13 @@ bool engineReprojectRows(EnginePoolRecord r, float2 ndc, float zr,
 // ENGINE_MOTION_CORE_END
 Texture2D<float2> ES : register(t21);
 StructuredBuffer<EnginePoolRecord> EP : register(t22);
+// G6 t19: the game's OWN target-6 texture, bound only while probe.w bit 4096
+// says a self-marking pair drew this eye-frame (kSelfMarking in
+// engine_velocity_families.h). The station's detail shaders natively write
+// the same marker encoding there (2 * slot + 1 from the DATAID's low 23 bits,
+// the fragment's noperspective z), so enginePixelZ reads it as a fallback
+// where the substituted draws' ES is cleared.
+Texture2D<float2> G6 : register(t19);
 // EN[276].x carries the frame stamp (the present-frame clock at this eye's
 // snapshot, as uint bits): a joined marker folds it in, so a record whose
 // last emission was an earlier frame declines to the camera term.
@@ -519,10 +526,16 @@ uint enginePixelZ(float2 p, float2 offset, bool haveZ, float knownZ, out float2 
     pp = 0; zp = 0;
     if ((uint(probe.w + 0.5) & 2048u) == 0u || holoJitter.z == 0) return 0u;
     const int2 q = region.xy + int2(round(p + offset));
-    const float2 es = ES.Load(int3(q, 0));
+    float2 es = ES.Load(int3(q, 0));
     // The patched pool shaders write 2 * slot + 1: the cleared -1 and an
-    // untouched texel both fall below 1.
-    if (!(es.x >= 1.0)) return 0u;
+    // untouched texel both fall below 1. Where no substituted draw marked the
+    // pixel, the self-marking detail shaders' own channel (the game's target 6,
+    // probe.w bit 4096) carries the same encoding for the same pixel.
+    if (!(es.x >= 1.0)) {
+        if ((uint(probe.w + 0.5) & 4096u) == 0u) return 0u;
+        es = G6.Load(int3(q, 0));
+        if (!(es.x >= 1.0)) return 0u;
+    }
     if (uiCovered(q)) return 0u;
     if ((uint(probe.w + 0.5) & 32u) != 0u && Screen.Load(int3(q, 0)).w > 0) return 0u;
     const float zr = haveZ ? knownZ : zSceneAt(q);

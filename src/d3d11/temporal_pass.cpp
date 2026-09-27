@@ -3467,7 +3467,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
     // Engine-record velocity's inputs for this eye (engine_velocity.h): MRT6,
     // the pool snapshot and the scene constants now/before; all four or none.
     EngineVelocityViews engineViews{};
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> engineHeldSrv[2];
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> engineHeldSrv[3];
     Microsoft::WRL::ComPtr<ID3D11Buffer> engineHeldCb[2];
     // Named apart from the trained block's `engineAvailable` (the upscaler's
     // availability, declared in an inner scope): the flight of 2026-09-23
@@ -3499,6 +3499,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
             engineViewsGiven = engineVelocityViews(ctx, eye, scene, &engineViews);
             engineHeldSrv[0].Attach(engineViews.slots);
             engineHeldSrv[1].Attach(engineViews.pool);
+            engineHeldSrv[2].Attach(engineViews.gameMark);   // the game's own self-marked target 6, or null
             engineHeldCb[0].Attach(engineViews.sceneNow);
             engineHeldCb[1].Attach(engineViews.scenePrev);
             scene->Release();
@@ -4795,6 +4796,11 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                     const bool engineBound = engineViewsGiven && depthSrv;
                     if (engineBound) p.probe[3] =
                         static_cast<float>(static_cast<uint32_t>(p.probe[3]) | 2048u);
+                    // Bit 4096 and t19: the game's own self-marked target-6
+                    // texture (the detail shaders write the marker encoding
+                    // natively), a fallback beside the slot target.
+                    if (engineBound && engineViews.gameMark)
+                        p.probe[3] = static_cast<float>(static_cast<uint32_t>(p.probe[3]) | 4096u);
                     engineCounted = engineBound && diagnostics;
                     // A masked engine pixel sets the bias mask too, for the
                     // presets and FSR that read it (modern DLSS honours the
@@ -4819,7 +4825,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                                                           smokeSrv, uiDepthSrv,
                                                           uiTrack && e.uiHistoryValid ? e.uiHistorySrv[e.uiHistoryRead] : nullptr,
                                                           terrainSrvs[0], terrainSrvs[1], terrainSrvs[2], holoSrvs[0], holoSrvs[1], screenSrv, nullptr, nullptr, nullptr, nullptr,   // t15..t18: free since 2026-09-23 (the mesh records, the static owner's promotion)
-                                                          nullptr, nullptr,   // t19/t20: free since stage B's removal
+                                                          engineViews.gameMark, nullptr,   // t19: the game's self-marked slot+depth channel (probe.w 4096); t20: free since stage B's removal
                                                           engineBound ? engineViews.slots : nullptr, engineBound ? engineViews.pool : nullptr};
                     ID3D11UnorderedAccessView* uavsM[8] = {debugPaint ? e.dlOutUav : nullptr,
                                                            nullptr, g_statsUav, e.dlMvUav,
@@ -5106,6 +5112,8 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
             p.probe[3] = uiFlags();
             engineOwn = engineViewsGiven && depthSrv;
             if (engineOwn) p.probe[3] = static_cast<float>(static_cast<uint32_t>(p.probe[3]) | 2048u);
+            if (engineOwn && engineViews.gameMark)
+                p.probe[3] = static_cast<float>(static_cast<uint32_t>(p.probe[3]) | 4096u);   // t19: the game's self-marked target 6
         }
         bool ran = usedDlaa || (ensureNative(dev, e, viewFmt) && setParams(ctx, p));
         // A native fallback also writes counters, even when the requested
@@ -5323,7 +5331,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                                                           smokeSrv, uiDepthSrv,
                                                           uiTrack && e.uiHistoryValid ? e.uiHistorySrv[e.uiHistoryRead] : nullptr,
                                                           terrainSrvs[0], terrainSrvs[1], terrainSrvs[2], holoSrvs[0], holoSrvs[1], screenSrv, nullptr, nullptr, nullptr, nullptr,   // t15..t18: free since 2026-09-23 (the mesh records, the static owner's promotion)
-                                                          nullptr, nullptr,   // t19/t20: free since stage B's removal
+                                                          engineViews.gameMark, nullptr,   // t19: the game's self-marked slot+depth channel (probe.w 4096); t20: free since stage B's removal
                                                           engineOwn ? engineViews.slots : nullptr, engineOwn ? engineViews.pool : nullptr};
                     // u2 (the stats buffer) is left UNBOUND here: the own pass
                     // writes its stats when it runs, and the mv entry writes
@@ -5625,7 +5633,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                                                      smokeSrv, uiDepthSrv,
                                                      uiTrack && e.uiHistoryValid ? e.uiHistorySrv[e.uiHistoryRead] : nullptr,
                                                           terrainSrvs[0], terrainSrvs[1], terrainSrvs[2], holoSrvs[0], holoSrvs[1], screenSrv, nullptr, nullptr, nullptr, nullptr,   // t15..t18: free since 2026-09-23 (the mesh records, the static owner's promotion)
-                                                          nullptr, nullptr,   // t19/t20: free since stage B's removal
+                                                          engineViews.gameMark, nullptr,   // t19: the game's self-marked slot+depth channel (probe.w 4096); t20: free since stage B's removal
                                                           engineOwn ? engineViews.slots : nullptr, engineOwn ? engineViews.pool : nullptr};
                 ID3D11UnorderedAccessView* uavs[7] = {e.outUav, e.histUav[writeIdx],
                                                       g_statsUav, nullptr,

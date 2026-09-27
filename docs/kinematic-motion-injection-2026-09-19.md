@@ -78,13 +78,13 @@
   their live owner/coverage is assessed); the world path's camera-term health near a
   station (rows chosen off the auxiliary passes, parked stays spanning motion, a 35-40%
   undershoot of the head in both sessions) -- belongs to the camera-rows arc, which owns
-  the gate; the port-face seams still blur with motion -- they draw stock through the
-  station families' SELF-MARKING pixel shaders ps_BCF75CEA37060EAE (vs_4361) and
-  ps_2F924695596C8195 (vs_889A), which natively write EDVR's exact (2*slot+1, z) marker
-  at SV_Target6 into the game's own buffer and so fail keying ("target 6 occupied"):
-  the open fork is the compose reading the game's own target-6 texture (no patching, no
-  draw disturbance) vs healing the world path (the camera-rows arc) -- the 2026-09-27
-  verification-flight entry; ships in space; builder-path movers and articulated parts
+  the gate; the port-face seams' blur with motion is ROUTE-A BUILT, NOT FLOWN (the
+  2026-09-27 route-A entry): the seam detail's stock pixel shaders
+  ps_BCF75CEA37060EAE (vs_4361) and ps_2F924695596C8195 (vs_889A) natively write EDVR's
+  exact marker encoding into the game's own SV_Target6 buffer, so the runtime latches
+  that texture and the compose reads it as a fallback beside ES (G6 t19, probe.w 4096;
+  harness-proven on WARP, both directions); route B (healing the world path) stays with
+  the camera-rows arc; ships in space; builder-path movers and articulated parts
   (phase 2).
 - **Ruled out (do not re-propose; each closed in its dated entry):** draw-shape memo
   identity, pool-slot identity, 3x3 SAD camera-vs-body match, hidden-bone-spin
@@ -103,14 +103,13 @@
   truth there); the stamp fix as the cause of the world-path death (191906 shows the
   same miss on the 09-25 build); the reconstruction floor as the close-range
   explanation (the chain is broken upstream of DLSS).
-- **Next:** FLOWN, better but the seams remain (the 2026-09-27 verification-flight
-  entry): the hull is engine-covered (53.5% on the station box, both keyed families
-  substituting thousands of draws); the seam detail still draws stock and rides the
-  world path. Decide the fork -- the compose reading the game's own self-marked
-  target-6 buffer (route A) vs healing the camera term (route B, the camera-rows
-  arc). Route A's first proof is offline: the harness drives a stock self-marking
-  draw and reads the game's texture. Then the controlled diagnostics 1 vs 0
-  comparison, and a walker near a drone with the motion_source view.
+- **Next:** FLY the route-A build at the coriolis port (055427's range, head moves, an
+  eye dump): the family lines name "self-marked N draws, latched M" on vs_4361/vs_889A
+  with M ~ the eye-frames, the dump's engine share on the station box climbs past
+  095337's 53.5% toward the families' full coverage, and the seams stay crisp through
+  motion. latched 0 with the blur unchanged means the game's buffer shape refused --
+  its format is the first suspect. Then the controlled diagnostics 1 vs 0 comparison,
+  and a walker near a drone with the motion_source view.
 
 ## Premise
 
@@ -3183,3 +3182,49 @@ B is the broader repair. They do not conflict.
 **Not a regression path:** nothing in this entry changes the keyed set. The
 two self-marking pairs stand in the rig's candidate list, where the harness
 now prints the refusal reason -- that print is the documentation.
+
+### 2026-09-27 -- Route A built: the compose reads the game's own self-marked channel
+
+Sean's call on the fork: route A. The seam shaders ps_BCF75CEA37060EAE
+(vs_4361) and ps_2F924695596C8195 (vs_889A) natively write the marker
+encoding -- 2*(DATAID low 23 bits)+1 and the fragment's noperspective z,
+byte-for-byte EDVR's own tail -- at SV_Target6 into the game's own texture.
+So they are not keyed, not patched, and their draws run untouched; the
+runtime only LATCHES the texture bound at target 6 when such a pair draws on
+an eye pass (captureGameMark: the write view must be R32G32_FLOAT
+single-slice at the pass's depth size, the texture may be typeless; one
+OMGetRenderTargets per eye-frame at most), and the compose reads it as G6
+(t19, probe.w bit 4096) where ES is cleared: the same odd/depth/stamp
+validation, the same record lookup, the same kind ladder -- ES wins where
+both are marked. Counted as "self-marked N draws (the game's own slot+depth
+channel, latched M eye-frames)" in the family lines; a latch failure leaves
+the feature off, distinguishable from success in the log.
+
+Proofs, all on WARP with the real dumped bytecode: the rig's corpus draws
+each stock shader and reads MRT6 back -- 4096 covered texels, (2*slot+1,
+depth) on every one, 0 bad, and the patcher's refusal is asserted ("target 6
+occupied", by design). The consumer rig drives the production compose shader:
+a G6-marked pixel with ES cleared joins with the record's exact motion
+(2.97e-07 px worst against the double reference); bit 4096 clear reads the
+baseline instead (the gate); ES marked AND G6 marked resolves to ES
+(precedence); a G6 depth mismatch declines like kind 4; the ES path is
+byte-identical with G6 bound. engine_velocity_test 1152 checks (the gate),
+1677 with the corpus.
+
+Not covered, deliberately: the on-foot screen path (SEN) and the flat mono
+prep read their own channels, unchanged; the game's target-6 texture is read
+only, never written by EDVR; a pixel the detail shaders did not touch this
+frame can hold an older frame's marker and is rejected by the same bit-exact
+depth equality that rejects a stale slot on ES (kind 4 by construction, same
+residual risk class). If the game's buffer is not R32G32_FLOAT at eye size,
+the latch refuses and the family line says so ("self-marked N draws, latched
+0").
+
+**What a flight shows.** Parked at the port through head moves: the family
+lines for vs_4361/vs_889A name ps_51EE/ps_D31D patched AND "self-marked N
+draws, latched M" with M ~ the eye-frames; an eye dump's engine share on the
+station box climbs past the 53.5% of 095337 toward the families' full
+coverage; the seams stay crisp through motion. If the seam blur persists with
+latched = 0, the game's buffer shape refused -- the format is the first
+suspect (the capture's log line alone cannot distinguish that; the dump's
+engine share can).

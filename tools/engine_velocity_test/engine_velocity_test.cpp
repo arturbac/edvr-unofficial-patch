@@ -47,6 +47,7 @@
 #include "actual_vs_link_test.h"
 #include "lifecycle_tests.h"
 #include "../../src/common/runtime_profile.h"
+#include "../../src/d3d11/engine_velocity_families.h"   // kSelfMarking
 #include "../../third_party/dxbc_hash/DxilHash.cpp"
 
 using Microsoft::WRL::ComPtr;
@@ -184,23 +185,39 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
     // while its live owner/coverage is assessed.
     const Pair candidates[] = {
         {L"vs_DE545DC8EE4FBB87", L"ps_A6070F9DD1CFB601", false},
-        // Eye run 095337 (2026-09-27, verification flight): after the
-        // close-range keying the hull is engine-covered, but the seams and
-        // greeble detail still draw stock -- vs_4361's and vs_889A's third
-        // pixel shaders. Dumped by the same flight's glare_shader_dump. Both
-        // FAIL the harness by design: they natively write EDVR's exact
-        // (2*slot+1, z) marker at SV_Target6 into the game's own buffer, so
-        // "output target 6 or above occupied" -- the compose-side read of
-        // the game's texture, not keying, is their route (the doc's 2026-09-27
-        // verification-flight entry).
-        {L"vs_436193B352A2897E", L"ps_BCF75CEA37060EAE", false},
-        {L"vs_889A5279E68F0672", L"ps_2F924695596C8195", false},
     };
     for (const auto& p : candidates) {
         g_softWhy.clear();
         const bool passed = onePair(device, context, root, p, &softCheck) && g_softWhy.empty();
         std::printf("  candidate: %ls + %ls: %s%s\n", p.vs, p.ps, passed ? "PASSES the harness" : "not keyable -- ",
                     passed ? "" : g_softWhy.c_str());
+    }
+    // Self-marking pairs (kSelfMarking, engine_velocity_families.h; eye run
+    // 095337's seam shaders): NOT keyable -- their stock pixel shaders natively
+    // write the marker encoding into the game's own SV_Target6. Two proofs:
+    // the patcher must refuse them ("target 6 occupied"), and the stock draw
+    // must hold (2*slot+1, the fragment's depth) at MRT6 with no patch at all.
+    for (const auto& p : edvr::engine_velocity_family::kSelfMarking) {
+        wchar_t wvs[24], wps[24];
+        std::swprintf(wvs, 24, L"vs_%016llX", static_cast<unsigned long long>(p.vs));
+        std::swprintf(wps, 24, L"ps_%016llX", static_cast<unsigned long long>(p.ps));
+        const auto vsb = readFile(root + L"\\shaders\\" + wvs + L".dxbc");
+        const auto psb = readFile(root + L"\\shaders\\" + wps + L".dxbc");
+        check(!vsb.empty() && !psb.empty(), "self-marking pair's dxbc present");
+        if (vsb.empty() || psb.empty()) continue;
+        edvr::EngineVelocityInputs in;
+        std::string why;
+        check(edvr::engineVelocityDeriveInputs(vsb.data(), vsb.size(), in, why), why.c_str());
+        std::vector<BYTE> patched;
+        const bool refused = !edvr::engineVelocityPatchPs(psb.data(), psb.size(), in, patched, why) &&
+                             why.find("target 6") != std::string::npos;
+        check(refused, "self-marking pair: the patcher refuses it -- its target 6 is occupied by design");
+        char name[96];
+        std::snprintf(name, sizeof(name), "%ls + %ls", wvs, wps);
+        const corpus_identity::Result r = corpus_identity::selfMarked(device, context, psb, in, &check, name);
+        check(r.driven, "self-marking pair driven, not skipped");
+        check(r.slotChecked > 0 && r.slotBad == 0,
+              "self-marking: the STOCK shader writes (2*slot+1, depth) at MRT6 natively, no patch");
     }
 }} // namespace
 

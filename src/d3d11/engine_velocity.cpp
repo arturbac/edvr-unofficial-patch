@@ -82,6 +82,7 @@ using engine_velocity_family::kFamilies;
 using engine_velocity_family::kFamilyCount;
 using engine_velocity_family::familyForProfile;
 using engine_velocity_family::keyedPs;
+using engine_velocity_family::selfMarkingPair;
 static_assert(kFamilyCount <= kMaxFamilies, "familyDraws holds every family");
 bool anyKeyedPs(uint64_t hash) {
     for (int i = 0; i < kFamilyCount; ++i)
@@ -106,6 +107,9 @@ struct PsInfo {
 std::unordered_map<ID3D11VertexShader*, VsInfo> g_vs;
 std::unordered_map<ID3D11PixelShader*, PsInfo> g_ps;
 constexpr size_t kRememberCap = 512;   // keyed shader objects kept (a few KB of bytecode each)
+// One SRV per distinct game target-6 texture, held: no address reuse while
+// remembered (the same rule as the shader cache above; a few textures total).
+std::unordered_map<ID3D11Texture2D*, Ptr<ID3D11ShaderResourceView>> g_gameMarkSrvs;
 
 struct FamilyState {
     bool derived = false, valid = false;
@@ -118,6 +122,8 @@ struct FamilyState {
     uint64_t binds = 0;                            // substitutions made (this window)
     uint64_t unkeyedPsDraws = 0;                   // bind events with a pixel shader outside the keyed set
     uint64_t unkeyedPsHash = 0;
+    uint64_t selfMarked = 0;                       // self-marking pair's stock draws (the game's own slot+depth channel)
+    uint64_t selfMarkedLatched = 0;                // ...of those, the draws that latched the game's texture for the eye-frame
 };
 FamilyState g_families[kFamilyCount];
 
@@ -194,6 +200,13 @@ struct Eye {
     Ptr<ID3D11ShaderResourceView> overlayBaseSrv;
     bool overlayGroup = false;
     unsigned width = 0, height = 0;
+    // The game's own target-6 texture, latched at this eye-frame's first
+    // self-marking draw (kSelfMarking): the detail shaders natively write the
+    // marker encoding (2*slot+1, z) there. Validated against the pass's depth
+    // size and R32G32_FLOAT at capture; handed to the compose with the views.
+    Ptr<ID3D11Texture2D> gameMark;
+    Ptr<ID3D11ShaderResourceView> gameMarkSrv;
+    uint32_t gameMarkFrame = ~0u;
     Ptr<ID3D11Buffer> pool;              // the snapshot copies
     Ptr<ID3D11ShaderResourceView> poolSrv;
     UINT poolBytes = 0;
@@ -974,6 +987,70 @@ bool bindTarget(ID3D11DeviceContext* ctx, Eye& e, ID3D11DepthStencilView* dsv) {
     return true;
 }
 
+// A self-marking pair (kSelfMarking): the stock pixel shader writes the marker
+// encoding (2 * slot + 1, the fragment's z) into the game's OWN SV_Target6, so
+// the draw runs untouched and the compose reads the game's texture beside ES.
+// Latch that texture for the eye-frame here: R32G32_FLOAT, single-slice, the
+// pass's depth size -- the shape the compose's float2 Load reads. Once per
+// eye-frame; nothing about the game's state is touched. True only when the
+// texture was latched (first latch of the eye-frame) -- the caller counts it,
+// so the family line can tell "drawn" and "actually read at the compose"
+// apart.
+bool captureGameMark(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame, ID3D11DepthStencilView* dsv) {
+    if (eye == kEngineVelocitySourceEye || e.gameMarkFrame == frame) return false;
+    ID3D11RenderTargetView* rts[8] = {};
+    Ptr<ID3D11DepthStencilView> dsvNow;
+    ctx->OMGetRenderTargets(8, rts, &dsvNow);
+    Ptr<ID3D11RenderTargetView> rt6;
+    rt6 = rts[6];
+    for (unsigned i = 0; i < 8; ++i)
+        if (rts[i] && rts[i] != rt6.Get()) rts[i]->Release();
+    Ptr<ID3D11Texture2D> tex;
+    if (rt6) {
+        Ptr<ID3D11Resource> res;
+        rt6->GetResource(&res);
+        if (res) res.As(&tex);
+    }
+    if (tex) {
+        D3D11_TEXTURE2D_DESC td{};
+        tex->GetDesc(&td);
+        D3D11_RENDER_TARGET_VIEW_DESC vd{};
+        rt6->GetDesc(&vd);
+        Ptr<ID3D11Resource> depthRes;
+        dsv->GetResource(&depthRes);
+        Ptr<ID3D11Texture2D> depthTex;
+        if (depthRes) depthRes.As(&depthTex);
+        D3D11_TEXTURE2D_DESC dd{};
+        if (depthTex) depthTex->GetDesc(&dd);
+        // The shape the compose's float2 Load reads: the VIEW the game writes
+        // through is R32G32_FLOAT single-slice (the texture itself may be
+        // typeless), at the pass's depth size.
+        const bool shapeOk = vd.Format == DXGI_FORMAT_R32G32_FLOAT &&
+                             vd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D && td.ArraySize == 1 &&
+                             td.SampleDesc.Count == 1 && depthTex && td.Width == dd.Width && td.Height == dd.Height;
+        if (shapeOk) {
+            auto& srv = g_gameMarkSrvs[tex.Get()];
+            if (!srv) {
+                D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+                sd.Format = DXGI_FORMAT_R32G32_FLOAT;
+                sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                sd.Texture2D.MipLevels = 1;
+                sd.Texture2D.MostDetailedMip = 0;
+                Ptr<ID3D11Device> dev;
+                ctx->GetDevice(&dev);
+                dev->CreateShaderResourceView(tex.Get(), &sd, &srv);   // fails if not shader-resource bound: unlatched
+            }
+            if (srv) {
+                e.gameMark = tex;
+                e.gameMarkSrv = srv;
+                e.gameMarkFrame = frame;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     ++g_draw.slowPaths;
     auto* vs = static_cast<ID3D11VertexShader*>(bindingGet(BindSlot::Vs));
@@ -1015,7 +1092,16 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     // snapshot, MRT6 -- is prepared for a draw that cannot export ownership;
     // a declined draw puts the game's state back, as before.
     if (!keyedPs(f, psHash, runtimeFlatProfile())) {
-        if (!anyKeyedPs(psHash)) { ++fam.unkeyedPsDraws; fam.unkeyedPsHash = psHash; }
+        if (eyePass && selfMarkingPair(vsHash, psHash)) {
+            // The stock shader already writes the marker into the game's own
+            // target 6: nothing to substitute -- latch that texture for the
+            // compose and let the draw run exactly as the game made it.
+            if (captureGameMark(ctx, e, eye, frame, dsv)) ++fam.selfMarkedLatched;
+            ++fam.selfMarked;
+        } else if (!anyKeyedPs(psHash)) {
+            ++fam.unkeyedPsDraws;
+            fam.unkeyedPsHash = psHash;
+        }
         restore(ctx);
         return;
     }
@@ -1382,13 +1468,17 @@ void summaryLocked(uint64_t now) {
         const bool seen = std::any_of(g_vs.begin(), g_vs.end(), [&](const auto& v) { return v.second.family == f; });
         const char* state = !seen ? "not created by the game this session" : !s.derived ? "not drawn yet"
                           : s.valid ? "live" : "STOOD DOWN";
-        Log::get().note("engine motion: family %s: %s%s%s; substituted %llu binds, %llu draws; patched [%s]%s%s%s%s.",
+        Log::get().note("engine motion: family %s: %s%s%s; substituted %llu binds, %llu draws; patched [%s]%s%s%s%s%s.",
                         kFamilies[f].name, state, s.reason.empty() ? "" : " -- ", s.reason.c_str(),
                         u(s.binds), u(familyDraws[f]), patched.c_str(),
                         failed.empty() ? "" : "; refused [", failed.c_str(), failed.empty() ? "" : "]",
-                        s.unkeyedPsDraws ? (" ; unkeyed pixel shader ps_" + hex64(s.unkeyedPsHash) + " left stock").c_str() : "");
+                        s.unkeyedPsDraws ? (" ; unkeyed pixel shader ps_" + hex64(s.unkeyedPsHash) + " left stock").c_str() : "",
+                        s.selfMarked ? ("; self-marked " + std::to_string(s.selfMarked) + " draws (the game's own slot+depth channel, latched " +
+                                        std::to_string(s.selfMarkedLatched) + " eye-frames)").c_str() : "");
         s.binds = 0;
         s.unkeyedPsDraws = 0;
+        s.selfMarked = 0;
+        s.selfMarkedLatched = 0;
         familyDraws[f] = 0;
     }
     g_emit.clear();
@@ -1407,7 +1497,7 @@ void clearLocked() {
     for (auto& w : g_watchInfo) w = WatchInfo{};
     for (auto& s : g_families) {
         s.patchedVs.clear(); s.patchedPs.clear(); s.guardedPs.clear(); s.psFailed.clear();
-        s.derived = s.valid = false; s.reason.clear(); s.binds = 0; s.unkeyedPsDraws = 0;
+        s.derived = s.valid = false; s.reason.clear(); s.binds = 0; s.unkeyedPsDraws = 0; s.selfMarked = 0; s.selfMarkedLatched = 0;
     }
     for (auto& d : familyDraws) d = 0;
     // g_bound stays: only the owner thread may put the game's state back
@@ -1688,6 +1778,12 @@ bool giveViewsLocked(Eye& e, ID3D11Texture2D* sceneDepth, EngineVelocityViews* o
     out->pool = e.poolSrv.Get(); out->pool->AddRef();
     out->sceneNow = e.scene[now].Get(); out->sceneNow->AddRef();
     out->scenePrev = e.scene[before].Get(); out->scenePrev->AddRef();
+    // The game's own self-marked channel, when a self-marking pair drew this
+    // eye-frame: the compose reads it as a fallback beside the slot target.
+    if (e.gameMarkFrame == frame && e.gameMarkSrv) {
+        out->gameMark = e.gameMarkSrv.Get();
+        out->gameMark->AddRef();
+    }
     ++c.given;
     return true;
 }
