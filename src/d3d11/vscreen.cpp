@@ -73,6 +73,7 @@
 #include "ui_depth.h"
 #include "ui_layer.h"
 #include "ui_layer_math.h"
+#include "hud_layer_census.h"  // advanced.hud_census: the crisp-HUD Phase 0 census gates
 #include "ui_surfaces.h"  // uiAtlasNoteWrite: the glyph atlas instrument's write count
 #include "celestial_motion.h"
 #include "engine_velocity.h"
@@ -1454,6 +1455,11 @@ inline bool foreignContext(ID3D11DeviceContext* self) {
 // the file.
 void* currentRtv0Resource(State* s);
 bool viewportIs(const D3D11_VIEWPORT& v, uint32_t w, uint32_t h);
+// The HUD layer census's G-D colourless re-issue pair, defined beside
+// pureDrawReissue which it uses; the eye-draw branch calls it on the
+// census's say-so.
+void hudCensusGdPair(ID3D11DeviceContext* self, char kind, UINT count, UINT instances,
+                     const DrawArgs& args);
 
 // Record a draw we are about to decline. Cheap by construction: a linear scan
 // of at most eight entries, and GetType is asked ONCE per context rather than
@@ -2402,6 +2408,17 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // one call and one bool.
     if (drawCensusArmed()) {
         drawCensusEyeDraw(self, kind, count, instances, s->eyeDrawsThisFrame, args);
+    }
+    // The HUD layer census (hud_layer_census.h): Phase 0 of the crisp-HUD
+    // design, observation only. One bool load while off (the default); when
+    // armed it watches for the three cockpit HUD families and the tonemap,
+    // and for a family draw it picked for its occlusion gate it re-issues
+    // this draw colourlessly (no colour target, writes masked, everything
+    // restored) around pureDrawReissue before the game's own draw runs.
+    if (hudLayerCensusArmed() && self == g_state->ownerCtx) {
+        if (hudLayerCensusEyeDraw(self, kind, count, instances, s->eyeDrawsThisFrame, args)) {
+            hudCensusGdPair(self, kind, count, instances, args);
+        }
     }
     // The pool probe (object_probe.h): one bool while off; a few t33 reads a
     // frame until the pool is known, then one a second. The bool is now read
@@ -3693,6 +3710,28 @@ __declspec(noinline) void pureDrawReissue(ID3D11DeviceContext* self, char kind, 
     }
 }
 
+// The HUD layer census's G-D pair (hud_layer_census.h): the game's own
+// draw, re-issued twice through pureDrawReissue with NO colour target --
+// once under a write-masked clone of the game's depth-stencil state (its
+// GEQUAL test exactly as submitted, nothing written), once with depth and
+// stencil off (every sample passes) -- each inside an occlusion query, so
+// the rejected share of the family's pixels is measured rather than
+// inferred. The module owns the queries, the cloned states, the OM save
+// and restore, and the answer; this helper is only the bracket the
+// re-issue needs because pureDrawReissue is file-local. NOINLINE for the
+// same reason pureDrawReissue is: it runs for a handful of family draws a
+// frame while armed, and the draw path must not pay its frame for the
+// rest.
+__declspec(noinline) void hudCensusGdPair(ID3D11DeviceContext* self, char kind, UINT count,
+                                          UINT instances, const DrawArgs& args) {
+    HudCensusGdSave save;
+    if (!hudLayerCensusGdBegin(self, save)) return;
+    pureDrawReissue(self, kind, count, instances, args);
+    hudLayerCensusGdSwapToDepthOff(self, save);
+    pureDrawReissue(self, kind, count, instances, args);
+    hudLayerCensusGdEnd(self, save);
+}
+
 // fix.ui_quality (ui_layer.h): which piece of the interface an owner draw is.
 // Asked only while the layer is live. A draw into anything that is not an
 // eye target is none -- the GUI's own draws into its surfaces are the
@@ -4044,6 +4083,11 @@ void STDMETHODCALLTYPE hookedBegin(ID3D11DeviceContext* self,
     if (drawCensusArmed()) {
         drawCensusQuery('B', async, foreignContext(self));
     }
+    // The HUD layer census's G-D pair declines while any game query is open
+    // on the owner context (hud_layer_census.h says why). One bool while off.
+    if (hudLayerCensusArmed() && !foreignContext(self)) {
+        hudLayerCensusNoteGameQuery(true, async);
+    }
     g_state->realBegin(self, async);
 }
 
@@ -4054,6 +4098,9 @@ void STDMETHODCALLTYPE hookedEnd(ID3D11DeviceContext* self,
     if (gpuFrameInternal()) { g_state->realEnd(self, async); return; }
     if (drawCensusArmed()) {
         drawCensusQuery('E', async, foreignContext(self));
+    }
+    if (hudLayerCensusArmed() && !foreignContext(self)) {
+        hudLayerCensusNoteGameQuery(false, async);
     }
     g_state->realEnd(self, async);
     if(!foreignContext(self))
@@ -5229,6 +5276,7 @@ void vScreenRefreshConfig() {
     objectProbeConfigure(cfg);
     pixelProbeConfigure(cfg);
     lodGovernorConfigure(cfg);
+    hudLayerCensusConfigure(cfg);
     // Every fix.head_offset_* key, on the reload path as well as the startup
     // one. A config reader on only one of the two is a specific repeatable bug
     // -- reload-only means the value stays its C++ initialiser for the whole
@@ -5369,6 +5417,10 @@ void vScreenFrameBoundary() {
         // cross-check and learning, the key's 30-second totals, and the end
         // of this frame's watch for draws after the UI.
         uiLayerFrameBoundary(g_state->ownerCtx);
+        // The HUD layer census's query polls, deferred readbacks and
+        // 30-second window report -- beside the layer's boundary, but gated
+        // only on advanced.hud_census, never on fix.ui_quality.
+        hudLayerCensusFrameBoundary(g_state->ownerCtx);
         screenMotionFrameBoundary(g_state->ownerCtx);
         celestialMotionFrameBoundary(g_state->ownerCtx);
         engineVelocityFrameBoundary(g_state->ownerCtx);
@@ -6411,6 +6463,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     objectProbeConfigure(cfg);
     pixelProbeConfigure(cfg);
     lodGovernorConfigure(cfg);
+    hudLayerCensusConfigure(cfg);
     // installGlitchFrameFix is called before this, deliberately, so this is its
     // settled answer rather than a guess about config it has not read yet.
     g_state->countForFlashFix = glitchFrameNeedsEyeDraws();
@@ -6725,6 +6778,7 @@ void shutdownVScreenFixes() {
     holoShutdown();
     uiDepthShutdown();
     uiLayerShutdown();
+    hudLayerCensusShutdown();
     screenMotionShutdown();
     nightVisionShutdown();
     celestialMotionShutdown();

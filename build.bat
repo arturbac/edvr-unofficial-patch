@@ -537,6 +537,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\wake_pulse.cpp" ^
     "src\d3d11\hud_grain.cpp" ^
     "src\d3d11\ui_depth.cpp" ^
+    "src\d3d11\hud_layer_census.cpp" ^
     "src\d3d11\ui_layer.cpp" "src\d3d11\ui_surfaces.cpp" "src\d3d11\ui_panel_scale.cpp" ^
     "third_party\dxbc_hash\DxilHash.cpp" ^
     "src\d3d11\backdrop_fix.cpp" ^
@@ -1398,6 +1399,9 @@ if errorlevel 1 ( echo [edvr] ERROR: panel snapshot test build failed & exit /b 
 "%OBJ%\panelsnapshot\eye_panel_snapshot_test.exe" "%OBJ%\panelsnapshot\fixture.bin" || exit /b 1
 python "tools\eye_panel_snapshot.py" --self-test || exit /b 1
 python "tools\eye_panel_snapshot.py" "%OBJ%\panelsnapshot\fixture.bin" --verify-fixture || exit /b 1
+REM The crisp-HUD parity gate (G-F) reads both snapshot formats; gate its
+REM self-test here, after both parents' fixtures ran.
+python "tools\hud_parity.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_vr_census_test

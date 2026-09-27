@@ -16,6 +16,7 @@
 #include "ui_layer_math.h"
 #include "ui_layer_shaders.h"
 #include "ui_layer_seed.h"  // the Seeder: the game's depth-stencil at the layer's size
+#include "draw_state_describe.h"  // viewName, describeBlend/describeDs, shapeOf, dsStateOf
 
 #include "binding_shadow.h"
 #include "depth_probe.h"   // depthProbeDrawsAtSize: the world-screen gate's own count
@@ -433,29 +434,6 @@ AfterSeen g_afterSeen[kMaxAfterLines];
 uint32_t g_afterSeenCount = 0;
 bool g_engageNoted = false, g_compositeNoted = false;
 
-const char* viewName(DXGI_FORMAT f) {
-    switch (f) {
-        case DXGI_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
-        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return "R8G8B8A8_UNORM_SRGB";
-        case DXGI_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
-        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return "B8G8R8A8_UNORM_SRGB";
-        case DXGI_FORMAT_R11G11B10_FLOAT: return "R11G11B10_FLOAT";
-        case DXGI_FORMAT_R10G10B10A2_UNORM: return "R10G10B10A2_UNORM";
-        case DXGI_FORMAT_R16G16B16A16_FLOAT: return "R16G16B16A16_FLOAT";
-        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return "R8G8B8A8_TYPELESS";
-        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return "B8G8R8A8_TYPELESS";
-        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return "D32_FLOAT_S8X24_UINT";
-        case DXGI_FORMAT_D24_UNORM_S8_UINT: return "D24_UNORM_S8_UINT";
-        case DXGI_FORMAT_D32_FLOAT: return "D32_FLOAT";
-        case DXGI_FORMAT_D16_UNORM: return "D16_UNORM";
-        case DXGI_FORMAT_R32G8X24_TYPELESS: return "R32G8X24_TYPELESS";
-        case DXGI_FORMAT_R24G8_TYPELESS: return "R24G8_TYPELESS";
-        case DXGI_FORMAT_R32_TYPELESS: return "R32_TYPELESS";
-        case DXGI_FORMAT_R16_TYPELESS: return "R16_TYPELESS";
-        default: return "another format";
-    }
-}
-
 bool structuralDecision(UiLayerDecision d) {
     // The transient ones -- not armed yet, late this frame -- are counted on
     // the totals line and never get a first-seen line of their own.
@@ -480,23 +458,6 @@ void noteFamily(UiLayerFamily f, UiLayerDecision d, const char* detail) {
                     static_cast<unsigned long long>(ps), g_tc.info.a, g_tc.info.b,
                     viewName(g_tc.view), uiLayerDecisionName(d), detail && *detail ? " -- " : "",
                     detail ? detail : "");
-}
-
-// The census's own notation for a blend (bl=enable src,dst,op/srcA,dstA,opA
-// and the write mask) and a depth-stencil state, for those lines.
-void describeBlend(const UiBlendRt& b, char* out, size_t n) {
-    _snprintf_s(out, n, _TRUNCATE, "bl=%u%u,%u,%u/%u,%u,%u bm=%X", b.enable ? 1u : 0u, b.src, b.dst,
-                b.op, b.srcA, b.dstA, b.opA, b.mask);
-}
-void describeDs(const UiDsState& s, UINT ref, DXGI_FORMAT viewFmt, char* out, size_t n) {
-    _snprintf_s(out, n, _TRUNCATE,
-                "depth %u func %u write %u; stencil %u ref %u read %02X write %02X front "
-                "func %u ops %u,%u,%u back func %u ops %u,%u,%u; %s%s%s",
-                s.depthEnable ? 1u : 0u, s.depthFunc, s.depthWriteAll ? 1u : 0u,
-                s.stencilEnable ? 1u : 0u, ref, s.readMask, s.writeMask, s.front.func, s.front.fail,
-                s.front.depthFail, s.front.pass, s.back.func, s.back.fail, s.back.depthFail,
-                s.back.pass, viewName(viewFmt), s.readOnlyDepth ? " read-only depth" : "",
-                s.readOnlyStencil ? " read-only stencil" : "");
 }
 
 // ------------------------------------------------------------ the layer
@@ -631,52 +592,17 @@ ID3D11BlendState* cachedBlend(ID3D11DeviceContext* ctx, const UiBlendRt& conv) {
     return g_blends[g_blendCount++].state.Get();
 }
 
-// The shape of a bound blend state, alpha-to-coverage and logic ops refused.
-UiBlendShape shapeOf(ID3D11BlendState* bs, UiBlendRt* rtOut) {
-    UiBlendRt rt;  // null state: D3D11's default -- blending off, all written
-    if (bs) {
-        D3D11_BLEND_DESC d{};
-        bs->GetDesc(&d);
-        rt = uiLayerBlendRtFrom(d.RenderTarget[0]);
-        if (rtOut) *rtOut = rt;
-        if (d.AlphaToCoverageEnable) return UiBlendShape::kRefused;
-        Ptr<ID3D11BlendState1> bs1;
-        if (SUCCEEDED(bs->QueryInterface(__uuidof(ID3D11BlendState1),
-                                         reinterpret_cast<void**>(bs1.GetAddressOf()))) &&
-            bs1) {
-            D3D11_BLEND_DESC1 d1{};
-            bs1->GetDesc1(&d1);
-            if (d1.RenderTarget[0].LogicOpEnable) return UiBlendShape::kRefused;
-        }
-    } else if (rtOut) {
-        *rtOut = rt;
-    }
-    return uiLayerBlendShape(rt);
-}
-
-// The depth-stencil state bound now, as UiDsState, with its reference.
-UiDsState dsStateOf(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv, UINT* refOut,
-                    DXGI_FORMAT* viewFmtOut) {
-    Ptr<ID3D11DepthStencilState> dss;
-    UINT ref = 0;
-    ctx->OMGetDepthStencilState(&dss, &ref);
-    D3D11_DEPTH_STENCIL_DESC d{};
-    if (dss) dss->GetDesc(&d);
-    UINT flags = 0;
-    DXGI_FORMAT viewFmt = DXGI_FORMAT_UNKNOWN;
-    if (dsv) {
-        D3D11_DEPTH_STENCIL_VIEW_DESC vd{};
-        dsv->GetDesc(&vd);
-        flags = vd.Flags;
-        viewFmt = vd.Format;
-    }
-    if (refOut) *refOut = ref;
-    if (viewFmtOut) *viewFmtOut = viewFmt;
-    UiDsState s = uiLayerDsStateFrom(dss ? &d : nullptr, flags);
+// The layer's own read of the bound depth-stencil state: dsStateOf itself
+// is shared with the HUD layer census now (draw_state_describe.h), but the
+// once-a-session note about a stencil test against a stencil-less view
+// speaks of the layer's copy, so it stays the layer's.
+UiDsState dsStateOfNoted(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv, UINT* refOut,
+                         DXGI_FORMAT* viewFmtOut) {
+    DXGI_FORMAT localFmt = DXGI_FORMAT_UNKNOWN;
+    UiDsState s = dsStateOf(ctx, dsv, refOut, viewFmtOut ? viewFmtOut : &localFmt);
+    const DXGI_FORMAT viewFmt = viewFmtOut ? *viewFmtOut : localFmt;
     // Decided here, once per draw: a stencil test against a view with no
     // stencil plane is no test at all (review P3-6), said once.
-    s.stencilPlane = viewFmt == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ||
-                     viewFmt == DXGI_FORMAT_D24_UNORM_S8_UINT;
     static bool stencillessNoted = false;
     if (dsv && s.stencilEnable && !s.stencilPlane && !stencillessNoted) {
         stencillessNoted = true;
@@ -2091,7 +2017,7 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
         f.mrt = boundCount(rtvs) > 1 || anyUav;
         UINT ref = 0;
         DXGI_FORMAT dsFmt = DXGI_FORMAT_UNKNOWN;
-        dsState = dsStateOf(ctx, dsv, &ref, &dsFmt);
+        dsState = dsStateOfNoted(ctx, dsv, &ref, &dsFmt);
         f.ds = uiLayerDsEffect(dsState, dsv != nullptr);
         char dsWhy[160] = "";
         if (f.ds.tests()) {
@@ -2253,7 +2179,7 @@ bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForw
         ResourceInfo info;
         if (!dsvView || !bindingResolve(dsvView, &info) || info.resource != e.dsSource) continue;
         ID3D11DepthStencilView* dsv = static_cast<ID3D11DepthStencilView*>(dsvView);
-        if (uiLayerDsEffect(dsStateOf(ctx, dsv, nullptr, nullptr), true).writes()) {
+        if (uiLayerDsEffect(dsStateOfNoted(ctx, dsv, nullptr, nullptr), true).writes()) {
             e.dsSeq = 0;
             ++g_win.seedStale;
         }

@@ -2,8 +2,9 @@
 
 ## Status
 
-- **State:** DESIGN, nothing built. Written 2026-09-27 from main
-  `035986fc` for the agent who builds it. Facts are tagged MEASURED (a
+- **State:** PHASE 0 BUILT, awaiting the census flight. Written 2026-09-27
+  from main `035986fc`; built 2026-09-27 on branch `kimi/crisp-hud-census`
+  (from main `279ea289`). Facts are tagged MEASURED (a
   flight log, census, disassembly or commit in this repo, cited) or
   BELIEVED (inference). Every BELIEVED fact the code leans on has a Phase 0
   gate.
@@ -23,7 +24,9 @@
   (lines 184-191: "PARKED, not declined"), with one change. It re-issues
   the game's own tonemap draw instead of transcribing it.
 - **Decisions for Sean:** see "Decisions", before Phase 1.
-- **Next step:** the Phase 0 census, which changes no rendering.
+- **Next step:** the Phase 0 flight on the Steam install (checklist in the
+  2026-09-27 "Phase 0 built" entry at the tail): `advanced.hud_census = on`,
+  the G-A..G-E line harvest, and an F10 eye run for G-F.
 
 ## What exists
 
@@ -207,3 +210,54 @@ For Sean, before Phase 1:
 3. Scope: the three families (Phases 1-2), or the hologram families too?
 4. The memory budget: +128-200 MB per eye on a Crystal-class output.
 5. Default: off until flown on Pimax and Quest.
+
+## Phase 0 built, 2026-09-27
+
+The census is code now, on branch `kimi/crisp-hud-census` (held off main
+until the feature flies and verifies on the Steam install). Full build
+green, every gate including the new `hud_parity` self-test.
+
+- **The instrument:** `advanced.hud_census = off | on` (default off, live),
+  a new module `src/d3d11/hud_layer_census.{h,cpp}` hooked into vscreen's
+  eye-draw branch INDEPENDENTLY of `uiLayerLive()` -- the design flight has
+  `fix.ui_quality` off, and the family naming runs only with the layer
+  live. Unarmed cost is one bool per eye draw. G-A family state lines on
+  first-seen/change plus 30-second window lines with draws-per-frame; G-B
+  tonemap variant lines (structure-first recognition, exact hashes logged,
+  so an EDHM swap names itself); G-C jitter verdicts on change; G-D
+  depth-rejected shares; G-E exposure + HUD-region HDR luma at 1 Hz. All
+  lines prefixed `hud layer census:`.
+- **G-D's shape:** an occlusion-query pair per sampled family draw, the
+  game's own GEQUAL test with ALL writes masked against depth-and-stencil
+  off, both re-issued with NO colour target, full OM save/restore, queries
+  never waited on. It declines on predication, on PS UAVs, and -- a case
+  the design missed -- while ANY game query is open on the context (a
+  re-issue inside the game's own occlusion bracket would feed its counter
+  and change what it draws a frame later; tracked from the Begin/End
+  hooks).
+- **G-F is offline:** `tools/hud_parity.py` reads one F10 eye-run ledger's
+  `panels_<stamp>.bin` (EyePanelSnapshot already captures the HDR target
+  before AND after each holo draw -- F and F(1-a)+L) and `tonemap_<stamp>.bin`
+  (exposure, LUT, HDR/output crops), replays T empirically from the captured
+  HDR->output pairs, and prints p50/p99/max of the parity error in 8-bit
+  steps, with the verdict gated on the bright-translucent regime. `--self-test`
+  green and gated in build.bat.
+- **Corrections to this doc from the build:**
+  - ruled out: "the composite pass `953C8123AD8DC13B`, believed to add bloom"
+    as a cockpit anchor -- every reference in this repo names that hash the
+    FSS scanner-body composite (edvr.ini, fss_probe.h, crisp-ui-handoff.md).
+    The census anchors ordering on the tonemap draw and logs any cockpit
+    sighting of the FSS hash to settle it.
+  - The family clip rows are VS cb0 rows 4..7, not 0..3
+    (flat_projection_recipes.h); G-C reads 64 bytes at offset 64 and votes on
+    the centre terms (m02/m12), which are all the jitter moves.
+  - The tonemap VS already varies in the wild: EDHM flies vs
+    `642017A6FEDAE0E8` with the same PS (edhm-black-cockpit-2026-09-15.md).
+- **Flight checklist (Steam):** install (`python tools\install_edvr.py
+  --target steam`), set `advanced.hud_census = on`, `fix.ui_quality` off,
+  HMD Quality 0.75 with DLSS. Cockpit in space (2 min), then a station
+  with a target locked (2 min), one bright scene and one dark (G-E); press
+  the eye-dump hotkey once with panels on screen (G-F). After:
+  `python tools\edvr_log.py --target steam --expect-build HEAD`, then
+  `--grep "hud layer census:"`, and `python tools\hud_parity.py <ledger
+  dir> --verbose`.
