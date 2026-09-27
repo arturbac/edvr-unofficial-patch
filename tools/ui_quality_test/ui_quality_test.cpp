@@ -29,6 +29,12 @@
 //     1.0 under jitter and at 1.25; the write-back leaves the game's stencil
 //     as the original draw did; a coloured quad composited at 1.25 equals
 //     the box-filter model; the debug view; a cropped layer rectangle.
+//   * the after-UI take (uiLayerNoteOther's write case, ui_layer_math.h's
+//     uiLayerAfterWriteDecide): a plain overlay drawn after the UI is
+//     attempted and, routed the same way into the layer, composites over
+//     the UI, matching the game's own order; an overlay sampling an
+//     eye-sized input, or one the take path refuses (kMrt and kVerdict,
+//     the same rules as any family), is left under the UI instead.
 //
 // Exit codes: 0 pass, 1 a check failed, 2 usage. --dry-run touches nothing.
 #include <windows.h>
@@ -938,6 +944,42 @@ void testFamilyRule() {
           "anything else: none");
 }
 
+// fix.ui_quality's after-UI take (uiLayerNoteOther, vscreen.cpp): a draw
+// after the UI that WRITES an eye target the UI was taken from is taken
+// into the same layer too, after the UI, so it stays over it -- unless it
+// samples an eye-sized input (uiLayerAfterWriteDecide's own gate: case b of
+// the pixel test below) or the take itself refuses (governed by the exact
+// same uiLayerDecide rules as any other family: case d). The read case
+// (case c) never reaches either of these -- it is uiLayerNoteOther's
+// unchanged 'R' branch, identified before a family is ever assigned, so
+// there is nothing of its own to unit-test here.
+void testAfterUi() {
+    check(std::strcmp(uiLayerFamilyName(UiLayerFamily::kAfterUi), "after the UI") == 0,
+          "the after-UI family's census name");
+    check(uiLayerAfterWriteDecide(false) == UiAfterWriteDecision::kAttempt,
+          "a write with no eye-sized input is attempted (case a's precondition)");
+    check(uiLayerAfterWriteDecide(true) == UiAfterWriteDecision::kPostPass,
+          "a write that samples an eye-sized input is left as a post pass, not attempted (case b)");
+    UiLayerDrawFacts f;
+    f.family = UiLayerFamily::kAfterUi;
+    f.verdictForwards = true;
+    f.eyeTarget = true;
+    f.ldrView = true;
+    f.eye = 1;
+    f.armed = true;
+    f.blend = UiBlendShape::kPremulOver;
+    check(uiLayerDecide(f) == UiLayerDecision::kRedirect,
+          "an after-UI write, armed and blended normally, is redirected exactly like any family");
+    UiLayerDrawFacts refused = f;
+    refused.mrt = true;
+    check(uiLayerDecide(refused) == UiLayerDecision::kMrt,
+          "an after-UI write into a second bound target is refused like any family (case d)");
+    UiLayerDrawFacts notForwarded = f;
+    notForwarded.verdictForwards = false;
+    check(uiLayerDecide(notForwarded) == UiLayerDecision::kVerdict,
+          "an after-UI write another fix swallows or re-issues is refused, not taken (case d)");
+}
+
 void testDepthStencil() {
     D3D11_DEPTH_STENCIL_DESC d{};
     // The menu panel, its escape-menu variant and the loader (census
@@ -1395,6 +1437,129 @@ void testComposite(Gpu& g) {
     check(std::abs(int(mid[at]) - int(one[inside])) <= 1, "a cropped rectangle samples the layer's matching pixels");
 }
 
+// fix.ui_quality's after-UI take, at the pixel level: the game's own order
+// (a small overlay quad drawn AFTER a big UI quad, into the same target) is
+// what the composite must reproduce once the UI has moved to the layer. The
+// overlay is routed by the SAME call uiLayerNoteOther makes --
+// uiLayerAfterWriteDecide, ui_layer_math.h -- so a regression that stops it
+// returning kAttempt for a plain write fails this, not just a hand-picked
+// "before/after" pair.
+// The layer's own storage (premultiplied colour + transmittance, 8-bit UNORM)
+// rounds at a different point than one hardware blend pass straight into
+// `direct`, exactly as testComposite's own worst<=3 tolerance already
+// accounts for -- so "the same order" is judged by a small per-channel
+// tolerance, not byte equality, and "the wrong order" by a difference far
+// past it (these colours are chosen far enough apart that landing under
+// instead of over the UI misses by tens of levels, not a rounding LSB).
+int worstDiff(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    int worst = 0;
+    for (size_t i = 0; i < a.size() && i < b.size(); ++i) worst = (std::max)(worst, std::abs(int(a[i]) - int(b[i])));
+    return worst;
+}
+
+void testAfterUiOrder(Gpu& g) {
+    using namespace uiblend;
+    const uint32_t W = 16, H = 12;
+    const D3D11_VIEWPORT vp{0, 0, static_cast<float>(W), static_cast<float>(H), 0, 1};
+    const float bg[4] = {0.1f, 0.15f, 0.2f, 1.0f};
+    // "The UI": a big translucent quad, always taken (unaffected by this fix).
+    const UiBlendRt uiGameBlend = blend(true, kSrcAlpha, kInvSrcAlpha);
+    const float uiRect[4] = {-1, -1, 1, 1};
+    const float uiColour[4] = {0.8f, 0.15f, 0.15f, 0.9f};
+    // "The overlay": a smaller translucent quad the stock game draws AFTER
+    // the UI, centred so it overlaps it -- the field report's holo effect
+    // over a UI surface, modelled generically.
+    const UiBlendRt overlayGameBlend = blend(true, kSrcAlpha, kInvSrcAlpha);
+    const float overlayRect[4] = {-0.4f, -0.4f, 0.4f, 0.4f};
+    const float overlayColour[4] = {0.1f, 0.85f, 0.15f, 0.55f};
+
+    UiBlendRt uiConv, overlayConv;
+    check(uiLayerConvertBlend(uiGameBlend, &uiConv), "the UI quad's blend converts");
+    check(uiLayerConvertBlend(overlayGameBlend, &overlayConv), "the overlay quad's blend converts");
+    ComPtr<ID3D11BlendState> uiGameBs = state(g, uiGameBlend), overlayGameBs = state(g, overlayGameBlend);
+    ComPtr<ID3D11BlendState> uiLayerBs = state(g, uiConv), overlayLayerBs = state(g, overlayConv);
+
+    // The stock reference: both quads drawn directly into one target, in the
+    // game's own order -- the overlay ends up over the UI.
+    Tex direct = makeTex(g, W, H, false);
+    g.ctx->ClearRenderTargetView(direct.rtv.Get(), bg);
+    quad(g, direct, uiRect, uiColour, 0, 0, vp, uiGameBs.Get());
+    quad(g, direct, overlayRect, overlayColour, 0, 0, vp, overlayGameBs.Get());
+    const std::vector<uint8_t> want = readBack(g, direct);
+
+    const uint32_t region[4] = {0, 0, W, H};
+    const float uvFull[4] = {0, 0, 1, 1};
+
+    // Case (a): a plain overlay -- no eye-sized input, nothing refuses it.
+    // Taken into the layer, after the UI: the composite must match "want".
+    {
+        Tex frame = makeTex(g, W, H, false), layer = makeTex(g, W, H, false), out = makeTex(g, W, H, true);
+        g.ctx->ClearRenderTargetView(frame.rtv.Get(), bg);
+        g.ctx->ClearRenderTargetView(layer.rtv.Get(), kUiLayerClear);
+        quad(g, layer, uiRect, uiColour, 0, 0, vp, uiLayerBs.Get());
+        const bool taken = uiLayerAfterWriteDecide(/*eyeSizedInput=*/false) == UiAfterWriteDecision::kAttempt;
+        check(taken, "case (a): a plain overlay write is attempted");
+        // The take path's OWN issue is uiLayerBegin/End around the game's
+        // draw, at the layer's target -- modelled here the same way every
+        // other decided draw in this file is (quad into `layer`, converted
+        // blend), since that machinery is proved elsewhere (testRedirect,
+        // testComposite). What this proves is which target it lands in.
+        if (taken) quad(g, layer, overlayRect, overlayColour, 0, 0, vp, overlayLayerBs.Get());
+        composite(g, frame, region, uvFull, layer, out, 0);
+        const std::vector<uint8_t> got = readBack(g, out);
+        // THE assertion that fails if the fix is reverted (uiLayerAfterWriteDecide
+        // always kPostPass, or nothing ever routes the overlay into `layer`):
+        // without the take, this falls to the frame branch below instead, and
+        // matches "want" only by the same coincidence case (b) is about to rule out.
+        check(worstDiff(got, want) <= 3,
+              "case (a): a plain overlay after the UI is taken into the layer and composites over it");
+    }
+    // Case (b): the overlay samples an eye-sized input (a post pass over the
+    // frame, or a copy of it) -- left in the frame, under the UI.
+    {
+        Tex frame = makeTex(g, W, H, false), layer = makeTex(g, W, H, false), out = makeTex(g, W, H, true);
+        g.ctx->ClearRenderTargetView(frame.rtv.Get(), bg);
+        g.ctx->ClearRenderTargetView(layer.rtv.Get(), kUiLayerClear);
+        quad(g, layer, uiRect, uiColour, 0, 0, vp, uiLayerBs.Get());
+        const bool taken = uiLayerAfterWriteDecide(/*eyeSizedInput=*/true) == UiAfterWriteDecision::kAttempt;
+        check(!taken, "case (b): an overlay sampling an eye-sized input is left as a post pass");
+        quad(g, frame, overlayRect, overlayColour, 0, 0, vp, overlayGameBs.Get());
+        composite(g, frame, region, uvFull, layer, out, 0);
+        const std::vector<uint8_t> got = readBack(g, out);
+        check(worstDiff(got, want) > 3,
+              "case (b): a post pass stays under the UI -- the composite reproduces the bug, proving "
+              "the comparison above has teeth");
+    }
+    // Case (d): the take path itself refuses a plain write at decide time
+    // (here: a second render target bound, uiLayerDecide's kMrt -- the same
+    // rule as testAfterUi's pure check). Left in the frame, exactly as (b).
+    {
+        Tex frame = makeTex(g, W, H, false), layer = makeTex(g, W, H, false), out = makeTex(g, W, H, true);
+        g.ctx->ClearRenderTargetView(frame.rtv.Get(), bg);
+        g.ctx->ClearRenderTargetView(layer.rtv.Get(), kUiLayerClear);
+        quad(g, layer, uiRect, uiColour, 0, 0, vp, uiLayerBs.Get());
+        UiLayerDrawFacts f;
+        f.family = UiLayerFamily::kAfterUi;
+        f.verdictForwards = true;
+        f.eyeTarget = true;
+        f.ldrView = true;
+        f.eye = 0;
+        f.armed = true;
+        f.blend = UiBlendShape::kPremulOver;
+        f.mrt = true;
+        const bool taken = uiLayerAfterWriteDecide(/*eyeSizedInput=*/false) == UiAfterWriteDecision::kAttempt &&
+                           uiLayerDecide(f) == UiLayerDecision::kRedirect;
+        check(!taken, "case (d): a write the take path refuses (a second bound target) is not taken");
+        quad(g, frame, overlayRect, overlayColour, 0, 0, vp, overlayGameBs.Get());
+        composite(g, frame, region, uvFull, layer, out, 0);
+        const std::vector<uint8_t> got = readBack(g, out);
+        check(worstDiff(got, want) > 3, "case (d): a refused take stays under the UI, same as a post pass");
+    }
+    // Case (c), the read exclusion, draws nothing and so has no pixel of its
+    // own to check here; it is uiLayerNoteOther's unchanged 'R' branch
+    // (testAfterUi's comment says why it has no unit test either).
+}
+
 // A render-size change with the layer engaged (the 13:23 flight: the FOV
 // trim adopted at the main menu took the door from 3070x3032 to 2458x2824 and
 // the game's eye from 1995x1970 to 1597x1835). The old layer no longer
@@ -1803,6 +1968,7 @@ int main(int argc, char** argv) {
     testFootprint();
     testGate();
     testFamilyRule();
+    testAfterUi();
     testChains();
     testPanelScale();
     Gpu g;
@@ -1812,6 +1978,7 @@ int main(int argc, char** argv) {
         testRedirect(g, 1.0f);
         testRedirect(g, 1.25f);
         testComposite(g);
+        testAfterUiOrder(g);
         testDownsample(g);
         testSeededStencil(g);
         testWriteBack(g);

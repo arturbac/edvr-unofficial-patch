@@ -3844,9 +3844,17 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
             uiLayerNoteFamilyProbe(vs, 0, 0, static_cast<int>(UiFamilyWhy::kNotEyeTarget));
         }
     }
-    // The one order the layer changes: a draw after the UI into (or reading)
-    // an eye target the UI was taken from now lands under it. Counted, named.
-    if (!uiLayer && owner && uiLayerWatching()) uiLayerNoteOther(self, count);
+    // After the UI: a draw that WRITES an eye target the UI was already
+    // taken from this frame is taken into the same eye's layer too, after
+    // the UI, so it stays over it -- unless it is a post pass (an eye-sized
+    // input) or the take path refuses it at issue, either of which leaves it
+    // in the game's frame as before. A draw that only READS the target is
+    // never taken (unchanged). verdictForwards/substituted are the same
+    // facts the family branch above passes uiLayerDecide, so an after-UI
+    // write is governed by the identical rules a real UI draw would be.
+    // Counted, named either way.
+    if (!uiLayer && owner && uiLayerWatching())
+        uiLayer = uiLayerNoteOther(self, count, uiLayerVerdictForwards(v), g_state->curveThisDraw);
     // The sub-draw probe, which also SWALLOWS the game's draw -- it re-issues
     // the surviving index ranges itself. Before the curve substitution
     // because both swallow, and two swallows would draw the quads twice.
