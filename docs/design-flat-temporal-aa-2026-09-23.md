@@ -77,7 +77,11 @@
   Section 74 (2026-09-27): the gate-2 review's final-pass pair closed
   without a flight -- the negotiated E keys the resolve's resource cache
   and the preflight carries it; buffer-pressure retirement loops until a
-  shared buffer unpins, bounded by the plan bank.
+  shared buffer unpins, bounded by the plan bank. Section 75 (2026-09-27):
+  the 0.5x canopy flicker traced to success-status Present results
+  resetting temporal history every frame; the history and phase gates now
+  use FAILED(hr)/SUCCEEDED(hr) with the value logged, awaiting the
+  confirming flight.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -4376,3 +4380,32 @@ four-binding plans, each buffer in exactly two, the second reference on
 distinct slots so each plan is its own topology) and the 65th buffer
 tracks only after the loop retires both plans pinning a shared buffer.
 Corpus replay unchanged: 6/6 frames identical.
+
+## 75. The 0.5x flicker: success-status presents reset history every frame (2026-09-27)
+
+Sean's 0.5x report: the red canopy structure flickered between
+stair-stepped and smooth on both upscalers, fine at 0.65x. His 12:33 A/B
+bracketing an F8 cycle proved the treated path healthy -- EDVR DLSS at
+0.5x smooth through a 1300-frame streak while stock 0.5x stair-stepped,
+which is inherent to 1080p input. The 12:12 FSR flight's log held the
+real defect: a 13-second episode where EVERY frame accepted a reset with
+adapter reason no-previous (450/5s), history never accumulating, jitter
+pinned at (0,0) as treated-zero-jitter, while refused froze and treated
+kept counting. Mechanism: a treated frame always sets the adapter's
+previous at frame end, so only reset() between frames produces
+every-frame no-previous; refuse() is excluded (its counter froze); and
+the jitter collapse names the survivor -- phase.finish received
+hr != S_OK every frame, pinning previousAcceptedValid false and the
+phase at zero. flatRuntimePresent gated the history reset and the phase
+finish on hr != S_OK, so any success-status Present (DXGI occlusion and
+friends, or a chained mod's status) reset temporal history every frame
+for as long as the status persisted.
+SHIPPED 2026-09-27: both gates now use FAILED(hr)/SUCCEEDED(hr) --
+success statuses no longer reset history or stall the phase -- and the
+present value is logged (8/session, present-not-ok= in the 5s adapter
+line) so the next flight names the exact status. CONFIRMING FLIGHT
+REQUIRED: hit the condition (overlay/alt-tab/whatever produces it) and
+verify present-not-ok names the value with NO no-previous storm through
+it. The stair-stepped 0.5x look WITHOUT a storm is inherent (stock shows
+it too); FSR's resolve of the canopy at 0.5x during healthy accumulation
+is not yet separately qualified.
