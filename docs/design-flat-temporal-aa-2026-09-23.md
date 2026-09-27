@@ -54,7 +54,12 @@
   stamp/mask/re-issue machinery removed, census and named classifier reasons
   kept. INSTALLED on Epic, NOT FLOWN. The review's staged program
   (three-size routing, FrameContract reducer, cache retirement, family
-  contracts, composition tests) is recorded, not started.
+  contracts, composition tests) is recorded, not started. Section 69
+  (2026-09-26): the section-68 flight FLOWN -- menu and flight treat
+  continuously (streak 3349, DLSS), zero unknown-pair captures (the
+  section-65 recipes hold), one one-frame observation episode on a reciped
+  pair. The surviving conflicting-hdr is qualified as transition-scoped
+  video/bloom content, not an HDR alias; no relaxation needed.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -4094,3 +4099,27 @@ menu and flight; expect treated streaks, `observing=` transitions with
 locally-refused pairs named instead of a reset storm when coverage is
 incomplete, and no conflicting-hdr at launch or menu-to-flight (a storm
 that survives section 66's slot fix is a genuine alias; qualify it then).
+
+## 69. Section-68 flight: observation holds, transition refusals are benign (2026-09-26)
+
+The 18:19 Epic flight (`edvr_gfx_20260926_181905.log`, clean
+`rc.2-24-gda9e2c8e`, EDHM chained, DLSS requested): menu and flight both
+treat continuously -- treated-streak 3349 with accepted-history ~450/5s in
+steady flight. Zero unknown-pair captures all session: the section-65
+recipes hold. The one observation episode is textbook section-68: frame
+44683 refuses `projection-preparation-refused` on the RECIPED
+5453D19B/289C3EA6 (a transient during the transition), returns to
+observation, and requalifies one frame later -- calm, no storm churn.
+
+The conflicting-hdr storm survives the section-66 slot fix, so per the
+flight plan it needed qualification. Every surviving writer is
+transition-scoped: the 1920x1080 chain's 129F/8826 and the copy-variant
+20F3/BF23 (`missing-depth-or-dsv`, BF23's blob still uncaptured), and the
+transition's video pass at 2496x1404 fmt 9: `image-copy-source` names the
+KNOWN HDR copy CFA9/`DFCBA0EC70B03C9B` (kHdrCopyPs; its blob: t0 copy at
+unchanged UV plus a luma tap) writing the resource the FCFA image filter
+(kImageFilterPs) first wrote. Not an alias of the true HDR -- transition
+content at a different extent, where refusing accumulation is correct.
+Qualification recorded; no alias relaxation needed. The
+2496x1404/video-extent provenance can join the family contracts when the
+review's staged program reaches them.
