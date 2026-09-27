@@ -13,9 +13,13 @@
   surfaces) into a per-eye layer at the door's output size x target and
   composites it after RCAS; and makes the cockpit's interface surfaces at
   the target's size. The cockpit's HDR families (holo panels, flight HUD,
-  sprite) are LEFT by the layer: the first censuses below (G1) put them
-  before the tonemap, and the deferred UI replay (`ui_deferred.cpp`,
-  `advanced.ui_replay`) re-draws them after the upscale at 1.0.
+  sprite) are LEFT by the layer, because the first censuses below (G1) put
+  them before the tonemap. They stay in the upscaled picture: the deferred
+  UI replay that was to re-draw them after the upscale was RETIRED
+  2026-09-23 (48ad7689), having captured nothing on any flown rig. Taking
+  them out is designed, not built, in
+  [cockpit-hud-layer-design-2026-09-27.md](cockpit-hud-layer-design-2026-09-27.md):
+  the parked form of Design A, with the game's own tonemap re-issued.
 - **Design B0 (the interface depth, `ui_depth.cpp`; once `fix.ui_depth`, now
   gated on `fix.temporal_aa` alone): SHIPPED**; its depth re-issue and
   reactive mask still serve every UI draw the layer does not take, and skip
