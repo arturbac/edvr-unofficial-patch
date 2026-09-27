@@ -162,12 +162,10 @@ struct State {
     // --- Frame-contract trace (staged-program gate 1) -------------------------
     // The reducer's input events, always recorded into a bounded ring and
     // dumped on the F10 audit arm; the replay rig runs the same reducer over
-    // the trace and compares contract hashes. The contract itself is produced
-    // at the copy draw; its hash seals the frame's slot at the next present.
+    // the trace and compares contract hashes. The contract accumulates every
+    // copy draw's outcome through the frame and is hashed at seal time.
     FlatTraceRing traceRing{};
     FlatFrameContract traceContract{};
-    uint64_t traceContractHash = 0;
-    bool traceContractProduced = false;
 
     // --- Partial temporal AA: coverage census (Part B), reset every 5s --------
     uint64_t covSceneDraws = 0, covExact = 0, covGeneric = 0, covInert = 0, covUnchanged = 0;
@@ -1151,16 +1149,31 @@ void flatTraceDumpToLogDir(State& s, uint64_t frame) {
         Log::get().note("flat trace dump: cannot write %ls (error %lu)", path, GetLastError());
         return;
     }
-    uint32_t frames = 0, events = 0;
+    // Emitted versus withheld counts are reported separately: the serializer
+    // skips the in-flight, empty and truncated slots, and a busy frame that
+    // dropped out must not read as captured evidence.
+    uint32_t emittedFrames = 0, emittedEvents = 0, skipped = 0;
+    for (uint32_t i = 0; i < kFlatTraceFrames; ++i) {
+        if (!s.traceRing.slotUsed[i]) continue;
+        if (i == s.traceRing.slot || s.traceRing.headers[i].truncated || !s.traceRing.headers[i].eventCount)
+            ++skipped;
+        else { ++emittedFrames; emittedEvents += s.traceRing.headers[i].eventCount; }
+    }
+    uint32_t expected = sizeof(FlatTraceHeader);
+    for (uint32_t i = 0; i < kFlatTraceFrames; ++i)
+        if (s.traceRing.slotUsed[i] && i != s.traceRing.slot && !s.traceRing.headers[i].truncated &&
+            s.traceRing.headers[i].eventCount)
+            expected += sizeof(FlatTraceFrameHeader) + s.traceRing.headers[i].eventCount * sizeof(FlatTraceEvent);
+    bool shortWrite = false;
     const uint32_t bytes = flatTraceDump(s.traceRing, [&](const void* data, uint32_t bytes) {
         DWORD wrote = 0; WriteFile(f, data, bytes, &wrote, nullptr);
+        if (wrote != bytes) shortWrite = true;
         return wrote;
     });
     CloseHandle(f);
-    for (uint32_t i = 0; i < kFlatTraceFrames; ++i)
-        if (s.traceRing.slotUsed[i]) { ++frames; events += s.traceRing.headers[i].eventCount; }
-    Log::get().note("flat trace dump: %ls frames=%u events=%u bytes=%u (truncated slots skipped)",
-        path, frames, events, bytes);
+    Log::get().note("flat trace dump: %ls frames=%u events=%u bytes=%u skipped-slots=%u%s",
+        path, emittedFrames, emittedEvents, bytes, skipped,
+        shortWrite || bytes != expected ? " SHORT WRITE -- capture unusable" : "");
 }
 void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT flags) {
     if (!runtimeFlatProfile() || !swap || (flags & DXGI_PRESENT_TEST)) return;
@@ -1325,10 +1338,11 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     if(!wanted && !s.projectionFrames) {s.projection.reset();s.projectionContext.Reset();}
     for (auto& r : s.colors) r.Reset(); for (auto& r : s.depths) r.Reset();
     s.prefix = FlatRuntimePrefix{}; s.prefix.frame = frame + 1;
-    // Trace ring: seal the frame that just ended with its produced contract's
-    // hash, then open the next frame's slot.
-    flatTraceSeal(s.traceRing, s.traceContractProduced, s.traceContractHash);
-    s.traceContractProduced = false; s.traceContractHash = 0;
+    // Trace ring: seal the frame that just ended with the hash over every
+    // copy outcome it produced, then reset the contract for the next frame.
+    flatTraceSeal(s.traceRing, s.traceContract.produced,
+                  s.traceContract.produced ? flatFrameContractHash(s.traceContract) : 0);
+    s.traceContract = FlatFrameContract{};
     flatTraceBeginFrame(s.traceRing, frame + 1, output.Get(), d.Width, d.Height, d.Format);
     s.phaseCensusPending=s.jitterWanted;
     s.phaseCensusFailed=false;
@@ -1531,10 +1545,6 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         ? flatRuntimeObserveContract(s.prefix, d, s.traceContract)
         : flatRuntimeObserve(s.prefix, d);
     flatTraceRecord(s.traceRing, d, foreignWork.load(std::memory_order_acquire));
-    if (copy) {
-        s.traceContractProduced = s.traceContract.produced;
-        s.traceContractHash = s.traceContract.produced ? flatFrameContractHash(s.traceContract) : 0;
-    }
     if(cameraProbeAttempt)for(uint32_t i=0;i<s.prefix.targetsUsed;++i)if(s.prefix.targets[i].resource==k.color){
         const auto& witness=s.prefix.targets[i].firstBad;
         Log::get().note("flat camera probe observer: attempt=%u frame=%llu draw-seq=%u first-bad=%s first-bad-seq=%u caused-first-camera-conflict=%u",

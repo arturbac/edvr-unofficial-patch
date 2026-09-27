@@ -1,0 +1,12 @@
+# Frame-contract trace corpus manifest: one "file frames scenario" per line.
+# The rig fails the build on a missing/unreadable entry, an empty corpus, a
+# frame-count mismatch, or any replay hash mismatch. Adding a file never
+# replaces a required scenario.
+#
+# Provenance: Epic install 2026-09-26 21:15 UTC session, build
+# v0.18.0-rc.2-32-g8fe74296 (trace format EDVRFTR2), EDHM chained, DLSS
+# requested, game supersampling 0.65 (R=2496x1404, D=3840x2160), tone route
+# EDHM grade (ps EAA5F18F10533BD1). Hashes regenerated to hash schema v3 by
+# `flat_temporal_test --trace-migrate` (same events, unchanged selector).
+flat_trace_10806.bin 3 edhm-menu-ss065-dlss
+flat_trace_16271.bin 3 edhm-flight-ss065-dlss

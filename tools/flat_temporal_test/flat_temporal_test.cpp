@@ -26,6 +26,8 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
+#include <sstream>
 #include <vector>
 
 namespace {
@@ -1298,7 +1300,7 @@ void testFrameContractTrace() {
         // The present boundary: seal happened above; the next frame opens a
         // new slot, and the dump skips the in-flight (current) slot.
         flatTraceBeginFrame(*ring, prefix->frame + 1, prefix->output, prefix->width, prefix->height, prefix->format);
-        check(contract->produced && contract->selection.selected(),
+        check(contract->produced && contract->copiesUsed == 1 && contract->copies[0].selected(),
               "trace online run produces a selected frame contract");
         const uint64_t wantHash = flatFrameContractHash(*contract);
         std::vector<unsigned char> bytes;
@@ -1341,27 +1343,53 @@ void testFrameContractTrace() {
               "trace round-trip replays to an identical frame contract");
     }
     // Committed corpus: every trace replays to its recorded contract hashes.
+    // The gate must not silently pass: a missing corpus, an unreadable entry,
+    // an empty directory or a manifest mismatch all fail the build.
     namespace fs = std::filesystem;
     const fs::path dir("tools/flat_temporal_test/traces");
-    if (!fs::exists(dir)) {
-        std::puts("NOTE: frame-contract trace corpus absent; captures arrive with flights");
+    const fs::path manifestPath = dir / "manifest.txt";
+    if (!fs::exists(dir) || !fs::exists(manifestPath)) {
+        check(false, "trace corpus or its manifest is missing");
         return;
     }
+    // The manifest pins the required scenarios: one "file frames scenario"
+    // per line, '#' for comments. Adding a file never replaces a required one.
+    std::map<std::string, uint32_t> required;
+    {
+        std::ifstream mf(manifestPath);
+        std::string line;
+        while (std::getline(mf, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream iss(line);
+            std::string name, scenario;
+            uint32_t frames = 0;
+            if (!(iss >> name >> frames >> scenario) || !frames) {
+                check(false, "trace corpus manifest line malformed");
+                continue;
+            }
+            required[name] = frames;
+        }
+    }
+    check(!required.empty(), "trace corpus manifest names no traces");
     uint32_t files = 0, framesMatched = 0, framesTotal = 0;
     for (const auto& entry : fs::directory_iterator(dir)) {
         if (entry.path().extension() != ".bin") continue;
         std::ifstream file(entry.path(), std::ios::binary | std::ios::ate);
-        if (!file) continue;
+        if (!file) { check(false, "trace corpus entry unreadable"); continue; }
         std::vector<unsigned char> bytes(static_cast<size_t>(file.tellg()));
         file.seekg(0); file.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
-        if (!file) { check(false, "trace corpus file unreadable"); continue; }
+        if (!file) { check(false, "trace corpus entry unreadable"); continue; }
         ++files;
+        const std::string name = entry.path().filename().string();
+        auto wanted = required.find(name);
+        check(wanted != required.end(), "trace corpus file is not in the manifest");
         FlatRuntimePrefix replay{};
         FlatFrameContract rc{};
         FlatTraceFrameHeader cur{};
+        uint32_t fileFrames = 0;
         auto finish = [&]() {
             if (!cur.eventCount) return;
-            ++framesTotal;
+            ++framesTotal; ++fileFrames;
             if (rc.produced == (cur.produced != 0) &&
                 (!rc.produced || flatFrameContractHash(rc) == cur.contractHash)) ++framesMatched;
         };
@@ -1385,14 +1413,110 @@ void testFrameContractTrace() {
             });
         finish();
         check(parsed, "trace corpus file parses");
+        if (wanted != required.end()) {
+            check(wanted->second == fileFrames, "trace corpus frame count matches the manifest");
+            required.erase(wanted);
+        }
     }
-    check(framesMatched == framesTotal, "trace corpus replays to the recorded frame contracts");
-    if (files) std::printf("frame-contract corpus: %u file(s), %u/%u frames replay identical\n",
-                           files, framesMatched, framesTotal);
+    check(required.empty(), "manifest scenario missing from the corpus");
+    check(files && framesTotal && framesMatched == framesTotal,
+          "trace corpus replays to the recorded frame contracts");
+    std::printf("frame-contract corpus: %u file(s), %u/%u frames replay identical\n",
+                files, framesMatched, framesTotal);
 }
+
+// reviews/flat-temporal-main-review-2026-09-26.md, G1-1: run one MonoFixture
+// stream through the reducer's contract wrapper with optional mutations.
+static std::unique_ptr<edvr::FlatFrameContract> runContractStream(uint32_t width, bool dropTone,
+        bool dropCopy, bool uncertainBeforeCopy, bool duplicateCopy) {
+    using namespace edvr;
+    MonoFixture fixture(width);
+    auto prefix = std::make_unique<FlatRuntimePrefix>();
+    prefix->frame = fixture.input.frame; prefix->output = fixture.input.output;
+    prefix->width = 1280; prefix->height = 720; prefix->format = 28;
+    struct Event { const FlatContractRecord* r; uint32_t q; } events[200]{};
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < fixture.input.worldCount; ++i) {
+        const auto& r = fixture.world[i];
+        for (uint32_t n = 0; n < r.draws; ++n) events[count++] = {&r, r.first + (r.last-r.first)*n/(r.draws>1?r.draws-1:1)};
+    }
+    if (!dropTone) events[count++] = {&fixture.handoff[0], fixture.handoff[0].first};
+    if (!dropCopy) events[count++] = {&fixture.handoff[1], fixture.handoff[1].first};
+    std::sort(events, events + count, [](const Event& a, const Event& b) { return a.q < b.q; });
+    auto contract = std::make_unique<FlatFrameContract>();
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& r = *events[i].r;
+        FlatRuntimeDraw d{}; d.key = r.key;
+        std::memcpy(d.camera, r.camera, sizeof(d.camera));
+        d.key.writeEpoch = prefix->frame; d.key.writeSeq = prefix->sequence + 1;
+        d.supported = engine_velocity_family::supportedPair(d.key.vs, d.key.ps);
+        d.instances = r.firstInstances;
+        const bool isCopy = d.key.vs == flat_mono_detail::kCopyVs &&
+            d.key.ps == flat_mono_detail::kCopyPs && d.key.color == prefix->output;
+        if (!isCopy) { flatRuntimeObserve(*prefix, d); continue; }
+        if (uncertainBeforeCopy) prefix->uncertain = true;
+        flatRuntimeObserveContract(*prefix, d, *contract);
+        if (duplicateCopy) flatRuntimeObserveContract(*prefix, d, *contract);
+    }
+    return contract;
+}
+
+void testFrameContractOutcomes() {
+    using namespace edvr;
+    // G1-1: every copy outcome is recorded and hashed, including the early
+    // refusals that assemble no fixture records.
+    const auto baseline = runContractStream(960, false, false, false, false);
+    check(baseline->produced && baseline->copiesUsed == 1 &&
+          baseline->copies[0].selected() && baseline->recordCount != 0 &&
+          flatFrameContractHash(*baseline) != 0,
+          "a selected copy produces a hashed contract");
+    const auto noTone = runContractStream(960, true, false, false, false);
+    check(noTone->produced && noTone->copiesUsed == 1 &&
+          noTone->copies[0].reason == FlatMonoReason::NoTonePass &&
+          noTone->recordCount == 0 && flatFrameContractHash(*noTone) != 0 &&
+          flatFrameContractHash(*noTone) != flatFrameContractHash(*baseline),
+          "a missing tone pass records and hashes its refusal");
+    const auto uncertain = runContractStream(960, false, false, true, false);
+    check(uncertain->copiesUsed == 1 &&
+          uncertain->copies[0].reason == FlatMonoReason::Truncated &&
+          flatFrameContractHash(*uncertain) != flatFrameContractHash(*baseline),
+          "uncertain input records and hashes its refusal");
+    const auto duplicate = runContractStream(960, false, false, false, true);
+    check(duplicate->produced && duplicate->copiesUsed == 2 &&
+          duplicate->copies[0].selected() &&
+          duplicate->copies[1].reason == FlatMonoReason::Truncated &&
+          duplicate->recordCount != 0 &&
+          flatFrameContractHash(*duplicate) != flatFrameContractHash(*baseline),
+          "a duplicate copy keeps the first outcome's records and hashes both");
+    const auto noCopy = runContractStream(960, false, true, false, false);
+    check(!noCopy->produced && !noCopy->copiesUsed,
+          "a frame without a copy produces no contract");
+}
+
+void testFrameContractHashCoverage() {
+    using namespace edvr;
+    // G1-2: the hash covers the full semantic selection and fixture fields.
+    const auto base = runContractStream(960, false, false, false, false);
+    const uint64_t want = flatFrameContractHash(*base);
+    auto mutated = *base;
+    mutated.copies[0].camera[0][0] += 1.0f;
+    check(flatFrameContractHash(mutated) != want,
+          "a selected camera row mutation changes the hash");
+    mutated = *base; mutated.copies[0].outputWidth ^= 1;
+    check(flatFrameContractHash(mutated) != want,
+          "a selected output extent mutation changes the hash");
+    mutated = *base; mutated.records[0].firstInstances ^= 1;
+    check(flatFrameContractHash(mutated) != want,
+          "an aggregate instance-count mutation changes the hash");
+    mutated = *base; mutated.copies[0].reason = FlatMonoReason::Truncated;
+    check(flatFrameContractHash(mutated) != want,
+          "a selection outcome mutation changes the hash");
+}
+
 
 // Diagnostic: replay one trace file frame by frame, printing the stored and
 // replayed contract hashes and the replayed selection's shape per frame.
+// Nonzero exit on any mismatch: the diagnostic must not read green on red.
 int flatTraceCheck(const char* path) {
     using namespace edvr;
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -1402,14 +1526,17 @@ int flatTraceCheck(const char* path) {
     FlatRuntimePrefix replay{};
     FlatFrameContract rc{};
     FlatTraceFrameHeader cur{};
-    uint32_t draws = 0, markers = 0;
+    uint32_t draws = 0, markers = 0, mismatches = 0;
     auto finish = [&]() {
         if (!cur.eventCount) return;
-        std::printf("frame %llu: events=%u draws=%u markers=%u produced(stored=%u replay=%u) hash(stored=%016llx replay=%016llx) reason=%s records=%u\n",
+        const uint64_t got = rc.produced ? flatFrameContractHash(rc) : 0;
+        const bool match = rc.produced == (cur.produced != 0) && (!rc.produced || got == cur.contractHash);
+        if (!match) ++mismatches;
+        std::printf("frame %llu: events=%u draws=%u markers=%u produced(stored=%u replay=%u) hash(stored=%016llx replay=%016llx) reason=%s records=%u%s\n",
             (unsigned long long)cur.frame, cur.eventCount, draws, markers, cur.produced, rc.produced ? 1u : 0u,
-            (unsigned long long)cur.contractHash,
-            (unsigned long long)(rc.produced ? flatFrameContractHash(rc) : 0),
-            flatMonoReasonName(rc.selection.reason), rc.recordCount);
+            (unsigned long long)cur.contractHash, (unsigned long long)got,
+            flatMonoReasonName(rc.copiesUsed ? rc.copies[0].reason : FlatMonoReason::InvalidInput),
+            rc.recordCount, match ? "" : "  MISMATCH");
         cur = FlatTraceFrameHeader{};
     };
     const bool parsed = flatTraceParse(bytes.data(), bytes.size(),
@@ -1433,6 +1560,7 @@ int flatTraceCheck(const char* path) {
         });
     finish();
     if (!parsed) { std::printf("malformed trace %s\n", path); return 2; }
+    if (mismatches) { std::printf("%u mismatched frame(s)\n", mismatches); return 1; }
     return 0;
 }
 
@@ -1468,13 +1596,82 @@ void testFlatResolveRoute() {
           "a zero on any axis refuses the route");
 }
 
+// Expectation regeneration (the review's path: same saved events, unchanged
+// selector, no new flight): replay every trace in a directory with the
+// current reducer and hash schema, rewriting each frame header's stored
+// contract hash in place.
+int flatTraceMigrate(const char* dirPath) {
+    using namespace edvr;
+    namespace fs = std::filesystem;
+    uint32_t files = 0, failed = 0;
+    for (const auto& entry : fs::directory_iterator(dirPath)) {
+        if (entry.path().extension() != ".bin") continue;
+        std::ifstream file(entry.path(), std::ios::binary | std::ios::ate);
+        if (!file) { std::printf("migrate: cannot read %s\n", entry.path().string().c_str()); ++failed; continue; }
+        std::vector<unsigned char> bytes(static_cast<size_t>(file.tellg()));
+        file.seekg(0); file.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (!file || bytes.size() < sizeof(FlatTraceHeader)) { ++failed; continue; }
+        FlatTraceHeader header{};
+        std::memcpy(&header, bytes.data(), sizeof(header));
+        // Input may be EDVRFTR2 (same event layout, old hash schema); the
+        // output is always EDVRFTR3 with the current schema's hashes.
+        if (std::memcmp(header.magic, "EDVRFTR3", 8) != 0 &&
+            std::memcmp(header.magic, "EDVRFTR2", 8) != 0) {
+            std::printf("migrate: %s is not EDVRFTR2/3\n", entry.path().string().c_str()); ++failed; continue;
+        }
+        size_t at = sizeof(FlatTraceHeader);
+        bool ok = true;
+        for (uint32_t f = 0; f < header.frameCount && ok; ++f) {
+            if (bytes.size() - at < sizeof(FlatTraceFrameHeader)) { ok = false; break; }
+            const size_t headerAt = at;
+            FlatTraceFrameHeader fh{};
+            std::memcpy(&fh, bytes.data() + at, sizeof(fh));
+            at += sizeof(fh);
+            if (!fh.eventCount || fh.eventCount > kFlatTraceEventsPerFrame ||
+                bytes.size() - at < fh.eventCount * sizeof(FlatTraceEvent)) { ok = false; break; }
+            FlatRuntimePrefix replay{};
+            replay.frame = fh.frame; replay.output = fh.output;
+            replay.width = fh.width; replay.height = fh.height; replay.format = fh.format;
+            FlatFrameContract rc{};
+            for (uint32_t i = 0; i < fh.eventCount; ++i) {
+                FlatTraceEvent e{};
+                std::memcpy(&e, bytes.data() + at, sizeof(e)); at += sizeof(e);
+                if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); continue; }
+                if (e.kind == kFlatTraceEventDispatchWritten) { flatRuntimeDispatchObserveWritten(replay, e.key.color); continue; }
+                if (e.kind == kFlatTraceEventMarkUncertain) { replay.uncertain = true; continue; }
+                if (e.kind == kFlatTraceEventCameraCapture) { ++replay.sequence; continue; }
+                FlatRuntimeDraw d = flatTraceEventToDraw(e);
+                if (e.flags & kFlatTraceForeignWork) replay.uncertain = true;
+                const bool copy = d.key.vs == flat_mono_detail::kCopyVs &&
+                    d.key.ps == flat_mono_detail::kCopyPs && d.key.color == replay.output;
+                if (copy) flatRuntimeObserveContract(replay, d, rc); else flatRuntimeObserve(replay, d);
+            }
+            fh.produced = rc.produced ? 1u : 0u;
+            fh.contractHash = rc.produced ? flatFrameContractHash(rc) : 0;
+            std::memcpy(bytes.data() + headerAt, &fh, sizeof(fh));
+        }
+        if (!ok || at != bytes.size()) { std::printf("migrate: %s malformed\n", entry.path().string().c_str()); ++failed; continue; }
+        header.magic[7] = '3';
+        std::memcpy(bytes.data(), &header, sizeof(header));
+        std::ofstream out(entry.path(), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (!out) { std::printf("migrate: cannot write %s\n", entry.path().string().c_str()); ++failed; continue; }
+        std::printf("migrate: %s rehashed (%u frames)\n", entry.path().string().c_str(), header.frameCount);
+        ++files;
+    }
+    if (!files && !failed) { std::printf("migrate: no traces in %s\n", dirPath); return 2; }
+    return failed ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
         return flatShaderClassifierSweep(argv[2]);
     if (argc == 3 && std::strcmp(argv[1], "--trace-check") == 0)
         return flatTraceCheck(argv[2]);
+    if (argc == 3 && std::strcmp(argv[1], "--trace-migrate") == 0)
+        return flatTraceMigrate(argv[2]);
     if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) {
-        std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir>");
+        std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir> | --trace-check <file> | --trace-migrate <dir>");
         return 2;
     }
     failures += flatProjectionViewportTests();
@@ -1504,6 +1701,8 @@ int main(int argc, char** argv) {
     flatRuntimeImageCopyTests();
     flatRuntimeMenuCopyTests();
     testFrameContractTrace();
+    testFrameContractOutcomes();
+    testFrameContractHashCoverage();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

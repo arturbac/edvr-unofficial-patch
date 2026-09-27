@@ -78,7 +78,7 @@ inline FlatRuntimeDraw flatTraceEventToDraw(const FlatTraceEvent& e) {
 }
 
 struct FlatTraceHeader {
-    char magic[8] = {'E','D','V','R','F','T','R','2'};
+    char magic[8] = {'E','D','V','R','F','T','R','3'};
     uint32_t frameCount = 0;
     uint32_t reserved = 0;
 };
@@ -162,7 +162,7 @@ inline bool flatTraceParse(const unsigned char* data, size_t size,
     if (!data || size < sizeof(FlatTraceHeader)) return false;
     FlatTraceHeader header{};
     std::memcpy(&header, data, sizeof(header));
-    if (std::memcmp(header.magic, "EDVRFTR2", 8) != 0) return false;
+    if (std::memcmp(header.magic, "EDVRFTR3", 8) != 0) return false;
     size_t at = sizeof(FlatTraceHeader);
     for (uint32_t f = 0; f < header.frameCount; ++f) {
         if (size - at < sizeof(FlatTraceFrameHeader)) return false;
