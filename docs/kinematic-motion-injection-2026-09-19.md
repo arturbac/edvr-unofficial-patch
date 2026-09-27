@@ -78,7 +78,14 @@
   their live owner/coverage is assessed); the world path's camera-term health near a
   station (rows chosen off the auxiliary passes, parked stays spanning motion, a 35-40%
   undershoot of the head in both sessions) -- belongs to the camera-rows arc, which owns
-  the gate; ships in space; builder-path movers and articulated parts (phase 2).
+  the gate; the port-face seams still blur with motion -- they draw stock through the
+  station families' SELF-MARKING pixel shaders ps_BCF75CEA37060EAE (vs_4361) and
+  ps_2F924695596C8195 (vs_889A), which natively write EDVR's exact (2*slot+1, z) marker
+  at SV_Target6 into the game's own buffer and so fail keying ("target 6 occupied"):
+  the open fork is the compose reading the game's own target-6 texture (no patching, no
+  draw disturbance) vs healing the world path (the camera-rows arc) -- the 2026-09-27
+  verification-flight entry; ships in space; builder-path movers and articulated parts
+  (phase 2).
 - **Ruled out (do not re-propose; each closed in its dated entry):** draw-shape memo
   identity, pool-slot identity, 3x3 SAD camera-vs-body match, hidden-bone-spin
   estimation (pre-2026-09-20); four engine-truth mover/static routes (2026-09-20
@@ -96,14 +103,14 @@
   truth there); the stamp fix as the cause of the world-path death (191906 shows the
   same miss on the 09-25 build); the reconstruction floor as the close-range
   explanation (the chain is broken upstream of DLSS).
-- **Next:** FLY the three-shader keying at the coriolis port (055427's range, head
-  moves): the family lines name ps_51EE1F922FD220B0 and ps_D31DCAFA7C05CB47 patched
-  (vs_4361/vs_889A substituted binds >> 0 at close range), the hull's engine-joined
-  share up from ~16-19% toward the families' coverage, the hull crisp through head
-  moves. If any blur remains with the hull fully engine-covered, the residue is the
-  camera-rows arc's (the world path's dead/undershooting camera term on the
-  remaining world pixels). Then the controlled diagnostics 1 vs 0 comparison, and a
-  walker near a drone with the motion_source view.
+- **Next:** FLOWN, better but the seams remain (the 2026-09-27 verification-flight
+  entry): the hull is engine-covered (53.5% on the station box, both keyed families
+  substituting thousands of draws); the seam detail still draws stock and rides the
+  world path. Decide the fork -- the compose reading the game's own self-marked
+  target-6 buffer (route A) vs healing the camera term (route B, the camera-rows
+  arc). Route A's first proof is offline: the harness drives a stock self-marking
+  draw and reads the game's texture. Then the controlled diagnostics 1 vs 0
+  comparison, and a walker near a drone with the motion_source view.
 
 ## Premise
 
@@ -3126,3 +3133,53 @@ texels, 0 mismatches; MRT6 8192 checked, 0 bad) and keyed; ps_A607 stays the
 only candidate. The full gate passed on the merged tree (engine_velocity_test
 1128 checks; 1637 with the corpus). Awaiting Sean's verification flight at
 the port.
+
+### 2026-09-27 -- The verification flight (eye run 095337): the hull holds; the seams are the game's own self-marking shaders
+
+Frontier, the fully keyed build (v0.18.0-rc.2-58-g6bc0e2a7). Sean: "Better
+but still not quite, the seams around the faces are still blurring with
+motion." The dump's path map shows the hull nearly all engine-covered (the
+station box: engine share 53.5%, up from ~19.5% pre-keying); vs_4361
+substituted 2242 binds/13222 draws with ps_51EE1F922FD220B0, vs_889A 694/1774
+with ps_D31DCAFA7C05CB47. Through the dump's opening 12 px move BOTH paths
+tracked (world err -0.2,-1.5; engine err -0.3,-1.3) -- the world path was
+alive this session (parked stays longest 1 frame) and the residual is the
+~46% still on it: the seam/greeble detail, thin high-contrast geometry where
+a sub-pixel miss shows first, undershooting through moves with the camera
+term (up to ~1-2 px on the quiet pairs, jitter floor +/-0.5).
+
+**What draws the seams:** the draw census pairs ps_BCF75CEA37060EAE with
+vs_436193B352A2897E (126 lines, up to 16.9k instances) and
+ps_2F924695596C8195 with vs_889A5279E68F0672 (12). Both dxbc dumped by the
+same flight. Both FAIL the harness with "output target 6 or above occupied" --
+and the reason is the discovery: they natively declare `dcl_output o6.xy` and
+write
+
+    and  rN.x, v0.<slot component>, l(0x007fffff)
+    imad rN.x, rN.x, l(2), l(1)
+    utof o6.x, rN.x
+    mov  o6.y, v<position>.z        (noperspective SIV)
+
+-- byte-for-byte EDVR's own marker encoding (dxbc_engine_velocity.h: x =
+2*slot+1 from DATAID's low 23 bits, y = SV_Position.z). The game's detail
+shaders self-mark their record slot and depth into the game's own target-6
+texture (vt slot 6 = @129 in the census; bound for these draws and refused
+for substitution by the "target 6 occupied" guard). EDVR's marker format was
+modelled on this idiom; these are the producers it was modelled from.
+
+**The route this opens (design fork, Sean's call):**
+  A. The compose reads the GAME's target-6 texture beside ES: a pixel whose
+     value is odd with a depth matching the scene's is engine-marked without
+     any patching or draw-state change -- no substitution cost, no
+     disturbance of the game's buffer. Needs the texture tracked per eye
+     frame (the census already sees it), its format and clear semantics
+     verified, and the harness to drive a stock self-marking draw through.
+  B. Leave the seams on the world path and heal the camera term (the
+     camera-rows arc: the 35-40% undershoot, the parked stays) -- helps all
+     world content, not just seams.
+The seams are rigid with the hull, so A gives them the hull's exact records;
+B is the broader repair. They do not conflict.
+
+**Not a regression path:** nothing in this entry changes the keyed set. The
+two self-marking pairs stand in the rig's candidate list, where the harness
+now prints the refusal reason -- that print is the documentation.

@@ -184,6 +184,17 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
     // while its live owner/coverage is assessed.
     const Pair candidates[] = {
         {L"vs_DE545DC8EE4FBB87", L"ps_A6070F9DD1CFB601", false},
+        // Eye run 095337 (2026-09-27, verification flight): after the
+        // close-range keying the hull is engine-covered, but the seams and
+        // greeble detail still draw stock -- vs_4361's and vs_889A's third
+        // pixel shaders. Dumped by the same flight's glare_shader_dump. Both
+        // FAIL the harness by design: they natively write EDVR's exact
+        // (2*slot+1, z) marker at SV_Target6 into the game's own buffer, so
+        // "output target 6 or above occupied" -- the compose-side read of
+        // the game's texture, not keying, is their route (the doc's 2026-09-27
+        // verification-flight entry).
+        {L"vs_436193B352A2897E", L"ps_BCF75CEA37060EAE", false},
+        {L"vs_889A5279E68F0672", L"ps_2F924695596C8195", false},
     };
     for (const auto& p : candidates) {
         g_softWhy.clear();
