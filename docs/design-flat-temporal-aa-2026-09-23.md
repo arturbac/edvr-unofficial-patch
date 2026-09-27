@@ -4488,11 +4488,16 @@ change was ever applied (no route lines past the initial native), so the
 supersample, sub-native-backend, odd-size and repeated-change cells all
 remain open. The refusing pair's bytecode IS on disk (shader capture:
 vs_24214E7C45496BE0.dxbc, ps_EC998602427115F3.dxbc) -- recipe it and the
-flight cells can run. Note: the unknown-projection capture reported
-distinct-pairs=0 all session despite the refusal naming the pair in
-every coverage line; its audit completed at 13:26:16, seconds before the
-pair first appeared -- whether post-audit capture should have picked it
-up is an open instrumentation question.
+flight cells can run. CORRECTION (same evening): an earlier version of
+this note claimed the unknown-projection capture reported
+distinct-pairs=0 all session and opened an instrumentation question.
+That was a log-sampling error on my part -- every window I had grepped
+ended before 13:26:36. The log shows the automatic post-audit path
+taking the pair at 13:26:36 (frame=45891, trigger=automatic,
+bytecode-stages-saved=2), the F10 rearm re-taking it under the audit
+trigger at 13:26:42, and distinct-pairs=1 stable to session end. The
+capture pipeline worked exactly as designed; those saved bytes are the
+.dxbc the recipe below was reviewed from.
 
 Recipe SHIPPED 2026-09-27: VS 24214E7C45496BE0 is the radar local-key
 marker VS, already vetted at cb2 ForwardColumns 8 against the stock
