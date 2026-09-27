@@ -24,6 +24,7 @@
 #include "engine_velocity_emit.h"
 #include "engine_velocity_families.h"
 #include "engine_velocity_state.h"
+#include "exposure_fix.h"   // lookupShaderHash: the PS shadow probe reads the registry
 #include "flat_compute_readback.h"
 #include "kinematic_eval_hook.h"
 #include "kinematic_eval_probe.h"
@@ -316,6 +317,10 @@ struct DrawStats {
     // the ones where neither the eye-pass nor the depth map named an eye,
     // and their PS's binds through vscreen's shader hook.
     uint64_t selfMarkSeen = 0, selfMarkNoEye = 0, selfMarkBinds = 0;
+    // The shadow probe (the same arc): sampled pool-context draws, and the
+    // ones where the live pixel shader was not the shadow's -- the bind
+    // bypassed the hook, and the truth was written in before the slow half.
+    uint64_t poolShadowProbes = 0, poolShadowHealed = 0;
     uint64_t pixelsJoined = 0, pixelsMasked = 0, pixelsCamera = 0, pixelsStale = 0, pixelsCorrupt = 0, pixelsStamped = 0,
              pixelReads = 0;
     // The on-foot source: its eye-frames (also counted in eyeFrames above),
@@ -349,6 +354,7 @@ DrawStats g_draw;
 uint64_t g_windowStartMs = 0;
 uint64_t g_lastGaps = 0;                 // g_emit.gaps at the last frame boundary
 uint32_t g_lastSubstitution = ~0u;       // the present frame of the last substitution
+uint32_t g_psShadowProbeN = 0;           // the header's sampling counter for the probe below
 constexpr uint64_t kSummaryMs = 30000;
 constexpr uint32_t kResumeFrames = 90;   // a substitution after this many quiet frames is logged
 constexpr uint64_t kBurstGaps = 32;      // gaps in one frame that make it a burst
@@ -1489,6 +1495,10 @@ void summaryLocked(uint64_t now) {
                         "eye attributable (not the eye's colour at slot 0, and the depth probe named none), %llu "
                         "binds through the PS hook.",
                         u(g_draw.selfMarkSeen), u(g_draw.selfMarkNoEye), u(g_draw.selfMarkBinds));
+    if (g_draw.poolShadowHealed)
+        Log::get().note("engine motion: the PS shadow was stale on %llu sampled pool draws (the live shader set it "
+                        "right, the slow half saw the truth) of %llu probed.",
+                        u(g_draw.poolShadowHealed), u(g_draw.poolShadowProbes));
     for (int f = 0; f < kFamilyCount; ++f) {
         FamilyState& s = g_families[f];
         std::string patched, failed;
@@ -1714,6 +1724,33 @@ void noteResourceWrite(const ID3D11Resource* resource) noexcept {
     }
     // The next draw takes the slow half (owner thread: this runs on it).
     if (matched) cache = DrawCache{};
+}
+
+// The seam arc's shadow probe (2026-09-27, the 142315/142624 sessions): a
+// pass's pixel-shader binds can bypass the PS hook entirely -- the census
+// reads ps_BCF75CEA37060EAE live on its draws while zero binds crossed
+// hookedPSSetShader all session. The shadow then holds the previous family
+// shader, the quick path sees no generation change, and the draws are never
+// substituted nor counted. Sampled by the header (one quick-pathed pool-
+// context draw in 64): when the live pixel shader is not the shadow's, the
+// truth is written into the shadow and the draw takes the slow half, which
+// then reads the real shader. Only ever the owner thread.
+void psShadowProbe(ID3D11DeviceContext* ctx) {
+    ++g_draw.poolShadowProbes;
+    ID3D11PixelShader* livePs = nullptr;
+    ctx->PSGetShader(&livePs, nullptr, nullptr);
+    if (!livePs) return;
+    const uint64_t liveHash = lookupShaderHash(livePs);
+    if (livePs != bindingGet(BindSlot::Ps) && liveHash != 0) {
+        // The truth wins: the bind bypassed the hook (or its memo missed it).
+        // The shadow takes the live state, and the draw takes the slow half,
+        // which then reads the real shader. EDVR's own patched shaders are not
+        // registered (hash 0): mid-substitution reads never heal.
+        bindingSetShader(BindSlot::Ps, livePs, liveHash);
+        ++g_draw.poolShadowHealed;
+        beforeDrawSlow(ctx, cache.eye);
+    }
+    livePs->Release();
 }
 } // namespace engine_velocity_detail
 

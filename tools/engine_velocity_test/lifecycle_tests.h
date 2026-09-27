@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../../src/common/log.h"
@@ -72,6 +73,7 @@ unsigned g_emitAttaches = 0, g_emitDetaches = 0;
 std::vector<std::string> g_log;
 uint64_t g_clock = 1000;
 uint64_t fakeClock() { return g_clock; }
+std::unordered_map<void*, uint64_t> g_objectHash;   // the registry's stand-in, for the shadow probe
 }  // namespace lifecycle_fake
 
 // --- The stubs engine_velocity.cpp links against -------------------------------
@@ -79,10 +81,18 @@ namespace edvr {
 void* bindingGet(BindSlot s) { return lifecycle_fake::g_slots[static_cast<unsigned>(s)].ptr; }
 uint32_t bindingGeneration(BindSlot s) { return lifecycle_fake::g_slots[static_cast<unsigned>(s)].gen; }
 uint64_t bindingShaderHash(BindSlot s) { return lifecycle_fake::g_slots[static_cast<unsigned>(s)].hash; }
+void bindingSetShader(BindSlot s, void* p, uint64_t hash) {
+    auto& x = lifecycle_fake::g_slots[static_cast<unsigned>(s)];
+    x.ptr = p; x.hash = hash; ++x.gen;
+}
 void bindingSet(BindSlot s, void* p) {
     auto& x = lifecycle_fake::g_slots[static_cast<unsigned>(s)];
     x.ptr = p;
     ++x.gen;
+}
+uint64_t lookupShaderHash(void* shader) {   // the registry's stand-in (filled by the S4 case)
+    auto it = lifecycle_fake::g_objectHash.find(shader);
+    return it == lifecycle_fake::g_objectHash.end() ? 0 : it->second;
 }
 bool depthProbeCurrentSceneEyeOf(ID3D11DepthStencilView* dsv, int* outEye, int* outTargetIndex) {
     for (int i = 0; i < 2; ++i)
@@ -1420,11 +1430,36 @@ inline void selfMarkingCase(const Harness& h, const std::vector<BYTE>& vsBytes) 
         h.check(v.gameMark == nullptr, "S4: a wrong-shaped channel is refused, never latched");
         release(v);
     }
+    // Frame 4: the stale-shadow case the probe exists for. The seam shader is
+    // bound LIVE only (ctx->PSSetShader straight, no shadow update -- the hook
+    // "missed" the bind, as measured live), so the shadow still says the
+    // fixture's stock PS and every generation matches the last slow half's.
+    // The probe must write the truth and run the slow half with it.
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    lifecycle_fake::g_objectHash[psSeam.Get()] = 0xBCF75CEA37060EAEull;
+    bindWithG6();
+    h.context->PSSetShader(psSeam.Get(), nullptr, 0);   // live only: the shadow never sees it
+    edvr::engine_velocity_detail::psShadowProbe(h.context);   // the sampled probe, called deterministically here
+    // The probe healed the shadow to the live shader...
+    h.check(lifecycle_fake::g_slots[static_cast<unsigned>(edvr::BindSlot::Ps)].ptr == psSeam.Get(),
+            "S4: the probe set the shadow to the live shader");
+    // ...and ran the slow half with it, which latched the channel:
+    {
+        edvr::EngineVelocityViews v{};
+        h.check(g.views(0, &v), "S4: eye 0 given after the heal");
+        h.check(v.gameMark != nullptr, "S4: the healed seam draw latched the channel");
+        release(v);
+    }
     g.endFrame(true);   // the window's summary
-    h.check(logged("self-marking pixel shaders at the draw path: 3 draws seen, 0 with no eye", mark),
+    h.check(logged("self-marking pixel shaders at the draw path: 4 draws seen, 0 with no eye", mark),
             "S4: the draw-path census counts the seam draws, none eyeless");
-    h.check(logged("self-marked 3 draws (the game's own slot+depth channel, latched 2 eye-frames)", mark),
-            "S4: the family line counts the stock draws and the two latched eye-frames");
+    h.check(logged("self-marked 4 draws (the game's own slot+depth channel, latched 3 eye-frames)", mark),
+            "S4: the family line counts the stock draws and the three latched eye-frames");
+    h.check(logged("the PS shadow was stale on 1 sampled pool draws", mark),
+            "S4: the probe reports the one stale-shadow heal it performed");
     edvr::engineVelocityShutdown();
     edvr::g_clockForTest = nullptr;
 }

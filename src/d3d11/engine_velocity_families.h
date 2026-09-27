@@ -48,6 +48,15 @@ constexpr bool selfMarkingPair(uint64_t vs, uint64_t ps) noexcept {
         if (p.vs == vs && p.ps == ps) return true;
     return false;
 }
+// Any keyed or self-marking pixel shader hash: the draw path's probe gate.
+constexpr bool anyFamilyPs(uint64_t ps) noexcept {
+    for (const Family& f : kFamilies)
+        for (uint64_t h : f.ps)
+            if (h == ps) return true;
+    for (const SelfMarking& p : kSelfMarking)
+        if (p.ps == ps) return true;
+    return false;
+}
 // The PS half alone: the shader hook's census of their binds (the draw path
 // never saw 095337's seam draws; the bind count separates "never bound through
 // the hook" from "bound but never drawn through it" in one flight).

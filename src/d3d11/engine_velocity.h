@@ -43,6 +43,7 @@
 #include <cstdint>
 
 #include "binding_shadow.h"
+#include "engine_velocity_families.h"
 
 struct ID3D11Buffer;
 struct ID3D11DeviceContext;
@@ -108,6 +109,13 @@ extern uint64_t familyDraws[kMaxFamilies];     // owner thread only: draws that 
 constexpr unsigned kWatchSlots = 6;
 extern std::atomic<const ID3D11Resource*> watch[kWatchSlots];
 void beforeDrawSlow(ID3D11DeviceContext*, bool rtv0Eye);
+extern uint32_t g_psShadowProbeN;   // owner thread; the header's sampling counter
+// The seam arc (2026-09-27): a pass can carry a live pixel shader the PS hook
+// never saw bound (the station detail pass: zero binds across a session while
+// the census reads it live), leaving the shadow stale and the quick path
+// blind. Sampled by the header, this compares the live shader against the
+// shadow's and writes the truth in before taking the slow half.
+void psShadowProbe(ID3D11DeviceContext*);
 void noteResourceMapped(const ID3D11Resource*, void* data, int mapType) noexcept;
 void noteResourceWrite(const ID3D11Resource*) noexcept;
 inline bool watchesResource(const ID3D11Resource* resource) noexcept {
@@ -123,8 +131,20 @@ inline void engineVelocityBeforeDraw(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     if (cache.vs != bindingGeneration(BindSlot::Vs) || cache.ps != bindingGeneration(BindSlot::Ps) ||
         cache.rtv != bindingGeneration(BindSlot::Rtv0) || cache.dsv != bindingGeneration(BindSlot::Dsv0) ||
         cache.blend != bindingGeneration(BindSlot::Blend) || cache.pool != bindingGet(BindSlot::VsSrv33) ||
-        cache.scene != bindingGet(BindSlot::VsCb1) || cache.eye != rtv0Eye)
+        cache.scene != bindingGet(BindSlot::VsCb1) || cache.eye != rtv0Eye) {
         beforeDrawSlow(ctx, rtv0Eye);
+    } else if (((++g_psShadowProbeN) & 63u) == 0u &&
+               (engine_velocity_family::familyOfVs(bindingShaderHash(BindSlot::Vs)) >= 0 ||
+                engine_velocity_family::anyFamilyPs(bindingShaderHash(BindSlot::Ps)))) {
+        // The quick path's blind spot, sampled (the seam arc, 2026-09-27): a
+        // pass's shader binds can bypass the PS hook entirely -- zero binds of
+        // the seam shaders over a whole session while the census reads them
+        // live -- and the shadow's unchanged generation then hides the draws.
+        // One pool-context draw in 64 pays the compare: when the live pixel
+        // shader is not the shadow's, the probe sets the shadow to the truth
+        // and the draw takes the slow half.
+        psShadowProbe(ctx);
+    }
     if (cache.family >= 0) ++familyDraws[cache.family];
 }
 

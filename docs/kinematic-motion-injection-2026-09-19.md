@@ -3290,3 +3290,30 @@ the game's channel and the views carry it; the detail-pass shape (no eye
 colour at slot 0) attributes by depth and latches; a wrong-format channel
 refuses, still counted. engine_velocity_test 1152 gate checks, 1728 with the
 corpus, on the final binary.
+
+### 2026-09-27 -- The stale-shadow heal: the seam pass's binds bypass the hook
+
+The v3 flight's census answered the v2 question: "self-marking pixel shaders
+at the draw path" never printed -- zero draws seen AND zero binds through the
+PS hook, all session. But the eye-run census reads ps_BCF75CEA37060EAE live
+(PSGetShader at the draw) on owner-context eye draws. Both together: the seam
+pass's shader binds bypass the PS hook entirely, so the binding shadow never
+holds the seam shader, its generation never changes at those draws, and the
+draw path's quick path never wakes for them -- they run stock, never
+substituted, never counted, never latched. (No command lists ran; the census
+marks nothing foreign; the unkeyed-sightings history never names them.)
+
+The fix at the draw path, built: sampled at one quick-pathed pool-context
+draw in 64 (engineVelocityBeforeDraw, gated on the shadow's VS or PS naming a
+pool family), compare the LIVE pixel shader against the shadow's; when they
+differ, the shadow takes the truth (bindingSetShader bumps the generation) and
+the slow half runs with the real shader -- which substitutes or latches
+exactly as if the hook had seen the bind. EDVR's own patched shaders are never
+registered, so a mid-substitution read (hash 0) never heals. Counted:
+"the PS shadow was stale on N sampled pool draws (the live shader set it
+right) of M probed".
+
+S4's frame 4 in the lifecycle rig: the seam shader bound live-only (the shadow
+left on the stock PS) heals at the probe, the slow half latches the game's
+channel, the views carry it. 1152 gate checks, 1732 with the corpus; full
+build green.
