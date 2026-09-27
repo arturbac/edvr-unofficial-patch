@@ -30,3 +30,11 @@ flat_trace_40160.bin 3 edhm-flight-ss150-fsr
 flat_trace_41502.bin 3 edhm-flight-ss050-fsr
 flat_trace_43870.bin 3 edhm-flight-ss150-taa
 flat_trace_49426.bin 3 edhm-flight-native-taa
+# Epic install 2026-09-27 14:31-14:34 UTC session, build
+# v0.18.0-rc.2-70-g7a0415b2, STOCK (EDHM disabled by Sean), in flight and
+# on foot in the station. The odd-size cell: borderless render resolution
+# 2560x1440 under a 3840x2160 backbuffer (negotiated quality, E=D), the
+# 0.5x DLSS flight cell, and the 0.5x DLSS on-foot station cell.
+flat_trace_45992.bin 3 stock-flight-res2560x1440-dlss
+flat_trace_52244.bin 3 stock-flight-ss050-dlss
+flat_trace_60043.bin 3 stock-onfoot-station-ss050-dlss

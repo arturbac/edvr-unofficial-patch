@@ -4514,3 +4514,22 @@ the repeated-changes cell stands on this evidence. Corpus is 9 files,
 27/27 replay identical. Still open: native DLSS flight, 0.5 DLSS flight,
 the odd-size/resolution-change cell (no route ever left 4K), and the
 EDHM-off stock matrix.
+
+Session 3 (2026-09-27 14:29, g7a0415b2, STOCK -- EDHM disabled): banked
+stock-flight-res2560x1440-dlss (the odd-size cell: borderless 2560x1440
+render under the 4K backbuffer, negotiated quality at E=D),
+stock-flight-ss050-dlss and stock-onfoot-station-ss050-dlss. Corpus is
+12 files, 36/36 replay identical. Sean reported cockpit HUD elements
+"swimming sometimes with motion" at 0.5x and station flicker; the 0.5x
+DLSS cockpit pixel capture (frames 52245/52260/52275) answers the
+machinery: HUD panel pixels carry cockpit-consistent near vectors
+(matching the dashboard, not space), the world-anchored local-key marker
+carries its far anchor's vector, rejection behaves on animated hologram
+content, and template-tracked displacement shows the panels locked to
+the cockpit geometry -- the reprojection input is correct in this
+capture. Remaining candidates for the visible swimming: the section-75
+sub-pixel scintillation family on 1px hologram lines at 1080p (same
+resolution floor as the canopy, expected at 0.5x), or a fast-motion
+vector failure this slow-motion capture cannot see. The discriminator is
+the parked jitter-off test: scintillation dies with jitter off; a true
+vector error would persist. OPEN.
