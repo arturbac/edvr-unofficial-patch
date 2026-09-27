@@ -158,6 +158,7 @@ void FlatProjectionRuntime::reset() {
         entry.privateBuffer.initialize(nullptr, nullptr, 0);
         entry.buffer.Reset(); entry.generation = 0; entry.width = 0;
         entry.mapped = entry.promoted = entry.privateReady = entry.pending = false;
+        entry.planRefs = 0;
         entry.mutationSerial = 1; entry.mutationOverflow = false;
         entry.mapBytes = nullptr;
     }
@@ -425,6 +426,48 @@ FlatProjectionRuntime::CachedPlan* FlatProjectionRuntime::findTopology(
     if (sameTopology(livePlan_, requests, count)) return &livePlan_;
     return nullptr;
 }
+bool FlatProjectionRuntime::planStale(const CachedPlan& slot) {
+    for (uint32_t i = 0; i < slot.count; ++i) {
+        const Tracked* entry = find(slot.requests[i].original);
+        if (!entry || entry->generation != slot.generations[i]) return true;
+        FlatProjectionShadowView view{};
+        if (!shadows_.lookup(slot.requests[i].original, entry->generation, view)) return true;
+    }
+    return false;
+}
+void FlatProjectionRuntime::demotePlanRefs(CachedPlan& slot) {
+    for (uint32_t i = 0; i < slot.count; ++i) {
+        if (Tracked* entry = find(slot.requests[i].original)) {
+            if (entry->planRefs) --entry->planRefs;
+            if (!entry->planRefs) entry->promoted = false;
+        }
+    }
+}
+// Generation-based retirement (section 72 step 3): a stale plan -- one of its
+// buffers' generations advanced or its shadow gone -- releases its slot first;
+// otherwise the least-recently-used idle plan releases one. A plan mid-scope
+// is never touched: the scope references it by pointer, and idle() is the
+// same guard the live retarget already honors. Its buffers' planRefs drop so
+// they become evictable again instead of promoted-forever (finding 3).
+FlatProjectionRuntime::CachedPlan* FlatProjectionRuntime::retirePlan() {
+    for (auto& slot : plans_) {
+        if (!slot.used || !slot.plan.idle() || !planStale(slot)) continue;
+        demotePlanRefs(slot);
+        slot.used = false; slot.count = 0;
+        ++status_.planRetiredStale;
+        return &slot;
+    }
+    CachedPlan* oldest = nullptr;
+    for (auto& slot : plans_) {
+        if (!slot.used || !slot.plan.idle()) continue;
+        if (!oldest || slot.usedSerial < oldest->usedSerial) oldest = &slot;
+    }
+    if (!oldest) return nullptr;
+    demotePlanRefs(*oldest);
+    oldest->used = false; oldest->count = 0;
+    ++status_.planRetiredLru;
+    return oldest;
+}
 void FlatProjectionRuntime::invalidatePreparedPlans() {
     // A plan pointer may outlive the request that produced it. Refusing a draw
     // revokes every handed-out token until its exact recipe is prepared again.
@@ -474,6 +517,9 @@ bool FlatProjectionRuntime::preflight(const FlatProjectionRuntimeRequest* reques
     }
     if (!cached) {
         for (auto& slot : plans_) if (!slot.used) { cached = &slot; break; }
+        // Retirement over the lifetime cliff: stale plans first, then the
+        // least-recently-used idle one; only genuinely all-live plans refuse.
+        if (!cached) cached = retirePlan();
         if (!cached) return refuseAt(FlatProjectionRuntimeRefusal::NoCapacity, "plan-capacity", 0);
     }
     FlatPrivateProjectionBinding bindings[FlatProjectionBindingPlan::kCapacity]{};
@@ -533,8 +579,19 @@ bool FlatProjectionRuntime::preflight(const FlatProjectionRuntimeRequest* reques
         return refuseAt(FlatProjectionRuntimeRefusal::PlanFailure, "plan-initialize-or-refresh");
     if (!liveRetarget) planCapabilityReady_ = true;
     else ++status_.livePlanRetargets;
+    // A re-preflighted plan first releases its old references, so repeated
+    // retargets cannot pin a buffer promoted-forever; the new references
+    // below are recorded exactly once per live plan.
+    if (cached->used) demotePlanRefs(*cached);
     cached->used = true; cached->count = count; cached->phase = phase; cached->jitter = jitter;
-    for (uint32_t i = 0; i < count; ++i) cached->requests[i] = requests[i];
+    for (uint32_t i = 0; i < count; ++i) {
+        cached->requests[i] = requests[i];
+        if (Tracked* entry = find(requests[i].original)) {
+            cached->generations[i] = entry->generation;
+            ++entry->planRefs; entry->promoted = true;
+        }
+    }
+    cached->usedSerial = nextUseSerial_++;
     ++status_.preflights;
     attempt_.active = false;
     return true;
@@ -583,6 +640,7 @@ const FlatProjectionBindingPlan* FlatProjectionRuntime::prepare(
     if (!cached->plan.refreshPrepared()) {
         return fail(FlatProjectionRuntimeRefusal::PlanFailure, "prepare-plan-refresh");
     }
+    cached->usedSerial = nextUseSerial_++;
     ++status_.prepared;
     attempt_.active = false;
     if (zero(jitter)) { ++status_.zeroPhaseReady; return nullptr; }

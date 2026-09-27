@@ -90,11 +90,12 @@ struct State {
     struct GenericClassification {
         uint64_t vs = 0, ps = 0;
         FlatShaderPairClassification classification{};
+        uint64_t lastSeenFrame = 0;
     };
     GenericClassification genericClassifications[64]{};
     uint32_t genericClassificationsUsed = 0;
-    // A full memo refuses later pairs unclassified. Named once per session,
-    // or that refusal reads exactly like a classifier verdict.
+    // The memo retires its least-recently-seen entry at 64 rather than
+    // refusing ever after; the first eviction of a session is logged once.
     bool genericClassificationOverflowLogged = false;
     struct LocalProjectionSample {
         uint64_t firstFrame = 0, frames[2]{};
@@ -169,7 +170,7 @@ struct State {
 
     // --- Partial temporal AA: coverage census (Part B), reset every 5s --------
     uint64_t covSceneDraws = 0, covExact = 0, covGeneric = 0, covInert = 0, covUnchanged = 0;
-    uint64_t covLocalRefused = 0, covMemoFull = 0;
+    uint64_t covLocalRefused = 0, covMemoEvictions = 0;
     uint64_t covFrames = 0, covFramesObserving = 0, covObservationEntries = 0;
     uint64_t covFramesLocallyRefused = 0;
     struct CoverageRefusedPair { uint64_t vs = 0, ps = 0; const char* reason = ""; uint64_t draws = 0; };
@@ -857,18 +858,29 @@ const char* flatPsSafetyName(FlatPsProjectionSafety p) {
 }
 FlatShaderPairClassification classifyFlatProjectionPair(State& s, uint64_t vs, uint64_t ps) {
     for (uint32_t i = 0; i < s.genericClassificationsUsed; ++i) {
-        const auto& entry = s.genericClassifications[i];
-        if (entry.vs == vs && entry.ps == ps) return entry.classification;
+        auto& entry = s.genericClassifications[i];
+        if (entry.vs == vs && entry.ps == ps) {
+            entry.lastSeenFrame = s.prefix.frame;
+            return entry.classification;
+        }
     }
-    FlatShaderPairClassification result{};
-    if (s.genericClassificationsUsed == 64) {
-        ++s.covMemoFull;
+    State::GenericClassification* slot = nullptr;
+    if (s.genericClassificationsUsed < 64) {
+        slot = &s.genericClassifications[s.genericClassificationsUsed++];
+    } else {
+        // LRU retirement (section 72 step 3): the memo never stops
+        // classifying; the least-recently-seen entry yields its slot and its
+        // pair simply reclassifies if it returns.
+        slot = &s.genericClassifications[0];
+        for (uint32_t i = 1; i < 64; ++i)
+            if (s.genericClassifications[i].lastSeenFrame < slot->lastSeenFrame)
+                slot = &s.genericClassifications[i];
+        ++s.covMemoEvictions;
         if (!s.genericClassificationOverflowLogged) {
             s.genericClassificationOverflowLogged = true;
-            Log::get().note("flat generic classification: memo full at 64 pairs from frame=%llu VS=%016llX PS=%016llX; later unreciped pairs refuse unclassified (coverage line memo-full=)",
-                (unsigned long long)s.prefix.frame, (unsigned long long)vs, (unsigned long long)ps);
+            Log::get().note("flat generic classification: memo evicts the least-recently-seen pair at 64 entries (frame=%llu); an evicted pair reclassifies on return (coverage line memo-evictions=)",
+                (unsigned long long)s.prefix.frame);
         }
-        return result;
     }
     const uint8_t* vsBytes = nullptr; size_t vsLen = 0;
     const uint8_t* psBytes = nullptr; size_t psLen = 0;
@@ -876,10 +888,9 @@ FlatShaderPairClassification classifyFlatProjectionPair(State& s, uint64_t vs, u
     const bool psFound = flatProbeShaderLookup('p', ps, &psBytes, &psLen);
     // A missing stage classifies as NoBytecode, which admits nothing; the
     // present stage is still classified so its own reason reaches the log.
-    result = classifyFlatShaderPair(vsFound ? vsBytes : nullptr, vsFound ? vsLen : 0,
+    FlatShaderPairClassification result = classifyFlatShaderPair(vsFound ? vsBytes : nullptr, vsFound ? vsLen : 0,
                                     psFound ? psBytes : nullptr, psFound ? psLen : 0);
-    auto& entry = s.genericClassifications[s.genericClassificationsUsed++];
-    entry.vs = vs; entry.ps = ps; entry.classification = result;
+    slot->vs = vs; slot->ps = ps; slot->classification = result; slot->lastSeenFrame = s.prefix.frame;
     // Once per pair per session (at most 64 lines): the verdict and the rule
     // behind it, so a refused pair needs no offline bytecode review to name.
     const bool clean = result.ps == FlatPsProjectionSafety::Clean;
@@ -1381,14 +1392,14 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         // "ran, nothing refused" (local-refused=0 on a line that is present).
         Log::get().note("flat coverage 5s: partial=%s observing=%u scene-draws=%llu exact=%llu generic=%llu inert=%llu "
             "unchanged=%llu local-refused=%llu frames=%llu frames-locally-refused=%llu "
-            "returned-to-observation=%llu frames-observing=%llu memo-full=%llu",
+            "returned-to-observation=%llu frames-observing=%llu memo-evictions=%llu",
             s.partialWanted?"on":"off", s.observing?1u:0u,
             static_cast<unsigned long long>(s.covSceneDraws), static_cast<unsigned long long>(s.covExact),
             static_cast<unsigned long long>(s.covGeneric), static_cast<unsigned long long>(s.covInert),
             static_cast<unsigned long long>(s.covUnchanged), static_cast<unsigned long long>(s.covLocalRefused),
             static_cast<unsigned long long>(s.covFrames), static_cast<unsigned long long>(s.covFramesLocallyRefused),
             static_cast<unsigned long long>(s.covObservationEntries), static_cast<unsigned long long>(s.covFramesObserving),
-            static_cast<unsigned long long>(s.covMemoFull));
+            static_cast<unsigned long long>(s.covMemoEvictions));
         {
             uint32_t order[32];
             for (uint32_t i=0;i<s.covRefusedPairsUsed;++i) order[i]=i;
@@ -1423,7 +1434,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.resetMissingWindow = s.resetGapWindow = s.resetDepthWindow = s.resetColorWindow = s.resetExtentWindow = 0;
         s.conflictWindow.clear();
         s.covSceneDraws = s.covExact = s.covGeneric = s.covInert = s.covUnchanged = 0;
-        s.covLocalRefused = s.covMemoFull = 0;
+        s.covLocalRefused = s.covMemoEvictions = 0;
         s.covFrames = s.covFramesObserving = s.covObservationEntries = s.covFramesLocallyRefused = 0;
         s.covRefusedPairsUsed = 0;
         s.lastReport = now;

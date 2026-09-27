@@ -4263,6 +4263,15 @@ Staged implementation:
 3. Retirement: generation-based release of projection plans and
    classifier memos (finding 3's 32/64 cliffs), with the corpus replaying
    retirement boundaries.
+   SHIPPED 2026-09-27: stale plans (a buffer generation advanced or its
+   shadow gone) release their slots first, then the least-recently-used
+   idle plan -- never a plan mid-scope, and each retired plan demotes its
+   buffers' planRefs so promoted-forever buffers become evictable again;
+   re-preflights demote before re-recording, so retargets are idempotent.
+   The 64-pair classifier memo retires least-recently-seen instead of
+   refusing ever after (coverage line memo-evictions=). WARP-qualified:
+   40 topologies through a 32-plan cache with LRU retirement and a
+   shadow-invalidated plan retiring stale ahead of any LRU victim.
 4. Backend negotiation: the served-floor ladder (dlss_floor.h) already
    answers under-floor inputs on the VR door; the flat route gets the same
    query on extent changes, logged per route.
