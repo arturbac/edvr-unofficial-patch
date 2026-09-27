@@ -94,6 +94,16 @@ enum FlatContractKind : uint8_t {
     kFlatContractNone = 0, kFlatContractPool = 1,
     kFlatContractScreen = 2, kFlatContractOutput = 3
 };
+// A uniform render-to-output mapping within independent integer rounding of
+// each axis (the exact bound of rounding a rational scale to whole pixels,
+// not an arbitrary aspect tolerance): a rounded scale like 1708x960 against
+// 1366x768 qualifies, a square shadow-like target does not.
+inline bool flatUniformScale(uint32_t w, uint32_t h, uint32_t ow, uint32_t oh) {
+    if (!w || !h || !ow || !oh) return false;
+    const uint64_t lhs = uint64_t(w) * oh, rhs = uint64_t(h) * ow;
+    const uint64_t diff = lhs > rhs ? lhs - rhs : rhs - lhs;
+    return diff <= uint64_t(ow) + uint64_t(oh);
+}
 inline FlatContractKind flatContractKind(bool knownPoolFamily,
                                          const void* color, const void* depth,
                                          uint32_t width, uint32_t height,
@@ -102,16 +112,16 @@ inline FlatContractKind flatContractKind(bool knownPoolFamily,
     if (isOutput && color) return kFlatContractOutput;
     if (knownPoolFamily && color && depth) return kFlatContractPool;
     const bool screenFormat = format == 23 || format == 26 || format == 27 || format == 60;
-    // The band tracks the game's render size R, not the output D: SS > 100%
-    // renders up to twice the display on each axis (design doc section 72;
-    // 04:30 Epic flight showed the <= D cap excluding every supersampled
-    // scene target, latching namedDepth null and refusing every frame).
-    // Aspect-preserving sizes only; crop/ultrawide aspects are the lineage
-    // rework the review's gate 2 calls for, not a wider band.
+    // Scene identity is a uniform render-to-output mapping within integer
+    // rounding (flatUniformScale), not exact aspect equality: a rounded
+    // scale like 1708x960 against 1366x768 is a mapping, while a square
+    // shadow-like target is not. The per-axis bounds are the working part:
+    // the floor excludes quarter-res blur/DoF chains; the cap bounds
+    // intermediates. True non-uniform crops wait for the review's
+    // source-rectangle lineage, deliberately not admitted here.
     const bool screenExtent = outputWidth && outputHeight && width && height &&
-        uint64_t(width) * outputHeight == uint64_t(height) * outputWidth &&
-        uint64_t(width) * 2 >= outputWidth &&
-        uint64_t(height) * 2 >= outputHeight &&
+        flatUniformScale(width, height, outputWidth, outputHeight) &&
+        width * 2 >= outputWidth && height * 2 >= outputHeight &&
         width <= outputWidth * 2 && height <= outputHeight * 2;
     return color && screenFormat && screenExtent
         ? kFlatContractScreen : kFlatContractNone;

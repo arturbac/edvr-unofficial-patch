@@ -104,6 +104,7 @@ inline int flatProjectionRecipeTests() {
         {0x820E5C131B99361Dull,0x6EAA86EFE135B2D4ull,0,FlatProjectionPatchLayout::ForwardDp4,4},
         {0xB75A6FF2CA9FA5D6ull,0xD56F859BE4781431ull,0,FlatProjectionPatchLayout::ForwardDp4,4},
         {0x24214E7C45496BE0ull,0x0C8FCDB6A3BECCE6ull,2,FlatProjectionPatchLayout::ForwardColumns,8},
+        {0x24214E7C45496BE0ull,0xEC998602427115F3ull,2,FlatProjectionPatchLayout::ForwardColumns,8},
         {0xA1B7CFCD0BE7493Eull,0x2DB678B6B558B604ull,2,FlatProjectionPatchLayout::ForwardDp4,10},
         {0xCE24A73943632F55ull,0x1F64463B15189104ull,2,FlatProjectionPatchLayout::ForwardDp4,10},
         // Complete menu VS/PS blobs from the Epic 5c78c34d flight.
@@ -117,7 +118,7 @@ inline int flatProjectionRecipeTests() {
         // Projected effect from the subsequent Epic 85d590e0 run.
         {0x2D8263CC54D55398ull,0x89B662E266E5D73Eull,0,FlatProjectionPatchLayout::ForwardDp4,4},
     };
-    expect(sizeof(latest)/sizeof(latest[0])==35,"latest supported ordinary pair census size");
+    expect(sizeof(latest)/sizeof(latest[0])==36,"latest supported ordinary pair census size");
     FlatProjectionJitter jitter{};
     expect(flatProjectionJitter(.375f,-.25f,1280,720,jitter),"recipe pixel offset constructed");
     for (const auto& pair : latest) {

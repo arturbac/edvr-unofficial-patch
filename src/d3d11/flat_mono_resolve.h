@@ -99,6 +99,10 @@ struct FlatMonoResolveFrame {
 // size-specific feature from incomplete or stale inputs.
 struct FlatMonoResolvePreflight {
     uint32_t renderWidth = 0, renderHeight = 0, outputWidth = 0, outputHeight = 0;
+    // Negotiated evaluation size override, same contract as the frame's: the
+    // preflight allocates at the E the resolve will evaluate at (gate-2 review
+    // F1), because the resolve's resource cache keys on E.
+    uint32_t evalWidth = 0, evalHeight = 0;
     FlatMonoResolveMode mode = FlatMonoResolveMode::Taa;
     DXGI_FORMAT colorViewFormat = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT depthViewFormat = DXGI_FORMAT_UNKNOWN;

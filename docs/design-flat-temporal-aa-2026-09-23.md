@@ -74,6 +74,17 @@
   designed (three sizes R/E/D, the routing table, retirement, negotiation);
   step 1 shipped: `flatResolveRoute` names today's effective treatment per
   pairing (honest refusals included), logged on plan change, rig-tabled.
+  Section 74 (2026-09-27): the gate-2 review's final-pass pair closed
+  without a flight -- the negotiated E keys the resolve's resource cache
+  and the preflight carries it; buffer-pressure retirement loops until a
+  shared buffer unpins, bounded by the plan bank. Section 75 (2026-09-27):
+  the 0.5x canopy flicker traced to success-status Present results
+  resetting temporal history every frame; the history and phase gates now
+  use FAILED(hr)/SUCCEEDED(hr) with the value logged, awaiting the
+  confirming flight. Section 76 (2026-09-27): the gate-2 qualification
+  flight matrix is staged -- the 0.5x DLSS menu trace admitted to the
+  corpus, the eight-step session script recorded; crops remain deferred
+  on the source-rectangle lineage.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -4259,6 +4270,14 @@ Staged implementation:
    now covers aspect-preserving sizes from 0.5x to 2x of output, with the
    conflicting-hdr guard as the loud backstop for full-res depthless
    intermediates; crops/ultrawide stay out of band for the lineage rework.
+   2026-09-27 later: the band is now flatUniformScale -- a uniform render-to-
+   output mapping within integer rounding of each axis (the exact bound of
+   rounding a rational scale to pixels, NOT an arbitrary aspect tolerance).
+   Rounded mappings like 1708x960 at 1366x768 admit; square shadow-like
+   targets and non-uniform crops stay excluded (the last waits for the
+   review's source-rectangle lineage). The selector's tone check uses the
+   same rule. Rig covers native, rounded, mild-crop, sub-half, shadow-like,
+   non-uniform, the 2x cap and past-cap.
    The 04:58 flight FLOWN: DLAA and TAA treat at 5760x3240 with the route
    lines naming each mode; FSR then engaged the same hour via Native AA --
    the 1.0x case of the same upscaler, evaluating at E = R with the game's
@@ -4333,3 +4352,165 @@ the outcome tests above. What the trace does NOT certify -- mode, backend,
 observation state, effective treatment, history and pixels -- is now stated
 in the manifest's provenance; those belong to gates 2-4's GPU and flight
 evidence.
+
+## 74. Gate-2 review final pass: E keys the resource cache, bounded retirement (2026-09-27)
+
+The [gate-2 review](../reviews/flat-temporal-gate2-review-2026-09-27.md)'s
+final pass found two reproduced gaps, both fixed without a flight:
+
+- F1: the negotiated evaluation size E was missing from the resolve's
+  resource cache key. A cut E (step 4's under-floor negotiation) arriving
+  after a default-E frame would reuse the default-sized allocation and the
+  finish pass would fill only the E rectangle of it; and the preflight --
+  which carries no frame -- allocated at the route's default E, so the
+  first treated frame of a negotiated contract reallocated anyway. E now
+  keys the cache alongside mode/R/D, the plan carries the same negotiated
+  override the frame carries (gated to the exact contract signature), and
+  the preflight allocates and verifies at that E.
+- F2: the buffer-pressure path retired ONE plan and re-scanned; a buffer
+  shared by two live plans keeps a nonzero planRefs after the first
+  retirement, so nothing freed and the write refused. The pressure path
+  now retires in a loop bounded by the plan-bank size, re-scanning after
+  each retirement; the guards stand (never a promoted/mapped/pending
+  buffer, never a non-idle plan).
+
+WARP-qualified: the rig's cut probe walks default E -> cut E=24 -> default
+on a 16x16-to-32x32 DLSS contract, checking the backend's observed grid,
+the output view's size and the allocation count at each step, and that a
+preflight carrying the cut lets the first treated frame hit the cache; the
+shared-refs pressure case pins all 64 buffer slots twice over (32
+four-binding plans, each buffer in exactly two, the second reference on
+distinct slots so each plan is its own topology) and the 65th buffer
+tracks only after the loop retires both plans pinning a shared buffer.
+Corpus replay unchanged: 6/6 frames identical.
+
+## 75. The 0.5x flicker: success-status presents reset history every frame (2026-09-27)
+
+Sean's 0.5x report: the red canopy structure flickered between
+stair-stepped and smooth on both upscalers, fine at 0.65x. His 12:33 A/B
+bracketing an F8 cycle proved the treated path healthy -- EDVR DLSS at
+0.5x smooth through a 1300-frame streak while stock 0.5x stair-stepped,
+which is inherent to 1080p input. The 12:12 FSR flight's log held the
+real defect: a 13-second episode where EVERY frame accepted a reset with
+adapter reason no-previous (450/5s), history never accumulating, jitter
+pinned at (0,0) as treated-zero-jitter, while refused froze and treated
+kept counting. Mechanism: a treated frame always sets the adapter's
+previous at frame end, so only reset() between frames produces
+every-frame no-previous; refuse() is excluded (its counter froze); and
+the jitter collapse names the survivor -- phase.finish received
+hr != S_OK every frame, pinning previousAcceptedValid false and the
+phase at zero. flatRuntimePresent gated the history reset and the phase
+finish on hr != S_OK, so any success-status Present (DXGI occlusion and
+friends, or a chained mod's status) reset temporal history every frame
+for as long as the status persisted.
+SHIPPED 2026-09-27: both gates now use FAILED(hr)/SUCCEEDED(hr) --
+success statuses no longer reset history or stall the phase -- and the
+present value is logged (8/session, present-not-ok= in the 5s adapter
+line) so the next flight names the exact status. CONFIRMING FLIGHT
+REQUIRED: hit the condition (overlay/alt-tab/whatever produces it) and
+verify present-not-ok names the value with NO no-previous storm through
+it. The stair-stepped 0.5x look WITHOUT a storm is inherent (stock shows
+it too); FSR's resolve of the canopy at 0.5x during healthy accumulation
+is not yet separately qualified.
+
+Addendum, same day: the 13:00 flight (g0b56952d) ran storm-free --
+present-not-ok=0 in every window, treated streaks past 4000 -- and the
+canopy flicker persisted on both backends, so the storm and the
+structure-localized flicker are separate phenomena. The 12:32 F10
+capture (frames 36808/36823/36838, healthy 0.5x DLSS) shows the
+mechanism directly: the struts are ~1 render pixel at 1080p, and their
+fringe pixels oscillate between frames at |delta|~68/255 while their
+cores sit at ~2 -- jitter moves the sub-pixel structure on and off texel
+centers each phase, the input to either upscaler oscillates there, and
+the temporal logic flickers on exactly those pixels. At 0.65x the struts
+are ~1.7 px, mostly covered every phase, hence stable.
+ruled out: rejection-mask flip-flop, because rejection is stable on 97%
+of the structure's pixels across the three frames.
+ruled out: depth/motion corruption, because depth reads 0.0009+-0.0003
+stable and the menu camera is static.
+ruled out: a backend defect, because both networks flicker identically
+while the shared input oscillates.
+OPEN (parked by Sean 2026-09-27): the live confirmation -- jitter off at
+0.5x should end the flicker (experimental.temporal_aa_jitter is
+hot-reloaded) -- and any policy decision (jitter off below native is a
+quality trade, not a default to take unilaterally). No threshold/clamp
+compensation: the oscillation is real coverage signal.
+
+## 76. Gate-2 qualification flight matrix: plan and corpus status (2026-09-27)
+
+The review's remaining boundary: the corpus certified one size pairing
+(0.65x DLSS, menu and flight); odd sizes, repeated mid-session changes,
+the other backends and the mod matrix are open. Crops stay deferred on
+the source-rectangle lineage; backend-failure forcing stays with the
+rigs. One trace per cell, admitted to the corpus with its manifest line;
+each F10 seals the three frames before the arm and dumps
+flat_trace_<frame>.bin into the game dir's edvr_logs\traces.
+
+Corpus today: edhm-menu-ss065-dlss, edhm-flight-ss065-dlss (2026-09-26),
+plus edhm-menu-ss050-dlss admitted 2026-09-27 from the 12:32 flight.
+
+Session script (one sitting, EDHM baseline, Epic install, start DLSS at
+SS 1.0; each step: wait ~20 s of treated frames, then F10):
+
+1. Main menu, SS 1.0, DLSS -> F10 (native menu).
+2. In flight, SS 1.0, DLSS -> F10 (native flight).
+3. SS 1.5, DLSS -> F10 (dlss-as-dlaa supersample).
+4. F8 to FSR, SS 0.5 -> F10 (FSR sub-native).
+5. SS 1.5, FSR -> F10 (FSR Native AA supersample).
+6. F8 to TAA, SS 1.0 -> F10 (TAA display-grid native).
+7. Output resolution 3840x2160 -> 2560x1440 mid-session, SS 0.65 -> F10
+   (odd pairing AND a live extent change without restart).
+8. Resolution back to 3840x2160, SS 1.0: no F10 needed; the runtime line
+   showing the streak resuming closes the repeated-changes cell.
+
+Per cell: one "flat route:" line names the effective treatment (the
+negotiation line joins it for sub-native DLSS); treated streaks rebuild
+within seconds of each change; no reset events beyond the change itself;
+the canopy scintillation at 0.5x is expected and recorded (section 75),
+not a blocker. After the session: --trace-check every new dump, admit
+one trace per cell with its manifest provenance line, full build (the
+corpus gate must print every file replaying identical), push. The
+EDHM-off stock matrix is a separate sitting (chain unlink, restart).
+
+Session 1 (2026-09-27 13:24, g0b56952d): menu cells only; the flight
+segment hit a NEW unreciped pair. Banked: edhm-menu-native-dlss (streak
+6000+ at capture). Eight seconds after entering flight, every frame
+began refusing locally on VS 24214E7C45496BE0 / PS EC998602427115F3
+(unknown-scene-projection-recipe, ~450 draws/5s window, every frame) and
+the runtime sat in observation for the rest of the session -- the
+section-68 design working as intended: zero treated, zero refusal-count
+churn, no reset storm, jitter parked at zero. All seven dumps replay
+identical under --trace-check, but the six post-observation ones
+(46463/48357/51105/53342/55208/57533) certify selection during local
+refusal, not treated cells; they stay unadmitted. No SS or resolution
+change was ever applied (no route lines past the initial native), so the
+supersample, sub-native-backend, odd-size and repeated-change cells all
+remain open. The refusing pair's bytecode IS on disk (shader capture:
+vs_24214E7C45496BE0.dxbc, ps_EC998602427115F3.dxbc) -- recipe it and the
+flight cells can run. Note: the unknown-projection capture reported
+distinct-pairs=0 all session despite the refusal naming the pair in
+every coverage line; its audit completed at 13:26:16, seconds before the
+pair first appeared -- whether post-audit capture should have picked it
+up is an open instrumentation question.
+
+Recipe SHIPPED 2026-09-27: VS 24214E7C45496BE0 is the radar local-key
+marker VS, already vetted at cb2 ForwardColumns 8 against the stock
+companion; EC998602 is the same marker recoloured through EDHM's t120
+config tree (same input semantics, colour-only delta, no projection or
+depth consumer), admitted as the exact companion. Not one of the
+coriolis arc's named seam suspects (BCF75CEA37060EAE / 2F924695596C8195
+at SV_Target6) -- adjacent family, new companion only. Rig pins the
+pair. The flight cells now wait on a re-fly, not on code.
+
+Session 2 (2026-09-27 13:56, g7a0415b2, in flight): the recipe holds --
+no observation episode, no local refusal beyond three one-draw transient
+projection-preparation-refused lines, present-not-ok=0 session-wide.
+Banked five cells, each captured with a rebuilt treated streak:
+edhm-flight-ss150-dlss (dlss-as-dlaa-supersample), edhm-flight-ss150-fsr
+(fsr-native-aa-supersample), edhm-flight-ss050-fsr (trained-upscale),
+edhm-flight-ss150-taa (display-grid down), edhm-flight-native-taa.
+Repeated contract changes rebuilt streaks within seconds every time --
+the repeated-changes cell stands on this evidence. Corpus is 9 files,
+27/27 replay identical. Still open: native DLSS flight, 0.5 DLSS flight,
+the odd-size/resolution-change cell (no route ever left 4K), and the
+EDHM-off stock matrix.

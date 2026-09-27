@@ -60,6 +60,8 @@ struct State {
     uint64_t acceptedResetWindow = 0, acceptedHistoryWindow = 0;
     uint64_t resetMissingWindow = 0, resetGapWindow = 0, resetDepthWindow = 0;
     uint64_t resetColorWindow = 0, resetExtentWindow = 0;
+    uint64_t presentNotOkWindow = 0;
+    uint32_t presentNotOkLogged = 0;
     uint64_t streak = 0, longestStreak = 0;
     std::map<std::string, uint64_t> refusedWindow;
     std::map<std::string, uint64_t> conflictWindow;
@@ -1258,7 +1260,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     s.drawCapture.present(s.context.Get(),frame);
     flatMonoResolvePollPixels(s.context.Get(),frame);
     if(s.phase.applied)++s.jitteredFrames;
-    s.phase.finish(s.temporalAccepted && hr==S_OK,s.frameCoverage && !s.prefix.uncertain && !foreignWork.load(std::memory_order_acquire));
+    s.phase.finish(s.temporalAccepted && SUCCEEDED(hr),s.frameCoverage && !s.prefix.uncertain && !foreignWork.load(std::memory_order_acquire));
     const bool wanted=_stricmp(Config::get().getString("experimental.temporal_aa_jitter","on").c_str(),"off")!=0;
     if(wanted!=s.jitterWanted) { s.phase.resetHistory();reset(); }
     s.jitterWanted=wanted;
@@ -1352,7 +1354,21 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.resolvePreflight=flatMonoResolvePreflight(s.device.Get(),s.context.Get(),s.plannedResolve);
         s.resolvePreflightRetryMs=preflightNow;
     }
-    if (!s.treated || hr != S_OK) reset();
+    // A success-status present is not a failed frame: DXGI returns status
+    // codes (occlusion and friends) alongside S_OK, and gating on S_OK reset
+    // temporal history every frame for as long as the status persisted --
+    // the 2026-09-27 0.5x flight's every-frame no-previous storm with the
+    // phase pinned at zero. Log the value so the flight names what the game
+    // actually returns; reset only on a real failure.
+    if (hr != S_OK) {
+        ++s.presentNotOkWindow;
+        if (s.presentNotOkLogged < 8) {
+            ++s.presentNotOkLogged;
+            Log::get().note("flat runtime: present result 0x%08lX is not S_OK; history and jitter reset only on FAILED",
+                static_cast<unsigned long>(hr));
+        }
+    }
+    if (!s.treated || FAILED(hr)) reset();
     Ptr<ID3D11Texture2D> output; if (FAILED(swap->GetBuffer(0, IID_PPV_ARGS(&output)))) return;
     // Swapchain image rotation does not change render scale. Resize/device
     // teardown clears the published extent; each qualified handoff updates it.
@@ -1439,10 +1455,10 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         }
         for (const auto& entry : s.conflictWindow)
             Log::get().note("flat runtime conflict 5s: cause=%s count=%llu", entry.first.c_str(), static_cast<unsigned long long>(entry.second));
-        Log::get().note("flat runtime adapter reset 5s: no-previous=%llu frame-gap=%llu depth-change=%llu color-change=%llu extent-change=%llu",
+        Log::get().note("flat runtime adapter reset 5s: no-previous=%llu frame-gap=%llu depth-change=%llu color-change=%llu extent-change=%llu present-not-ok=%llu",
             static_cast<unsigned long long>(s.resetMissingWindow), static_cast<unsigned long long>(s.resetGapWindow),
             static_cast<unsigned long long>(s.resetDepthWindow), static_cast<unsigned long long>(s.resetColorWindow),
-            static_cast<unsigned long long>(s.resetExtentWindow));
+            static_cast<unsigned long long>(s.resetExtentWindow), static_cast<unsigned long long>(s.presentNotOkWindow));
         const auto renderer = flatMonoResolveStats();
         Log::get().note("flat runtime renderer cumulative: calls=%llu init=%llu context-change=%llu allocations=%llu full-reset=%llu invalidations=%llu accepted-reset=%llu accepted-continue=%llu requested-reset=%llu lost-history=%llu frame-gap=%llu invalid-prev-camera=%llu format-change=%llu camera-cut=%llu backend-failure=%llu continue-run=%llu longest-continue-run=%llu",
             static_cast<unsigned long long>(renderer.calls), static_cast<unsigned long long>(renderer.initializations),
@@ -1456,6 +1472,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             static_cast<unsigned long long>(renderer.longestContinueRun));
         s.refusedWindow.clear(); s.acceptedResetWindow = s.acceptedHistoryWindow = 0;
         s.resetMissingWindow = s.resetGapWindow = s.resetDepthWindow = s.resetColorWindow = s.resetExtentWindow = 0;
+        s.presentNotOkWindow = 0;
         s.conflictWindow.clear();
         s.covSceneDraws = s.covExact = s.covGeneric = s.covInert = s.covUnchanged = 0;
         s.covLocalRefused = s.covMemoEvictions = 0;
@@ -1829,6 +1846,12 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
                 }
             }
         }
+        // The plan carries the same negotiated E the frame does (gate-2 review
+        // F1): preflight allocates at E and the resolve's resource cache keys
+        // on E, so a plan without it would allocate the fallback output at the
+        // route's default size and the first treated frame would reallocate.
+        plan.evalWidth = negotiatedMatch ? s.negotiatedEvalW : 0;
+        plan.evalHeight = negotiatedMatch ? s.negotiatedEvalH : 0;
         s.plannedResolve=plan;s.haveResolvePlan=true;
     }
     std::memcpy(f.camera, selected.camera, sizeof(f.camera));

@@ -10,3 +10,23 @@
 # `flat_temporal_test --trace-migrate` (same events, unchanged selector).
 flat_trace_10806.bin 3 edhm-menu-ss065-dlss
 flat_trace_16271.bin 3 edhm-flight-ss065-dlss
+# Epic install 2026-09-27 12:33 UTC session, build v0.18.0-rc.2-65-g1caacf14,
+# EDHM chained, DLSS requested, game supersampling 0.5 (R=1920x1080,
+# D=3840x2160), main-menu hangar. Sub-native cell of the gate-2 matrix.
+flat_trace_36807.bin 3 edhm-menu-ss050-dlss
+# Epic install 2026-09-27 13:26 UTC session, build v0.18.0-rc.2-66-g0b56952d,
+# EDHM chained, DLSS requested, game supersampling 1.0 (R=D=3840x2160),
+# main-menu hangar, treated streak 6000+ at capture. Native cell.
+flat_trace_43365.bin 3 edhm-menu-native-dlss
+# Epic install 2026-09-27 13:58-14:00 UTC session, build
+# v0.18.0-rc.2-70-g7a0415b2, EDHM chained, in flight. One line per backend
+# cell; each captured with a rebuilt treated streak (session-wide
+# present-not-ok=0, no observation episodes after the 24214E7C/EC998602
+# recipe). Routes: dlss-as-dlaa-supersample / fsr-native-aa-supersample at
+# SS 1.5 (R=5760x3240), trained-upscale at SS 0.5 (R=1920x1080), TAA
+# display-grid at SS 1.5 and native at SS 1.0, all D=3840x2160.
+flat_trace_39261.bin 3 edhm-flight-ss150-dlss
+flat_trace_40160.bin 3 edhm-flight-ss150-fsr
+flat_trace_41502.bin 3 edhm-flight-ss050-fsr
+flat_trace_43870.bin 3 edhm-flight-ss150-taa
+flat_trace_49426.bin 3 edhm-flight-native-taa

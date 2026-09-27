@@ -454,4 +454,59 @@ void projectionRuntimeTests(ID3D11Device* device, ID3D11DeviceContext* base) {
               "the 65th buffer tracks after 64 failed preflights (no ownerless pins)");
         pressure.reset();
     }
+    // Gate-2 review F2: a buffer referenced by two plans stays promoted until
+    // BOTH retire, so single-shot retirement frees nothing. With the whole
+    // bank shared pairwise across 32 four-binding plans, the 65th buffer must
+    // still track: the bounded loop retires plans until a buffer unpins.
+    {
+        FlatProjectionRuntime shared;
+        check(shared.initialize(base), "shared-refs runtime initialized");
+        unsigned char blob[1024]; std::memset(blob, 7, sizeof(blob));
+        FlatProjectionJitter pz{};
+        check(flatProjectionJitter(.25f, -.25f, 960, 540, pz), "shared-refs phase conversion");
+        ComPtr<ID3D11Buffer> pins[64]{};
+        for (UINT i = 0; i < 64; ++i) {
+            D3D11_BUFFER_DESC bd{}; bd.ByteWidth = sizeof(blob); bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_SUBRESOURCE_DATA bi{}; bi.pSysMem = blob;
+            check(SUCCEEDED(device->CreateBuffer(&bd, &bi, pins[i].GetAddressOf())), "shared-refs CB created");
+            shared.observeCreateBuffer(pins[i].Get(), blob);
+        }
+        bool plansReady = true;
+        for (UINT plan = 0; plan < 32 && plansReady; ++plan) {
+            // Plans 0-15 give buffers 0-63 their first reference, plans 16-31
+            // their second: every buffer is pinned by exactly two plans. The
+            // second reference binds different slots, because the buffer
+            // identity and slot are both part of a plan's topology -- same
+            // slots would re-preflight the first-reference plan instead of
+            // filling the bank.
+            FlatProjectionRuntimeRequest four[4]{};
+            for (UINT j = 0; j < 4; ++j) {
+                four[j].stage = FlatProjectionStage::Vertex;
+                four[j].slot = 1 + (plan / 16) * 4 + j;
+                four[j].original = pins[(plan % 16) * 4 + j].Get();
+                four[j].firstConstant = 0; four[j].constantCount = sizeof(blob) / 16;
+                four[j].patchCount = 1;
+                four[j].patches[0] = {FlatProjectionPatchLayout::ForwardColumns, 0, {}};
+            }
+            plansReady = shared.preflight(four, 4, pz, plan + 1);
+        }
+        check(plansReady && shared.status().planRefsLive == 128,
+              "32 four-binding plans pin all 64 buffers exactly twice");
+        ComPtr<ID3D11Buffer> sixtyFive;
+        {
+            D3D11_BUFFER_DESC bd{}; bd.ByteWidth = sizeof(blob); bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_SUBRESOURCE_DATA bi{}; bi.pSysMem = blob;
+            check(SUCCEEDED(device->CreateBuffer(&bd, &bi, sixtyFive.GetAddressOf())), "shared-refs 65th CB created");
+        }
+        check(shared.observeCreateBuffer(sixtyFive.Get(), blob) &&
+              shared.status().planRetiredLru >= 2,
+              "the 65th buffer tracks while every slot is pinned twice (bounded retirement loop)");
+        FlatProjectionRuntimeRequest rq65{};
+        rq65.stage = FlatProjectionStage::Vertex; rq65.slot = 1; rq65.original = sixtyFive.Get();
+        rq65.firstConstant = 0; rq65.constantCount = sizeof(blob) / 16; rq65.patchCount = 1;
+        rq65.patches[0] = {FlatProjectionPatchLayout::ForwardColumns, 0, {}};
+        check(shared.preflight(&rq65, 1, pz, 65),
+              "a plan for the 65th buffer preflights after the retirements");
+        shared.reset();
+    }
 }
