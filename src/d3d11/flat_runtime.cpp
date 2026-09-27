@@ -8,6 +8,7 @@
 #include "flat_live_phase.h"
 #include "flat_draw_capture.h"
 #include "flat_local_reject.h"
+#include "flat_trace.h"
 #include "binding_shadow.h"
 #include "exposure_fix.h"
 #include "device_hook.h"
@@ -153,6 +154,16 @@ struct State {
     // (State& only) can name the refused pair in the census -- the same
     // convention as s.namedDepth and s.reason.
     uint64_t drawVs = 0, drawPs = 0;
+
+    // --- Frame-contract trace (staged-program gate 1) -------------------------
+    // The reducer's input events, always recorded into a bounded ring and
+    // dumped on the F10 audit arm; the replay rig runs the same reducer over
+    // the trace and compares contract hashes. The contract itself is produced
+    // at the copy draw; its hash seals the frame's slot at the next present.
+    FlatTraceRing traceRing{};
+    FlatFrameContract traceContract{};
+    uint64_t traceContractHash = 0;
+    bool traceContractProduced = false;
 
     // --- Partial temporal AA: coverage census (Part B), reset every 5s --------
     uint64_t covSceneDraws = 0, covExact = 0, covGeneric = 0, covInert = 0, covUnchanged = 0;
@@ -1119,6 +1130,32 @@ void flatRuntimeArmProjectionAudit() { if(runtimeFlatProfile()) projectionAuditR
 void flatRuntimeCreateBuffer(ID3D11Buffer* buffer, const void* initialData) {
     if(owner() && state().projection) state().projection->observeCreateBuffer(buffer,initialData);
 }
+// Gate 1 trace dump: write the ring's complete frames to logDir\traces on the
+// F10 audit arm. CREATE_ALWAYS: each arm is a new capture of the newest slots.
+void flatTraceDumpToLogDir(State& s, uint64_t frame) {
+    const auto root = Config::get().logDir() + L"\\traces";
+    if (!CreateDirectoryW(root.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        Log::get().note("flat trace dump: cannot create %ls (error %lu)", root.c_str(), GetLastError());
+        return;
+    }
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%ls\\flat_trace_%llu.bin", root.c_str(), (unsigned long long)frame);
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        Log::get().note("flat trace dump: cannot write %ls (error %lu)", path, GetLastError());
+        return;
+    }
+    uint32_t frames = 0, events = 0;
+    const uint32_t bytes = flatTraceDump(s.traceRing, [&](const void* data, uint32_t bytes) {
+        DWORD wrote = 0; WriteFile(f, data, bytes, &wrote, nullptr);
+        return wrote;
+    });
+    CloseHandle(f);
+    for (uint32_t i = 0; i < kFlatTraceFrames; ++i)
+        if (s.traceRing.slotUsed[i]) { ++frames; events += s.traceRing.headers[i].eventCount; }
+    Log::get().note("flat trace dump: %ls frames=%u events=%u bytes=%u (truncated slots skipped)",
+        path, frames, events, bytes);
+}
 void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT flags) {
     if (!runtimeFlatProfile() || !swap || (flags & DXGI_PRESENT_TEST)) return;
     auto& s = state(); if (s.thread && !owner()) return;
@@ -1226,6 +1263,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             s.resolvePreflight=s.haveResolvePlan ? flatMonoResolvePreflight(s.device.Get(),s.context.Get(),s.plannedResolve) : FlatMonoResolvePreflightResult{};
             if(s.haveResolvePlan)s.resolvePreflightRetryMs=GetTickCount64();
             Log::get().note("flat projection: armed 900-frame live preparation audit; frame phase governs raster and backend; F10 does not reset live projection resources");
+            flatTraceDumpToLogDir(s, frame);
             // Refresh exact creation bytecode once per manual arm, or emit
             // an explicit missing-cache result; no inferred shader admission.
             captureFlatProbeShader('v',0x5EAFFCD01B97D0C4ull);
@@ -1273,6 +1311,11 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     if(!wanted && !s.projectionFrames) {s.projection.reset();s.projectionContext.Reset();}
     for (auto& r : s.colors) r.Reset(); for (auto& r : s.depths) r.Reset();
     s.prefix = FlatRuntimePrefix{}; s.prefix.frame = frame + 1;
+    // Trace ring: seal the frame that just ended with its produced contract's
+    // hash, then open the next frame's slot.
+    flatTraceSeal(s.traceRing, s.traceContractProduced, s.traceContractHash);
+    s.traceContractProduced = false; s.traceContractHash = 0;
+    flatTraceBeginFrame(s.traceRing, frame + 1, output.Get(), d.Width, d.Height, d.Format);
     s.phaseCensusPending=s.jitterWanted;
     s.phaseCensusFailed=false;
     s.prefix.output = output.Get(); s.prefix.width = d.Width; s.prefix.height = d.Height; s.prefix.format = d.Format;
@@ -1472,7 +1515,17 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     const uint32_t oldImageAccepted=s.prefix.imageCopiesAccepted,oldImageRefused=s.prefix.imageCopiesRefused;
     const uint32_t oldMenuAccepted=s.prefix.menuCopiesAccepted,oldMenuRefused=s.prefix.menuCopiesRefused;
     const uint32_t cameraProbeAttempt=captureCameraConflict(s,d);
-    const auto selected = flatRuntimeObserve(s.prefix, d);
+    // Gate 1 consolidation: the copy draw's selection is produced as the
+    // frame contract (identical decision), and every draw is recorded into
+    // the trace ring for the reducer replay.
+    const auto selected = copy
+        ? flatRuntimeObserveContract(s.prefix, d, s.traceContract)
+        : flatRuntimeObserve(s.prefix, d);
+    flatTraceRecord(s.traceRing, d);
+    if (copy) {
+        s.traceContractProduced = s.traceContract.produced;
+        s.traceContractHash = s.traceContract.produced ? flatFrameContractHash(s.traceContract) : 0;
+    }
     if(cameraProbeAttempt)for(uint32_t i=0;i<s.prefix.targetsUsed;++i)if(s.prefix.targets[i].resource==k.color){
         const auto& witness=s.prefix.targets[i].firstBad;
         Log::get().note("flat camera probe observer: attempt=%u frame=%llu draw-seq=%u first-bad=%s first-bad-seq=%u caused-first-camera-conflict=%u",

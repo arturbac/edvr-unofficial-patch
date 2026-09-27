@@ -4,6 +4,7 @@
 #include "../../src/d3d11/flat_temporal_model.h"
 #include "../../src/d3d11/flat_mono_frame.h"
 #include "../../src/d3d11/flat_runtime_model.h"
+#include "../../src/d3d11/flat_trace.h"
 #include "../../src/d3d11/engine_velocity_families.h"
 #include "flat_shader_capture_tests.h"
 #include "flat_projection_math_tests.h"
@@ -21,7 +22,10 @@
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <vector>
 
 namespace {
 struct Pair {
@@ -1249,6 +1253,125 @@ void flatRuntimeMenuCopyTests() {
           "unknown depthless shader pair does not enter menu copy path");
 }
 
+void testFrameContractTrace() {
+    using namespace edvr;
+    // Gate 1 (the staged program): the frame contract is produced by the same
+    // reducer online and under trace replay, with identical decisions.
+    for (uint32_t width : {960u, 1280u}) {
+        MonoFixture fixture(width);
+        auto prefix = std::make_unique<FlatRuntimePrefix>();
+        prefix->frame = fixture.input.frame; prefix->output = fixture.input.output;
+        prefix->width = 1280; prefix->height = 720; prefix->format = 28;
+        auto ring = std::make_unique<FlatTraceRing>();
+        flatTraceBeginFrame(*ring, prefix->frame, prefix->output, prefix->width, prefix->height, prefix->format);
+        struct Event { const FlatContractRecord* r; uint32_t q; } events[200]{};
+        uint32_t count = 0;
+        for (uint32_t i = 0; i < fixture.input.worldCount; ++i) {
+            const auto& r = fixture.world[i];
+            for (uint32_t n = 0; n < r.draws; ++n) events[count++] = {&r, r.first + (r.last-r.first)*n/(r.draws>1?r.draws-1:1)};
+        }
+        events[count++] = {&fixture.handoff[0], fixture.handoff[0].first};
+        events[count++] = {&fixture.handoff[1], fixture.handoff[1].first};
+        std::sort(events, events + count, [](const Event& a, const Event& b) { return a.q < b.q; });
+        auto isCopy = [](const FlatRuntimeDraw& d, const FlatRuntimePrefix& p) {
+            return d.key.vs == flat_mono_detail::kCopyVs && d.key.ps == flat_mono_detail::kCopyPs &&
+                d.key.color == p.output;
+        };
+        auto contract = std::make_unique<FlatFrameContract>();
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& r = *events[i].r;
+            FlatRuntimeDraw d{}; d.key = r.key;
+            std::memcpy(d.camera, r.camera, sizeof(d.camera));
+            d.key.writeEpoch = prefix->frame; d.key.writeSeq = prefix->sequence + 1;
+            d.supported = engine_velocity_family::supportedPair(d.key.vs, d.key.ps);
+            d.instances = r.firstInstances;
+            if (isCopy(d, *prefix)) flatRuntimeObserveContract(*prefix, d, *contract);
+            else flatRuntimeObserve(*prefix, d);
+            flatTraceRecord(*ring, d);
+        }
+        flatTraceSeal(*ring, contract->produced, contract->produced ? flatFrameContractHash(*contract) : 0);
+        check(contract->produced && contract->selection.selected(),
+              "trace online run produces a selected frame contract");
+        const uint64_t wantHash = flatFrameContractHash(*contract);
+        std::vector<unsigned char> bytes;
+        flatTraceDump(*ring, [&](const void* data, uint32_t n) {
+            const auto* p = static_cast<const unsigned char*>(data);
+            bytes.insert(bytes.end(), p, p + n); return n;
+        });
+        uint32_t framesReplayed = 0, framesMatched = 0;
+        FlatRuntimePrefix replay{};
+        FlatFrameContract rc{};
+        FlatTraceFrameHeader cur{};
+        auto finishFrame = [&]() {
+            if (!cur.eventCount) return;
+            ++framesReplayed;
+            if (rc.produced == (cur.produced != 0) &&
+                (!rc.produced || flatFrameContractHash(rc) == cur.contractHash)) ++framesMatched;
+        };
+        const bool parsed = flatTraceParse(bytes.data(), bytes.size(),
+            [&](const FlatTraceFrameHeader& h) {
+                finishFrame(); cur = h;
+                replay = FlatRuntimePrefix{}; replay.frame = h.frame; replay.output = h.output;
+                replay.width = h.width; replay.height = h.height; replay.format = h.format;
+                rc = FlatFrameContract{};
+            },
+            [&](const FlatTraceEvent& e) {
+                FlatRuntimeDraw d = flatTraceEventToDraw(e);
+                d.key.writeEpoch = replay.frame; d.key.writeSeq = replay.sequence + 1;
+                if (isCopy(d, replay)) flatRuntimeObserveContract(replay, d, rc);
+                else flatRuntimeObserve(replay, d);
+            });
+        finishFrame();
+        check(parsed && framesReplayed == 1 && framesMatched == 1 && wantHash == cur.contractHash,
+              "trace round-trip replays to an identical frame contract");
+    }
+    // Committed corpus: every trace replays to its recorded contract hashes.
+    namespace fs = std::filesystem;
+    const fs::path dir("tools/flat_temporal_test/traces");
+    if (!fs::exists(dir)) {
+        std::puts("NOTE: frame-contract trace corpus absent; captures arrive with flights");
+        return;
+    }
+    uint32_t files = 0, framesMatched = 0, framesTotal = 0;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (entry.path().extension() != ".bin") continue;
+        std::ifstream file(entry.path(), std::ios::binary | std::ios::ate);
+        if (!file) continue;
+        std::vector<unsigned char> bytes(static_cast<size_t>(file.tellg()));
+        file.seekg(0); file.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (!file) { check(false, "trace corpus file unreadable"); continue; }
+        ++files;
+        FlatRuntimePrefix replay{};
+        FlatFrameContract rc{};
+        FlatTraceFrameHeader cur{};
+        auto finish = [&]() {
+            if (!cur.eventCount) return;
+            ++framesTotal;
+            if (rc.produced == (cur.produced != 0) &&
+                (!rc.produced || flatFrameContractHash(rc) == cur.contractHash)) ++framesMatched;
+        };
+        const bool parsed = flatTraceParse(bytes.data(), bytes.size(),
+            [&](const FlatTraceFrameHeader& h) {
+                finish(); cur = h;
+                replay = FlatRuntimePrefix{}; replay.frame = h.frame; replay.output = h.output;
+                replay.width = h.width; replay.height = h.height; replay.format = h.format;
+                rc = FlatFrameContract{};
+            },
+            [&](const FlatTraceEvent& e) {
+                FlatRuntimeDraw d = flatTraceEventToDraw(e);
+                d.key.writeEpoch = replay.frame; d.key.writeSeq = replay.sequence + 1;
+                const bool copy = d.key.vs == flat_mono_detail::kCopyVs &&
+                    d.key.ps == flat_mono_detail::kCopyPs && d.key.color == replay.output;
+                if (copy) flatRuntimeObserveContract(replay, d, rc); else flatRuntimeObserve(replay, d);
+            });
+        finish();
+        check(parsed, "trace corpus file parses");
+    }
+    check(framesMatched == framesTotal, "trace corpus replays to the recorded frame contracts");
+    if (files) std::printf("frame-contract corpus: %u file(s), %u/%u frames replay identical\n",
+                           files, framesMatched, framesTotal);
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
         return flatShaderClassifierSweep(argv[2]);
@@ -1281,6 +1404,7 @@ int main(int argc, char** argv) {
     flatRuntimePrefixTests();
     flatRuntimeImageCopyTests();
     flatRuntimeMenuCopyTests();
+    testFrameContractTrace();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

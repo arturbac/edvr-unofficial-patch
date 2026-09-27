@@ -149,7 +149,15 @@ inline void flatRuntimeComputeWritten(FlatRuntimePrefix& p, const void* resource
             return;
         }
 }
-inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeDraw& d) {
+// Optional sink for the copy branch's assembled fixture records: the frame
+// contract's carrier (flat_frame_contract.h). count is set only when the
+// copy branch ran, so count != 0 means the reducer produced a contract.
+struct FlatRuntimeContractSink {
+    FlatContractRecord* records = nullptr;
+    uint32_t capacity = 0, count = 0;
+};
+inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeDraw& d,
+                                        FlatRuntimeContractSink* sink) {
     using namespace flat_mono_detail;
     FlatMonoFrame out{}; out.frame = out.epoch = p.frame;
     const uint32_t q = ++p.sequence;
@@ -178,6 +186,12 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
         records[n++] = tone->tone;
         for (uint32_t i = 0; i < p.sourcesUsed; ++i) records[n++] = p.sources[i];
         records[n++] = current;
+        // The frame contract's record fixture: the exact records the selector
+        // ran on, delivered to the sink before selection.
+        if (sink && sink->records && n <= sink->capacity) {
+            std::memcpy(sink->records, records, n * sizeof(FlatContractRecord));
+            sink->count = n;
+        }
         FlatMonoFrameInput in{}; in.world = records; in.worldCount = n;
         in.output = p.output; in.outputWidth = p.width; in.outputHeight = p.height; in.outputFormat = p.format;
         in.frame = in.epoch = p.frame; in.supportedPair = [](uint64_t, uint64_t) { return true; };
@@ -378,5 +392,10 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
         }
     }
     return out;
+}
+// The two-argument form keeps every existing caller; the sink form is the
+// frame-contract producer (flat_frame_contract.h).
+inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeDraw& d) {
+    return flatRuntimeObserve(p, d, nullptr);
 }
 } // namespace edvr
