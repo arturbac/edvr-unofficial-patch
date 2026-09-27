@@ -523,3 +523,42 @@ it (decision 5 stands).
   taken 22-24/frame, re-issues 2.00/frame, declines none, the HDR layer's
   size/memory, the route GPU times. Validate the jitter cancel visually
   (the G-C caveat: absolute phase unanchored, x slope at 94-99%).
+
+## Phase 1 flight 1, 2026-09-27 (Steam, f032e024): the menu regression
+
+Cockpit side measured clean: 12.41 then 23.24 holo draws/frame taken,
+2.00 re-issues and coverage passes a frame, 0 declines, 0 HDR content
+lost, 0 composites refused. Sean: "cockpit looks good".
+
+The regression: the ui menus. The family census says the menus were NEVER
+taken this flight -- 0 redirected in every window. Two measured
+populations:
+
+- In the cockpit: the in-flight menu composite (station services, the
+  escape menu) draws vs A888D51024D9798E / ps 015EF9349EC097E8 -- the
+  TINTED variant, documented in ui_depth.cpp:105-115 (three variants, nine
+  disassembly lines apart, none in the sampling) but MISSING from the
+  family rule's pair list (kUiPanelPs had only the two main-menu PSes
+  since 2026-09-23). With no learned surface bound at recognition, the
+  family was never found: "no learned surface, pixel shader not known",
+  ~5,200 draws a window. This gap predates the branch -- the recognition
+  is identical on main -- but ui_quality defaults off, so nobody had flown
+  the menu take against the tinted variant.
+- The main-menu/loading untinted panels (ps 9107E72CB016CC02, in the list)
+  were recognized but refused "eye unknown" (uiDepthEyeOfTarget can't name
+  their target's eye there) -- unchanged behaviour, separate question.
+
+The regression's mechanism: with the menus left in the eye and the holo
+panels now composited over the finished eye at the door, an open in-flight
+menu sits UNDER the cockpit panels. Stock order (panels under menus) held
+before because the panels never left the eye.
+
+The fix (43ab5364): the tinted and cheap variants join kUiPanelPs -- the
+pair route exists exactly for "no learned surface bound" -- so the
+in-flight menu takes, lands in the layer AFTER the re-issue (game order:
+menus draw post-tonemap), and sits over the panels again, now at layer
+sharpness. The rig's family-rule fixture moved to the new expectation.
+Built green, installed to Steam (v0.18.0-rc.2-58-g43ab5364). VERIFY with
+a docked menu open: the menu over the panels and sharp; the log's family
+line should show "decided as the menu panel: N redirected" with the tinted
+PS named, and the crisp hud line clean.
