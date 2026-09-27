@@ -2,12 +2,15 @@
 
 ## Status
 
-- **State:** PHASE 0, flight 1 read (2026-09-27, Steam, build fc89d59d,
-  EDHM active). G-A settled (all three families, the sprite's target
-  included), G-B settled (measured pair + the EDHM swap, in the wild),
-  G-E settled directionally. G-C and G-D measured nothing -- instrument
-  gaps, not negative results (see the flight entry). G-F got no data: the
-  eye-run hotkey was never pressed.
+- **State:** PHASE 0, flight 2 read (2026-09-27, Steam, build 6798b6de,
+  two sessions). G-F MEASURED (five ledgers; the parity identity holds
+  except in the bright-translucent regime, quantified). G-D still no data:
+  the guard fix worked (zero declines) but the log hit its 4 MB cap
+  seconds before the first results window -- G-A's state lines flooded it
+  (fixed on the branch as Phase 0.2). G-C: the full-cb0 dump ruled out a
+  bare projection in cb0; rows 4..7 are one per-eye composed matrix
+  shared by all three families; factorisation is offline work from the
+  flight-2 ledgers. G-A/G-B/G-E consistent with flight 1.
 - **Goal:** composite the cockpit HUD after the upscale, at output
   resolution, out of DLSS/FSR history. That means the holo panels, the
   flight HUD and the target sprite. It should be as sharp at HMD Quality
@@ -24,10 +27,10 @@
   (lines 184-191: "PARKED, not declined"), with one change. It re-issues
   the game's own tonemap draw instead of transcribing it.
 - **Decisions for Sean:** see "Decisions", before Phase 1.
-- **Next step:** Phase 0.1 -- type-aware G-D query guard + decline-reason
-  split, a wider G-C cb0 read, then one short re-fly that also presses the
-  eye-run hotkey (INSERT) with holo panels on screen. Details in the flight
-  entry at the tail.
+- **Next step:** flight 3 (Phase 0.2 build): hold the cockpit HUD for one
+  full 30 s window and G-D prints. In parallel, G-C's offline
+  factorisation from `pool\draws_<stamp>.bin` (the flight-2 ledgers carry
+  the families' VS b0/b1/b2). Then the Decisions below, then Phase 1.
 
 ## What exists
 
@@ -341,3 +344,53 @@ projection lives outside cb0 dumps every row once per eye for offline
 factorisation. Installed to Steam as v0.18.0-rc.2-50-g6798b6de; awaiting
 flight 2 (same profile as flight 1, plus one INSERT press with holo
 panels on screen for G-F).
+
+## Phase 0, flight 2, 2026-09-27 (Steam, 6798b6de, two sessions)
+
+Both logs verified build 6798b6de. Sessions 12:21 and 12:24; five eye-run
+ledgers at 12:30:21..12:31:04. ~19.2k census lines harvested.
+
+- **G-D: the guard fix worked; the log cap ate the results.** Zero
+  declines in every window (the type-aware guard passes gpu_span's
+  disjoint), all three families' game depth states were cloned and pairs
+  began -- and then the gfx log hit its 4 MB cap at 12:26:50, seven
+  seconds before the first window carrying G-D results would print. The
+  cap's cause is the census's own G-A flood: a single last-fingerprint
+  slot re-logged every panel of every frame (~12 distinct holo interface
+  surfaces cycle through one family's slot), ~9.7k lines in two minutes
+  of cockpit. Fixed as Phase 0.2: first-seen-per-session fingerprint sets
+  (64 per family, with a table-full note). G-D data: still none; flight 3
+  gets it by holding the cockpit for one 30 s window.
+- **G-C: cb0 ruled out; the composed matrix is shared.** The wide read
+  dumped all of cb0: rows 0..3 are constants ([1 1 1 1], [0 0 0 0],
+  [16 16 0 0], [16 16 0 0] -- panel parameters, not a projection), rows
+  4..7 a composed transform, and MEASURED near-identical per eye across
+  all three families (row 4 agrees to ~3 decimals between holo, flight
+  HUD and sprite): one shared per-eye view-projection, the
+  family-specific part elsewhere. Jitter inside a composed matrix is not
+  separable by row inspection; the flight-2 ledgers captured the
+  families' VS b0/b1/b2 (pool\draws_<stamp>.bin), so factorisation
+  against the scene camera is offline work -- no re-fly needed. "The
+  families carry the eye's jittered projection" stays BELIEVED until
+  then; Phase 1's jitter cancel keeps its G-C gate.
+- **G-F: measured.** Five ledgers, ~440k HUD pixels pooled. err p50 0.00,
+  p99 0.00 8-bit steps: stock and the layer agree except in the predicted
+  regime. In it (0<a<1 over background luma > 1): 5-40 pixels a frame
+  (0.0-0.1%), restricted p99 40-113 steps; the stamp with the most
+  in-regime pixels (123104, 40 of 221k) fails the default budget (113 vs
+  2). Caveats measured alongside: every panel draw is INSTANCED, so the
+  a/L recovery used the luminance fallback (per-pixel a is heuristic; the
+  cross-check is by-construction there), and the empirical T fit residual
+  ran p99 1.5-2.5 steps. Physical reading: a layer-composited HUD differs
+  from stock only where translucent glass crosses a bright background, a
+  few dozen pixels a frame, and there stock is brighter -- the halo,
+  quantified. That is Decisions 1's price with numbers; the Phase 4 blur
+  is the way back if those edges read wrong in flight.
+- **G-A/G-B consistent across both sessions and both render sizes flown**
+  (2600x2514 and 3000x2901): holo 22.0 draws/f with the 0x04 stencil
+  write, sprite 2.0/f depthless with stencil 0x05, flight HUD ~5/f with
+  the eye-sized R32 depth at t0; tonemap 1.00/frame/eye in session 1,
+  five variants named (the same five), bloom composite 953C8123AD8DC13B
+  never sighted in cockpit again.
+- **G-E:** exposure tracked 11.3..115 across the two sessions' scenes;
+  the HUD-region crop still mixes scene and HUD (by design).
