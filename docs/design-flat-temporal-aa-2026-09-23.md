@@ -4471,3 +4471,24 @@ not a blocker. After the session: --trace-check every new dump, admit
 one trace per cell with its manifest provenance line, full build (the
 corpus gate must print every file replaying identical), push. The
 EDHM-off stock matrix is a separate sitting (chain unlink, restart).
+
+Session 1 (2026-09-27 13:24, g0b56952d): menu cells only; the flight
+segment hit a NEW unreciped pair. Banked: edhm-menu-native-dlss (streak
+6000+ at capture). Eight seconds after entering flight, every frame
+began refusing locally on VS 24214E7C45496BE0 / PS EC998602427115F3
+(unknown-scene-projection-recipe, ~450 draws/5s window, every frame) and
+the runtime sat in observation for the rest of the session -- the
+section-68 design working as intended: zero treated, zero refusal-count
+churn, no reset storm, jitter parked at zero. All seven dumps replay
+identical under --trace-check, but the six post-observation ones
+(46463/48357/51105/53342/55208/57533) certify selection during local
+refusal, not treated cells; they stay unadmitted. No SS or resolution
+change was ever applied (no route lines past the initial native), so the
+supersample, sub-native-backend, odd-size and repeated-change cells all
+remain open. The refusing pair's bytecode IS on disk (shader capture:
+vs_24214E7C45496BE0.dxbc, ps_EC998602427115F3.dxbc) -- recipe it and the
+flight cells can run. Note: the unknown-projection capture reported
+distinct-pairs=0 all session despite the refusal naming the pair in
+every coverage line; its audit completed at 13:26:16, seconds before the
+pair first appeared -- whether post-audit capture should have picked it
+up is an open instrumentation question.
