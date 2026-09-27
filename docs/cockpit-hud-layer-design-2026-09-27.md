@@ -327,3 +327,17 @@ on, EDHM installed and active). Build stamp verified by
 Re-fly notes: keep the cockpit HUD up for one full 30 s window (the FSS
 scanner replaced it mid-flight this time), fly one bright and one dark
 scene, and press INSERT once with holo panels on screen for G-F.
+
+## Phase 0.1 instrument, 2026-09-27 (6798b6de)
+
+Flight 1's two instrument gaps are fixed on the branch: G-D's open-query
+guard is type-aware (it declines only while a sample-counting query --
+occlusion, stream-out or pipeline statistics -- is open; gpu_span's
+frame-wide TIMESTAMP_DISJOINT no longer trips it), declines are counted
+by reason on their own window line, and a stream-out-bound decline was
+added beside the PS UAV one. G-C reads the whole VS cb0 (up to 16 rows)
+and votes each 4-row quad for bare-projection structure; a family whose
+projection lives outside cb0 dumps every row once per eye for offline
+factorisation. Installed to Steam as v0.18.0-rc.2-50-g6798b6de; awaiting
+flight 2 (same profile as flight 1, plus one INSERT press with holo
+panels on screen for G-F).
