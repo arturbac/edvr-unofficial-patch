@@ -63,8 +63,9 @@
   (2026-09-26): the review's gate 1 shipped -- the reducer produces the
   immutable FlatFrameContract at the copy draw with no decision change, the
   trace ring records its inputs and dumps on F10, and the rig replays
-  traces to identical contract hashes. INSTALLED on Epic; the stock/EDHM
-  trace corpus is owed by the next flights.
+  traces to identical contract hashes. FLOWN 2026-09-26: the stock/EDHM
+  menu and flight traces replay byte-identical (6/6 frames) and are
+  committed as the corpus's first entries.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -4171,6 +4172,14 @@ with its own counter. The trace now carries a camera-capture event kind,
 replays the resolved write epochs verbatim, and the dump skips the
 in-flight unsealed slot so captured frames are always complete. The two
 v2 captures predate the fix; one more recapture validates.
+
+Validated: the 21:15 captures (three sealed frames each from the EDHM menu
+at 2496x1404 and from steady flight) replay byte-identical on every frame
+-- stored and replayed contract hashes equal -- and pass the corpus gate:
+2 files, 6/6 frames identical. Committed as the corpus's first entries:
+tools/flat_temporal_test/traces/flat_trace_10806.bin (menu) and
+flat_trace_16271.bin (flight). From here the corpus only grows: a frame
+whose decision changes fails the build.
 
 ## 71. Second review cycle: observation transitions closed (2026-09-26)
 
