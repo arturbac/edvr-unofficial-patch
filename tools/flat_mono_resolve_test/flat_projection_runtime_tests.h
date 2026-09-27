@@ -319,4 +319,58 @@ void projectionRuntimeTests(ID3D11Device* device, ID3D11DeviceContext* base) {
         ctx->VSSetConstantBuffers1(1,1,&lateBound,&first,&count);
     }
     runtime.reset();
+    // Section 72 step 3 (review finding 3): the 32-plan cache retires instead
+    // of refusing at 33 -- stale plans release first, then the least-recently
+    // used idle plan, and a retired plan's buffers demote back to evictable.
+    {
+        FlatProjectionRuntime capacity;
+        check(capacity.initialize(base), "capacity runtime initialized");
+        constexpr UINT kTopologies = 40;
+        ComPtr<ID3D11Buffer> buffers[kTopologies]{};
+        unsigned char blob[1024]; std::memset(blob, 7, sizeof(blob));
+        FlatProjectionJitter pz{};
+        check(flatProjectionJitter(.25f, -.25f, 960, 540, pz), "capacity phase conversion");
+        bool allPreflighted = true;
+        for (UINT i = 0; i < kTopologies; ++i) {
+            D3D11_BUFFER_DESC bd{}; bd.ByteWidth = sizeof(blob); bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_SUBRESOURCE_DATA bi{}; bi.pSysMem = blob;
+            if (FAILED(device->CreateBuffer(&bd, &bi, buffers[i].GetAddressOf()))) { allPreflighted = false; break; }
+            capacity.observeCreateBuffer(buffers[i].Get(), blob);
+            FlatProjectionRuntimeRequest rq{};
+            rq.stage = FlatProjectionStage::Vertex; rq.slot = 1; rq.original = buffers[i].Get();
+            rq.firstConstant = 0; rq.constantCount = sizeof(blob) / 16; rq.patchCount = 1;
+            rq.patches[0] = {FlatProjectionPatchLayout::ForwardColumns, 0, {}};
+            if (!capacity.preflight(&rq, 1, pz, i + 1)) { allPreflighted = false; break; }
+        }
+        check(allPreflighted && capacity.status().preflights == kTopologies &&
+              capacity.status().planRetiredLru == kTopologies - 32,
+              "the plan cache retires the least-recently-used idle plan past 32 instead of refusing");
+        // Invalidate a NEW plan's shadow: stale retirement must choose it
+        // over any LRU victim (buffers[0]'s plan was LRU-retired long ago).
+        capacity.invalidate(buffers[kTopologies - 2].Get());
+        {
+            D3D11_BUFFER_DESC bd{}; bd.ByteWidth = sizeof(blob); bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_SUBRESOURCE_DATA bi{}; bi.pSysMem = blob;
+            ComPtr<ID3D11Buffer> extra;
+            check(SUCCEEDED(device->CreateBuffer(&bd, &bi, extra.GetAddressOf())), "stale-case CB created");
+            capacity.observeCreateBuffer(extra.Get(), blob);
+            FlatProjectionRuntimeRequest rq{};
+            rq.stage = FlatProjectionStage::Vertex; rq.slot = 1; rq.original = extra.Get();
+            rq.firstConstant = 0; rq.constantCount = sizeof(blob) / 16; rq.patchCount = 1;
+            rq.patches[0] = {FlatProjectionPatchLayout::ForwardColumns, 0, {}};
+            check(capacity.preflight(&rq, 1, pz, kTopologies + 1) &&
+                  capacity.status().planRetiredStale >= 1,
+                  "a plan whose shadow is invalidated retires stale before any LRU eviction");
+        }
+        UINT first = 0, count = sizeof(blob) / 16; auto* lastBound = buffers[kTopologies - 1].Get();
+        ctx->VSSetConstantBuffers1(1, 1, &lastBound, &first, &count);
+        FlatProjectionRuntimeRequest last{};
+        last.stage = FlatProjectionStage::Vertex; last.slot = 1; last.original = buffers[kTopologies - 1].Get();
+        last.firstConstant = 0; last.constantCount = sizeof(blob) / 16; last.patchCount = 1;
+        last.patches[0] = {FlatProjectionPatchLayout::ForwardColumns, 0, {}};
+        const auto* lastPlan = capacity.prepare(&last, 1, pz, kTopologies);
+        check(lastPlan != nullptr, "a surviving plan still prepares after retirements");
+        if (lastPlan) { FlatProjectionBindingScope scope(*lastPlan); check(scope.active(), "surviving plan binds"); }
+        capacity.reset();
+    }
 }
