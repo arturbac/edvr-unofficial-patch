@@ -78,6 +78,18 @@ struct FamWindow {
     uint32_t gdPairs[2] = {0, 0};
 };
 
+// Why an occlusion pair declined, counted separately since flight 1: the
+// combined counter could not tell the guard from the budget, and the one
+// number hid the frame-wide TIMESTAMP_DISJOINT story for a whole flight.
+enum GdDecline : uint8_t {
+    kGdDeclPredication = 0,
+    kGdDeclQuery,   // a sample-counting game query is open on the context
+    kGdDeclRing,    // every pair still awaits its GPU result
+    kGdDeclUav,     // a pixel-shader UAV is bound
+    kGdDeclSo,      // a stream-out target is bound
+    kGdDeclCount
+};
+
 struct Window {
     uint32_t frames = 0;
     uint32_t eyeDrawsMax = 0;
@@ -88,7 +100,7 @@ struct Window {
     uint32_t tonemapHdrIsFam = 0;   // tonemaps whose HDR SRV was a family target
     uint32_t bloomSightings = 0;    // vs 953C8123AD8DC13B
     uint32_t bloomInFamilyFrames = 0;
-    uint32_t gdDeclined = 0;        // budget, predication, open game query, ring full
+    uint32_t gdDecl[kGdDeclCount] = {};
     uint32_t gdDropped = 0;         // pairs whose result never arrived
     uint32_t gcSkipped = 0;         // ring full, no or small cb0
 };
@@ -247,20 +259,27 @@ void noteFamilyState(ID3D11DeviceContext* ctx, int fam, int eye, uint32_t ord, c
 
 // ------------------------------ G-C: VS cb0 rows 4..7 against the projection
 
-// The three family shaders form clip position from four dp4 rows at VS cb0
-// rows 4..7 (flat_projection_recipes.h: the recipe for all three, with
-// their measured PS companions). 64 bytes at offset 64, copied into a ring
-// of staging slots at the draw, mapped at the frame boundary -- one frame
-// late, which the comparison does not care about: the frusta and shift the
-// reference is rebuilt from are the same frame's.
+// The three family shaders were expected to form clip position from four
+// dp4 rows at VS cb0 rows 4..7 (flat_projection_recipes.h, the flat path's
+// recipe). Flight 1 (2026-09-27) measured rows 4..7 as a COMPOSED
+// model-view transform in all three families -- dense rows, no bare
+// projection structure -- so the centre-term test had nothing to vote on.
+// The read is the whole cb0 now (up to 16 rows, 256 bytes), each 4-row
+// quad voted the same way; the first quad with bare-projection structure
+// gives the verdict, and a draw with none dumps every row once per family
+// per eye for offline factorisation. Copied into a ring of staging slots
+// at the draw, mapped at the frame boundary -- one frame late, which the
+// comparison does not care about: the frusta and shift the reference is
+// rebuilt from are the same frame's.
 constexpr uint32_t kGcRing = 16;
-constexpr uint32_t kGcBytes = 64;
-constexpr uint32_t kGcRowOffset = 64;
+constexpr uint32_t kGcBytes = 256;
+constexpr uint32_t kGcRowOffset = 0;
 Ptr<ID3D11Buffer> g_gcStage;
 struct GcSlot {
     bool pending = false;
     int fam = -1, eye = -1;
     uint32_t ord = 0;
+    uint32_t bytes = 0;  // the cb0 bytes this slot actually holds
 };
 GcSlot g_gcSlots[kGcRing];
 uint32_t g_gcSkipped = 0;
@@ -308,14 +327,16 @@ void gcOnFamilyDraw(ID3D11DeviceContext* ctx, int fam, int eye, uint32_t ord) {
     D3D11_BUFFER_DESC bd{};
     cb->GetDesc(&bd);
     const uint64_t begin = static_cast<uint64_t>(first) * 16 + kGcRowOffset;
-    if (begin + kGcBytes > bd.ByteWidth) {
+    uint64_t avail = begin < bd.ByteWidth ? bd.ByteWidth - begin : 0;
+    if (avail > kGcBytes) avail = kGcBytes;
+    avail &= ~15ull;  // whole rows only; the vote counts full 4-row quads
+    if (avail < 64) {
         if (!g_gcSmallCbNoted[fam]) {
             g_gcSmallCbNoted[fam] = true;
             Log::get().note(
-                "hud layer census: gc %s: VS cb0 is %u bytes (first constant %u); rows 4..7 need "
-                "%llu -- G-C cannot read this family's projection.",
-                kFamNames[fam], bd.ByteWidth, first,
-                static_cast<unsigned long long>(begin + kGcBytes));
+                "hud layer census: gc %s: VS cb0 is %u bytes (first constant %u); one 4-row "
+                "quad needs 64 -- G-C cannot read this family's projection.",
+                kFamNames[fam], bd.ByteWidth, first, static_cast<unsigned long long>(avail));
         }
         ++g_gcSkipped;
         return;
@@ -332,12 +353,13 @@ void gcOnFamilyDraw(ID3D11DeviceContext* ctx, int fam, int eye, uint32_t ord) {
             return;
         }
     }
-    const D3D11_BOX box{static_cast<UINT>(begin), 0, 0, static_cast<UINT>(begin + kGcBytes), 1, 1};
+    const D3D11_BOX box{static_cast<UINT>(begin), 0, 0, static_cast<UINT>(begin + avail), 1, 1};
     ctx->CopySubresourceRegion(g_gcStage.Get(), 0, slot * kGcBytes, 0, 0, cb.Get(), 0, &box);
     g_gcSlots[slot].pending = true;
     g_gcSlots[slot].fam = fam;
     g_gcSlots[slot].eye = eye;
     g_gcSlots[slot].ord = ord;
+    g_gcSlots[slot].bytes = static_cast<uint32_t>(avail);
 }
 
 // One axis of the comparison: the measured centre term against its
@@ -357,10 +379,11 @@ int gcAxisVote(float meas, float unjit, float expShift) {
     return 2;
 }
 
-void gcVerdict(int fam, int eye, uint32_t ord, const float r[16]) {
+void gcVerdict(int fam, int eye, uint32_t ord, const float r[64], uint32_t bytes) {
     FamWindow& w = g_win.fam[fam];
     float frusta[4]{}, shift[2]{}, nearZ = 0.0f, farZ = 0.0f;
     GcVerdict v = kGcAbstain;
+    int quad = -1;
     float m00 = 0, m02 = 0, m11 = 0, m12 = 0, c02u = 0, c12u = 0, sx = 0, sy = 0;
     bool haveRef = eye >= 0 && eye <= 1 &&
                    nativeTemporalProjectionReference(static_cast<uint32_t>(eye), frusta, shift,
@@ -378,23 +401,29 @@ void gcVerdict(int fam, int eye, uint32_t ord, const float r[16]) {
         c12u = (frusta[3] + frusta[2]) / bt;
         sx = 2.0f * shift[0] / rl;
         sy = 2.0f * shift[1] / bt;
-        m00 = r[0];
-        m02 = r[2];
-        m11 = r[5];
-        m12 = r[6];
-        // Structure: a bare projection's clip rows are (m00, 0, m02, 0) and
-        // (0, m11, m12, 0). The zero slots are tested against the rows' own
-        // scale, so a composed model transform (which fills them) reads as
-        // not-the-scene-projection rather than as a jitter verdict.
-        const float scale = std::fabs(m00) + std::fabs(m02) + std::fabs(m11) + std::fabs(m12);
-        const bool structure =
-            std::fabs(r[1]) + std::fabs(r[3]) + std::fabs(r[4]) + std::fabs(r[7]) <=
-                1e-3f * (scale + 1e-6f) &&
-            std::fabs(m00 - e00) <= 1e-3f * std::fabs(e00) &&
-            std::fabs(m11 - e11) <= 1e-3f * std::fabs(e11);
-        if (!structure) {
-            v = kGcNotScene;
-        } else {
+        // Vote each full 4-row quad the slot holds: the FIRST whose rows
+        // have bare-projection structure carries the verdict. Structure: a
+        // bare projection's clip rows are (m00, 0, m02, 0) and (0, m11,
+        // m12, 0); the zero slots are tested against the rows' own scale,
+        // so a composed model transform (which fills them) is skipped
+        // rather than mis-voted. Flight 1's rows 4..7 were all composed.
+        const uint32_t quads = bytes / 64;
+        for (uint32_t q = 0; q < quads && quad < 0; ++q) {
+            const float* m = r + q * 16;
+            const float q00 = m[0], q02 = m[2], q11 = m[5], q12 = m[6];
+            const float scale =
+                std::fabs(q00) + std::fabs(q02) + std::fabs(q11) + std::fabs(q12);
+            const bool structure =
+                std::fabs(m[1]) + std::fabs(m[3]) + std::fabs(m[4]) + std::fabs(m[7]) <=
+                    1e-3f * (scale + 1e-6f) &&
+                std::fabs(q00 - e00) <= 1e-3f * std::fabs(e00) &&
+                std::fabs(q11 - e11) <= 1e-3f * std::fabs(e11);
+            if (!structure) continue;
+            quad = static_cast<int>(q);
+            m00 = q00;
+            m02 = q02;
+            m11 = q11;
+            m12 = q12;
             const int vx = gcAxisVote(m02, c02u, sx);
             const int vy = gcAxisVote(m12, c12u, sy);
             if ((vx == 1 || vy == 1) && vx != -1 && vy != -1 && vx != 2 && vy != 2)
@@ -406,6 +435,7 @@ void gcVerdict(int fam, int eye, uint32_t ord, const float r[16]) {
             else
                 v = kGcOther;
         }
+        if (quad < 0) v = kGcNotScene;
     }
     switch (v) {
         case kGcJittered: ++w.gcJittered; break;
@@ -420,19 +450,32 @@ void gcVerdict(int fam, int eye, uint32_t ord, const float r[16]) {
     const GcVerdict was = last;
     last = v;
     if (v == kGcNotScene) {
+        // The offline factorisation input: every row the slot holds, once
+        // per transition into not-scene (flight 1 proved rows 4..7 alone
+        // cannot answer the gate).
+        std::string rows;
+        char num[320];
+        const uint32_t n = bytes / 16;
+        for (uint32_t i = 0; i < n; ++i) {
+            _snprintf_s(num, _TRUNCATE, "%s[%.6g %.6g %.6g %.6g]", i ? " " : "", r[i * 4],
+                        r[i * 4 + 1], r[i * 4 + 2], r[i * 4 + 3]);
+            rows += num;
+        }
         Log::get().note(
-            "hud layer census: gc %s eye=%d verdict=%s (was %s): cb0 rows 4..7 = "
-            "[%.6g %.6g %.6g %.6g][%.6g %.6g %.6g %.6g][%.6g %.6g %.6g %.6g][%.6g %.6g %.6g %.6g] "
-            "(ord=%u) -- a model transform is composed in, or this is not the eye's projection.",
-            kFamNames[fam], eye, gcVerdictName(v), gcVerdictName(was), r[0], r[1], r[2], r[3],
-            r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15], ord);
+            "hud layer census: gc %s eye=%d verdict=%s (was %s): no 4-row quad of cb0 is the "
+            "eye's projection; rows 0..%u = %s (ord=%u).",
+            kFamNames[fam], eye, gcVerdictName(v), gcVerdictName(was), n ? n * 4 - 1 : 0,
+            rows.c_str(), ord);
     } else {
+        char qt[40] = "";
+        if (quad >= 0)
+            _snprintf_s(qt, _TRUNCATE, " on cb0 rows %d..%d", quad * 4, quad * 4 + 3);
         Log::get().note(
-            "hud layer census: gc %s eye=%d verdict=%s (was %s): m02 %.6g (jittered %.6g, "
+            "hud layer census: gc %s eye=%d verdict=%s (was %s)%s: m02 %.6g (jittered %.6g, "
             "unjittered %.6g), m12 %.6g (jittered %.6g, unjittered %.6g); m00 %.6g m11 %.6g, "
             "near %.4g far %.6g (ord=%u).",
-            kFamNames[fam], eye, gcVerdictName(v), gcVerdictName(was), m02, c02u + sx, c02u, m12,
-            c12u + sy, c12u, m00, m11, nearZ, farZ, ord);
+            kFamNames[fam], eye, gcVerdictName(v), gcVerdictName(was), qt, m02, c02u + sx, c02u,
+            m12, c12u + sy, c12u, m00, m11, nearZ, farZ, ord);
     }
 }
 
@@ -459,7 +502,7 @@ void gcPoll(ID3D11DeviceContext* ctx) {
         if (!g_gcSlots[i].pending) continue;
         const float* rows =
             reinterpret_cast<const float*>(static_cast<const char*>(m.pData) + i * kGcBytes);
-        gcVerdict(g_gcSlots[i].fam, g_gcSlots[i].eye, g_gcSlots[i].ord, rows);
+        gcVerdict(g_gcSlots[i].fam, g_gcSlots[i].eye, g_gcSlots[i].ord, rows, g_gcSlots[i].bytes);
         g_gcSlots[i].pending = false;
     }
     ctx->Unmap(g_gcStage.Get(), 0);
@@ -505,17 +548,41 @@ struct GdDerived {
 constexpr uint32_t kGdDerivedMax = 4;
 GdDerived g_gdDerived[kGdDerivedMax];
 bool g_gdDisabled = false;
-uint32_t g_gdDeclined = 0;
+uint32_t g_gdDecl[kGdDeclCount] = {};
 uint32_t g_gdDropped = 0;
 int g_gdPendingFam = -1, g_gdPendingEye = -1;  // set by EyeDraw, consumed by GdBegin
 
 // The game queries currently open on the owner context (hudLayerCensusNoteGameQuery):
-// a re-issue inside the game's own bracket would feed its counter. The
-// census's own ring queries are filtered out. 16 is far past anything
-// measured; overflow stands the gate down to "open" rather than guess.
+// a re-issue inside the game's own SAMPLE-COUNTING bracket -- occlusion,
+// stream-out or pipeline statistics -- would feed its counter, and
+// changing what the game measures changes what it draws a frame later.
+// Timestamps, their disjoint and events count no samples and are ignored:
+// flight 1's blanket guard declined every pair because EDVR's own
+// gpu_span TIMESTAMP_DISJOINT is open across the frame. The census's own
+// ring queries are filtered out. 16 is far past anything measured;
+// overflow stands the gate down to "open" rather than guess.
 void* g_openGameQueries[16] = {};
 uint32_t g_openGameQueryCount = 0;
 bool g_openGameQueryOverflow = false;
+
+// True when an open query of this type would count the re-issue's
+// samples; everything else (timestamp, disjoint, event, stream-out
+// overflow) can stay open across the pair.
+bool gdQueryTypeBlocks(D3D11_QUERY t) {
+    switch (t) {
+        case D3D11_QUERY_OCCLUSION:
+        case D3D11_QUERY_PIPELINE_STATISTICS:
+        case D3D11_QUERY_OCCLUSION_PREDICATE:
+        case D3D11_QUERY_SO_STATISTICS:
+        case D3D11_QUERY_SO_STATISTICS_STREAM0:
+        case D3D11_QUERY_SO_STATISTICS_STREAM1:
+        case D3D11_QUERY_SO_STATISTICS_STREAM2:
+        case D3D11_QUERY_SO_STATISTICS_STREAM3:
+            return true;
+        default:
+            return false;
+    }
+}
 
 bool isOwnQuery(const void* q) {
     for (const auto& p : g_gdPairs)
@@ -1047,7 +1114,7 @@ void resetSession() {
     }
     g_gcSkipped = 0;
     g_gdDisabled = false;
-    g_gdDeclined = 0;
+    for (auto& d : g_gdDecl) d = 0;
     g_gdDropped = 0;
     g_gdPendingFam = -1;
     g_gdPendingEye = -1;
@@ -1127,12 +1194,21 @@ void logWindow(double secs) {
     Log::get().note(
         "hud layer census: gb tonemap: %u (%.2f/f), ord %u..%u, hdr=family-target %u times, "
         "srv-shape rejects %u, variants %u%s, bloom 953C8123AD8DC13B sightings %u (%u in "
-        "family frames). gd declined %u, dropped %u; gc skipped %u.",
+        "family frames). gd dropped %u; gc skipped %u.",
         w.tonemaps, w.frames ? static_cast<double>(w.tonemaps) / w.frames : 0.0,
         w.tonemapOrdMin == ~0u ? 0 : w.tonemapOrdMin, w.tonemapOrdMax, w.tonemapHdrIsFam,
         w.tonemapRejected, g_toneVariantCount,
         g_toneVariantOverflow ? " (table full)" : "", w.bloomSightings, w.bloomInFamilyFrames,
-        w.gdDeclined, w.gdDropped, w.gcSkipped);
+        w.gdDropped, w.gcSkipped);
+    uint32_t gdDeclTotal = 0;
+    for (uint32_t d : w.gdDecl) gdDeclTotal += d;
+    if (gdDeclTotal) {
+        Log::get().note(
+            "hud layer census: gd declines: predication %u, sample-counting query open %u, "
+            "ring full %u, ps uav %u, stream-out bound %u.",
+            w.gdDecl[kGdDeclPredication], w.gdDecl[kGdDeclQuery], w.gdDecl[kGdDeclRing],
+            w.gdDecl[kGdDeclUav], w.gdDecl[kGdDeclSo]);
+    }
     if (g_geHaveLast) {
         Log::get().note("hud layer census: ge last: eye=%d exposure=%.6g hud_luma=%.6g (max %.6g).",
                         g_geLastEye, static_cast<double>(g_geLastExposure),
@@ -1240,14 +1316,14 @@ bool hudLayerCensusGdBegin(ID3D11DeviceContext* ctx, HudCensusGdSave& save) {
         BOOL predValue = FALSE;
         ctx->GetPredication(&pred, &predValue);
         if (pred) {
-            ++g_gdDeclined;
+            ++g_gdDecl[kGdDeclPredication];
             return;
         }
-        // A game query open on this context: the re-issue would feed its
-        // counter, and changing what the game measures changes what it
-        // draws a frame later.
+        // A sample-counting game query open on this context: the re-issue
+        // would feed its counter, and changing what the game measures
+        // changes what it draws a frame later.
         if (g_openGameQueryCount || g_openGameQueryOverflow) {
-            ++g_gdDeclined;
+            ++g_gdDecl[kGdDeclQuery];
             return;
         }
         int slot = -1;
@@ -1268,7 +1344,7 @@ bool hudLayerCensusGdBegin(ID3D11DeviceContext* ctx, HudCensusGdSave& save) {
             break;
         }
         if (slot < 0) {
-            ++g_gdDeclined;  // every pair still awaits its GPU result
+            ++g_gdDecl[kGdDeclRing];  // every pair still awaits its GPU result
             return;
         }
         ID3D11RenderTargetView* rawRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
@@ -1287,7 +1363,24 @@ bool hudLayerCensusGdBegin(ID3D11DeviceContext* ctx, HudCensusGdSave& save) {
             }
         }
         if (anyUav) {
-            ++g_gdDeclined;
+            ++g_gdDecl[kGdDeclUav];
+            gdReleaseSave(save);
+            return;
+        }
+        // A stream-out binding would take the re-issue's vertices a second
+        // time; the families have none measured, but decline rather than
+        // presume (the same terms as the PS UAV check above).
+        ID3D11Buffer* so[D3D11_SO_BUFFER_SLOT_COUNT] = {};
+        ctx->SOGetTargets(D3D11_SO_BUFFER_SLOT_COUNT, so);
+        bool anySo = false;
+        for (auto* b : so) {
+            if (b) {
+                anySo = true;
+                b->Release();
+            }
+        }
+        if (anySo) {
+            ++g_gdDecl[kGdDeclSo];
             gdReleaseSave(save);
             return;
         }
@@ -1381,6 +1474,20 @@ void hudLayerCensusNoteGameQuery(bool begin, void* async) {
     if (begin) {
         for (uint32_t i = 0; i < g_openGameQueryCount; ++i)
             if (g_openGameQueries[i] == async) return;
+        // Only sample-counting types reach the open list (gdQueryTypeBlocks
+        // says why); an End for an ignored type simply finds nothing below.
+        // A query whose type cannot be read blocks: the wrong direction to
+        // guess is the one that feeds the game's counter.
+        bool blocks = true;
+        Ptr<ID3D11Query> query;
+        if (SUCCEEDED(reinterpret_cast<ID3D11Asynchronous*>(async)->QueryInterface(
+                IID_PPV_ARGS(&query))) &&
+            query) {
+            D3D11_QUERY_DESC qd{};
+            query->GetDesc(&qd);
+            blocks = gdQueryTypeBlocks(qd.Query);
+        }
+        if (!blocks) return;
         if (g_openGameQueryCount < 16) {
             g_openGameQueries[g_openGameQueryCount++] = async;
         } else {
@@ -1425,8 +1532,10 @@ void hudLayerCensusFrameBoundary(ID3D11DeviceContext* ctx) {
         if (g_frame.tonemapOrd[t] > w.tonemapOrdMax) w.tonemapOrdMax = g_frame.tonemapOrd[t];
         if (g_frame.tonemapHdrIsFam[t]) ++w.tonemapHdrIsFam;
     }
-    w.gdDeclined += g_gdDeclined;
-    g_gdDeclined = 0;
+    for (uint32_t i = 0; i < kGdDeclCount; ++i) {
+        w.gdDecl[i] += g_gdDecl[i];
+        g_gdDecl[i] = 0;
+    }
     w.gdDropped += g_gdDropped;
     g_gdDropped = 0;
     w.gcSkipped += g_gcSkipped;

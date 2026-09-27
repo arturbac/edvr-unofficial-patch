@@ -16,11 +16,13 @@
 //        matching draw, deduplicated, so an EDHM swap names itself), its
 //        SRV identities (exposure, LUT, HDR), PS b2's size, and whether
 //        the HDR SRV's resource is one the family draws targeted.
-//   G-C  the family's VS cb0 rows 4..7 (flat_projection_recipes.h: the
-//        three family shaders' clip rows) against the scene's jittered
-//        projection for that eye, rebuilt from native_temporal's own
-//        frusta/shift/planes -- jitter carried, carried but unjittered,
-//        or not the scene projection. Verdict on change; share per 30 s.
+//   G-C  the family's VS cb0, read whole (up to 16 rows), each 4-row
+//        quad voted against the scene's jittered projection for that eye,
+//        rebuilt from native_temporal's own frusta/shift/planes -- jitter
+//        carried, carried but unjittered, or no quad is the scene
+//        projection (rows 4..7 alone were a composed model-view transform
+//        in flight 1; a no-quad draw dumps every row for offline
+//        factorisation). Verdict on change; share per 30 s.
 //   G-D  the share of each family's pixels its GEQUAL depth test rejects:
 //        an occlusion-query pair per sampled family draw, the game's own
 //        depth state (writes masked off) against depth-off, both re-issued
@@ -103,10 +105,14 @@ struct HudCensusGdSave {
 
 // From vscreen's query-bracket hooks while the census is armed (owner
 // context only): a game query began or End'd. The G-D pair declines while
-// ANY game query is open on the context -- a re-issued family draw inside
-// the game's own occlusion bracket would feed its counter, and changing
-// what the game measures changes what it draws a frame later. The census's
-// own ring queries are recognised and ignored.
+// a SAMPLE-COUNTING game query is open on the context (occlusion,
+// stream-out or pipeline statistics) -- a re-issued family draw inside
+// such a bracket would feed its counter, and changing what the game
+// measures changes what it draws a frame later. Timestamps, their
+// disjoint and events count no samples and are ignored (gpu_span's
+// frame-wide TIMESTAMP_DISJOINT would otherwise decline every pair, as
+// it did in flight 1). The census's own ring queries are recognised and
+// ignored.
 void hudLayerCensusNoteGameQuery(bool begin, void* async);
 
 // The three steps of the G-D pair, driven by vscreen's helper around its
