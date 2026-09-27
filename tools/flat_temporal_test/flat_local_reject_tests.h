@@ -5,6 +5,8 @@
 
 inline int flatLocalRejectTests() {
     using edvr::flatLocalRefusalReason;
+    using edvr::flatObservationClears;
+    using edvr::flatObservationToggle;
     int failures = 0;
     auto expect = [&](bool ok, const char* name) {
         if (!ok) { std::printf("FAIL: local reject %s\n", name); ++failures; }
@@ -29,6 +31,22 @@ inline int flatLocalRejectTests() {
            !flatLocalRefusalReason("producer-source-identity-mismatch") &&
            !flatLocalRefusalReason(nullptr),
            "frame-global reasons and a null reason are never locally refusable");
+
+    // reviews/flat-temporal-main-review-2026-09-26.md: observation exit
+    // requires a positively qualified handoff on a completely covered frame;
+    // empty, failed, uncertain or foreign-work frames keep observing.
+    expect(!flatObservationClears(true, false, true) &&
+           !flatObservationClears(true, true, false) &&
+           !flatObservationClears(true, false, false) &&
+           flatObservationClears(true, true, true) &&
+           !flatObservationClears(false, true, true),
+           "observation clears only on a qualified, completely covered frame");
+    expect(!flatObservationToggle(true, true, false) &&
+           flatObservationToggle(true, true, true) &&
+           flatObservationToggle(true, false, true) &&
+           flatObservationToggle(true, false, false) &&
+           !flatObservationToggle(false, true, false),
+           "only the on-to-off toggle ends observation explicitly");
 
     return failures;
 }

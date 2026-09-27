@@ -148,6 +148,10 @@ struct State {
     // the copy-draw treatment is skipped; the contract observation that
     // requalifies keeps running.
     bool observing = false;
+    // This frame's copy draw selected through the contract observation --
+    // the positive witness the observation exit predicate requires
+    // (flat_local_reject.h). Reset every frame.
+    bool observingQualifiedHandoff = false;
     // This frame saw a per-draw-local refusal (for the census close-out).
     bool covFrameLocallyRefused = false;
     // The current draw's shader identities, stashed per draw so refuseDraw
@@ -1211,12 +1215,20 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // Partial temporal AA: read live, same idiom as jitter above. Unlike
     // jitter, toggling it does not change any projection math, so it needs
     // no history reset -- it only gates refuseDraw, checked fresh on every
-    // draw from here on.
-    s.partialWanted=_stricmp(Config::get().getString("experimental.temporal_aa_partial","on").c_str(),"off")!=0;
-    // Local refusal's observation: a refusal-free frame requalifies the
-    // contract and resumes warm-up. phase.finish() above made this frame's
-    // coverage/failed flags final.
-    if (s.observing && s.frameCoverage && !s.phase.failed) {
+    // draw from here on. The on->off transition ends observation explicitly:
+    // off's per-frame retry resumes (reviews/flat-temporal-main-review-2026-09-26.md).
+    const bool partialWanted=_stricmp(Config::get().getString("experimental.temporal_aa_partial","on").c_str(),"off")!=0;
+    const bool observingAfterToggle = flatObservationToggle(s.observing, s.partialWanted, partialWanted);
+    if (s.observing && !observingAfterToggle)
+        Log::get().note("flat coverage: observation ended by setting change at frame=%llu; per-frame attempts resume",
+            (unsigned long long)frame);
+    s.observing = observingAfterToggle; s.partialWanted = partialWanted;
+    // Local refusal's observation exit: a positively qualified handoff on a
+    // completely covered frame (the same coverage trio phase.finish used
+    // above) requalifies the contract and resumes warm-up. Empty, failed,
+    // uncertain or foreign-work frames keep observing.
+    if (flatObservationClears(s.observing, s.observingQualifiedHandoff,
+            s.frameCoverage && !s.prefix.uncertain && !foreignWork.load(std::memory_order_acquire))) {
         s.observing = false;
         Log::get().note("flat coverage: contract requalified at frame=%llu; warm-up resumes",
             (unsigned long long)frame);
@@ -1320,6 +1332,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     s.phaseCensusFailed=false;
     s.prefix.output = output.Get(); s.prefix.width = d.Width; s.prefix.height = d.Height; s.prefix.format = d.Format;
     s.namedDepth = s.namedConstants = nullptr; s.treated = false;
+    s.observingQualifiedHandoff = false;
     s.drawCapture.begin(frame+1,s.phaseDepth.Get(),s.phaseWidth,s.phaseHeight);
     foreignWork.store(false, std::memory_order_release);
     // Retain bounded CB identities across frames: unchanged bindings are legal.
@@ -1648,10 +1661,11 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         else refuseDraw(s,"draw-binding-refused");
     }
     if (!copy) return;
-    // Local refusal's observation: no selection or resolve until a
-    // refusal-free frame requalifies the contract; the contract observation
-    // above (flatRuntimeObserve) is what requalifies, so it keeps running.
-    if (s.observing) return;
+    // Local refusal's observation: no resolve until a qualified, completely
+    // covered frame requalifies the contract; the contract observation above
+    // (flatRuntimeObserve) is what requalifies, so it keeps running, and the
+    // selector's own result is the exit predicate's positive witness.
+    if (s.observing) { s.observingQualifiedHandoff = selected.selected(); return; }
     if(nonzeroPhase(s) && !s.phase.applied)failPhase(s,"no-raster-application");
     s.reason = flatMonoReasonName(selected.reason);
     // Close only the two sampled prefix frames against their actual copy

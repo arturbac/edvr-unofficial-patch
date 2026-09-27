@@ -37,4 +37,23 @@ inline bool flatLocalRefusalReason(const char* reason) {
         std::strcmp(reason, "draw-binding-refused") == 0;
 }
 
+// Observation exit, one tested predicate shared by flat_runtime.cpp and the
+// rig (reviews/flat-temporal-main-review-2026-09-26.md): observation entered
+// by a per-draw-local refusal clears only on a frame with a positively
+// qualified handoff -- the copy draw's selector selected -- AND complete
+// coverage (no failPhase, no uncertain prefix, no foreign work, the same
+// trio phase.finish uses). Anything else, empty frames included, keeps
+// observing. The config toggle is NOT this predicate's business; see below.
+inline bool flatObservationClears(bool observing, bool qualifiedHandoff, bool completeCoverage) {
+    return observing && qualifiedHandoff && completeCoverage;
+}
+
+// The on->off config transition ends observation explicitly: off's per-frame
+// retry resumes instead of staying latched by a persistent refusal (history
+// is already invalid from the observing frames). off->on changes nothing
+// until the next local refusal. Returns the observing state after the toggle.
+inline bool flatObservationToggle(bool observing, bool wasWanted, bool wanted) {
+    return observing && !(wasWanted && !wanted);
+}
+
 } // namespace edvr
