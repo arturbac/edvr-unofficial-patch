@@ -1347,6 +1347,8 @@ inline void selfMarkingCase(const Harness& h, const std::vector<BYTE>& vsBytes) 
     // size, render-target AND shader-resource bindable (the compose reads it).
     ComPtr<ID3D11Texture2D> g6;
     ComPtr<ID3D11RenderTargetView> g6Rtv;
+    auto refCount = [](ID3D11Resource* r) { const ULONG n = r->AddRef(); r->Release(); return n - 1; };
+    ULONG g6AtCreate = 0;
     {
         D3D11_TEXTURE2D_DESC td{};
         td.Width = kW; td.Height = kH; td.MipLevels = td.ArraySize = td.SampleDesc.Count = 1;
@@ -1354,6 +1356,7 @@ inline void selfMarkingCase(const Harness& h, const std::vector<BYTE>& vsBytes) 
         td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         h.check(SUCCEEDED(h.device->CreateTexture2D(&td, nullptr, &g6)), "S4: the game's channel texture");
         h.check(SUCCEEDED(h.device->CreateRenderTargetView(g6.Get(), nullptr, &g6Rtv)), "S4: its RTV");
+        g6AtCreate = refCount(g6.Get());   // the fixture's hold + its RTV's, before any latch
     }
     auto bindWithG6 = [&] {
         ID3D11RenderTargetView* r[8] = {g.rtv[0][0].Get(), g.rtv[0][1].Get(), g.rtv[0][2].Get(), g.rtv[0][3].Get(),
@@ -1460,6 +1463,62 @@ inline void selfMarkingCase(const Harness& h, const std::vector<BYTE>& vsBytes) 
             "S4: the family line counts the stock draws and the three latched eye-frames");
     h.check(logged("the PS shadow was stale on 1 sampled pool draws", mark),
             "S4: the probe reports the one stale-shadow heal it performed");
+
+    // The review's F2/F3 (2026-09-27): the capture's reference discipline.
+    // Measured as the texture's COM refcount (the fixture's own hold included):
+    // a re-capture of the same channel must not grow it, and a replaced
+    // channel must retire to its pre-latch count, not be kept alive by the eye.
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    g.setPs(psSeam.Get(), 0xBCF75CEA37060EAEull);
+    bindWithG6();
+    g.draw();
+    const ULONG g6Latched = refCount(g6.Get());
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    g.setPs(psSeam.Get(), 0xBCF75CEA37060EAEull);
+    bindWithG6();
+    g.draw();
+    h.check(refCount(g6.Get()) == g6Latched, "S4/F2: re-capturing the same channel texture leaks no reference");
+    // A changed channel (a live resolution/quality change): the old texture's
+    // count returns to its creation-time count -- the eye retired its hold.
+    ComPtr<ID3D11Texture2D> g6b;
+    ComPtr<ID3D11RenderTargetView> g6bRtv;
+    {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = kW; td.Height = kH; td.MipLevels = td.ArraySize = td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_R32G32_FLOAT; td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        h.check(SUCCEEDED(h.device->CreateTexture2D(&td, nullptr, &g6b)), "S4/F3: the replacement channel texture");
+        h.check(SUCCEEDED(h.device->CreateRenderTargetView(g6b.Get(), nullptr, &g6bRtv)), "S4/F3: its RTV");
+    }
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    g.setPs(psSeam.Get(), 0xBCF75CEA37060EAEull);
+    {
+        ID3D11RenderTargetView* r[8] = {g.rtv[0][0].Get(), g.rtv[0][1].Get(), g.rtv[0][2].Get(), g.rtv[0][3].Get(),
+                                        nullptr, nullptr, g6bRtv.Get(), nullptr};
+        h.context->OMSetRenderTargets(8, r, g.dsv[0].Get());
+    }
+    g.draw();
+    {
+        edvr::EngineVelocityViews v{};
+        h.check(g.views(0, &v) && v.gameMark != nullptr, "S4/F3: the replacement channel latches");
+        if (v.gameMark) {
+            ComPtr<ID3D11Resource> res;
+            v.gameMark->GetResource(&res);
+            h.check(res.Get() == g6b.Get(), "S4/F3: the compose now reads the replacement channel");
+        }
+        release(v);
+    }
+    h.check(refCount(g6.Get()) == g6AtCreate,
+            "S4/F3: the replaced channel's texture is retired, not retained by the eye");
     edvr::engineVelocityShutdown();
     edvr::g_clockForTest = nullptr;
 }

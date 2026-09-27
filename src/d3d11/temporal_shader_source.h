@@ -526,20 +526,27 @@ uint enginePixelZ(float2 p, float2 offset, bool haveZ, float knownZ, out float2 
     pp = 0; zp = 0;
     if ((uint(probe.w + 0.5) & 2048u) == 0u || holoJitter.z == 0) return 0u;
     const int2 q = region.xy + int2(round(p + offset));
+    const float zr = haveZ ? knownZ : zSceneAt(q);
+    // Ownership before channel preference (the 2026-09-27 review, F1): the
+    // channel whose marker depth is the scene's owns the surface. A stale ES
+    // marker -- a substituted hull draw's write at a pixel the seam later drew
+    // nearer -- must not suppress a valid marker in the game's own channel.
     float2 es = ES.Load(int3(q, 0));
-    // The patched pool shaders write 2 * slot + 1: the cleared -1 and an
-    // untouched texel both fall below 1. Where no substituted draw marked the
-    // pixel, the self-marking detail shaders' own channel (the game's target 6,
-    // probe.w bit 4096) carries the same encoding for the same pixel.
-    if (!(es.x >= 1.0)) {
-        if ((uint(probe.w + 0.5) & 4096u) == 0u) return 0u;
-        es = G6.Load(int3(q, 0));
-        if (!(es.x >= 1.0)) return 0u;
+    bool marked = es.x >= 1.0;
+    bool owns = marked && zr > 0.0 && asuint(zr) == asuint(es.y);
+    if (!owns && (uint(probe.w + 0.5) & 4096u) != 0u) {
+        // The self-marking detail shaders' own channel (the game's target 6),
+        // the same encoding, read where ES does not own the pixel.
+        const float2 g6 = G6.Load(int3(q, 0));
+        if (g6.x >= 1.0) {
+            marked = true;
+            if (zr > 0.0 && asuint(zr) == asuint(g6.y)) { es = g6; owns = true; }
+        }
     }
+    if (!marked) return 0u;
     if (uiCovered(q)) return 0u;
     if ((uint(probe.w + 0.5) & 32u) != 0u && Screen.Load(int3(q, 0)).w > 0) return 0u;
-    const float zr = haveZ ? knownZ : zSceneAt(q);
-    if (!(zr > 0.0) || asuint(zr) != asuint(es.y)) return 4u;
+    if (!owns) return 4u;
     const uint code = uint(es.x);
     if (float(code) != es.x || (code & 1u) == 0u) return 5u;
     uint count, stride;

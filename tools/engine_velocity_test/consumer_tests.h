@@ -363,6 +363,14 @@ inline void run(const Harness& h) {
     setG6(pxP, 1.0f, kZBg);            // ...also marks pxP (slot 0), where ES says slot 2
     setG6(pxT, 1.0f, kZBg + 0.25f);    // ...and pxT, at a depth the scene does not have
 
+    // The overlap cases (the 2026-09-27 review's F1): ownership of the scene
+    // depth picks the channel, not ES-first ordering.
+    const Px pxO1{10, 13}, pxO2{2, 13};
+    setEs(pxO1, 1.0f, kZBg * 2.0f);    // a substituted draw's stale marker: the seam has since drawn nearer
+    setG6(pxO1, 1.0f, kZBg);           // G6's foreground marker owns the pixel: it must win
+    setEs(pxO2, 1.0f, kZBg * 2.0f);    // neither channel owns the pixel: both stale
+    setG6(pxO2, 1.0f, kZBg + 0.25f);
+
     // -------------------------- resources --------------------------
     auto structuredSrv = [&](const void* src, UINT stride, UINT count, ID3D11ShaderResourceView** srv) {
         D3D11_BUFFER_DESC d{}; d.ByteWidth = stride * count; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -544,16 +552,17 @@ inline void run(const Harness& h) {
     // -------------------------- Stats[50..55]: the diagnostics compile's own counters --------------------------
     // 50 joined (a, c, and pxP's ES marker -- the precedence pixel is a joined
     // unmoved record through ES), 51 masked (b), 52 not-a-rig-record (notRig),
-    // 53 stale (e), 54 corrupt (d1 even, d2 fractional), 55 stale stamp (h).
-    // d3's code 0 fails the ES.x >= 1 gate before the corrupt check runs
-    // (kind 0), and kind 0 -- like d3, f and g -- is never tallied by mv's
-    // own diagnostics (only engineKind != 0 increments a counter), so none
-    // of those three add to any of the six buckets checked here. The G6
-    // pixels read baseline with bit 4096 clear, so they tally nothing either.
+    // 53 stale (e, and the two overlap pixels o1/o2 whose ES marker is stale:
+    // with bit 4096 clear the G6 channel is not read), 54 corrupt (d1 even,
+    // d2 fractional), 55 stale stamp (h). d3's code 0 fails the ES.x >= 1 gate
+    // before the corrupt check runs (kind 0), and kind 0 -- like d3, f and g --
+    // is never tallied by mv's own diagnostics (only engineKind != 0 increments
+    // a counter), so none of those three add to any of the six buckets checked
+    // here. The G6 pixels read baseline with bit 4096 clear, tallying nothing.
     h.check(stats[50] == 3, "Stats[50] (JOINED pixels) == 3 (a, c, pxP)");
     h.check(stats[51] == 1, "Stats[51] (MASKED pixels) == 1 (b)");
     h.check(stats[52] == 1, "Stats[52] (pool records that are not rig records) == 1 (notRig)");
-    h.check(stats[53] == 1, "Stats[53] (STALE pixels) == 1 (e)");
+    h.check(stats[53] == 3, "Stats[53] (STALE pixels) == 3 (e, and the overlap pixels o1/o2, G6 unread without bit 4096)");
     h.check(stats[54] == 2, "Stats[54] (CORRUPT pixels) == 2 (d1, d2)");
     h.check(stats[55] == 1, "Stats[55] (STALE-STAMP pixels) == 1 (h: a joined marker from an older frame)");
 
@@ -599,13 +608,39 @@ inline void run(const Harness& h) {
         h.check(mv.first == mvBase.first && mv.second == mvBase.second,
                 "SELF-MARKING: a G6 marker whose depth is not the scene's declines exactly like the stale case");
     }
+    {   // pxO1 (the review's F1): a stale ES marker AND a valid foreground G6
+        // marker -- ownership decides, the seam's marker wins over the hull's
+        // stale one, and the pixel joins with the record's exact motion.
+        double ndcOx, ndcOy;
+        pixelToNdc(pxO1.x, pxO1.y, kDim, ndcOx, ndcOy);
+        const V3 posO1Now = solveRel(camRows, ndcOx, ndcOy, zViewEff);
+        const V3 posO1Prev = add(sub(posO1Now, posANow), posAPrev);
+        const V3 posO1PrevF{double(float(posO1Prev.x)), double(float(posO1Prev.y)), double(float(posO1Prev.z))};
+        double before[4];
+        Camera::clip(camRows, posO1PrevF, before);
+        double ppX, ppY;
+        clipToPixel(before, kDim, ppX, ppY);
+        const auto mv = mvAt(g6Mv, pxO1);
+        const double gotX = double(pxO1.x) + double(mv.first), gotY = double(pxO1.y) + double(mv.second);
+        const double err = std::max(std::fabs(gotX - ppX), std::fabs(gotY - ppY));
+        worstErr = std::max(worstErr, err);
+        if (err > 1e-3) std::fprintf(stderr, "  case overlap: GPU previous pixel (%.6f %.6f) vs double reference (%.6f %.6f), error %.2e\n", gotX, gotY, ppX, ppY, err);
+        h.check(err <= 1e-3, "OVERLAP: a stale ES marker must not suppress a valid foreground G6 marker -- the G6 marker's motion applies");
+    }
+    {   // pxO2: neither channel owns the pixel (both depths stale) -- declines
+        // exactly like the stale case.
+        const auto mv = mvAt(g6Mv, pxO2);
+        const auto mvBase = mvAt(baseMv, pxO2);
+        h.check(mv.first == mvBase.first && mv.second == mvBase.second,
+                "OVERLAP: when neither channel owns the scene pixel, the pixel declines to the camera term");
+    }
     {   // The ES path is unaffected by G6's presence: pxA's exact motion holds.
         const auto mv = mvAt(g6Mv, pxA);
         const auto mvArmed = mvAt(armedMv, pxA);
         h.check(mv.first == mvArmed.first && mv.second == mvArmed.second,
                 "SELF-MARKING: the substituted path is byte-identical with G6 bound");
     }
-    for (Px p : {pxS, pxP, pxT}) {
+    for (Px p : {pxS, pxP, pxT, pxO1, pxO2}) {
         const auto pv = mvAt(g6Plain.first, p);
         const auto dv = mvAt(g6Mv, p);
         h.check(pv.first == dv.first && pv.second == dv.second,
@@ -613,7 +648,8 @@ inline void run(const Harness& h) {
     }
 
     std::printf("  consumer: %d pixels: joined 3 (worst error %.2e px), masked 1 (sentinel + MK=1), declined 8, "
-                "the self-marking fallback joined/gated/preceded/stale as specified, counters match\n",
+                "the self-marking fallback joined/gated/preceded/stale as specified, the overlap cases by ownership, "
+                "counters match\n",
                 kDim * kDim, worstErr);
 }
 

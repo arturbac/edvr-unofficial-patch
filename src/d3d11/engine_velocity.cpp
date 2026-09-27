@@ -108,9 +108,6 @@ struct PsInfo {
 std::unordered_map<ID3D11VertexShader*, VsInfo> g_vs;
 std::unordered_map<ID3D11PixelShader*, PsInfo> g_ps;
 constexpr size_t kRememberCap = 512;   // keyed shader objects kept (a few KB of bytecode each)
-// One SRV per distinct game target-6 texture, held: no address reuse while
-// remembered (the same rule as the shader cache above; a few textures total).
-std::unordered_map<ID3D11Texture2D*, Ptr<ID3D11ShaderResourceView>> g_gameMarkSrvs;
 
 struct FamilyState {
     bool derived = false, valid = false;
@@ -700,6 +697,10 @@ bool ensureSlots(ID3D11DeviceContext* ctx, Eye& e, int eye, ID3D11Texture2D* dep
     const unsigned wasW = e.width, wasH = e.height;
     e.slots.Reset(); e.slotsRtv.Reset(); e.slotsSrv.Reset();
     e.overlayBase.Reset(); e.overlayBaseSrv.Reset(); e.overlayGroup = false;
+    // The latched game channel was latched for the old depth's size: it goes
+    // with it (the review's F3; a stale SRV of the wrong size would read as
+    // cleared until the next capture re-latches anyway).
+    e.gameMark.Reset(); e.gameMarkSrv.Reset(); e.gameMarkFrame = ~0u;
     e.depth = depth; e.width = dd.Width; e.height = dd.Height;
     D3D11_TEXTURE2D_DESC d{};
     d.Width = dd.Width; d.Height = dd.Height; d.MipLevels = 1; d.ArraySize = 1; d.SampleDesc.Count = 1;
@@ -1012,10 +1013,15 @@ bool captureGameMark(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame, 
     ID3D11RenderTargetView* rts[8] = {};
     Ptr<ID3D11DepthStencilView> dsvNow;
     ctx->OMGetRenderTargets(8, rts, &dsvNow);
+    // OMGet returns owned references: adopt slot 6's, release the rest
+    // (the 2026-09-27 review's F2 -- assigning the raw pointer into a smart
+    // pointer that addrefs, then releasing around it, leaked one reference per
+    // capture attempt).
     Ptr<ID3D11RenderTargetView> rt6;
-    rt6 = rts[6];
+    rt6.Attach(rts[6]);
+    rts[6] = nullptr;
     for (unsigned i = 0; i < 8; ++i)
-        if (rts[i] && rts[i] != rt6.Get()) rts[i]->Release();
+        if (rts[i]) rts[i]->Release();
     Ptr<ID3D11Texture2D> tex;
     if (rt6) {
         Ptr<ID3D11Resource> res;
@@ -1034,14 +1040,21 @@ bool captureGameMark(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame, 
         D3D11_TEXTURE2D_DESC dd{};
         if (depthTex) depthTex->GetDesc(&dd);
         // The shape the compose's float2 Load reads: the VIEW the game writes
-        // through is R32G32_FLOAT single-slice (the texture itself may be
-        // typeless), at the pass's depth size.
+        // through is R32G32_FLOAT single-slice at mip 0 (the texture itself may
+        // be typeless), at the pass's depth size.
         const bool shapeOk = vd.Format == DXGI_FORMAT_R32G32_FLOAT &&
-                             vd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D && td.ArraySize == 1 &&
-                             td.SampleDesc.Count == 1 && depthTex && td.Width == dd.Width && td.Height == dd.Height;
+                             vd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D && vd.Texture2D.MipSlice == 0 &&
+                             td.ArraySize == 1 && td.SampleDesc.Count == 1 && depthTex &&
+                             td.Width == dd.Width && td.Height == dd.Height;
         if (shapeOk) {
-            auto& srv = g_gameMarkSrvs[tex.Get()];
-            if (!srv) {
+            if (e.gameMarkSrv && e.gameMark.Get() == tex.Get()) {
+                // The same texture as the eye's: reuse the SRV.
+            } else {
+                // A new channel texture (a resolution/quality change): the old
+                // SRV -- and the texture it kept alive -- retires here, not at
+                // shutdown (the 2026-09-27 review's F3).
+                e.gameMarkSrv.Reset();
+                e.gameMark.Reset();
                 D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
                 sd.Format = DXGI_FORMAT_R32G32_FLOAT;
                 sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -1049,14 +1062,12 @@ bool captureGameMark(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame, 
                 sd.Texture2D.MostDetailedMip = 0;
                 Ptr<ID3D11Device> dev;
                 ctx->GetDevice(&dev);
-                dev->CreateShaderResourceView(tex.Get(), &sd, &srv);   // fails if not shader-resource bound: unlatched
-            }
-            if (srv) {
+                dev->CreateShaderResourceView(tex.Get(), &sd, &e.gameMarkSrv);
+                if (!e.gameMarkSrv) return false;
                 e.gameMark = tex;
-                e.gameMarkSrv = srv;
-                e.gameMarkFrame = frame;
-                return true;
             }
+            e.gameMarkFrame = frame;
+            return true;
         }
     }
     return false;

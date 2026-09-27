@@ -3317,3 +3317,38 @@ S4's frame 4 in the lifecycle rig: the seam shader bound live-only (the shadow
 left on the stock PS) heals at the probe, the slow half latches the game's
 channel, the views carry it. 1152 gate checks, 1732 with the corpus; full
 build green.
+
+### 2026-09-27 -- The review's three findings, fixed (reviews/coriolis-station-blur-review-2026-09-27.md)
+
+The other agent's review of the seam work (reproduced on WARP, not flown):
+
+**F1 (the overlap bug, reproduced):** enginePixelZ chose G6 only when ES was
+empty -- so a substituted hull draw's STALE ES marker (its depth behind the
+seam that has since drawn nearer) suppressed the seam's valid G6 marker, and
+the pixel kept the camera term in exactly the overlap the channel exists for.
+Now ownership picks the channel: the marker whose depth is the scene's owns
+the pixel; G6 is read only where ES does not own it, with the same encoding,
+stamp, record and projection checks either way; ES precedence is preserved
+where ES genuinely owns. Consumer regressions cover both orders, both-valid
+precedence, and neither owning -- the WARP production-shader run: the overlap
+pixel joins with the record's exact motion (4.1e-07 px worst).
+
+**F2 (the capture leaked one RTV reference per attempt):** OMGetRenderTargets'
+returned references are adopted with Attach and the rest released uniformly.
+S4 measures the channel texture's COM refcount across re-captures -- flat.
+
+**F3 (the SRV cache never evicted):** the global map is gone; the eye holds one
+SRV for its current channel texture, replaced when the texture changes (a
+resolution/quality change), retired with the eye, and the eye-frame's depth
+reset clears the latch with the old size. S4's replacement frame proves the
+old texture retires to its creation refcount. The review's two validation
+contracts are also now explicit: the channel's write view must be mip 0
+single-slice (checked at capture), and the freshness claim rides the same
+bit-exact depth equality as ES's kind 4 -- a pixel the detail shaders skipped
+this frame with an unchanged depth can still carry an older marker; that is
+the known residual-risk note, same class as ES's own.
+
+The review's diagnostic caution stands as written: the v3 zero-readings are
+recorded history, not proof of a replay-path root cause; the heal's counters
+(poolShadowHealed / the draw-path census) answer reachability live. The rig:
+1156 gate checks, 1742 with the corpus, on the fixed code.
