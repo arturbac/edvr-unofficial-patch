@@ -4250,6 +4250,12 @@ Staged implementation:
    preflight's drifted copy of the refusal rules is consolidated onto the
    route function. WARP-qualified: the rig's supersample case checks the
    backend receives E = R on both axes and the output view is render-sized.
+   Same evening: the first SS > 100% flight refused every frame --
+   flatContractKind's screen band capped sizes at <= D, so supersampled
+   scene targets classified as none and no producer ever latched. The band
+   now covers aspect-preserving sizes from 0.5x to 2x of output, with the
+   conflicting-hdr guard as the loud backstop for full-res depthless
+   intermediates; crops/ultrawide stay out of band for the lineage rework.
 3. Retirement: generation-based release of projection plans and
    classifier memos (finding 3's 32/64 cliffs), with the corpus replaying
    retirement boundaries.
