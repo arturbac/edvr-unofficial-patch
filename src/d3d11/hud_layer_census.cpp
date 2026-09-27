@@ -197,8 +197,16 @@ struct FamFingerprint {
     uint32_t srv[4][3];  // w, h, fmt per slot; zero when unbound or not 2D
 };
 
-uint64_t g_famFp[kFamilies] = {};
-bool g_famFpValid[kFamilies] = {};
+// First-seen state sets, per family: a state's full fingerprint is logged
+// the first time it appears in the session and never again. Flight 2's
+// single last-fingerprint compare re-logged every panel of every frame
+// (a dozen holo panels with distinct interface surfaces cycle through one
+// slot), ate the 4 MB log cap two minutes into the cockpit, and cost that
+// flight its G-D window. 64 is far past the ~dozen states a family shows.
+constexpr uint32_t kFamFpMax = 64;
+uint64_t g_famFpSeen[kFamilies][kFamFpMax] = {};
+uint32_t g_famFpCount[kFamilies] = {};
+bool g_famFpFullNoted[kFamilies] = {};
 
 void noteFamilyState(ID3D11DeviceContext* ctx, int fam, int eye, uint32_t ord, const TargetCache& tc,
                      uint64_t vs, uint64_t ps) {
@@ -229,9 +237,19 @@ void noteFamilyState(ID3D11DeviceContext* ctx, int fam, int eye, uint32_t ord, c
         }
     }
     const uint64_t h = fnv1a64(&fp, sizeof(fp));
-    if (g_famFpValid[fam] && g_famFp[fam] == h) return;
-    g_famFp[fam] = h;
-    g_famFpValid[fam] = true;
+    for (uint32_t i = 0; i < g_famFpCount[fam]; ++i)
+        if (g_famFpSeen[fam][i] == h) return;
+    if (g_famFpCount[fam] >= kFamFpMax) {
+        if (!g_famFpFullNoted[fam]) {
+            g_famFpFullNoted[fam] = true;
+            Log::get().note(
+                "hud layer census: ga %s: %u distinct states logged; further state changes are "
+                "not printed (the window's draws/frame lines continue).",
+                kFamNames[fam], kFamFpMax);
+        }
+        return;
+    }
+    g_famFpSeen[fam][g_famFpCount[fam]++] = h;
     char bl[64], dsb[320];
     describeBlend(fp.blend, bl, sizeof(bl));
     describeDs(fp.ds, ref, dsFmt, dsb, sizeof(dsb));
@@ -1107,8 +1125,8 @@ void resetSession() {
     g_frame = FrameScratch{};
     g_tc = TargetCache{};
     for (int i = 0; i < kFamilies; ++i) {
-        g_famFp[i] = 0;
-        g_famFpValid[i] = false;
+        g_famFpCount[i] = 0;
+        g_famFpFullNoted[i] = false;
         g_gcSmallCbNoted[i] = false;
         for (int e = 0; e < 2; ++e) g_gcLast[i][e] = kGcNoData;
     }

@@ -10,8 +10,9 @@
 //   G-A  the families, per frame: target resource and format, blend and
 //        depth/stencil state, SRV sizes, draws per frame, and the draw
 //        ordinal against the tonemap draw's (the door is after both by
-//        construction). First-seen and on-change state lines; draws per
-//        frame and ordinals on the 30-second window lines.
+//        construction). State lines are first-seen-per-session per state
+//        fingerprint (a last-one compare flooded the log cap in flight 2);
+//        draws per frame and ordinals on the 30-second window lines.
 //   G-B  the tonemap: the admitted variant (vs/ps logged for EVERY shape-
 //        matching draw, deduplicated, so an EDHM swap names itself), its
 //        SRV identities (exposure, LUT, HDR), PS b2's size, and whether
