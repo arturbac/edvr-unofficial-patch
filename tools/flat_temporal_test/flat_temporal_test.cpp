@@ -3,23 +3,32 @@
 #include <utility>
 #include "../../src/d3d11/flat_temporal_model.h"
 #include "../../src/d3d11/flat_mono_frame.h"
+#include "../../src/d3d11/flat_mono_resolve.h"
 #include "../../src/d3d11/flat_runtime_model.h"
+#include "../../src/d3d11/flat_trace.h"
 #include "../../src/d3d11/engine_velocity_families.h"
 #include "flat_shader_capture_tests.h"
 #include "flat_projection_math_tests.h"
 #include "flat_projection_bindings_tests.h"
 #include "flat_projection_recipe_tests.h"
+#include "flat_shader_classifier_tests.h"
 #include "flat_projection_viewport_tests.h"
 #include "flat_projection_ownership_tests.h"
 #include "flat_compute_tests.h"
 #include "flat_lighting_tests.h"
 #include "flat_live_phase_tests.h"
 #include "flat_pixel_capture_tests.h"
+#include "flat_local_reject_tests.h"
 
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <map>
+#include <sstream>
+#include <vector>
 
 namespace {
 struct Pair {
@@ -621,6 +630,55 @@ void testMonoFrameSelection() {
         MonoFixture::setCamera(f.handoff[0], invalid);
         MonoFixture::setCamera(f.handoff[1], invalid);
     }, "malformed fullscreen camera bytes are irrelevant to texture-only passes");
+    auto hdrAtPs0 = [](MonoFixture& f) {
+        // The HDR moves to PS0; PS1 becomes the variant's blur/bloom with its
+        // own tokens, so a wrong-slot read cannot pass as the HDR.
+        auto& k = f.handoff[0].key;
+        k.srvView[0] = MonoFixture::token(0x2602); k.srvResource[0] = MonoFixture::token(0x2600);
+        k.srvView[1] = MonoFixture::token(0x2B12); k.srvResource[1] = MonoFixture::token(0x2B10);
+    };
+    {   // Epic 20260926_073622, all settings maxed: the DoF-composite tone
+        // variant is the same tone VS with a different PS, and it binds the
+        // HDR at PS0 (its PS1 is the quarter-res DoF blur). The chain's role
+        // and ordering checks are unchanged.
+        MonoFixture f;
+        f.handoff[0].key.ps = flat_mono_detail::kToneDofCompositePs;
+        hdrAtPs0(f);
+        const auto out = flatSelectMonoFrame(f.input);
+        check(out.selected() && out.hdr == MonoFixture::token(0x2600) &&
+              out.toneSequence == 511u,
+            "DoF-composite tone variant selects with its HDR lineage at PS0");
+    }
+    {   // Epic 20260926_124418 frame 33504 (EDHM chained): the settings-tier
+        // tone rides the no-constant passthrough VS with the bloom-composite
+        // PS; its HDR lineage is at PS0.
+        MonoFixture f;
+        f.handoff[0].key.vs = flat_mono_detail::kToneVsNoConst;
+        f.handoff[0].key.ps = flat_mono_detail::kToneBloomCompositePs;
+        hdrAtPs0(f);
+        const auto out = flatSelectMonoFrame(f.input);
+        check(out.selected() && out.hdr == MonoFixture::token(0x2600) &&
+              out.toneSequence == 511u,
+            "bloom-composite tier tone selects with its HDR lineage at PS0");
+    }
+    {   // Epic 20260926_124418 frame 33939 (EDHM chained): EDHM's recolor
+        // grade PS rides the stock tone VS; the HDR stays at PS1.
+        MonoFixture f;
+        f.handoff[0].key.ps = flat_mono_detail::kToneEdhmGradePs;
+        const auto out = flatSelectMonoFrame(f.input);
+        check(out.selected() && out.hdr == MonoFixture::token(0x2600) &&
+              out.toneSequence == 511u,
+            "EDHM-grade tone selects with its HDR lineage at PS1");
+    }
+    {   // Epic 20260926_075702 frame 32865: the same grade PS with the cb2-z
+        // passthrough VS -- the observed frames mix tone VS against tone PS.
+        MonoFixture f;
+        f.handoff[0].key.vs = flat_mono_detail::kToneVsCbZ;
+        f.handoff[0].key.ps = flat_mono_detail::kToneEdhmGradePs;
+        const auto out = flatSelectMonoFrame(f.input);
+        check(out.selected() && out.hdr == MonoFixture::token(0x2600),
+            "tone VS variants are interchangeable against a known tone PS");
+    }
     for (uint32_t width : {960u, 1280u}) {
         MonoFixture f(width); f.applyEpic63521CameraWords();
         const auto out = flatSelectMonoFrame(f.input);
@@ -645,6 +703,10 @@ void testMonoFrameSelection() {
         "distinct output-copy records are ambiguous even when their sources agree");
     reject([](auto& f) { f.handoff[0].draws = 2; f.handoff[0].last++; }, FlatMonoReason::AmbiguousTonePass,
         "coalesced repeated tone pass is not unique");
+    reject([](auto& f) { f.handoff[0].key.ps = 0x0BAD0BAD0BAD0BADull; }, FlatMonoReason::NoTonePass,
+        "an unreviewed tone PS remains refused");
+    reject([](auto& f) { f.handoff[0].key.vs = 0x0BAD0BAD0BAD0BADull; }, FlatMonoReason::NoTonePass,
+        "an unreviewed tone VS remains refused");
     reject([](auto& f) { f.handoff[1].key.viewport[0] = .25f; }, FlatMonoReason::InvalidOutputCopy,
         "fractional output viewport offset is not fullscreen");
     reject([](auto& f) { f.handoff[0].key.viewportCount = 2; }, FlatMonoReason::InvalidTonePass,
@@ -850,6 +912,87 @@ void flatRuntimePrefixTests() {
 
         prefix->copies = 0; flatRuntimeWritten(*prefix, selected.color);
         check(!flatRuntimeObserve(*prefix, copy).selected(), "write after tone invalidates current handoff");
+    }
+    {   // Epic 20260926_131921: the online model hardcoded the tone pass's
+        // HDR input at PS1. The DoF composite (kToneDofCompositePs) and
+        // bloom composite (kToneBloomCompositePs) bind their HDR at PS0 and
+        // their own blur/bloom at PS1 (129F602B2A9CA439/8826CACC6382C78D);
+        // treating that blur/bloom as the HDR refused every frame.
+        auto blurWrite = [](MonoFixture& f, uint32_t q) {
+            FlatContractRecord r;
+            f.fill(r, kFlatContractScreen, 0x2B10, 26, q, q, 1,
+                0x129F602B2A9CA439ull, 0x8826CACC6382C78Dull, 0, 0, false);
+            r.key.width /= 2; r.key.height /= 2;
+            r.key.viewport[2] /= 2; r.key.viewport[3] /= 2;
+            r.key.depth = r.key.dsv = nullptr;
+            r.key.depthWidth = r.key.depthHeight = r.key.depthFormat = 0;
+            return r;
+        };
+        auto hdrAtPs0Slot = [](MonoFixture& f) {
+            // The HDR moves to PS0; PS1 becomes the variant's blur/bloom with
+            // its own tokens, so a wrong-slot read cannot pass as the HDR.
+            auto& k = f.handoff[0].key;
+            k.srvView[0] = MonoFixture::token(0x2602); k.srvResource[0] = MonoFixture::token(0x2600);
+            k.srvView[1] = MonoFixture::token(0x2B12); k.srvResource[1] = MonoFixture::token(0x2B10);
+        };
+        auto replayTone = [&](MonoFixture& fixture, bool chain) {
+            auto prefix = std::make_unique<FlatRuntimePrefix>();
+            prefix->frame = fixture.input.frame; prefix->output = fixture.input.output;
+            prefix->width = 1280; prefix->height = 720; prefix->format = 28;
+            FlatContractRecord chainRecords[2]{};
+            if (chain) {
+                chainRecords[0] = blurWrite(fixture, fixture.handoff[0].first - 6);
+                chainRecords[1] = blurWrite(fixture, fixture.handoff[0].first - 3);
+            }
+            struct Event { const FlatContractRecord* r; uint32_t q; } events[200]{};
+            uint32_t count = 0;
+            for (uint32_t i = 0; i < fixture.input.worldCount; ++i) {
+                const auto& r = fixture.world[i];
+                for (uint32_t n = 0; n < r.draws; ++n)
+                    events[count++] = {&r, r.first + (r.last-r.first)*n/(r.draws>1?r.draws-1:1)};
+            }
+            if (chain) {
+                events[count++] = {&chainRecords[0], chainRecords[0].first};
+                events[count++] = {&chainRecords[1], chainRecords[1].first};
+            }
+            events[count++] = {&fixture.handoff[0], fixture.handoff[0].first};
+            events[count++] = {&fixture.handoff[1], fixture.handoff[1].first};
+            std::sort(events, events + count, [](const Event& a, const Event& b) { return a.q < b.q; });
+            FlatMonoFrame selected{};
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto& r = *events[i].r; FlatRuntimeDraw d{}; d.key = r.key;
+                std::memcpy(d.camera, r.camera, sizeof(d.camera));
+                d.key.writeEpoch = prefix->frame; d.key.writeSeq = prefix->sequence + 1;
+                d.supported = engine_velocity_family::supportedPair(d.key.vs, d.key.ps);
+                d.instances = r.firstInstances;
+                selected = flatRuntimeObserve(*prefix, d);
+            }
+            return selected;
+        };
+        // Replays fixture.handoff[0] as each tone variant, at both render
+        // extents, and checks the online model selects the HDR at token
+        // 0x2600 rather than refusing or aggregating the blur/bloom.
+        auto toneVariant = [&](const char* message, uint64_t vs, uint64_t ps, bool ps0, bool chain) {
+            for (uint32_t width : {960u, 1280u}) {
+                MonoFixture f(width);
+                f.handoff[0].key.vs = vs; f.handoff[0].key.ps = ps;
+                if (ps0) hdrAtPs0Slot(f);
+                const auto out = replayTone(f, chain);
+                check(out.selected() && out.hdr == MonoFixture::token(0x2600), message);
+            }
+        };
+        toneVariant("stock tone selects its HDR at PS1",
+            flat_mono_detail::kToneVs, flat_mono_detail::kTonePs, false, false);
+        toneVariant("EDHM-grade control selects its HDR at PS1",
+            flat_mono_detail::kToneVs, flat_mono_detail::kToneEdhmGradePs, false, false);
+        toneVariant("DoF-composite tone selects its own PS0 HDR, not its PS1 blur",
+            flat_mono_detail::kToneVs, flat_mono_detail::kToneDofCompositePs, true, false);
+        toneVariant("DoF-composite tone selects its HDR through an active blur chain",
+            flat_mono_detail::kToneVs, flat_mono_detail::kToneDofCompositePs, true, true);
+        toneVariant("bloom-composite tone selects its own PS0 HDR, not its PS1 bloom",
+            flat_mono_detail::kToneVsNoConst, flat_mono_detail::kToneBloomCompositePs, true, false);
+        toneVariant("bloom-composite tone selects its HDR through an active bloom chain",
+            flat_mono_detail::kToneVsNoConst, flat_mono_detail::kToneBloomCompositePs, true, true);
     }
 }
 
@@ -1113,9 +1256,428 @@ void flatRuntimeMenuCopyTests() {
           "unknown depthless shader pair does not enter menu copy path");
 }
 
+void testFrameContractTrace() {
+    using namespace edvr;
+    // Gate 1 (the staged program): the frame contract is produced by the same
+    // reducer online and under trace replay, with identical decisions.
+    for (uint32_t width : {960u, 1280u}) {
+        MonoFixture fixture(width);
+        auto prefix = std::make_unique<FlatRuntimePrefix>();
+        prefix->frame = fixture.input.frame; prefix->output = fixture.input.output;
+        prefix->width = 1280; prefix->height = 720; prefix->format = 28;
+        auto ring = std::make_unique<FlatTraceRing>();
+        flatTraceBeginFrame(*ring, prefix->frame, prefix->output, prefix->width, prefix->height, prefix->format);
+        struct Event { const FlatContractRecord* r; uint32_t q; } events[200]{};
+        uint32_t count = 0;
+        for (uint32_t i = 0; i < fixture.input.worldCount; ++i) {
+            const auto& r = fixture.world[i];
+            for (uint32_t n = 0; n < r.draws; ++n) events[count++] = {&r, r.first + (r.last-r.first)*n/(r.draws>1?r.draws-1:1)};
+        }
+        events[count++] = {&fixture.handoff[0], fixture.handoff[0].first};
+        events[count++] = {&fixture.handoff[1], fixture.handoff[1].first};
+        std::sort(events, events + count, [](const Event& a, const Event& b) { return a.q < b.q; });
+        auto isCopy = [](const FlatRuntimeDraw& d, const FlatRuntimePrefix& p) {
+            return d.key.vs == flat_mono_detail::kCopyVs && d.key.ps == flat_mono_detail::kCopyPs &&
+                d.key.color == p.output;
+        };
+        auto contract = std::make_unique<FlatFrameContract>();
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& r = *events[i].r;
+            FlatRuntimeDraw d{}; d.key = r.key;
+            std::memcpy(d.camera, r.camera, sizeof(d.camera));
+            d.key.writeEpoch = prefix->frame; d.key.writeSeq = prefix->sequence + 1;
+            d.supported = engine_velocity_family::supportedPair(d.key.vs, d.key.ps);
+            d.instances = r.firstInstances;
+            if (isCopy(d, *prefix)) flatRuntimeObserveContract(*prefix, d, *contract);
+            else flatRuntimeObserve(*prefix, d);
+            flatTraceRecord(*ring, d, false);
+        }
+        flatTraceSeal(*ring, contract->produced, contract->produced ? flatFrameContractHash(*contract) : 0);
+        // Exercise the non-draw kinds: recorded after the copy, they apply
+        // post-contract on both sides and must not perturb the sealed hash.
+        flatTraceMark(*ring, kFlatTraceEventWriteResource, MonoFixture::token(0xDEAD));
+        flatTraceMark(*ring, kFlatTraceEventMarkUncertain, nullptr);
+        // The present boundary: seal happened above; the next frame opens a
+        // new slot, and the dump skips the in-flight (current) slot.
+        flatTraceBeginFrame(*ring, prefix->frame + 1, prefix->output, prefix->width, prefix->height, prefix->format);
+        check(contract->produced && contract->copiesUsed == 1 && contract->copies[0].selected(),
+              "trace online run produces a selected frame contract");
+        const uint64_t wantHash = flatFrameContractHash(*contract);
+        std::vector<unsigned char> bytes;
+        flatTraceDump(*ring, [&](const void* data, uint32_t n) {
+            const auto* p = static_cast<const unsigned char*>(data);
+            bytes.insert(bytes.end(), p, p + n); return n;
+        });
+        uint32_t framesReplayed = 0, framesMatched = 0;
+        FlatRuntimePrefix replay{};
+        FlatFrameContract rc{};
+        FlatTraceFrameHeader cur{};
+        auto finishFrame = [&]() {
+            if (!cur.eventCount) return;
+            ++framesReplayed;
+            if (rc.produced == (cur.produced != 0) &&
+                (!rc.produced || flatFrameContractHash(rc) == cur.contractHash)) ++framesMatched;
+        };
+        const bool parsed = flatTraceParse(bytes.data(), bytes.size(),
+            [&](const FlatTraceFrameHeader& h) {
+                finishFrame(); cur = h;
+                replay = FlatRuntimePrefix{}; replay.frame = h.frame; replay.output = h.output;
+                replay.width = h.width; replay.height = h.height; replay.format = h.format;
+                rc = FlatFrameContract{};
+            },
+            [&](const FlatTraceEvent& e) {
+                if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); return; }
+                if (e.kind == kFlatTraceEventDispatchWritten) { flatRuntimeDispatchObserveWritten(replay, e.key.color); return; }
+                if (e.kind == kFlatTraceEventMarkUncertain) { replay.uncertain = true; return; }
+                if (e.kind == kFlatTraceEventCameraCapture) { ++replay.sequence; return; }
+                FlatRuntimeDraw d = flatTraceEventToDraw(e);
+                // The traced writeEpoch/writeSeq are the online-resolved
+                // values; replaying them verbatim keeps the shared camera/
+                // draw sequence counter's online interleaving intact.
+                if (e.flags & kFlatTraceForeignWork) replay.uncertain = true;
+                if (isCopy(d, replay)) flatRuntimeObserveContract(replay, d, rc);
+                else flatRuntimeObserve(replay, d);
+            });
+        finishFrame();
+        check(parsed && framesReplayed == 1 && framesMatched == 1 && wantHash == cur.contractHash,
+              "trace round-trip replays to an identical frame contract");
+    }
+    // Committed corpus: every trace replays to its recorded contract hashes.
+    // The gate must not silently pass: a missing corpus, an unreadable entry,
+    // an empty directory or a manifest mismatch all fail the build.
+    namespace fs = std::filesystem;
+    const fs::path dir("tools/flat_temporal_test/traces");
+    const fs::path manifestPath = dir / "manifest.txt";
+    if (!fs::exists(dir) || !fs::exists(manifestPath)) {
+        check(false, "trace corpus or its manifest is missing");
+        return;
+    }
+    // The manifest pins the required scenarios: one "file frames scenario"
+    // per line, '#' for comments. Adding a file never replaces a required one.
+    std::map<std::string, uint32_t> required;
+    {
+        std::ifstream mf(manifestPath);
+        std::string line;
+        while (std::getline(mf, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream iss(line);
+            std::string name, scenario;
+            uint32_t frames = 0;
+            if (!(iss >> name >> frames >> scenario) || !frames) {
+                check(false, "trace corpus manifest line malformed");
+                continue;
+            }
+            required[name] = frames;
+        }
+    }
+    check(!required.empty(), "trace corpus manifest names no traces");
+    uint32_t files = 0, framesMatched = 0, framesTotal = 0;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (entry.path().extension() != ".bin") continue;
+        std::ifstream file(entry.path(), std::ios::binary | std::ios::ate);
+        if (!file) { check(false, "trace corpus entry unreadable"); continue; }
+        std::vector<unsigned char> bytes(static_cast<size_t>(file.tellg()));
+        file.seekg(0); file.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (!file) { check(false, "trace corpus entry unreadable"); continue; }
+        ++files;
+        const std::string name = entry.path().filename().string();
+        auto wanted = required.find(name);
+        check(wanted != required.end(), "trace corpus file is not in the manifest");
+        FlatRuntimePrefix replay{};
+        FlatFrameContract rc{};
+        FlatTraceFrameHeader cur{};
+        uint32_t fileFrames = 0;
+        auto finish = [&]() {
+            if (!cur.eventCount) return;
+            ++framesTotal; ++fileFrames;
+            if (rc.produced == (cur.produced != 0) &&
+                (!rc.produced || flatFrameContractHash(rc) == cur.contractHash)) ++framesMatched;
+        };
+        const bool parsed = flatTraceParse(bytes.data(), bytes.size(),
+            [&](const FlatTraceFrameHeader& h) {
+                finish(); cur = h;
+                replay = FlatRuntimePrefix{}; replay.frame = h.frame; replay.output = h.output;
+                replay.width = h.width; replay.height = h.height; replay.format = h.format;
+                rc = FlatFrameContract{};
+            },
+            [&](const FlatTraceEvent& e) {
+                if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); return; }
+                if (e.kind == kFlatTraceEventDispatchWritten) { flatRuntimeDispatchObserveWritten(replay, e.key.color); return; }
+                if (e.kind == kFlatTraceEventMarkUncertain) { replay.uncertain = true; return; }
+                if (e.kind == kFlatTraceEventCameraCapture) { ++replay.sequence; return; }
+                FlatRuntimeDraw d = flatTraceEventToDraw(e);
+                if (e.flags & kFlatTraceForeignWork) replay.uncertain = true;
+                const bool copy = d.key.vs == flat_mono_detail::kCopyVs &&
+                    d.key.ps == flat_mono_detail::kCopyPs && d.key.color == replay.output;
+                if (copy) flatRuntimeObserveContract(replay, d, rc); else flatRuntimeObserve(replay, d);
+            });
+        finish();
+        check(parsed, "trace corpus file parses");
+        if (wanted != required.end()) {
+            check(wanted->second == fileFrames, "trace corpus frame count matches the manifest");
+            required.erase(wanted);
+        }
+    }
+    check(required.empty(), "manifest scenario missing from the corpus");
+    check(files && framesTotal && framesMatched == framesTotal,
+          "trace corpus replays to the recorded frame contracts");
+    std::printf("frame-contract corpus: %u file(s), %u/%u frames replay identical\n",
+                files, framesMatched, framesTotal);
+}
+
+// reviews/flat-temporal-main-review-2026-09-26.md, G1-1: run one MonoFixture
+// stream through the reducer's contract wrapper with optional mutations.
+static std::unique_ptr<edvr::FlatFrameContract> runContractStream(uint32_t width, bool dropTone,
+        bool dropCopy, bool uncertainBeforeCopy, bool duplicateCopy) {
+    using namespace edvr;
+    MonoFixture fixture(width);
+    auto prefix = std::make_unique<FlatRuntimePrefix>();
+    prefix->frame = fixture.input.frame; prefix->output = fixture.input.output;
+    prefix->width = 1280; prefix->height = 720; prefix->format = 28;
+    struct Event { const FlatContractRecord* r; uint32_t q; } events[200]{};
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < fixture.input.worldCount; ++i) {
+        const auto& r = fixture.world[i];
+        for (uint32_t n = 0; n < r.draws; ++n) events[count++] = {&r, r.first + (r.last-r.first)*n/(r.draws>1?r.draws-1:1)};
+    }
+    if (!dropTone) events[count++] = {&fixture.handoff[0], fixture.handoff[0].first};
+    if (!dropCopy) events[count++] = {&fixture.handoff[1], fixture.handoff[1].first};
+    std::sort(events, events + count, [](const Event& a, const Event& b) { return a.q < b.q; });
+    auto contract = std::make_unique<FlatFrameContract>();
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& r = *events[i].r;
+        FlatRuntimeDraw d{}; d.key = r.key;
+        std::memcpy(d.camera, r.camera, sizeof(d.camera));
+        d.key.writeEpoch = prefix->frame; d.key.writeSeq = prefix->sequence + 1;
+        d.supported = engine_velocity_family::supportedPair(d.key.vs, d.key.ps);
+        d.instances = r.firstInstances;
+        const bool isCopy = d.key.vs == flat_mono_detail::kCopyVs &&
+            d.key.ps == flat_mono_detail::kCopyPs && d.key.color == prefix->output;
+        if (!isCopy) { flatRuntimeObserve(*prefix, d); continue; }
+        if (uncertainBeforeCopy) prefix->uncertain = true;
+        flatRuntimeObserveContract(*prefix, d, *contract);
+        if (duplicateCopy) flatRuntimeObserveContract(*prefix, d, *contract);
+    }
+    return contract;
+}
+
+void testFrameContractOutcomes() {
+    using namespace edvr;
+    // G1-1: every copy outcome is recorded and hashed, including the early
+    // refusals that assemble no fixture records.
+    const auto baseline = runContractStream(960, false, false, false, false);
+    check(baseline->produced && baseline->copiesUsed == 1 &&
+          baseline->copies[0].selected() && baseline->recordCount != 0 &&
+          flatFrameContractHash(*baseline) != 0,
+          "a selected copy produces a hashed contract");
+    const auto noTone = runContractStream(960, true, false, false, false);
+    check(noTone->produced && noTone->copiesUsed == 1 &&
+          noTone->copies[0].reason == FlatMonoReason::NoTonePass &&
+          noTone->recordCount == 0 && flatFrameContractHash(*noTone) != 0 &&
+          flatFrameContractHash(*noTone) != flatFrameContractHash(*baseline),
+          "a missing tone pass records and hashes its refusal");
+    const auto uncertain = runContractStream(960, false, false, true, false);
+    check(uncertain->copiesUsed == 1 &&
+          uncertain->copies[0].reason == FlatMonoReason::Truncated &&
+          flatFrameContractHash(*uncertain) != flatFrameContractHash(*baseline),
+          "uncertain input records and hashes its refusal");
+    const auto duplicate = runContractStream(960, false, false, false, true);
+    check(duplicate->produced && duplicate->copiesUsed == 2 &&
+          duplicate->copies[0].selected() &&
+          duplicate->copies[1].reason == FlatMonoReason::Truncated &&
+          duplicate->recordCount != 0 &&
+          flatFrameContractHash(*duplicate) != flatFrameContractHash(*baseline),
+          "a duplicate copy keeps the first outcome's records and hashes both");
+    const auto noCopy = runContractStream(960, false, true, false, false);
+    check(!noCopy->produced && !noCopy->copiesUsed,
+          "a frame without a copy produces no contract");
+}
+
+void testFrameContractHashCoverage() {
+    using namespace edvr;
+    // G1-2: the hash covers the full semantic selection and fixture fields.
+    const auto base = runContractStream(960, false, false, false, false);
+    const uint64_t want = flatFrameContractHash(*base);
+    auto mutated = *base;
+    mutated.copies[0].camera[0][0] += 1.0f;
+    check(flatFrameContractHash(mutated) != want,
+          "a selected camera row mutation changes the hash");
+    mutated = *base; mutated.copies[0].outputWidth ^= 1;
+    check(flatFrameContractHash(mutated) != want,
+          "a selected output extent mutation changes the hash");
+    mutated = *base; mutated.records[0].firstInstances ^= 1;
+    check(flatFrameContractHash(mutated) != want,
+          "an aggregate instance-count mutation changes the hash");
+    mutated = *base; mutated.copies[0].reason = FlatMonoReason::Truncated;
+    check(flatFrameContractHash(mutated) != want,
+          "a selection outcome mutation changes the hash");
+}
+
+
+// Diagnostic: replay one trace file frame by frame, printing the stored and
+// replayed contract hashes and the replayed selection's shape per frame.
+// Nonzero exit on any mismatch: the diagnostic must not read green on red.
+int flatTraceCheck(const char* path) {
+    using namespace edvr;
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) { std::printf("cannot read %s\n", path); return 2; }
+    std::vector<unsigned char> bytes(static_cast<size_t>(file.tellg()));
+    file.seekg(0); file.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
+    FlatRuntimePrefix replay{};
+    FlatFrameContract rc{};
+    FlatTraceFrameHeader cur{};
+    uint32_t draws = 0, markers = 0, mismatches = 0;
+    auto finish = [&]() {
+        if (!cur.eventCount) return;
+        const uint64_t got = rc.produced ? flatFrameContractHash(rc) : 0;
+        const bool match = rc.produced == (cur.produced != 0) && (!rc.produced || got == cur.contractHash);
+        if (!match) ++mismatches;
+        std::printf("frame %llu: events=%u draws=%u markers=%u produced(stored=%u replay=%u) hash(stored=%016llx replay=%016llx) reason=%s records=%u%s\n",
+            (unsigned long long)cur.frame, cur.eventCount, draws, markers, cur.produced, rc.produced ? 1u : 0u,
+            (unsigned long long)cur.contractHash, (unsigned long long)got,
+            flatMonoReasonName(rc.copiesUsed ? rc.copies[0].reason : FlatMonoReason::InvalidInput),
+            rc.recordCount, match ? "" : "  MISMATCH");
+        cur = FlatTraceFrameHeader{};
+    };
+    const bool parsed = flatTraceParse(bytes.data(), bytes.size(),
+        [&](const FlatTraceFrameHeader& h) {
+            finish(); cur = h;
+            replay = FlatRuntimePrefix{}; replay.frame = h.frame; replay.output = h.output;
+            replay.width = h.width; replay.height = h.height; replay.format = h.format;
+            rc = FlatFrameContract{}; draws = markers = 0;
+        },
+        [&](const FlatTraceEvent& e) {
+            if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); ++markers; return; }
+            if (e.kind == kFlatTraceEventDispatchWritten) { flatRuntimeDispatchObserveWritten(replay, e.key.color); ++markers; return; }
+            if (e.kind == kFlatTraceEventMarkUncertain) { replay.uncertain = true; ++markers; return; }
+            if (e.kind == kFlatTraceEventCameraCapture) { ++replay.sequence; ++markers; return; }
+            FlatRuntimeDraw d = flatTraceEventToDraw(e);
+            if (e.flags & kFlatTraceForeignWork) replay.uncertain = true;
+            const bool copy = d.key.vs == flat_mono_detail::kCopyVs &&
+                d.key.ps == flat_mono_detail::kCopyPs && d.key.color == replay.output;
+            if (copy) flatRuntimeObserveContract(replay, d, rc); else flatRuntimeObserve(replay, d);
+            ++draws;
+        });
+    finish();
+    if (!parsed) { std::printf("malformed trace %s\n", path); return 2; }
+    if (mismatches) { std::printf("%u mismatched frame(s)\n", mismatches); return 1; }
+    return 0;
+}
+
+void testFlatResolveRoute() {
+    using namespace edvr;
+    // Gate 2 discovery (section 72): today's effective route per size pairing,
+    // honest refusals included. Mirrors the resolve's own predicates.
+    struct Case { FlatMonoResolveMode mode; uint32_t rW, rH, dW, dH;
+                  uint32_t eW, eH; bool refused; const char* name; };
+    const Case cases[] = {
+        // The flown stock pairing: SS 0.65 render upscaled by DLSS.
+        {FlatMonoResolveMode::Dlss, 2496,1404, 3840,2160, 3840,2160, false, "trained-upscale"},
+        {FlatMonoResolveMode::Dlss, 3840,2160, 3840,2160, 3840,2160, false, "trained-native"},
+        {FlatMonoResolveMode::Fsr,  2496,1404, 3840,2160, 3840,2160, false, "trained-upscale"},
+        // R > D (section 72 step 2): NVIDIA evaluates DLAA at R and the game's
+        // copy downsamples E = R to D; FSR mirrors it via Native AA at 1.0x.
+        {FlatMonoResolveMode::Dlss, 5760,3240, 3840,2160, 5760,3240, false, "dlss-as-dlaa-supersample"},
+        {FlatMonoResolveMode::Dlaa, 5760,3240, 3840,2160, 5760,3240, false, "dlaa-supersample"},
+        {FlatMonoResolveMode::Fsr,  5760,3240, 3840,2160, 5760,3240, false, "fsr-native-aa-supersample"},
+        {FlatMonoResolveMode::Taa,  5760,3240, 3840,2160, 3840,2160, false, "taa-display-grid-down"},
+        {FlatMonoResolveMode::Dlaa, 3840,2160, 3840,2160, 3840,2160, false, "dlaa-native"},
+        {FlatMonoResolveMode::Taa,  3840,2160, 3840,2160, 3840,2160, false, "taa-native"},
+        {FlatMonoResolveMode::Taa,  2496,1404, 3840,2160, 3840,2160, false, "taa-display-grid-up"},
+        // DLAA never upscales; mixed axes route NVIDIA to the supersample path.
+        {FlatMonoResolveMode::Dlaa, 2496,1404, 3840,2160, 0,0, true, "dlaa-requires-native"},
+        {FlatMonoResolveMode::Dlss, 3000,2160, 3840,1404, 3000,2160, false, "dlss-as-dlaa-supersample"},
+        {FlatMonoResolveMode::Taa,  3000,2160, 3840,1404, 3840,1404, false, "taa-display-grid-down"},
+    };
+    for (const auto& c : cases) {
+        const auto route = flatResolveRoute(c.mode, c.rW, c.rH, c.dW, c.dH);
+        check(route.refused == c.refused && route.evalWidth == c.eW && route.evalHeight == c.eH &&
+              std::strcmp(route.name, c.name) == 0, "resolve route names the effective treatment honestly");
+    }
+    check(std::strcmp(flatResolveRoute(FlatMonoResolveMode::Dlaa, 2496, 1404, 3840, 2160).failReason,
+                      "flat-dlaa-requires-native-render-size") == 0,
+          "the DLAA upscale refusal's log token is stable");
+    check(flatResolveRoute(FlatMonoResolveMode::Taa, 0, 2160, 3840, 2160).refused &&
+          flatResolveRoute(FlatMonoResolveMode::Dlss, 3840, 2160, 3840, 0).refused,
+          "a zero on any axis refuses the route");
+}
+
+// Expectation regeneration (the review's path: same saved events, unchanged
+// selector, no new flight): replay every trace in a directory with the
+// current reducer and hash schema, rewriting each frame header's stored
+// contract hash in place.
+int flatTraceMigrate(const char* dirPath) {
+    using namespace edvr;
+    namespace fs = std::filesystem;
+    uint32_t files = 0, failed = 0;
+    for (const auto& entry : fs::directory_iterator(dirPath)) {
+        if (entry.path().extension() != ".bin") continue;
+        std::ifstream file(entry.path(), std::ios::binary | std::ios::ate);
+        if (!file) { std::printf("migrate: cannot read %s\n", entry.path().string().c_str()); ++failed; continue; }
+        std::vector<unsigned char> bytes(static_cast<size_t>(file.tellg()));
+        file.seekg(0); file.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (!file || bytes.size() < sizeof(FlatTraceHeader)) { ++failed; continue; }
+        FlatTraceHeader header{};
+        std::memcpy(&header, bytes.data(), sizeof(header));
+        // Input may be EDVRFTR2 (same event layout, old hash schema); the
+        // output is always EDVRFTR3 with the current schema's hashes.
+        if (std::memcmp(header.magic, "EDVRFTR3", 8) != 0 &&
+            std::memcmp(header.magic, "EDVRFTR2", 8) != 0) {
+            std::printf("migrate: %s is not EDVRFTR2/3\n", entry.path().string().c_str()); ++failed; continue;
+        }
+        size_t at = sizeof(FlatTraceHeader);
+        bool ok = true;
+        for (uint32_t f = 0; f < header.frameCount && ok; ++f) {
+            if (bytes.size() - at < sizeof(FlatTraceFrameHeader)) { ok = false; break; }
+            const size_t headerAt = at;
+            FlatTraceFrameHeader fh{};
+            std::memcpy(&fh, bytes.data() + at, sizeof(fh));
+            at += sizeof(fh);
+            if (!fh.eventCount || fh.eventCount > kFlatTraceEventsPerFrame ||
+                bytes.size() - at < fh.eventCount * sizeof(FlatTraceEvent)) { ok = false; break; }
+            FlatRuntimePrefix replay{};
+            replay.frame = fh.frame; replay.output = fh.output;
+            replay.width = fh.width; replay.height = fh.height; replay.format = fh.format;
+            FlatFrameContract rc{};
+            for (uint32_t i = 0; i < fh.eventCount; ++i) {
+                FlatTraceEvent e{};
+                std::memcpy(&e, bytes.data() + at, sizeof(e)); at += sizeof(e);
+                if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); continue; }
+                if (e.kind == kFlatTraceEventDispatchWritten) { flatRuntimeDispatchObserveWritten(replay, e.key.color); continue; }
+                if (e.kind == kFlatTraceEventMarkUncertain) { replay.uncertain = true; continue; }
+                if (e.kind == kFlatTraceEventCameraCapture) { ++replay.sequence; continue; }
+                FlatRuntimeDraw d = flatTraceEventToDraw(e);
+                if (e.flags & kFlatTraceForeignWork) replay.uncertain = true;
+                const bool copy = d.key.vs == flat_mono_detail::kCopyVs &&
+                    d.key.ps == flat_mono_detail::kCopyPs && d.key.color == replay.output;
+                if (copy) flatRuntimeObserveContract(replay, d, rc); else flatRuntimeObserve(replay, d);
+            }
+            fh.produced = rc.produced ? 1u : 0u;
+            fh.contractHash = rc.produced ? flatFrameContractHash(rc) : 0;
+            std::memcpy(bytes.data() + headerAt, &fh, sizeof(fh));
+        }
+        if (!ok || at != bytes.size()) { std::printf("migrate: %s malformed\n", entry.path().string().c_str()); ++failed; continue; }
+        header.magic[7] = '3';
+        std::memcpy(bytes.data(), &header, sizeof(header));
+        std::ofstream out(entry.path(), std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (!out) { std::printf("migrate: cannot write %s\n", entry.path().string().c_str()); ++failed; continue; }
+        std::printf("migrate: %s rehashed (%u frames)\n", entry.path().string().c_str(), header.frameCount);
+        ++files;
+    }
+    if (!files && !failed) { std::printf("migrate: no traces in %s\n", dirPath); return 2; }
+    return failed ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
+        return flatShaderClassifierSweep(argv[2]);
+    if (argc == 3 && std::strcmp(argv[1], "--trace-check") == 0)
+        return flatTraceCheck(argv[2]);
+    if (argc == 3 && std::strcmp(argv[1], "--trace-migrate") == 0)
+        return flatTraceMigrate(argv[2]);
     if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) {
-        std::puts("usage: flat_temporal_test --self-test");
+        std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir> | --trace-check <file> | --trace-migrate <dir>");
         return 2;
     }
     failures += flatProjectionViewportTests();
@@ -1128,19 +1690,25 @@ int main(int argc, char** argv) {
     testContractAdmissionAndReservation();
     testAdmissionAndWindow();
     testMonoFrameSelection();
+    testFlatResolveRoute();
     testProjectionSlices();
     testDetailBudget();
     failures += flatShaderCaptureTests();
     failures += flatProjectionMathTests();
     failures += flatProjectionBindingsTests();
     failures += flatProjectionRecipeTests();
+    failures += flatShaderClassifierTests();
     failures += flatProjectionOwnershipTests();
     failures += flatComputeTests();
     failures += flatLightingTests();
     failures += flatLivePhaseTests();
+    failures += flatLocalRejectTests();
     flatRuntimePrefixTests();
     flatRuntimeImageCopyTests();
     flatRuntimeMenuCopyTests();
+    testFrameContractTrace();
+    testFrameContractOutcomes();
+    testFrameContractHashCoverage();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

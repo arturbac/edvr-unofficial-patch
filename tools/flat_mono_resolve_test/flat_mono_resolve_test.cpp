@@ -22,6 +22,7 @@ bool backendFail=false,backendReset=false,infiniteSeen=false;
 std::vector<std::string> resetEvents;
 float expectedJx=0,expectedJy=0;
 float observedMotion=0,observedMotionY=0,observedDepth=0;unsigned observedReject=0;
+uint32_t observedInW=0,observedInH=0,observedOutW=0,observedOutH=0;
 void check(bool ok,const char* text){if(!ok){std::printf("FAIL: %s\n",text);++failures;}}
 bool readPixel(ID3D11DeviceContext* context,ID3D11Texture2D* texture,void* out,size_t bytes,UINT x=8,UINT y=8) {
     ComPtr<ID3D11Device> device;context->GetDevice(device.GetAddressOf());
@@ -86,12 +87,14 @@ thread_local bool g_flatComputeInternal = false;
 bool dlaaAvailable(ID3D11Device*,const char**){return true;}
 bool fsr3Available(ID3D11Device*,const char**){return true;}
 bool dlaaEvaluate(ID3D11DeviceContext* c,int,ID3D11Texture2D*,ID3D11Texture2D* depth,ID3D11Texture2D* mv,
-    ID3D11Texture2D* out,ID3D11Texture2D* mask,uint32_t,uint32_t,uint32_t,uint32_t,float jx,float jy,bool reset,float,const char** why) {
+    ID3D11Texture2D* out,ID3D11Texture2D* mask,uint32_t w,uint32_t h,uint32_t outW,uint32_t outH,float jx,float jy,bool reset,float,const char** why) {
+    observedInW=w;observedInH=h;observedOutW=outW;observedOutH=outH;
     return backend(c,depth,mv,mask,out,jx,jy,reset,why);
 }
 bool fsr3Evaluate(ID3D11DeviceContext* c,unsigned,ID3D11Texture2D*,ID3D11Texture2D* depth,ID3D11Texture2D* mv,
-    ID3D11Texture2D* mask,ID3D11Texture2D* out,uint32_t,uint32_t,uint32_t,uint32_t,float jx,float jy,bool reset,float,
+    ID3D11Texture2D* mask,ID3D11Texture2D* out,uint32_t w,uint32_t h,uint32_t outW,uint32_t outH,float jx,float jy,bool reset,float,
     float nearZ,float,float fov,const char** why,bool infinite) {
+    observedInW=w;observedInH=h;observedOutW=outW;observedOutH=outH;
     infiniteSeen=infinite;check(nearZ==.025f && std::abs(fov-1.5707963f)<1e-5f,"FSR actual near and FOV");
     return backend(c,depth,mv,mask,out,jx,jy,reset,why);
 }
@@ -317,6 +320,65 @@ int main(int argc,char** argv) {
     bindOriginal();ComPtr<ID3D11ShaderResourceView> badJitter;
     check(!edvr::flatMonoResolveSpatialFallback(device.Get(),context.Get(),f,badJitter.GetAddressOf(),&fallbackReason) &&
           !badJitter && restored(),"nonfinite jitter cannot silently reach spatial fallback");
+    // Gate 2 step 2 (design doc section 72): a supersampled render (R > D) on
+    // the NVIDIA route evaluates DLAA at E = R on both axes, and the resolved
+    // output view is R-sized so the game's own copy downsamples it to D.
+    {
+        const UINT w2=w*2,h2=h*2;
+        std::vector<uint32_t> red2(w2*h2,0xff0000ff);std::vector<float> z2(w2*h2,.01f);
+        std::vector<float> slots2(w2*h2*2);for(size_t i=0;i<slots2.size();i+=2){slots2[i]=-1;slots2[i+1]=.01f;}
+        auto color2=texture(device.Get(),w2,h2,DXGI_FORMAT_R8G8B8A8_UNORM,D3D11_BIND_SHADER_RESOURCE,red2.data(),w2*4);
+        auto depth2=texture(device.Get(),w2,h2,DXGI_FORMAT_R32_FLOAT,D3D11_BIND_SHADER_RESOURCE,z2.data(),w2*4);
+        auto slotTexture2=texture(device.Get(),w2,h2,DXGI_FORMAT_R32G32_FLOAT,D3D11_BIND_SHADER_RESOURCE,slots2.data(),w2*8);
+        auto colorView2=view(device.Get(),color2.Get()),depthView2=view(device.Get(),depth2.Get()),slotView2=view(device.Get(),slotTexture2.Get());
+        edvr::FlatMonoResolveFrame f2{};f2.color=colorView2.Get();f2.depth=depthView2.Get();
+        f2.renderWidth=w2;f2.renderHeight=h2;f2.outputWidth=w;f2.outputHeight=h;f2.deltaMs=16;
+        camera(f2.camera);camera(f2.previousCamera);
+        f2.engine={slotView2.Get(),poolView.Get(),now.Get(),old.Get()};
+        f2.mode=edvr::FlatMonoResolveMode::Dlss;f2.frame=1;
+        expectedJx=expectedJy=0;  // this block runs unjittered
+        edvr::FlatMonoResolvePreflight planned2{};planned2.renderWidth=w2;planned2.renderHeight=h2;
+        planned2.outputWidth=w;planned2.outputHeight=h;planned2.mode=f2.mode;
+        planned2.colorViewFormat=DXGI_FORMAT_R8G8B8A8_UNORM;planned2.depthViewFormat=DXGI_FORMAT_R32_FLOAT;
+        auto preflight2=edvr::flatMonoResolvePreflight(device.Get(),context.Get(),planned2);
+        check(preflight2.readyForRasterJitter() && preflight2.backendAvailable,
+              "supersampled preflight is ready with backend creation deferred");
+        bindOriginal();ComPtr<ID3D11ShaderResourceView> out2;const char* reason2=nullptr;
+        check(edvr::flatMonoResolve(device.Get(),context.Get(),f2,out2.GetAddressOf(),&reason2) && out2,
+              "supersampled DLSS frame resolves via DLAA at render size");
+        if(reason2)std::printf("info: supersample resolver reason %s\n",reason2);
+        check(restored(),"supersampled resolve restores the complete original pipeline");
+        check(observedInW==w2 && observedInH==h2 && observedOutW==w2 && observedOutH==h2,
+              "backend evaluates the supersample route at render size on both axes");
+        ComPtr<ID3D11Resource> outResource2;if(out2)out2->GetResource(outResource2.GetAddressOf());
+        ComPtr<ID3D11Texture2D> outTexture2;if(outResource2)outResource2.As(&outTexture2);
+        D3D11_TEXTURE2D_DESC outDesc2{};if(outTexture2)outTexture2->GetDesc(&outDesc2);
+        check(outDesc2.Width==w2 && outDesc2.Height==h2,
+              "the supersampled output view is render-sized for the game's downsample");
+        check(pixel(out2.Get(),16,16)==0xff0000ff,"supersampled reset displays current render-size color");
+        // FSR mirrors NVIDIA here: Native AA is the 1.0x case of the same
+        // upscaler, evaluating at render size for the game's downsample.
+        f2.mode=edvr::FlatMonoResolveMode::Fsr;f2.frame=2;
+        bindOriginal();ComPtr<ID3D11ShaderResourceView> outFsr;reason2=nullptr;
+        check(edvr::flatMonoResolve(device.Get(),context.Get(),f2,outFsr.GetAddressOf(),&reason2) && outFsr,
+              "supersampled FSR frame resolves via Native AA at render size");
+        if(reason2)std::printf("info: supersample FSR resolver reason %s\n",reason2);
+        check(restored(),"supersampled FSR resolve restores the complete original pipeline");
+        check(observedInW==w2 && observedInH==h2 && observedOutW==w2 && observedOutH==h2,
+              "FSR evaluates the supersample route at render size on both axes");
+        // TAA at R > D evaluates on the display grid today (the route's
+        // honest report): the resolved view stays D-sized.
+        f2.mode=edvr::FlatMonoResolveMode::Taa;f2.frame=3;
+        bindOriginal();ComPtr<ID3D11ShaderResourceView> outTaa;reason2=nullptr;
+        check(edvr::flatMonoResolve(device.Get(),context.Get(),f2,outTaa.GetAddressOf(),&reason2) && outTaa,
+              "supersampled TAA frame resolves on the display grid");
+        if(reason2)std::printf("info: supersample TAA resolver reason %s\n",reason2);
+        ComPtr<ID3D11Resource> outResTaa;if(outTaa)outTaa->GetResource(outResTaa.GetAddressOf());
+        ComPtr<ID3D11Texture2D> outTexTaa;if(outResTaa)outResTaa.As(&outTexTaa);
+        D3D11_TEXTURE2D_DESC outDescTaa{};if(outTexTaa)outTexTaa->GetDesc(&outDescTaa);
+        check(outDescTaa.Width==w && outDescTaa.Height==h,
+              "the display-grid TAA output stays display-sized at supersampling");
+    }
     context->ClearState();
     failures+=flatPixelCaptureGpuTests(device.Get(),context.Get());
     failures+=flatDrawCaptureGpuTests(device.Get(),context.Get());

@@ -338,7 +338,8 @@ static void selfTest() {
           "a missing, reordered or doubled marker, or a resource inside, fails the build");
     const std::string production = extractCore(edvr::kTemporalCsHlsl);
     const std::string flat = production + edvr::kFlatMonoShaderSource;
-    for (const char* entry : {"prep", "taa", "finish", "spatial"}) {
+    static const char* flatEntries[] = {"prep", "taa", "finish", "spatial"};
+    for (const char* entry : flatEntries) {
         Variant mono{"kFlatSelfTest", "flat_mono_self_test", entry, nullptr, {}, true};
         check(compile(compiler.fn, flat.c_str(), mono), "production flat mono shader compilation");
     }

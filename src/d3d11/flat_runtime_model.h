@@ -149,7 +149,28 @@ inline void flatRuntimeComputeWritten(FlatRuntimePrefix& p, const void* resource
             return;
         }
 }
-inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeDraw& d) {
+// The dispatch path's full UAV-write guard (flat_runtime.cpp's dispatch
+// scope), shared with the trace replay: the completed handoff and its HDR
+// input refuse GPU writes after lighting's legitimate pre-tone window.
+inline void flatRuntimeDispatchObserveWritten(FlatRuntimePrefix& p, const void* resource) {
+    flatRuntimeComputeWritten(p, resource);
+    for (uint32_t i = 0; i < p.targetsUsed; ++i) {
+        auto& target = p.targets[i];
+        const void* const hdrInput = flat_mono_detail::toneHdrInput(target.tone.key);
+        if (target.tones && (target.resource == resource || (hdrInput && hdrInput == resource)))
+            p.uncertain = true;
+    }
+    for (uint32_t i = 0; i < p.sourcesUsed; ++i) if (p.sources[i].key.depth == resource) p.uncertain = true;
+}
+// Optional sink for the copy branch's assembled fixture records: the frame
+// contract's carrier (flat_frame_contract.h). count is set only when the
+// copy branch ran, so count != 0 means the reducer produced a contract.
+struct FlatRuntimeContractSink {
+    FlatContractRecord* records = nullptr;
+    uint32_t capacity = 0, count = 0;
+};
+inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeDraw& d,
+                                        FlatRuntimeContractSink* sink) {
     using namespace flat_mono_detail;
     FlatMonoFrame out{}; out.frame = out.epoch = p.frame;
     const uint32_t q = ++p.sequence;
@@ -163,12 +184,13 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
         FlatRuntimeTarget* tone = nullptr;
         for (uint32_t i = 0; i < p.targetsUsed; ++i) if (p.targets[i].resource == k.srvResource[0]) tone = &p.targets[i];
         if (!tone || tone->tones != 1 || tone->tone.last != tone->writes.last) { out.reason = FlatMonoReason::NoTonePass; return out; }
+        const void* const hdrInput = toneHdrInput(tone->tone.key);
         FlatContractRecord records[36]{}; uint32_t n = 0;
         // Reuse the proven completed-frame selector on this exact prefix. Only
         // HDR aggregates, supported sources and tone/copy enter the fixture.
         for (uint32_t i = 0; i < p.targetsUsed; ++i) {
             const auto& t = p.targets[i];
-            if (t.resource == tone->tone.key.srvResource[1] && t.writes.key.format == 26 && t.writes.draws) {
+            if (hdrInput && t.resource == hdrInput && t.writes.key.format == 26 && t.writes.draws) {
                 if (t.hdrBad) { p.selectedConflict = t.firstBad; out.reason = FlatMonoReason::ConflictingHdr; return out; }
                 records[n] = t.writes; records[n].key.camera = nullptr; records[n++].key.kind = kFlatContractScreen;
                 if (t.hdrCamera) { records[n] = t.tone; records[n++].key.kind = kFlatContractScreen; }
@@ -177,6 +199,12 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
         records[n++] = tone->tone;
         for (uint32_t i = 0; i < p.sourcesUsed; ++i) records[n++] = p.sources[i];
         records[n++] = current;
+        // The frame contract's record fixture: the exact records the selector
+        // ran on, delivered to the sink before selection.
+        if (sink && sink->records && n <= sink->capacity) {
+            std::memcpy(sink->records, records, n * sizeof(FlatContractRecord));
+            sink->count = n;
+        }
         FlatMonoFrameInput in{}; in.world = records; in.worldCount = n;
         in.output = p.output; in.outputWidth = p.width; in.outputHeight = p.height; in.outputFormat = p.format;
         in.frame = in.epoch = p.frame; in.supportedPair = [](uint64_t, uint64_t) { return true; };
@@ -184,7 +212,7 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
         if (out.reason == FlatMonoReason::ConflictingHdr) {
             for (uint32_t i = 0; i < p.targetsUsed; ++i) {
                 const auto& t = p.targets[i];
-                if (t.resource != tone->tone.key.srvResource[1] || !t.writes.draws) continue;
+                if (!hdrInput || t.resource != hdrInput || !t.writes.draws) continue;
                 auto& w = p.selectedConflict;
                 w.hdr = t.resource; w.sequence = t.hdrCamera ? t.tone.first : t.writes.first;
                 w.reference = flatRuntimeWitnessDraw(t.writes);
@@ -361,7 +389,7 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
     if (!t->writes.draws) t->writes = current;
     else { ++t->writes.draws; t->writes.last = q; t->writes.lastInstances = d.instances;
         if (k.camera) { t->writes.lastWriteEpoch = k.writeEpoch; t->writes.lastWriteSeq = k.writeSeq; } }
-    if (k.format != 9 && k.vs == kToneVs && k.ps == kTonePs) { ++t->tones; t->tone = current; }
+    if (k.format != 9 && toneHdrSlot(k.vs, k.ps) != ~0u) { ++t->tones; t->tone = current; }
     if (d.supported && k.depth && k.kind == kFlatContractPool) {
         FlatContractRecord* source = nullptr;
         for (uint32_t i = 0; i < p.sourcesUsed; ++i) if (p.sources[i].key.depth == k.depth && sameCamera(p.sources[i], current)) { source = &p.sources[i]; break; }
@@ -377,5 +405,10 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
         }
     }
     return out;
+}
+// The two-argument form keeps every existing caller; the sink form is the
+// frame-contract producer (flat_frame_contract.h).
+inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeDraw& d) {
+    return flatRuntimeObserve(p, d, nullptr);
 }
 } // namespace edvr

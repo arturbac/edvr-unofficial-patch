@@ -319,4 +319,139 @@ void projectionRuntimeTests(ID3D11Device* device, ID3D11DeviceContext* base) {
         ctx->VSSetConstantBuffers1(1,1,&lateBound,&first,&count);
     }
     runtime.reset();
+    // Section 72 step 3 (review finding 3): the 32-plan cache retires instead
+    // of refusing at 33 -- stale plans release first, then the least-recently
+    // used idle plan, and a retired plan's buffers demote back to evictable.
+    {
+        FlatProjectionRuntime capacity;
+        check(capacity.initialize(base), "capacity runtime initialized");
+        constexpr UINT kTopologies = 40;
+        ComPtr<ID3D11Buffer> buffers[kTopologies]{};
+        unsigned char blob[1024]; std::memset(blob, 7, sizeof(blob));
+        FlatProjectionJitter pz{};
+        check(flatProjectionJitter(.25f, -.25f, 960, 540, pz), "capacity phase conversion");
+        bool allPreflighted = true;
+        for (UINT i = 0; i < kTopologies; ++i) {
+            D3D11_BUFFER_DESC bd{}; bd.ByteWidth = sizeof(blob); bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_SUBRESOURCE_DATA bi{}; bi.pSysMem = blob;
+            if (FAILED(device->CreateBuffer(&bd, &bi, buffers[i].GetAddressOf()))) { allPreflighted = false; break; }
+            capacity.observeCreateBuffer(buffers[i].Get(), blob);
+            FlatProjectionRuntimeRequest rq{};
+            rq.stage = FlatProjectionStage::Vertex; rq.slot = 1; rq.original = buffers[i].Get();
+            rq.firstConstant = 0; rq.constantCount = sizeof(blob) / 16; rq.patchCount = 1;
+            rq.patches[0] = {FlatProjectionPatchLayout::ForwardColumns, 0, {}};
+            if (!capacity.preflight(&rq, 1, pz, i + 1)) { allPreflighted = false; break; }
+        }
+        check(allPreflighted && capacity.status().preflights == kTopologies &&
+              capacity.status().planRetiredLru == kTopologies - 32,
+              "the plan cache retires the least-recently-used idle plan past 32 instead of refusing");
+        // Invalidate a NEW plan's shadow: stale retirement must choose it
+        // over any LRU victim (buffers[0]'s plan was LRU-retired long ago).
+        capacity.invalidate(buffers[kTopologies - 2].Get());
+        {
+            D3D11_BUFFER_DESC bd{}; bd.ByteWidth = sizeof(blob); bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_SUBRESOURCE_DATA bi{}; bi.pSysMem = blob;
+            ComPtr<ID3D11Buffer> extra;
+            check(SUCCEEDED(device->CreateBuffer(&bd, &bi, extra.GetAddressOf())), "stale-case CB created");
+            capacity.observeCreateBuffer(extra.Get(), blob);
+            FlatProjectionRuntimeRequest rq{};
+            rq.stage = FlatProjectionStage::Vertex; rq.slot = 1; rq.original = extra.Get();
+            rq.firstConstant = 0; rq.constantCount = sizeof(blob) / 16; rq.patchCount = 1;
+            rq.patches[0] = {FlatProjectionPatchLayout::ForwardColumns, 0, {}};
+            check(capacity.preflight(&rq, 1, pz, kTopologies + 1) &&
+                  capacity.status().planRetiredStale >= 1,
+                  "a plan whose shadow is invalidated retires stale before any LRU eviction");
+        }
+        UINT first = 0, count = sizeof(blob) / 16; auto* lastBound = buffers[kTopologies - 1].Get();
+        ctx->VSSetConstantBuffers1(1, 1, &lastBound, &first, &count);
+        FlatProjectionRuntimeRequest last{};
+        last.stage = FlatProjectionStage::Vertex; last.slot = 1; last.original = buffers[kTopologies - 1].Get();
+        last.firstConstant = 0; last.constantCount = sizeof(blob) / 16; last.patchCount = 1;
+        last.patches[0] = {FlatProjectionPatchLayout::ForwardColumns, 0, {}};
+        const auto* lastPlan = capacity.prepare(&last, 1, pz, kTopologies);
+        check(lastPlan != nullptr, "a surviving plan still prepares after retirements");
+        if (lastPlan) { FlatProjectionBindingScope scope(*lastPlan); check(scope.active(), "surviving plan binds"); }
+        capacity.reset();
+    }
+    // Gate-2 review reproductions: ownership is transactional. Live retargets
+    // balance references exactly once, a failed preflight pins nothing, and
+    // buffer pressure retires before refusing admission.
+    {
+        FlatProjectionRuntime refs;
+        check(refs.initialize(base), "refs runtime initialized");
+        unsigned char blob[1024]; std::memset(blob, 7, sizeof(blob));
+        auto mk = [&](FlatProjectionRuntime& rt, ComPtr<ID3D11Buffer>& out) {
+            D3D11_BUFFER_DESC bd{}; bd.ByteWidth = sizeof(blob); bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_SUBRESOURCE_DATA bi{}; bi.pSysMem = blob;
+            check(SUCCEEDED(device->CreateBuffer(&bd, &bi, out.GetAddressOf())), "refs CB created");
+            rt.observeCreateBuffer(out.Get(), blob);
+        };
+        auto rqOf = [](ID3D11Buffer* b, UINT constants) {
+            FlatProjectionRuntimeRequest rq{};
+            rq.stage = FlatProjectionStage::Vertex; rq.slot = 1; rq.original = b;
+            rq.firstConstant = 0; rq.constantCount = constants; rq.patchCount = 1;
+            rq.patches[0] = {FlatProjectionPatchLayout::ForwardColumns, 0, {}};
+            return rq;
+        };
+        FlatProjectionJitter pz{};
+        check(flatProjectionJitter(.25f, -.25f, 960, 540, pz), "refs phase conversion");
+        ComPtr<ID3D11Buffer> warm, live1, live2;
+        mk(refs, warm); mk(refs, live1); mk(refs, live2);
+        auto warmA = rqOf(warm.Get(), sizeof(blob) / 16);
+        check(refs.preflight(&warmA, 1, pz, 1) && refs.status().planRefsLive == 1,
+              "one warm plan holds exactly one reference");
+        auto warmB = rqOf(live1.Get(), sizeof(blob) / 16);
+        check(refs.preflight(&warmB, 1, pz, 2) && refs.status().planRefsLive == 2,
+              "a second warm plan holds its own reference");
+        // The live retarget path wants an already privately-ready buffer with
+        // a first-seen topology: same buffer, new structure.
+        auto liveReq1 = rqOf(live1.Get(), sizeof(blob) / 16);
+        liveReq1.patchCount = 2;
+        liveReq1.patches[1] = {FlatProjectionPatchLayout::ForwardColumns, 64, {}};
+        check(refs.preflight(&liveReq1, 1, pz, 3, false) && refs.status().planRefsLive == 3,
+              "the first live retarget records its references exactly once");
+        auto liveReq2 = rqOf(live1.Get(), sizeof(blob) / 16);
+        liveReq2.patchCount = 2;
+        liveReq2.patches[1] = {FlatProjectionPatchLayout::ForwardColumns, 128, {}};
+        check(refs.preflight(&liveReq2, 1, pz, 4, false) && refs.status().planRefsLive == 3,
+              "repeated live retargets abandon no references");
+        FlatProjectionRuntimeRequest two[2]{rqOf(live1.Get(), sizeof(blob) / 16), rqOf(live2.Get(), 0)};
+        const auto beforeFail = refs.status().planRefsLive;
+        check(!refs.preflight(two, 2, pz, 4) && refs.status().planRefsLive == beforeFail,
+              "a failed multi-buffer preflight pins no ownerless buffer");
+        refs.reset();
+    }
+    {
+        FlatProjectionRuntime pressure;
+        check(pressure.initialize(base), "pressure runtime initialized");
+        unsigned char blob[1024]; std::memset(blob, 7, sizeof(blob));
+        ComPtr<ID3D11Buffer> pins[64]{};
+        auto mk = [&](ComPtr<ID3D11Buffer>& out) {
+            D3D11_BUFFER_DESC bd{}; bd.ByteWidth = sizeof(blob); bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+            D3D11_SUBRESOURCE_DATA bi{}; bi.pSysMem = blob;
+            check(SUCCEEDED(device->CreateBuffer(&bd, &bi, out.GetAddressOf())), "pressure CB created");
+            pressure.observeCreateBuffer(out.Get(), blob);
+        };
+        FlatProjectionJitter pz{};
+        check(flatProjectionJitter(.25f, -.25f, 960, 540, pz), "pressure phase conversion");
+        for (UINT i = 0; i < 64; ++i) {
+            mk(pins[i]);
+            FlatProjectionRuntimeRequest two[2]{};
+            two[0].stage = FlatProjectionStage::Vertex; two[0].slot = 1; two[0].original = pins[i].Get();
+            two[0].firstConstant = 0; two[0].constantCount = sizeof(blob) / 16; two[0].patchCount = 1;
+            two[0].patches[0] = {FlatProjectionPatchLayout::ForwardColumns, 0, {}};
+            // The second request is invalid on its face; before staged
+            // promotion the first buffer stayed promoted ownerless.
+            if (pressure.preflight(two, 2, pz, i + 1)) { check(false, "invalid second request must refuse"); break; }
+        }
+        ComPtr<ID3D11Buffer> sixtyFive;
+        mk(sixtyFive);
+        FlatProjectionRuntimeRequest rq65{};
+        rq65.stage = FlatProjectionStage::Vertex; rq65.slot = 1; rq65.original = sixtyFive.Get();
+        rq65.firstConstant = 0; rq65.constantCount = sizeof(blob) / 16; rq65.patchCount = 1;
+        rq65.patches[0] = {FlatProjectionPatchLayout::ForwardColumns, 0, {}};
+        check(pressure.preflight(&rq65, 1, pz, 65),
+              "the 65th buffer tracks after 64 failed preflights (no ownerless pins)");
+        pressure.reset();
+    }
 }

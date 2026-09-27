@@ -61,7 +61,7 @@ struct FlatMonoFrame {
     FlatMonoReason reason = FlatMonoReason::InvalidInput;
     uint64_t frame = 0, epoch = 0;
     const void* color = nullptr;  // post-tone format 27, before output copy/UI
-    const void* hdr = nullptr;    // format 26, observed tone input at PS1
+    const void* hdr = nullptr;    // format 26, observed tone input at the variant's HDR slot
     const void* depth = nullptr, *dsv = nullptr, *sceneConstants = nullptr;
     const void* output = nullptr;
     uint32_t renderWidth = 0, renderHeight = 0, outputWidth = 0, outputHeight = 0;
@@ -77,9 +77,60 @@ struct FlatMonoFrame {
 
 namespace flat_mono_detail {
 constexpr uint64_t kToneVs = 0xF9CFC798F21E9AEAull;
+// Epic 20260926_124418 (EDHM chained): the same session's frames swap the
+// tone slot's VS between the stock one, this no-constant passthrough
+// (position + UV only -- vs_CFA91824129ECBBC review in build/flat-audit-menu)
+// and this one, which adds a cb2[2].y varying z (vs_43CA9F1C0AD2ACFE review).
+// None consumes a camera or projects; all three are interchangeable for the
+// tone role, and the observed frames mix them against the PS variants below.
+constexpr uint64_t kToneVsNoConst = 0xCFA91824129ECBBCull;
+constexpr uint64_t kToneVsCbZ = 0x43CA9F1C0AD2ACFEull;
 constexpr uint64_t kTonePs = 0xFEE777E92850B390ull;
+// Epic 20260926_073622, all graphics settings maxed: the same tone VS with
+// the DoF composite folded in. This PS blends the HDR -- bound at PS0 here,
+// not PS1 -- with the quarter-res DoF blur at PS1, by a VS-varying factor,
+// all at unchanged UV, with no depth texture, SV_Position or projection
+// consumption of its own (ps_DE65BFFF2F12ECC6 review in
+// build/flat-audit-menu). Same tone role, same jitter contract; its HDR
+// lineage lives in slot 0.
+constexpr uint64_t kToneDofCompositePs = 0xDE65BFFF2F12ECC6ull;
+// Epic 20260926_124418 frame 33504 (EDHM chained): the settings-tier tone
+// with the bloom composite folded in -- t0 is the HDR sampled at unchanged
+// UV, t1 the soft-clamped bloom blended by cb2[1].w, no depth texture,
+// SV_Position or matrix consumption (ps_9270C355389DA302 review). Its HDR
+// lineage lives in slot 0, like the DoF composite.
+constexpr uint64_t kToneBloomCompositePs = 0x9270C355389DA302ull;
+// Same session, frame 33939: EDHM's recolor grade folded into the tone --
+// t1 is the HDR at unchanged UV, t2 the bloom, t0 a color-grade LUT applied
+// after tonemapping, t120 the mod's own config table; no depth texture,
+// SV_Position or matrix consumption (ps_EAA5F18F10533BD1 review). Same tone
+// role and jitter contract; its HDR lineage lives in slot 1, like the stock.
+constexpr uint64_t kToneEdhmGradePs = 0xEAA5F18F10533BD1ull;
 constexpr uint64_t kCopyVs = 0x20F383BBAC05C031ull;
 constexpr uint64_t kCopyPs = 0xDED8796049C7BB4Aull;
+
+inline bool knownToneVs(uint64_t vs) {
+    return vs == kToneVs || vs == kToneVsNoConst || vs == kToneVsCbZ;
+}
+// The slot a known tone PS binds its HDR lineage to: stock and the EDHM
+// grade read it at PS1, the DoF and bloom composites at PS0 (their PS1 is
+// the blur/bloom). ~0u when the PS is no known tone variant.
+inline uint32_t tonePsHdrSlot(uint64_t ps) {
+    if (ps == kTonePs || ps == kToneEdhmGradePs) return 1;
+    if (ps == kToneDofCompositePs || ps == kToneBloomCompositePs) return 0;
+    return ~0u;
+}
+// ~0u unless (vs,ps) is a known tone pass; otherwise its HDR lineage slot.
+inline uint32_t toneHdrSlot(uint64_t vs, uint64_t ps) {
+    return knownToneVs(vs) ? tonePsHdrSlot(ps) : ~0u;
+}
+// The resource a recorded tone pass reads its HDR lineage from, or nullptr
+// when (vs,ps) is no known tone variant. Every consumer of the tone's HDR
+// input goes through this; hardcoded slots aggregated the DoF blur as HDR.
+inline const void* toneHdrInput(const FlatContractObservation& k) {
+    const uint32_t slot = toneHdrSlot(k.vs, k.ps);
+    return slot < 2 ? k.srvResource[slot] : nullptr;
+}
 
 inline const FlatContractRecord& record(const FlatMonoFrameInput& in, uint32_t i) {
     return i < in.worldCount ? in.world[i] : in.handoff[i - in.worldCount];
@@ -179,18 +230,21 @@ inline FlatMonoFrame flatSelectMonoFrame(const FlatMonoFrameInput& in) {
     const FlatContractRecord* tone = nullptr;
     for (uint32_t i = 0; i < count; ++i) {
         const auto& r = record(in, i);
-        if (r.key.color != ck.srvResource[0] || r.key.vs != kToneVs || r.key.ps != kTonePs) continue;
+        if (r.key.color != ck.srvResource[0] || toneHdrSlot(r.key.vs, r.key.ps) == ~0u) continue;
         if (tone || r.draws != 1) return refuse(FlatMonoReason::AmbiguousTonePass);
         tone = &r;
     }
     if (!tone) return refuse(FlatMonoReason::NoTonePass);
     const auto& tk = tone->key;
+    // Each admitted variant names the slot its HDR lineage binds; the rest of
+    // the role checks is unchanged across variants.
+    const uint32_t hdrSlot = toneHdrSlot(tk.vs, tk.ps);
     if (!oneDraw(*tone) || !tk.rtv || tk.format != 27 || tk.depth || tk.dsv ||
         !fullViewport(tk, tk.width, tk.height) ||
         uint64_t(tk.width) * in.outputHeight != uint64_t(tk.height) * in.outputWidth)
         return refuse(FlatMonoReason::InvalidTonePass);
-    if (!tk.srvView[1] || !tk.srvResource[1] || tk.srvResource[1] == tk.color ||
-        tk.srvResource[1] == in.output) return refuse(FlatMonoReason::BrokenLineage);
+    if (!tk.srvView[hdrSlot] || !tk.srvResource[hdrSlot] || tk.srvResource[hdrSlot] == tk.color ||
+        tk.srvResource[hdrSlot] == in.output) return refuse(FlatMonoReason::BrokenLineage);
     if (tone->last >= copy->first) return refuse(FlatMonoReason::WrongOrder);
     // Tone and copy are texture operations. Their bound VS b1 can have been
     // reused by unrelated work; the current scene camera belongs to HDR.
@@ -200,7 +254,7 @@ inline FlatMonoFrame flatSelectMonoFrame(const FlatMonoFrameInput& in) {
     for (uint32_t i = 0; i < count; ++i) {
         const auto& r = record(in, i);
         const auto& k = r.key;
-        if (k.color != tk.srvResource[1]) continue;
+        if (k.color != tk.srvResource[hdrSlot]) continue;
         if (!ordered(r) || k.format != 26 || k.width != tk.width || k.height != tk.height ||
             !k.rtv || !k.depth || !k.dsv || !k.depthFormat ||
             k.depthWidth != tk.width || k.depthHeight != tk.height ||
@@ -259,7 +313,7 @@ inline FlatMonoFrame flatSelectMonoFrame(const FlatMonoFrameInput& in) {
         if (k.color == in.output && r.first > copy->last &&
             (!out.firstLaterOutput || r.first < out.firstLaterOutput)) out.firstLaterOutput = r.first;
     }
-    out.color = tk.color; out.hdr = tk.srvResource[1];
+    out.color = tk.color; out.hdr = tk.srvResource[hdrSlot];
     out.depth = hdr->key.depth; out.dsv = hdr->key.dsv; out.depthFormat = hdr->key.depthFormat;
     out.sceneConstants = hdrCamera->key.b1; out.output = in.output;
     out.renderWidth = tk.width; out.renderHeight = tk.height;

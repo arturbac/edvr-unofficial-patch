@@ -244,6 +244,10 @@ struct Window {
     uint64_t multiplies = 0, writeBacks = 0, dsTested = 0, seeds = 0, seedFailures = 0;
     uint64_t lostLayers = 0, doors = 0, treated = 0, composites = 0, overGameImage = 0;
     uint64_t compositeRefused = 0, afterWrites = 0, afterReads = 0, debugComposites = 0;
+    // afterWrites' own breakdown: taken into the layer after the UI (kept
+    // over it), left as a post pass (an eye-sized input), or refused at
+    // issue (decide-time, via decided[kAfterUi][...], plus begin-time below).
+    uint64_t afterTaken = 0, afterPostPass = 0, afterRefused = 0, afterDeclined = 0;
     uint64_t eyeMatched = 0, eyeSwapped = 0, eyeUntold = 0, seedStale = 0;
     // The world-screen gate: frames read, 2D screen draws that asked, and the
     // frames each signal held the screen in the picture.
@@ -1083,6 +1087,7 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
     if (!converted || !(layerBlend = cachedBlend(ctx, conv))) {
         if (bs) bs->Release();
         ++g_win.refusedAtIssue;
+        if (g_draw.family == UiLayerFamily::kAfterUi) ++g_win.afterRefused;
         return false;
     }
     // A new frame for this eye's layer: clear it, and count a layer the door
@@ -1151,6 +1156,7 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
                 ++g_win.seedFailures;
                 releaseSaved();
                 ++g_win.refusedAtIssue;
+                if (g_draw.family == UiLayerFamily::kAfterUi) ++g_win.afterRefused;
                 return false;
             }
         }
@@ -1206,6 +1212,7 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
         ++g_win.redirected;
         ++g_sessionRedirected;
         noteTaken(g_draw.family, g_draw.eye, e.w, e.h);
+        if (g_draw.family == UiLayerFamily::kAfterUi) ++g_win.afterTaken;
         g_win.viewportRemaps += g_draw.vpCount;
         if (g_draw.scissorSet) g_win.scissorRemaps += g_draw.scCount;
         if (g_draw.jx != 0.0f || g_draw.jy != 0.0f) ++g_win.jitterCancels;
@@ -1889,14 +1896,21 @@ void logTotals(double seconds) {
         "(left in the game's frame); %llu layers never reached the door; the door ran %llu "
         "times, the pass treated %llu eyes; %llu composites refused; %llu redirected draws "
         "refused at issue (a changed blend, or a seed that failed); after the UI the game drew "
-        "%llu times into, and %llu times read, an eye target the UI was taken from (those now "
-        "land under it, or miss it); eye check against the game's Submit: %llu matched, %llu "
-        "SWAPPED, %llu could not be told; %llu redirected this session%s.",
+        "%llu times into an eye target the UI was taken from: %llu taken into the layer after "
+        "the UI (kept over it), %llu left as post passes (eye-sized input), %llu declined by "
+        "the layer's rules (the families line's 'after the UI' says which), %llu refused at "
+        "issue; %llu times read one (a post pass: the UI misses it); eye check against the "
+        "game's Submit: %llu matched, %llu SWAPPED, %llu could not be told; %llu redirected "
+        "this session%s.",
         static_cast<unsigned long long>(late), static_cast<unsigned long long>(g_win.lostLayers),
         static_cast<unsigned long long>(g_win.doors), static_cast<unsigned long long>(g_win.treated),
         static_cast<unsigned long long>(g_win.compositeRefused),
         static_cast<unsigned long long>(g_win.refusedAtIssue),
         static_cast<unsigned long long>(g_win.afterWrites),
+        static_cast<unsigned long long>(g_win.afterTaken),
+        static_cast<unsigned long long>(g_win.afterPostPass),
+        static_cast<unsigned long long>(g_win.afterDeclined),
+        static_cast<unsigned long long>(g_win.afterRefused),
         static_cast<unsigned long long>(g_win.afterReads),
         static_cast<unsigned long long>(g_win.eyeMatched),
         static_cast<unsigned long long>(g_win.eyeSwapped),
@@ -2012,7 +2026,7 @@ int uiLayerTargetKind() {
 }
 
 bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards,
-                   bool substituted) {
+                   bool substituted, int knownEye) {
     g_draw.decided = false;
     g_draw.counted = false;
     g_draw.ds = UiDsEffect{};
@@ -2037,7 +2051,14 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     float jx = 0.0f, jy = 0.0f;
     uint32_t sw = 0, sh = 0;
     if (f.eyeTarget && f.ldrView) {
-        f.eye = uiDepthEyeOfTarget(g_tc.info.resource, g_tc.info.a, g_tc.info.b, g_tc.info.fmt);
+        // A caller that already knows the eye (uiLayerNoteOther, for an
+        // after-UI write into the exact resource this frame's UI left)
+        // passes it directly: uiDepthEyeOfTarget's own table lookup would
+        // otherwise re-derive the answer redundantly, with no structural
+        // guarantee it agrees with which eye's layer actually holds the UI
+        // this resource was taken from.
+        f.eye = knownEye >= 0 ? knownEye
+                              : uiDepthEyeOfTarget(g_tc.info.resource, g_tc.info.a, g_tc.info.b, g_tc.info.fmt);
         if (f.eye >= 0 &&
             nativeTemporalDrawJitter(static_cast<uint32_t>(f.eye), &seq, &jx, &jy, &sw, &sh)) {
             // The map sends the whole target onto the layer: only right when
@@ -2218,8 +2239,8 @@ void uiLayerWriteBackEnd(ID3D11DeviceContext* ctx) {
     g_draw.wbActive = false;
 }
 
-void uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count) {
-    if (!ctx) return;
+bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForwards, bool substituted) {
+    if (!ctx) return false;
     const void* taken[2] = {nullptr, nullptr};
     for (int e = 0; e < 2; ++e) {
         if (g_eye[e].seq == g_lastRedirectSeq && g_eye[e].draws) taken[e] = g_eye[e].target;
@@ -2237,8 +2258,9 @@ void uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count) {
             ++g_win.seedStale;
         }
     }
-    if (!taken[0] && !taken[1]) return;
+    if (!taken[0] && !taken[1]) return false;
     char kind = 0;
+    int takenEye = -1;
     // A write: the draw's target is one the UI left this frame -- a compare
     // on the target cache, every draw. A read: a pass over the eye samples it
     // at t0/t1 -- full-screen passes are a handful of vertices, so only those
@@ -2246,6 +2268,7 @@ void uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count) {
     if (uiLayerTargetKind() != 0 &&
         (g_tc.info.resource == taken[0] || g_tc.info.resource == taken[1])) {
         kind = 'W';
+        takenEye = g_tc.info.resource == taken[0] ? 0 : 1;
         ++g_win.afterWrites;
     } else if (count <= 6 && g_watchBudget) {
         --g_watchBudget;
@@ -2261,21 +2284,73 @@ void uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count) {
             }
         }
     }
-    if (!kind) return;
+    if (!kind) return false;
     const uint64_t vs = bindingShaderHash(BindSlot::Vs), ps = bindingShaderHash(BindSlot::Ps);
-    for (uint32_t i = 0; i < g_afterSeenCount; ++i) {
-        if (g_afterSeen[i].kind == kind && g_afterSeen[i].vs == vs && g_afterSeen[i].ps == ps) return;
+    // Exclusion 1 (today's behaviour, unchanged): a draw that READS the
+    // target is never taken -- it only stops seeing the UI in what it reads.
+    if (kind == 'R') {
+        for (uint32_t i = 0; i < g_afterSeenCount; ++i) {
+            if (g_afterSeen[i].kind == 'R' && g_afterSeen[i].vs == vs && g_afterSeen[i].ps == ps) return false;
+        }
+        if (g_afterSeenCount < kMaxAfterLines) {
+            g_afterSeen[g_afterSeenCount++] = {'R', vs, ps};
+            Log::get().note(
+                "ui quality: layer: after the UI, the game read an eye target the UI was taken "
+                "from: vs %016llX ps %016llX -- with the layer, that no longer sees the UI in what "
+                "it reads (a post pass over the eye: the UI misses it).",
+                static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps));
+        }
+        return false;
     }
-    if (g_afterSeenCount >= kMaxAfterLines) return;
-    g_afterSeen[g_afterSeenCount++] = {kind, vs, ps};
-    Log::get().note(
-        "ui quality: layer: after the UI, the game %s an eye target the UI was taken from: vs "
-        "%016llX ps %016llX -- with the layer, that %s.",
-        kind == 'W' ? "drew into" : "read", static_cast<unsigned long long>(vs),
-        static_cast<unsigned long long>(ps),
-        kind == 'W' ? "lands under the UI now instead of over it"
-                    : "no longer sees the UI in what it reads (a post pass over the eye: the UI "
-                      "misses it)");
+    // kind == 'W'. Exclusion 2: a post pass that samples an eye-sized texture
+    // at ANY bound PS SRV slot is left in the frame, never taken -- whole-frame
+    // input, whatever the resource, is how a post pass differs from an
+    // overlay (the field log's named draws sample 512x512 and 614x365, both
+    // smaller than the eye). vScreenIsEyeSized is the same predicate
+    // uiLayerTargetKind() already used to call this draw's OWN target an eye
+    // target, so a match here means literally "as large as the thing being
+    // written," not a fresh tolerance.
+    bool eyeSizedInput = false;
+    uint32_t srvW = 0, srvH = 0;
+    static const BindSlot kPsSlots[4] = {BindSlot::PsSrv0, BindSlot::PsSrv1, BindSlot::PsSrv2,
+                                         BindSlot::PsSrv3};
+    for (BindSlot slot : kPsSlots) {
+        void* v = bindingGet(slot);
+        if (!v) continue;
+        ResourceInfo info;
+        if (bindingResolve(v, &info) && info.isTexture2D && vScreenIsEyeSized(info.a, info.b)) {
+            eyeSizedInput = true;
+            srvW = info.a;
+            srvH = info.b;
+            break;
+        }
+    }
+    if (uiLayerAfterWriteDecide(eyeSizedInput) == UiAfterWriteDecision::kPostPass) {
+        ++g_win.afterPostPass;
+        for (uint32_t i = 0; i < g_afterSeenCount; ++i) {
+            if (g_afterSeen[i].kind == 'P' && g_afterSeen[i].vs == vs && g_afterSeen[i].ps == ps) return false;
+        }
+        if (g_afterSeenCount < kMaxAfterLines) {
+            g_afterSeen[g_afterSeenCount++] = {'P', vs, ps};
+            Log::get().note(
+                "ui quality: layer: after the UI, the game drew into an eye target the UI was "
+                "taken from: vs %016llX ps %016llX -- left as a post pass (it samples a %ux%u "
+                "input the eye's own size): stays under the UI.",
+                static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps), srvW, srvH);
+        }
+        return false;
+    }
+    // Not excluded: attempt the take through the exact machinery a real UI
+    // draw uses. A decline here (kMrt, kBlendRefused, kVerdict, a
+    // depth-stencil the layer cannot reproduce...) counts in afterDeclined,
+    // and the families line says which rule; a decide-time success that
+    // still fails at uiLayerBegin (a changed blend, a seed failure) counts
+    // in afterRefused there. Either way the draw goes to the game's frame
+    // exactly as it did before the layer took after-UI draws.
+    const bool took = uiLayerDecide(ctx, static_cast<int>(UiLayerFamily::kAfterUi), verdictForwards,
+                                    substituted, takenEye);
+    if (!took) ++g_win.afterDeclined;
+    return took;
 }
 
 void uiLayerNoteDepthClear(void* dsv) {

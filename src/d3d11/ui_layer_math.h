@@ -553,6 +553,13 @@ enum class UiLayerFamily : uint8_t {
     kHolo,       // cockpit holo panels (vs 81216C77F90DEDD6)
     kFlightHud,  // flight HUD (vs B7790CBFC6554097)
     kSprite,     // target-time sprite (vs E508648660A352B2)
+    kAfterUi,    // not the interface at all: an owner draw that WRITES an eye
+                 // target the UI was already taken from this frame
+                 // (uiLayerNoteOther's 'W' case), taken into the same layer
+                 // after the UI so it stays over it. Never reached through
+                 // uiLayerFamilyOf/uiLayerFamilyFor -- uiLayerNoteOther
+                 // assigns it, with the eye already known from the taken
+                 // target, not derived by family.
     kCount
 };
 
@@ -566,8 +573,29 @@ inline const char* uiLayerFamilyName(UiLayerFamily f) {
         case UiLayerFamily::kHolo: return "cockpit holo panels";
         case UiLayerFamily::kFlightHud: return "flight HUD";
         case UiLayerFamily::kSprite: return "target sprite";
+        case UiLayerFamily::kAfterUi: return "after the UI";
         default: return "none";
     }
+}
+
+// After the UI: whether a later owner draw that WRITES an eye target the UI
+// was already taken from this frame (uiLayerNoteOther's 'W' case) should be
+// ATTEMPTED as a take into the same layer, after the UI. The read case (its
+// 'R' case) never reaches this at all -- a draw that only reads the target
+// is left exactly as before, uncounted here. kAttempt still goes through
+// uiLayerDecide as UiLayerFamily::kAfterUi, which may itself refuse (family
+// census: kMrt, kBlendRefused, kDepthStencilTest, kSubstitutedWrite,
+// kVerdict, a begin-time blend or seed failure...) -- counted separately
+// from this gate.
+enum class UiAfterWriteDecision : uint8_t {
+    kAttempt = 0,  // not an eye-sized input: try the take
+    kPostPass,     // samples an eye-sized texture at a bound PS SRV slot (the
+                   // frame or a copy of it; an overlay's own art is smaller):
+                   // left, so a post pass is never captured whole into the layer
+};
+
+inline UiAfterWriteDecision uiLayerAfterWriteDecide(bool eyeSizedInput) {
+    return eyeSizedInput ? UiAfterWriteDecision::kPostPass : UiAfterWriteDecision::kAttempt;
 }
 
 // THE FAMILY RULE, pure: vscreen.cpp's uiLayerFamilyOf gathers these facts

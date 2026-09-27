@@ -2,10 +2,13 @@
 #include "flat_runtime_model.h"
 #include "flat_mono_resolve.h"
 #include "flat_projection_recipes.h"
+#include "flat_shader_classifier.h"
 #include "flat_projection_ownership.h"
 #include "flat_camera_probe.h"
 #include "flat_live_phase.h"
 #include "flat_draw_capture.h"
+#include "flat_local_reject.h"
+#include "flat_trace.h"
 #include "binding_shadow.h"
 #include "exposure_fix.h"
 #include "device_hook.h"
@@ -15,6 +18,7 @@
 #include "../common/runtime_profile.h"
 #include "../common/temporal_mode.h"
 #include <wrl/client.h>
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <map>
@@ -80,6 +84,24 @@ struct State {
     };
     AuditOutcome projectionOutcomes[256]{}; uint32_t projectionOutcomesUsed = 0;
     uint64_t projectionOutcomeOverflow = 0;
+    // Generic shader classification memo: fixed-size, linear scan, no
+    // allocation on the draw path; classification runs at most once per
+    // (vs,ps) pair per session. Overflow keeps the existing refuse path.
+    struct GenericClassification {
+        uint64_t vs = 0, ps = 0;
+        FlatShaderPairClassification classification{};
+        uint64_t lastSeenFrame = 0;
+    };
+    GenericClassification genericClassifications[64]{};
+    uint32_t genericClassificationsUsed = 0;
+    // The memo retires its least-recently-seen entry at 64 rather than
+    // refusing ever after; the first eviction of a session is logged once.
+    bool genericClassificationOverflowLogged = false;
+    // Verdict-log dedup, independent of the 64-entry memo (gate-2 review):
+    // a pair's verdict logs once per session even across eviction, from a
+    // 256-entry FIFO of pair hashes replaced round-robin.
+    uint64_t classificationLogged[256]{};
+    uint32_t classificationLoggedNext = 0;
     struct LocalProjectionSample {
         uint64_t firstFrame = 0, frames[2]{};
         const void* color[2]{}, *depth[2]{};
@@ -120,6 +142,45 @@ struct State {
     uint64_t phaseOverflowCalls=0, phaseOverflowFrames=0, phaseOverflowLastFrame=0;
     uint64_t phaseCensusFrames=0, phaseCensusFailedFrames=0, phaseCensusTreatedFailedFrames=0;
     bool phaseCensusPending=false, phaseCensusFailed=false;
+
+    // --- Partial temporal AA ("local refusal"), redesigned per the 2026-09-26
+    // review: one raster phase across shared scene depth/colour. A per-draw-
+    // local refusal invalidates the frame's history and returns the runtime
+    // to observation until a refusal-free frame requalifies the contract;
+    // it is never claimed as treated. See docs/design-flat-temporal-aa-2026-09-23.md.
+    bool partialWanted = true;
+    // The returned-to-observation state: set by a per-draw-local refusal,
+    // cleared by a refusal-free frame. While set, frames run unjittered and
+    // the copy-draw treatment is skipped; the contract observation that
+    // requalifies keeps running.
+    bool observing = false;
+    // This frame's copy draw selected through the contract observation --
+    // the positive witness the observation exit predicate requires
+    // (flat_local_reject.h). Reset every frame.
+    bool observingQualifiedHandoff = false;
+    // This frame saw a per-draw-local refusal (for the census close-out).
+    bool covFrameLocallyRefused = false;
+    // The current draw's shader identities, stashed per draw so refuseDraw
+    // (State& only) can name the refused pair in the census -- the same
+    // convention as s.namedDepth and s.reason.
+    uint64_t drawVs = 0, drawPs = 0;
+
+    // --- Frame-contract trace (staged-program gate 1) -------------------------
+    // The reducer's input events, always recorded into a bounded ring and
+    // dumped on the F10 audit arm; the replay rig runs the same reducer over
+    // the trace and compares contract hashes. The contract accumulates every
+    // copy draw's outcome through the frame and is hashed at seal time.
+    FlatTraceRing traceRing{};
+    FlatFrameContract traceContract{};
+
+    // --- Partial temporal AA: coverage census (Part B), reset every 5s --------
+    uint64_t covSceneDraws = 0, covExact = 0, covGeneric = 0, covInert = 0, covUnchanged = 0;
+    uint64_t covLocalRefused = 0, covMemoEvictions = 0;
+    uint64_t covFrames = 0, covFramesObserving = 0, covObservationEntries = 0;
+    uint64_t covFramesLocallyRefused = 0;
+    struct CoverageRefusedPair { uint64_t vs = 0, ps = 0; const char* reason = ""; uint64_t draws = 0; };
+    CoverageRefusedPair covRefusedPairs[32]{};
+    uint32_t covRefusedPairsUsed = 0;
 };
 // Driver objects retire on the owner Present; never release under loader lock.
 State& state() { static State* p = new State; return *p; }
@@ -305,7 +366,7 @@ void reportProjection(State& s, const char* event) {
         (unsigned long long)(s.projectionViewportChecks-s.projectionViewportMismatches),
         (unsigned long long)s.projectionViewportMismatches,(unsigned long long)s.projectionViewportWitnesses,(unsigned long long)s.projectionViewportSuppressed,
         (unsigned long long)s.projectionViewportUnrecorded);
-    Log::get().note("flat projection outcome totals: distinct=%u overflow-observations=%llu unchanged-draws=%llu; result=prepared is reason-code 0, failures retain their code, 101=unknown-recipe, 103=bytecode-unchanged, 104=projection-viewport-mismatch",
+    Log::get().note("flat projection outcome totals: distinct=%u overflow-observations=%llu unchanged-draws=%llu; result=prepared is reason-code 0, failures retain their code, 101=unknown-recipe, 103=bytecode-unchanged, 104=projection-viewport-mismatch, 105=generic-recipe, 106=generic-inert",
         s.projectionOutcomesUsed,(unsigned long long)s.projectionOutcomeOverflow,(unsigned long long)s.projectionUnchanged);
     static const char* outcomeNames[]={"prepared","wrong-thread","no-context1","capacity","unknown-buffer","missing-full-write","unsupported-range","binding-mismatch","invalid-recipe","private-failure","plan-failure"};
     for(uint32_t i=0;i<s.projectionOutcomesUsed;++i) {
@@ -313,7 +374,8 @@ void reportProjection(State& s, const char* event) {
         const char* label=outcome.reason<11?outcomeNames[outcome.reason]:
             outcome.reason==100?"actual-shader-mismatch":outcome.reason==101?"unknown-scene-projection-recipe":
             outcome.reason==102?"invalid-render-extent":outcome.reason==103?"bytecode-unchanged":
-            outcome.reason==104?"projection-viewport-mismatch":"other-refusal";
+            outcome.reason==104?"projection-viewport-mismatch":outcome.reason==105?"generic-recipe":
+            outcome.reason==106?"generic-inert":"other-refusal";
         Log::get().note("flat projection outcome: event=%s VS=%016llX PS=%016llX CS=%016llX result=%s code=%u count=%llu",
             event,(unsigned long long)outcome.vs,(unsigned long long)outcome.ps,(unsigned long long)outcome.cs,
             label,outcome.reason,(unsigned long long)outcome.observations);
@@ -543,7 +605,7 @@ void captureCopyProvenance(State& s, ID3D11DeviceContext* ctx, const FlatRuntime
             writes.key.rtv,writes.key.depth,writes.key.dsv,writes.key.b1,(unsigned long long)writes.key.cameraHash,
             writes.key.camera?1u:0u,(unsigned long long)writes.firstWriteEpoch,writes.firstWriteSeq,
             (unsigned long long)writes.lastWriteEpoch,writes.lastWriteSeq,target->hdrBad?1u:0u,target->imageSourceBad?1u:0u,
-            flatRuntimeConflictName(target->firstBad.cause),target->tones,target->tone.key.srvResource[1]);
+            flatRuntimeConflictName(target->firstBad.cause),target->tones,flat_mono_detail::toneHdrInput(target->tone.key));
     }
 }
 struct LocalRows { bool pixel; UINT slot, row, count; const char* name; };
@@ -778,6 +840,135 @@ void recordProjectionReference(State& s, State::AuditOutcome& outcome,
         if(result.translationResidual>outcome.translationResidual)outcome.translationResidual=result.translationResidual;
     }
 }
+// Generic admission: classify the actual creation bytecode once per (vs,ps)
+// pair. Missing blobs classify as NoBytecode and keep the existing refuse
+// path; a full memo table also keeps it (no per-draw classification).
+const char* flatVsClassName(FlatVsProjectionClass c) {
+    switch (c) {
+    case FlatVsProjectionClass::NoBytecode: return "no-bytecode";
+    case FlatVsProjectionClass::InertNoCB: return "inert-no-cb";
+    case FlatVsProjectionClass::ForwardColumns: return "forward-columns";
+    case FlatVsProjectionClass::ForwardDp4: return "forward-dp4";
+    case FlatVsProjectionClass::Unclassified: return "unclassified";
+    }
+    return "unknown";
+}
+const char* flatPsSafetyName(FlatPsProjectionSafety p) {
+    switch (p) {
+    case FlatPsProjectionSafety::NoBytecode: return "no-bytecode";
+    case FlatPsProjectionSafety::Clean: return "clean";
+    case FlatPsProjectionSafety::Consumer: return "consumer";
+    }
+    return "unknown";
+}
+FlatShaderPairClassification classifyFlatProjectionPair(State& s, uint64_t vs, uint64_t ps) {
+    for (uint32_t i = 0; i < s.genericClassificationsUsed; ++i) {
+        auto& entry = s.genericClassifications[i];
+        if (entry.vs == vs && entry.ps == ps) {
+            entry.lastSeenFrame = s.prefix.frame;
+            return entry.classification;
+        }
+    }
+    State::GenericClassification* slot = nullptr;
+    if (s.genericClassificationsUsed < 64) {
+        slot = &s.genericClassifications[s.genericClassificationsUsed++];
+    } else {
+        // LRU retirement (section 72 step 3): the memo never stops
+        // classifying; the least-recently-seen entry yields its slot and its
+        // pair simply reclassifies if it returns.
+        slot = &s.genericClassifications[0];
+        for (uint32_t i = 1; i < 64; ++i)
+            if (s.genericClassifications[i].lastSeenFrame < slot->lastSeenFrame)
+                slot = &s.genericClassifications[i];
+        ++s.covMemoEvictions;
+        if (!s.genericClassificationOverflowLogged) {
+            s.genericClassificationOverflowLogged = true;
+            Log::get().note("flat generic classification: memo evicts the least-recently-seen pair at 64 entries (frame=%llu); an evicted pair reclassifies on return (coverage line memo-evictions=)",
+                (unsigned long long)s.prefix.frame);
+        }
+    }
+    const uint8_t* vsBytes = nullptr; size_t vsLen = 0;
+    const uint8_t* psBytes = nullptr; size_t psLen = 0;
+    const bool vsFound = flatProbeShaderLookup('v', vs, &vsBytes, &vsLen);
+    const bool psFound = flatProbeShaderLookup('p', ps, &psBytes, &psLen);
+    // A missing stage classifies as NoBytecode, which admits nothing; the
+    // present stage is still classified so its own reason reaches the log.
+    FlatShaderPairClassification result = classifyFlatShaderPair(vsFound ? vsBytes : nullptr, vsFound ? vsLen : 0,
+                                    psFound ? psBytes : nullptr, psFound ? psLen : 0);
+    slot->vs = vs; slot->ps = ps; slot->classification = result; slot->lastSeenFrame = s.prefix.frame;
+    // The verdict and the rule behind it, logged once per pair per session
+    // even across memo evictions (the 256-entry FIFO, not the memo, owns
+    // that guarantee) -- a refused pair needs no offline review to name.
+    const uint64_t pairHash = (vs ^ (ps * 1099511628211ull)) | 1ull;
+    bool verdictSeen = false;
+    for (uint32_t i = 0; i < 256; ++i) if (s.classificationLogged[i] == pairHash) { verdictSeen = true; break; }
+    if (!verdictSeen) {
+        s.classificationLogged[s.classificationLoggedNext] = pairHash;
+        s.classificationLoggedNext = (s.classificationLoggedNext + 1) % 256;
+        const bool clean = result.ps == FlatPsProjectionSafety::Clean;
+        const char* verdict = clean && (result.vs == FlatVsProjectionClass::ForwardColumns ||
+                                        result.vs == FlatVsProjectionClass::ForwardDp4) ? "generic-recipe" :
+                              clean && result.vs == FlatVsProjectionClass::InertNoCB ? "generic-inert" : "refused";
+        char vsExtra[32] = "", psExtra[48] = "";
+        if (result.vsReason == FlatClassifierReason::UnknownOpcode)
+            std::snprintf(vsExtra, sizeof(vsExtra), " vs-opcode=%u", unsigned(result.vsUnknownOpcode));
+        if (result.psReason == FlatClassifierReason::UnknownOpcode)
+            std::snprintf(psExtra, sizeof(psExtra), " ps-opcode=%u", unsigned(result.psUnknownOpcode));
+        else if (result.psReason == FlatClassifierReason::VposConsumer)
+            std::snprintf(psExtra, sizeof(psExtra), " ps-rule=%s", flatVposConsumerSubcodeName(result.psConsumerSubcode));
+        Log::get().note("flat generic classification: frame=%llu VS=%016llX PS=%016llX verdict=%s vs=%s slot=%u row=%u vs-reason=%s%s ps=%s ps-reason=%s%s",
+            (unsigned long long)s.prefix.frame, (unsigned long long)vs, (unsigned long long)ps, verdict,
+            flatVsClassName(result.vs), result.vsSlot, result.vsRow, flatClassifierReasonName(result.vsReason), vsExtra,
+            flatPsSafetyName(result.ps), flatClassifierReasonName(result.psReason), psExtra);
+    }
+    return result;
+}
+// --- Partial temporal AA ("local refusal") --------------------------------
+// Redesigned 2026-09-26 per docs/review-flat-temporal-aa-2026-09-26.md
+// findings 1, 4 and 5: one raster phase across shared scene depth/colour.
+// A scene draw that cannot be jittered for a reason specific to that one
+// draw still goes out unjittered (the proxy cannot stop the game's own
+// draw); the frame's history is invalidated and the runtime returns to
+// observation until a refusal-free frame requalifies the contract. It is
+// never claimed as treated. experimental.temporal_aa_partial=off is the
+// previous behaviour: failPhase per frame, retrying every frame.
+
+// Part B per-pair breakdown of the top locally refused (VS,PS,reason)
+// triples this window. Overflow past this fixed table only drops out of the
+// top-5 breakdown; the aggregate covLocalRefused counter still counts it.
+void recordLocallyRefusedPair(State& s, uint64_t vs, uint64_t ps, const char* reason) {
+    for (uint32_t i = 0; i < s.covRefusedPairsUsed; ++i) {
+        auto& e = s.covRefusedPairs[i];
+        if (e.vs == vs && e.ps == ps && std::strcmp(e.reason, reason) == 0) { ++e.draws; return; }
+    }
+    if (s.covRefusedPairsUsed < 32) {
+        auto& e = s.covRefusedPairs[s.covRefusedPairsUsed++];
+        e.vs = vs; e.ps = ps; e.reason = reason; e.draws = 1;
+    }
+}
+
+// Local-refusal entry point for a per-draw-local reason on a SCENE DRAW.
+// qualifyProjection's cs!=0 (compute/dispatch) callers must never reach
+// this -- they call failPhase directly, gated on cs at each of its three
+// call sites -- and every other caller here is a scene draw by construction.
+void refuseDraw(State& s, const char* reason) {
+    if (!flatLocalRefusalReason(reason)) { failPhase(s, reason); return; }
+    ++s.covLocalRefused;
+    s.covFrameLocallyRefused = true;
+    recordLocallyRefusedPair(s, s.drawVs, s.drawPs, reason);
+    // The current frame fails coherently either way: zero phase when nothing
+    // jittered yet, the spatial fallback otherwise -- never a mixed-phase
+    // temporal evaluation.
+    failPhase(s, reason);
+    if (s.partialWanted && !s.observing) {
+        s.observing = true;
+        ++s.covObservationEntries;
+        Log::get().note("flat coverage: returned to observation at frame=%llu reason=%s VS=%016llX PS=%016llX; treatment resumes after a refusal-free frame",
+            (unsigned long long)s.prefix.frame, reason,
+            (unsigned long long)s.drawVs, (unsigned long long)s.drawPs);
+    }
+}
+
 const FlatProjectionBindingPlan* qualifyProjection(State& s, FlatProjectionRecipes recipes, uint32_t width, uint32_t height,
                        uint64_t vs, uint64_t ps, uint64_t cs, bool owned, bool sceneHdr = false) {
     if (!s.projection || !recipes.count) return nullptr;
@@ -799,7 +990,10 @@ const FlatProjectionBindingPlan* qualifyProjection(State& s, FlatProjectionRecip
         shadersMatch=lookupShaderHash(actualVs.Get())==vs && lookupShaderHash(actualPs.Get())==ps; }
     if (!shadersMatch) {
         if(audit) { ++s.projectionMissing;projectionDetail(s,vs,ps,cs,100,"actual-shader-mismatch"); }
-        failPhase(s,"actual-shader-mismatch");return nullptr;
+        // Local refusal only on the draw path (cs==0); the dispatch path
+        // stays frame-global.
+        if(!cs) refuseDraw(s,"actual-shader-mismatch"); else failPhase(s,"actual-shader-mismatch");
+        return nullptr;
     }
     if(!cs) {
         UINT count=1;D3D11_VIEWPORT viewport{};s.context->RSGetViewports(&count,&viewport);
@@ -808,7 +1002,10 @@ const FlatProjectionBindingPlan* qualifyProjection(State& s, FlatProjectionRecip
                                       viewport.Height,viewport.MinDepth,viewport.MaxDepth};
         if(!flatRuntimeProjectionViewport(count,actualViewport,width,height,sceneHdr)) {
             if(audit)recordProjectionViewportFailure(s,vs,ps,cs,width,height,count,viewport);
-            failPhase(s,"projection-viewport-mismatch");return nullptr;
+            // Only reachable with cs==0 (the enclosing !cs block), but spelled
+            // out the same way as the other two qualifyProjection refusals.
+            if(!cs) refuseDraw(s,"projection-viewport-mismatch"); else failPhase(s,"projection-viewport-mismatch");
+            return nullptr;
         }
     }
     Ptr<ID3D11Buffer> buffers[3];
@@ -843,7 +1040,10 @@ const FlatProjectionBindingPlan* qualifyProjection(State& s, FlatProjectionRecip
     }
     reportProjectionFailure(s,recipes,vs,ps,cs);
     if(audit) { ++s.projectionMissing;projectionDetail(s,vs,ps,cs,static_cast<uint32_t>(s.projection->status().last),"private-preparation-refused"); }
-    failPhase(s,"projection-preparation-refused");return nullptr;
+    // Local refusal only on the draw path (cs==0); the dispatch path stays
+    // frame-global.
+    if(!cs) refuseDraw(s,"projection-preparation-refused"); else failPhase(s,"projection-preparation-refused");
+    return nullptr;
 }
 void reset() { auto& s = state(); s.havePrevious = false; FlatComputeInternalScope guard; flatMonoResolveInvalidateHistory(); }
 void refuse(State& s) {
@@ -910,12 +1110,14 @@ Camera* camera(ID3D11Resource* resource, bool add) {
     uint32_t index = s.cameraCount;
     if (index == 64) {
         for (uint32_t i = 0; i < 64; ++i) if (s.cameras[i].frame != s.prefix.frame && !s.cameras[i].mapped) { index = i; break; }
-        if (index == 64) { s.prefix.uncertain = true; return nullptr; }
+        if (index == 64) { s.prefix.uncertain = true; flatTraceMark(s.traceRing, kFlatTraceEventMarkUncertain, nullptr); return nullptr; }
     } else ++s.cameraCount;
     auto& c = s.cameras[index]; c = Camera{}; c.buffer = buffer; c.width = d.ByteWidth; return &c;
 }
 void capture(Camera& c, const void* bytes) {
-    c.valid = flatCaptureCameraRows(c.rows, bytes, c.width); c.frame = state().prefix.frame; c.sequence = ++state().prefix.sequence;
+    c.valid = flatCaptureCameraRows(c.rows, bytes, c.width); c.frame = state().prefix.frame;
+    flatTraceMark(state().traceRing, kFlatTraceEventCameraCapture, nullptr);
+    c.sequence = ++state().prefix.sequence;
 }
 bool depthView(ID3D11Texture2D* depth) {
     auto& s = state(); if (s.sceneDepth.Get() == depth && s.depthView) return true;
@@ -945,6 +1147,9 @@ void flatRuntimeResize() {
     for (auto& r : s.colors) r.Reset(); for (auto& r : s.depths) r.Reset();
     for (auto& r : s.uavs) r.Reset();
     for (auto& c : s.cameras) c = Camera{}; s.cameraCount = 0;
+    // Local refusal's observation ends with the contract: a resize or device
+    // change requalifies nothing, but the state itself must not survive.
+    s.observing = false; s.covFrameLocallyRefused = false;
     s.prefix = FlatRuntimePrefix{}; s.context.Reset(); s.device.Reset(); s.thread = 0; s.viewportCount = 0;
 }
 void flatRuntimeBeforePresent() { g_flatRuntimeLive.store(false, std::memory_order_release); }
@@ -953,6 +1158,47 @@ void flatRuntimeArmProjectionAudit() { if(runtimeFlatProfile()) projectionAuditR
 void flatRuntimeCreateBuffer(ID3D11Buffer* buffer, const void* initialData) {
     if(owner() && state().projection) state().projection->observeCreateBuffer(buffer,initialData);
 }
+// Gate 1 trace dump: write the ring's complete frames to logDir\traces on the
+// F10 audit arm. CREATE_ALWAYS: each arm is a new capture of the newest slots.
+void flatTraceDumpToLogDir(State& s, uint64_t frame) {
+    const auto root = Config::get().logDir() + L"\\traces";
+    if (!CreateDirectoryW(root.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        Log::get().note("flat trace dump: cannot create %ls (error %lu)", root.c_str(), GetLastError());
+        return;
+    }
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%ls\\flat_trace_%llu.bin", root.c_str(), (unsigned long long)frame);
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        Log::get().note("flat trace dump: cannot write %ls (error %lu)", path, GetLastError());
+        return;
+    }
+    // Emitted versus withheld counts are reported separately: the serializer
+    // skips the in-flight, empty and truncated slots, and a busy frame that
+    // dropped out must not read as captured evidence.
+    uint32_t emittedFrames = 0, emittedEvents = 0, skipped = 0;
+    for (uint32_t i = 0; i < kFlatTraceFrames; ++i) {
+        if (!s.traceRing.slotUsed[i]) continue;
+        if (i == s.traceRing.slot || s.traceRing.headers[i].truncated || !s.traceRing.headers[i].eventCount)
+            ++skipped;
+        else { ++emittedFrames; emittedEvents += s.traceRing.headers[i].eventCount; }
+    }
+    uint32_t expected = sizeof(FlatTraceHeader);
+    for (uint32_t i = 0; i < kFlatTraceFrames; ++i)
+        if (s.traceRing.slotUsed[i] && i != s.traceRing.slot && !s.traceRing.headers[i].truncated &&
+            s.traceRing.headers[i].eventCount)
+            expected += sizeof(FlatTraceFrameHeader) + s.traceRing.headers[i].eventCount * sizeof(FlatTraceEvent);
+    bool shortWrite = false;
+    const uint32_t bytes = flatTraceDump(s.traceRing, [&](const void* data, uint32_t bytes) {
+        DWORD wrote = 0; WriteFile(f, data, bytes, &wrote, nullptr);
+        if (wrote != bytes) shortWrite = true;
+        return wrote;
+    });
+    CloseHandle(f);
+    Log::get().note("flat trace dump: %ls frames=%u events=%u bytes=%u skipped-slots=%u%s",
+        path, emittedFrames, emittedEvents, bytes, skipped,
+        shortWrite || bytes != expected ? " SHORT WRITE -- capture unusable" : "");
+}
 void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT flags) {
     if (!runtimeFlatProfile() || !swap || (flags & DXGI_PRESENT_TEST)) return;
     auto& s = state(); if (s.thread && !owner()) return;
@@ -960,6 +1206,13 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // Account for the completed frame before mode/resize changes or the next
     // prefix clears its identity. A resize flush sees no pending frame twice.
     finishPhaseCensusFrame(s);
+    // Part B coverage census: close out the frame that just ended. Always
+    // on, independent of jitterWanted/partialWanted -- see the 5s report
+    // below.
+    ++s.covFrames;
+    if (s.observing) ++s.covFramesObserving;
+    if (s.covFrameLocallyRefused) ++s.covFramesLocallyRefused;
+    s.covFrameLocallyRefused = false;
     const auto mode = Config::get().requestedTemporalMode();
     const bool enabled = temporalModeEnabled(mode);
     const auto model = Config::get().getString("fix.temporal_aa_model", "k");
@@ -998,6 +1251,27 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     const bool wanted=_stricmp(Config::get().getString("experimental.temporal_aa_jitter","on").c_str(),"off")!=0;
     if(wanted!=s.jitterWanted) { s.phase.resetHistory();reset(); }
     s.jitterWanted=wanted;
+    // Partial temporal AA: read live, same idiom as jitter above. Unlike
+    // jitter, toggling it does not change any projection math, so it needs
+    // no history reset -- it only gates refuseDraw, checked fresh on every
+    // draw from here on. The on->off transition ends observation explicitly:
+    // off's per-frame retry resumes (reviews/flat-temporal-main-review-2026-09-26.md).
+    const bool partialWanted=_stricmp(Config::get().getString("experimental.temporal_aa_partial","on").c_str(),"off")!=0;
+    const bool observingAfterToggle = flatObservationToggle(s.observing, s.partialWanted, partialWanted);
+    if (s.observing && !observingAfterToggle)
+        Log::get().note("flat coverage: observation ended by setting change at frame=%llu; per-frame attempts resume",
+            (unsigned long long)frame);
+    s.observing = observingAfterToggle; s.partialWanted = partialWanted;
+    // Local refusal's observation exit: a positively qualified handoff on a
+    // completely covered frame (the same coverage trio phase.finish used
+    // above) requalifies the contract and resumes warm-up. Empty, failed,
+    // uncertain or foreign-work frames keep observing.
+    if (flatObservationClears(s.observing, s.observingQualifiedHandoff,
+            s.frameCoverage && !s.prefix.uncertain && !foreignWork.load(std::memory_order_acquire))) {
+        s.observing = false;
+        Log::get().note("flat coverage: contract requalified at frame=%llu; warm-up resumes",
+            (unsigned long long)frame);
+    }
     if(wanted && !s.projection) {
         s.projection.reset(new(std::nothrow) FlatProjectionRuntime);
         s.context.As(&s.projectionContext);
@@ -1040,6 +1314,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             s.resolvePreflight=s.haveResolvePlan ? flatMonoResolvePreflight(s.device.Get(),s.context.Get(),s.plannedResolve) : FlatMonoResolvePreflightResult{};
             if(s.haveResolvePlan)s.resolvePreflightRetryMs=GetTickCount64();
             Log::get().note("flat projection: armed 900-frame live preparation audit; frame phase governs raster and backend; F10 does not reset live projection resources");
+            flatTraceDumpToLogDir(s, frame);
             // Refresh exact creation bytecode once per manual arm, or emit
             // an explicit missing-cache result; no inferred shader admission.
             captureFlatProbeShader('v',0x5EAFFCD01B97D0C4ull);
@@ -1080,17 +1355,24 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.phaseDepth=static_cast<ID3D11Resource*>(const_cast<void*>(s.previous.depth));
         s.phaseHdr=static_cast<ID3D11Resource*>(const_cast<void*>(s.previous.hdr));
     }
-    s.phase.beginFrame(wanted && s.projection!=nullptr,compatible,s.phaseWidth,s.phaseHeight);
+    s.phase.beginFrame(wanted && !s.observing && s.projection!=nullptr,compatible,s.phaseWidth,s.phaseHeight);
     s.frameCoverage=true;s.temporalAccepted=false;
     s.jitterReason=nonzeroPhase(s)?"live":"warming";
     if(s.projection)s.projection->enableColdReadback(!nonzeroPhase(s));
     if(!wanted && !s.projectionFrames) {s.projection.reset();s.projectionContext.Reset();}
     for (auto& r : s.colors) r.Reset(); for (auto& r : s.depths) r.Reset();
     s.prefix = FlatRuntimePrefix{}; s.prefix.frame = frame + 1;
+    // Trace ring: seal the frame that just ended with the hash over every
+    // copy outcome it produced, then reset the contract for the next frame.
+    flatTraceSeal(s.traceRing, s.traceContract.produced,
+                  s.traceContract.produced ? flatFrameContractHash(s.traceContract) : 0);
+    s.traceContract = FlatFrameContract{};
+    flatTraceBeginFrame(s.traceRing, frame + 1, output.Get(), d.Width, d.Height, d.Format);
     s.phaseCensusPending=s.jitterWanted;
     s.phaseCensusFailed=false;
     s.prefix.output = output.Get(); s.prefix.width = d.Width; s.prefix.height = d.Height; s.prefix.format = d.Format;
     s.namedDepth = s.namedConstants = nullptr; s.treated = false;
+    s.observingQualifiedHandoff = false;
     s.drawCapture.begin(frame+1,s.phaseDepth.Get(),s.phaseWidth,s.phaseHeight);
     foreignWork.store(false, std::memory_order_release);
     // Retain bounded CB identities across frames: unchanged bindings are legal.
@@ -1118,6 +1400,32 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             static_cast<unsigned long long>(s.streak), static_cast<unsigned long long>(s.longestStreak));
         for (const auto& entry : s.refusedWindow)
             Log::get().note("flat runtime refusal 5s: reason=%s count=%llu", entry.first.c_str(), static_cast<unsigned long long>(entry.second));
+        // Part B coverage census: always printed, even when every field is
+        // zero -- that is how "code never ran" (line absent) differs from
+        // "ran, nothing refused" (local-refused=0 on a line that is present).
+        Log::get().note("flat coverage 5s: partial=%s observing=%u scene-draws=%llu exact=%llu generic=%llu inert=%llu "
+            "unchanged=%llu local-refused=%llu frames=%llu frames-locally-refused=%llu "
+            "returned-to-observation=%llu frames-observing=%llu memo-evictions=%llu",
+            s.partialWanted?"on":"off", s.observing?1u:0u,
+            static_cast<unsigned long long>(s.covSceneDraws), static_cast<unsigned long long>(s.covExact),
+            static_cast<unsigned long long>(s.covGeneric), static_cast<unsigned long long>(s.covInert),
+            static_cast<unsigned long long>(s.covUnchanged), static_cast<unsigned long long>(s.covLocalRefused),
+            static_cast<unsigned long long>(s.covFrames), static_cast<unsigned long long>(s.covFramesLocallyRefused),
+            static_cast<unsigned long long>(s.covObservationEntries), static_cast<unsigned long long>(s.covFramesObserving),
+            static_cast<unsigned long long>(s.covMemoEvictions));
+        {
+            uint32_t order[32];
+            for (uint32_t i=0;i<s.covRefusedPairsUsed;++i) order[i]=i;
+            std::sort(order, order+s.covRefusedPairsUsed, [&](uint32_t a, uint32_t b) {
+                return s.covRefusedPairs[a].draws > s.covRefusedPairs[b].draws;
+            });
+            for (uint32_t i=0;i<s.covRefusedPairsUsed && i<5;++i) {
+                const auto& e = s.covRefusedPairs[order[i]];
+                Log::get().note("flat coverage locally-refused 5s: VS=%016llX PS=%016llX reason=%s draws=%llu",
+                    static_cast<unsigned long long>(e.vs), static_cast<unsigned long long>(e.ps),
+                    e.reason, static_cast<unsigned long long>(e.draws));
+            }
+        }
         for (const auto& entry : s.conflictWindow)
             Log::get().note("flat runtime conflict 5s: cause=%s count=%llu", entry.first.c_str(), static_cast<unsigned long long>(entry.second));
         Log::get().note("flat runtime adapter reset 5s: no-previous=%llu frame-gap=%llu depth-change=%llu color-change=%llu extent-change=%llu",
@@ -1138,6 +1446,10 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.refusedWindow.clear(); s.acceptedResetWindow = s.acceptedHistoryWindow = 0;
         s.resetMissingWindow = s.resetGapWindow = s.resetDepthWindow = s.resetColorWindow = s.resetExtentWindow = 0;
         s.conflictWindow.clear();
+        s.covSceneDraws = s.covExact = s.covGeneric = s.covInert = s.covUnchanged = 0;
+        s.covLocalRefused = s.covMemoEvictions = 0;
+        s.covFrames = s.covFramesObserving = s.covObservationEntries = s.covFramesLocallyRefused = 0;
+        s.covRefusedPairsUsed = 0;
         s.lastReport = now;
     }
     g_flatRuntimeLive.store(true, std::memory_order_release);
@@ -1147,7 +1459,7 @@ void flatRuntimeConstantBuffers(UINT start, UINT count, ID3D11Buffer* const* buf
     if (owner() && start <= 1 && 1-start < count && buffers && buffers[1-start]) camera(buffers[1-start], true);
 }
 void flatRuntimeClearBindings() { if (owner()) { state().viewportCount = 0; for (auto& u : state().uavs) u.Reset(); } }
-void flatRuntimeUnknown() { if (owner()) { state().prefix.uncertain = true; state().viewportCount = 0; for (auto& c : state().cameras) c.valid = false; for (auto& u : state().uavs) u.Reset(); if(state().projection) {state().projection->invalidateAll();failPhase(state(),"unknown-context-state");} } }
+void flatRuntimeUnknown() { if (owner()) { flatTraceMark(state().traceRing, kFlatTraceEventMarkUncertain, nullptr); state().prefix.uncertain = true; state().viewportCount = 0; for (auto& c : state().cameras) c.valid = false; for (auto& u : state().uavs) u.Reset(); if(state().projection) {state().projection->invalidateAll();failPhase(state(),"unknown-context-state");} } }
 void flatRuntimeUavs(UINT start, UINT count, ID3D11UnorderedAccessView* const* views) {
     if (!owner()) return;
     for (UINT i = 0; i < count && start + i < 8; ++i) {
@@ -1181,19 +1493,14 @@ FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
         }
     }
     for (const auto& u : s.uavs) if (u) {
-        flatRuntimeComputeWritten(s.prefix,u.Get());
-        for (uint32_t i = 0; i < s.prefix.targetsUsed; ++i) {
-            auto& target = s.prefix.targets[i];
-            // Lighting legitimately writes HDR before tone. Any GPU write
-            // into the completed handoff or its HDR input afterwards refuses.
-            if (target.tones && (target.resource == u.Get() || target.tone.key.srvResource[1] == u.Get())) s.prefix.uncertain = true;
-        }
-        for (uint32_t i = 0; i < s.prefix.sourcesUsed; ++i) if (s.prefix.sources[i].key.depth == u.Get()) s.prefix.uncertain = true;
+        flatTraceMark(s.traceRing, kFlatTraceEventDispatchWritten, u.Get());
+        flatRuntimeDispatchObserveWritten(s.prefix, u.Get());
     }
     if(s.prefix.uncertain && s.projection)failPhase(s,"compute-source-invalidated");
 }
 void flatRuntimeWritten(ID3D11Resource* res) {
-    if (!owner()) return; flatRuntimeWritten(state().prefix, res);
+    if (!owner()) return; flatTraceMark(state().traceRing, kFlatTraceEventWriteResource, res);
+    flatRuntimeWritten(state().prefix, res);
     if (auto* c = camera(res, false)) c->valid = false;
     if(state().projection)state().projection->invalidate(res);
 }
@@ -1223,6 +1530,11 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     k.color = rt.resource; k.rtv = bindingGet(BindSlot::Rtv0); k.width = rt.a; k.height = rt.b; k.format = rt.fmt;
     k.depth = ds.resource; k.dsv = bindingGet(BindSlot::Dsv0); k.depthWidth = ds.a; k.depthHeight = ds.b; k.depthFormat = ds.fmt;
     k.vs = bindingShaderHash(BindSlot::Vs); k.ps = bindingShaderHash(BindSlot::Ps);
+    // Partial temporal AA's current-draw identities (see refuseDraw): the
+    // pair a per-draw reason refuses, named in the coverage census. Cheap
+    // POD stores, done for every draw so qualifyProjection (State& only) can
+    // reach them too.
+    s.drawVs = k.vs; s.drawPs = k.ps;
     k.b1 = bindingGet(BindSlot::VsCb1); k.viewportCount = s.viewportCount;
     static_assert(sizeof(k.viewport) == sizeof(D3D11_VIEWPORT), "viewport layout"); std::memcpy(k.viewport, &s.viewport, sizeof(k.viewport));
     if (auto* c = camera(static_cast<ID3D11Buffer*>(const_cast<void*>(k.b1)), false)) {
@@ -1230,7 +1542,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     }
     d.supported = engineVelocityPoolFamilyPair(k.vs, k.ps); d.instances = instances;
     k.kind = flatContractKind(d.supported, k.color, k.depth, k.width, k.height, k.format, s.prefix.width, s.prefix.height, k.color == s.prefix.output);
-    const bool tone = k.vs == flat_mono_detail::kToneVs && k.ps == flat_mono_detail::kTonePs;
+    const bool tone = flat_mono_detail::toneHdrSlot(k.vs, k.ps) != ~0u;
     const bool copy = k.vs == flat_mono_detail::kCopyVs && k.ps == flat_mono_detail::kCopyPs && k.color == s.prefix.output;
     if(!copy && s.drawCapture.active()) {
         FlatComputeInternalScope guard;
@@ -1250,7 +1562,13 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     const uint32_t oldImageAccepted=s.prefix.imageCopiesAccepted,oldImageRefused=s.prefix.imageCopiesRefused;
     const uint32_t oldMenuAccepted=s.prefix.menuCopiesAccepted,oldMenuRefused=s.prefix.menuCopiesRefused;
     const uint32_t cameraProbeAttempt=captureCameraConflict(s,d);
-    const auto selected = flatRuntimeObserve(s.prefix, d);
+    // Gate 1 consolidation: the copy draw's selection is produced as the
+    // frame contract (identical decision), and every draw is recorded into
+    // the trace ring for the reducer replay.
+    const auto selected = copy
+        ? flatRuntimeObserveContract(s.prefix, d, s.traceContract)
+        : flatRuntimeObserve(s.prefix, d);
+    flatTraceRecord(s.traceRing, d, foreignWork.load(std::memory_order_acquire));
     if(cameraProbeAttempt)for(uint32_t i=0;i<s.prefix.targetsUsed;++i)if(s.prefix.targets[i].resource==k.color){
         const auto& witness=s.prefix.targets[i].firstBad;
         Log::get().note("flat camera probe observer: attempt=%u frame=%llu draw-seq=%u first-bad=%s first-bad-seq=%u caused-first-camera-conflict=%u",
@@ -1284,9 +1602,14 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     if(s.projection) {
         if(s.projectionFrames)++s.projectionDraws;
         if(sceneExtent && k.color!=s.prefix.output && (k.format==9 || k.format==23 || k.format==26 || k.format==60)) {
+            // Part B coverage census (always on, no F10 audit needed): which
+            // recipe branch this candidate draw took. Orthogonal to whether
+            // qualifyProjection then accepted or locally/globally refused it.
+            ++s.covSceneDraws;
             if(s.projectionFrames)captureLocalProjection(s,k.vs,k.ps);
             const auto recipes=flatProjectionDrawRecipes(k.vs,k.ps);
             if(recipes.count) {
+                ++s.covExact;
                 FlatComputeInternalScope guard;
                 Ptr<ID3D11DepthStencilView> actualDepth;Ptr<ID3D11Resource> depthResource;
                 ctx->OMGetRenderTargets(0,nullptr,&actualDepth);
@@ -1298,17 +1621,52 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
                 projectionPlan=qualifyProjection(s,recipes,k.width,k.height,k.vs,k.ps,0,owned,sceneHdr);
             }
             else if(flatProjectionDrawUnchanged(k.vs,k.ps)) {
+                ++s.covUnchanged;
                 FlatComputeInternalScope guard;
                 Ptr<ID3D11VertexShader> actualVs;Ptr<ID3D11PixelShader> actualPs;
                 ctx->VSGetShader(&actualVs,nullptr,nullptr);ctx->PSGetShader(&actualPs,nullptr,nullptr);
                 if(lookupShaderHash(actualVs.Get())==k.vs && lookupShaderHash(actualPs.Get())==k.ps) {
                     if(s.projectionFrames) {++s.projectionUnchanged;projectionDetail(s,k.vs,k.ps,0,103,"bytecode-unchanged");}
-                } else {if(s.projectionFrames) {++s.projectionUnknown;projectionDetail(s,k.vs,k.ps,0,100,"actual-shader-mismatch");}failPhase(s,"unchanged-shader-mismatch");}
+                } else {if(s.projectionFrames) {++s.projectionUnknown;projectionDetail(s,k.vs,k.ps,0,100,"actual-shader-mismatch");}refuseDraw(s,"unchanged-shader-mismatch");}
             }
             else if(k.depth && (k.depth==s.namedDepth || k.depth==s.phaseDepth.Get())) {
-                captureUnknownProjection(s,k);
-                if(s.projectionFrames) {++s.projectionUnknown;projectionDetail(s,k.vs,k.ps,0,101,"unknown-scene-projection-recipe");}
-                failPhase(s,"unknown-scene-projection-recipe");
+                // Generic admission: classify the actual bytecode once per
+                // pair. Provably forward or inert pairs take the identical
+                // owned/sceneHdr/qualify flow as the exact recipes; anything
+                // unproven keeps the capture+failPhase behavior below.
+                const auto generic=classifyFlatProjectionPair(s,k.vs,k.ps);
+                if((generic.vs==FlatVsProjectionClass::ForwardColumns || generic.vs==FlatVsProjectionClass::ForwardDp4) &&
+                   generic.ps==FlatPsProjectionSafety::Clean) {
+                    ++s.covGeneric;
+                    FlatProjectionRecipes genericRecipes;
+                    genericRecipes.add(FlatProjectionStage::Vertex,generic.vsSlot,
+                        generic.vs==FlatVsProjectionClass::ForwardColumns?FlatProjectionPatchLayout::ForwardColumns:FlatProjectionPatchLayout::ForwardDp4,
+                        generic.vsRow);
+                    if(s.projectionFrames)projectionDetail(s,k.vs,k.ps,0,105,"generic-recipe");
+                    FlatComputeInternalScope guard;
+                    Ptr<ID3D11DepthStencilView> actualDepth;Ptr<ID3D11Resource> depthResource;
+                    ctx->OMGetRenderTargets(0,nullptr,&actualDepth);
+                    if(actualDepth)actualDepth->GetResource(&depthResource);
+                    const bool owned=depthResource && (depthResource.Get()==s.namedDepth || depthResource.Get()==s.phaseDepth.Get());
+                    if(!owned && k.color==s.phaseHdr.Get())failPhase(s,"scene-projection-depth-unassociated");
+                    if(nonzeroPhase(s) && owned && s.phaseDepth && depthResource.Get()!=s.phaseDepth.Get())failPhase(s,"scene-depth-changed");
+                    const bool sceneHdr=flatRuntimeProjectionHdr(k,s.prefix.output,owned?depthResource.Get():nullptr);
+                    projectionPlan=qualifyProjection(s,genericRecipes,k.width,k.height,k.vs,k.ps,0,owned,sceneHdr);
+                }
+                else if(generic.vs==FlatVsProjectionClass::InertNoCB && generic.ps==FlatPsProjectionSafety::Clean) {
+                    ++s.covInert;
+                    FlatComputeInternalScope guard;
+                    Ptr<ID3D11VertexShader> actualVs;Ptr<ID3D11PixelShader> actualPs;
+                    ctx->VSGetShader(&actualVs,nullptr,nullptr);ctx->PSGetShader(&actualPs,nullptr,nullptr);
+                    if(lookupShaderHash(actualVs.Get())==k.vs && lookupShaderHash(actualPs.Get())==k.ps) {
+                        if(s.projectionFrames) {++s.projectionUnchanged;projectionDetail(s,k.vs,k.ps,0,106,"generic-inert");}
+                    } else {if(s.projectionFrames) {++s.projectionUnknown;projectionDetail(s,k.vs,k.ps,0,100,"actual-shader-mismatch");}refuseDraw(s,"unchanged-shader-mismatch");}
+                }
+                else {
+                    captureUnknownProjection(s,k);
+                    if(s.projectionFrames) {++s.projectionUnknown;projectionDetail(s,k.vs,k.ps,0,101,"unknown-scene-projection-recipe");}
+                    refuseDraw(s,"unknown-scene-projection-recipe");
+                }
             }
         }
     }
@@ -1330,9 +1688,14 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     if(projectionPlan) {
         projection.emplace(*projectionPlan);
         if(projection->active()) {s.phase.noteApplied();++s.jitterDraws;}
-        else failPhase(s,"draw-binding-refused");
+        else refuseDraw(s,"draw-binding-refused");
     }
     if (!copy) return;
+    // Local refusal's observation: no resolve until a qualified, completely
+    // covered frame requalifies the contract; the contract observation above
+    // (flatRuntimeObserve) is what requalifies, so it keeps running, and the
+    // selector's own result is the exit predicate's positive witness.
+    if (s.observing) { s.observingQualifiedHandoff = selected.selected(); return; }
     if(nonzeroPhase(s) && !s.phase.applied)failPhase(s,"no-raster-application");
     s.reason = flatMonoReasonName(selected.reason);
     // Close only the two sampled prefix frames against their actual copy
@@ -1346,7 +1709,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
             if(k.srvResource[0])for(uint32_t t=0;t<s.prefix.targetsUsed;++t)
                 if(s.prefix.targets[t].resource==k.srvResource[0]) {
                     toneInput=s.prefix.targets[t].resource;
-                    candidateHdr=s.prefix.targets[t].tone.key.srvResource[1];break;
+                    candidateHdr=flat_mono_detail::toneHdrInput(s.prefix.targets[t].tone.key);break;
                 }
             Log::get().note("flat local projection handoff-model: pair=%u attempt=%u frame=%llu copy-seq=%u reason=%s sampled-rt=%p sampled-dsv-depth=%p tone-output=%p candidate-hdr=%p model-selected-hdr=%p model-selected-depth=%p rt-is-candidate=%u rt-is-selected=%u depth-is-selected=%u; actual copy handoff validation follows this observer decision",
                 pair,i+1,(unsigned long long)s.prefix.frame,s.prefix.sequence,s.reason,
@@ -1408,6 +1771,13 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         plan.depthResourceMipLevels=depthDesc.MipLevels;plan.depthArraySize=depthDesc.ArraySize;plan.depthSampleCount=depthDesc.SampleDesc.Count;
         if(!s.haveResolvePlan || !sameResolvePlan(plan,s.plannedResolve)) {
             s.resolvePreflight={};s.resolvePreflightRetryMs=0;
+            // Gate 2 discovery: the effective route, logged when the plan
+            // changes (startup, extent or backend-mode change).
+            const auto route = flatResolveRoute(plan.mode, plan.renderWidth, plan.renderHeight,
+                                                plan.outputWidth, plan.outputHeight);
+            Log::get().note("flat route: %s R=%ux%u E=%ux%u D=%ux%u%s", route.name,
+                plan.renderWidth, plan.renderHeight, route.evalWidth, route.evalHeight,
+                plan.outputWidth, plan.outputHeight, route.refused ? " (refused today)" : "");
         }
         s.plannedResolve=plan;s.haveResolvePlan=true;
     }

@@ -67,6 +67,10 @@ void hookDevice(ID3D11Device* device);
 // Manually armed flat producer probe only. Saves exact creation bytes by hash;
 // false is explicitly missing evidence, never permission to infer a shader.
 bool captureFlatProbeShader(char stage, uint64_t hash);
+// In-memory view of the same creation-byte cache for the generic projection
+// classifier. The map is node-based and entries are never mutated or erased
+// after insert, so the returned pointer stays valid after the lock releases.
+bool flatProbeShaderLookup(char stage, uint64_t hash, const uint8_t** data, size_t* bytes);
 // Sticky for the process, including later devices and submit-side passes.
 // True for either sentinel recovery or advanced.d3d11_fixes=0.
 bool deviceHookRecoveryDisabled();

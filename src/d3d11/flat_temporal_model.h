@@ -102,11 +102,17 @@ inline FlatContractKind flatContractKind(bool knownPoolFamily,
     if (isOutput && color) return kFlatContractOutput;
     if (knownPoolFamily && color && depth) return kFlatContractPool;
     const bool screenFormat = format == 23 || format == 26 || format == 27 || format == 60;
+    // The band tracks the game's render size R, not the output D: SS > 100%
+    // renders up to twice the display on each axis (design doc section 72;
+    // 04:30 Epic flight showed the <= D cap excluding every supersampled
+    // scene target, latching namedDepth null and refusing every frame).
+    // Aspect-preserving sizes only; crop/ultrawide aspects are the lineage
+    // rework the review's gate 2 calls for, not a wider band.
     const bool screenExtent = outputWidth && outputHeight && width && height &&
         uint64_t(width) * outputHeight == uint64_t(height) * outputWidth &&
         uint64_t(width) * 2 >= outputWidth &&
         uint64_t(height) * 2 >= outputHeight &&
-        width <= outputWidth && height <= outputHeight;
+        width <= outputWidth * 2 && height <= outputHeight * 2;
     return color && screenFormat && screenExtent
         ? kFlatContractScreen : kFlatContractNone;
 }

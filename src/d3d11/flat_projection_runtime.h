@@ -29,6 +29,8 @@ struct FlatProjectionRuntimeStatus {
     uint64_t fullWrites = 0, invalidations = 0, initialWrites = 0;
     uint64_t preflights = 0, prepared = 0, zeroPhaseReady = 0;
     uint64_t livePlanRetargets = 0;
+    uint64_t planRetiredStale = 0, planRetiredLru = 0;
+    uint64_t planRefsLive = 0;   // references held by live plans right now
     uint64_t coldQueued = 0, coldCompleted = 0, coldStale = 0;
     uint64_t coldFailed = 0, coldPending = 0, coldTimeouts = 0;
 };
@@ -111,10 +113,17 @@ private:
         uint64_t mutationSerial = 1;
         const void* mapBytes = nullptr;
         FlatProjectionPrivateBuffer privateBuffer;
+        // Live plans referencing this buffer; promoted only while nonzero, so
+        // a retired plan's buffers become evictable again (section 72 step 3).
+        uint32_t planRefs = 0;
     };
     struct CachedPlan {
         bool used = false;
         FlatProjectionRuntimeRequest requests[FlatProjectionBindingPlan::kCapacity]{};
+        // The tracked generation of each request's buffer at preflight; a
+        // mismatch or a missing shadow now makes the plan stale.
+        uint64_t generations[FlatProjectionBindingPlan::kCapacity]{};
+        uint64_t usedSerial = 0;   // last prepare/preflight, for LRU retirement
         uint32_t count = 0, phase = 0;
         FlatProjectionJitter jitter{};
         FlatProjectionBindingPlan plan;
@@ -134,6 +143,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11DeviceContext1> context_;
     DWORD owner_ = 0;
     uint64_t nextGeneration_ = 1;
+    uint64_t nextUseSerial_ = 1;
     uint32_t coldAttempts_ = 0;
     bool coldEnabled_ = false;
     bool planCapabilityReady_ = false;
@@ -159,6 +169,9 @@ private:
     void mutate(Tracked& entry);
     bool queueCold(Tracked& entry);
     void clearCold(ColdReadback& item);
+    bool planStale(const CachedPlan& slot);
+    void demotePlanRefs(CachedPlan& slot);
+    CachedPlan* retirePlan();
     bool sameRecipe(const CachedPlan& plan, const FlatProjectionRuntimeRequest* requests,
                     uint32_t count, const FlatProjectionJitter& jitter, uint32_t phase) const;
     bool sameTopology(const CachedPlan& plan, const FlatProjectionRuntimeRequest* requests,

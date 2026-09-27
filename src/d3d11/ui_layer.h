@@ -39,10 +39,13 @@
 // transcribing it. Every family it leaves is named in the log with the
 // reason.
 //
-// THE ORDER IT CHANGES, and the only one: anything the game drew into an
-// eye AFTER a redirected draw now lands UNDER it. The totals line counts
-// those draws (and draws that read the eye's target after the UI) and names
-// each shader pair once.
+// THE ORDER IT CHANGES, and the only one: a draw after a redirected draw
+// that WRITES the same eye target is taken into the layer too, after the
+// UI, so it stays where the game drew it -- over the UI. Two things still
+// land under it as before: a post pass (it samples an eye-sized input) and
+// a write the take path refuses at issue. A draw that only READS the
+// target is never taken; it no longer sees the UI in what it reads. The
+// totals line counts every case and names each shader pair once.
 #pragma once
 
 #include <cstdint>
@@ -84,8 +87,12 @@ int uiLayerTargetKind();
 // than swallowing it or re-issuing it. substituted: the draw will be issued
 // through the curved screen's own geometry, which the second issues below
 // cannot repeat (so a multiply or a depth/stencil write through it stays in
-// the frame).
-bool uiLayerDecide(ID3D11DeviceContext* ctx, int family, bool verdictForwards, bool substituted);
+// the frame). knownEye: -1 asks uiDepthEyeOfTarget, as every real UI family
+// does; uiLayerNoteOther passes the eye it already knows instead (the
+// target IS the one that eye's UI was taken from this frame), rather than
+// re-deriving an answer that must agree with it by construction.
+bool uiLayerDecide(ID3D11DeviceContext* ctx, int family, bool verdictForwards, bool substituted,
+                   int knownEye = -1);
 
 // The family census (vscreen.cpp, owner draws while live): one draw of the
 // menu panel's or the loading screen's composite vertex shader, the family
@@ -129,12 +136,19 @@ void uiLayerWriteBackEnd(ID3D11DeviceContext* ctx);
 inline bool uiLayerRedirecting() { return detail::g_uiLayerRedirecting; }
 
 // After the first redirected draw of a frame: one load. When true, every
-// other owner draw is shown to uiLayerNoteOther, which counts draws that
-// write an eye target the UI was taken from, or (a full-screen pass: count
-// <= 6 vertices) read one -- the one order the layer changes (they now land
-// under the UI, or no longer see it).
+// other owner draw is shown to uiLayerNoteOther, which decides whether a
+// draw that WRITES an eye target the UI was taken from should be taken into
+// the layer too, after the UI (so it stays over it) -- unless it is a post
+// pass (an eye-sized input) or the take path refuses it at issue, both left
+// as before -- and returns true exactly when it was, so the caller can
+// bracket it with uiLayerBegin/uiLayerEnd like any other decided draw. A
+// draw that only READS the target (a full-screen pass: count <= 6 vertices)
+// is left alone and never taken; it no longer sees the UI in what it reads.
+// verdictForwards and substituted are the same facts uiLayerDecide takes for
+// a real UI family (vscreen.cpp's forwardWithVerdict already has them to
+// hand). Every case is counted and each shader pair named once.
 inline bool uiLayerWatching() { return detail::g_uiLayerWatching; }
-void uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count);
+bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForwards, bool substituted);
 // A game clear of a depth-stencil view, while watching: when it clears the
 // buffer a layer's depth-stencil target was seeded from this frame, the
 // layer's copy is stale and the next tested draw seeds it again. (A game
