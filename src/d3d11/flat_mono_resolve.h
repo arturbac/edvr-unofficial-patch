@@ -27,9 +27,14 @@ inline FlatResolveRoute flatResolveRoute(FlatMonoResolveMode mode,
     if (!rW || !rH || !dW || !dH) return out;
     const bool smaller = rW < dW || rH < dH, larger = rW > dW || rH > dH;
     if (mode == FlatMonoResolveMode::Taa) {
-        out.evalWidth = rW; out.evalHeight = rH; out.refused = false;
+        // The current TAA evaluates on the display grid: allocation, dispatch
+        // and shader indexing all run at D, sampling render-sized input -- a
+        // fused display-grid TAA, honestly named. The agreed render-grid TAA
+        // with one explicit R -> D conversion is the deferred gate-2 design
+        // step; the route reports what actually runs today (gate-2 review G2-2).
+        out.evalWidth = dW; out.evalHeight = dH; out.refused = false;
         out.name = !smaller && !larger ? "taa-native"
-                 : larger ? "taa-render-then-composite-down" : "taa-render-then-composite-up";
+                 : larger ? "taa-display-grid-down" : "taa-display-grid-up";
         return out;
     }
     if (mode == FlatMonoResolveMode::Dlaa) {

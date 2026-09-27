@@ -362,6 +362,18 @@ int main(int argc,char** argv) {
         check(restored(),"supersampled FSR resolve restores the complete original pipeline");
         check(observedInW==w2 && observedInH==h2 && observedOutW==w2 && observedOutH==h2,
               "FSR evaluates the supersample route at render size on both axes");
+        // TAA at R > D evaluates on the display grid today (the route's
+        // honest report): the resolved view stays D-sized.
+        f2.mode=edvr::FlatMonoResolveMode::Taa;f2.frame=3;
+        bindOriginal();ComPtr<ID3D11ShaderResourceView> outTaa;reason2=nullptr;
+        check(edvr::flatMonoResolve(device.Get(),context.Get(),f2,outTaa.GetAddressOf(),&reason2) && outTaa,
+              "supersampled TAA frame resolves on the display grid");
+        if(reason2)std::printf("info: supersample TAA resolver reason %s\n",reason2);
+        ComPtr<ID3D11Resource> outResTaa;if(outTaa)outTaa->GetResource(outResTaa.GetAddressOf());
+        ComPtr<ID3D11Texture2D> outTexTaa;if(outResTaa)outResTaa.As(&outTexTaa);
+        D3D11_TEXTURE2D_DESC outDescTaa{};if(outTexTaa)outTexTaa->GetDesc(&outDescTaa);
+        check(outDescTaa.Width==w && outDescTaa.Height==h,
+              "the display-grid TAA output stays display-sized at supersampling");
     }
     context->ClearState();
     failures+=flatPixelCaptureGpuTests(device.Get(),context.Get());

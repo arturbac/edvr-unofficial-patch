@@ -1580,14 +1580,14 @@ void testFlatResolveRoute() {
         {FlatMonoResolveMode::Dlss, 5760,3240, 3840,2160, 5760,3240, false, "dlss-as-dlaa-supersample"},
         {FlatMonoResolveMode::Dlaa, 5760,3240, 3840,2160, 5760,3240, false, "dlaa-supersample"},
         {FlatMonoResolveMode::Fsr,  5760,3240, 3840,2160, 5760,3240, false, "fsr-native-aa-supersample"},
-        {FlatMonoResolveMode::Taa,  5760,3240, 3840,2160, 5760,3240, false, "taa-render-then-composite-down"},
+        {FlatMonoResolveMode::Taa,  5760,3240, 3840,2160, 3840,2160, false, "taa-display-grid-down"},
         {FlatMonoResolveMode::Dlaa, 3840,2160, 3840,2160, 3840,2160, false, "dlaa-native"},
         {FlatMonoResolveMode::Taa,  3840,2160, 3840,2160, 3840,2160, false, "taa-native"},
-        {FlatMonoResolveMode::Taa,  2496,1404, 3840,2160, 2496,1404, false, "taa-render-then-composite-up"},
+        {FlatMonoResolveMode::Taa,  2496,1404, 3840,2160, 3840,2160, false, "taa-display-grid-up"},
         // DLAA never upscales; mixed axes route NVIDIA to the supersample path.
         {FlatMonoResolveMode::Dlaa, 2496,1404, 3840,2160, 0,0, true, "dlaa-requires-native"},
         {FlatMonoResolveMode::Dlss, 3000,2160, 3840,1404, 3000,2160, false, "dlss-as-dlaa-supersample"},
-        {FlatMonoResolveMode::Taa,  3000,2160, 3840,1404, 3000,2160, false, "taa-render-then-composite-down"},
+        {FlatMonoResolveMode::Taa,  3000,2160, 3840,1404, 3840,1404, false, "taa-display-grid-down"},
     };
     for (const auto& c : cases) {
         const auto route = flatResolveRoute(c.mode, c.rW, c.rH, c.dW, c.dH);
