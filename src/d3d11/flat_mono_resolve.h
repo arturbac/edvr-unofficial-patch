@@ -55,11 +55,12 @@ inline FlatResolveRoute flatResolveRoute(FlatMonoResolveMode mode,
         out.name = smaller ? "trained-upscale" : "trained-native";
         return out;
     }
-    // FSR: the D3D11 port's Native AA mode is unqualified (section 72), so
-    // FSR refuses supersampling honestly rather than substituting TAA.
+    // FSR: Native AA is the 1.0x case of the same upscaler (equal render and
+    // upscale sizes, already exercised on the R == D route), so supersampling
+    // mirrors NVIDIA: evaluate at E = R and let the game's copy downsample.
     if (larger) {
-        out.name = "fsr-native-aa-unqualified";
-        out.failReason = "flat-trained-resolve-cannot-downsample";
+        out.evalWidth = rW; out.evalHeight = rH; out.refused = false;
+        out.name = "fsr-native-aa-supersample";
         return out;
     }
     out.evalWidth = dW; out.evalHeight = dH; out.refused = false;

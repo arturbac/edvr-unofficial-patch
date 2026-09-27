@@ -352,6 +352,16 @@ int main(int argc,char** argv) {
         check(outDesc2.Width==w2 && outDesc2.Height==h2,
               "the supersampled output view is render-sized for the game's downsample");
         check(pixel(out2.Get(),16,16)==0xff0000ff,"supersampled reset displays current render-size color");
+        // FSR mirrors NVIDIA here: Native AA is the 1.0x case of the same
+        // upscaler, evaluating at render size for the game's downsample.
+        f2.mode=edvr::FlatMonoResolveMode::Fsr;f2.frame=2;
+        bindOriginal();ComPtr<ID3D11ShaderResourceView> outFsr;reason2=nullptr;
+        check(edvr::flatMonoResolve(device.Get(),context.Get(),f2,outFsr.GetAddressOf(),&reason2) && outFsr,
+              "supersampled FSR frame resolves via Native AA at render size");
+        if(reason2)std::printf("info: supersample FSR resolver reason %s\n",reason2);
+        check(restored(),"supersampled FSR resolve restores the complete original pipeline");
+        check(observedInW==w2 && observedInH==h2 && observedOutW==w2 && observedOutH==h2,
+              "FSR evaluates the supersample route at render size on both axes");
     }
     context->ClearState();
     failures+=flatPixelCaptureGpuTests(device.Get(),context.Get());

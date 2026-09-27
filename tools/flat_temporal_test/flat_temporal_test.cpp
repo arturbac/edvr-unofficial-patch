@@ -1576,10 +1576,10 @@ void testFlatResolveRoute() {
         {FlatMonoResolveMode::Dlss, 3840,2160, 3840,2160, 3840,2160, false, "trained-native"},
         {FlatMonoResolveMode::Fsr,  2496,1404, 3840,2160, 3840,2160, false, "trained-upscale"},
         // R > D (section 72 step 2): NVIDIA evaluates DLAA at R and the game's
-        // copy downsamples E = R to D; FSR refuses until Native AA qualifies.
+        // copy downsamples E = R to D; FSR mirrors it via Native AA at 1.0x.
         {FlatMonoResolveMode::Dlss, 5760,3240, 3840,2160, 5760,3240, false, "dlss-as-dlaa-supersample"},
         {FlatMonoResolveMode::Dlaa, 5760,3240, 3840,2160, 5760,3240, false, "dlaa-supersample"},
-        {FlatMonoResolveMode::Fsr,  5760,3240, 3840,2160, 0,0, true, "fsr-native-aa-unqualified"},
+        {FlatMonoResolveMode::Fsr,  5760,3240, 3840,2160, 5760,3240, false, "fsr-native-aa-supersample"},
         {FlatMonoResolveMode::Taa,  5760,3240, 3840,2160, 5760,3240, false, "taa-render-then-composite-down"},
         {FlatMonoResolveMode::Dlaa, 3840,2160, 3840,2160, 3840,2160, false, "dlaa-native"},
         {FlatMonoResolveMode::Taa,  3840,2160, 3840,2160, 3840,2160, false, "taa-native"},
@@ -1595,10 +1595,8 @@ void testFlatResolveRoute() {
               std::strcmp(route.name, c.name) == 0, "resolve route names the effective treatment honestly");
     }
     check(std::strcmp(flatResolveRoute(FlatMonoResolveMode::Dlaa, 2496, 1404, 3840, 2160).failReason,
-                      "flat-dlaa-requires-native-render-size") == 0 &&
-          std::strcmp(flatResolveRoute(FlatMonoResolveMode::Fsr, 5760, 3240, 3840, 2160).failReason,
-                      "flat-trained-resolve-cannot-downsample") == 0,
-          "refusal log tokens are stable");
+                      "flat-dlaa-requires-native-render-size") == 0,
+          "the DLAA upscale refusal's log token is stable");
     check(flatResolveRoute(FlatMonoResolveMode::Taa, 0, 2160, 3840, 2160).refused &&
           flatResolveRoute(FlatMonoResolveMode::Dlss, 3840, 2160, 3840, 0).refused,
           "a zero on any axis refuses the route");

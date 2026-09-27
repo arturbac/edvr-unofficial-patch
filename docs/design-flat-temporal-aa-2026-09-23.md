@@ -4256,6 +4256,10 @@ Staged implementation:
    now covers aspect-preserving sizes from 0.5x to 2x of output, with the
    conflicting-hdr guard as the loud backstop for full-res depthless
    intermediates; crops/ultrawide stay out of band for the lineage rework.
+   The 04:58 flight FLOWN: DLAA and TAA treat at 5760x3240 with the route
+   lines naming each mode; FSR then engaged the same hour via Native AA --
+   the 1.0x case of the same upscaler, evaluating at E = R with the game's
+   copy downsampling, WARP-verified on both backends at render size.
 3. Retirement: generation-based release of projection plans and
    classifier memos (finding 3's 32/64 cliffs), with the corpus replaying
    retirement boundaries.
