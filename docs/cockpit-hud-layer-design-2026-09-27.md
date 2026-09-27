@@ -57,6 +57,19 @@ vscreen.cpp:3909-3950 and 4569-4581 (MEASURED). Measured layer memory is
 | Flight HUD, vs `B7790CBFC6554097`, ps `8DEF46452FA459F5` | UNKNOWN | the same HDR target | as above | a 256x256 grain LUT at t1, and the eye-sized scene depth at t0 (NDC-derived UV) for its own cockpit fade | MEASURED, hud_grain.h:1-25; crisp-ui-handoff.md:796-803 |
 | Target sprite, vs `E508648660A352B2`, ps `63ABD86359B57D01` | 1 an eye with a target | DISPUTED: the HDR target (ui_depth.cpp:116-131) or `RGB10A2_TYPELESS` (crisp-ui-handoff.md:174) | its VS forces device Z to 1 | one surface of ~0.94x0.83 render size at t0, with alpha discard and the HUD colour matrix | MEASURED, target_sharp.h:6-12 |
 
+The list is not closed. A field log (2026-09-27) has ui_depth reporting
+"a new interface family -- vs `925ACEDA0153AA5B` ps `738A98ED038E58B7`
+draws into 1331x1661 DXGI format 26: samples a learned surface but has no
+depth shader of its own yet ... left alone -- this composite still swims".
+That is a fourth HDR-target composite of a learned surface. It appears in
+none of this repo's records, Sean's shader dumps or his logs of that week.
+Today each such family needs a hand transcription before ui_depth can give
+it depth. The layer needs none, because it redraws the game's own draw.
+So take by rule, not by list: any owner draw into the HDR eye target that
+samples a learned interface surface (ui_depth's classifier already says
+so), plus the direct families by VS (the flight HUD). G-A lists every
+family the rule takes.
+
 Jitter: BELIEVED that all three carry the eye's jittered projection (G4
 was never checked per family). HDR values above 1.0: UNKNOWN. Ordering,
 MEASURED (G1/G8): all three draw before the composite pass
@@ -109,7 +122,9 @@ last reader of the HDR target. SMAA runs after it on RGBA8.
    128 MB per eye at 100 and 200 MB at 125; at a Quest 3's 2564x2460, 50
    MB. Clear it per eye-frame.
 2. **Take the families:** with the new key on, `uiLayerDecide` routes
-   kHolo, kFlightHud and kSprite to the HDR layer instead of kHdrTarget.
+   kHolo, kFlightHud and kSprite, and any other HDR-target composite of a
+   learned surface (see "The three families"), to the HDR layer instead
+   of kHdrTarget.
    They get the same remap, jitter cancel, seeded depth (they test GEQUAL
    against the scene pair), refusals and census, and the `!layered` skips
    of ui_depth, the hologram pass, the reactive mask and screen motion.
