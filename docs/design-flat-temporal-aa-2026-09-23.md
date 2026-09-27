@@ -4501,3 +4501,16 @@ depth consumer), admitted as the exact companion. Not one of the
 coriolis arc's named seam suspects (BCF75CEA37060EAE / 2F924695596C8195
 at SV_Target6) -- adjacent family, new companion only. Rig pins the
 pair. The flight cells now wait on a re-fly, not on code.
+
+Session 2 (2026-09-27 13:56, g7a0415b2, in flight): the recipe holds --
+no observation episode, no local refusal beyond three one-draw transient
+projection-preparation-refused lines, present-not-ok=0 session-wide.
+Banked five cells, each captured with a rebuilt treated streak:
+edhm-flight-ss150-dlss (dlss-as-dlaa-supersample), edhm-flight-ss150-fsr
+(fsr-native-aa-supersample), edhm-flight-ss050-fsr (trained-upscale),
+edhm-flight-ss150-taa (display-grid down), edhm-flight-native-taa.
+Repeated contract changes rebuilt streaks within seconds every time --
+the repeated-changes cell stands on this evidence. Corpus is 9 files,
+27/27 replay identical. Still open: native DLSS flight, 0.5 DLSS flight,
+the odd-size/resolution-change cell (no route ever left 4K), and the
+EDHM-off stock matrix.
