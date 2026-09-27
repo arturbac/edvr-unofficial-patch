@@ -2,12 +2,12 @@
 
 ## Status
 
-- **State:** PHASE 0 BUILT, awaiting the census flight. Written 2026-09-27
-  from main `035986fc`; built 2026-09-27 on branch `kimi/crisp-hud-census`
-  (from main `279ea289`). Facts are tagged MEASURED (a
-  flight log, census, disassembly or commit in this repo, cited) or
-  BELIEVED (inference). Every BELIEVED fact the code leans on has a Phase 0
-  gate.
+- **State:** PHASE 0, flight 1 read (2026-09-27, Steam, build fc89d59d,
+  EDHM active). G-A settled (all three families, the sprite's target
+  included), G-B settled (measured pair + the EDHM swap, in the wild),
+  G-E settled directionally. G-C and G-D measured nothing -- instrument
+  gaps, not negative results (see the flight entry). G-F got no data: the
+  eye-run hotkey was never pressed.
 - **Goal:** composite the cockpit HUD after the upscale, at output
   resolution, out of DLSS/FSR history. That means the holo panels, the
   flight HUD and the target sprite. It should be as sharp at HMD Quality
@@ -24,9 +24,10 @@
   (lines 184-191: "PARKED, not declined"), with one change. It re-issues
   the game's own tonemap draw instead of transcribing it.
 - **Decisions for Sean:** see "Decisions", before Phase 1.
-- **Next step:** the Phase 0 flight on the Steam install (checklist in the
-  2026-09-27 "Phase 0 built" entry at the tail): `advanced.hud_census = on`,
-  the G-A..G-E line harvest, and an F10 eye run for G-F.
+- **Next step:** Phase 0.1 -- type-aware G-D query guard + decline-reason
+  split, a wider G-C cb0 read, then one short re-fly that also presses the
+  eye-run hotkey (INSERT) with holo panels on screen. Details in the flight
+  entry at the tail.
 
 ## What exists
 
@@ -261,3 +262,68 @@ green, every gate including the new `hud_parity` self-test.
   `python tools\edvr_log.py --target steam --expect-build HEAD`, then
   `--grep "hud layer census:"`, and `python tools\hud_parity.py <ledger
   dir> --verbose`.
+
+## Phase 0, flight 1, 2026-09-27 (Steam, fc89d59d)
+
+Short flight (~2 min: menu, cockpit, the FSS scanner mid-flight, a
+HUD-present stretch of ~270 frames at 2600x2514 = HMD Quality 0.75, DLSS
+on, EDHM installed and active). Build stamp verified by
+`edvr_log.py --expect-build HEAD` before any counter was read. 9,596
+`hud layer census:` lines harvested; the per-gate verdicts:
+
+- **G-A SETTLED.** Holo: 22.0 draws/frame (11/eye), the lit HDR target
+  (R11G11B10_FLOAT), premultiplied over, GEQUAL depth with no depth write
+  -- and a STENCIL WRITE the doc's table missed (ref/write 0x04, pass
+  REPLACE: Phase 1's take needs the write-back machinery for these).
+  Flight HUD: 4.8 draws/frame (4..6; was UNKNOWN), same HDR target,
+  GEQUAL, stencil off; t0 = the eye-sized R32_TYPELESS depth and t1 = the
+  256x256 grain LUT, both as the doc's table said. Sprite: 2.0 draws/frame
+  (1/eye with a target) -- the target dispute is SETTLED for the lit HDR
+  target (R11G11B10_FLOAT, the same two resources as the other families;
+  ui_depth.cpp:116-131 right, crisp-ui-handoff.md:174's RGB10A2_TYPELESS
+  refuted on this config) -- but its state is NOT the table's GEQUAL:
+  depth test off with write-all, stencil on (0x05, GREATER), consistent
+  with the VS forcing device Z to 1. Ordering holds: families at ordinals
+  503..2684, the tonemap at 767..2687, always after. The bloom composite
+  953C8123AD8DC13B was never seen in cockpit (0 sightings): MEASURED now
+  that this hash is the FSS scanner-body composite; where bloom lives in a
+  cockpit frame stays BELIEVED and un-hashed.
+- **G-B SETTLED, with the variant named.** The measured pair (vs
+  2D78DC3FD2C0C543 / ps 99C21CEB7A699821) flew as a full structural match:
+  exposure R32 at VS t0, 3D LUT at PS t0, HDR source at PS t1 = the
+  families' own target resource (identity join 442/442 in the HUD window),
+  b2 = 272 bytes. The EDHM swap flew too (vs 642017A6FEDAE0E8, same PS) --
+  and it binds NO exposure at VS t0, so a Phase 1 re-issue must bind the
+  admitted draw's own SRVs, never a remembered exposure (where EDHM's
+  exposure lives is an open question, next to the G-C rework). Two
+  menu-size composites named themselves shape-only and were never
+  followed; the structure-first recognition did its job.
+- **G-C NOT SETTLED -- instrument gap.** All three families' cb0 rows
+  4..7 are a composed model-view transform (dense rotation-like rows;
+  row 2 = [0 0 0 0.025]), not the bare projection, so the centre-term
+  test has nothing to compare (0 jittered, 0 unjittered, n=3552
+  not-scene). "All three carry the eye's jittered projection" stays
+  BELIEVED. Next instrument: capture the whole cb0 for offline
+  factorisation, or vote the per-eye row deltas against the per-eye
+  jitter delta; the projection may not live in cb0 at all.
+- **G-D NO DATA -- instrument gap.** Every selected pair declined (2,290)
+  and no result ever polled. Near-certain mechanism: EDVR's own gpu_span
+  TIMESTAMP_DISJOINT query is open across the frame's draw sections
+  (gpu_span_d3d11.cpp:75) and the guard declines on ANY open query, though
+  a disjoint/timestamp counts no samples and could not be fed by the
+  re-issue; game predication is the other candidate. Next instrument:
+  split the decline counter by reason, and make the guard type-aware
+  (decline only for occlusion-family queries and predication).
+- **G-E SETTLED directionally.** The tonemap's own VS t0 exposure tracked
+  the scene: ~600 in the bright stretch down to ~44-51 in the dark one.
+  The HUD-region crop luma follows the background more than the HUD
+  (0.15-0.23 bright, 0.003-0.012 dark), so "HUD display brightness"
+  proper stays an offline read; the gate's deliverable is that exposure
+  is a per-frame scalar the re-issue inherits by binding the admitted
+  draw's own SRV -- with the EDHM caveat above.
+- **G-F NO DATA.** The eye-run hotkey (INSERT) was never pressed; no
+  ledger armed, no panels_/tonemap_ bins. Re-fly item.
+
+Re-fly notes: keep the cockpit HUD up for one full 30 s window (the FSS
+scanner replaced it mid-flight this time), fly one bright and one dark
+scene, and press INSERT once with holo panels on screen for G-F.
