@@ -4492,3 +4492,12 @@ distinct-pairs=0 all session despite the refusal naming the pair in
 every coverage line; its audit completed at 13:26:16, seconds before the
 pair first appeared -- whether post-audit capture should have picked it
 up is an open instrumentation question.
+
+Recipe SHIPPED 2026-09-27: VS 24214E7C45496BE0 is the radar local-key
+marker VS, already vetted at cb2 ForwardColumns 8 against the stock
+companion; EC998602 is the same marker recoloured through EDHM's t120
+config tree (same input semantics, colour-only delta, no projection or
+depth consumer), admitted as the exact companion. Not one of the
+coriolis arc's named seam suspects (BCF75CEA37060EAE / 2F924695596C8195
+at SV_Target6) -- adjacent family, new companion only. Rig pins the
+pair. The flight cells now wait on a re-fly, not on code.

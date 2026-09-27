@@ -152,7 +152,12 @@ inline FlatProjectionRecipes flatProjectionDrawRecipes(uint64_t vs, uint64_t ps)
     case 0xB75A6FF2CA9FA5D6ull: if (ps == 0xD56F859BE4781431ull) result.add(S::Vertex,0,L::ForwardDp4,4); break;
     // The direct depthless effect emits o2 = sum(coord * CB2[8..10])
     // + CB2[11], the same column convention at a different offset.
-    case 0x24214E7C45496BE0ull: if (ps == 0x0C8FCDB6A3BECCE6ull) result.add(S::Vertex,2,L::ForwardColumns,8); break;
+    // EC998602 (Epic 20260927_132414, EDHM chain) is the same radar
+    // local-key marker recoloured through EDHM's t120 config tree --
+    // colour-only, identical cb row profile, no projection consumer.
+    case 0x24214E7C45496BE0ull:
+        if (ps == 0x0C8FCDB6A3BECCE6ull || ps == 0xEC998602427115F3ull)
+            result.add(S::Vertex,2,L::ForwardColumns,8); break;
     case 0xA1B7CFCD0BE7493Eull: if (ps == 0x2DB678B6B558B604ull) result.add(S::Vertex,2,L::ForwardDp4,10); break;
     case 0xCE24A73943632F55ull: if (ps == 0x1F64463B15189104ull) result.add(S::Vertex,2,L::ForwardDp4,10); break;
     default: break;
