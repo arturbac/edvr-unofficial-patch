@@ -10,3 +10,7 @@
 # `flat_temporal_test --trace-migrate` (same events, unchanged selector).
 flat_trace_10806.bin 3 edhm-menu-ss065-dlss
 flat_trace_16271.bin 3 edhm-flight-ss065-dlss
+# Epic install 2026-09-27 12:33 UTC session, build v0.18.0-rc.2-65-g1caacf14,
+# EDHM chained, DLSS requested, game supersampling 0.5 (R=1920x1080,
+# D=3840x2160), main-menu hangar. Sub-native cell of the gate-2 matrix.
+flat_trace_36807.bin 3 edhm-menu-ss050-dlss

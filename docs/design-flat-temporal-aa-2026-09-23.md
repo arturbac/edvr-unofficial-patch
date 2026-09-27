@@ -81,7 +81,10 @@
   the 0.5x canopy flicker traced to success-status Present results
   resetting temporal history every frame; the history and phase gates now
   use FAILED(hr)/SUCCEEDED(hr) with the value logged, awaiting the
-  confirming flight.
+  confirming flight. Section 76 (2026-09-27): the gate-2 qualification
+  flight matrix is staged -- the 0.5x DLSS menu trace admitted to the
+  corpus, the eight-step session script recorded; crops remain deferred
+  on the source-rectangle lineage.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -4432,3 +4435,39 @@ OPEN (parked by Sean 2026-09-27): the live confirmation -- jitter off at
 hot-reloaded) -- and any policy decision (jitter off below native is a
 quality trade, not a default to take unilaterally). No threshold/clamp
 compensation: the oscillation is real coverage signal.
+
+## 76. Gate-2 qualification flight matrix: plan and corpus status (2026-09-27)
+
+The review's remaining boundary: the corpus certified one size pairing
+(0.65x DLSS, menu and flight); odd sizes, repeated mid-session changes,
+the other backends and the mod matrix are open. Crops stay deferred on
+the source-rectangle lineage; backend-failure forcing stays with the
+rigs. One trace per cell, admitted to the corpus with its manifest line;
+each F10 seals the three frames before the arm and dumps
+flat_trace_<frame>.bin into the game dir's edvr_logs\traces.
+
+Corpus today: edhm-menu-ss065-dlss, edhm-flight-ss065-dlss (2026-09-26),
+plus edhm-menu-ss050-dlss admitted 2026-09-27 from the 12:32 flight.
+
+Session script (one sitting, EDHM baseline, Epic install, start DLSS at
+SS 1.0; each step: wait ~20 s of treated frames, then F10):
+
+1. Main menu, SS 1.0, DLSS -> F10 (native menu).
+2. In flight, SS 1.0, DLSS -> F10 (native flight).
+3. SS 1.5, DLSS -> F10 (dlss-as-dlaa supersample).
+4. F8 to FSR, SS 0.5 -> F10 (FSR sub-native).
+5. SS 1.5, FSR -> F10 (FSR Native AA supersample).
+6. F8 to TAA, SS 1.0 -> F10 (TAA display-grid native).
+7. Output resolution 3840x2160 -> 2560x1440 mid-session, SS 0.65 -> F10
+   (odd pairing AND a live extent change without restart).
+8. Resolution back to 3840x2160, SS 1.0: no F10 needed; the runtime line
+   showing the streak resuming closes the repeated-changes cell.
+
+Per cell: one "flat route:" line names the effective treatment (the
+negotiation line joins it for sub-native DLSS); treated streaks rebuild
+within seconds of each change; no reset events beyond the change itself;
+the canopy scintillation at 0.5x is expected and recorded (section 75),
+not a blocker. After the session: --trace-check every new dump, admit
+one trace per cell with its manifest provenance line, full build (the
+corpus gate must print every file replaying identical), push. The
+EDHM-off stock matrix is a separate sitting (chain unlink, restart).
