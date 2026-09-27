@@ -158,6 +158,10 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
         {L"vs_BBE58E40FE88EC80", L"ps_DB3E8D20CF53FBC0", false}, {L"vs_DE545DC8EE4FBB87", L"ps_E46E3E4832B2FDB0", false},
         {L"vs_AACFDCF2FB9AD809", L"ps_CF534B32F491561A", false}, {L"vs_66DE2CADB1F4AE6B", L"ps_864F1F949851B8DE", false},
         {L"vs_61AE8EB05FDC18DD", L"ps_FC43E42710010343", false},
+        // Eye run 055427 (2026-09-26, parked close to a coriolis port): the
+        // family's stock pixel shader at close range -- part of the hull sat
+        // on the camera term while it drew.
+        {L"vs_61AE8EB05FDC18DD", L"ps_4504BC268E109C31", false},
         // The station (eye run 143416): the two stock station pairs keyed.
         {L"vs_DE545DC8EE4FBB87", L"ps_CB429E043DBB2506", false}, {L"vs_61AE8EB05FDC18DD", L"ps_451A82D4DD1BA254", false},
         // Flight 6 (153446, the shader dump armed at a station): the station's
@@ -174,6 +178,12 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
     // while its live owner/coverage is assessed.
     const Pair candidates[] = {
         {L"vs_DE545DC8EE4FBB87", L"ps_A6070F9DD1CFB601", false},
+        // Eye run 055427 (2026-09-26, parked close to a coriolis port): the
+        // station's close-range stock pixel shaders -- the hull's pixel path
+        // while the keyed pairs of the same families draw nothing. Awaiting
+        // the dumped dxbc (a glare_shader_dump flight at the port).
+        {L"vs_436193B352A2897E", L"ps_51EE1F922FD220B0", false},
+        {L"vs_889A5279E68F0672", L"ps_D31DCAFA7C05CB47", false},
     };
     for (const auto& p : candidates) {
         g_softWhy.clear();

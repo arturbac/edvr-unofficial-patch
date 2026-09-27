@@ -51,16 +51,33 @@
   items: a ~0.15-0.2 px engine-path bias (possibly genuine coriolis rotation via
   fresh records; below the visible threshold), a one-frame record-refresh lag after
   a 5 px move, and the pool snapshot is not part of an eye dump, so stamp freshness
-  was inferred from the census rather than read directly.
+  was inferred from the census rather than read directly. CLOSE RANGE REREADS THE
+  RESIDUAL (the 2026-09-27 entry, eye run 055427, parked at the port): the station
+  does not rotate in-image (<0.02 deg/frame -- the ship co-rotates), yet the hull
+  blurred, because the hull there is 84% on the world path (vs_4361/vs_889A drew 0
+  keyed binds at that range; their stock pixel shaders ps_51EE1F922FD220B0 and
+  ps_D31DCAFA7C05CB47 drew instead) and the world path's camera term was DEAD from
+  the dump's frame 2 on (~0 through a 12.6 px move, ~1 px/frame short on the
+  steady drift) while the engine path was exact (<=0.3 px quiet, <=1.5 px through
+  the move). A dragged history on a broken camera term, not the reconstruction
+  floor -- the floor verdict stands only at 10 km, where the chain was verified.
+  ps_4504BC268E109C31 keyed for vs_61AE (corpus-harness proven). The world-path
+  death is the camera-rows arc's H2 convicted (a parked stay of 4674 frames
+  spanned the move; the rows also undershot the head 35% all session, live).
 - **Open:** walkers (vs_F516BF0201303B87, not a pool family; w=2 on the panel) wait on
   phase 2's previous bone palette -- a walking NPC still blurs after the on-foot fix;
   which camera the walk's other draws use (the new line's rows and distance say); a
   temporal pass on the flat source for its own aliasing; the stale cockpit (the
   commander's legs under ps_B7D5 and vs_7B0DC42D, DECIDED not keyed; 35.4% undecided, low
   priority); the census's evaluated-but-not-drawn movers (the 09:38 entry); the boarding
-  flicker (the LOD governor, not this arc); vs_DE54's ps_91F8 and ps_A607 (the family's
-  SV_Position register holds another semantic in them: a patcher extension); ships in
-  space; builder-path movers and articulated parts (phase 2).
+  flicker (the LOD governor, not this arc); vs_DE54's ps_91F8 and ps_A607 (the patcher
+  handles both now -- ps_A607 passes the harness as a candidate; both stay unkeyed while
+  their live owner/coverage is assessed); the close-range hull pair ps_51EE1F922FD220B0
+  (vs_4361) and ps_D31DCAFA7C05CB47 (vs_889A) -- candidates in the rig, awaiting the
+  dumped dxbc (the 2026-09-27 entry); the world path's camera-term health near a
+  station (rows chosen off the auxiliary passes, parked stays spanning motion, a 35%
+  undershoot of the head all session) -- belongs to the camera-rows arc, which owns the
+  gate; ships in space; builder-path movers and articulated parts (phase 2).
 - **Ruled out (do not re-propose; each closed in its dated entry):** draw-shape memo
   identity, pool-slot identity, 3x3 SAD camera-vs-body match, hidden-bone-spin
   estimation (pre-2026-09-20); four engine-truth mover/static routes (2026-09-20
@@ -72,11 +89,20 @@
   5); the on-foot world packed per eye, enginePixel's fetch as the ~3 ms prep, and a
   depth pre-pass/bias as the stale cockpit (the re-fly entry); green cockpit panels as
   a mover bug, and engine-path CPU cost as the frame-time cause (09:38 entry); the
-  station's joined motion wrong at range (The station entry).
-- **Next:** FLY the stamp build at the coriolis station, parked and through head moves:
-  stale-stamp nonzero near the station, engine-joined down by roughly that population,
-  the hull crisp. Then the controlled diagnostics 1 vs 0 comparison, and a walker near a
-  drone with the motion_source view.
+  station's joined motion wrong at range (The station entry); the station's own
+  in-image rotation as the 055427 blur (the ship co-rotates: <0.02 deg/frame, two
+  methods); a phantom engine delta in 055427 (the engine path equals the grid-searched
+  truth there); the stamp fix as the cause of the world-path death (191906 shows the
+  same miss on the 09-25 build); the reconstruction floor as the close-range
+  explanation (the chain is broken upstream of DLSS).
+- **Next:** one flight on the frontier install, advanced.glare_shader_dump = 1 (restart
+  to arm) and advanced.temporal_aa_diagnostics = 1, parked at the coriolis port at
+  055427's range for a couple of minutes, an eye dump while moving the head: captures
+  ps_51EE1F922FD220B0/ps_D31DCAFA7C05CB47 for the harness; the family lines should name
+  ps_4504BC268E109C31 patched on vs_61AE instead of left stock, and the trained-path
+  kinds show the hull's engine-joined share up from ~16%. Then harness, key both,
+  rebuild, re-fly: the hull crisp through head moves. Then the controlled diagnostics
+  1 vs 0 comparison, and a walker near a drone with the motion_source view.
 
 ## Premise
 
@@ -2958,3 +2984,103 @@ probe is an offline replay of one captured C/Z/MV bundle through the current DLS
 versus 0.17.0's, same scene moment; that is instrumentation, not a motion fix. Do not
 re-propose estimation: it measured wrong when it measured at all, and its calm look here
 is exactly "camera term plus nothing".
+
+### 2026-09-27 -- Close range (eye run 055427): the world path's camera term died on the hull; the engine path was exact
+
+Sean's report: the latest frontier eye dump shows the coriolis station blurring
+under its own rotation with DLSS. The dump is eye run 055427 (2026-09-26
+05:54:27, frontier install, build v0.18.0-rc.2-2-g2b285732 -- the stamp fix;
+the two commits above it are docs-only, so this log IS evidence about the
+branch tip). Parked close to the port of Francisco de Almeida Ring, the port
+face filling most of the crop; DLSS quality 2648x2559 -> 4074x3938 preset K,
+Pimax Crystal Super 90 Hz. 16 frames (game 19160-19175): a head move at
+frames 1-3, then a steady ~1 px/frame downward drift.
+
+**Method:** the true content shift between consecutive raw C frames by
+exhaustive integer-then-0.1 px grid search on the port-face box
+(self-validating: the 16.9 -> 9.3 |diff| collapse on the big pair); the
+stored per-pixel MV from the D bins, validated equal to the actual DLSS
+input (MV.bin vs D00: p99 |delta| 0.0004 px); the warp's sign and scale
+settled empirically (history is sampled at cur+mv, 1x); station in-image
+rotation by eye_run_spin and eye_run_fit, both agreeing < 0.02 deg/frame
+(the ship co-rotates with the station).
+
+**The station does not rotate in-image.** Both rotation measures read under
+0.02 deg/frame for 15 pairs. So the hull's true motion is the camera term's
+job plus nothing: translation only, 0.6 to 12.6 px a frame.
+
+**The world path (84% of the port face) was dead from frame 2 on.** Stored
+world-path MV vs the correct reprojection (grid-searched truth):
+
+| pair | true shift (px) | correct MV | world MV (error) | engine MV (error) |
+|---|---|---|---|---|
+| 0->1 | (-0.5, -4.5) | (+0.5, +4.5) | (+0.6, +5.8) (+0.1, +1.3) | (+0.8, +4.7) (+0.3, +0.2) |
+| 1->2 | (-0.5, +12.6) | (+0.5, -12.6) | (-0.8, -0.8) (-1.3, +11.8) | (-1.0, -11.9) (-1.5, +0.7) |
+| 2->3 | (-0.5, +4.6) | (+0.5, -4.6) | (+0.2, +0.5) (-0.3, +5.1) | (+0.0, -5.5) (-0.5, -0.9) |
+| 3->4 | (-1.4, +2.6) | (+1.4, -2.6) | (+0.3, +0.1) (-1.1, +2.7) | (+0.3, -2.5) (-1.1, +0.1) |
+| 7->8 | (-1.4, +0.6) | (+1.4, -0.6) | (+0.5, +0.2) (-0.9, +0.8) | (+0.5, -1.1) (-0.9, -0.5) |
+| 11->12 | (-1.4, +1.5) | (+1.4, -1.5) | (+0.4, +0.1) (-1.0, +1.6) | (+0.4, -1.2) (-1.0, +0.3) |
+
+The same dead reading on the deep-space strip as on the hull (f2: -1.75 vs
+-0.83), so the camera term itself produced ~zero from frame 2 -- global, not
+hull-specific. The engine path (16% of the face) stayed exact through the
+same frames, including the 12.6 px move. hidden_history 0, stale stamp 0,
+masked 0, corrupt 0 on the face -- the stamp plumbing has nothing to do with
+this one.
+
+**Why the hull sat on the world path at all:** at this range the two big
+rotating families drew NOTHING through their keyed pairs -- the 30-s window
+covering the dump reads vs_436193B352A2897E "substituted 0 binds, 0 draws;
+patched [ps_16940F576006BE65]; unkeyed pixel shader ps_51EE1F922FD220B0 left
+stock", and vs_889A5279E68F0672 the same with ps_D31DCAFA7C05CB47 (at
+05:53:52, mid-range, each still had 178 keyed draws). vs_61AE's
+ps_4504BC268E109C31 drew stock all session. The close-range LOD of the hull
+draws through pixel shaders that were never keyed.
+
+**The blur pattern matches a dragged history, not the reconstruction floor.**
+Treated/raw edge-energy retention on the port face (Laplacian energy of the
+treated crop against a clean bicubic resample of the raw crop): 0.61-0.80
+against the cockpit's 0.73-0.83, and the signature is temporal -- 0.90 right after the move's
+history rejection, decaying to ~0.65 over eight quiet frames as history
+re-accumulates along wrong vectors, recovering on the next nudge. The
+2026-09-26 "reconstruction damping" conclusion stands for 10 km, where the
+chain was verified; at close range the motion chain on the world path is
+measurably broken, so no softness here is chargeable to the floor.
+
+**The world path's frailty is chronic and live, not a dump artifact.** The
+session's registration lines (05:54:42, counters span the whole session, not
+the eye run): the world delta differed from the head by 0.300 deg/frame on
+average; "the rows turned (1+k) times the head, k = -0.347 (x -0.309,
+y -0.295, z -0.544), leading by -0.17 frames"; the history's best match sat
+(+0.11, -0.88) px from the world path's prediction across 5758 probes; the
+camera's delta was dropped as a parked camera's on 13,462 eye-frames (longest
+stay 4674 = ~52 s); rows chosen by continuity were "another's" on 4032
+frames; auxiliary cameras jump ~9300 units every ~120 frames all session
+("transition flash: a camera parked at (+16xx ...)" lines, the station's
+auxiliary passes). Eye run 191906 (09-25, the pre-stamp build, parked at
+10 km) shows the same class at smaller scale: on its one moving pair the
+world path missed a 3 px shift (err -3.25, +1.91) while the engine path read
+-1.07, +0.24. This convicts the camera-rows arc's H2 (long parked stays
+carry one delta -- the stay here spanned a 12.6 px head move); that doc's
+Status block now says so.
+
+**Fix landed here:** ps_4504BC268E109C31 keyed for vs_61AE (corpus identity
+harness: slot v0.x, SV_Position v4; 40,960 texels, 0 mismatches; MRT6 8192
+checked, 0 bad). Its dxbc was already dumped (09-06).
+
+**Awaiting dumps:** ps_51EE1F922FD220B0 (vs_4361) and ps_D31DCAFA7C05CB47
+(vs_889A) are candidates in the rig; their dxbc are not in any shaders dir.
+The flight that gets them: advanced.glare_shader_dump = 1 for one session
+(restart to arm), park close to the port exactly as 055427, a minute or two --
+then harness, key, and re-fly. With diagnostics on that same flight
+(advanced.temporal_aa_diagnostics = 1), the trained-path line answers the
+residual question directly: engine-joined share of the hull up from ~16%,
+the hull crisp through head moves.
+
+**Ruled out for this dump (do not re-propose):** the station's own in-image
+rotation (it is below 0.02 deg/frame -- nothing to deliver); a phantom engine
+delta of the 09-25 stale class (engine MV equals truth; stamps fresh);
+hidden-history mishandling (0 on the face); the reconstruction floor as the
+explanation at this range (the chain is broken upstream of DLSS); a
+regression from the stamp fix (its temporal_pass.cpp delta is Stats plumbing;
+191906 shows the same world-path miss on the 09-25 build).
