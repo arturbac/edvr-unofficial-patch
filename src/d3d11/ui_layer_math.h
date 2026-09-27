@@ -618,7 +618,15 @@ constexpr uint64_t kUiVsGuiVector = 0x666EF0C4C616F67Eull, kUiVsGuiText = 0x1012
 // menu, had the game re-create its interface surfaces: the redirects stopped
 // within a third of a second of the render-size change and never resumed,
 // though ui_depth learned one of the new surfaces a second later.
-constexpr uint64_t kUiPanelPs[] = {0x9107E72CB016CC02ull, 0x219323C8C025AD94ull};
+// 2026-09-27: the tinted and cheap variants join (ui_depth.cpp:105-115
+// documents all three: nine disassembly lines differ, none in the
+// sampling; the IN-FLIGHT menu -- the escape menu, station services -- and
+// the holo effect over the panels draw through them). The first crisp-HUD
+// flight showed the cockpit's menu composites were never recognized with
+// the two original PSes alone (30k+ draws, "no learned surface, pixel
+// shader not known"), so in-flight menus never took the layer at all.
+constexpr uint64_t kUiPanelPs[] = {0x9107E72CB016CC02ull, 0x219323C8C025AD94ull,
+                                   0x015EF9349EC097E8ull, 0xF2F872B191F656D5ull};
 constexpr uint64_t kUiLoaderPs[] = {0x85565E9261812E2Full, 0x8ADB2A81A45E8A4Bull};
 
 inline bool uiKnownPs(const uint64_t* list, size_t n, uint64_t ps) {

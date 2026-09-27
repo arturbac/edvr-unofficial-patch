@@ -912,7 +912,13 @@ void testFamilyRule() {
           "...over a re-created surface nothing has learned: still the menu panel, by its shader pair");
     f.ps = 0x219323C8C025AD94ull;
     check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kPanel, "...its variant pixel shader too");
-    f.ps = 0x015EF9349EC097E8ull;  // the same vertex shader drawn after the UI, unclassified
+    f.ps = 0x015EF9349EC097E8ull;  // the tinted in-flight variant (ui_depth.cpp:105-115)
+    check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kPanel && why == UiFamilyWhy::kShaderPair,
+          "the tinted in-flight variant is the menu panel too (the 2026-09-27 flight: never recognized, never taken)");
+    f.ps = 0xF2F872B191F656D5ull;  // and the cheap one
+    check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kPanel && why == UiFamilyWhy::kShaderPair,
+          "the cheap variant too");
+    f.ps = 0xDEADBEEFCAFEF00Dull;  // a pixel shader that is no variant of the pair
     check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kNone && why == UiFamilyWhy::kNoSurface,
           "the same vertex shader with another pixel shader and no learned surface: not UI, and said why");
     f.vs = kUiVsLoader;
