@@ -2,15 +2,14 @@
 
 ## Status
 
-- **State:** PHASE 0, flight 2 read (2026-09-27, Steam, build 6798b6de,
-  two sessions). G-F MEASURED (five ledgers; the parity identity holds
-  except in the bright-translucent regime, quantified). G-D still no data:
-  the guard fix worked (zero declines) but the log hit its 4 MB cap
-  seconds before the first results window -- G-A's state lines flooded it
-  (fixed on the branch as Phase 0.2). G-C: the full-cb0 dump ruled out a
-  bare projection in cb0; rows 4..7 are one per-eye composed matrix
-  shared by all three families; factorisation is offline work from the
-  flight-2 ledgers. G-A/G-B/G-E consistent with flight 1.
+- **State:** PHASE 0, flight 3 read (2026-09-27, Steam, build 4db05397).
+  G-D SETTLED: the families' depth test rejects ~0% of samples, so the
+  seeded depth is a correctness item, not an edge-quality one. G-A final
+  (holo 22-24/f steady; flight HUD 4.8-56/f content-dependent; sprite
+  2-6/f). G-B identity join 100% with families present. G-F measured in
+  flight 2. G-C alone remains open, and it is offline work now
+  (pool\draws_<stamp>.bin from flight 2). Phase 0 is otherwise answered;
+  the Decisions are unblocked.
 - **Goal:** composite the cockpit HUD after the upscale, at output
   resolution, out of DLSS/FSR history. That means the holo panels, the
   flight HUD and the target sprite. It should be as sharp at HMD Quality
@@ -27,10 +26,8 @@
   (lines 184-191: "PARKED, not declined"), with one change. It re-issues
   the game's own tonemap draw instead of transcribing it.
 - **Decisions for Sean:** see "Decisions", before Phase 1.
-- **Next step:** flight 3 (Phase 0.2 build): hold the cockpit HUD for one
-  full 30 s window and G-D prints. In parallel, G-C's offline
-  factorisation from `pool\draws_<stamp>.bin` (the flight-2 ledgers carry
-  the families' VS b0/b1/b2). Then the Decisions below, then Phase 1.
+- **Next step:** G-C's offline factorisation from the flight-2 ledgers
+  (`pool\draws_*.bin`), then the Decisions below, then Phase 1.
 
 ## What exists
 
@@ -394,3 +391,43 @@ ledgers at 12:30:21..12:31:04. ~19.2k census lines harvested.
   never sighted in cockpit again.
 - **G-E:** exposure tracked 11.3..115 across the two sessions' scenes;
   the HUD-region crop still mixes scene and HUD (by design).
+
+## Phase 0, flight 3, 2026-09-27 (Steam, 4db05397)
+
+One session, ~4 min, build verified. The Phase 0.2 dedupe held: 143 census
+lines for the whole session (flight 2 spent 9.7k in two minutes), the log
+cap never approached, and the G-D windows printed.
+
+- **G-D SETTLED: the depth test rejects nothing.** Per family per eye the
+  occlusion pair's on/off sample counts were EQUAL (holo eye 0: 33,123,678
+  of 33,123,678 passed, 1,989 pairs; flight HUD eye 0 across the second
+  window: 1,282,658,327 of 1,282,658,328 -- ONE sample rejected in 1.28
+  billion). The doc's "large share means the seeded depth's
+  input-resolution edges show" is measured absent: occlusion is ~0%, so
+  Phase 1's seeded depth is a correctness item (the GEQUAL test exists and
+  runs), not an edge-quality one. Two qualifications, both measured: the
+  sprite's own state is depth-off, so its pair A equals B by construction
+  and its line carries no gate; and the flight exercised cockpit-in-space
+  and station-with-target, not a panel buried behind the dashboard at an
+  extreme look-down. The ring-full declines (14-19k per window) are the
+  8-pair ring throttling the 12-pair/frame budget -- sampling only; the
+  accumulated counts make the 0.0% robust.
+- **G-A, final numbers:** holo steady at 22..24 draws/frame (11-12/eye)
+  across every flight and both render sizes; the flight HUD is
+  content-dependent, 4.8 draws/f in quiet flight up to 54-56/f (27/eye) in
+  the busy station scene; the sprite 2..6/f with a target. The doc's
+  flight-HUD UNKNOWN is a measured range now.
+- **G-B:** the identity join held 100% whenever families were present
+  (4,282/4,282 and 4,526/4,526 tonemaps' HDR SRV is the families' target);
+  bloom composite 953C8123AD8DC13B never sighted on a third flight; the
+  five variants are the same five every session.
+- **G-C unchanged:** no cb0 quad is the bare projection (n=16k+ per family
+  per window, all not-scene); the dumps are consistent with flight 2's and
+  add that eye 0/eye 1 differ in rotation while the w column differs per
+  family -- shared view rotation plus per-family translation. The
+  factorisation against the scene camera stays the named offline path
+  (flight 2's draws_*.bin carry the families' VS b0/b1/b2).
+- **G-E:** exposure 42..625 across this flight's scenes, same behaviour.
+
+Phase 0 closes with one open item: G-C's factorisation, which needs no
+flight. Every other gate is answered; the Decisions are unblocked.
