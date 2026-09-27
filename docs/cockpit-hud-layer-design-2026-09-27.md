@@ -2,13 +2,14 @@
 
 ## Status
 
-- **State:** PHASE 0 COMPLETE (2026-09-27: flights 1-3 plus the offline
-  G-C factorisation of the flight-2 ledgers). Every gate is answered:
-  G-A the families, G-B the tonemap (measured pair + EDHM swap), G-C the
-  jitter is CARRIED by all three families (bit-exact, 7,039/7,039 draws),
-  G-D ~0% depth rejection, G-E exposure behaves, G-F the parity error is
-  zero except the quantified bright-translucent regime. The Decisions are
-  unblocked.
+- **State:** PHASE 1 BUILT (2026-09-27, branch `kimi/crisp-hud-census`,
+  f032e024, installed to Steam as v0.18.0-rc.2-56-gf032e024): the holo
+  panels take a per-eye HDR layer and return to the picture through the
+  tonemap re-issue, folded into `fix.ui_quality` (Sean's decision 2 --
+  no key of its own). Phase 0's gates are all answered (flights 1-3 + the
+  offline G-C). Awaiting the Phase 1 flight: fix.ui_quality = 100, HMD
+  Quality 0.5 and 0.75 with DLSS, panels as sharp as at 1.0, no
+  brightness step (the G-F budget), the census clean.
 - **Goal:** composite the cockpit HUD after the upscale, at output
   resolution, out of DLSS/FSR history. That means the holo panels, the
   flight HUD and the target sprite. It should be as sharp at HMD Quality
@@ -25,11 +26,10 @@
   (lines 184-191: "PARKED, not declined"), with one change. It re-issues
   the game's own tonemap draw instead of transcribing it.
 - **Decisions for Sean:** see "Decisions", before Phase 1.
-- **Next step:** the Decisions below, then Phase 1 (the holo panels only,
-  behind the key) -- with the Phase-1 jitter-cancel caveat from the G-C
-  entry carried in: the cancel validates visually, because the absolute
-  jitter phase is not anchored from a ledger and the game-applied x slope
-  ran at 94-99% of the naive value.
+- **Next step:** the Phase 1 flight (checklist in the tail entry), then
+  its log read against the Phase 1 gates (sharpness at 0.5/0.75, no
+  brightness step, declines clean). Then Phase 2: the flight HUD and the
+  target sprite.
 
 ## What exists
 
@@ -205,14 +205,21 @@ Quality 0.75 with DLSS. Each gate is a `hud layer census:` line:
 
 ## Decisions
 
-For Sean, before Phase 1:
-1. Accept losing the HUD's bloom halo, at least initially?
+For Sean, before Phase 1 -- ANSWERED 2026-09-27:
+1. Accept losing the HUD's bloom halo, at least initially? YES (the G-F
+   numbers sized it: a few dozen pixels a frame in the bright-translucent
+   regime; the Phase 4 blur is the way back if the edges read wrong).
 2. The key. Suggested: `fix.crisp_hud = off | on`, named for what the
    player gets, which follows `fix.ui_quality`'s size target and arms the
    layer at 100 when that key is off. Or fold it into `fix.ui_quality`.
+   SEAN: folded -- the holo take is part of fix.ui_quality (no key of its
+   own).
 3. Scope: the three families (Phases 1-2), or the hologram families too?
+   AS SUGGESTED: three families; the holograms stay Phase 3-optional.
 4. The memory budget: +128-200 MB per eye on a Crystal-class output.
-5. Default: off until flown on Pimax and Quest.
+   ACCEPTED (the configure and layer lines report the actual numbers).
+5. Default: off until flown on Pimax and Quest. STANDS -- fix.ui_quality
+   defaults off, so the take defaults off with it.
 
 ## Phase 0 built, 2026-09-27
 
@@ -469,3 +476,50 @@ Steam install's edvr_logs\pool). No flight was needed.
   plus the jitter fingerprint; a direct scene-side confirmation, if ever
   wanted, is one re-fly with advanced.eye_depth_capture on, comparing the
   scene pair's b1 rows 270..273.
+
+## Phase 1 built, 2026-09-27 (f032e024)
+
+The design's Phase 1 is code, on the branch and installed to Steam
+(v0.18.0-rc.2-56-gf032e024). Built per the design with the Phase 0
+measurements folded in; Sean folded the key into fix.ui_quality (decision
+2) -- the take arms with the layer at 100/125 and is off by default with
+it (decision 5 stands).
+
+- **The take:** a holo draw into the lit HDR target routes to the eye's
+  HDR layer (R16G16B16A16_FLOAT, door size x target) through the LDR
+  take's own path -- same remap, same jitter cancel (G-C: the families
+  carry the jitter, so the cancel is exact), same seeded depth-stencil
+  (G-D measured rejection ~0%), and the measured 0x04 stencil write keeps
+  landing in the game's own buffer through the existing colourless
+  write-back. The flight HUD and the sprite refuse kHdrTarget as before
+  (Phase 2).
+- **The re-issue:** the tonemap draw is admitted structurally
+  (tonemap_admit.h, the census's G-B recognition factored out and
+  shared), once per eye per frame, right after its own issue: same VS/PS,
+  b2, samplers, the admitted draw's own exposure and LUT (the EDHM swap
+  binds no exposure at VS t0 -- nothing is re-bound there), the HDR layer
+  at the admitted per-PS HDR slot, rendering RGB-only into the 8-bit
+  layer at the layer viewport; one EDVR pass then writes the HDR layer's
+  coverage into the 8-bit layer's alpha. Menus after the tonemap land on
+  top in game order; the door composite is untouched. The "tone
+  separation" case is the once-per-eye guard (a second admitted tonemap
+  for an eye is counted, never re-issued).
+- **Declines, all counted and named once:** no HDR slot (unknown PS --
+  never guessed), no content, layer busy (an LDR draw already holds the
+  frame -- the ordering guard), second tonemap, size mismatch, state
+  drift, PS UAV, layer failed. A failure stands only the HDR path down;
+  the LDR take is untouched; off means exactly stock.
+- **The rig:** ui_quality_test's parity block models stock T(F(1-a)+L)
+  against the layer's T(F)(1-a)+T(L) through two stand-in tonemaps:
+  opaque/uncovered bit-exact, dark within the G-F budget (2 steps), the
+  translucent-over-bright regime bounded by flight 2's measured ceiling
+  (113 steps), and proven sensitive to a take-removed mutant.
+- **Phase 1 flight protocol:** fix.ui_quality = 100, HMD Quality 0.5 then
+  0.75 with DLSS, cockpit with the panels up (a station with a target
+  locked for the busy scene). The panels should read as sharp as at 1.0,
+  with no brightness step against pass-off (the G-F budget) and no halo
+  (accepted). After: `python tools\edvr_log.py --target steam
+  --expect-build HEAD`, then the "crisp hud" and "ui quality" lines:
+  taken 22-24/frame, re-issues 2.00/frame, declines none, the HDR layer's
+  size/memory, the route GPU times. Validate the jitter cancel visually
+  (the G-C caveat: absolute phase unanchored, x slope at 94-99%).
