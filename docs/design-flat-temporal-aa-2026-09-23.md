@@ -59,7 +59,12 @@
   continuously (streak 3349, DLSS), zero unknown-pair captures (the
   section-65 recipes hold), one one-frame observation episode on a reciped
   pair. The surviving conflicting-hdr is qualified as transition-scoped
-  video/bloom content, not an HDR alias; no relaxation needed.
+  video/bloom content, not an HDR alias; no relaxation needed. Section 70
+  (2026-09-26): the review's gate 1 shipped -- the reducer produces the
+  immutable FlatFrameContract at the copy draw with no decision change, the
+  trace ring records its inputs and dumps on F10, and the rig replays
+  traces to identical contract hashes. INSTALLED on Epic; the stock/EDHM
+  trace corpus is owed by the next flights.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -4123,3 +4128,28 @@ content at a different extent, where refusing accumulation is correct.
 Qualification recorded; no alias relaxation needed. The
 2496x1404/video-extent provenance can join the family contracts when the
 review's staged program reaches them.
+
+## 70. Gate 1: the frame contract and reducer trace/replay (2026-09-26)
+
+Implements the review's first delivery gate
+([review-flat-temporal-aa-2026-09-26.md](review-flat-temporal-aa-2026-09-26.md)):
+consolidate the FrameContract and the online/replay reducer without
+changing output. The flat temporal reducer -- one streaming pass of
+`flatRuntimeObserve` over FlatRuntimeDraw events -- now produces a named,
+immutable per-frame artifact at the output-copy draw: `FlatFrameContract`
+carries the assembled fixture records, the selection and the conflict
+witness (flat_frame_contract.h), with a field-wise content hash over
+exactly the decision-relevant fields. No decision changes: the online
+driver consumes the identical FlatMonoFrame, and the sink
+(FlatRuntimeContractSink) is a carrier, not a second selector.
+
+Trace/replay (flat_trace.h): every reducer input event serializes into a
+bounded, always-recording ring (four frames x 4096 events, frame-atomic, no
+allocation on the draw path); the F10 audit arm dumps the complete frames
+to `edvr_logs\traces\flat_trace_<frame>.bin`. The rig round-trips a
+two-extent MonoFixture stream to an identical contract hash and replays
+every committed trace in `tools/flat_temporal_test/traces/*.bin`, failing
+the build if a recorded decision ever changes. The corpus starts empty:
+next flights capture stock/EDHM menu and flight traces for commit.
+Gates 2-5 (three-size routing, retirement, family contracts, composition
+tests) are untouched; this gate exists to catch their regressions.
