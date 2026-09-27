@@ -76,6 +76,11 @@ struct FlatMonoResolveFrame {
     ID3D11ShaderResourceView* color = nullptr;
     ID3D11ShaderResourceView* depth = nullptr;
     uint32_t renderWidth = 0, renderHeight = 0, outputWidth = 0, outputHeight = 0;
+    // Optional negotiated evaluation size override (gate 2 step 4): nonzero
+    // overrides the route's default E. Only the driver sets it, from the
+    // vendor's queried ranges; the resolver uses it only when the route
+    // itself is not refused.
+    uint32_t evalWidth = 0, evalHeight = 0;
     float camera[6][4] = {}, previousCamera[6][4] = {}; // unjittered b1[270..275]
     // Actual raster phases in render pixels, positive right/down. Camera rows
     // and engine scene snapshots above remain raw and unjittered. Zero defaults

@@ -4278,6 +4278,14 @@ Staged implementation:
 4. Backend negotiation: the served-floor ladder (dlss_floor.h) already
    answers under-floor inputs on the VR door; the flat route gets the same
    query on extent changes, logged per route.
+   SHIPPED 2026-09-27: flatDlssNegotiate names the effective treatment from
+   the vendor's queried ranges -- serving mode and evaluation size, an
+   under-floor input cut to the floor it reaches with the game's copy
+   upsampling the rest (the VR door's rule), never a silent substitution.
+   The negotiated E overrides the resolve frame's evaluation grid;
+   requested vs effective treatment are both logged on every contract
+   change. Rig-pinned over the flight's own ladder shape (served at the
+   door output, ultra's point, proportional cuts, unanswered queries).
 
 Qualification matrix (the review's gate 2 tests): sub-native, native,
 supersampled, odd sizes, crops, live extent changes without a restart,
