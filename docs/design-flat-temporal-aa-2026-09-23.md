@@ -4154,6 +4154,14 @@ next flights capture stock/EDHM menu and flight traces for commit.
 Gates 2-5 (three-size routing, retirement, family contracts, composition
 tests) are untouched; this gate exists to catch their regressions.
 
+2026-09-26, same evening: the first capture's corpus replay failed 0/8 --
+the gate working as intended. The v1 trace recorded only draw events,
+while the prefix also mutates on the dispatch UAV guard, resource writes
+(Copy/Map/Update), flatRuntimeUnknown and the camera overflow. v2 records
+those as their own event kinds in sequence order, the dispatch guard now
+shared by runtime and replay out of flat_runtime_model.h, and the magic
+bumps to EDVRFTR2 (v1 captures rejected). Awaiting one recapture flight.
+
 ## 71. Second review cycle: observation transitions closed (2026-09-26)
 
 [reviews/flat-temporal-main-review-2026-09-26.md](../reviews/flat-temporal-main-review-2026-09-26.md)
