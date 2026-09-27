@@ -9,6 +9,7 @@
 #include "flat_draw_capture.h"
 #include "flat_local_reject.h"
 #include "flat_trace.h"
+#include "flat_dlss_negotiate.h"
 #include "binding_shadow.h"
 #include "exposure_fix.h"
 #include "device_hook.h"
@@ -164,6 +165,10 @@ struct State {
     // (State& only) can name the refused pair in the census -- the same
     // convention as s.namedDepth and s.reason.
     uint64_t drawVs = 0, drawPs = 0;
+
+    // Gate 2 step 4's negotiated evaluation size (vendor-queried at plan
+    // change): nonzero overrides the route's default E on the resolve frame.
+    uint32_t negotiatedEvalW = 0, negotiatedEvalH = 0;
 
     // --- Frame-contract trace (staged-program gate 1) -------------------------
     // The reducer's input events, always recorded into a bounded ring and
@@ -1746,6 +1751,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     }
     FlatMonoResolveFrame f{}; f.color = original; f.depth = s.depthView.Get(); f.renderWidth = selected.renderWidth; f.renderHeight = selected.renderHeight;
     f.outputWidth = selected.outputWidth; f.outputHeight = selected.outputHeight; f.frame = s.prefix.frame; f.mode = s.engine;
+    f.evalWidth = s.negotiatedEvalW; f.evalHeight = s.negotiatedEvalH;
     nativeScale.store(f.renderWidth >= f.outputWidth && f.renderHeight >= f.outputHeight,
                       std::memory_order_release);
     f.configuredDlssPreset=s.preset;
@@ -1778,6 +1784,30 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
             Log::get().note("flat route: %s R=%ux%u E=%ux%u D=%ux%u%s", route.name,
                 plan.renderWidth, plan.renderHeight, route.evalWidth, route.evalHeight,
                 plan.outputWidth, plan.outputHeight, route.refused ? " (refused today)" : "");
+            // Gate 2 step 4: negotiate the effective treatment with the vendor
+            // on every contract change. The request is recorded above; this is
+            // the vendor's answer -- serving mode and evaluation size, with an
+            // under-floor input cut to the floor it reaches (the game's copy
+            // upsamples the rest), never a silent TAA substitution.
+            s.negotiatedEvalW = s.negotiatedEvalH = 0;
+            if (plan.mode == FlatMonoResolveMode::Dlss && !route.refused &&
+                (plan.renderWidth < plan.outputWidth || plan.renderHeight < plan.outputHeight)) {
+                const char* why = nullptr;
+                if (dlaaAvailable(s.device.Get(), &why)) {
+                    DlssModeRange modes[kDlssModeCount];
+                    if (dlssModeRanges(s.device.Get(), plan.outputWidth, plan.outputHeight, modes)) {
+                        const auto neg = flatDlssNegotiate(modes, plan.renderWidth, plan.renderHeight,
+                                                           plan.outputWidth, plan.outputHeight);
+                        Log::get().note("flat route negotiation: dlss R=%ux%u D=%ux%u -> E=%ux%u mode=%s%s",
+                            plan.renderWidth, plan.renderHeight, plan.outputWidth, plan.outputHeight,
+                            neg.evalWidth, neg.evalHeight,
+                            neg.served ? kDlssModeNames[static_cast<int>(neg.mode)] : "unserved",
+                            neg.cut ? " (input under the floor; the game's copy upsamples the rest)" :
+                            neg.served ? "" : " (the backend refusal path stands)");
+                        if (neg.served) { s.negotiatedEvalW = neg.evalWidth; s.negotiatedEvalH = neg.evalHeight; }
+                    }
+                }
+            }
         }
         s.plannedResolve=plan;s.haveResolvePlan=true;
     }

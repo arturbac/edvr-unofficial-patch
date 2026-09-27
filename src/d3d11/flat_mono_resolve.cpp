@@ -187,8 +187,10 @@ bool resources(const FlatMonoResolveFrame& f,const char** reason) {
     // to D. Upscale and native routes evaluate at E = D as before; TAA keeps
     // its render-grid evaluation with the composite mapping, outputs at D.
     const auto route = flatResolveRoute(f.mode, f.renderWidth, f.renderHeight, f.outputWidth, f.outputHeight);
-    const uint32_t evalW = route.refused ? f.outputWidth : route.evalWidth;
-    const uint32_t evalH = route.refused ? f.outputHeight : route.evalHeight;
+    const uint32_t evalW = route.refused ? f.outputWidth :
+        (f.evalWidth && f.evalHeight) ? f.evalWidth : route.evalWidth;
+    const uint32_t evalH = route.refused ? f.outputHeight :
+        (f.evalWidth && f.evalHeight) ? f.evalHeight : route.evalHeight;
     auto make=[&](Image& out,DXGI_FORMAT format,bool output=false,bool writable=true) {
         return image(g.device.Get(),output?evalW:f.renderWidth,output?evalH:f.renderHeight,format,out,writable);
     };
@@ -301,12 +303,11 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     // port's Native AA qualifies.
     const auto route = flatResolveRoute(f.mode, f.renderWidth, f.renderHeight, f.outputWidth, f.outputHeight);
     if (route.refused) return fail(reason, route.failReason);
-    // The evaluation grid E from the route contract: the display grid for
-    // trained upscale/native and TAA today, the render grid for the
-    // supersample routes. One contract drives allocation, dispatch and
-    // telemetry (gate-2 review G2-2).
-    const uint32_t evalW = route.evalWidth;
-    const uint32_t evalH = route.evalHeight;
+    // The evaluation grid E from the route contract, with the driver's
+    // negotiated override honored when present (gate 2 step 4). One contract
+    // drives allocation, dispatch and telemetry (gate-2 review G2-2).
+    const uint32_t evalW = (!route.refused && f.evalWidth && f.evalHeight) ? f.evalWidth : route.evalWidth;
+    const uint32_t evalH = (!route.refused && f.evalWidth && f.evalHeight) ? f.evalHeight : route.evalHeight;
     if(!initialize(device,context,reason))return false;
     ComPtr<ID3D11Texture2D> color,depth;
     if(!inputTexture(f.color,f.renderWidth,f.renderHeight,true,color) ||
@@ -446,8 +447,10 @@ bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* co
     // The spatial recovery runs on the route's evaluation grid, exactly as
     // the resolve it substitutes for (section 72's supersample routes).
     const auto route = flatResolveRoute(f.mode, f.renderWidth, f.renderHeight, f.outputWidth, f.outputHeight);
-    const uint32_t evalW = route.refused ? f.outputWidth : route.evalWidth;
-    const uint32_t evalH = route.refused ? f.outputHeight : route.evalHeight;
+    const uint32_t evalW = route.refused ? f.outputWidth :
+        (f.evalWidth && f.evalHeight) ? f.evalWidth : route.evalWidth;
+    const uint32_t evalH = route.refused ? f.outputHeight :
+        (f.evalWidth && f.evalHeight) ? f.evalHeight : route.evalHeight;
     Constants constants{};
     constants.size[0]=f.renderWidth;constants.size[1]=f.renderHeight;
     constants.size[2]=evalW;constants.size[3]=evalH;
