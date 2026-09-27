@@ -311,6 +311,10 @@ struct DrawStats {
              refusedPrevious = 0;
     uint64_t restores = 0;
     uint64_t frames = 0;
+    // The self-marking detail shaders' draw-path census (the seam arc,
+    // 2026-09-27): reached slowPath with a self-marking PS bound, and of those
+    // the ones where neither the eye-pass nor the depth map named an eye.
+    uint64_t selfMarkSeen = 0, selfMarkNoEye = 0;
     uint64_t pixelsJoined = 0, pixelsMasked = 0, pixelsCamera = 0, pixelsStale = 0, pixelsCorrupt = 0, pixelsStamped = 0,
              pixelReads = 0;
     // The on-foot source: its eye-frames (also counted in eyeFrames above),
@@ -1061,6 +1065,17 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     int eye = -1, target = -1;
     const bool eyePass = rtv0Eye && dsv && depthProbeCurrentSceneEyeOf(dsv, &eye, &target) && (eye == 0 || eye == 1);
     const int f = familyForProfile(vsHash, runtimeFlatProfile());
+    // The self-marking detail shaders (kSelfMarking) can draw in the eye's
+    // pass without the eye's colour at slot 0 -- rtv0Eye never names those an
+    // eye pass. The capture needs only which eye, and the depth probe's own
+    // map of the scene pair answers it from the depth view alone.
+    const bool selfMarkPs = f >= 0 && selfMarkingPair(vsHash, psHash);
+    if (selfMarkPs) ++g_draw.selfMarkSeen;
+    int markEye = -1, markTarget = -1;
+    if (selfMarkPs && !eyePass && dsv &&
+        !(depthProbeCurrentSceneEyeOf(dsv, &markEye, &markTarget) && (markEye == 0 || markEye == 1)))
+        markEye = -1;
+    const bool selfMarkEyePass = markEye >= 0;
     // On foot no pool draw targets an eye: the source pass is a pool family
     // draw into the depth screen_motion named this frame or the last two.
     bool sourcePass = false;
@@ -1077,12 +1092,16 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     // by the consumer's exact DSV comparison.
     if (sourcePass && !overlayPair) g_eyes[kEngineVelocitySourceEye].overlayGroup = false;
     auto vsInfo = vs ? g_vs.find(vs) : g_vs.end();
-    if (!g_emitLive.load(std::memory_order_acquire) || !(eyePass || sourcePass) || f < 0 || vsInfo == g_vs.end() ||
-        vsInfo->second.family != f) { restore(ctx); return; }
+    if (!g_emitLive.load(std::memory_order_acquire) || !(eyePass || sourcePass || selfMarkEyePass) || f < 0 || vsInfo == g_vs.end() ||
+        vsInfo->second.family != f) {
+        if (selfMarkPs && !eyePass && !selfMarkEyePass) ++g_draw.selfMarkNoEye;
+        restore(ctx);
+        return;
+    }
     deriveFamily(f);
     FamilyState& fam = g_families[f];
     if (!fam.valid) { restore(ctx); return; }
-    Eye& e = g_eyes[eye];
+    Eye& e = g_eyes[eyePass || sourcePass ? eye : markEye];
     const uint32_t frame = frameNow();
     // An eye-frame with a recognised pool family draw: the old order prepared
     // on this alone (the 2026-09-23 performance review, item 2).
@@ -1092,11 +1111,19 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     // snapshot, MRT6 -- is prepared for a draw that cannot export ownership;
     // a declined draw puts the game's state back, as before.
     if (!keyedPs(f, psHash, runtimeFlatProfile())) {
-        if (eyePass && selfMarkingPair(vsHash, psHash)) {
+        if (selfMarkPs) {
             // The stock shader already writes the marker into the game's own
             // target 6: nothing to substitute -- latch that texture for the
-            // compose and let the draw run exactly as the game made it.
-            if (captureGameMark(ctx, e, eye, frame, dsv)) ++fam.selfMarkedLatched;
+            // compose and let the draw run exactly as the game made it. The
+            // eye comes from the pass's colour (eyePass) or, for the detail
+            // pass that never binds it, from the depth probe's map of the
+            // scene pair (selfMarkEyePass).
+            const int which = eyePass ? eye : markEye;
+            if (which >= 0) {
+                if (captureGameMark(ctx, g_eyes[which], which, frame, dsv)) ++fam.selfMarkedLatched;
+            } else {
+                ++g_draw.selfMarkNoEye;
+            }
             ++fam.selfMarked;
         } else if (!anyKeyedPs(psHash)) {
             ++fam.unkeyedPsDraws;
@@ -1456,6 +1483,10 @@ void summaryLocked(uint64_t now) {
                         "declined state %llu, resource %llu, shader %llu.",
                         u(g_draw.overlayCopies), double(g_draw.overlayBytes) / 1e6, u(g_draw.overlayGuardedDraws),
                         u(g_draw.overlayDeclinedState), u(g_draw.overlayDeclinedCreate), u(g_draw.overlayDeclinedShader));
+    if (g_draw.selfMarkSeen)
+        Log::get().note("engine motion: self-marking pixel shaders at the draw path: %llu draws seen, %llu with no "
+                        "eye attributable (not the eye's colour at slot 0, and the depth probe named none).",
+                        u(g_draw.selfMarkSeen), u(g_draw.selfMarkNoEye));
     for (int f = 0; f < kFamilyCount; ++f) {
         FamilyState& s = g_families[f];
         std::string patched, failed;

@@ -3228,3 +3228,35 @@ coverage; the seams stay crisp through motion. If the seam blur persists with
 latched = 0, the game's buffer shape refused -- the format is the first
 suspect (the capture's log line alone cannot distinguish that; the dump's
 engine share can).
+
+### 2026-09-27 -- Route A v2: the detail pass never reached the capture
+
+Flown (eye runs 121801/121900/121926 and five more, 12:18-12:54): hull
+better, the seams still blurred -- and the family lines showed NO self-marked
+tail at all. The capture branch never ran: vs_4361 substituted 21,528 binds
+while ps_BCF75CEA37060EAE drew 347 times in the census, yet selfMarked stayed
+0 and no "unkeyed ... left stock" tail named it either (the print keeps only
+the last hash, so this was always silent).
+
+The seam draws are byte-identical to the keyed hull draws in every census
+field the eye-pass test reads (same r= slot-0 token, same depth view, same
+context -- no t=f), so the working hypothesis for the miss is the eye-pass
+gate itself: the detail draws can run in the eye's pass without the eye's
+colour at slot 0 in the engine's actual bind order, making rtv0Eye false
+there (the gate wants slot 0 eye-sized AND the depth probe's naming). The
+census's r= records the shadow's slot-0 view token, and the hypothesis is not
+fully proven by it -- which is why the fix and the instrument fly together:
+
+1. The capture no longer waits for rtv0Eye: for a self-marking pair the eye
+   is attributed from the depth probe's own map of the scene pair alone
+   (depthProbeCurrentSceneEyeOf on the draw's depth view), and the early-out
+   lets that through.
+2. A draw-path census answers the remaining possibilities in one flight:
+   "engine motion: self-marking pixel shaders at the draw path: N draws seen,
+   M with no eye attributable". N = 0 means the draws never reach the hook
+   path at all (a verdict or context question, not the gate); N > 0 with
+   latched 0 means the game's buffer shape refused; latched ~ the eye-frames
+   with the blur gone means it was the gate.
+
+engine_velocity_test 1152 (the gate), 1677 with the corpus, after the change;
+full build green. Not merged to main (Sean's call: verification first).
