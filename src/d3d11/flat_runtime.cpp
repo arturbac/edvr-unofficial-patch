@@ -1088,7 +1088,7 @@ Camera* camera(ID3D11Resource* resource, bool add) {
     uint32_t index = s.cameraCount;
     if (index == 64) {
         for (uint32_t i = 0; i < 64; ++i) if (s.cameras[i].frame != s.prefix.frame && !s.cameras[i].mapped) { index = i; break; }
-        if (index == 64) { s.prefix.uncertain = true; return nullptr; }
+        if (index == 64) { s.prefix.uncertain = true; flatTraceMark(s.traceRing, kFlatTraceEventMarkUncertain, nullptr); return nullptr; }
     } else ++s.cameraCount;
     auto& c = s.cameras[index]; c = Camera{}; c.buffer = buffer; c.width = d.ByteWidth; return &c;
 }
@@ -1419,7 +1419,7 @@ void flatRuntimeConstantBuffers(UINT start, UINT count, ID3D11Buffer* const* buf
     if (owner() && start <= 1 && 1-start < count && buffers && buffers[1-start]) camera(buffers[1-start], true);
 }
 void flatRuntimeClearBindings() { if (owner()) { state().viewportCount = 0; for (auto& u : state().uavs) u.Reset(); } }
-void flatRuntimeUnknown() { if (owner()) { state().prefix.uncertain = true; state().viewportCount = 0; for (auto& c : state().cameras) c.valid = false; for (auto& u : state().uavs) u.Reset(); if(state().projection) {state().projection->invalidateAll();failPhase(state(),"unknown-context-state");} } }
+void flatRuntimeUnknown() { if (owner()) { flatTraceMark(state().traceRing, kFlatTraceEventMarkUncertain, nullptr); state().prefix.uncertain = true; state().viewportCount = 0; for (auto& c : state().cameras) c.valid = false; for (auto& u : state().uavs) u.Reset(); if(state().projection) {state().projection->invalidateAll();failPhase(state(),"unknown-context-state");} } }
 void flatRuntimeUavs(UINT start, UINT count, ID3D11UnorderedAccessView* const* views) {
     if (!owner()) return;
     for (UINT i = 0; i < count && start + i < 8; ++i) {
@@ -1453,20 +1453,14 @@ FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
         }
     }
     for (const auto& u : s.uavs) if (u) {
-        flatRuntimeComputeWritten(s.prefix,u.Get());
-        for (uint32_t i = 0; i < s.prefix.targetsUsed; ++i) {
-            auto& target = s.prefix.targets[i];
-            const void* const hdrInput = flat_mono_detail::toneHdrInput(target.tone.key);
-            // Lighting legitimately writes HDR before tone. Any GPU write
-            // into the completed handoff or its HDR input afterwards refuses.
-            if (target.tones && (target.resource == u.Get() || (hdrInput && hdrInput == u.Get()))) s.prefix.uncertain = true;
-        }
-        for (uint32_t i = 0; i < s.prefix.sourcesUsed; ++i) if (s.prefix.sources[i].key.depth == u.Get()) s.prefix.uncertain = true;
+        flatTraceMark(s.traceRing, kFlatTraceEventDispatchWritten, u.Get());
+        flatRuntimeDispatchObserveWritten(s.prefix, u.Get());
     }
     if(s.prefix.uncertain && s.projection)failPhase(s,"compute-source-invalidated");
 }
 void flatRuntimeWritten(ID3D11Resource* res) {
-    if (!owner()) return; flatRuntimeWritten(state().prefix, res);
+    if (!owner()) return; flatTraceMark(state().traceRing, kFlatTraceEventWriteResource, res);
+    flatRuntimeWritten(state().prefix, res);
     if (auto* c = camera(res, false)) c->valid = false;
     if(state().projection)state().projection->invalidate(res);
 }
@@ -1534,7 +1528,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     const auto selected = copy
         ? flatRuntimeObserveContract(s.prefix, d, s.traceContract)
         : flatRuntimeObserve(s.prefix, d);
-    flatTraceRecord(s.traceRing, d);
+    flatTraceRecord(s.traceRing, d, foreignWork.load(std::memory_order_acquire));
     if (copy) {
         s.traceContractProduced = s.traceContract.produced;
         s.traceContractHash = s.traceContract.produced ? flatFrameContractHash(s.traceContract) : 0;

@@ -1287,9 +1287,13 @@ void testFrameContractTrace() {
             d.instances = r.firstInstances;
             if (isCopy(d, *prefix)) flatRuntimeObserveContract(*prefix, d, *contract);
             else flatRuntimeObserve(*prefix, d);
-            flatTraceRecord(*ring, d);
+            flatTraceRecord(*ring, d, false);
         }
         flatTraceSeal(*ring, contract->produced, contract->produced ? flatFrameContractHash(*contract) : 0);
+        // Exercise the non-draw kinds: recorded after the copy, they apply
+        // post-contract on both sides and must not perturb the sealed hash.
+        flatTraceMark(*ring, kFlatTraceEventWriteResource, MonoFixture::token(0xDEAD));
+        flatTraceMark(*ring, kFlatTraceEventMarkUncertain, nullptr);
         check(contract->produced && contract->selection.selected(),
               "trace online run produces a selected frame contract");
         const uint64_t wantHash = flatFrameContractHash(*contract);
@@ -1316,8 +1320,12 @@ void testFrameContractTrace() {
                 rc = FlatFrameContract{};
             },
             [&](const FlatTraceEvent& e) {
+                if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); return; }
+                if (e.kind == kFlatTraceEventDispatchWritten) { flatRuntimeDispatchObserveWritten(replay, e.key.color); return; }
+                if (e.kind == kFlatTraceEventMarkUncertain) { replay.uncertain = true; return; }
                 FlatRuntimeDraw d = flatTraceEventToDraw(e);
                 d.key.writeEpoch = replay.frame; d.key.writeSeq = replay.sequence + 1;
+                if (e.flags & kFlatTraceForeignWork) replay.uncertain = true;
                 if (isCopy(d, replay)) flatRuntimeObserveContract(replay, d, rc);
                 else flatRuntimeObserve(replay, d);
             });
@@ -1358,8 +1366,12 @@ void testFrameContractTrace() {
                 rc = FlatFrameContract{};
             },
             [&](const FlatTraceEvent& e) {
+                if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); return; }
+                if (e.kind == kFlatTraceEventDispatchWritten) { flatRuntimeDispatchObserveWritten(replay, e.key.color); return; }
+                if (e.kind == kFlatTraceEventMarkUncertain) { replay.uncertain = true; return; }
                 FlatRuntimeDraw d = flatTraceEventToDraw(e);
                 d.key.writeEpoch = replay.frame; d.key.writeSeq = replay.sequence + 1;
+                if (e.flags & kFlatTraceForeignWork) replay.uncertain = true;
                 const bool copy = d.key.vs == flat_mono_detail::kCopyVs &&
                     d.key.ps == flat_mono_detail::kCopyPs && d.key.color == replay.output;
                 if (copy) flatRuntimeObserveContract(replay, d, rc); else flatRuntimeObserve(replay, d);

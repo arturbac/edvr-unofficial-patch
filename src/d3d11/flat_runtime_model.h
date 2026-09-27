@@ -149,6 +149,19 @@ inline void flatRuntimeComputeWritten(FlatRuntimePrefix& p, const void* resource
             return;
         }
 }
+// The dispatch path's full UAV-write guard (flat_runtime.cpp's dispatch
+// scope), shared with the trace replay: the completed handoff and its HDR
+// input refuse GPU writes after lighting's legitimate pre-tone window.
+inline void flatRuntimeDispatchObserveWritten(FlatRuntimePrefix& p, const void* resource) {
+    flatRuntimeComputeWritten(p, resource);
+    for (uint32_t i = 0; i < p.targetsUsed; ++i) {
+        auto& target = p.targets[i];
+        const void* const hdrInput = flat_mono_detail::toneHdrInput(target.tone.key);
+        if (target.tones && (target.resource == resource || (hdrInput && hdrInput == resource)))
+            p.uncertain = true;
+    }
+    for (uint32_t i = 0; i < p.sourcesUsed; ++i) if (p.sources[i].key.depth == resource) p.uncertain = true;
+}
 // Optional sink for the copy branch's assembled fixture records: the frame
 // contract's carrier (flat_frame_contract.h). count is set only when the
 // copy branch ran, so count != 0 means the reducer produced a contract.

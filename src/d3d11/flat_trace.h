@@ -11,19 +11,32 @@
 
 namespace edvr {
 
+// Event kinds. Draws carry a full FlatRuntimeDraw; the prefix-mutating paths
+// that run BETWEEN draws (resource writes, dispatch UAV guards, uncertain
+// markers) record as their own kinds so a replay applies every mutation in
+// sequence order. Anything less diverges on the first dispatch-heavy frame.
+constexpr uint32_t kFlatTraceEventDraw = 0;
+constexpr uint32_t kFlatTraceEventWriteResource = 1;    // key.color = resource
+constexpr uint32_t kFlatTraceEventDispatchWritten = 2;  // key.color = UAV resource
+constexpr uint32_t kFlatTraceEventMarkUncertain = 3;
+
 struct FlatTraceEvent {
     FlatContractObservation key{};   // camera and projection[].bytes are null
     unsigned char camera[kFlatCameraBytes]{};
     uint32_t instances = 1;
     uint32_t flags = 0;
+    uint32_t kind = kFlatTraceEventDraw;
 };
 constexpr uint32_t kFlatTraceHasCamera = 1u << 0;
 constexpr uint32_t kFlatTraceSupported = 1u << 1;
 constexpr uint32_t kFlatTraceHdrCopyVerified = 1u << 2;
 constexpr uint32_t kFlatTraceMenuCopyVerified = 1u << 3;
 constexpr uint32_t kFlatTraceImageSourceVerified = 1u << 4;
+// The draw ctor observed foreign (non-owner) work this frame; the replay sets
+// prefix.uncertain before the reducer sees the draw, as the ctor does.
+constexpr uint32_t kFlatTraceForeignWork = 1u << 5;
 
-inline FlatTraceEvent flatTraceEventFromDraw(const FlatRuntimeDraw& d) {
+inline FlatTraceEvent flatTraceEventFromDraw(const FlatRuntimeDraw& d, bool foreignWork) {
     FlatTraceEvent e{};
     e.key = d.key;
     e.flags |= d.key.camera ? kFlatTraceHasCamera : 0;
@@ -36,6 +49,15 @@ inline FlatTraceEvent flatTraceEventFromDraw(const FlatRuntimeDraw& d) {
     e.flags |= d.hdrCopyVerified ? kFlatTraceHdrCopyVerified : 0;
     e.flags |= d.menuHdrCopyVerified ? kFlatTraceMenuCopyVerified : 0;
     e.flags |= d.imageSourceCameraIndependentVerified ? kFlatTraceImageSourceVerified : 0;
+    e.flags |= foreignWork ? kFlatTraceForeignWork : 0;
+    e.kind = kFlatTraceEventDraw;
+    return e;
+}
+// The non-draw prefix mutations carry only their resource token (or nothing).
+inline FlatTraceEvent flatTraceEventMarker(uint32_t kind, const void* resource) {
+    FlatTraceEvent e{};
+    e.kind = kind;
+    e.key.color = resource;
     return e;
 }
 inline FlatRuntimeDraw flatTraceEventToDraw(const FlatTraceEvent& e) {
@@ -52,7 +74,7 @@ inline FlatRuntimeDraw flatTraceEventToDraw(const FlatTraceEvent& e) {
 }
 
 struct FlatTraceHeader {
-    char magic[8] = {'E','D','V','R','F','T','R','1'};
+    char magic[8] = {'E','D','V','R','F','T','R','2'};
     uint32_t frameCount = 0;
     uint32_t reserved = 0;
 };
@@ -87,11 +109,17 @@ inline void flatTraceBeginFrame(FlatTraceRing& r, uint64_t frame, const void* ou
     h.frame = frame; h.output = output; h.width = width; h.height = height; h.format = format;
     r.slotUsed[r.slot] = true;
 }
-inline void flatTraceRecord(FlatTraceRing& r, const FlatRuntimeDraw& d) {
+inline void flatTraceRecord(FlatTraceRing& r, const FlatRuntimeDraw& d, bool foreignWork) {
     if (!r.slotUsed[r.slot]) return;
     auto& h = r.headers[r.slot];
     if (h.eventCount >= kFlatTraceEventsPerFrame) { h.truncated = 1; return; }
-    r.events[r.slot][h.eventCount++] = flatTraceEventFromDraw(d);
+    r.events[r.slot][h.eventCount++] = flatTraceEventFromDraw(d, foreignWork);
+}
+inline void flatTraceMark(FlatTraceRing& r, uint32_t kind, const void* resource) {
+    if (!r.slotUsed[r.slot]) return;
+    auto& h = r.headers[r.slot];
+    if (h.eventCount >= kFlatTraceEventsPerFrame) { h.truncated = 1; return; }
+    r.events[r.slot][h.eventCount++] = flatTraceEventMarker(kind, resource);
 }
 inline void flatTraceSeal(FlatTraceRing& r, bool produced, uint64_t contractHash) {
     if (!r.slotUsed[r.slot]) return;
@@ -128,7 +156,7 @@ inline bool flatTraceParse(const unsigned char* data, size_t size,
     if (!data || size < sizeof(FlatTraceHeader)) return false;
     FlatTraceHeader header{};
     std::memcpy(&header, data, sizeof(header));
-    if (std::memcmp(header.magic, "EDVRFTR1", 8) != 0) return false;
+    if (std::memcmp(header.magic, "EDVRFTR2", 8) != 0) return false;
     size_t at = sizeof(FlatTraceHeader);
     for (uint32_t f = 0; f < header.frameCount; ++f) {
         if (size - at < sizeof(FlatTraceFrameHeader)) return false;
