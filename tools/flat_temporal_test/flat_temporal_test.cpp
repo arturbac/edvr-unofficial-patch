@@ -1294,6 +1294,9 @@ void testFrameContractTrace() {
         // post-contract on both sides and must not perturb the sealed hash.
         flatTraceMark(*ring, kFlatTraceEventWriteResource, MonoFixture::token(0xDEAD));
         flatTraceMark(*ring, kFlatTraceEventMarkUncertain, nullptr);
+        // The present boundary: seal happened above; the next frame opens a
+        // new slot, and the dump skips the in-flight (current) slot.
+        flatTraceBeginFrame(*ring, prefix->frame + 1, prefix->output, prefix->width, prefix->height, prefix->format);
         check(contract->produced && contract->selection.selected(),
               "trace online run produces a selected frame contract");
         const uint64_t wantHash = flatFrameContractHash(*contract);
@@ -1323,8 +1326,11 @@ void testFrameContractTrace() {
                 if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); return; }
                 if (e.kind == kFlatTraceEventDispatchWritten) { flatRuntimeDispatchObserveWritten(replay, e.key.color); return; }
                 if (e.kind == kFlatTraceEventMarkUncertain) { replay.uncertain = true; return; }
+                if (e.kind == kFlatTraceEventCameraCapture) { ++replay.sequence; return; }
                 FlatRuntimeDraw d = flatTraceEventToDraw(e);
-                d.key.writeEpoch = replay.frame; d.key.writeSeq = replay.sequence + 1;
+                // The traced writeEpoch/writeSeq are the online-resolved
+                // values; replaying them verbatim keeps the shared camera/
+                // draw sequence counter's online interleaving intact.
                 if (e.flags & kFlatTraceForeignWork) replay.uncertain = true;
                 if (isCopy(d, replay)) flatRuntimeObserveContract(replay, d, rc);
                 else flatRuntimeObserve(replay, d);
@@ -1369,8 +1375,8 @@ void testFrameContractTrace() {
                 if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); return; }
                 if (e.kind == kFlatTraceEventDispatchWritten) { flatRuntimeDispatchObserveWritten(replay, e.key.color); return; }
                 if (e.kind == kFlatTraceEventMarkUncertain) { replay.uncertain = true; return; }
+                if (e.kind == kFlatTraceEventCameraCapture) { ++replay.sequence; return; }
                 FlatRuntimeDraw d = flatTraceEventToDraw(e);
-                d.key.writeEpoch = replay.frame; d.key.writeSeq = replay.sequence + 1;
                 if (e.flags & kFlatTraceForeignWork) replay.uncertain = true;
                 const bool copy = d.key.vs == flat_mono_detail::kCopyVs &&
                     d.key.ps == flat_mono_detail::kCopyPs && d.key.color == replay.output;
@@ -1384,9 +1390,56 @@ void testFrameContractTrace() {
                            files, framesMatched, framesTotal);
 }
 
+// Diagnostic: replay one trace file frame by frame, printing the stored and
+// replayed contract hashes and the replayed selection's shape per frame.
+int flatTraceCheck(const char* path) {
+    using namespace edvr;
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) { std::printf("cannot read %s\n", path); return 2; }
+    std::vector<unsigned char> bytes(static_cast<size_t>(file.tellg()));
+    file.seekg(0); file.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
+    FlatRuntimePrefix replay{};
+    FlatFrameContract rc{};
+    FlatTraceFrameHeader cur{};
+    uint32_t draws = 0, markers = 0;
+    auto finish = [&]() {
+        if (!cur.eventCount) return;
+        std::printf("frame %llu: events=%u draws=%u markers=%u produced(stored=%u replay=%u) hash(stored=%016llx replay=%016llx) reason=%s records=%u\n",
+            (unsigned long long)cur.frame, cur.eventCount, draws, markers, cur.produced, rc.produced ? 1u : 0u,
+            (unsigned long long)cur.contractHash,
+            (unsigned long long)(rc.produced ? flatFrameContractHash(rc) : 0),
+            flatMonoReasonName(rc.selection.reason), rc.recordCount);
+        cur = FlatTraceFrameHeader{};
+    };
+    const bool parsed = flatTraceParse(bytes.data(), bytes.size(),
+        [&](const FlatTraceFrameHeader& h) {
+            finish(); cur = h;
+            replay = FlatRuntimePrefix{}; replay.frame = h.frame; replay.output = h.output;
+            replay.width = h.width; replay.height = h.height; replay.format = h.format;
+            rc = FlatFrameContract{}; draws = markers = 0;
+        },
+        [&](const FlatTraceEvent& e) {
+            if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); ++markers; return; }
+            if (e.kind == kFlatTraceEventDispatchWritten) { flatRuntimeDispatchObserveWritten(replay, e.key.color); ++markers; return; }
+            if (e.kind == kFlatTraceEventMarkUncertain) { replay.uncertain = true; ++markers; return; }
+            if (e.kind == kFlatTraceEventCameraCapture) { ++replay.sequence; ++markers; return; }
+            FlatRuntimeDraw d = flatTraceEventToDraw(e);
+            if (e.flags & kFlatTraceForeignWork) replay.uncertain = true;
+            const bool copy = d.key.vs == flat_mono_detail::kCopyVs &&
+                d.key.ps == flat_mono_detail::kCopyPs && d.key.color == replay.output;
+            if (copy) flatRuntimeObserveContract(replay, d, rc); else flatRuntimeObserve(replay, d);
+            ++draws;
+        });
+    finish();
+    if (!parsed) { std::printf("malformed trace %s\n", path); return 2; }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
         return flatShaderClassifierSweep(argv[2]);
+    if (argc == 3 && std::strcmp(argv[1], "--trace-check") == 0)
+        return flatTraceCheck(argv[2]);
     if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) {
         std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir>");
         return 2;

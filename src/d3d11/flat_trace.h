@@ -19,6 +19,10 @@ constexpr uint32_t kFlatTraceEventDraw = 0;
 constexpr uint32_t kFlatTraceEventWriteResource = 1;    // key.color = resource
 constexpr uint32_t kFlatTraceEventDispatchWritten = 2;  // key.color = UAV resource
 constexpr uint32_t kFlatTraceEventMarkUncertain = 3;
+// Camera captures share prefix.sequence with draws (capture() in
+// flat_runtime.cpp); each one advances the counter, so it must interleave
+// in the trace or every later draw's q is low by the capture count.
+constexpr uint32_t kFlatTraceEventCameraCapture = 4;
 
 struct FlatTraceEvent {
     FlatContractObservation key{};   // camera and projection[].bytes are null
@@ -127,19 +131,21 @@ inline void flatTraceSeal(FlatTraceRing& r, bool produced, uint64_t contractHash
     r.headers[r.slot].contractHash = contractHash;
 }
 
-// Serialize complete frames oldest-first. Returns total bytes written.
+// Serialize complete frames oldest-first, skipping the current slot: its
+// frame is mid-flight, unsealed and partial. Returns total bytes written.
 template <class Write>
 inline uint32_t flatTraceDump(const FlatTraceRing& r, Write&& write) {
     FlatTraceHeader header{};
     for (uint32_t i = 0; i < kFlatTraceFrames; ++i) {
-        const auto& h = r.headers[(r.slot + 1 + i) % kFlatTraceFrames];
-        if (r.slotUsed[(r.slot + 1 + i) % kFlatTraceFrames] && !h.truncated && h.eventCount)
+        const uint32_t slot = (r.slot + 1 + i) % kFlatTraceFrames;
+        const auto& h = r.headers[slot];
+        if (slot != r.slot && r.slotUsed[slot] && !h.truncated && h.eventCount)
             ++header.frameCount;
     }
     uint32_t bytes = write(&header, sizeof(header));
     for (uint32_t i = 0; i < kFlatTraceFrames; ++i) {
         const uint32_t slot = (r.slot + 1 + i) % kFlatTraceFrames;
-        if (!r.slotUsed[slot]) continue;
+        if (slot == r.slot || !r.slotUsed[slot]) continue;
         const auto& h = r.headers[slot];
         if (h.truncated || !h.eventCount) continue;
         bytes += write(&h, sizeof(h));

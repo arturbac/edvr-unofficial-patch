@@ -1093,7 +1093,9 @@ Camera* camera(ID3D11Resource* resource, bool add) {
     auto& c = s.cameras[index]; c = Camera{}; c.buffer = buffer; c.width = d.ByteWidth; return &c;
 }
 void capture(Camera& c, const void* bytes) {
-    c.valid = flatCaptureCameraRows(c.rows, bytes, c.width); c.frame = state().prefix.frame; c.sequence = ++state().prefix.sequence;
+    c.valid = flatCaptureCameraRows(c.rows, bytes, c.width); c.frame = state().prefix.frame;
+    flatTraceMark(state().traceRing, kFlatTraceEventCameraCapture, nullptr);
+    c.sequence = ++state().prefix.sequence;
 }
 bool depthView(ID3D11Texture2D* depth) {
     auto& s = state(); if (s.sceneDepth.Get() == depth && s.depthView) return true;
