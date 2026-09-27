@@ -1829,6 +1829,12 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
                 }
             }
         }
+        // The plan carries the same negotiated E the frame does (gate-2 review
+        // F1): preflight allocates at E and the resolve's resource cache keys
+        // on E, so a plan without it would allocate the fallback output at the
+        // route's default size and the first treated frame would reallocate.
+        plan.evalWidth = negotiatedMatch ? s.negotiatedEvalW : 0;
+        plan.evalHeight = negotiatedMatch ? s.negotiatedEvalH : 0;
         s.plannedResolve=plan;s.haveResolvePlan=true;
     }
     std::memcpy(f.camera, selected.camera, sizeof(f.camera));

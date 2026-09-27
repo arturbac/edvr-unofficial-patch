@@ -288,8 +288,11 @@ FlatProjectionRuntime::Tracked* FlatProjectionRuntime::track(ID3D11Resource* res
     }
     // Buffer pressure (gate-2 review, inherited finding 2): retire plans
     // before refusing capacity, so an available initial write is never lost
-    // for want of an evictable slot while plans pin the whole bank.
-    if (!free && retirePlan()) {
+    // for want of an evictable slot while plans pin the whole bank. A buffer
+    // shared by several plans stays promoted until its last referencing plan
+    // retires (F2), so keep retiring while retirement can still free one,
+    // bounded by the plan bank size.
+    for (uint32_t attempts = 0; !free && attempts < kPlans && retirePlan(); ++attempts) {
         for (auto& entry : tracked_) if (!entry.buffer) { free = &entry; break; }
         if (!free) for (auto& entry : tracked_) if (!entry.promoted && !entry.mapped && !entry.pending) {
             free = &entry; discard(entry); break;

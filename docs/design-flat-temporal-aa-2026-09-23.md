@@ -74,6 +74,10 @@
   designed (three sizes R/E/D, the routing table, retirement, negotiation);
   step 1 shipped: `flatResolveRoute` names today's effective treatment per
   pairing (honest refusals included), logged on plan change, rig-tabled.
+  Section 74 (2026-09-27): the gate-2 review's final-pass pair closed
+  without a flight -- the negotiated E keys the resolve's resource cache
+  and the preflight carries it; buffer-pressure retirement loops until a
+  shared buffer unpins, bounded by the plan bank.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -4341,3 +4345,34 @@ the outcome tests above. What the trace does NOT certify -- mode, backend,
 observation state, effective treatment, history and pixels -- is now stated
 in the manifest's provenance; those belong to gates 2-4's GPU and flight
 evidence.
+
+## 74. Gate-2 review final pass: E keys the resource cache, bounded retirement (2026-09-27)
+
+The [gate-2 review](../reviews/flat-temporal-gate2-review-2026-09-27.md)'s
+final pass found two reproduced gaps, both fixed without a flight:
+
+- F1: the negotiated evaluation size E was missing from the resolve's
+  resource cache key. A cut E (step 4's under-floor negotiation) arriving
+  after a default-E frame would reuse the default-sized allocation and the
+  finish pass would fill only the E rectangle of it; and the preflight --
+  which carries no frame -- allocated at the route's default E, so the
+  first treated frame of a negotiated contract reallocated anyway. E now
+  keys the cache alongside mode/R/D, the plan carries the same negotiated
+  override the frame carries (gated to the exact contract signature), and
+  the preflight allocates and verifies at that E.
+- F2: the buffer-pressure path retired ONE plan and re-scanned; a buffer
+  shared by two live plans keeps a nonzero planRefs after the first
+  retirement, so nothing freed and the write refused. The pressure path
+  now retires in a loop bounded by the plan-bank size, re-scanning after
+  each retirement; the guards stand (never a promoted/mapped/pending
+  buffer, never a non-idle plan).
+
+WARP-qualified: the rig's cut probe walks default E -> cut E=24 -> default
+on a 16x16-to-32x32 DLSS contract, checking the backend's observed grid,
+the output view's size and the allocation count at each step, and that a
+preflight carrying the cut lets the first treated frame hit the cache; the
+shared-refs pressure case pins all 64 buffer slots twice over (32
+four-binding plans, each buffer in exactly two, the second reference on
+distinct slots so each plan is its own topology) and the 65th buffer
+tracks only after the loop retires both plans pinning a shared buffer.
+Corpus replay unchanged: 6/6 frames identical.
