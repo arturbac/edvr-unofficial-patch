@@ -65,7 +65,10 @@
   trace ring records its inputs and dumps on F10, and the rig replays
   traces to identical contract hashes. FLOWN 2026-09-26: the stock/EDHM
   menu and flight traces replay byte-identical (6/6 frames) and are
-  committed as the corpus's first entries.
+  committed as the corpus's first entries. Section 72 (2026-09-26): gate 2
+  designed (three sizes R/E/D, the routing table, retirement, negotiation);
+  step 1 shipped: `flatResolveRoute` names today's effective treatment per
+  pairing (honest refusals included), logged on plan change, rig-tabled.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -4206,3 +4209,42 @@ predicates. Also noted there: the observing copy return skips the old
 spatial recovery for the one compromised frame a late refusal can leave;
 the policy is "invalidate and observe", stated in section 68, and
 recover() stays out of the mixed-phase path.
+
+## 72. Gate 2 design: three sizes, retirement, negotiation (2026-09-26)
+
+Per [the review](review-flat-temporal-aa-2026-09-26.md)'s gate 2. Today's
+measured behaviour (flat_mono_resolve.cpp): DLAA refuses R != D outright
+(`flat-dlaa-requires-native-render-size`); DLSS/FSR refuse R > D
+(`flat-trained-resolve-cannot-downsample`); DLSS/FSR upscale R < D directly
+(E = D, flown today: 2496x1404 balanced to 3840x2160); TAA evaluates at R
+and composites to D with the bilinear minify. The design target is the
+review's table; the deltas are the R > D route (DLAA at R, downsample E=R
+to D, or native TAA at R) and the honesty rules (never silently disable
+the requested backend, never hide a lower internal resolution).
+
+Definitions the contract will carry explicitly: R = the game's render
+size (tone target), D = the present size (output), E = the temporal
+evaluation size. Route policy: DLSS/FSR upscale R < D evaluate at E = D;
+native (R == D) evaluates at E = R; R > D evaluates at E = R with a
+downsample stage E -> D (DLAA first, FSR Native AA pending its D3D11
+port's support, TAA already conforms). The copy chain's own downsample
+stays in place where it already maps R to D (the game does this at SS >
+100% today); EDVR supplies a conversion only where the game's sampling
+contract does not cover the replacement image's texel mapping.
+
+Staged implementation:
+1. (this section) Discovery: the contract reports R/E/D and the named
+   route from the existing selection fields, logged on change; no
+   behaviour change, no hash change (the corpus stands).
+2. R > D: DLAA at R with the downsample qualified against the copy's
+   texel mapping; FSR Native AA where the port allows it.
+3. Retirement: generation-based release of projection plans and
+   classifier memos (finding 3's 32/64 cliffs), with the corpus replaying
+   retirement boundaries.
+4. Backend negotiation: the served-floor ladder (dlss_floor.h) already
+   answers under-floor inputs on the VR door; the flat route gets the same
+   query on extent changes, logged per route.
+
+Qualification matrix (the review's gate 2 tests): sub-native, native,
+supersampled, odd sizes, crops, live extent changes without a restart,
+each with the corpus growing one trace per cell.

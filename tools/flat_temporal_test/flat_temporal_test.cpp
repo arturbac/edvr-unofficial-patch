@@ -3,6 +3,7 @@
 #include <utility>
 #include "../../src/d3d11/flat_temporal_model.h"
 #include "../../src/d3d11/flat_mono_frame.h"
+#include "../../src/d3d11/flat_mono_resolve.h"
 #include "../../src/d3d11/flat_runtime_model.h"
 #include "../../src/d3d11/flat_trace.h"
 #include "../../src/d3d11/engine_velocity_families.h"
@@ -1435,6 +1436,38 @@ int flatTraceCheck(const char* path) {
     return 0;
 }
 
+void testFlatResolveRoute() {
+    using namespace edvr;
+    // Gate 2 discovery (section 72): today's effective route per size pairing,
+    // honest refusals included. Mirrors the resolve's own predicates.
+    struct Case { FlatMonoResolveMode mode; uint32_t rW, rH, dW, dH;
+                  uint32_t eW, eH; bool refused; const char* name; };
+    const Case cases[] = {
+        // The flown stock pairing: SS 0.65 render upscaled by DLSS.
+        {FlatMonoResolveMode::Dlss, 2496,1404, 3840,2160, 3840,2160, false, "trained-upscale"},
+        {FlatMonoResolveMode::Dlss, 3840,2160, 3840,2160, 3840,2160, false, "trained-native"},
+        {FlatMonoResolveMode::Fsr,  2496,1404, 3840,2160, 3840,2160, false, "trained-upscale"},
+        // R > D: trained backends refuse today (gate-2 step 2 adds DLAA at R).
+        {FlatMonoResolveMode::Dlss, 5760,3240, 3840,2160, 0,0, true, "trained-cannot-downsample"},
+        {FlatMonoResolveMode::Dlaa, 5760,3240, 3840,2160, 0,0, true, "dlaa-requires-native"},
+        {FlatMonoResolveMode::Taa,  5760,3240, 3840,2160, 5760,3240, false, "taa-render-then-composite-down"},
+        {FlatMonoResolveMode::Dlaa, 3840,2160, 3840,2160, 3840,2160, false, "dlaa-native"},
+        {FlatMonoResolveMode::Taa,  3840,2160, 3840,2160, 3840,2160, false, "taa-native"},
+        {FlatMonoResolveMode::Taa,  2496,1404, 3840,2160, 2496,1404, false, "taa-render-then-composite-up"},
+        // Mixed axes (a crop) refuse the trained backends on either axis.
+        {FlatMonoResolveMode::Dlss, 3000,2160, 3840,1404, 0,0, true, "trained-cannot-downsample"},
+        {FlatMonoResolveMode::Taa,  3000,2160, 3840,1404, 3000,2160, false, "taa-render-then-composite-down"},
+    };
+    for (const auto& c : cases) {
+        const auto route = flatResolveRoute(c.mode, c.rW, c.rH, c.dW, c.dH);
+        check(route.refused == c.refused && route.evalWidth == c.eW && route.evalHeight == c.eH &&
+              std::strcmp(route.name, c.name) == 0, "resolve route names the effective treatment honestly");
+    }
+    check(flatResolveRoute(FlatMonoResolveMode::Taa, 0, 2160, 3840, 2160).refused &&
+          flatResolveRoute(FlatMonoResolveMode::Dlss, 3840, 2160, 3840, 0).refused,
+          "a zero on any axis refuses the route");
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
         return flatShaderClassifierSweep(argv[2]);
@@ -1454,6 +1487,7 @@ int main(int argc, char** argv) {
     testContractAdmissionAndReservation();
     testAdmissionAndWindow();
     testMonoFrameSelection();
+    testFlatResolveRoute();
     testProjectionSlices();
     testDetailBudget();
     failures += flatShaderCaptureTests();

@@ -9,6 +9,42 @@ struct ID3D11ShaderResourceView;
 
 namespace edvr {
 enum class FlatMonoResolveMode { Taa, Dlaa, Dlss, Fsr };
+
+// The three sizes of the staged program's gate 2 (docs/design-flat-temporal-aa-2026-09-23.md
+// section 72): the game's render size R, the temporal evaluation size E and
+// the present size D, with today's effective route named honestly -- refused
+// pairings refuse, they do not silently substitute. The resolve's own
+// refusals are the same predicates (flat_mono_resolve.cpp).
+struct FlatResolveRoute {
+    uint32_t evalWidth = 0, evalHeight = 0;   // E; zero when refused
+    const char* name = "invalid";
+    bool refused = true;
+};
+inline FlatResolveRoute flatResolveRoute(FlatMonoResolveMode mode,
+                                         uint32_t rW, uint32_t rH, uint32_t dW, uint32_t dH) {
+    FlatResolveRoute out{};
+    if (!rW || !rH || !dW || !dH) return out;
+    const bool smaller = rW < dW || rH < dH, larger = rW > dW || rH > dH;
+    if (mode == FlatMonoResolveMode::Taa) {
+        out.evalWidth = rW; out.evalHeight = rH; out.refused = false;
+        out.name = !smaller && !larger ? "taa-native"
+                 : larger ? "taa-render-then-composite-down" : "taa-render-then-composite-up";
+        return out;
+    }
+    if (mode == FlatMonoResolveMode::Dlaa) {
+        if (smaller || larger) { out.name = "dlaa-requires-native"; return out; }
+        out.evalWidth = rW; out.evalHeight = rH; out.refused = false;
+        out.name = "dlaa-native";
+        return out;
+    }
+    // Trained backends (DLSS/FSR): upscale evaluating at E = D; a larger
+    // render size is refused today -- the gate-2 step-2 route is DLAA at R
+    // with a downsample E = R to D, not a silent TAA substitution.
+    if (larger) { out.name = "trained-cannot-downsample"; return out; }
+    out.evalWidth = dW; out.evalHeight = dH; out.refused = false;
+    out.name = smaller ? "trained-upscale" : "trained-native";
+    return out;
+}
 struct FlatMonoResolveFrame {
     ID3D11ShaderResourceView* color = nullptr;
     ID3D11ShaderResourceView* depth = nullptr;

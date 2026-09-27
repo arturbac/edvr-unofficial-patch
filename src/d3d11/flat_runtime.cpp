@@ -1737,6 +1737,13 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         plan.depthResourceMipLevels=depthDesc.MipLevels;plan.depthArraySize=depthDesc.ArraySize;plan.depthSampleCount=depthDesc.SampleDesc.Count;
         if(!s.haveResolvePlan || !sameResolvePlan(plan,s.plannedResolve)) {
             s.resolvePreflight={};s.resolvePreflightRetryMs=0;
+            // Gate 2 discovery: the effective route, logged when the plan
+            // changes (startup, extent or backend-mode change).
+            const auto route = flatResolveRoute(plan.mode, plan.renderWidth, plan.renderHeight,
+                                                plan.outputWidth, plan.outputHeight);
+            Log::get().note("flat route: %s R=%ux%u E=%ux%u D=%ux%u%s", route.name,
+                plan.renderWidth, plan.renderHeight, route.evalWidth, route.evalHeight,
+                plan.outputWidth, plan.outputHeight, route.refused ? " (refused today)" : "");
         }
         s.plannedResolve=plan;s.haveResolvePlan=true;
     }
