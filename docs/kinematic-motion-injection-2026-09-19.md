@@ -61,9 +61,12 @@
   steady drift) while the engine path was exact (<=0.3 px quiet, <=1.5 px through
   the move). A dragged history on a broken camera term, not the reconstruction
   floor -- the floor verdict stands only at 10 km, where the chain was verified.
-  ps_4504BC268E109C31 keyed for vs_61AE (corpus-harness proven). The world-path
-  death is the camera-rows arc's H2 convicted (a parked stay of 4674 frames
-  spanned the move; the rows also undershot the head 35% all session, live).
+  ps_4504BC268E109C31 keyed for vs_61AE, and ps_51EE1F922FD220B0 (vs_4361) +
+  ps_D31DCAFA7C05CB47 (vs_889A) keyed from the 2026-09-27 glare_shader_dump
+  flight's dumps -- every pair corpus-harness proven (40,960 texels, 0
+  mismatches; MRT6 8192, 0 bad). The world-path death is the camera-rows arc's
+  H2 convicted (a parked stay of 4674 frames spanned the move; the rows also
+  undershot the head 35-40% in both sessions, live).
 - **Open:** walkers (vs_F516BF0201303B87, not a pool family; w=2 on the panel) wait on
   phase 2's previous bone palette -- a walking NPC still blurs after the on-foot fix;
   which camera the walk's other draws use (the new line's rows and distance say); a
@@ -72,12 +75,10 @@
   priority); the census's evaluated-but-not-drawn movers (the 09:38 entry); the boarding
   flicker (the LOD governor, not this arc); vs_DE54's ps_91F8 and ps_A607 (the patcher
   handles both now -- ps_A607 passes the harness as a candidate; both stay unkeyed while
-  their live owner/coverage is assessed); the close-range hull pair ps_51EE1F922FD220B0
-  (vs_4361) and ps_D31DCAFA7C05CB47 (vs_889A) -- candidates in the rig, awaiting the
-  dumped dxbc (the 2026-09-27 entry); the world path's camera-term health near a
-  station (rows chosen off the auxiliary passes, parked stays spanning motion, a 35%
-  undershoot of the head all session) -- belongs to the camera-rows arc, which owns the
-  gate; ships in space; builder-path movers and articulated parts (phase 2).
+  their live owner/coverage is assessed); the world path's camera-term health near a
+  station (rows chosen off the auxiliary passes, parked stays spanning motion, a 35-40%
+  undershoot of the head in both sessions) -- belongs to the camera-rows arc, which owns
+  the gate; ships in space; builder-path movers and articulated parts (phase 2).
 - **Ruled out (do not re-propose; each closed in its dated entry):** draw-shape memo
   identity, pool-slot identity, 3x3 SAD camera-vs-body match, hidden-bone-spin
   estimation (pre-2026-09-20); four engine-truth mover/static routes (2026-09-20
@@ -95,14 +96,14 @@
   truth there); the stamp fix as the cause of the world-path death (191906 shows the
   same miss on the 09-25 build); the reconstruction floor as the close-range
   explanation (the chain is broken upstream of DLSS).
-- **Next:** one flight on the frontier install, advanced.glare_shader_dump = 1 (restart
-  to arm) and advanced.temporal_aa_diagnostics = 1, parked at the coriolis port at
-  055427's range for a couple of minutes, an eye dump while moving the head: captures
-  ps_51EE1F922FD220B0/ps_D31DCAFA7C05CB47 for the harness; the family lines should name
-  ps_4504BC268E109C31 patched on vs_61AE instead of left stock, and the trained-path
-  kinds show the hull's engine-joined share up from ~16%. Then harness, key both,
-  rebuild, re-fly: the hull crisp through head moves. Then the controlled diagnostics
-  1 vs 0 comparison, and a walker near a drone with the motion_source view.
+- **Next:** FLY the three-shader keying at the coriolis port (055427's range, head
+  moves): the family lines name ps_51EE1F922FD220B0 and ps_D31DCAFA7C05CB47 patched
+  (vs_4361/vs_889A substituted binds >> 0 at close range), the hull's engine-joined
+  share up from ~16-19% toward the families' coverage, the hull crisp through head
+  moves. If any blur remains with the hull fully engine-covered, the residue is the
+  camera-rows arc's (the world path's dead/undershooting camera term on the
+  remaining world pixels). Then the controlled diagnostics 1 vs 0 comparison, and a
+  walker near a drone with the motion_source view.
 
 ## Premise
 
@@ -3084,3 +3085,44 @@ hidden-history mishandling (0 on the face); the reconstruction floor as the
 explanation at this range (the chain is broken upstream of DLSS); a
 regression from the stamp fix (its temporal_pass.cpp delta is Stats plumbing;
 191906 shows the same world-path miss on the 09-25 build).
+
+### 2026-09-27 -- Re-flown with ps_4504 keyed (eye run 080242): better, still blurring
+
+Frontier, the keyed build flown at once (v0.18.0-rc.2-4-g571e6d8c-dirty, its
+version line checked against the install). Same station, a few hundred px
+across this time (farther than 055427). ps_4504BC268E109C31 live on vs_61AE
+(48,835 -> 89,977 substituted binds in consecutive windows, named in the
+patched list); the hull's engine share on the station box rose from ~16% to
+~19.5%. vs_4361 and vs_889A still drew 0 keyed binds, ps_51EE1F922FD220B0 and
+ps_D31DCAFA7C05CB47 still stock -- the two biggest families await their
+dumps, so most of the hull keeps the camera term, and the blur persists
+(Sean, same evening: "still blurs").
+
+The dump (eye_080242, 08:02:42) repeats 055427's signature: the world path
+tracked the opening 7.5 px move (err -1.0, -0.2), then died on the next one
+(err +3.7, -2.2 against a 5.7 px move) and read ~0 through the ~1 px/frame
+drift; the engine path was again the closer signal (err +1.1, -1.4 on the
+move). At this range both paths' quiet-frame errors sit inside the jitter's
++/-0.5 px contamination of the raw frames -- a method limit, not a claim the
+engine path degrades at range; 055427's close-range numbers are the clean
+instrument. The session counters repeat the chronic world-path reading: rows
+undershoot the head, k = -0.397 this session (x -0.448, y -0.293, z -0.633),
+a steady (-0.69, +0.16) px offset on 1320 world-depth probes, 48 parked
+eye-frames (longest stay 1 -- short session). Two sessions, same undershoot:
+the camera-rows arc's H3 is not a one-off.
+
+**What a flight shows (the shader-dump flight):** advanced.glare_shader_dump
+= 1 (restart to arm) and advanced.temporal_aa_diagnostics = 1, parked at the
+port at 055427's range for a couple of minutes. edvr_logs\shaders gains
+ps_51EE1F922FD220B0.dxbc and ps_D31DCAFA7C05CB47.dxbc; the family lines then
+name them patched after keying, and the trained-path kinds show the hull's
+engine-joined share approaching the keyed families' coverage.
+
+**Keyed, same morning (build v0.18.0-rc.2-55-gd9a5be41):** the glare dump
+captured ps_51EE1F922FD220B0 (9148 B, ps_1694's close-range twin layout: slot
+v0.y, SV_Position v5) and ps_D31DCAFA7C05CB47 (3456 B, ps_B46E's twin: slot
+v0.x, SV_Position v4). Both through the corpus identity harness (40,960
+texels, 0 mismatches; MRT6 8192 checked, 0 bad) and keyed; ps_A607 stays the
+only candidate. The full gate passed on the merged tree (engine_velocity_test
+1128 checks; 1637 with the corpus). Awaiting Sean's verification flight at
+the port.

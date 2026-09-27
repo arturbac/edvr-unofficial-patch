@@ -73,9 +73,10 @@ std::atomic<const ID3D11Resource*> watch[kWatchSlots] = {};
 // session, and the two big rotating families drew NOTHING through their keyed
 // pairs at this range -- vs_4361 through ps_51EE1F922FD220B0, vs_889A through
 // ps_D31DCAFA7C05CB47, both stock -- so most of the hull kept the camera term
-// while it moved. ps_4504 keyed (the corpus identity harness: 40,960 texels,
-// 0 mismatches; MRT6 8192 checked, 0 bad). ps_51EE and ps_D31D await their
-// dumped dxbc (a glare_shader_dump flight at the port).
+// while it moved. All three keyed: ps_4504 from the 09-06 dump, ps_51EE and
+// ps_D31D dumped by the 2026-09-27 glare_shader_dump flight at the port; each
+// pair through the corpus identity harness (40,960 texels, 0 mismatches;
+// MRT6 8192 checked, 0 bad).
 using engine_velocity_family::Family;
 using engine_velocity_family::kFamilies;
 using engine_velocity_family::kFamilyCount;

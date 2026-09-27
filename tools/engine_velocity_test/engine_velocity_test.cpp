@@ -169,6 +169,12 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
         // its pixel shaders (ps_B46E at the station, ps_EBA9 elsewhere).
         {L"vs_436193B352A2897E", L"ps_16940F576006BE65", false},
         {L"vs_889A5279E68F0672", L"ps_B46E52A1E0B2F39C", false}, {L"vs_889A5279E68F0672", L"ps_EBA95E15B0A66102", false},
+        // Eye run 055427 (2026-09-26, parked close to a coriolis port): the
+        // station's close-range stock pixel shaders -- the hull's pixel path
+        // while the keyed pairs of the same families draw nothing. Dumped by
+        // the 2026-09-27 glare_shader_dump flight, harnessed, keyed.
+        {L"vs_436193B352A2897E", L"ps_51EE1F922FD220B0", false},
+        {L"vs_889A5279E68F0672", L"ps_D31DCAFA7C05CB47", false},
     };
     for (const auto& p : pairs) onePair(device, context, root, p, &check);
     // Candidates: pairs seen drawing stock that are not keyed. Each is tried
@@ -178,12 +184,6 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
     // while its live owner/coverage is assessed.
     const Pair candidates[] = {
         {L"vs_DE545DC8EE4FBB87", L"ps_A6070F9DD1CFB601", false},
-        // Eye run 055427 (2026-09-26, parked close to a coriolis port): the
-        // station's close-range stock pixel shaders -- the hull's pixel path
-        // while the keyed pairs of the same families draw nothing. Awaiting
-        // the dumped dxbc (a glare_shader_dump flight at the port).
-        {L"vs_436193B352A2897E", L"ps_51EE1F922FD220B0", false},
-        {L"vs_889A5279E68F0672", L"ps_D31DCAFA7C05CB47", false},
     };
     for (const auto& p : candidates) {
         g_softWhy.clear();
