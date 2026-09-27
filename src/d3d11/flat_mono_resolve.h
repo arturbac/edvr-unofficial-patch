@@ -12,12 +12,13 @@ enum class FlatMonoResolveMode { Taa, Dlaa, Dlss, Fsr };
 
 // The three sizes of the staged program's gate 2 (docs/design-flat-temporal-aa-2026-09-23.md
 // section 72): the game's render size R, the temporal evaluation size E and
-// the present size D, with today's effective route named honestly -- refused
+// the present size D, with the effective route named honestly -- refused
 // pairings refuse, they do not silently substitute. The resolve's own
-// refusals are the same predicates (flat_mono_resolve.cpp).
+// refusals use failReason verbatim (flat_mono_resolve.cpp).
 struct FlatResolveRoute {
     uint32_t evalWidth = 0, evalHeight = 0;   // E; zero when refused
     const char* name = "invalid";
+    const char* failReason = "flat-resolve-invalid-route";  // stable refusal token
     bool refused = true;
 };
 inline FlatResolveRoute flatResolveRoute(FlatMonoResolveMode mode,
@@ -32,15 +33,35 @@ inline FlatResolveRoute flatResolveRoute(FlatMonoResolveMode mode,
         return out;
     }
     if (mode == FlatMonoResolveMode::Dlaa) {
-        if (smaller || larger) { out.name = "dlaa-requires-native"; return out; }
+        if (smaller) {
+            out.name = "dlaa-requires-native";
+            out.failReason = "flat-dlaa-requires-native-render-size";
+            return out;
+        }
         out.evalWidth = rW; out.evalHeight = rH; out.refused = false;
-        out.name = "dlaa-native";
+        out.name = larger ? "dlaa-supersample" : "dlaa-native";
         return out;
     }
-    // Trained backends (DLSS/FSR): upscale evaluating at E = D; a larger
-    // render size is refused today -- the gate-2 step-2 route is DLAA at R
-    // with a downsample E = R to D, not a silent TAA substitution.
-    if (larger) { out.name = "trained-cannot-downsample"; return out; }
+    if (mode == FlatMonoResolveMode::Dlss) {
+        if (larger) {
+            // The honest NVIDIA reading of "DLSS" with supersampling: DLSS at
+            // 100% is DLAA, so evaluate at R and let the game's own copy
+            // downsample E = R to D. One final scaling step, nothing hidden.
+            out.evalWidth = rW; out.evalHeight = rH; out.refused = false;
+            out.name = "dlss-as-dlaa-supersample";
+            return out;
+        }
+        out.evalWidth = dW; out.evalHeight = dH; out.refused = false;
+        out.name = smaller ? "trained-upscale" : "trained-native";
+        return out;
+    }
+    // FSR: the D3D11 port's Native AA mode is unqualified (section 72), so
+    // FSR refuses supersampling honestly rather than substituting TAA.
+    if (larger) {
+        out.name = "fsr-native-aa-unqualified";
+        out.failReason = "flat-trained-resolve-cannot-downsample";
+        return out;
+    }
     out.evalWidth = dW; out.evalHeight = dH; out.refused = false;
     out.name = smaller ? "trained-upscale" : "trained-native";
     return out;

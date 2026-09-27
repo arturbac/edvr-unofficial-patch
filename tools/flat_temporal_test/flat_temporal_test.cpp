@@ -1575,15 +1575,18 @@ void testFlatResolveRoute() {
         {FlatMonoResolveMode::Dlss, 2496,1404, 3840,2160, 3840,2160, false, "trained-upscale"},
         {FlatMonoResolveMode::Dlss, 3840,2160, 3840,2160, 3840,2160, false, "trained-native"},
         {FlatMonoResolveMode::Fsr,  2496,1404, 3840,2160, 3840,2160, false, "trained-upscale"},
-        // R > D: trained backends refuse today (gate-2 step 2 adds DLAA at R).
-        {FlatMonoResolveMode::Dlss, 5760,3240, 3840,2160, 0,0, true, "trained-cannot-downsample"},
-        {FlatMonoResolveMode::Dlaa, 5760,3240, 3840,2160, 0,0, true, "dlaa-requires-native"},
+        // R > D (section 72 step 2): NVIDIA evaluates DLAA at R and the game's
+        // copy downsamples E = R to D; FSR refuses until Native AA qualifies.
+        {FlatMonoResolveMode::Dlss, 5760,3240, 3840,2160, 5760,3240, false, "dlss-as-dlaa-supersample"},
+        {FlatMonoResolveMode::Dlaa, 5760,3240, 3840,2160, 5760,3240, false, "dlaa-supersample"},
+        {FlatMonoResolveMode::Fsr,  5760,3240, 3840,2160, 0,0, true, "fsr-native-aa-unqualified"},
         {FlatMonoResolveMode::Taa,  5760,3240, 3840,2160, 5760,3240, false, "taa-render-then-composite-down"},
         {FlatMonoResolveMode::Dlaa, 3840,2160, 3840,2160, 3840,2160, false, "dlaa-native"},
         {FlatMonoResolveMode::Taa,  3840,2160, 3840,2160, 3840,2160, false, "taa-native"},
         {FlatMonoResolveMode::Taa,  2496,1404, 3840,2160, 2496,1404, false, "taa-render-then-composite-up"},
-        // Mixed axes (a crop) refuse the trained backends on either axis.
-        {FlatMonoResolveMode::Dlss, 3000,2160, 3840,1404, 0,0, true, "trained-cannot-downsample"},
+        // DLAA never upscales; mixed axes route NVIDIA to the supersample path.
+        {FlatMonoResolveMode::Dlaa, 2496,1404, 3840,2160, 0,0, true, "dlaa-requires-native"},
+        {FlatMonoResolveMode::Dlss, 3000,2160, 3840,1404, 3000,2160, false, "dlss-as-dlaa-supersample"},
         {FlatMonoResolveMode::Taa,  3000,2160, 3840,1404, 3000,2160, false, "taa-render-then-composite-down"},
     };
     for (const auto& c : cases) {
@@ -1591,6 +1594,11 @@ void testFlatResolveRoute() {
         check(route.refused == c.refused && route.evalWidth == c.eW && route.evalHeight == c.eH &&
               std::strcmp(route.name, c.name) == 0, "resolve route names the effective treatment honestly");
     }
+    check(std::strcmp(flatResolveRoute(FlatMonoResolveMode::Dlaa, 2496, 1404, 3840, 2160).failReason,
+                      "flat-dlaa-requires-native-render-size") == 0 &&
+          std::strcmp(flatResolveRoute(FlatMonoResolveMode::Fsr, 5760, 3240, 3840, 2160).failReason,
+                      "flat-trained-resolve-cannot-downsample") == 0,
+          "refusal log tokens are stable");
     check(flatResolveRoute(FlatMonoResolveMode::Taa, 0, 2160, 3840, 2160).refused &&
           flatResolveRoute(FlatMonoResolveMode::Dlss, 3840, 2160, 3840, 0).refused,
           "a zero on any axis refuses the route");

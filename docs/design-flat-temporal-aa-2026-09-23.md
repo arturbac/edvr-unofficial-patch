@@ -4243,6 +4243,13 @@ Staged implementation:
    behaviour change, no hash change (the corpus stands).
 2. R > D: DLAA at R with the downsample qualified against the copy's
    texel mapping; FSR Native AA where the port allows it.
+   SHIPPED 2026-09-26: the route table owns the size refusals
+   (flatResolveRoute), NVIDIA supersampling evaluates DLAA at E = R and the
+   game's copy downsamples to D (one final scaling step), FSR at R > D
+   stays honestly refused until its port's Native AA qualifies. The
+   preflight's drifted copy of the refusal rules is consolidated onto the
+   route function. WARP-qualified: the rig's supersample case checks the
+   backend receives E = R on both axes and the output view is render-sized.
 3. Retirement: generation-based release of projection plans and
    classifier memos (finding 3's 32/64 cliffs), with the corpus replaying
    retirement boundaries.
