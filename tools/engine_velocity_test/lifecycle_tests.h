@@ -343,6 +343,7 @@ float4 main(PsIn i) : SV_Target0 { return float4(i.uv, 1, 1); }
         x.ptr = p; x.hash = hash; ++x.gen;
     }
     void setVs() { ctx->VSSetShader(vs.Get(), nullptr, 0); shadow(BindSlot::Vs, vs.Get(), kVsHash); }
+    void setVs(ID3D11VertexShader* p, uint64_t hash) { ctx->VSSetShader(p, nullptr, 0); shadow(BindSlot::Vs, p, hash); }
     void setPs(ID3D11PixelShader* p, uint64_t hash) { ctx->PSSetShader(p, nullptr, 0); shadow(BindSlot::Ps, p, hash); }
     void setPool(ID3D11ShaderResourceView* v) { ctx->VSSetShaderResources(33, 1, &v); shadow(BindSlot::VsSrv33, v); }
     void setScene(ID3D11Buffer* b) { ctx->VSSetConstantBuffers(1, 1, &b); shadow(BindSlot::VsCb1, b); }
@@ -384,6 +385,13 @@ float4 main(PsIn i) : SV_Target0 { return float4(i.uv, 1, 1); }
     }
     void draw(UINT instance = 5) {
         edvr::engineVelocityBeforeDraw(ctx, true);
+        ctx->DrawInstanced(4, 1, 0, instance == 9 ? 1 : 0);
+    }
+    // A draw whose slot-0 target is not the eye's colour: vscreen computes
+    // rtv0Eye false for it (the detail pass's shape), so only the depth view
+    // names the eye.
+    void drawNoEyeColour(UINT instance = 5) {
+        edvr::engineVelocityBeforeDraw(ctx, false);
         ctx->DrawInstanced(4, 1, 0, instance == 9 ? 1 : 0);
     }
     void clearEye(int eye) {
@@ -1302,6 +1310,123 @@ inline void run(const Harness& h) {
     std::printf("  lifecycle: engine_velocity.cpp's draw half on WARP -- re-maps, interleaved eyes, source swaps, pool "
                 "writes, blend states, depth formats, the on-foot source's slot target, stand-down: every case as "
                 "specified (%zu log lines)\n", g_log.size());
+}
+
+// S4 (the coriolis seam arc, 2026-09-27): a self-marking pair's stock draw
+// (kSelfMarking, engine_velocity_families.h) latches the game's own target-6
+// texture for the eye-frame and the compose's views carry it -- including the
+// detail pass's shape, where the eye's colour is not at slot 0 and the depth
+// probe's map of the scene pair names the eye alone. Drives the production
+// draw half with the family's REAL dumped vertex shader (the corpus dir), so
+// deriveFamily succeeds exactly as live.
+inline void selfMarkingCase(const Harness& h, const std::vector<BYTE>& vsBytes) {
+    edvr::g_clockForTest = &lifecycle_fake::fakeClock;   // run() cleared it; the summary window rides the fake clock
+    Game g(h);
+    g.setup();
+    edvr::engineVelocityConfigure(true);
+    const size_t mark = g_log.size();
+    ComPtr<ID3D11VertexShader> vs4361;
+    h.check(SUCCEEDED(h.device->CreateVertexShader(vsBytes.data(), vsBytes.size(), nullptr, &vs4361)),
+            "S4: the family's real VS creates on WARP");
+    edvr::engineVelocityRememberVs(vs4361.Get(), 0x436193B352A2897Eull, vsBytes.data(), vsBytes.size(), false);
+    const auto psBlob = g.compile(shader_tests::kPsA, "ps_5_0");
+    ComPtr<ID3D11PixelShader> psSeam;
+    h.check(SUCCEEDED(h.device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &psSeam)),
+            "S4: a stand-in PS object (the hash names the seam shader)");
+    // The game's own target-6 buffer for the pass: R32G32_FLOAT at the eye
+    // size, render-target AND shader-resource bindable (the compose reads it).
+    ComPtr<ID3D11Texture2D> g6;
+    ComPtr<ID3D11RenderTargetView> g6Rtv;
+    {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = kW; td.Height = kH; td.MipLevels = td.ArraySize = td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_R32G32_FLOAT; td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        h.check(SUCCEEDED(h.device->CreateTexture2D(&td, nullptr, &g6)), "S4: the game's channel texture");
+        h.check(SUCCEEDED(h.device->CreateRenderTargetView(g6.Get(), nullptr, &g6Rtv)), "S4: its RTV");
+    }
+    auto bindWithG6 = [&] {
+        ID3D11RenderTargetView* r[8] = {g.rtv[0][0].Get(), g.rtv[0][1].Get(), g.rtv[0][2].Get(), g.rtv[0][3].Get(),
+                                        nullptr, nullptr, g6Rtv.Get(), nullptr};
+        h.context->OMSetRenderTargets(8, r, g.dsv[0].Get());
+    };
+
+    // Frame 1: the keyed pair's pass first (the eye-frame is prepared by it,
+    // as live), then two seam draws with the game's channel at slot 6.
+    g.ordinaryFrame();
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    g.setPs(psSeam.Get(), 0xBCF75CEA37060EAEull);
+    bindWithG6();
+    g.draw();
+    g.draw();   // a second seam draw of the eye-frame must not re-latch or double-count
+    {
+        edvr::EngineVelocityViews v{};
+        h.check(g.views(0, &v), "S4: eye 0 given with the seam draw latched");
+        h.check(v.gameMark != nullptr, "S4: the views carry the game's own target-6 channel for the compose");
+        release(v);
+    }
+
+    // Frame 2, the detail pass's own shape: slot 0 is NOT the eye's colour
+    // (the source's targets stand in for "not eye-sized"), so rtv0Eye is
+    // false and the depth probe's map of the scene pair names the eye alone.
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    g.setPs(psSeam.Get(), 0xBCF75CEA37060EAEull);
+    {
+        ID3D11RenderTargetView* r[8] = {g.sourceRtv[0].Get(), nullptr, nullptr, nullptr, nullptr, nullptr,
+                                        g6Rtv.Get(), nullptr};
+        h.context->OMSetRenderTargets(8, r, g.dsv[0].Get());
+        g.shadow(BindSlot::Rtv0, r[0]);
+    }
+    g.drawNoEyeColour();
+    {
+        edvr::EngineVelocityViews v{};
+        h.check(g.views(0, &v), "S4: eye 0 given on the detail-pass shape too");
+        h.check(v.gameMark != nullptr, "S4: the eye was attributed by depth and the channel latched");
+        release(v);
+    }
+
+    // Frame 3: a channel of the wrong shape is refused but still counted.
+    // (The texture must OUTLIVE the draw: OM holds the pointer. And same
+    // size, wrong format: D3D11 demands all targets share the depth's dims,
+    // so a smaller one would never even bind.)
+    ComPtr<ID3D11Texture2D> wrong;
+    ComPtr<ID3D11RenderTargetView> wrongRtv;
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    g.setPs(psSeam.Get(), 0xBCF75CEA37060EAEull);
+    {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = kW; td.Height = kH; td.MipLevels = td.ArraySize = td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        h.check(SUCCEEDED(h.device->CreateTexture2D(&td, nullptr, &wrong)), "S4: wrong-format channel texture");
+        h.check(SUCCEEDED(h.device->CreateRenderTargetView(wrong.Get(), nullptr, &wrongRtv)), "S4: its RTV");
+        ID3D11RenderTargetView* r[8] = {g.rtv[0][0].Get(), g.rtv[0][1].Get(), g.rtv[0][2].Get(), g.rtv[0][3].Get(),
+                                        nullptr, nullptr, wrongRtv.Get(), nullptr};
+        h.context->OMSetRenderTargets(8, r, g.dsv[0].Get());
+    }
+    g.draw();
+    {
+        edvr::EngineVelocityViews v{};
+        h.check(g.views(0, &v), "S4: eye 0 given");
+        h.check(v.gameMark == nullptr, "S4: a wrong-shaped channel is refused, never latched");
+        release(v);
+    }
+    g.endFrame(true);   // the window's summary
+    h.check(logged("self-marking pixel shaders at the draw path: 3 draws seen, 0 with no eye", mark),
+            "S4: the draw-path census counts the seam draws, none eyeless");
+    h.check(logged("self-marked 3 draws (the game's own slot+depth channel, latched 2 eye-frames)", mark),
+            "S4: the family line counts the stock draws and the two latched eye-frames");
+    edvr::engineVelocityShutdown();
+    edvr::g_clockForTest = nullptr;
 }
 
 }  // namespace lifecycle_tests

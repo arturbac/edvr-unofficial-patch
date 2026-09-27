@@ -3260,3 +3260,33 @@ fully proven by it -- which is why the fix and the instrument fly together:
 
 engine_velocity_test 1152 (the gate), 1677 with the corpus, after the change;
 full build green. Not merged to main (Sean's call: verification first).
+
+### 2026-09-27 -- Route A v3: the seam draws never reach the draw path; the bind census goes in
+
+Flown (13:05 session, the route-A v2 build): selfMarkSeen read 0 all session
+-- the seam draws never arrive at slowPath with the hash bound, so the v2
+depth-attribution fix could not have been the blocker (it is kept regardless:
+the detail pass legitimately lacks the eye's colour at slot 0). The unkeyed
+sighting history across EVERY frontier session is the long-form witness:
+ps_BCF75CEA37060EAE and ps_2F924695596C8195 never once printed "left stock"
+while ps_51EE/ps_D31D/ps_4504/ps_451A etc. all have -- their draws do not
+reach the counting branch, while the eye-run census (called from
+beginPanelOverride, earlier in the same thunk) records them fine. The live
+question is therefore at the hook layer: whether the seam pass's PS binds
+come through hookedPSSetShader at all (a command-list replay would not call
+it) or the draws miss engineVelocityBeforeDraw.
+
+The instrument for it, in this build: vscreen's PS hook counts the two
+hashes' binds, and the per-window line reads "self-marking pixel shaders at
+the draw path: N draws seen, M with no eye attributable, B binds through the
+PS hook". B = 0 with the draws in the census says command-list replay (the
+repair moves to the replay path); B > 0 with N = 0 says the draw thunk skips
+them (the verdict or the quick-path); B > 0, N > 0, latched ~ the eye-frames
+says healthy.
+
+S4 in the lifecycle rig drives the production draw half through the branch
+with the family's real dumped VS: the keyed pass then a seam draw latches
+the game's channel and the views carry it; the detail-pass shape (no eye
+colour at slot 0) attributes by depth and latches; a wrong-format channel
+refuses, still counted. engine_velocity_test 1152 gate checks, 1728 with the
+corpus, on the final binary.

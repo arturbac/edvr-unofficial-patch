@@ -312,9 +312,10 @@ struct DrawStats {
     uint64_t restores = 0;
     uint64_t frames = 0;
     // The self-marking detail shaders' draw-path census (the seam arc,
-    // 2026-09-27): reached slowPath with a self-marking PS bound, and of those
-    // the ones where neither the eye-pass nor the depth map named an eye.
-    uint64_t selfMarkSeen = 0, selfMarkNoEye = 0;
+    // 2026-09-27): reached slowPath with a self-marking PS bound, of those
+    // the ones where neither the eye-pass nor the depth map named an eye,
+    // and their PS's binds through vscreen's shader hook.
+    uint64_t selfMarkSeen = 0, selfMarkNoEye = 0, selfMarkBinds = 0;
     uint64_t pixelsJoined = 0, pixelsMasked = 0, pixelsCamera = 0, pixelsStale = 0, pixelsCorrupt = 0, pixelsStamped = 0,
              pixelReads = 0;
     // The on-foot source: its eye-frames (also counted in eyeFrames above),
@@ -1483,10 +1484,11 @@ void summaryLocked(uint64_t now) {
                         "declined state %llu, resource %llu, shader %llu.",
                         u(g_draw.overlayCopies), double(g_draw.overlayBytes) / 1e6, u(g_draw.overlayGuardedDraws),
                         u(g_draw.overlayDeclinedState), u(g_draw.overlayDeclinedCreate), u(g_draw.overlayDeclinedShader));
-    if (g_draw.selfMarkSeen)
+    if (g_draw.selfMarkSeen || g_draw.selfMarkBinds)
         Log::get().note("engine motion: self-marking pixel shaders at the draw path: %llu draws seen, %llu with no "
-                        "eye attributable (not the eye's colour at slot 0, and the depth probe named none).",
-                        u(g_draw.selfMarkSeen), u(g_draw.selfMarkNoEye));
+                        "eye attributable (not the eye's colour at slot 0, and the depth probe named none), %llu "
+                        "binds through the PS hook.",
+                        u(g_draw.selfMarkSeen), u(g_draw.selfMarkNoEye), u(g_draw.selfMarkBinds));
     for (int f = 0; f < kFamilyCount; ++f) {
         FamilyState& s = g_families[f];
         std::string patched, failed;
@@ -1922,6 +1924,13 @@ void engineVelocityNotePixels(uint32_t joined, uint32_t masked, uint32_t camera,
     g_draw.pixelsCorrupt += corrupt;
     g_draw.pixelsStamped += stamped;
     ++g_draw.pixelReads;
+}
+
+void engineVelocityNoteSelfMarkingPs(uint64_t psHash) noexcept {
+    // vscreen's PS hook, owner context: the self-marking detail shaders' binds,
+    // counted for the draw-path census (the seam arc's live question: do their
+    // binds come through the hook at all).
+    if (engine_velocity_family::selfMarkingPs(psHash)) ++g_draw.selfMarkBinds;
 }
 
 } // namespace edvr

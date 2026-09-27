@@ -197,6 +197,9 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
     // write the marker encoding into the game's own SV_Target6. Two proofs:
     // the patcher must refuse them ("target 6 occupied"), and the stock draw
     // must hold (2*slot+1, the fragment's depth) at MRT6 with no patch at all.
+    // Then S4: the production draw half driven through the self-marking branch
+    // with the family's real VS.
+    std::vector<BYTE> vs4361;
     for (const auto& p : edvr::engine_velocity_family::kSelfMarking) {
         wchar_t wvs[24], wps[24];
         std::swprintf(wvs, 24, L"vs_%016llX", static_cast<unsigned long long>(p.vs));
@@ -205,6 +208,7 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
         const auto psb = readFile(root + L"\\shaders\\" + wps + L".dxbc");
         check(!vsb.empty() && !psb.empty(), "self-marking pair's dxbc present");
         if (vsb.empty() || psb.empty()) continue;
+        if (p.vs == 0x436193B352A2897Eull) vs4361 = vsb;
         edvr::EngineVelocityInputs in;
         std::string why;
         check(edvr::engineVelocityDeriveInputs(vsb.data(), vsb.size(), in, why), why.c_str());
@@ -219,6 +223,7 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
         check(r.slotChecked > 0 && r.slotBad == 0,
               "self-marking: the STOCK shader writes (2*slot+1, depth) at MRT6 natively, no patch");
     }
+    if (!vs4361.empty()) lifecycle_tests::selfMarkingCase({device, context, &check}, vs4361);
 }} // namespace
 
 int wmain(int argc, wchar_t** argv) {

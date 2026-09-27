@@ -192,6 +192,10 @@ bool engineVelocityTakeCaptureGpu(EngineVelocityCaptureGpu* out);
 // camera term).
 void engineVelocityNotePixels(uint32_t joined, uint32_t masked, uint32_t camera, uint32_t stale, uint32_t corrupt,
                               uint32_t stamped);
+// vscreen's PS hook calls this with the bound shader's content hash: counts
+// binds of the self-marking detail shaders, so the draw-path census can tell
+// "never bound through the hook" from "bound but never drawn through it".
+void engineVelocityNoteSelfMarkingPs(uint64_t psHash) noexcept;
 // On foot (docs/kinematic-motion-injection-2026-09-19.md, 2026-09-23 "On
 // foot"): the world is drawn into a flat SOURCE image that the 2D screen
 // shows in each eye, and no pool draw targets an eye. screen_motion names the
