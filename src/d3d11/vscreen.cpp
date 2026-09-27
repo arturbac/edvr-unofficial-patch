@@ -2420,6 +2420,15 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
             hudCensusGdPair(self, kind, count, instances, args);
         }
     }
+    // the crisp-HUD half of fix.ui_quality (ui_layer.h): admit the game's tonemap draw for its
+    // re-issue, which tonemaps the HDR HUD layer into the eye's 8-bit layer
+    // right after the draw's own issue (crispHudTonemapReissue below). One
+    // bool load while off (the default); while on, the 3-vertex prefilter
+    // and the structural admission run for a handful of full-screen draws a
+    // frame.
+    if (uiLayerCrispOn() && self == g_state->ownerCtx) {
+        uiLayerCrispNoteEyeDraw(self, kind, count, instances, args.startInstance);
+    }
     // The pool probe (object_probe.h): one bool while off; a few t33 reads a
     // frame until the pool is known, then one a second. The bool is now read
     // HERE: objectProbeWantsDraws() is the callee's own first test, inline,
@@ -3732,6 +3741,23 @@ __declspec(noinline) void hudCensusGdPair(ID3D11DeviceContext* self, char kind, 
     hudLayerCensusGdEnd(self, save);
 }
 
+// the crisp-HUD half of fix.ui_quality's tonemap re-issue (ui_layer.h): the game's admitted tonemap
+// draw once more through pureDrawReissue, between uiLayerCrispToneBegin's
+// rebind (the HDR HUD layer at the admitted HDR slot, the eye's 8-bit layer
+// as the target, RGB-only) and uiLayerCrispToneEnd's restore and coverage
+// pass. Runs right after the draw's own issue, so every other binding is the
+// game's own. NOINLINE for the same reason pureDrawReissue is: at most two
+// admitted draws a frame while the crisp-HUD half is on, and the draw path must not
+// pay its frame for the rest.
+__declspec(noinline) void crispHudTonemapReissue(ID3D11DeviceContext* self, char kind, UINT count,
+                                                 UINT instances, const DrawArgs& args) {
+    if (uiLayerCrispToneBegin(self)) {
+        GpuCensusScope census(self, GpuCensusSection::FrameUiLayerReissues);
+        pureDrawReissue(self, kind, count, instances, args);
+        uiLayerCrispToneEnd(self);
+    }
+}
+
 // fix.ui_quality (ui_layer.h): which piece of the interface an owner draw is.
 // Asked only while the layer is live. A draw into anything that is not an
 // eye target is none -- the GUI's own draws into its surfaces are the
@@ -3891,8 +3917,11 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // never taken (unchanged). verdictForwards/substituted are the same
     // facts the family branch above passes uiLayerDecide, so an after-UI
     // write is governed by the identical rules a real UI draw would be.
-    // Counted, named either way.
-    if (!uiLayer && owner && uiLayerWatching())
+    // Counted, named either way. An admitted crisp-HUD tonemap draw is not
+    // shown to it: the tonemap READS the HDR target the holo panels were
+    // taken from, which is exactly what the re-issue re-points -- not a post
+    // pass to name.
+    if (!uiLayer && owner && uiLayerWatching() && !uiLayerCrispPending())
         uiLayer = uiLayerNoteOther(self, count, uiLayerVerdictForwards(v), g_state->curveThisDraw);
     // The sub-draw probe, which also SWALLOWS the game's draw -- it re-issues
     // the surviving index ranges itself. Before the curve substitution
@@ -3944,6 +3973,15 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     if (layered) {
         uiLayerEnd(self);
         if (originalIssued) uiLayerSecondIssues(self, kind, count, instances, args);
+    }
+    // the crisp-HUD half of fix.ui_quality: the game's tonemap draw, admitted in the eye-draw branch
+    // while the HDR HUD layer holds this frame's holo panels, is issued once
+    // more with the layer as its HDR source -- tonemapping the HUD into the
+    // eye's 8-bit layer, which the door's composite shows. AFTER the game's
+    // own issue, so the picture is stock whether or not the re-issue runs;
+    // one bool load for the ordinary draw.
+    if (originalIssued && uiLayerCrispPending()) {
+        crispHudTonemapReissue(self, kind, count, instances, args);
     }
     // A draw the UI layer took is not in the eye's colour at all, so the
     // interface depth below does not re-issue it: its depth and its
@@ -5134,6 +5172,12 @@ void vScreenUpdateSubresourceRaw(ID3D11DeviceContext* ctx, ID3D11Resource* dstRe
 void vScreenRSSetViewportsRaw(ID3D11DeviceContext* ctx, uint32_t n, const D3D11_VIEWPORT* vps) {
     if (!g_state || !g_state->realRSSetViewports || !ctx) return;
     g_state->realRSSetViewports(ctx, n, vps);
+}
+
+void vScreenPSSetShaderResourcesRaw(ID3D11DeviceContext* ctx, uint32_t startSlot, uint32_t n,
+                                    ID3D11ShaderResourceView* const* srvs) {
+    if (!g_state || !g_state->realPSSetShaderResources || !ctx) return;
+    g_state->realPSSetShaderResources(ctx, startSlot, n, srvs);
 }
 
 void vScreenClearRenderTargetViewRaw(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv,

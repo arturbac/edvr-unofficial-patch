@@ -32,6 +32,7 @@ struct ID3D11ClassInstance;
 struct ID3D11Buffer;
 struct ID3D11Resource;
 struct ID3D11BlendState;
+struct ID3D11ShaderResourceView;
 struct D3D11_BOX;
 struct D3D11_VIEWPORT;
 
@@ -143,6 +144,12 @@ void vScreenUpdateSubresourceRaw(ID3D11DeviceContext* ctx, ID3D11Resource* dstRe
 void vScreenRSSetViewportsRaw(ID3D11DeviceContext* ctx, uint32_t n, const D3D11_VIEWPORT* vps);
 void vScreenClearRenderTargetViewRaw(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv,
                                      const float colour[4]);
+// The PS shader-resource slots, past the binding shadow's hook: the crisp-HUD half's of fix.ui_quality
+// tonemap re-issue swaps the admitted draw's HDR source slot for the HDR HUD
+// layer's SRV and puts the game's own back after (ui_layer.cpp), and the
+// shadow must keep describing the game's bindings throughout.
+void vScreenPSSetShaderResourcesRaw(ID3D11DeviceContext* ctx, uint32_t startSlot, uint32_t n,
+                                    ID3D11ShaderResourceView* const* srvs);
 // The layer's copy of the game's depth-stencil target, which it seeds its
 // own from (a depth- or stencil-tested UI draw): past the copy hook, which
 // would report the write to the motion paths.

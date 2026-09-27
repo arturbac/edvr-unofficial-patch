@@ -11,6 +11,7 @@
 
 #include "binding_shadow.h"       // the owner-context binding shadow
 #include "draw_state_describe.h"  // viewName, describeBlend/describeDs, shapeOf, dsStateOf
+#include "tonemap_admit.h"        // the tonemap draw's structural admission, shared with the crisp-HUD half of fix.ui_quality
 #include "ui_depth.h"             // uiDepthEyeOfTarget: the eye, by the pass's own table
 #include "ui_layer.h"             // nativeTemporalProjectionReference
 #include "ui_layer_math.h"        // the family VS hashes
@@ -54,13 +55,10 @@ int familyOfVs(uint64_t vs) {
     return -1;
 }
 
-// The measured tonemap pair (eye_tonemap_snapshot.h:139), the EDHM swap
-// (docs/edhm-black-cockpit-2026-09-15.md:161), and the composite pass the
+// The measured tonemap pair, the EDHM swap (both in tonemap_admit.h now,
+// shared with the crisp-HUD half of fix.ui_quality's re-issue), and the composite pass the
 // design doc's bloom question turns on. Recognition is STRUCTURE-FIRST;
 // the hashes only name what was found.
-constexpr uint64_t kToneVsMeasured = 0x2D78DC3FD2C0C543ull;
-constexpr uint64_t kTonePsMeasured = 0x99C21CEB7A699821ull;
-constexpr uint64_t kToneVsEdhm = 0x642017A6FEDAE0E8ull;
 constexpr uint64_t kCompositeVs = 0x953C8123AD8DC13Bull;
 
 // ------------------------------------------------------------------ window
@@ -945,101 +943,14 @@ void geResolve(ID3D11DeviceContext* ctx) {
 // PS b2 at least 256 bytes. The exact vs/ps is logged for every structure
 // match (deduplicated) so a variant names itself; the FULL tonemap adds
 // the measured SRV shape -- VS t0 (exposure) present, PS t0 a 3D view
-// (the colour LUT), PS t1 2D (the HDR source).
-struct ToneInfo {
-    bool full = false;
-    void* rtvRes = nullptr;
-    uint32_t rtvW = 0, rtvH = 0;
-    DXGI_FORMAT rtvFmt = DXGI_FORMAT_UNKNOWN;
-    uint32_t b2 = 0;
-    void* vsT0Res = nullptr;
-    void* psT0Res = nullptr;
-    bool psT0Is3D = false;
-    void* psT1Res = nullptr;
-    uint32_t psT1W = 0, psT1H = 0;
-    DXGI_FORMAT psT1Fmt = DXGI_FORMAT_UNKNOWN;
-};
+// (the colour LUT), the HDR source 2D at the ps table's slot. The structure
+// and the shape read are tonemap_admit.h's, shared with the crisp-HUD half of fix.ui_quality's
+// re-issue so the two can never drift apart about which draw the tonemap is;
+// ToneInfo is the shared ToneAdmit under this file's own name.
+using ToneInfo = ToneAdmit;
 
-bool toneInspect(ID3D11DeviceContext* ctx, ToneInfo& ti) {
-    ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-    Ptr<ID3D11DepthStencilView> dsv;
-    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
-    bool one = rtvs[0] != nullptr && dsv == nullptr;
-    for (uint32_t i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) one = one && !rtvs[i];
-    Ptr<ID3D11RenderTargetView> rt;
-    rt.Attach(rtvs[0]);
-    for (uint32_t i = 1; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
-        if (rtvs[i]) rtvs[i]->Release();
-    if (!one || !rt) return false;
-    D3D11_RENDER_TARGET_VIEW_DESC rd{};
-    rt->GetDesc(&rd);
-    if (rd.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D || rd.Texture2D.MipSlice) return false;
-    Ptr<ID3D11BlendState> blend;
-    FLOAT factors[4]{};
-    UINT mask = 0;
-    ctx->OMGetBlendState(&blend, factors, &mask);
-    if (blend) {
-        D3D11_BLEND_DESC bd{};
-        blend->GetDesc(&bd);
-        if (bd.RenderTarget[0].BlendEnable) return false;
-    }
-    Ptr<ID3D11Buffer> cb;
-    ctx->PSGetConstantBuffers(2, 1, &cb);
-    if (!cb) return false;
-    D3D11_BUFFER_DESC cbd{};
-    cb->GetDesc(&cbd);
-    if (cbd.ByteWidth < 256) return false;
-    ti.b2 = cbd.ByteWidth;
-    ti.rtvFmt = rd.Format;
-    Ptr<ID3D11Resource> res;
-    rt->GetResource(&res);
-    if (res) {
-        ti.rtvRes = res.Get();
-        Ptr<ID3D11Texture2D> t2;
-        if (SUCCEEDED(res->QueryInterface(IID_PPV_ARGS(&t2)))) {
-            D3D11_TEXTURE2D_DESC td{};
-            t2->GetDesc(&td);
-            ti.rtvW = td.Width;
-            ti.rtvH = td.Height;
-        }
-    }
-    Ptr<ID3D11ShaderResourceView> vsT0, psT0, psT1;
-    ctx->VSGetShaderResources(0, 1, &vsT0);
-    ctx->PSGetShaderResources(0, 1, &psT0);
-    ctx->PSGetShaderResources(1, 1, &psT1);
-    if (vsT0) {
-        Ptr<ID3D11Resource> r;
-        vsT0->GetResource(&r);
-        ti.vsT0Res = r.Get();
-    }
-    if (psT0) {
-        D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
-        psT0->GetDesc(&vd);
-        ti.psT0Is3D = vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE3D;
-        Ptr<ID3D11Resource> r;
-        psT0->GetResource(&r);
-        ti.psT0Res = r.Get();
-    }
-    if (psT1) {
-        D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
-        psT1->GetDesc(&vd);
-        ti.psT1Fmt = vd.Format;
-        Ptr<ID3D11Resource> r;
-        psT1->GetResource(&r);
-        ti.psT1Res = r.Get();
-        if (r && vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) {
-            Ptr<ID3D11Texture2D> t2;
-            if (SUCCEEDED(r->QueryInterface(IID_PPV_ARGS(&t2)))) {
-                D3D11_TEXTURE2D_DESC td{};
-                t2->GetDesc(&td);
-                ti.psT1W = td.Width;
-                ti.psT1H = td.Height;
-            }
-        }
-        ti.full = ti.vsT0Res != nullptr && ti.psT0Is3D && ti.psT1Res != nullptr &&
-                  vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D;
-    }
-    return true;
+bool toneInspect(ID3D11DeviceContext* ctx, uint64_t ps, ToneInfo& ti) {
+    return tonemapAdmitStructure(ctx, ps, ti);
 }
 
 // One line per distinct (vs, ps) that passes the structure test, with
@@ -1067,13 +978,14 @@ void noteToneVariant(uint64_t vs, uint64_t ps, const ToneInfo& ti) {
                                                                            : "NEW";
     Log::get().note(
         "hud layer census: gb tonemap variant: vs=%016llX ps=%016llX (%s)%s: rtv %ux%u %s "
-        "res=%p, b2=%u, vs t0=%p (exposure), ps t0=%p (lut, %s), ps t1=%p %ux%u %s (hdr) "
+        "res=%p, b2=%u, vs t0=%p (exposure), ps t0=%p (lut, %s), ps t%d=%p %ux%u %s (hdr) "
         "hdr=family-target:%s",
         static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps), which,
         ti.full ? " [full match]" : " [shape only -- srv shape fails]",
         ti.rtvW, ti.rtvH, viewName(ti.rtvFmt), ti.rtvRes, ti.b2, ti.vsT0Res, ti.psT0Res,
-        ti.psT0Is3D ? "3D" : "not 3D", ti.psT1Res, ti.psT1W, ti.psT1H, viewName(ti.psT1Fmt),
-        famTargeted(ti.psT1Res) ? "yes" : "no");
+        ti.psT0Is3D ? "3D" : "not 3D", ti.hdrSlotRead >= 0 ? ti.hdrSlotRead : 1, ti.hdrRes,
+        ti.hdrW, ti.hdrH, viewName(ti.hdrFmt),
+        famTargeted(ti.hdrRes) ? "yes" : "no");
 }
 
 // The design doc's bloom question: vs 953C8123AD8DC13B, believed there to
@@ -1293,9 +1205,9 @@ bool hudLayerCensusEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count, 
     // which. The 3-vertex prefilter is register-cheap; the state reads
     // happen for the handful of full-screen triangles a frame that pass it.
     if ((kind == 'D' || kind == 'N') && count == 3 && instances == 1 && args.startInstance == 0) {
+        const uint64_t ps = bindingShaderHash(BindSlot::Ps);
         ToneInfo ti;
-        if (toneInspect(ctx, ti)) {
-            const uint64_t ps = bindingShaderHash(BindSlot::Ps);
+        if (toneInspect(ctx, ps, ti)) {
             noteToneVariant(vs, ps, ti);
             if (ti.full) {
                 int eye = -1;
@@ -1309,7 +1221,7 @@ bool hudLayerCensusEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count, 
                     const uint32_t t = f.tonemapCount++;
                     f.tonemapOrd[t] = eyeDrawIndex;
                     f.tonemapEye[t] = eye;
-                    f.tonemapHdrIsFam[t] = famTargeted(ti.psT1Res);
+                    f.tonemapHdrIsFam[t] = famTargeted(ti.hdrRes);
                 }
                 geOnTonemap(ctx, eye);
             } else {

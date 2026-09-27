@@ -31,13 +31,17 @@
 // drawn against the layer's own depth-stencil target, the game's resampled
 // to the layer's size with the jitter cancelled. A multiply (the loading
 // screen's gamma pass) scales the layer and a per-channel transmittance the
-// composite applies to the frame. WHAT IT LEAVES: the cockpit's holo
-// panels, flight HUD and target sprite, which the game draws into the lit
-// HDR target before exposure and the tonemap -- they stay in the picture the
-// upscaler reconstructs, steadied by the UI depth and the reactive mask, and
-// the layer, composited after the tonemap, cannot take them without
-// transcribing it. Every family it leaves is named in the log with the
-// reason.
+// composite applies to the frame. ALSO TAKEN, into a per-eye HDR layer at
+// the same size (the crisp-HUD half, Phase 1 of
+// docs/cockpit-hud-layer-design-2026-09-27.md): the cockpit's holo panels,
+// which the game draws into the lit HDR target before exposure and the
+// tonemap -- they are tonemapped into the 8-bit layer by the game's own
+// tonemap draw, re-issued once per eye with the layer as its HDR source
+// (the tonemap_admit.h admission), so the exposure, LUT and bloom are the
+// game's own and the door's composite is untouched. WHAT IT LEAVES: the
+// flight HUD and target sprite (Phase 2), which stay in the picture the
+// upscaler reconstructs, steadied by the UI depth and the reactive mask.
+// Every family it leaves is named in the log with the reason.
 //
 // THE ORDER IT CHANGES, and the only one: a draw after a redirected draw
 // that WRITES the same eye target is taken into the layer too, after the
@@ -61,6 +65,8 @@ namespace detail {
 extern bool g_uiLayerLive;
 extern bool g_uiLayerWatching;
 extern bool g_uiLayerRedirecting;
+extern bool g_uiLayerCrispOn;
+extern bool g_uiLayerCrispPending;
 }  // namespace detail
 
 // The draw path's one gate: fix.ui_quality is on, a temporal mode is on, and
@@ -126,6 +132,39 @@ bool uiLayerMultiplyBegin(ID3D11DeviceContext* ctx);
 // scissors (the draw re-issued as it was; closed by uiLayerWriteBackEnd).
 bool uiLayerWriteBackBegin(ID3D11DeviceContext* ctx);
 void uiLayerWriteBackEnd(ID3D11DeviceContext* ctx);
+
+// the crisp-HUD half of fix.ui_quality (Phase 1 of docs/cockpit-hud-layer-design-2026-09-27.md): the
+// cockpit holo panels are taken into a per-eye HDR layer by the ordinary take
+// path above (g_draw.hdr), and reach the eye at the game's own tonemap draw,
+// re-issued once per eye per frame with the HDR layer as its HDR source, into
+// the 8-bit layer -- which the door's composite then shows unchanged.
+//
+// uiLayerCrispOn: the draw path's one gate, beside uiLayerLive -- the key is
+// on, a temporal mode is on, the jitter switches are as shipped, and the HDR
+// path has not stood down. One load.
+inline bool uiLayerCrispOn() { return detail::g_uiLayerCrispOn; }
+// From vscreen's eye-draw branch (owner context, uiLayerCrispOn()): is this
+// draw the game's tonemap, admitted for the re-issue (tonemap_admit.h's
+// structural admission, shared with the HUD layer census)? True only when the
+// eye's HDR layer holds this frame's holo draws and every ordering guard
+// passes; then the caller skips its after-UI read check for the draw and
+// brackets the draw's own issue with uiLayerCrispToneBegin/End.
+bool uiLayerCrispNoteEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count, uint32_t instances,
+                             uint32_t startInstance);
+// One load for the ordinary draw between admission and issue: an admission is
+// outstanding, so forwardWithVerdict must run the re-issue bracket after the
+// game's own issue.
+inline bool uiLayerCrispPending() { return detail::g_uiLayerCrispPending; }
+// Around the re-issue of the admitted tonemap draw (the game's own draw,
+// re-issued by the caller between them): Begin binds the 8-bit layer, the
+// disabled RGB-only blend, the full-layer viewport and the HDR layer at the
+// admitted HDR slot -- everything else stays the game's, still bound from its
+// draw -- and returns false with the game's state untouched on any decline
+// (each counted, each named once a session). End puts the game's state back
+// through the raw entry points, runs the coverage pass (the HDR layer's
+// transmittance into the 8-bit layer's alpha), and marks the layer's frame.
+bool uiLayerCrispToneBegin(ID3D11DeviceContext* ctx);
+void uiLayerCrispToneEnd(ID3D11DeviceContext* ctx);
 
 // True between a successful uiLayerBegin and its End (owner context only):
 // the passes that ride the game's own draw -- the screen's motion and UI

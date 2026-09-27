@@ -901,6 +901,13 @@ struct UiLayerDrawFacts {
     bool substituted = false;     // drawn by a substitution's own geometry
     UiBlendShape blend = UiBlendShape::kRefused;
     bool layerReady = true;       // the eye's layer exists at the wanted size
+    // The HDR HUD take is armed (with fix.ui_quality) and this is the cockpit
+    // holo family drawn into the lit HDR (pre-tonemap) eye target: the draw
+    // goes to the HDR layer, and the tonemap re-issue brings it back over the
+    // finished eye. Every other test (eye known, armed, not late, no MRT/UAV,
+    // the seeded depth-stencil, the blend) applies exactly as for the LDR
+    // take.
+    bool crispHdr = false;
 };
 
 inline UiLayerDecision uiLayerDecide(const UiLayerDrawFacts& f) {
@@ -910,7 +917,10 @@ inline UiLayerDecision uiLayerDecide(const UiLayerDrawFacts& f) {
     // (armed or not, late or not): the screen that shows the world stays.
     if (f.worldScreen && f.family == UiLayerFamily::kScreen) return UiLayerDecision::kWorldScreen;
     if (!f.eyeTarget) return UiLayerDecision::kNotEyeTarget;
-    if (!f.ldrView) return UiLayerDecision::kHdrTarget;
+    // The lit HDR target, before exposure and the tonemap: refused as stock,
+    // unless the HDR HUD take owns this family (Phase 1: the holo panels
+    // only -- the flight HUD and the sprite stay).
+    if (!f.ldrView && !f.crispHdr) return UiLayerDecision::kHdrTarget;
     if (f.vrs) return UiLayerDecision::kVrs;
     if (f.eye < 0 || f.eye > 1) return UiLayerDecision::kNoEye;
     if (!f.targetMatchesEye) return UiLayerDecision::kTargetSize;
@@ -986,7 +996,21 @@ inline bool uiLayerRegionMatches(uint32_t regionW, uint32_t regionH, const float
 // can run more than once in an eye's frame (a write-back per depth-writing
 // draw). The UI draws themselves, rasterised into the layer instead of the
 // eye, are the game's own work and are not timed.
-enum class UiRouteStage : uint8_t { kClear = 0, kSeed, kMultiply, kWriteBack, kComposite, kCount };
+enum class UiRouteStage : uint8_t {
+    kClear = 0,
+    kSeed,
+    kMultiply,
+    kWriteBack,
+    kComposite,
+    // the crisp-HUD half's of fix.ui_quality HDR HUD layer: its per-frame clear, its depth-stencil
+    // seed, the tonemap re-issue over the 8-bit layer, and the coverage pass
+    // that writes the HDR layer's transmittance into the 8-bit layer's alpha.
+    kHdrClear,
+    kHdrSeed,
+    kHdrTonemap,
+    kHdrCoverage,
+    kCount
+};
 
 inline const char* uiRouteStageName(UiRouteStage s) {
     switch (s) {
@@ -995,6 +1019,10 @@ inline const char* uiRouteStageName(UiRouteStage s) {
         case UiRouteStage::kMultiply: return "multiply";
         case UiRouteStage::kWriteBack: return "write-back";
         case UiRouteStage::kComposite: return "composite";
+        case UiRouteStage::kHdrClear: return "HDR HUD clear";
+        case UiRouteStage::kHdrSeed: return "HDR HUD depth-stencil seed";
+        case UiRouteStage::kHdrTonemap: return "HUD tonemap re-issue";
+        case UiRouteStage::kHdrCoverage: return "HUD coverage";
         default: return "?";
     }
 }
