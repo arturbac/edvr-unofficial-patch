@@ -4162,6 +4162,16 @@ those as their own event kinds in sequence order, the dispatch guard now
 shared by runtime and replay out of flat_runtime_model.h, and the magic
 bumps to EDVRFTR2 (v1 captures rejected). Awaiting one recapture flight.
 
+Same evening, second pass: the v2 captures still replayed 0/8, and the
+rig's new `--trace-check` mode named the divergence -- decisions matched
+(every frame selected) while hashes diverged, because capture() shares
+prefix.sequence with draws (untraced camera captures left every later
+draw's q low in replay) and the replay overwrote the traced write epochs
+with its own counter. The trace now carries a camera-capture event kind,
+replays the resolved write epochs verbatim, and the dump skips the
+in-flight unsealed slot so captured frames are always complete. The two
+v2 captures predate the fix; one more recapture validates.
+
 ## 71. Second review cycle: observation transitions closed (2026-09-26)
 
 [reviews/flat-temporal-main-review-2026-09-26.md](../reviews/flat-temporal-main-review-2026-09-26.md)
