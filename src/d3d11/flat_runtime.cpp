@@ -167,8 +167,14 @@ struct State {
     uint64_t drawVs = 0, drawPs = 0;
 
     // Gate 2 step 4's negotiated evaluation size (vendor-queried at plan
-    // change): nonzero overrides the route's default E on the resolve frame.
+    // change): nonzero overrides the route's default E on the resolve frame,
+    // but ONLY for the exact (mode, render, output) contract it was
+    // negotiated for -- a transition frame must never evaluate with the
+    // previous contract's override (the 08:29 ladder refusal).
     uint32_t negotiatedEvalW = 0, negotiatedEvalH = 0;
+    FlatMonoResolveMode negotiatedMode = FlatMonoResolveMode::Taa;
+    uint32_t negotiatedRenderW = 0, negotiatedRenderH = 0;
+    uint32_t negotiatedOutputW = 0, negotiatedOutputH = 0;
 
     // --- Frame-contract trace (staged-program gate 1) -------------------------
     // The reducer's input events, always recorded into a bounded ring and
@@ -1751,7 +1757,14 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     }
     FlatMonoResolveFrame f{}; f.color = original; f.depth = s.depthView.Get(); f.renderWidth = selected.renderWidth; f.renderHeight = selected.renderHeight;
     f.outputWidth = selected.outputWidth; f.outputHeight = selected.outputHeight; f.frame = s.prefix.frame; f.mode = s.engine;
-    f.evalWidth = s.negotiatedEvalW; f.evalHeight = s.negotiatedEvalH;
+    // The negotiated override applies only to the exact contract it was
+    // negotiated for; anything else resolves on the route's default E.
+    const bool negotiatedMatch = s.negotiatedEvalW && s.negotiatedEvalH &&
+        f.mode == s.negotiatedMode && f.renderWidth == s.negotiatedRenderW &&
+        f.renderHeight == s.negotiatedRenderH && f.outputWidth == s.negotiatedOutputW &&
+        f.outputHeight == s.negotiatedOutputH;
+    f.evalWidth = negotiatedMatch ? s.negotiatedEvalW : 0;
+    f.evalHeight = negotiatedMatch ? s.negotiatedEvalH : 0;
     nativeScale.store(f.renderWidth >= f.outputWidth && f.renderHeight >= f.outputHeight,
                       std::memory_order_release);
     f.configuredDlssPreset=s.preset;
@@ -1790,6 +1803,8 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
             // under-floor input cut to the floor it reaches (the game's copy
             // upsamples the rest), never a silent TAA substitution.
             s.negotiatedEvalW = s.negotiatedEvalH = 0;
+            s.negotiatedRenderW = s.negotiatedRenderH = 0;
+            s.negotiatedOutputW = s.negotiatedOutputH = 0;
             if (plan.mode == FlatMonoResolveMode::Dlss && !route.refused &&
                 (plan.renderWidth < plan.outputWidth || plan.renderHeight < plan.outputHeight)) {
                 const char* why = nullptr;
@@ -1804,7 +1819,12 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
                             neg.served ? kDlssModeNames[static_cast<int>(neg.mode)] : "unserved",
                             neg.cut ? " (input under the floor; the game's copy upsamples the rest)" :
                             neg.served ? "" : " (the backend refusal path stands)");
-                        if (neg.served) { s.negotiatedEvalW = neg.evalWidth; s.negotiatedEvalH = neg.evalHeight; }
+                        if (neg.served) {
+                            s.negotiatedEvalW = neg.evalWidth; s.negotiatedEvalH = neg.evalHeight;
+                            s.negotiatedMode = plan.mode;
+                            s.negotiatedRenderW = plan.renderWidth; s.negotiatedRenderH = plan.renderHeight;
+                            s.negotiatedOutputW = plan.outputWidth; s.negotiatedOutputH = plan.outputHeight;
+                        }
                     }
                 }
             }

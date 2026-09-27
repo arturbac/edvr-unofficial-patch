@@ -4286,6 +4286,12 @@ Staged implementation:
    requested vs effective treatment are both logged on every contract
    change. Rig-pinned over the flight's own ladder shape (served at the
    door output, ultra's point, proportional cuts, unanswered queries).
+   FLOWN 2026-09-27 (09:55 Epic): the full ladder 1.0/0.5/0.65/1.5/1.0
+   negotiated per change (floor performance at 0.5, quality at 0.65, DLAA
+   supersample at 1.5) with ZERO fallback lines and continuous streaks.
+   The first pass exposed a stale-override transition bug (the previous
+   contract's negotiated E leaking into the next frame); the override is
+   now gated to its exact contract signature.
 
 Qualification matrix (the review's gate 2 tests): sub-native, native,
 supersampled, odd sizes, crops, live extent changes without a restart,
