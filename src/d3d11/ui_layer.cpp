@@ -309,8 +309,8 @@ enum class CrispToneDecline : uint8_t {
 const char* crispToneDeclineName(CrispToneDecline d) {
     switch (d) {
         case CrispToneDecline::kNoHdrSlot:
-            return "the admitted draw's pixel shader is not in the HDR-slot table, or no 2D HDR "
-                   "source is bound at its slot";
+            return "no PS slot of the admitted draw reads an eye's HDR HUD source (a settings-tier "
+                   "or EDHM variant the identity read cannot place)";
         case CrispToneDecline::kNoContent: return "the eye's HDR layer holds nothing this frame";
         case CrispToneDecline::kLayerBusy:
             return "the 8-bit layer already holds this frame's UI (the menus draw after the "
@@ -2611,35 +2611,54 @@ bool uiLayerCrispNoteEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count
     bool shaped = false;
     guarded("uiLayer.crispAdmit", [&] { shaped = tonemapAdmitStructure(ctx, ps, ta); });
     if (!shaped) return false;
-    // Which eye's tonemap this is, told WITHOUT ui_depth's table: a lookup
-    // there would REGISTER the tonemap's LDR output, and on 2026-09-27 that
-    // registration took the table's two same-shape slots ahead of the main
-    // menu's own composite target every frame -- the menus read "no eye"
-    // and never took the layer again. The admitted draw's own HDR source IS
-    // an eye's HDR target, and the holo take recorded which this frame, so
-    // the eye is read off that identity -- exact, and the table is untouched.
-    int eye = -1;
+    // The HDR source, by IDENTITY, not by table: the PS slot whose 2D view
+    // reads an eye's HDR target this frame (the holo take recorded which).
+    // A table of PS hashes cannot cover the settings tiers -- the 2026-09-28
+    // flight at HMD Quality 0.50 flew ps D0A16B9E55BF22CC, the table said
+    // kNoHdrSlot, and the taken panels never came back. The identity read
+    // covers every variant. It also never touches ui_depth's eye table --
+    // registering the tonemap's output there crowded the main menu's
+    // composite out of it, the 2026-09-27 regression.
+    int eye = -1, hdrSlot = -1;
+    const void* hdrRes = nullptr;
     uint64_t seq = 0;
     float jx = 0.0f, jy = 0.0f;
     uint32_t jw = 0, jh = 0;
-    for (int cand = 0; cand < 2 && eye < 0; ++cand) {
-        const Eye& c = g_eye[cand];
-        if (!c.hdrDraws || !ta.hdrRes || ta.hdrRes != c.hdrTarget) continue;
-        if (!nativeTemporalDrawJitter(static_cast<uint32_t>(cand), &seq, &jx, &jy, &jw, &jh))
-            continue;
-        if (c.hdrSeq != seq || !c.hdrSrv) continue;  // another frame's content
-        eye = cand;
+    // The frame's sequence (the per-eye jitter is not read here).
+    if (!nativeTemporalDrawJitter(0, &seq, &jx, &jy, &jw, &jh)) return false;
+    bool content = false;
+    for (UINT s = 0; s < 4 && eye < 0; ++s) {
+        Ptr<ID3D11ShaderResourceView> srv;
+        ctx->PSGetShaderResources(s, 1, &srv);
+        if (!srv) continue;
+        D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+        srv->GetDesc(&vd);
+        if (vd.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D) continue;  // the LUT is 3D, never this
+        Ptr<ID3D11Resource> r;
+        srv->GetResource(&r);
+        if (!r) continue;
+        for (int cand = 0; cand < 2; ++cand) {
+            const Eye& c = g_eye[cand];
+            const bool fresh = c.hdrSeq == seq && c.hdrDraws && c.hdrSrv;
+            if (fresh) content = true;
+            if (eye >= 0 || !fresh || r.Get() != c.hdrTarget) continue;
+            eye = cand;
+            hdrSlot = static_cast<int>(s);
+            hdrRes = r.Get();
+        }
     }
-    if (eye < 0) return false;  // no eye's HDR layer holds what this draw reads
-    Eye& e = g_eye[eye];
-    if (e.hdrSeq != seq || !e.hdrDraws || !e.hdrSrv) return false;
-    // The crisp contract on top of the structure: a known HDR slot with a 2D
-    // source bound there (a tonemap-shaped draw with an unknown ps -- the
-    // menu-size composites the census names shape-only -- is declined here).
-    if (ta.hdrSlot < 0 || !ta.hdrRes || !ta.hdr2D) {
-        crispToneDecline(CrispToneDecline::kNoHdrSlot, vs, ps);
+    if (eye < 0) {
+        // Fresh holo content this frame, but this draw reads no eye's HUD
+        // source: the panels were taken and cannot come back through it.
+        // Named once, counted -- and the crisp path stands down to stock
+        // rather than lose the HUD for the session.
+        if (content) {
+            crispToneDecline(CrispToneDecline::kNoHdrSlot, vs, ps);
+            crispStandDown("no PS slot of the tonemap reads an eye's HUD source");
+        }
         return false;
     }
+    Eye& e = g_eye[eye];
     // The ordering guards.
     if (e.seq == seq && e.draws) {
         crispToneDecline(CrispToneDecline::kLayerBusy, vs, ps);
@@ -2652,9 +2671,9 @@ bool uiLayerCrispNoteEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count
     g_crispPending.pending = true;
     g_crispPending.eye = eye;
     g_crispPending.seq = seq;
-    g_crispPending.hdrSlot = ta.hdrSlot;
+    g_crispPending.hdrSlot = hdrSlot;
     g_crispPending.rtvRes = ta.rtvRes;
-    g_crispPending.hdrRes = ta.hdrRes;
+    g_crispPending.hdrRes = hdrRes;
     g_crispPending.vs = vs;
     g_crispPending.ps = ps;
     detail::g_uiLayerCrispPending = true;
