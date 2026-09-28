@@ -11,6 +11,7 @@
 #include "flat_trace.h"
 #include "flat_dlss_negotiate.h"
 #include "flat_negotiated_eval.h"
+#include "flat_camera_producer_probe.h"
 #include "binding_shadow.h"
 #include "exposure_fix.h"
 #include "device_hook.h"
@@ -1293,6 +1294,8 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     if (!runtimeFlatProfile() || !swap || (flags & DXGI_PRESENT_TEST)) return;
     auto& s = state(); if (s.thread && !owner()) return;
     s.thread = GetCurrentThreadId();
+    // The camera producer probe's per-Present cadence (config-gated inside).
+    flatCameraProducerProbeFrame(frame);
     // Account for the completed frame before mode/resize changes or the next
     // prefix clears its identity. A resize flush sees no pending frame twice.
     finishPhaseCensusFrame(s);
