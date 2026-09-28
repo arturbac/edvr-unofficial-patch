@@ -42,17 +42,18 @@
   assumptions, fetch cost, cockpit depth pre-pass/bias, motion-cost
   interpretations, wrong joined station motion, close-range
   reconstruction-floor-only diagnosis.
-- **Validation:** absolute build.bat --jobs 4 passed all gates: production
-  DLLs, 82 pooled jobs + 4 quiet, 262-key contract and installer resources.
-  Focused/full-build engine rig: 1686 checks; prior real corpus: 2398. The
-  09-28 repair entry records the receipt. Commit, promotion and installation
-  are pending.
-- **Next:** after promotion/install, capture the rotating station on the
-  promoted build. Require hooked primary/copier/merge/clear statuses, nonzero
-  joined private rows/scatter, actual EP/EN ownership exports and correct brace
+- **Validation / delivery:** absolute build.bat --jobs 4 passed all gates:
+  production DLLs, 82 pooled jobs + 4 quiet, 262-key contract and installer
+  resources. Focused/full-build engine rig: 1686 checks; prior real corpus:
+  2398. Source fix 4118ae84 is committed, merged and pushed; remote main was
+  verified. The repair entry records the full source commit and receipt.
+- **Next:** rotating-station capture on the installed repair, after clean
+  promotion/deployment is verified by the installer and delivery report.
+  Require hooked primary/copier/merge/clear statuses, nonzero joined private
+  rows/scatter, actual EP/EN ownership exports and correct brace
   motion/coverage; inspect remaining WORLD and building pixels separately.
-  Visual verification is pending. Native primary records stay unchanged; no
-  bones, estimation, generic pool matching or new shader admission.
+  Visual verification is open. Native primary records stay unchanged; no bones,
+  estimation, generic pool matching or new shader admission.
 
 ## Premise
 
@@ -3674,9 +3675,11 @@ lifetime/diagnostic amendments. Full validation passed: absolute build.bat
 the 262-key config contract and installer resource verification; its engine
 gate reports 1686 checks. Receipt input SHA256:
 81f8df86a2b4845872fda55d1c34cf41541f129823c8409981aabf8a562ea3f0
-(build/coriolis-primary-full-build.log). Commit, promotion and installation are
-pending. The next rotating-station capture exports actual consumed EP ownership
-and EN private-pool bytes on its first frame; it must show these named rigid
-braces gaining accurate engine motion. Top-building attribution, incomplete
-captured geometry/material visibility and any remaining reconstruction softness
-remain explicit limits.
+(build/coriolis-primary-full-build.log). Source fix committed, merged and
+pushed as 4118ae845891e934e27fa69aa258a0f25f53ae41; remote main was verified at
+that exact commit. Clean promotion/deployment will be verified through the
+installer and delivery report before flight. The next rotating-station capture
+exports actual consumed EP ownership and EN private-pool bytes on its first
+frame; it must show these named rigid braces gaining accurate engine motion.
+Top-building attribution, incomplete captured geometry/material visibility and
+any remaining reconstruction softness remain explicit limits.
