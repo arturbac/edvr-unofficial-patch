@@ -2,10 +2,10 @@
 
 ## Status
 
-- **State:** rendering remains last-flown Frontier `8d60b453`
-  (`155419`/`160518`). This update adds optional combined CPU/GPU profiling
-  only; promotion metadata follows validation. Read these flights with
-  `--expect-build 8d60b453`. Main separate; SteamVR/OpenXR target.
+- **State:** installed `45da6ae3` lacks NGX/FFX; exclude `164641` fallback.
+  Rendering source unchanged; good flights `155419`/`160518` use
+  `--expect-build 8d60b453`. Corrected SDK full gate passed; promotion next.
+  Main separate, SteamVR/OpenXR target.
 - **Finding:** guarded preservation removes three stale reseeds/eye: four→one
   seed, zero stale/failures. Parent seed median .623→.156 ms/eye; machinery
   .963→.485. Current and earlier Pimax flights differ in dimensions/runtime, so
@@ -13,8 +13,6 @@
 - **Correctness:** guarded optimization passes 2,896 WARP/RTX checks with exact
   legacy pixels/depth, four→one seed/eye for captured stencil-only writes.
   Private-write/read-only-view/late replay frames keep legacy invalidation.
-- **Graph:** `Submit wall` publishes caller work, a wider boundary than
-  0.17.0's CPU benchmark; see below. No graph/configuration key was renamed.
 - **Open:** user reports lower average GPU but storms of slower frames in new
   Frontier `160518`/runtime `160519_481_49900`, verified `8d60b453`; analysis
   confirms tails even with diagnostics OFF and early stale 0. Factory/Map
@@ -25,11 +23,10 @@
   runtime `160131`/`6AA6D378`; user reports fpsVR 8.9–9.6 ms.
   Dimensions/preset/DLSS hash match current, but legacy Valve OpenVR and
   current native OpenXR over SteamVR differ. No exact regression conclusion.
-- **Next:** bounded `tools/cpu_profile.py --gpu` file-mode capture: CPU stacks,
-  native markers and DxgKrnl, holding scene/DLSS mode and excluding
-  transitions. Correlate resource/driver work, competing contexts and frame-end
-  queue; provider presence alone is not GPU busy time. No rendering fix without
-  evidence.
+- **Next:** receipt-guarded corrected promotion/Frontier verify, confirm DLSS
+  engagement, then bounded `tools/cpu_profile.py --gpu` file-mode CPU
+  stacks/native markers/DxgKrnl. Prior capture stopped ARMED, no flight ETL.
+  Provider presence is not GPU busy time; no rendering fix without evidence.
 - **Environment:** latest RTX 5090 flight uses SteamVR/OpenXR, 2016×1948 input
   → 4032×3896 output/eye, DLSS Performance/preset K, UI 125 5040×4870. Earlier
   Pimax Crystal Super/Pimax OpenXR 90 Hz evidence used
@@ -39,9 +36,8 @@
 
 ## Pre-optimization Frontier evidence
 
-The reviewed logs match `v0.18.0-rc.3-7-g538175a8` (graphics build `6ABA6DF5`),
-not HEAD. Through `1d2e60ef`, intervening flat/menu/config/installer changes
-leave the reviewed DLSS, hologram and native runtime paths unchanged.
+Historical logs verify rc3-7/`538175a8`, graphics `6ABA6DF5`; changes through
+`1d2e60ef` leave reviewed rendering/runtime paths unchanged.
 
 Historical 12:36:05 census: EDVR ~4.949 ms/stereo, DLSS 3.129, UI depth .520.
 Round-robin/floor-corrected overlapping scopes are not a synchronized budget;
@@ -56,17 +52,15 @@ post-submit work; excludes the next pose wait. 0.17.0/current benchmark CPU
 rows use pre-submit `applicationMs`. At 90 Hz the graph turns orange above 1.02
 periods (~11.33 ms) and red above two (~22.22 ms).
 
-Older flight:172 reds; owner Submit .423/.592/.738 ms p50/p95/p99 excludes
-caller roundtrips. 12,625 overlaps/zero sync failures; rare submit 24.342,
-outside-Present54.665 ms unattributed.
+Older owner Submit p50/p95/p99 .423/.592/.738 ms excludes caller roundtrips;
+12,625 overlaps/zero sync failures. Rare stalls remain separate.
 
 ## Source review against 0.17.0
 
-DLSS still copies colour, prepares MV/depth/masks, runs NGX and resolves UI;
-native transfer is separate. Added engine/hologram/diagnostic work costs;
-retired separation removes work. Resolve/NGX timing predate 0.17.0; setup
-size/preset gated, polling DONOTFLUSH. Old luma blocking fallback was possible,
-not proven in flight; desk probes remain synchronous.
+DLSS retains copy→MV/depth/masks→NGX→UI; transfer separate. Added
+engine/hologram/diagnostics cost work, retired separation removes work.
+Resolve/NGX timing predates 0.17.0; setup gated/DONOTFLUSH polling. Old luma
+blocking was possible, not proven; desk probes synchronous.
 
 ## Optimizations delivered in 0229c358
 
@@ -75,13 +69,11 @@ not proven in flight; desk probes remain synchronous.
 six→96 copies, WARP extra .034 ms not hardware gain. Nonblocking retry
 2,759/UAV reuse 1,729 checks; scatter factory gain conditional.
 
-`0229c358` combines `a001f669`/`472ff122`; main separate. Eight holo families
-admitted, sphere/corona/world reticle remain in-scene; accepted HDR skips
-generic reissues. Keep remaining `ui_depth.cpp`
-masks/classification/motion/fallbacks; `fix.ui_depth` already retired. Coverage
-cache preserves dynamic pixels/Execute(TRUE)/failures (768); timing rejects
-incomplete eyes (1,183). Moved shading is not net overhead; seed WARP/RTX
-385,610 each needs fallback clear. See crisp arc.
+`0229c358` combines `a001f669`/`472ff122`. Eight holo families admitted;
+sphere/corona/reticle stay in-scene, `ui_depth.cpp` remains necessary,
+`fix.ui_depth` already retired. Coverage 768/timing 1,183 checks preserve
+pixels/failures/complete-eye totals; moved shading is not net overhead. Seed
+WARP/RTX 385,610: fallback needs clear. See crisp arc.
 
 Full builds 83/84/85 jobs plus quiet gates pass config/exports/rigs/installer;
 combined receipt
@@ -235,11 +227,23 @@ optional combined file-mode profiling is now available. Provider presence alone
 is not busy time. Correlations do not prove causes; no seed fix without
 discriminator.
 
+## SDK deployment correction
+
+`45da6ae3` Frontier `164641`: "this build has no DLSS SDK", user confirms.
+Auto-detection omitted NGX/FFX; cause unproven. Good `8d60b453` had NGX
+310.9.1/FFX 3.1.2. Explicit verified `EDVR_NGX_SDK`/`EDVR_FFX_DX11` full gate
+passed (`build/cpu-gpu-capture-sdk-full.log`, UI 2,899/FSR 63, DLSS runtime
+carried); receipt requested/resolved paths correct. Corrected promotion HEAD
+next. Combined smoke: 60 CPU frames/zero lost, Dxg 567919/D3D11 11153/DXGI 4076
+events, coverage only. Stopped ARMED; no flight ETL.
+
 ## Exclusions and next flight
 
 - ruled out: persistent submit blocking as principal cause of logged large
   cycles, because owner-body p99 <.74 ms and caller rows mostly outside
   submits. Rare acquire/submit stalls remain separate candidates.
+- ruled out: settings causing DLSS failure in `45da6ae3`, because the binary
+  lacks its SDK. Exclude `164641` fallback from DLSS performance evidence.
 - ruled out: diagnostics ON as a necessary cause of red bars, because latest
   steady OFF has three reds and ON zero. This does not prove ON prevents reds
   or identify a cadence/root cause.
@@ -265,9 +269,7 @@ discriminator.
 - unresolved: regression versus 0.17.0. No matched scene/size/DLSS flight pair;
   graph boundary change is a confound, not proof performance is unchanged.
 
-Further Frontier work uses SteamVR/OpenXR. Hold scene, dimensions/UI 125, mode
-and runtime; exclude transitions and compare matched external timing. For
-persistent reds correlate sequence/Present/CPU-CSwitch stacks before
-attributing periodic work: monitor 1 s, journal 500 ms/eager 100 ms, config 1
-s, menu 250 ms and GPU polling are hypotheses only. ETW was externally
-disabled; keep keyed-mutex waits separate from fast producer copies.
+SteamVR/OpenXR capture must correlate sequence/Present/stacks. Periodic monitor
+1 s/journal 500 ms/eager 100 ms/config 1 s/menu 250 ms/GPU polling remain
+hypotheses; earlier ETW was externally disabled. Separate keyed-mutex waits
+from fast producer copies.
