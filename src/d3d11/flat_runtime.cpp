@@ -1134,6 +1134,81 @@ void capture(Camera& c, const void* bytes) {
     flatTraceMark(state().traceRing, kFlatTraceEventCameraCapture, nullptr);
     c.sequence = ++state().prefix.sequence;
 }
+// The camera producer witness (design-flat-camera-integration.md, C0/C1):
+// where the camera table already captures a camera CB write, capture the
+// writer's stack once per unique game call site -- the C1 passive evidence
+// for the producer hypotheses, bounded and passive with no mutation. The
+// first frame outside EDVR's own image is the game's upload call site; one
+// stack per site, up to 16 sites and three buffers per site. Overflow is a
+// named line, never silence.
+struct CameraWitnessSite { void* address = nullptr; const void* buffers[3]{}; uint32_t bufferCount = 0; uint64_t writes = 0; };
+struct CameraWitness {
+    CameraWitnessSite sites[16]{};
+    uint64_t writes = 0, dedupHits = 0, budgetDropped = 0;
+    bool budgetNoted = false;
+};
+CameraWitness g_camWitness;
+// Brief module-plus-offset naming for witness stacks (vtable_hook.cpp's
+// ownerModuleBrief stays internal to it; this is the same formatting with
+// EDVR's own image prefixed so a stack never blames the proxy by mistake).
+const char* witnessModuleBrief(void* p, char* buf, size_t bufLen) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi) || !mbi.AllocationBase) return "no module";
+    char path[MAX_PATH] = {};
+    if (!GetModuleFileNameA(static_cast<HMODULE>(mbi.AllocationBase), path, sizeof(path))) return "no module";
+    const char* leaf = path;
+    for (const char* c = path; *c; ++c) if (*c == '\\' || *c == '/') leaf = c + 1;
+    static HMODULE self = nullptr;
+    if (!self) {
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&witnessModuleBrief), &self);
+    }
+    _snprintf_s(buf, bufLen, _TRUNCATE, "%s%s+0x%llX",
+                (self && mbi.AllocationBase == self) ? "EDVR's own " : "", leaf,
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(p) -
+                                                reinterpret_cast<uintptr_t>(mbi.AllocationBase)));
+    return buf;
+}
+void cameraWitness(const void* buffer) {
+    auto& w = g_camWitness; ++w.writes;
+    void* frames[10] = {};
+    const USHORT n = CaptureStackBackTrace(0, 10, frames, nullptr);
+    void* site = nullptr;
+    for (USHORT i = 0; i < n; ++i) {
+        if (!isExecutableAddress(frames[i])) continue;
+        char brief[96]; witnessModuleBrief(frames[i], brief, sizeof(brief));
+        if (std::strncmp(brief, "EDVR's own ", 11) == 0) continue;
+        site = frames[i]; break;
+    }
+    if (!site) { ++w.dedupHits; return; }
+    for (auto& s : w.sites) if (s.address == site) {
+        ++s.writes; ++w.dedupHits;
+        bool known = false;
+        for (uint32_t b = 0; b < s.bufferCount; ++b) known |= s.buffers[b] == buffer;
+        if (!known && s.bufferCount < 3) {
+            s.buffers[s.bufferCount++] = buffer;
+            char brief[96]; witnessModuleBrief(site, brief, sizeof(brief));
+            Log::get().note("flat camera witness: producer site %s also writes %p", brief, buffer);
+        }
+        return;
+    }
+    for (auto& s : w.sites) if (!s.address) {
+        s.address = site; s.writes = 1; s.buffers[0] = buffer; s.bufferCount = 1;
+        char line[768]{}; size_t used = 0;
+        for (USHORT i = 0; i < n && used < sizeof(line) - 96; ++i) {
+            if (!isExecutableAddress(frames[i])) continue;
+            char brief[96]; witnessModuleBrief(frames[i], brief, sizeof(brief));
+            used += static_cast<size_t>(std::snprintf(line + used, sizeof(line) - used, "%s%s", used ? " <- " : "", brief));
+        }
+        Log::get().note("flat camera witness: new producer site for buffer=%p: %s", buffer, line);
+        return;
+    }
+    if (!w.budgetNoted) {
+        w.budgetNoted = true;
+        Log::get().note("flat camera witness: site budget reached; later writers counted without stacks");
+    }
+    ++w.budgetDropped;
+}
 bool depthView(ID3D11Texture2D* depth) {
     auto& s = state(); if (s.sceneDepth.Get() == depth && s.depthView) return true;
     s.sceneDepth.Reset(); s.depthView.Reset(); if (!depth) return false;
@@ -1457,6 +1532,10 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         }
         for (const auto& entry : s.conflictWindow)
             Log::get().note("flat runtime conflict 5s: cause=%s count=%llu", entry.first.c_str(), static_cast<unsigned long long>(entry.second));
+        uint64_t witnessSites = 0; for (const auto& st : g_camWitness.sites) witnessSites += st.address != nullptr;
+        Log::get().note("flat camera witness 5s: writes=%llu unique-sites=%llu dedup-hits=%llu stack-drops=%llu; every camera-table write is a producer witness candidate",
+            static_cast<unsigned long long>(g_camWitness.writes), static_cast<unsigned long long>(witnessSites),
+            static_cast<unsigned long long>(g_camWitness.dedupHits), static_cast<unsigned long long>(g_camWitness.budgetDropped));
         Log::get().note("flat runtime adapter reset 5s: no-previous=%llu frame-gap=%llu depth-change=%llu color-change=%llu extent-change=%llu present-not-ok=%llu",
             static_cast<unsigned long long>(s.resetMissingWindow), static_cast<unsigned long long>(s.resetGapWindow),
             static_cast<unsigned long long>(s.resetDepthWindow), static_cast<unsigned long long>(s.resetColorWindow),
@@ -1541,11 +1620,16 @@ void flatRuntimeMap(ID3D11Resource* res, D3D11_MAP type, void* bytes) {
 }
 void flatRuntimeUnmap(ID3D11Resource* res) {
     if (!owner()) return; if(state().projection)state().projection->observeUnmap(res);
-    if (auto* c = camera(res, false)) { if (c->mapped) capture(*c, c->mapped); c->mapped = nullptr; }
+    if (auto* c = camera(res, false)) {
+        if (c->mapped) { capture(*c, c->mapped); cameraWitness(res); }
+        c->mapped = nullptr;
+    }
 }
 void flatRuntimeUpdate(ID3D11Resource* res, const void* bytes, const D3D11_BOX* box) {
     if (!owner()) return; flatRuntimeWritten(res);
-    if (auto* c = camera(res, false)) { if (!box || (box->left == 0 && box->right == c->width)) capture(*c, bytes); }
+    if (auto* c = camera(res, false)) {
+        if (!box || (box->left == 0 && box->right == c->width)) { capture(*c, bytes); cameraWitness(res); }
+    }
     if(state().projection)state().projection->observeUpdate(res,bytes,box);
 }
 

@@ -295,3 +295,49 @@ Implementing C++ changes requires the full absolute-path `build.bat` and its
 green receipt before commit. Install/verify/log operations use the sanctioned
 tools. After promotion, retain an independent stand-down path for unknown
 executables, conflicting hooks and unsupported camera domains.
+
+## C0 addendum, 2026-09-28: the existing anchors, mapped
+
+What the installed adapter already proves about the per-view camera, before
+any producer probe exists:
+
+- The mono scene constants are a VS b1 CB of 336 float4s (observed bound at
+  `VSb1`, e.g. 000001EB2E751E20 in the 203919 Caspian session); the
+  per-view forward camera is its rows 270..275
+  (`flat_temporal_model.h`'s kFlatCameraOffset). A per-frame camera hash
+  (flatCameraHash) changes every frame in flight.
+- Write paths are both shadowed at the API: hookedUpdateSubresource ->
+  flatRuntimeUpdate -> camera table capture (complete CPU writes), and
+  Map/Unmap -> flatRuntimeMap/Unmap -> capture at Unmap. The table holds
+  up to 64 camera-shaped CBs (any CB >= 2784 bytes with
+  BIND_CONSTANT_BUFFER); each draw's bound b1 is matched against it and
+  contributes its rows, write epoch and sequence to the draw's contract.
+- Auxiliary per-view cameras exist and share the block shape: the VR
+  arc's carry evidence (camera-rows-carry-2026-09-25.md) convicts parked
+  auxiliary passes writing into the same block as the view, so a global
+  single-camera model is refuted before probing. The camera settings
+  probe (camera_view.cpp, the 6ad.x records) covers FOV/planes, not
+  per-frame matrices.
+- The producer gap, precisely: EDVR observes the uploaded bytes, their
+  epochs and their consumers, but not WHO computed rows 270..275, from
+  what source object, at what point in the frame. Existing stack/owner
+  utilities (captureWriterStack's guarded unwind, ownerModuleBrief's
+  module+offset naming, isExecutableAddress) make that gap closable
+  without inventing RVAs or a global camera pointer.
+
+C1 probe design (bounded, passive, no mutation): the camera producer
+witness. Where the existing camera table already captures a write
+(UpdateSubresource full-buffer, or Unmap of a mapped camera CB), also
+capture the writer's stack (bounded frames, CaptureStackBackTrace),
+name each frame module+offset, and keep one stack per unique first
+non-EDVR frame (the game's upload call site), deduped to 16 sites.
+Every write logs buffer, width, box/full, epoch, sequence, thread and
+frame; per-5s counters report writes, unique sites and dedup drops;
+overflow is a named "later writers counted without stacks" line, never
+silence. Discriminators it buys for the section-3 hypotheses: one or
+two shared outermost call sites across camera-table writes supports a
+common per-view finalizer; a generic upload helper on every write
+supports a packer; distinct call sites per camera domain supports a
+view-table builder; multiple call sites writing ONE buffer means shared
+staging. Deferred-context writes stay tagged by thread for the
+record/replay distinction the doc requires.
