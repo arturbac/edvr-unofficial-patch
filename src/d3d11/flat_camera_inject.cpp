@@ -33,9 +33,12 @@ namespace {
 // for process lifetime -- disable closes the gate and nothing more (no
 // uninstall, no free, ever).
 
-constexpr uintptr_t kRefreshRva = 0x5921f0;
-constexpr uint8_t kRefreshPrologue[16] = {0x48, 0x85, 0xD2, 0x0F, 0x84, 0x79, 0x05, 0x00,
-                                         0x00, 0x48, 0x8B, 0xC4, 0x41, 0x55, 0x41, 0x56};
+constexpr uintptr_t kRefreshRva = 0x5921f9;
+// The function's own first instruction is a conditional jump CodeHook
+// cannot move; the hook sits one instruction later, after the param_2
+// null check (a null param_2 is no refresh anyway).
+constexpr uint8_t kRefreshPrologue[16] = {0x48, 0x8B, 0xC4, 0x41, 0x55, 0x41, 0x56, 0x41,
+                                         0x57, 0x48, 0x81, 0xEC, 0xE0, 0x00, 0x00, 0x00};
 constexpr size_t kRelayBytes = 44;
 constexpr uint32_t kOriginalLiteral = 36;
 
