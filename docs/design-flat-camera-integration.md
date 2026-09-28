@@ -2,9 +2,14 @@
 
 ## Status
 
-- State: proposed investigation and architecture, based on `418e5231`
-  (`v0.18.0-rc.3`). No upstream flat camera hook, address, ABI or complete
-  derivation chain has been identified or validated by this work.
+- State: producer discovery landed. The C1 producer probe named the
+  camera-row writer (FUN_140596830, trap RIP `0x596A54`) and its refresh
+  chain (FUN_1405921f0 <- FUN_140594d90 <- FUN_14058ef90); the C1/C2
+  addendum records the verified findings with the 2026-09-28 review's
+  corrections. C1 remains partial (cache helpers FUN_1404f49f0 /
+  FUN_1404f2ff0 / FUN_1404f4910 undecompiled; consumer lineage unjoined;
+  auxiliary composer callers unclassified) and C2 is not demonstrated —
+  do not turn camera mutation on from this evidence.
 - Decision: investigate jittering the game's per-view camera construction
   before it derives raster/lighting data. Preserve the existing frame
   discovery, size negotiation, temporal backends and resource isolation.
@@ -13,15 +18,18 @@
   observation. Sean reproduced non-activation with another ship; its exact
   shader correspondence remains unverified.
 - Open hypotheses: a common producer covers the derived transforms; camera
-  domains and recording epochs can be distinguished before mutation.
+  domains and recording epochs can be distinguished before mutation. The
+  camera-struct hook point is a candidate, not a validated design.
 - Ruled out for that session: a backend evaluation failure as the immediate
   cause, because no backend initialized. Missing shader coverage is proven;
   whether quality settings or a mod produced those variants is not.
-- Next: design the camera hook against the now-named producer chain (C1/C2
-  addendum): FUN_140596830 composes view·projection into the staging block,
-  called by FUN_1405921f0 (view-constant refresh), called at pass
-  start/first-object/end by FUN_140594d90. Decide hook point and validation
-  flight.
+- Next: decompile the three cache helpers and their dirty-flag rules;
+  trace camera/generation through derived data, CB writes/binds and
+  handoff to establish consumer lineage; then C2 reducer and WARP
+  geometry/lighting tests. The producer probe itself was rebuilt per the
+  review's R1-R6 (gate-only stand-down, per-thread watch ownership,
+  external-thread arm/disarm, mandatory handler registration,
+  module-naming fallbacks, bounded witness collection).
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable/build
   identities, backend versions, dimensions, formats and mod chain for
@@ -311,9 +319,10 @@ any producer probe exists:
 - Write paths are both shadowed at the API: hookedUpdateSubresource ->
   flatRuntimeUpdate -> camera table capture (complete CPU writes), and
   Map/Unmap -> flatRuntimeMap/Unmap -> capture at Unmap. The table holds
-  up to 64 camera-shaped CBs (any CB >= 2784 bytes with
-  BIND_CONSTANT_BUFFER); each draw's bound b1 is matched against it and
-  contributes its rows, write epoch and sequence to the draw's contract.
+  up to 64 camera-shaped CBs (any CB of at least 4416 bytes — rows
+  270..275 need 270*16 + 6*16 — with BIND_CONSTANT_BUFFER); each draw's
+  bound b1 is matched against it and contributes its rows, write epoch
+  and sequence to the draw's contract.
 - Auxiliary per-view cameras exist and share the block shape: the VR
   arc's carry evidence (camera-rows-carry-2026-09-25.md) convicts parked
   auxiliary passes writing into the same block as the view, so a global
@@ -357,42 +366,57 @@ killed the process (fixed 8af85423: the VEH claims its own hits armed or
 not, clears Dr6, and disarms only through ep->ContextRecord). The clean
 flight then answered the finalizer question in 30 ms:
 
-- Writer instruction: `EliteDangerous64.exe+0x596A54`, one of the 16
-  MOVUPS stores inside **FUN_140596830** (0x596830..0x596AAA), reproduced
-  identically across two staging blocks and three call sites
-  (0x594E13 / 0x594EAB / 0x594FE1).
+- Writer trap RIP: `EliteDangerous64.exe+0x596A54`, inside
+  **FUN_140596830** (0x596830..0x596AAA). A data watchpoint traps after the
+  store executes, so this is the post-access RIP, not proof of which exact
+  store fired. All eight named hits came from ONE staging block through
+  three call sites (0x594E13 / 0x594EAB / 0x594FE1); a second block's watch
+  recorded one further hit, logged only as budget exhaustion with no RIP —
+  consistent with the same writer, not proof of it.
 - **FUN_140596830(viewCbSlot, poolWriteCtx, cameraStruct+0x20)** composes
-  view·projection: the camera 3x4 (rotation+origin, struct +0x20..+0x4C)
-  times the projection 4x4 (struct +0x1F0..+0x22C), sixteen products
-  stored straight into staging rows 270..273 through a pointer
-  FUN_1404fc580 hands back into the block. No static writer exists
-  because the write goes through a computed pointer, and the rows change
-  every frame because this runs ~30 times a frame.
+  view·projection: a twelve-float camera input (camera+0x20..+0x4C read
+  through the argument; origin is NOT established there — the explicit
+  origin-shaped copies in the refresh read camera +0x50/+0x54/+0x58) times
+  the projection 4x4 at camera **+0x1D0..+0x20C** (uint indices 0x6C..0x7B
+  from camera+0x20), sixteen float products stored into staging rows
+  270..273 through a pointer FUN_1404fc580 hands back into the block. No
+  static writer exists because the write goes through a computed pointer,
+  and the rows change every frame because this runs ~30 times a frame.
 - **FUN_1405921f0(viewConstCtx, , cameraStruct)** is the view-constant
-  refresh: copies projection, camera axes and origin (origin negated via
-  the 0x80000000 sign mask), near/far and viewport terms out of the
-  camera struct (+0x250 flags, +0x254/+0x258 planes), then invokes the
-  composer when the slot at +0x70 is present. Called at pass start, at
-  the first rendered object, and at pass end.
+  refresh: copies camera +0x210..+0x24C into the context +0x40..+0x7C,
+  camera axes and the negated origin triple (the 0x80000000 sign mask on
+  +0x50/+0x54/+0x58), near/far (+0x254/+0x258) and viewport terms, then
+  invokes the composer when the slot at +0x70 is present. The refresh's
+  context copy and the composer's camera read are NOT the same source:
+  the composer reads the original camera struct through camera+0x20, so
+  mutating only the context copy can miss the composer. Called at pass
+  start (camera from view+0x158), at the first rendered object (camera
+  from view+0x250), and at pass end (view+0x158).
 - **FUN_140594d90(viewCtx, renderItem)** is the per-view render update:
   visibility-masked walk of the object list (item+0x30 & view+0x270),
   per-object vtable +0x70/+0x78 updates, with the refresh calls at
-  0x594E0E / 0x594EA6 / 0x594FDC. Its caller is FUN_14058ef90's per-item
-  loop (call at 0x58F2EF). Other composer callers (FUN_143654ff0,
-  FUN_14365d3c0, FUN_1436db5f0, FUN_1436dd650) are the auxiliary view
-  domains the carry evidence predicted — shadow/reflection/env passes
-  each refreshing the same staging block, which is why a global
-  single-camera model stays refuted.
+  0x594E0E / 0x594EA6 / 0x594FDC. Its only code caller is FUN_14058ef90
+  (call at 0x58F2EF), itself not yet decompiled. The composer's other
+  callers (FUN_143654ff0, FUN_14365d3c0, FUN_1436db5f0, FUN_1436dd650)
+  are cross-references only; that they are shadow/reflection/env domains
+  sharing the staging block remains a hypothesis to prove from their
+  behavior, not a finding.
 - Decompiles: analysis/decomp/flash/camera/camera_producer.txt (script
   analysis/ghidra_scripts/CameraProducerName.java).
 
-Hook-point consequence for section 5's camera contract: the mutable,
-per-view, per-frame input is the camera STRUCT consumed by FUN_1405921f0,
-not the uploaded bytes. Jittering the projection at the struct (or at
-FUN_1405921f0's copy into the view-constant context) reaches every
-consumer downstream — the scene CB, the derived raster/lighting data —
-through the game's own derivation, which is the doc's acceptance
-requirement 4 (admission by lineage, no per-ship allowlists). The
-auxiliary domains distinguish themselves by which camera struct pointer
-arrives; recording epoch vs mutation epoch can be separated inside one
-FUN_1405921f0 detour by tagging the struct source.
+Candidate-hook hypothesis for section 5's camera contract — a hypothesis,
+not a satisfaction of acceptance requirement 4: the mutable, per-view,
+per-frame input is likely the camera STRUCT consumed by FUN_1405921f0,
+not the uploaded bytes. Whether jittering the projection there reaches
+every raster/lighting consumer is unproven, and the two candidate
+mutation points are not equivalent (the refresh copies into the context;
+the composer reads the original camera). The decompile also shows three
+conditional re-derivation gates on the camera flag word at +0x250 —
+FUN_1404f49f0 before the +0x210 copy (bit 8), FUN_1404f2ff0 before the
+composer reads its matrix (bit 4), FUN_1404f4910 before another upload
+consumes products at +0x190/+0x870/+0x8B0 (bit 2). Those helpers and
+their invalidation rules are undecompiled; changing one matrix could
+leave inverse/ray data stale. Identify the authoritative inputs, dirty
+flags, regeneration order and any earlier consumers before choosing a
+mutation point; whether the camera pointer distinguishes domains and
+recording/mutation epochs likewise remains to be joined.

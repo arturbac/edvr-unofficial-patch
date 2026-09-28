@@ -1147,6 +1147,11 @@ struct CameraWitness {
     CameraWitnessSite sites[16]{};
     uint64_t writes = 0, dedupHits = 0, budgetDropped = 0;
     bool budgetNoted = false;
+    // Once every site slot is claimed the producer population is presumed
+    // mapped, and the expensive part -- a stack walk plus module queries on
+    // the render thread, measured at microseconds per call over hundreds of
+    // thousands of writes -- stops. Counts stay cheap and keep coming.
+    bool sitesFull = false;
 };
 CameraWitness g_camWitness;
 // Brief module-plus-offset naming for witness stacks (vtable_hook.cpp's
@@ -1172,12 +1177,14 @@ const char* witnessModuleBrief(void* p, char* buf, size_t bufLen) {
 }
 void cameraWitness(const void* buffer) {
     auto& w = g_camWitness; ++w.writes;
+    if (w.sitesFull) { ++w.dedupHits; return; }
     void* frames[10] = {};
     const USHORT n = CaptureStackBackTrace(0, 10, frames, nullptr);
     void* site = nullptr;
     for (USHORT i = 0; i < n; ++i) {
         if (!isExecutableAddress(frames[i])) continue;
-        char brief[96]; witnessModuleBrief(frames[i], brief, sizeof(brief));
+        char briefBuf[96];
+        const char* brief = witnessModuleBrief(frames[i], briefBuf, sizeof(briefBuf));
         if (std::strncmp(brief, "EDVR's own ", 11) == 0) continue;
         site = frames[i]; break;
     }
@@ -1188,7 +1195,8 @@ void cameraWitness(const void* buffer) {
         for (uint32_t b = 0; b < s.bufferCount; ++b) known |= s.buffers[b] == buffer;
         if (!known && s.bufferCount < 3) {
             s.buffers[s.bufferCount++] = buffer;
-            char brief[96]; witnessModuleBrief(site, brief, sizeof(brief));
+            char briefBuf[96];
+            const char* brief = witnessModuleBrief(site, briefBuf, sizeof(briefBuf));
             Log::get().note("flat camera witness: producer site %s also writes %p", brief, buffer);
         }
         return;
@@ -1198,10 +1206,17 @@ void cameraWitness(const void* buffer) {
         char line[768]{}; size_t used = 0;
         for (USHORT i = 0; i < n && used < sizeof(line) - 96; ++i) {
             if (!isExecutableAddress(frames[i])) continue;
-            char brief[96]; witnessModuleBrief(frames[i], brief, sizeof(brief));
+            char briefBuf[96];
+            const char* brief = witnessModuleBrief(frames[i], briefBuf, sizeof(briefBuf));
             used += static_cast<size_t>(std::snprintf(line + used, sizeof(line) - used, "%s%s", used ? " <- " : "", brief));
         }
         Log::get().note("flat camera witness: new producer site for buffer=%p: %s", buffer, line);
+        if (&s == &w.sites[15]) {
+            // The last slot just filled: stop the per-write stack walks.
+            w.sitesFull = true; w.budgetNoted = true;
+            Log::get().note("flat camera witness: all 16 producer site slots are claimed; "
+                            "stack collection stops here, write counts continue");
+        }
         return;
     }
     if (!w.budgetNoted) {
