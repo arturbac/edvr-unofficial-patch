@@ -81,7 +81,7 @@ struct FamWindow {
 // number hid the frame-wide TIMESTAMP_DISJOINT story for a whole flight.
 enum GdDecline : uint8_t {
     kGdDeclPredication = 0,
-    kGdDeclQuery,   // a sample-counting game query is open on the context
+    kGdDeclQuery,   // a sample-counting (or unclassified, pre-arm) game query is open
     kGdDeclRing,    // every pair still awaits its GPU result
     kGdDeclUav,     // a pixel-shader UAV is bound
     kGdDeclSo,      // a stream-out target is bound
@@ -577,6 +577,15 @@ int g_gdPendingFam = -1, g_gdPendingEye = -1;  // set by EyeDraw, consumed by Gd
 // gpu_span TIMESTAMP_DISJOINT is open across the frame. The census's own
 // ring queries are filtered out. 16 is far past anything measured;
 // overflow stands the gate down to "open" rather than guess.
+//
+// Tracked ARMED OR NOT (review R7): a bracket that began before a live arm
+// must still block G-D until it closes, so resetSession does NOT clear this
+// set -- Ends erase entries and a pre-arm bracket closes within a frame or
+// two. An entry begun while unarmed is UNCLASSIFIED (its type is never read
+// then -- the unarmed price stays a pointer append/erase) and blocks exactly
+// like a sample-counting one; every entry in the set therefore blocks, which
+// is all the G-D guard's g_openGameQueryCount || g_openGameQueryOverflow
+// test says.
 void* g_openGameQueries[16] = {};
 uint32_t g_openGameQueryCount = 0;
 bool g_openGameQueryOverflow = false;
@@ -1048,9 +1057,9 @@ void resetSession() {
     g_gdDropped = 0;
     g_gdPendingFam = -1;
     g_gdPendingEye = -1;
-    g_openGameQueryCount = 0;
-    g_openGameQueryOverflow = false;
-    for (auto& q : g_openGameQueries) q = nullptr;
+    // NOT the open game-query set: tracked unarmed too, it must survive the
+    // arm this reset serves so a pre-arm bracket still blocks G-D until its
+    // End (review R7; the set's own comment says the whole bargain).
     g_geLastQpc = LARGE_INTEGER{};
     g_geExposureNoted = false;
     g_geLumaFmtNoted = false;
@@ -1249,9 +1258,10 @@ bool hudLayerCensusGdBegin(ID3D11DeviceContext* ctx, HudCensusGdSave& save) {
             ++g_gdDecl[kGdDeclPredication];
             return;
         }
-        // A sample-counting game query open on this context: the re-issue
-        // would feed its counter, and changing what the game measures
-        // changes what it draws a frame later.
+        // A sample-counting game query open on this context -- or an
+        // UNCLASSIFIED one begun before the arm (review R7) -- : the
+        // re-issue would feed its counter, and changing what the game
+        // measures changes what it draws a frame later.
         if (g_openGameQueryCount || g_openGameQueryOverflow) {
             ++g_gdDecl[kGdDeclQuery];
             return;
@@ -1404,20 +1414,26 @@ void hudLayerCensusNoteGameQuery(bool begin, void* async) {
     if (begin) {
         for (uint32_t i = 0; i < g_openGameQueryCount; ++i)
             if (g_openGameQueries[i] == async) return;
-        // Only sample-counting types reach the open list (gdQueryTypeBlocks
-        // says why); an End for an ignored type simply finds nothing below.
-        // A query whose type cannot be read blocks: the wrong direction to
-        // guess is the one that feeds the game's counter.
-        bool blocks = true;
-        Ptr<ID3D11Query> query;
-        if (SUCCEEDED(reinterpret_cast<ID3D11Asynchronous*>(async)->QueryInterface(
-                IID_PPV_ARGS(&query))) &&
-            query) {
-            D3D11_QUERY_DESC qd{};
-            query->GetDesc(&qd);
-            blocks = gdQueryTypeBlocks(qd.Query);
+        // Armed, only sample-counting types reach the open list
+        // (gdQueryTypeBlocks says why); an End for an ignored type simply
+        // finds nothing below. Unarmed, the type is NEVER read -- the price
+        // stays a pointer append -- and the entry is UNCLASSIFIED, which
+        // blocks exactly like a sample-counting one (review R7: a bracket
+        // spanning the arm transition must still block G-D). A query whose
+        // type cannot be read blocks too: the wrong direction to guess is
+        // the one that feeds the game's counter.
+        if (hudLayerCensusArmed()) {
+            bool blocks = true;
+            Ptr<ID3D11Query> query;
+            if (SUCCEEDED(reinterpret_cast<ID3D11Asynchronous*>(async)->QueryInterface(
+                    IID_PPV_ARGS(&query))) &&
+                query) {
+                D3D11_QUERY_DESC qd{};
+                query->GetDesc(&qd);
+                blocks = gdQueryTypeBlocks(qd.Query);
+            }
+            if (!blocks) return;
         }
-        if (!blocks) return;
         if (g_openGameQueryCount < 16) {
             g_openGameQueries[g_openGameQueryCount++] = async;
         } else {

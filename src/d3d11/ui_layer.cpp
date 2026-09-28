@@ -69,6 +69,11 @@ constexpr uint64_t kTotalsMs = 30000;
 constexpr uint32_t kWatchPerFrame = 64;
 constexpr uint32_t kMaxFamilyLines = 48;
 constexpr uint32_t kMaxAfterLines = 16;
+// The crisp-HUD missing-consumer deadline (review R1): this many consecutive
+// content-frames with no tonemap publication stands the HDR path down. The
+// tonemap runs every frame when the path works, so a streak this long says
+// the consumer is not coming; ~a third of a second at 90 Hz.
+constexpr uint32_t kCrispHdrMissFrames = 30;
 
 // ------------------------------------------------------------ configuration
 
@@ -186,6 +191,10 @@ struct Eye {
     const void* hdrTarget = nullptr;  // the HDR target those draws left (identity)
     LayerDs hdrDs;                    // its own depth-stencil, seeded the same way
     uint64_t hdrToneSeq = 0;          // the frame the tonemap re-issue ran for
+    // Consecutive content-frames no tonemap re-issue published (review R1's
+    // frame deadline): counted beside hdrLost at the per-frame clear, reset
+    // where a publication lands. The stand-down is at kCrispHdrMissFrames.
+    uint32_t hdrMissStreak = 0;
 
     // The door.
     UiLayerDoorState door;
@@ -295,7 +304,7 @@ bool g_seederTried = false;
 // NAMED once a session (first-seen per reason and shader pair below); the
 // game's own draw is always untouched.
 enum class CrispToneDecline : uint8_t {
-    kNoHdrSlot = 0,  // the admitted ps is not in the slot table, or no 2D HDR source there
+    kNoHdrSlot = 0,  // the eye's own full-shape tonemap read no eye's HDR HUD source while its content was outstanding
     kNoContent,      // the eye's HDR layer holds nothing this frame (no holo draws taken)
     kLayerBusy,      // the 8-bit layer already holds this frame's content (ordering guard)
     kSecondTonemap,  // this eye was already re-tonemapped this frame (never double-tonemap)
@@ -709,6 +718,7 @@ bool releaseLayers() {
         e.hdrTarget = nullptr;
         releaseLayerDs(e.hdrDs);
         e.hdrToneSeq = 0;
+        e.hdrMissStreak = 0;
         e.dsCopy.Reset();
         e.dsCopyDepth.Reset();
         e.dsCopyStencil.Reset();
@@ -1195,7 +1205,25 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
         ++g_win.clears;
     }
     if (which == 0 && g_draw.hdr && e.hdrSeq != g_draw.seq) {
-        if (e.hdrSeq && e.hdrDraws && e.hdrToneSeq != e.hdrSeq) ++g_win.hdrLost;
+        if (e.hdrSeq && e.hdrDraws && e.hdrToneSeq != e.hdrSeq) {
+            ++g_win.hdrLost;
+            // The missing-consumer deadline (review R1): a content-frame no
+            // tonemap re-issue published -- the already-published case does
+            // NOT count (hdrToneSeq == hdrSeq). The tonemap runs every frame
+            // when the path works; a streak of kCrispHdrMissFrames says the
+            // consumer is not coming, so stand down to stock rather than
+            // lose the HUD every frame. The streak resets where a
+            // publication lands (uiLayerCrispToneEnd). This draw still
+            // completes into the layer; the NEXT holo draw is stock.
+            if (++e.hdrMissStreak >= kCrispHdrMissFrames) {
+                char why[200];
+                _snprintf_s(why, _TRUNCATE,
+                            "the HUD layer's content reached no tonemap for %u consecutive frames "
+                            "(the cockpit holo panels were taken but never came back)",
+                            kCrispHdrMissFrames);
+                crispStandDown(why);
+            }
+        }
         const int timer = routeBegin(ctx, UiRouteStage::kHdrClear, g_draw.eye, g_draw.seq);
         vScreenClearRenderTargetViewRaw(ctx, e.hdrRtv.Get(), kUiLayerClear);
         routeEnd(ctx, timer);
@@ -2063,6 +2091,10 @@ void logTotals(double seconds) {
 
 }  // namespace
 
+// The crisp take's whole dependency set, established no later than the first
+// holo take (review R2) -- defined beside the coverage machinery, below.
+bool crispTakeReady(ID3D11DeviceContext* ctx, int eye);
+
 // --------------------------------------------------------------- the API
 
 void uiLayerConfigure(Config& cfg) {
@@ -2265,11 +2297,19 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
         // depth or stencil WRITE would then land twice in the layer's copy.
         const bool multiplyWrites = f.blend == UiBlendShape::kMultiply && f.ds.writes();
         if (multiplyWrites) f.blend = UiBlendShape::kRefused;
+        // Review R5: the HDR half has no transmittance route, so the pure
+        // gate refuses a crisp multiply; the detail line names it below.
+        const bool hdrMultiply = f.crispHdr && f.blend == UiBlendShape::kMultiply;
         d = uiLayerDecide(f);
         if (d == UiLayerDecision::kRedirect) {
+            // The crisp take establishes its WHOLE dependency set here, no
+            // later than the first take (review R2): a failure refuses the
+            // take as kLayerFailed -- the draw stays stock -- and
+            // crispTakeReady has already stood the path down with the
+            // reason. Never take-then-drop.
             f.layerReady =
                 f.crispHdr
-                    ? ensureHdrLayerFor(ctx, f.eye)
+                    ? crispTakeReady(ctx, f.eye)
                     : ensureLayerFor(ctx, f.eye) &&
                           (f.blend != UiBlendShape::kMultiply || ensureMult(ctx, g_eye[f.eye], f.eye));
             d = uiLayerDecide(f);
@@ -2280,7 +2320,9 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
         describeDs(dsState, ref, dsFmt, ds, sizeof(ds));
         if (d == UiLayerDecision::kBlendRefused) {
             _snprintf_s(detail, _TRUNCATE, "%s%s", bl,
-                        multiplyWrites ? " (a multiply that writes depth or stencil)" : "");
+                        multiplyWrites ? " (a multiply that writes depth or stencil)"
+                        : hdrMultiply  ? " (a multiply has no transmittance route into the HDR layer)"
+                                       : "");
         } else if (d == UiLayerDecision::kDepthStencilTest ||
                    d == UiLayerDecision::kSubstitutedWrite) {
             _snprintf_s(detail, _TRUNCATE, "%s%s%s", ds, *dsWhy ? "; " : "", dsWhy);
@@ -2502,6 +2544,55 @@ void compileCoverageOnce(ID3D11DeviceContext* ctx) {
     }
 }
 
+// The coverage pass's deferred context, created once a session (the one
+// attempt is g_crispDeferredTried). Warmed through crispTakeReady at the
+// first holo take; the pass itself keeps its own late-failure handling.
+bool crispCoverageContextReady(ID3D11DeviceContext* ctx) {
+    if (g_crispDeferred) return true;
+    if (g_crispDeferredTried || !ctx) return false;
+    g_crispDeferredTried = true;
+    Ptr<ID3D11Device> dev;
+    ctx->GetDevice(&dev);
+    return dev && SUCCEEDED(dev->CreateDeferredContext(0, &g_crispDeferred)) && g_crispDeferred;
+}
+
+// The whole dependency set a taken holo draw needs at the tonemap,
+// established no later than the FIRST holo take of it (review R2): the eye's
+// HDR layer, its 8-bit layer, the RGB-only blend the re-issue draws with,
+// and the coverage pass's shaders and deferred context. The HDR take used to
+// ensure only the FP16 layer before redirecting; the rest were first ensured
+// at the tonemap, after the holo draws had left stock, and a failure there
+// dropped the already-taken HUD every frame. A failure here REFUSES the take
+// (the draw runs stock, the decide's kLayerFailed names it on the 30 s line)
+// and stands the path down with the reason: never take-then-drop.
+bool crispTakeReady(ID3D11DeviceContext* ctx, int eye) {
+    if (!ensureHdrLayerFor(ctx, eye)) {
+        crispStandDown("the HDR HUD layer could not be created");
+        return false;
+    }
+    if (!ensureLayerFor(ctx, eye)) {
+        crispStandDown("the eye's 8-bit layer (the tonemap re-issue's target) could not be created");
+        return false;
+    }
+    UiBlendRt rgbOnly;  // the re-issue's blend: disabled, the colour channels alone written
+    rgbOnly.enable = false;
+    rgbOnly.mask = uiblend::kWriteRgb;
+    if (!cachedBlend(ctx, rgbOnly)) {
+        crispStandDown("the tonemap re-issue's blend state could not be created");
+        return false;
+    }
+    compileCoverageOnce(ctx);
+    if (!g_covVs || !g_covPs) {
+        crispStandDown("the coverage pass's shaders could not be compiled");
+        return false;
+    }
+    if (!crispCoverageContextReady(ctx)) {
+        crispStandDown("no deferred context for the coverage pass");
+        return false;
+    }
+    return true;
+}
+
 // First-seen lines, deduplicated per (reason, vs, ps) -- and, with reason
 // kCount, the first re-issue per variant.
 struct CrispToneSeen {
@@ -2545,11 +2636,12 @@ bool crispCoveragePass(ID3D11DeviceContext* ctx, Eye& e, int eye, uint64_t seq) 
     if (!g_covVs || !g_covPs) compileCoverageOnce(ctx);
     if (!g_covVs || !g_covPs) return false;
     if (!g_crispDeferred) {
-        if (g_crispDeferredTried) return false;
-        g_crispDeferredTried = true;
-        Ptr<ID3D11Device> dev;
-        ctx->GetDevice(&dev);
-        if (!dev || FAILED(dev->CreateDeferredContext(0, &g_crispDeferred)) || !g_crispDeferred) {
+        // crispTakeReady has run at the first holo take since R2, so a
+        // failure here was almost always said there already; say it once
+        // when it is genuinely first seen.
+        const bool triedBefore = g_crispDeferredTried;
+        if (!crispCoverageContextReady(ctx)) {
+            if (triedBefore) return false;
             Log::get().note("crisp hud: no deferred context for the coverage pass; the crisp-HUD half of fix.ui_quality "
                             "stands down (the holo panels are drawn as they always were).");
             crispStandDown("no deferred context for the coverage pass");
@@ -2640,7 +2732,10 @@ bool uiLayerCrispNoteEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count
         for (int cand = 0; cand < 2; ++cand) {
             const Eye& c = g_eye[cand];
             const bool fresh = c.hdrSeq == seq && c.hdrDraws && c.hdrSrv;
-            if (fresh) content = true;
+            // Outstanding = fresh and NOT yet published: already-consumed
+            // content (hdrToneSeq == hdrSeq) must not arm the failed-consumer
+            // fallback below (review R1's second half).
+            if (fresh && c.hdrToneSeq != c.hdrSeq) content = true;
             if (eye >= 0 || !fresh || r.Get() != c.hdrTarget) continue;
             eye = cand;
             hdrSlot = static_cast<int>(s);
@@ -2648,13 +2743,37 @@ bool uiLayerCrispNoteEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count
         }
     }
     if (eye < 0) {
-        // Fresh holo content this frame, but this draw reads no eye's HUD
-        // source: the panels were taken and cannot come back through it.
-        // Named once, counted -- and the crisp path stands down to stock
-        // rather than lose the HUD for the session.
-        if (content) {
-            crispToneDecline(CrispToneDecline::kNoHdrSlot, vs, ps);
-            crispStandDown("no PS slot of the tonemap reads an eye's HUD source");
+        // Outstanding holo content this frame, but this draw reads no eye's
+        // HUD source. Only the eye's OWN tonemap failing to read it is a
+        // failed consumer (review R1): the draw must BE the tonemap -- the
+        // full SRV shape, or the EDHM swap's known exposure-less one
+        // (tonemapAdmitFull) -- and its output must be the eye whose content
+        // is outstanding (the census measures hundreds-thousands of
+        // tonemap-SHAPED draws a window that are not it: SMAA and the post
+        // passes after it, skipped silently here, as before this branch
+        // existed). A consumer that never comes at all is the frame
+        // deadline's (beginInner's HDR clear). The eye read is the eye
+        // table's READ-ONLY lookup: the registering form crowded the main
+        // menu's composite out of it (the 2026-09-27 regression).
+        if (content && tonemapAdmitFull(ta, vs)) {
+            int outEye = -1;
+            if (ta.rtvRes) {
+                ResourceInfo ri;
+                if (bindingResolveResource(ta.rtvRes, &ri) && ri.isTexture2D)
+                    outEye = uiDepthEyeOfTargetReadOnly(ri.resource);
+            }
+            bool failedConsumer = false;
+            if (outEye >= 0 && outEye < 2) {
+                const Eye& c = g_eye[outEye];
+                failedConsumer =
+                    c.hdrSeq == seq && c.hdrDraws && c.hdrSrv && c.hdrToneSeq != c.hdrSeq;
+            }
+            if (failedConsumer) {
+                // Named once, counted -- and the crisp path stands down to
+                // stock rather than lose the HUD for the session.
+                crispToneDecline(CrispToneDecline::kNoHdrSlot, vs, ps);
+                crispStandDown("no PS slot of the tonemap reads an eye's HUD source");
+            }
         }
         return false;
     }
@@ -2893,6 +3012,7 @@ void uiLayerCrispToneEnd(ID3D11DeviceContext* ctx) {
     e.draws = 1;
     e.target = rtvRes;  // the RGBA8 eye the game's tonemap wrote: the eye check's identity
     e.hdrToneSeq = seq;
+    e.hdrMissStreak = 0;  // a publication landed: the R1 deadline's streak resets
     g_lastRedirectSeq = seq;
     detail::g_uiLayerWatching = true;
     ++g_win.hdrReissued;

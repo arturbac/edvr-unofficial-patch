@@ -1688,7 +1688,8 @@ bool drawGateSubscribed(State* s) {
         hudSpriteWantsDraws() || panelUpscaleWantsDraws() || hudGrainWantsDraws() ||
         uiDepthWantsDraws() ||
         sunglareWantsDraws() ||
-        drawCensusArmed() || objectProbeWantsDraws() ||
+        drawCensusArmed() || hudLayerCensusArmed() ||  // review R6: the HUD layer census announces armed and emits windows; without this term it never saw a draw when every other subscriber was off
+        objectProbeWantsDraws() ||
         panelCurveWants() || particleWantsDraws() || backdropWantsDraws() ||
         scrimWantsDraws() || quadProbeWants() || loaderPanelWants() ||
         introProbeWants() || introPanelWants();
@@ -4122,8 +4123,11 @@ void STDMETHODCALLTYPE hookedBegin(ID3D11DeviceContext* self,
         drawCensusQuery('B', async, foreignContext(self));
     }
     // The HUD layer census's G-D pair declines while any game query is open
-    // on the owner context (hud_layer_census.h says why). One bool while off.
-    if (hudLayerCensusArmed() && !foreignContext(self)) {
+    // on the owner context (hud_layer_census.h says why). Tracked whether or
+    // not the census is armed, so a bracket begun before a live arm still
+    // blocks the pair until it closes (review R7); unarmed, the price is a
+    // pointer append on a <=16-entry set, no query type read.
+    if (!foreignContext(self)) {
         hudLayerCensusNoteGameQuery(true, async);
     }
     g_state->realBegin(self, async);
@@ -4137,8 +4141,8 @@ void STDMETHODCALLTYPE hookedEnd(ID3D11DeviceContext* self,
     if (drawCensusArmed()) {
         drawCensusQuery('E', async, foreignContext(self));
     }
-    if (hudLayerCensusArmed() && !foreignContext(self)) {
-        hudLayerCensusNoteGameQuery(false, async);
+    if (!foreignContext(self)) {
+        hudLayerCensusNoteGameQuery(false, async);  // the matching End; unarmed too (R7)
     }
     g_state->realEnd(self, async);
     if(!foreignContext(self))

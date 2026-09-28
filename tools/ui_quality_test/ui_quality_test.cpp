@@ -426,6 +426,43 @@ void testGate() {
           "a multiply through a substitution is left (its second draw cannot be repeated)");
     check(with([](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kRefused; }) == UiLayerDecision::kBlendRefused, "blend");
 
+    // The crisp-HUD (HDR) take of the holo panels: every admitted blend
+    // shape must have its composition semantics end to end. A multiply has
+    // no transmittance route into the HDR layer (the HDR take skips
+    // ensureMult; the coverage pass transfers only scalar alpha), so the
+    // gate refuses it BEFORE the redirect (review R5); the measured holo
+    // blends -- premultiplied-over and opaque -- must still be taken.
+    auto hdrWith = [&](void (*edit)(UiLayerDrawFacts&)) {
+        UiLayerDrawFacts g = f;
+        g.family = UiLayerFamily::kHolo;
+        g.ldrView = false;  // the lit pre-tonemap HDR target
+        g.crispHdr = true;
+        edit(g);
+        return uiLayerDecide(g);
+    };
+    check(hdrWith([](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kPremulOver; }) == UiLayerDecision::kRedirect,
+          "the holo panels' premultiplied-over is taken into the HDR layer");
+    check(hdrWith([](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kOpaque; }) == UiLayerDecision::kRedirect,
+          "an opaque holo draw is taken into the HDR layer");
+    check(hdrWith([](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kMultiply; }) == UiLayerDecision::kBlendRefused,
+          "a multiply into the HDR target is refused: the HDR half has no transmittance route");
+    check(hdrWith([](UiLayerDrawFacts& g) {
+              g.blend = UiBlendShape::kMultiply;
+              g.substituted = true;
+          }) == UiLayerDecision::kBlendRefused,
+          "...through a substitution too");
+    check(hdrWith([](UiLayerDrawFacts& g) {
+              g.blend = UiBlendShape::kMultiply;
+              g.layerReady = false;
+          }) == UiLayerDecision::kBlendRefused,
+          "...and the refusal is the blend's, ahead of the layer's readiness");
+    check(with([](UiLayerDrawFacts& g) {
+              g.family = UiLayerFamily::kHolo;
+              g.ldrView = false;
+              g.blend = UiBlendShape::kMultiply;
+          }) == UiLayerDecision::kHdrTarget,
+          "with the crisp take off a holo multiply is still plain HDR, left stock");
+
     // The on-foot gate: on foot the 2D screen IS the world (flight 09:38:
     // the layer took it and the temporal pass got a black eye). The journal's
     // pair (known, on foot), read once a frame, drives the fact.

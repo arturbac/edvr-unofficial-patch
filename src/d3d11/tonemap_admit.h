@@ -176,4 +176,17 @@ inline bool tonemapAdmitStructure(ID3D11DeviceContext* ctx, uint64_t ps, ToneAdm
     return true;
 }
 
+// Is the admitted draw genuinely THE tonemap, not merely tonemap-shaped
+// (review R1: the census measures hundreds-thousands of structure matches a
+// window that fail this -- SMAA and the post passes after the tonemap among
+// them)? The full SRV shape: exposure bound at VS t0 -- or its KNOWN absence
+// in the EDHM swap (vs kToneVsEdhm binds none, flight 1's G-B) -- PS t0 a 3D
+// LUT view, and a 2D HDR source view. ui_layer.cpp's crisp path gates its
+// failed-consumer stand-down on this; the census's "full match" lines keep
+// ToneAdmit::full's stricter reading (the EDHM swap stays not-full there).
+inline bool tonemapAdmitFull(const ToneAdmit& t, uint64_t vs) {
+    const bool exposure = t.vsT0Res != nullptr || vs == kToneVsEdhm;
+    return exposure && t.psT0Is3D && t.hdrRes != nullptr && t.hdr2D;
+}
+
 }  // namespace edvr

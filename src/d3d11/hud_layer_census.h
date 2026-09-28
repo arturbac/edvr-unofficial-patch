@@ -104,16 +104,23 @@ struct HudCensusGdSave {
     bool bOpen = false;  // query B begun, not yet End'd
 };
 
-// From vscreen's query-bracket hooks while the census is armed (owner
-// context only): a game query began or End'd. The G-D pair declines while
-// a SAMPLE-COUNTING game query is open on the context (occlusion,
-// stream-out or pipeline statistics) -- a re-issued family draw inside
-// such a bracket would feed its counter, and changing what the game
-// measures changes what it draws a frame later. Timestamps, their
-// disjoint and events count no samples and are ignored (gpu_span's
-// frame-wide TIMESTAMP_DISJOINT would otherwise decline every pair, as
-// it did in flight 1). The census's own ring queries are recognised and
-// ignored.
+// From vscreen's query-bracket hooks (owner context only, ARMED OR NOT):
+// a game query began or End'd. The G-D pair declines while a SAMPLE-COUNTING
+// game query is open on the context (occlusion, stream-out or pipeline
+// statistics) -- a re-issued family draw inside such a bracket would feed
+// its counter, and changing what the game measures changes what it draws a
+// frame later. Timestamps, their disjoint and events count no samples and
+// are ignored (gpu_span's frame-wide TIMESTAMP_DISJOINT would otherwise
+// decline every pair, as it did in flight 1). The census's own ring queries
+// are recognised and ignored.
+//
+// The bracket set is tracked while unarmed too, so a bracket begun before a
+// live arm still blocks the pair until it closes (review R7): an entry
+// begun while unarmed is UNCLASSIFIED -- no type read, the unarmed price is
+// a pointer append/erase on a <=16-entry set -- and blocks like a
+// sample-counting one, so arming mid-frame defers G-D until every pre-arm
+// bracket has closed (a frame or two). resetSession deliberately does not
+// clear the set; Ends keep it exact.
 void hudLayerCensusNoteGameQuery(bool begin, void* async);
 
 // The three steps of the G-D pair, driven by vscreen's helper around its

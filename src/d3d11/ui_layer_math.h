@@ -939,6 +939,13 @@ inline UiLayerDecision uiLayerDecide(const UiLayerDrawFacts& f) {
     if (f.ds.writes() && f.substituted) return UiLayerDecision::kSubstitutedWrite;
     if (f.blend == UiBlendShape::kRefused) return UiLayerDecision::kBlendRefused;
     if (f.blend == UiBlendShape::kMultiply && f.substituted) return UiLayerDecision::kBlendRefused;
+    // The HDR half has no transmittance route for a multiply: the HDR take
+    // skips ensureMult (the transmittance target is the LDR layer's), and
+    // the coverage pass transfers only scalar HDR alpha, so a multiply
+    // redirected into the HDR layer would lose its destination modulation
+    // (review R5). Refuse BEFORE the redirect. Measured holo draws are
+    // premultiplied-over, so this refuses nothing seen in flight.
+    if (f.crispHdr && f.blend == UiBlendShape::kMultiply) return UiLayerDecision::kBlendRefused;
     if (!f.layerReady) return UiLayerDecision::kLayerFailed;
     return UiLayerDecision::kRedirect;
 }
