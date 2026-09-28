@@ -663,6 +663,45 @@ inline void run(const Harness& h) {
     h.check(logged("(the census is off: it runs only with engine motion's diagnostics", mark),
             "P1: the emit's census is off without diagnostics, and says its zeros are not counts");
 
+    // F7 (rc-since-rc2 review, 2026-09-27): the sampled shadow probe meets
+    // EDVR's own installed substitution, the generated patch registered in
+    // the hash registry exactly as the production hook registers it
+    // (device_hook.cpp). The probe must leave the shadow on the game's
+    // original with its generation intact, the substitution must stand, and
+    // the frame boundary must restore. A genuine bypass must still heal.
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    {
+        ComPtr<ID3D11PixelShader> patch;
+        h.context->PSGetShader(&patch, nullptr, nullptr);
+        h.check(patch && patch.Get() != g.ps.Get(), "F7: the keyed draw installed the substitution");
+        lifecycle_fake::g_objectHash[patch.Get()] = 0x5B0F383DFAFF6AE6ull;
+        const auto& psSlot = lifecycle_fake::g_slots[static_cast<unsigned>(edvr::BindSlot::Ps)];
+        void* shadowPtr = psSlot.ptr;
+        const uint32_t shadowGen = psSlot.gen;
+        edvr::engine_velocity_detail::psShadowProbe(h.context);
+        h.check(psSlot.ptr == shadowPtr && psSlot.gen == shadowGen,
+                "F7: the probe leaves the shadow on the game's original, generation intact");
+        h.context->PSGetShader(&patch, nullptr, nullptr);
+        h.check(patch && patch.Get() != g.ps.Get(), "F7: the substitution still stands after the probe");
+    }
+    g.endFrame(true);
+    {
+        ComPtr<ID3D11PixelShader> live;
+        h.context->PSGetShader(&live, nullptr, nullptr);
+        h.check(live.Get() == g.ps.Get(),
+                "F7: the frame boundary restores the game's original (the saved identity survived)");
+    }
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    lifecycle_fake::g_objectHash[g.ps2.Get()] = 0x3434972DB5336AA4ull;
+    h.context->PSSetShader(g.ps2.Get(), nullptr, 0);   // live only; the hook "missed" the bind
+    edvr::engine_velocity_detail::psShadowProbe(h.context);
+    h.check(lifecycle_fake::g_slots[static_cast<unsigned>(edvr::BindSlot::Ps)].ptr == g.ps2.Get(),
+            "F7: a genuine bypass-bound game shader still heals the shadow");
+
     // Read the actual bound MRT6 resource, independent of the view flavor.
     const auto mrt6 = [&] {
         ID3D11RenderTargetView* rt[8] = {};

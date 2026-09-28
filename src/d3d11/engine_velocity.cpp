@@ -1758,15 +1758,24 @@ void psShadowProbe(ID3D11DeviceContext* ctx) {
     ID3D11PixelShader* livePs = nullptr;
     ctx->PSGetShader(&livePs, nullptr, nullptr);
     if (!livePs) return;
-    const uint64_t liveHash = lookupShaderHash(livePs);
-    if (livePs != bindingGet(BindSlot::Ps) && liveHash != 0) {
-        // The truth wins: the bind bypassed the hook (or its memo missed it).
-        // The shadow takes the live state, and the draw takes the slow half,
-        // which then reads the real shader. EDVR's own patched shaders are not
-        // registered (hash 0): mid-substitution reads never heal.
-        bindingSetShader(BindSlot::Ps, livePs, liveHash);
-        ++g_draw.poolShadowHealed;
-        beforeDrawSlow(ctx, cache.eye);
+    // EDVR's own installed substitution is not a bypass (rc-since-rc2 review
+    // F7): the shadow correctly holds the game's original and g_bound owns
+    // the patch's identity and saved generation. Healing here would adopt
+    // the patch as game state, break the generation restore() compares by,
+    // and lose the original -- the frame boundary then has nothing to
+    // restore with. The pointer compares are free and cover both identities
+    // before any registry lookup; EDVR shaders with no registered hash never
+    // heal either (the liveHash gate below, as before).
+    if (livePs != bindingGet(BindSlot::Ps) && livePs != g_bound.patchedPs) {
+        const uint64_t liveHash = lookupShaderHash(livePs);
+        if (liveHash != 0) {
+            // The truth wins: the bind bypassed the hook (or its memo missed
+            // it). The shadow takes the live state, and the draw takes the
+            // slow half, which then reads the real shader.
+            bindingSetShader(BindSlot::Ps, livePs, liveHash);
+            ++g_draw.poolShadowHealed;
+            beforeDrawSlow(ctx, cache.eye);
+        }
     }
     livePs->Release();
 }

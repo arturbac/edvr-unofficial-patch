@@ -4602,6 +4602,24 @@ F1-F6, all fixed without a flight:
   accepted, and the engine guards the read with a named failure. Rig:
   both boundary fixtures in flat_pixels --self-test.
 
+F7 (the updated pass's new P1): the sampled VR PS-shadow probe could
+adopt EDVR's own installed substitution as game state -- the probe
+assumed EDVR shaders hash zero, but the production hook registers the
+generated patch's nonzero hash, so a sample wrote the patch into the
+game shadow, broke the generation restore() compares by, and lost the
+original's identity (the frame boundary then had nothing to restore
+with). The probe now skips the currently installed patch by pointer
+identity before any registry lookup -- the shadow keeps the game's
+original and the saved generation. Lifecycle rig (gate-executed):
+substitution survives a sample with shadow and generation untouched,
+the frame boundary restores the original, and a genuine bypass-bound
+game shader still heals (engine_velocity_test 1162 checks). The pass's
+four performance items (inverse stamp decode, stage-verdict cache,
+exact-plan prepare reuse, camera hash at capture) are assessed
+optimization candidates with equivalence/measurement plans, not RC
+blockers; they wait on their own equivalence tests and a GPU timing
+flight before any source change.
+
 Full build green: mono resolve PASS, collector policy PASS, corpus
 36/36, engine_velocity 1157 checks, ui_quality 254 checks,
 openxr_shutdown 63 checks, flat_pixels self-test passed. One transient
