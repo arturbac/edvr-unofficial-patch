@@ -263,6 +263,7 @@ struct Draw {
     float jx = 0.0f, jy = 0.0f;  // this frame's jitter, in the target's pixels
     UiBlendShape shape = UiBlendShape::kRefused;  // as decided
     UiDsEffect ds;               // what it does with the game's depth-stencil
+    bool rawDepthWritePotential = false; // before the original DSV's read-only mask
     uint8_t stencilRead = 0;     // its stencil read mask, for the seed
     // Saved at Begin, put back at End.
     ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
@@ -307,6 +308,9 @@ uint32_t g_blendCount = 0;
 std::unique_ptr<edvr_layer_seed::Seeder> g_seeder;
 Ptr<ID3D11DeviceContext> g_deferred;
 bool g_seederTried = false;
+// Conservative across both eyes and LDR/HDR caches. A redirected depth
+// writer may also change another cache's game source through raw write-back.
+UiLayerPrivateDepthGuard g_privateDepthGuard;
 
 // ------------------------------------------------- the crisp-HUD half's of fix.ui_quality declines
 
@@ -365,6 +369,8 @@ struct Window {
     // issue (decide-time, via decided[kAfterUi][...], plus begin-time below).
     uint64_t afterTaken = 0, afterPostPass = 0, afterRefused = 0, afterDeclined = 0;
     uint64_t eyeMatched = 0, eyeSwapped = 0, eyeUntold = 0, seedStale = 0;
+    uint64_t depthOnlySeedPreservedWriters = 0;
+    uint64_t privateDepthPotentialBegins = 0;
     // the crisp-HUD half of fix.ui_quality: HUD draws taken into the HDR layer, tonemap re-issues,
     // coverage passes, HDR layers whose content never reached a tonemap, and
     // the re-issue's declines by reason (each also named once a session).
@@ -1465,6 +1471,10 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
     }
     ctx->OMSetBlendState(layerBlend, factor, sampleMask);
     vScreenSetRenderTargetsRaw(ctx, 1, &target, layerDsv);
+    // An original read-only view can mask its effect, while this private view
+    // is writable. Preserve the raw state's potential without another query.
+    g_privateDepthGuard.note(g_draw.seq, g_draw.rawDepthWritePotential);
+    if (g_draw.rawDepthWritePotential && !g_draw.counted) ++g_win.privateDepthPotentialBegins;
     g_draw.active = true;
     // A multiply's second issue -- the game's draw again, into the
     // transmittance -- is the layer's own work: timed to uiLayerEnd. The
@@ -2154,6 +2164,13 @@ void logTotals(double seconds) {
     }
     const Eye& l = g_eye[0];
     Log::get().note(
+        "ui quality: layer seed preservation: %llu stencil-only game writers kept an unmodified "
+        "depth-only seed; matched layer/eye events, not avoided-seed count; %llu first-issue attempts "
+        "with raw depth-enabled/write-ALL state activated a conservative whole-frame guard "
+        "across both eyes/layers (potential writes, including no private DSV or original read-only view).",
+        static_cast<unsigned long long>(g_win.depthOnlySeedPreservedWriters),
+        static_cast<unsigned long long>(g_win.privateDepthPotentialBegins));
+    Log::get().note(
         "ui quality: layer: %.0f s, %llu frames, %ux%u per eye + composite output %ux%u; %.2f draws "
         "a frame redirected (%s), %.2f multiplies, %.2f depth/stencil write-backs, %.2f tested "
         "against a seeded copy (%llu seeds, %llu failed, %llu stale); per frame %.2f viewport remaps, "
@@ -2554,6 +2571,7 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     g_draw.shape = f.blend;
     g_draw.ds = f.ds;
     g_draw.stencilRead = dsState.readMask;
+    g_draw.rawDepthWritePotential = dsState.depthEnable && dsState.depthWriteAll;
     // The pass computed the jitter against the eye's submitted region, which
     // is the target (targetMatchesEye above).
     g_draw.jx = jx;
@@ -2602,6 +2620,7 @@ bool uiLayerWriteBackBegin(ID3D11DeviceContext* ctx) {
     guarded("uiLayer.writeBack", [&] {
         ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, g_draw.wbRtv, &g_draw.wbDsv);
         if (!g_draw.wbDsv) return;
+        g_privateDepthGuard.noteReplay(g_draw.seq, g_lastRedirectSeq, g_draw.rawDepthWritePotential);
         // The game's own depth target and state, no colour target: the draw's
         // depth or stencil write lands in the game's buffer exactly as it
         // always did, and its colour lands nowhere (it is in the layer).
@@ -3241,7 +3260,10 @@ bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForw
             DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
             const UiDsState ds = dsStateOfNoted(ctx, dsv,
                 matchingDiagnostic ? &ref : nullptr, matchingDiagnostic ? &fmt : nullptr);
-            const bool invalidated = matchingFresh && uiLayerDsEffect(ds, true).writes();
+            const UiDsEffect writer = uiLayerDsEffect(ds, true);
+            const bool invalidated = matchingFresh && uiLayerSeedWriterInvalidates(writer,
+                l->seededMask, l->seededDepth, g_privateDepthGuard.active(g_lastRedirectSeq));
+            if (matchingFresh && writer.writes() && !invalidated) ++g_win.depthOnlySeedPreservedWriters;
             if (matchingDiagnostic) {
                 const UiSeedKey key = uiSeedDrawKey(ds, count, instances, verdict,
                     bindingShaderHash(BindSlot::Vs), bindingShaderHash(BindSlot::Ps), ref,
@@ -3581,6 +3603,7 @@ void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
 }
 
 void uiLayerShutdown() {
+    g_privateDepthGuard.reset();
     g_hdrSeedGpu.reset(); // release-only shutdown; the owner/device may already be gone
     g_hdrSeedActive = 0;
     g_seedCensus = UiSeedCensus{};

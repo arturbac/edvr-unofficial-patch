@@ -2353,6 +2353,7 @@ void testWriteBack(Gpu& g) {
 }
 
 #include "ui_seed_census_test.h"
+#include "ui_seed_freshness_test.h"
 
 }  // namespace
 
@@ -2370,6 +2371,7 @@ int main(int argc, char** argv) {
     }
     testRenderState();
     testSeedCensusCpu();
+    testSeedWriterRule();
     testKey();
     testSize();
     testMap();
@@ -2395,6 +2397,8 @@ int main(int argc, char** argv) {
         testSeededStencil(g);
         testWriteBack(g);
         testSeedCensusGpu(g);
+        testPrivateDepthRefreshProof(g);
+        testSeedFreshnessGpu(g);
         testSizeChange(g);
     }
     std::printf("ui_quality_test: %u checks, %u failures\n", g_checks, g_fails);

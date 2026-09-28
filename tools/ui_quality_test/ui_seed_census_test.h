@@ -258,3 +258,56 @@ void testSeedCensusGpu(Gpu& g) {
         }
     }
 }
+
+// A private UI depth write at the layer's finer grid can differ from its raw
+// game write-back resampled by a later seed. Prove whether the proposed
+// stencil-only shortcut needs to retain the legacy refresh in this case.
+void testPrivateDepthRefreshProof(Gpu& g) {
+    Ds game = makeDs(g, 12, 8, true), legacy = makeDs(g, 15, 10, false), held = makeDs(g, 15, 10, false);
+    Tex oldColour = makeTex(g, 15, 10, false), heldColour = makeTex(g, 15, 10, false);
+    edvr_layer_seed::Seeder seeder;
+    try { seeder.init(g.dev.Get()); } catch (...) { check(false, "private depth proof Seeder init"); return; }
+    const float jx = .23f, jy = -.31f;
+    auto seed = [&](Ds& dst) {
+        g.ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        seeder.seed(g.ctx.Get(), game.depth.Get(), game.stencil.Get(), dst.dsv.Get(),
+                    12, 8, 15, 10, jx, jy, 0, true);
+    };
+    g.ctx->ClearDepthStencilView(game.dsv.Get(), 3, .75f, 165);
+    seed(legacy); seed(held);
+    D3D11_DEPTH_STENCIL_DESC desc{};
+    desc.DepthEnable = TRUE; desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    ComPtr<ID3D11DepthStencilState> depthWriter;
+    check(SUCCEEDED(g.dev->CreateDepthStencilState(&desc, &depthWriter)), "private depth proof writer state");
+    const float rect[4] = {-.37f, -.5f, .51f, .43f}, full[4] = {-1.2f, -1.2f, 1.2f, 1.2f};
+    const float white[4] = {1, 1, 1, 1}, black[4] = {0, 0, 0, 0};
+    const D3D11_VIEWPORT gameVp{0, 0, 12, 8, 0, 1}, layerVp{0, 0, 15, 10, 0, 1};
+    quadDs(g, nullptr, legacy.dsv.Get(), depthWriter.Get(), rect, white, 0, 0, layerVp, nullptr);
+    quadDs(g, nullptr, held.dsv.Get(), depthWriter.Get(), rect, white, 0, 0, layerVp, nullptr);
+    // The production raw write-back uses the game's original viewport/jitter.
+    quadDs(g, nullptr, game.dsv.Get(), depthWriter.Get(), rect, white,
+           2 * jx / 12, -2 * jy / 8, gameVp, nullptr);
+    const auto gameBefore = readBackDs(g, game);
+    const auto stencilWriter = stencilState(g, true);
+    quadDs(g, nullptr, game.dsv.Get(), stencilWriter.Get(), full, white, 0, 0, gameVp, nullptr);
+    const auto gameAfter = readBackDs(g, game);
+    bool unchanged = true;
+    for (size_t i = 0; i < gameBefore.size(); i += 4)
+        unchanged = unchanged && std::memcmp(&gameBefore[i], &gameAfter[i], 3) == 0;
+    check(unchanged, "actual game stencil-only write leaves sourced depth byte-exact after raw replay");
+    seed(legacy);
+    const auto a = readBackDs(g, legacy), b = readBackDs(g, held);
+    bool differs = false;
+    for (size_t i = 0; i < a.size(); i += 4) differs = differs || std::memcmp(&a[i], &b[i], 3) != 0;
+    check(differs, "private finer depth and later game-depth resampling can differ despite stencil-only intervening writer");
+    desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO; desc.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
+    ComPtr<ID3D11DepthStencilState> tester;
+    check(SUCCEEDED(g.dev->CreateDepthStencilState(&desc, &tester)), "private depth proof consumer state");
+    g.ctx->ClearRenderTargetView(oldColour.rtv.Get(), black);
+    g.ctx->ClearRenderTargetView(heldColour.rtv.Get(), black);
+    quadDs(g, oldColour.rtv.Get(), legacy.dsv.Get(), tester.Get(), full, white, 0, 0, layerVp, nullptr);
+    quadDs(g, heldColour.rtv.Get(), held.dsv.Get(), tester.Get(), full, white, 0, 0, layerVp, nullptr);
+    check(readBack(g, oldColour) != readBack(g, heldColour),
+          "omitting refresh after accepted private depth write can change later consumer colour");
+}

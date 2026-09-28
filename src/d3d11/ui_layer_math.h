@@ -512,6 +512,34 @@ inline UiDsEffect uiLayerDsEffect(const UiDsState& s, bool dsvBound) {
     return e;
 }
 
+// A stencil-only game write cannot change an unmodified depth-only seed.
+// Keep the legacy whole-seed refresh for every other writer. In particular,
+// any private depth-writing interaction in this frame retains it across all
+// eyes/layers: its fine-grid depth or another cache's raw source may differ
+// from a fresh resampling of the game buffer. The UI-quality rig proves this
+// guard with actual differing depth/colour, not just predicate arithmetic.
+inline bool uiLayerSeedWriterInvalidates(const UiDsEffect& writer, uint8_t seededMask,
+                                        bool seededDepth, bool privateDepthWriteThisFrame) {
+    return writer.writes() && !(writer.stencilWrite && !writer.depthWrite &&
+        seededDepth && !seededMask && !privateDepthWriteThisFrame);
+}
+
+struct UiLayerPrivateDepthGuard {
+    uint64_t sequence = 0;
+    void note(uint64_t current, bool rawDepthWritePotential) {
+        if (rawDepthWritePotential && current > sequence) sequence = current;
+    }
+    void noteReplay(uint64_t captured, uint64_t lastRedirect, bool rawDepthWritePotential) {
+        // A late replay protects the current caches without advancing any
+        // rendering cache's freshness sequence.
+        note(captured > lastRedirect ? captured : lastRedirect, rawDepthWritePotential);
+    }
+    // An earlier/out-of-order cache sequence is conservative too; only a
+    // monotonically newer frame can resume preservation.
+    bool active(uint64_t current) const { return !current || current <= sequence; }
+    void reset() { sequence = 0; }
+};
+
 // ------------------------------------------------------ the composite filter --
 
 // The layer texels a footprint [x0, x1) covers along one axis, with their
