@@ -10,6 +10,9 @@ Records in WPR file mode by default (buffers flush to disk; not a fixed ring);
 pass --memory-ring for the old 512 x 1 MiB memory ring instead.
 --start-key/--stop-key arm and end the flight leg on a hotkey (F1-F12, or a
 single letter/digit); --start-after-seconds bounds or replaces the arm wait.
+--gpu adds Windows' built-in GPU profile in the same private file-mode session.
+Provider event counts establish coverage, not GPU busy time; the ETL retains
+the queue events for GPU analysis. --gpu cannot be combined with --memory-ring.
 --status-json samples Status.json at 4 Hz while recording (on by default when
 the Frontier Saved Games copy exists) into <output>\\status_samples.jsonl.
 
@@ -151,21 +154,24 @@ def session_command(wpr, operation, *arguments, instance):
     return [str(wpr), operation, *map(str, arguments), "-instancename", instance]
 
 
-def wpr_commands(wpr, profile, trace, instance, filemode, recordtempto):
+def wpr_commands(wpr, profile, trace, instance, filemode, recordtempto, gpu=False):
     """Build the exact start/stop/cancel commands record() will run.
 
     Shared by plan() (to preview them in --dry-run) and record() (to run
     them), so the printed plan can never drift from what actually executes.
     """
-    extra = ["-filemode", "-recordtempto", str(recordtempto)] if filemode else []
+    if gpu and not filemode:
+        raise ValueError("--gpu requires file mode; --memory-ring is not supported")
+    extra = (["-start", "GPU"] if gpu else []) + (
+        ["-filemode", "-recordtempto", str(recordtempto)] if filemode else [])
     return dict(start=session_command(wpr, "-start", str(profile) + "!EDVRCPU", *extra, instance=instance),
                 stop=session_command(wpr, "-stop", trace, instance=instance),
                 cancel=session_command(wpr, "-cancel", instance=instance))
 
 
 def record(wpr, profile, output, instance, workload, runner=invoke, filemode=False, recordtempto=None,
-          on_started=None, on_stopped=None):
-    commands = wpr_commands(wpr, profile, output, instance, filemode, recordtempto)
+          on_started=None, on_stopped=None, gpu=False):
+    commands = wpr_commands(wpr, profile, output, instance, filemode, recordtempto, gpu)
     start, stop, cancel = commands["start"], commands["stop"], commands["cancel"]
     # A failed start can leave partially-created sessions. The randomized
     # instance belongs only to this invocation, including in the error path.
@@ -177,11 +183,11 @@ def record(wpr, profile, output, instance, workload, runner=invoke, filemode=Fal
         except Exception:
             pass
         raise
-    if on_started:
-        on_started()
     failure = None
     value = None
     try:
+        if on_started:
+            on_started()
         value = workload()
     except BaseException as exc:
         failure = exc
@@ -467,11 +473,34 @@ def wait_for_flight_version(target, process, expected, timeout=30, finder=flight
         return verified
 
 
-def analyze(dotnet, analyzer, trace, pid, output):
+def analyze(dotnet, analyzer, trace, pid, output, gpu=False):
     if output.exists():
         raise ValueError("Analysis output already exists: " + str(output))
     return invoke([str(dotnet), str(analyzer), "--input", str(trace), "--pid", str(pid),
-                   "--output", str(output)], timeout=300)
+                   "--output", str(output)] + (["--gpu-coverage"] if gpu else []), timeout=300)
+
+
+def gpu_profile_details(wpr, profile, runner=None):
+    # Read-only WPR validation is allowed in --dry-run. No trace or output file
+    # is created; use WPR's own installed GPU schema rather than hand-built ETW masks.
+    runner = runner or invoke
+    command = [str(wpr), "-profiledetails", str(profile) + "!EDVRCPU+GPU", "-filemode"]
+    details = runner(command)
+    required = ("EDVRCPU.Verbose.File", "GPU.Verbose.File", "Microsoft-Windows-DxgKrnl")
+    if not all(value in details for value in required):
+        raise ValueError("Combined EDVR CPU + built-in GPU file profile is unavailable")
+    return dict(enabled=True, profile="GPU", preflight_command=command, profile_details=details,
+                qualification="Provider event counts are coverage only, not GPU busy time; "
+                              "GPU queues/preemption require ETL analysis.")
+
+
+def validate_gpu_smoke_report(report):
+    coverage = report.get("gpuProviderCoverage", {})
+    counts = coverage.get("providerEvents", [])
+    dxg = next((entry for entry in counts if entry.get("provider") == "Microsoft-Windows-DxgKrnl"), {})
+    if report.get("eventsLost") != 0 or coverage.get("eventsLost") != 0 or dxg.get("systemWide", 0) <= 0:
+        raise ValueError("GPU smoke has absent DxgKrnl events or reported event loss; flight capture was not armed")
+    return dict(gpu_provider_coverage=coverage)
 
 
 def installed_receipt(target):
@@ -688,6 +717,9 @@ def match_symbols(installed_files, candidate_dirs):
 
 
 def plan(args):
+    gpu = getattr(args, "gpu", False)
+    if gpu and args.memory_ring:
+        raise ValueError("--gpu requires file mode; --memory-ring is not supported")
     import install_edvr
     import edvr_log
     target = Path(install_edvr.resolve_target(args.target)).resolve()
@@ -713,11 +745,11 @@ def plan(args):
     stop_vk = virtual_key_code(args.stop_key) if args.stop_key else None
     status_json = Path(args.status_json).resolve() if args.status_json else default_status_json()
     logging_mode = "memory" if args.memory_ring else "file"
-    commands = wpr_commands(wpr, PROFILE, output / "flight.etl", instance, logging_mode == "file", output)
+    commands = wpr_commands(wpr, PROFILE, output / "flight.etl", instance, logging_mode == "file", output, gpu)
     symbols = dict(candidate_dirs=[str(ROOT / "build")],
                   dlls=[{"key": e["key"], "target": e["target"], "source": e["source"]}
                         for e in receipt["files"] if e.get("key") in SYMBOL_KEYS])
-    return dict(target=str(target), executable=str(executable), expected_build=expected, receipt=receipt_path,
+    result = dict(target=str(target), executable=str(executable), expected_build=expected, receipt=receipt_path,
                 installed_files=receipt["files"], output=str(output), wpr=str(wpr),
                 profile=str(PROFILE), analyzer=str(ANALYZER), dotnet=dotnet,
                 instance=instance, wait_seconds=args.wait_seconds,
@@ -726,6 +758,9 @@ def plan(args):
                 stop_command=commands["stop"], cancel_command=commands["cancel"],
                 start_vk=start_vk, stop_vk=stop_vk, start_after_seconds=args.start_after_seconds,
                 status_json=str(status_json) if status_json else None, symbols=symbols)
+    if gpu:
+        result["gpu"] = gpu_profile_details(wpr, PROFILE)
+    return result
 
 
 def smoke_test_capture(p, directory):
@@ -748,10 +783,13 @@ def smoke_test_capture(p, directory):
             raise RuntimeError("C++ marker smoke fixture failed: " + stdout[-4000:] + stderr[-1000:])
 
     record(p["wpr"], p["profile"], trace, p["instance"] + "_smoke", workload,
-          filemode=(p["logging_mode"] == "file"), recordtempto=directory)
+          filemode=(p["logging_mode"] == "file"), recordtempto=directory, gpu=("gpu" in p))
     report = directory / "smoke-report.json"
-    print(analyze(p["dotnet"], p["analyzer"], trace, smoke_result["pid"], report), flush=True)
-    validated = validate_smoke_report(json.loads(report.read_text(encoding="utf-8")))
+    print(analyze(p["dotnet"], p["analyzer"], trace, smoke_result["pid"], report, gpu=("gpu" in p)), flush=True)
+    decoded = json.loads(report.read_text(encoding="utf-8"))
+    validated = validate_smoke_report(decoded)
+    if "gpu" in p:
+        validated.update(validate_gpu_smoke_report(decoded))
     return dict(pid=smoke_result["pid"], report=str(report), **validated)
 
 
@@ -847,10 +885,10 @@ def capture(args, key_reader=key_is_down):
         trace = directory / "flight.etl"
         record(p["wpr"], p["profile"], trace, p["instance"], workload,
               filemode=(p["logging_mode"] == "file"), recordtempto=directory,
-              on_started=on_started, on_stopped=on_stopped)
+              on_started=on_started, on_stopped=on_stopped, gpu=("gpu" in p))
         write_status(directory, "analyzing", flight=verified, trace=str(trace))
         report = directory / "report.json"
-        print(analyze(p["dotnet"], p["analyzer"], trace, process.pid, report), flush=True)
+        print(analyze(p["dotnet"], p["analyzer"], trace, process.pid, report, gpu=("gpu" in p)), flush=True)
         write_status(directory, "complete", report=str(report))
         return 0
     except BaseException as exc:
@@ -886,6 +924,52 @@ def self_test():
 
     check(record("wpr", "profile", "out.etl", "EDVRCPU_test", lambda: 42, runner) == 42)
     check([c[1] for c in calls] == ["-start", "-stop"])
+
+    # Exercise the actual smoke plumbing with a fake process/analyzer, not a
+    # separately rebuilt command. An optional GPU flight must not pass a CPU-only smoke.
+    gpu_smoke = {"eventsLost": 0, "gpuProviderCoverage": {
+        "eventsLost": 0, "providerEvents": [{"provider": "Microsoft-Windows-DxgKrnl", "systemWide": 1}],
+        "absentProviders": ["Microsoft-Windows-Direct3D11", "Microsoft-Windows-DXGI"],
+        "gpuBusyTimeAnalyzed": False}}
+    check(validate_gpu_smoke_report(gpu_smoke)["gpu_provider_coverage"]["absentProviders"] ==
+          ["Microsoft-Windows-Direct3D11", "Microsoft-Windows-DXGI"])
+    for bad in ({}, {"eventsLost": 1, "gpuProviderCoverage": gpu_smoke["gpuProviderCoverage"]},
+                {"eventsLost": 0, "gpuProviderCoverage": {"eventsLost": 1, "providerEvents": gpu_smoke["gpuProviderCoverage"]["providerEvents"]}},
+                {"eventsLost": 0, "gpuProviderCoverage": {"eventsLost": 0, "providerEvents": []}}):
+        try:
+            validate_gpu_smoke_report(bad)
+            check(False)
+        except ValueError:
+            check(True)
+    with tempfile.TemporaryDirectory() as smoke_tmp:
+        smoke_dir = Path(smoke_tmp)
+        p_smoke = dict(wpr="wpr", profile="profile", instance="private_smoke", dotnet="dotnet", analyzer="analyzer",
+                       logging_mode="file", gpu={"enabled": True}, output=str(smoke_dir / "capture"), smoke_first=True)
+        smoke_process = mock.Mock(pid=789, returncode=0)
+        smoke_process.communicate.return_value = ("fixture", "")
+        def smoke_record(*arguments, **keywords):
+            check(keywords["gpu"] and keywords["filemode"])
+            check(arguments[3] == "private_smoke_smoke")
+            return arguments[4]()
+        def smoke_analyze(*arguments, **keywords):
+            check(keywords["gpu"])
+            check(arguments[2].name == "smoke.etl" and arguments[3] == 789)
+            arguments[4].write_text(json.dumps(gpu_smoke), encoding="utf-8")
+            return "fixture analyzed"
+        with mock.patch(__name__ + ".record", side_effect=smoke_record), \
+                mock.patch(__name__ + ".analyze", side_effect=smoke_analyze), \
+                mock.patch(__name__ + ".subprocess.Popen", return_value=smoke_process), \
+                mock.patch(__name__ + ".validate_smoke_report", return_value={"cpu": "validated"}):
+            check(smoke_test_capture(p_smoke, smoke_dir)["gpu_provider_coverage"]["gpuBusyTimeAnalyzed"] is False)
+            gpu_smoke = {"eventsLost": 0}  # CPU-only report must abort before waiting for Elite.
+            with mock.patch(__name__ + ".plan", return_value=p_smoke), \
+                    mock.patch(__name__ + ".ctypes.windll.shell32.IsUserAnAdmin", return_value=True), \
+                    mock.patch(__name__ + ".wait_for_game", side_effect=AssertionError("flight armed after CPU-only smoke")):
+                try:
+                    capture(argparse.Namespace(dry_run=False, smoke_first=True))
+                    check(False)
+                except ValueError:
+                    check(True)
     check(all(c[-2:] == ["-instancename", "EDVRCPU_test"] for c in calls))
     calls.clear()
     try:
@@ -933,6 +1017,61 @@ def self_test():
     commands = wpr_commands("wpr", "profile", "out.etl", "EDVRCPU_x", False, "C:\\cap dir")
     check("-filemode" not in commands["start"] and "-recordtempto" not in commands["start"])
     check(commands["start"] == ["wpr", "-start", "profile!EDVRCPU", "-instancename", "EDVRCPU_x"])
+
+    gpu_details = "Windows Performance Recorder fixture\nEDVRCPU.Verbose.File\nGPU.Verbose.File\nMicrosoft-Windows-DxgKrnl"
+    calls.clear()
+    def details_runner(command):
+        calls.append(command)
+        return gpu_details
+    detail = gpu_profile_details("wpr", "profile", details_runner)
+    check(calls == [["wpr", "-profiledetails", "profile!EDVRCPU+GPU", "-filemode"]])
+    check(detail["enabled"] and detail["profile"] == "GPU" and "not GPU busy time" in detail["qualification"])
+    for missing in ("", "EDVRCPU.Verbose.File GPU.Verbose.File", "GPU.Verbose.File Microsoft-Windows-DxgKrnl"):
+        try:
+            gpu_profile_details("wpr", "profile", lambda _: missing)
+            check(False)
+        except ValueError:
+            check(True)
+    try:
+        wpr_commands("wpr", "profile", "out.etl", "private", False, "cap", gpu=True)
+        check(False)
+    except ValueError:
+        check(True)
+    commands = wpr_commands("wpr", "profile", "out.etl", "private", True, "cap", gpu=True)
+    check(commands["start"] == ["wpr", "-start", "profile!EDVRCPU", "-start", "GPU", "-filemode",
+                                "-recordtempto", "cap", "-instancename", "private"])
+    check(commands["stop"][-2:] == commands["cancel"][-2:] == ["-instancename", "private"])
+    for failure in ("start", "callback", "workload", "stop", "callback_stop"):
+        calls.clear()
+        workload_calls = []
+        def gpu_runner(command, **kw):
+            calls.append(command)
+            if command[1] == "-start" and failure == "start":
+                raise RuntimeError("partial GPU start")
+            if command[1] == "-stop" and failure in ("stop", "callback_stop"):
+                raise RuntimeError("GPU stop")
+            return ""
+        def gpu_started():
+            if failure in ("callback", "callback_stop"):
+                raise RuntimeError("GPU callback")
+        def gpu_workload():
+            workload_calls.append(True)
+            if failure == "workload":
+                raise RuntimeError("GPU workload")
+            return "game_exit"
+        try:
+            record("wpr", "profile", "out.etl", "private_gpu", gpu_workload, gpu_runner,
+                   filemode=True, recordtempto="cap", on_started=gpu_started, gpu=True)
+            check(False)
+        except RuntimeError:
+            check([c[1] for c in calls] == (["-start", "-cancel"] if failure == "start" else
+                  ["-start", "-stop", "-cancel"] if failure in ("stop", "callback_stop") else ["-start", "-stop"]))
+            check(all(c[-2:] == ["-instancename", "private_gpu"] for c in calls))
+            check(bool(workload_calls) == (failure in ("workload", "stop")))
+    calls.clear()
+    check(record("wpr", "profile", "out.etl", "private_gpu", lambda: "capture_limit", runner,
+                 filemode=True, recordtempto="cap", gpu=True) == "capture_limit")
+    check([c[1] for c in calls] == ["-start", "-stop"])
 
     calls.clear()
     started, stopped = [], []
@@ -1218,6 +1357,34 @@ def self_test():
                         check(armed["status_json"] == str(status_fixture.resolve()))
                         check(capture(armed_args) == 0)
 
+                        gpu_args = argparse.Namespace(**{**vars(args), "gpu": True})
+                        def readonly_preflight(command, **kw):
+                            check(command == [str(system / "System32" / "wpr.exe"), "-profiledetails",
+                                              str(profile) + "!EDVRCPU+GPU", "-filemode"])
+                            return gpu_details
+                        with mock.patch(__name__ + ".invoke", side_effect=readonly_preflight), \
+                                mock.patch(__name__ + ".capture_symbols", side_effect=AssertionError("dry-run copied PDB")), \
+                                mock.patch(__name__ + ".record", side_effect=AssertionError("dry-run recorded")), \
+                                mock.patch(__name__ + ".wait_for_game", side_effect=AssertionError("dry-run waited for game")):
+                            check(capture(gpu_args) == 0)
+                            gpu_plan = plan(gpu_args)
+                            check(gpu_plan["gpu"]["enabled"] and "GPU" in gpu_plan["start_command"])
+                            check(gpu_plan["stop_command"][-1] == gpu_plan["instance"])
+                            check(gpu_plan["cancel_command"][-1] == gpu_plan["instance"])
+                            with mock.patch(__name__ + ".invoke", return_value="GPU profile absent"):
+                                try:
+                                    capture(gpu_args)
+                                    check(False)
+                                except ValueError:
+                                    check(True)
+                        check("gpu" not in p)
+                        check(before == snapshot())
+                        try:
+                            plan(argparse.Namespace(**{**vars(gpu_args), "memory_ring": True}))
+                            check(False)
+                        except ValueError:
+                            check(True)
+
                         try:
                             plan(argparse.Namespace(**{**vars(args), "start_key": "Ctrl"}))
                             check(False)
@@ -1500,6 +1667,9 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--memory-ring", action="store_true",
                         help="use the legacy 512x1MiB memory-ring WPR profile instead of file mode")
+    parser.add_argument("--gpu", action="store_true",
+                        help="add the built-in GPU profile to the same private file-mode session; "
+                             "provider counts are coverage only, not GPU busy time")
     parser.add_argument("--start-key", help="hotkey (F1-F12, or a letter/digit) that arms the WPR start")
     parser.add_argument("--stop-key", help="hotkey (F1-F12, or a letter/digit) that ends the flight leg early")
     parser.add_argument("--start-after-seconds", type=float,

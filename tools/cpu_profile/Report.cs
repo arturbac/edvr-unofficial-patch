@@ -274,6 +274,7 @@ internal static class Report
                 ["windows"] = runtimeLog.Windows.Count,
             },
         };
+        if (data.GpuCoverage is not null) report["gpuProviderCoverage"] = data.GpuCoverage.Report(data.EventsLost);
         return report;
     }
 

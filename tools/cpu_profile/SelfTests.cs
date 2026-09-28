@@ -10,8 +10,31 @@ internal static class SelfTests
 {
     private static int _checks;
 
+    private static void GpuProviderCoverage()
+    {
+        var coverage = new GpuCoverage();
+        Check((string)coverage.Report(0)["status"]! == "providers_absent", "missing GPU events are not success");
+        coverage.Observe(Collector.EdvrProvider, 10, 10);
+        Check(((string[])coverage.Report(0)["absentProviders"]!).Length == 3, "CPU markers do not establish GPU coverage");
+        coverage.Observe(GpuCoverage.DxgKrnl, 0, 10);
+        coverage.Observe(GpuCoverage.DxgKrnl, 10, 10);
+        coverage.Observe(GpuCoverage.Direct3D11, 20, 10);
+        coverage.Observe(GpuCoverage.Dxgi, 10, 10);
+        var report = coverage.Report(0);
+        var counts = (Dictionary<string, object?>[])report["providerEvents"]!;
+        Check((long)counts[0]["systemWide"]! == 2 && (long)counts[0]["targetPid"]! == 1,
+            "GPU coverage retains system-wide events without guessing kernel context PID");
+        Check((long)counts[1]["systemWide"]! == 1 && (long)counts[1]["targetPid"]! == 0,
+            "foreign GPU processes remain visible");
+        Check((string)report["status"]! == "providers_observed_no_reported_loss", "all providers observed");
+        Check(!(bool)report["gpuBusyTimeAnalyzed"]!, "coverage is never busy time");
+        Check((string)coverage.Report(1)["status"]! == "events_lost", "lost ETW events qualify GPU observations");
+        Check(new Collected().GpuCoverage is null, "CPU-only collection does not add a GPU report");
+    }
+
     public static void Run()
     {
+        GpuProviderCoverage();
         SchedulerStateMapping();
         StateDurationWalk();
         RunningWalk();
@@ -769,6 +792,10 @@ internal static class SelfTests
             var bare = Program.ParseOptions(["--input", etl, "--pid", "7", "--output",
                                              Path.Combine(root, "r.json")]);
             Check(bare.Symbols is null, "no symbols directory beside the trace means symbols stay off");
+            Check(!bare.GpuCoverage, "CPU-only command does not count GPU providers");
+            var gpu = Program.ParseOptions(["--input", etl, "--pid", "7", "--output",
+                                            Path.Combine(root, "g.json"), "--gpu-coverage"]);
+            Check(gpu.GpuCoverage && gpu.Pid == bare.Pid, "optional GPU coverage preserves CPU PID filtering");
             Directory.CreateDirectory(Path.Combine(root, "symbols"));
             var defaulted = Program.ParseOptions(["--input", etl, "--pid", "7", "--output",
                                                   Path.Combine(root, "r.json")]);
@@ -851,6 +878,14 @@ internal static class SelfTests
         try
         {
             var report = Report.Build(input, Pid, data, framesPath, null);
+            Check(!report.ContainsKey("gpuProviderCoverage"), "CPU-only report shape is unchanged");
+            data.GpuCoverage = new GpuCoverage();
+            data.GpuCoverage.Observe(GpuCoverage.DxgKrnl, 0, Pid);
+            var withGpu = Report.Build(input, Pid, data, framesPath, null);
+            Check(withGpu.Remove("gpuProviderCoverage"), "GPU coverage is a separate report section");
+            Check(JsonSerializer.Serialize(report) == JsonSerializer.Serialize(withGpu),
+                "adding GPU provider events leaves every CPU report field unchanged");
+            data.GpuCoverage = null;
             // The keys tools/cpu_profile.py's smoke check reads must keep their
             // meaning: the legacy per-frame window is still [presentEnd, nextWaitEntry).
             foreach (var key in new[] { "schemaVersion", "coverageComplete", "analyzedFrameCount", "frames",
