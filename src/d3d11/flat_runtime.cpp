@@ -5,6 +5,7 @@
 #include "flat_shader_classifier.h"
 #include "flat_projection_ownership.h"
 #include "flat_camera_probe.h"
+#include "flat_camera_inject.h"
 #include "flat_live_phase.h"
 #include "flat_draw_capture.h"
 #include "flat_local_reject.h"
@@ -968,6 +969,15 @@ void recordLocallyRefusedPair(State& s, uint64_t vs, uint64_t ps, const char* re
 // this -- they call failPhase directly, gated on cs at each of its three
 // call sites -- and every other caller here is a scene draw by construction.
 void refuseDraw(State& s, const char* reason) {
+    // The upstream camera injector's admission (the C3 plan's R6): on a
+    // certified camera lineage under Upstream ownership, an unknown recipe
+    // is admitted through the camera, not the shader recipe -- no phase
+    // failure, no observation entry. Legacy observation keeps collecting
+    // its own evidence with no veto over the certified route.
+    if (flatCameraInjectBypassRefusal(reason)) {
+        ++s.covInert;
+        return;
+    }
     if (!flatLocalRefusalReason(reason)) { failPhase(s, reason); return; }
     ++s.covLocalRefused;
     s.covFrameLocallyRefused = true;
@@ -1260,6 +1270,16 @@ void flatRuntimeResize() {
 }
 void flatRuntimeBeforePresent() { g_flatRuntimeLive.store(false, std::memory_order_release); }
 bool flatRuntimeNativeScale() { return nativeScale.load(std::memory_order_acquire); }
+void flatRuntimePhaseState(float* x, float* y, uint32_t* w, uint32_t* h, uint32_t* applied) {
+    auto& s = state();
+    if (x) *x = s.phase.currentX;
+    if (y) *y = s.phase.currentY;
+    if (w) *w = s.phaseWidth;
+    if (h) *h = s.phaseHeight;
+    if (applied) *applied = s.phase.applied;
+}
+void flatRuntimeNoteCameraApplied() { auto& s = state(); s.phase.noteApplied(); ++s.jitterDraws; }
+bool flatRuntimeLegacyPlanExists() { return state().projection != nullptr; }
 void flatRuntimeArmProjectionAudit() { if(runtimeFlatProfile()) projectionAuditRequested.store(true,std::memory_order_release); }
 void flatRuntimeCreateBuffer(ID3D11Buffer* buffer, const void* initialData) {
     if(owner() && state().projection) state().projection->observeCreateBuffer(buffer,initialData);
@@ -1477,7 +1497,8 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.phaseDepth=static_cast<ID3D11Resource*>(const_cast<void*>(s.previous.depth));
         s.phaseHdr=static_cast<ID3D11Resource*>(const_cast<void*>(s.previous.hdr));
     }
-    s.phase.beginFrame(wanted && !s.observing && s.projection!=nullptr,compatible,s.phaseWidth,s.phaseHeight);
+    s.phase.beginFrame((wanted && !s.observing && s.projection!=nullptr) || flatCameraInjectWanted(),compatible,s.phaseWidth,s.phaseHeight);
+    flatCameraInjectFrame(frame + 1);
     s.frameCoverage=true;s.temporalAccepted=false;
     s.jitterReason=nonzeroPhase(s)?"live":"warming";
     if(s.projection)s.projection->enableColdReadback(!nonzeroPhase(s));
@@ -1613,9 +1634,14 @@ FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
             D3D11_TEXTURE2D_DESC desc{};if(texture)texture->GetDesc(&desc);
             const bool owned=materialResource && (materialResource.Get()==s.namedDepth || materialResource.Get()==s.phaseDepth.Get());
             if(const auto* plan=qualifyProjection(s,flatProjectionDispatchRecipes(cs,desc.Width,desc.Height),desc.Width,desc.Height,0,0,cs,owned)) {
-                projection.emplace(*plan);
-                if(projection->active()) {s.phase.noteApplied();++s.jitterDispatches;}
-                else failPhase(s,"compute-binding-refused");
+                // Under Upstream ownership the compute path's private-row
+                // mutation is suppressed too (the camera was jittered at the
+                // source); the injector's noteApplied covers the accounting.
+                if (!flatCameraInjectUpstreamOwns()) {
+                    projection.emplace(*plan);
+                    if(projection->active()) {s.phase.noteApplied();++s.jitterDispatches;}
+                    else failPhase(s,"compute-binding-refused");
+                }
             }
         }
     }
@@ -1815,9 +1841,12 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         FlatComputeInternalScope guard;
         s.drawCapture.motionBefore(ctx,producer && !targets[6] && engineVelocityDrawSubstituted(),sourceCandidate);
     }
-    // Engine motion observes unmodified game constants above. Only the actual
-    // raster draw sees private projection rows; restore before leaving scope.
-    if(projectionPlan) {
+    // Engine motion observes unmodified game constants above. Under Upstream
+    // ownership the camera was already jittered at the source by the
+    // injector, so the legacy row-patching scope is suppressed (a counter
+    // elsewhere, never silence); the injector's noteApplied covers the
+    // phase machine's application accounting.
+    if(projectionPlan && !flatCameraInjectUpstreamOwns()) {
         projection.emplace(*projectionPlan);
         if(projection->active()) {s.phase.noteApplied();++s.jitterDraws;}
         else refuseDraw(s,"draw-binding-refused");
