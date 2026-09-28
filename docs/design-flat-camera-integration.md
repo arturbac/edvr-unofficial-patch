@@ -23,12 +23,10 @@
 - Ruled out for that session: a backend evaluation failure as the immediate
   cause, because no backend initialized. Missing shader coverage is proven;
   whether quality settings or a mod produced those variants is not.
-- Next: C2 -- reducer and WARP geometry/lighting tests of exactly-once
-  jitter through the refresh injection point, cache invalidation,
-  forward/inverse/ray consistency, and proof legacy CB jitter cannot
-  coexist with the upstream injector. The function-level consumer
-  lineage is closed (consumer-lineage addendum); what remains is
-  per-shader runtime evidence.
+- Next: build the C2-A derive reducer rig (tools/, reimplementing only
+  the decompiled semantics with citations), then the C2-B WARP harness
+  and the C2-C coexistence proof, per the C2 test plan addendum. Live
+  activation stays C3; the injector's config surface defaults off.
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable/build
   identities, backend versions, dimensions, formats and mod chain for
@@ -299,6 +297,62 @@ treatment/history streaks and reset reasons. No persistent observation, mixed
 phase, stale generation or hidden steady fallback. Compare CPU/GPU cost with
 the existing adapter at the same scene/size. Steady state allocates nothing,
 does no blocking readbacks/captures; resolve regressions before promotion.
+
+## C2 test plan addendum, 2026-09-28: reducer, WARP and coexistence
+
+C2 is an offline gate: no game session is required or sufficient. Every
+test names its discriminating signature and its stop condition up front,
+because a failed proof here retains the existing adapter unchanged.
+
+### C2-A: the derive reducer (pure event/matrix rig)
+
+A new rig under `tools/` reimplements ONLY the semantics read out of the
+decompiles -- the projection builder (FUN_1404f2ff0: frustum params
++0x234..+0x2A0, kind at +0x244, oblique adjust at +0x2A0), the
+view/VP/ray finalizers (FUN_1404f4910 / FUN_1404f49f0 / FUN_1404f3770)
+and the composers (FUN_140596830, FUN_1405964c0) -- each reduction cited
+to its decompile file and line. A divergence between rig and decompile
+is a rig bug, never papered over with a fudge factor.
+
+| Test | Signature that passes | Stop condition |
+| --- | --- | --- |
+| A1 exactly-once | Jitter at the frustum params; derive twice through the protocol; both VP products identical, and each element's delta equals the analytic partial of the phase (no element carries the phase twice) | Any double-scaled or missing term |
+| A2 bit protocol (negative control) | Mutate without raising bits: downstream blocks read STALE caches, matching the decompile's guard behaviour; with bits 4/8 (2/1 as applicable) raised, every block re-derives | The harness ever re-derives without the bits, or stays stale with them |
+| A3 canonical mutation form | Frustum-param mutation and direct projection-matrix mutation produce identical VP within float tolerance, across the kind branches (perspective/ortho/third) and the oblique path | A branch where they diverge -- that branch forbids direct-matrix edits and must be named |
+| A4 override composition | Mid-pass per-item near/far poke (FUN_140591f30's setter shape) applied after jitter; the section refresh composes override x jitter in the game's order; the jitter term survives unscaled | Jitter scaled, lost, or applied to the pre-override values |
+| A5 generations and replay | Same sources derived twice yield identical blocks; a source generation bump changes them; the injector keys its phase to the source generation, never to wall-frame index | Phase advances without a generation change, or survives one |
+| A6 recovery | Simulated backend failure mid-frame: the next frame carries exactly zero jitter with a named refusal; mid-job disable completes the in-flight frame unjittered | Any mixed-phase frame |
+
+### C2-B: WARP geometry and lighting harness
+
+A minimal user-mode D3D11 renderer (WARP device, no game, no EDVR) draws
+known geometry through shaders consuming a 336-row scene CB with camera
+rows 270..275 plus the frustum-ray and depth blocks in the refresh's own
+layout. The derive math runs on CPU per the reducer.
+
+| Test | Signature that passes | Stop condition |
+| --- | --- | --- |
+| W1 raster shift | Centroid shift of a known grid equals the phase in pixels, both axes, at 1.0x and 0.5x SS, odd extents and crops | Sub-pixel error above tolerance, or a size-dependent shift |
+| W2 forward/inverse/ray | Per-pixel unproject through the frustum-ray path and reproject through VP round-trips within float tolerance, jitter on and off | VP and ray CB disagree anywhere |
+| W3 lighting invariance | Lambert + specular surface lit from the same struct-derived vectors: the lighting buffer is bit-identical with jitter on vs off | Any lighting delta from a camera-only change |
+| W4 reversed-Z / asymmetric | W1 and W2 repeated under reversed depth and an asymmetric (oblique-adjust) frustum | Any failure specific to either convention |
+| W5 motion preservation | Two-frame synthetic pan: the camera-only term from VP_prev^-1 x VP_curr equals the pan after the backend's own jitter accounting; per-pixel motion matches analytic reprojection | Motion term polluted by jitter in the backend's own convention |
+
+### C2-C: coexistence with the legacy CB jitter
+
+| Test | Signature that passes | Stop condition |
+| --- | --- | --- |
+| C1 XOR proof | Enumerate the frames the legacy qualified-jitter scopes would have patched; with the injector active, every frame is treated by exactly one path, and any double-candidate frame is refused by name | A frame treated by both, or by neither with AA on |
+| C2 steady-state cost | CPU/GPU cost of the injector vs the adapter at equal scene/size; steady state allocates nothing, performs no blocking readback | A regression the counters cannot explain |
+
+### What C2 does not decide
+
+Live activation, per-shader consumption in the real scene, per-ship
+coverage and mod-chain qualification remain C3 (one bounded session:
+producer -> derived data -> scene/depth -> accepted history, no
+duplicate jitter, no uncovered domain) and C4 (qualification matrix).
+The injector's config surface is designed here but defaults off; no
+feature removal or rename is authorized by this plan.
 
 Implementing C++ changes requires the full absolute-path `build.bat` and its
 green receipt before commit. Install/verify/log operations use the sanctioned
