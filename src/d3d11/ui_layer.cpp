@@ -18,6 +18,8 @@
 #include "ui_layer_shaders.h"
 #include "ui_layer_coverage.h"
 #include "ui_layer_seed.h"  // the Seeder: the game's depth-stencil at the layer's size
+#include "ui_layer_seed_census.h"
+#include "ui_layer_seed_timing.h"
 #include "draw_state_describe.h"  // viewName, describeBlend/describeDs, shapeOf, dsStateOf
 #include "tonemap_admit.h"  // the tonemap draw's structural admission, shared with the census
 
@@ -57,6 +59,7 @@ namespace edvr {
 namespace detail {
 bool g_uiLayerLive = false;
 bool g_uiLayerWatching = false;
+bool g_uiSeedDiagnostics = false;
 bool g_uiLayerRedirecting = false;
 bool g_uiLayerCrispOn = false;      // the HDR HUD take/re-issue armed this frame (with the layer)
 bool g_uiLayerCrispPending = false; // a tonemap draw was admitted; its re-issue follows its draw
@@ -448,6 +451,9 @@ constexpr size_t kStages = static_cast<size_t>(UiRouteStage::kCount);
 constexpr size_t kRouteTotal = kStages;     // the stats slot of the whole route's sum
 constexpr size_t kRouteWithMoved = kStages + 1;
 bool g_hdrDrawTimingOn = false;  // advanced.temporal_aa_diagnostics, read at configure only
+UiSeedCensus g_seedCensus;
+UiHdrSeedGpuProbe g_hdrSeedGpu;
+UiHdrSeedGpuProbe::Token g_hdrSeedActive = 0; // explicit outer-guard recovery for SEH
 UiRouteSum g_stageSum[kStages][2];
 UiRouteFrameTotals g_routeTotals[2];
 UiRouteCoverage g_routeCoverage;
@@ -966,7 +972,7 @@ bool dsReproducible(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv, uint3
 // copy of the game's buffer the seed reads is the eye's, shared.
 bool seedLayerDepth(ID3D11DeviceContext* ctx, Eye& e, LayerDs& l, int eye, uint32_t outW,
                     uint32_t outH, ID3D11DepthStencilView* gameDsv, uint8_t stencilMask,
-                    bool needDepth, UiRouteStage stage, const char* who) {
+                    bool needDepth, UiRouteStage stage, const char* who, const UiSeedPlan& seedPlan) {
     if (!gameDsv || !g_seeder || !g_deferred) return false;
     Ptr<ID3D11Resource> res;
     gameDsv->GetResource(&res);
@@ -1057,7 +1063,30 @@ bool seedLayerDepth(ID3D11DeviceContext* ctx, Eye& e, LayerDs& l, int eye, uint3
     // The seed's price (review P3-4): the copy and the Seeder's passes, one
     // interval of this eye-frame's route.
     const int timer = routeBegin(ctx, stage, eye, g_draw.seq);
+    UiHdrSeedTimingMeta seedMeta;
+    if (stage == UiRouteStage::kHdrSeed && g_hdrDrawTimingOn) {
+        seedMeta.seq = g_draw.seq; seedMeta.eye = eye; seedMeta.reason = seedPlan.reason;
+        seedMeta.sourceW = td.Width; seedMeta.sourceH = td.Height;
+        seedMeta.width = outW; seedMeta.height = outH;
+        seedMeta.stencilMask = stencilMask; seedMeta.needsDepth = needDepth;
+        seedMeta.passes = seedPlan.passes;
+    }
+    const auto seedToken = stage == UiRouteStage::kHdrSeed
+        ? g_hdrSeedGpu.beginCopy(dev.Get(), ctx, g_hdrDrawTimingOn, seedMeta) : 0;
+    if (seedToken) g_hdrSeedActive = seedToken;
+    // Observation must not change replay, including a failed timing begin.
+    struct SeedProbeScope {
+        ID3D11DeviceContext* ctx;
+        UiHdrSeedGpuProbe::Token token;
+        ~SeedProbeScope() {
+            if (token) {
+                g_hdrSeedGpu.cancel(ctx, token, UiHdrSeedGpuProbe::Cancel::ExecutionFailed);
+                g_hdrSeedActive = 0;
+            }
+        }
+    } seedProbe{ctx, seedToken};
     vScreenCopyResourceRaw(ctx, e.dsCopy.Get(), tex.Get());
+    if (seedToken) g_hdrSeedGpu.endCopy(ctx, seedToken);
     bool recorded = false;
     try {
         g_seeder->seed(g_deferred.Get(), e.dsCopyDepth.Get(), e.dsCopyStencil.Get(), l.dsv.Get(),
@@ -1070,10 +1099,17 @@ bool seedLayerDepth(ID3D11DeviceContext* ctx, Eye& e, LayerDs& l, int eye, uint3
     Ptr<ID3D11CommandList> list;
     const HRESULT fin = g_deferred->FinishCommandList(FALSE, &list);
     if (!recorded || FAILED(fin) || !list) {
+        if (seedToken) g_hdrSeedGpu.cancel(ctx, seedToken, UiHdrSeedGpuProbe::Cancel::RecordingFailed);
+        seedProbe.token = 0;
+        if (seedToken) g_hdrSeedActive = 0;
         routeEnd(ctx, timer);
         return false;
     }
+    if (seedToken) g_hdrSeedGpu.beginWork(ctx, seedToken);
     vScreenExecuteCommandListRaw(ctx, list.Get(), 1);
+    if (seedToken) g_hdrSeedGpu.endWork(ctx, seedToken);
+    seedProbe.token = 0;
+    if (seedToken) g_hdrSeedActive = 0;
     routeEnd(ctx, timer);
     // What the seed wrote: with SV_StencilRef, one pass copies the depth and
     // all eight stencil bits whenever it draws at all; without it, the depth
@@ -1369,9 +1405,22 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
             const uint8_t mask =
                 static_cast<uint8_t>(wantMask | (stale ? 0 : lds.seededMask));
             const bool depth = g_draw.ds.depthTest || (!stale && lds.seededDepth);
-            if (!seedLayerDepth(ctx, e, lds, g_draw.eye, layerW, layerH, g_draw.dsv, mask, depth,
+            UiSeedPlan seedPlan;
+            if (g_seedCensus.enabled) {
+                D3D11_DEPTH_STENCIL_VIEW_DESC vd{};
+                g_draw.dsv->GetDesc(&vd);
+                DXGI_FORMAT tf, df, sf;
+                const bool stencil = dsFormats(vd.Format, &tf, &df, &sf) && sf != DXGI_FORMAT_UNKNOWN;
+                seedPlan = g_seedCensus.plan(g_draw.eye, g_draw.hdr, g_draw.seq, gameDs,
+                    layerW, layerH, stale, shortDepth, shortBits, mask, depth,
+                    g_seeder && g_seeder->usesSpecifiedStencilRef(), stencil);
+            }
+            const bool seeded = seedLayerDepth(ctx, e, lds, g_draw.eye, layerW, layerH, g_draw.dsv, mask, depth,
                                 g_draw.hdr ? UiRouteStage::kHdrSeed : UiRouteStage::kSeed,
-                                g_draw.hdr ? "a cockpit HUD draw" : "a UI draw")) {
+                                g_draw.hdr ? "a cockpit HUD draw" : "a UI draw", seedPlan);
+            if (g_seedCensus.enabled) g_seedCensus.seed(g_draw.eye, g_draw.hdr, g_draw.seq,
+                gameDs, layerW, layerH, seedPlan, seeded);
+            if (!seeded) {
                 ++g_win.seedFailures;
                 releaseSaved();
                 ++g_win.refusedAtIssue;
@@ -1491,6 +1540,23 @@ bool beginGuarded(ID3D11DeviceContext* ctx, int which) {
     bool ok = false;
     const bool ran = guardedBudget(g_drawBudget, [&] { ok = beginInner(ctx, which); });
     if (!ran || !ok) {
+        // /EHsc does not promise local destructor unwinding for the SEH
+        // fault caught by guardedBudget. Explicitly retire its diagnostic pair.
+        if (!ran) {
+            // A fault inside beginCopy may precede its returned token. Reset
+            // every timer, including a partially initialized empty slot.
+            const bool reset = guarded("uiLayer.seedProbe.reset", [&] {
+                if (!g_hdrSeedGpu.reset(ctx)) g_hdrSeedGpu.reset();
+            });
+            if (!reset) g_hdrSeedGpu.reset();
+            g_hdrSeedActive = 0;
+        } else if (g_hdrSeedActive) {
+            const bool cancelled = guarded("uiLayer.seedProbe.abort", [&] {
+                g_hdrSeedGpu.cancel(ctx, g_hdrSeedActive, UiHdrSeedGpuProbe::Cancel::ExecutionFailed);
+            });
+            if (!cancelled) g_hdrSeedGpu.reset(); // release-only if the context itself faulted
+            g_hdrSeedActive = 0;
+        }
         // A timer opened for this issue is discarded: the draw did not issue.
         if (g_draw.hdr && which == 0 && g_draw.drawRoute.slot >= 0) ++g_win.hdrDrawTimingAborted;
         g_draw.drawRoute.cancel([&](int slot) { routeAbort(ctx, slot); });
@@ -1604,6 +1670,7 @@ ID3D11Texture2D* compositeInner(Eye& e, uint32_t eye, ID3D11Texture2D* frame,
         return nullptr;
     }
     routePoll(ctx.Get());
+    g_hdrSeedGpu.poll(ctx.Get());
     compileOnce(ctx.Get());
     if (!g_cs) {
         *why = "the composite shader did not compile";
@@ -2037,6 +2104,8 @@ void logMemory() {
 }
 
 void logTotals(double seconds) {
+    g_seedCensus.report([](const char* line) { Log::get().note("%s", line); });
+    g_hdrSeedGpu.report(g_hdrDrawTimingOn, [](const char* line) { Log::get().note("%s", line); });
     const double frames = g_win.frames ? static_cast<double>(g_win.frames) : 1.0;
     std::string taken, left;
     for (size_t f = 1; f < static_cast<size_t>(UiLayerFamily::kCount); ++f) {
@@ -2216,6 +2285,8 @@ bool crispTakeReady(ID3D11DeviceContext* ctx, int eye);
 
 void uiLayerConfigure(Config& cfg) {
     g_hdrDrawTimingOn = cfg.getBool("advanced.temporal_aa_diagnostics", false);
+    detail::g_uiSeedDiagnostics = g_hdrDrawTimingOn;
+    g_seedCensus.configure(g_hdrDrawTimingOn);
     const std::string text = cfg.getString("fix.ui_quality", "off");
     bool recognized = true;
     const char* newSpelling = nullptr;
@@ -3142,7 +3213,7 @@ void uiLayerCrispToneEnd(ID3D11DeviceContext* ctx) {
 }
 
 bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForwards, bool substituted,
-                      bool excluded, bool panelSized) {
+                      bool excluded, bool panelSized, uint32_t instances, uint32_t verdict, char drawKind) {
     if (!ctx) return false;
     const void* taken[2] = {nullptr, nullptr};
     for (int e = 0; e < 2; ++e) {
@@ -3150,15 +3221,34 @@ bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForw
     }
     // A game draw that writes the depth target a seed copied, after the seed:
     // the layer's copy is stale, and the next tested draw seeds again.
-    for (Eye& e : g_eye) {
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        Eye& e = g_eye[eye];
         for (LayerDs* l : {&e.ds, &e.hdrDs}) {
-            if (l->seq != g_lastRedirectSeq || !l->source) continue;
+            const bool hdr = l == &e.hdrDs;
+            const bool freshCandidate = l->seq == g_lastRedirectSeq && l->source;
+            const bool diagnosticCandidate = g_seedCensus.enabled &&
+                g_seedCensus.tracks[eye][hdr ? 1 : 0].known;
+            if (!freshCandidate && !diagnosticCandidate) continue;
             void* dsvView = bindingGet(BindSlot::Dsv0);
             ResourceInfo info;
-            if (!dsvView || !bindingResolve(dsvView, &info) || info.resource != l->source)
+            if (!dsvView || !bindingResolve(dsvView, &info))
                 continue;
+            const bool matchingFresh = freshCandidate && info.resource == l->source;
+            const bool matchingDiagnostic = g_seedCensus.matches(eye, hdr, info.resource);
+            if (!matchingFresh && !matchingDiagnostic) continue;
             ID3D11DepthStencilView* dsv = static_cast<ID3D11DepthStencilView*>(dsvView);
-            if (uiLayerDsEffect(dsStateOfNoted(ctx, dsv, nullptr, nullptr), true).writes()) {
+            UINT ref = 0;
+            DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+            const UiDsState ds = dsStateOfNoted(ctx, dsv,
+                matchingDiagnostic ? &ref : nullptr, matchingDiagnostic ? &fmt : nullptr);
+            const bool invalidated = matchingFresh && uiLayerDsEffect(ds, true).writes();
+            if (matchingDiagnostic) {
+                const UiSeedKey key = uiSeedDrawKey(ds, count, instances, verdict,
+                    bindingShaderHash(BindSlot::Vs), bindingShaderHash(BindSlot::Ps), ref,
+                    static_cast<uint32_t>(fmt), drawKind);
+                g_seedCensus.event(eye, hdr, g_lastRedirectSeq, key, invalidated);
+            }
+            if (invalidated) {
                 l->seq = 0;
                 ++g_win.seedStale;
             }
@@ -3266,17 +3356,33 @@ bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForw
     return took;
 }
 
-void uiLayerNoteDepthClear(void* dsv) {
+void uiLayerSeedDrawOutcome(bool forwarded, bool substituted, bool redirected, bool known) {
+    if (g_seedCensus.enabled) g_seedCensus.finishDraw(forwarded, substituted, redirected, known);
+}
+
+void uiLayerNoteDepthClear(void* dsv, uint32_t flags, float depth, uint8_t stencil) {
     if (!dsv) return;
     bool any = false;
     for (const Eye& e : g_eye)
         any = any || (e.ds.seq && e.ds.source) || (e.hdrDs.seq && e.hdrDs.source);
-    if (!any) return;
+    if (!any && !g_seedCensus.enabled) return;
     ResourceInfo info;
     if (!bindingResolve(dsv, &info) || !info.resource) return;
-    for (Eye& e : g_eye) {
+    for (uint32_t eye = 0; eye < 2; ++eye) {
+        Eye& e = g_eye[eye];
         for (LayerDs* l : {&e.ds, &e.hdrDs}) {
-            if (l->seq && l->source == info.resource) {
+            const bool hdr = l == &e.hdrDs;
+            const bool invalidated = l->seq && l->source == info.resource;
+            if (g_seedCensus.matches(eye, hdr, info.resource)) {
+                D3D11_DEPTH_STENCIL_VIEW_DESC vd{};
+                static_cast<ID3D11DepthStencilView*>(dsv)->GetDesc(&vd);
+                DXGI_FORMAT tf, df, sf;
+                const bool hasStencil = dsFormats(vd.Format, &tf, &df, &sf) && sf != DXGI_FORMAT_UNKNOWN;
+                g_seedCensus.event(eye, hdr, g_lastRedirectSeq,
+                    uiSeedClearKey(flags, depth, stencil, vd.Flags, uint32_t(vd.Format), hasStencil),
+                    invalidated);
+            }
+            if (invalidated) {
                 l->seq = 0;
                 ++g_win.seedStale;
             }
@@ -3345,6 +3451,7 @@ void uiLayerNoteSubmitted(uint64_t sequence, uint32_t eye, const void* submitted
 ID3D11Texture2D* uiLayerComposite(uint64_t sequence, uint32_t eye, ID3D11Texture2D* frame,
                                   const uint32_t region[4], const float layerUv[4]) {
     if (eye > 1 || !frame || !region || !layerUv) return nullptr;
+    g_seedCensus.door(eye, sequence);
     Eye& e = g_eye[eye];
     if (!e.srv || !e.rtv || e.compositedSeq == sequence) return nullptr;
     const bool hasUi = e.seq == sequence && e.draws;
@@ -3429,6 +3536,7 @@ void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     ++g_win.frames;
     // The route's timers read back (the door reads them too).
     routePoll(ctx);
+    g_hdrSeedGpu.poll(ctx);
     // The next frame's answer to "is the 2D screen the world?".
     onFootGateTick();
     // A door size change's watch: the dropped line, two seconds on.
@@ -3464,6 +3572,7 @@ void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     const bool anything = g_win.redirected || g_win.composites || g_win.compositeRefused;
     if (g_target > 0.0f || anything) logTotals(static_cast<double>(now - g_winStartMs) / 1000.0);
     g_win = Window{};
+    g_seedCensus.nextWindow();
     for (RouteStats& r : g_routeStats) {
         r.n = 0;
         r.seen = 0;  // the reservoir restarts with the window
@@ -3472,6 +3581,10 @@ void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
 }
 
 void uiLayerShutdown() {
+    g_hdrSeedGpu.reset(); // release-only shutdown; the owner/device may already be gone
+    g_hdrSeedActive = 0;
+    g_seedCensus = UiSeedCensus{};
+    detail::g_uiSeedDiagnostics = false;
     if (g_draw.active) releaseSaved();
     g_draw = Draw{};
     g_crispPending = CrispTonePending{};

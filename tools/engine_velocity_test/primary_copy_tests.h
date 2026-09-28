@@ -12,7 +12,7 @@ using Record=std::array<uint32_t,84>;
 struct UavCreationSpy {
     using CreateFn=HRESULT (STDMETHODCALLTYPE*)(ID3D11Device*,ID3D11Resource*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,ID3D11UnorderedAccessView**);
     inline static UavCreationSpy* active=nullptr;
-    ID3D11Device* device;void** original;void* slots[64];
+    ID3D11Device* device;void** original;void* slots[43];
     unsigned calls=0;bool failNext=false;
     static HRESULT STDMETHODCALLTYPE create(ID3D11Device* d,ID3D11Resource* resource,const D3D11_UNORDERED_ACCESS_VIEW_DESC* desc,ID3D11UnorderedAccessView** out) {
         ++active->calls;
@@ -55,6 +55,93 @@ struct Dictionary {
         if(node)node->links(anchor(),1);
     }
 };
+inline void runObservers(ID3D11Device* device,void (*check)(bool,const char*)) {
+    constexpr uint32_t frame=42;constexpr unsigned repeats=256;
+    Node node;Dictionary dictionary;dictionary.set(&node);node.item(0)=record(80);
+    uintptr_t destination[2]={reinterpret_cast<uintptr_t>(destination),reinterpret_cast<uintptr_t>(destination)};
+    copy::reset();rig_allocations::start();
+    for(unsigned i=0;i<repeats;++i)copy::invalidateDictionaryImpl<false>(dictionary.ptr());
+    const auto clearBefore=rig_allocations::stop();const auto clearOld=copy::stats();
+    copy::reset();rig_allocations::start();
+    for(unsigned i=0;i<repeats;++i)copy::invalidateDictionary(dictionary.ptr());
+    const auto clearAfter=rig_allocations::stop();const auto clearNew=copy::stats();
+    check(clearBefore>0 && clearAfter==0 && clearOld.clearNodes==repeats && clearNew.clearNodes==0 &&
+          clearNew.clearCalls==repeats && clearNew.clearNoClaims==repeats,
+          "primary observer: no-claim clear bypass avoids measured heap allocations and native traversal");
+    copy::reset();rig_allocations::start();
+    for(unsigned i=0;i<repeats;++i)copy::endMergeOpaque(copy::beginMergeOpaque(reinterpret_cast<uintptr_t>(destination),dictionary.anchor(),frame),true);
+    const auto mergeBefore=rig_allocations::stop();const auto mergeOld=copy::stats();
+    copy::reset();rig_allocations::start();
+    for(unsigned i=0;i<repeats;++i)copy::endMergeOpaque(copy::beginMergeOpaque(reinterpret_cast<uintptr_t>(destination),dictionary.anchor(),frame),true);
+    const auto mergeAfter=rig_allocations::stop();const auto mergeNew=copy::stats();
+    check(mergeBefore>0 && mergeAfter==mergeBefore && mergeOld.mergeNodes==repeats && mergeNew.mergeNodes==repeats &&
+          mergeNew.mergeCalls==repeats && mergeNew.mergeWithoutClaims==repeats && mergeNew.mergePlans==repeats,
+          "primary observer: empty native merge plan allocation/traversal remains unchanged for unwind safety");
+    std::printf("primary observer no-claim production work / %u calls: clear allocations %llu -> %llu, nodes %llu -> %llu; merge allocations %llu -> %llu, nodes %llu -> %llu\n",
+                repeats,static_cast<unsigned long long>(clearBefore),static_cast<unsigned long long>(clearAfter),
+                static_cast<unsigned long long>(clearOld.clearNodes),static_cast<unsigned long long>(clearNew.clearNodes),
+                static_cast<unsigned long long>(mergeBefore),static_cast<unsigned long long>(mergeAfter),
+                static_cast<unsigned long long>(mergeOld.mergeNodes),static_cast<unsigned long long>(mergeNew.mergeNodes));
+    D3D11_BUFFER_DESC d{};d.ByteWidth=672;d.BindFlags=D3D11_BIND_SHADER_RESOURCE;d.StructureByteStride=336;d.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    ComPtr<ID3D11Buffer> buffer;check(SUCCEEDED(device->CreateBuffer(&d,nullptr,&buffer)),"primary observer: retained pool fixture");
+    auto exercise=[&](bool bypass){
+        copy::reset();const auto epoch=copy::g_emissionEpoch;
+        Node source;Dictionary dict;dict.set(&source);source.item(0)=record(80);Record other=record(90),mapped[2]={source.item(0),other};
+        auto clear=[&](){if(bypass)copy::invalidateDictionary(dict.ptr());else copy::invalidateDictionaryImpl<false>(dict.ptr());};
+        uintptr_t dst[2]={reinterpret_cast<uintptr_t>(dst),reinterpret_cast<uintptr_t>(dst)};
+        auto begin=[&](){return copy::beginMergeOpaque(reinterpret_cast<uintptr_t>(dst),dict.anchor(),frame);};
+        clear();check(claim(source.item(0),frame) && claim(other,frame),"primary observer: fresh and unmapped unrelated claims after empty clear");clear();
+        check(!copy::g_emissions.count(reinterpret_cast<uintptr_t>(&source.item(0))) && copy::g_emissions.count(reinterpret_cast<uintptr_t>(&other)),"primary observer: owned clear preserves unrelated unmapped source");
+        copy::beginMap(buffer.Get(),mapped,sizeof(mapped),336,D3D11_MAP_WRITE_DISCARD,1,frame);
+        copy::copier(reinterpret_cast<uintptr_t>(mapped),336,reinterpret_cast<uintptr_t>(&source.item(0)),0,1,frame);copy::endMap(buffer.Get(),1);
+        check(copy::patches(buffer.Get(),frame).empty(),"primary observer: freed same-address identical bytes cannot inherit a certificate");
+        claim(source.item(0),frame);copy::beginMap(buffer.Get(),mapped,sizeof(mapped),336,D3D11_MAP_WRITE_DISCARD,2,frame);
+        copy::copier(reinterpret_cast<uintptr_t>(mapped),336,reinterpret_cast<uintptr_t>(&source.item(0)),0,1,frame);copy::endMap(buffer.Get(),2);clear();
+        check(copy::patches(buffer.Get(),frame).size()==1,"primary observer: native clear preserves independent copied GPU certificate");
+        copy::invalidateEmission(reinterpret_cast<uintptr_t>(&other));claim(source.item(0),frame);
+        void* pending=begin();check(pending && copy::g_emissions.empty() && copy::stats().activePlans==1,"primary observer: detached claim blocks no-owner shortcut");
+        const auto skips=copy::stats().clearNoClaims;clear();check(copy::stats().clearNoClaims==skips,"primary observer: active plan clear performs native ownership walk");copy::endMergeOpaque(pending,true);
+        check(copy::g_emissions.empty() && copy::stats().activePlans==0,"primary observer: clear revokes detached plan before end");
+        // Snapshot semantics: a plan opened with no claims cannot pick up a
+        // later emission. Native merge/clear may reenter between begin/end.
+        void* emptyPlan=begin();check(emptyPlan!=nullptr,"primary observer: empty merge retains its native relay plan token");
+        claim(source.item(0),frame);check(copy::stats().activeClaims==1,"primary observer: emission may arrive inside native merge");
+        void* nested=begin();check(nested!=nullptr,"primary observer: reentrant merge sees late claim and cannot bypass");
+        clear();copy::endMergeOpaque(nested,true);copy::endMergeOpaque(emptyPlan,true);
+        check(copy::g_emissions.empty() && copy::stats().activePlans==0,"primary observer: nested clear/end cannot resurrect late claims");
+        // Also cover late arrival without a nested clear: original empty
+        // plan has no transfers and must preserve the newly arrived claim.
+        emptyPlan=begin();claim(source.item(0),frame);copy::endMergeOpaque(emptyPlan,true);
+        check(copy::g_emissions.count(reinterpret_cast<uintptr_t>(&source.item(0)))==1,"primary observer: late claim survives empty-plan end unchanged");
+        copy::invalidateEmission(reinterpret_cast<uintptr_t>(&source.item(0)));
+        emptyPlan=begin();claim(source.item(0),frame);const auto beforeUnwind=copy::g_emissionEpoch;copy::endMergeOpaque(emptyPlan,false);
+        check(copy::g_emissions.empty() && copy::g_emissionEpoch!=beforeUnwind,"primary observer: unsuccessful empty-plan unwind revokes late claims");
+        emptyPlan=begin();claim(source.item(0),frame);clear();claim(other,frame);
+        const auto clearedEpoch=copy::g_emissionEpoch;copy::endMergeOpaque(emptyPlan,false);
+        check(copy::g_emissions.count(reinterpret_cast<uintptr_t>(&other))==1 && copy::g_emissionEpoch==clearedEpoch,
+              "primary observer: clear-invalidated empty-plan unwind preserves unrelated later owners");
+        copy::invalidateEmission(reinterpret_cast<uintptr_t>(&other));emptyPlan=begin();claim(other,frame+1);
+        const auto futureEpoch=copy::g_emissionEpoch;copy::endMergeOpaque(emptyPlan,false);
+        check(copy::g_emissions.count(reinterpret_cast<uintptr_t>(&other))==1 && copy::g_emissionEpoch==futureEpoch,
+              "primary observer: stale empty-plan unwind preserves owners registered in a newer epoch");
+        copy::invalidateEmission(reinterpret_cast<uintptr_t>(&other));
+        claim(source.item(0),frame+1);
+        const auto retained=copy::patches(buffer.Get(),frame);
+        check(retained.size()==1 && copy::patches(buffer.Get(),frame+1).empty(),"primary observer: retained output freshness remains frame-specific");
+        const auto& current=copy::g_emissions.at(reinterpret_cast<uintptr_t>(&source.item(0)));
+        std::vector<uint32_t> result={uint32_t(copy::g_emissions.size()),copy::g_emissionFrame,copy::g_overflowFrame,uint32_t(copy::g_emissionEpoch-epoch),current.patch.marker};
+        result.insert(result.end(),current.patch.native.begin(),current.patch.native.end());result.insert(result.end(),current.patch.previous.w,current.patch.previous.w+5);
+        result.insert(result.end(),retained[0].native.begin(),retained[0].native.end());result.push_back(retained[0].marker);result.push_back(retained[0].slot);
+        copy::reset();return result;
+    };
+    const auto before=exercise(false),after=exercise(true);
+    check(before==after,"primary observer: original/bypassed ownership, generation and exact output certificate bytes match");
+    // Skip means uninspected, never a synthetic successful native validation.
+    copy::reset();const auto epoch=copy::g_emissionEpoch;copy::invalidateDictionary(0);
+    check(copy::stats().clearCalls==1 && copy::stats().clearNoClaims==1 && copy::stats().clearFailed==0 && copy::g_emissionEpoch==epoch,
+          "primary observer: no-owner malformed dictionary is explicitly skipped without changing future epoch");
+    copy::reset();
+}
 inline void run(ID3D11Device* device,ID3D11DeviceContext* ctx,void (*check)(bool,const char*)) {
     copy::reset();copy::OutputCache output;const uint32_t frame=42;
     Record src[2]={record(10),record(20)},mapped[2]={src[0],src[1]};
@@ -293,6 +380,6 @@ inline void run(ID3D11Device* device,ID3D11DeviceContext* ctx,void (*check)(bool
     copy::reset();std::vector<Record> many(copy::kMaxEmissions+1,record(300));
     for(auto& r:many)claim(r,frame);
     check(copy::g_emissions.empty() && copy::stats().overflows==1 && !claim(src[0],frame),"primary copy: capacity overflow poisons all same-frame claims");
-    copy::forget(native.Get());copy::reset();
+    copy::forget(native.Get());copy::reset();runObservers(device,check);
 }
 }

@@ -9,12 +9,14 @@
 #include <thread>
 #include <vector>
 #include <type_traits>
+#include <memory>
 #include "../../src/d3d11/gpu_timing.h"
 #include "../../src/d3d11/gpu_frame_timing.h"
 #include "../../src/common/gpu_frame_protocol.h"
 extern "C" uint64_t WINAPI edvrGpuFrameEvent(unsigned, unsigned, uint64_t, unsigned, unsigned, void*);
 #include "../../src/d3d11/gpu_interval.h"
 #include "../../src/d3d11/ui_layer_draw_timing.h"
+#include "../../src/d3d11/ui_layer_seed_timing.h"
 #include "../../src/d3d11/gpu_disjoint_d3d11.h"
 #include "../../src/common/system_d3d11.h"
 using Microsoft::WRL::ComPtr;
@@ -40,7 +42,7 @@ struct Ops {
     std::vector<Query> queries;
     unsigned allocated=0,released=0,creates=0,commands=0,active=0;
     int failCreate=-1, pendingQuery=-1, failedQuery=-1;
-    bool abandoning=false, failStamp=false, disjoint=false, pendingAll=false;
+    bool abandoning=false, failStamp=false, disjoint=false, pendingAll=false, faultNextStamp=false;
     uint64_t frequency=1000;
     bool nonnullFailure=false,nullSuccess=false,bad=false,scripted=true,failBegin=false,failEnd=false;
     HRESULT failedStatus=E_FAIL;
@@ -61,6 +63,10 @@ struct Ops {
     }
     static HRESULT end(void* p,ID3D11DeviceContext* c,ID3D11Asynchronous* q){
         auto& s=*static_cast<Ops*>(p);++s.commands;auto* x=s.find(q);if(!x)return E_FAIL;
+        if(s.faultNextStamp&&x->kind==D3D11_QUERY_TIMESTAMP){
+            s.faultNextStamp=false;
+            RaiseException(0xE042ED50u,0,0,nullptr); // before native End returns/first marker issues
+        }
         if(x->kind==D3D11_QUERY_TIMESTAMP_DISJOINT){
             if(!x->open||s.active!=1){s.bad=true;return E_FAIL;}x->open=false;--s.active;
         }else if(!s.active){s.bad=true;return E_FAIL;}
@@ -775,7 +781,276 @@ void hdrDrawRouteCases(Device& d) {
               "missing machinery interval spoils both totals");
     }
 }
-void run(){Runtime runtime;Device device(runtime);policyCases(device,runtime);frameDriverCases(device);controllerCases(device,runtime);nativeWork(device);nativeFrameWork(device);hdrDrawRouteCases(device);std::printf("PASS: %u shared GPU timer lifecycle checks\n",checks);}
+struct SeedProbeClock {
+    uint64_t ms = 1; int64_t tick = 100; bool available = true;
+    unsigned millisCalls = 0, counterCalls = 0;
+    static bool counter(void* p, int64_t& out) { auto& c = *static_cast<SeedProbeClock*>(p); ++c.counterCalls; out = c.tick++; return c.available; }
+    static uint64_t millis(void* p) { auto& c = *static_cast<SeedProbeClock*>(p); ++c.millisCalls; return c.ms; }
+    UiHdrSeedGpuProbe::Clock clock() { return {this, counter, millis, 1}; }
+};
+static_assert(std::is_trivially_destructible<UiHdrSeedGpuProbe>::value,
+              "seed probe destruction never issues context, COM or shutdown work");
+struct SeedProbeFrame {
+    Fixture& f; GpuTimingFrameDriver driver;
+    explicit SeedProbeFrame(Fixture& fixture) : f(fixture) {
+        check(driver.bind(f.d.dev.Get(), f.ctx()) && driver.create(0), "seed probe frame driver created"); open();
+    }
+    void open() { check(driver.begin(0) && driver.timestamp(0, 0), "seed probe borrows application frame"); }
+    void close() { check(driver.timestamp(0, 1) && driver.end(0), "seed probe outer frame closes"); }
+    void consume() { GpuSpanRawSample raw{}; check(driver.poll(0, raw) == GpuSpanPoll::Ready, "seed probe frame remains valid"); }
+    void finish() { driver.destroy(0); driver.reset(f.ctx()); }
+};
+UiHdrSeedTimingMeta seedMeta(uint64_t seq = 32, int eye = 0) {
+    UiHdrSeedTimingMeta m; m.seq = seq; m.eye = eye; m.reason = 2; m.needsDepth = true;
+    m.passes = 1; m.sourceW = 2037; m.sourceH = 1969; m.width = 4074; m.height = 3938;
+    return m;
+}
+UiHdrSeedGpuProbe::Token seedPair(Fixture& f, UiHdrSeedGpuProbe& probe, const UiHdrSeedTimingMeta& meta) {
+    const auto token = probe.beginCopy(f.d.dev.Get(), f.ctx(), true, meta);
+    check(token && probe.endCopy(f.ctx(), token) && probe.beginWork(f.ctx(), token) &&
+              probe.endWork(f.ctx(), token), "complete production seed-subprice pair queued");
+    return token;
+}
+// A primitive-only thunk catches the injected driver SEH without promising
+// /EHsc unwinding through beginCopy. This is the live outer-guard failure gap.
+DWORD seedCopyFaultThunk(UiHdrSeedGpuProbe* probe, ID3D11Device* dev, ID3D11DeviceContext* ctx,
+                         const UiHdrSeedTimingMeta* meta, UiHdrSeedGpuProbe::Token* result) {
+    __try { *result = probe->beginCopy(dev, ctx, true, *meta); return 0; }
+    __except(GetExceptionCode() == 0xE042ED50u ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return GetExceptionCode();
+    }
+}
+void hdrSeedProbeCases(Device& d) {
+    {
+        Fixture f(d); SeedProbeClock clock;
+        auto ownedProbe = std::make_unique<UiHdrSeedGpuProbe>(clock.clock()); auto& probe = *ownedProbe;
+        const auto commands = f.ops.commands, allocated = f.ops.allocated;
+        for (uint64_t seq = 1; seq <= 64; ++seq)
+            check(!probe.beginCopy(d.dev.Get(), f.ctx(), false, seedMeta(seq, int(seq & 1))), "disabled seed observer emits no token");
+        for (uint64_t seq = 1; seq < 32; ++seq)
+            check(!probe.beginCopy(d.dev.Get(), f.ctx(), true, seedMeta(seq)), "all non-selected frames skip GPU work");
+        probe.endCopy(f.ctx(), 0); probe.beginWork(f.ctx(), 0); probe.endWork(f.ctx(), 0); probe.poll(f.ctx());
+        for (unsigned i = 0; i < 128; ++i) { probe.poll(f.ctx()); check(!probe.pending(), "idle pending check is constant time"); }
+        check(f.ops.commands == commands && f.ops.allocated == allocated && probe.health().disabled == 64 &&
+                  probe.health().notSelected == 31 && !probe.pending() && !clock.counterCalls && !clock.millisCalls,
+              "off/stride/idle gates allocate no GPU queries, markers, clock reads or ring polls");
+        check(!probe.beginCopy(d.dev.Get(), f.ctx(), true, seedMeta()) && probe.health().copyBeginFailed == 1 &&
+                  f.ops.commands == commands, "no application scope declines instead of opening a private disjoint");
+        std::vector<std::string> lines; probe.report(false, [&](const char* line) { lines.emplace_back(line); });
+        check(lines.size() == 3 && lines[0].find("subset_of_HDRseed=1") != std::string::npos &&
+                  lines[0].find("not_additive=1") != std::string::npos &&
+                  lines[2].find("copy_gpu=- (n=0") != std::string::npos,
+              "no-run output explicitly distinguishes absent samples from zero cost");
+        probe.reset(f.ctx()); f.finish();
+    }
+    {
+        Fixture f(d); SeedProbeFrame frame(f); SeedProbeClock clock;
+        auto ownedProbe = std::make_unique<UiHdrSeedGpuProbe>(clock.clock()); auto& probe = *ownedProbe;
+        const auto commands = f.ops.commands;
+        const auto token = seedPair(f, probe, seedMeta());
+        check(f.ops.commands == commands + 4 && f.ops.active == 1 && probe.pending() == 1,
+              "one sampled seed adds four timestamps and no frequency scope");
+        check(!probe.endCopy(f.ctx(), token) && !probe.beginWork(f.ctx(), token) && !probe.endWork(f.ctx(), token),
+              "duplicate or out-of-order scope calls cannot reissue markers");
+        std::thread foreign([&] { probe.endWork(f.ctx(), token); probe.poll(f.ctx()); }); foreign.join();
+        check(f.ops.commands == commands + 4, "foreign owner cannot touch seed probe queries");
+        frame.close(); const unsigned firstCopy = 9; // frame driver allocated eight stamps and one disjoint query
+        f.ops.pendingQuery = int(firstCopy + 2); probe.poll(f.ctx());
+        check(!probe.validSamples() && probe.pending() == 1, "ready copy plus pending execute never publishes a partial subprice");
+        const auto reads = f.ops.queries[firstCopy].reads; probe.poll(f.ctx());
+        check(f.ops.queries[firstCopy].reads == reads, "ready copy is cached while its paired execution is pending");
+        std::vector<std::string> lines; probe.report(false, [&](const char* line) { lines.emplace_back(line); });
+        check(probe.pending() == 1 && lines[0].find("pending=1") != std::string::npos,
+              "report/toggle retains an armed pending pair");
+        f.ops.pendingQuery = -1; probe.poll(f.ctx());
+        check(probe.validSamples() == 1 && probe.health().lateWindow == 1 && probe.health().paired == 1,
+              "prior-window armed pair completes after diagnostics turn off");
+        lines.clear(); probe.report(false, [&](const char* line) { lines.emplace_back(line); });
+        check(lines.size() == 4 && lines[2].find("copy_gpu=1.0000/1.0000/1.0000") != std::string::npos &&
+                  lines[2].find("execute_gpu=1.0000/1.0000/1.0000") != std::string::npos &&
+                  lines[2].find("record_wall_cpu=1.0000/1.0000/1.0000") != std::string::npos &&
+                  lines[3].find("reason=0x2 need_depth=1 stencil_mask=0x00 passes=1") != std::string::npos,
+              "paired prices and recorded depth/mask/reason/pass classification reach the log");
+        frame.consume(); frame.finish(); probe.reset(f.ctx()); f.finish();
+    }
+    for (int failure = 0; failure < 6; ++failure) {
+        Fixture f(d); SeedProbeFrame frame(f);
+        auto ownedProbe = std::make_unique<UiHdrSeedGpuProbe>(); auto& probe = *ownedProbe;
+        if (failure == 0) f.ops.failCreate = int(f.ops.creates);
+        if (failure == 4) f.ops.failStamp = true;
+        auto token = probe.beginCopy(d.dev.Get(), f.ctx(), true, seedMeta());
+        if (failure == 0 || failure == 4) check(!token && probe.health().copyBeginFailed == 1, "copy allocation/first-marker failure drops pair");
+        else {
+            check(token != 0, "failure fixture copy starts");
+            if (failure == 1) f.ops.failStamp = true;
+            const bool copied = probe.endCopy(f.ctx(), token);
+            if (failure == 1) check(!copied && probe.health().copyEndFailed == 1, "copy end-marker failure drops pair");
+            else {
+                check(copied, "failure fixture copy closes");
+                if (failure == 2) f.ops.failCreate = int(f.ops.creates);
+                if (failure == 5) f.ops.failStamp = true;
+                const bool worked = probe.beginWork(f.ctx(), token);
+                if (failure == 2 || failure == 5) check(!worked && probe.health().workBeginFailed == 1, "execution allocation/first-marker failure drops completed copy");
+                else { check(worked, "failure fixture execute begins"); f.ops.failStamp = true;
+                    check(!probe.endWork(f.ctx(), token) && probe.health().workEndFailed == 1, "execution end-marker failure drops both prices"); }
+            }
+        }
+        f.ops.failStamp = false; f.ops.failCreate = -1;
+        check(!probe.pending() && !probe.validSamples(), "no begin/end failure publishes a partial pair");
+        seedPair(f, probe, seedMeta(64)); frame.close(); probe.poll(f.ctx());
+        check(probe.validSamples() == 1, "query failure retries safely in a later selected frame");
+        frame.consume(); frame.finish(); probe.reset(f.ctx()); f.finish();
+    }
+    {
+        Fixture f(d); SeedProbeFrame frame(f);
+        auto ownedProbe = std::make_unique<UiHdrSeedGpuProbe>(); auto& probe = *ownedProbe;
+        const auto meta = seedMeta(); UiHdrSeedGpuProbe::Token token = 0;
+        const unsigned frameOnly = f.ops.allocated - f.ops.released;
+        f.ops.faultNextStamp = true;
+        check(seedCopyFaultThunk(&probe, d.dev.Get(), f.ctx(), &meta, &token) == 0xE042ED50u,
+              "driver first-marker SEH is caught by the outer primitive thunk");
+        check(!token && !probe.pending() && !probe.validSamples() && !probe.health().copyStarted &&
+                  probe.health().selected == 1 && f.ops.allocated - f.ops.released > frameOnly,
+              "partial begin owns timer resources before any helper slot or token is published");
+        check(probe.reset(f.ctx()) && f.ops.allocated - f.ops.released == frameOnly && f.ops.active == 1,
+              "outer reset reclaims even Phase::Empty timer resources and leaves frame scope intact");
+        frame.close(); frame.consume(); frame.open(); seedPair(f, probe, seedMeta(64));
+        frame.close(); probe.poll(f.ctx());
+        check(probe.validSamples() == 1 && probe.health().paired == 1 && probe.health().copyStarted == 1 &&
+                  probe.health().workStarted == 1 && !probe.pending(),
+              "next selected frame retries after partial-begin fault without reporting phantom success");
+        frame.consume(); frame.finish(); probe.reset(f.ctx()); f.finish();
+    }
+    for (int failure = 0; failure < 3; ++failure) {
+        Fixture f(d); SeedProbeFrame frame(f);
+        auto ownedProbe = std::make_unique<UiHdrSeedGpuProbe>(); auto& probe = *ownedProbe;
+        const int firstQuery = int(f.ops.queries.size()); seedPair(f, probe, seedMeta()); frame.close();
+        if (failure == 2) f.ops.disjoint = true;
+        else f.ops.failedQuery = firstQuery + (failure == 0 ? 0 : 2);
+        probe.poll(f.ctx());
+        check(!probe.pending() && !probe.validSamples() &&
+                  (failure == 1 ? probe.health().invalidWork : probe.health().invalidCopy) == 1,
+              "copy/execute GetData failure or shared disjoint invalidity never accepts half a pair");
+        f.ops.failedQuery = -1; f.ops.disjoint = false;
+        frame.finish(); probe.reset(f.ctx()); f.finish();
+    }
+    {
+        Fixture f(d); SeedProbeFrame frame(f);
+        auto ownedProbe = std::make_unique<UiHdrSeedGpuProbe>(); auto& probe = *ownedProbe;
+        std::array<UiHdrSeedGpuProbe::Token, UiHdrSeedGpuProbe::kSlots> tokens{};
+        for (unsigned i = 0; i < tokens.size(); ++i) tokens[i] = seedPair(f, probe, seedMeta(32, int(i & 1)));
+        const auto commands = f.ops.commands;
+        check(!probe.beginCopy(d.dev.Get(), f.ctx(), true, seedMeta()) && probe.health().busy == 1 &&
+                  f.ops.commands == commands, "busy fixed pool drops an entire pair without marker commands");
+        check(probe.reset(f.ctx()) && probe.health().resetDropped == 32 && !probe.pending(),
+              "owned reset cancels all bounded paired leases");
+        const auto replacement = probe.beginCopy(d.dev.Get(), f.ctx(), true, seedMeta(64));
+        check(replacement && replacement != tokens[0] && !probe.endCopy(f.ctx(), tokens[0]),
+              "generation token rejects stale callbacks after pool reuse");
+        check(probe.endCopy(f.ctx(), replacement) && probe.beginWork(f.ctx(), replacement) &&
+                  probe.endWork(f.ctx(), replacement), "pool can resume after reset");
+        frame.close(); probe.poll(f.ctx()); check(probe.validSamples() == 1, "only replacement pair survives reset");
+        frame.consume(); frame.finish(); probe.reset(f.ctx()); f.finish();
+    }
+    {
+        Fixture f(d); SeedProbeFrame frame(f);
+        auto ownedProbe = std::make_unique<UiHdrSeedGpuProbe>(); auto& probe = *ownedProbe;
+        // Leave exactly one shared lease. Copy can start and finish, but its
+        // paired execute cannot acquire a lease until earlier samples drain.
+        for (unsigned i = 0; i < DisjointClock::kLeases - 2; ++i)
+            check(f.begin(i), "fill application frame shared lease budget");
+        const auto token = probe.beginCopy(d.dev.Get(), f.ctx(), true, seedMeta());
+        check(token && probe.endCopy(f.ctx(), token), "last available lease measures copy");
+        const auto commands = f.ops.commands;
+        check(!probe.beginWork(f.ctx(), token) && probe.health().workBeginFailed == 1 &&
+                  !probe.pending() && !probe.validSamples() && f.ops.commands == commands,
+              "execute lease exhaustion drops whole pair without another marker");
+        for (unsigned i = 0; i < DisjointClock::kLeases - 2; ++i)
+            check(f.timers[i].end(f.ctx()), "pressure fixture borrowers end");
+        frame.close(); double ms = 0;
+        for (unsigned i = 0; i < DisjointClock::kLeases - 2; ++i)
+            check(f.timers[i].poll(f.ctx(), ms) == GpuTimerPoll::Ready, "pressure fixture leases drain");
+        frame.consume(); frame.open(); seedPair(f, probe, seedMeta(64)); frame.close(); probe.poll(f.ctx());
+        check(probe.validSamples() == 1, "sample retry succeeds after shared lease pressure drains");
+        frame.consume(); frame.finish(); probe.reset(f.ctx()); f.finish();
+    }
+    for (unsigned phase = 0; phase < 4; ++phase) {
+        Fixture f(d); SeedProbeFrame frame(f); SeedProbeClock clock;
+        auto ownedProbe = std::make_unique<UiHdrSeedGpuProbe>(clock.clock()); auto& probe = *ownedProbe;
+        const auto token = probe.beginCopy(d.dev.Get(), f.ctx(), true, seedMeta()); check(token != 0, "expiry sample starts");
+        if (phase >= 1) check(probe.endCopy(f.ctx(), token), "expiry sample copy ends");
+        if (phase >= 2) check(probe.beginWork(f.ctx(), token), "expiry sample work starts");
+        if (phase >= 3) check(probe.endWork(f.ctx(), token), "expiry sample work ends");
+        clock.ms += UiHdrSeedGpuProbe::kExpireMs; probe.poll(f.ctx());
+        check(!probe.pending() && !probe.validSamples() && probe.health().expired == 1,
+              "unfinished/open/pending scopes expire explicitly without waiting");
+        frame.close(); frame.consume(); frame.finish(); probe.reset(f.ctx()); f.finish();
+    }
+    {
+        Fixture f(d); SeedProbeFrame frame(f); SeedProbeClock clock;
+        auto ownedProbe = std::make_unique<UiHdrSeedGpuProbe>(clock.clock()); auto& probe = *ownedProbe;
+        auto token = probe.beginCopy(d.dev.Get(), f.ctx(), true, seedMeta());
+        check(token && probe.endCopy(f.ctx(), token), "recording decline fixture copy ends");
+        probe.cancel(f.ctx(), token, UiHdrSeedGpuProbe::Cancel::RecordingFailed);
+        token = probe.beginCopy(d.dev.Get(), f.ctx(), true, seedMeta());
+        check(token && probe.endCopy(f.ctx(), token) && probe.beginWork(f.ctx(), token), "execution decline fixture opens");
+        check(!probe.endWork(f.ctx(), token, false), "execution decline cancels open measurement");
+        token = probe.beginCopy(d.dev.Get(), f.ctx(), true, seedMeta()); probe.cancel(f.ctx(), token);
+        check(probe.health().recordingFailed == 1 && probe.health().executionFailed == 1 &&
+                  probe.health().cancelled == 1 && !probe.pending() && !probe.validSamples(),
+              "record/Finish failure, execution failure and explicit cancellation are distinct");
+        clock.available = false; seedPair(f, probe, seedMeta(64)); frame.close(); probe.poll(f.ctx());
+        check(probe.validSamples() == 1 && probe.health().recordUnavailable == 1,
+              "CPU-clock unavailability remains explicit while both GPU intervals are valid");
+        frame.consume(); frame.finish(); probe.reset(f.ctx()); f.finish();
+    }
+    {
+        Fixture f(d); SeedProbeFrame frame(f);
+        auto ownedProbe = std::make_unique<UiHdrSeedGpuProbe>(); auto& probe = *ownedProbe;
+        for (unsigned i = 0; i < 17; ++i) { auto m = seedMeta(); m.reason = i; seedPair(f, probe, m); }
+        frame.close(); probe.poll(f.ctx());
+        check(probe.validSamples() == 17 && probe.health().classOverflow == 1,
+              "classification capacity is explicit and never drops global paired pricing");
+        std::vector<std::string> lines; probe.report(true, [&](const char* line) { lines.emplace_back(line); });
+        check(lines.size() == 19, "bounded classification emits at most sixteen detail lines");
+        frame.consume(); frame.finish(); probe.reset(f.ctx()); f.finish();
+    }
+    {
+        Fixture f(d); SeedProbeFrame frame(f);
+        auto ownedProbe = std::make_unique<UiHdrSeedGpuProbe>(); auto& probe = *ownedProbe;
+        unsigned warmAllocations = 0;
+        for (unsigned round = 1; round <= 20; ++round) {
+            if (round > 1) frame.open();
+            for (unsigned i = 0; i < 32; ++i) seedPair(f, probe, seedMeta(uint64_t(round) * 32, int(i & 1)));
+            frame.close(); probe.poll(f.ctx()); frame.consume();
+            check(!probe.pending() && probe.health().paired == uint64_t(round) * 32,
+                  "completed pairs release shared leases for the next selected frame");
+            if (round == 16) warmAllocations = f.ops.allocated;
+        }
+        check(f.ops.allocated == warmAllocations, "fixed timer objects reuse query allocations after warmup");
+        std::vector<std::string> lines; probe.report(true, [&](const char* line) { lines.emplace_back(line); });
+        check(lines[2].find("n=640 retained=512") != std::string::npos,
+              "bounded reservoir retains unbiased whole-window pricing beyond capacity");
+        frame.finish(); probe.reset(f.ctx()); f.finish();
+    }
+    {
+        Fixture f(d); f.ops.scripted = false; SeedProbeFrame frame(f);
+        auto ownedProbe = std::make_unique<UiHdrSeedGpuProbe>(); auto& probe = *ownedProbe;
+        D3D11_TEXTURE2D_DESC desc{}; desc.Width = desc.Height = 64; desc.MipLevels = desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
+        ComPtr<ID3D11Texture2D> a, b; hr(d.dev->CreateTexture2D(&desc, nullptr, &a)); hr(d.dev->CreateTexture2D(&desc, nullptr, &b));
+        const auto token = probe.beginCopy(d.dev.Get(), f.ctx(), true, seedMeta()); check(token != 0, "real WARP sampled copy starts");
+        f.ctx()->CopyResource(b.Get(), a.Get()); check(probe.endCopy(f.ctx(), token), "real WARP copy interval ends");
+        check(probe.beginWork(f.ctx(), token), "real WARP execution interval starts after recording");
+        f.ctx()->CopyResource(a.Get(), b.Get()); check(probe.endWork(f.ctx(), token), "real WARP execution interval ends");
+        frame.close(); f.ctx()->Flush(); // fixture submission only; live probe never Flushes or waits
+        const uint64_t deadline = GetTickCount64() + 5000;
+        do { probe.poll(f.ctx()); if (probe.pending()) Sleep(1); } while (probe.pending() && GetTickCount64() < deadline);
+        check(probe.validSamples() == 1 && !probe.pending(), "real WARP accepts both subprices with DONOTFLUSH reads");
+        frame.consume(); frame.finish(); probe.reset(f.ctx()); f.finish();
+    }
+}
+void run(){Runtime runtime;Device device(runtime);policyCases(device,runtime);frameDriverCases(device);controllerCases(device,runtime);nativeWork(device);nativeFrameWork(device);hdrDrawRouteCases(device);hdrSeedProbeCases(device);std::printf("PASS: %u shared GPU timer lifecycle checks\n",checks);}
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {

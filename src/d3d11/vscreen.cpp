@@ -3902,6 +3902,17 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // Off, this is one load; on, eye draws pay a generation compare and, on
     // the post-tonemap target only, the family rules.
     bool uiLayer = false;
+    struct SeedOutcomeScope {
+        bool on, original = false, substituted = false, known = true, redirected = false;
+        ~SeedOutcomeScope() {
+            if (on) uiLayerSeedDrawOutcome(original, substituted, redirected, known);
+        }
+    } seedOutcome{owner && uiLayerSeedDiagnostics()};
+    auto observedDraw = [&]() {
+        const bool issued = draw();
+        if (seedOutcome.on) seedOutcome.original = seedOutcome.original || issued;
+        return issued;
+    };
     if (owner && uiLayerLive() && g_state->rtv0Eye && v != DrawVerdict::kQuadSkip) {
         const UiLayerFamily uiFamily = uiLayerFamilyOf(g_state, kind, count);
         if (uiFamily != UiLayerFamily::kNone) {
@@ -3937,7 +3948,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         const bool afterExcluded = uiDepthIsExcluded(bindingShaderHash(BindSlot::Vs));
         const bool afterPanelSized = srv0IsPanelSized(g_state, kind, count);
         uiLayer = uiLayerNoteOther(self, count, uiLayerVerdictForwards(v), g_state->curveThisDraw,
-                                   afterExcluded, afterPanelSized);
+                                   afterExcluded, afterPanelSized, instances, static_cast<uint32_t>(v), kind);
     }
     // The sub-draw probe, which also SWALLOWS the game's draw -- it re-issues
     // the surviving index ranges itself. Before the curve substitution
@@ -3945,12 +3956,17 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // The resized panel, which swallows the draw only when it succeeds.
     if (v == DrawVerdict::kLoaderPanel) {
         const bool layered = uiLayer && uiLayerBegin(self);
+        if (seedOutcome.on && layered) seedOutcome.redirected = true;
         const bool swallowed = loaderPanelSubstitute(self, g_state->realDrawIndexedInstanced,
                                                      g_state->qsInstances,
                                                      g_state->qsStartInstance);
+        if (seedOutcome.on) {
+            seedOutcome.substituted = swallowed;
+            seedOutcome.known = !swallowed; // substitute can withhold or issue geometry
+        }
         // The loader panel withholds the draw or forwards the game's own:
         // the second issues repeat the game's own, so they follow it.
-        const bool issued = !swallowed && draw();
+        const bool issued = !swallowed && observedDraw();
         if (layered) {
             uiLayerEnd(self);
             if (issued) uiLayerSecondIssues(self, kind, count, instances, args);
@@ -3958,6 +3974,10 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         return;
     }
     if (v == DrawVerdict::kQuadSkip) {
+        if (seedOutcome.on) {
+            seedOutcome.substituted = true;
+            seedOutcome.known = false; // surviving ranges may issue zero or several commands
+        }
         forwardQuadSkip(self);
         return;
     }
@@ -3967,7 +3987,14 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     if (g_state->curveThisDraw) {
         g_state->curveThisDraw = false;
         const bool layered = uiLayer && uiLayerBegin(self);
+        if (seedOutcome.on && layered) seedOutcome.redirected = true;
         const bool swallowed = panelCurveSubstitute(self, g_state->realDrawIndexedInstanced);
+        if (seedOutcome.on) {
+            seedOutcome.substituted = swallowed;
+            // A successful substitute issues its mesh and can issue the
+            // private motion pass too; original count is not its command count.
+            seedOutcome.known = !swallowed;
+        }
         if (layered) uiLayerEnd(self);
         if (swallowed) return;
     }
@@ -3985,7 +4012,8 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // RemLok scissor, a slot swap) so the layer maps the state the draw is
     // actually issued with, and around nothing but the game's own draw.
     const bool layered = uiLayer && uiLayerBegin(self);
-    const bool originalIssued=draw();
+    if (seedOutcome.on && layered) seedOutcome.redirected = true;
+    const bool originalIssued=observedDraw();
     if (layered) {
         uiLayerEnd(self);
         if (originalIssued) uiLayerSecondIssues(self, kind, count, instances, args);
@@ -4126,7 +4154,7 @@ void STDMETHODCALLTYPE hookedClearDsv(ID3D11DeviceContext* self,
     // target to, which says which way its depth runs. eye_mask learns
     // whether this is a re-clear of a target it already drew its ring
     // into this frame -- which would wipe the ring -- for its summary.
-    if (!foreignContext(self)) {depthProbeNoteClear(dsv, depth);eyeMaskOnClear(dsv);if(uiLayerWatching())uiLayerNoteDepthClear(dsv);}
+    if (!foreignContext(self)) {depthProbeNoteClear(dsv, depth);eyeMaskOnClear(dsv);if(uiLayerWatching())uiLayerNoteDepthClear(dsv, flags, depth, stencil);}
     if (!foreignContext(self) && (flags & D3D11_CLEAR_DEPTH) && flatRuntimeActive()) { ResourceInfo info{}; if (bindingResolve(dsv, &info)) flatRuntimeWritten(static_cast<ID3D11Resource*>(info.resource)); }
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalClearDepth(dsv, flags, depth);
     g_state->realClearDsv(self, dsv, flags, depth, stencil);

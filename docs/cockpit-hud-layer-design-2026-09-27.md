@@ -7,9 +7,10 @@
   Main remains separate. Holo panels, flight HUD, target sprite and eight
   generic hologram families take the HDR layer. Sphere, corona and world
   reticle remain in-scene for the recorded safety reasons; canopy stays out.
-  Additive visual parity remains a headset check. Latest matching Steam log
-  prices route machinery but excludes primary redirected HDR shading; the
-  combined review is adding that attribution before Frontier profiling.
+  Frontier `0229c358` flew with diagnostics off/on: Sean says HUD looked good.
+  This is a qualitative visual check, not measured bloom parity. Armed HDR
+  shading median .126 ms/eye; machinery .962 ms/eye with seed .612. Joint
+  seed attribution is next; see the combined performance review.
 - **Goal:** composite the cockpit HUD after the upscale, at output
   resolution, out of DLSS/FSR history. That means the holo panels, the
   flight HUD and the target sprite. It should be as sharp at HMD Quality
@@ -26,10 +27,10 @@
   (lines 184-191: "PARKED, not declined"), with one change. It re-issues
   the game's own tonemap draw instead of transcribing it.
 - **Decisions for Sean:** see "Decisions", before Phase 1.
-- **Next step:** combined Frontier performance and visual checks, including
-  UI quality 100 and 125. See `dlss-performance-review-2026-09-28.md` for
-  the optimization evidence and next-flight conditions. Revisit lost halo
-  and translucent-over-bright behavior using the tail entry's checklist.
+- **Next step:** combined Frontier seed cause/subprice and CPU-clear profiling
+  at UI quality 125, then a separate 100/125 comparison. See
+  `dlss-performance-review-2026-09-28.md` for the evidence and conditions.
+  Revisit halo/translucent-over-bright behavior using the tail checklist.
 
 - **Tonemap** (vs `2D78DC3FD2C0C543` / ps `99C21CEB7A699821`), MEASURED
   (eye_tonemap_snapshot.h:87,139,170-201):

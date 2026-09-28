@@ -69,6 +69,7 @@ class Config;
 namespace detail {
 extern bool g_uiLayerLive;
 extern bool g_uiLayerWatching;
+extern bool g_uiSeedDiagnostics;
 extern bool g_uiLayerRedirecting;
 extern bool g_uiLayerCrispOn;
 extern bool g_uiLayerCrispPending;
@@ -193,13 +194,16 @@ inline bool uiLayerRedirecting() { return detail::g_uiLayerRedirecting; }
 // a real UI family (vscreen.cpp's forwardWithVerdict already has them to
 // hand). Every case is counted and each shader pair named once.
 inline bool uiLayerWatching() { return detail::g_uiLayerWatching; }
+inline bool uiLayerSeedDiagnostics() { return detail::g_uiSeedDiagnostics; }
 bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForwards, bool substituted,
-                      bool excluded, bool panelSized);
+                      bool excluded, bool panelSized, uint32_t instances, uint32_t verdict, char drawKind);
+// Completes CPU-only observation after the forwarding/substitution decision.
+void uiLayerSeedDrawOutcome(bool forwarded, bool substituted, bool redirected, bool outcomeKnown);
 // A game clear of a depth-stencil view, while watching: when it clears the
 // buffer a layer's depth-stencil target was seeded from this frame, the
 // layer's copy is stale and the next tested draw seeds it again. (A game
 // draw that writes it is caught by uiLayerNoteOther the same way.)
-void uiLayerNoteDepthClear(void* dsv);
+void uiLayerNoteDepthClear(void* dsv, uint32_t flags, float depth, uint8_t stencil);
 
 // The eye check, the one authority on which eye is which: the game's
 // Submit names it. A copy out of a target the UI was taken from this frame

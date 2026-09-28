@@ -1434,6 +1434,13 @@ void summaryLocked(uint64_t now) {
                     u(copyStats.sourceResets),u(copyStats.copierNoLease),u(copyStats.copierAmbiguous),
                     u(copyStats.copierInvalidRange),u(copyStats.mergePlans),u(copyStats.mergeFailed),
                     u(copyStats.clearCalls),u(copyStats.clearedClaims),u(copyStats.clearFailed));
+    Log::get().note("engine motion: primary copy observer work cumulative: clear calls %llu, no-claim skips %llu, "
+                    "nodes walked %llu; merge calls %llu, started without claims %llu, nodes walked %llu; "
+                    "active source claims %llu, detached plans %llu. Skips do not inspect native dictionaries; "
+                    "clear failures describe attempted observer work, not skipped calls. Merge walks are retained for clear/unwind safety.",
+                    u(copyStats.clearCalls),u(copyStats.clearNoClaims),u(copyStats.clearNodes),
+                    u(copyStats.mergeCalls),u(copyStats.mergeWithoutClaims),u(copyStats.mergeNodes),
+                    u(copyStats.activeClaims),u(copyStats.activePlans));
     Log::get().note("engine motion: emit (%s) over %.0f s, %.0f frames: FUN_144312E00 calls %llu (%llu appended, %llu pool "
                     "records in all); pool records joined %llu (with motion %llu), masked %llu; masked for: first seen %llu, "
                     "gap %llu, reused pointer %llu, pose changed within one frame %llu, previous frame not certified %llu, "

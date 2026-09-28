@@ -57,6 +57,7 @@
 
 #include "../../src/common/temporal_math.h"
 #include "../../src/d3d11/ui_layer_seed.h"
+#include "../../src/d3d11/ui_layer_seed_census.h"
 #include "../../src/d3d11/ui_layer_math.h"
 #include "../../src/d3d11/ui_layer_shaders.h"
 #include "../../src/d3d11/ui_quality_math.h"
@@ -2351,6 +2352,8 @@ void testWriteBack(Gpu& g) {
     check(a == b && written > 0, "the write-back leaves the game's stencil as the original draw did");
 }
 
+#include "ui_seed_census_test.h"
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2366,6 +2369,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     testRenderState();
+    testSeedCensusCpu();
     testKey();
     testSize();
     testMap();
@@ -2390,6 +2394,7 @@ int main(int argc, char** argv) {
         testDownsample(g);
         testSeededStencil(g);
         testWriteBack(g);
+        testSeedCensusGpu(g);
         testSizeChange(g);
     }
     std::printf("ui_quality_test: %u checks, %u failures\n", g_checks, g_fails);
