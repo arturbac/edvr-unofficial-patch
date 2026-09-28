@@ -1058,6 +1058,17 @@ if errorlevel 1 ( echo [edvr] ERROR: c2 derive test build failed & exit /b 1 )
 "%BUILD%\c2_derive_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_c2_warp_test
+echo [edvr] === c2_warp_test.exe ===
+if not exist "%OBJ%\c2warp" mkdir "%OBJ%\c2warp"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\c2warp\\" ^
+    /Fe"%BUILD%\c2_warp_test.exe" "tools\c2_warp_test\c2_warp_test.cpp" ^
+    /link /INCREMENTAL:NO d3d11.lib dxgi.lib d3dcompiler.lib
+if errorlevel 1 ( echo [edvr] ERROR: c2 warp test build failed & exit /b 1 )
+"%BUILD%\c2_warp_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_config_test
 echo [edvr] === config_test.exe ===
 REM The real parser over the real shipped edvr.ini. The file's own layout
