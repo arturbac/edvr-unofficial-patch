@@ -2,14 +2,15 @@
 
 ## Status
 
-- **State:** PHASE 1 BUILT (2026-09-27, branch `kimi/crisp-hud-census`,
-  f032e024, installed to Steam as v0.18.0-rc.2-56-gf032e024): the holo
-  panels take a per-eye HDR layer and return to the picture through the
-  tonemap re-issue, folded into `fix.ui_quality` (Sean's decision 2 --
-  no key of its own). Phase 0's gates are all answered (flights 1-3 + the
-  offline G-C). Awaiting the Phase 1 flight: fix.ui_quality = 100, HMD
-  Quality 0.5 and 0.75 with DLSS, panels as sharp as at 1.0, no
-  brightness step (the G-F budget), the census clean.
+- **State:** PHASES 1-3 BUILT (2026-09-28, branch `kimi/crisp-hud-census`,
+  e4d1df1d, installed to Steam as v0.18.0-rc.3-31-ge4d1df1d): all four
+  families take the HDR layer -- the holo panels, the flight HUD, the
+  target sprite, and now the hologram pass's eleven (Sean opted in; the
+  pitch-swim he saw is on main identically, the AA pass's reconstruction).
+  The canopy stays out, as the depth pass refuses it. The review round's
+  seven findings are fixed and flown once; the consolidated flight was
+  clean. Awaiting the Phase 3 flight (the additive-parity question is
+  judged visually -- no instrument answers it).
 - **Goal:** composite the cockpit HUD after the upscale, at output
   resolution, out of DLSS/FSR history. That means the holo panels, the
   flight HUD and the target sprite. It should be as sharp at HMD Quality
@@ -26,63 +27,10 @@
   (lines 184-191: "PARKED, not declined"), with one change. It re-issues
   the game's own tonemap draw instead of transcribing it.
 - **Decisions for Sean:** see "Decisions", before Phase 1.
-- **Next step:** the Phase 1 flight (checklist in the tail entry), then
-  its log read against the Phase 1 gates (sharpness at 0.5/0.75, no
-  brightness step, declines clean). Then Phase 2: the flight HUD and the
-  target sprite.
-
-## What exists
-
-`fix.ui_quality` (`off | 100 | 125`, default off) owns a per-eye 8-bit
-layer at the door's output size x target. It takes the post-tonemap UI
-(2D screen composite, menu and modal panels, loading screen, GUI-direct)
-and composites it last at the door, after the upscale and RCAS, as
-premultiplied-over. All MEASURED: ui-layer-2026-09-23.md "The layer" and
-crisp-ui-handoff.md:611-829. The machinery a taken draw gets is:
-- eye identity by (target, viewport origin);
-- a viewport and scissor remap from the game's lied viewport to the
-  layer's frustum;
-- a jitter cancel through `temporalJitterToTangents`;
-- a depth-stencil target seeded from the game's own through
-  `ui_layer_seed.h`;
-- the multiply second draw, and the colourless write-back of
-  depth/stencil writes;
-- since 2026-09-27, draws the game makes after the UI into the same eye
-  (`kAfterUi`).
-
-A draw the layer takes skips ui_depth's depth re-issue, the hologram depth
-pass and screen motion. That is the `!layered` gating at
-vscreen.cpp:3909-3950 and 4569-4581 (MEASURED). Measured layer memory is
-37-116 MB per eye (ui-layer doc "Cost").
-
-## The three families (as built)
-
-| Family | Draws | Target | Blend, depth | Samples | Source |
-|---|---|---|---|---|---|
-| Holo panels, vs `81216C77F90DEDD6`, ps `A2965EC2931A39C8` | 22-24 a frame | `R11G11B10_FLOAT`, the lit HDR target | premultiplied ONE/INV_SRC_ALPHA; tests GEQUAL against the scene pair, no write | its interface surface at PS t2 | MEASURED, crisp-ui-handoff.md:174-176,235; ui_depth.cpp:133-137 |
-| Flight HUD, vs `B7790CBFC6554097`, ps `8DEF46452FA459F5` | UNKNOWN | the same HDR target | as above | a 256x256 grain LUT at t1, and the eye-sized scene depth at t0 (NDC-derived UV) for its own cockpit fade | MEASURED, hud_grain.h:1-25; crisp-ui-handoff.md:796-803 |
-| Target sprite, vs `E508648660A352B2`, ps `63ABD86359B57D01` | 1 an eye with a target | DISPUTED: the HDR target (ui_depth.cpp:116-131) or `RGB10A2_TYPELESS` (crisp-ui-handoff.md:174) | its VS forces device Z to 1 | one surface of ~0.94x0.83 render size at t0, with alpha discard and the HUD colour matrix | MEASURED, target_sharp.h:6-12 |
-
-The list is not closed. A field log (2026-09-27) has ui_depth reporting
-"a new interface family -- vs `925ACEDA0153AA5B` ps `738A98ED038E58B7`
-draws into 1331x1661 DXGI format 26: samples a learned surface but has no
-depth shader of its own yet ... left alone -- this composite still swims".
-That is a fourth HDR-target composite of a learned surface. It appears in
-none of this repo's records, Sean's shader dumps or his logs of that week.
-Today each such family needs a hand transcription before ui_depth can give
-it depth. The layer needs none, because it redraws the game's own draw.
-So take by rule, not by list: any owner draw into the HDR eye target that
-samples a learned interface surface (ui_depth's classifier already says
-so), plus the direct families by VS (the flight HUD). G-A lists every
-family the rule takes.
-
-Jitter: BELIEVED that all three carry the eye's jittered projection (G4
-was never checked per family). HDR values above 1.0: UNKNOWN. Ordering,
-MEASURED (G1/G8): all three draw before the composite pass
-(`953C8123AD8DC13B`, believed to add bloom) and the tonemap, which is the
-last reader of the HDR target. SMAA runs after it on RGBA8.
-
-## The post chain
+- **Next step:** the Phase 3 flight (the tail entry's checklist), then
+  the "rendered the same way" revisit Sean named: with everything through
+  one path, re-read the remaining differences (the lost halo, the
+  translucent-over-bright regime).
 
 - **Tonemap** (vs `2D78DC3FD2C0C543` / ps `99C21CEB7A699821`), MEASURED
   (eye_tonemap_snapshot.h:87,139,170-201):
@@ -697,3 +645,43 @@ target locked (never occluded by construction); no brightness step (the
 G-F budget); the target HOLOGRAM unchanged (Phase 3, not taken). The log:
 "crisp hud" sums all three families (~28-80 draws a frame), declines
 clean, 0 lost; write-backs nonzero with a target locked.
+
+## Phase 3 built, 2026-09-28 (e4d1df1d)
+
+The hologram pass's eleven families join the crisp take as one family
+(kHoloGeneric, matched by VS hash through holo_families.h -- the shared
+list the take, the depth pass and the census now read; moved, not copied):
+the radar contacts, the ship and target holograms, the icons, and the
+world-marker reticle. The canopy is deliberately not on the list (it sits
+in front of the whole sky; covering it would smear the stars behind it --
+the depth pass's own reasoning). Sean opted in: the pitch-swim on those
+elements reproduces on main, so it is the AA pass's reconstruction, and
+taking them out of it is the fix.
+
+Their states were never census-measured (Phase 0 watched the three named
+families), so the refusal net is the safety and the census's new fourth
+family watch ("hologram": ga state lines, window counts, G-C votes, G-D
+pairs) doubles as their G-A measurement in the Phase 3 flight. Additive
+converts exactly and covers nothing (transmittance untouched), so the
+take adds no coverage of its own; what differs from stock is WHERE the
+light lands. THE open question, judged visually: for additive elements
+stock computes T(F+L) and the layer gives T(F)+T(L) -- over a bright
+background a glow reads differently, and no instrument answers it (G-F
+measured premultiplied-over; the parity capture is keyed to the holo
+pair).
+
+The hologram pass's re-issues skip taken holograms through the
+family-blind !layered gate; its 30 s line keeps counting listed draws
+while declining eye-frames "nothing listed" -- expected (a reading note
+sits at both). Rig: 295 checks, 0 failures; hologram_depth_test 2309
+PASS. Installed to Steam as v0.18.0-rc.3-31-ge4d1df1d.
+
+Phase 3 flight: HMD 0.5/0.75 with DLSS, ui_quality = 100. Radar contacts,
+ship and target holograms, icons sharp and steady through rapid head
+pitch; the world-marker reticle on a distant target; a station approach
+for the additive-glow-over-bright question (the halo's read on the
+holograms); the canopy unchanged. The log: a "hologram" row in the 30 s
+table with taken counts, no refusal naming a hologram, declines clean,
+and the census's ga hologram state lines as the G-A record. Then the
+revisit Sean named: with everything rendered through one path, re-read
+the remaining differences (the lost halo, the translucent regime).
