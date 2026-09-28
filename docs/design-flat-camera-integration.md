@@ -2,18 +2,14 @@
 
 ## Status
 
-- State: producer discovery and function-level lineage landed. The C1
-  producer probe named the camera-row writer (FUN_140596830, trap RIP
-  `0x596A54`) and its refresh chain (FUN_1405921f0 <- FUN_140594d90 <-
-  FUN_14058ef90); the cache helpers, the dirty-flag protocol, the setter
-  map and the refresh's consumers are decompiled and recorded in the
-  addenda, with the field schema corrected to one camera-relative typed
-  table per the C2-plan review. The ray basis (+0x870/+0x8B0) is resolved
-  as a view/origin snapshot written by FUN_1406be790 with no projection
-  dependency. The auxiliary composer callers remain unclassified by
-  behavior, and the complete view/execution lineage (which passes run
-  which refresh on which thread, record vs replay) is not yet joined.
-  C2 is planned, not demonstrated — do not turn camera mutation on.
+- State: C2 is complete and green (c2 derive, c2 warp, c2 coexist in the
+  build pool). Producer discovery, the function-level lineage, the derive
+  reducer, the WARP geometry/lighting proofs and the coexistence policy
+  are all landed and cited in the addenda; the field schema is one
+  camera-relative typed table. The auxiliary composer callers remain
+  unclassified by behavior, and the complete view/execution lineage
+  (which passes run which refresh on which thread, record vs replay) is
+  not yet joined. C3 is planned, not built — live mutation stays off.
 - Decision: investigate jittering the game's per-view camera construction
   before it derives raster/lighting data. Preserve the existing frame
   discovery, size negotiation, temporal backends and resource isolation.
@@ -27,10 +23,10 @@
 - Ruled out for that session: a backend evaluation failure as the immediate
   cause, because no backend initialized. Missing shader coverage is proven;
   whether quality settings or a mod produced those variants is not.
-- Next: build the C2-A derive reducer rig (tools/, reimplementing only
-  the decompiled semantics with citations), then the C2-B WARP harness
-  and the C2-C coexistence proof, per the C2 test plan addendum. Live
-  activation stays C3; the injector's config surface defaults off.
+- Next: C3, per the C3 wiring plan addendum -- the FUN_1405921f0 detour
+  behind a default-off key, the ownership policy wired into flat_runtime,
+  the classifier's jittered-encoding question answered, then one bounded
+  session against the acceptance criteria there.
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable/build
   identities, backend versions, dimensions, formats and mod chain for
@@ -374,6 +370,132 @@ derived data -> scene/depth -> accepted history, no duplicate jitter, no
 uncovered domain) and C4 (qualification matrix). The injector's config
 surface is designed here but defaults off; live mutation stays disabled
 until these gates pass; no feature removal or rename is authorized.
+
+## C3 wiring plan addendum, 2026-09-28: the injector's integration
+
+Everything below is design against the mapped chain, not built code. C2's
+proofs hold for this exact integration shape; a change to the detour
+point, mutation form or ownership call sites re-opens the relevant tests.
+
+### Detour point and form
+
+One CodeHook on FUN_1405921f0, installed with the producer probe's
+discipline (prologue verification against the Ghidra bytes, gate-first
+relay, hold-open for process lifetime, no uninstall on disable). The
+refresh is the only mutation point: it runs after the setters in each
+section, and every projection-dependent consumer derives inside it.
+
+Per detour call, when the ownership policy names Upstream for the call's
+view-group:
+
+1. Read the camera struct pointer (the refresh's third argument; the
+   view+0x158 vs view+0x250 vs auxiliary distinction the setter map
+   established) and its projection kind at camera+0x264. Kind 3, kind 1
+   or the default branch: proceed. Kinds 4/5 or anything else: mark the
+   group upstreamUnsupported for the policy (named; no mutation).
+2. Apply the phase in the bound pair, absolutely: boundX = baseX + jx/R,
+   boundY = baseY - jy/R_h (the D3D sign convention W1 proved), where R is
+   the negotiated evaluation extent from the existing flat runtime state.
+   The phase comes from the production temporalJitter sequence at the
+   existing FlatLivePhase machine's phaseSequence.
+3. The base pair is captured per camera-struct pointer per phaseSequence:
+   the first detour call for a (pointer, sequence) records the current
+   values as base and applies base+phase; later calls at the same
+   (pointer, sequence) re-apply the identical absolute value (A5.1's no-
+   accumulated-offset, and A4's composition with mid-frame setters, which
+   poke different fields). A base that changes between calls at one
+   sequence without our write is a base-rewrite: count it, recapture, and
+   name it in the per-5s line.
+4. Raise dirty bits 4 and 8 (projection and cached VP; the mutation
+   protocol: the refresh copies the CACHED VP when bit 8 is clear, so a
+   projection edit without bit 8 is silently stale). Bits 2/1 are not
+   raised: a projection-only jitter leaves the view rows and the ray
+   snapshots legitimately unchanged (the consumer-lineage addendum).
+5. Call the original refresh through the trampoline. Its finalizers
+   re-derive the projection, the cached VP, the scene CB and the depth
+   CBs from the mutated parameters in the same call.
+
+### Ownership integration points
+
+flatCameraOwnerSelect (src/d3d11/flat_camera_ownership.h, the policy the
+C2-C rig proves) is consulted once per view-group per frame BEFORE any
+mutation, at the two existing decision points in flat_runtime.cpp:
+
+- In the draw path, where projection plans apply private rows today
+  (flat_runtime.cpp:1820-1823, and its compute siblings at :1615-1618):
+  under Upstream ownership the legacy scope mutation is skipped by name
+  (a counter, not silence); under Legacy ownership it runs exactly as
+  today.
+- The detour consults the same decision: it mutates only when the
+  decision named Upstream for this group. refuseDraw/observing semantics
+  (:970-986, :1830) are unchanged and feed the policy's legacyEligible /
+  legacyObserving inputs.
+
+The per-frame close follows the production discipline: the detour marks
+"mutated at refresh N"; flat_runtime's scene-draw evidence notes applied
+when a treated CB binds to an eligible draw (the noteApplied discipline
+of flat_live_phase.h:49-52); the ownership close then records the owner,
+and the FlatLivePhase machine's fail/finish paths keep their A6 boundary
+semantics untouched.
+
+### The classifier's jittered encoding
+
+The production projection ownership classifier's measured encoding
+requires camera[i][2] == 0 exactly (flat_projection_ownership.h:75-80).
+The composed scene rows carry p8*s8 + p2*s0 + p6*s4 in those slots; with
+an injected nonzero bound pair and a rotated view, out[0][2] = 2*dbx*s8
+is small but nonzero, and the check returns Unavailable. C3 must not
+silently break the legacy evidence path: either the classifier's caller
+subtracts the applied phase before classification under Upstream
+ownership, or the encoding check accepts the off-center terms within the
+phase bound. Choose when wiring; the discriminating check is the C6 rig
+re-run against a jittered composed block (it currently certifies only
+the unjittered encoding). Record the choice in the commit that lands it.
+
+### Config surface
+
+One new key, default off, named for what the user gets (the config
+contract gate documents it): `fix.temporal_aa_camera = off | on`. `on`
+permits upstream camera jitter for the temporal backends when the frame
+is certified; `off` is today's behavior with zero detour activity (the
+hook may still be installed for the producer probe's evidence, per its
+own key). The injector's activation also requires a temporal backend
+selected (fix.temporal_aa) and the flat profile.
+
+### Counters and log lines
+
+Per-5s, one line: injected-frames, applied (treated CB bound to eligible
+draws), refused with reasons, base-rewrites, unsupported-kinds, ownership
+(per group), duplicate-jitter refusals (any frame both routes would have
+mutated, refused by name), treated-streak, accepted-history, backend
+reset reasons. No per-frame logging; a new event logs once per cause.
+
+### Session acceptance (the C3 gate)
+
+One bounded game session, EDHM disabled for the cleanest evidence (the
+mod-chain matrix is C4): F8 selects each backend (TAA, DLSS, FSR) in
+turn with fix.temporal_aa_camera = on. Required before proceeding to C4:
+
+- Producer -> derived data -> scene/depth -> accepted history, in the
+  log: injected frames land, treated CBs bind, backends accept history
+  (accepted-history-5s grows, treated-streak runs).
+- Zero duplicate-jitter refusals after startup; zero frames both routes
+  mutated (the ownership counters say so by name).
+- No uncovered domain: auxiliary cameras (shadow/reflection/env) are
+  named unsupported or owned, never silently jittered (per-group lines).
+- SS changes (0.5/1.0/1.5) requalify bounded; F8 off disables jitter
+  exactly (next frame zero, named); menu open/close and a docking
+  transition show no new refusal causes.
+- The existing gates stay green: flat runtime refusal census no new
+  causes, DLSS resets no increase over the legacy baseline, frame time
+  within the existing adapter's envelope at the same scene/size.
+- The injector off-key flight immediately before shows the same scene
+  with zero injected frames (the off state is observable, not assumed).
+
+Stop conditions: any mixed-phase frame, any double-scaled jitter term,
+any stale-cache read under the protocol, any unexplained backend history
+regression -- land, disable, retain the adapter, publish the failing
+dependency.
 
 Implementing C++ changes requires the full absolute-path `build.bat` and its
 green receipt before commit. Install/verify/log operations use the sanctioned
