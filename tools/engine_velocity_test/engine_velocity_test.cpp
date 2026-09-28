@@ -141,6 +141,9 @@ bool onePair(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstr
     std::snprintf(name, sizeof(name), "%ls + %ls", p.vs, p.ps);
     const corpus_identity::Result r = corpus_identity::compare(device, context, ps, pps, in, ok, name);
     ok(r.driven, "real corpus pair driven for the o0..o3 identity check (not skipped)");
+    if (std::wcscmp(p.ps, L"ps_03B17F89B31C4788") == 0)
+        ok(r.covered > 0 && r.uncoveredChecked > 0 && r.uncoveredBad == 0,
+           "station alpha pair: the real corpus drives survivors and discard, with discarded MRT6 untouched");
     const bool actual = std::wcscmp(p.vs, L"vs_DE545DC8EE4FBB87") != 0 ||
                         std::wcscmp(p.ps, L"ps_91F8937EDA723663") != 0 ||
                         actual_vs_link_test::run(device, context, vs, ps, pps, ok);
@@ -156,6 +159,10 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
         {L"vs_BFE51414CC3024B4", L"ps_DB79AE788E049DFD", false},
         {L"vs_EB5234DB6ADB491D", L"ps_CB9F297EFF264251", false}, {L"vs_EB5234DB6ADB491D", L"ps_9ABF60B4B51F2C1F", false},
         {L"vs_EB5234DB6ADB491D", L"ps_3434972DB5336AA4", false}, {L"vs_5B4D8E894EEDA8B4", L"ps_4375B72964F386CD", true},
+        // 054658: current joined station records drawn by previously stock PSs.
+        {L"vs_EB5234DB6ADB491D", L"ps_DC603C35BBE74B31", false},
+        {L"vs_EB5234DB6ADB491D", L"ps_63B1524A9F805A4C", false},
+        {L"vs_DE545DC8EE4FBB87", L"ps_03B17F89B31C4788", false},
         {L"vs_BBE58E40FE88EC80", L"ps_DB3E8D20CF53FBC0", false}, {L"vs_DE545DC8EE4FBB87", L"ps_E46E3E4832B2FDB0", false},
         {L"vs_AACFDCF2FB9AD809", L"ps_CF534B32F491561A", false}, {L"vs_66DE2CADB1F4AE6B", L"ps_864F1F949851B8DE", false},
         {L"vs_66DE2CADB1F4AE6B", L"ps_BBDE4E71FB78528A", false},   // the 15:46 session's stock station draws
@@ -186,10 +193,8 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
     // while its live owner/coverage is assessed.
     const Pair candidates[] = {
         {L"vs_DE545DC8EE4FBB87", L"ps_A6070F9DD1CFB601", false},
-        // The 15:46 session's stock station draws (eye run 154655's seams and
-        // windows riding the world path), dumped by the same glare run. The
-        // three "target 6 occupied" ones moved to kSelfMarking (verified
-        // byte-identical in the marker encoding).
+        // Historical double-patch candidate: BA58 is EDVR's generated 4375
+        // substitution, proven by production-patcher hashes in 162120.
         {L"vs_5B4D8E894EEDA8B4", L"ps_BA58469C3D6120A7", true},
     };
     for (const auto& p : candidates) {
@@ -198,13 +203,10 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
         std::printf("  candidate: %ls + %ls: %s%s\n", p.vs, p.ps, passed ? "PASSES the harness" : "not keyable -- ",
                     passed ? "" : g_softWhy.c_str());
     }
-    // Self-marking pairs (kSelfMarking, engine_velocity_families.h; eye run
-    // 095337's seam shaders): NOT keyable -- their stock pixel shaders natively
-    // write the marker encoding into the game's own SV_Target6. Two proofs:
-    // the patcher must refuse them ("target 6 occupied"), and the stock draw
-    // must hold (2*slot+1, the fragment's depth) at MRT6 with no patch at all.
-    // Then S4: the production draw half driven through the self-marking branch
-    // with the family's real VS.
+    // Historical kSelfMarking compatibility pairs are EDVR-generated
+    // substitutions, not native game producers (162120 hash proof). Preserve
+    // their checks: a second patch is refused and the already-patched shader
+    // writes the exact marker. S4 still drives the compatibility branch.
     std::vector<BYTE> vs4361;
     for (const auto& p : edvr::engine_velocity_family::kSelfMarking) {
         wchar_t wvs[24], wps[24];
@@ -227,7 +229,7 @@ void corpus(ID3D11Device* device, ID3D11DeviceContext* context, const std::wstri
         const corpus_identity::Result r = corpus_identity::selfMarked(device, context, psb, in, &check, name);
         check(r.driven, "self-marking pair driven, not skipped");
         check(r.slotChecked > 0 && r.slotBad == 0,
-              "self-marking: the STOCK shader writes (2*slot+1, depth) at MRT6 natively, no patch");
+              "self-marking compatibility: the already-patched shader writes exact slot/depth at MRT6");
     }
     if (!vs4361.empty()) lifecycle_tests::selfMarkingCase({device, context, &check}, vs4361);
 }} // namespace
@@ -278,6 +280,26 @@ int wmain(int argc, wchar_t** argv) {
     edvr::g_runtimeProfile = edvr::RuntimeProfile::LegacyVr;
     check(!edvr::engineVelocityPoolFamilyPair(edgeVs, edgePs),
           "legacy VR also excludes the flat-only front-face pair");
+    constexpr uint64_t stationVs = 0xEB5234DB6ADB491Dull;
+    constexpr uint64_t stationPs = 0xDC603C35BBE74B31ull;
+    constexpr uint64_t detailPs = 0x63B1524A9F805A4Cull;
+    constexpr uint64_t alphaPs = 0x03B17F89B31C4788ull;
+    for (const auto profile : {edvr::RuntimeProfile::Vr, edvr::RuntimeProfile::LegacyVr, edvr::RuntimeProfile::Flat}) {
+        edvr::g_runtimeProfile = profile;
+        check(edvr::engineVelocityPoolFamilyPair(stationVs, stationPs) &&
+              edvr::engineVelocityPoolFamilyPair(stationVs, detailPs) &&
+              edvr::engineVelocityPoolFamilyPair(edgeVs, alphaPs),
+              "Coriolis: the three exact qualified station pairs are eligible in each runtime profile");
+        check(!edvr::engineVelocityPoolFamilyPair(stationVs, alphaPs) &&
+              !edvr::engineVelocityPoolFamilyPair(edgeVs, stationPs) &&
+              !edvr::engineVelocityPoolFamilyPair(edgeVs, detailPs),
+              "Coriolis: a qualified pixel shader stays excluded from the other family");
+        check(!edvr::engineVelocityPoolFamilyPair(stationVs, 0x123456789abcdef0ull) &&
+              !edvr::engineVelocityPoolFamilyPair(0x123456789abcdef0ull, stationPs) &&
+              !edvr::engineVelocityPoolFamilyPair(0x61AE8EB05FDC18DDull, 0x06D24ACAB0DC11B3ull),
+              "Coriolis: unknown pairs and the camera-following unrelated rig remain unkeyed");
+    }
+    edvr::g_runtimeProfile = edvr::RuntimeProfile::LegacyVr;
     shader_tests::run({device.Get(), context.Get(), &check});
     overlay_depth_gpu_tests::run(device.Get(), context.Get(), &check);
     emit_tests::run({&check});

@@ -40,6 +40,7 @@ using Microsoft::WRL::ComPtr;
 
 struct Result {
     unsigned targets = 0, texelsCompared = 0, mismatches = 0, covered = 0, slotChecked = 0, slotBad = 0;
+    unsigned uncoveredChecked = 0, uncoveredBad = 0;
     bool driven = false;
     std::string skipped;
 };
@@ -621,10 +622,6 @@ inline Result compare(ID3D11Device* dev, ID3D11DeviceContext* ctx, const std::ve
               SUCCEEDED(dev->CreatePixelShader(stockPs.data(), stockPs.size(), nullptr, &stock)) &&
               SUCCEEDED(dev->CreatePixelShader(patchedPs.data(), patchedPs.size(), nullptr, &patched)),
           "identity: the synthetic VS and both PSs created");
-    unsigned first = 0;   // coverage is read from the first declared target: o0 in every real family
-    while (formats[first] == DXGI_FORMAT_UNKNOWN) ++first;
-    BYTE clear[16];
-    clearTexel(formats[first], clear);
     const char* const labels[5] = {"o0", "o1", "o2", "o3", "depth"};
     auto word = [](const std::vector<BYTE>& v, size_t at) {
         uint32_t w;
@@ -662,12 +659,25 @@ inline Result compare(ID3D11Device* dev, ID3D11DeviceContext* ctx, const std::ve
             }
         }
         for (unsigned p = 0; p < kSize * kSize; ++p) {
-            if (std::memcmp(&a.target[first][size_t(p) * 16], clear, 16) != 0) ++r.covered;
-            if (std::memcmp(&b.target[first][size_t(p) * 16], clear, 16) == 0) continue;
-            ++r.slotChecked;
             float s[2], z;
             std::memcpy(s, &b.slot[size_t(p) * 8], 8);
             std::memcpy(&z, &b.depth[size_t(p) * 4], 4);
+            // ALWAYS depth writes at z=0.5 distinguish survivors from discard
+            // without assuming the first colour differs from its clear value.
+            // Coverage comes from the original: a patch must neither export
+            // ownership for discarded pixels nor silently lose survivors.
+            if (word(a.depth, size_t(p) * 4) == 0u) {
+                ++r.uncoveredChecked;
+                if (word(b.slot, size_t(p) * 8) == 0xbf800000u &&
+                    word(b.slot, size_t(p) * 8 + 4) == 0u)
+                    continue;
+                if (r.uncoveredBad++ < 4)
+                    std::printf("    %s: data set %u, discarded MRT6 at (%u,%u) = (%.9g, %.9g); want clear (-1, 0)\n",
+                                name, seed, p % kSize, p / kSize, s[0], s[1]);
+                continue;
+            }
+            ++r.covered;
+            ++r.slotChecked;
             if (s[0] == kSlotCode && s[1] == kDepth && word(b.slot, size_t(p) * 8 + 4) == word(b.depth, size_t(p) * 4))
                 continue;
             if (r.slotBad++ < 4)
@@ -684,8 +694,9 @@ inline Result compare(ID3D11Device* dev, ID3D11DeviceContext* ctx, const std::ve
     ctx->ClearState();
     r.driven = true;
     std::printf("  identity: %s: %u targets + depth, 2 data sets: %u texels compared, %u mismatches; %u covered, "
-                "MRT6 %u checked, %u bad; distinct o0..o3 %zu/%zu/%zu/%zu, data set 1 changed %u\n",
-                name, r.targets, r.texelsCompared, r.mismatches, r.covered, r.slotChecked, r.slotBad, varied[0],
+                "MRT6 %u checked, %u bad; discarded %u checked, %u bad; distinct o0..o3 %zu/%zu/%zu/%zu, data set 1 changed %u\n",
+                name, r.targets, r.texelsCompared, r.mismatches, r.covered, r.slotChecked, r.slotBad,
+                r.uncoveredChecked, r.uncoveredBad, varied[0],
                 varied[1], varied[2], varied[3], changed);
     check(*std::max_element(varied, varied + 4) > 1, "identity: vacuous -- every stock target is uniform");
     check(decls.empty() || changed > 0, "identity: vacuous -- the second data set changed no stock output");
@@ -693,6 +704,8 @@ inline Result compare(ID3D11Device* dev, ID3D11DeviceContext* ctx, const std::ve
     check(r.covered > 0, "identity: vacuous -- the stock draw covered no texel");
     check(r.slotChecked > 0 && r.slotBad == 0,
           "identity: MRT6 holds 2 * slot + 1 and the fragment's depth on every texel the patched draw covered");
+    check(r.uncoveredBad == 0,
+          "identity: MRT6 remains bit-exact clear (-1, 0) on every uncovered or discarded texel");
     return r;
 }
 

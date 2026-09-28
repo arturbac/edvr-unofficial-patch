@@ -8,17 +8,21 @@ namespace engine_velocity_family {
 struct Family {
     uint64_t vs;
     const char* name;
-    uint64_t ps[4];
+    uint64_t ps[5];
     bool flatOnly = false;
     uint64_t flatPs = 0;
 };
 constexpr Family kFamilies[] = {
-    {0xEB5234DB6ADB491Dull, "vs_EB5234DB6ADB491D", {0xCB9F297EFF264251ull, 0x9ABF60B4B51F2C1Full, 0x3434972DB5336AA4ull, 0}},
+    // 054658: both additional PSs draw certified moving station records;
+    // the real corpus preserves their G-buffer/depth and exports exact MRT6.
+    {0xEB5234DB6ADB491Dull, "vs_EB5234DB6ADB491D", {0xCB9F297EFF264251ull, 0x9ABF60B4B51F2C1Full, 0x3434972DB5336AA4ull, 0xDC603C35BBE74B31ull, 0x63B1524A9F805A4Cull}},
     {0x5B4D8E894EEDA8B4ull, "vs_5B4D8E894EEDA8B4", {0x4375B72964F386CDull, 0, 0, 0}},
     {0xBBE58E40FE88EC80ull, "vs_BBE58E40FE88EC80", {0xDB3E8D20CF53FBC0ull, 0, 0, 0}},
     // PS91 needs a separate rasterizer-position input beside SV_IsFrontFace.
     // The captured pair is draw-qualified on WARP; VR remains unqualified.
-    {0xDE545DC8EE4FBB87ull, "vs_DE545DC8EE4FBB87", {0xE46E3E4832B2FDB0ull, 0xCB429E043DBB2506ull, 0, 0}, false, 0x91F8937EDA723663ull},
+    // 054658: 03B17 draws the station's moving rig; its survivors and discard
+    // branch are qualified against the original on WARP.
+    {0xDE545DC8EE4FBB87ull, "vs_DE545DC8EE4FBB87", {0xE46E3E4832B2FDB0ull, 0xCB429E043DBB2506ull, 0x03B17F89B31C4788ull, 0}, false, 0x91F8937EDA723663ull},
     {0xAACFDCF2FB9AD809ull, "vs_AACFDCF2FB9AD809", {0xCF534B32F491561Aull, 0, 0, 0}},
     {0x66DE2CADB1F4AE6Bull, "vs_66DE2CADB1F4AE6B", {0x864F1F949851B8DEull, 0xBBDE4E71FB78528Aull, 0, 0}},
     {0x61AE8EB05FDC18DDull, "vs_61AE8EB05FDC18DD", {0xFC43E42710010343ull, 0x451A82D4DD1BA254ull, 0x4504BC268E109C31ull, 0}},

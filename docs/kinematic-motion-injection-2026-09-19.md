@@ -5,18 +5,20 @@
 - **State:** B+C is merged and flown: camera-only statics, certified
   engine-record deltas for movers, reactive-mask fallback. Estimation/tracker
   retirement: 2026-09-23 teardown entry.
-- **Coriolis:** window expansion FLOWN, residual remains; 162120 matches
-  f2f27f97. Production-patcher hash proof identifies the alleged native
-  seam/window/refused shaders as EDVR's own generated patches. The old shadow
-  probe loses their ownership; current main already fixes it in 418e5231 (F7),
-  absent from that flight. See the 2026-09-28 entry; old-source reproduction,
-  stronger regression, and full validation passed. Visual verification remains.
+- **Coriolis, current:** 054658 matches post-F7 build 7664e386 and proves
+  remaining wrong world vectors. Three genuine station-material pairs are now
+  keyed: EB52/DC603 and EB52/63B1, DE54/03B17. Current joined records, exact
+  depth coincidence and WARP identity justify them; the 09-28 coverage-repair
+  entry below records limits. Focused self-test + real corpus passed 1922
+  checks; the full validation build passed. Promotion/installation and the
+  rotating-station capture remain pending.
 - **162120:** raw-image warps independently validate engine motion (quiet
   median correction <=0.05 input px). World-covered detail misses by ~0.3-0.6
   px quietly, up to 6 px on the opening move. Engine share: inset ~74%, seam
   64-67%, face ~82%. The ownership failure leaves object motion missing on
   these pixels.
-- **Camera:** selected rows match all 16 captured scene blocks within 5e-6; all
+- **Camera:** 162120 selected rows match all 16 scene blocks within 5e-6;
+  054658 actual eye-draw b1 rows match CSV now across all 16 within 4.8e-7; all
   32 eyes accept/bind them, follow 30. Stale carry/later auxiliary
   contamination ruled out FOR THIS RUN. Earlier H2 and H3 remain with
   docs/camera-rows-carry-2026-09-25.md.
@@ -37,9 +39,11 @@
   assumptions, fetch cost, cockpit depth pre-pass/bias, motion-cost
   interpretations, wrong joined station motion, close-range
   reconstruction-floor-only diagnosis.
-- **Next:** promote and install the validated F7 build, then repeat the same
-  station view and eye dump. Confirm engine coverage improves and the circled
-  detail stays clear; headset verification remains pending.
+- **Next:** clean promotion/installation, then capture on the promoted build at
+  the rotating station. Verify original DC603/63B1/03B17 hashes are patched,
+  affected detail gains engine coverage, and world-vector error/visible blur
+  falls. Do not claim every remaining soft pixel fixed.
+
 
 ## Premise
 
@@ -3398,3 +3402,114 @@ detail in the headset. Numerical artifacts:
 build/coriolis-162120/warp-refinement-blur2.json, roi-analysis.json and paired
 inset/seam crops; the saved dump and production-patcher hash proof make the
 diagnosis reproducible.
+
+### 2026-09-28 -- Post-F7 eye run 054658: engine motion holds, remaining world-covered detail still blurs
+
+Frontier log edvr_gfx_20260928_054242 matches HEAD 7664e386 via edvr_log.py.
+Sean reports building-like hull detail and seams still soft while the station
+rotates. The 16-frame capture uses 2037x1969 -> 4074x3938 per eye, CSV/D frames
+24366-24381. This is a different station angle from 162120, so coverage
+percentages are not a controlled before/after comparison.
+
+**Independent measurement:** previous raw C warped by current D minus
+(current-minus-previous jitter), with a fitted correction on each path.
+Gaussian blur radius 2 suppresses input aliasing. Quiet-pair median corrections
+(indices 5-15), in input pixels:
+
+| raw-crop ROI | median engine share | world correction | engine correction |
+|---|---|---|---|
+| upper buildings (875,464)-(990,502) | 67% | (+0.55,0) | (0,0) |
+| lower buildings (712,622)-(835,663) | 54% | (+0.50,-0.30) | (0,0) |
+| right seam (972,560)-(1008,651) | 55% | (+0.55,-0.05) | (-0.05,0) |
+| face (790,500)-(970,599) | 89% | (+0.60,-0.15) | (0,0) |
+| upper-left detail (714,513)-(809,573) | 74% | (+0.45,-0.30) | (0,-0.05) |
+
+On content-move pair 2, the seam's world correction is (+6.05,-0.20), reducing
+warp RMSE 14.96 -> 2.92; lower buildings need (+5.45,-3.25), RMSE 15.42 ->
+2.46. Engine median correction remains <=0.05 px; the largest fitted correction
+across these regions/pairs is 0.32 px. Do not label that opening content
+advance a head move without separate evidence.
+
+UI flags are zero throughout these ROIs. Engine hidden_history is zero;
+lower-building and seam world pixels also have none. Upper/face world pixels
+reach only ~1.5% hidden history on the opening move, not a pervasive rejection
+explanation. Projection validity is present on the analyzed world pixels.
+Relative to 162120, accurate engine motion and erroneous world-covered detail
+persist at similar error scale (~0.3-0.6 px quietly, ~6 px transiently); the
+wrong-vector subsets still prevent a reconstruction-floor-only verdict.
+
+ruled out: F7 alone as the complete Coriolis blur fix, because the verified
+post-fix dump still gives inaccurate vectors to world-covered station detail
+while engine motion matches independent raw-image warps. The ownership repair
+remains valid.
+
+ruled out: stale carry or later auxiliary camera contamination in 054658,
+because actual eye-draw b1 rows match CSV now across all 16 frames within
+4.8e-7. The first three eyemesh captures corroborate the eligible static
+producer.
+
+**Next:** attribute the world-covered producers before another code change.
+Genuine stock candidates (PS/VS) are 03B17F89B31C4788/DE545DC8EE4FBB87 (2
+draws/eye), DC603C35BBE74B31/EB5234DB6ADB491D (5),
+06D24ACAB0DC11B3/61AE8EB05FDC18DD (1): originals write targets 0-3, without an
+EDVR tail. Pixel footprint attribution is pending; none is yet convicted.
+Artifacts: build/coriolis-054658/warp-refinement-blur2.json, roi-map.png,
+path-map.png and paired crops.
+
+### 2026-09-28 -- Bounded coverage repair: three qualified station-material pairs
+
+The 054658 census identifies three genuine originals previously left stock:
+vs_EB5234DB6ADB491D with ps_DC603C35BBE74B31 and ps_63B1524A9F805A4C;
+vs_DE545DC8EE4FBB87 with ps_03B17F89B31C4788. Their draws share the eye's full
+2037x1969 viewport, colour @75 and depth @74. Family.ps expands mechanically
+from 4 to 5 entries to retain every existing EB52 key and add both proven
+materials; admission remains an exact family/PS list.
+
+**Captured motion and ownership proof.** All candidate records certify kind 1
+at current engine token 24367. EB52 draws slots 531/533/535/537, already drawn
+through keyed DE54/E46E and EB52/3434 in that eye. Actual captured VS
+rasterized on WARP for DC603 slot 537 matches SceneZ bit-for-bit on WORLD
+pixels: upper buildings 46, lower 78, seam 9, face 305, upper-left 1. For 63B1
+slot 537 the same test matches lower 30, seam 8, face 24. These coincidences
+locate candidate surfaces at world-covered pixels. The hardware replay uses an
+opaque depth-only PS; original material discard and culling are not replayed,
+so it does not establish complete game-PS visibility or live material coverage.
+
+DE54/03B17 draw ordinal 245 uses slot 179, already drawn immediately before
+through keyed DE54/E46E and AACF/CF53. Its normalized relative rig rotation is
+0.03862 degrees around (-0.181,0.716,-0.674), consistent with known station
+slots 183/583/537 (~0.034-0.038 degrees). Missing slot-179 geometry payload
+limits exact red-ROI footprint attribution; the captured moving station rig and
+real-shader qualification establish eligibility without estimating poses.
+
+**Qualification and gates.** Production-patched originals preserve all 40,960
+o0..o3/depth texels per pair, zero mismatches; exported MRT6 slot/depth checks
+are exact (03B17 4604, the other two 8192 each), zero bad. Controlled 03B17
+alpha inputs also drive 4096 surviving and 4096 discarded fragments, preserving
+discarded clears. The mandatory real-corpus gate now includes all three pairs
+and requires nonzero survivors AND discard for 03B17; corpus_identity::compare
+checks bit-exact MRT6 clear (-1,0) on every original-depth-uncovered pixel.
+Profile regression admits the exact pairs in VR, LegacyVr and Flat while
+refusing unknown/cross-family pairs and the unrelated 06D24 pair. The rebuilt
+focused rig passed --self-test --corpus with 1922 checks: 03B17 exercises 4604
+survivors and 3588 discarded pixels, zero ownership errors. The full validation
+build passed (exit 0): production DLLs, 82 pooled rigs plus four quiet jobs,
+self-contained installer/resource verification and 262 key-contract checks.
+Log: build/coriolis-material-full-build.log; full-build receipt written.
+
+ruled out: 61AE/06D24 as a station-motion candidate, because slot 276 has zero
+relative quaternion rotation and translation equal to the camera-origin delta;
+it remains unkeyed. Full eye unkeyed enumeration additionally found EB52/B7D:
+GPU clipping/raster replay of all four draws produces zero pixels in all five
+station ROIs, and slot 752 is current kind 3 (uncertified). It remains unkeyed.
+
+**Resulting behavior / next flight.** These three draws previously supplied
+only the camera term; their qualified patches now export ownership into EDVR's
+existing channel so compose can use the current certified record delta.
+Promotion/installation and post-install visual verification remain pending. The
+next capture on the promoted build must show original DC603/63B1/03B17 hashes
+patched, affected detail gaining engine coverage, and its world-vector
+error/visible blur falling during station rotation. This fixes a proven
+coverage gap; it does not certify all remaining softness solved. Flown
+environment: Pimax OpenXR, Crystal Super, 2037x1969 -> 4074x3938, preset K,
+DLSS 310.7.0.0; fixed family capacity is now five PS entries.
