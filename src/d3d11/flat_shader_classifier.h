@@ -376,6 +376,7 @@ struct ProgramFacts {
     bool operandOutOfRange = false;
     int32_t vposRegister = -1;      // PS: dcl_input_ps_siv position register
     bool depthOutput = false;       // PS: SV_Depth (or ge/le variants) output
+    bool texCoordMultiRowDot = false; // PS: a fetch coordinate assembles >=2 vector-dot rows of one cb
     int32_t posOutputRegister = -1; // VS: dcl_output_siv position register
     bool sawUnknownOpcode = false;
     uint16_t firstUnknownOpcode = 0; // opcode number of the first unknown instruction
@@ -627,8 +628,31 @@ inline bool isTwoDestOpcode(uint32_t op) {
     return op == kOpSincos || op == kOpImul || op == kOpUmul || op == 78 || op == 132 || op == 133;
 }
 
+inline bool opcodeIsTextureFetch(uint32_t op);
+inline bool textureCoordOperand(uint32_t op, uint8_t idx);
+
+// Evaluate a texture coordinate's row provenance at a point in the program:
+// >=2 vector-dot (coefKind 2) terms from distinct rows of one cb buffer is a
+// PS-side projection (rc-since-rc2 review F1: separate U/V dot products).
+// Read at the point of use -- a later overwrite of the coordinate register
+// (the fetch's own dest, a divide) must not erase the evidence.
+inline bool texCoordIsMultiRowDot(const Operand& coord, const FormBank& temps, uint32_t tempCount) {
+    if (coord.type != kOperandTemp || coord.reg >= tempCount) return false;
+    Form joined;
+    for (uint32_t c = 0; c < 4; ++c) {
+        if (!(coord.mask & (1u << c))) continue;
+        formUnion(joined, temps.at(coord.reg, sourceComponent(coord, c)));
+    }
+    for (uint8_t a = 0; a < joined.termCount; ++a)
+        for (uint8_t b = uint8_t(a + 1); b < joined.termCount; ++b)
+            if (joined.terms[a].coefKind == 2 && joined.terms[b].coefKind == 2 &&
+                joined.terms[a].slot == joined.terms[b].slot && joined.terms[a].row != joined.terms[b].row)
+                return true;
+    return false;
+}
+
 // Forward dataflow over the instruction list, filling `temps` and `outputs`.
-inline void buildForms(const std::vector<Instr>& instrs, const ProgramFacts& facts,
+inline void buildForms(const std::vector<Instr>& instrs, ProgramFacts& facts,
                        FormBank& temps, FormBank& outputs) {
     for (const Instr& in : instrs) {
         if (isDeclaration(in.opcode) || !in.opCount) continue;
@@ -662,6 +686,14 @@ inline void buildForms(const std::vector<Instr>& instrs, const ProgramFacts& fac
             }
         }
         if (!destIsTemp && !destIsOutput) continue;
+        // The fetch's coordinate is read BEFORE its dest form is computed: a
+        // fetch that writes its own coordinate register, or a later divide,
+        // cannot erase the projection evidence (rc-since-rc2 review F1).
+        if (opcodeIsTextureFetch(in.opcode))
+            for (uint8_t i = 1; i < in.opCount && !facts.texCoordMultiRowDot; ++i)
+                if (textureCoordOperand(in.opcode, i) &&
+                    texCoordIsMultiRowDot(in.ops[i], temps, facts.tempCount))
+                    facts.texCoordMultiRowDot = true;
         FormBank& bank = destIsTemp ? temps : outputs;
         const uint32_t destReg = dest.reg;
         for (uint32_t c = 0; c < 4; ++c) {
@@ -785,6 +817,19 @@ inline void buildForms(const std::vector<Instr>& instrs, const ProgramFacts& fac
                 out = sourceForm(in, 1, c, temps, outputs, facts.tempCount);
                 out.cfTainted |= in.cfDepth != 0;
                 break;
+            case kOpDiv: {
+                // The projective-texture idiom (uv/w): forward only the
+                // vector-dot projection provenance through the divide when
+                // the denominator carries no row terms (rc-since-rc2 review
+                // F1). Scalar/rect terms stay cleared as before, and no
+                // arithmetic merge is judged at a divide.
+                Form num = sourceForm(in, 1, c, temps, outputs, facts.tempCount);
+                Form den = sourceForm(in, 2, c, temps, outputs, facts.tempCount);
+                if (!den.termCount)
+                    for (uint8_t ti = 0; ti < num.termCount; ++ti)
+                        if (num.terms[ti].coefKind == 2) formAddTerm(out, num.terms[ti]);
+                break;
+            }
             default:
                 // Every other opcode consumes or clears row terms; the
                 // safety scan only fires on mul/mad/add/dp4 combines.
@@ -1288,30 +1333,12 @@ inline bool analyzePs(const std::vector<uint32_t>& t, PsAnalysis& out) {
     // A texture coordinate assembled from >=2 distinct rows of one cb buffer
     // ACROSS its used components is a PS-side projection even when every
     // component alone is single-row (rc-since-rc2 review F1: U and V formed
-    // by separate dot products against two camera rows). The per-component
-    // forms already carry the row provenance.
-    for (const Instr& in : instrs) {
-        if (isDeclaration(in.opcode) || !in.opCount || !opcodeIsTextureFetch(in.opcode)) continue;
-        for (uint8_t i = 1; i < in.opCount; ++i) {
-            if (!textureCoordOperand(in.opcode, i)) continue;
-            const Operand& coord = in.ops[i];
-            if (coord.type != kOperandTemp || coord.reg >= facts.tempCount) continue;
-            Form joined;
-            for (uint32_t c = 0; c < 4; ++c) {
-                if (!(coord.mask & (1u << c))) continue;
-                formUnion(joined, temps.at(coord.reg, sourceComponent(coord, c)));
-            }
-            bool multi = false;
-            for (uint8_t a = 0; a < joined.termCount && !multi; ++a)
-                for (uint8_t b = uint8_t(a + 1); b < joined.termCount && !multi; ++b)
-                    if (joined.terms[a].coefKind == 2 && joined.terms[b].coefKind == 2 &&
-                        joined.terms[a].slot == joined.terms[b].slot &&
-                        joined.terms[a].row != joined.terms[b].row) multi = true;
-            if (multi) {
-                out.reason = FlatClassifierReason::MultiRowTexCoord;
-                return false;
-            }
-        }
+    // by separate dot products against two camera rows). Evaluated at each
+    // fetch's point of use in buildForms, so a fetch overwriting its own
+    // coordinate register or a divide cannot erase the evidence.
+    if (facts.texCoordMultiRowDot) {
+        out.reason = FlatClassifierReason::MultiRowTexCoord;
+        return false;
     }
 
     // vPos taint / origin dataflow.

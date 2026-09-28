@@ -4564,7 +4564,15 @@ F1-F6, all fixed without a flight:
   Scoped to vector-dot terms so the rect-filter idiom (scale/offset
   constants) still passes; the inert stock filter ps_F0BAE053476F8730
   verifies Clean. Rig: synthetic two-row dp4 sample refuses, single-row
-  control passes.
+  control passes. FOLLOW-UP (same evening): the reviewer's sqrt and
+  divide escape variants -- a fetch overwriting its own coordinate
+  register (sample into r0) and the projective divide (uv/w) -- erased
+  the row evidence before the first check read it. The coordinate's row
+  provenance is now evaluated at each fetch's POINT OF USE inside
+  buildForms (facts.texCoordMultiRowDot), and a divide with a term-free
+  denominator forwards the numerator's vector-dot terms. The reviewer's
+  own probe confirms matrix, matrix_sqrt and matrix_div all refuse as
+  multi-row-texcoord; the rect-filter fixture still passes.
 - F2 (classifier misses legal SV_Depth): the plain dcl_output form's
   depth operand (oDepth/oDepthGE/oDepthLE, operand types 12/38/39) now
   sets depthOutput, alongside the Sgv/Siv system-value path. Rig:

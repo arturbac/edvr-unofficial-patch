@@ -413,7 +413,7 @@ inline int tests() {
             const std::vector<uint32_t> decls = {
                 opTok(89, 4), CB_SRC, 1, 272,            // dcl_constantbuffer cb1[272]
                 opTok(88, 4, 3u << 11), T_DCL, 0, 0x5555, // dcl_resource_texture2d t0
-                opTok(90, 2), 0x306000,                   // dcl_sampler s0
+                opTok(90, 3), 0x106000, 0,                // dcl_sampler s0
                 opTok(101, 3), O_DST, 0,                  // dcl_output o0.xyzw
                 opTok(104, 2), 2,                          // dcl_temps 2
             };
@@ -421,7 +421,7 @@ inline int tests() {
             const std::vector<uint32_t> body = {
                 opTok(17, 8), RX_DST, 0, V0_SRC, 0, CB_SRC, 1, 270,        // dp4 r0.x, v0, cb1[270]
                 opTok(17, 8), RY_DST, 0, V0_SRC, 0, CB_SRC, 1, secondRow,  // dp4 r0.y, v0, cb1[row]
-                opTok(69, 9), R_DST, 1, RXY_SRC, 0, T_SRC, 0, 0x306000, 0, // sample r1.xyzw, r0.xy, t0, s0
+                opTok(69, 9), R_DST, 1, RXY_SRC, 0, T_SRC, 0, 0x106000, 0, // sample r1.xyzw, r0.xy, t0, s0
                 opTok(54, 5), O_DST, 0, R_SRC, 1,                          // mov o0.xyzw, r1.xyzw
             };
             prog.insert(prog.end(), body.begin(), body.end());
@@ -441,6 +441,51 @@ inline int tests() {
         const auto one = matrixPs(270, false);
         expect(one.psReason != FlatClassifierReason::MultiRowTexCoord,
                "a coordinate from one camera row alone is not refused as a projection");
+        // The reviewer's escape variants: the fetch overwriting its own
+        // coordinate register (sample into r0) and the projective divide
+        // (uv/w) must not erase the projection evidence.
+        auto escapePs = [&](bool overwrite, bool projective) {
+            std::vector<uint32_t> prog = {0x00000050u, 0};
+            const std::vector<uint32_t> decls = {
+                opTok(89, 4), CB_SRC, 1, 272,
+                opTok(88, 4, 3u << 11), T_DCL, 0, 0x5555,
+                opTok(90, 3), 0x106000, 0,
+                opTok(101, 3), O_DST, 0,
+                opTok(104, 2), 2,
+            };
+            prog.insert(prog.end(), decls.begin(), decls.end());
+            const std::vector<uint32_t> dots = {
+                opTok(17, 8), RX_DST, 0, V0_SRC, 0, CB_SRC, 1, 270,
+                opTok(17, 8), RY_DST, 0, V0_SRC, 0, CB_SRC, 1, 271,
+            };
+            prog.insert(prog.end(), dots.begin(), dots.end());
+            if (projective) {
+                const std::vector<uint32_t> div = {
+                    opTok(14, 7), R_DST, 1, RXY_SRC, 0, 0x10103A, 0,   // div r1.xy, r0.xy, v0.w
+                };
+                prog.insert(prog.end(), div.begin(), div.end());
+            }
+            const std::vector<uint32_t> fetch = {
+                opTok(69, 9), R_DST, overwrite ? 0u : 1u,                  // sample r[coord reg], r0.xy, t0, s0
+                RXY_SRC, 0, T_SRC, 0, 0x106000, 0,
+            };
+            prog.insert(prog.end(), fetch.begin(), fetch.end());
+            const std::vector<uint32_t> tail = {opTok(54, 5), O_DST, 0, R_SRC, 1};
+            prog.insert(prog.end(), tail.begin(), tail.end());
+            prog.push_back(opTok(62, 1));
+            prog[1] = static_cast<uint32_t>(prog.size());
+            Chunk shex; shex.tag = 0x58454853u;
+            shex.bytes.resize(prog.size() * 4);
+            std::memcpy(shex.bytes.data(), prog.data(), shex.bytes.size());
+            const auto blob = makeContainer({shex});
+            return edvr::classifyFlatShaderPair(nullptr, 0, blob.data(), blob.size());
+        };
+        const auto overwrite = escapePs(true, false);
+        expect(overwrite.psReason == FlatClassifierReason::MultiRowTexCoord,
+               "a fetch overwriting its own coordinate register still refuses");
+        const auto projective = escapePs(false, true);
+        expect(projective.psReason == FlatClassifierReason::MultiRowTexCoord,
+               "the projective divide (uv/w) still refuses");
     }
 
     // --- Walker robustness: every fixture walks exactly ------------------------
