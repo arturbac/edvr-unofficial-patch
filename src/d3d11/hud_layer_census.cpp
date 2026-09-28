@@ -12,7 +12,7 @@
 #include "binding_shadow.h"       // the owner-context binding shadow
 #include "draw_state_describe.h"  // viewName, describeBlend/describeDs, shapeOf, dsStateOf
 #include "tonemap_admit.h"        // the tonemap draw's structural admission, shared with the crisp-HUD half of fix.ui_quality
-#include "ui_depth.h"             // uiDepthEyeOfTarget: the eye, by the pass's own table
+#include "ui_depth.h"             // uiDepthEyeOfTargetReadOnly: the eye, by the pass's own table (never registers)
 #include "ui_layer.h"             // nativeTemporalProjectionReference
 #include "ui_layer_math.h"        // the family VS hashes
 #include "vscreen.h"              // vScreenSetRenderTargetsRaw
@@ -1182,7 +1182,7 @@ bool hudLayerCensusEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count, 
         if (eyeDrawIndex > fs.lastOrd) fs.lastOrd = eyeDrawIndex;
         const TargetCache& tc = targetOf();
         int eye = -1;
-        if (tc.ok) eye = uiDepthEyeOfTarget(tc.resource, tc.w, tc.h, tc.fmt);
+        if (tc.ok) eye = uiDepthEyeOfTargetReadOnly(tc.resource);
         if (eye >= 0 && eye < 2) ++fs.eyeDraws[eye];
         if (tc.ok) noteFamTarget(tc.resource);
         const uint64_t ps = bindingShaderHash(BindSlot::Ps);
@@ -1214,7 +1214,7 @@ bool hudLayerCensusEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count, 
                 if (ti.rtvRes) {
                     ResourceInfo ri;
                     if (bindingResolveResource(ti.rtvRes, &ri) && ri.isTexture2D) {
-                        eye = uiDepthEyeOfTarget(ri.resource, ri.a, ri.b, ri.fmt);
+                        eye = uiDepthEyeOfTargetReadOnly(ri.resource);
                     }
                 }
                 if (f.tonemapCount < 4) {

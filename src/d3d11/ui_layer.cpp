@@ -2611,22 +2611,27 @@ bool uiLayerCrispNoteEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count
     bool shaped = false;
     guarded("uiLayer.crispAdmit", [&] { shaped = tonemapAdmitStructure(ctx, ps, ta); });
     if (!shaped) return false;
-    // Which eye's RGBA8 target the draw writes.
+    // Which eye's tonemap this is, told WITHOUT ui_depth's table: a lookup
+    // there would REGISTER the tonemap's LDR output, and on 2026-09-27 that
+    // registration took the table's two same-shape slots ahead of the main
+    // menu's own composite target every frame -- the menus read "no eye"
+    // and never took the layer again. The admitted draw's own HDR source IS
+    // an eye's HDR target, and the holo take recorded which this frame, so
+    // the eye is read off that identity -- exact, and the table is untouched.
     int eye = -1;
-    if (ta.rtvRes) {
-        ResourceInfo ri;
-        if (bindingResolveResource(ta.rtvRes, &ri) && ri.isTexture2D)
-            eye = uiDepthEyeOfTarget(ri.resource, ri.a, ri.b, ri.fmt);
-    }
-    if (eye < 0) return false;  // not an eye the pass knows: nothing to aim a layer at
     uint64_t seq = 0;
     float jx = 0.0f, jy = 0.0f;
     uint32_t jw = 0, jh = 0;
-    if (!nativeTemporalDrawJitter(static_cast<uint32_t>(eye), &seq, &jx, &jy, &jw, &jh))
-        return false;
+    for (int cand = 0; cand < 2 && eye < 0; ++cand) {
+        const Eye& c = g_eye[cand];
+        if (!c.hdrDraws || !ta.hdrRes || ta.hdrRes != c.hdrTarget) continue;
+        if (!nativeTemporalDrawJitter(static_cast<uint32_t>(cand), &seq, &jx, &jy, &jw, &jh))
+            continue;
+        if (c.hdrSeq != seq || !c.hdrSrv) continue;  // another frame's content
+        eye = cand;
+    }
+    if (eye < 0) return false;  // no eye's HDR layer holds what this draw reads
     Eye& e = g_eye[eye];
-    // No holo content in the eye's HDR layer this frame: the ordinary case
-    // (no panels on screen), silent.
     if (e.hdrSeq != seq || !e.hdrDraws || !e.hdrSrv) return false;
     // The crisp contract on top of the structure: a known HDR slot with a 2D
     // source bound there (a tonemap-shaped draw with an unknown ps -- the

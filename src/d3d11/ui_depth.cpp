@@ -2672,6 +2672,21 @@ int uiDepthEyeOfTarget(const void* res, uint32_t w, uint32_t h, uint32_t fmt) {
     return eye;
 }
 
+// The read-only form (ui_depth.h says who may call which): a known target's
+// eye, or -1 when the table has not seen it. Never registers.
+int uiDepthEyeOfTargetReadOnly(const void* res) {
+    if (!res) return -1;
+    for (uint32_t i = 0; i < g_frameTargetCount; ++i) {
+        const FrameTarget& t = g_frameTargets[i];
+        if (t.res == res) {
+            int eye = static_cast<int>(t.eye);
+            if (g_eyesSwapped) eye = 1 - eye;
+            return eye;
+        }
+    }
+    return -1;
+}
+
 bool uiDepthIsExcluded(uint64_t vsHash) {
     return vsHash && inList(g_exclude, g_excludeCount, vsHash);
 }
