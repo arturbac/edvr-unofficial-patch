@@ -67,24 +67,52 @@ footprint on the rtv crop:
     the captured pair. The residual |after - (before*(1-a)+L)| is reported
     per draw (p50/p99/max, HDR units); a large residual invalidates the
     whole a/L chain (wrong UV mapping, glow alpha the surface does not
-    carry, depth-rejected pixels misread). Pixels whose after==before
-    (depth-rejected or zero-effect) are excluded from the footprint.
+    carry, depth-rejected pixels misread). The rasterized footprint alone
+    is the coverage evidence: stock before/after equality NEVER excludes a
+    pixel, because a translucent draw can leave the stock HDR exactly
+    unchanged (F*(1-a)+L == F) while the separated composition differs by
+    tens of steps. Genuinely depth-rejected pixels surface through the
+    cross-check residual (L != a*F there) and the ceiling below, instead of
+    being silently dropped.
   * FALLBACK (route=luminance): where geometry is not decodable, a is
     solved per pixel from luma mixing against a single estimated HUD
     radiance Lbar (median of after over the darkest-decile footprint
     pixels) and L = after - before*(1-a) exactly. This assumes a spatially
     constant HUD radiance and F != Lbar; it is wrong for multi-coloured
-    panels. The limitation is printed whenever this route is used.
+    panels. The limitation is printed whenever this route is used. Pixels
+    whose solved a claims coverage but that stock left unchanged cannot be
+    resolved on this route (after == before makes the luma equation
+    degenerate); they are counted and printed as an AMBIGUOUS class with
+    the possible parity error bounded per pixel by
+    max_a |T(F) - (1-a)*T(F) - T(a*F)| (L == a*F is forced there), never
+    silently dropped.
 
 Metric: err = |T(F*(1-a)+L) - (T(F)*(1-a)+T(L))| per HUD pixel (a > eps),
 max over RGB, in 8-bit steps (x255; note T(after) is the stock term since
 after = F*(1-a)+L by capture). Reported pooled and per draw: p50/p99/max
 and counts; plus the share of HUD pixels in the regime that matters
 (0 < a < 1 AND background luma above --bright-luma, default 1.0 HDR) and
-the p99 restricted to that regime. VERDICT compares that restricted p99
-(or the overall p99 when the regime has <32 samples) against --budget
-(default 2.0 8-bit steps, the design doc's G-F budget). Exit 0 PASS,
-1 FAIL, 2 data/parse error.
+the p99 restricted to that regime. VERDICT: a PASS requires ALL of
+
+  1. a PROVEN PAIR: the capture stamps match (when both file names carry
+     one), the tonemap draw's frame equals the panels frame, and the
+     tonemap draw's HDR resource equals the panels target identity. No
+     unique compatible draw is INVALID; --allow-mismatched measures anyway
+     under a banner and caps the outcome at non-PASS.
+  2. RESIDUALS UNDER CEILING: T fit residual p99 <= 4.0 steps and every
+     geometry draw's blend cross-check p99 <= 0.25 HDR units. The ceilings
+     come from the flown ledgers: flight 2's fit residual p99 ran
+     1.45-2.53 steps with a clean cross-check, so 4.0 keeps ~1.6x headroom
+     over the worst valid flight while a cross-channel EDHM LUT or a
+     corrupt capture lands far past it; 0.25 is 5x the R11G11B10 rounding
+     scale of consistent captures (<0.05) and a quarter of the corrupt
+     blend-chain fixture (1.03 HDR units).
+  3. the restricted p99 (or the overall p99 when the regime has <32
+     samples) under --budget (default 2.0 8-bit steps, the design doc's
+     G-F budget), as before.
+
+Anything else is INVALID with the reason printed. Exit 0 PASS, 1 FAIL
+budget, 2 data/INVALID.
 
 What this does NOT prove: T here is an empirical per-channel replay, not
 the game's tonemap shader (EDHM 3D-LUT cross-channel terms degrade it;
@@ -128,9 +156,20 @@ EPS_A = 0.5 / 255.0           # coverage below this is not a HUD pixel
 REGIME_MIN = 32               # samples before the restricted p99 drives the verdict
 LUMA = (0.2126, 0.7152, 0.0722)
 
+# Residual ceilings for the INVALID verdict (rationale in the docstring):
+# flight 2's ledgers ran a T-fit residual p99 of 1.45-2.53 steps and a clean
+# cross-check, so PASS allows ~1.6x headroom on the fit and 5x the R11G11B10
+# rounding scale (<0.05 HDR units) on the cross-check.
+FIT_P99_CEILING = 4.0       # 8-bit steps
+XCHECK_P99_CEILING = 0.25   # HDR units
+
 
 def fail(message):
     raise ValueError(message)
+
+
+class InvalidData(ValueError):
+    """The captures cannot support a gate verdict; reported as INVALID (exit 2)."""
 
 
 # ---------------------------------------------------------------- formats
@@ -473,10 +512,13 @@ def recover_geometry(draw, blobs, before, after):
     sy = np.clip((uv[..., 1] * sh).astype(int), 0, sh - 1)
     a = surf[sy, sx, 3]
     L = surf[sy, sx, :3]
-    region = mask & change_mask(before, after)
-    if not region.any():
-        return None, 'rasterized footprint changed no pixel'
-    return {'a': a, 'L': L, 'region': region, 'rasterized': int(mask.sum()),
+    # The rasterized footprint is the coverage evidence. Stock before/after
+    # equality must NOT exclude a pixel: a translucent draw can leave the
+    # stock HDR exactly unchanged (F*(1-a)+L == F) while the separated
+    # composition differs by tens of steps. Depth-rejected pixels now fail
+    # the cross-check residual (L != a*F there) instead of being dropped.
+    return {'a': a, 'L': L, 'region': mask, 'rasterized': int(mask.sum()),
+            'changed': int((mask & change_mask(before, after)).sum()),
             'xcheck': after - (before * (1.0 - a[..., None]) + L)}, ''
 
 
@@ -506,7 +548,28 @@ def recover_luminance(before, after):
     a[~bright] = np.where(np.abs(lum_a[~bright] - lum_l) <= np.abs(lum_a[~bright] - lum_f[~bright]),
                           1.0, 0.0)
     L = np.clip(after - before * (1.0 - a[..., None]), 0.0, None)
-    return {'a': a, 'L': L, 'region': region, 'rasterized': None, 'xcheck': None}, ''
+    return {'a': a, 'L': L, 'region': region, 'changed': int(region.sum()),
+            'rasterized': None, 'xcheck': None}, ''
+
+
+def coverage_bound(tfit, F):
+    """Per-pixel bound on the parity error a STOCK-UNCHANGED covered pixel could
+    carry. after == before forces L == a*F, so the error at coverage a is
+    max_c |T(F_c) - ((1-a)*T(F_c) + T(a*F_c))|; bound = max over a on a grid.
+    Computed per channel on the fitted knots, then interpolated to each pixel.
+    An estimate of a bound: the gap is the chord-vs-curve distance, exact at
+    the knots and tight for the concave game tonemaps this gate measures."""
+    F = np.asarray(F, dtype=np.float64).reshape(-1, 3)
+    alphas = np.linspace(0.0, 1.0, 49)[:, None]
+    bound = np.zeros(F.shape[0])
+    for c in range(3):
+        xs, ys = tfit['curves'][c].x, tfit['curves'][c].y
+        keep = np.concatenate(([True], np.diff(xs) > 0))
+        xs, ys = xs[keep], ys[keep]
+        taf = np.interp((alphas * xs[None, :]).ravel(), xs, ys).reshape(len(alphas), len(xs))
+        gap = np.abs(ys[None, :] - ((1.0 - alphas) * ys[None, :] + taf)).max(axis=0)
+        bound = np.maximum(bound, np.interp(np.clip(F[:, c], 0.0, None), xs, gap))
+    return bound
 
 
 def measure_draw(index, draw, tfit, bright):
@@ -529,7 +592,7 @@ def measure_draw(index, draw, tfit, bright):
     hud = region & (a > EPS_A)
     if not hud.any():
         return {'index': index, 'route': route, 'reason': 'no HUD pixels (a <= eps)',
-                'rasterized': rec['rasterized'], 'changed': int(region.sum())}
+                'rasterized': rec['rasterized'], 'changed': rec['changed']}
     F, A = before[hud], after[hud]
     aa, LL = a[hud], L[hud]
     tF, tA, tL = tfit['apply'](F), tfit['apply'](A), tfit['apply'](np.clip(LL, 0.0, None))
@@ -541,7 +604,7 @@ def measure_draw(index, draw, tfit, bright):
     oor = max(tfit['curves'][c].oor(np.concatenate([F[:, c], A[:, c], LL[:, c]])) for c in range(3))
     out = {'index': index, 'route': route, 'reason': why if route == 'luminance' else '',
            'ordinal': draw.info.get('ordinal'), 'frame': draw.info.get('frame'),
-           'rasterized': rec['rasterized'], 'changed': int(region.sum()),
+           'rasterized': rec['rasterized'], 'changed': rec['changed'],
            'hud': int(hud.sum()), 'regime': int(regime.sum()), 'oor': oor,
            'err': err, 'rerr': rerr}
     if rec['xcheck'] is not None:
@@ -549,6 +612,18 @@ def measure_draw(index, draw, tfit, bright):
         out['xcheck_p50'] = float(np.percentile(xc, 50))
         out['xcheck_p99'] = float(np.percentile(xc, 99))
         out['xcheck_max'] = float(xc.max())
+    if route == 'luminance':
+        # Stock-unchanged pixels whose solved a claims coverage: the luma
+        # equation is degenerate there (after == before), so they can be
+        # covered or not. Count them and bound the possible error instead of
+        # dropping them silently.
+        amb = (~region) & (a > EPS_A)
+        out['ambiguous'] = int(amb.sum())
+        if amb.any():
+            b = coverage_bound(tfit, before[amb])
+            out['amb_p50'] = float(np.percentile(b, 50))
+            out['amb_p99'] = float(np.percentile(b, 99))
+            out['amb_max'] = float(b.max())
     return out
 
 
@@ -566,6 +641,14 @@ def summarize_draw(d):
 
 # -------------------------------------------------------------------- CLI
 
+def _stamp(path, prefix):
+    """The <stamp> of a panels_<stamp>.bin / tonemap_<stamp>.bin name, else None."""
+    name = os.path.basename(path)
+    if name.startswith(prefix) and name.endswith('.bin'):
+        return name[len(prefix):-len('.bin')]
+    return None
+
+
 def find_pair(path):
     panels = {os.path.basename(p)[len('panels_'):-len('.bin')]: p
               for p in glob.glob(os.path.join(path, 'panels_*.bin'))}
@@ -574,8 +657,9 @@ def find_pair(path):
     common = sorted(set(panels) & set(tonemaps))
     if len(common) == 1:
         return panels[common[0]], tonemaps[common[0]]
-    if len(panels) == 1 and len(tonemaps) == 1:
-        return next(iter(panels.values())), next(iter(tonemaps.values()))
+    if not common and panels and tonemaps:
+        raise InvalidData(f'no panels_*/tonemap_* pair with a matching stamp in {path}: '
+                          f'panels stamps {sorted(panels)}, tonemap stamps {sorted(tonemaps)}')
     fail(f'cannot pair panels_*/tonemap_* in {path}: panels stamps {sorted(panels)}, '
          f'tonemap stamps {sorted(tonemaps)}, common {common}')
 
@@ -590,21 +674,52 @@ def sniff_pair(first, second):
     return pair[b'EDVRPNL1'], pair[b'EDVRTON1']
 
 
-def analyze(panels_path, tonemap_path, budget=2.0, bright=1.0, verbose=False, tonemap_draw=None):
+def analyze(panels_path, tonemap_path, budget=2.0, bright=1.0, verbose=False,
+            tonemap_draw=None, allow_mismatched=False):
     snap = pnl.read_snapshot(panels_path)
     tsnap = ton.read(tonemap_path)
     if not tsnap['draws']:
         fail('tonemap bin holds no draw')
+    tdraws = tsnap['draws']
     target = snap.header.get('target_identity', 0)
+    pframes = {d.info.get('frame') for d in snap.draws if d.info.get('frame') is not None}
+    pframe = next(iter(pframes)) if len(pframes) == 1 else snap.header.get('first_frame')
+
+    # Pairing must be PROVEN before T is fit: same capture stamp (when the
+    # names carry one), same frame, and the tonemap draw's HDR resource ==
+    # the panels target identity. Otherwise the verdict is INVALID; an
+    # exploratory --allow-mismatched measures anyway, capped at non-PASS.
+    mismatch = []
+    ps, ts = _stamp(panels_path, 'panels_'), _stamp(tonemap_path, 'tonemap_')
+    if ps is not None and ts is not None and ps != ts:
+        mismatch.append(f'capture stamps differ: panels_{ps}.bin vs tonemap_{ts}.bin')
+    resources = [d['blobs'][2]['meta'].get('resource') for d in tdraws]
+    res_matches = [i for i, r in enumerate(resources) if r == target] if target else []
     pick = 0
     if tonemap_draw is not None:
+        if not 0 <= tonemap_draw < len(tdraws):
+            fail(f'--tonemap-draw {tonemap_draw} out of range ({len(tdraws)} draws)')
         pick = tonemap_draw
-    elif target:
-        matches = [i for i, d in enumerate(tsnap['draws'])
-                   if d['blobs'][2]['meta'].get('resource') == target]
-        if matches:
-            pick = matches[0]
-    tfit = fit_tonemap(tsnap['draws'][pick])
+        if target and resources[pick] != target:
+            mismatch.append(f'tonemap draw {pick} HDR resource {resources[pick]} '
+                            f'!= panels target {target}')
+    elif not target:
+        mismatch.append('panels bin carries no target identity; the pairing cannot be proven')
+    elif not res_matches:
+        mismatch.append(f'no tonemap draw reads the panels HDR target {target} '
+                        f'(captured HDR resources: {resources})')
+    elif len(res_matches) > 1:
+        mismatch.append(f'{len(res_matches)} tonemap draws read the panels target {target}; '
+                        f'disambiguate with --tonemap-draw')
+        pick = res_matches[0]
+    else:
+        pick = res_matches[0]
+    if pframe is not None and tdraws[pick].get('frame') != pframe:
+        mismatch.append(f'tonemap draw frame {tdraws[pick].get("frame")} != panels frame {pframe}')
+    if mismatch and not allow_mismatched:
+        raise InvalidData('; '.join(mismatch) +
+                          ' (re-measure with --allow-mismatched; the outcome is capped at non-PASS)')
+    tfit = fit_tonemap(tdraws[pick])
     draws = [summarize_draw(measure_draw(i, d, tfit, bright)) for i, d in enumerate(snap.draws)]
     errs = [d['err'] for d in draws if 'err' in d]
     rerrs = [d['rerr'] for d in draws if 'err' in d and len(d['rerr'])]
@@ -616,16 +731,32 @@ def analyze(panels_path, tonemap_path, budget=2.0, bright=1.0, verbose=False, to
         basis, value = 'restricted p99', pct(prerr, 99)
     else:
         basis, value = 'overall p99', pct(pooled, 99)
-    passed = bool(len(pooled)) and value <= budget
+    # A PASS also requires the evidence chain to be healthy: the fitted T
+    # must reproduce the captured output bytes, and the blend identity must
+    # hold on every geometry-routed draw.
+    invalid = []
+    if tfit['fit_p99'] > FIT_P99_CEILING:
+        invalid.append(f'T fit residual p99 {tfit["fit_p99"]:.2f} steps exceeds the '
+                       f'{FIT_P99_CEILING:g}-step ceiling (T untrustworthy: cross-channel '
+                       f'LUT terms or a corrupt capture)')
+    for d in draws:
+        if d.get('xcheck_p99', 0.0) > XCHECK_P99_CEILING:
+            invalid.append(f'draw {d["index"]} blend cross-check p99 {d["xcheck_p99"]:.3f} HDR '
+                           f'units exceeds the {XCHECK_P99_CEILING:g} ceiling (the a/L chain '
+                           f'is broken)')
+    passed = bool(len(pooled)) and value <= budget and not invalid and not mismatch
     return {'panels': str(panels_path), 'tonemap': str(tonemap_path), 'tonemap_draw': pick,
-            'tonemap_draws': len(tsnap['draws']), 'tfit': tfit, 'draws': draws,
+            'tonemap_draws': len(tdraws), 'tfit': tfit, 'draws': draws,
             'hud': hud, 'regime': regime, 'pooled': pooled, 'prerr': prerr,
             'basis': basis, 'value': value, 'budget': budget, 'passed': passed,
-            'bright': bright}
+            'invalid': invalid, 'mismatch': mismatch, 'bright': bright}
 
 
 def print_report(rep, verbose=False):
     tf = rep['tfit']
+    if rep.get('mismatch'):
+        print('!! ALLOW-MISMATCHED: captures are NOT a proven pair: ' + '; '.join(rep['mismatch']))
+        print('!! the measurement below is exploratory; the outcome is capped at non-PASS')
     print(f"hud parity (G-F): {os.path.basename(rep['panels'])} + {os.path.basename(rep['tonemap'])}")
     note = '' if tf['aligned'] else f" (partial overlap, intersected to {tf['region']})"
     print(f"tonemap T: draw {rep['tonemap_draw']}/{rep['tonemap_draws']}, {tf['pooled']} pooled px{note}, "
@@ -653,6 +784,12 @@ def print_report(rep, verbose=False):
     for d in rep['draws']:
         if d['route'] == 'luminance':
             print(f"  draw {d['index']}: {d['reason']}")
+        if d.get('ambiguous'):
+            print(f"  draw {d['index']}: {d['ambiguous']} stock-unchanged pixels carry "
+                  f"alpha-evidence of coverage under the luma estimate; if covered, their "
+                  f"parity error is bounded at p50 {d['amb_p50']:.2f} / p99 {d['amb_p99']:.2f} / "
+                  f"max {d['amb_max']:.2f} steps (counted, not measured: the luma equation is "
+                  f"degenerate where after == before)")
         if 'err' in d and d.get('oor', 0) > 0.01:
             print(f"  draw {d['index']}: {100 * d['oor']:.1f}% of T evaluations beyond the fitted "
                   f"HDR range (clamped)")
@@ -664,12 +801,18 @@ def print_report(rep, verbose=False):
               f"p99 {pct(rep['pooled'], 99):.2f} max {float(rep['pooled'].max()):.2f} steps")
         print(f"  regime that matters (0<a<1 and background luma > {rep['bright']:g}): "
               f"{rep['regime']} px ({share:.1f}% of HUD), restricted p99 {pct(rep['prerr'], 99):.2f} steps")
-    if not len(rep['pooled']):
+    if rep['invalid']:
+        print(f"VERDICT: INVALID ({'; '.join(rep['invalid'])})")
+    elif not len(rep['pooled']):
         print('VERDICT: NO DATA (no HUD pixels)')
-    else:
-        verdict = 'PASS' if rep['passed'] else 'FAIL'
-        print(f"VERDICT: {verdict} ({rep['basis']} {rep['value']:.2f} steps vs budget "
+    elif rep['passed']:
+        print(f"VERDICT: PASS ({rep['basis']} {rep['value']:.2f} steps vs budget "
               f"{rep['budget']:g}; G-F budget)")
+    else:
+        why = ('; mismatched captures admitted under --allow-mismatched cap the outcome at '
+               'non-PASS') if rep['mismatch'] else ''
+        print(f"VERDICT: FAIL ({rep['basis']} {rep['value']:.2f} steps vs budget "
+              f"{rep['budget']:g}; G-F budget{why})")
 
 
 # -------------------------------------------------------------- self-test
@@ -709,23 +852,26 @@ def _u32(v):
     return struct.pack('<I', v)
 
 
-def build_tonemap_bin(path, w=64, h=48, seed=7):
-    """Synthetic EDVRTON1 exactly per eye_tonemap_snapshot.h:226-253."""
+def build_tonemap_bin(path, w=64, h=48, seed=7, draws=1, frame=42, hdr_resource=9003,
+                      gain_noise=False):
+    """Synthetic EDVRTON1 exactly per eye_tonemap_snapshot.h:226-253.
+
+    draws=2 writes a second same-frame draw reading the SAME HDR resource
+    (the pairing-ambiguity fixture); frame/hdr_resource parameterize the
+    negative pairing fixtures; gain_noise applies a per-pixel gain to the
+    output crop so the per-channel monotone T fit residual exceeds the
+    INVALID ceiling while the parity metric itself is unaffected.
+    """
     rng = np.random.default_rng(seed)
     hdr = rng.random((h, w, 3)) * 9.0
     t_true = lambda x: x / (1.0 + x)
-    out = np.round(t_true(hdr) * 255.0).astype(np.uint8)
+    if gain_noise:
+        gain = 0.85 + 0.30 * rng.random((h, w, 1))
+        out = np.round(np.clip(t_true(hdr) * gain, 0.0, 1.0) * 255.0).astype(np.uint8)
+    else:
+        out = np.round(t_true(hdr) * 255.0).astype(np.uint8)
     out_rgba = np.concatenate([out, np.full((h, w, 1), 255, np.uint8)], axis=-1)
     hdr_packed = pack_r11g11b10(hdr)
-    meta = {'frame': 42, 'ordinal': 1, 'vs': ton.VS, 'ps': ton.PS, 'kind': ord('D'),
-            'count': 3, 'start': 0, 'instances': 1, 'start_instance': 0, 'topology': 5,
-            'vb_stride': 20, 'vb_offset': 0, 'complete_inputs': True,
-            'layout': [['POSITION', 0, 6, 0, 0, 0, 0], ['TEXCOORD', 0, 16, 0, 12, 0, 0]],
-            'blend': None, 'blend_factor': [0, 0, 0, 0], 'sample_mask': 0xffffffff,
-            'depth': None, 'stencil_ref': 0, 'raster': None,
-            'viewports': [[struct.unpack('<I', struct.pack('<f', x))[0]
-                           for x in (0.0, 0.0, float(w), float(h), 0.0, 1.0)]],
-            'scissors': [[0, 0, w, h]], 'samplers': [None, None, None]}
 
     def tex(type_, resource, fmt, view_fmt, view, src, origin, size, data):
         m = {'type': type_, 'resource': resource, 'format': fmt, 'view_format': view_fmt,
@@ -733,25 +879,36 @@ def build_tonemap_bin(path, w=64, h=48, seed=7):
              'row': size[0] * 4, 'bytes': len(data)}
         return _text(json.dumps(m)) + _u32(len(data)) + data
 
-    blobs = [
-        tex(2, 9001, R32_FLOAT, R32_FLOAT, [R32_FLOAT, 4, 0, 1, 0, 0],
-            [1, 1, 1], [0, 0, 0], [1, 1, 1], struct.pack('<f', 1.0)),
-        tex(3, 9002, RGBA8_UNORM, RGBA8_UNORM, [RGBA8_UNORM, 8, 0, 1, 0, 0],
-            [4, 4, 4], [0, 0, 0], [4, 4, 4], bytes(256)),
-        tex(2, 9003, R11G11B10_FLOAT, R11G11B10_FLOAT, [R11G11B10_FLOAT, 4, 0, 1, 0, 0],
-            [w, h, 1], [0, 0, 0], [w, h, 1], hdr_packed.astype('<u4').tobytes()),
-        # Blob 3's "view" is the RTV descriptor (5 words), not an SRV one.
-        tex(2, 9004, RGBA8_TYPELESS, RGBA8_UNORM, [RGBA8_UNORM, 4, 0, 0, 0],
-            [w, h, 1], [0, 0, 0], [w, h, 1], out_rgba.tobytes()),
-        _text(json.dumps({'type': 1, 'resource': 9005, 'whole': 256, 'offset': 0, 'bytes': 256}))
-        + _u32(256) + bytes(256),
-        _text(json.dumps({'type': 1, 'resource': 9006, 'whole': 60, 'offset': 0, 'bytes': 60}))
-        + _u32(60) + bytes(60),
-    ]
-    payload = b''.join(blobs)
-    total = 4 + hdr_packed.astype('<u4').nbytes + out_rgba.nbytes + 256 + 60 + 256
-    head = b'EDVRTON1' + _u32(1) + _u32(1) + _u32(0) + _u32(total)
-    body = _text(json.dumps(meta)) + payload
+    def draw(ordinal, base):
+        meta = {'frame': frame, 'ordinal': ordinal, 'vs': ton.VS, 'ps': ton.PS, 'kind': ord('D'),
+                'count': 3, 'start': 0, 'instances': 1, 'start_instance': 0, 'topology': 5,
+                'vb_stride': 20, 'vb_offset': 0, 'complete_inputs': True,
+                'layout': [['POSITION', 0, 6, 0, 0, 0, 0], ['TEXCOORD', 0, 16, 0, 12, 0, 0]],
+                'blend': None, 'blend_factor': [0, 0, 0, 0], 'sample_mask': 0xffffffff,
+                'depth': None, 'stencil_ref': 0, 'raster': None,
+                'viewports': [[struct.unpack('<I', struct.pack('<f', x))[0]
+                               for x in (0.0, 0.0, float(w), float(h), 0.0, 1.0)]],
+                'scissors': [[0, 0, w, h]], 'samplers': [None, None, None]}
+        blobs = [
+            tex(2, base + 1, R32_FLOAT, R32_FLOAT, [R32_FLOAT, 4, 0, 1, 0, 0],
+                [1, 1, 1], [0, 0, 0], [1, 1, 1], struct.pack('<f', 1.0)),
+            tex(3, base + 2, RGBA8_UNORM, RGBA8_UNORM, [RGBA8_UNORM, 8, 0, 1, 0, 0],
+                [4, 4, 4], [0, 0, 0], [4, 4, 4], bytes(256)),
+            tex(2, hdr_resource, R11G11B10_FLOAT, R11G11B10_FLOAT, [R11G11B10_FLOAT, 4, 0, 1, 0, 0],
+                [w, h, 1], [0, 0, 0], [w, h, 1], hdr_packed.astype('<u4').tobytes()),
+            # Blob 3's "view" is the RTV descriptor (5 words), not an SRV one.
+            tex(2, base + 4, RGBA8_TYPELESS, RGBA8_UNORM, [RGBA8_UNORM, 4, 0, 0, 0],
+                [w, h, 1], [0, 0, 0], [w, h, 1], out_rgba.tobytes()),
+            _text(json.dumps({'type': 1, 'resource': base + 5, 'whole': 256, 'offset': 0,
+                              'bytes': 256})) + _u32(256) + bytes(256),
+            _text(json.dumps({'type': 1, 'resource': base + 6, 'whole': 60, 'offset': 0,
+                              'bytes': 60})) + _u32(60) + bytes(60),
+        ]
+        return _text(json.dumps(meta)) + b''.join(blobs)
+
+    body = b''.join(draw(i + 1, 9000 + 10 * i) for i in range(draws))
+    per_draw = 4 + hdr_packed.astype('<u4').nbytes + out_rgba.nbytes + 256 + 60 + 256
+    head = b'EDVRTON1' + _u32(1) + _u32(draws) + _u32(0) + _u32(draws * per_draw)
     shaders = _u32(2)
     for hsh in (ton.VS, ton.PS):
         blob = b'DXBC' + bytes(60)
@@ -781,24 +938,27 @@ def _tex_meta(resource, w, h, storage, cropped, view=None):
     return m
 
 
-def build_panels_bin(path, w=64, h=48, corrupt=False, second_draw=True):
+def build_panels_bin(path, w=64, h=48, corrupt=False, second_draw=True, equality=False):
     """Synthetic EDVRPNL1 exactly per eye_panel_snapshot.h:452-506.
 
     One indexed quad over the right half of a 64x48 HDR crop: left half of
     the panel opaque (a=255/255), right half translucent (a=128/255), over a
     dark then bright background; after = before*(1-a)+L encoded through the
     same R11G11B10 quantizer. Draw 2 is instanced to force the fallback.
+    equality=True makes the translucent half satisfy F*(1-a)+L == F EXACTLY
+    (F = 1.5, a = 128/255, L = 192/255 per channel, all exactly representable
+    in R11G11B10): the stock-unchanged covered pixels of the R3 regression.
     """
-    a_byte, l_byte = 128, (128, 77, 26)
+    a_byte, l_byte = 128, ((192, 192, 192) if equality else (128, 77, 26))
     a_cov = a_byte / 255.0
     L = np.array(l_byte, dtype=np.float64) / 255.0
     before = np.zeros((h, w, 3))
     before[:, :] = (0.1, 0.1, 0.1)
     before[:, 32:48] = (0.05, 0.02, 0.01)          # dark, under the opaque half
-    before[:, 48:] = (8.0, 4.0, 2.0)               # bright, under the translucent half
+    before[:, 48:] = 1.5 if equality else (8.0, 4.0, 2.0)   # under the translucent half
     after = before.copy()
     after[:, 32:48] = L                            # a=1: after == L
-    after[:, 48:] = before[:, 48:] * (1.0 - a_cov) + L
+    after[:, 48:] = before[:, 48:] * (1.0 - a_cov) + L     # == before exactly when equality
     if corrupt:
         after[:, 48:] += (0.0, 0.0, 1.0)           # break the blend identity
     surf = np.zeros((16, 16, 4), dtype=np.uint8)
@@ -857,6 +1017,7 @@ def build_panels_bin(path, w=64, h=48, corrupt=False, second_draw=True):
 
 
 def self_test():
+    import shutil
     import subprocess
     with tempfile.TemporaryDirectory() as td:
         tonemap_bin = os.path.join(td, 'tonemap_20260927_120000.bin')
@@ -911,13 +1072,112 @@ def self_test():
         # Fallback route on the instanced second draw.
         assert d1['route'] == 'luminance', d1
         assert d1['hud'] > 0 and 'xcheck_p50' not in d1
+        # Luminance route: stock-unchanged pixels whose solved a claims
+        # coverage are counted and bounded, not silently dropped. The whole
+        # unchanged background qualifies (the luma equation is degenerate
+        # there); on this dark background the bound is small.
+        assert d1['ambiguous'] == 64 * 48 - 32 * 48, d1.get('ambiguous')
+        assert d1['amb_p99'] < 5.0, d1.get('amb_p99')
 
-        # Corrupt rtv_after: the cross-check must blow up.
-        bad_bin = os.path.join(td, 'panels_bad.bin')
+        # (e) R3 regression: stock-unchanged translucent pixels stay in the
+        # HUD set. The equality fixture satisfies F*(1-a)+L == F exactly on
+        # the translucent half; pre-fix the tool excluded that half and
+        # manufactured a PASS from the opaque half alone (proved below).
+        os.makedirs(os.path.join(td, 'eq'))
+        eq_bin = os.path.join(td, 'eq', 'panels_eq.bin')
+        eq_ton = os.path.join(td, 'eq', 'tonemap_eq.bin')
+        fx_eq = build_panels_bin(eq_bin, second_draw=False, equality=True)
+        shutil.copy(tonemap_bin, eq_ton)
+        eq = analyze(eq_bin, eq_ton)
+        d0 = eq['draws'][0]
+        assert d0['route'] == 'geometry' and d0['rasterized'] == 32 * 48
+        assert d0['changed'] == 16 * 48, 'the translucent half must be stock-unchanged'
+        assert d0['hud'] == 32 * 48, 'stock-unchanged covered pixels dropped from the HUD set'
+        assert d0['regime'] == 16 * 48 and eq['basis'] == 'restricted p99', eq['basis']
+        assert d0['xcheck_p99'] < XCHECK_P99_CEILING and not eq['invalid'], eq['invalid']
+        Feq = np.array([1.5] * 3)
+        expected_eq = 255.0 * float(np.max(np.abs(
+            t_true(Feq) - (t_true(Feq) * (1.0 - fx_eq['a']) + t_true(fx_eq['L'])))))
+        assert expected_eq > 30.0, f'equality hand value too small to be a test: {expected_eq}'
+        assert abs(eq['value'] - expected_eq) < 0.25 * expected_eq, \
+            f"equality err {eq['value']} vs hand {expected_eq}"
+        assert not eq['passed'], 'equality fixture must not PASS'
+        # Pre-fix proof: the stock-changed subset alone (the old mask) passes
+        # at the default budget -- the old PASS came from opaque pixels only.
+        Aq = fx_eq['after'][:, 32:48].reshape(-1, 3)
+        old_err = np.abs(eq['tfit']['apply'](Aq)
+                         - eq['tfit']['apply'](np.broadcast_to(fx_eq['L'], Aq.shape))).max(axis=-1)
+        assert pct(old_err, 99) <= 2.0, 'pre-fix PASS population not reproduced'
+
+        # (f) R4 negative pairing fixtures: each was an ordinary PASS pre-fix
+        # (the analyzer silently fell back to draw 0 / accepted the stamps).
+        def must_invalid(p, t, needle):
+            try:
+                analyze(p, t)
+            except InvalidData as e:
+                assert needle in str(e), str(e)
+                return
+            raise AssertionError(f'expected InvalidData: {needle}')
+
+        os.makedirs(os.path.join(td, 'wrongres'))
+        wr_p = os.path.join(td, 'wrongres', 'panels_m.bin')
+        wr_t = os.path.join(td, 'wrongres', 'tonemap_m.bin')
+        shutil.copy(panels_bin, wr_p)
+        build_tonemap_bin(wr_t, hdr_resource=9993)      # target is 9003
+        must_invalid(wr_p, wr_t, 'no tonemap draw reads the panels HDR target 9003')
+        cap = analyze(wr_p, wr_t, budget=100.0, allow_mismatched=True)
+        assert cap['mismatch'] and not cap['passed'] and cap['value'] <= 100.0, \
+            'the --allow-mismatched fallback is the pre-fix path: it must cap at non-PASS'
+
+        os.makedirs(os.path.join(td, 'wrongframe'))
+        wf_p = os.path.join(td, 'wrongframe', 'panels_f.bin')
+        wf_t = os.path.join(td, 'wrongframe', 'tonemap_f.bin')
+        shutil.copy(panels_bin, wf_p)
+        build_tonemap_bin(wf_t, frame=43)               # panels frame is 42
+        must_invalid(wf_p, wf_t, 'frame 43 != panels frame 42')
+
+        os.makedirs(os.path.join(td, 'amb'))
+        am_p = os.path.join(td, 'amb', 'panels_a.bin')
+        am_t = os.path.join(td, 'amb', 'tonemap_a.bin')
+        shutil.copy(panels_bin, am_p)
+        build_tonemap_bin(am_t, draws=2)                # both read target 9003
+        must_invalid(am_p, am_t, 'disambiguate with --tonemap-draw')
+        ok = analyze(am_p, am_t, budget=100.0, tonemap_draw=0)
+        assert ok['passed'] and not ok['mismatch'] and ok['tonemap_draw'] == 0
+
+        mix = os.path.join(td, 'stampmix')
+        os.makedirs(mix)
+        shutil.copy(panels_bin, os.path.join(mix, 'panels_20260927_120000.bin'))
+        shutil.copy(tonemap_bin, os.path.join(mix, 'tonemap_20260927_999999.bin'))
+        try:
+            find_pair(mix)
+        except InvalidData as e:
+            assert 'matching stamp' in str(e), str(e)
+        else:
+            raise AssertionError('mismatched directory stamps accepted')
+
+        # (g) Residual ceilings. Corrupt blend chain: pre-fix PASS at budget
+        # 100 with a 1.0-HDR-unit cross-check; now INVALID at any budget.
+        os.makedirs(os.path.join(td, 'bad'))
+        bad_bin = os.path.join(td, 'bad', 'panels_bad.bin')
+        bad_ton = os.path.join(td, 'bad', 'tonemap_bad.bin')
         build_panels_bin(bad_bin, corrupt=True, second_draw=False)
-        bad = analyze(bad_bin, tonemap_bin)
+        shutil.copy(tonemap_bin, bad_ton)
+        bad = analyze(bad_bin, bad_ton, budget=100.0)
         assert bad['draws'][0]['xcheck_p99'] > 0.5, \
             f"corruption not detected: {bad['draws'][0].get('xcheck_p99')}"
+        assert bad['invalid'] and not bad['passed'] and bad['value'] <= 100.0, \
+            'corrupt blend chain must be INVALID even within budget'
+        # T-fit residual: a per-pixel gain makes out non-functional in hdr.
+        os.makedirs(os.path.join(td, 'gain'))
+        gn_p = os.path.join(td, 'gain', 'panels_g.bin')
+        gn_t = os.path.join(td, 'gain', 'tonemap_g.bin')
+        shutil.copy(panels_bin, gn_p)
+        build_tonemap_bin(gn_t, gain_noise=True)
+        gain = analyze(gn_p, gn_t, budget=100.0)
+        assert gain['tfit']['fit_p99'] > FIT_P99_CEILING, gain['tfit']['fit_p99']
+        assert gain['invalid'] and not gain['passed'] and gain['value'] <= 100.0, \
+            'a large T-fit residual must be INVALID even within budget'
 
         # (d) verdict flips with budget, through the CLI, and the ledger dir
         # auto-pairing finds the stamped pair.
@@ -932,11 +1192,31 @@ def self_test():
                              panels_bin, tonemap_bin, '--budget', '100'],
                             capture_output=True, text=True)
         assert rc.returncode == 0, (rc.returncode, rc.stderr)
+        # (h) CLI wiring of the new outcomes: INVALID exits 2 with the reason,
+        # the equality fixture fails the budget (exit 1), --allow-mismatched
+        # prints the banner and caps at non-PASS.
+        def cli(*args):
+            return subprocess.run([sys.executable, os.path.abspath(__file__), *args],
+                                  capture_output=True, text=True)
+        rc = cli(os.path.join(td, 'eq'))
+        assert rc.returncode == 1 and 'VERDICT: FAIL' in rc.stdout, (rc.returncode, rc.stdout)
+        rc = cli(mix)
+        assert rc.returncode == 2 and 'VERDICT: INVALID' in rc.stdout, (rc.returncode, rc.stdout)
+        rc = cli(wr_p, wr_t)
+        assert rc.returncode == 2 and 'VERDICT: INVALID' in rc.stdout, (rc.returncode, rc.stdout)
+        rc = cli(wr_p, wr_t, '--budget', '100', '--allow-mismatched')
+        assert (rc.returncode == 1 and 'ALLOW-MISMATCHED' in rc.stdout
+                and 'VERDICT: FAIL' in rc.stdout), (rc.returncode, rc.stdout)
+        rc = cli(bad_bin, bad_ton, '--budget', '100')
+        assert rc.returncode == 2 and 'VERDICT: INVALID' in rc.stdout, (rc.returncode, rc.stdout)
+        rc = cli(gn_p, gn_t, '--budget', '100')
+        assert rc.returncode == 2 and 'VERDICT: INVALID' in rc.stdout, (rc.returncode, rc.stdout)
         # Uncovered pixels (a == 0) never enter the metric: err there is
         # identically 0 by T(F) - T(F), and the footprint excludes them.
         assert rep['hud'] == 2 * (32 * 48), rep['hud']
     print('hud_parity self-test: PASS (T recovery, opaque/covered identity, translucent-over-bright '
-          'hand check, cross-check corruption detection, verdict exit codes)')
+          'hand check, stock-unchanged translucent inclusion, luminance ambiguous bound, pairing '
+          'mismatch INVALIDs, residual-ceiling INVALIDs, verdict exit codes)')
 
 
 def main(argv=None):
@@ -948,8 +1228,12 @@ def main(argv=None):
     ap.add_argument('--bright-luma', type=float, default=1.0,
                     help='background luma threshold for the regime that matters (default 1.0 HDR)')
     ap.add_argument('--tonemap-draw', type=int, default=None,
-                    help='which EDVRTON1 draw to fit T on (default: the draw whose HDR resource '
-                         'matches the panels target, else 0)')
+                    help='which EDVRTON1 draw to fit T on (default: the unique draw whose HDR '
+                         'resource matches the panels target identity; no unique compatible '
+                         'draw is INVALID)')
+    ap.add_argument('--allow-mismatched', action='store_true',
+                    help='measure even when the captures are not a proven pair (stamp/frame/'
+                         'target mismatch); prints a banner and caps the outcome at non-PASS')
     ap.add_argument('--verbose', action='store_true', help='per-draw table')
     ap.add_argument('--self-test', action='store_true')
     a = ap.parse_args(argv)
@@ -964,11 +1248,15 @@ def main(argv=None):
         else:
             ap.error('give a ledger directory or the two bin paths')
         rep = analyze(panels_path, tonemap_path, budget=a.budget, bright=a.bright_luma,
-                      verbose=a.verbose, tonemap_draw=a.tonemap_draw)
+                      verbose=a.verbose, tonemap_draw=a.tonemap_draw,
+                      allow_mismatched=a.allow_mismatched)
         print_report(rep, verbose=a.verbose)
-        if not len(rep['pooled']):
+        if rep['invalid'] or not len(rep['pooled']):
             return 2
         return 0 if rep['passed'] else 1
+    except InvalidData as e:
+        print(f'VERDICT: INVALID ({e})')
+        return 2
     except (OSError, ValueError, KeyError, TypeError) as e:
         print(f'hud_parity: FAIL: {e}')
         return 2
