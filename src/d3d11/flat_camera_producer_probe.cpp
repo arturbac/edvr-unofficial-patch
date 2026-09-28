@@ -33,8 +33,8 @@ constexpr uint8_t kUploadPrologue[16] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x8
                                          0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x50, 0x41};
 constexpr uint32_t kSceneBytes = 5376;
 constexpr uint32_t kCameraRowOffset = 270u * 16u; // 0x10E0
-constexpr size_t kRelayBytes = 40;
-constexpr uint32_t kOriginalLiteral = 28;
+constexpr size_t kRelayBytes = 44;
+constexpr uint32_t kOriginalLiteral = 36;
 constexpr uint32_t kMaxBlocks = 8, kMaxRearms = 8, kMaxHits = 8, kArmMs = 30000;
 
 struct ProbeState {
@@ -54,6 +54,9 @@ struct ProbeState {
 };
 ProbeState g_probe;
 std::atomic<uintptr_t> g_gate{0};
+// The trampoline to the real upload helper, stored by prepareRelay; the
+// relay callback calls it so the scene CB upload is never swallowed.
+std::atomic<uintptr_t> g_uploadForward{0};
 
 bool sehCheck(uintptr_t at, const uint8_t* expected, size_t bytes) noexcept {
     __try { return std::memcmp(reinterpret_cast<const void*>(at), expected, bytes) == 0; }
@@ -75,9 +78,9 @@ void buildRelay(uint8_t* code, const void* gate, void* callback) noexcept {
     // mov rax,&gate; cmp qword ptr[rax],0; je original; jmp [callback];
     // original: jmp [trampoline]. RAX/flags are volatile on entry here.
     const uint8_t body[kRelayBytes] = {
-        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0x48, 0x83, 0x38, 0,
-        0x74, 0x0E, 0xFF, 0x25, 0, 0, 0, 0, 0, 0, 0, 0,
-        0xFF, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+        0x48,0xB8,0,0,0,0,0,0,0,0, 0x48,0x83,0x38,0,
+        0x74,0x0E, 0xFF,0x25,0,0,0,0, 0,0,0,0,0,0,0,0,
+        0xFF,0x25,0,0,0,0, 0,0,0,0,0,0,0,0};
     std::memcpy(code, body, sizeof(body));
     const uintptr_t gateAddress = reinterpret_cast<uintptr_t>(gate);
     const uintptr_t callbackAddress = reinterpret_cast<uintptr_t>(callback);
@@ -88,8 +91,10 @@ bool prepareRelay(void* trampoline, void*) noexcept {
     const uintptr_t address = reinterpret_cast<uintptr_t>(trampoline);
     std::memcpy(g_probe.relay + kOriginalLiteral, &address, 8);
     DWORD oldProtect = 0;
-    return VirtualProtect(g_probe.relay, 4096, PAGE_EXECUTE_READ, &oldProtect) &&
-           FlushInstructionCache(GetCurrentProcess(), g_probe.relay, kRelayBytes);
+    if (!VirtualProtect(g_probe.relay, 4096, PAGE_EXECUTE_READ, &oldProtect) ||
+        !FlushInstructionCache(GetCurrentProcess(), g_probe.relay, kRelayBytes)) return false;
+    g_uploadForward.store(address, std::memory_order_release);
+    return true;
 }
 
 void disarmWatch(const char* reason) {
@@ -146,7 +151,7 @@ LONG CALLBACK producerWatchVeh(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-void __fastcall uploadRelay(uintptr_t, uintptr_t, const void* src, int sizeA, int sizeB) {
+void observeSceneUpload(const void* src, int sizeA, int sizeB) {
     if (static_cast<int64_t>(sizeA) * sizeB != kSceneBytes || !src) return;
     for (uint32_t i = 0; i < g_probe.blockCount; ++i)
         if (g_probe.blocks[i] == src) return;
@@ -155,6 +160,14 @@ void __fastcall uploadRelay(uintptr_t, uintptr_t, const void* src, int sizeA, in
     Log::get().note("flat camera producer: scene-sized staging block %p (%u/%u)",
                     src, g_probe.blockCount, kMaxBlocks);
     if (!g_probe.armed && g_probe.rearmCount < kMaxRearms) armWatch(src, 0);
+}
+
+using UploadFn = int (__fastcall*)(uintptr_t, uintptr_t, const void*, int, int);
+int __fastcall uploadRelay(uintptr_t a, uintptr_t b, const void* src, int sizeA, int sizeB) noexcept {
+    const auto forward = reinterpret_cast<UploadFn>(g_uploadForward.load(std::memory_order_acquire));
+    if (!forward) return 0;
+    observeSceneUpload(src, sizeA, sizeB);
+    return forward(a, b, src, sizeA, sizeB);
 }
 
 void standDown(const char* why) {
