@@ -426,35 +426,67 @@ void testGate() {
           "a multiply through a substitution is left (its second draw cannot be repeated)");
     check(with([](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kRefused; }) == UiLayerDecision::kBlendRefused, "blend");
 
-    // The crisp-HUD (HDR) take of the holo panels: every admitted blend
-    // shape must have its composition semantics end to end. A multiply has
-    // no transmittance route into the HDR layer (the HDR take skips
+    // The crisp-HUD (HDR) take of the three cockpit HUD families (Phase 2:
+    // the holo panels, the flight HUD and the target sprite): every admitted
+    // blend shape must have its composition semantics end to end. A multiply
+    // has no transmittance route into the HDR layer (the HDR take skips
     // ensureMult; the coverage pass transfers only scalar alpha), so the
-    // gate refuses it BEFORE the redirect (review R5); the measured holo
-    // blends -- premultiplied-over and opaque -- must still be taken.
-    auto hdrWith = [&](void (*edit)(UiLayerDrawFacts&)) {
+    // gate refuses it BEFORE the redirect (review R5), per family; the
+    // measured blends -- premultiplied-over and opaque -- must still be
+    // taken, with each family's MEASURED depth-stencil state (the Phase 0
+    // census, flights 1-3; the classification of those states is in
+    // testDepthStencil).
+    auto hdrWith = [&](UiLayerFamily fam, void (*edit)(UiLayerDrawFacts&)) {
         UiLayerDrawFacts g = f;
-        g.family = UiLayerFamily::kHolo;
+        g.family = fam;
         g.ldrView = false;  // the lit pre-tonemap HDR target
         g.crispHdr = true;
         edit(g);
         return uiLayerDecide(g);
     };
-    check(hdrWith([](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kPremulOver; }) == UiLayerDecision::kRedirect,
+    check(hdrWith(UiLayerFamily::kHolo, [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kPremulOver; }) ==
+              UiLayerDecision::kRedirect,
           "the holo panels' premultiplied-over is taken into the HDR layer");
-    check(hdrWith([](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kOpaque; }) == UiLayerDecision::kRedirect,
+    check(hdrWith(UiLayerFamily::kHolo, [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kOpaque; }) ==
+              UiLayerDecision::kRedirect,
           "an opaque holo draw is taken into the HDR layer");
-    check(hdrWith([](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kMultiply; }) == UiLayerDecision::kBlendRefused,
+    check(hdrWith(UiLayerFamily::kFlightHud,
+                  [](UiLayerDrawFacts& g) {
+                      g.blend = UiBlendShape::kPremulOver;
+                      g.ds.depthTest = true;  // the measured GEQUAL against the scene pair, no write
+                  }) == UiLayerDecision::kRedirect,
+          "the flight HUD's premultiplied-over, testing depth, is taken into the HDR layer");
+    check(hdrWith(UiLayerFamily::kSprite,
+                  [](UiLayerDrawFacts& g) {
+                      g.blend = UiBlendShape::kPremulOver;
+                      // The measured sprite: depth OFF (no test, no write),
+                      // stencil tested (read 0x01) and written (0x05).
+                      g.ds.stencilTest = true;
+                      g.ds.stencilWrite = true;
+                  }) == UiLayerDecision::kRedirect,
+          "the target sprite, testing and writing stencil, is taken (the write-back keeps the "
+          "game's buffer)");
+    check(hdrWith(UiLayerFamily::kHolo, [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kMultiply; }) ==
+              UiLayerDecision::kBlendRefused,
           "a multiply into the HDR target is refused: the HDR half has no transmittance route");
-    check(hdrWith([](UiLayerDrawFacts& g) {
-              g.blend = UiBlendShape::kMultiply;
-              g.substituted = true;
-          }) == UiLayerDecision::kBlendRefused,
+    check(hdrWith(UiLayerFamily::kFlightHud,
+                  [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kMultiply; }) ==
+              UiLayerDecision::kBlendRefused,
+          "...refused for the flight HUD too (R5, per family)");
+    check(hdrWith(UiLayerFamily::kSprite, [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kMultiply; }) ==
+              UiLayerDecision::kBlendRefused,
+          "...and for the target sprite (R5, per family)");
+    check(hdrWith(UiLayerFamily::kHolo,
+                  [](UiLayerDrawFacts& g) {
+                      g.blend = UiBlendShape::kMultiply;
+                      g.substituted = true;
+                  }) == UiLayerDecision::kBlendRefused,
           "...through a substitution too");
-    check(hdrWith([](UiLayerDrawFacts& g) {
-              g.blend = UiBlendShape::kMultiply;
-              g.layerReady = false;
-          }) == UiLayerDecision::kBlendRefused,
+    check(hdrWith(UiLayerFamily::kHolo,
+                  [](UiLayerDrawFacts& g) {
+                      g.blend = UiBlendShape::kMultiply;
+                      g.layerReady = false;
+                  }) == UiLayerDecision::kBlendRefused,
           "...and the refusal is the blend's, ahead of the layer's readiness");
     check(with([](UiLayerDrawFacts& g) {
               g.family = UiLayerFamily::kHolo;
@@ -462,6 +494,15 @@ void testGate() {
               g.blend = UiBlendShape::kMultiply;
           }) == UiLayerDecision::kHdrTarget,
           "with the crisp take off a holo multiply is still plain HDR, left stock");
+    check(with([](UiLayerDrawFacts& g) {
+              g.family = UiLayerFamily::kFlightHud;
+              g.ldrView = false;
+          }) == UiLayerDecision::kHdrTarget &&
+              with([](UiLayerDrawFacts& g) {
+                  g.family = UiLayerFamily::kSprite;
+                  g.ldrView = false;
+              }) == UiLayerDecision::kHdrTarget,
+          "with the crisp take off the flight HUD and the sprite stay plain HDR, left stock");
 
     // The on-foot gate: on foot the 2D screen IS the world (flight 09:38:
     // the layer took it and the temporal pass got a black eye). The journal's
@@ -972,6 +1013,11 @@ void testFamilyRule() {
           "the lit HDR target: not the composite's");
     f.vs = kUiVsHolo;
     check(uiLayerFamilyFor(f) == UiLayerFamily::kHolo, "...where the holo panels are named");
+    f.vs = kUiVsFlightHud;
+    check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kFlightHud && why == UiFamilyWhy::kDirect,
+          "...the flight HUD is named, a direct shader");
+    f.vs = kUiVsSprite;
+    check(uiLayerFamilyFor(f) == UiLayerFamily::kSprite, "...and the target sprite");
     f.targetKind = 2;
     f.vs = kUiVsPanel;
     f.ps = 0x9107E72CB016CC02ull;
@@ -1260,6 +1306,36 @@ void testDepthStencil() {
     a.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
     e = uiLayerDsEffect(uiLayerDsStateFrom(&a, 0), true);
     check(!e.tests() && !e.writes(), "depth ALWAYS without a write is neither");
+    // The three crisp-HUD families' MEASURED states (Phase 0 census, flights
+    // 1-3; build/hud_census_f3.txt's "ga <family> state" lines), classified:
+    // the holo panels and the flight HUD test GEQUAL against the scene pair
+    // and write nothing; the target sprite is depth-off by construction and
+    // writes STENCIL (its footprint, ref 5, mask 0x05), so its take needs the
+    // seeded copy's bit 0x01 AND the colourless write-back into the game's
+    // own buffer.
+    D3D11_DEPTH_STENCIL_DESC hud{};
+    hud.DepthEnable = TRUE;
+    hud.DepthFunc = D3D11_COMPARISON_GREATER_EQUAL;
+    hud.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    hud.StencilEnable = FALSE;
+    e = uiLayerDsEffect(uiLayerDsStateFrom(&hud, 0), true);
+    check(e.depthTest && !e.depthWrite && !e.stencilTest && !e.stencilWrite,
+          "the flight HUD (and the holo panels): tests GEQUAL, writes nothing -- seeded depth, no "
+          "write-back");
+    D3D11_DEPTH_STENCIL_DESC spr{};
+    spr.DepthEnable = FALSE;  // the census's "depth 0 func 2 write 1": the
+    spr.DepthFunc = D3D11_COMPARISON_LESS;  // write mask is a no-op with depth off
+    spr.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    spr.StencilEnable = TRUE;
+    spr.StencilReadMask = 0x01;
+    spr.StencilWriteMask = 0x05;
+    spr.FrontFace = {D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_REPLACE,
+                     D3D11_COMPARISON_EQUAL};
+    spr.BackFace = spr.FrontFace;
+    e = uiLayerDsEffect(uiLayerDsStateFrom(&spr, 0), true);
+    check(!e.depthTest && !e.depthWrite && e.stencilTest && e.stencilWrite,
+          "the target sprite: no depth test or write (depth is off), tests and writes stencil -- "
+          "seeded bit 0x01, and the write-back keeps the game's buffer");
     // A stencil test against a view with no stencil plane (D32_FLOAT): D3D11
     // passes it and drops the write; there is nothing to seed, so nothing is
     // (review P3-6: it re-seeded on every draw).

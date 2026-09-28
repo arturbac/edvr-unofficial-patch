@@ -909,12 +909,13 @@ struct UiLayerDrawFacts {
     bool substituted = false;     // drawn by a substitution's own geometry
     UiBlendShape blend = UiBlendShape::kRefused;
     bool layerReady = true;       // the eye's layer exists at the wanted size
-    // The HDR HUD take is armed (with fix.ui_quality) and this is the cockpit
-    // holo family drawn into the lit HDR (pre-tonemap) eye target: the draw
-    // goes to the HDR layer, and the tonemap re-issue brings it back over the
-    // finished eye. Every other test (eye known, armed, not late, no MRT/UAV,
-    // the seeded depth-stencil, the blend) applies exactly as for the LDR
-    // take.
+    // The HDR HUD take is armed (with fix.ui_quality) and this is one of the
+    // three cockpit HUD families (the holo panels, the flight HUD, the
+    // target sprite) drawn into the lit HDR (pre-tonemap) eye target: the
+    // draw goes to the HDR layer, and the tonemap re-issue brings it back
+    // over the finished eye. Every other test (eye known, armed, not late,
+    // no MRT/UAV, the seeded depth-stencil, the blend) applies exactly as
+    // for the LDR take.
     bool crispHdr = false;
 };
 
@@ -926,8 +927,8 @@ inline UiLayerDecision uiLayerDecide(const UiLayerDrawFacts& f) {
     if (f.worldScreen && f.family == UiLayerFamily::kScreen) return UiLayerDecision::kWorldScreen;
     if (!f.eyeTarget) return UiLayerDecision::kNotEyeTarget;
     // The lit HDR target, before exposure and the tonemap: refused as stock,
-    // unless the HDR HUD take owns this family (Phase 1: the holo panels
-    // only -- the flight HUD and the sprite stay).
+    // unless the HDR HUD take owns this family (the three cockpit HUD
+    // families: the holo panels, the flight HUD, the target sprite).
     if (!f.ldrView && !f.crispHdr) return UiLayerDecision::kHdrTarget;
     if (f.vrs) return UiLayerDecision::kVrs;
     if (f.eye < 0 || f.eye > 1) return UiLayerDecision::kNoEye;
@@ -943,8 +944,8 @@ inline UiLayerDecision uiLayerDecide(const UiLayerDrawFacts& f) {
     // skips ensureMult (the transmittance target is the LDR layer's), and
     // the coverage pass transfers only scalar HDR alpha, so a multiply
     // redirected into the HDR layer would lose its destination modulation
-    // (review R5). Refuse BEFORE the redirect. Measured holo draws are
-    // premultiplied-over, so this refuses nothing seen in flight.
+    // (review R5). Refuse BEFORE the redirect. All three measured families
+    // are premultiplied-over, so this refuses nothing seen in flight.
     if (f.crispHdr && f.blend == UiBlendShape::kMultiply) return UiLayerDecision::kBlendRefused;
     if (!f.layerReady) return UiLayerDecision::kLayerFailed;
     return UiLayerDecision::kRedirect;

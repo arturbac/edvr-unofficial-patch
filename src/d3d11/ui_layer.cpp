@@ -100,17 +100,17 @@ void refreshLive() {
     detail::g_uiLayerCrispOn = detail::g_uiLayerLive && !g_crispStoodDown;
 }
 
-// The HDR HUD path fails alone: the holo panels stay in the game's frame
-// exactly as stock (their kHdrTarget refusal), and the LDR take is
-// untouched.
+// The HDR HUD path fails alone: the cockpit HUD families (the holo panels,
+// the flight HUD, the target sprite) stay in the game's frame exactly as
+// stock (their kHdrTarget refusal), and the LDR take is untouched.
 void crispStandDown(const char* why) {
     if (g_crispStoodDown) return;
     g_crispStoodDown = true;
     refreshLive();
     Log::get().note(
         "ui quality: the HDR HUD path stands down for the rest of the session -- %s. The "
-        "cockpit holo panels are drawn as they always were (the rest of the layer is "
-        "unaffected). Turning fix.ui_quality off and on re-arms it.",
+        "cockpit's holo panels, flight HUD and target sprite are drawn as they always were "
+        "(the rest of the layer is unaffected). Turning fix.ui_quality off and on re-arms it.",
         why ? why : "a refusal");
 }
 
@@ -175,9 +175,10 @@ struct Eye {
     DXGI_FORMAT dsCopyFmt = DXGI_FORMAT_UNKNOWN;
 
     // the crisp-HUD half's of fix.ui_quality HDR HUD layer: R16G16B16A16_FLOAT at the 8-bit layer's
-    // size (the door's output x the same target), holding the cockpit holo
-    // panels' premultiplied radiance and transmittance in the layer's own
-    // alpha convention, cleared at the first taken holo draw of each
+    // size (the door's output x the same target), holding the cockpit HUD
+    // families' (holo panels, flight HUD, target sprite) premultiplied
+    // radiance and transmittance in the layer's own
+    // alpha convention, cleared at the first taken HUD draw of each
     // eye-frame. The game's tonemap draw, re-issued over the 8-bit layer
     // with this as its HDR source, tonemaps the HUD into the 8-bit layer's
     // colour; this layer's alpha then replaces the 8-bit layer's (the
@@ -186,7 +187,7 @@ struct Eye {
     Ptr<ID3D11RenderTargetView> hdrRtv;
     Ptr<ID3D11ShaderResourceView> hdrSrv;
     uint32_t hdrW = 0, hdrH = 0;
-    uint64_t hdrSeq = 0;            // the frame whose holo draws it holds
+    uint64_t hdrSeq = 0;            // the frame whose HUD draws it holds
     uint32_t hdrDraws = 0;
     const void* hdrTarget = nullptr;  // the HDR target those draws left (identity)
     LayerDs hdrDs;                    // its own depth-stencil, seeded the same way
@@ -305,7 +306,7 @@ bool g_seederTried = false;
 // game's own draw is always untouched.
 enum class CrispToneDecline : uint8_t {
     kNoHdrSlot = 0,  // the eye's own full-shape tonemap read no eye's HDR HUD source while its content was outstanding
-    kNoContent,      // the eye's HDR layer holds nothing this frame (no holo draws taken)
+    kNoContent,      // the eye's HDR layer holds nothing this frame (no HUD draws taken)
     kLayerBusy,      // the 8-bit layer already holds this frame's content (ordering guard)
     kSecondTonemap,  // this eye was already re-tonemapped this frame (never double-tonemap)
     kSizeMismatch,   // the HDR and 8-bit layers differ in size (the sample must be 1:1)
@@ -354,7 +355,7 @@ struct Window {
     // issue (decide-time, via decided[kAfterUi][...], plus begin-time below).
     uint64_t afterTaken = 0, afterPostPass = 0, afterRefused = 0, afterDeclined = 0;
     uint64_t eyeMatched = 0, eyeSwapped = 0, eyeUntold = 0, seedStale = 0;
-    // the crisp-HUD half of fix.ui_quality: holo draws taken into the HDR layer, tonemap re-issues,
+    // the crisp-HUD half of fix.ui_quality: HUD draws taken into the HDR layer, tonemap re-issues,
     // coverage passes, HDR layers whose content never reached a tonemap, and
     // the re-issue's declines by reason (each also named once a session).
     uint64_t hdrRedirected = 0, hdrReissued = 0, hdrCoveragePasses = 0, hdrLost = 0;
@@ -652,7 +653,8 @@ bool ensureHdrLayerFor(ID3D11DeviceContext* ctx, int eye) {
     e.hdrH = s.h;
     Log::get().note(
         "crisp hud: layer: %s eye's HDR HUD layer %s at %ux%u (R16G16B16A16_FLOAT, %.1f MB) -- "
-        "the cockpit holo panels are drawn into it and tonemapped over the finished eye.",
+        "the cockpit's holo panels, flight HUD and target sprite are drawn into it and "
+        "tonemapped over the finished eye.",
         eye == 0 ? "left" : "right", resized ? "re-created" : "created", s.w, s.h,
         uiLayerMB(uiLayerBytes(s.w, s.h, 8)));
     return true;
@@ -1214,12 +1216,12 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
             // consumer is not coming, so stand down to stock rather than
             // lose the HUD every frame. The streak resets where a
             // publication lands (uiLayerCrispToneEnd). This draw still
-            // completes into the layer; the NEXT holo draw is stock.
+            // completes into the layer; the NEXT HUD draw is stock.
             if (++e.hdrMissStreak >= kCrispHdrMissFrames) {
                 char why[200];
                 _snprintf_s(why, _TRUNCATE,
                             "the HUD layer's content reached no tonemap for %u consecutive frames "
-                            "(the cockpit holo panels were taken but never came back)",
+                            "(the cockpit HUD was taken but never came back)",
                             kCrispHdrMissFrames);
                 crispStandDown(why);
             }
@@ -1284,7 +1286,7 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
             const bool depth = g_draw.ds.depthTest || (!stale && lds.seededDepth);
             if (!seedLayerDepth(ctx, e, lds, g_draw.eye, layerW, layerH, g_draw.dsv, mask, depth,
                                 g_draw.hdr ? UiRouteStage::kHdrSeed : UiRouteStage::kSeed,
-                                g_draw.hdr ? "a cockpit holo draw" : "a UI draw")) {
+                                g_draw.hdr ? "a cockpit HUD draw" : "a UI draw")) {
                 ++g_win.seedFailures;
                 releaseSaved();
                 ++g_win.refusedAtIssue;
@@ -2008,12 +2010,12 @@ void logTotals(double seconds) {
         static_cast<unsigned long long>(g_win.debugComposites), price.c_str());
     logMemory();
     if (detail::g_uiLayerCrispOn) {
-        // The HDR HUD half's Phase 1 line: the holo take, the re-issues and
+        // The HDR HUD half's line: the take (all three cockpit HUD
+        // families), the re-issues and
         // coverage passes, what never reached a tonemap, and the declines by
         // reason (each decline is also named once a session where it
         // happened). The taken/left/refused per family WITH the reason is the
-        // decided table on the lines around this one (the cockpit holo
-        // panels row).
+        // decided table on the lines around this one.
         std::string declines;
         for (size_t d = 0; d < static_cast<size_t>(CrispToneDecline::kCount); ++d) {
             const uint64_t n = g_win.hdrDeclined[d];
@@ -2023,7 +2025,7 @@ void logTotals(double seconds) {
                     crispToneDeclineName(static_cast<CrispToneDecline>(d)));
         }
         Log::get().note(
-            "crisp hud: %.2f holo draws a frame taken into the HDR layer, %.2f tonemap "
+            "crisp hud: %.2f HUD draws a frame taken into the HDR layer, %.2f tonemap "
             "re-issues and %.2f coverage passes a frame; %llu HDR layers' content never reached "
             "a tonemap; re-issue declines: %s.",
             static_cast<double>(g_win.hdrRedirected) / frames,
@@ -2092,7 +2094,7 @@ void logTotals(double seconds) {
 }  // namespace
 
 // The crisp take's whole dependency set, established no later than the first
-// holo take (review R2) -- defined beside the coverage machinery, below.
+// HUD take (review R2) -- defined beside the coverage machinery, below.
 bool crispTakeReady(ID3D11DeviceContext* ctx, int eye);
 
 // --------------------------------------------------------------- the API
@@ -2168,12 +2170,12 @@ void uiLayerConfigure(Config& cfg) {
               "except the 2D screen while it shows the world -- on foot, or a 3D map -- where it "
               "stays in the picture for the temporal pass (the game's Status.json says on foot, a "
               "second or so late; the screen's own depth, busy with the world, says so within "
-              "two frames); the cockpit's holo panels are drawn into a per-eye HDR layer at the "
+              "two frames); the cockpit's holo panels, the flight HUD and the target sprite are "
+              "drawn into a per-eye HDR layer at the "
               "same size and tonemapped over the finished eye by the game's own tonemap draw "
               "re-issued with the layer as its HDR source (their bloom halo goes with the "
-              "upscaled frame; the \"crisp hud\" lines report it), while the flight HUD and "
-              "target sprite are drawn before the tonemap and stay in the picture, steadied by "
-              "the UI depth and the reactive mask. Draws the layer takes get no UI depth and no "
+              "upscaled frame; the \"crisp hud\" lines report it). Draws the layer takes get no "
+              "UI depth and no "
               "reactive mask.");
     if (debugView && temporal) {
         Log::get().note("ui quality: advanced.temporal_aa_debug = ui_layer -- the layer is shown "
@@ -2226,13 +2228,15 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     const int kind = uiLayerTargetKind();
     f.eyeTarget = kind != 0;
     f.ldrView = kind == 2;
-    // The HDR HUD take (Phase 1: the holo panels only): a holo draw into
-    // the lit HDR pre-tonemap eye target goes to the eye's HDR HUD layer
-    // instead of the kHdrTarget refusal; the flight HUD and the sprite are
-    // Phase 2. The take arms with the layer (fix.ui_quality), and every
-    // other refusal applies to it exactly as to the LDR take.
-    f.crispHdr = detail::g_uiLayerCrispOn && family == UiLayerFamily::kHolo && f.eyeTarget &&
-                 !f.ldrView;
+    // The HDR HUD take (Phase 2: all three cockpit HUD families -- the holo
+    // panels, the flight HUD and the target sprite): a draw of one into the
+    // lit HDR pre-tonemap eye target goes to the eye's HDR HUD layer instead
+    // of the kHdrTarget refusal. The take arms with the layer
+    // (fix.ui_quality), and every other refusal applies to it exactly as to
+    // the LDR take.
+    f.crispHdr = detail::g_uiLayerCrispOn && f.eyeTarget && !f.ldrView &&
+                 (family == UiLayerFamily::kHolo || family == UiLayerFamily::kFlightHud ||
+                  family == UiLayerFamily::kSprite);
     // A shading-rate image bound for the eye (or possibly bound) would shade
     // the layer -- a different size -- through the eye's tiles.
     f.vrs = detail::g_foveationBound != nullptr || detail::g_foveationBoundUnknown;
@@ -2444,8 +2448,9 @@ void uiLayerWriteBackEnd(ID3D11DeviceContext* ctx) {
 
 // ------------------------------------- the crisp-HUD half of fix.ui_quality: the tonemap re-issue
 //
-// Phase 1 of docs/cockpit-hud-layer-design-2026-09-27.md. The cockpit holo
-// panels are taken into the eye's HDR HUD layer by the draw path above
+// Phases 1-2 of docs/cockpit-hud-layer-design-2026-09-27.md. The cockpit's
+// HDR HUD families (the holo panels, the flight HUD, the target sprite) are
+// taken into the eye's HDR HUD layer by the draw path above
 // (g_draw.hdr); they reach the eye HERE, at the game's own tonemap draw --
 // the last reader of the lit HDR target, recognised by tonemap_admit.h's
 // structural admission shared with the HUD layer census. Right AFTER the
@@ -2477,8 +2482,8 @@ void uiLayerWriteBackEnd(ID3D11DeviceContext* ctx) {
 // the bindings at the re-issue must be the admitted draw's own, no PS UAV
 // may be bound, and both layers must exist. A failure of EDVR's own
 // machinery (the coverage shaders, the deferred context) stands the crisp-HUD half of fix.ui_quality
-// down alone; the LDR take is unaffected, and the holo panels go back to
-// stock (their kHdrTarget refusal).
+// down alone; the LDR take is unaffected, and the cockpit HUD families go
+// back to stock (their kHdrTarget refusal).
 
 // The admitted draw, from its admission in vscreen's eye-draw branch until
 // the re-issue right after its own issue. One at a time, render thread only;
@@ -2546,7 +2551,7 @@ void compileCoverageOnce(ID3D11DeviceContext* ctx) {
 
 // The coverage pass's deferred context, created once a session (the one
 // attempt is g_crispDeferredTried). Warmed through crispTakeReady at the
-// first holo take; the pass itself keeps its own late-failure handling.
+// first HUD take; the pass itself keeps its own late-failure handling.
 bool crispCoverageContextReady(ID3D11DeviceContext* ctx) {
     if (g_crispDeferred) return true;
     if (g_crispDeferredTried || !ctx) return false;
@@ -2556,12 +2561,12 @@ bool crispCoverageContextReady(ID3D11DeviceContext* ctx) {
     return dev && SUCCEEDED(dev->CreateDeferredContext(0, &g_crispDeferred)) && g_crispDeferred;
 }
 
-// The whole dependency set a taken holo draw needs at the tonemap,
-// established no later than the FIRST holo take of it (review R2): the eye's
+// The whole dependency set a taken HUD draw needs at the tonemap,
+// established no later than the FIRST HUD take of it (review R2): the eye's
 // HDR layer, its 8-bit layer, the RGB-only blend the re-issue draws with,
 // and the coverage pass's shaders and deferred context. The HDR take used to
 // ensure only the FP16 layer before redirecting; the rest were first ensured
-// at the tonemap, after the holo draws had left stock, and a failure there
+// at the tonemap, after the HUD draws had left stock, and a failure there
 // dropped the already-taken HUD every frame. A failure here REFUSES the take
 // (the draw runs stock, the decide's kLayerFailed names it on the 30 s line)
 // and stands the path down with the reason: never take-then-drop.
@@ -2636,14 +2641,14 @@ bool crispCoveragePass(ID3D11DeviceContext* ctx, Eye& e, int eye, uint64_t seq) 
     if (!g_covVs || !g_covPs) compileCoverageOnce(ctx);
     if (!g_covVs || !g_covPs) return false;
     if (!g_crispDeferred) {
-        // crispTakeReady has run at the first holo take since R2, so a
+        // crispTakeReady has run at the first HUD take since R2, so a
         // failure here was almost always said there already; say it once
         // when it is genuinely first seen.
         const bool triedBefore = g_crispDeferredTried;
         if (!crispCoverageContextReady(ctx)) {
             if (triedBefore) return false;
             Log::get().note("crisp hud: no deferred context for the coverage pass; the crisp-HUD half of fix.ui_quality "
-                            "stands down (the holo panels are drawn as they always were).");
+                            "stands down (the cockpit HUD is drawn as it always was).");
             crispStandDown("no deferred context for the coverage pass");
             return false;
         }
@@ -2687,7 +2692,7 @@ bool crispCoveragePass(ID3D11DeviceContext* ctx, Eye& e, int eye, uint64_t seq) 
 // prefilter is register-cheap; the structural admission's state reads run
 // for the handful of full-screen triangles a frame that pass it. True =
 // admitted: the caller skips its after-UI read check for this draw (it READS
-// the HDR target the holo panels were taken from -- that is the point of the
+// the HDR target the HUD families were taken from -- that is the point of the
 // re-issue, not a post pass to name) and brackets its issue with
 // uiLayerCrispToneBegin/End.
 bool uiLayerCrispNoteEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count, uint32_t instances,
@@ -2704,7 +2709,7 @@ bool uiLayerCrispNoteEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count
     guarded("uiLayer.crispAdmit", [&] { shaped = tonemapAdmitStructure(ctx, ps, ta); });
     if (!shaped) return false;
     // The HDR source, by IDENTITY, not by table: the PS slot whose 2D view
-    // reads an eye's HDR target this frame (the holo take recorded which).
+    // reads an eye's HDR target this frame (the HUD take recorded which).
     // A table of PS hashes cannot cover the settings tiers -- the 2026-09-28
     // flight at HMD Quality 0.50 flew ps D0A16B9E55BF22CC, the table said
     // kNoHdrSlot, and the taken panels never came back. The identity read
@@ -2743,7 +2748,7 @@ bool uiLayerCrispNoteEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count
         }
     }
     if (eye < 0) {
-        // Outstanding holo content this frame, but this draw reads no eye's
+        // Outstanding HUD content this frame, but this draw reads no eye's
         // HUD source. Only the eye's OWN tonemap failing to read it is a
         // failed consumer (review R1): the draw must BE the tonemap -- the
         // full SRV shape, or the EDHM swap's known exposure-less one
@@ -2999,8 +3004,8 @@ void uiLayerCrispToneEnd(ID3D11DeviceContext* ctx) {
         vScreenClearRenderTargetViewRaw(ctx, e.rtv.Get(), kUiLayerClear);
         if (!g_crispStoodDown) {
             Log::get().note("crisp hud: the coverage pass failed; the HUD misses this frame, and "
-                            "the crisp-HUD half of fix.ui_quality stands down (the holo panels are drawn as they always "
-                            "were).");
+                            "the crisp-HUD half of fix.ui_quality stands down (the cockpit HUD is drawn as it always "
+                            "was).");
             crispStandDown("the coverage pass failed");
         }
         return;

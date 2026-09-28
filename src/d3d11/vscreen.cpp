@@ -3919,7 +3919,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // facts the family branch above passes uiLayerDecide, so an after-UI
     // write is governed by the identical rules a real UI draw would be.
     // Counted, named either way. An admitted crisp-HUD tonemap draw is not
-    // shown to it: the tonemap READS the HDR target the holo panels were
+    // shown to it: the tonemap READS the HDR target the HUD families were
     // taken from, which is exactly what the re-issue re-points -- not a post
     // pass to name.
     if (!uiLayer && owner && uiLayerWatching() && !uiLayerCrispPending())
@@ -3976,7 +3976,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         if (originalIssued) uiLayerSecondIssues(self, kind, count, instances, args);
     }
     // the crisp-HUD half of fix.ui_quality: the game's tonemap draw, admitted in the eye-draw branch
-    // while the HDR HUD layer holds this frame's holo panels, is issued once
+    // while the HDR HUD layer holds this frame's HUD draws, is issued once
     // more with the layer as its HDR source -- tonemapping the HUD into the
     // eye's 8-bit layer, which the door's composite shows. AFTER the game's
     // own issue, so the picture is stock whether or not the re-issue runs;
