@@ -33,17 +33,17 @@
 // screen's gamma pass) scales the layer and a per-channel transmittance the
 // composite applies to the frame. ALSO TAKEN, into a per-eye HDR layer at
 // the same size (the crisp-HUD half of fix.ui_quality,
-// docs/cockpit-hud-layer-design-2026-09-27.md): the cockpit's three HDR HUD
-// families -- the holo panels, the flight HUD and the target sprite -- which
-// the game draws into the lit HDR target before exposure and the tonemap.
+// docs/cockpit-hud-layer-design-2026-09-27.md): the cockpit's HDR HUD
+// families -- the holo panels, the flight HUD, the target sprite, and the
+// hologram pass's eleven (the radar contacts, the ship and target
+// holograms, the icons, the world-marker reticle; NOT the glass canopy,
+// which sits in front of the whole sky and stays) -- which the game draws
+// into the lit HDR target before exposure and the tonemap.
 // They are tonemapped into the 8-bit layer by the game's own tonemap draw,
 // re-issued once per eye with the layer as its HDR source (the
 // tonemap_admit.h admission), so the exposure, LUT and bloom are the game's
-// own and the door's composite is untouched. The hologram families (the
-// radar contacts, the ship and target holograms, the icons) stay in the
-// picture the upscaler reconstructs (Phase 3, optional), steadied by the UI
-// depth and the reactive mask. Every family it leaves is named in the log
-// with the reason.
+// own and the door's composite is untouched. Every family it leaves is
+// named in the log with the reason.
 //
 // THE ORDER IT CHANGES, and the only one: a draw after a redirected draw
 // that WRITES the same eye target is taken into the layer too, after the
@@ -135,9 +135,9 @@ bool uiLayerMultiplyBegin(ID3D11DeviceContext* ctx);
 bool uiLayerWriteBackBegin(ID3D11DeviceContext* ctx);
 void uiLayerWriteBackEnd(ID3D11DeviceContext* ctx);
 
-// the crisp-HUD half of fix.ui_quality (Phases 1-2 of docs/cockpit-hud-layer-design-2026-09-27.md): the
+// the crisp-HUD half of fix.ui_quality (Phases 1-3 of docs/cockpit-hud-layer-design-2026-09-27.md): the
 // cockpit's HDR HUD families (the holo panels, the flight HUD, the target
-// sprite) are taken into a per-eye HDR layer by the ordinary take
+// sprite, the holograms) are taken into a per-eye HDR layer by the ordinary take
 // path above (g_draw.hdr), and reach the eye at the game's own tonemap draw,
 // re-issued once per eye per frame with the HDR layer as its HDR source, into
 // the 8-bit layer -- which the door's composite then shows unchanged.

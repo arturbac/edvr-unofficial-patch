@@ -42,6 +42,8 @@
 #include <cstdint>
 #include <cstring>
 
+#include "holo_families.h"  // the hologram pass's eleven VS hashes: kHoloGeneric's match list
+
 namespace edvr {
 
 // ---------------------------------------------------------------- the key --
@@ -331,6 +333,13 @@ inline UiBlendShape uiLayerBlendShape(const UiBlendRt& b) {
 // uiLayerMultiplyBlend: the composite is then out = L.rgb + F.rgb * T * M.rgb,
 // exact for any order of the accepted shapes (over: L' = c + L(1-a),
 // T' = T(1-a); additive: L' = L + c; multiply: L' = L s, M' = M s).
+// ADDITIVE (ONE, ONE) and scaled additive (SRC_ALPHA, ONE) convert exactly
+// and cover NOTHING: transmittance is untouched (T' = T), the layer's colour
+// gain is exactly the light the game's blend would have added. That is the
+// hologram families' shape -- they are additive glows drawn with depth off
+// (holo_families.h, ui_depth.cpp's generic hologram coverage) -- so their
+// crisp take adds no coverage of its own; what differs from stock is WHERE
+// the light lands (the layer, tonemapped once more), never how much.
 //
 // False for a refused shape: the draw is not redirected.
 inline bool uiLayerConvertBlend(const UiBlendRt& in, UiBlendRt* out) {
@@ -553,6 +562,13 @@ enum class UiLayerFamily : uint8_t {
     kHolo,       // cockpit holo panels (vs 81216C77F90DEDD6)
     kFlightHud,  // flight HUD (vs B7790CBFC6554097)
     kSprite,     // target-time sprite (vs E508648660A352B2)
+    kHoloGeneric,  // the hologram pass's eleven (holo_families.h: the radar
+                   // contacts, the ship and target holograms, the icons, and
+                   // the world-marker reticle -- the canopy is not one), Phase
+                   // 3 of the crisp-HUD design. ONE family for eleven hashes:
+                   // the 30 s table prints one row, and the per-draw
+                   // first-seen lines name the VS hash (ui_layer.cpp's
+                   // noteFamily keys on (family, decision, vs, ps)).
     kAfterUi,    // not the interface at all: an owner draw that WRITES an eye
                  // target the UI was already taken from this frame
                  // (uiLayerNoteOther's 'W' case), taken into the same layer
@@ -573,6 +589,7 @@ inline const char* uiLayerFamilyName(UiLayerFamily f) {
         case UiLayerFamily::kHolo: return "cockpit holo panels";
         case UiLayerFamily::kFlightHud: return "flight HUD";
         case UiLayerFamily::kSprite: return "target sprite";
+        case UiLayerFamily::kHoloGeneric: return "hologram";
         case UiLayerFamily::kAfterUi: return "after the UI";
         default: return "none";
     }
@@ -690,9 +707,17 @@ inline UiLayerFamily uiLayerFamilyFor(const UiFamilyFacts& f, UiFamilyWhy* why =
         w = UiFamilyWhy::kNotEyeTarget;
     } else if (f.targetKind == 1) {
         w = UiFamilyWhy::kNotPostTonemap;
+        // The hologram pass's eleven join the three named families (Phase 3):
+        // one family, matched by VS hash against holo_families.h's shared
+        // list. The canopy is deliberately NOT on that list -- it sits in
+        // front of the whole sky, and covering it would smear the stars
+        // behind it, the depth pass's own reasoning -- so a canopy draw
+        // matches nothing here and stays stock, exactly as the pass refuses
+        // it.
         out = f.vs == kUiVsHolo        ? UiLayerFamily::kHolo
               : f.vs == kUiVsFlightHud ? UiLayerFamily::kFlightHud
               : f.vs == kUiVsSprite    ? UiLayerFamily::kSprite
+              : uiHoloGenericHash(f.vs) ? UiLayerFamily::kHoloGeneric
                                        : UiLayerFamily::kNone;
         if (out != UiLayerFamily::kNone) w = UiFamilyWhy::kDirect;
     } else if (f.excluded) {
@@ -922,12 +947,12 @@ struct UiLayerDrawFacts {
     UiBlendShape blend = UiBlendShape::kRefused;
     bool layerReady = true;       // the eye's layer exists at the wanted size
     // The HDR HUD take is armed (with fix.ui_quality) and this is one of the
-    // three cockpit HUD families (the holo panels, the flight HUD, the
-    // target sprite) drawn into the lit HDR (pre-tonemap) eye target: the
-    // draw goes to the HDR layer, and the tonemap re-issue brings it back
-    // over the finished eye. Every other test (eye known, armed, not late,
-    // no MRT/UAV, the seeded depth-stencil, the blend) applies exactly as
-    // for the LDR take.
+    // cockpit HUD families (the holo panels, the flight HUD, the target
+    // sprite, and the hologram pass's eleven as kHoloGeneric) drawn into the
+    // lit HDR (pre-tonemap) eye target: the draw goes to the HDR layer, and
+    // the tonemap re-issue brings it back over the finished eye. Every other
+    // test (eye known, armed, not late, no MRT/UAV, the seeded depth-stencil,
+    // the blend) applies exactly as for the LDR take.
     bool crispHdr = false;
 };
 
@@ -939,8 +964,8 @@ inline UiLayerDecision uiLayerDecide(const UiLayerDrawFacts& f) {
     if (f.worldScreen && f.family == UiLayerFamily::kScreen) return UiLayerDecision::kWorldScreen;
     if (!f.eyeTarget) return UiLayerDecision::kNotEyeTarget;
     // The lit HDR target, before exposure and the tonemap: refused as stock,
-    // unless the HDR HUD take owns this family (the three cockpit HUD
-    // families: the holo panels, the flight HUD, the target sprite).
+    // unless the HDR HUD take owns this family (the cockpit HUD families: the
+    // holo panels, the flight HUD, the target sprite, the holograms).
     if (!f.ldrView && !f.crispHdr) return UiLayerDecision::kHdrTarget;
     if (f.vrs) return UiLayerDecision::kVrs;
     if (f.eye < 0 || f.eye > 1) return UiLayerDecision::kNoEye;
@@ -956,8 +981,12 @@ inline UiLayerDecision uiLayerDecide(const UiLayerDrawFacts& f) {
     // skips ensureMult (the transmittance target is the LDR layer's), and
     // the coverage pass transfers only scalar HDR alpha, so a multiply
     // redirected into the HDR layer would lose its destination modulation
-    // (review R5). Refuse BEFORE the redirect. All three measured families
-    // are premultiplied-over, so this refuses nothing seen in flight.
+    // (review R5). Refuse BEFORE the redirect, kHoloGeneric included. The
+    // three named families measured premultiplied-over; the holograms are
+    // documented additive glows (depth off, mirrored blends -- ui_depth.cpp's
+    // generic hologram coverage). Their states are NOT flight-measured: an
+    // unconvertible blend or depth-stencil state is what the refusal net is
+    // for, and it names the state that refused.
     if (f.crispHdr && f.blend == UiBlendShape::kMultiply) return UiLayerDecision::kBlendRefused;
     if (!f.layerReady) return UiLayerDecision::kLayerFailed;
     return UiLayerDecision::kRedirect;

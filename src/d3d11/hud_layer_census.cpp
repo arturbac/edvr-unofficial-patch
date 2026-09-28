@@ -44,14 +44,20 @@ template <class T>
 using Ptr = Microsoft::WRL::ComPtr<T>;
 
 constexpr uint64_t kTotalsMs = 30000;
-constexpr int kFamilies = 3;
-enum : int { kFamHolo = 0, kFamFlightHud = 1, kFamSprite = 2 };
-const char* const kFamNames[kFamilies] = {"holo", "flighthud", "sprite"};
+constexpr int kFamilies = 4;
+enum : int { kFamHolo = 0, kFamFlightHud = 1, kFamSprite = 2, kFamHoloGeneric = 3 };
+const char* const kFamNames[kFamilies] = {"holo", "flighthud", "sprite", "hologram"};
 
 int familyOfVs(uint64_t vs) {
     if (vs == kUiVsHolo) return kFamHolo;
     if (vs == kUiVsFlightHud) return kFamFlightHud;
     if (vs == kUiVsSprite) return kFamSprite;
+    // Phase 3: the hologram pass's eleven (holo_families.h, the same list
+    // the crisp take's kHoloGeneric matches) get ONE watch, so their ga
+    // state lines (first-seen, 64 cap) and window counts double as their
+    // G-A measurement. They draw with depth off, so a G-D pair reads
+    // on == off, like the sprite's -- that documents exactly that.
+    if (uiHoloGenericHash(vs)) return kFamHoloGeneric;
     return -1;
 }
 
@@ -114,7 +120,7 @@ struct FrameScratch {
         uint32_t draws = 0, firstOrd = ~0u, lastOrd = 0;
         uint64_t eyeDraws[2] = {0, 0};
     } fam[kFamilies];
-    uint32_t gdBudget[kFamilies][2] = {{2, 2}, {2, 2}, {2, 2}};  // pairs per family per eye per frame
+    uint32_t gdBudget[kFamilies][2] = {{2, 2}, {2, 2}, {2, 2}, {2, 2}};  // pairs per family per eye per frame
     const void* famTargets[4] = {};
     uint32_t famTargetCount = 0;
     bool anyFamily = false;

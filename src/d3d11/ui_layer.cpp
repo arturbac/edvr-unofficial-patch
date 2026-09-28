@@ -67,7 +67,10 @@ using Ptr = Microsoft::WRL::ComPtr<T>;
 
 constexpr uint64_t kTotalsMs = 30000;
 constexpr uint32_t kWatchPerFrame = 64;
-constexpr uint32_t kMaxFamilyLines = 48;
+// First-seen lines are one per (family, decision, vs, ps): Phase 3's eleven
+// hologram hashes share the one kHoloGeneric row, so each needs its own
+// entry here (48 barely covered the named families and their refusals).
+constexpr uint32_t kMaxFamilyLines = 80;
 constexpr uint32_t kMaxAfterLines = 16;
 // The crisp-HUD missing-consumer deadline (review R1): this many consecutive
 // content-frames with no tonemap publication stands the HDR path down. The
@@ -101,16 +104,17 @@ void refreshLive() {
 }
 
 // The HDR HUD path fails alone: the cockpit HUD families (the holo panels,
-// the flight HUD, the target sprite) stay in the game's frame exactly as
-// stock (their kHdrTarget refusal), and the LDR take is untouched.
+// the flight HUD, the target sprite, the holograms) stay in the game's
+// frame exactly as stock (their kHdrTarget refusal), and the LDR take is
+// untouched.
 void crispStandDown(const char* why) {
     if (g_crispStoodDown) return;
     g_crispStoodDown = true;
     refreshLive();
     Log::get().note(
         "ui quality: the HDR HUD path stands down for the rest of the session -- %s. The "
-        "cockpit's holo panels, flight HUD and target sprite are drawn as they always were "
-        "(the rest of the layer is unaffected). Turning fix.ui_quality off and on re-arms it.",
+        "cockpit's holo panels, flight HUD, target sprite and holograms are drawn as they always "
+        "were (the rest of the layer is unaffected). Turning fix.ui_quality off and on re-arms it.",
         why ? why : "a refusal");
 }
 
@@ -176,8 +180,8 @@ struct Eye {
 
     // the crisp-HUD half's of fix.ui_quality HDR HUD layer: R16G16B16A16_FLOAT at the 8-bit layer's
     // size (the door's output x the same target), holding the cockpit HUD
-    // families' (holo panels, flight HUD, target sprite) premultiplied
-    // radiance and transmittance in the layer's own
+    // families' (holo panels, flight HUD, target sprite, holograms)
+    // premultiplied radiance and transmittance in the layer's own
     // alpha convention, cleared at the first taken HUD draw of each
     // eye-frame. The game's tonemap draw, re-issued over the 8-bit layer
     // with this as its HDR source, tonemaps the HUD into the 8-bit layer's
@@ -653,8 +657,8 @@ bool ensureHdrLayerFor(ID3D11DeviceContext* ctx, int eye) {
     e.hdrH = s.h;
     Log::get().note(
         "crisp hud: layer: %s eye's HDR HUD layer %s at %ux%u (R16G16B16A16_FLOAT, %.1f MB) -- "
-        "the cockpit's holo panels, flight HUD and target sprite are drawn into it and "
-        "tonemapped over the finished eye.",
+        "the cockpit's holo panels, flight HUD, target sprite and holograms are drawn into it "
+        "and tonemapped over the finished eye.",
         eye == 0 ? "left" : "right", resized ? "re-created" : "created", s.w, s.h,
         uiLayerMB(uiLayerBytes(s.w, s.h, 8)));
     return true;
@@ -2010,8 +2014,8 @@ void logTotals(double seconds) {
         static_cast<unsigned long long>(g_win.debugComposites), price.c_str());
     logMemory();
     if (detail::g_uiLayerCrispOn) {
-        // The HDR HUD half's line: the take (all three cockpit HUD
-        // families), the re-issues and
+        // The HDR HUD half's line: the take (the cockpit HUD
+        // families, holograms included), the re-issues and
         // coverage passes, what never reached a tonemap, and the declines by
         // reason (each decline is also named once a session where it
         // happened). The taken/left/refused per family WITH the reason is the
@@ -2170,8 +2174,9 @@ void uiLayerConfigure(Config& cfg) {
               "except the 2D screen while it shows the world -- on foot, or a 3D map -- where it "
               "stays in the picture for the temporal pass (the game's Status.json says on foot, a "
               "second or so late; the screen's own depth, busy with the world, says so within "
-              "two frames); the cockpit's holo panels, the flight HUD and the target sprite are "
-              "drawn into a per-eye HDR layer at the "
+              "two frames); the cockpit's holo panels, the flight HUD, the target sprite and the "
+              "holograms (the radar contacts, the ship and target holograms, the icons -- the "
+              "glass canopy stays) are drawn into a per-eye HDR layer at the "
               "same size and tonemapped over the finished eye by the game's own tonemap draw "
               "re-issued with the layer as its HDR source (their bloom halo goes with the "
               "upscaled frame; the \"crisp hud\" lines report it). Draws the layer takes get no "
@@ -2228,15 +2233,15 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     const int kind = uiLayerTargetKind();
     f.eyeTarget = kind != 0;
     f.ldrView = kind == 2;
-    // The HDR HUD take (Phase 2: all three cockpit HUD families -- the holo
-    // panels, the flight HUD and the target sprite): a draw of one into the
-    // lit HDR pre-tonemap eye target goes to the eye's HDR HUD layer instead
-    // of the kHdrTarget refusal. The take arms with the layer
-    // (fix.ui_quality), and every other refusal applies to it exactly as to
-    // the LDR take.
+    // The HDR HUD take (Phases 1-3: the cockpit HUD families -- the holo
+    // panels, the flight HUD, the target sprite, and the hologram pass's
+    // eleven as kHoloGeneric): a draw of one into the lit HDR pre-tonemap
+    // eye target goes to the eye's HDR HUD layer instead of the kHdrTarget
+    // refusal. The take arms with the layer (fix.ui_quality), and every
+    // other refusal applies to it exactly as to the LDR take.
     f.crispHdr = detail::g_uiLayerCrispOn && f.eyeTarget && !f.ldrView &&
                  (family == UiLayerFamily::kHolo || family == UiLayerFamily::kFlightHud ||
-                  family == UiLayerFamily::kSprite);
+                  family == UiLayerFamily::kSprite || family == UiLayerFamily::kHoloGeneric);
     // A shading-rate image bound for the eye (or possibly bound) would shade
     // the layer -- a different size -- through the eye's tiles.
     f.vrs = detail::g_foveationBound != nullptr || detail::g_foveationBoundUnknown;
@@ -2448,8 +2453,9 @@ void uiLayerWriteBackEnd(ID3D11DeviceContext* ctx) {
 
 // ------------------------------------- the crisp-HUD half of fix.ui_quality: the tonemap re-issue
 //
-// Phases 1-2 of docs/cockpit-hud-layer-design-2026-09-27.md. The cockpit's
-// HDR HUD families (the holo panels, the flight HUD, the target sprite) are
+// Phases 1-3 of docs/cockpit-hud-layer-design-2026-09-27.md. The cockpit's
+// HDR HUD families (the holo panels, the flight HUD, the target sprite, the
+// holograms) are
 // taken into the eye's HDR HUD layer by the draw path above
 // (g_draw.hdr); they reach the eye HERE, at the game's own tonemap draw --
 // the last reader of the lit HDR target, recognised by tonemap_admit.h's

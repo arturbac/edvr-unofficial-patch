@@ -2412,7 +2412,8 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     }
     // The HUD layer census (hud_layer_census.h): Phase 0 of the crisp-HUD
     // design, observation only. One bool load while off (the default); when
-    // armed it watches for the three cockpit HUD families and the tonemap,
+    // armed it watches for the three cockpit HUD families, the hologram
+    // families (Phase 3's family watch, one row) and the tonemap,
     // and for a family draw it picked for its occlusion gate it re-issues
     // this draw colourlessly (no colour target, writes masked, everything
     // restored) around pureDrawReissue before the game's own draw runs.
@@ -3767,8 +3768,9 @@ __declspec(noinline) void crispHudTonemapReissue(ID3D11DeviceContext* self, char
 // Asked only while the layer is live. A draw into anything that is not an
 // eye target is none -- the GUI's own draws into its surfaces are the
 // surfaces' content, not the eye's UI. Into an eye target that is not 8-bit
-// UNORM (the lit HDR target -- thousands of scene draws a frame) only three
-// hash compares run, to name the cockpit families the layer leaves; the
+// UNORM (the lit HDR target -- thousands of scene draws a frame) only the
+// hash compares run, to name the cockpit families the crisp take takes (the
+// three named shaders and the hologram pass's eleven, one family); the
 // full rules run for the post-tonemap target alone, where a frame has a few
 // dozen draws. The 2D screen's composite is recognised exactly as the panel
 // distance and the curved screen recognise it (srv0IsPanelSized); the rest
@@ -4031,7 +4033,12 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // nearest depth into another. Both test only the pass's own radius
     // target, so they need nothing from the family reissue above.
     // uiDepthWantsReissue() answers for that reissue alone; holoOn is this
-    // pass's own classification.
+    // pass's own classification. !layered covers the crisp take: a taken
+    // hologram (the pass's eleven are the take's kHoloGeneric) is not in the
+    // eye's colour any more, so its contribution and element-depth re-issues
+    // skip it like any taken draw -- the pass's resolve then declines the
+    // eye-frame as "nothing listed", which its census line counts (expected
+    // with the take on, not a pass failure).
     if (!layered && uiDepthScope.holoOn) {
         GpuCensusScope census(self, GpuCensusSection::FrameHologramPasses);
         if (uiDepthHologramContributionBegin(self)) pureDrawReissue(self,kind,count,instances,args);

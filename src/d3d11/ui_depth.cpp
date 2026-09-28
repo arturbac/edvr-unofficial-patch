@@ -5,6 +5,7 @@
 #include "gpu_interval.h"
 #include "ui_content.h"
 #include "holo_material.h"
+#include "holo_families.h"  // the eleven hologram family hashes and the canopy: shared with the crisp take's family rule
 
 #include <windows.h>
 
@@ -61,35 +62,12 @@ constexpr uint64_t kFlightHud = 0xB7790CBFC6554097ull;
 constexpr uint64_t kFlightHudPs = 0x8DEF46452FA459F5ull;
 // The cockpit's holo-panel family (panel_upscale.h).
 constexpr uint64_t kHoloPanel = 0x81216C77F90DEDD6ull;
-// The generic hologram/icon depth pass's other built-in families (below,
-// "GENERIC HOLOGRAM/ICON DEPTH COVERAGE"): the radar's star icon core, its
-// two stalks, and the sun's corona family, which also paints the icon's
-// glow. Unlike kHoloPanel these carry no per-family coverage shader at
-// all -- eye dump eye_135907, frame 17847: the radar star icon over sky
-// carried the sky's motion at 0% AA depth coverage.
-constexpr uint64_t kHoloIconCore     = 0xF8D8A92E96419901ull;
-constexpr uint64_t kHoloCoronaFamily = 0xD1281DF454A153ADull;
-constexpr uint64_t kHoloIconStalkA   = 0xDF3503CD07F9B10Cull;
-constexpr uint64_t kHoloIconStalkB   = 0x5453D19B6D362364ull;
-// The target hologram's sphere (two premultiplied quads, ps EA02FAC2BD6C643C
-// and E95634B0F61D218F) and the radar's five contact-marker families --
-// flight 20260924_155636, eye dump eye_155832: unlisted, the target sphere
-// carried the sky's motion at (-3.9,-6.1) px/frame rolling, and the contact
-// bars (pool\draws_155832.bin, frame 8548, right after the two stalks in each
-// eye's cockpit section) read 0% contribution.
-constexpr uint64_t kHoloTargetSphere = 0x5559BD94B6852E83ull;
-constexpr uint64_t kHoloContactA     = 0xA2C2D5510BF1926Dull;
-constexpr uint64_t kHoloContactB     = 0x9B34C331902DC1EDull;
-constexpr uint64_t kHoloContactC     = 0x9611A454527F7FEBull;
-constexpr uint64_t kHoloContactD     = 0xB932058F26B76691ull;
-constexpr uint64_t kHoloContactE     = 0x94D5C556DFD6D705ull;
-// The target reticle's three 3D triangles (72 non-indexed vertices, three
-// prisms -- pool\draws_163515.bin, frame 27528, right after the canopy):
-// a WORLD MARKER, not a cockpit family. It tracks the targeted ship, which
-// can be kilometres out, so it is never radius-clipped like the families
-// above -- eye dump eye_163515: sky MV (+0.59,-0.89) against the bracketed
-// ship's (+0.14,+0.27) at 1.65 km, going indistinct with speed.
-constexpr uint64_t kHoloWorldMarkerReticle = 0x71DD8B8B09060A81ull;
+// The generic hologram/icon depth pass's other built-in families (the radar's
+// star icon core, its two stalks, the corona family, the target hologram's
+// sphere, the five contact markers), the world-marker reticle, and the canopy
+// it refuses now live in holo_families.h -- shared with the crisp take's
+// family rule (ui_layer_math.h's kHoloGeneric), so the take and this pass
+// read ONE list. Their per-family commentary moved with them.
 // The two interface composites drawn through the interface projection: the
 // menu's and the loader's panel (vs A888D51024D9798E, ps 9107E72CB016CC02)
 // and the loader's curved screen (vs 4EF6DDB075A927FA, ps 85565E9261812E2F).
@@ -1319,21 +1297,11 @@ SmokeDepth* smokeDepthFor(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_
 // private AA copy wherever the accumulated light clears a floor and (when
 // the eye's finished colour is in hand) is a real share of it, before the
 // temporal pass reads that copy (uiDepthTemporalDepth).
-constexpr uint64_t kHoloFamiliesBuiltIn[10] = {kHoloIconCore, kHoloCoronaFamily,
-                                               kHoloIconStalkA, kHoloIconStalkB,
-                                               kHoloTargetSphere, kHoloContactA, kHoloContactB,
-                                               kHoloContactC, kHoloContactD, kHoloContactE};
-// WORLD MARKERS: a second, separate built-in list for draws that must be
-// covered wherever they are, not just inside the cockpit radius (the
-// families above are all short-range panel/icon geometry; a world marker
-// tracks something that can be kilometres out). Fixed, never extended by
+// The built-in cockpit list (ten families), the world-marker list, and the
+// canopy the pass refuses are holo_families.h's -- one list, shared with the
+// crisp take's family rule; their commentary moved there with them. The
+// world-marker list stays fixed, never extended by
 // advanced.temporal_aa_hologram_families -- see holoWorldMarkerList below.
-constexpr uint64_t kHoloWorldMarkers[1] = {kHoloWorldMarkerReticle};
-constexpr uint32_t kHoloWorldMarkerCount = static_cast<uint32_t>(sizeof(kHoloWorldMarkers) / sizeof(kHoloWorldMarkers[0]));
-// The canopy sits in front of the whole sky; covering it would smear the
-// stars behind it. Refused even if named in advanced.
-// temporal_aa_hologram_families (holoBuildFamilyList, below parseHashes).
-constexpr uint64_t kHoloCanopy = 0x8C091FFD08644E02ull;
 uint64_t g_holoFamilies[kMaxHashes];
 uint32_t g_holoFamilyCount = 0;
 float    g_holoFloor = 0.05f;    // advanced.temporal_aa_hologram_floor: display brightness, 0..1
@@ -2262,6 +2230,14 @@ void holoDepthWindowTick(ID3D11DeviceContext* ctx) {
         ? static_cast<double>(nearLightTotal) / g_holoNearLightSampleCount : 0.0;
     // One combined note, not two: the rig (and anything else reading the
     // last logged line) expects a single "hologram depth:" note per tick.
+    // With fix.ui_quality's crisp take on, this line needs one reading
+    // note: a hologram draw the take owns is still CLASSIFIED here (the
+    // "listed draws" count keeps it -- classification runs at the eye-draw
+    // branch, before the layer decides), but its contribution and
+    // element-depth re-issues skip it (vscreen.cpp's !layered gate), so the
+    // scratch is never prepared and the resolve declines the eye-frame as
+    // "nothing listed". Listed draws with every resolve so declining means
+    // the layer took the holograms -- expected, not a pass failure.
     Log::get().note("hologram depth: %.0f s, %u frames, listed draws %.2f/frame, resolved "
                     "eye-frames %u, stamped pixels/eye-frame p50 %llu (occlusion, %u sampled), "
                     "share test skipped %u (no target view), floor on contribution %u (no display "

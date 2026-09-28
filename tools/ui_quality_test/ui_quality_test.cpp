@@ -476,6 +476,24 @@ void testGate() {
     check(hdrWith(UiLayerFamily::kSprite, [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kMultiply; }) ==
               UiLayerDecision::kBlendRefused,
           "...and for the target sprite (R5, per family)");
+    // Phase 3: the hologram pass's eleven, the one kHoloGeneric family. Their
+    // states are NOT flight-measured; the documented shape is an additive
+    // glow with depth off (ui_depth.cpp's generic hologram coverage), and the
+    // refusal net owns anything unconvertible, with the reason named.
+    check(hdrWith(UiLayerFamily::kHoloGeneric, [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kAdditive; }) ==
+              UiLayerDecision::kRedirect,
+          "a hologram's additive glow (ONE, ONE, depth off) is taken into the HDR layer");
+    check(hdrWith(UiLayerFamily::kHoloGeneric,
+                  [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kScaledAdditive; }) ==
+              UiLayerDecision::kRedirect,
+          "...a scaled-additive one (SRC_ALPHA, ONE) too");
+    check(hdrWith(UiLayerFamily::kHoloGeneric, [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kMultiply; }) ==
+              UiLayerDecision::kBlendRefused,
+          "...and the R5 multiply refusal stands for the holograms");
+    check(hdrWith(UiLayerFamily::kHoloGeneric,
+                  [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kRefused; }) ==
+              UiLayerDecision::kBlendRefused,
+          "...and an unconvertible hologram blend refuses to stock, named");
     check(hdrWith(UiLayerFamily::kHolo,
                   [](UiLayerDrawFacts& g) {
                       g.blend = UiBlendShape::kMultiply;
@@ -501,8 +519,13 @@ void testGate() {
               with([](UiLayerDrawFacts& g) {
                   g.family = UiLayerFamily::kSprite;
                   g.ldrView = false;
+              }) == UiLayerDecision::kHdrTarget &&
+              with([](UiLayerDrawFacts& g) {
+                  g.family = UiLayerFamily::kHoloGeneric;
+                  g.ldrView = false;
               }) == UiLayerDecision::kHdrTarget,
-          "with the crisp take off the flight HUD and the sprite stay plain HDR, left stock");
+          "with the crisp take off the flight HUD, the sprite and the holograms stay plain HDR, "
+          "left stock");
 
     // The on-foot gate: on foot the 2D screen IS the world (flight 09:38:
     // the layer took it and the temporal pass got a black eye). The journal's
@@ -1018,6 +1041,23 @@ void testFamilyRule() {
           "...the flight HUD is named, a direct shader");
     f.vs = kUiVsSprite;
     check(uiLayerFamilyFor(f) == UiLayerFamily::kSprite, "...and the target sprite");
+    // Phase 3: the hologram pass's eleven (holo_families.h, the shared list)
+    // each name the one kHoloGeneric family on the lit HDR target; the canopy
+    // is not one of them and names nothing, so it stays stock.
+    const uint64_t kElevenVs[] = {kHoloIconCore,  kHoloCoronaFamily, kHoloIconStalkA,
+                                  kHoloIconStalkB, kHoloTargetSphere, kHoloContactA,
+                                  kHoloContactB,  kHoloContactC,     kHoloContactD,
+                                  kHoloContactE,  kHoloWorldMarkerReticle};
+    for (uint64_t h : kElevenVs) {
+        f.vs = h;
+        char what[128];
+        std::snprintf(what, sizeof(what), "vs %016llX names the hologram family on the HDR target",
+                      static_cast<unsigned long long>(h));
+        check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kHoloGeneric && why == UiFamilyWhy::kDirect, what);
+    }
+    f.vs = kHoloCanopy;
+    check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kNone && why == UiFamilyWhy::kNotPostTonemap,
+          "the canopy is refused: not one of the eleven, it sits in front of the whole sky");
     f.targetKind = 2;
     f.vs = kUiVsPanel;
     f.ps = 0x9107E72CB016CC02ull;
