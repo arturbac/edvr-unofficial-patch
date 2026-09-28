@@ -35,7 +35,10 @@ Three things it does that a `copy` does not:
 edvr.ini is NOT copied unless --ini says so. It is the one file in the
 payload that carries the settings of whoever flew last, a reinstall does
 not undo an edit to it, and clobbering it has cost a session. --ini backs
-it up first and says loudly what it did.
+it up first and says loudly what it did. The flat profile's settings live
+in edvr-flat.ini instead: --ini flat writes that file, and a flat install
+that finds no edvr-flat.ini yet seeds one from the existing edvr.ini, so
+the two profiles stop sharing one file's settings.
 
 --dry-run prints the plan and writes nothing at all -- no copies, no
 backups, no directories. The self-test asserts that, because a --dry-run
@@ -680,7 +683,9 @@ def _validate_v2_receipt(r):
     required = {"runtime", "graphics", "loader", "notice", "config"} if r["kind"] == NATIVE_KIND else {"graphics", "profile"}
     targets = {key: paths[key + "_target"] for key in ("runtime", "graphics", "loader", "notice") if key + "_target" in paths}
     if r["kind"] == NATIVE_KIND: targets["config"] = paths["config"]
-    targets.update(profile=os.path.join(target, PROFILE_FILE), ini=os.path.join(target, "edvr.ini"), dlss=os.path.join(target, "nvngx_dlss.dll"))
+    targets.update(profile=os.path.join(target, PROFILE_FILE),
+                   ini=_ini_target(target, "flat" if r["kind"] == FLAT_KIND else "vr"),
+                   dlss=os.path.join(target, "nvngx_dlss.dll"))
     keys = [e["key"] for e in files]
     if len(keys) != len(set(keys)) or not required.issubset(keys) or set(keys) - targets.keys():
         raise ValueError("incomplete or duplicate EDVR v2 components")
@@ -997,6 +1002,12 @@ def _ini_source(root, profile):
         os.path.join(root, "build", "edvr-flat.ini")
 
 
+def _ini_target(target, profile):
+    """The flat profile keeps its settings in a file of its own, so one
+    profile's install never clobbers the other profile's tuning."""
+    return os.path.join(target, "edvr.ini" if profile == "vr" else "edvr-flat.ini")
+
+
 def _flat_vr_leftovers(target):
     """Recognized EDVR VR state needs the GUI's original-file recovery."""
     xr = os.path.join(target, "Openvr", "win64")
@@ -1083,7 +1094,7 @@ def standard_native_install(root, target, tag, dry_run=False, verify_only=False,
             if not os.path.isfile(dst) or sha256(dst) != sha256(dlss):
                 print("[edvr] %s verify mismatch: %s" % (profile, dst)); ok = False
         if include_ini:
-            ini_target = os.path.join(target, "edvr.ini")
+            ini_target = _ini_target(target, profile)
             if (not os.path.isfile(ini_target) or not os.path.isfile(ini_source) or
                     open(ini_target, "rb").read() != open(ini_source, "rb").read()):
                 print("[edvr] %s verify mismatch: %s" % (profile, ini_target)); ok = False
@@ -1118,7 +1129,7 @@ def standard_native_install(root, target, tag, dry_run=False, verify_only=False,
                         "before_sha256": sha256(dst) if os.path.isfile(dst) else None,
                         "installed_sha256": sha256(src)})
     if include_ini:
-        src = ini_source; dst = os.path.join(target, "edvr.ini")
+        src = ini_source; dst = _ini_target(target, profile)
         entries.append({"key": "ini", "source": os.path.abspath(src), "target": os.path.abspath(dst),
                         "backup": _native_backup_name(dst, tag, stamp) if os.path.isfile(dst) else None,
                         "before_sha256": sha256(dst) if os.path.isfile(dst) else None,
@@ -1132,8 +1143,18 @@ def standard_native_install(root, target, tag, dry_run=False, verify_only=False,
                     "backup": _native_backup_name(descriptor, tag, stamp) if os.path.isfile(descriptor) else None,
                     "before_sha256": sha256(descriptor) if os.path.isfile(descriptor) else None,
                     "installed_sha256": hashlib.sha256(descriptor_bytes).hexdigest().upper()})
+    # A flat install with no edvr-flat.ini yet inherits the settings of
+    # whoever flew last by seeding the new file from edvr.ini. Not journaled:
+    # the seed is a brand-new file no prior state needs restoring into, and
+    # keeping it out of the receipt means a later edit of edvr-flat.ini is
+    # not "the installed file changed" to repair/restore.
+    seed_ini = (not native and not include_ini and
+                not os.path.isfile(_ini_target(target, "flat")) and
+                os.path.isfile(os.path.join(target, "edvr.ini")))
     print("[edvr] %s plan%s: %s" % (profile, " (DRY RUN -- nothing will be written)" if dry_run else "", target))
     for e in entries: print("       %-7s %s" % (e["key"], e["target"]))
+    if seed_ini:
+        print("       seed     %s (from edvr.ini; a new file, so no backup)" % _ini_target(target, "flat"))
     print("       receipt  %s" % receipt)
     if dry_run:
         print("[edvr] dry run: wrote nothing."); return 0
@@ -1184,6 +1205,13 @@ def standard_native_install(root, target, tag, dry_run=False, verify_only=False,
             try: _replace_receipt(receipt, journal)
             except (OSError, IOError, ValueError): pass
         return 1
+    if seed_ini:
+        try:
+            shutil.copy2(os.path.join(target, "edvr.ini"), _ini_target(target, "flat"))
+            print("[edvr] flat settings seeded: %s (copied from edvr.ini; the flat profile no longer reads edvr.ini)" %
+                  _ini_target(target, "flat"))
+        except OSError as exc:
+            print("[edvr] WARNING: flat settings seed failed (%s); copy edvr.ini to edvr-flat.ini by hand to keep your settings" % exc)
     print("[edvr] %s package installed and verified; receipt: %s" % (profile, receipt))
     return 0
 
@@ -1206,8 +1234,9 @@ def main(argv=None):
     ap.add_argument("--dlss", action="store_true",
                     help="also install build/nvngx_dlss.dll")
     ap.add_argument("--ini", action="store_true",
-                    help="also overwrite the target's edvr.ini with the "
-                         "selected profile's template -- this discards tuned settings")
+                    help="also overwrite the selected profile's settings file "
+                         "(edvr.ini for vr, edvr-flat.ini for flat) with its "
+                         "template -- this discards tuned settings")
     ap.add_argument("--all", action="store_true",
                     help="selected profile plus available DLSS (never ini)")
     ap.add_argument("--native-openxr", action="store_true",
@@ -1536,6 +1565,9 @@ def self_test():
             assert Path(fgame, "d3d11.dll").read_bytes() == b"FLAT-GRAPHICS"
             assert Path(fgame, "nvngx_dlss.dll").read_bytes() == b"FLAT-DLSS"
             assert Path(fgame, "edvr.ini").read_bytes() == b"[user]\nkeep=1\n"
+            # First flat install with no edvr-flat.ini yet seeds it from the
+            # existing edvr.ini; after that the two profiles' settings part.
+            assert Path(fgame, "edvr-flat.ini").read_bytes() == b"[user]\nkeep=1\n"
             descriptor_path = Path(fgame, PROFILE_FILE)
             assert descriptor_path.read_bytes() == profile_bytes("flat")
             receipt_path = Path(fgame, "edvr_flat_receipt.json")
@@ -1573,11 +1605,15 @@ def self_test():
             assert main(ini_args + ["--dry-run"]) == 0
             assert snapshot() == before, "flat --ini dry run wrote files"
             assert main(ini_args) == 0
-            assert Path(fgame, "edvr.ini").read_bytes() == flat_template.read_bytes()
+            # --ini flat writes the flat file only; edvr.ini is the VR
+            # profile's and stays exactly as the user left it.
+            assert Path(fgame, "edvr-flat.ini").read_bytes() == flat_template.read_bytes()
+            assert Path(fgame, "edvr.ini").read_bytes() == b"[user]\nkeep=1\n"
             ini_receipt = next(Path(fgame).glob("edvr_flat_receipt.json.pre-flatini-*.bak"))
             ini_entry = next(e for e in verify_native_receipt(str(ini_receipt), fgame)["files"]
                              if e["key"] == "ini")
             assert ini_entry["source"] == str(flat_template)
+            assert ini_entry["target"] == str(Path(fgame, "edvr-flat.ini"))
             assert Path(ini_entry["backup"]).read_bytes() == b"[user]\nkeep=1\n"
             receipt_bytes = ini_receipt.read_bytes()
             changed_receipt = json.loads(receipt_bytes)
@@ -1589,10 +1625,11 @@ def self_test():
             except ValueError: pass
             ini_receipt.write_bytes(receipt_bytes)
             assert main(ini_args + ["--verify-only"]) == 0
-            Path(fgame, "edvr.ini").write_bytes(b"[fix]\ntemporal_aa=dlss\n")
+            Path(fgame, "edvr-flat.ini").write_bytes(b"[fix]\ntemporal_aa=dlss\n")
             assert main(ini_args + ["--verify-only"]) == 1
-            Path(fgame, "edvr.ini").write_bytes(flat_template.read_bytes())
+            Path(fgame, "edvr-flat.ini").write_bytes(flat_template.read_bytes())
             assert restore_native(str(ini_receipt)) == 0
+            assert Path(fgame, "edvr-flat.ini").read_bytes() == b"[user]\nkeep=1\n"
             assert Path(fgame, "edvr.ini").read_bytes() == b"[user]\nkeep=1\n"
             assert xr_snapshot() == before_xr, "flat --ini changed Openvr"
             Path(fgame, "d3d11.dll").write_bytes(b"FOREIGN-GRAPHICS")

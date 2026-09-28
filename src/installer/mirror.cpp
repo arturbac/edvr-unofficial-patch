@@ -12,6 +12,7 @@ namespace edvr::installer {
 namespace {
 
 const wchar_t* kIni = L"edvr.ini";
+const wchar_t* kFlatIni = L"edvr-flat.ini";
 const wchar_t* kBaseIni = L"edvr.ini.base";
 const wchar_t* kStateIni = L"state.ini";
 const wchar_t* kD3d11 = L"d3d11.dll";
@@ -103,6 +104,7 @@ MirrorInfo readMirror(const std::wstring& mirrorDir) {
 
     const std::wstring iniPath = joinPath(mirrorDir, kIni);
     info.hasIni = fileExists(iniPath);
+    info.hasFlatIni = fileExists(joinPath(mirrorDir, kFlatIni));
     info.hasBaseIni = fileExists(joinPath(mirrorDir, kBaseIni));
     info.hasState = fileExists(joinPath(mirrorDir, kStateIni));
     // The mirror preserves ownership metadata, not the active runtime scope.
@@ -125,6 +127,12 @@ MirrorResult updateMirror(const std::wstring& gameDir, const std::wstring& backu
     const std::wstring iniPath = joinPath(gameDir, kIni);
     if (fileExists(iniPath) && copyOver(iniPath, joinPath(mirrorDir, kIni)))
         result.saved.push_back("edvr.ini");
+
+    // The flat profile's own settings file, mirrored whenever a flat install
+    // left one; a VR-only folder simply has nothing to copy.
+    const std::wstring flatIniPath = joinPath(gameDir, kFlatIni);
+    if (fileExists(flatIniPath) && copyOver(flatIniPath, joinPath(mirrorDir, kFlatIni)))
+        result.saved.push_back("edvr-flat.ini");
 
     const std::wstring basePath = baseIniPath(gameDir);
     if (fileExists(basePath) && copyOver(basePath, joinPath(mirrorDir, kBaseIni)))
@@ -163,10 +171,16 @@ MirrorResult updateMirrorIni(const std::wstring& gameDir, const std::wstring& mi
     if (mirrorDir.empty() || !ensureDirTree(mirrorDir)) return result;
 
     const std::wstring iniPath = joinPath(gameDir, kIni);
-    if (!fileExists(iniPath)) return result;
+    if (fileExists(iniPath) && copyOver(iniPath, joinPath(mirrorDir, kIni))) {
+        result.ok = true;
+        result.saved.push_back("edvr.ini");
+    }
 
-    result.ok = copyOver(iniPath, joinPath(mirrorDir, kIni));
-    if (result.ok) result.saved.push_back("edvr.ini");
+    const std::wstring flatIniPath = joinPath(gameDir, kFlatIni);
+    if (fileExists(flatIniPath) && copyOver(flatIniPath, joinPath(mirrorDir, kFlatIni))) {
+        result.ok = true;
+        result.saved.push_back("edvr-flat.ini");
+    }
     return result;
 }
 
@@ -179,6 +193,9 @@ bool restoreFromMirror(const std::wstring& gameDir, const MirrorInfo& info,
 
     if (!copyOver(joinPath(info.dir, kIni), joinPath(gameDir, kIni))) return false;
     note("Restored edvr.ini from the copy kept outside the game folder.");
+
+    if (info.hasFlatIni && copyOver(joinPath(info.dir, kFlatIni), joinPath(gameDir, kFlatIni)))
+        note("Restored edvr-flat.ini too, so the flat profile keeps its own settings.");
 
     if (info.hasBaseIni || info.hasState) {
         if (ensureDirTree(stateDirPath(gameDir))) {

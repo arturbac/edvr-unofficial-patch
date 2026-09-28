@@ -353,6 +353,8 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
         std::wstring name;
         FILETIME     written{};
     };
+    FILETIME newestLog{};
+    bool haveNewestLog = false;
     std::vector<LogFile> logs;
     WIN32_FIND_DATAW fd{};
     HANDLE h = FindFirstFileW(joinPath(logDir, L"edvr_*.log").c_str(), &fd);
@@ -377,6 +379,8 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
         for (const LogFile& log : logs) {
             if (CompareFileTime(&log.written, &newest->written) > 0) newest = &log;
         }
+        newestLog = newest->written;
+        haveNewestLog = true;
         int sessionCount = 0;
         for (const LogFile& log : logs) {
             if (secondsBetween(log.written, newest->written) > kSessionWindowSeconds) continue;
@@ -399,6 +403,9 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
         {joinPath(gameDir, L"edvr_breadcrumbs.txt"), L"edvr_breadcrumbs.txt", nullptr},
         {joinPath(gameDir, L"edvr_FATAL.txt"), L"edvr_FATAL.txt", nullptr},
         {joinPath(gameDir, L"edvr.ini"), L"edvr.ini", "edvr.ini is not there"},
+        // The flat profile's own settings file; legitimately absent on VR-only
+        // installs, so its absence says nothing.
+        {joinPath(gameDir, L"edvr-flat.ini"), L"edvr-flat.ini", nullptr},
         {statePath(gameDir), L"edvr_install_state.ini", nullptr},
     };
     for (const Extra& extra : extras) {
@@ -406,6 +413,97 @@ LogBundle collectLogs(const std::wstring& gameDir, const std::wstring& outDir) t
             take.push_back({extra.path, extra.name});
         } else if (extra.missing) {
             bundle.notes.push_back(extra.missing);
+        }
+    }
+
+    // ---- the F10 capture evidence --------------------------------------
+    //
+    // dump_draws (F10) and the flat capture probes write into subfolders of
+    // the log dir: the frame-ring dump (traces\), the stage bytecode
+    // (shaders\), and the pixel captures (flat_pixels\ and flat_draw_pixels\,
+    // each holding one subfolder per capture). A support zip without them
+    // already cost a round-trip: the six stage files and the frame trace had
+    // to be chased by hand. Same session window as the logs. Raw pixel dumps
+    // run to tens of MB each and the folders accumulate without bound, so
+    // per-file and aggregate caps keep the bundle sendable -- and whatever a
+    // cap leaves out is NAMED, never silently absent. Rides along with a
+    // report like the settings do; captures without logs are not a report.
+    if (!take.empty() && haveNewestLog) {
+        const unsigned long long kCapFileBytes = 64ull << 20;   // one 4K dump fits
+        const unsigned long long kCapTotalBytes = 512ull << 20; // the bundle stays sendable
+        const wchar_t* captureRoots[] = {L"shaders", L"traces", L"flat_pixels", L"flat_draw_pixels"};
+        struct CapFile {
+            std::wstring path, zipName;
+            FILETIME written{};
+            unsigned long long size = 0;
+        };
+        std::vector<CapFile> caps;
+        for (const wchar_t* root : captureRoots) {
+            const std::wstring rootPath = joinPath(logDir, root);
+            WIN32_FIND_DATAW cfd{};
+            HANDLE ch = FindFirstFileW(joinPath(rootPath, L"*").c_str(), &cfd);
+            if (ch == INVALID_HANDLE_VALUE) continue;
+            do {
+                if (wcscmp(cfd.cFileName, L".") == 0 || wcscmp(cfd.cFileName, L"..") == 0) continue;
+                if (cfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    // One level of per-capture subfolders (the pixel roots);
+                    // deeper nesting does not exist today, and a recursive
+                    // sweep of gigabytes is not something to grow by accident.
+                    const std::wstring sub = cfd.cFileName;
+                    WIN32_FIND_DATAW sfd{};
+                    HANDLE sh = FindFirstFileW(joinPath(joinPath(rootPath, sub), L"*").c_str(), &sfd);
+                    if (sh == INVALID_HANDLE_VALUE) continue;
+                    do {
+                        if (sfd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                        if (secondsBetween(sfd.ftLastWriteTime, newestLog) > kSessionWindowSeconds)
+                            continue;
+                        caps.push_back({joinPath(joinPath(rootPath, sub), sfd.cFileName),
+                                        std::wstring(root) + L"/" + sub + L"/" + sfd.cFileName,
+                                        sfd.ftLastWriteTime,
+                                        (static_cast<unsigned long long>(sfd.nFileSizeHigh) << 32) |
+                                            sfd.nFileSizeLow});
+                    } while (FindNextFileW(sh, &sfd));
+                    FindClose(sh);
+                } else {
+                    if (secondsBetween(cfd.ftLastWriteTime, newestLog) > kSessionWindowSeconds)
+                        continue;
+                    caps.push_back({joinPath(rootPath, cfd.cFileName),
+                                    std::wstring(root) + L"/" + cfd.cFileName, cfd.ftLastWriteTime,
+                                    (static_cast<unsigned long long>(cfd.nFileSizeHigh) << 32) |
+                                        cfd.nFileSizeLow});
+                }
+            } while (FindNextFileW(ch, &cfd));
+            FindClose(ch);
+        }
+        // Newest first: when the aggregate budget cuts, it cuts the oldest
+        // evidence of the session, never the capture just taken.
+        std::sort(caps.begin(), caps.end(), [](const CapFile& a, const CapFile& b) {
+            return CompareFileTime(&a.written, &b.written) > 0;
+        });
+        unsigned long long spent = 0, leftBytes = 0;
+        int taken = 0, leftOut = 0;
+        for (const CapFile& cap : caps) {
+            if (cap.size > kCapFileBytes || spent + cap.size > kCapTotalBytes) {
+                ++leftOut;
+                leftBytes += cap.size;
+                continue;
+            }
+            take.push_back({cap.path, cap.zipName});
+            spent += cap.size;
+            ++taken;
+        }
+        char line[192];
+        if (taken > 0) {
+            sprintf_s(line, "%d capture file%s from the most recent session (traces, shaders, pixel captures)",
+                      taken, taken == 1 ? "" : "s");
+            bundle.notes.push_back(line);
+        }
+        if (leftOut > 0) {
+            sprintf_s(line,
+                      "%d capture file%s (%.1f GB) left out of the zip for size; still in the log folder",
+                      leftOut, leftOut == 1 ? "" : "s",
+                      static_cast<double>(leftBytes) / 1073741824.0);
+            bundle.notes.push_back(line);
         }
     }
 

@@ -144,6 +144,11 @@ minutes after a flight finally reproduced the effect being chased.
 - `edvr.ini` in a game directory carries the settings of whoever flew
   last. A reinstall does not undo an edit to it. `install_edvr.py` does not
   touch it unless `--ini` says so, and backs it up when it does.
+- `edvr-flat.ini` is the flat profile's own settings file: the flat build
+  reads it first and falls back to `edvr.ini`, `--profile flat --ini`
+  writes it (never `edvr.ini`), and a flat install seeds it from
+  `edvr.ini` when the game directory has none yet. Everything above about
+  a live `edvr.ini` applies to it verbatim.
 - Settings mirror to `%LOCALAPPDATA%\EDVR\<leaf>-<store>\` and are restored
   from there, because a game update once wiped the whole install directory
   including the ini.

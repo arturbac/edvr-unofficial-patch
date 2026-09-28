@@ -98,14 +98,23 @@ void Config::init(const std::wstring& moduleDir) {
     runtimeProfileInitialize(moduleDir, executableDirectory());
     if (!m_impl) m_impl = new Impl();
 
-    const std::wstring candidates[] = {
-        moduleDir + L"\\edvr.ini",
-        executableDirectory() + L"\\edvr.ini",
-    };
+    // The flat profile keeps its settings in a file of its own, so a flat
+    // install over a VR one (or back) never clobbers the other profile's
+    // tuning. A flat install without edvr-flat.ini yet falls back to
+    // edvr.ini, which is how existing flat installs keep their settings
+    // until the installer seeds the separate file.
+    std::wstring candidates[4];
+    size_t count = 0;
+    if (runtimeFlatProfile()) {
+        candidates[count++] = moduleDir + L"\\edvr-flat.ini";
+        candidates[count++] = executableDirectory() + L"\\edvr-flat.ini";
+    }
+    candidates[count++] = moduleDir + L"\\edvr.ini";
+    candidates[count++] = executableDirectory() + L"\\edvr.ini";
     m_path = candidates[0];
-    for (const std::wstring& c : candidates) {
-        if (GetFileAttributesW(c.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            m_path = c;
+    for (size_t i = 0; i < count; ++i) {
+        if (GetFileAttributesW(candidates[i].c_str()) != INVALID_FILE_ATTRIBUTES) {
+            m_path = candidates[i];
             break;
         }
     }

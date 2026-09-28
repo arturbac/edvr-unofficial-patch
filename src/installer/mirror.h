@@ -46,6 +46,7 @@ std::wstring mirrorDirFor(const GameInstall& game,
 struct MirrorInfo {
     std::wstring dir;
     bool         hasIni = false;
+    bool         hasFlatIni = false;     // edvr-flat.ini, the flat profile's own settings
     bool         hasBaseIni = false;
     bool         hasState = false;
     bool         hasBackupPair = false;  // at least one of d3d11.dll / openvr_api.dll
