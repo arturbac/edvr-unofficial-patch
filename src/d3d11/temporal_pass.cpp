@@ -2,6 +2,7 @@
 #include "temporal_history.h"
 #include "../common/runtime_profile.h"
 #include "draw_census.h"
+#include "eye_engine_capture.h"
 
 #include <algorithm>  // std::sort, the price report's median/p95
 #include <cmath>
@@ -591,7 +592,7 @@ struct Slot {
     bool          timeDone = false;
     bool          timing = false;
     bool          statsDone = false;
-    bool          engineStats = false;   // Stats 50..54 hold engine-record velocity's counts
+    bool          engineStats = false;   // Stats 50..55 hold engine-record velocity's counts
     uint64_t      pixels = 0;
     // The instrument's bookkeeping for this call: which candidates had a
     // delta (their pixel totals), the head's turn, whether history ran.
@@ -644,7 +645,7 @@ struct Slot {
     bool          totalValid = false;
 };
 constexpr int kSlots = 16;
-constexpr int kStatCount = 56;   // 0-28 and 30-38 used; 29 and 39-49 free since the estimated body, ship and stepped-part paths retired (2026-09-23), the rest keeping their numbers; 50-54 engine-record velocity's pixel counts; a 224-byte buffer
+constexpr int kStatCount = 56;   // 0-28 and 30-38 used; 29 and 39-49 free since the estimated body, ship and stepped-part paths retired (2026-09-23), the rest keeping their numbers; 50-55 engine-record velocity's pixel counts (the sixth, 55, the stale-stamp decline of 2026-09-25); a 224-byte buffer
 Slot g_slots[kSlots];
 
 // Bumped on every temporalPassConfigure call (both its call sites in
@@ -1200,7 +1201,7 @@ void pollSlots(ID3D11DeviceContext* ctx) {
                                         D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
             if (SUCCEEDED(hr) && m.pData) {
                 const uint32_t* v = static_cast<const uint32_t*>(m.pData);
-                if (q.engineStats) engineVelocityNotePixels(v[50], v[51], v[52], v[53], v[54]);
+                if (q.engineStats) engineVelocityNotePixels(v[50], v[51], v[52], v[53], v[54], v[55]);
                 g_rejected += v[0];
                 g_clipped += v[1];
                 g_pixelsSeen += q.pixels;
@@ -1581,13 +1582,17 @@ bool             g_eyeOverviewTaken[2] = {};
 bool             g_eyeTreatedWritten[kEyeRun] = {};
 bool             g_eyeTreatedTaken[kEyeRun] = {};
 bool             g_eyeRawWritten[kEyeRun] = {};
-// Slot 11 is free since the mesh records' coverage retired (2026-09-23);
-// the slots after it keep their numbers. 16..18 (DlssColour, UiInfluence,
-// UiDepth) went with the UI separation that filled them (2026-09-23).
-constexpr int kEyeInputs=16;
+// Preserve the original input numbers; 16/17 append ownership snapshots.
+constexpr int kEyeInputs=18;
 ID3D11Texture2D*  g_eyeInputs[kEyeInputs] = {};
 uint32_t         g_eyeInputsFrame=0,g_eyeInputsUiBound=0,g_eyeInputsUiFlags=0;
-const wchar_t* const kEyeInputNames[kEyeInputs]={L"MV",L"Z",L"UI",L"Bias",L"SceneZ",L"TerrainIndex",L"TerrainZ",L"HoloCoverage",L"UiEdits",L"ScreenMotion",L"WeaponMotion",L"HoloContribution",L"PrevZ",L"DlssBeforeUi",L"UiPrevious",L"UiNext"};
+const wchar_t* const kEyeInputNames[kEyeInputs]={L"MV",L"Z",L"UI",L"Bias",L"SceneZ",L"TerrainIndex",L"TerrainZ",L"HoloCoverage",L"UiEdits",L"ScreenMotion",L"WeaponMotion",L"HoloContribution",L"PrevZ",L"DlssBeforeUi",L"UiPrevious",L"UiNext",L"EngineSlots",L"GameG6"};
+edvr::eye_engine_capture::Result g_eyeEngineInputStatus[2] = {};
+ID3D11Buffer* g_eyeEngineBuffers[2]={};
+edvr::eye_engine_capture::Result g_eyeEngineBufferStatus[2]={};
+const wchar_t* const kEyeEngineBufferNames[2]={L"EnginePool",L"EngineNow"};
+uint32_t g_eyeEngineBufferMeta[2][5]={}; // bytes, record stride, SRV format, first element, element count
+bool g_eyeInputCaptureAttempted=false;
 uint32_t         g_eyeRunWidth = 0, g_eyeRunHeight = 0;
 bool             g_eyeRawTaken[kEyeRun] = {};
 uint32_t         g_eyeRunFrames[kEyeRun] = {};
@@ -1896,8 +1901,9 @@ struct TemporalHistoryScope {
 
 // Preserve the actual first-frame inputs before the next eye overwrites them.
 void stageEyeInputs(ID3D11DeviceContext* ctx,EyeState& e,ID3D11ShaderResourceView* scene,
-                    ID3D11Texture2D* ui,float uiBound,float uiFlags) {
-    if(g_eyeRunLeft<=0 || g_eyeRunTaken!=0 || g_eyeInputs[0])return;
+                    ID3D11Texture2D* ui,float uiBound,float uiFlags,
+                    bool engineBound,const EngineVelocityViews& engineViews) {
+    if(g_eyeRunLeft<=0 || g_eyeRunTaken!=0 || g_eyeInputCaptureAttempted)return;
     ID3D11Texture2D* textures[kEyeInputs]={e.dlMv,e.dlDepth,ui,e.dlMask};
     if(e.dlMv) {
         D3D11_TEXTURE2D_DESC d{};e.dlMv->GetDesc(&d);
@@ -1943,10 +1949,28 @@ void stageEyeInputs(ID3D11DeviceContext* ctx,EyeState& e,ID3D11ShaderResourceVie
         textures[14]=e.uiHistory[e.uiHistoryRead];textures[14]->AddRef();
     }
     for(int k=0;k<kEyeInputs;++k)if(textures[k])stageEyeRun(ctx,textures[k],g_eyeInputs,k);
+    // The held views are the exact inputs supplied to this preparation,
+    // even though its CS bindings have already been restored here.
+    g_eyeEngineInputStatus[0]=edvr::eye_engine_capture::stage(ctx,engineBound,engineViews.slots,&g_eyeInputs[16]);
+    g_eyeEngineInputStatus[1]=edvr::eye_engine_capture::stage(ctx,engineBound,engineViews.gameMark,&g_eyeInputs[17]);
+    Microsoft::WRL::ComPtr<ID3D11Resource> poolResource;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> poolBuffer;
+    D3D11_SHADER_RESOURCE_VIEW_DESC poolView{};
+    if(engineViews.pool){engineViews.pool->GetResource(&poolResource);poolResource.As(&poolBuffer);engineViews.pool->GetDesc(&poolView);}
+    ID3D11Buffer* actualBuffers[2]={poolBuffer.Get(),engineViews.sceneNow};
+    for(int k=0;k<2;++k){
+        if(actualBuffers[k]){D3D11_BUFFER_DESC d{};actualBuffers[k]->GetDesc(&d);
+            auto* m=g_eyeEngineBufferMeta[k];m[0]=d.ByteWidth;m[1]=k==0?d.StructureByteStride:16;
+            m[2]=k==0?unsigned(poolView.Format):unsigned(DXGI_FORMAT_R32G32B32A32_FLOAT);
+            m[3]=k==0?poolView.Buffer.FirstElement:0;m[4]=k==0?poolView.Buffer.NumElements:d.ByteWidth/16;
+        }
+        g_eyeEngineBufferStatus[k]=edvr::eye_engine_capture::stageBuffer(ctx,engineBound,actualBuffers[k],&g_eyeEngineBuffers[k]);
+    }
     for(int k=5;k<kEyeInputs;++k)if(textures[k])textures[k]->Release();
     if(textures[4])textures[4]->Release();
     g_eyeInputsFrame=g_rowsFrame;g_eyeInputsUiBound=static_cast<uint32_t>(uiBound);
     g_eyeInputsUiFlags=static_cast<uint32_t>(uiFlags);
+    g_eyeInputCaptureAttempted=true; // only after ownership and every other input attempted
 }
 ID3D11ComputeShader* motionTraceShader(ID3D11DeviceContext* ctx) {
     if (!g_csMvTrace && !g_csMvTraceTried) {
@@ -1958,6 +1982,34 @@ ID3D11ComputeShader* motionTraceShader(ID3D11DeviceContext* ctx) {
 }
 
 void writeEyeInputs(ID3D11DeviceContext* ctx,const std::wstring& dir) {
+    // EDVRBUF1 exports preserve complete actual private-pool/EN bytes. The
+    // view range is metadata; no raw native-pool assumption enters decoding.
+    wchar_t metaPath[MAX_PATH];_snwprintf_s(metaPath,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_EngineBuffers.json",dir.c_str(),g_eyeRunStamp);
+    FILE* meta=nullptr;_wfopen_s(&meta,metaPath,L"wb");
+    if(meta)fprintf(meta,"{\"version\":1,\"scene_frame\":%u,\"buffers\":[",g_eyeInputsFrame);
+    for(int k=0;k<2;++k){
+        const auto status=g_eyeEngineBufferStatus[k];const char* outcome=edvr::eye_engine_capture::name(status);
+        if(g_eyeEngineBuffers[k]){
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if(SUCCEEDED(ctx->Map(g_eyeEngineBuffers[k],0,D3D11_MAP_READ,0,&mapped))){
+                wchar_t path[MAX_PATH];_snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_%s.bin",dir.c_str(),g_eyeRunStamp,kEyeEngineBufferNames[k]);
+                FILE* f=nullptr;_wfopen_s(&f,path,L"wb");
+                if(f){const auto* m=g_eyeEngineBufferMeta[k];const uint32_t header[8]={1,m[0],m[1],m[2],m[3],m[4],g_eyeInputsFrame,0};
+                    const bool ok=fwrite("EDVRBUF1",1,8,f)==8 && fwrite(header,sizeof(header),1,f)==1 && fwrite(mapped.pData,1,m[0],f)==m[0];fclose(f);
+                    outcome=ok?"written":"write_failed";
+                }else outcome="file_creation_failed";
+                ctx->Unmap(g_eyeEngineBuffers[k],0);
+            }else outcome="staging_map_failed";
+            g_eyeEngineBuffers[k]->Release();g_eyeEngineBuffers[k]=nullptr;
+        }
+        const auto* m=g_eyeEngineBufferMeta[k];
+        Log::get().note("eye capture: %ls input %ls availability: %s, scene frame %u, bytes %u stride %u view [%u,%u).",g_eyeRunStamp,kEyeEngineBufferNames[k],outcome,g_eyeInputsFrame,m[0],m[1],m[3],m[3]+m[4]);
+        if(meta)fprintf(meta,"%s{\"name\":\"%ls\",\"status\":\"%s\",\"bytes\":%u,\"stride\":%u,\"format\":%u,\"first_element\":%u,\"num_elements\":%u}",k?",":"",kEyeEngineBufferNames[k],outcome,m[0],m[1],m[2],m[3],m[4]);
+    }
+    if(meta){fprintf(meta,"]}\n");fclose(meta);}else Log::get().note("eye capture: engine buffer availability manifest file creation failed.");
+    for(int k=0;k<2;++k)
+        Log::get().note("eye capture: %ls input %ls availability: %s, scene frame %u; a written all-clear texture is available ownership data.",
+            g_eyeRunStamp,kEyeInputNames[16+k],edvr::eye_engine_capture::name(g_eyeEngineInputStatus[k]),g_eyeInputsFrame);
     for(int k=0;k<kEyeInputs;++k) {
         auto* texture=g_eyeInputs[k];if(!texture)continue;
         D3D11_TEXTURE2D_DESC d{};texture->GetDesc(&d);
@@ -1984,7 +2036,7 @@ void writeEyeInputs(ID3D11DeviceContext* ctx,const std::wstring& dir) {
                 for(uint32_t y=0;y<d.Height && ok;++y)ok=fwrite(static_cast<const char*>(map.pData)+y*map.RowPitch,1,d.Width*bytes,f)==d.Width*bytes;
                 fclose(f);
                 Log::get().note("eye capture: %ls input %ls %ux%u format %u, scene frame %u: %s.",g_eyeRunStamp,kEyeInputNames[k],d.Width,d.Height,static_cast<unsigned>(d.Format),g_eyeInputsFrame,ok?"written":"write failed");
-            }
+            } else if(k>=16) Log::get().note("eye capture: %ls input %ls unavailable on disk: file creation failed.",g_eyeRunStamp,kEyeInputNames[k]);
             // The MV input's census of the history the pass invalidated
             // (backgroundHistoryHidden's size*2 sentinel), so a dump says in
             // the log how much of the eye NVIDIA was told to start afresh.
@@ -2008,7 +2060,7 @@ void writeEyeInputs(ID3D11DeviceContext* ctx,const std::wstring& dir) {
                                 g_eyeRunStamp,hidden,total,total>0?100.0*hidden/total:0.0,g_eyeInputsFrame);
             }
             ctx->Unmap(texture,0);
-        }
+        } else if(k>=16) Log::get().note("eye capture: %ls input %ls unavailable on disk: format unsupported or staging map failed.",g_eyeRunStamp,kEyeInputNames[k]);
         texture->Release();g_eyeInputs[k]=nullptr;
     }
     celestialMotionWriteDump(ctx,dir.c_str(),g_eyeRunStamp);
@@ -2150,7 +2202,7 @@ void writeEyeDecisionArtifacts(ID3D11DeviceContext* ctx, const std::wstring& dir
         }
         return;
     }
-    fprintf(f, "{\n  \"schema\": 1,\n  \"stamp\": \"%ls\",\n  \"requested\": %d,\n  \"frames\": [\n",
+    fprintf(f, "{\n  \"schema\": 1,\n  \"engine_kind_shift\": 12,\n  \"engine_kind_mask\": 7,\n  \"stamp\": \"%ls\",\n  \"requested\": %d,\n  \"frames\": [\n",
             g_eyeRunStamp, kEyeRun);
     for (int k = 0; k < g_eyeRunTaken; ++k) {
         const EyeDecisionFrame& d = g_eyeDecisions[k];
@@ -3467,7 +3519,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
     // Engine-record velocity's inputs for this eye (engine_velocity.h): MRT6,
     // the pool snapshot and the scene constants now/before; all four or none.
     EngineVelocityViews engineViews{};
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> engineHeldSrv[2];
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> engineHeldSrv[3];
     Microsoft::WRL::ComPtr<ID3D11Buffer> engineHeldCb[2];
     // Named apart from the trained block's `engineAvailable` (the upscaler's
     // availability, declared in an inner scope): the flight of 2026-09-23
@@ -3499,6 +3551,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
             engineViewsGiven = engineVelocityViews(ctx, eye, scene, &engineViews);
             engineHeldSrv[0].Attach(engineViews.slots);
             engineHeldSrv[1].Attach(engineViews.pool);
+            engineHeldSrv[2].Attach(engineViews.gameMark);   // the game's own self-marked target 6, or null
             engineHeldCb[0].Attach(engineViews.sceneNow);
             engineHeldCb[1].Attach(engineViews.scenePrev);
             scene->Release();
@@ -4049,7 +4102,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                             "instrumented one runs instead (its registration counters stay on).");
         }
         const bool statsWritten = diagnostics || ((flags & 2u) == 0 && !leanOwn) || foveaConfigured();
-        // Engine-record velocity's pixel counts (Stats 50..53) come from the
+        // Engine-record velocity's pixel counts (Stats 50..55) come from the
         // trained path's instrumented mv entry alone, through its own counter
         // array -- no barrier or counter is added to the lean variant.
         bool engineCounted = false;   // the instrumented mv ran with the engine inputs bound
@@ -4795,6 +4848,11 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                     const bool engineBound = engineViewsGiven && depthSrv;
                     if (engineBound) p.probe[3] =
                         static_cast<float>(static_cast<uint32_t>(p.probe[3]) | 2048u);
+                    // Bit 4096 and t19: the game's own self-marked target-6
+                    // texture (the detail shaders write the marker encoding
+                    // natively), a fallback beside the slot target.
+                    if (engineBound && engineViews.gameMark)
+                        p.probe[3] = static_cast<float>(static_cast<uint32_t>(p.probe[3]) | 4096u);
                     engineCounted = engineBound && diagnostics;
                     // A masked engine pixel sets the bias mask too, for the
                     // presets and FSR that read it (modern DLSS honours the
@@ -4819,7 +4877,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                                                           smokeSrv, uiDepthSrv,
                                                           uiTrack && e.uiHistoryValid ? e.uiHistorySrv[e.uiHistoryRead] : nullptr,
                                                           terrainSrvs[0], terrainSrvs[1], terrainSrvs[2], holoSrvs[0], holoSrvs[1], screenSrv, nullptr, nullptr, nullptr, nullptr,   // t15..t18: free since 2026-09-23 (the mesh records, the static owner's promotion)
-                                                          nullptr, nullptr,   // t19/t20: free since stage B's removal
+                                                          engineViews.gameMark, nullptr,   // t19: the game's self-marked slot+depth channel (probe.w 4096); t20: free since stage B's removal
                                                           engineBound ? engineViews.slots : nullptr, engineBound ? engineViews.pool : nullptr};
                     ID3D11UnorderedAccessView* uavsM[8] = {debugPaint ? e.dlOutUav : nullptr,
                                                            nullptr, g_statsUav, e.dlMvUav,
@@ -4865,7 +4923,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                     endRegion(qs, Region::Prep, ctx);
                     if (haveDepth && e.zPrev) zcWritten = true;
                     if (uiTrack && !uiResolve) uiEvidenceWritten = true;
-                    if(eye==0)stageEyeInputs(ctx,e,depthSrv,coverageMask,p.probe[2],p.probe[3]);
+                    if(eye==0)stageEyeInputs(ctx,e,depthSrv,coverageMask,p.probe[2],p.probe[3],engineBound,engineViews);
                     // What NVIDIA is handed: the union when the mover mask
                     // ran this frame, else the interface's alone (as before
                     // the mover mask existed), else nothing. Engine-record
@@ -5106,6 +5164,8 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
             p.probe[3] = uiFlags();
             engineOwn = engineViewsGiven && depthSrv;
             if (engineOwn) p.probe[3] = static_cast<float>(static_cast<uint32_t>(p.probe[3]) | 2048u);
+            if (engineOwn && engineViews.gameMark)
+                p.probe[3] = static_cast<float>(static_cast<uint32_t>(p.probe[3]) | 4096u);   // t19: the game's self-marked target 6
         }
         bool ran = usedDlaa || (ensureNative(dev, e, viewFmt) && setParams(ctx, p));
         // A native fallback also writes counters, even when the requested
@@ -5323,7 +5383,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                                                           smokeSrv, uiDepthSrv,
                                                           uiTrack && e.uiHistoryValid ? e.uiHistorySrv[e.uiHistoryRead] : nullptr,
                                                           terrainSrvs[0], terrainSrvs[1], terrainSrvs[2], holoSrvs[0], holoSrvs[1], screenSrv, nullptr, nullptr, nullptr, nullptr,   // t15..t18: free since 2026-09-23 (the mesh records, the static owner's promotion)
-                                                          nullptr, nullptr,   // t19/t20: free since stage B's removal
+                                                          engineViews.gameMark, nullptr,   // t19: the game's self-marked slot+depth channel (probe.w 4096); t20: free since stage B's removal
                                                           engineOwn ? engineViews.slots : nullptr, engineOwn ? engineViews.pool : nullptr};
                     // u2 (the stats buffer) is left UNBOUND here: the own pass
                     // writes its stats when it runs, and the mv entry writes
@@ -5578,14 +5638,14 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                         // skip unsafe there. The inscribed axis-aligned
                         // rectangle of that true ellipse is exactly safe.
                         const float rz = 0.5f * static_cast<float>(fcw);
-                        const float rw = 0.5f * static_cast<float>(fch);
-                        const float m = rz < rw ? rz : rw;
+                        const float rh = 0.5f * static_cast<float>(fch);
+                        const float m = rz < rh ? rz : rh;
                         const float k = 1.0f - margin / m;
                         if (k > 0.0f) {
                             const float halfX = rz * k * 0.70710678f;
-                            const float halfY = rw * k * 0.70710678f;
+                            const float halfY = rh * k * 0.70710678f;
                             const float ccx = static_cast<float>(fcx) + rz;
-                            const float ccy = static_cast<float>(fcy) + rw;
+                            const float ccy = static_cast<float>(fcy) + rh;
                             sx0 = ccx - halfX; sy0 = ccy - halfY;
                             sx1 = ccx + halfX; sy1 = ccy + halfY;
                         }
@@ -5625,7 +5685,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                                                      smokeSrv, uiDepthSrv,
                                                      uiTrack && e.uiHistoryValid ? e.uiHistorySrv[e.uiHistoryRead] : nullptr,
                                                           terrainSrvs[0], terrainSrvs[1], terrainSrvs[2], holoSrvs[0], holoSrvs[1], screenSrv, nullptr, nullptr, nullptr, nullptr,   // t15..t18: free since 2026-09-23 (the mesh records, the static owner's promotion)
-                                                          nullptr, nullptr,   // t19/t20: free since stage B's removal
+                                                          engineViews.gameMark, nullptr,   // t19: the game's self-marked slot+depth channel (probe.w 4096); t20: free since stage B's removal
                                                           engineOwn ? engineViews.slots : nullptr, engineOwn ? engineViews.pool : nullptr};
                 ID3D11UnorderedAccessView* uavs[7] = {e.outUav, e.histUav[writeIdx],
                                                       g_statsUav, nullptr,
@@ -7101,6 +7161,10 @@ static void beginEyeRun() {
     applyEngineMotionDiagnostics();   // the census runs for the run
     g_eyeMotionTraceCount = 0;
     g_eyeInputsFrame=0;
+    for(auto& status:g_eyeEngineInputStatus)status=edvr::eye_engine_capture::Result::NotReached;
+    for(auto& status:g_eyeEngineBufferStatus)status=edvr::eye_engine_capture::Result::NotReached;
+    memset(g_eyeEngineBufferMeta,0,sizeof(g_eyeEngineBufferMeta));
+    g_eyeInputCaptureAttempted=false;
     g_eyeRunUntreated=false;
     memset(g_eyeOverviewTaken,0,sizeof(g_eyeOverviewTaken));
     memset(g_eyeTreatedWritten,0,sizeof(g_eyeTreatedWritten));
@@ -7112,6 +7176,7 @@ static void beginEyeRun() {
         g_eyeDecisions[k]=EyeDecisionFrame{};
     }
     for(auto& texture:g_eyeInputs)if(texture){texture->Release();texture=nullptr;}
+    for(auto& buffer:g_eyeEngineBuffers)if(buffer){buffer->Release();buffer=nullptr;}
     memset(g_eyeRawTaken, 0, sizeof(g_eyeRawTaken));
     memset(g_eyeRawInputW, 0, sizeof(g_eyeRawInputW));
     memset(g_eyeRawInputH, 0, sizeof(g_eyeRawInputH));
@@ -7170,6 +7235,10 @@ void temporalPassShutdown() {
     g_eyeRunReady = false;
     g_eyeMotionTraceCount = 0;
     g_eyeInputsFrame=0;
+    for(auto& status:g_eyeEngineInputStatus)status=edvr::eye_engine_capture::Result::NotReached;
+    for(auto& status:g_eyeEngineBufferStatus)status=edvr::eye_engine_capture::Result::NotReached;
+    memset(g_eyeEngineBufferMeta,0,sizeof(g_eyeEngineBufferMeta));
+    g_eyeInputCaptureAttempted=false;
     g_eyeRunUntreated=false;
     memset(g_eyeOverviewTaken,0,sizeof(g_eyeOverviewTaken));
     memset(g_eyeTreatedWritten,0,sizeof(g_eyeTreatedWritten));
@@ -7177,6 +7246,7 @@ void temporalPassShutdown() {
     memset(g_eyeRawWritten,0,sizeof(g_eyeRawWritten));
     for(int k=0;k<kEyeRun;++k) g_eyeDecisions[k]=EyeDecisionFrame{};
     for(auto& texture:g_eyeInputs)if(texture){texture->Release();texture=nullptr;}
+    for(auto& buffer:g_eyeEngineBuffers)if(buffer){buffer->Release();buffer=nullptr;}
     if (g_statsUav) { g_statsUav->Release(); g_statsUav = nullptr; }
     if (g_stats) { g_stats->Release(); g_stats = nullptr; }
     if (g_samp) { g_samp->Release(); g_samp = nullptr; }

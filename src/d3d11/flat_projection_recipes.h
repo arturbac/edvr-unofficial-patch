@@ -95,7 +95,9 @@ inline FlatProjectionRecipes flatProjectionDrawRecipes(uint64_t vs, uint64_t ps)
     case 0x8289669D93A18C1Dull: if (ps == 0xC6E6E419DA9F6FADull) result.add(S::Vertex,2,L::ForwardDp4,10); break;
     case 0x963B52C73B4143ACull: if (ps == 0x50364C9D994141D5ull) result.add(S::Vertex,2,L::ForwardDp4,10); break;
     // b2[6..9] and [7..10]: clip is a scalar-weighted row sum.
-    case 0xDF3503CD07F9B10Cull: if (ps == 0x8C08EB252B0F6095ull) result.add(S::Vertex,2,L::ForwardColumns,6); break;
+    case 0xDF3503CD07F9B10Cull:
+        if (ps == 0x8C08EB252B0F6095ull || ps == 0x76BF170A625F18E3ull ||
+            ps == 0x02CC981DF36257C3ull) result.add(S::Vertex,2,L::ForwardColumns,6); break;
     case 0xB932058F26B76691ull: if (ps == 0x65861AC394D51526ull) result.add(S::Vertex,2,L::ForwardColumns,6); break;
     case 0x9611A454527F7FEBull: if (ps == 0x1E1C49DC51C0E509ull) result.add(S::Vertex,2,L::ForwardColumns,7); break;
     default: break;
@@ -152,7 +154,12 @@ inline FlatProjectionRecipes flatProjectionDrawRecipes(uint64_t vs, uint64_t ps)
     case 0xB75A6FF2CA9FA5D6ull: if (ps == 0xD56F859BE4781431ull) result.add(S::Vertex,0,L::ForwardDp4,4); break;
     // The direct depthless effect emits o2 = sum(coord * CB2[8..10])
     // + CB2[11], the same column convention at a different offset.
-    case 0x24214E7C45496BE0ull: if (ps == 0x0C8FCDB6A3BECCE6ull) result.add(S::Vertex,2,L::ForwardColumns,8); break;
+    // EC998602 (Epic 20260927_132414, EDHM chain) is the same radar
+    // local-key marker recoloured through EDHM's t120 config tree --
+    // colour-only, identical cb row profile, no projection consumer.
+    case 0x24214E7C45496BE0ull:
+        if (ps == 0x0C8FCDB6A3BECCE6ull || ps == 0xEC998602427115F3ull)
+            result.add(S::Vertex,2,L::ForwardColumns,8); break;
     case 0xA1B7CFCD0BE7493Eull: if (ps == 0x2DB678B6B558B604ull) result.add(S::Vertex,2,L::ForwardDp4,10); break;
     case 0xCE24A73943632F55ull: if (ps == 0x1F64463B15189104ull) result.add(S::Vertex,2,L::ForwardDp4,10); break;
     default: break;
@@ -173,7 +180,8 @@ inline FlatProjectionRecipes flatProjectionDrawRecipes(uint64_t vs, uint64_t ps)
     case 0xA8E4D93B8B294505ull: if (ps == 0x75D12D8561BA8525ull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
     case 0xA6A39338C06E03A1ull: if (ps == 0xED91F94EC94FA5C2ull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
     case 0x617C6E44A034E0C2ull: if (ps == 0x627FEC646836683Full) result.add(S::Vertex,1,L::ForwardColumns,270); break;
-    case 0xB43A856E285815E3ull: if (ps == 0x702C3974A260DE14ull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
+    case 0xB43A856E285815E3ull:
+        if (ps == 0x702C3974A260DE14ull || ps == 0x9A664735737E2667ull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
     case 0xF512712C40D93C12ull: if (ps == 0xD0B9213C1F248335ull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
     case 0x359BF8FF5CFAA4C3ull: if (ps == 0x92FF8499ED345759ull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
     case 0xEFE42AC6142C1815ull: if (ps == 0x29D8624FD690277Full) result.add(S::Vertex,1,L::ForwardColumns,270); break;
@@ -273,6 +281,29 @@ inline FlatProjectionRecipes flatProjectionDrawRecipes(uint64_t vs, uint64_t ps)
     case 0x76ED1E4F8C72C26Eull: if (ps == 0x7ECF7C83FD5AD373ull) result.add(S::Vertex,0,L::ForwardDp4,4); break;
     default: break;
     }
+    // Epic 20260927_203919, Caspian Explorer and fleet-carrier scene
+    // (reviews/flat-aa-user-log-20260928-030237.md triage): the hull and
+    // effect PS companions are colour-only by the established vetting --
+    // texture coordinates from varyings or scalar-built grids, cb1 reads
+    // only at 61/90/210/227..254 (lighting) and 277..279 (orientation dp3),
+    // never the 270..273 clip rows, no depth output. The multi-row-temp
+    // verdicts are paint-layer/material blends (cb2 livery/weights), the
+    // indexable-temp and resinfo cases are array lighting and atlas-dimension
+    // queries. CB0[9..11] local pre-transforms before the 270..273 columns
+    // are covered by the ce715126 block's local-transform note.
+    if (result.count == 0) switch (vs) {
+    case 0x9BFC7FD232328391ull: if (ps == 0xCB7AF179DF4E6A60ull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
+    case 0x2BB766C168B450A2ull: if (ps == 0x4888F2B05460FA9Bull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
+    case 0xA47A3315FFF5E2E4ull: if (ps == 0xC67370DE72E4422Cull) result.add(S::Vertex,0,L::ForwardDp4,4); break;
+    case 0x99B41C87E45319E6ull:
+        // The decal projective-depth family, exactly as 0A298DE7/D8FCE3CE:
+        // the PS divides an exported view-position varying for the depth UV,
+        // so the VS projection and the depth pass stay aligned.
+        if (ps == 0xA9975F91040B0BCDull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
+    case 0xACE405F428C17EF6ull: if (ps == 0) result.add(S::Vertex,1,L::ForwardColumns,270); break;
+    case 0x72BDD292154158ADull: if (ps == 0x76849D64AC657DB9ull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
+    default: break;
+    }
     // Epic 20260925_122208 on-foot hangar/concourse (d0898e1b flight). A/B
     // are decal shaders: their PS divides the exported view-position varying
     // for a depth-texture UV, so the VS projection and the depth pass must
@@ -283,7 +314,9 @@ inline FlatProjectionRecipes flatProjectionDrawRecipes(uint64_t vs, uint64_t ps)
     case 0x0A298DE7DF833A46ull: if (ps == 0x6FD4C38BA927C8C7ull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
     case 0xD8FCE3CEA16B9B51ull: if (ps == 0x06AA136E4D58CBA2ull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
     case 0xBA16062A2EB66F1Full: if (ps == 0x33758387B70944A1ull) result.add(S::Vertex,0,L::ForwardDp4,4); break;
-    case 0x66DE2CADB1F4AE6Bull: if (ps == 0xBBDE4E71FB78528Aull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
+    case 0x66DE2CADB1F4AE6Bull:
+        if (ps == 0xBBDE4E71FB78528Aull || ps == 0x235567BE2840B3EDull ||
+            ps == 0x818212B5F404C002ull) result.add(S::Vertex,1,L::ForwardColumns,270); break;
     default: break;
     }
     // Epic 20260925_173622/193443 main-menu hangar under the EDHM chain

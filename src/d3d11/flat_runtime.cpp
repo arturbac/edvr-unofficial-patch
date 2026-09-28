@@ -9,6 +9,9 @@
 #include "flat_draw_capture.h"
 #include "flat_local_reject.h"
 #include "flat_trace.h"
+#include "flat_dlss_negotiate.h"
+#include "flat_negotiated_eval.h"
+#include "flat_camera_producer_probe.h"
 #include "binding_shadow.h"
 #include "exposure_fix.h"
 #include "device_hook.h"
@@ -59,6 +62,8 @@ struct State {
     uint64_t acceptedResetWindow = 0, acceptedHistoryWindow = 0;
     uint64_t resetMissingWindow = 0, resetGapWindow = 0, resetDepthWindow = 0;
     uint64_t resetColorWindow = 0, resetExtentWindow = 0;
+    uint64_t presentNotOkWindow = 0;
+    uint32_t presentNotOkLogged = 0;
     uint64_t streak = 0, longestStreak = 0;
     std::map<std::string, uint64_t> refusedWindow;
     std::map<std::string, uint64_t> conflictWindow;
@@ -97,6 +102,11 @@ struct State {
     // The memo retires its least-recently-seen entry at 64 rather than
     // refusing ever after; the first eviction of a session is logged once.
     bool genericClassificationOverflowLogged = false;
+    // Verdict-log dedup, independent of the 64-entry memo (gate-2 review):
+    // a pair's verdict logs once per session even across eviction, from a
+    // 256-entry FIFO of pair hashes replaced round-robin.
+    uint64_t classificationLogged[256]{};
+    uint32_t classificationLoggedNext = 0;
     struct LocalProjectionSample {
         uint64_t firstFrame = 0, frames[2]{};
         const void* color[2]{}, *depth[2]{};
@@ -159,6 +169,16 @@ struct State {
     // (State& only) can name the refused pair in the census -- the same
     // convention as s.namedDepth and s.reason.
     uint64_t drawVs = 0, drawPs = 0;
+
+    // Gate 2 step 4's negotiated evaluation size (vendor-queried at plan
+    // change): nonzero overrides the route's default E on the resolve frame,
+    // but ONLY for the exact (mode, render, output) contract it was
+    // negotiated for -- a transition frame must never evaluate with the
+    // previous contract's override (the 08:29 ladder refusal).
+    uint32_t negotiatedEvalW = 0, negotiatedEvalH = 0;
+    FlatMonoResolveMode negotiatedMode = FlatMonoResolveMode::Taa;
+    uint32_t negotiatedRenderW = 0, negotiatedRenderH = 0;
+    uint32_t negotiatedOutputW = 0, negotiatedOutputH = 0;
 
     // --- Frame-contract trace (staged-program gate 1) -------------------------
     // The reducer's input events, always recorded into a bounded ring and
@@ -273,7 +293,8 @@ void reportPhaseCensus(State& s,const char* event) {
 }
 bool sameResolvePlan(const FlatMonoResolvePreflight& a,const FlatMonoResolvePreflight& b) {
     return a.renderWidth==b.renderWidth && a.renderHeight==b.renderHeight && a.outputWidth==b.outputWidth &&
-        a.outputHeight==b.outputHeight && a.mode==b.mode && a.colorViewFormat==b.colorViewFormat &&
+        a.outputHeight==b.outputHeight && a.evalWidth==b.evalWidth && a.evalHeight==b.evalHeight &&
+        a.mode==b.mode && a.colorViewFormat==b.colorViewFormat &&
         a.depthViewFormat==b.depthViewFormat && a.colorViewIsTexture2D==b.colorViewIsTexture2D &&
         a.depthViewIsTexture2D==b.depthViewIsTexture2D && a.colorMostDetailedMip==b.colorMostDetailedMip &&
         a.depthMostDetailedMip==b.depthMostDetailedMip && a.colorViewMipLevels==b.colorViewMipLevels &&
@@ -891,23 +912,31 @@ FlatShaderPairClassification classifyFlatProjectionPair(State& s, uint64_t vs, u
     FlatShaderPairClassification result = classifyFlatShaderPair(vsFound ? vsBytes : nullptr, vsFound ? vsLen : 0,
                                     psFound ? psBytes : nullptr, psFound ? psLen : 0);
     slot->vs = vs; slot->ps = ps; slot->classification = result; slot->lastSeenFrame = s.prefix.frame;
-    // Once per pair per session (at most 64 lines): the verdict and the rule
-    // behind it, so a refused pair needs no offline bytecode review to name.
-    const bool clean = result.ps == FlatPsProjectionSafety::Clean;
-    const char* verdict = clean && (result.vs == FlatVsProjectionClass::ForwardColumns ||
-                                    result.vs == FlatVsProjectionClass::ForwardDp4) ? "generic-recipe" :
-                          clean && result.vs == FlatVsProjectionClass::InertNoCB ? "generic-inert" : "refused";
-    char vsExtra[32] = "", psExtra[48] = "";
-    if (result.vsReason == FlatClassifierReason::UnknownOpcode)
-        std::snprintf(vsExtra, sizeof(vsExtra), " vs-opcode=%u", unsigned(result.vsUnknownOpcode));
-    if (result.psReason == FlatClassifierReason::UnknownOpcode)
-        std::snprintf(psExtra, sizeof(psExtra), " ps-opcode=%u", unsigned(result.psUnknownOpcode));
-    else if (result.psReason == FlatClassifierReason::VposConsumer)
-        std::snprintf(psExtra, sizeof(psExtra), " ps-rule=%s", flatVposConsumerSubcodeName(result.psConsumerSubcode));
-    Log::get().note("flat generic classification: frame=%llu VS=%016llX PS=%016llX verdict=%s vs=%s slot=%u row=%u vs-reason=%s%s ps=%s ps-reason=%s%s",
-        (unsigned long long)s.prefix.frame, (unsigned long long)vs, (unsigned long long)ps, verdict,
-        flatVsClassName(result.vs), result.vsSlot, result.vsRow, flatClassifierReasonName(result.vsReason), vsExtra,
-        flatPsSafetyName(result.ps), flatClassifierReasonName(result.psReason), psExtra);
+    // The verdict and the rule behind it, logged once per pair per session
+    // even across memo evictions (the 256-entry FIFO, not the memo, owns
+    // that guarantee) -- a refused pair needs no offline review to name.
+    const uint64_t pairHash = (vs ^ (ps * 1099511628211ull)) | 1ull;
+    bool verdictSeen = false;
+    for (uint32_t i = 0; i < 256; ++i) if (s.classificationLogged[i] == pairHash) { verdictSeen = true; break; }
+    if (!verdictSeen) {
+        s.classificationLogged[s.classificationLoggedNext] = pairHash;
+        s.classificationLoggedNext = (s.classificationLoggedNext + 1) % 256;
+        const bool clean = result.ps == FlatPsProjectionSafety::Clean;
+        const char* verdict = clean && (result.vs == FlatVsProjectionClass::ForwardColumns ||
+                                        result.vs == FlatVsProjectionClass::ForwardDp4) ? "generic-recipe" :
+                              clean && result.vs == FlatVsProjectionClass::InertNoCB ? "generic-inert" : "refused";
+        char vsExtra[32] = "", psExtra[48] = "";
+        if (result.vsReason == FlatClassifierReason::UnknownOpcode)
+            std::snprintf(vsExtra, sizeof(vsExtra), " vs-opcode=%u", unsigned(result.vsUnknownOpcode));
+        if (result.psReason == FlatClassifierReason::UnknownOpcode)
+            std::snprintf(psExtra, sizeof(psExtra), " ps-opcode=%u", unsigned(result.psUnknownOpcode));
+        else if (result.psReason == FlatClassifierReason::VposConsumer)
+            std::snprintf(psExtra, sizeof(psExtra), " ps-rule=%s", flatVposConsumerSubcodeName(result.psConsumerSubcode));
+        Log::get().note("flat generic classification: frame=%llu VS=%016llX PS=%016llX verdict=%s vs=%s slot=%u row=%u vs-reason=%s%s ps=%s ps-reason=%s%s",
+            (unsigned long long)s.prefix.frame, (unsigned long long)vs, (unsigned long long)ps, verdict,
+            flatVsClassName(result.vs), result.vsSlot, result.vsRow, flatClassifierReasonName(result.vsReason), vsExtra,
+            flatPsSafetyName(result.ps), flatClassifierReasonName(result.psReason), psExtra);
+    }
     return result;
 }
 // --- Partial temporal AA ("local refusal") --------------------------------
@@ -1106,6 +1135,81 @@ void capture(Camera& c, const void* bytes) {
     flatTraceMark(state().traceRing, kFlatTraceEventCameraCapture, nullptr);
     c.sequence = ++state().prefix.sequence;
 }
+// The camera producer witness (design-flat-camera-integration.md, C0/C1):
+// where the camera table already captures a camera CB write, capture the
+// writer's stack once per unique game call site -- the C1 passive evidence
+// for the producer hypotheses, bounded and passive with no mutation. The
+// first frame outside EDVR's own image is the game's upload call site; one
+// stack per site, up to 16 sites and three buffers per site. Overflow is a
+// named line, never silence.
+struct CameraWitnessSite { void* address = nullptr; const void* buffers[3]{}; uint32_t bufferCount = 0; uint64_t writes = 0; };
+struct CameraWitness {
+    CameraWitnessSite sites[16]{};
+    uint64_t writes = 0, dedupHits = 0, budgetDropped = 0;
+    bool budgetNoted = false;
+};
+CameraWitness g_camWitness;
+// Brief module-plus-offset naming for witness stacks (vtable_hook.cpp's
+// ownerModuleBrief stays internal to it; this is the same formatting with
+// EDVR's own image prefixed so a stack never blames the proxy by mistake).
+const char* witnessModuleBrief(void* p, char* buf, size_t bufLen) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi) || !mbi.AllocationBase) return "no module";
+    char path[MAX_PATH] = {};
+    if (!GetModuleFileNameA(static_cast<HMODULE>(mbi.AllocationBase), path, sizeof(path))) return "no module";
+    const char* leaf = path;
+    for (const char* c = path; *c; ++c) if (*c == '\\' || *c == '/') leaf = c + 1;
+    static HMODULE self = nullptr;
+    if (!self) {
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&witnessModuleBrief), &self);
+    }
+    _snprintf_s(buf, bufLen, _TRUNCATE, "%s%s+0x%llX",
+                (self && mbi.AllocationBase == self) ? "EDVR's own " : "", leaf,
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(p) -
+                                                reinterpret_cast<uintptr_t>(mbi.AllocationBase)));
+    return buf;
+}
+void cameraWitness(const void* buffer) {
+    auto& w = g_camWitness; ++w.writes;
+    void* frames[10] = {};
+    const USHORT n = CaptureStackBackTrace(0, 10, frames, nullptr);
+    void* site = nullptr;
+    for (USHORT i = 0; i < n; ++i) {
+        if (!isExecutableAddress(frames[i])) continue;
+        char brief[96]; witnessModuleBrief(frames[i], brief, sizeof(brief));
+        if (std::strncmp(brief, "EDVR's own ", 11) == 0) continue;
+        site = frames[i]; break;
+    }
+    if (!site) { ++w.dedupHits; return; }
+    for (auto& s : w.sites) if (s.address == site) {
+        ++s.writes; ++w.dedupHits;
+        bool known = false;
+        for (uint32_t b = 0; b < s.bufferCount; ++b) known |= s.buffers[b] == buffer;
+        if (!known && s.bufferCount < 3) {
+            s.buffers[s.bufferCount++] = buffer;
+            char brief[96]; witnessModuleBrief(site, brief, sizeof(brief));
+            Log::get().note("flat camera witness: producer site %s also writes %p", brief, buffer);
+        }
+        return;
+    }
+    for (auto& s : w.sites) if (!s.address) {
+        s.address = site; s.writes = 1; s.buffers[0] = buffer; s.bufferCount = 1;
+        char line[768]{}; size_t used = 0;
+        for (USHORT i = 0; i < n && used < sizeof(line) - 96; ++i) {
+            if (!isExecutableAddress(frames[i])) continue;
+            char brief[96]; witnessModuleBrief(frames[i], brief, sizeof(brief));
+            used += static_cast<size_t>(std::snprintf(line + used, sizeof(line) - used, "%s%s", used ? " <- " : "", brief));
+        }
+        Log::get().note("flat camera witness: new producer site for buffer=%p: %s", buffer, line);
+        return;
+    }
+    if (!w.budgetNoted) {
+        w.budgetNoted = true;
+        Log::get().note("flat camera witness: site budget reached; later writers counted without stacks");
+    }
+    ++w.budgetDropped;
+}
 bool depthView(ID3D11Texture2D* depth) {
     auto& s = state(); if (s.sceneDepth.Get() == depth && s.depthView) return true;
     s.sceneDepth.Reset(); s.depthView.Reset(); if (!depth) return false;
@@ -1190,6 +1294,8 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     if (!runtimeFlatProfile() || !swap || (flags & DXGI_PRESENT_TEST)) return;
     auto& s = state(); if (s.thread && !owner()) return;
     s.thread = GetCurrentThreadId();
+    // The camera producer probe's per-Present cadence (config-gated inside).
+    flatCameraProducerProbeFrame(frame);
     // Account for the completed frame before mode/resize changes or the next
     // prefix clears its identity. A resize flush sees no pending frame twice.
     finishPhaseCensusFrame(s);
@@ -1234,7 +1340,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     s.drawCapture.present(s.context.Get(),frame);
     flatMonoResolvePollPixels(s.context.Get(),frame);
     if(s.phase.applied)++s.jitteredFrames;
-    s.phase.finish(s.temporalAccepted && hr==S_OK,s.frameCoverage && !s.prefix.uncertain && !foreignWork.load(std::memory_order_acquire));
+    s.phase.finish(s.temporalAccepted && SUCCEEDED(hr),s.frameCoverage && !s.prefix.uncertain && !foreignWork.load(std::memory_order_acquire));
     const bool wanted=_stricmp(Config::get().getString("experimental.temporal_aa_jitter","on").c_str(),"off")!=0;
     if(wanted!=s.jitterWanted) { s.phase.resetHistory();reset(); }
     s.jitterWanted=wanted;
@@ -1328,7 +1434,21 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.resolvePreflight=flatMonoResolvePreflight(s.device.Get(),s.context.Get(),s.plannedResolve);
         s.resolvePreflightRetryMs=preflightNow;
     }
-    if (!s.treated || hr != S_OK) reset();
+    // A success-status present is not a failed frame: DXGI returns status
+    // codes (occlusion and friends) alongside S_OK, and gating on S_OK reset
+    // temporal history every frame for as long as the status persisted --
+    // the 2026-09-27 0.5x flight's every-frame no-previous storm with the
+    // phase pinned at zero. Log the value so the flight names what the game
+    // actually returns; reset only on a real failure.
+    if (hr != S_OK) {
+        ++s.presentNotOkWindow;
+        if (s.presentNotOkLogged < 8) {
+            ++s.presentNotOkLogged;
+            Log::get().note("flat runtime: present result 0x%08lX is not S_OK; history and jitter reset only on FAILED",
+                static_cast<unsigned long>(hr));
+        }
+    }
+    if (!s.treated || FAILED(hr)) reset();
     Ptr<ID3D11Texture2D> output; if (FAILED(swap->GetBuffer(0, IID_PPV_ARGS(&output)))) return;
     // Swapchain image rotation does not change render scale. Resize/device
     // teardown clears the published extent; each qualified handoff updates it.
@@ -1415,10 +1535,14 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         }
         for (const auto& entry : s.conflictWindow)
             Log::get().note("flat runtime conflict 5s: cause=%s count=%llu", entry.first.c_str(), static_cast<unsigned long long>(entry.second));
-        Log::get().note("flat runtime adapter reset 5s: no-previous=%llu frame-gap=%llu depth-change=%llu color-change=%llu extent-change=%llu",
+        uint64_t witnessSites = 0; for (const auto& st : g_camWitness.sites) witnessSites += st.address != nullptr;
+        Log::get().note("flat camera witness 5s: writes=%llu unique-sites=%llu dedup-hits=%llu stack-drops=%llu; every camera-table write is a producer witness candidate",
+            static_cast<unsigned long long>(g_camWitness.writes), static_cast<unsigned long long>(witnessSites),
+            static_cast<unsigned long long>(g_camWitness.dedupHits), static_cast<unsigned long long>(g_camWitness.budgetDropped));
+        Log::get().note("flat runtime adapter reset 5s: no-previous=%llu frame-gap=%llu depth-change=%llu color-change=%llu extent-change=%llu present-not-ok=%llu",
             static_cast<unsigned long long>(s.resetMissingWindow), static_cast<unsigned long long>(s.resetGapWindow),
             static_cast<unsigned long long>(s.resetDepthWindow), static_cast<unsigned long long>(s.resetColorWindow),
-            static_cast<unsigned long long>(s.resetExtentWindow));
+            static_cast<unsigned long long>(s.resetExtentWindow), static_cast<unsigned long long>(s.presentNotOkWindow));
         const auto renderer = flatMonoResolveStats();
         Log::get().note("flat runtime renderer cumulative: calls=%llu init=%llu context-change=%llu allocations=%llu full-reset=%llu invalidations=%llu accepted-reset=%llu accepted-continue=%llu requested-reset=%llu lost-history=%llu frame-gap=%llu invalid-prev-camera=%llu format-change=%llu camera-cut=%llu backend-failure=%llu continue-run=%llu longest-continue-run=%llu",
             static_cast<unsigned long long>(renderer.calls), static_cast<unsigned long long>(renderer.initializations),
@@ -1432,6 +1556,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             static_cast<unsigned long long>(renderer.longestContinueRun));
         s.refusedWindow.clear(); s.acceptedResetWindow = s.acceptedHistoryWindow = 0;
         s.resetMissingWindow = s.resetGapWindow = s.resetDepthWindow = s.resetColorWindow = s.resetExtentWindow = 0;
+        s.presentNotOkWindow = 0;
         s.conflictWindow.clear();
         s.covSceneDraws = s.covExact = s.covGeneric = s.covInert = s.covUnchanged = 0;
         s.covLocalRefused = s.covMemoEvictions = 0;
@@ -1498,11 +1623,16 @@ void flatRuntimeMap(ID3D11Resource* res, D3D11_MAP type, void* bytes) {
 }
 void flatRuntimeUnmap(ID3D11Resource* res) {
     if (!owner()) return; if(state().projection)state().projection->observeUnmap(res);
-    if (auto* c = camera(res, false)) { if (c->mapped) capture(*c, c->mapped); c->mapped = nullptr; }
+    if (auto* c = camera(res, false)) {
+        if (c->mapped) { capture(*c, c->mapped); cameraWitness(res); }
+        c->mapped = nullptr;
+    }
 }
 void flatRuntimeUpdate(ID3D11Resource* res, const void* bytes, const D3D11_BOX* box) {
     if (!owner()) return; flatRuntimeWritten(res);
-    if (auto* c = camera(res, false)) { if (!box || (box->left == 0 && box->right == c->width)) capture(*c, bytes); }
+    if (auto* c = camera(res, false)) {
+        if (!box || (box->left == 0 && box->right == c->width)) { capture(*c, bytes); cameraWitness(res); }
+    }
     if(state().projection)state().projection->observeUpdate(res,bytes,box);
 }
 
@@ -1756,6 +1886,13 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         }
         plan.colorResourceMipLevels=colorDesc.MipLevels;plan.colorArraySize=colorDesc.ArraySize;plan.colorSampleCount=colorDesc.SampleDesc.Count;
         plan.depthResourceMipLevels=depthDesc.MipLevels;plan.depthArraySize=depthDesc.ArraySize;plan.depthSampleCount=depthDesc.SampleDesc.Count;
+        // E is part of the plan identity (rc-since-rc2 review F5): the
+        // standing negotiation answers for this contract, so the comparison
+        // sees an E-only drift as a change too.
+        flatNegotiatedEval(s.negotiatedEvalW, s.negotiatedEvalH, s.negotiatedMode,
+            s.negotiatedRenderW, s.negotiatedRenderH, s.negotiatedOutputW, s.negotiatedOutputH,
+            plan.mode, plan.renderWidth, plan.renderHeight, plan.outputWidth, plan.outputHeight,
+            plan.evalWidth, plan.evalHeight);
         if(!s.haveResolvePlan || !sameResolvePlan(plan,s.plannedResolve)) {
             s.resolvePreflight={};s.resolvePreflightRetryMs=0;
             // Gate 2 discovery: the effective route, logged when the plan
@@ -1765,9 +1902,57 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
             Log::get().note("flat route: %s R=%ux%u E=%ux%u D=%ux%u%s", route.name,
                 plan.renderWidth, plan.renderHeight, route.evalWidth, route.evalHeight,
                 plan.outputWidth, plan.outputHeight, route.refused ? " (refused today)" : "");
+            // Gate 2 step 4: negotiate the effective treatment with the vendor
+            // on every contract change. The request is recorded above; this is
+            // the vendor's answer -- serving mode and evaluation size, with an
+            // under-floor input cut to the floor it reaches (the game's copy
+            // upsamples the rest), never a silent TAA substitution.
+            s.negotiatedEvalW = s.negotiatedEvalH = 0;
+            s.negotiatedRenderW = s.negotiatedRenderH = 0;
+            s.negotiatedOutputW = s.negotiatedOutputH = 0;
+            if (plan.mode == FlatMonoResolveMode::Dlss && !route.refused &&
+                (plan.renderWidth < plan.outputWidth || plan.renderHeight < plan.outputHeight)) {
+                const char* why = nullptr;
+                if (dlaaAvailable(s.device.Get(), &why)) {
+                    DlssModeRange modes[kDlssModeCount];
+                    if (dlssModeRanges(s.device.Get(), plan.outputWidth, plan.outputHeight, modes)) {
+                        const auto neg = flatDlssNegotiate(modes, plan.renderWidth, plan.renderHeight,
+                                                           plan.outputWidth, plan.outputHeight);
+                        Log::get().note("flat route negotiation: dlss R=%ux%u D=%ux%u -> E=%ux%u mode=%s%s",
+                            plan.renderWidth, plan.renderHeight, plan.outputWidth, plan.outputHeight,
+                            neg.evalWidth, neg.evalHeight,
+                            neg.served ? kDlssModeNames[static_cast<int>(neg.mode)] : "unserved",
+                            neg.cut ? " (input under the floor; the game's copy upsamples the rest)" :
+                            neg.served ? "" : " (the backend refusal path stands)");
+                        if (neg.served) {
+                            s.negotiatedEvalW = neg.evalWidth; s.negotiatedEvalH = neg.evalHeight;
+                            s.negotiatedMode = plan.mode;
+                            s.negotiatedRenderW = plan.renderWidth; s.negotiatedRenderH = plan.renderHeight;
+                            s.negotiatedOutputW = plan.outputWidth; s.negotiatedOutputH = plan.outputHeight;
+                        }
+                    }
+                }
+            }
         }
+        // The plan carries the same negotiated E the frame does (gate-2 review
+        // F1): preflight allocates at E and the resolve's resource cache keys
+        // on E. Computed AFTER the negotiation above (rc-since-rc2 review F5):
+        // the first frame of an under-floor contract preflights at the cut E,
+        // not the route default it would reallocate from next frame.
+        flatNegotiatedEval(s.negotiatedEvalW, s.negotiatedEvalH, s.negotiatedMode,
+            s.negotiatedRenderW, s.negotiatedRenderH, s.negotiatedOutputW, s.negotiatedOutputH,
+            plan.mode, plan.renderWidth, plan.renderHeight, plan.outputWidth, plan.outputHeight,
+            plan.evalWidth, plan.evalHeight);
         s.plannedResolve=plan;s.haveResolvePlan=true;
     }
+    // The frame's override comes from the same post-negotiation state as the
+    // plan's: an under-floor contract resolves at the cut E on its FIRST
+    // frame (rc-since-rc2 review F5), never at the default that the backend
+    // refuses and the next frame reallocates.
+    flatNegotiatedEval(s.negotiatedEvalW, s.negotiatedEvalH, s.negotiatedMode,
+        s.negotiatedRenderW, s.negotiatedRenderH, s.negotiatedOutputW, s.negotiatedOutputH,
+        f.mode, f.renderWidth, f.renderHeight, f.outputWidth, f.outputHeight,
+        f.evalWidth, f.evalHeight);
     std::memcpy(f.camera, selected.camera, sizeof(f.camera));
     const bool resetMissing = !s.havePrevious;
     const bool resetGap = s.havePrevious && s.previous.frame + 1 != selected.frame;

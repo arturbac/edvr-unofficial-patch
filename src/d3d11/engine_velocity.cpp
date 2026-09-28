@@ -22,8 +22,10 @@
 #include "gpu_timing.h"
 #include "dxbc_engine_velocity.h"
 #include "engine_velocity_emit.h"
+#include "engine_velocity_primary_copy.h"
 #include "engine_velocity_families.h"
 #include "engine_velocity_state.h"
+#include "exposure_fix.h"   // lookupShaderHash: the PS shadow probe reads the registry
 #include "flat_compute_readback.h"
 #include "kinematic_eval_hook.h"
 #include "kinematic_eval_probe.h"
@@ -37,6 +39,7 @@ namespace engine_velocity_detail {
 
 template <class T> using Ptr = Microsoft::WRL::ComPtr<T>;
 namespace emit = engine_velocity_emit;
+namespace primaryCopy = engine_velocity_primary_copy;
 
 std::atomic<bool> live{false};
 DrawCache cache;
@@ -67,11 +70,27 @@ std::atomic<const ID3D11Resource*> watch[kWatchSlots] = {};
 // flat-only: its SV_IsFrontFace occupies the register formerly assumed for
 // PS position. A separate rasterizer input passes the actual VS draw gate.
 // DE54/A607 remains unqualified and unkeyed.
+//
+// Eye run 055427 (2026-09-26, parked at the port, the "close range" entry):
+// vs_61AE's stock pixel shader ps_4504BC268E109C31 drew hull parts all
+// session, and the two big rotating families drew NOTHING through their keyed
+// pairs at this range -- vs_4361 through ps_51EE1F922FD220B0, vs_889A through
+// ps_D31DCAFA7C05CB47, both stock -- so most of the hull kept the camera term
+// while it moved. All three keyed: ps_4504 from the 09-06 dump, ps_51EE and
+// ps_D31D dumped by the 2026-09-27 glare_shader_dump flight at the port; each
+// pair through the corpus identity harness (40,960 texels, 0 mismatches;
+// MRT6 8192 checked, 0 bad). ps_BBDE4E71FB78528A (vs_66DE) keyed from the
+// 15:46 session's dumps the same day. Provenance correction, 2026-09-28:
+// ps_BA58469C3D6120A7 is the exact EDVR patch of ps_4375B72964F386CD,
+// not another stock variant. Its occupied slot is our existing export.
+// Likewise all kSelfMarking hashes are generated substitutions; see their
+// lineage in engine_velocity_families.h and the investigation doc.
 using engine_velocity_family::Family;
 using engine_velocity_family::kFamilies;
 using engine_velocity_family::kFamilyCount;
 using engine_velocity_family::familyForProfile;
 using engine_velocity_family::keyedPs;
+using engine_velocity_family::selfMarkingPair;
 static_assert(kFamilyCount <= kMaxFamilies, "familyDraws holds every family");
 bool anyKeyedPs(uint64_t hash) {
     for (int i = 0; i < kFamilyCount; ++i)
@@ -108,6 +127,8 @@ struct FamilyState {
     uint64_t binds = 0;                            // substitutions made (this window)
     uint64_t unkeyedPsDraws = 0;                   // bind events with a pixel shader outside the keyed set
     uint64_t unkeyedPsHash = 0;
+    uint64_t selfMarked = 0;                       // self-marking pair's stock draws (the game's own slot+depth channel)
+    uint64_t selfMarkedLatched = 0;                // ...of those, the draws that latched the game's texture for the eye-frame
 };
 FamilyState g_families[kFamilyCount];
 
@@ -150,6 +171,11 @@ constexpr size_t kBlendCap = 64;
 // source scene): the writes seen since the slot was assigned, and for the
 // scene constants the registers 270..275 the last Unmap left.
 constexpr unsigned kRowsFirst = 270, kRowsBytes = 6 * 16;
+// The freshness stamp (2026-09-25): the engine-motion shaders read
+// EN[276].x (SEN[276].x on foot) as the present-frame clock the emit folded
+// into each marker, uint bits. Our scene-constants copies are sized to hold
+// it even where the game's own buffer stops at row 275.
+constexpr unsigned kStampFloat4 = 276, kStampBytes = (kStampFloat4 + 1) * 16;
 struct WatchInfo {
     const ID3D11Resource* resource = nullptr;
     void* mapped = nullptr;
@@ -159,6 +185,15 @@ struct WatchInfo {
     uint8_t rows[kRowsBytes] = {};
 };
 WatchInfo g_watchInfo[kWatchSlots];
+std::atomic<const ID3D11Resource*> primaryPoolResources[kPrimaryPoolResources] = {};
+struct PrimaryMap {
+    Ptr<ID3D11Buffer> buffer;
+    uint32_t bytes=0,lastFrame=0;
+    uint64_t sequence=0;
+    bool mapped=false;
+};
+PrimaryMap g_primaryMaps[kPrimaryPoolResources];
+uint64_t g_primaryMapSequence=0,g_primaryMapOverflow=0,g_primaryCopyCalls=0,g_primaryApplied=0;
 
 // --- Per eye -------------------------------------------------------------------
 enum Invalid : int {
@@ -179,12 +214,20 @@ struct Eye {
     Ptr<ID3D11ShaderResourceView> overlayBaseSrv;
     bool overlayGroup = false;
     unsigned width = 0, height = 0;
+    // The game's own target-6 texture, latched at this eye-frame's first
+    // self-marking draw (kSelfMarking): the detail shaders natively write the
+    // marker encoding (2*slot+1, z) there. Validated against the pass's depth
+    // size and R32G32_FLOAT at capture; handed to the compose with the views.
+    Ptr<ID3D11Texture2D> gameMark;
+    Ptr<ID3D11ShaderResourceView> gameMarkSrv;
+    uint32_t gameMarkFrame = ~0u;
     Ptr<ID3D11Buffer> pool;              // the snapshot copies
     Ptr<ID3D11ShaderResourceView> poolSrv;
     UINT poolBytes = 0;
     Ptr<ID3D11Buffer> scene[2];          // the game's cb1, by present-frame parity
     uint32_t sceneFrame[2] = {~0u, ~0u};
     UINT sceneBytes = 0;
+    Ptr<ID3D11Buffer> stampCell;         // 16 bytes: the frame stamp's carrier into scene[slot]
     uint32_t frame = ~0u;                // the present frame this eye's data belongs to
     uint32_t rtvGen = 0, dsvGen = 0;     // the pass binding MRT6 was added to
     bool bindingStale = false;           // an internal flat restore removed MRT6 without a game generation
@@ -239,6 +282,8 @@ std::atomic<uint32_t> g_frame{0};
 std::unique_ptr<emit::Table> g_table;
 std::unique_ptr<emit::Census> g_census;
 emit::Stats g_emit;
+emit::Stats g_primaryEmit;
+std::atomic<uint64_t> g_primaryAttempts{0};
 std::atomic<emit::LookupFn> g_lookup{nullptr};
 std::atomic<uint64_t> g_emitSampled{0}, g_emitSampledTicks{0};
 const char* g_verifyWhy = nullptr;            // the build check's refusal, null = passed
@@ -282,7 +327,17 @@ struct DrawStats {
              refusedPrevious = 0;
     uint64_t restores = 0;
     uint64_t frames = 0;
-    uint64_t pixelsJoined = 0, pixelsMasked = 0, pixelsCamera = 0, pixelsStale = 0, pixelsCorrupt = 0, pixelReads = 0;
+    // The self-marking detail shaders' draw-path census (the seam arc,
+    // 2026-09-27): reached slowPath with a self-marking PS bound, of those
+    // the ones where neither the eye-pass nor the depth map named an eye,
+    // and their PS's binds through vscreen's shader hook.
+    uint64_t selfMarkSeen = 0, selfMarkNoEye = 0, selfMarkBinds = 0;
+    // The shadow probe (the same arc): sampled pool-context draws, and the
+    // ones where the live pixel shader was not the shadow's -- the bind
+    // bypassed the hook, and the truth was written in before the slow half.
+    uint64_t poolShadowProbes = 0, poolShadowHealed = 0;
+    uint64_t pixelsJoined = 0, pixelsMasked = 0, pixelsCamera = 0, pixelsStale = 0, pixelsCorrupt = 0, pixelsStamped = 0,
+             pixelReads = 0;
     // The on-foot source: its eye-frames (also counted in eyeFrames above),
     // the screen shader's view requests and refusals, and its panel pixels.
     uint64_t sourceFrames = 0, sourceFramesBound = 0;
@@ -304,8 +359,9 @@ struct DrawStats {
     uint64_t sourceInvalid[kInvalidCount] = {};
     // The screen shader's per-kind eye-pixel counts: [0] every pixel of every
     // frame (diagnostics or motion_source), [1] sampled (one frame in
-    // kPanelSampleFrames, one eye pixel in kPanelSampleStride squared).
-    uint64_t panel[2][5] = {}, panelDraws[2] = {};
+    // kPanelSampleFrames, one eye pixel in kPanelSampleStride squared). The
+    // kinds are the compose's six (stale stamp last; see enginePixelZ).
+    uint64_t panel[2][6] = {}, panelDraws[2] = {};
     uint64_t burstFrames = 0, burstGaps = 0;
     void clear() { *this = DrawStats{}; }
 };
@@ -313,6 +369,7 @@ DrawStats g_draw;
 uint64_t g_windowStartMs = 0;
 uint64_t g_lastGaps = 0;                 // g_emit.gaps at the last frame boundary
 uint32_t g_lastSubstitution = ~0u;       // the present frame of the last substitution
+uint32_t g_psShadowProbeN = 0;           // the header's sampling counter for the probe below
 constexpr uint64_t kSummaryMs = 30000;
 constexpr uint32_t kResumeFrames = 90;   // a substitution after this many quiet frames is logged
 constexpr uint64_t kBurstGaps = 32;      // gaps in one frame that make it a burst
@@ -421,6 +478,43 @@ void observeEmit(uintptr_t record, uintptr_t owner, int32_t before, int32_t afte
         g_emitSampled.fetch_add(1, std::memory_order_relaxed);
         g_emitSampledTicks.fetch_add(static_cast<uint64_t>(qpcNow() - t0), std::memory_order_relaxed);
     }
+}
+
+void observePrimaryEmit(const emit::PrimaryIdentity& identity, uintptr_t owner, uintptr_t key,
+                        uintptr_t position, uintptr_t quaternion, int32_t before, int32_t after) noexcept {
+    if (!live.load(std::memory_order_acquire) || !g_table) return;
+    g_primaryAttempts.fetch_add(1,std::memory_order_relaxed);
+    const auto sink=+[](uintptr_t item,const emit::Pose&,const emit::Pose& previous,uint32_t marker,uint32_t frame) noexcept {
+        uint32_t native[84]{};
+        return emit::read(item,native,sizeof(native)) && primaryCopy::recordEmission(item,native,previous,marker,frame);
+    };
+    // Invalidate an older claim at the exact newly-appended primary item,
+    // even when this call will be declined by the pose/deformation checks.
+    if(int64_t(after)-int64_t(before)==1) {
+        const auto lookup=g_lookup.load(std::memory_order_acquire);
+        const uintptr_t entry=lookup?emit::guardedLookup(lookup,owner+emit::kOwnerDictionary,key):0;
+        uintptr_t item=0;
+        if(entry && emit::collectItems(entry,1,&item))primaryCopy::invalidateEmission(item);
+        else primaryCopy::invalidateEmission(0);
+    } else primaryCopy::invalidateEmission(0); // ownership/fault: no stale CPU claim may survive
+    emit::observePrimary(identity,owner,key,position,quaternion,before,after,frameNow(),
+                         g_lookup.load(std::memory_order_acquire),*g_table,g_primaryEmit,sink);
+}
+
+void observePoolCopy(uintptr_t mapped,uint32_t stride,uintptr_t source,uint64_t slot,uint32_t count) noexcept {
+    if(!live.load(std::memory_order_acquire))return;
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    ++g_primaryCopyCalls;
+    if(count==UINT32_MAX || slot>UINT32_MAX){primaryCopy::invalidateMapped(mapped);return;}
+    primaryCopy::copier(mapped,stride,source,static_cast<uint32_t>(slot),count,frameNow());
+}
+void* observeMergeBegin(uintptr_t destination,uintptr_t source) noexcept {
+    if(!live.load(std::memory_order_acquire))return nullptr;
+    return primaryCopy::beginMergeOpaque(destination,source,frameNow());
+}
+void observeMergeEnd(void* plan,bool completed) noexcept {primaryCopy::endMergeOpaque(plan,completed);}
+void observeDictionaryClear(uintptr_t dictionary) noexcept {
+    if(live.load(std::memory_order_acquire))primaryCopy::invalidateDictionary(dictionary);
 }
 
 // The stand-down rule (the 2026-09-23 review): with no emit, no record gets a
@@ -658,6 +752,10 @@ bool ensureSlots(ID3D11DeviceContext* ctx, Eye& e, int eye, ID3D11Texture2D* dep
     const unsigned wasW = e.width, wasH = e.height;
     e.slots.Reset(); e.slotsRtv.Reset(); e.slotsSrv.Reset();
     e.overlayBase.Reset(); e.overlayBaseSrv.Reset(); e.overlayGroup = false;
+    // The latched game channel was latched for the old depth's size: it goes
+    // with it (the review's F3; a stale SRV of the wrong size would read as
+    // cleared until the next capture re-latches anyway).
+    e.gameMark.Reset(); e.gameMarkSrv.Reset(); e.gameMarkFrame = ~0u;
     e.depth = depth; e.width = dd.Width; e.height = dd.Height;
     D3D11_TEXTURE2D_DESC d{};
     d.Width = dd.Width; d.Height = dd.Height; d.MipLevels = 1; d.ArraySize = 1; d.SampleDesc.Count = 1;
@@ -713,6 +811,11 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
     poolBuf->GetDesc(&pd);
     if (pd.StructureByteStride != emit::kItemBytes || !(pd.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) ||
         pd.ByteWidth < emit::kItemBytes) { invalidate(e, kNoPool); return false; }
+    const bool knownPrimary=watchesPrimaryResource(poolBuf.Get());
+    notePrimaryBufferCreated(poolBuf.Get(),pd); // existing buffer on mid-session activation
+    if(!knownPrimary && watchesPrimaryResource(poolBuf.Get()))
+        Log::get().note("engine motion: primary pool %p nominated at draw frame %u after its initial upload; "
+                        "private-copy coverage warms up on its next observed map.",static_cast<void*>(poolBuf.Get()),frame);
     Ptr<ID3D11Buffer> scene;
     ctx->VSGetConstantBuffers(kEngineVelocitySceneSlot, 1, &scene);
     if (!scene) { invalidate(e, kNoScene); return false; }
@@ -729,6 +832,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         e.pool.Reset(); e.poolSrv.Reset();
         D3D11_BUFFER_DESC d = pd;
         d.Usage = D3D11_USAGE_DEFAULT; d.CPUAccessFlags = 0; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        d.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
         if (FAILED(dev->CreateBuffer(&d, nullptr, &e.pool)) || FAILED(dev->CreateShaderResourceView(e.pool.Get(), nullptr, &e.poolSrv))) {
             e.pool.Reset(); e.poolSrv.Reset(); e.poolBytes = 0; ++g_draw.createFailed;
             invalidate(e, kCreate);
@@ -741,7 +845,8 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         for (auto& b : e.scene) b.Reset();
         e.sceneFrame[0] = e.sceneFrame[1] = ~0u;
         D3D11_BUFFER_DESC d{};
-        d.ByteWidth = sd.ByteWidth; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        d.ByteWidth = std::max<UINT>(sd.ByteWidth, kStampBytes); d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         for (auto& b : e.scene) if (FAILED(dev->CreateBuffer(&d, nullptr, &b))) {
             for (auto& c : e.scene) c.Reset();
             e.sceneBytes = 0; ++g_draw.createFailed;
@@ -756,7 +861,34 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         // instead of paying two pairs' worth of overhead for it.
         GpuCensusScope census(ctx, GpuCensusSection::FrameEngineVelocity);
         ctx->CopyResource(e.pool.Get(), poolBuf.Get());
-        ctx->CopyResource(e.scene[slot].Get(), scene.Get());
+        if(primaryCopy::apply(ctx,e.pool.Get(),poolBuf.Get(),frame))++g_primaryApplied;
+        // The copy by region, not resource: our buffer can be a float4
+        // larger than the game's (the stamp), which CopyResource would
+        // reject. The stamp is this eye-frame's present-frame clock -- the
+        // same g_frame the emit folded into the markers this window -- so a
+        // joined record the engine did not re-evaluate this frame declines
+        // to the camera term instead of replaying its stale delta. A boxed
+        // UpdateSubresource on a buffer is dropped (WARP no-ops it), so the
+        // stamp rides a 16-byte cell: a whole-subresource update, then a
+        // boxed copy into the scene constants' shadow.
+        ctx->CopySubresourceRegion(e.scene[slot].Get(), 0, 0, 0, 0, scene.Get(), 0, nullptr);
+        if (!e.stampCell) {
+            D3D11_BUFFER_DESC cd{};
+            cd.ByteWidth = 16; cd.Usage = D3D11_USAGE_DEFAULT;
+            if (FAILED(dev->CreateBuffer(&cd, nullptr, &e.stampCell))) {
+                ++g_draw.createFailed;
+                invalidate(e, kCreate);
+                return false;
+            }
+        }
+        // Whole-subresource upload of the 16-byte cell needs a 16-byte SOURCE:
+        // &frame alone is four bytes and the null box read twelve past it
+        // (rc-since-rc2 review F3). Only the first word is consumed today;
+        // the rest is defined zero rather than adjacent stack storage.
+        const uint32_t stamp[4] = {frame, 0, 0, 0};
+        ctx->UpdateSubresource(e.stampCell.Get(), 0, nullptr, stamp, 16, 0);
+        const D3D11_BOX stampBox{0, 0, 0, 16, 1, 1};
+        ctx->CopySubresourceRegion(e.scene[slot].Get(), 0, kStampFloat4 * 16u, 0, 0, e.stampCell.Get(), 0, &stampBox);
     }
     // What the snapshots copy (the performance review, item 4: measured
     // before any storage change): the whole pool buffer, whatever the view
@@ -827,6 +959,7 @@ void checkSources(ID3D11DeviceContext* ctx, Eye& e, int eye) {
             // snapshot()'s pair.
             GpuCensusScope census(ctx, GpuCensusSection::FrameEngineVelocity);
             ctx->CopyResource(e.pool.Get(), e.poolBuffer.Get());
+            if(primaryCopy::apply(ctx,e.pool.Get(),e.poolBuffer.Get(),e.frame))++g_primaryApplied;
         }
         endCapture(ctx, refreshTimer);
         e.poolAppendEpoch = wp.appendEpoch;
@@ -934,6 +1067,81 @@ bool bindTarget(ID3D11DeviceContext* ctx, Eye& e, ID3D11DepthStencilView* dsv) {
     return true;
 }
 
+// The historical self-marking compatibility path latches the currently bound
+// SV_Target6. Its known hashes are EDVR's generated patches, not native game
+// writers (2026-09-28 exact-hash proof in engine_velocity_families.h). The PS
+// shadow probe must not adopt our installed patch and enter this path as if
+// it were game state. Latch for the eye-frame here: R32G32_FLOAT, single-slice,
+// at the pass's depth size -- the shape the compose's float2 Load reads. Once per
+// eye-frame; nothing about the game's state is touched. True only when the
+// texture was latched (first latch of the eye-frame) -- the caller counts it,
+// so the family line can tell "drawn" and "actually read at the compose"
+// apart.
+bool captureGameMark(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame, ID3D11DepthStencilView* dsv) {
+    if (eye == kEngineVelocitySourceEye || e.gameMarkFrame == frame) return false;
+    ID3D11RenderTargetView* rts[8] = {};
+    Ptr<ID3D11DepthStencilView> dsvNow;
+    ctx->OMGetRenderTargets(8, rts, &dsvNow);
+    // OMGet returns owned references: adopt slot 6's, release the rest
+    // (the 2026-09-27 review's F2 -- assigning the raw pointer into a smart
+    // pointer that addrefs, then releasing around it, leaked one reference per
+    // capture attempt).
+    Ptr<ID3D11RenderTargetView> rt6;
+    rt6.Attach(rts[6]);
+    rts[6] = nullptr;
+    for (unsigned i = 0; i < 8; ++i)
+        if (rts[i]) rts[i]->Release();
+    Ptr<ID3D11Texture2D> tex;
+    if (rt6) {
+        Ptr<ID3D11Resource> res;
+        rt6->GetResource(&res);
+        if (res) res.As(&tex);
+    }
+    if (tex) {
+        D3D11_TEXTURE2D_DESC td{};
+        tex->GetDesc(&td);
+        D3D11_RENDER_TARGET_VIEW_DESC vd{};
+        rt6->GetDesc(&vd);
+        Ptr<ID3D11Resource> depthRes;
+        dsv->GetResource(&depthRes);
+        Ptr<ID3D11Texture2D> depthTex;
+        if (depthRes) depthRes.As(&depthTex);
+        D3D11_TEXTURE2D_DESC dd{};
+        if (depthTex) depthTex->GetDesc(&dd);
+        // The shape the compose's float2 Load reads: the VIEW the game writes
+        // through is R32G32_FLOAT single-slice at mip 0 (the texture itself may
+        // be typeless), at the pass's depth size.
+        const bool shapeOk = vd.Format == DXGI_FORMAT_R32G32_FLOAT &&
+                             vd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D && vd.Texture2D.MipSlice == 0 &&
+                             td.ArraySize == 1 && td.SampleDesc.Count == 1 && depthTex &&
+                             td.Width == dd.Width && td.Height == dd.Height;
+        if (shapeOk) {
+            if (e.gameMarkSrv && e.gameMark.Get() == tex.Get()) {
+                // The same texture as the eye's: reuse the SRV.
+            } else {
+                // A new channel texture (a resolution/quality change): the old
+                // SRV -- and the texture it kept alive -- retires here, not at
+                // shutdown (the 2026-09-27 review's F3).
+                e.gameMarkSrv.Reset();
+                e.gameMark.Reset();
+                D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+                sd.Format = DXGI_FORMAT_R32G32_FLOAT;
+                sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                sd.Texture2D.MipLevels = 1;
+                sd.Texture2D.MostDetailedMip = 0;
+                Ptr<ID3D11Device> dev;
+                ctx->GetDevice(&dev);
+                dev->CreateShaderResourceView(tex.Get(), &sd, &e.gameMarkSrv);
+                if (!e.gameMarkSrv) return false;
+                e.gameMark = tex;
+            }
+            e.gameMarkFrame = frame;
+            return true;
+        }
+    }
+    return false;
+}
+
 void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     ++g_draw.slowPaths;
     auto* vs = static_cast<ID3D11VertexShader*>(bindingGet(BindSlot::Vs));
@@ -944,6 +1152,17 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     int eye = -1, target = -1;
     const bool eyePass = rtv0Eye && dsv && depthProbeCurrentSceneEyeOf(dsv, &eye, &target) && (eye == 0 || eye == 1);
     const int f = familyForProfile(vsHash, runtimeFlatProfile());
+    // The self-marking detail shaders (kSelfMarking) can draw in the eye's
+    // pass without the eye's colour at slot 0 -- rtv0Eye never names those an
+    // eye pass. The capture needs only which eye, and the depth probe's own
+    // map of the scene pair answers it from the depth view alone.
+    const bool selfMarkPs = f >= 0 && selfMarkingPair(vsHash, psHash);
+    if (selfMarkPs) ++g_draw.selfMarkSeen;
+    int markEye = -1, markTarget = -1;
+    if (selfMarkPs && !eyePass && dsv &&
+        !(depthProbeCurrentSceneEyeOf(dsv, &markEye, &markTarget) && (markEye == 0 || markEye == 1)))
+        markEye = -1;
+    const bool selfMarkEyePass = markEye >= 0;
     // On foot no pool draw targets an eye: the source pass is a pool family
     // draw into the depth screen_motion named this frame or the last two.
     bool sourcePass = false;
@@ -960,12 +1179,16 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     // by the consumer's exact DSV comparison.
     if (sourcePass && !overlayPair) g_eyes[kEngineVelocitySourceEye].overlayGroup = false;
     auto vsInfo = vs ? g_vs.find(vs) : g_vs.end();
-    if (!g_emitLive.load(std::memory_order_acquire) || !(eyePass || sourcePass) || f < 0 || vsInfo == g_vs.end() ||
-        vsInfo->second.family != f) { restore(ctx); return; }
+    if (!g_emitLive.load(std::memory_order_acquire) || !(eyePass || sourcePass || selfMarkEyePass) || f < 0 || vsInfo == g_vs.end() ||
+        vsInfo->second.family != f) {
+        if (selfMarkPs && !eyePass && !selfMarkEyePass) ++g_draw.selfMarkNoEye;
+        restore(ctx);
+        return;
+    }
     deriveFamily(f);
     FamilyState& fam = g_families[f];
     if (!fam.valid) { restore(ctx); return; }
-    Eye& e = g_eyes[eye];
+    Eye& e = g_eyes[eyePass || sourcePass ? eye : markEye];
     const uint32_t frame = frameNow();
     // An eye-frame with a recognised pool family draw: the old order prepared
     // on this alone (the 2026-09-23 performance review, item 2).
@@ -975,7 +1198,24 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     // snapshot, MRT6 -- is prepared for a draw that cannot export ownership;
     // a declined draw puts the game's state back, as before.
     if (!keyedPs(f, psHash, runtimeFlatProfile())) {
-        if (!anyKeyedPs(psHash)) { ++fam.unkeyedPsDraws; fam.unkeyedPsHash = psHash; }
+        if (selfMarkPs) {
+            // Compatibility path for a marker-bearing shader: latch target
+            // 6 without adding a second export. Known hashes are our own
+            // generated patches; the probe excludes our installed identity.
+            // The eye comes from the pass's colour (eyePass) or, for the detail
+            // pass that never binds it, from the depth probe's map of the
+            // scene pair (selfMarkEyePass).
+            const int which = eyePass ? eye : markEye;
+            if (which >= 0) {
+                if (captureGameMark(ctx, g_eyes[which], which, frame, dsv)) ++fam.selfMarkedLatched;
+            } else {
+                ++g_draw.selfMarkNoEye;
+            }
+            ++fam.selfMarked;
+        } else if (!anyKeyedPs(psHash)) {
+            ++fam.unkeyedPsDraws;
+            fam.unkeyedPsHash = psHash;
+        }
         restore(ctx);
         return;
     }
@@ -1166,6 +1406,33 @@ void summaryLocked(uint64_t now) {
     const double emitUs = sampled ? double(sampledTicks) * 1e6 / freq / double(sampled) : 0.0;
     const double emitMsPerFrame = emitUs * double(g_emit.calls.load()) / frames / 1000.0;
     if (!g_emitLive.load(std::memory_order_acquire)) logStoodDown();
+    uint64_t primaryCalls=0,primaryUnowned=0;
+    kinematicEvalPrimaryEmitCounters(primaryCalls,primaryUnowned);
+    const uint64_t attempts=g_primaryAttempts.load(std::memory_order_relaxed);
+    const uint64_t written=g_primaryEmit.itemsJoined.load()+g_primaryEmit.itemsMasked.load();
+    Log::get().note("engine motion: primary rigid emit (%s): relay calls %llu, unowned %llu, observer calls %llu, "
+                    "joined %llu, moving %llu, masked %llu, declined %llu; disagreements %llu, locate failures %llu, "
+                    "read faults %llu, write faults %llu. Zero relay calls means this producer did not run.",
+                    kinematicEvalPrimaryEmitStatus(),u(primaryCalls),u(primaryUnowned),u(attempts),
+                    r(g_primaryEmit.itemsJoined),r(g_primaryEmit.itemsMoving),r(g_primaryEmit.itemsMasked),
+                    u(attempts>=written?attempts-written:0),r(g_primaryEmit.disagreements),r(g_primaryEmit.locateFailures),
+                    r(g_primaryEmit.readFaults),r(g_primaryEmit.writeFaults));
+    Log::get().note("engine motion: primary private copy cumulative (copier %s, merge %s, clear %s): copier spans %llu, apply successes %llu, "
+                    "positive map cache overflow %llu (capacity %u); primary native records are unchanged.",
+                    kinematicEvalPoolCopyStatus(),kinematicEvalMergeStatus(),kinematicEvalClearStatus(),u(g_primaryCopyCalls),u(g_primaryApplied),u(g_primaryMapOverflow),kPrimaryPoolResources);
+    const auto copyStats=primaryCopy::stats();
+    Log::get().note("engine motion: primary copy certificates cumulative: emissions %llu, native copy ranges %llu, joined slots %llu, "
+                    "declined %llu, invalidated %llu, overflow %llu; private scatter batches %llu, rows %llu, empty %llu, "
+                    "failed %llu (%s). Empty means no certified private rows; zero emissions means no primary record qualified.",
+                    u(copyStats.emissions),u(copyStats.copies),u(copyStats.joined),u(copyStats.declined),u(copyStats.invalidated),
+                    u(copyStats.overflows),u(copyStats.scatterBatches),u(copyStats.scatterRows),u(copyStats.scatterEmpty),
+                    u(copyStats.scatterFailed),primaryCopy::scatterFailureName(copyStats.lastScatterFailure));
+    Log::get().note("engine motion: primary copy routing cumulative: source resets %llu, no active map %llu, "
+                    "ambiguous map %llu, invalid range %llu, merge plans %llu, merge failures %llu, "
+                    "clear calls %llu, cleared claims %llu, clear failures %llu.",
+                    u(copyStats.sourceResets),u(copyStats.copierNoLease),u(copyStats.copierAmbiguous),
+                    u(copyStats.copierInvalidRange),u(copyStats.mergePlans),u(copyStats.mergeFailed),
+                    u(copyStats.clearCalls),u(copyStats.clearedClaims),u(copyStats.clearFailed));
     Log::get().note("engine motion: emit (%s) over %.0f s, %.0f frames: FUN_144312E00 calls %llu (%llu appended, %llu pool "
                     "records in all); pool records joined %llu (with motion %llu), masked %llu; masked for: first seen %llu, "
                     "gap %llu, reused pointer %llu, pose changed within one frame %llu, previous frame not certified %llu, "
@@ -1248,10 +1515,12 @@ void summaryLocked(uint64_t now) {
         Log::get().note("engine motion: pixels per eye-frame on the trained path: engine-joined %.0f (a rig record's "
                         "certified exact motion, moving or still -- not a mover count), masked %.0f "
                         "(no history), pool surface not a rig record %.0f (camera term), stale slot %.0f (the slot's "
-                        "recorded depth is not the pixel's), corrupt slot code %.0f (declined; must be 0); %llu readbacks.",
+                        "recorded depth is not the pixel's), corrupt slot code %.0f (declined; must be 0), stale stamp %.0f "
+                        "(a joined marker from an older frame: the camera term); %llu readbacks.",
                         double(g_draw.pixelsJoined) / double(g_draw.pixelReads), double(g_draw.pixelsMasked) / double(g_draw.pixelReads),
                         double(g_draw.pixelsCamera) / double(g_draw.pixelReads), double(g_draw.pixelsStale) / double(g_draw.pixelReads),
-                        double(g_draw.pixelsCorrupt) / double(g_draw.pixelReads), u(g_draw.pixelReads));
+                        double(g_draw.pixelsCorrupt) / double(g_draw.pixelReads), double(g_draw.pixelsStamped) / double(g_draw.pixelReads),
+                        u(g_draw.pixelReads));
     else
         Log::get().note("engine motion: pixels: not counted this window -- the counts come from the instrumented DLSS/FSR "
                         "motion shader only (advanced.temporal_aa_diagnostics = 1, or a debug view) with the engine inputs "
@@ -1287,7 +1556,7 @@ void summaryLocked(uint64_t now) {
         // The panel's kinds: every pixel (diagnostics, motion_source) when
         // counted, else the sampled count, else nothing.
         const int mode = g_draw.panelDraws[0] ? 0 : g_draw.panelDraws[1] ? 1 : -1;
-        char pixels[640];
+        char pixels[720];
         if (mode >= 0) {
             const double draws = double(g_draw.panelDraws[mode]);
             const uint64_t* p = g_draw.panel[mode];
@@ -1298,10 +1567,10 @@ void summaryLocked(uint64_t now) {
                             kPanelSampleStride, kPanelSampleStride);
             _snprintf_s(pixels, _TRUNCATE, "panel pixels per %s eye draw: engine-joined %.0f (a rig record's certified "
                         "exact motion, carried through the panel), masked %.0f (no history), pool surface not a rig "
-                        "record %.0f (camera term), stale slot %.0f, corrupt slot code %.0f (declined; must be 0) over "
-                        "%llu counted eye draws%s", mode ? "sampled" : "counted", double(p[0]) / draws,
-                        double(p[1]) / draws, double(p[2]) / draws, double(p[3]) / draws, double(p[4]) / draws,
-                        u(g_draw.panelDraws[mode]), sampleNote);
+                        "record %.0f (camera term), stale slot %.0f, corrupt slot code %.0f (declined; must be 0), "
+                        "stale stamp %.0f over %llu counted eye draws%s", mode ? "sampled" : "counted",
+                        double(p[0]) / draws, double(p[1]) / draws, double(p[2]) / draws, double(p[3]) / draws,
+                        double(p[4]) / draws, double(p[5]) / draws, u(g_draw.panelDraws[mode]), sampleNote);
         } else {
             _snprintf_s(pixels, _TRUNCATE, "panel pixels: none counted this window (sampled one frame in %u while the "
                         "source's views are given; every pixel with advanced.temporal_aa_diagnostics = 1 or the "
@@ -1328,6 +1597,15 @@ void summaryLocked(uint64_t now) {
                         "declined state %llu, resource %llu, shader %llu.",
                         u(g_draw.overlayCopies), double(g_draw.overlayBytes) / 1e6, u(g_draw.overlayGuardedDraws),
                         u(g_draw.overlayDeclinedState), u(g_draw.overlayDeclinedCreate), u(g_draw.overlayDeclinedShader));
+    if (g_draw.selfMarkSeen || g_draw.selfMarkBinds)
+        Log::get().note("engine motion: self-marking pixel shaders at the draw path: %llu draws seen, %llu with no "
+                        "eye attributable (not the eye's colour at slot 0, and the depth probe named none), %llu "
+                        "binds through the PS hook.",
+                        u(g_draw.selfMarkSeen), u(g_draw.selfMarkNoEye), u(g_draw.selfMarkBinds));
+    if (g_draw.poolShadowHealed)
+        Log::get().note("engine motion: the PS shadow was stale on %llu sampled pool draws (the live shader set it "
+                        "right, the slow half saw the truth) of %llu probed.",
+                        u(g_draw.poolShadowHealed), u(g_draw.poolShadowProbes));
     for (int f = 0; f < kFamilyCount; ++f) {
         FamilyState& s = g_families[f];
         std::string patched, failed;
@@ -1340,16 +1618,21 @@ void summaryLocked(uint64_t now) {
         const bool seen = std::any_of(g_vs.begin(), g_vs.end(), [&](const auto& v) { return v.second.family == f; });
         const char* state = !seen ? "not created by the game this session" : !s.derived ? "not drawn yet"
                           : s.valid ? "live" : "STOOD DOWN";
-        Log::get().note("engine motion: family %s: %s%s%s; substituted %llu binds, %llu draws; patched [%s]%s%s%s%s.",
+        Log::get().note("engine motion: family %s: %s%s%s; substituted %llu binds, %llu draws; patched [%s]%s%s%s%s%s.",
                         kFamilies[f].name, state, s.reason.empty() ? "" : " -- ", s.reason.c_str(),
                         u(s.binds), u(familyDraws[f]), patched.c_str(),
                         failed.empty() ? "" : "; refused [", failed.c_str(), failed.empty() ? "" : "]",
-                        s.unkeyedPsDraws ? (" ; unkeyed pixel shader ps_" + hex64(s.unkeyedPsHash) + " left stock").c_str() : "");
+                        s.unkeyedPsDraws ? (" ; unkeyed pixel shader ps_" + hex64(s.unkeyedPsHash) + " left stock").c_str() : "",
+                        s.selfMarked ? ("; self-marked " + std::to_string(s.selfMarked) + " draws (the game's own slot+depth channel, latched " +
+                                        std::to_string(s.selfMarkedLatched) + " eye-frames)").c_str() : "");
         s.binds = 0;
         s.unkeyedPsDraws = 0;
+        s.selfMarked = 0;
+        s.selfMarkedLatched = 0;
         familyDraws[f] = 0;
     }
     g_emit.clear();
+    g_primaryEmit.clear(); g_primaryAttempts.store(0,std::memory_order_relaxed);
     g_lastGaps = 0;
     g_draw.clear();
     g_windowStartMs = now;
@@ -1365,7 +1648,7 @@ void clearLocked() {
     for (auto& w : g_watchInfo) w = WatchInfo{};
     for (auto& s : g_families) {
         s.patchedVs.clear(); s.patchedPs.clear(); s.guardedPs.clear(); s.psFailed.clear();
-        s.derived = s.valid = false; s.reason.clear(); s.binds = 0; s.unkeyedPsDraws = 0;
+        s.derived = s.valid = false; s.reason.clear(); s.binds = 0; s.unkeyedPsDraws = 0; s.selfMarked = 0; s.selfMarkedLatched = 0;
     }
     for (auto& d : familyDraws) d = 0;
     // g_bound stays: only the owner thread may put the game's state back
@@ -1376,6 +1659,7 @@ void clearLocked() {
     if (g_table) g_table->clear();
     if (g_census) g_census->clear();
     g_emit.clear();
+    g_primaryEmit.clear(); g_primaryAttempts.store(0,std::memory_order_relaxed);
     g_lastGaps = 0;
     g_lastSubstitution = ~0u;
     g_draw.clear();
@@ -1415,11 +1699,21 @@ void engineVelocityConfigure(bool on) {
     if (g_verifyWhy) {
         g_lookup.store(nullptr, std::memory_order_release);
         kinematicEvalSetEmitObserver(nullptr);
+        kinematicEvalSetPrimaryEmitObserver(nullptr);
+        kinematicEvalSetPoolCopyObserver(nullptr);
+        kinematicEvalSetMergeObserver(nullptr,nullptr);
+        kinematicEvalSetClearObserver(nullptr);
     } else {
         g_lookup.store(reinterpret_cast<emit::LookupFn>(base + kLookupRva), std::memory_order_release);
         kinematicEvalSetEmitObserver(&observeEmit);
+        kinematicEvalSetPrimaryEmitObserver(&observePrimaryEmit);
+        kinematicEvalSetPoolCopyObserver(&observePoolCopy);
+        kinematicEvalSetMergeObserver(&observeMergeBegin,&observeMergeEnd);
+        kinematicEvalSetClearObserver(&observeDictionaryClear);
     }
     refreshEmitStatus(true);
+    Log::get().note("engine motion: primary rigid producer 42B4130 %s; canonical collection-record history, "
+                    "unit-scale unskinned records only; unsupported records remain native.",kinematicEvalPrimaryEmitStatus());
     g_windowStartMs = nowMs();
     live.store(true, std::memory_order_release);
     if (!g_emitLive.load(std::memory_order_acquire)) { logStoodDown(); return; }
@@ -1436,6 +1730,12 @@ void engineVelocityShutdown() {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     const bool was = live.exchange(false, std::memory_order_acq_rel);
     kinematicEvalSetEmitObserver(nullptr);
+    kinematicEvalSetPrimaryEmitObserver(nullptr);
+    kinematicEvalSetPoolCopyObserver(nullptr);
+    kinematicEvalSetMergeObserver(nullptr,nullptr);
+    kinematicEvalSetClearObserver(nullptr);
+    primaryCopy::reset();
+    for(unsigned i=0;i<kPrimaryPoolResources;++i){primaryPoolResources[i].store(nullptr);g_primaryMaps[i]={};}
     if (g_emitAttached) { kinematicEvalEmitDetach(); g_emitAttached = false; }
     g_lookup.store(nullptr, std::memory_order_release);
     g_emitLive.store(false, std::memory_order_release);
@@ -1511,6 +1811,47 @@ void noteResourceMapped(const ID3D11Resource* resource, void* data, int mapType)
         if (w.resource == resource) { w.mapped = data; w.mapType = mapType; }
 }
 
+void notePrimaryBufferCreated(ID3D11Buffer* buffer,const D3D11_BUFFER_DESC& desc) noexcept {
+    if(!buffer || desc.Usage!=D3D11_USAGE_DYNAMIC || desc.StructureByteStride!=336 ||
+       !(desc.MiscFlags&D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) || !(desc.CPUAccessFlags&D3D11_CPU_ACCESS_WRITE))return;
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    for(auto& slot:g_primaryMaps)if(slot.buffer.Get()==buffer)return;
+    unsigned chosen=kPrimaryPoolResources;
+    for(unsigned i=0;i<kPrimaryPoolResources;++i)if(!g_primaryMaps[i].buffer){chosen=i;break;}
+    if(chosen==kPrimaryPoolResources){++g_primaryMapOverflow;return;}
+    auto& slot=g_primaryMaps[chosen];slot.buffer=buffer;slot.bytes=desc.ByteWidth;slot.lastFrame=frameNow();
+    primaryPoolResources[chosen].store(buffer,std::memory_order_release);
+}
+void notePrimaryResourceMapped(const ID3D11Resource* resource,void* data,int mapType) noexcept {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    for(auto& slot:g_primaryMaps)if(slot.buffer.Get()==resource) {
+        D3D11_BUFFER_DESC desc{};slot.buffer->GetDesc(&desc);
+        slot.sequence=++g_primaryMapSequence;slot.lastFrame=frameNow();
+        slot.mapped=primaryCopy::beginMap(slot.buffer.Get(),data,desc.ByteWidth,desc.StructureByteStride,
+                                        static_cast<D3D11_MAP>(mapType),slot.sequence,frameNow());
+        return;
+    }
+}
+void notePrimaryResourceUnknown(const ID3D11Resource* resource) noexcept {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    for(auto& slot:g_primaryMaps)if(slot.buffer && (!resource || slot.buffer.Get()==resource)) {
+        primaryCopy::forget(slot.buffer.Get());slot.mapped=false;
+    }
+    // A previously patched private snapshot must also stand down: its native
+    // source may now have changed without the ordinary owner-context watch.
+    for(auto& eye:g_eyes)if(eye.poolBuffer && (!resource || eye.poolBuffer.Get()==resource))invalidate(eye,kPoolRewritten);
+    cache=DrawCache{};
+}
+void notePrimaryResourceWritten(const ID3D11Resource* resource) noexcept {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    if(!resource){notePrimaryResourceUnknown(nullptr);return;}
+    for(auto& slot:g_primaryMaps)if(slot.buffer.Get()==resource) {
+        if(slot.mapped){primaryCopy::endMap(slot.buffer.Get(),slot.sequence);slot.mapped=false;}
+        else primaryCopy::forget(slot.buffer.Get()); // Copy/Update/unknown mutation
+        return;
+    }
+}
+
 // A write to a watched source: what it changed, for the next substituted
 // draw of that eye-frame to judge (checkSources). Nothing is dropped here --
 // the other eye's rows go through the same cb1 between the eyes' passes, and
@@ -1549,6 +1890,43 @@ void noteResourceWrite(const ID3D11Resource* resource) noexcept {
     }
     // The next draw takes the slow half (owner thread: this runs on it).
     if (matched) cache = DrawCache{};
+}
+
+// The seam arc's shadow probe (2026-09-27), retained as a backstop for a
+// genuine unobserved bind. Provenance correction, 2026-09-28: the cited
+// ps_BCF75CEA37060EAE is our own generated patch of ps_51EE1F922FD220B0.
+// Zero hooked binds for it is expected. All live/shadow shader differences
+// in the first three 162120 capture frames reproduce our generated hashes;
+// those captures supply no evidence of a real bypass. Sampled by the header
+// (one quick-pathed pool-context draw in 64): when the live pixel shader is
+// neither the shadow's nor our installed patch, the truth is written into
+// the shadow and the draw takes the slow half, which
+// then reads the real shader. Only ever the owner thread.
+void psShadowProbe(ID3D11DeviceContext* ctx) {
+    ++g_draw.poolShadowProbes;
+    ID3D11PixelShader* livePs = nullptr;
+    ctx->PSGetShader(&livePs, nullptr, nullptr);
+    if (!livePs) return;
+    // EDVR's own installed substitution is not a bypass (rc-since-rc2 review
+    // F7): the shadow correctly holds the game's original and g_bound owns
+    // the patch's identity and saved generation. Healing here would adopt
+    // the patch as game state, break the generation restore() compares by,
+    // and lose the original -- the frame boundary then has nothing to
+    // restore with. The pointer compares are free and cover both identities
+    // before any registry lookup; EDVR shaders with no registered hash never
+    // heal either (the liveHash gate below, as before).
+    if (livePs != bindingGet(BindSlot::Ps) && livePs != g_bound.patchedPs) {
+        const uint64_t liveHash = lookupShaderHash(livePs);
+        if (liveHash != 0) {
+            // The truth wins: the bind bypassed the hook (or its memo missed
+            // it). The shadow takes the live state, and the draw takes the
+            // slow half, which then reads the real shader.
+            bindingSetShader(BindSlot::Ps, livePs, liveHash);
+            ++g_draw.poolShadowHealed;
+            beforeDrawSlow(ctx, cache.eye);
+        }
+    }
+    livePs->Release();
 }
 } // namespace engine_velocity_detail
 
@@ -1646,6 +2024,12 @@ bool giveViewsLocked(Eye& e, ID3D11Texture2D* sceneDepth, EngineVelocityViews* o
     out->pool = e.poolSrv.Get(); out->pool->AddRef();
     out->sceneNow = e.scene[now].Get(); out->sceneNow->AddRef();
     out->scenePrev = e.scene[before].Get(); out->scenePrev->AddRef();
+    // The game's own self-marked channel, when a self-marking pair drew this
+    // eye-frame: the compose reads it as a fallback beside the slot target.
+    if (e.gameMarkFrame == frame && e.gameMarkSrv) {
+        out->gameMark = e.gameMarkSrv.Get();
+        out->gameMark->AddRef();
+    }
     ++c.given;
     return true;
 }
@@ -1733,16 +2117,17 @@ bool engineVelocitySourceViews(ID3D11Texture2D* sourceDepth, EngineVelocityViews
 }
 
 void engineVelocityNotePanelPixels(uint32_t joined, uint32_t masked, uint32_t camera, uint32_t stale, uint32_t corrupt,
-                                   uint32_t eyeDraws, uint32_t pixelStride) {
+                                   uint32_t stamped, uint32_t eyeDraws, uint32_t pixelStride) {
     if (!live.load(std::memory_order_acquire)) return;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     const int mode = pixelStride > 1u ? 1 : 0;
-    const uint32_t k[5] = {joined, masked, camera, stale, corrupt};
-    for (int i = 0; i < 5; ++i) g_draw.panel[mode][i] += k[i];
+    const uint32_t k[6] = {joined, masked, camera, stale, corrupt, stamped};
+    for (int i = 0; i < 6; ++i) g_draw.panel[mode][i] += k[i];
     g_draw.panelDraws[mode] += eyeDraws;
 }
 
-void engineVelocityNotePixels(uint32_t joined, uint32_t masked, uint32_t camera, uint32_t stale, uint32_t corrupt) {
+void engineVelocityNotePixels(uint32_t joined, uint32_t masked, uint32_t camera, uint32_t stale, uint32_t corrupt,
+                              uint32_t stamped) {
     if (!live.load(std::memory_order_acquire)) return;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     g_draw.pixelsJoined += joined;
@@ -1750,7 +2135,15 @@ void engineVelocityNotePixels(uint32_t joined, uint32_t masked, uint32_t camera,
     g_draw.pixelsCamera += camera;
     g_draw.pixelsStale += stale;
     g_draw.pixelsCorrupt += corrupt;
+    g_draw.pixelsStamped += stamped;
     ++g_draw.pixelReads;
+}
+
+void engineVelocityNoteSelfMarkingPs(uint64_t psHash) noexcept {
+    // vscreen's PS hook, owner context: the self-marking detail shaders' binds,
+    // counted for the draw-path census (the seam arc's live question: do their
+    // binds come through the hook at all).
+    if (engine_velocity_family::selfMarkingPs(psHash)) ++g_draw.selfMarkBinds;
 }
 
 } // namespace edvr

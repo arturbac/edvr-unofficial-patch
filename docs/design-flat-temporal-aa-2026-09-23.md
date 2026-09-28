@@ -74,6 +74,21 @@
   designed (three sizes R/E/D, the routing table, retirement, negotiation);
   step 1 shipped: `flatResolveRoute` names today's effective treatment per
   pairing (honest refusals included), logged on plan change, rig-tabled.
+  Section 74 (2026-09-27): the gate-2 review's final-pass pair closed
+  without a flight -- the negotiated E keys the resolve's resource cache
+  and the preflight carries it; buffer-pressure retirement loops until a
+  shared buffer unpins, bounded by the plan bank. Section 75 (2026-09-27):
+  the 0.5x canopy flicker traced to success-status Present results
+  resetting temporal history every frame; the history and phase gates now
+  use FAILED(hr)/SUCCEEDED(hr) with the value logged, awaiting the
+  confirming flight. Section 76 (2026-09-27): the gate-2 qualification
+  flight matrix is staged -- the 0.5x DLSS menu trace admitted to the
+  corpus, the eight-step session script recorded; crops remain deferred
+  on the source-rectangle lineage. Section 77 (2026-09-27): all six
+  rc-since-rc2 review findings fixed without a flight -- classifier
+  depth-output and multi-row texcoord detection, the stamp over-read,
+  after-UI exclusion preservation, negotiation-before-eval ordering, and
+  the analyzer's legacy-layout gate.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -4230,9 +4245,12 @@ the requested backend, never hide a lower internal resolution).
 Definitions the contract will carry explicitly: R = the game's render
 size (tone target), D = the present size (output), E = the temporal
 evaluation size. Route policy: DLSS/FSR upscale R < D evaluate at E = D;
-native (R == D) evaluates at E = R; R > D evaluates at E = R with a
+native (R == D) evaluates at E = R = D; R > D evaluates at E = R with a
 downsample stage E -> D (DLAA first, FSR Native AA pending its D3D11
-port's support, TAA already conforms). The copy chain's own downsample
+port's support, TAA already conforms). TAA today is a fused display-grid
+resolve at E = D sampling render-sized input (gate-2 review G2-2 -- the
+route now reports that honestly); render-grid TAA at E = R with one
+explicit R -> D conversion is the recorded design step, not yet built. The copy chain's own downsample
 stays in place where it already maps R to D (the game does this at SS >
 100% today); EDVR supplies a conversion only where the game's sampling
 contract does not cover the replacement image's texel mapping.
@@ -4256,6 +4274,14 @@ Staged implementation:
    now covers aspect-preserving sizes from 0.5x to 2x of output, with the
    conflicting-hdr guard as the loud backstop for full-res depthless
    intermediates; crops/ultrawide stay out of band for the lineage rework.
+   2026-09-27 later: the band is now flatUniformScale -- a uniform render-to-
+   output mapping within integer rounding of each axis (the exact bound of
+   rounding a rational scale to pixels, NOT an arbitrary aspect tolerance).
+   Rounded mappings like 1708x960 at 1366x768 admit; square shadow-like
+   targets and non-uniform crops stay excluded (the last waits for the
+   review's source-rectangle lineage). The selector's tone check uses the
+   same rule. Rig covers native, rounded, mild-crop, sub-half, shadow-like,
+   non-uniform, the 2x cap and past-cap.
    The 04:58 flight FLOWN: DLAA and TAA treat at 5760x3240 with the route
    lines naming each mode; FSR then engaged the same hour via Native AA --
    the 1.0x case of the same upscaler, evaluating at E = R with the game's
@@ -4275,6 +4301,20 @@ Staged implementation:
 4. Backend negotiation: the served-floor ladder (dlss_floor.h) already
    answers under-floor inputs on the VR door; the flat route gets the same
    query on extent changes, logged per route.
+   SHIPPED 2026-09-27: flatDlssNegotiate names the effective treatment from
+   the vendor's queried ranges -- serving mode and evaluation size, an
+   under-floor input cut to the floor it reaches with the game's copy
+   upsampling the rest (the VR door's rule), never a silent substitution.
+   The negotiated E overrides the resolve frame's evaluation grid;
+   requested vs effective treatment are both logged on every contract
+   change. Rig-pinned over the flight's own ladder shape (served at the
+   door output, ultra's point, proportional cuts, unanswered queries).
+   FLOWN 2026-09-27 (09:55 Epic): the full ladder 1.0/0.5/0.65/1.5/1.0
+   negotiated per change (floor performance at 0.5, quality at 0.65, DLAA
+   supersample at 1.5) with ZERO fallback lines and continuous streaks.
+   The first pass exposed a stale-override transition bug (the previous
+   contract's negotiated E leaking into the next frame); the override is
+   now gated to its exact contract signature.
 
 Qualification matrix (the review's gate 2 tests): sub-native, native,
 supersampled, odd sizes, crops, live extent changes without a restart,
@@ -4316,3 +4356,300 @@ the outcome tests above. What the trace does NOT certify -- mode, backend,
 observation state, effective treatment, history and pixels -- is now stated
 in the manifest's provenance; those belong to gates 2-4's GPU and flight
 evidence.
+
+## 74. Gate-2 review final pass: E keys the resource cache, bounded retirement (2026-09-27)
+
+The [gate-2 review](../reviews/flat-temporal-gate2-review-2026-09-27.md)'s
+final pass found two reproduced gaps, both fixed without a flight:
+
+- F1: the negotiated evaluation size E was missing from the resolve's
+  resource cache key. A cut E (step 4's under-floor negotiation) arriving
+  after a default-E frame would reuse the default-sized allocation and the
+  finish pass would fill only the E rectangle of it; and the preflight --
+  which carries no frame -- allocated at the route's default E, so the
+  first treated frame of a negotiated contract reallocated anyway. E now
+  keys the cache alongside mode/R/D, the plan carries the same negotiated
+  override the frame carries (gated to the exact contract signature), and
+  the preflight allocates and verifies at that E.
+- F2: the buffer-pressure path retired ONE plan and re-scanned; a buffer
+  shared by two live plans keeps a nonzero planRefs after the first
+  retirement, so nothing freed and the write refused. The pressure path
+  now retires in a loop bounded by the plan-bank size, re-scanning after
+  each retirement; the guards stand (never a promoted/mapped/pending
+  buffer, never a non-idle plan).
+
+WARP-qualified: the rig's cut probe walks default E -> cut E=24 -> default
+on a 16x16-to-32x32 DLSS contract, checking the backend's observed grid,
+the output view's size and the allocation count at each step, and that a
+preflight carrying the cut lets the first treated frame hit the cache; the
+shared-refs pressure case pins all 64 buffer slots twice over (32
+four-binding plans, each buffer in exactly two, the second reference on
+distinct slots so each plan is its own topology) and the 65th buffer
+tracks only after the loop retires both plans pinning a shared buffer.
+Corpus replay unchanged: 6/6 frames identical.
+
+## 75. The 0.5x flicker: success-status presents reset history every frame (2026-09-27)
+
+Sean's 0.5x report: the red canopy structure flickered between
+stair-stepped and smooth on both upscalers, fine at 0.65x. His 12:33 A/B
+bracketing an F8 cycle proved the treated path healthy -- EDVR DLSS at
+0.5x smooth through a 1300-frame streak while stock 0.5x stair-stepped,
+which is inherent to 1080p input. The 12:12 FSR flight's log held the
+real defect: a 13-second episode where EVERY frame accepted a reset with
+adapter reason no-previous (450/5s), history never accumulating, jitter
+pinned at (0,0) as treated-zero-jitter, while refused froze and treated
+kept counting. Mechanism: a treated frame always sets the adapter's
+previous at frame end, so only reset() between frames produces
+every-frame no-previous; refuse() is excluded (its counter froze); and
+the jitter collapse names the survivor -- phase.finish received
+hr != S_OK every frame, pinning previousAcceptedValid false and the
+phase at zero. flatRuntimePresent gated the history reset and the phase
+finish on hr != S_OK, so any success-status Present (DXGI occlusion and
+friends, or a chained mod's status) reset temporal history every frame
+for as long as the status persisted.
+SHIPPED 2026-09-27: both gates now use FAILED(hr)/SUCCEEDED(hr) --
+success statuses no longer reset history or stall the phase -- and the
+present value is logged (8/session, present-not-ok= in the 5s adapter
+line) so the next flight names the exact status. CONFIRMING FLIGHT
+REQUIRED: hit the condition (overlay/alt-tab/whatever produces it) and
+verify present-not-ok names the value with NO no-previous storm through
+it. The stair-stepped 0.5x look WITHOUT a storm is inherent (stock shows
+it too); FSR's resolve of the canopy at 0.5x during healthy accumulation
+is not yet separately qualified.
+
+Addendum, same day: the 13:00 flight (g0b56952d) ran storm-free --
+present-not-ok=0 in every window, treated streaks past 4000 -- and the
+canopy flicker persisted on both backends, so the storm and the
+structure-localized flicker are separate phenomena. The 12:32 F10
+capture (frames 36808/36823/36838, healthy 0.5x DLSS) shows the
+mechanism directly: the struts are ~1 render pixel at 1080p, and their
+fringe pixels oscillate between frames at |delta|~68/255 while their
+cores sit at ~2 -- jitter moves the sub-pixel structure on and off texel
+centers each phase, the input to either upscaler oscillates there, and
+the temporal logic flickers on exactly those pixels. At 0.65x the struts
+are ~1.7 px, mostly covered every phase, hence stable.
+ruled out: rejection-mask flip-flop, because rejection is stable on 97%
+of the structure's pixels across the three frames.
+ruled out: depth/motion corruption, because depth reads 0.0009+-0.0003
+stable and the menu camera is static.
+ruled out: a backend defect, because both networks flicker identically
+while the shared input oscillates.
+CLOSED (live, 2026-09-27 evening): the parked jitter-off test confirms
+the family -- HUD and canopy scintillation both die with jitter off
+while reprojection keeps running; see section 76 session 3.
+No threshold/clamp compensation: the oscillation is real coverage
+signal. 0.5x's price is flicker or softness; jitter-off is the manual
+escape hatch, not a default.
+
+## 76. Gate-2 qualification flight matrix: plan and corpus status (2026-09-27)
+
+The review's remaining boundary: the corpus certified one size pairing
+(0.65x DLSS, menu and flight); odd sizes, repeated mid-session changes,
+the other backends and the mod matrix are open. Crops stay deferred on
+the source-rectangle lineage; backend-failure forcing stays with the
+rigs. One trace per cell, admitted to the corpus with its manifest line;
+each F10 seals the three frames before the arm and dumps
+flat_trace_<frame>.bin into the game dir's edvr_logs\traces.
+
+Corpus today: edhm-menu-ss065-dlss, edhm-flight-ss065-dlss (2026-09-26),
+plus edhm-menu-ss050-dlss admitted 2026-09-27 from the 12:32 flight.
+
+Session script (one sitting, EDHM baseline, Epic install, start DLSS at
+SS 1.0; each step: wait ~20 s of treated frames, then F10):
+
+1. Main menu, SS 1.0, DLSS -> F10 (native menu).
+2. In flight, SS 1.0, DLSS -> F10 (native flight).
+3. SS 1.5, DLSS -> F10 (dlss-as-dlaa supersample).
+4. F8 to FSR, SS 0.5 -> F10 (FSR sub-native).
+5. SS 1.5, FSR -> F10 (FSR Native AA supersample).
+6. F8 to TAA, SS 1.0 -> F10 (TAA display-grid native).
+7. Output resolution 3840x2160 -> 2560x1440 mid-session, SS 0.65 -> F10
+   (odd pairing AND a live extent change without restart).
+8. Resolution back to 3840x2160, SS 1.0: no F10 needed; the runtime line
+   showing the streak resuming closes the repeated-changes cell.
+
+Per cell: one "flat route:" line names the effective treatment (the
+negotiation line joins it for sub-native DLSS); treated streaks rebuild
+within seconds of each change; no reset events beyond the change itself;
+the canopy scintillation at 0.5x is expected and recorded (section 75),
+not a blocker. After the session: --trace-check every new dump, admit
+one trace per cell with its manifest provenance line, full build (the
+corpus gate must print every file replaying identical), push. The
+EDHM-off stock matrix is a separate sitting (chain unlink, restart).
+
+Session 1 (2026-09-27 13:24, g0b56952d): menu cells only; the flight
+segment hit a NEW unreciped pair. Banked: edhm-menu-native-dlss (streak
+6000+ at capture). Eight seconds after entering flight, every frame
+began refusing locally on VS 24214E7C45496BE0 / PS EC998602427115F3
+(unknown-scene-projection-recipe, ~450 draws/5s window, every frame) and
+the runtime sat in observation for the rest of the session -- the
+section-68 design working as intended: zero treated, zero refusal-count
+churn, no reset storm, jitter parked at zero. All seven dumps replay
+identical under --trace-check, but the six post-observation ones
+(46463/48357/51105/53342/55208/57533) certify selection during local
+refusal, not treated cells; they stay unadmitted. No SS or resolution
+change was ever applied (no route lines past the initial native), so the
+supersample, sub-native-backend, odd-size and repeated-change cells all
+remain open. The refusing pair's bytecode IS on disk (shader capture:
+vs_24214E7C45496BE0.dxbc, ps_EC998602427115F3.dxbc) -- recipe it and the
+flight cells can run. CORRECTION (same evening): an earlier version of
+this note claimed the unknown-projection capture reported
+distinct-pairs=0 all session and opened an instrumentation question.
+That was a log-sampling error on my part -- every window I had grepped
+ended before 13:26:36. The log shows the automatic post-audit path
+taking the pair at 13:26:36 (frame=45891, trigger=automatic,
+bytecode-stages-saved=2), the F10 rearm re-taking it under the audit
+trigger at 13:26:42, and distinct-pairs=1 stable to session end. The
+capture pipeline worked exactly as designed; those saved bytes are the
+.dxbc the recipe below was reviewed from.
+
+Recipe SHIPPED 2026-09-27: VS 24214E7C45496BE0 is the radar local-key
+marker VS, already vetted at cb2 ForwardColumns 8 against the stock
+companion; EC998602 is the same marker recoloured through EDHM's t120
+config tree (same input semantics, colour-only delta, no projection or
+depth consumer), admitted as the exact companion. Not one of the
+coriolis arc's named seam suspects (BCF75CEA37060EAE / 2F924695596C8195
+at SV_Target6) -- adjacent family, new companion only. Rig pins the
+pair. The flight cells now wait on a re-fly, not on code.
+
+Session 2 (2026-09-27 13:56, g7a0415b2, in flight): the recipe holds --
+no observation episode, no local refusal beyond three one-draw transient
+projection-preparation-refused lines, present-not-ok=0 session-wide.
+Banked five cells, each captured with a rebuilt treated streak:
+edhm-flight-ss150-dlss (dlss-as-dlaa-supersample), edhm-flight-ss150-fsr
+(fsr-native-aa-supersample), edhm-flight-ss050-fsr (trained-upscale),
+edhm-flight-ss150-taa (display-grid down), edhm-flight-native-taa.
+Repeated contract changes rebuilt streaks within seconds every time --
+the repeated-changes cell stands on this evidence. Corpus is 9 files,
+27/27 replay identical. Still open: native DLSS flight, 0.5 DLSS flight,
+the odd-size/resolution-change cell (no route ever left 4K), and the
+EDHM-off stock matrix.
+
+Session 3 (2026-09-27 14:29, g7a0415b2, STOCK -- EDHM disabled): banked
+stock-flight-res2560x1440-dlss (the odd-size cell: borderless 2560x1440
+render under the 4K backbuffer, negotiated quality at E=D),
+stock-flight-ss050-dlss and stock-onfoot-station-ss050-dlss. Corpus is
+12 files, 36/36 replay identical. Sean reported cockpit HUD elements
+"swimming sometimes with motion" at 0.5x and station flicker; the 0.5x
+DLSS cockpit pixel capture (frames 52245/52260/52275) answers the
+machinery: HUD panel pixels carry cockpit-consistent near vectors
+(matching the dashboard, not space), the world-anchored local-key marker
+carries its far anchor's vector, rejection behaves on animated hologram
+content, and template-tracked displacement shows the panels locked to
+the cockpit geometry -- the reprojection input is correct in this
+capture. Remaining candidates for the visible swimming: the section-75
+sub-pixel scintillation family on 1px hologram lines at 1080p (same
+resolution floor as the canopy, expected at 0.5x), or a fast-motion
+vector failure this slow-motion capture cannot see. The discriminator is
+the parked jitter-off test: scintillation dies with jitter off; a true
+vector error would persist. CLOSED 2026-09-27 evening: Sean flew 0.5x
+with experimental.temporal_aa_jitter=off -- the HUD went low-res (the
+expected trade) and did NOT smear/swim with motion. The resolve still
+reprojects by its motion vectors with jitter off, so a vector error
+would have persisted; it did not. The swimming is the section-75
+scintillation family, confirmed twice over (canopy probe, live HUD
+test); the vectors are right (cockpit capture, locked to the dashboard).
+0.5x's honest price is flicker or softness; jitter-off is the manual
+escape hatch, not a default.
+
+## 77. rc-since-rc2 review: all six findings addressed (2026-09-27)
+
+Per [the review](../reviews/rc-since-rc2-review-2026-09-27.md)'s
+F1-F6, all fixed without a flight:
+
+- F1 (generic admission accepts a camera-dependent PS): the classifier
+  now refuses a texture coordinate whose used components carry vector-dot
+  (coefKind=2) terms from >=2 distinct rows of one cb -- the separate-U/V
+  idiom (U=dp4(v,rowA), V=dp4(v,rowB)), reason multi-row-texcoord.
+  Scoped to vector-dot terms so the rect-filter idiom (scale/offset
+  constants) still passes; the inert stock filter ps_F0BAE053476F8730
+  verifies Clean. Rig: synthetic two-row dp4 sample refuses, single-row
+  control passes. FOLLOW-UP (same evening): the reviewer's sqrt and
+  divide escape variants -- a fetch overwriting its own coordinate
+  register (sample into r0) and the projective divide (uv/w) -- erased
+  the row evidence before the first check read it. The coordinate's row
+  provenance is now evaluated at each fetch's POINT OF USE inside
+  buildForms (facts.texCoordMultiRowDot), and a divide with a term-free
+  denominator forwards the numerator's vector-dot terms. The reviewer's
+  own probe confirms matrix, matrix_sqrt and matrix_div all refuse as
+  multi-row-texcoord; the rect-filter fixture still passes.
+- F2 (classifier misses legal SV_Depth): the plain dcl_output form's
+  depth operand (oDepth/oDepthGE/oDepthLE, operand types 12/38/39) now
+  sets depthOutput, alongside the Sgv/Siv system-value path. Rig:
+  hand-assembled binaries for all three refuse as depth-output; a plain
+  colour output stays Clean.
+- F3 (12 bytes read past the 4-byte frame stamp): the 16-byte stamp cell
+  now uploads an initialized uint32_t[4]; the S2 lifecycle test checks
+  the whole copied float4 (frame, 0, 0, 0).
+- F4 (after-UI capture bypasses exclusions): the retry preserves the
+  original decision's two exclusions before attempting the take -- the
+  ui_depth shader exclusion and the held world-screen identity
+  (panel-sized SRV while the screen shows the world) -- via
+  uiLayerAfterWritePreserved, facts gathered at the vscreen call site.
+  VR-only path (fix.ui_quality, off by default); flat does not use it.
+  Rig: the test traverses the original kWorldScreen decision and the
+  retry gate together.
+- F5 (negotiated E one frame late): negotiation now completes BEFORE the
+  frame's and the plan's eval override are assigned (flatNegotiatedEval,
+  called post-negotiation in both places), so the first frame of an
+  under-floor contract resolves and preflights at the cut E -- no
+  default-E refusal, no next-frame reallocation. E is also part of
+  sameResolvePlan, so readiness tracks the effective plan. Rig: the
+  gate's truth table (flat_negotiated_eval_tests.h).
+- F6 (276-row captures crash the analyzer): load_manifest refuses
+  non-reset captures whose scene constants lack the freshness-stamp row
+  (a named CaptureError), reset captures on the legacy layout stay
+  accepted, and the engine guards the read with a named failure. Rig:
+  both boundary fixtures in flat_pixels --self-test.
+
+F7 (the updated pass's new P1): the sampled VR PS-shadow probe could
+adopt EDVR's own installed substitution as game state -- the probe
+assumed EDVR shaders hash zero, but the production hook registers the
+generated patch's nonzero hash, so a sample wrote the patch into the
+game shadow, broke the generation restore() compares by, and lost the
+original's identity (the frame boundary then had nothing to restore
+with). The probe now skips the currently installed patch by pointer
+identity before any registry lookup -- the shadow keeps the game's
+original and the saved generation. Lifecycle rig (gate-executed):
+substitution survives a sample with shadow and generation untouched,
+the frame boundary restores the original, and a genuine bypass-bound
+game shader still heals (engine_velocity_test 1162 checks). The pass's
+four performance items (inverse stamp decode, stage-verdict cache,
+exact-plan prepare reuse, camera hash at capture) are assessed
+optimization candidates with equivalence/measurement plans, not RC
+blockers; they wait on their own equivalence tests and a GPU timing
+flight before any source change.
+
+Full build green: mono resolve PASS, collector policy PASS, corpus
+36/36, engine_velocity 1157 checks, ui_quality 254 checks,
+openxr_shutdown 63 checks, flat_pixels self-test passed. One transient
+openxr_shutdown WARP-binding flake in an earlier attempt did not
+reproduce in the two following runs.
+
+## 78. Ship-population coverage: the ten-pair triage (2026-09-28)
+
+The supporter's never-starting report
+([reviews/flat-aa-user-log-20260928-030237.md](../reviews/flat-aa-user-log-20260928-030237.md))
+and Sean's same-evening reproduction (Caspian Explorer; the fleet
+carrier also refused) are the same defect class: known VS families with
+NEW pixel-shader companions, refusing generically every frame so the
+runtime holds observation forever (calls=0). Bytecode review of the
+session's ten refusing pairs (18 of 20 stages captured locally):
+every PS is colour-only by the established vetting -- texture
+coordinates from varyings or scalar-built grids, cb1 reads only at
+61/90/210/227..254 (lighting) and 277..279 (orientation dp3), never the
+270..273 clip rows, no depth output. The multi-row-temp verdicts are
+paint-layer/material blends, indexable-temp is array lighting, resinfo
+is an atlas-dimension query, and ps_A9975F91040B0BCD is the decal
+projective-depth family exactly as the already-reciped 0A298DE7/
+D8FCE3CE cases. vs_A47A3315FFF5E2E4 is a partial-z ForwardDp4(0,4);
+vs_ACE405F428C17EF6 and vs_72BDD292154158AD project ForwardColumns
+270..273 behind a cb0[9..11] local pre-transform (the ce715126 block's
+local-transform note); vs_2BB766C168B450A2 is columns 270..273 with a
+harmless resinfo atlas query. Nine pairs reciped and rig-pinned (census
+46); vs_C7FA0C0F5DD49180's blob was never captured, so its pair stays
+refused until a capture supplies it. The review's follow-up notes the
+architectural direction: exact recipes are the current mechanism, ship
+diversity is regression coverage, an upstream flat camera/projection
+hook is the proposed long-term investigation (unvalidated, not
+started), and the refusal is never to be bypassed.

@@ -125,7 +125,11 @@ int main(int argc,char** argv) {
     bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_SHADER_RESOURCE;bd.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
     D3D11_SUBRESOURCE_DATA initial{};initial.pSysMem=record;ComPtr<ID3D11Buffer> pool;
     check(SUCCEEDED(device->CreateBuffer(&bd,&initial,pool.GetAddressOf())),"pool buffer");auto poolView=view(device.Get(),pool.Get());
-    float scene[276][4]{};float cam[6][4];camera(cam);std::memcpy(scene+270,cam,sizeof(cam));
+    // The freshness stamp the prep shader's EN[276].x reads (the emit's
+    // present-frame clock in production): the fixture's markers fold it in.
+    constexpr uint32_t kFixtureStamp = 77;
+    float scene[277][4]{};float cam[6][4];camera(cam);std::memcpy(scene+270,cam,sizeof(cam));
+    {const uint32_t stamp=kFixtureStamp;std::memcpy(&scene[276][0],&stamp,4);}
     bd={};bd.ByteWidth=sizeof(scene);bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
     initial.pSysMem=scene;ComPtr<ID3D11Buffer> now,old;
     check(SUCCEEDED(device->CreateBuffer(&bd,&initial,now.GetAddressOf())) &&
@@ -203,7 +207,7 @@ int main(int argc,char** argv) {
     record[73]=bits(-.3125f);record[74]=bits(0);record[75]=bits(2.5f);
     edvr::engine_velocity_emit::Pose np{{record[4],record[5],record[6],record[2],record[3]}};
     edvr::engine_velocity_emit::Pose pp{{record[73],record[74],record[75],record[78],record[79]}};
-    record[72]=0x7FC0ED01u^edvr::engine_velocity_emit::markerHash(np,pp);
+    record[72]=0x7FC0ED01u^edvr::engine_velocity_emit::markerHash(np,pp,kFixtureStamp);
     context->UpdateSubresource(pool.Get(),0,nullptr,record,0,0);
     slots[(8*w+8)*2]=1;context->UpdateSubresource(slotTexture.Get(),0,nullptr,slots.data(),w*8,0);
     ++f.frame;run(true);
@@ -213,7 +217,7 @@ int main(int argc,char** argv) {
     for(unsigned kind=0;kind<3;++kind){
         if(kind==0)slots[(8*w+8)*2]=2; // corrupt even code
         if(kind==1){slots[(8*w+8)*2]=1;slots[(8*w+8)*2+1]=.02f;} // stale depth
-        if(kind==2){slots[(8*w+8)*2+1]=.01f;record[72]=0x7FC0ED02u^edvr::engine_velocity_emit::markerHash(np,pp);context->UpdateSubresource(pool.Get(),0,nullptr,record,0,0);}
+        if(kind==2){slots[(8*w+8)*2+1]=.01f;record[72]=0x7FC0ED02u^edvr::engine_velocity_emit::markerHash(np,pp,kFixtureStamp);context->UpdateSubresource(pool.Get(),0,nullptr,record,0,0);}
         context->UpdateSubresource(slotTexture.Get(),0,nullptr,slots.data(),w*8,0);++f.frame;
         auto rejected=run(true);check(observedReject==255 && pixel(rejected.Get())==0xff0000ff,"corrupt/stale/masked pixel displays current color");
     }
@@ -362,6 +366,79 @@ int main(int argc,char** argv) {
         check(restored(),"supersampled FSR resolve restores the complete original pipeline");
         check(observedInW==w2 && observedInH==h2 && observedOutW==w2 && observedOutH==h2,
               "FSR evaluates the supersample route at render size on both axes");
+        // TAA at R > D evaluates on the display grid today (the route's
+        // honest report): the resolved view stays D-sized.
+        f2.mode=edvr::FlatMonoResolveMode::Taa;f2.frame=3;
+        bindOriginal();ComPtr<ID3D11ShaderResourceView> outTaa;reason2=nullptr;
+        check(edvr::flatMonoResolve(device.Get(),context.Get(),f2,outTaa.GetAddressOf(),&reason2) && outTaa,
+              "supersampled TAA frame resolves on the display grid");
+        if(reason2)std::printf("info: supersample TAA resolver reason %s\n",reason2);
+        ComPtr<ID3D11Resource> outResTaa;if(outTaa)outTaa->GetResource(outResTaa.GetAddressOf());
+        ComPtr<ID3D11Texture2D> outTexTaa;if(outResTaa)outResTaa.As(&outTexTaa);
+        D3D11_TEXTURE2D_DESC outDescTaa{};if(outTexTaa)outTexTaa->GetDesc(&outDescTaa);
+        check(outDescTaa.Width==w && outDescTaa.Height==h,
+              "the display-grid TAA output stays display-sized at supersampling");
+    }
+    // Gate-2 review F1: the negotiated evaluation size is part of the resolve's
+    // resource cache key, and the preflight carries it. A cut E must reallocate
+    // at the cut size (never reuse the route-default cache), restoring the
+    // default reallocates back, and a preflight carrying the same cut lets the
+    // first treated frame hit that cache instead of reallocating.
+    {
+        expectedJx=expectedJy=0;  // this block runs unjittered
+        edvr::FlatMonoResolveFrame fc{};fc.color=colorView.Get();fc.depth=depthView.Get();
+        fc.renderWidth=w;fc.renderHeight=h;fc.outputWidth=32;fc.outputHeight=32;fc.deltaMs=16;
+        camera(fc.camera);camera(fc.previousCamera);
+        fc.engine={slotView.Get(),poolView.Get(),now.Get(),old.Get()};
+        fc.mode=edvr::FlatMonoResolveMode::Dlss;fc.frame=1;
+        const auto cutBase=edvr::flatMonoResolveStats();
+        bindOriginal();ComPtr<ID3D11ShaderResourceView> outDefault;const char* cutReason=nullptr;
+        check(edvr::flatMonoResolve(device.Get(),context.Get(),fc,outDefault.GetAddressOf(),&cutReason) && outDefault,
+              "default-E frame resolves on the route's evaluation grid");
+        if(cutReason)std::printf("info: cut-probe default reason %s\n",cutReason);
+        check(restored(),"default-E resolve restores the complete original pipeline");
+        check(observedInW==w && observedInH==h && observedOutW==32 && observedOutH==32,
+              "backend evaluates the default route at display size");
+        check(edvr::flatMonoResolveStats().allocations==cutBase.allocations+1,
+              "default-E frame allocates the route-default resource set once");
+        ++fc.frame;fc.evalWidth=fc.evalHeight=24;
+        bindOriginal();ComPtr<ID3D11ShaderResourceView> outCut;cutReason=nullptr;
+        check(edvr::flatMonoResolve(device.Get(),context.Get(),fc,outCut.GetAddressOf(),&cutReason) && outCut,
+              "cut-E frame resolves on the negotiated evaluation grid");
+        if(cutReason)std::printf("info: cut-probe cut reason %s\n",cutReason);
+        check(restored(),"cut-E resolve restores the complete original pipeline");
+        check(observedInW==w && observedInH==h && observedOutW==24 && observedOutH==24,
+              "backend evaluates the negotiated cut at its own size");
+        ComPtr<ID3D11Resource> outCutResource;if(outCut)outCut->GetResource(outCutResource.GetAddressOf());
+        ComPtr<ID3D11Texture2D> outCutTexture;if(outCutResource)outCutResource.As(&outCutTexture);
+        D3D11_TEXTURE2D_DESC outCutDesc{};if(outCutTexture)outCutTexture->GetDesc(&outCutDesc);
+        check(outCutDesc.Width==24 && outCutDesc.Height==24,
+              "the cut-E output view is cut-sized for the game's upsample");
+        check(edvr::flatMonoResolveStats().allocations==cutBase.allocations+2,
+              "a changed E reallocates rather than reusing the route-default cache");
+        ++fc.frame;fc.evalWidth=fc.evalHeight=0;
+        bindOriginal();ComPtr<ID3D11ShaderResourceView> outBack;cutReason=nullptr;
+        check(edvr::flatMonoResolve(device.Get(),context.Get(),fc,outBack.GetAddressOf(),&cutReason) && outBack &&
+              observedOutW==32 && observedOutH==32,
+              "dropping the override returns to the route's evaluation grid");
+        check(edvr::flatMonoResolveStats().allocations==cutBase.allocations+3,
+              "returning to the default E reallocates back");
+        edvr::FlatMonoResolvePreflight cutPlan{};cutPlan.renderWidth=w;cutPlan.renderHeight=h;
+        cutPlan.outputWidth=32;cutPlan.outputHeight=32;cutPlan.mode=fc.mode;
+        cutPlan.evalWidth=cutPlan.evalHeight=24;
+        cutPlan.colorViewFormat=DXGI_FORMAT_R8G8B8A8_UNORM;cutPlan.depthViewFormat=DXGI_FORMAT_R32_FLOAT;
+        auto cutPreflight=edvr::flatMonoResolvePreflight(device.Get(),context.Get(),cutPlan);
+        check(cutPreflight.readyForRasterJitter() && cutPreflight.spatialFallbackReady,
+              "preflight carrying the negotiated E allocates at the cut size");
+        check(edvr::flatMonoResolveStats().allocations==cutBase.allocations+4,
+              "the cut-E preflight reallocates from the default-sized cache");
+        ++fc.frame;fc.evalWidth=fc.evalHeight=24;
+        bindOriginal();ComPtr<ID3D11ShaderResourceView> outPreflighted;cutReason=nullptr;
+        check(edvr::flatMonoResolve(device.Get(),context.Get(),fc,outPreflighted.GetAddressOf(),&cutReason) && outPreflighted &&
+              observedOutW==24 && observedOutH==24,
+              "the preflighted cut-E frame resolves on the negotiated grid");
+        check(edvr::flatMonoResolveStats().allocations==cutBase.allocations+4,
+              "the first treated frame hits the preflighted cache instead of reallocating");
     }
     context->ClearState();
     failures+=flatPixelCaptureGpuTests(device.Get(),context.Get());

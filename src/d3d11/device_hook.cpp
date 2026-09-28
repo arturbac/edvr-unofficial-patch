@@ -1001,6 +1001,7 @@ HRESULT STDMETHODCALLTYPE hookedDevCreate(ID3D11Device* self, const void* first,
             noteDeviceCreateFailure(Slot, hr, first, second, FirstIsResource);
         } else if constexpr (Slot == kDevCreateBuffer) {
             const auto* desc=static_cast<const D3D11_BUFFER_DESC*>(first);
+            if(out && *out)engineVelocityBufferCreated(static_cast<ID3D11Buffer*>(*out),desc);
             if(out && *out && desc && desc->BindFlags==D3D11_BIND_CONSTANT_BUFFER && flatRuntimeActive()) {
                 const auto* initial=static_cast<const D3D11_SUBRESOURCE_DATA*>(second);
                 flatRuntimeCreateBuffer(static_cast<ID3D11Buffer*>(*out),initial?initial->pSysMem:nullptr);

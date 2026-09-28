@@ -1073,6 +1073,25 @@ void testAfterUi() {
     notForwarded.verdictForwards = false;
     check(uiLayerDecide(notForwarded) == UiLayerDecision::kVerdict,
           "an after-UI write another fix swallows or re-issues is refused, not taken (case d)");
+    // rc-since-rc2 review F4: the retry preserves the original decision's
+    // exclusions. Original: a world-screen composite while the screen shows
+    // the world is never taken (kWorldScreen); the family rule's kExcluded
+    // never reaches a family. The retry must decline both the same way.
+    {
+        UiLayerDrawFacts w;
+        w.family = UiLayerFamily::kScreen;
+        w.worldScreen = true;
+        check(uiLayerDecide(w) == UiLayerDecision::kWorldScreen,
+              "the original decision holds the world screen out of the layer");
+        check(!uiLayerAfterWritePreserved(true, false, false),
+              "an excluded shader is never taken after the UI (F4)");
+        check(!uiLayerAfterWritePreserved(false, true, true),
+              "the held world-screen composite is never taken after the UI (F4)");
+        check(uiLayerAfterWritePreserved(false, true, false),
+              "an ordinary write while the world shows still attempts (F4)");
+        check(uiLayerAfterWritePreserved(false, false, true),
+              "a panel-sized write with nothing held still attempts (F4)");
+    }
 }
 
 // ------------------------------------------------------------ the crisp HUD

@@ -30,6 +30,7 @@ struct FlatProjectionRuntimeStatus {
     uint64_t preflights = 0, prepared = 0, zeroPhaseReady = 0;
     uint64_t livePlanRetargets = 0;
     uint64_t planRetiredStale = 0, planRetiredLru = 0;
+    uint64_t planRefsLive = 0;   // references held by live plans right now
     uint64_t coldQueued = 0, coldCompleted = 0, coldStale = 0;
     uint64_t coldFailed = 0, coldPending = 0, coldTimeouts = 0;
 };

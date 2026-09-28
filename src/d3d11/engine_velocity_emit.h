@@ -3,7 +3,7 @@
 // logic with no D3D in it, so tools/engine_velocity_test drives it with a
 // fake owner, dictionary and node lists laid out as the engine lays them.
 //
-// The engine (build 332841; docs/kinematic-motion-injection-2026-09-19.md,
+// The existing SECONDARY producer (build 332841; docs/kinematic-motion-injection-2026-09-19.md,
 // 2026-09-23 "Phase 1 built", and the decompiles it cites):
 //   FUN_144312E00(rig record, owner, masks, tail) builds the record's
 //   0x150-byte pool record on its stack -- byte-for-byte the t33 record --
@@ -19,13 +19,24 @@
 //   bytes +0x120..+0x13F except those whole-record copies, and nothing
 //   writes +0x120 at all (it is uninitialised stack in every producer).
 //
-// So the bracket, after the forward, looks the entry up again (a pure read on
+// Its secondary bracket, after the forward, looks the entry up again (a pure read on
 // a hit, no lock), takes the call's k records off the tail, checks EVERY one's
 // current pose against the rig record bit for bit (the disagreement gate)
 // before any history is committed, and writes the record's PREVIOUS engine
 // pose into its second block with a self-checking marker at +0x120:
-// tag ^ markerHash(both blocks), the same hash the compose's
-// ENGINE_MOTION_HLSL block (temporal_shader_source.h) recomputes on the GPU.
+// tag ^ markerHash(both blocks, the present-frame clock), the same hash the
+// compose's ENGINE_MOTION_HLSL block (temporal_shader_source.h) recomputes on
+// the GPU. The frame stamp is the freshness half of the fix of 2026-09-25
+// (docs/kinematic-motion-injection-2026-09-19.md): a record the engine does
+// not re-evaluate keeps its last pair and marker, and without the stamp the
+// compose replays that stale delta indefinitely.
+//
+// PRIMARY 42B4130 shares these canonical collection-record history rules,
+// but uses its exact owned model-key append and an emission sink. It never
+// writes native records. Verified 36819D0 clear, 434E740 relocation and 4C81BE0 upload
+// boundaries carry address ownership into engine_velocity_primary_copy;
+// full native-record guards permit previous-pose writes only in EDVR's
+// private clone. Unproved identity, deformation or ownership stays native.
 //
 // HISTORY RULES (the 2026-09-23 review, reviews\engine-motion-review-2026-
 // 09-23.md, items 1 and 2). Missing motion is not evidence of a stationary
@@ -85,13 +96,16 @@ struct Pose {
     bool operator!=(const Pose& o) const { return !(*this == o); }
 };
 
-// The ENGINE_MOTION_HLSL block's engineMarkerHash, word for word: the current block
-// (position, quaternion) then the previous block (position, quaternion).
-inline uint32_t markerHash(const Pose& now, const Pose& prev) {
+// The ENGINE_MOTION_HLSL block's engineMarkerHash, word for word: the current
+// block (position, quaternion), then the previous block (position, quaternion),
+// then the frame stamp (the present-frame clock at the emission; the compose
+// declines a joined marker whose stamp is not the frame it is composing).
+inline uint32_t markerHash(const Pose& now, const Pose& prev, uint32_t frame) {
     uint32_t h = 0x811C9DC5u;
     auto mix = [&](uint32_t v) { h = (h ^ v) * 0x01000193u; h ^= h >> 13; };
     for (uint32_t v : now.w) mix(v);
     for (uint32_t v : prev.w) mix(v);
+    mix(frame);
     return h;
 }
 
@@ -390,10 +404,28 @@ inline bool readItemPose(uintptr_t item, Pose& pose) noexcept {
     return read(item + kItemPos, &pose.w[0], 12) && read(item + kItemQuat, &pose.w[3], 8);
 }
 
+// The primary builder is called for a collection record, not for a model
+// identity: different objects share its owner and dictionary key. Its outer
+// 42B4420 call supplies record+0x210 and *(record+0x290), respectively.
+struct PrimaryIdentity { uintptr_t record = 0, node = 0, context = 0; };
+using EmissionSink = bool (*)(uintptr_t item, const Pose& now, const Pose& previous,
+                             uint32_t marker, uint32_t frame) noexcept;
+inline bool primaryIdentity(uintptr_t context, uintptr_t lod, PrimaryIdentity& out) noexcept {
+    out = {};
+    if (!context || lod < 0x210) return false;
+    const uintptr_t record = lod - 0x210;
+    uintptr_t actualContext = 0, node = 0;
+    if (!read(record + 0x290, &actualContext, sizeof(actualContext)) || actualContext != context ||
+        !read(record + kRecordNode, &node, sizeof(node)) || !node) return false;
+    out = {record, node, context};
+    return true;
+}
+
 // The whole bracket. frame = the present-frame clock at the call. census may
 // be null (no census this run).
 inline void observe(uintptr_t record, uintptr_t owner, int32_t before, int32_t after, uint32_t frame,
-                    LookupFn lookup, Table& table, Stats& s, Census* census = nullptr) noexcept {
+                    LookupFn lookup, Table& table, Stats& s, Census* census = nullptr,
+                    uintptr_t ownedKey = 0, bool primary = false, EmissionSink sink = nullptr) noexcept {
     bump(s.calls);
     if (after < before) { bump(s.drained); return; }
     const int32_t k = after - before;
@@ -411,7 +443,8 @@ inline void observe(uintptr_t record, uintptr_t owner, int32_t before, int32_t a
     if (k == 0) return;
     bump(s.callsWithItems);
     bump(s.itemsAppended, static_cast<uint64_t>(k));
-    const uintptr_t entry = lookup ? guardedLookup(lookup, owner + kOwnerDictionary, record + kRecordKey) : 0;
+    const uintptr_t entry = lookup ? guardedLookup(lookup, owner + kOwnerDictionary,
+                                                   ownedKey ? ownedKey : record + kRecordKey) : 0;
     uintptr_t items[kMaxAppended] = {};
     if (!entry || !collectItems(entry, k, items)) {
         bump(s.locateFailures);
@@ -427,6 +460,25 @@ inline void observe(uintptr_t record, uintptr_t owner, int32_t before, int32_t a
         Pose itemPose;
         if (!readItemPose(items[j], itemPose)) { bump(s.readFaults); continue; }
         if (itemPose != pose) { bump(s.disagreements); continue; }
+        if (primary) {
+            uint32_t header[2]{}, copiedScale = 0;
+            Pose copied;
+            if (!read(items[j], header, sizeof(header)) ||
+                !read(items[j] + 0x134, &copiedScale, sizeof(copiedScale)) ||
+                !read(items[j] + kItemPrevPos, &copied.w[0], 12) ||
+                !read(items[j] + kItemPrevQuat, &copied.w[3], 8)) {
+                bump(s.readFaults); continue;
+            }
+            // The secondary 4312E00 initializer also fixes both scale words
+            // to verified DAT_4DDE614=1.0; shared canonical history has the
+            // same unit-scale domain. Only rigid primary records qualify. Bones
+            // or variable scale need their own previous deformation source.
+            if (header[0] != 0 || header[1] != 0x3F800000u || copiedScale != 0x3F800000u) {
+                table.taint(record, frame, s);
+                return; // leave unsupported native records untouched
+            }
+            if (copied != pose) { bump(s.disagreements); continue; }
+        }
         itemOk[j] = true;
         ++valid;
     }
@@ -444,15 +496,41 @@ inline void observe(uintptr_t record, uintptr_t owner, int32_t before, int32_t a
     for (int32_t j = 0; j < k; ++j) {
         if (!itemOk[j]) continue;   // never write into an item that did not validate
         const Pose& written = joined ? prev : pose;   // masked: the engine's own same-frame copy
-        const uint32_t marker = (joined ? kJoined : kMasked) ^ markerHash(pose, written);
-        if (!write(items[j] + kItemPrevPos, &written.w[0], 12) || !write(items[j] + kItemPrevQuat, &written.w[3], 8) ||
-            !write(items[j] + kItemMarker, &marker, 4)) {
+        const uint32_t marker = (joined ? kJoined : kMasked) ^ markerHash(pose, written, frame);
+        const bool stored = sink ? sink(items[j],pose,written,marker,frame) :
+            (!primary && write(items[j] + kItemPrevPos, &written.w[0], 12) &&
+             write(items[j] + kItemPrevQuat, &written.w[3], 8) && write(items[j] + kItemMarker, &marker, 4));
+        if (!stored) {
             bump(s.writeFaults);
             continue;
         }
         if (joined) { bump(s.itemsJoined); if (written != pose) bump(s.itemsMoving); }
         else bump(s.itemsMasked);
     }
+}
+
+inline void observePrimary(const PrimaryIdentity& identity, uintptr_t owner, uintptr_t key,
+                           uintptr_t position, uintptr_t quaternion, int32_t before, int32_t after,
+                           uint32_t frame, LookupFn lookup, Table& table, Stats& s, EmissionSink sink) noexcept {
+    PrimaryIdentity current;
+    uint32_t pos[3]{}, contextPos[3]{}, quat[4]{}, contextQuat[4]{};
+    Pose canonical;
+    uint64_t node = 0;
+    if (!identity.record || !primaryIdentity(identity.context, identity.record + 0x210, current) ||
+        current.node != identity.node || !readRecordPose(identity.record, canonical, node) ||
+        !read(position, pos, sizeof(pos)) || !read(identity.context + 0x20, contextPos, sizeof(contextPos)) ||
+        !read(quaternion, quat, sizeof(quat)) || !read(identity.context + 0x10, contextQuat, sizeof(contextQuat))) {
+        bump(s.readFaults); if (identity.record) table.taint(identity.record, frame, s); return;
+    }
+    if (int64_t(after) - int64_t(before) != 1 || !key ||
+        std::memcmp(pos, canonical.w, sizeof(pos)) || std::memcmp(pos, contextPos, sizeof(pos)) ||
+        std::memcmp(quat, contextQuat, sizeof(quat))) {
+        bump(s.callsUnproven); table.taint(identity.record, frame, s); return;
+    }
+    // Same canonical record+0x170/+0x17C pose as the secondary rig producer:
+    // share its table and all continuity/ambiguity rules, but use the actual
+    // primary model key rather than the secondary record+0x250 key.
+    observe(identity.record, owner, before, after, frame, lookup, table, s, nullptr, key, true, sink);
 }
 
 } // namespace engine_velocity_emit

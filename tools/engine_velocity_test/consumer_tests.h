@@ -56,14 +56,16 @@ inline double dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 inline V3 cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
 
 // A camera: clip rows 270..273 and origin 275, exactly as the game fills
-// cb1/cb2 (math_tests.h's Camera, verbatim).
+// cb1/cb2 (math_tests.h's Camera, verbatim). The array holds a 277th float4:
+// the freshness stamp the compose's EN[276].x reads (math_tests'
+// kStampFrame, uint bits).
 struct Camera {
     double rot[3][3];
     V3 t;
     V3 origin;
     double fx, fy, nearZ, jx, jy;
-    std::array<float, 276 * 4> rows() const {
-        std::array<float, 276 * 4> cb{};
+    std::array<float, 277 * 4> rows(uint32_t token = math_tests::kStampFrame) const {
+        std::array<float, 277 * 4> cb{};
         auto clipLin = [&](V3 v, float* out) {
             const double w = -v.z;
             out[0] = float(fx * v.x + jx * w);
@@ -77,12 +79,14 @@ struct Camera {
         cb[275 * 4 + 0] = float(origin.x);
         cb[275 * 4 + 1] = float(origin.y);
         cb[275 * 4 + 2] = float(origin.z);
+        uint32_t stamp = token;
+        std::memcpy(&cb[276 * 4], &stamp, 4);
         return cb;
     }
     // Project a camera-relative point (world - origin) through the FLOAT
     // rows, in double, as the GPU would multiply them (engineReproject's
     // forward half).
-    static void clip(const std::array<float, 276 * 4>& cb, V3 rel, double out[4]) {
+    static void clip(const std::array<float, 277 * 4>& cb, V3 rel, double out[4]) {
         for (int k = 0; k < 4; ++k)
             out[k] = rel.x * cb[270 * 4 + k] + rel.y * cb[271 * 4 + k] + rel.z * cb[272 * 4 + k] + cb[273 * 4 + k];
     }
@@ -104,7 +108,7 @@ inline Camera camera(double yawDeg, V3 origin, double jx, double jy) {
 // (temporal_shader_source.h, ENGINE_MOTION_HLSL block), transcribed in
 // double. Used only to PLACE a record exactly under a chosen pixel;
 // engineReproject itself, on the GPU, only ever runs forward (pose -> clip).
-inline V3 solveRel(const std::array<float, 276 * 4>& rows, double ndcX, double ndcY, double zView) {
+inline V3 solveRel(const std::array<float, 277 * 4>& rows, double ndcX, double ndcY, double zView) {
     const V3 a{rows[270 * 4 + 0], rows[271 * 4 + 0], rows[272 * 4 + 0]};
     const V3 b{rows[270 * 4 + 1], rows[271 * 4 + 1], rows[272 * 4 + 1]};
     const V3 c{rows[270 * 4 + 3], rows[271 * 4 + 3], rows[272 * 4 + 3]};
@@ -140,7 +144,9 @@ struct Record {
         else { b.w[0] = w[73]; b.w[1] = w[74]; b.w[2] = w[75]; b.w[3] = w[78]; b.w[4] = w[79]; }
         return b;
     }
-    void mark(uint32_t tag) { w[72] = tag ^ ev::markerHash(block(false), block(true)); }
+    // The marker folds the frame stamp in: mark() takes the token EN[276].x
+    // must carry for the join to certify.
+    void mark(uint32_t tag, uint32_t token) { w[72] = tag ^ ev::markerHash(block(false), block(true), token); }
 };
 static_assert(sizeof(Record) == 336, "t33 stride");
 
@@ -180,8 +186,9 @@ inline std::string loadTemporalHlsl(const Harness& h) {
     return hlsl;
 }
 
-inline ComPtr<ID3DBlob> compileMv(const Harness& h, const std::string& hlsl, bool diagnostics) {
-    const std::string source = diagnostics ? ("#define EDVR_TEMPORAL_DIAGNOSTICS 1\n" + hlsl) : hlsl;
+inline ComPtr<ID3DBlob> compileMv(const Harness& h, const std::string& hlsl, bool diagnostics, bool trace=false) {
+    const std::string source = (trace ? std::string("#define EDVR_TEMPORAL_TRACE 1\n") : std::string()) +
+        (diagnostics ? ("#define EDVR_TEMPORAL_DIAGNOSTICS 1\n" + hlsl) : hlsl);
     ComPtr<ID3DBlob> code, errors;
     const HRESULT hr = D3DCompile(source.data(), source.size(), "temporal-mv-consumer", nullptr, nullptr, "mv", "cs_5_0",
                                    D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
@@ -193,7 +200,7 @@ inline ComPtr<ID3DBlob> compileMv(const Harness& h, const std::string& hlsl, boo
 
 struct Px { int x, y; };
 
-inline void run(const Harness& h) {
+inline void run(const Harness& h,const uint32_t* primaryRecord=nullptr,uint32_t stampFrame=math_tests::kStampFrame) {
     const int kDim = 16;   // region origin (0,0), size == texSize == 16x16
 
     const std::string hlsl = loadTemporalHlsl(h);
@@ -263,9 +270,14 @@ inline void run(const Harness& h) {
     // EngineBefore (b2), so an unmoved record's camera term (case c) is an
     // exact round-trip -- projecting a reconstructed point back through the
     // SAME rows it came from -- matching the zero-motion baseline above by
-    // construction, not by coincidence.
-    const Camera engineCam = camera(0.0, {0.0, 0.0, 0.0}, 0.0, 0.0);
-    const std::array<float, 276 * 4> camRows = engineCam.rows();
+    // construction, not by coincidence. The rows carry the freshness stamp
+    // at float4 276 (math_tests' kStampFrame): every joined record below is
+    // marked with the same token, except the stale-stamp case.
+    auto wordFloat=[](uint32_t v){float f;std::memcpy(&f,&v,4);return f;};
+    const V3 origin=primaryRecord?V3{wordFloat(primaryRecord[4]),wordFloat(primaryRecord[5]),double(wordFloat(primaryRecord[6]))+50.0}:V3{0,0,0};
+    const Camera engineCam = camera(0.0, origin, 0.0, 0.0);
+    const std::array<float, 277 * 4> camRows = engineCam.rows(stampFrame);
+    const V3 cameraOrigin{camRows[275*4],camRows[275*4+1],camRows[275*4+2]};
     ComPtr<ID3D11Buffer> enebCb;
     { D3D11_BUFFER_DESC d{}; d.ByteWidth = UINT(camRows.size() * 4); d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
       D3D11_SUBRESOURCE_DATA init{camRows.data(), 0, 0};
@@ -277,37 +289,46 @@ inline void run(const Harness& h) {
     // The pool: slot 0 a moving JOINED record (case a), 1 MASKED (b, pose
     // reused from a -- irrelevant, since a masked kind never reaches the
     // reprojection math), 2 an unmoved JOINED record (c), 3 a record with a
-    // garbage marker: a valid pose, not a rig record (kind 3). 4..7 unused.
+    // garbage marker: a valid pose, not a rig record (kind 3), 4 a JOINED
+    // record stamped with an OLDER frame (h): the stale-stamp decline. 5..7
+    // unused.
     std::vector<Record> pool(8);
     const uint16_t* ident = identLanes();
 
     const Px pxA{2, 2}, pxB{2, 6}, pxC{2, 10};
     const Px pxD1{6, 2}, pxD2{6, 6}, pxD3{6, 10};
-    const Px pxE{10, 2}, pxF{10, 6}, pxG{10, 10}, pxNotRig{13, 13};
+    const Px pxE{10, 2}, pxF{10, 6}, pxG{10, 10}, pxNotRig{13, 13}, pxStamp{13, 2};
 
     double ndcAx, ndcAy;
     pixelToNdc(pxA.x, pxA.y, kDim, ndcAx, ndcAy);
-    const V3 posANow = solveRel(camRows, ndcAx, ndcAy, zViewEff);
+    const V3 posANow = add(solveRel(camRows, ndcAx, ndcAy, zViewEff),cameraOrigin);
     const V3 deltaA{2.0, -1.0, 3.0};   // metres: a landing-ship-scale motion, not camera motion (EN == EB)
     const V3 posAPrev = sub(posANow, deltaA);
     pool[0].pose(posANow, ident, 1.0f, false);
     pool[0].pose(posAPrev, ident, 1.0f, true);
-    pool[0].mark(ev::kJoined);
+    pool[0].mark(ev::kJoined, stampFrame);
+    if(primaryRecord)std::memcpy(pool[0].w,primaryRecord,sizeof(pool[0].w)); // production emit bytes, including its unmodified marker
 
     pool[1].pose(posANow, ident, 1.0f, false);
     pool[1].pose(posAPrev, ident, 1.0f, true);
-    pool[1].mark(ev::kMasked);
+    pool[1].mark(ev::kMasked, stampFrame);
 
     double ndcCx, ndcCy;
     pixelToNdc(pxC.x, pxC.y, kDim, ndcCx, ndcCy);
-    const V3 posC = solveRel(camRows, ndcCx, ndcCy, zViewEff);
+    const V3 posC = add(solveRel(camRows, ndcCx, ndcCy, zViewEff),cameraOrigin);
     pool[2].pose(posC, ident, 1.0f, false);
     pool[2].pose(posC, ident, 1.0f, true);   // second block == first: engineRecordMoved() is false
-    pool[2].mark(ev::kJoined);
+    pool[2].mark(ev::kJoined, stampFrame);
 
     pool[3].pose(posANow, ident, 1.0f, false);
     pool[3].pose(posAPrev, ident, 1.0f, true);
     pool[3].w[72] = 0xDEADBEEFu;   // NOT tag ^ markerHash(...): declines as "not a rig record" (kind 3)
+
+    // 4: the moving joined record of case (a), but its marker folds an older
+    // frame's stamp -- the cull case: the record was not re-evaluated this
+    // frame, and replaying its stale pose pair would phantom-drift the hull.
+    pool[4] = pool[0];
+    pool[4].mark(ev::kJoined, stampFrame - 1);
 
     // ES (t21): x = 2*slot+1 (the patched pool draw's slot code), y = the
     // depth that draw wrote, raw bits. Z (t2): the scene's own depth.
@@ -330,6 +351,30 @@ inline void run(const Harness& h) {
     setEs(pxF, -1.0f, 0.0f);           // cleared (explicit, though it is also this tile's default)
     setEs(pxG, 199.0f, kZBg);          // 2*99+1: slot 99 >= the pool's 8 records
     setEs(pxNotRig, 7.0f, kZBg);       // 2*3+1: a real, in-range slot with a garbage marker
+    setEs(pxStamp, 9.0f, kZBg);        // 2*4+1: joined, but stamped with an older frame
+
+    // The self-marking fallback (the game's own target-6 channel, G6 t19,
+    // probe.w bit 4096): pxS joins through G6 with ES cleared; pxP has BOTH
+    // marked (ES must win); pxT's G6 depth mismatches the scene (stale).
+    const Px pxS{13, 6}, pxP{13, 10}, pxT{6, 13};
+    setEs(pxP, 5.0f, kZBg);            // ES: 2*2+1, the unmoved joined record
+    std::vector<float> g6Data(size_t(kDim) * kDim * 2, 0.0f);
+    for (int i = 0; i < kDim * kDim; ++i) { g6Data[size_t(i) * 2 + 0] = -1.0f; g6Data[size_t(i) * 2 + 1] = 0.0f; }
+    auto setG6 = [&](Px p, float code, float depth) {
+        const size_t i = size_t(p.y) * kDim + p.x;
+        g6Data[i * 2 + 0] = code; g6Data[i * 2 + 1] = depth;
+    };
+    setG6(pxS, 1.0f, kZBg);            // the game's own write: slot 0, the moving joined record
+    setG6(pxP, 1.0f, kZBg);            // ...also marks pxP (slot 0), where ES says slot 2
+    setG6(pxT, 1.0f, kZBg + 0.25f);    // ...and pxT, at a depth the scene does not have
+
+    // The overlap cases (the 2026-09-27 review's F1): ownership of the scene
+    // depth picks the channel, not ES-first ordering.
+    const Px pxO1{10, 13}, pxO2{2, 13};
+    setEs(pxO1, 1.0f, kZBg * 2.0f);    // a substituted draw's stale marker: the seam has since drawn nearer
+    setG6(pxO1, 1.0f, kZBg);           // G6's foreground marker owns the pixel: it must win
+    setEs(pxO2, 1.0f, kZBg * 2.0f);    // neither channel owns the pixel: both stale
+    setG6(pxO2, 1.0f, kZBg + 0.25f);
 
     // -------------------------- resources --------------------------
     auto structuredSrv = [&](const void* src, UINT stride, UINT count, ID3D11ShaderResourceView** srv) {
@@ -353,9 +398,11 @@ inline void run(const Harness& h) {
     };
     const ComPtr<ID3D11Texture2D> esTex = makeTexture(DXGI_FORMAT_R32G32_FLOAT, D3D11_BIND_SHADER_RESOURCE, esData.data(), UINT(kDim) * 2 * 4);
     const ComPtr<ID3D11Texture2D> zTex = makeTexture(DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, zData.data(), UINT(kDim) * 4);
-    ComPtr<ID3D11ShaderResourceView> esSrv, zSrv;
+    const ComPtr<ID3D11Texture2D> g6Tex = makeTexture(DXGI_FORMAT_R32G32_FLOAT, D3D11_BIND_SHADER_RESOURCE, g6Data.data(), UINT(kDim) * 2 * 4);
+    ComPtr<ID3D11ShaderResourceView> esSrv, zSrv, g6Srv;
     h.check(SUCCEEDED(h.device->CreateShaderResourceView(esTex.Get(), nullptr, &esSrv)), "ES SRV");
     h.check(SUCCEEDED(h.device->CreateShaderResourceView(zTex.Get(), nullptr, &zSrv)), "Z SRV");
+    h.check(SUCCEEDED(h.device->CreateShaderResourceView(g6Tex.Get(), nullptr, &g6Srv)), "G6 SRV");
 
     const ComPtr<ID3D11Texture2D> mvTex = makeTexture(DXGI_FORMAT_R32G32_FLOAT, D3D11_BIND_UNORDERED_ACCESS, nullptr, 0);
     const ComPtr<ID3D11Texture2D> zcTex = makeTexture(DXGI_FORMAT_R32_FLOAT, D3D11_BIND_UNORDERED_ACCESS, nullptr, 0);
@@ -412,6 +459,7 @@ inline void run(const Harness& h) {
     h.context->CSSetShaderResources(2, 1, zSrv.GetAddressOf());
     ID3D11ShaderResourceView* esEp[2] = {esSrv.Get(), epSrv.Get()};   // t21 = ES, t22 = EP
     h.context->CSSetShaderResources(21, 2, esEp);
+    h.context->CSSetShaderResources(19, 1, g6Srv.GetAddressOf());     // t19 = G6 (the game's own self-marked channel)
     ID3D11UnorderedAccessView* uavs[4] = {statsUav.Get(), mvUav.Get(), zcUav.Get(), mkUav.Get()};   // u2..u5
     h.context->CSSetUnorderedAccessViews(2, 4, uavs, nullptr);
 
@@ -437,13 +485,41 @@ inline void run(const Harness& h) {
     // 3) The no-engine baseline: same everything, probe.w bit 2048 clear.
     const auto baseline = dispatchAndRead(csDiag.Get(), 0.0f);
 
+    // 4) The self-marking fallback armed: bit 4096 added, G6 (t19) read where
+    //    ES is cleared. Run AFTER the Stats read above: it adds a joined count
+    //    of its own. The plain compile's own run follows for the agreement
+    //    cross-check.
+    const auto g6Armed = dispatchAndRead(csDiag.Get(), 2048.0f + 4096.0f);
+    const auto g6Plain = dispatchAndRead(csPlain.Get(), 2048.0f + 4096.0f);
+
     const std::vector<float>&armedMv = diagArmed.first, &armedMk = diagArmed.second;
     const std::vector<float>&baseMv = baseline.first, &baseMk = baseline.second;
 
+    auto predictBefore=[&](Px point){
+    // Independent CPU-double pose inverse/forward for the exact record
+    // supplied by production observePrimary, or the synthetic baseline.
+    const Record& record=pool[0];
+    auto turnRecord=[&](bool previous,V3 v){
+        const unsigned qi=previous?78:2;
+        const uint16_t lanes[4]={uint16_t(record.w[qi]),uint16_t(record.w[qi]>>16),uint16_t(record.w[qi+1]),uint16_t(record.w[qi+1]>>16)};
+        const auto turned=math_tests::turn(math_tests::decode(lanes),{v.x,v.y,v.z});
+        return V3{turned.x,turned.y,turned.z};
+    };
+    const V3 nowPos{wordFloat(record.w[4]),wordFloat(record.w[5]),wordFloat(record.w[6])};
+    const V3 prevPos{wordFloat(record.w[73]),wordFloat(record.w[74]),wordFloat(record.w[75])};
+    const double scale=wordFloat(record.w[1]),previousScale=wordFloat(record.w[77]);
+    const V3 mx=turnRecord(false,{scale,0,0}),my=turnRecord(false,{0,scale,0}),mz=turnRecord(false,{0,0,scale});
+    const V3 ix=cross(my,mz),iy=cross(mz,mx),iz=cross(mx,my);
+    const double det=dot(mx,ix);
+    double nx,ny;pixelToNdc(point.x,point.y,kDim,nx,ny);
+    const V3 localWorld=sub(add(solveRel(camRows,nx,ny,zViewEff),cameraOrigin),nowPos);
+    const V3 local{dot(ix,localWorld)/det,dot(iy,localWorld)/det,dot(iz,localWorld)/det};
+    return sub(add(prevPos,mul(turnRecord(true,local),previousScale)),cameraOrigin);
+    };
     // -------------------------- (a) JOINED, moving: exact motion --------------------------
     double worstErr = 0.0;
     {
-        const V3 posAPrevF{double(float(posAPrev.x)), double(float(posAPrev.y)), double(float(posAPrev.z))};
+        const V3 posAPrevF=predictBefore(pxA);
         double before[4];
         Camera::clip(camRows, posAPrevF, before);
         h.check(before[3] > 0.0, "case a: the moved record's previous position reprojects in front of the (static) camera");
@@ -490,28 +566,141 @@ inline void run(const Harness& h) {
     expectBaseline(pxF, "cleared ES (-1, 0): declines exactly like the no-engine baseline");
     expectBaseline(pxG, "slot >= the pool's record count: declines exactly like the no-engine baseline");
     expectBaseline(pxNotRig, "a pool record that is not a rig record (garbage marker): declines exactly like the no-engine baseline");
+    expectBaseline(pxStamp, "STALE STAMP (a joined marker from an older frame): declines to the camera term exactly like the no-engine baseline");
 
     // -------------------------- plain vs EDVR_TEMPORAL_DIAGNOSTICS-1: must agree --------------------------
-    for (Px p : {pxA, pxB, pxC, pxD1, pxD2, pxD3, pxE, pxF, pxG, pxNotRig}) {
+    for (Px p : {pxA, pxB, pxC, pxD1, pxD2, pxD3, pxE, pxF, pxG, pxNotRig, pxStamp}) {
         const auto pv = mvAt(plainArmed.first, p);
         const auto dv = mvAt(armedMv, p);
         h.check(pv.first == dv.first && pv.second == dv.second, "the plain and EDVR_TEMPORAL_DIAGNOSTICS-1 compiles of mv agree on MV at every constructed pixel");
     }
 
-    // -------------------------- Stats[50..54]: the diagnostics compile's own counters --------------------------
-    // 50 joined (a, c), 51 masked (b), 52 not-a-rig-record (notRig), 53
-    // stale (e), 54 corrupt (d1 even, d2 fractional). d3's code 0 fails the
-    // ES.x >= 1 gate before the corrupt check runs (kind 0), and kind 0 --
-    // like d3, f and g -- is never tallied by mv's own diagnostics (only
-    // engineKind != 0 increments a counter), so none of those three add to
-    // any of the five buckets checked here.
-    h.check(stats[50] == 2, "Stats[50] (JOINED pixels) == 2 (a, c)");
+    // Drive the production capture compile through the same real resources:
+    // ownership classifications must survive its float flags, while every
+    // NVIDIA MV and history-mask result remains bit-identical to production.
+    const auto traceCode=compileMv(h,hlsl,true,true);
+    ComPtr<ID3D11ComputeShader> traceCs;
+    h.check(traceCode && SUCCEEDED(h.device->CreateComputeShader(traceCode->GetBufferPointer(),traceCode->GetBufferSize(),nullptr,&traceCs)),
+            "production capture motion shader creates on WARP");
+    const auto decisionTex=makeTexture(DXGI_FORMAT_R32G32B32A32_FLOAT,D3D11_BIND_UNORDERED_ACCESS,nullptr,0);
+    ComPtr<ID3D11UnorderedAccessView> decisionUav;
+    h.check(SUCCEEDED(h.device->CreateUnorderedAccessView(decisionTex.Get(),nullptr,&decisionUav)),"capture decision UAV");
+    h.context->CSSetUnorderedAccessViews(7,1,decisionUav.GetAddressOf(),nullptr);
+    const auto captured=dispatchAndRead(traceCs.Get(),2048.0f);
+    const auto decisions=readTex(decisionTex.Get(),4);
+    for(Px p:{pxA,pxB,pxC,pxE,pxF,pxNotRig,pxStamp}) {
+        h.check(mvAt(captured.first,p)==mvAt(armedMv,p) && mkAt(captured.second,p)==mkAt(armedMk,p),
+                "capture diagnostics preserve exact production vectors and history masks");
+    }
+    for(const auto& item:std::vector<std::pair<Px,unsigned>>{{pxA,1},{pxNotRig,3},{pxE,4},{pxStamp,6}}) {
+        const size_t i=(size_t(item.first.y)*kDim+item.first.x)*4;
+        const unsigned bits=static_cast<unsigned>(decisions[i+3]);
+        h.check(decisions[i+3]==float(bits) && ((bits>>12)&7)==item.second,
+                "capture flags encode joined/nonrig/stale-slot/stale-stamp without float precision loss");
+        const auto motion=mvAt(armedMv,item.first);
+        h.check(decisions[i]==motion.first && decisions[i+1]==motion.second,
+                "capture ownership bits preserve physical decision motion");
+        h.check((bits&15)==(item.second==1?11u:1u) && (bits&1024)!=0 && (bits&256)!=0,
+                "capture ownership bits preserve path and projection/depth flags");
+    }
+    ID3D11UnorderedAccessView* noDecision=nullptr;
+    h.context->CSSetUnorderedAccessViews(7,1,&noDecision,nullptr);
+
+    // -------------------------- Stats[50..55]: the diagnostics compile's own counters --------------------------
+    // 50 joined (a, c, and pxP's ES marker -- the precedence pixel is a joined
+    // unmoved record through ES), 51 masked (b), 52 not-a-rig-record (notRig),
+    // 53 stale (e, and the two overlap pixels o1/o2 whose ES marker is stale:
+    // with bit 4096 clear the G6 channel is not read), 54 corrupt (d1 even,
+    // d2 fractional), 55 stale stamp (h). d3's code 0 fails the ES.x >= 1 gate
+    // before the corrupt check runs (kind 0), and kind 0 -- like d3, f and g --
+    // is never tallied by mv's own diagnostics (only engineKind != 0 increments
+    // a counter), so none of those three add to any of the six buckets checked
+    // here. The G6 pixels read baseline with bit 4096 clear, tallying nothing.
+    h.check(stats[50] == 3, "Stats[50] (JOINED pixels) == 3 (a, c, pxP)");
     h.check(stats[51] == 1, "Stats[51] (MASKED pixels) == 1 (b)");
     h.check(stats[52] == 1, "Stats[52] (pool records that are not rig records) == 1 (notRig)");
-    h.check(stats[53] == 1, "Stats[53] (STALE pixels) == 1 (e)");
+    h.check(stats[53] == 3, "Stats[53] (STALE pixels) == 3 (e, and the overlap pixels o1/o2, G6 unread without bit 4096)");
     h.check(stats[54] == 2, "Stats[54] (CORRUPT pixels) == 2 (d1, d2)");
+    h.check(stats[55] == 1, "Stats[55] (STALE-STAMP pixels) == 1 (h: a joined marker from an older frame)");
 
-    std::printf("  consumer: %d pixels: joined 2 (worst error %.2e px), masked 1 (sentinel + MK=1), declined 7, counters match\n",
+    // -------------------------- the self-marking fallback (G6 t19, probe.w 4096) --------------------------
+    const std::vector<float>&g6Mv = g6Armed.first;
+    {   // pxS: ES cleared, G6 marked with slot 0's code -- joins through the
+        // game's own channel with the moving record's exact motion, computed
+        // in double as case (a)'s: the pixel's world point carried by the
+        // record's pose delta (identity orientation, scale 1).
+        const V3 posSPrev = predictBefore(pxS);
+        const V3 posSPrevF{double(float(posSPrev.x)), double(float(posSPrev.y)), double(float(posSPrev.z))};
+        double before[4];
+        Camera::clip(camRows, posSPrevF, before);
+        double ppX, ppY;
+        clipToPixel(before, kDim, ppX, ppY);
+        const auto mv = mvAt(g6Mv, pxS);
+        const double gotX = double(pxS.x) + double(mv.first), gotY = double(pxS.y) + double(mv.second);
+        const double err = std::max(std::fabs(gotX - ppX), std::fabs(gotY - ppY));
+        worstErr = std::max(worstErr, err);
+        if (err > 1e-3) std::fprintf(stderr, "  case g6-join: GPU previous pixel (%.6f %.6f) vs double reference (%.6f %.6f), error %.2e\n", gotX, gotY, ppX, ppY, err);
+        h.check(err <= 1e-3, "SELF-MARKING: a G6-marked pixel with ES cleared joins with the record's exact motion, within 1e-3 px");
+    }
+    {   // Bit 4096 is the gate: the same pixel in the 2048-only runs keeps the
+        // no-fallback result exactly.
+        const auto mv = mvAt(armedMv, pxS);
+        const auto mvBase = mvAt(baseMv, pxS);
+        h.check(mv.first == mvBase.first && mv.second == mvBase.second,
+                "SELF-MARKING: with bit 4096 clear the G6 channel is not read -- the pixel declines like the baseline");
+    }
+    {   // pxP: ES marked (slot 2, unmoved) and G6 marked (slot 0, moving) --
+        // the substituted draws' channel wins.
+        const auto mv = mvAt(g6Mv, pxP);
+        const auto mvBase = mvAt(baseMv, pxP);
+        h.check(mv.first == mvBase.first && mv.second == mvBase.second,
+                "SELF-MARKING: ES takes precedence over G6 where both are marked (the unmoved record's camera term)");
+    }
+    {   // pxT: G6's depth is not the scene's -- stale, declined like kind 4.
+        const auto mv = mvAt(g6Mv, pxT);
+        const auto mvBase = mvAt(baseMv, pxT);
+        h.check(mv.first == mvBase.first && mv.second == mvBase.second,
+                "SELF-MARKING: a G6 marker whose depth is not the scene's declines exactly like the stale case");
+    }
+    {   // pxO1 (the review's F1): a stale ES marker AND a valid foreground G6
+        // marker -- ownership decides, the seam's marker wins over the hull's
+        // stale one, and the pixel joins with the record's exact motion.
+        const V3 posO1Prev = predictBefore(pxO1);
+        const V3 posO1PrevF{double(float(posO1Prev.x)), double(float(posO1Prev.y)), double(float(posO1Prev.z))};
+        double before[4];
+        Camera::clip(camRows, posO1PrevF, before);
+        double ppX, ppY;
+        clipToPixel(before, kDim, ppX, ppY);
+        const auto mv = mvAt(g6Mv, pxO1);
+        const double gotX = double(pxO1.x) + double(mv.first), gotY = double(pxO1.y) + double(mv.second);
+        const double err = std::max(std::fabs(gotX - ppX), std::fabs(gotY - ppY));
+        worstErr = std::max(worstErr, err);
+        if (err > 1e-3) std::fprintf(stderr, "  case overlap: GPU previous pixel (%.6f %.6f) vs double reference (%.6f %.6f), error %.2e\n", gotX, gotY, ppX, ppY, err);
+        h.check(err <= 1e-3, "OVERLAP: a stale ES marker must not suppress a valid foreground G6 marker -- the G6 marker's motion applies");
+    }
+    {   // pxO2: neither channel owns the pixel (both depths stale) -- declines
+        // exactly like the stale case.
+        const auto mv = mvAt(g6Mv, pxO2);
+        const auto mvBase = mvAt(baseMv, pxO2);
+        h.check(mv.first == mvBase.first && mv.second == mvBase.second,
+                "OVERLAP: when neither channel owns the scene pixel, the pixel declines to the camera term");
+    }
+    {   // The ES path is unaffected by G6's presence: pxA's exact motion holds.
+        const auto mv = mvAt(g6Mv, pxA);
+        const auto mvArmed = mvAt(armedMv, pxA);
+        h.check(mv.first == mvArmed.first && mv.second == mvArmed.second,
+                "SELF-MARKING: the substituted path is byte-identical with G6 bound");
+    }
+    for (Px p : {pxS, pxP, pxT, pxO1, pxO2}) {
+        const auto pv = mvAt(g6Plain.first, p);
+        const auto dv = mvAt(g6Mv, p);
+        h.check(pv.first == dv.first && pv.second == dv.second,
+                "the plain and diagnostics compiles agree at the self-marking pixels too");
+    }
+
+    std::printf("  consumer: %d pixels: joined 3 (worst error %.2e px), masked 1 (sentinel + MK=1), declined 8, "
+                "the self-marking fallback joined/gated/preceded/stale as specified, the overlap cases by ownership, "
+                "counters match\n",
                 kDim * kDim, worstErr);
 }
 

@@ -1,5 +1,6 @@
 #include "kinematic_eval_hook.h"
 #include "kinematic_eval_probe.h"
+#include "engine_velocity_emit.h"
 #include "../common/code_hook.h"
 #include <windows.h>
 #include <intrin.h>
@@ -62,6 +63,18 @@ static_assert(decltype(evalGate)::is_always_lock_free,
 std::atomic<bool> emitWanted{false};
 // Engine-record velocity's emit observer (direct producer 0's post-forward).
 alignas(8) std::atomic<EngineEmitObserverFn> emitObserver{nullptr};
+alignas(8) std::atomic<EnginePrimaryEmitObserverFn> primaryEmitObserver{nullptr};
+alignas(8) std::atomic<uintptr_t> primaryGate{0};
+std::atomic<uintptr_t> g_primaryReturn{0};
+std::atomic<const char*> g_primaryStatus{"not requested"};
+std::atomic<uint64_t> g_primaryCalls{0},g_primaryUnowned{0};
+alignas(8) std::atomic<EnginePoolCopyObserverFn> poolCopyObserver{nullptr};
+std::atomic<const char*> g_poolCopyStatus{"not requested"};
+alignas(8) std::atomic<EngineMergeBeginFn> mergeBeginObserver{nullptr};
+alignas(8) std::atomic<EngineMergeEndFn> mergeEndObserver{nullptr};
+std::atomic<const char*> g_mergeStatus{"not requested"};
+alignas(8) std::atomic<EngineClearObserverFn> clearObserver{nullptr};
+std::atomic<const char*> g_clearStatus{"not requested"};
 // The scheduler stack probe's want: its targets 0/1 are the job bodies
 // themselves, already patched by this file, so it observes through the
 // job-0/1 relays and holds this gate open while armed.
@@ -266,6 +279,11 @@ __declspec(noinline) uintptr_t __fastcall evalObserved(uintptr_t,uintptr_t,uintp
 __declspec(noinline) uintptr_t __fastcall rigEvalObserved(uintptr_t,uintptr_t) noexcept;
 __declspec(noinline) uintptr_t __fastcall bucketBuildObserved(uintptr_t,uintptr_t,uintptr_t,
                                                               uintptr_t,uintptr_t,uintptr_t) noexcept;
+__declspec(noinline) uintptr_t __fastcall primaryBuildObserved(uintptr_t,uintptr_t,uintptr_t,
+                                                               uintptr_t,uintptr_t,uintptr_t) noexcept;
+__declspec(noinline) void __fastcall poolCopyObserved(uintptr_t) noexcept;
+__declspec(noinline) void __fastcall poolMergeObserved(uintptr_t,uintptr_t) noexcept;
+__declspec(noinline) void __fastcall poolClearObserved(uintptr_t,uintptr_t) noexcept;
 __declspec(noinline) uintptr_t __fastcall partTestObserved(uintptr_t,uintptr_t,uintptr_t) noexcept;
 __declspec(noinline) uintptr_t __fastcall setterObserved(uintptr_t,uintptr_t,uintptr_t,uintptr_t,
                                                          uintptr_t,uintptr_t,uintptr_t) noexcept;
@@ -293,6 +311,14 @@ HookEntry g_jobEntries[KinematicEvalProbe::kJobCount]={
 };
 HookEntry g_bucketEntry{"kinematic-bucket-build",KinematicEvalProbe::kBucketBuildRva,
                         reinterpret_cast<void*>(&bucketBuildObserved),&builderGate};
+HookEntry g_primaryEntry{"engine-primary-rigid-emit",0x42B4130u,
+                         reinterpret_cast<void*>(&primaryBuildObserved),&primaryGate};
+HookEntry g_poolCopyEntry{"engine-primary-pool-copy",0x4C81BE0u,
+                          reinterpret_cast<void*>(&poolCopyObserved),&primaryGate};
+HookEntry g_poolMergeEntry{"engine-primary-list-merge",0x434E740u,
+                           reinterpret_cast<void*>(&poolMergeObserved),&primaryGate};
+HookEntry g_poolClearEntry{"engine-primary-list-clear",0x36819D0u,
+                           reinterpret_cast<void*>(&poolClearObserved),&primaryGate};
 HookEntry g_directEntries[KinematicEvalProbe::kDirectProducerCount]={
     {"kinematic-build-144312e00",KinematicEvalProbe::kDirectBuildRvas[0],
      reinterpret_cast<void*>(&directBuild0)},
@@ -396,6 +422,7 @@ thread_local uint32_t t_jobMask=0;
 // bucketBuildObserved around its forward, save/restore), read by the part
 // test's observer: joins each FUN_1442B3FC0 verdict to its builder row.
 thread_local uint32_t t_builderRow=kGateProbeNoRow;
+thread_local engine_velocity_emit::PrimaryIdentity t_primaryIdentity;
 
 __declspec(noinline) uintptr_t __fastcall evalObserved(uintptr_t descriptor,uintptr_t param2,
                                                        uintptr_t renderRecord) noexcept {
@@ -577,6 +604,10 @@ __declspec(noinline) uintptr_t __fastcall bucketBuildObserved(uintptr_t a,uintpt
     const auto builderProbe=gateProbeBuilder.load(std::memory_order_acquire);
     const uint32_t outerRow=t_builderRow;
     t_builderRow=builderProbe?builderProbe(a,b,c,d):kGateProbeNoRow;
+    const auto outerIdentity=t_primaryIdentity;
+    t_primaryIdentity={};
+    if(primaryEmitObserver.load(std::memory_order_acquire))
+        engine_velocity_emit::primaryIdentity(a,d,t_primaryIdentity);
     // The bucket census is the eval-gate consumers' (kinematicEvalProbe's
     // bucket_items): it runs only while the eval gate is open, exactly as it
     // did when that gate was this relay's own. The governor alone holding the
@@ -585,8 +616,9 @@ __declspec(noinline) uintptr_t __fastcall bucketBuildObserved(uintptr_t a,uintpt
     BucketSnap snaps[kBucketWalkCap];
     uint32_t flags=0;
     const uint32_t n=census?collectBuckets(a,snaps,kBucketWalkCap,&flags):0;
-    const uintptr_t result=forward(a,b,c,d,e,f);
-    t_builderRow=outerRow;
+    uintptr_t result=0;
+    __try { result=forward(a,b,c,d,e,f); }
+    __finally { t_builderRow=outerRow; t_primaryIdentity=outerIdentity; }
     if(!census)return result;
     if(n) {
         uint64_t items=0;
@@ -608,6 +640,98 @@ __declspec(noinline) uintptr_t __fastcall bucketBuildObserved(uintptr_t a,uintpt
         kinematicEvalProbe.noteBucketBuild(0,0,0,flags);
     }
     return result;
+}
+
+// Six arguments are required: the original reads the mask and optional
+// four-word tail on the stack. The relay jumps here, preserving the native
+// caller's return address; only 42B4420's verified primary call is eligible.
+__declspec(noinline) uintptr_t __fastcall primaryBuildObserved(uintptr_t model,uintptr_t lod,
+    uintptr_t position,uintptr_t quaternion,uintptr_t mask,uintptr_t tail) noexcept {
+    const auto forward=reinterpret_cast<BucketFn>(g_primaryEntry.forward.load(std::memory_order_acquire));
+    if(!forward)return 0;
+    g_primaryCalls.fetch_add(1,std::memory_order_relaxed);
+    const auto identity=t_primaryIdentity;
+    const auto observe=primaryEmitObserver.load(std::memory_order_acquire);
+    const bool eligible=observe && identity.record &&
+        reinterpret_cast<uintptr_t>(_ReturnAddress())==g_primaryReturn.load(std::memory_order_relaxed);
+    uintptr_t owner=0;
+    int32_t before=0,after=0;
+    const bool counted=observe && engine_velocity_emit::read(model+0x20,&owner,sizeof(owner)) && owner &&
+        engine_velocity_emit::read(owner+engine_velocity_emit::kOwnerCount,&before,sizeof(before));
+    uintptr_t result=0;
+    bool returned=false;
+    __try { result=forward(model,lod,position,quaternion,mask,tail); returned=true; }
+    __finally {
+        const bool complete=returned && counted &&
+            engine_velocity_emit::read(owner+engine_velocity_emit::kOwnerCount,&after,sizeof(after));
+        // Every append invalidates its prior address claim, including native
+        // callers outside the certified outer frame. Only eligible identity
+        // can create a replacement claim.
+        if(observe)observe(eligible?identity:engine_velocity_emit::PrimaryIdentity{},owner,model+0x40,position,quaternion,
+                           complete?before:0,complete?after:0);
+        if(!complete || !eligible)g_primaryUnowned.fetch_add(1,std::memory_order_relaxed);
+    }
+    return result;
+}
+
+// Authoritative whole-record upload, one task argument. Every destination
+// range is reported, including unknown sources, so overwritten certificates
+// cannot survive merely because the replacement did not receive a pose.
+__declspec(noinline) void __fastcall poolCopyObserved(uintptr_t task) noexcept {
+    const auto forward=reinterpret_cast<void(__fastcall*)(uintptr_t)>(g_poolCopyEntry.forward.load(std::memory_order_acquire));
+    if(!forward)return;
+    const auto observe=poolCopyObserver.load(std::memory_order_acquire);
+    namespace ev=engine_velocity_emit;
+    uintptr_t holder=0,buffer=0,descriptor=0,mapped=0;
+    uint32_t stride=0;uint64_t offset=0;
+    const bool metadata=ev::read(task+0xD0,&holder,8) && holder && ev::read(holder+0x10,&buffer,8) && buffer &&
+       ev::read(buffer+0x180,&mapped,8) && mapped && ev::read(buffer+0x100,&descriptor,8) && descriptor &&
+       ev::read(descriptor+0x10,&stride,4) && stride==336 && ev::read(task+0xC0,&offset,8);
+    bool returned=false;
+    __try {forward(task);returned=true;}
+    __finally {if(observe && (!returned || !metadata))observe(mapped,stride,0,0,UINT32_MAX);}
+    if(!observe || !metadata)return;
+    for(unsigned group=0;group<8;++group) {
+        uint64_t count=0;uintptr_t entries=0;
+        const uintptr_t list=group==0?task+8:task+0x20+uintptr_t(group-1)*0x18;
+        const uint32_t entryStride=group==0?0x48u:0x50u;
+        if(!ev::read(list,&count,8) || !ev::read(list+8,&entries,8) || count>65536 ||
+           (count && (!entries || entries>UINTPTR_MAX-count*entryStride))) {
+            observe(mapped,stride,0,0,UINT32_MAX);return;
+        }
+        for(uint64_t i=0;i<count;++i) {
+            const uintptr_t entry=entries+i*entryStride;
+            uintptr_t source=0;uint32_t slot=0,records=0;
+            if(!ev::read(entry+8,&source,8) || !ev::read(entry+0x38,&slot,4) ||
+               !ev::read(entry+0x3C,&records,4) || offset>UINT64_MAX-slot) {
+                observe(mapped,stride,0,0,UINT32_MAX);return;
+            }
+            observe(mapped,stride,source,offset+slot,records);
+        }
+    }
+}
+
+// Exact list relocation boundary. The plan stages claims before freed source
+// nodes can be recycled; a native unwind discards the staged epoch.
+__declspec(noinline) void __fastcall poolMergeObserved(uintptr_t destination,uintptr_t source) noexcept {
+    const auto forward=reinterpret_cast<void(__fastcall*)(uintptr_t,uintptr_t)>(g_poolMergeEntry.forward.load(std::memory_order_acquire));
+    if(!forward)return;
+    const auto begin=mergeBeginObserver.load(std::memory_order_acquire);
+    const auto end=mergeEndObserver.load(std::memory_order_acquire);
+    void* plan=begin && end?begin(destination,source):nullptr;
+    bool completed=false;
+    __try {forward(destination,source);completed=true;}
+    __finally {if(begin && end)end(plan,completed);}
+}
+// Typed 336-byte dictionary clear frees nodes outside the merge/copy path.
+// Revoke exact source addresses before allocator recycling; preserve claims
+// in unrelated source dictionaries awaiting the destination merge.
+__declspec(noinline) void __fastcall poolClearObserved(uintptr_t dictionary,uintptr_t allocatorOwner) noexcept {
+    const auto forward=reinterpret_cast<void(__fastcall*)(uintptr_t,uintptr_t)>(g_poolClearEntry.forward.load(std::memory_order_acquire));
+    if(!forward)return;
+    const auto observe=clearObserver.load(std::memory_order_acquire);
+    if(observe)observe(dictionary);
+    forward(dictionary,allocatorOwner);
 }
 
 // --- The per-part test's observer (FUN_1442B3FC0) ---------------------------
@@ -835,6 +959,133 @@ bool partPatchIsOurs(uintptr_t base) noexcept {
            std::memcmp(bytes+5,kPartPrologue+5,sizeof(bytes)-5)==0;
 }
 
+// Verified build 332841: primary ABI/prologue, its sole builder callsite,
+// dictionary key/owner loads, and terminal append count. No guessed frame.
+const char* primarySignature(uintptr_t base) noexcept {
+    constexpr uint8_t prologue[]={0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x6C,0x24,0x20,
+        0x56,0x57,0x41,0x56,0x48,0x81,0xEC,0x90,0x01,0x00,0x00};
+    constexpr uint8_t call[]={0xE8,0xE8,0xF8,0xFF,0xFF};
+    constexpr uint8_t append[]={0x48,0xFF,0x42,0x18,0xFF,0x86,0xA4,0x02,0x00,0x00};
+    constexpr uint8_t key[]={0x4C,0x8D,0x71,0x40}; // lea r14,[rcx+40h]
+    constexpr uint8_t owner[]={0x48,0x8B,0x76,0x20}; // mov rsi,[rsi+20h]
+    __try {
+        uint8_t got[sizeof(prologue)]{};
+        std::memcpy(got,reinterpret_cast<const void*>(base+0x42B4130),sizeof(got));
+        if(g_primaryEntry.ready.load(std::memory_order_acquire) && !std::memcmp(got,prologue,sizeof(got)))
+            return "our primary patch is gone";
+        if(std::memcmp(got,prologue,sizeof(got))) {
+            int32_t jump=0;std::memcpy(&jump,got+1,4);
+            const intptr_t expected=reinterpret_cast<intptr_t>(g_primaryEntry.relay)-intptr_t(base+0x42B4135);
+            if(!g_primaryEntry.relay || got[0]!=0xE9 || jump!=expected ||
+                std::memcmp(got+5,prologue+5,sizeof(got)-5))return "primary prologue mismatch";
+        }
+        if(std::memcmp(reinterpret_cast<const void*>(base+0x42B4843),call,sizeof(call)))return "primary caller mismatch";
+        if(std::memcmp(reinterpret_cast<const void*>(base+0x42B43D8),append,sizeof(append)))return "primary append mismatch";
+        if(std::memcmp(reinterpret_cast<const void*>(base+0x42B415B),key,sizeof(key)))return "primary key mismatch";
+        if(std::memcmp(reinterpret_cast<const void*>(base+0x42B42DC),owner,sizeof(owner)))return "primary owner mismatch";
+        uint64_t primaryHash=0xCBF29CE484222325ull,outerHash=primaryHash;
+        for(uintptr_t i=5;i<0x2DA;++i)primaryHash=(primaryHash^*reinterpret_cast<const uint8_t*>(base+0x42B4130+i))*0x100000001B3ull;
+        for(uintptr_t i=5;i<0xC96;++i)outerHash=(outerHash^*reinterpret_cast<const uint8_t*>(base+0x42B4420+i))*0x100000001B3ull;
+        if(primaryHash!=0xB525B15AAC531498ull)return "primary body mismatch";
+        if(outerHash!=0x34D08F7A20C30F09ull)return "outer builder body mismatch";
+        // The complete outer body certifies six-argument setup and record/
+        // context derivation. Its bracket must still be our installed relay.
+        uint8_t outer[5]{};std::memcpy(outer,reinterpret_cast<const void*>(base+0x42B4420),5);
+        int32_t jump=0;std::memcpy(&jump,outer+1,4);
+        if(!g_bucketEntry.ready.load(std::memory_order_acquire) || !g_bucketEntry.relay || outer[0]!=0xE9 ||
+           jump!=reinterpret_cast<intptr_t>(g_bucketEntry.relay)-intptr_t(base+0x42B4425))return "outer builder patch is not ours";
+        return nullptr;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return "primary image unreadable";}
+}
+
+void ensurePrimaryEmit(uintptr_t base) noexcept {
+    const char* why=primarySignature(base);
+    if(why){g_primaryStatus.store(why,std::memory_order_release);return;}
+    g_primaryReturn.store(base+0x42B4848,std::memory_order_release);
+    if(!g_primaryEntry.ready.load(std::memory_order_acquire) && !installOne(g_primaryEntry,base)) {
+        g_primaryStatus.store("CodeHook refused primary emit",std::memory_order_release);return;
+    }
+    g_primaryStatus.store("hooked",std::memory_order_release);
+}
+
+const char* poolCopySignature(uintptr_t base) noexcept {
+    constexpr uint8_t prologue[]={0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x6C,0x24,0x18,
+        0x48,0x89,0x74,0x24,0x20,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x83,0xEC,0x20};
+    constexpr uint8_t layout[]={0x48,0x8B,0x81,0xD0,0x00,0x00,0x00,0x4C,0x8B,0xF9,
+        0x48,0x8B,0x59,0x10,0x48,0x8B,0x50,0x10,0x48,0x8B,0x82,0x00,0x01,0x00,0x00,
+        0x4C,0x8B,0xB2,0x80,0x01,0x00,0x00,0x8B,0x68,0x10};
+    __try {
+        uint8_t got[sizeof(prologue)]{};
+        std::memcpy(got,reinterpret_cast<const void*>(base+0x4C81BE0),sizeof(got));
+        if(std::memcmp(got,prologue,sizeof(got))) {
+            int32_t actual=0;std::memcpy(&actual,got+1,4);
+            if(!g_poolCopyEntry.relay || got[0]!=0xE9 ||
+               actual!=reinterpret_cast<intptr_t>(g_poolCopyEntry.relay)-intptr_t(base+0x4C81BE5) ||
+               std::memcmp(got+5,prologue+5,sizeof(got)-5))return "pool copier prologue mismatch";
+        } else if(g_poolCopyEntry.ready.load(std::memory_order_acquire))return "our pool copier patch is gone";
+        if(std::memcmp(reinterpret_cast<const void*>(base+0x4C81BFC),layout,sizeof(layout)))return "pool copier layout mismatch";
+        uint64_t hash=0xCBF29CE484222325ull;
+        for(uintptr_t i=5;i<0x283;++i)hash=(hash^*reinterpret_cast<const uint8_t*>(base+0x4C81BE0+i))*0x100000001B3ull;
+        if(hash!=0x0EEFD3E802137BD5ull)return "pool copier body mismatch";
+        return nullptr;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {return "pool copier image unreadable";}
+}
+void ensurePoolCopy(uintptr_t base) noexcept {
+    const char* why=poolCopySignature(base);
+    if(why){g_poolCopyStatus.store(why,std::memory_order_release);return;}
+    if(!g_poolCopyEntry.ready.load(std::memory_order_acquire) && !installOne(g_poolCopyEntry,base)) {
+        g_poolCopyStatus.store("CodeHook refused pool copier",std::memory_order_release);return;
+    }
+    g_poolCopyStatus.store("hooked",std::memory_order_release);
+}
+
+void ensurePoolMerge(uintptr_t base) noexcept {
+    const char* why=nullptr;
+    __try {
+        constexpr uint8_t prologue[]={0x40,0x53,0x41,0x54,0x48,0x83,0xEC,0x28};
+        uint8_t got[sizeof(prologue)]{};std::memcpy(got,reinterpret_cast<const void*>(base+0x434E740),sizeof(got));
+        if(std::memcmp(got,prologue,sizeof(got))) {
+            int32_t jump=0;std::memcpy(&jump,got+1,4);
+            if(!g_poolMergeEntry.relay || got[0]!=0xE9 ||
+               jump!=reinterpret_cast<intptr_t>(g_poolMergeEntry.relay)-intptr_t(base+0x434E745) ||
+               std::memcmp(got+5,prologue+5,3))why="merge prologue mismatch";
+        } else if(g_poolMergeEntry.ready.load(std::memory_order_acquire))why="our merge patch is gone";
+        // Entire untouched native body includes full-node splice, partial
+        // fill/shift and cold free path, certifying every relocation offset.
+        uint64_t hash=0xCBF29CE484222325ull;
+        for(uintptr_t i=8;i<0x2A0;++i)hash=(hash^*reinterpret_cast<const uint8_t*>(base+0x434E740+i))*0x100000001B3ull;
+        if(hash!=0xFE795C2530FDF4F7ull)why="merge body mismatch";
+    } __except(EXCEPTION_EXECUTE_HANDLER){why="merge image unreadable";}
+    if(why){g_mergeStatus.store(why,std::memory_order_release);return;}
+    if(!g_poolMergeEntry.ready.load(std::memory_order_acquire) && !installOne(g_poolMergeEntry,base)) {
+        g_mergeStatus.store("CodeHook refused list merge",std::memory_order_release);return;
+    }
+    g_mergeStatus.store("hooked",std::memory_order_release);
+}
+void ensurePoolClear(uintptr_t base) noexcept {
+    // Verified build332841: void(dictionary RCX, allocatorOwner RDX),
+    // specialized 336-byte nodes using DAT_145EFDD30. Entire native body
+    // [36819D5,3681B22) FNV below has no PE relocations; own entry separately.
+    const char* why=nullptr;
+    __try {
+        constexpr uint8_t prologue[]={0x48,0x89,0x4C,0x24,0x08};
+        uint8_t got[5]{};std::memcpy(got,reinterpret_cast<const void*>(base+0x36819D0),5);
+        if(std::memcmp(got,prologue,5)) {
+            int32_t jump=0;std::memcpy(&jump,got+1,4);
+            if(!g_poolClearEntry.relay || got[0]!=0xE9 ||
+               jump!=reinterpret_cast<intptr_t>(g_poolClearEntry.relay)-intptr_t(base+0x36819D5))why="clear prologue mismatch";
+        } else if(g_poolClearEntry.ready.load(std::memory_order_acquire))why="our clear patch is gone";
+        uint64_t hash=0xCBF29CE484222325ull;
+        for(uintptr_t i=5;i<0x152;++i)hash=(hash^*reinterpret_cast<const uint8_t*>(base+0x36819D0+i))*0x100000001B3ull;
+        if(hash!=0x9D89B67124CE2ADFull)why="typed clear body mismatch";
+    } __except(EXCEPTION_EXECUTE_HANDLER){why="clear image unreadable";}
+    if(why){g_clearStatus.store(why,std::memory_order_release);return;}
+    if(!g_poolClearEntry.ready.load(std::memory_order_acquire) && !installOne(g_poolClearEntry,base)) {
+        g_clearStatus.store("CodeHook refused typed clear",std::memory_order_release);return;
+    }
+    g_clearStatus.store("hooked",std::memory_order_release);
+}
+
 // Installs the part test's patch once (process lifetime, like the others),
 // under g_installMutex. Stands down alone: the status says why.
 void ensurePartTest(uintptr_t base) noexcept {
@@ -978,6 +1229,16 @@ void recomputeGateLocked() noexcept {
     // settlement LOD governor's (which needs this relay and no other).
     const bool builder=open || governorWanted.load(std::memory_order_acquire);
     builderGate.store(builder?uintptr_t(1):uintptr_t(0),std::memory_order_release);
+    primaryGate.store(emitWanted.load(std::memory_order_acquire) &&
+        g_primaryEntry.ready.load(std::memory_order_acquire) &&
+        g_poolCopyEntry.ready.load(std::memory_order_acquire) &&
+        g_poolMergeEntry.ready.load(std::memory_order_acquire) &&
+        g_poolClearEntry.ready.load(std::memory_order_acquire) &&
+        std::strcmp(g_primaryStatus.load(std::memory_order_acquire),"hooked")==0 &&
+        std::strcmp(g_poolCopyStatus.load(std::memory_order_acquire),"hooked")==0 &&
+        std::strcmp(g_mergeStatus.load(std::memory_order_acquire),"hooked")==0 &&
+        std::strcmp(g_clearStatus.load(std::memory_order_acquire),"hooked")==0 ? uintptr_t(1):uintptr_t(0),
+        std::memory_order_release);
 }
 
 // FUN_1442B3FC0's cell, from its two consumers' wants and whether the patch
@@ -1000,6 +1261,26 @@ void detachKinematicEvalHooks(KinematicEvalProbe* probe) noexcept {
 void kinematicEvalSetEmitObserver(EngineEmitObserverFn fn) noexcept {
     emitObserver.store(fn,std::memory_order_release);
 }
+void kinematicEvalSetPrimaryEmitObserver(EnginePrimaryEmitObserverFn fn) noexcept {
+    primaryEmitObserver.store(fn,std::memory_order_release);
+}
+const char* kinematicEvalPrimaryEmitStatus() noexcept {
+    return g_primaryStatus.load(std::memory_order_acquire);
+}
+void kinematicEvalPrimaryEmitCounters(uint64_t& calls,uint64_t& unowned) noexcept {
+    calls=g_primaryCalls.exchange(0,std::memory_order_relaxed);
+    unowned=g_primaryUnowned.exchange(0,std::memory_order_relaxed);
+}
+void kinematicEvalSetPoolCopyObserver(EnginePoolCopyObserverFn fn) noexcept {
+    poolCopyObserver.store(fn,std::memory_order_release);
+}
+const char* kinematicEvalPoolCopyStatus() noexcept { return g_poolCopyStatus.load(std::memory_order_acquire); }
+void kinematicEvalSetMergeObserver(EngineMergeBeginFn begin,EngineMergeEndFn end) noexcept {
+    mergeBeginObserver.store(begin,std::memory_order_release);mergeEndObserver.store(end,std::memory_order_release);
+}
+const char* kinematicEvalMergeStatus() noexcept {return g_mergeStatus.load(std::memory_order_acquire);}
+void kinematicEvalSetClearObserver(EngineClearObserverFn fn) noexcept {clearObserver.store(fn,std::memory_order_release);}
+const char* kinematicEvalClearStatus() noexcept {return g_clearStatus.load(std::memory_order_acquire);}
 
 bool kinematicEvalEmitHookLive(const char** why) noexcept {
     const char* reason=nullptr;
@@ -1022,6 +1303,10 @@ const char* kinematicEvalEmitAttach() noexcept {
             return "identity_mismatch";
         if(!ensureInstalled(base))return "install_failed";
         if(!patchIsOurs(g_evalEntry,base))return "opcode_mismatch";
+        ensurePrimaryEmit(base);
+        ensurePoolCopy(base);
+        ensurePoolMerge(base);
+        ensurePoolClear(base);
         emitWanted.store(true,std::memory_order_release);
         recomputeGateLocked();
         return "installed";

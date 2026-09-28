@@ -201,8 +201,13 @@ def load_manifest(path):
                 if (stride == 0 or size % stride or (first + count) * stride > size or
                         record.get("srv_format") != 0 or record.get("srv_dimension") != 1):
                     raise CaptureError(f"{path}: unsupported pool view/layout")
-            elif stride != 0 or size < 276 * 16 or size % 16:
+            elif stride != 0 or size % 16 or size < 276 * 16:
                 raise CaptureError(f"{path}: invalid {name} constant buffer layout")
+            # The freshness stamp lives at row 276. Legacy 276-row scenes are
+            # accepted only where record interpretation never reads it
+            # (rc-since-rc2 review F6).
+            elif not manifest["reset"] and size < 277 * 16:
+                raise CaptureError(f"{path}: {name} lacks the freshness-stamp row a non-reset capture needs")
             buffer_path = path.parent / filename
             if buffer_path.resolve().parent != path.parent.resolve() or not buffer_path.is_file() or buffer_path.stat().st_size != size:
                 raise CaptureError(f"{path}: missing or unsafe buffer {filename}")
@@ -465,9 +470,11 @@ def verify_fixture(capture_dir):
             raise CaptureError("fixture slot bytes differ from the WARP pattern")
         pool_path, view = meta["buffers"]["pool"]
         pool = np.fromfile(pool_path, dtype="<u4").reshape((-1, 21, 4))
+        scene_now = np.fromfile(meta["buffers"]["scene_now"][0], dtype="<f4").reshape((-1, 4))
+        token = np.float32(scene_now[276, 0]).view(np.uint32)
         if (view["first_element"] != 1 or view["num_elements"] != 3 or
                 int(pool[0, 0, 0]) != 0x12345678 or
-                [record_kind(pool[i]) for i in (1, 2, 3)] !=
+                [record_kind(pool[i], token) for i in (1, 2, 3)] !=
                 ["unmarked", "joined", "masked"]):
             raise CaptureError("fixture pool view offset or marker bytes differ")
         for name, rows in (("scene_now", meta["camera"]),
@@ -649,7 +656,7 @@ def self_test():
             pass
         # A tiny complete capture exercises actual branch selection, view
         # offset, stale depth, malformed slot, and masked record handling.
-        from flat_pixels_engine import marker_hash, record_kind
+        from flat_pixels_engine import marker_hash_stamped, record_kind
         complete = json.loads(json.dumps(v2))
         complete["reset"] = False
         complete["engine"] = {"complete": True, "status": "complete",
@@ -664,17 +671,21 @@ def self_test():
                                      "row_stride": rw * 8, "byte_size": rw * rh * 8,
                                      "srv_format": 16, "srv_dimension": 4,
                                      "most_detailed_mip": 0, "mip_levels": 1})
+        # The freshness stamp the prep shader's EN[276].x carries: the markers
+        # fold it in and certify only at that frame.
+        stamp = 77
         pool = np.zeros((4, 21, 4), dtype="<u4")
         fbits = np.asarray(1, dtype="<f4").view("<u4").item()
         pool[0, 0, 0] = 0x12345678
         for index in (2, 3):
             pool[index, 0, 1] = pool[index, 19, 1] = fbits
             pool[index, 0, 2:4] = pool[index, 19, 2:4] = [0x7FFF7FFF, 0xFFFE7FFF]
-            pool[index, 18, 0] = (0x7FC0ED01 if index == 2 else 0x7FC0ED02) ^ marker_hash(pool[index])
-        assert [record_kind(pool[i]) for i in (1, 2, 3)] == ["unmarked", "joined", "masked"]
+            pool[index, 18, 0] = (0x7FC0ED01 if index == 2 else 0x7FC0ED02) ^ marker_hash_stamped(pool[index], stamp)
+        assert [record_kind(pool[i], stamp) for i in (1, 2, 3)] == ["unmarked", "joined", "masked"]
         (v2_session / "frame_7_pool.bin").write_bytes(pool.tobytes())
-        scene = np.zeros((276, 4), dtype="<f4")
+        scene = np.zeros((277, 4), dtype="<f4")
         scene[270:276] = np.asarray(complete["camera"], dtype="<f4")
+        scene[276, 0] = np.uint32(stamp).view("<f4")
         for name in ("scene_now", "scene_previous"):
             (v2_session / f"frame_7_{name}.bin").write_bytes(scene.tobytes())
         complete["buffers"] = [
@@ -694,6 +705,25 @@ def self_test():
         stride_meta = load_manifest(v2_path)
         stride_branches = analyze(stride_meta, [("one", (1, 0, 1, 1))])["engine_analysis"]["rois"][0]["branch_counts"]
         assert stride_branches["rejected_pool_stride"] == 1
+        # F6 boundary fixtures: the previous 276-row scene layout. A non-reset
+        # capture reads the stamp row and must be refused at load; a reset
+        # capture never interprets records and stays accepted.
+        legacy = json.loads(json.dumps(complete))
+        legacy_scene = np.zeros((276, 4), dtype="<f4")
+        legacy_scene[270:276] = np.asarray(legacy["camera"], dtype="<f4")
+        for name in ("scene_now", "scene_previous"):
+            (v2_session / f"frame_7_{name}.bin").write_bytes(legacy_scene.tobytes())
+        for record in legacy["buffers"][1:]:
+            record["byte_size"] = legacy_scene.nbytes
+        v2_path.write_text(json.dumps(legacy), encoding="utf-8")
+        try:
+            load_manifest(v2_path)
+            raise AssertionError("a non-reset capture without the stamp row was accepted")
+        except CaptureError:
+            pass
+        legacy["reset"] = True
+        v2_path.write_text(json.dumps(legacy), encoding="utf-8")
+        assert load_manifest(v2_path)["reset"] is True
         del rejection, geometry, meta
         # A small copy of the WARP writer's known pixels checks the fixture
         # verifier itself. The full build checks bytes emitted by the real GPU.

@@ -190,7 +190,8 @@ inline bool uiLayerRedirecting() { return detail::g_uiLayerRedirecting; }
 // a real UI family (vscreen.cpp's forwardWithVerdict already has them to
 // hand). Every case is counted and each shader pair named once.
 inline bool uiLayerWatching() { return detail::g_uiLayerWatching; }
-bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForwards, bool substituted);
+bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForwards, bool substituted,
+                      bool excluded, bool panelSized);
 // A game clear of a depth-stencil view, while watching: when it clears the
 // buffer a layer's depth-stencil target was seeded from this frame, the
 // layer's copy is stale and the next tested draw seeds it again. (A game

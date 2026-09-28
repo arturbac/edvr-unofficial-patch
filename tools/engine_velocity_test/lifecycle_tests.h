@@ -51,6 +51,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "../../src/common/log.h"
@@ -72,6 +73,7 @@ unsigned g_emitAttaches = 0, g_emitDetaches = 0;
 std::vector<std::string> g_log;
 uint64_t g_clock = 1000;
 uint64_t fakeClock() { return g_clock; }
+std::unordered_map<void*, uint64_t> g_objectHash;   // the registry's stand-in, for the shadow probe
 }  // namespace lifecycle_fake
 
 // --- The stubs engine_velocity.cpp links against -------------------------------
@@ -79,10 +81,18 @@ namespace edvr {
 void* bindingGet(BindSlot s) { return lifecycle_fake::g_slots[static_cast<unsigned>(s)].ptr; }
 uint32_t bindingGeneration(BindSlot s) { return lifecycle_fake::g_slots[static_cast<unsigned>(s)].gen; }
 uint64_t bindingShaderHash(BindSlot s) { return lifecycle_fake::g_slots[static_cast<unsigned>(s)].hash; }
+void bindingSetShader(BindSlot s, void* p, uint64_t hash) {
+    auto& x = lifecycle_fake::g_slots[static_cast<unsigned>(s)];
+    x.ptr = p; x.hash = hash; ++x.gen;
+}
 void bindingSet(BindSlot s, void* p) {
     auto& x = lifecycle_fake::g_slots[static_cast<unsigned>(s)];
     x.ptr = p;
     ++x.gen;
+}
+uint64_t lookupShaderHash(void* shader) {   // the registry's stand-in (filled by the S4 case)
+    auto it = lifecycle_fake::g_objectHash.find(shader);
+    return it == lifecycle_fake::g_objectHash.end() ? 0 : it->second;
 }
 bool depthProbeCurrentSceneEyeOf(ID3D11DepthStencilView* dsv, int* outEye, int* outTargetIndex) {
     for (int i = 0; i < 2; ++i)
@@ -90,6 +100,15 @@ bool depthProbeCurrentSceneEyeOf(ID3D11DepthStencilView* dsv, int* outEye, int* 
     return false;
 }
 void kinematicEvalSetEmitObserver(EngineEmitObserverFn) noexcept {}
+void kinematicEvalSetPrimaryEmitObserver(EnginePrimaryEmitObserverFn) noexcept {}
+const char* kinematicEvalPrimaryEmitStatus() noexcept { return "rig: hooked"; }
+void kinematicEvalPrimaryEmitCounters(uint64_t& calls,uint64_t& unowned) noexcept { calls=unowned=0; }
+void kinematicEvalSetPoolCopyObserver(EnginePoolCopyObserverFn) noexcept {}
+const char* kinematicEvalPoolCopyStatus() noexcept { return "rig: hooked"; }
+void kinematicEvalSetMergeObserver(EngineMergeBeginFn,EngineMergeEndFn) noexcept {}
+const char* kinematicEvalMergeStatus() noexcept { return "rig: hooked"; }
+void kinematicEvalSetClearObserver(EngineClearObserverFn) noexcept {}
+const char* kinematicEvalClearStatus() noexcept { return "rig: hooked"; }
 bool kinematicEvalEmitHookLive(const char** why) noexcept {
     if (why) *why = lifecycle_fake::g_hookLive ? nullptr : "rig: kinematic-build-144312e00 refused";
     return lifecycle_fake::g_hookLive;
@@ -343,6 +362,7 @@ float4 main(PsIn i) : SV_Target0 { return float4(i.uv, 1, 1); }
         x.ptr = p; x.hash = hash; ++x.gen;
     }
     void setVs() { ctx->VSSetShader(vs.Get(), nullptr, 0); shadow(BindSlot::Vs, vs.Get(), kVsHash); }
+    void setVs(ID3D11VertexShader* p, uint64_t hash) { ctx->VSSetShader(p, nullptr, 0); shadow(BindSlot::Vs, p, hash); }
     void setPs(ID3D11PixelShader* p, uint64_t hash) { ctx->PSSetShader(p, nullptr, 0); shadow(BindSlot::Ps, p, hash); }
     void setPool(ID3D11ShaderResourceView* v) { ctx->VSSetShaderResources(33, 1, &v); shadow(BindSlot::VsSrv33, v); }
     void setScene(ID3D11Buffer* b) { ctx->VSSetConstantBuffers(1, 1, &b); shadow(BindSlot::VsCb1, b); }
@@ -384,6 +404,13 @@ float4 main(PsIn i) : SV_Target0 { return float4(i.uv, 1, 1); }
     }
     void draw(UINT instance = 5) {
         edvr::engineVelocityBeforeDraw(ctx, true);
+        ctx->DrawInstanced(4, 1, 0, instance == 9 ? 1 : 0);
+    }
+    // A draw whose slot-0 target is not the eye's colour: vscreen computes
+    // rtv0Eye false for it (the detail pass's shape), so only the depth view
+    // names the eye.
+    void drawNoEyeColour(UINT instance = 5) {
+        edvr::engineVelocityBeforeDraw(ctx, false);
         ctx->DrawInstanced(4, 1, 0, instance == 9 ? 1 : 0);
     }
     void clearEye(int eye) {
@@ -644,6 +671,63 @@ inline void run(const Harness& h) {
             "C: the movers line reads without a tracker comparison");
     h.check(logged("(the census is off: it runs only with engine motion's diagnostics", mark),
             "P1: the emit's census is off without diagnostics, and says its zeros are not counts");
+
+    // F7 (rc-since-rc2 review, 2026-09-27): the sampled shadow probe meets
+    // EDVR's own installed substitution, the generated patch registered in
+    // the hash registry exactly as the production hook registers it
+    // (device_hook.cpp). The probe must leave the shadow on the game's
+    // original with its generation intact, the substitution must stand, and
+    // the frame boundary must restore. A genuine bypass must still heal.
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    {
+        ComPtr<ID3D11PixelShader> patch;
+        h.context->PSGetShader(&patch, nullptr, nullptr);
+        h.check(patch && patch.Get() != g.ps.Get(), "F7: the keyed draw installed the substitution");
+        lifecycle_fake::g_objectHash[patch.Get()] = 0x5B0F383DFAFF6AE6ull;
+        const auto& psSlot = lifecycle_fake::g_slots[static_cast<unsigned>(edvr::BindSlot::Ps)];
+        void* shadowPtr = psSlot.ptr;
+        const uint32_t shadowGen = psSlot.gen;
+        edvr::engine_velocity_detail::psShadowProbe(h.context);
+        h.check(psSlot.ptr == shadowPtr && psSlot.gen == shadowGen,
+                "F7: the probe leaves the shadow on the game's original, generation intact");
+        h.context->PSGetShader(&patch, nullptr, nullptr);
+        h.check(patch && patch.Get() != g.ps.Get(), "F7: the substitution still stands after the probe");
+    }
+    g.endFrame(true);
+    {
+        ComPtr<ID3D11PixelShader> live;
+        h.context->PSGetShader(&live, nullptr, nullptr);
+        h.check(live.Get() == g.ps.Get(),
+                "F7: the frame boundary restores the game's original (the saved identity survived)");
+    }
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0, 1, 9);   // a different owner: stale MRT6 contents cannot pass
+    {
+        edvr::EngineVelocityViews v{};
+        const bool given = g.views(0, &v);
+        h.check(given, "F7: the next frame still gives fresh engine-marker inputs");
+        if (given) {
+            unsigned exact = 0, other = 0;
+            ownership(h, g, 0, v, 9, &exact, &other);
+            h.check(exact > 0 && other == 0,
+                    "F7: the next frame's MRT6 names its new owner, with no old owner left");
+            const auto now = readBuffer(h, v.sceneNow), before = readBuffer(h, v.scenePrev);
+            uint32_t nowStamp = 0, beforeStamp = 0;
+            if (now.size() >= 277 * 4) std::memcpy(&nowStamp, &now[276 * 4], 4);
+            if (before.size() >= 277 * 4) std::memcpy(&beforeStamp, &before[276 * 4], 4);
+            h.check(nowStamp == g.frame && beforeStamp == g.frame - 1,
+                    "F7: compose receives this frame's scene snapshot and its consecutive predecessor");
+        }
+        release(v);
+    }
+    lifecycle_fake::g_objectHash[g.ps2.Get()] = 0x3434972DB5336AA4ull;
+    h.context->PSSetShader(g.ps2.Get(), nullptr, 0);   // live only; the hook "missed" the bind
+    edvr::engine_velocity_detail::psShadowProbe(h.context);
+    h.check(lifecycle_fake::g_slots[static_cast<unsigned>(edvr::BindSlot::Ps)].ptr == g.ps2.Get(),
+            "F7: a genuine bypass-bound game shader still heals the shadow");
 
     // Read the actual bound MRT6 resource, independent of the view flavor.
     const auto mrt6 = [&] {
@@ -1008,6 +1092,19 @@ inline void run(const Harness& h) {
                         "S2: the source's scene constants now are the world's rows 270..275, exactly");
                 h.check(before.size() >= 276 * 4 && std::memcmp(&before[270 * 4], &wantBefore[270 * 4], 24 * 4) == 0,
                         "S2: and last frame's are the world's rows of last frame");
+                // The freshness stamp end to end: float4 276 of the NOW copy
+                // carries the present-frame clock the snapshot took (g_frame,
+                // the same clock the emit folds into its markers); the
+                // previous frame's copy carries last frame's.
+                uint32_t stampNow[4] = {}, stampBefore[4] = {};
+                h.check(now.size() >= 277 * 4 && before.size() >= 277 * 4, "S2: the copies hold the stamp's float4");
+                std::memcpy(stampNow, &now[276 * 4], 16);
+                std::memcpy(stampBefore, &before[276 * 4], 16);
+                h.check(stampNow[0] == g.frame && stampBefore[0] == g.frame - 1,
+                        "S2: the NOW copy is stamped with this present frame, the BEFORE copy with last frame's");
+                h.check(stampNow[1] == 0 && stampNow[2] == 0 && stampNow[3] == 0 &&
+                        stampBefore[1] == 0 && stampBefore[2] == 0 && stampBefore[3] == 0,
+                        "S2: the stamp float4's unused words are initialized zero, not adjacent stack bytes");
                 ComPtr<ID3D11Resource> slotsRes;
                 v.slots->GetResource(&slotsRes);
                 UINT w = 0, wd = 0;
@@ -1292,6 +1389,209 @@ inline void run(const Harness& h) {
     std::printf("  lifecycle: engine_velocity.cpp's draw half on WARP -- re-maps, interleaved eyes, source swaps, pool "
                 "writes, blend states, depth formats, the on-foot source's slot target, stand-down: every case as "
                 "specified (%zu log lines)\n", g_log.size());
+}
+
+// S4: synthetic compatibility with a self-marking pair (kSelfMarking,
+// engine_velocity_families.h): its draw latches a target-6 texture for the
+// eye-frame and the compose's views carry it -- including the
+// detail pass's shape, where the eye's colour is not at slot 0 and the depth
+// probe's map of the scene pair names the eye alone. Drives the production
+// draw half with the family's REAL dumped vertex shader (the corpus dir), so
+// deriveFamily succeeds. The Coriolis capture's apparent stock seam hashes
+// were proved to be EDVR-generated substitutions on 2026-09-28; these fixtures
+// do not establish an independent game marker channel in that capture.
+inline void selfMarkingCase(const Harness& h, const std::vector<BYTE>& vsBytes) {
+    edvr::g_clockForTest = &lifecycle_fake::fakeClock;   // run() cleared it; the summary window rides the fake clock
+    Game g(h);
+    g.setup();
+    edvr::engineVelocityConfigure(true);
+    const size_t mark = g_log.size();
+    ComPtr<ID3D11VertexShader> vs4361;
+    h.check(SUCCEEDED(h.device->CreateVertexShader(vsBytes.data(), vsBytes.size(), nullptr, &vs4361)),
+            "S4: the family's real VS creates on WARP");
+    edvr::engineVelocityRememberVs(vs4361.Get(), 0x436193B352A2897Eull, vsBytes.data(), vsBytes.size(), false);
+    const auto psBlob = g.compile(shader_tests::kPsA, "ps_5_0");
+    ComPtr<ID3D11PixelShader> psSeam;
+    h.check(SUCCEEDED(h.device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &psSeam)),
+            "S4: a stand-in PS object (the hash names the seam shader)");
+    // The game's own target-6 buffer for the pass: R32G32_FLOAT at the eye
+    // size, render-target AND shader-resource bindable (the compose reads it).
+    ComPtr<ID3D11Texture2D> g6;
+    ComPtr<ID3D11RenderTargetView> g6Rtv;
+    auto refCount = [](ID3D11Resource* r) { const ULONG n = r->AddRef(); r->Release(); return n - 1; };
+    ULONG g6AtCreate = 0;
+    {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = kW; td.Height = kH; td.MipLevels = td.ArraySize = td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_R32G32_FLOAT; td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        h.check(SUCCEEDED(h.device->CreateTexture2D(&td, nullptr, &g6)), "S4: the game's channel texture");
+        h.check(SUCCEEDED(h.device->CreateRenderTargetView(g6.Get(), nullptr, &g6Rtv)), "S4: its RTV");
+        g6AtCreate = refCount(g6.Get());   // the fixture's hold + its RTV's, before any latch
+    }
+    auto bindWithG6 = [&] {
+        ID3D11RenderTargetView* r[8] = {g.rtv[0][0].Get(), g.rtv[0][1].Get(), g.rtv[0][2].Get(), g.rtv[0][3].Get(),
+                                        nullptr, nullptr, g6Rtv.Get(), nullptr};
+        h.context->OMSetRenderTargets(8, r, g.dsv[0].Get());
+    };
+
+    // Frame 1: the keyed pair's pass first (the eye-frame is prepared by it,
+    // as live), then two seam draws with the game's channel at slot 6.
+    g.ordinaryFrame();
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    g.setPs(psSeam.Get(), 0xBCF75CEA37060EAEull);
+    bindWithG6();
+    g.draw();
+    g.draw();   // a second seam draw of the eye-frame must not re-latch or double-count
+    {
+        edvr::EngineVelocityViews v{};
+        h.check(g.views(0, &v), "S4: eye 0 given with the seam draw latched");
+        h.check(v.gameMark != nullptr, "S4: the views carry the game's own target-6 channel for the compose");
+        release(v);
+    }
+
+    // Frame 2, the detail pass's own shape: slot 0 is NOT the eye's colour
+    // (the source's targets stand in for "not eye-sized"), so rtv0Eye is
+    // false and the depth probe's map of the scene pair names the eye alone.
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    g.setPs(psSeam.Get(), 0xBCF75CEA37060EAEull);
+    {
+        ID3D11RenderTargetView* r[8] = {g.sourceRtv[0].Get(), nullptr, nullptr, nullptr, nullptr, nullptr,
+                                        g6Rtv.Get(), nullptr};
+        h.context->OMSetRenderTargets(8, r, g.dsv[0].Get());
+        g.shadow(BindSlot::Rtv0, r[0]);
+    }
+    g.drawNoEyeColour();
+    {
+        edvr::EngineVelocityViews v{};
+        h.check(g.views(0, &v), "S4: eye 0 given on the detail-pass shape too");
+        h.check(v.gameMark != nullptr, "S4: the eye was attributed by depth and the channel latched");
+        release(v);
+    }
+
+    // Frame 3: a channel of the wrong shape is refused but still counted.
+    // (The texture must OUTLIVE the draw: OM holds the pointer. And same
+    // size, wrong format: D3D11 demands all targets share the depth's dims,
+    // so a smaller one would never even bind.)
+    ComPtr<ID3D11Texture2D> wrong;
+    ComPtr<ID3D11RenderTargetView> wrongRtv;
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    g.setPs(psSeam.Get(), 0xBCF75CEA37060EAEull);
+    {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = kW; td.Height = kH; td.MipLevels = td.ArraySize = td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        h.check(SUCCEEDED(h.device->CreateTexture2D(&td, nullptr, &wrong)), "S4: wrong-format channel texture");
+        h.check(SUCCEEDED(h.device->CreateRenderTargetView(wrong.Get(), nullptr, &wrongRtv)), "S4: its RTV");
+        ID3D11RenderTargetView* r[8] = {g.rtv[0][0].Get(), g.rtv[0][1].Get(), g.rtv[0][2].Get(), g.rtv[0][3].Get(),
+                                        nullptr, nullptr, wrongRtv.Get(), nullptr};
+        h.context->OMSetRenderTargets(8, r, g.dsv[0].Get());
+    }
+    g.draw();
+    {
+        edvr::EngineVelocityViews v{};
+        h.check(g.views(0, &v), "S4: eye 0 given");
+        h.check(v.gameMark == nullptr, "S4: a wrong-shaped channel is refused, never latched");
+        release(v);
+    }
+    // Frame 4: the stale-shadow case the probe exists for. The seam shader is
+    // bound LIVE only (ctx->PSSetShader straight, no shadow update -- the hook
+    // "missed" the bind in this synthetic case), so the shadow still says the
+    // fixture's stock PS and every generation matches the last slow half's.
+    // The probe must write the truth and run the slow half with it.
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    lifecycle_fake::g_objectHash[psSeam.Get()] = 0xBCF75CEA37060EAEull;
+    bindWithG6();
+    h.context->PSSetShader(psSeam.Get(), nullptr, 0);   // live only: the shadow never sees it
+    edvr::engine_velocity_detail::psShadowProbe(h.context);   // the sampled probe, called deterministically here
+    // The probe healed the shadow to the live shader...
+    h.check(lifecycle_fake::g_slots[static_cast<unsigned>(edvr::BindSlot::Ps)].ptr == psSeam.Get(),
+            "S4: the probe set the shadow to the live shader");
+    // ...and ran the slow half with it, which latched the channel:
+    {
+        edvr::EngineVelocityViews v{};
+        h.check(g.views(0, &v), "S4: eye 0 given after the heal");
+        h.check(v.gameMark != nullptr, "S4: the healed seam draw latched the channel");
+        release(v);
+    }
+    g.endFrame(true);   // the window's summary
+    h.check(logged("self-marking pixel shaders at the draw path: 4 draws seen, 0 with no eye", mark),
+            "S4: the draw-path census counts the seam draws, none eyeless");
+    h.check(logged("self-marked 4 draws (the game's own slot+depth channel, latched 3 eye-frames)", mark),
+            "S4: the family line counts the stock draws and the three latched eye-frames");
+    h.check(logged("the PS shadow was stale on 1 sampled pool draws", mark),
+            "S4: the probe reports the one stale-shadow heal it performed");
+
+    // The review's F2/F3 (2026-09-27): the capture's reference discipline.
+    // Measured as the texture's COM refcount (the fixture's own hold included):
+    // a re-capture of the same channel must not grow it, and a replaced
+    // channel must retire to its pre-latch count, not be kept alive by the eye.
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    g.setPs(psSeam.Get(), 0xBCF75CEA37060EAEull);
+    bindWithG6();
+    g.draw();
+    const ULONG g6Latched = refCount(g6.Get());
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    g.setPs(psSeam.Get(), 0xBCF75CEA37060EAEull);
+    bindWithG6();
+    g.draw();
+    h.check(refCount(g6.Get()) == g6Latched, "S4/F2: re-capturing the same channel texture leaks no reference");
+    // A changed channel (a live resolution/quality change): the old texture's
+    // count returns to its creation-time count -- the eye retired its hold.
+    ComPtr<ID3D11Texture2D> g6b;
+    ComPtr<ID3D11RenderTargetView> g6bRtv;
+    {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = kW; td.Height = kH; td.MipLevels = td.ArraySize = td.SampleDesc.Count = 1;
+        td.Format = DXGI_FORMAT_R32G32_FLOAT; td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        h.check(SUCCEEDED(h.device->CreateTexture2D(&td, nullptr, &g6b)), "S4/F3: the replacement channel texture");
+        h.check(SUCCEEDED(h.device->CreateRenderTargetView(g6b.Get(), nullptr, &g6bRtv)), "S4/F3: its RTV");
+    }
+    g.beginFrame();
+    g.writeScene(g.sceneA.Get(), g.rows[0]);
+    g.pass(0);
+    g.setVs(vs4361.Get(), 0x436193B352A2897Eull);
+    g.setPs(psSeam.Get(), 0xBCF75CEA37060EAEull);
+    {
+        ID3D11RenderTargetView* r[8] = {g.rtv[0][0].Get(), g.rtv[0][1].Get(), g.rtv[0][2].Get(), g.rtv[0][3].Get(),
+                                        nullptr, nullptr, g6bRtv.Get(), nullptr};
+        h.context->OMSetRenderTargets(8, r, g.dsv[0].Get());
+    }
+    g.draw();
+    {
+        edvr::EngineVelocityViews v{};
+        h.check(g.views(0, &v) && v.gameMark != nullptr, "S4/F3: the replacement channel latches");
+        if (v.gameMark) {
+            ComPtr<ID3D11Resource> res;
+            v.gameMark->GetResource(&res);
+            h.check(res.Get() == g6b.Get(), "S4/F3: the compose now reads the replacement channel");
+        }
+        release(v);
+    }
+    h.check(refCount(g6.Get()) == g6AtCreate,
+            "S4/F3: the replaced channel's texture is retired, not retained by the eye");
+    edvr::engineVelocityShutdown();
+    edvr::g_clockForTest = nullptr;
 }
 
 }  // namespace lifecycle_tests

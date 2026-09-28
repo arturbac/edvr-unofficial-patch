@@ -2,47 +2,60 @@
 
 ## Status
 
-*Update this block whenever the doc changes. Last updated 2026-09-25, fix
-built.*
+*Last updated 2026-09-28: H2 remains convicted; 162120 rules it out for its
+captured frames.*
 
-- **State:** BUILT 2026-09-25 (branch `claude/camera-rows-carry`, merged to
-  main), NOT FLOWN. The world path's gate now tracks whether the rows a
-  frame measures from are the view's own. A delta that does not turn at all,
-  measured from rows a drop left behind, is refused, and the last good real
-  delta is carried. The rig (`tools\temporal_test`) replays the dumped
-  event and passes. With the refusal disabled it fails exactly those checks.
-- **Symptom:** a brief sky/world smear during a roll or turn, two frames
-  long, wherever the transition-flash tracker logs a "camera parked at"
-  line. Found in eye run 050423 (flight log `edvr_gfx_20260925_050051`,
-  Frontier, build c9cab91e = v0.18.0-rc.1).
+- **State:** the 2026-09-25 gate fix (branch `claude/camera-rows-carry`, merged
+  to main) is FLOWN and working as designed, and its open hypothesis is now
+  closed by evidence: H2 CONVICTED 2026-09-27 (the dated entry, eye run 055427)
+  -- a parked stay of 4674 frames (~52 s) in one frontier session, and a dump
+  that caught a carried ~zero through a 12.6 px head move: the world path's MV
+  read ~0 for 14 straight frames while the content moved every frame, and the
+  station hull (84% on the world path at that range) blurred under its own
+  motion. The stand-down the doc deferred is now owed: after how many carried
+  frames, and to what.
+- **Symptom:** a brief sky/world smear during a roll or turn, two frames long,
+  wherever the transition-flash tracker logs a "camera parked at" line. Found
+  in eye run 050423 (flight log `edvr_gfx_20260925_050051`, Frontier, build
+  c9cab91e = v0.18.0-rc.1). And the long form: a sustained smear for the length
+  of a stay, 055427.
 - **Cause (confirmed from the dump):** after the chooser landed on a parked
   auxiliary pass (148 deg from the view, rejected, carried), the next frame
-  took the same pass's identical write. That delta was zero, and under a
-  still head a zero passes the 3-degree test. The old gate ACCEPTED it and
-  stored it as the last good. The next frame, back on the view, carried
-  the zero.
+  took the same pass's identical write. That delta was zero, and under a still
+  head a zero passes the 3-degree test. The old gate ACCEPTED it and stored it
+  as the last good. The next frame, back on the view, carried the zero.
 - **Open hypothesis, the entry (H1):** the chooser left the view because
-  nothing in 19996 was within 3 deg of 19995's rows: a hitch of about 16
-  frames of flight (below). In this dump the hitch was probably the eye
-  run's own draw census. The fix does not depend on H1.
-- **Open, long stays (H2):** a parked stay carries one delta for its whole
-  length. When the pass writes the bound block, nothing else ends a stay,
-  because the head-follow score trusts that block. This stay was one
-  frame. If stays run long, a stale carry is a worse guess than the head
-  path, and the world path should stand down after a few frames. The
-  census's "longest stay" is the witness; no limit is built until it says
-  one is needed.
-- **Ruled out / declined:** see "Declined" at the end. It covers measuring
-  from the last accepted rows, and refusing every delta after a drop.
-- **Next flight:** Frontier install. Roll near a station or a planet where
-  the log shows "transition flash: a camera parked at" lines, and take an
-  eye dump while rolling. Pass condition in "Verification".
-- **Environment:** depends on the world path (`fix.temporal_aa`, depth
-  motion) and the game's view rows at float 932 of the scene block. It does
-  not depend on the VR runtime, headset or DLSS version, since it reads the
-  game's own rows. Flown rig: Pimax (runtime "Pimax OpenXR") on EDVR's
-  native runtime, DLSS 2037x1969 -> 4074x3938 per eye. Fixed-size table:
-  the chooser's ring of 256 writes (unchanged).
+  nothing in 19996 was within 3 deg of 19995's rows: a hitch of about 16 frames
+  of flight (below). In this dump the hitch was probably the eye run's own draw
+  census. The fix does not depend on H1.
+- **H2 (closed, convicted):** "if stays run long, a stale carry is a worse
+  guess than the head path, and the world path should stand down after a few
+  frames." Stays run long: 4674 frames. The stand-down is the open design.
+- **Open, the scale (H3, the 2026-09-27 entry):** the rows' delta undershot the
+  head's by (1+k), k = -0.347, over a whole frontier session near the station,
+  with a steady (+0.11, -0.88) px registration offset on the world-depth
+  probes; auxiliary passes jump ~9300 units every ~120 frames and were chosen
+  on 4032 frames. Interleaved auxiliary writes or a sampling skew against the
+  head stream -- undecided.
+- **Ruled out / declined:** see "Declined" at the end. It covers measuring from
+  the last accepted rows, and refusing every delta after a drop.
+- **Latest evidence (162120):** all 16 actual scene-row blocks match the
+  selected rows within 5e-6; all 32 eyes accept/bind rows with follow 30. Stale
+  carry and later auxiliary selection contamination do not explain this run.
+  World-covered detail still misses raw-image motion; the confirmed
+  substitution-ownership defect and existing F7 repair belong to the
+  kinematic-motion doc, 2026-09-28 entry. Earlier H2 and the session-wide H3
+  question remain open work.
+- **Next:** no additional Coriolis flight is planned until a concrete repair is
+  proven. The earlier roll/turn protocol in "Verification" remains the
+  discriminating test for the H2 stand-down once designed.
+- **Environment:** depends on the world path (`fix.temporal_aa`, depth motion)
+  and the game's view rows at float 932 of the scene block. It does not depend
+  on the VR runtime, headset or DLSS version, since it reads the game's own
+  rows. Flown rig: Pimax (runtime "Pimax OpenXR") on EDVR's native runtime,
+  DLSS 2037x1969 -> 4074x3938 per eye. Fixed-size table: the chooser's ring of
+  256 writes (unchanged).
+
 
 ## The event (eye run 050423, eye 0)
 
@@ -178,3 +191,63 @@ python tools\edvr_log.py --target frontier --grep "registration, the rest|camera
 - **Changing the chooser's reference after a drop:** the chooser must keep
   following the rejected rows. After a hitch those rows ARE the view, and
   continuity from them is how the view is found again.
+
+## 2026-09-27 -- H2 convicted, and a scale problem beside it (eye run 055427)
+
+Frontier, build v0.18.0-rc.2-2-g2b285732, parked close to a coriolis port;
+game build 332841. The session census (05:54:42, whole 3.4 min session): the
+camera's delta was dropped as a parked camera's on 13,462 eye-frames and the
+LONGEST STAY WAS 4674 FRAMES (~52 s) -- H2's witness is in, and tens of
+frames were the bar for the stand-down. The eye run (055427, 16 frames,
+05:54:27) caught a stay spanning real motion: the stored world-path MV reads
+~0 from its frame 2 through 15 while the rendered content, measured by grid
+search on the raw frames, moved 0.6-12.6 px a frame (a 12.6 px head move at
+frames 1-3, then a steady ~1 px/frame drift). Deep space reads the same zero
+as the hull, so the carried delta itself was ~zero. DLSS got that MV on 84%
+of the port face and dragged its history: the station blurred along its
+motion, exactly H2's "a stale carry is a worse guess than the head path".
+Full measurement table in docs/kinematic-motion-injection-2026-09-19.md's
+2026-09-27 entry.
+
+Beside the stays, a second, chronic reading: "the rows turned (1+k) times
+the head, k = -0.347 (x -0.309, y -0.295, z -0.544), leading by -0.17
+frames" over the session, and the history's best match sat (+0.11, -0.88) px
+from the world path's prediction across 5758 probes -- a steady offset, i.e.
+a lag or a scale, not noise. The rows also chose "another's" block on 4032
+frames while auxiliary passes near the station jumped ~9300 units every ~120
+frames. Whether the undershoot is interleaved auxiliary writes or a sampling
+skew against the head stream is open -- call it H3. H1's hitch question also
+stands: the eye run's own hitch remains the suspected entry for the dump's
+stay, and the 05:53:52 window (mid-approach, no dump running) already had
+parked carries, so ordinary flight enters too.
+
+Open design question, now owed an answer: the stand-down -- after how many
+carried frames, and to what (no history at all, or the head path) when the
+world's own rows cannot be trusted. 055427's stay outlasted a 12.6 px move;
+that is the cost of the current answer.
+
+## 2026-09-28 -- 162120 does not reproduce the stale-carry defect
+
+Frontier eye run 162120, failed-fix build f2f27f97: all 16 actual captured
+scene-constant camera blocks match the selected rows within 5e-6, and all 32
+eye evaluations have rowsOk=1, rowsBound=1, rowsFollow=30. The ledger's
+pre-boundary frame convention is deliberate: ledger.frame = CSV.frame+1
+(object_probe.cpp, ledgerNoteDraw), not a C/D motion lag.
+
+ruled out: stale carry and later auxiliary selection contamination as the blur
+cause IN THIS RUN, because the accepted/bound rows are the rows used by the
+captured scene. This does not retract 055427's 4674-frame stay or its dead
+world vectors; H2 remains a real, separately evidenced defect outside this
+dump.
+
+Independent raw-image warps need <=0.05 input px median quiet correction on
+engine pixels but roughly 0.3-0.6 px on world-covered details, with a 6 px
+opening-motion miss. Production-patcher hash proof identifies the alleged
+native/refused shaders as EDVR's own substitutions, mishandled by the old
+PS-shadow probe. Current main already contains F7's ownership repair, absent
+from this installed build. The old-source F7 reproduction, stronger next-frame
+regression, and full production/installer validation have passed; promotion,
+installation, and headset verification follow. The complete ROI table and
+reconstruction-floor exclusion live in
+docs/kinematic-motion-injection-2026-09-19.md's 2026-09-28 entry. No new flight
+is needed for diagnosis before that verified repair is installed.

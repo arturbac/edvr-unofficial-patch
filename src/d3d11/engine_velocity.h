@@ -18,6 +18,9 @@
 //     validated pose, masked otherwise (engine_velocity_emit.h has the rules).
 //     The engine's own copy then carries it to the GPU: no slot map, no
 //     matching, no readback of write-combined memory.
+//     Primary rigid 42B4130 emissions use the same canonical history through
+//     an emission sink: native records stay unchanged. Verified CPU list
+//     relocation/upload joins certify only EDVR's private clone for patching.
 //  2. DRAW (render thread). The pool families' pixel shaders are substituted
 //     (hash-keyed, dxbc_engine_velocity.h) so the game's own draws write, per
 //     pixel, the t33 slot they drew (odd-coded) and the depth they wrote to
@@ -43,6 +46,7 @@
 #include <cstdint>
 
 #include "binding_shadow.h"
+#include "engine_velocity_families.h"
 
 struct ID3D11Buffer;
 struct ID3D11DeviceContext;
@@ -51,6 +55,7 @@ struct ID3D11Resource;
 struct ID3D11ShaderResourceView;
 struct ID3D11Texture2D;
 struct ID3D11VertexShader;
+struct D3D11_BUFFER_DESC;
 
 namespace edvr {
 
@@ -108,8 +113,27 @@ extern uint64_t familyDraws[kMaxFamilies];     // owner thread only: draws that 
 constexpr unsigned kWatchSlots = 6;
 extern std::atomic<const ID3D11Resource*> watch[kWatchSlots];
 void beforeDrawSlow(ID3D11DeviceContext*, bool rtv0Eye);
+extern uint32_t g_psShadowProbeN;   // owner thread; the header's sampling counter
+// Sampled backstop for a genuinely unobserved game bind. The seam arc's
+// original zero-bind/live-census evidence was our own generated shaders
+// (exact production-patcher hash proof, 2026-09-28; see the family header).
+// The probe must exclude the installed EDVR patch before considering a live
+// shader absent from the shadow; otherwise it adopts our substitution as
+// game state and destroys restoration ownership.
+void psShadowProbe(ID3D11DeviceContext*);
 void noteResourceMapped(const ID3D11Resource*, void* data, int mapType) noexcept;
 void noteResourceWrite(const ID3D11Resource*) noexcept;
+constexpr unsigned kPrimaryPoolResources=16;
+extern std::atomic<const ID3D11Resource*> primaryPoolResources[kPrimaryPoolResources];
+void notePrimaryBufferCreated(ID3D11Buffer*,const D3D11_BUFFER_DESC&) noexcept;
+void notePrimaryResourceMapped(const ID3D11Resource*,void*,int) noexcept;
+void notePrimaryResourceWritten(const ID3D11Resource*) noexcept;
+void notePrimaryResourceUnknown(const ID3D11Resource*) noexcept;
+inline bool watchesPrimaryResource(const ID3D11Resource* resource) noexcept {
+    if(!resource)return false;
+    for(const auto& slot:primaryPoolResources)if(slot.load(std::memory_order_relaxed)==resource)return true;
+    return false;
+}
 inline bool watchesResource(const ID3D11Resource* resource) noexcept {
     if (!resource) return false;
     for (const auto& w : watch) if (w.load(std::memory_order_relaxed) == resource) return true;
@@ -123,8 +147,19 @@ inline void engineVelocityBeforeDraw(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     if (cache.vs != bindingGeneration(BindSlot::Vs) || cache.ps != bindingGeneration(BindSlot::Ps) ||
         cache.rtv != bindingGeneration(BindSlot::Rtv0) || cache.dsv != bindingGeneration(BindSlot::Dsv0) ||
         cache.blend != bindingGeneration(BindSlot::Blend) || cache.pool != bindingGet(BindSlot::VsSrv33) ||
-        cache.scene != bindingGet(BindSlot::VsCb1) || cache.eye != rtv0Eye)
+        cache.scene != bindingGet(BindSlot::VsCb1) || cache.eye != rtv0Eye) {
         beforeDrawSlow(ctx, rtv0Eye);
+    } else if (((++g_psShadowProbeN) & 63u) == 0u &&
+               (engine_velocity_family::familyOfVs(bindingShaderHash(BindSlot::Vs)) >= 0 ||
+                engine_velocity_family::anyFamilyPs(bindingShaderHash(BindSlot::Ps)))) {
+        // One pool-context draw in 64 checks for an unobserved game bind.
+        // A live shader different from the shadow is normally our installed
+        // substitution, so the probe first excludes its owned identity. The
+        // 162120 capture's live/shadow differences all reproduce EDVR patch
+        // hashes; they are not evidence of a real hook bypass. A different
+        // registered game shader heals the shadow and takes the slow half.
+        psShadowProbe(ctx);
+    }
     if (cache.family >= 0) ++familyDraws[cache.family];
 }
 
@@ -132,7 +167,9 @@ inline void engineVelocityBeforeDraw(ID3D11DeviceContext* ctx, bool rtv0Eye) {
 // mapped pointer and the map type of a watched source, for the write tee.
 inline void engineVelocityResourceMapped(const ID3D11Resource* resource, void* data, int mapType) {
     using namespace engine_velocity_detail;
-    if (live.load(std::memory_order_relaxed) && watchesResource(resource)) noteResourceMapped(resource, data, mapType);
+    if (!live.load(std::memory_order_relaxed))return;
+    if(watchesPrimaryResource(resource))notePrimaryResourceMapped(resource,data,mapType);
+    if(watchesResource(resource))noteResourceMapped(resource,data,mapType);
 }
 
 // The Unmap/Copy/Update tees (vscreen, owner context; an Unmap before the
@@ -142,7 +179,18 @@ inline void engineVelocityResourceMapped(const ID3D11Resource* resource, void* d
 // the slow half, which keeps, refreshes or drops the eye-frame's snapshot.
 inline void engineVelocityResourceWritten(const ID3D11Resource* resource) {
     using namespace engine_velocity_detail;
-    if (live.load(std::memory_order_relaxed) && watchesResource(resource)) noteResourceWrite(resource);
+    if (!live.load(std::memory_order_relaxed))return;
+    if(!resource || watchesPrimaryResource(resource))notePrimaryResourceWritten(resource);
+    if(watchesResource(resource))noteResourceWrite(resource);
+}
+
+inline void engineVelocityBufferCreated(ID3D11Buffer* buffer,const D3D11_BUFFER_DESC* desc) {
+    if(buffer && desc)
+        engine_velocity_detail::notePrimaryBufferCreated(buffer,*desc);
+}
+inline void engineVelocityResourceUnknown(const ID3D11Resource* resource) {
+    using namespace engine_velocity_detail;
+    if(live.load(std::memory_order_relaxed) && (!resource || watchesPrimaryResource(resource)))notePrimaryResourceUnknown(resource);
 }
 
 // The present-frame clock (device_hook, once per owned Present).
@@ -162,12 +210,16 @@ inline bool engineVelocityDrawSubstituted() noexcept {
 // read, and the game's scene constants for this frame and the previous one
 // (registers 270..275 are read). False, with every pointer null, when the eye
 // has no complete engine data this frame -- the compose then keeps the camera
-// term everywhere.
+// term everywhere. gameMark, when set, is the game's OWN target-6 texture,
+// captured this eye-frame at a self-marking pair's draw (kSelfMarking in
+// engine_velocity_families.h): detail shaders that natively write the marker
+// encoding there. The compose reads it as a fallback beside the slot target.
 struct EngineVelocityViews {
     ID3D11ShaderResourceView* slots = nullptr;
     ID3D11ShaderResourceView* pool = nullptr;
     ID3D11Buffer* sceneNow = nullptr;
     ID3D11Buffer* scenePrev = nullptr;
+    ID3D11ShaderResourceView* gameMark = nullptr;
 };
 bool engineVelocityViews(ID3D11DeviceContext*, int eye, ID3D11Texture2D* sceneDepth, EngineVelocityViews* out);
 // The eye-pass capture's GPU time since the last take (the performance
@@ -183,9 +235,15 @@ struct EngineVelocityCaptureGpu {
 };
 bool engineVelocityTakeCaptureGpu(EngineVelocityCaptureGpu* out);
 // One eye's compose pixel counts, read back by the temporal pass (Stats
-// 50..54): engine-joined, masked, pool-but-not-a-rig-record, stale slot,
-// corrupt slot code.
-void engineVelocityNotePixels(uint32_t joined, uint32_t masked, uint32_t camera, uint32_t stale, uint32_t corrupt);
+// 50..55): engine-joined, masked, pool-but-not-a-rig-record, stale slot,
+// corrupt slot code, stale stamp (a joined marker from an older frame: the
+// camera term).
+void engineVelocityNotePixels(uint32_t joined, uint32_t masked, uint32_t camera, uint32_t stale, uint32_t corrupt,
+                              uint32_t stamped);
+// vscreen's PS hook calls this with the bound shader's content hash: counts
+// binds of the self-marking detail shaders, so the draw-path census can tell
+// "never bound through the hook" from "bound but never drawn through it".
+void engineVelocityNoteSelfMarkingPs(uint64_t psHash) noexcept;
 // On foot (docs/kinematic-motion-injection-2026-09-19.md, 2026-09-23 "On
 // foot"): the world is drawn into a flat SOURCE image that the 2D screen
 // shows in each eye, and no pool draw targets an eye. screen_motion names the
@@ -225,6 +283,6 @@ bool engineVelocitySourceViews(ID3D11Texture2D* sourceDepth, EngineVelocityViews
 // the eye pixel), raw; pixelStride 1 = every pixel (diagnostics, motion_source).
 constexpr uint32_t kPanelSampleFrames = 300, kPanelSampleStride = 4;
 void engineVelocityNotePanelPixels(uint32_t joined, uint32_t masked, uint32_t camera, uint32_t stale, uint32_t corrupt,
-                                   uint32_t eyeDraws, uint32_t pixelStride);
+                                   uint32_t stamped, uint32_t eyeDraws, uint32_t pixelStride);
 
 }  // namespace edvr

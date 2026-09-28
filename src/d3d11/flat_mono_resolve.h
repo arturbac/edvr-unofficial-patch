@@ -27,9 +27,14 @@ inline FlatResolveRoute flatResolveRoute(FlatMonoResolveMode mode,
     if (!rW || !rH || !dW || !dH) return out;
     const bool smaller = rW < dW || rH < dH, larger = rW > dW || rH > dH;
     if (mode == FlatMonoResolveMode::Taa) {
-        out.evalWidth = rW; out.evalHeight = rH; out.refused = false;
+        // The current TAA evaluates on the display grid: allocation, dispatch
+        // and shader indexing all run at D, sampling render-sized input -- a
+        // fused display-grid TAA, honestly named. The agreed render-grid TAA
+        // with one explicit R -> D conversion is the deferred gate-2 design
+        // step; the route reports what actually runs today (gate-2 review G2-2).
+        out.evalWidth = dW; out.evalHeight = dH; out.refused = false;
         out.name = !smaller && !larger ? "taa-native"
-                 : larger ? "taa-render-then-composite-down" : "taa-render-then-composite-up";
+                 : larger ? "taa-display-grid-down" : "taa-display-grid-up";
         return out;
     }
     if (mode == FlatMonoResolveMode::Dlaa) {
@@ -71,6 +76,11 @@ struct FlatMonoResolveFrame {
     ID3D11ShaderResourceView* color = nullptr;
     ID3D11ShaderResourceView* depth = nullptr;
     uint32_t renderWidth = 0, renderHeight = 0, outputWidth = 0, outputHeight = 0;
+    // Optional negotiated evaluation size override (gate 2 step 4): nonzero
+    // overrides the route's default E. Only the driver sets it, from the
+    // vendor's queried ranges; the resolver uses it only when the route
+    // itself is not refused.
+    uint32_t evalWidth = 0, evalHeight = 0;
     float camera[6][4] = {}, previousCamera[6][4] = {}; // unjittered b1[270..275]
     // Actual raster phases in render pixels, positive right/down. Camera rows
     // and engine scene snapshots above remain raw and unjittered. Zero defaults
@@ -89,6 +99,10 @@ struct FlatMonoResolveFrame {
 // size-specific feature from incomplete or stale inputs.
 struct FlatMonoResolvePreflight {
     uint32_t renderWidth = 0, renderHeight = 0, outputWidth = 0, outputHeight = 0;
+    // Negotiated evaluation size override, same contract as the frame's: the
+    // preflight allocates at the E the resolve will evaluate at (gate-2 review
+    // F1), because the resolve's resource cache keys on E.
+    uint32_t evalWidth = 0, evalHeight = 0;
     FlatMonoResolveMode mode = FlatMonoResolveMode::Taa;
     DXGI_FORMAT colorViewFormat = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT depthViewFormat = DXGI_FORMAT_UNKNOWN;
