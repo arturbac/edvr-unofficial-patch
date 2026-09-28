@@ -55,6 +55,7 @@ void sceneCameraRows(Cam& c, float out[24]) {
 void testC1() {
     std::printf("C1 single owner\n");
     FlatCameraOwnershipState s{};
+    flatCameraOwnerBegin(s);
     FlatCameraGroupInput in;
     in.upstreamCertified = true;
     in.legacyEligible = true;
@@ -63,10 +64,8 @@ void testC1() {
           d.legacyGraphicsSuppressed && d.legacyComputeSuppressed &&
           d.outcome == FlatCameraOutcome::Treated,
           "C1 a both-eligible frame gets upstream as the single owner, legacy graphics+compute suppressed");
-    // The selection precedes any mutation by construction (it is called with
-    // only the state and inputs); the close records application afterwards.
     flatCameraOwnerClose(s, d, true, true);
-    check(s.outstanding == FlatCameraOwner::Upstream && s.historyValid,
+    check(s.lastOwner == FlatCameraOwner::Upstream && s.historyValid,
           "C1 closure records the upstream owner and valid history");
 }
 
@@ -76,19 +75,21 @@ void testC1() {
 void testC2() {
     std::printf("C2 unknown shaders cannot veto certified lineage\n");
     FlatCameraOwnershipState s{};
+    flatCameraOwnerBegin(s);
     FlatCameraGroupInput in;
     in.upstreamCertified = true;
     in.legacyEligible = false;   // the legacy selector does not know this pair
     in.legacyObserving = true;   // ...and is parked in observation
     const FlatCameraOwnershipDecision d = flatCameraOwnerSelect(s, in);
+    // Suppression follows the selected owner for every mutation in the
+    // group, independently of overall legacy eligibility: individually
+    // qualified draws may still exist here and must not mutate.
     check(d.owner == FlatCameraOwner::Upstream &&
           d.outcome == FlatCameraOutcome::Treated &&
-          !d.legacyGraphicsSuppressed && !d.legacyComputeSuppressed,
+          d.legacyGraphicsSuppressed && d.legacyComputeSuppressed,
           "C2 certified lineage reaches treatment without legacy admission hashes");
-    // The legacy observation state is untouched (it keeps collecting
-    // evidence); it simply has no veto over the certified route.
     flatCameraOwnerClose(s, d, true, true);
-    check(s.outstanding == FlatCameraOwner::Upstream,
+    check(s.lastOwner == FlatCameraOwner::Upstream,
           "C2 legacy observation continues without a veto");
 }
 
@@ -150,6 +151,7 @@ void testC4() {
     // auxiliary unsupported. Per-group selection must give each its own
     // owner -- a frame-wide OR would have hidden the auxiliary's Unsupported.
     FlatCameraOwnershipState mainS{}, cockpitS{}, auxS{};
+    flatCameraOwnerBegin(mainS); flatCameraOwnerBegin(cockpitS); flatCameraOwnerBegin(auxS);
     FlatCameraGroupInput mainIn, cockpitIn, auxIn;
     mainIn.upstreamCertified = true; mainIn.legacyEligible = true;
     cockpitIn.legacyEligible = true;
@@ -172,41 +174,83 @@ void testC4() {
 }
 
 // ---------------------------------------------------------------------------
-// C5 ownership switch waits for outstanding work.
+// C5 ownership lifecycle across frames, exercised through the real API
+// sequence (no manually preloaded states).
 // ---------------------------------------------------------------------------
 void testC5() {
-    std::printf("C5 ownership switch\n");
-    // Outstanding legacy work already applied: the switch defers a frame
-    // rather than mixing phases.
+    std::printf("C5 ownership lifecycle\n");
+    // Frame 1: legacy treats and closes cleanly. Frame 2's certified
+    // upstream must switch cleanly -- the completed frame never blocks the
+    // switch (the review's "closed legacy work blocks upstream indefinitely"
+    // defect, now guarded by the begin-transition's retirement).
     {
         FlatCameraOwnershipState s{};
-        s.outstanding = FlatCameraOwner::Legacy;
-        s.outstandingApplied = true;
-        s.historyValid = true;
         FlatCameraGroupInput in;
-        in.upstreamCertified = true;
-        const FlatCameraOwnershipDecision d = flatCameraOwnerSelect(s, in);
-        check(d.owner == FlatCameraOwner::Legacy && !d.historyReset &&
-              std::strcmp(d.reason, "switch-deferred-outstanding-legacy") == 0,
-              "C5 outstanding legacy work defers the switch (no mixed phase)");
-    }
-    // No outstanding legacy application: the switch happens, with history
-    // reset and the original camera inputs preserved for motion
-    // reconstruction.
-    {
-        FlatCameraOwnershipState s{};
-        s.outstanding = FlatCameraOwner::Legacy;
-        s.outstandingApplied = false;
-        s.historyValid = true;
-        FlatCameraGroupInput in;
-        in.upstreamCertified = true;
-        const FlatCameraOwnershipDecision d = flatCameraOwnerSelect(s, in);
+        in.legacyEligible = true;
+        flatCameraOwnerBegin(s);
+        FlatCameraOwnershipDecision d = flatCameraOwnerSelect(s, in);
+        flatCameraOwnerNoteApplied(s, d);
+        flatCameraOwnerClose(s, d, true, true);
+        check(s.lastOwner == FlatCameraOwner::Legacy && s.historyValid,
+              "C5 frame 1: legacy treats and closes cleanly");
+        FlatCameraGroupInput in2;
+        in2.upstreamCertified = true;
+        in2.legacyEligible = true;
+        flatCameraOwnerBegin(s); // retirement: frame 1's work is done
+        d = flatCameraOwnerSelect(s, in2);
         check(d.owner == FlatCameraOwner::Upstream && d.historyReset &&
               d.preserveCameraInputs,
-              "C5 a clean switch resets history and preserves camera inputs");
+              "C5 frame 2: certified upstream switches cleanly (history reset, inputs preserved)");
         flatCameraOwnerClose(s, d, true, true);
-        check(s.outstanding == FlatCameraOwner::Upstream && s.historyValid,
-              "C5 closure after the switch records the new owner and fresh history");
+        check(s.lastOwner == FlatCameraOwner::Upstream && s.historyValid,
+              "C5 frame 2 closes with the new owner and fresh history");
+    }
+    // Mid-frame mix guard, forward: legacy applied, a later re-selection
+    // this frame keeps the owner.
+    {
+        FlatCameraOwnershipState s{};
+        FlatCameraGroupInput in;
+        in.legacyEligible = true;
+        flatCameraOwnerBegin(s);
+        FlatCameraOwnershipDecision d = flatCameraOwnerSelect(s, in);
+        check(d.owner == FlatCameraOwner::Legacy, "C5 mid-frame: legacy selected");
+        flatCameraOwnerNoteApplied(s, d);
+        FlatCameraGroupInput in2;
+        in2.upstreamCertified = true;
+        d = flatCameraOwnerSelect(s, in2);
+        check(d.owner == FlatCameraOwner::Legacy &&
+              std::strcmp(d.reason, "switch-deferred-applied-legacy") == 0,
+              "C5 mid-frame: an applied legacy defers the switch (no mixed phase)");
+    }
+    // Mid-frame mix guard, reverse: upstream applied, a later legacy-only
+    // selection keeps upstream.
+    {
+        FlatCameraOwnershipState s{};
+        FlatCameraGroupInput in;
+        in.upstreamCertified = true;
+        flatCameraOwnerBegin(s);
+        FlatCameraOwnershipDecision d = flatCameraOwnerSelect(s, in);
+        check(d.owner == FlatCameraOwner::Upstream, "C5 mid-frame: upstream selected");
+        flatCameraOwnerNoteApplied(s, d);
+        FlatCameraGroupInput in2;
+        in2.legacyEligible = true;
+        d = flatCameraOwnerSelect(s, in2);
+        check(d.owner == FlatCameraOwner::Upstream &&
+              std::strcmp(d.reason, "switch-deferred-applied-upstream") == 0,
+              "C5 mid-frame: an applied upstream defers the legacy takeover (symmetric guard)");
+    }
+    // Dirty closure ALWAYS invalidates history, even after a valid one.
+    {
+        FlatCameraOwnershipState s{};
+        FlatCameraGroupInput in;
+        in.upstreamCertified = true;
+        flatCameraOwnerBegin(s);
+        FlatCameraOwnershipDecision d = flatCameraOwnerSelect(s, in);
+        flatCameraOwnerClose(s, d, true, true);
+        check(s.historyValid, "C5 a clean closure validates history");
+        flatCameraOwnerClose(s, d, true, false);
+        check(!s.historyValid,
+              "C5 a dirty closure invalidates history unconditionally");
     }
 }
 
@@ -225,7 +269,9 @@ void testC6() {
     const auto t0 = std::chrono::steady_clock::now();
     uint32_t upstream = 0;
     for (uint32_t i = 0; i < 1000000; ++i) {
+        flatCameraOwnerBegin(s);
         const FlatCameraOwnershipDecision d = flatCameraOwnerSelect(s, in);
+        flatCameraOwnerClose(s, d, true, true);
         upstream += d.owner == FlatCameraOwner::Upstream ? 1u : 0u;
     }
     const auto t1 = std::chrono::steady_clock::now();

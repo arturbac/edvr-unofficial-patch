@@ -2,14 +2,20 @@
 
 ## Status
 
-- State: C2 is complete and green (c2 derive, c2 warp, c2 coexist in the
-  build pool). Producer discovery, the function-level lineage, the derive
-  reducer, the WARP geometry/lighting proofs and the coexistence policy
-  are all landed and cited in the addenda; the field schema is one
-  camera-relative typed table. The auxiliary composer callers remain
-  unclassified by behavior, and the complete view/execution lineage
-  (which passes run which refresh on which thread, record vs replay) is
-  not yet joined. C3 is planned, not built — live mutation stays off.
+- State: the C2 math and policy checks are established and green in the
+  build pool: the derive reducer (all five projection branches pinned by
+  independently computed fixtures, the bit protocol, canonical mutation
+  form on kind 3, override composition), the WARP raster/ray/lighting
+  proofs across the size matrix, and the coexistence policy's full
+  ownership lifecycle through the real API. The ray CB is composed and
+  consumed under the contract its own products prove (anchoring
+  transform, axes-product rotation, corrupt/stale measurably visible);
+  pinning the reprojection application convention needs the consuming
+  shader disassembled -- a named follow-up. The complete view/execution
+  lineage (which passes run which refresh on which thread, record vs
+  replay) is not yet joined, and auxiliary composer callers remain
+  unclassified by behavior. C3 is planned against this state -- live
+  mutation stays off.
 - Decision: investigate jittering the game's per-view camera construction
   before it derives raster/lighting data. Preserve the existing frame
   discovery, size negotiation, temporal backends and resource isolation.
@@ -390,30 +396,41 @@ view-group:
 
 1. Read the camera struct pointer (the refresh's third argument; the
    view+0x158 vs view+0x250 vs auxiliary distinction the setter map
-   established) and its projection kind at camera+0x264. Kind 3, kind 1
-   or the default branch: proceed. Kinds 4/5 or anything else: mark the
-   group upstreamUnsupported for the policy (named; no mutation).
-2. Apply the phase in the bound pair, absolutely: boundX = baseX + jx/R,
-   boundY = baseY - jy/R_h (the D3D sign convention W1 proved), where R is
-   the negotiated evaluation extent from the existing flat runtime state.
-   The phase comes from the production temporalJitter sequence at the
-   existing FlatLivePhase machine's phaseSequence.
-3. The base pair is captured per camera-struct pointer per phaseSequence:
-   the first detour call for a (pointer, sequence) records the current
-   values as base and applies base+phase; later calls at the same
-   (pointer, sequence) re-apply the identical absolute value (A5.1's no-
-   accumulated-offset, and A4's composition with mid-frame setters, which
-   poke different fields). A base that changes between calls at one
-   sequence without our write is a base-rewrite: count it, recapture, and
-   name it in the per-5s line.
-4. Raise dirty bits 4 and 8 (projection and cached VP; the mutation
-   protocol: the refresh copies the CACHED VP when bit 8 is clear, so a
-   projection edit without bit 8 is silently stale). Bits 2/1 are not
-   raised: a projection-only jitter leaves the view rows and the ray
-   snapshots legitimately unchanged (the consumer-lineage addendum).
-5. Call the original refresh through the trampoline. Its finalizers
+   established) and its projection kind at camera+0x264. **Kind 3 only:**
+   proceed. Every other branch is named upstreamUnsupported with no
+   mutation -- the A7 fixtures prove the bound pair is a no-op on the
+   ortho and default branches, so "treated" there would mean a requested
+   phase that never reached rasterization. A separately proven mutation
+   form can re-admit a branch later; kinds 4/5 stay refused meanwhile.
+2. Apply the phase in the bound pair, ABSOLUTELY and TRANSIENTLY, on the
+   values read at entry: boundX = entryX + jx/R_w, boundY = entryY - jy/R_h
+   (the D3D sign convention W1 proved), then raise dirty bits 4 and 8.
+   **R is the actual scene sampling viewport in RENDER pixels** (from the
+   validated early plan's render dimensions -- not the negotiated
+   evaluation extent E, which differs during upscaling and supersampled
+   TAA; E is preserved independently for the backend's allocation and
+   evaluation). The phase comes from the production temporalJitter
+   sequence at the existing FlatLivePhase machine's phaseSequence, and
+   the backend is told the same phase in E terms independently. The
+   end-to-end check (W1 plus the C3 session): measured raster
+   displacement equals the phase in RENDER pixels whenever R differs
+   from E, including crop/origin and E-only changes.
+3. Call the original refresh through the trampoline. Its finalizers
    re-derive the projection, the cached VP, the scene CB and the depth
    CBs from the mutated parameters in the same call.
+4. **Restore the entry values immediately after the original returns**
+   (the restore-after-call protocol, replacing the earlier base-capture
+   design, which accumulated prior phases across sequences and left the
+   last write behind on disable). The entry values ARE the authoritative
+   originals: no bookkeeping survives the call, nothing distinguishes
+   EDVR's last write from a game rewrite, a mid-frame setter's poke is
+   naturally next call's entry value (A4's composition), and disable
+   leaves nothing to clean up -- the last treated frame keeps its
+   committed phase (A6's boundary semantics) and the next frame derives
+   from pristine sources.
+5. Bits 2/1 are never raised: a projection-only jitter leaves the view
+   rows and the ray snapshots legitimately unchanged (the
+   consumer-lineage addendum).
 
 ### Ownership integration points
 
@@ -426,10 +443,30 @@ mutation, at the two existing decision points in flat_runtime.cpp:
   under Upstream ownership the legacy scope mutation is skipped by name
   (a counter, not silence); under Legacy ownership it runs exactly as
   today.
+- **Admission is rewired, not left unchanged**: refuseDraw (:970-986,
+  :1795-1800) consults the ownership decision BEFORE failing the phase
+  or entering observation. Under Upstream ownership with a certified
+  camera lineage, an unknown or color-only shader recipe does not fail
+  the frame's phase and does not enter observation -- the camera lineage
+  is the admission, and the frame proceeds to resolve acceptance and a
+  history streak. Legacy observation keeps collecting its own evidence
+  (its exit predicate and logs are unchanged), but its refusal holds no
+  veto over the certified route. A true late camera rewrite or an
+  uncovered secondary camera still refuses, by name. The later draw
+  cannot retroactively authorize a mutation: the decision is made from a
+  prepared, validated record before the refresh mutates anything.
 - The detour consults the same decision: it mutates only when the
-  decision named Upstream for this group. refuseDraw/observing semantics
-  (:970-986, :1830) are unchanged and feed the policy's legacyEligible /
-  legacyObserving inputs.
+  decision named Upstream for this group.
+
+**Original-camera provenance.** The injector publishes the phase applied
+at each refresh (per camera struct, per phaseSequence). The uploaded
+scene CB carries jittered rows, so the camera-table consumers that need
+ORIGINAL rows -- FlatMonoResolveFrame.camera/previousCamera, engine
+motion's original scene snapshots (flat_runtime.cpp:1811-1819,
+1981-1991) -- subtract the published phase to recover them, the same
+subtraction the reprojection already performs with the phase machine's
+own numbers, now sourced upstream. The classifier's encoding question
+below is the one deliberate exception to publishing.
 
 The per-frame close follows the production discipline: the detour marks
 "mutated at refresh N"; flat_runtime's scene-draw evidence notes applied

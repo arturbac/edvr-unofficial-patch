@@ -264,9 +264,23 @@ void testA5() {
           (!feq(ph.currentX, x1, 0.0f) || !feq(ph.currentY, y1, 0.0f)),
           "A5.2 new execution advances the phase with unchanged sources");
 
+    // Case 3: a per-item source revision WITHIN the execution -- inject a
+    // real source edit (the per-item setter's shape), re-derive, and require
+    // the derivatives to rebuild while the group's pixel phase is preserved.
     const float mx = ph.currentX, my = ph.currentY;
-    check(feq(ph.currentX, mx, 0.0f) && feq(ph.currentY, my, 0.0f),
-          "A5.3 mid-execution revisions preserve the group phase");
+    {
+        Cam rev; makeCamera(rev);
+        derive(rev);
+        const float before = *projSlot(rev, 14);
+        camF(rev, kCamCompoundNear) = 0.25f;                       // the +0x25C poke
+        camF(rev, kCamAngular) = camF(rev, kCamAngular) * 1.05f;   // the +0x280 poke
+        camU(rev, kCamFlags) |= kFlagProj | kFlagVP;
+        derive(rev);
+        check(!feq(*projSlot(rev, 14), before, 1e-6f),
+              "A5.3 an injected source revision rebuilds the derivatives");
+        check(feq(ph.currentX, mx, 0.0f) && feq(ph.currentY, my, 0.0f),
+              "A5.3 the group's pixel phase is preserved across the revision");
+    }
 
     edvr::FlatLivePhase g;
     g.beginFrame(true, true, 3840, 2160); g.finish(true, true);
@@ -277,6 +291,10 @@ void testA5() {
     check(!g.previousAcceptedValid && g.warmFrames == 0,
           "A5.4 generation change rejects stale ownership/history");
 
+    // Case 5: replay -- a recorded execution (source generation + recorded
+    // products) replays bit-identically, and a stale generation cannot
+    // masquerade as fresh: the products change with the source, and the
+    // phase machine's failed closure invalidates an established history.
     Cam r1; makeCamera(r1);
     camF(r1, kCamBoundX) += -0.0002f;
     derive(r1);
@@ -286,10 +304,19 @@ void testA5() {
     bool replay = true;
     for (int i = 0; i < 16; ++i) replay &= feq(*projSlot(r1, i), *projSlot(r2, i), 0.0f);
     check(replay, "A5.5 recorded execution replays bit-identically");
-    const bool wasValid = g.previousAcceptedValid;
+    Cam r3; makeCamera(r3);
+    camF(r3, kCamAngular) = camF(r3, kCamAngular) * 1.01f; // a new source generation
+    camU(r3, kCamFlags) |= kFlagProj | kFlagVP;
+    camF(r3, kCamBoundX) += -0.0002f;
+    derive(r3);
+    bool stale = true;
+    for (int i = 0; i < 16; ++i) stale &= feq(*projSlot(r1, i), *projSlot(r3, i), 1e-7f);
+    check(!stale, "A5.5 a new source generation changes the products (stale replay detectable)");
+    g.beginFrame(true, true, 3840, 2160); g.finish(true, true); // re-establish
+    check(g.previousAcceptedValid, "A5.5 a clean closure first validates history");
     g.finish(false, false);
-    check(!g.previousAcceptedValid && !wasValid,
-          "A5.5 a late/failed execution publishes no fresh history");
+    check(!g.previousAcceptedValid,
+          "A5.5 a late/failed execution invalidates established history");
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +325,15 @@ void testA5() {
 // ---------------------------------------------------------------------------
 void testA6() {
     std::printf("A6 failure/disable at the consumption boundary (production FlatLivePhase)\n");
+    // Before preparation: disabled means no camera mutation may reach
+    // rendering at all.
+    edvr::FlatLivePhase off;
+    off.beginFrame(false, true, 3840, 2160);
+    check(feq(off.currentX, 0.0f, 0.0f) && feq(off.currentY, 0.0f, 0.0f) &&
+          !off.previousAcceptedValid,
+          "A6 before preparation: disabled keeps everything at zero");
+
+    // Before any consumer: a failure keeps the whole frame at zero.
     edvr::FlatLivePhase pre;
     pre.beginFrame(true, true, 3840, 2160); pre.finish(true, true);
     pre.beginFrame(true, true, 3840, 2160); pre.finish(true, true);
@@ -305,8 +341,11 @@ void testA6() {
     pre.fail();
     check(feq(pre.currentX, 0.0f, 0.0f) && feq(pre.currentY, 0.0f, 0.0f) &&
           !pre.needsSpatialFallback(),
-          "A6 before consumption: refusal keeps the frame unjittered");
+          "A6 after mutation before consumption: refusal keeps the frame unjittered");
 
+    // After the first consumer: the committed phase is retained for the
+    // frame's remaining work, history is invalidated, and the fallback is
+    // the spatial path -- no perfect-rollback claim.
     edvr::FlatLivePhase post;
     post.beginFrame(true, true, 3840, 2160); post.finish(true, true);
     post.beginFrame(true, true, 3840, 2160); post.finish(true, true);
@@ -317,12 +356,89 @@ void testA6() {
     check(feq(post.currentX, cx, 0.0f) && feq(post.currentY, cy, 0.0f) &&
           post.needsSpatialFallback(),
           "A6 after first consumer: committed phase retained, spatial fallback named");
+
+    // At backend evaluation: a failed evaluation publishes no history.
     post.finish(false, true);
     check(!post.previousAcceptedValid,
-          "A6 a failed frame publishes no temporal history");
+          "A6 at backend evaluation: failure publishes no temporal history");
+
+    // At handoff: the failed frame's remaining work goes through the named
+    // spatial recovery, not a hidden temporal fallback -- and the next frame
+    // restarts without a stale phase.
     post.beginFrame(true, false, 3840, 2160);
-    check(feq(post.currentX, 0.0f, 0.0f) && feq(post.currentY, 0.0f, 0.0f),
-          "A6 the next frame restarts without a stale phase");
+    check(feq(post.currentX, 0.0f, 0.0f) && feq(post.currentY, 0.0f, 0.0f) &&
+          !post.previousAcceptedValid,
+          "A6 at handoff: the next frame restarts clean (no stale phase)");
+}
+
+// ---------------------------------------------------------------------------
+// A7 branch fixtures, independently computed (the C2-work review's
+// counterexamples, encoded as regression fixtures).
+// ---------------------------------------------------------------------------
+void testA7() {
+    std::printf("A7 branch fixtures (independently computed)\n");
+    // Ortho fixture (the review's probe): helper+0x264 = 2.0 (scale),
+    // +0x268 = 1.0, +0x240 = 1.6. Expected: p0 = 2, p5 = 3.2, p11 = 0,
+    // p15 = 1, and NO fall-through into the trigonometric block.
+    Cam o; makeCamera(o);
+    camU(o, kCamKind) = 1;
+    o.F(0x264) = 2.0f;
+    o.F(0x268) = 1.0f;
+    o.F(0x240) = 1.6f;
+    camU(o, kCamFlags) |= kFlagProj;
+    buildProjection(o);
+    check(feq(*projSlot(o, 0), 2.0f, 1e-6f) && feq(*projSlot(o, 5), 3.2f, 1e-6f) &&
+          feq(*projSlot(o, 11), 0.0f, 1e-7f) && feq(*projSlot(o, 15), 1.0f, 1e-7f),
+          "A7 ortho branch: p0 = 2, p5 = 3.2, p11 = 0, p15 = 1 (no trig fall-through)");
+
+    // Oblique fixture (the review's counterexample, computed from the
+    // decompile by hand): kind 3, window x [-0.3, 0.7], y [0.1, 0.7], and an
+    // unrelated +0x28C = -0.3 that the correct transcription never reads.
+    // Expected: proj9 = (f18b+f22)/(f18b-f22) = 1/3, proj8 = 0.6,
+    // proj0 = 1.0194, proj5 = 2.7184.
+    Cam q; makeCamera(q);
+    camU(q, kCamKind) = 3;
+    camU(q, kCamFlags) |= kFlagProj;
+    q.B(0x2A0) = 1;
+    q.F(0x280) = -0.3f; q.F(0x290) = 0.7f;   // x window
+    q.F(0x284) = 0.1f;  q.F(0x294) = 0.7f;   // y window
+    q.F(0x28C) = -0.3f;                      // the unrelated field
+    buildProjection(q);
+    check(feq(*projSlot(q, 9), 1.0f / 3.0f, 1e-4f) &&
+          feq(*projSlot(q, 8), 0.6f, 1e-4f) &&
+          feq(*projSlot(q, 0), 1.0194f, 1e-3f) &&
+          feq(*projSlot(q, 5), 2.7184f, 1e-3f),
+          "A7 oblique adjust: proj9 = 1/3, proj8 = 0.6 with unrelated +0x28C unread");
+
+    // The no-op branches (the review's kind-2/default probe): the default
+    // branch and the repaired ortho branch do NOT read the bound pair, so a
+    // bound-pair mutation changes nothing there. These domains need a
+    // separately proven mutation form or an explicit refusal -- and the rig
+    // now proves the refusal is required.
+    Cam d1; makeCamera(d1);
+    camU(d1, kCamKind) = 2;
+    camF(d1, kCamBoundX) = 0.0f; camF(d1, kCamBoundY) = 0.0f;
+    camU(d1, kCamFlags) |= kFlagProj;
+    buildProjection(d1);
+    Cam d2 = d1;
+    camF(d2, kCamBoundX) = 0.013f; camF(d2, kCamBoundY) = -0.007f;
+    camU(d2, kCamFlags) |= kFlagProj;
+    buildProjection(d2);
+    bool noop = true;
+    for (int i = 0; i < 16; ++i) noop &= feq(*projSlot(d1, i), *projSlot(d2, i), 0.0f);
+    check(noop, "A7 default branch: bound-pair mutation is a no-op (mutation must be refused here)");
+    Cam o2; makeCamera(o2);
+    camU(o2, kCamKind) = 1;
+    o2.F(0x264) = 2.0f; o2.F(0x268) = 1.0f; o2.F(0x240) = 1.6f;
+    camU(o2, kCamFlags) |= kFlagProj;
+    buildProjection(o2);
+    Cam o3 = o2;
+    camF(o3, kCamBoundX) = 0.013f;
+    camU(o3, kCamFlags) |= kFlagProj;
+    buildProjection(o3);
+    bool onoop = true;
+    for (int i = 0; i < 16; ++i) onoop &= feq(*projSlot(o2, i), *projSlot(o3, i), 0.0f);
+    check(onoop, "A7 ortho branch: bound-pair mutation is a no-op (mutation must be refused here)");
 }
 
 int runSelfTest() {
@@ -332,6 +448,7 @@ int runSelfTest() {
     testA4();
     testA5();
     testA6();
+    testA7();
     if (g_failures == 0) {
         std::printf("c2 derive: PASS\n");
         return 0;
