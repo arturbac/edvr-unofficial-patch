@@ -620,3 +620,37 @@ table regression (observers registering) argues for exactly that direction
 -- the admission now answers its own questions by identity instead. A
 fuller merge of the two passes' recognition is real work and is NOT
 folded into this regression fix; noted for the Phase 2 review.
+
+## The review round, 2026-09-28 (d9ead2e8 + cfa72f33)
+
+reviews/crisp-hud-census-review-2026-09-28.md (against 09baba69) found
+seven P2s; all fixed on the branch:
+
+- R1/R2 (production failure paths): the missing-consumer stand-down now
+  requires the genuine full-shape tonemap whose OUTPUT eye has
+  outstanding content (SMAA and the post passes are tonemap-shaped and
+  were one flight from standing the feature down), with the real backstop
+  a 30-consecutive-frame publication deadline per eye; and the crisp take
+  now establishes its whole dependency set (HDR layer, 8-bit layer, RGB
+  blend, coverage shaders, deferred context) at the FIRST take -- a
+  failure refuses the take (stock) instead of dropping the taken HUD.
+- R5: a crisp multiply refuses before redirect (no HDR transmittance
+  route; nothing measured uses it), with rig coverage.
+- R6: the census joins the draw-gate subscriber expression.
+- R7: the open-query set is tracked armed or not; pre-arm brackets block
+  G-D until they close.
+- R3/R4 (parity evidence): stock-unchanged covered pixels can no longer
+  be omitted from the gate (the equality fixture now fails at 32.9 steps,
+  as it should); pairing must be proven (stamp + frame + HDR-resource
+  identity, unique) or the verdict is INVALID, never a PASS; the T-fit
+  and cross-check residuals carry ceilings (4 steps / 0.25 HDR units)
+  that also land INVALID. --allow-mismatched measures under a banner,
+  never a PASS.
+
+The review's noted non-findings stand: the lost halo and the nonlinear
+translucent difference are the accepted trade; the menu eye-table fix and
+the identity admission were already in. Full build green both halves
+(265 rig checks, parity self-test with the new negatives). Awaiting the
+consolidated verification flight: the 0.50/0.75 tiers, ui_quality 100/125,
+menus over cockpit panels, and feature re-arming (a ui_quality toggle
+mid-flight).
