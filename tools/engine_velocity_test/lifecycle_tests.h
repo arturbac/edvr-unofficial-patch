@@ -695,7 +695,25 @@ inline void run(const Harness& h) {
     }
     g.beginFrame();
     g.writeScene(g.sceneA.Get(), g.rows[0]);
-    g.pass(0);
+    g.pass(0, 1, 9);   // a different owner: stale MRT6 contents cannot pass
+    {
+        edvr::EngineVelocityViews v{};
+        const bool given = g.views(0, &v);
+        h.check(given, "F7: the next frame still gives fresh engine-marker inputs");
+        if (given) {
+            unsigned exact = 0, other = 0;
+            ownership(h, g, 0, v, 9, &exact, &other);
+            h.check(exact > 0 && other == 0,
+                    "F7: the next frame's MRT6 names its new owner, with no old owner left");
+            const auto now = readBuffer(h, v.sceneNow), before = readBuffer(h, v.scenePrev);
+            uint32_t nowStamp = 0, beforeStamp = 0;
+            if (now.size() >= 277 * 4) std::memcpy(&nowStamp, &now[276 * 4], 4);
+            if (before.size() >= 277 * 4) std::memcpy(&beforeStamp, &before[276 * 4], 4);
+            h.check(nowStamp == g.frame && beforeStamp == g.frame - 1,
+                    "F7: compose receives this frame's scene snapshot and its consecutive predecessor");
+        }
+        release(v);
+    }
     lifecycle_fake::g_objectHash[g.ps2.Get()] = 0x3434972DB5336AA4ull;
     h.context->PSSetShader(g.ps2.Get(), nullptr, 0);   // live only; the hook "missed" the bind
     edvr::engine_velocity_detail::psShadowProbe(h.context);
@@ -1364,13 +1382,15 @@ inline void run(const Harness& h) {
                 "specified (%zu log lines)\n", g_log.size());
 }
 
-// S4 (the coriolis seam arc, 2026-09-27): a self-marking pair's stock draw
-// (kSelfMarking, engine_velocity_families.h) latches the game's own target-6
-// texture for the eye-frame and the compose's views carry it -- including the
+// S4: synthetic compatibility with a self-marking pair (kSelfMarking,
+// engine_velocity_families.h): its draw latches a target-6 texture for the
+// eye-frame and the compose's views carry it -- including the
 // detail pass's shape, where the eye's colour is not at slot 0 and the depth
 // probe's map of the scene pair names the eye alone. Drives the production
 // draw half with the family's REAL dumped vertex shader (the corpus dir), so
-// deriveFamily succeeds exactly as live.
+// deriveFamily succeeds. The Coriolis capture's apparent stock seam hashes
+// were proved to be EDVR-generated substitutions on 2026-09-28; these fixtures
+// do not establish an independent game marker channel in that capture.
 inline void selfMarkingCase(const Harness& h, const std::vector<BYTE>& vsBytes) {
     edvr::g_clockForTest = &lifecycle_fake::fakeClock;   // run() cleared it; the summary window rides the fake clock
     Game g(h);
@@ -1477,7 +1497,7 @@ inline void selfMarkingCase(const Harness& h, const std::vector<BYTE>& vsBytes) 
     }
     // Frame 4: the stale-shadow case the probe exists for. The seam shader is
     // bound LIVE only (ctx->PSSetShader straight, no shadow update -- the hook
-    // "missed" the bind, as measured live), so the shadow still says the
+    // "missed" the bind in this synthetic case), so the shadow still says the
     // fixture's stock PS and every generation matches the last slow half's.
     // The probe must write the truth and run the slow half with it.
     g.beginFrame();

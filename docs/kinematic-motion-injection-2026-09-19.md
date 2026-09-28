@@ -2,114 +2,44 @@
 
 ## Status
 
-- **State:** DECIDED DIRECTION, 2026-09-19 (Sean): engine-level injection from
-  KinematicRig truth, not draw-call interpretation (ruled out as a class); phases
-  0/A/B flown clean 2026-09-20 (B's veto since removed); four engine-truth flag routes
-  closed. RESUMED 2026-09-23 with Sean's requirement -- GENERALIZED, no estimation
-  anywhere, not even as a fallback: camera-only for statics, engine-record delta via
-  substituted pool shaders for movers (design C fed by B), the reactive mask the only
-  fallback. Design A (pool content-pairing) measured wrong and an engine velocity
-  buffer ruled out with blur off and on (the 2026-09-23 entries); B+C IS THE DESIGN.
-  PHASE 1 + FIX ROUND MERGED and FLOWN (093817, "The re-fly" entry): eye-frames bound
-  and given, invalidated 0, corrupt codes 0, engine-joined 67-73k px an eye-frame.
-  FOLLOW-UPS FLOWN (114958): cockpit prep 0.15-0.23 ms a pair, no faults. STAGE B
-  REMOVED (engine motion is part of fix.temporal_aa); PERFORMANCE ROUND merged. ON
-  FOOT FLOWN (flight 5, 140351, "Flight 5" entry): standing, source views given
-  2938/2938; WALKING, EVERY SOURCE FRAME DROPPED (2031/2031) by the eyes' rows rule --
-  the source is drawn by more than one camera. FIXED, MERGED, NOT FLOWN: each source
-  pool draw held to the naming draw's camera, the others declined, the frame kept.
-  HANGAR (flight 6, "The hangar" entry): no terrain draw, so NOTHING NAMED the source
-  (no on-foot line at all); now the screen's own depth names it. BUILT, NOT FLOWN.
-  STATION (eye run 143416, "The station" entry): the joined station pixels are EXACT
-  (one rigid motion to 0.002 px at the records' own 0.106-0.110 deg a frame), but 55%
-  of its pixels kept the camera term, 0.31-0.35 px a frame short. KEYED,
-  harness-proven, NOT FLOWN: ps_CB42 (DE54) and ps_451A (61AE); then from flight 6's
-  dump ("Flight 6" entry) vs_4361 + ps_1694 (547 of the station's 1193 instances a
-  frame) and vs_889A + ps_B46E / ps_EBA9. vs_DE54's ps_91F8 and ps_A607: refused by
-  the patcher. TODAY (162703, 16:27, build f05c84bf): the hangar and the station FLOWN
-  OK -- no faults or stand-downs; vs_4361+ps_1694 and vs_889A+ps_B46E/ps_EBA9 live and
-  substituted at the station (2982/29422 and 360/2206 draws per window); the hangar
-  source named by its own depth as built (5088x2862 R32G32, 116.5 MB); on-foot windows
-  clean (764/764 then 5398/5398 given, 0 invalidated); Sean judged both good.
-  TEARDOWN (last entry): the per-object estimates (per-object-motion.md) and the legacy
-  kinematic tracker retired 2026-09-23; the emit's census still counts the undrawn movers.
-  PHANTOM MV CONVICTED AND FIXED (2026-09-25 entry): a culled record kept its last pose
-  pair and marker, and the compose replayed that stale delta every frame (~0.2 px/frame
-  parked at a coriolis station, 3 px after a head move). The present-frame clock now
-  folds into the marker hash (11th FNV word, both tags); the eye-frame snapshot's scene
-  copies carry the same g_frame at EN[276].x, and a joined marker certifies only at its
-  own frame -- an older one declines to the camera term as kind 6 "stale stamp"
-  (64-frame window, Stats 55). FLOWN 2026-09-26 (2b285732, eye runs 045802 and
-  045845, parked 10 km out): the phantom drift is gone (the engine median tracks the
-  camera term within 0.1-0.3 px every frame, including a 5 px head move; the constant
-  parked drift is absent), the hull's treated edge-energy retention roughly doubled
-  (0.23 -> 0.47-0.55, cockpit ~1.0), and the stale-stamp counter read 0 because the
-  phantom population was not present at this range (the 045845 hull was 100% camera
-  term -- nothing stale to decline). The residual Sean reports (a little soft vs
-  taa=off) is the reconstruction floor on a distant dense structure at 2648x2559
-  input, not motion: constant frame-to-frame with a verified motion chain. Watch
-  items: a ~0.15-0.2 px engine-path bias (possibly genuine coriolis rotation via
-  fresh records; below the visible threshold), a one-frame record-refresh lag after
-  a 5 px move, and the pool snapshot is not part of an eye dump, so stamp freshness
-  was inferred from the census rather than read directly. CLOSE RANGE REREADS THE
-  RESIDUAL (the 2026-09-27 entry, eye run 055427, parked at the port): the station
-  does not rotate in-image (<0.02 deg/frame -- the ship co-rotates), yet the hull
-  blurred, because the hull there is 84% on the world path (vs_4361/vs_889A drew 0
-  keyed binds at that range; their stock pixel shaders ps_51EE1F922FD220B0 and
-  ps_D31DCAFA7C05CB47 drew instead) and the world path's camera term was DEAD from
-  the dump's frame 2 on (~0 through a 12.6 px move, ~1 px/frame short on the
-  steady drift) while the engine path was exact (<=0.3 px quiet, <=1.5 px through
-  the move). A dragged history on a broken camera term, not the reconstruction
-  floor -- the floor verdict stands only at 10 km, where the chain was verified.
-  ps_4504BC268E109C31 keyed for vs_61AE, and ps_51EE1F922FD220B0 (vs_4361) +
-  ps_D31DCAFA7C05CB47 (vs_889A) keyed from the 2026-09-27 glare_shader_dump
-  flight's dumps -- every pair corpus-harness proven (40,960 texels, 0
-  mismatches; MRT6 8192, 0 bad). The world-path death is the camera-rows arc's
-  H2 convicted (a parked stay of 4674 frames spanned the move; the rows also
-  undershot the head 35-40% in both sessions, live).
-- **Open:** walkers (vs_F516BF0201303B87, not a pool family; w=2 on the panel) wait on
-  phase 2's previous bone palette -- a walking NPC still blurs after the on-foot fix;
-  which camera the walk's other draws use (the new line's rows and distance say); a
-  temporal pass on the flat source for its own aliasing; the stale cockpit (the
-  commander's legs under ps_B7D5 and vs_7B0DC42D, DECIDED not keyed; 35.4% undecided, low
-  priority); the census's evaluated-but-not-drawn movers (the 09:38 entry); the boarding
-  flicker (the LOD governor, not this arc); vs_DE54's ps_91F8 and ps_A607 (the patcher
-  handles both now -- ps_A607 passes the harness as a candidate; both stay unkeyed while
-  their live owner/coverage is assessed); the world path's camera-term health near a
-  station (rows chosen off the auxiliary passes, parked stays spanning motion, a 35-40%
-  undershoot of the head in both sessions) -- belongs to the camera-rows arc, which owns
-  the gate; the port-face seams' blur with motion is ROUTE-A BUILT, NOT FLOWN (the
-  2026-09-27 route-A entry): the seam detail's stock pixel shaders
-  ps_BCF75CEA37060EAE (vs_4361) and ps_2F924695596C8195 (vs_889A) natively write EDVR's
-  exact marker encoding into the game's own SV_Target6 buffer, so the runtime latches
-  that texture and the compose reads it as a fallback beside ES (G6 t19, probe.w 4096;
-  harness-proven on WARP, both directions); route B (healing the world path) stays with
-  the camera-rows arc; ships in space; builder-path movers and articulated parts
-  (phase 2).
-- **Ruled out (do not re-propose; each closed in its dated entry):** draw-shape memo
-  identity, pool-slot identity, 3x3 SAD camera-vs-body match, hidden-bone-spin
-  estimation (pre-2026-09-20); four engine-truth mover/static routes (2026-09-20
-  21:25); an engine velocity buffer with blur off or on, and record+0x1C0..0x1F8 as
-  previous-frame truth (2026-09-23 entries); design A pool content-pairing (evening
-  entry); the fix round's five hypotheses -- a scaled history delta, a straddling
-  tick, rows 270..275 mid-pass, MRT6-blend coverage loss, and the substituted shaders
-  altering the G-buffer (Fix round entry); one camera per on-foot source frame (Flight
-  5); the on-foot world packed per eye, enginePixel's fetch as the ~3 ms prep, and a
-  depth pre-pass/bias as the stale cockpit (the re-fly entry); green cockpit panels as
-  a mover bug, and engine-path CPU cost as the frame-time cause (09:38 entry); the
-  station's joined motion wrong at range (The station entry); the station's own
-  in-image rotation as the 055427 blur (the ship co-rotates: <0.02 deg/frame, two
-  methods); a phantom engine delta in 055427 (the engine path equals the grid-searched
-  truth there); the stamp fix as the cause of the world-path death (191906 shows the
-  same miss on the 09-25 build); the reconstruction floor as the close-range
-  explanation (the chain is broken upstream of DLSS).
-- **Next:** FLY the route-A build at the coriolis port (055427's range, head moves, an
-  eye dump): the family lines name "self-marked N draws, latched M" on vs_4361/vs_889A
-  with M ~ the eye-frames, the dump's engine share on the station box climbs past
-  095337's 53.5% toward the families' full coverage, and the seams stay crisp through
-  motion. latched 0 with the blur unchanged means the game's buffer shape refused --
-  its format is the first suspect. Then the controlled diagnostics 1 vs 0 comparison,
-  and a walker near a drone with the motion_source view.
+- **State:** B+C is merged and flown: camera-only statics, certified
+  engine-record deltas for movers, reactive-mask fallback. Estimation/tracker
+  retirement: 2026-09-23 teardown entry.
+- **Coriolis:** window expansion FLOWN, residual remains; 162120 matches
+  f2f27f97. Production-patcher hash proof identifies the alleged native
+  seam/window/refused shaders as EDVR's own generated patches. The old shadow
+  probe loses their ownership; current main already fixes it in 418e5231 (F7),
+  absent from that flight. See the 2026-09-28 entry; old-source reproduction,
+  stronger regression, and full validation passed. Visual verification remains.
+- **162120:** raw-image warps independently validate engine motion (quiet
+  median correction <=0.05 input px). World-covered detail misses by ~0.3-0.6
+  px quietly, up to 6 px on the opening move. Engine share: inset ~74%, seam
+  64-67%, face ~82%. The ownership failure leaves object motion missing on
+  these pixels.
+- **Camera:** selected rows match all 16 captured scene blocks within 5e-6; all
+  32 eyes accept/bind them, follow 30. Stale carry/later auxiliary
+  contamination ruled out FOR THIS RUN. Earlier H2 and H3 remain with
+  docs/camera-rows-carry-2026-09-25.md.
+- **Coriolis pointers:** 09-25 frame stamp fixes phantom record motion; 09-26
+  distant reconstruction limit; 055427/080242 dead world motion; 095337 alleged
+  native seam markers; route-A, stale-shadow, review F1/F2/F3 and window-band
+  entries describe coverage repairs. The 09-28 bytecode proof supersedes their
+  native-marker/bypass interpretation: all five alleged native pairs and BA58
+  were EDVR-generated.
+- **Other open work:** phase 2 bones for walkers/builder movers/articulated
+  parts; ships, evaluated-but-undrawn movers, flat-source aliasing; stale
+  cockpit (low priority); ps_91F8/ps_A607 owner/coverage. Flight 5/6 and 162703
+  cover the fixed on-foot/hangar paths. Boarding flicker: LOD governor. Pending
+  checks: diagnostics 1 vs 0, walker near drone with motion_source.
+- **Ruled-out pointer:** dated entries close estimation/shape/slot identity,
+  four flag routes, velocity buffers, record+0x1C0 previous poses,
+  content-pairing A, fix-round five hypotheses, on-foot camera/packing
+  assumptions, fetch cost, cockpit depth pre-pass/bias, motion-cost
+  interpretations, wrong joined station motion, close-range
+  reconstruction-floor-only diagnosis.
+- **Next:** promote and install the validated F7 build, then repeat the same
+  station view and eye dump. Confirm engine coverage improves and the circled
+  detail stays clear; headset verification remains pending.
 
 ## Premise
 
@@ -3379,3 +3309,92 @@ vs_61AE carry "self-marked N draws, latched M eye-frames", vs_66DE patches
 ps_BBDE, the window bands go engine-joined in the dump's path map, and the
 seams hold through motion. What is left on the world path after this: the
 refused ps_BA58's draws and anything the pool does not own at all.
+
+### 2026-09-28 -- Eye run 162120: window expansion flown, substitution ownership convicted
+
+Frontier's failed-fix build matches f2f27f97: the window expansion was flown,
+and Sean still sees blur with head and ship held still. Sixteen left-eye C/D
+frames (10043-10058), 2037x1969 -> 4074x3938, distinguish missing object motion
+from bad fresh engine motion.
+
+**Independent raw-image evidence.** Warp previous C to current C with each
+pixel's D vector, then minimize photometric mismatch by fitting a correction
+separately on each path. Raster motion is D minus (current jitter minus
+previous jitter). Gaussian blur radii 1 and 2 suppress aliasing and agree;
+shifting D by either adjacent frame worsens the engine warp. Quiet-pair median
+corrections, blur radius 2, in input pixels:
+
+| raw-crop ROI | engine share | world correction | engine correction |
+|---|---|---|---|
+| inset (730,415)-(890,470) | ~74% | (-0.15,-0.25) | <=0.05 px |
+| seam (939,430)-(985,691) | 64-67% | (-0.35,-0.25) | <=0.05 px |
+| face (722,472)-(906,655) | ~82% | (-0.35,-0.30) | <=0.05 px |
+
+Blur radius 1 gives roughly 0.3-0.6 px world error. On opening pair 2 the
+seam's world correction is (-6.0,-0.7), reducing warp RMSE 31.0 -> 8.74; engine
+correction (-0.1,0) barely changes RMSE 6.17 -> 6.15. Engine motion is
+accurate, but significant world-covered detail misses the raw content before
+DLSS. This does not explain every soft engine-covered detail.
+
+**Camera and frame join.** All 16 captured scene-row blocks match selected rows
+within 5e-6; all 32 eyes have rowsOk=1, rowsBound=1, rowsFollow=30. Join
+ledger.frame = CSV.frame+1: ledgerNoteDraw uses g_frame+1 before the boundary
+(object_probe.cpp:611), so ledger 10044-10059 and C/D/CSV 10043-10058 agree.
+Earlier H2 remains real outside this capture.
+
+**Exact production-patcher proof.** All alleged native seam/window shaders and
+refused BA58 are EDVR's own generated patches:
+
+| original PS | exact generated PS |
+|---|---|
+| 51EE1F922FD220B0 | BCF75CEA37060EAE |
+| D31DCAFA7C05CB47 | 2F924695596C8195 |
+| DB3E8D20CF53FBC0 | 25CC28229319DFA8 |
+| CF534B32F491561A | C4835018A5128866 |
+| FC43E42710010343 | C21E17F391CC04AF |
+| 4375B72964F386CD | BA58469C3D6120A7 |
+
+The VS patcher reproduces 5B4D8E894EEDA8B4 -> BC3EE3F509EB3956 too. Complete
+captured live-versus-shadow mismatches: 567/1398, 561/1400, 575/1263 on the
+first three frames (third capped), mapping to 13 exact generated PS pairs; six
+VS mismatches per frame reproduce the generated 5B4D patch. No captured
+mismatch requires a genuine hook bypass. EDVR installs patches through raw
+setters, so their zero hook-bind counts are expected. BA58's refusal was an
+attempt to patch an already-patched shader.
+
+**Ownership root cause and existing repair.** Failed-fix f2f27f97's
+psShadowProbe adopts a registered installed EDVR PS into the game's binding
+shadow, bumps its generation, and enters the slow path with an unkeyed
+generated hash. restore then fails the saved PS-generation comparison and
+clears the bound substitution, losing the original ownership and subsequent
+current markers. Current main's F7 (418e5231), absent from that installed
+build, excludes g_bound.patchedPs by identity before registry lookup. It
+preserves shadow/generation and restoration. Historical
+route-A/native-marker/bypass claims above are superseded; rosters remain
+unchanged here.
+
+ruled out: stale carry and later auxiliary selection contamination IN THIS RUN,
+because selected rows equal the accepted/bound captured scene rows.
+
+ruled out: wrong fresh engine motion or reconstruction damping alone, because
+independent engine warps are accurate while world-covered detail receives
+measurably wrong vectors.
+
+ruled out: native game self-marking, genuine shader-bind bypass, and an
+unpatchable original BA58 producer as these captured hashes' explanation,
+because production patching reproduces every alleged native/refused hash and
+all audited mismatches exactly.
+
+**Validation:** the exact f2f27f97 runtime source fails the F7 shadow
+identity/generation regression. Current source passes 1175 focused checks,
+including next-frame compose availability, a new marker owner replacing the old
+owner, and consecutive scene stamps. The full build passed all gates, including
+82 pooled rigs, four quiet rigs, the production DLLs, and the self-contained
+installer; build/full_build_receipt.json records the validated compiled inputs.
+
+**Next:** clean-commit promotion and Frontier installation, then repeat the
+same station view and take an eye dump to verify improved coverage and clear
+detail in the headset. Numerical artifacts:
+build/coriolis-162120/warp-refinement-blur2.json, roi-analysis.json and paired
+inset/seam crops; the saved dump and production-patcher hash proof make the
+diagnosis reproducible.

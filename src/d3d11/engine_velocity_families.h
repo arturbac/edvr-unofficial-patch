@@ -29,22 +29,27 @@ constexpr Family kFamilies[] = {
     {0xBFE51414CC3024B4ull, "vs_BFE51414CC3024B4", {0xDB79AE788E049DFDull, 0, 0, 0}, true},
 };
 constexpr int kFamilyCount = static_cast<int>(sizeof(kFamilies) / sizeof(kFamilies[0]));
-// Pairs whose STOCK pixel shader natively writes EDVR's marker encoding --
-// o6.x = 2 * (DATAID's low 23 bits) + 1, o6.y = noperspective SV_Position.z --
-// into the GAME's own SV_Target6 buffer (the coriolis port faces' seam detail,
-// eye run 095337; docs/kinematic-motion-injection-2026-09-19.md). Unkeyable by
-// construction (their target 6 is occupied by design): no substitution, no
-// shader patch -- the runtime captures the game's target-6 texture for the
-// eye-frame, and the compose reads it beside EDVR's own slot target.
+// Historical marker-bearing pairs retained for compatibility. PROVENANCE
+// CORRECTION, 2026-09-28: every PS below is EDVR's generated substitution,
+// not a native game shader. Re-running engineVelocityPatchPs on the captured
+// originals reproduces these exact creation-byte hashes:
+//   51EE1F922FD220B0 -> BCF75CEA37060EAE
+//   D31DCAFA7C05CB47 -> 2F924695596C8195
+//   DB3E8D20CF53FBC0 -> 25CC28229319DFA8
+//   CF534B32F491561A -> C4835018A5128866
+//   FC43E42710010343 -> C21E17F391CC04AF
+// The device's creation hook dumps/registers EDVR shaders too. A census
+// reading these hashes live while the PS hook sees zero binds is expected
+// substitution, not evidence of a bypass. Do not key them as game variants.
+// See docs/kinematic-motion-injection-2026-09-19.md, 2026-09-28 investigation.
 struct SelfMarking {
     uint64_t vs, ps;
 };
 constexpr SelfMarking kSelfMarking[] = {
     {0x436193B352A2897Eull, 0xBCF75CEA37060EAEull},
     {0x889A5279E68F0672ull, 0x2F924695596C8195ull},
-    // The 15:46 session's remaining stock station draws, each verified
-    // byte-identical in the encoding (2*(v0.x & 0x7fffff)+1, noperspective
-    // position z at o6.y): the seams' light/detail shaders.
+    // The 15:46 session's marker-bearing draws: these are also EDVR's
+    // generated shaders, as the exact lineage above proves.
     {0xBBE58E40FE88EC80ull, 0x25CC28229319DFA8ull},
     {0xAACFDCF2FB9AD809ull, 0xC4835018A5128866ull},
     {0x61AE8EB05FDC18DDull, 0xC21E17F391CC04AFull},

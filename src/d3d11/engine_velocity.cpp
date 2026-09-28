@@ -78,8 +78,11 @@ std::atomic<const ID3D11Resource*> watch[kWatchSlots] = {};
 // ps_D31D dumped by the 2026-09-27 glare_shader_dump flight at the port; each
 // pair through the corpus identity harness (40,960 texels, 0 mismatches;
 // MRT6 8192 checked, 0 bad). ps_BBDE4E71FB78528A (vs_66DE) keyed from the
-// 15:46 session's dumps the same day. ps_BA58469C3D6120A7 (vs_5B4D) stays
-// stock: its input register for the slot is occupied (the harness says so).
+// 15:46 session's dumps the same day. Provenance correction, 2026-09-28:
+// ps_BA58469C3D6120A7 is the exact EDVR patch of ps_4375B72964F386CD,
+// not another stock variant. Its occupied slot is our existing export.
+// Likewise all kSelfMarking hashes are generated substitutions; see their
+// lineage in engine_velocity_families.h and the investigation doc.
 using engine_velocity_family::Family;
 using engine_velocity_family::kFamilies;
 using engine_velocity_family::kFamilyCount;
@@ -1006,11 +1009,12 @@ bool bindTarget(ID3D11DeviceContext* ctx, Eye& e, ID3D11DepthStencilView* dsv) {
     return true;
 }
 
-// A self-marking pair (kSelfMarking): the stock pixel shader writes the marker
-// encoding (2 * slot + 1, the fragment's z) into the game's OWN SV_Target6, so
-// the draw runs untouched and the compose reads the game's texture beside ES.
-// Latch that texture for the eye-frame here: R32G32_FLOAT, single-slice, the
-// pass's depth size -- the shape the compose's float2 Load reads. Once per
+// The historical self-marking compatibility path latches the currently bound
+// SV_Target6. Its known hashes are EDVR's generated patches, not native game
+// writers (2026-09-28 exact-hash proof in engine_velocity_families.h). The PS
+// shadow probe must not adopt our installed patch and enter this path as if
+// it were game state. Latch for the eye-frame here: R32G32_FLOAT, single-slice,
+// at the pass's depth size -- the shape the compose's float2 Load reads. Once per
 // eye-frame; nothing about the game's state is touched. True only when the
 // texture was latched (first latch of the eye-frame) -- the caller counts it,
 // so the family line can tell "drawn" and "actually read at the compose"
@@ -1137,10 +1141,10 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     // a declined draw puts the game's state back, as before.
     if (!keyedPs(f, psHash, runtimeFlatProfile())) {
         if (selfMarkPs) {
-            // The stock shader already writes the marker into the game's own
-            // target 6: nothing to substitute -- latch that texture for the
-            // compose and let the draw run exactly as the game made it. The
-            // eye comes from the pass's colour (eyePass) or, for the detail
+            // Compatibility path for a marker-bearing shader: latch target
+            // 6 without adding a second export. Known hashes are our own
+            // generated patches; the probe excludes our installed identity.
+            // The eye comes from the pass's colour (eyePass) or, for the detail
             // pass that never binds it, from the depth probe's map of the
             // scene pair (selfMarkEyePass).
             const int which = eyePass ? eye : markEye;
@@ -1744,14 +1748,15 @@ void noteResourceWrite(const ID3D11Resource* resource) noexcept {
     if (matched) cache = DrawCache{};
 }
 
-// The seam arc's shadow probe (2026-09-27, the 142315/142624 sessions): a
-// pass's pixel-shader binds can bypass the PS hook entirely -- the census
-// reads ps_BCF75CEA37060EAE live on its draws while zero binds crossed
-// hookedPSSetShader all session. The shadow then holds the previous family
-// shader, the quick path sees no generation change, and the draws are never
-// substituted nor counted. Sampled by the header (one quick-pathed pool-
-// context draw in 64): when the live pixel shader is not the shadow's, the
-// truth is written into the shadow and the draw takes the slow half, which
+// The seam arc's shadow probe (2026-09-27), retained as a backstop for a
+// genuine unobserved bind. Provenance correction, 2026-09-28: the cited
+// ps_BCF75CEA37060EAE is our own generated patch of ps_51EE1F922FD220B0.
+// Zero hooked binds for it is expected. All live/shadow shader differences
+// in the first three 162120 capture frames reproduce our generated hashes;
+// those captures supply no evidence of a real bypass. Sampled by the header
+// (one quick-pathed pool-context draw in 64): when the live pixel shader is
+// neither the shadow's nor our installed patch, the truth is written into
+// the shadow and the draw takes the slow half, which
 // then reads the real shader. Only ever the owner thread.
 void psShadowProbe(ID3D11DeviceContext* ctx) {
     ++g_draw.poolShadowProbes;

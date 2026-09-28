@@ -110,11 +110,12 @@ constexpr unsigned kWatchSlots = 6;
 extern std::atomic<const ID3D11Resource*> watch[kWatchSlots];
 void beforeDrawSlow(ID3D11DeviceContext*, bool rtv0Eye);
 extern uint32_t g_psShadowProbeN;   // owner thread; the header's sampling counter
-// The seam arc (2026-09-27): a pass can carry a live pixel shader the PS hook
-// never saw bound (the station detail pass: zero binds across a session while
-// the census reads it live), leaving the shadow stale and the quick path
-// blind. Sampled by the header, this compares the live shader against the
-// shadow's and writes the truth in before taking the slow half.
+// Sampled backstop for a genuinely unobserved game bind. The seam arc's
+// original zero-bind/live-census evidence was our own generated shaders
+// (exact production-patcher hash proof, 2026-09-28; see the family header).
+// The probe must exclude the installed EDVR patch before considering a live
+// shader absent from the shadow; otherwise it adopts our substitution as
+// game state and destroys restoration ownership.
 void psShadowProbe(ID3D11DeviceContext*);
 void noteResourceMapped(const ID3D11Resource*, void* data, int mapType) noexcept;
 void noteResourceWrite(const ID3D11Resource*) noexcept;
@@ -136,13 +137,12 @@ inline void engineVelocityBeforeDraw(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     } else if (((++g_psShadowProbeN) & 63u) == 0u &&
                (engine_velocity_family::familyOfVs(bindingShaderHash(BindSlot::Vs)) >= 0 ||
                 engine_velocity_family::anyFamilyPs(bindingShaderHash(BindSlot::Ps)))) {
-        // The quick path's blind spot, sampled (the seam arc, 2026-09-27): a
-        // pass's shader binds can bypass the PS hook entirely -- zero binds of
-        // the seam shaders over a whole session while the census reads them
-        // live -- and the shadow's unchanged generation then hides the draws.
-        // One pool-context draw in 64 pays the compare: when the live pixel
-        // shader is not the shadow's, the probe sets the shadow to the truth
-        // and the draw takes the slow half.
+        // One pool-context draw in 64 checks for an unobserved game bind.
+        // A live shader different from the shadow is normally our installed
+        // substitution, so the probe first excludes its owned identity. The
+        // 162120 capture's live/shadow differences all reproduce EDVR patch
+        // hashes; they are not evidence of a real hook bypass. A different
+        // registered game shader heals the shadow and takes the slow half.
         psShadowProbe(ctx);
     }
     if (cache.family >= 0) ++familyDraws[cache.family];
