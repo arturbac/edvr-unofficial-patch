@@ -22,6 +22,7 @@
 #include "gpu_timing.h"
 #include "dxbc_engine_velocity.h"
 #include "engine_velocity_emit.h"
+#include "engine_velocity_primary_copy.h"
 #include "engine_velocity_families.h"
 #include "engine_velocity_state.h"
 #include "exposure_fix.h"   // lookupShaderHash: the PS shadow probe reads the registry
@@ -38,6 +39,7 @@ namespace engine_velocity_detail {
 
 template <class T> using Ptr = Microsoft::WRL::ComPtr<T>;
 namespace emit = engine_velocity_emit;
+namespace primaryCopy = engine_velocity_primary_copy;
 
 std::atomic<bool> live{false};
 DrawCache cache;
@@ -183,6 +185,15 @@ struct WatchInfo {
     uint8_t rows[kRowsBytes] = {};
 };
 WatchInfo g_watchInfo[kWatchSlots];
+std::atomic<const ID3D11Resource*> primaryPoolResources[kPrimaryPoolResources] = {};
+struct PrimaryMap {
+    Ptr<ID3D11Buffer> buffer;
+    uint32_t bytes=0,lastFrame=0;
+    uint64_t sequence=0;
+    bool mapped=false;
+};
+PrimaryMap g_primaryMaps[kPrimaryPoolResources];
+uint64_t g_primaryMapSequence=0,g_primaryMapOverflow=0,g_primaryCopyCalls=0,g_primaryApplied=0;
 
 // --- Per eye -------------------------------------------------------------------
 enum Invalid : int {
@@ -271,6 +282,8 @@ std::atomic<uint32_t> g_frame{0};
 std::unique_ptr<emit::Table> g_table;
 std::unique_ptr<emit::Census> g_census;
 emit::Stats g_emit;
+emit::Stats g_primaryEmit;
+std::atomic<uint64_t> g_primaryAttempts{0};
 std::atomic<emit::LookupFn> g_lookup{nullptr};
 std::atomic<uint64_t> g_emitSampled{0}, g_emitSampledTicks{0};
 const char* g_verifyWhy = nullptr;            // the build check's refusal, null = passed
@@ -465,6 +478,43 @@ void observeEmit(uintptr_t record, uintptr_t owner, int32_t before, int32_t afte
         g_emitSampled.fetch_add(1, std::memory_order_relaxed);
         g_emitSampledTicks.fetch_add(static_cast<uint64_t>(qpcNow() - t0), std::memory_order_relaxed);
     }
+}
+
+void observePrimaryEmit(const emit::PrimaryIdentity& identity, uintptr_t owner, uintptr_t key,
+                        uintptr_t position, uintptr_t quaternion, int32_t before, int32_t after) noexcept {
+    if (!live.load(std::memory_order_acquire) || !g_table) return;
+    g_primaryAttempts.fetch_add(1,std::memory_order_relaxed);
+    const auto sink=+[](uintptr_t item,const emit::Pose&,const emit::Pose& previous,uint32_t marker,uint32_t frame) noexcept {
+        uint32_t native[84]{};
+        return emit::read(item,native,sizeof(native)) && primaryCopy::recordEmission(item,native,previous,marker,frame);
+    };
+    // Invalidate an older claim at the exact newly-appended primary item,
+    // even when this call will be declined by the pose/deformation checks.
+    if(int64_t(after)-int64_t(before)==1) {
+        const auto lookup=g_lookup.load(std::memory_order_acquire);
+        const uintptr_t entry=lookup?emit::guardedLookup(lookup,owner+emit::kOwnerDictionary,key):0;
+        uintptr_t item=0;
+        if(entry && emit::collectItems(entry,1,&item))primaryCopy::invalidateEmission(item);
+        else primaryCopy::invalidateEmission(0);
+    } else primaryCopy::invalidateEmission(0); // ownership/fault: no stale CPU claim may survive
+    emit::observePrimary(identity,owner,key,position,quaternion,before,after,frameNow(),
+                         g_lookup.load(std::memory_order_acquire),*g_table,g_primaryEmit,sink);
+}
+
+void observePoolCopy(uintptr_t mapped,uint32_t stride,uintptr_t source,uint64_t slot,uint32_t count) noexcept {
+    if(!live.load(std::memory_order_acquire))return;
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    ++g_primaryCopyCalls;
+    if(count==UINT32_MAX || slot>UINT32_MAX){primaryCopy::invalidateMapped(mapped);return;}
+    primaryCopy::copier(mapped,stride,source,static_cast<uint32_t>(slot),count,frameNow());
+}
+void* observeMergeBegin(uintptr_t destination,uintptr_t source) noexcept {
+    if(!live.load(std::memory_order_acquire))return nullptr;
+    return primaryCopy::beginMergeOpaque(destination,source,frameNow());
+}
+void observeMergeEnd(void* plan,bool completed) noexcept {primaryCopy::endMergeOpaque(plan,completed);}
+void observeDictionaryClear(uintptr_t dictionary) noexcept {
+    if(live.load(std::memory_order_acquire))primaryCopy::invalidateDictionary(dictionary);
 }
 
 // The stand-down rule (the 2026-09-23 review): with no emit, no record gets a
@@ -761,6 +811,11 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
     poolBuf->GetDesc(&pd);
     if (pd.StructureByteStride != emit::kItemBytes || !(pd.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) ||
         pd.ByteWidth < emit::kItemBytes) { invalidate(e, kNoPool); return false; }
+    const bool knownPrimary=watchesPrimaryResource(poolBuf.Get());
+    notePrimaryBufferCreated(poolBuf.Get(),pd); // existing buffer on mid-session activation
+    if(!knownPrimary && watchesPrimaryResource(poolBuf.Get()))
+        Log::get().note("engine motion: primary pool %p nominated at draw frame %u after its initial upload; "
+                        "private-copy coverage warms up on its next observed map.",static_cast<void*>(poolBuf.Get()),frame);
     Ptr<ID3D11Buffer> scene;
     ctx->VSGetConstantBuffers(kEngineVelocitySceneSlot, 1, &scene);
     if (!scene) { invalidate(e, kNoScene); return false; }
@@ -777,6 +832,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         e.pool.Reset(); e.poolSrv.Reset();
         D3D11_BUFFER_DESC d = pd;
         d.Usage = D3D11_USAGE_DEFAULT; d.CPUAccessFlags = 0; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        d.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
         if (FAILED(dev->CreateBuffer(&d, nullptr, &e.pool)) || FAILED(dev->CreateShaderResourceView(e.pool.Get(), nullptr, &e.poolSrv))) {
             e.pool.Reset(); e.poolSrv.Reset(); e.poolBytes = 0; ++g_draw.createFailed;
             invalidate(e, kCreate);
@@ -805,6 +861,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         // instead of paying two pairs' worth of overhead for it.
         GpuCensusScope census(ctx, GpuCensusSection::FrameEngineVelocity);
         ctx->CopyResource(e.pool.Get(), poolBuf.Get());
+        if(primaryCopy::apply(ctx,e.pool.Get(),poolBuf.Get(),frame))++g_primaryApplied;
         // The copy by region, not resource: our buffer can be a float4
         // larger than the game's (the stamp), which CopyResource would
         // reject. The stamp is this eye-frame's present-frame clock -- the
@@ -902,6 +959,7 @@ void checkSources(ID3D11DeviceContext* ctx, Eye& e, int eye) {
             // snapshot()'s pair.
             GpuCensusScope census(ctx, GpuCensusSection::FrameEngineVelocity);
             ctx->CopyResource(e.pool.Get(), e.poolBuffer.Get());
+            if(primaryCopy::apply(ctx,e.pool.Get(),e.poolBuffer.Get(),e.frame))++g_primaryApplied;
         }
         endCapture(ctx, refreshTimer);
         e.poolAppendEpoch = wp.appendEpoch;
@@ -1348,6 +1406,33 @@ void summaryLocked(uint64_t now) {
     const double emitUs = sampled ? double(sampledTicks) * 1e6 / freq / double(sampled) : 0.0;
     const double emitMsPerFrame = emitUs * double(g_emit.calls.load()) / frames / 1000.0;
     if (!g_emitLive.load(std::memory_order_acquire)) logStoodDown();
+    uint64_t primaryCalls=0,primaryUnowned=0;
+    kinematicEvalPrimaryEmitCounters(primaryCalls,primaryUnowned);
+    const uint64_t attempts=g_primaryAttempts.load(std::memory_order_relaxed);
+    const uint64_t written=g_primaryEmit.itemsJoined.load()+g_primaryEmit.itemsMasked.load();
+    Log::get().note("engine motion: primary rigid emit (%s): relay calls %llu, unowned %llu, observer calls %llu, "
+                    "joined %llu, moving %llu, masked %llu, declined %llu; disagreements %llu, locate failures %llu, "
+                    "read faults %llu, write faults %llu. Zero relay calls means this producer did not run.",
+                    kinematicEvalPrimaryEmitStatus(),u(primaryCalls),u(primaryUnowned),u(attempts),
+                    r(g_primaryEmit.itemsJoined),r(g_primaryEmit.itemsMoving),r(g_primaryEmit.itemsMasked),
+                    u(attempts>=written?attempts-written:0),r(g_primaryEmit.disagreements),r(g_primaryEmit.locateFailures),
+                    r(g_primaryEmit.readFaults),r(g_primaryEmit.writeFaults));
+    Log::get().note("engine motion: primary private copy cumulative (copier %s, merge %s, clear %s): copier spans %llu, apply successes %llu, "
+                    "positive map cache overflow %llu (capacity %u); primary native records are unchanged.",
+                    kinematicEvalPoolCopyStatus(),kinematicEvalMergeStatus(),kinematicEvalClearStatus(),u(g_primaryCopyCalls),u(g_primaryApplied),u(g_primaryMapOverflow),kPrimaryPoolResources);
+    const auto copyStats=primaryCopy::stats();
+    Log::get().note("engine motion: primary copy certificates cumulative: emissions %llu, native copy ranges %llu, joined slots %llu, "
+                    "declined %llu, invalidated %llu, overflow %llu; private scatter batches %llu, rows %llu, empty %llu, "
+                    "failed %llu (%s). Empty means no certified private rows; zero emissions means no primary record qualified.",
+                    u(copyStats.emissions),u(copyStats.copies),u(copyStats.joined),u(copyStats.declined),u(copyStats.invalidated),
+                    u(copyStats.overflows),u(copyStats.scatterBatches),u(copyStats.scatterRows),u(copyStats.scatterEmpty),
+                    u(copyStats.scatterFailed),primaryCopy::scatterFailureName(copyStats.lastScatterFailure));
+    Log::get().note("engine motion: primary copy routing cumulative: source resets %llu, no active map %llu, "
+                    "ambiguous map %llu, invalid range %llu, merge plans %llu, merge failures %llu, "
+                    "clear calls %llu, cleared claims %llu, clear failures %llu.",
+                    u(copyStats.sourceResets),u(copyStats.copierNoLease),u(copyStats.copierAmbiguous),
+                    u(copyStats.copierInvalidRange),u(copyStats.mergePlans),u(copyStats.mergeFailed),
+                    u(copyStats.clearCalls),u(copyStats.clearedClaims),u(copyStats.clearFailed));
     Log::get().note("engine motion: emit (%s) over %.0f s, %.0f frames: FUN_144312E00 calls %llu (%llu appended, %llu pool "
                     "records in all); pool records joined %llu (with motion %llu), masked %llu; masked for: first seen %llu, "
                     "gap %llu, reused pointer %llu, pose changed within one frame %llu, previous frame not certified %llu, "
@@ -1547,6 +1632,7 @@ void summaryLocked(uint64_t now) {
         familyDraws[f] = 0;
     }
     g_emit.clear();
+    g_primaryEmit.clear(); g_primaryAttempts.store(0,std::memory_order_relaxed);
     g_lastGaps = 0;
     g_draw.clear();
     g_windowStartMs = now;
@@ -1573,6 +1659,7 @@ void clearLocked() {
     if (g_table) g_table->clear();
     if (g_census) g_census->clear();
     g_emit.clear();
+    g_primaryEmit.clear(); g_primaryAttempts.store(0,std::memory_order_relaxed);
     g_lastGaps = 0;
     g_lastSubstitution = ~0u;
     g_draw.clear();
@@ -1612,11 +1699,21 @@ void engineVelocityConfigure(bool on) {
     if (g_verifyWhy) {
         g_lookup.store(nullptr, std::memory_order_release);
         kinematicEvalSetEmitObserver(nullptr);
+        kinematicEvalSetPrimaryEmitObserver(nullptr);
+        kinematicEvalSetPoolCopyObserver(nullptr);
+        kinematicEvalSetMergeObserver(nullptr,nullptr);
+        kinematicEvalSetClearObserver(nullptr);
     } else {
         g_lookup.store(reinterpret_cast<emit::LookupFn>(base + kLookupRva), std::memory_order_release);
         kinematicEvalSetEmitObserver(&observeEmit);
+        kinematicEvalSetPrimaryEmitObserver(&observePrimaryEmit);
+        kinematicEvalSetPoolCopyObserver(&observePoolCopy);
+        kinematicEvalSetMergeObserver(&observeMergeBegin,&observeMergeEnd);
+        kinematicEvalSetClearObserver(&observeDictionaryClear);
     }
     refreshEmitStatus(true);
+    Log::get().note("engine motion: primary rigid producer 42B4130 %s; canonical collection-record history, "
+                    "unit-scale unskinned records only; unsupported records remain native.",kinematicEvalPrimaryEmitStatus());
     g_windowStartMs = nowMs();
     live.store(true, std::memory_order_release);
     if (!g_emitLive.load(std::memory_order_acquire)) { logStoodDown(); return; }
@@ -1633,6 +1730,12 @@ void engineVelocityShutdown() {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     const bool was = live.exchange(false, std::memory_order_acq_rel);
     kinematicEvalSetEmitObserver(nullptr);
+    kinematicEvalSetPrimaryEmitObserver(nullptr);
+    kinematicEvalSetPoolCopyObserver(nullptr);
+    kinematicEvalSetMergeObserver(nullptr,nullptr);
+    kinematicEvalSetClearObserver(nullptr);
+    primaryCopy::reset();
+    for(unsigned i=0;i<kPrimaryPoolResources;++i){primaryPoolResources[i].store(nullptr);g_primaryMaps[i]={};}
     if (g_emitAttached) { kinematicEvalEmitDetach(); g_emitAttached = false; }
     g_lookup.store(nullptr, std::memory_order_release);
     g_emitLive.store(false, std::memory_order_release);
@@ -1706,6 +1809,47 @@ void noteResourceMapped(const ID3D11Resource* resource, void* data, int mapType)
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     for (auto& w : g_watchInfo)
         if (w.resource == resource) { w.mapped = data; w.mapType = mapType; }
+}
+
+void notePrimaryBufferCreated(ID3D11Buffer* buffer,const D3D11_BUFFER_DESC& desc) noexcept {
+    if(!buffer || desc.Usage!=D3D11_USAGE_DYNAMIC || desc.StructureByteStride!=336 ||
+       !(desc.MiscFlags&D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) || !(desc.CPUAccessFlags&D3D11_CPU_ACCESS_WRITE))return;
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    for(auto& slot:g_primaryMaps)if(slot.buffer.Get()==buffer)return;
+    unsigned chosen=kPrimaryPoolResources;
+    for(unsigned i=0;i<kPrimaryPoolResources;++i)if(!g_primaryMaps[i].buffer){chosen=i;break;}
+    if(chosen==kPrimaryPoolResources){++g_primaryMapOverflow;return;}
+    auto& slot=g_primaryMaps[chosen];slot.buffer=buffer;slot.bytes=desc.ByteWidth;slot.lastFrame=frameNow();
+    primaryPoolResources[chosen].store(buffer,std::memory_order_release);
+}
+void notePrimaryResourceMapped(const ID3D11Resource* resource,void* data,int mapType) noexcept {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    for(auto& slot:g_primaryMaps)if(slot.buffer.Get()==resource) {
+        D3D11_BUFFER_DESC desc{};slot.buffer->GetDesc(&desc);
+        slot.sequence=++g_primaryMapSequence;slot.lastFrame=frameNow();
+        slot.mapped=primaryCopy::beginMap(slot.buffer.Get(),data,desc.ByteWidth,desc.StructureByteStride,
+                                        static_cast<D3D11_MAP>(mapType),slot.sequence,frameNow());
+        return;
+    }
+}
+void notePrimaryResourceUnknown(const ID3D11Resource* resource) noexcept {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    for(auto& slot:g_primaryMaps)if(slot.buffer && (!resource || slot.buffer.Get()==resource)) {
+        primaryCopy::forget(slot.buffer.Get());slot.mapped=false;
+    }
+    // A previously patched private snapshot must also stand down: its native
+    // source may now have changed without the ordinary owner-context watch.
+    for(auto& eye:g_eyes)if(eye.poolBuffer && (!resource || eye.poolBuffer.Get()==resource))invalidate(eye,kPoolRewritten);
+    cache=DrawCache{};
+}
+void notePrimaryResourceWritten(const ID3D11Resource* resource) noexcept {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    if(!resource){notePrimaryResourceUnknown(nullptr);return;}
+    for(auto& slot:g_primaryMaps)if(slot.buffer.Get()==resource) {
+        if(slot.mapped){primaryCopy::endMap(slot.buffer.Get(),slot.sequence);slot.mapped=false;}
+        else primaryCopy::forget(slot.buffer.Get()); // Copy/Update/unknown mutation
+        return;
+    }
 }
 
 // A write to a watched source: what it changed, for the next substituted

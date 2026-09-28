@@ -100,6 +100,15 @@ bool depthProbeCurrentSceneEyeOf(ID3D11DepthStencilView* dsv, int* outEye, int* 
     return false;
 }
 void kinematicEvalSetEmitObserver(EngineEmitObserverFn) noexcept {}
+void kinematicEvalSetPrimaryEmitObserver(EnginePrimaryEmitObserverFn) noexcept {}
+const char* kinematicEvalPrimaryEmitStatus() noexcept { return "rig: hooked"; }
+void kinematicEvalPrimaryEmitCounters(uint64_t& calls,uint64_t& unowned) noexcept { calls=unowned=0; }
+void kinematicEvalSetPoolCopyObserver(EnginePoolCopyObserverFn) noexcept {}
+const char* kinematicEvalPoolCopyStatus() noexcept { return "rig: hooked"; }
+void kinematicEvalSetMergeObserver(EngineMergeBeginFn,EngineMergeEndFn) noexcept {}
+const char* kinematicEvalMergeStatus() noexcept { return "rig: hooked"; }
+void kinematicEvalSetClearObserver(EngineClearObserverFn) noexcept {}
+const char* kinematicEvalClearStatus() noexcept { return "rig: hooked"; }
 bool kinematicEvalEmitHookLive(const char** why) noexcept {
     if (why) *why = lifecycle_fake::g_hookLive ? nullptr : "rig: kinematic-build-144312e00 refused";
     return lifecycle_fake::g_hookLive;

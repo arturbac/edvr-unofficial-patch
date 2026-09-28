@@ -21,6 +21,7 @@
 #include <memory>
 #include <random>
 #include <vector>
+#include <unordered_map>
 
 #include "../../src/d3d11/engine_velocity_emit.h"
 
@@ -67,6 +68,8 @@ struct Fake {
         alignas(16) uint8_t item[0x150];
         for (auto& b : item) b = static_cast<uint8_t>(garbage());
         std::memset(item, 0, 0x120);                  // initializer: base 0, material zero...
+        put<uint32_t>(reinterpret_cast<uintptr_t>(item)+4,0x3F800000u);
+        put<uint32_t>(reinterpret_cast<uintptr_t>(item)+0x134,0x3F800000u);
         std::memcpy(item + ev::kItemQuat, record + ev::kRecordQuat, 8);
         std::memcpy(item + ev::kItemPos, record + ev::kRecordPos, 12);
         std::memcpy(item + ev::kItemPrevPos, record + ev::kRecordPos, 12);   // the same-frame copy
@@ -127,6 +130,114 @@ inline ev::Pose blockNow(const std::array<uint8_t, 0x150>& r) {
 }
 inline ev::Pose blockPrev(const std::array<uint8_t, 0x150>& r) {
     ev::Pose p; std::memcpy(&p.w[0], r.data() + ev::kItemPrevPos, 12); std::memcpy(&p.w[3], r.data() + ev::kItemPrevQuat, 8); return p;
+}
+
+uintptr_t g_primaryOwner=0,g_primaryKey=0,g_primaryEntry=0;
+std::array<uint32_t,84> g_joinedPrimary[2]{};
+std::unordered_map<uintptr_t,std::array<uint8_t,336>> g_primaryOutputs;
+bool primarySink(uintptr_t item,const ev::Pose&,const ev::Pose& previous,uint32_t marker,uint32_t) noexcept {
+    std::array<uint8_t,336> copy{};
+    if(!ev::read(item,copy.data(),copy.size()))return false;
+    std::memcpy(copy.data()+ev::kItemMarker,&marker,4);
+    std::memcpy(copy.data()+ev::kItemPrevPos,previous.w,12);
+    std::memcpy(copy.data()+ev::kItemPrevQuat,previous.w+3,8);
+    g_primaryOutputs[item]=copy;return true;
+}
+inline std::vector<std::array<uint8_t,336>> primaryCopies(Fake& f) {
+    auto result=f.copier();size_t index=0;
+    for(uintptr_t n=Fake::get<uint64_t>(f.anchor());n!=f.anchor();n=Fake::get<uint64_t>(n))
+        for(uint64_t i=0;i<Fake::get<uint64_t>(n+ev::kNodeCount);++i,++index) {
+            auto found=g_primaryOutputs.find(n+ev::kNodeRecords+i*336);
+            if(found!=g_primaryOutputs.end())result[index]=found->second;
+        }
+    return result;
+}
+uintptr_t __fastcall primaryLookup(uintptr_t dictionary,uintptr_t key) {
+    return dictionary==g_primaryOwner+ev::kOwnerDictionary && key==g_primaryKey?g_primaryEntry:0;
+}
+
+inline void runPrimary(Harness h) {
+    auto a=std::make_unique<Fake>(),b=std::make_unique<Fake>();
+    auto table=std::make_unique<ev::Table>();ev::Stats stats;
+    const auto reset=[&](){a->reset();g_primaryOutputs.clear();};
+    alignas(16) uint8_t ctxA[192]{},ctxB[192]{},model[96]{};
+    // Actual 061832 canonical fields for the distinct collection records
+    // owning WORLD brace slots729/736; shared model key, distinct identities.
+    ev::Pose pa{{0x45F50758u,0xC58CF230u,0x4504B124u,0xA917A365u,0xE90CB10Bu}};
+    ev::Pose pb{{0x45E39954u,0xC5B50587u,0x44615A01u,0x46FDC747u,0xA663D11Au}};
+    const float qa[]={.2765651643f,.3210669458f,.3832007647f,.8207222223f};
+    const float qb[]={.5569114089f,-.4453887641f,.6336560249f,.2999308407f};
+    const auto setup=[&](Fake& f,uint8_t* ctx,const ev::Pose& pose,const float* q,uint64_t node){
+        f.setPose(pose,node);Fake::put<uintptr_t>(f.rec()+0x290,reinterpret_cast<uintptr_t>(ctx));
+        std::memcpy(ctx+0x20,pose.w,12);std::memcpy(ctx+0x10,q,16);
+    };
+    setup(*a,ctxA,pa,qa,0xAA11);setup(*b,ctxB,pb,qb,0xBB22);
+    g_primaryOwner=a->own();g_primaryKey=reinterpret_cast<uintptr_t>(model)+0x40;g_primaryEntry=a->ent();
+    ev::PrimaryIdentity ia,ib;
+    h.check(ev::primaryIdentity(reinterpret_cast<uintptr_t>(ctxA),a->rec()+0x210,ia)&&
+            ev::primaryIdentity(reinterpret_cast<uintptr_t>(ctxB),b->rec()+0x210,ib),"primary outer arguments identify two distinct collection records");
+    const auto append=[&](Fake& source){
+        uint8_t saved[20];std::memcpy(saved,a->record+ev::kRecordPos,12);std::memcpy(saved+12,a->record+ev::kRecordQuat,8);
+        std::memcpy(a->record+ev::kRecordPos,source.record+ev::kRecordPos,12);
+        std::memcpy(a->record+ev::kRecordQuat,source.record+ev::kRecordQuat,8);
+        a->producer(1);std::memcpy(a->record+ev::kRecordPos,saved,12);std::memcpy(a->record+ev::kRecordQuat,saved+12,8);
+    };
+    const auto observe=[&](const ev::PrimaryIdentity& id,uint8_t* ctx,int before,int after,uint32_t frame){
+        ev::observePrimary(id,a->own(),g_primaryKey,reinterpret_cast<uintptr_t>(ctx+0x20),
+            reinterpret_cast<uintptr_t>(ctx+0x10),before,after,frame,&primaryLookup,*table,stats,&primarySink);
+    };
+    append(*a);observe(ia,ctxA,0,1,100);append(*b);observe(ib,ctxB,1,2,100);
+    h.check(stats.itemsMasked==2 && stats.itemsJoined==0,"shared owner/model key warms up each primary engine identity independently");
+    const auto firstA=pa,firstB=pb;
+    // Actual next-frame engine/pool fields:729->742 and736->749 repacking.
+    pa={{0x45F4FFA5u,0xC58CF5E9u,0x4504AD16u,0xA911A360u,0xE90BB116u}};
+    pb={{0x45E39D4Cu,0xC5B50A64u,0x446128C7u,0x46FEC746u,0xA657D121u}};
+    reset();setup(*a,ctxA,pa,qa,0xAA11);setup(*b,ctxB,pb,qb,0xBB22);
+    append(*a);observe(ia,ctxA,0,1,101);append(*b);observe(ib,ctxB,1,2,101);
+    auto pool=primaryCopies(*a);
+    h.check(blockPrev(a->copier()[0])==pa && blockPrev(a->copier()[1])==pb,
+            "primary emission sink leaves every native pose block unchanged");
+    h.check(stats.itemsJoined==2 && blockPrev(pool[0])==firstA && blockPrev(pool[1])==firstB &&
+            blockNow(pool[0])==pa && blockNow(pool[1])==pb,"shared primary bucket keeps captured previous pose and native current per collection record");
+    std::memcpy(g_joinedPrimary[0].data(),pool[0].data(),336);
+    std::memcpy(g_joinedPrimary[1].data(),pool[1].data(),336);
+    const auto previous=pool[1];observe(ia,ctxA,0,2,101);
+    h.check(primaryCopies(*a)[1]==previous,"interleaved append count refuses to select an earlier shared bucket item");
+    reset();append(*a);observe(ia,ctxA,0,1,102);
+    h.check(stats.itemsMasked==3,"failed ownership taints next frame instead of asserting history");
+    reset();append(*a);observe(ia,ctxA,0,1,104);
+    h.check(stats.itemsMasked==4,"primary gap rebaselines through the shared history rules");
+    reset();setup(*a,ctxA,pa,qa,0xCC33);append(*a);
+    const auto untouched=a->copier()[0];observe(ia,ctxA,0,1,105);
+    h.check(a->copier()[0]==untouched,"identity replaced between outer entry and primary completion is untouched");
+    ev::primaryIdentity(reinterpret_cast<uintptr_t>(ctxA),a->rec()+0x210,ia);observe(ia,ctxA,0,1,105);
+    h.check(stats.identityResets==1,"primary reused node resets canonical shared history");
+    reset();append(*a);const uintptr_t item=a->tail()+ev::kNodeRecords;
+    Fake::put<uint32_t>(item,1u);const auto skinned=a->copier()[0];observe(ia,ctxA,0,1,106);
+    h.check(a->copier()[0]==skinned,"primary bones remain native and cannot certify rigid history");
+    Fake::put<uint32_t>(item,0u);Fake::put<uint32_t>(item+4,0x40000000u);const auto scaled=a->copier()[0];observe(ia,ctxA,0,1,106);
+    h.check(a->copier()[0]==scaled,"primary nonunit scale remains native");
+    Fake::put<uint32_t>(item+4,0x3F800000u);Fake::put<uint32_t>(item+ev::kItemPrevPos,pa.w[0]^1u);
+    const auto badCopy=a->copier()[0];observe(ia,ctxA,0,1,106);
+    h.check(a->copier()[0]==badCopy,"primary native second-pose mismatch is never overwritten");
+    Fake::put<uintptr_t>(a->rec()+0x290,reinterpret_cast<uintptr_t>(ctxB));
+    h.check(!ev::primaryIdentity(reinterpret_cast<uintptr_t>(ctxA),a->rec()+0x210,ia),"outer pose context mismatch is refused");
+    // Both producers read the same canonical collection record. The native
+    // secondary initializer has unit scale, so it can supply primary history.
+    table->clear();reset();setup(*a,ctxA,firstA,qa,0xAA11);
+    ev::Stats mixed;g_fake=a.get();a->producer(1);
+    ev::observe(a->rec(),a->own(),0,1,200,&fakeLookup,*table,mixed);
+    reset();setup(*a,ctxA,pa,qa,0xAA11);
+    ev::primaryIdentity(reinterpret_cast<uintptr_t>(ctxA),a->rec()+0x210,ia);
+    append(*a);observe(ia,ctxA,0,1,201);
+    h.check(blockPrev(primaryCopies(*a)[0])==firstA,"secondary canonical unit pose can seed primary private history");
+    auto wrong=pa;wrong.w[0]^=1;
+    reset();setup(*a,ctxA,wrong,qa,0xAA11);a->producer(1);
+    ev::observe(a->rec(),a->own(),0,1,201,&fakeLookup,*table,mixed);
+    reset();setup(*a,ctxA,pa,qa,0xAA11);append(*a);observe(ia,ctxA,0,1,202);
+    h.check(mixed.sameFrameChanges>0 && blockPrev(primaryCopies(*a)[0])==pa,
+            "mixed producers disagreeing in one frame cannot carry that ambiguous history forward");
+    g_primaryOwner=g_primaryKey=g_primaryEntry=0;
 }
 inline uint32_t marker(const std::array<uint8_t, 0x150>& r) { uint32_t m; std::memcpy(&m, r.data() + ev::kItemMarker, 4); return m; }
 // The marker hash's stamp-free seed, mirrored (the HLSL engineKindHash):
@@ -399,6 +510,7 @@ inline void run(const Harness& h) {
     h.check(ev::markerHash(p1, p2, 100) != ev::markerHash(p2, p1, 100), "marker hash distinguishes current from previous");
     h.check(ev::markerHash(p1, p2, 100) != ev::markerHash(p1, p2, 101), "marker hash distinguishes the frame stamp");
     g_fake = nullptr;
+    runPrimary(h);
     std::printf("  emit: %llu calls, joined %llu, masked %llu, disagreements %llu, unproven %llu (the gates' own fixtures)\n",
                 (unsigned long long)s.calls.load(), (unsigned long long)s.itemsJoined.load(),
                 (unsigned long long)s.itemsMasked.load(), (unsigned long long)s.disagreements.load(),

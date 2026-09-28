@@ -13,6 +13,7 @@
 #include <vector>
 #include "../../src/d3d11/temporal_shader_source.h"
 #include "../../src/d3d11/flat_mono_shader_source.h"
+#include "../../src/d3d11/engine_velocity_primary_copy_shader.h"
 
 namespace fs = std::filesystem;
 using Microsoft::WRL::ComPtr;
@@ -66,6 +67,7 @@ struct Variant {
     const D3D_SHADER_MACRO* macros;
     std::vector<unsigned char> bytes;
     bool flat = false;
+    const char* alternate = nullptr;
 };
 
 static bool compile(CompileFn fn, const char* source, Variant& v, bool quiet = false) {
@@ -254,6 +256,7 @@ static int generate(const Options& o) {
     static const D3D_SHADER_MACRO diagnostic[] = {{"EDVR_TEMPORAL_DIAGNOSTICS", "1"}, {nullptr, nullptr}};
     static const D3D_SHADER_MACRO trace[] = {{"EDVR_TEMPORAL_DIAGNOSTICS", "1"}, {"EDVR_TEMPORAL_TRACE", "1"}, {nullptr, nullptr}};
     std::vector<Variant> variants = {
+        {"kEnginePrimaryCopyScatterBytecode", "engine_primary_copy_scatter_cs", "main", nullptr, {}, false, edvr::kEnginePrimaryCopyScatterCsHlsl},
         {"kTemporalMvFastBytecode", "temporal_mv_fast_cs", "mv", fast, {}},
         {"kTemporalMvBytecode", "temporal_mv_cs", "mv", diagnostic, {}},
         {"kTemporalMvTraceBytecode", "temporal_mv_trace_cs", "mv", trace, {}},
@@ -266,14 +269,14 @@ static int generate(const Options& o) {
     };
     const std::string core = extractCore(edvr::kTemporalCsHlsl);   // throws on a broken core before any work
     const std::string flat = core + edvr::kFlatMonoShaderSource;
-    const std::string allSources = std::string(edvr::kTemporalCsHlsl) + flat;
+    const std::string allSources = std::string(edvr::kTemporalCsHlsl) + flat + edvr::kEnginePrimaryCopyScatterCsHlsl;
     const std::string key = sourceKey(allSources.c_str(), variants, compilerPath());
     if (outputCurrent(o.output, key)) {
         std::printf("temporal shaders: unchanged (key %s), reusing %ls\n", key.c_str(), o.output.c_str());
         return 0;
     }
     Compiler compiler;
-    for (auto& v : variants) if (!compile(compiler.fn, v.flat ? flat.c_str() : edvr::kTemporalCsHlsl, v)) return 4;
+    for (auto& v : variants) if (!compile(compiler.fn, v.alternate ? v.alternate : (v.flat ? flat.c_str() : edvr::kTemporalCsHlsl), v)) return 4;
     if (!writeAtomic(o.output, render(variants, key, core))) {
         std::fprintf(stderr, "cannot atomically write generated shader header\n");
         return 5;

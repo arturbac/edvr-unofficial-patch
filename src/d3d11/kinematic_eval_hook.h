@@ -40,6 +40,23 @@ void detachKinematicEvalHooks(KinematicEvalProbe* probe) noexcept;
 // Null = off: one atomic load.
 using EngineEmitObserverFn = void (*)(uintptr_t record, uintptr_t owner, int32_t before, int32_t after) noexcept;
 void kinematicEvalSetEmitObserver(EngineEmitObserverFn fn) noexcept;
+namespace engine_velocity_emit { struct PrimaryIdentity; }
+using EnginePrimaryEmitObserverFn = void (*)(const engine_velocity_emit::PrimaryIdentity&, uintptr_t owner,
+    uintptr_t key, uintptr_t position, uintptr_t quaternion, int32_t before, int32_t after) noexcept;
+void kinematicEvalSetPrimaryEmitObserver(EnginePrimaryEmitObserverFn fn) noexcept;
+const char* kinematicEvalPrimaryEmitStatus() noexcept;
+void kinematicEvalPrimaryEmitCounters(uint64_t& calls, uint64_t& unowned) noexcept;
+using EnginePoolCopyObserverFn = void (*)(uintptr_t mappedBase, uint32_t stride, uintptr_t source,
+                                         uint64_t firstSlot, uint32_t count) noexcept;
+void kinematicEvalSetPoolCopyObserver(EnginePoolCopyObserverFn fn) noexcept;
+const char* kinematicEvalPoolCopyStatus() noexcept;
+using EngineMergeBeginFn = void* (*)(uintptr_t destination, uintptr_t source) noexcept;
+using EngineMergeEndFn = void (*)(void* plan, bool completed) noexcept;
+void kinematicEvalSetMergeObserver(EngineMergeBeginFn begin, EngineMergeEndFn end) noexcept;
+const char* kinematicEvalMergeStatus() noexcept;
+using EngineClearObserverFn = void (*)(uintptr_t dictionary) noexcept;
+void kinematicEvalSetClearObserver(EngineClearObserverFn fn) noexcept;
+const char* kinematicEvalClearStatus() noexcept;
 // The emit's own want on the shared hook set: validates the executable and
 // installs the same hooks as the probe's attach, then holds the gate open
 // for the direct-producer relay. Same return vocabulary as

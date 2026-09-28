@@ -186,8 +186,9 @@ inline std::string loadTemporalHlsl(const Harness& h) {
     return hlsl;
 }
 
-inline ComPtr<ID3DBlob> compileMv(const Harness& h, const std::string& hlsl, bool diagnostics) {
-    const std::string source = diagnostics ? ("#define EDVR_TEMPORAL_DIAGNOSTICS 1\n" + hlsl) : hlsl;
+inline ComPtr<ID3DBlob> compileMv(const Harness& h, const std::string& hlsl, bool diagnostics, bool trace=false) {
+    const std::string source = (trace ? std::string("#define EDVR_TEMPORAL_TRACE 1\n") : std::string()) +
+        (diagnostics ? ("#define EDVR_TEMPORAL_DIAGNOSTICS 1\n" + hlsl) : hlsl);
     ComPtr<ID3DBlob> code, errors;
     const HRESULT hr = D3DCompile(source.data(), source.size(), "temporal-mv-consumer", nullptr, nullptr, "mv", "cs_5_0",
                                    D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
@@ -199,7 +200,7 @@ inline ComPtr<ID3DBlob> compileMv(const Harness& h, const std::string& hlsl, boo
 
 struct Px { int x, y; };
 
-inline void run(const Harness& h) {
+inline void run(const Harness& h,const uint32_t* primaryRecord=nullptr,uint32_t stampFrame=math_tests::kStampFrame) {
     const int kDim = 16;   // region origin (0,0), size == texSize == 16x16
 
     const std::string hlsl = loadTemporalHlsl(h);
@@ -272,8 +273,11 @@ inline void run(const Harness& h) {
     // construction, not by coincidence. The rows carry the freshness stamp
     // at float4 276 (math_tests' kStampFrame): every joined record below is
     // marked with the same token, except the stale-stamp case.
-    const Camera engineCam = camera(0.0, {0.0, 0.0, 0.0}, 0.0, 0.0);
-    const std::array<float, 277 * 4> camRows = engineCam.rows(math_tests::kStampFrame);
+    auto wordFloat=[](uint32_t v){float f;std::memcpy(&f,&v,4);return f;};
+    const V3 origin=primaryRecord?V3{wordFloat(primaryRecord[4]),wordFloat(primaryRecord[5]),double(wordFloat(primaryRecord[6]))+50.0}:V3{0,0,0};
+    const Camera engineCam = camera(0.0, origin, 0.0, 0.0);
+    const std::array<float, 277 * 4> camRows = engineCam.rows(stampFrame);
+    const V3 cameraOrigin{camRows[275*4],camRows[275*4+1],camRows[275*4+2]};
     ComPtr<ID3D11Buffer> enebCb;
     { D3D11_BUFFER_DESC d{}; d.ByteWidth = UINT(camRows.size() * 4); d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
       D3D11_SUBRESOURCE_DATA init{camRows.data(), 0, 0};
@@ -297,23 +301,24 @@ inline void run(const Harness& h) {
 
     double ndcAx, ndcAy;
     pixelToNdc(pxA.x, pxA.y, kDim, ndcAx, ndcAy);
-    const V3 posANow = solveRel(camRows, ndcAx, ndcAy, zViewEff);
+    const V3 posANow = add(solveRel(camRows, ndcAx, ndcAy, zViewEff),cameraOrigin);
     const V3 deltaA{2.0, -1.0, 3.0};   // metres: a landing-ship-scale motion, not camera motion (EN == EB)
     const V3 posAPrev = sub(posANow, deltaA);
     pool[0].pose(posANow, ident, 1.0f, false);
     pool[0].pose(posAPrev, ident, 1.0f, true);
-    pool[0].mark(ev::kJoined, math_tests::kStampFrame);
+    pool[0].mark(ev::kJoined, stampFrame);
+    if(primaryRecord)std::memcpy(pool[0].w,primaryRecord,sizeof(pool[0].w)); // production emit bytes, including its unmodified marker
 
     pool[1].pose(posANow, ident, 1.0f, false);
     pool[1].pose(posAPrev, ident, 1.0f, true);
-    pool[1].mark(ev::kMasked, math_tests::kStampFrame);
+    pool[1].mark(ev::kMasked, stampFrame);
 
     double ndcCx, ndcCy;
     pixelToNdc(pxC.x, pxC.y, kDim, ndcCx, ndcCy);
-    const V3 posC = solveRel(camRows, ndcCx, ndcCy, zViewEff);
+    const V3 posC = add(solveRel(camRows, ndcCx, ndcCy, zViewEff),cameraOrigin);
     pool[2].pose(posC, ident, 1.0f, false);
     pool[2].pose(posC, ident, 1.0f, true);   // second block == first: engineRecordMoved() is false
-    pool[2].mark(ev::kJoined, math_tests::kStampFrame);
+    pool[2].mark(ev::kJoined, stampFrame);
 
     pool[3].pose(posANow, ident, 1.0f, false);
     pool[3].pose(posAPrev, ident, 1.0f, true);
@@ -323,7 +328,7 @@ inline void run(const Harness& h) {
     // frame's stamp -- the cull case: the record was not re-evaluated this
     // frame, and replaying its stale pose pair would phantom-drift the hull.
     pool[4] = pool[0];
-    pool[4].mark(ev::kJoined, math_tests::kStampFrame - 1);
+    pool[4].mark(ev::kJoined, stampFrame - 1);
 
     // ES (t21): x = 2*slot+1 (the patched pool draw's slot code), y = the
     // depth that draw wrote, raw bits. Z (t2): the scene's own depth.
@@ -490,10 +495,31 @@ inline void run(const Harness& h) {
     const std::vector<float>&armedMv = diagArmed.first, &armedMk = diagArmed.second;
     const std::vector<float>&baseMv = baseline.first, &baseMk = baseline.second;
 
+    auto predictBefore=[&](Px point){
+    // Independent CPU-double pose inverse/forward for the exact record
+    // supplied by production observePrimary, or the synthetic baseline.
+    const Record& record=pool[0];
+    auto turnRecord=[&](bool previous,V3 v){
+        const unsigned qi=previous?78:2;
+        const uint16_t lanes[4]={uint16_t(record.w[qi]),uint16_t(record.w[qi]>>16),uint16_t(record.w[qi+1]),uint16_t(record.w[qi+1]>>16)};
+        const auto turned=math_tests::turn(math_tests::decode(lanes),{v.x,v.y,v.z});
+        return V3{turned.x,turned.y,turned.z};
+    };
+    const V3 nowPos{wordFloat(record.w[4]),wordFloat(record.w[5]),wordFloat(record.w[6])};
+    const V3 prevPos{wordFloat(record.w[73]),wordFloat(record.w[74]),wordFloat(record.w[75])};
+    const double scale=wordFloat(record.w[1]),previousScale=wordFloat(record.w[77]);
+    const V3 mx=turnRecord(false,{scale,0,0}),my=turnRecord(false,{0,scale,0}),mz=turnRecord(false,{0,0,scale});
+    const V3 ix=cross(my,mz),iy=cross(mz,mx),iz=cross(mx,my);
+    const double det=dot(mx,ix);
+    double nx,ny;pixelToNdc(point.x,point.y,kDim,nx,ny);
+    const V3 localWorld=sub(add(solveRel(camRows,nx,ny,zViewEff),cameraOrigin),nowPos);
+    const V3 local{dot(ix,localWorld)/det,dot(iy,localWorld)/det,dot(iz,localWorld)/det};
+    return sub(add(prevPos,mul(turnRecord(true,local),previousScale)),cameraOrigin);
+    };
     // -------------------------- (a) JOINED, moving: exact motion --------------------------
     double worstErr = 0.0;
     {
-        const V3 posAPrevF{double(float(posAPrev.x)), double(float(posAPrev.y)), double(float(posAPrev.z))};
+        const V3 posAPrevF=predictBefore(pxA);
         double before[4];
         Camera::clip(camRows, posAPrevF, before);
         h.check(before[3] > 0.0, "case a: the moved record's previous position reprojects in front of the (static) camera");
@@ -549,6 +575,37 @@ inline void run(const Harness& h) {
         h.check(pv.first == dv.first && pv.second == dv.second, "the plain and EDVR_TEMPORAL_DIAGNOSTICS-1 compiles of mv agree on MV at every constructed pixel");
     }
 
+    // Drive the production capture compile through the same real resources:
+    // ownership classifications must survive its float flags, while every
+    // NVIDIA MV and history-mask result remains bit-identical to production.
+    const auto traceCode=compileMv(h,hlsl,true,true);
+    ComPtr<ID3D11ComputeShader> traceCs;
+    h.check(traceCode && SUCCEEDED(h.device->CreateComputeShader(traceCode->GetBufferPointer(),traceCode->GetBufferSize(),nullptr,&traceCs)),
+            "production capture motion shader creates on WARP");
+    const auto decisionTex=makeTexture(DXGI_FORMAT_R32G32B32A32_FLOAT,D3D11_BIND_UNORDERED_ACCESS,nullptr,0);
+    ComPtr<ID3D11UnorderedAccessView> decisionUav;
+    h.check(SUCCEEDED(h.device->CreateUnorderedAccessView(decisionTex.Get(),nullptr,&decisionUav)),"capture decision UAV");
+    h.context->CSSetUnorderedAccessViews(7,1,decisionUav.GetAddressOf(),nullptr);
+    const auto captured=dispatchAndRead(traceCs.Get(),2048.0f);
+    const auto decisions=readTex(decisionTex.Get(),4);
+    for(Px p:{pxA,pxB,pxC,pxE,pxF,pxNotRig,pxStamp}) {
+        h.check(mvAt(captured.first,p)==mvAt(armedMv,p) && mkAt(captured.second,p)==mkAt(armedMk,p),
+                "capture diagnostics preserve exact production vectors and history masks");
+    }
+    for(const auto& item:std::vector<std::pair<Px,unsigned>>{{pxA,1},{pxNotRig,3},{pxE,4},{pxStamp,6}}) {
+        const size_t i=(size_t(item.first.y)*kDim+item.first.x)*4;
+        const unsigned bits=static_cast<unsigned>(decisions[i+3]);
+        h.check(decisions[i+3]==float(bits) && ((bits>>12)&7)==item.second,
+                "capture flags encode joined/nonrig/stale-slot/stale-stamp without float precision loss");
+        const auto motion=mvAt(armedMv,item.first);
+        h.check(decisions[i]==motion.first && decisions[i+1]==motion.second,
+                "capture ownership bits preserve physical decision motion");
+        h.check((bits&15)==(item.second==1?11u:1u) && (bits&1024)!=0 && (bits&256)!=0,
+                "capture ownership bits preserve path and projection/depth flags");
+    }
+    ID3D11UnorderedAccessView* noDecision=nullptr;
+    h.context->CSSetUnorderedAccessViews(7,1,&noDecision,nullptr);
+
     // -------------------------- Stats[50..55]: the diagnostics compile's own counters --------------------------
     // 50 joined (a, c, and pxP's ES marker -- the precedence pixel is a joined
     // unmoved record through ES), 51 masked (b), 52 not-a-rig-record (notRig),
@@ -572,10 +629,7 @@ inline void run(const Harness& h) {
         // game's own channel with the moving record's exact motion, computed
         // in double as case (a)'s: the pixel's world point carried by the
         // record's pose delta (identity orientation, scale 1).
-        double ndcSx, ndcSy;
-        pixelToNdc(pxS.x, pxS.y, kDim, ndcSx, ndcSy);
-        const V3 posSNow = solveRel(camRows, ndcSx, ndcSy, zViewEff);
-        const V3 posSPrev = add(sub(posSNow, posANow), posAPrev);
+        const V3 posSPrev = predictBefore(pxS);
         const V3 posSPrevF{double(float(posSPrev.x)), double(float(posSPrev.y)), double(float(posSPrev.z))};
         double before[4];
         Camera::clip(camRows, posSPrevF, before);
@@ -611,10 +665,7 @@ inline void run(const Harness& h) {
     {   // pxO1 (the review's F1): a stale ES marker AND a valid foreground G6
         // marker -- ownership decides, the seam's marker wins over the hull's
         // stale one, and the pixel joins with the record's exact motion.
-        double ndcOx, ndcOy;
-        pixelToNdc(pxO1.x, pxO1.y, kDim, ndcOx, ndcOy);
-        const V3 posO1Now = solveRel(camRows, ndcOx, ndcOy, zViewEff);
-        const V3 posO1Prev = add(sub(posO1Now, posANow), posAPrev);
+        const V3 posO1Prev = predictBefore(pxO1);
         const V3 posO1PrevF{double(float(posO1Prev.x)), double(float(posO1Prev.y)), double(float(posO1Prev.z))};
         double before[4];
         Camera::clip(camRows, posO1PrevF, before);

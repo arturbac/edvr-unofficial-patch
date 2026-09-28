@@ -21,7 +21,11 @@ PATHS = {0: 'invalid', 1: 'head', 2: 'world', 3: 'ship', 4: 'body',
 FLAGS = {16: 'hidden_history', 32: 'screen_invalid_history', 64: 'ui_here',
          128: 'world_available', 256: 'depth_valid', 512: 'tracked_foreground',
          1024: 'projection_valid', 2048: 'static_confirmed'}
-KNOWN = 15 | sum(FLAGS)
+ENGINE_KINDS = {0: 'unavailable', 1: 'joined', 2: 'masked', 3: 'nonrig',
+                4: 'stale_slot', 5: 'corrupt_slot', 6: 'stale_stamp'}
+ENGINE_KIND_SHIFT = 12
+ENGINE_KIND_MASK = 7
+KNOWN = 15 | sum(FLAGS) | (ENGINE_KIND_MASK << ENGINE_KIND_SHIFT)
 
 
 def integers(value, count, label, positive=False):
@@ -108,7 +112,7 @@ def colour_difference(before, after, roi):
 
 def summarize(data, extent, roi):
     x, y, w, h = roi
-    counts, bits = Counter(), Counter()
+    counts, bits, engine = Counter(), Counter(), Counter()
     motion_sq = motion_max = 0.0
     invalid = motion_samples = 0
     labels = bytearray()
@@ -117,12 +121,14 @@ def summarize(data, extent, roi):
         for mx, my, depth, packed in struct.iter_unpack('<4f', memoryview(data)[start:start + w * 16]):
             if (not all(math.isfinite(v) for v in (mx, my, depth, packed)) or
                     packed < 0 or packed > KNOWN or packed != int(packed) or
-                    int(packed) & ~KNOWN or (int(packed) & 15) not in PATHS):
+                    int(packed) & ~KNOWN or (int(packed) & 15) not in PATHS or
+                    ((int(packed) >> ENGINE_KIND_SHIFT) & ENGINE_KIND_MASK) not in ENGINE_KINDS):
                 invalid += 1
                 labels.append(255)
                 continue
             value = int(packed)
             counts[PATHS[value & 15]] += 1
+            engine[ENGINE_KINDS[(value >> ENGINE_KIND_SHIFT) & ENGINE_KIND_MASK]] += 1
             for bit, label in FLAGS.items():
                 if value & bit:
                     bits[label] += 1
@@ -136,6 +142,7 @@ def summarize(data, extent, roi):
     return {'pixels': n, 'invalid_pixels': invalid,
             'path_fraction': {label: counts[label] / n for label in PATHS.values()},
             'flag_fraction': {label: bits[label] / n for label in FLAGS.values()},
+            'engine_kind_fraction': {label: engine[label] / n for label in ENGINE_KINDS.values()},
             'physical_motion_samples': motion_samples,
             'physical_motion_rms_px': math.sqrt(motion_sq / motion_samples) if motion_samples else None,
             'physical_motion_max_px': motion_max if motion_samples else None}, labels
@@ -157,6 +164,10 @@ def analyze(manifest_path, requested_roi=None):
         raise ValueError('invalid manifest frame list')
     result = {'schema': 1, 'stamp': stamp, 'complete': len(frames) == 16, 'frames': [],
               'interpretation': 'Fixed-raster comparisons are not object tracking. P/T differences identify post-DLSS modification, not whether it is erroneous. Capture timing is not a performance benchmark.'}
+    encoding = (manifest.get('engine_kind_shift'), manifest.get('engine_kind_mask'))
+    if encoding not in ((None, None), (ENGINE_KIND_SHIFT, ENGINE_KIND_MASK)):
+        raise ValueError('unsupported engine-kind encoding')
+    result['engine_kind_captured'] = encoding == (ENGINE_KIND_SHIFT, ENGINE_KIND_MASK)
     prior_labels = prior_key = None
     seen_frames = set()
     last_frame = 0
@@ -201,6 +212,8 @@ def analyze(manifest_path, requested_roi=None):
             read_bmp(raw_path, dc[2:])
             summary, labels = summarize(data, dc[2:], roi)
             report.update(summary)
+            if not result['engine_kind_captured']:
+                report['engine_kind_fraction'] = None  # absent legacy bits are not measured unavailability
             if summary['invalid_pixels']:
                 raise ValueError('invalid decision pixels')
             before = read_bmp(before_path, oc[2:])
@@ -256,7 +269,9 @@ def self_test():
             return analyze(path, roi)
         result = run()
         assert result['complete']
+        assert not result['engine_kind_captured']  # old manifests remain readable
         first = result['frames'][0]
+        assert first['engine_kind_fraction'] is None
         assert first['path_fraction']['world'] == .25
         assert first['flag_fraction']['hidden_history'] == .25
         assert first['flag_fraction']['static_confirmed'] == .25
@@ -292,10 +307,29 @@ def self_test():
         dpath = base / frames[0]['decision_file']
         original = dpath.read_bytes()
         for payload in (original[:-1], original[:28] + struct.pack('<I', 123) + original[32:],
-                        original[:56] + struct.pack('<f', 4096) + original[60:],
+                        original[:56] + struct.pack('<f', 32768) + original[60:],
                         original[:44] + struct.pack('<f', float('nan')) + original[48:]):
             dpath.write_bytes(payload)
             assert not run()['complete']
+        dpath.write_bytes(original)
+        # Ownership result is separate from path membership and history flags.
+        encoded = bytearray(original)
+        for i, kind in enumerate((1, 3, 4, 6)):
+            flag, = struct.unpack_from('<f', encoded, 56 + i * 16)
+            struct.pack_into('<f', encoded, 56 + i * 16, int(flag) | (kind << ENGINE_KIND_SHIFT))
+        dpath.write_bytes(encoded)
+        manifest.update(engine_kind_shift=ENGINE_KIND_SHIFT, engine_kind_mask=ENGINE_KIND_MASK)
+        augmented_report = run()
+        assert augmented_report['engine_kind_captured']
+        augmented = augmented_report['frames'][0]
+        for label in ('joined', 'nonrig', 'stale_slot', 'stale_stamp'):
+            assert augmented['engine_kind_fraction'][label] == .25
+        for field in ('path_fraction', 'flag_fraction', 'physical_motion_rms_px',
+                      'physical_motion_max_px', 'physical_motion_samples'):
+            assert augmented[field] == result['frames'][0][field], field
+        struct.pack_into('<f', encoded, 56, 7 << ENGINE_KIND_SHIFT)
+        dpath.write_bytes(encoded)
+        assert not run()['complete']
         dpath.write_bytes(original)
         assert mapped_output_roi([0, 0, 1, 1], (1, 1, 2, 2), [5, 5], [8, 8], (1, 1, 5, 5)) == (1, 1, 1, 1)
     print('eye_decisions: self-test passed')

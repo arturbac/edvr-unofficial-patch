@@ -1004,7 +1004,8 @@ R"HLSL(
         uint decisionFlags=decisionPath | (hidden?16u:0u) |
             (decisionPath==10u && !projectionValid?32u:0u) | (uiHere?64u:0u) |
             (worldAvailable?128u:0u) | (depthValid?256u:0u) |
-            (trackedForeground?512u:0u) | (projectionValid?1024u:0u);   // 2048 (static_confirmed) retired with the rigid-owner promotion
+            (trackedForeground?512u:0u) | (projectionValid?1024u:0u) |
+            ((engineKind & 7u) << 12); // capture-only ownership result, bits 12..14; exactly representable as float
         DT[id.xy]=float4(decisionMotion,decisionDepth,float(decisionFlags));
 #else
         ML[id.xy] = written + lead.xy;

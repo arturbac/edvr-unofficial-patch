@@ -42,6 +42,8 @@
 #include "emit_tests.h"
 #include "math_tests.h"
 #include "consumer_tests.h"
+#include "capture_tests.h"
+#include "primary_copy_tests.h"
 #include "panel_tests.h"
 #include "corpus_identity.h"
 #include "actual_vs_link_test.h"
@@ -305,6 +307,10 @@ int wmain(int argc, wchar_t** argv) {
     emit_tests::run({&check});
     math_tests::run({device.Get(), context.Get(), &check});
     consumer_tests::run({device.Get(), context.Get(), &check});
+    for (const auto& primary : emit_tests::g_joinedPrimary)
+        consumer_tests::run({device.Get(), context.Get(), &check},primary.data(),101);
+    capture_tests::run(device.Get(),context.Get(),&check);
+    primary_copy_tests::run(device.Get(),context.Get(),&check);
     panel_tests::run({device.Get(), context.Get(), &check});
     lifecycle_tests::run({device.Get(), context.Get(), &check});
     if (!realLinkRoot.empty()) {

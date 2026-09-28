@@ -3208,6 +3208,7 @@ void STDMETHODCALLTYPE hookedExecuteCommandList(ID3D11DeviceContext* self,
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::ExecuteList, self, static_cast<int>(self->GetType()));
     State* s = g_state;
     if (foreignContext(self)) {
+        engineVelocityResourceUnknown(nullptr);
         s->realExecuteCommandList(self, list, restoreContextState);
         return;
     }
@@ -3269,6 +3270,7 @@ HRESULT STDMETHODCALLTYPE hookedMap(ID3D11DeviceContext* self, ID3D11Resource* r
     ++s->thunkHits[kHitMap];
     if (type != D3D11_MAP_READ) uiAtlasNoteWrite(res, 1);  // one load until an atlas is watched
     if (foreignContext(self)) {
+        if(type!=D3D11_MAP_READ)engineVelocityResourceUnknown(res);
         return s->realMap(self, res, sub, type, flags, mapped);
     }
     // Timed, not touched: the wait inside the runtime's Map is the game's
@@ -3434,6 +3436,7 @@ void STDMETHODCALLTYPE hookedUnmap(ID3D11DeviceContext* self, ID3D11Resource* re
     State* s = g_state;
     ++s->thunkHits[kHitUnmap];
     if (foreignContext(self)) {
+        engineVelocityResourceUnknown(res);
         s->realUnmap(self, res, sub);
         return;
     }
@@ -4007,6 +4010,7 @@ void STDMETHODCALLTYPE hookedCopyResource(ID3D11DeviceContext* self,
     noteStaleForward(kSlotCopyResource, reinterpret_cast<const void*>(g_state->realCopyResource),
                      "CopyResource");
     uiAtlasNoteWrite(dst, 2);
+    if(foreignContext(self))engineVelocityResourceUnknown(dst);
     if (!foreignContext(self)) {motionResourceWritten(dst);celestialMotionConstantsUnknownWrite(dst);glitchFrameInvalidatePool(dst);if(fssResActive())fssResNoteCopyMaybeMismatched(dst,src);if(uiLayerWatching())uiLayerNoteCopy(dst,src);}
     if (!foreignContext(self) && flatRuntimeActive()) flatRuntimeWritten(dst);
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalTransfer(dst, src, 'R');
@@ -4136,6 +4140,7 @@ void STDMETHODCALLTYPE hookedCopyStructureCount(ID3D11DeviceContext* self,
                                                 ID3D11UnorderedAccessView* src) {
     gpuFrameCommand(self);
     if(!foreignContext(self)){motionResourceWritten(dst,off,uint64_t(off)+4);glitchFrameInvalidatePool(dst);}
+    else engineVelocityResourceUnknown(dst);
     if (drawCensusArmed()) {
         drawCensusStructCount(dst, off, src, foreignContext(self));
     }
@@ -4151,6 +4156,7 @@ void STDMETHODCALLTYPE hookedCopySubresourceRegion(
     noteStaleForward(kSlotCopySubresourceRegion, reinterpret_cast<const void*>(g_state->realCopySubresourceRegion),
                      "CopySubresourceRegion");
     uiAtlasNoteWrite(dst, 2);
+    if(foreignContext(self))engineVelocityResourceUnknown(dst);
     if (!foreignContext(self)) {
         // Buffer boxes are byte ranges. Keep the destination offset: a
         // small upload into the shared IB must not invalidate other meshes.
@@ -4188,6 +4194,7 @@ void STDMETHODCALLTYPE hookedUpdateSubresource(ID3D11DeviceContext* self,
     noteStaleForward(kSlotUpdateSubresource, reinterpret_cast<const void*>(g_state->realUpdateSubresource),
                      "UpdateSubresource");
     uiAtlasNoteWrite(dst, 0);
+    if(foreignContext(self))engineVelocityResourceUnknown(dst);
     if (!foreignContext(self)) {
         if(box && box->right>=box->left)motionResourceWritten(dst,box->left,box->right);
         else motionResourceWritten(dst);

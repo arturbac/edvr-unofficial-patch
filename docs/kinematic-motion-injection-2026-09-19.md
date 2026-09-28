@@ -5,45 +5,54 @@
 - **State:** B+C is merged and flown: camera-only statics, certified
   engine-record deltas for movers, reactive-mask fallback. Estimation/tracker
   retirement: 2026-09-23 teardown entry.
-- **Coriolis, current:** 054658 matches post-F7 build 7664e386 and proves
-  remaining wrong world vectors. Three genuine station-material pairs are now
-  keyed: EB52/DC603 and EB52/63B1, DE54/03B17. Current joined records, exact
-  depth coincidence and WARP identity justify them; the 09-28 coverage-repair
-  entry below records limits. Focused self-test + real corpus passed 1922
-  checks; the full validation build passed. Promotion/installation and the
-  rotating-station capture remain pending.
+- **Coriolis, current:** verified 061832 (848ca4b8) refutes the three material
+  keys alone as a complete repair. Exact keyed EB52/9ABF WORLD brace geometry
+  uses moving base0 rigid records with duplicate-current native poses and no
+  history marker. The bounded primary-producer repair now certifies record/node
+  history through authoritative append, list relocation/clear and mapped copy
+  joins; only EDVR's private pool receives previous poses. The 09-28 numerical,
+  rigid-producer and private-pool repair entries own the evidence/design.
+  Top-building attribution and post-install visual verification remain open.
 - **162120:** raw-image warps independently validate engine motion (quiet
   median correction <=0.05 input px). World-covered detail misses by ~0.3-0.6
   px quietly, up to 6 px on the opening move. Engine share: inset ~74%, seam
   64-67%, face ~82%. The ownership failure leaves object motion missing on
   these pixels.
-- **Camera:** 162120 selected rows match all 16 scene blocks within 5e-6;
-  054658 actual eye-draw b1 rows match CSV now across all 16 within 4.8e-7; all
-  32 eyes accept/bind them, follow 30. Stale carry/later auxiliary
-  contamination ruled out FOR THIS RUN. Earlier H2 and H3 remain with
-  docs/camera-rows-carry-2026-09-25.md.
+- **Camera / routing:** 162120 and 054658 provenance checks remain as recorded.
+  In 061832 all 16 actual eye-draw scene-row blocks match selected CSV rows
+  within 4.84e-6; D matches actual DLSS-input MV within half rounding
+  (<=0.000458 px). Captures succeed with history and no reset. Earlier H2/H3
+  remain with docs/camera-rows-carry-2026-09-25.md; no fresh
+  camera/late-vector-overwrite defect is convicted here.
 - **Coriolis pointers:** 09-25 frame stamp fixes phantom record motion; 09-26
   distant reconstruction limit; 055427/080242 dead world motion; 095337 alleged
   native seam markers; route-A, stale-shadow, review F1/F2/F3 and window-band
   entries describe coverage repairs. The 09-28 bytecode proof supersedes their
   native-marker/bypass interpretation: all five alleged native pairs and BA58
   were EDVR-generated.
-- **Other open work:** phase 2 bones for walkers/builder movers/articulated
-  parts; ships, evaluated-but-undrawn movers, flat-source aliasing; stale
-  cockpit (low priority); ps_91F8/ps_A607 owner/coverage. Flight 5/6 and 162703
-  cover the fixed on-foot/hangar paths. Boarding flicker: LOD governor. Pending
-  checks: diagnostics 1 vs 0, walker near drone with motion_source.
+- **Other open work:** phase 2 rigid builder/per-part history and bones for
+  walkers/articulated parts; ships, evaluated-but-undrawn movers, flat-source
+  aliasing; stale cockpit (low priority); ps_91F8/ps_A607 owner/coverage.
+  Flight 5/6 and 162703 cover the fixed on-foot/hangar paths. Boarding flicker:
+  LOD governor. Pending checks: diagnostics 1 vs 0, walker near drone with
+  motion_source.
 - **Ruled-out pointer:** dated entries close estimation/shape/slot identity,
   four flag routes, velocity buffers, record+0x1C0 previous poses,
   content-pairing A, fix-round five hypotheses, on-foot camera/packing
   assumptions, fetch cost, cockpit depth pre-pass/bias, motion-cost
   interpretations, wrong joined station motion, close-range
   reconstruction-floor-only diagnosis.
-- **Next:** clean promotion/installation, then capture on the promoted build at
-  the rotating station. Verify original DC603/63B1/03B17 hashes are patched,
-  affected detail gains engine coverage, and world-vector error/visible blur
-  falls. Do not claim every remaining soft pixel fixed.
-
+- **Validation:** absolute build.bat --jobs 4 passed all gates: production
+  DLLs, 82 pooled jobs + 4 quiet, 262-key contract and installer resources.
+  Focused/full-build engine rig: 1686 checks; prior real corpus: 2398. The
+  09-28 repair entry records the receipt. Commit, promotion and installation
+  are pending.
+- **Next:** after promotion/install, capture the rotating station on the
+  promoted build. Require hooked primary/copier/merge/clear statuses, nonzero
+  joined private rows/scatter, actual EP/EN ownership exports and correct brace
+  motion/coverage; inspect remaining WORLD and building pixels separately.
+  Visual verification is pending. Native primary records stay unchanged; no
+  bones, estimation, generic pool matching or new shader admission.
 
 ## Premise
 
@@ -3513,3 +3522,161 @@ error/visible blur falling during station rotation. This fixes a proven
 coverage gap; it does not certify all remaining softness solved. Flown
 environment: Pimax OpenXR, Crystal Super, 2037x1969 -> 4074x3938, preset K,
 DLSS 310.7.0.0; fixed family capacity is now five PS entries.
+
+### 2026-09-28 -- Eye run 061832: three material keys flown, crossbraces still on wrong world motion
+
+Frontier log edvr_gfx_20260928_061620 matches HEAD 848ca4b8 (rc.3-5); 061832
+captures C/D frames 12947-12962 at 2037x1969 -> 4074x3938. Sean still sees
+crossbraces across seams and building-like hull structures blur at this
+distance. Fresh ROIs were selected from this station angle; it differs from
+054658, so coverage/edge-energy changes are not a controlled before/after
+comparison.
+
+**Independent raw-image test.** Warp previous C by current D minus
+(current-minus-previous jitter), then fit each path's residual correction. Blur
+radii 1 and 2 agree. Quiet median corrections, blur 2, in input pixels:
+
+| raw-crop ROI | engine share | world correction | engine correction |
+|---|---|---|---|
+| front brace (880,562)-(1010,610) | 81% | (+0.30,+0.20) | (0,0) |
+| right seam (1080,602)-(1138,738) | 80% | (+0.20,+0.30) | (0,0) |
+| top buildings (934,493)-(1036,557) | 79% | (+0.45,+0.15) | (-0.05,0) |
+| right buildings (1170,605)-(1240,680) | 64% | (+0.20,+0.30) | (0,0) |
+
+Crucially, path overlays place the named thin diagonal braces and building
+uprights on WORLD, with adjacent window grids/hull on ENGINE. Blur-1 pair 2:
+front WORLD needs (+2.7,+1.8), warp RMSE 24.01 -> 7.37; engine needs (0,0),
+8.01 -> 8.01. Right-seam WORLD needs (+2.05,+2.75), 27.20 -> 9.99; engine
+(0,+0.15), 9.74 -> 9.67. The engine field has no persistent fitted bias on
+these regions; its small spatial variation (~0.04-0.12 px/component interdecile
+ranges) is not evidence of corrupt or erratic vectors. Raw-input aliasing
+limits finer claims about individual subpixel struts.
+
+**Routing/provenance:** actual eye-draw scene constants match selected CSV rows
+in all 16 frames (max 4.84e-6; ledger frame = CSV frame+1). D matches actual
+DLSS input MV to half rounding only, <=0.000458 px; no late EDVR overwrite is
+present. All captures succeed, history true/reset false. UI/Bias/UiEdits are
+zero in the ROIs; engine hidden history is zero, brace/seam/top WORLD hidden
+zero. Right-building rejection is sparse (<1% of its whole ROI). Pre-UI P and
+submitted T differ by <0.07 gray levels in mean absolute ROI difference, so
+this softness is already before cleanup. Raw-versus-treated crops show softened
+world braces; raw bicubic edge-energy comparisons are descriptive, not proof of
+a reconstruction floor.
+
+ruled out: the three station material keys alone as the complete Coriolis blur
+fix, because the verified post-key capture still puts the named braces/uprights
+on measurably inaccurate world vectors while adjacent engine motion matches
+independent raw-image warps. The prior repairs remain valid.
+
+**Next:** trace remaining pixel ownership/depth and producer coverage before a
+new runtime fix; do not charge this demonstrated wrong-vector subset to
+reconstruction damping. Artifacts:
+build/coriolis-061832/warp-refinement-blur1.json, warp-refinement-blur2.json,
+detail-metrics.json, roi-map.png and paired brace/building crops/path overlays.
+
+### 2026-09-28 -- 061832 braces: keyed rigid geometry lacks certified producer history
+
+The complete keyed-instance replay (283 EB52/DE54 rasters) places remaining
+WORLD brace surfaces on unsupported rigid records. EB52/9ABF draw131 slot736
+has 151 bit-exact SceneZ/WORLD coincidences in front_brace (338 within 1 ULP);
+draw130 slot729 has 130 exact in right_seam (275 within 1 ULP). Across
+available keyed geometry, kind3 union counts are front_brace 172 exact/386
+within 1 ULP of 1225 WORLD pixels, right_seam 193/440 of 1585. Available
+joined-kind1 WORLD exact coincidences: zero. Replay is opaque depth-only and
+does not replay material discard/culling, so these counts locate surfaces, not
+complete live material visibility. Top-building geometry was omitted by the
+capture budget; its producer remains unassigned.
+
+Slots729/736/740/742/770/772 have boneBase0, marker word72 zero, scales1.0 in
+both blocks, and bit-identical current/native second poses. Both blocks change
+between frames12948 and12949; captured mesh-time pool bytes equal end-pool
+bytes. Thus the second block is a same-frame copy, not previous motion, and
+these are moving rigid records without certified EDVR producer history.
+Actual336-byte census items join the 42B42EF builder producer, with shared
+owner/key but distinct R12 objects: a bucket key alone is not a safe part
+identity. The original material pair is already keyed and its installed PS is
+the EDVR patch.
+
+ruled out: missing EB52/9ABF material admission, stale stamp in these records,
+or missing previous bone palette as the named replayed brace producer's history
+defect, because its genuine keyed patched material draws moving base0 records
+with marker0 and duplicate-current pose blocks. Final EngineSlots was not
+dumped: later MRT6 overwrite/stale-slot rejection can coexist and is not ruled
+out per pixel by the replay.
+
+**Safe extension requirements:** existing emit history observes only
+FUN_144312E00 (kinematic_eval_hook.cpp directBracket), keys a source engine
+record plus reuse discriminator, validates every owned appended item's current
+pose before committing history, masks missing/gapped/reused/ambiguous
+observations, and frame-hashes both pose blocks. The original second block is
+deliberately a current copy; it is not latent previous truth. The 09-23
+CPU-reader audit permits bytes288-319 only through whole-record copies; runtime
+writes marker288, previous position292-303 and quaternion312-319, preserving
+base/scale. A builder extension must independently prove part/object identity,
+producer-owned append boundaries, exact current pose correspondence,
+consecutive frame lifetime, and these reader/writer invariants for its actual
+route. Prior +0x1C0 transforms and generic content-pairing remain ruled out; no
+bones/config change follows from this evidence. Artifact:
+build/coriolis-061832/nonrig-world-depth-coincidence.png.
+
+### 2026-09-28 -- 061832 repair: certified primary history in the private pool
+
+Verified build 332841 exposes six-argument FUN1442B4130 at the sole 42B4843
+call under outer 42B4420. Outer TLS is restored on nested/fault exits.
+Recovered canonical collection record/node and pose-context identity are
+rechecked around exactly one owned append; input and packed emitted current
+poses must agree. Primary and secondary share the existing Table(record,node):
+missing/gapped/reused identities or same-frame disagreement mask history. The
+six captured brace records and successor samples corroborate canonical
+conversion. Secondary's initializer scale is independently 1.0; its native
+route is unchanged.
+
+Primary native records are never modified. Native shaders permit dynamic
+material offsets that can reach bytes288-319; the six captured material0
+fixtures cannot authorize broad native writes. The primary sink retains native
+336 bytes and certified previous pose at the exact CPU source item.
+Authoritative 4C81BE0 copy joins that item to an active retained-COM Map lease
+and destination slot; both source and mapped destination must still equal all
+84 saved words. Copies consume claims and invalidate every overwritten slot,
+including unrecognized sources. DISCARD replaces the resource generation;
+NO_OVERWRITE retains unaffected same-frame certificates. Foreign writes,
+ambiguous maps, extents/overflow/faults refuse certificates.
+
+Authoritative 434E740 merge stages claims before clearing all eight old source
+addresses and overwritten destinations, then verifies all 336 bytes after
+native relocation. Full eight-item nodes splice at the head and preserve an
+existing partial tail; partial fill/shift and freed nodes follow native layout.
+Typed 36819D0 clear revokes each freed node's eight source addresses before
+recycling and invalidates touching staged plans, preserving unrelated sources
+awaiting destination merge. Malformed clear/merge invalidates the pending
+epoch. This closes the direct-clear source lifetime path that copy consumption
+alone did not cover.
+
+After initial snapshot and append refresh, a compute scatter checks all 84
+native words on EDVR's private clone before writing marker/previous pose. The
+native GPU source is never a UAV. CS shader/classes, t0/u0/b0 and COM ownership
+are restored. All four primary/copier/merge/clear hook statuses must be valid.
+Whole native bodies plus installed relay bytes are checked; the analysis and
+Frontier EXEs match SHA256
+e6be8bbe04e6a7ae226d4318945af7f367de13dc5a007a261964d9ba8144e988, PE timestamp
+1788384820/image size 104894464. None of the five hashed
+primary/outer/copier/merge/clear extents contains an ASLR relocation.
+
+Environment: Pimax OpenXR Crystal Super, input 2037x1969/output 4074x3938, DLSS
+310.7.0.0 preset K. Limits: history 16x1024 entries/probe 32; pending
+emissions/private slots 16384 each; copy registry 32 pools; retained positive
+Map resource cache 16. Overflow declines. Focused production engine rig: 1686
+checks pass, including captured-pose consumer, exact-copy/scatter,
+identity/reuse, merge/clear and state-restoration gates; hook compile passes.
+The real shader corpus passed 2398 checks before the final engine-only
+lifetime/diagnostic amendments. Full validation passed: absolute build.bat
+--jobs 4 compiled the production DLLs and passed 82 pooled jobs plus 4 quiet,
+the 262-key config contract and installer resource verification; its engine
+gate reports 1686 checks. Receipt input SHA256:
+81f8df86a2b4845872fda55d1c34cf41541f129823c8409981aabf8a562ea3f0
+(build/coriolis-primary-full-build.log). Commit, promotion and installation are
+pending. The next rotating-station capture exports actual consumed EP ownership
+and EN private-pool bytes on its first frame; it must show these named rigid
+braces gaining accurate engine motion. Top-building attribution, incomplete
+captured geometry/material visibility and any remaining reconstruction softness
+remain explicit limits.

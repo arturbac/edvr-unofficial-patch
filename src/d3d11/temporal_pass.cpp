@@ -2,6 +2,7 @@
 #include "temporal_history.h"
 #include "../common/runtime_profile.h"
 #include "draw_census.h"
+#include "eye_engine_capture.h"
 
 #include <algorithm>  // std::sort, the price report's median/p95
 #include <cmath>
@@ -1581,13 +1582,17 @@ bool             g_eyeOverviewTaken[2] = {};
 bool             g_eyeTreatedWritten[kEyeRun] = {};
 bool             g_eyeTreatedTaken[kEyeRun] = {};
 bool             g_eyeRawWritten[kEyeRun] = {};
-// Slot 11 is free since the mesh records' coverage retired (2026-09-23);
-// the slots after it keep their numbers. 16..18 (DlssColour, UiInfluence,
-// UiDepth) went with the UI separation that filled them (2026-09-23).
-constexpr int kEyeInputs=16;
+// Preserve the original input numbers; 16/17 append ownership snapshots.
+constexpr int kEyeInputs=18;
 ID3D11Texture2D*  g_eyeInputs[kEyeInputs] = {};
 uint32_t         g_eyeInputsFrame=0,g_eyeInputsUiBound=0,g_eyeInputsUiFlags=0;
-const wchar_t* const kEyeInputNames[kEyeInputs]={L"MV",L"Z",L"UI",L"Bias",L"SceneZ",L"TerrainIndex",L"TerrainZ",L"HoloCoverage",L"UiEdits",L"ScreenMotion",L"WeaponMotion",L"HoloContribution",L"PrevZ",L"DlssBeforeUi",L"UiPrevious",L"UiNext"};
+const wchar_t* const kEyeInputNames[kEyeInputs]={L"MV",L"Z",L"UI",L"Bias",L"SceneZ",L"TerrainIndex",L"TerrainZ",L"HoloCoverage",L"UiEdits",L"ScreenMotion",L"WeaponMotion",L"HoloContribution",L"PrevZ",L"DlssBeforeUi",L"UiPrevious",L"UiNext",L"EngineSlots",L"GameG6"};
+edvr::eye_engine_capture::Result g_eyeEngineInputStatus[2] = {};
+ID3D11Buffer* g_eyeEngineBuffers[2]={};
+edvr::eye_engine_capture::Result g_eyeEngineBufferStatus[2]={};
+const wchar_t* const kEyeEngineBufferNames[2]={L"EnginePool",L"EngineNow"};
+uint32_t g_eyeEngineBufferMeta[2][5]={}; // bytes, record stride, SRV format, first element, element count
+bool g_eyeInputCaptureAttempted=false;
 uint32_t         g_eyeRunWidth = 0, g_eyeRunHeight = 0;
 bool             g_eyeRawTaken[kEyeRun] = {};
 uint32_t         g_eyeRunFrames[kEyeRun] = {};
@@ -1896,8 +1901,9 @@ struct TemporalHistoryScope {
 
 // Preserve the actual first-frame inputs before the next eye overwrites them.
 void stageEyeInputs(ID3D11DeviceContext* ctx,EyeState& e,ID3D11ShaderResourceView* scene,
-                    ID3D11Texture2D* ui,float uiBound,float uiFlags) {
-    if(g_eyeRunLeft<=0 || g_eyeRunTaken!=0 || g_eyeInputs[0])return;
+                    ID3D11Texture2D* ui,float uiBound,float uiFlags,
+                    bool engineBound,const EngineVelocityViews& engineViews) {
+    if(g_eyeRunLeft<=0 || g_eyeRunTaken!=0 || g_eyeInputCaptureAttempted)return;
     ID3D11Texture2D* textures[kEyeInputs]={e.dlMv,e.dlDepth,ui,e.dlMask};
     if(e.dlMv) {
         D3D11_TEXTURE2D_DESC d{};e.dlMv->GetDesc(&d);
@@ -1943,10 +1949,28 @@ void stageEyeInputs(ID3D11DeviceContext* ctx,EyeState& e,ID3D11ShaderResourceVie
         textures[14]=e.uiHistory[e.uiHistoryRead];textures[14]->AddRef();
     }
     for(int k=0;k<kEyeInputs;++k)if(textures[k])stageEyeRun(ctx,textures[k],g_eyeInputs,k);
+    // The held views are the exact inputs supplied to this preparation,
+    // even though its CS bindings have already been restored here.
+    g_eyeEngineInputStatus[0]=edvr::eye_engine_capture::stage(ctx,engineBound,engineViews.slots,&g_eyeInputs[16]);
+    g_eyeEngineInputStatus[1]=edvr::eye_engine_capture::stage(ctx,engineBound,engineViews.gameMark,&g_eyeInputs[17]);
+    Microsoft::WRL::ComPtr<ID3D11Resource> poolResource;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> poolBuffer;
+    D3D11_SHADER_RESOURCE_VIEW_DESC poolView{};
+    if(engineViews.pool){engineViews.pool->GetResource(&poolResource);poolResource.As(&poolBuffer);engineViews.pool->GetDesc(&poolView);}
+    ID3D11Buffer* actualBuffers[2]={poolBuffer.Get(),engineViews.sceneNow};
+    for(int k=0;k<2;++k){
+        if(actualBuffers[k]){D3D11_BUFFER_DESC d{};actualBuffers[k]->GetDesc(&d);
+            auto* m=g_eyeEngineBufferMeta[k];m[0]=d.ByteWidth;m[1]=k==0?d.StructureByteStride:16;
+            m[2]=k==0?unsigned(poolView.Format):unsigned(DXGI_FORMAT_R32G32B32A32_FLOAT);
+            m[3]=k==0?poolView.Buffer.FirstElement:0;m[4]=k==0?poolView.Buffer.NumElements:d.ByteWidth/16;
+        }
+        g_eyeEngineBufferStatus[k]=edvr::eye_engine_capture::stageBuffer(ctx,engineBound,actualBuffers[k],&g_eyeEngineBuffers[k]);
+    }
     for(int k=5;k<kEyeInputs;++k)if(textures[k])textures[k]->Release();
     if(textures[4])textures[4]->Release();
     g_eyeInputsFrame=g_rowsFrame;g_eyeInputsUiBound=static_cast<uint32_t>(uiBound);
     g_eyeInputsUiFlags=static_cast<uint32_t>(uiFlags);
+    g_eyeInputCaptureAttempted=true; // only after ownership and every other input attempted
 }
 ID3D11ComputeShader* motionTraceShader(ID3D11DeviceContext* ctx) {
     if (!g_csMvTrace && !g_csMvTraceTried) {
@@ -1958,6 +1982,34 @@ ID3D11ComputeShader* motionTraceShader(ID3D11DeviceContext* ctx) {
 }
 
 void writeEyeInputs(ID3D11DeviceContext* ctx,const std::wstring& dir) {
+    // EDVRBUF1 exports preserve complete actual private-pool/EN bytes. The
+    // view range is metadata; no raw native-pool assumption enters decoding.
+    wchar_t metaPath[MAX_PATH];_snwprintf_s(metaPath,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_EngineBuffers.json",dir.c_str(),g_eyeRunStamp);
+    FILE* meta=nullptr;_wfopen_s(&meta,metaPath,L"wb");
+    if(meta)fprintf(meta,"{\"version\":1,\"scene_frame\":%u,\"buffers\":[",g_eyeInputsFrame);
+    for(int k=0;k<2;++k){
+        const auto status=g_eyeEngineBufferStatus[k];const char* outcome=edvr::eye_engine_capture::name(status);
+        if(g_eyeEngineBuffers[k]){
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if(SUCCEEDED(ctx->Map(g_eyeEngineBuffers[k],0,D3D11_MAP_READ,0,&mapped))){
+                wchar_t path[MAX_PATH];_snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_%s.bin",dir.c_str(),g_eyeRunStamp,kEyeEngineBufferNames[k]);
+                FILE* f=nullptr;_wfopen_s(&f,path,L"wb");
+                if(f){const auto* m=g_eyeEngineBufferMeta[k];const uint32_t header[8]={1,m[0],m[1],m[2],m[3],m[4],g_eyeInputsFrame,0};
+                    const bool ok=fwrite("EDVRBUF1",1,8,f)==8 && fwrite(header,sizeof(header),1,f)==1 && fwrite(mapped.pData,1,m[0],f)==m[0];fclose(f);
+                    outcome=ok?"written":"write_failed";
+                }else outcome="file_creation_failed";
+                ctx->Unmap(g_eyeEngineBuffers[k],0);
+            }else outcome="staging_map_failed";
+            g_eyeEngineBuffers[k]->Release();g_eyeEngineBuffers[k]=nullptr;
+        }
+        const auto* m=g_eyeEngineBufferMeta[k];
+        Log::get().note("eye capture: %ls input %ls availability: %s, scene frame %u, bytes %u stride %u view [%u,%u).",g_eyeRunStamp,kEyeEngineBufferNames[k],outcome,g_eyeInputsFrame,m[0],m[1],m[3],m[3]+m[4]);
+        if(meta)fprintf(meta,"%s{\"name\":\"%ls\",\"status\":\"%s\",\"bytes\":%u,\"stride\":%u,\"format\":%u,\"first_element\":%u,\"num_elements\":%u}",k?",":"",kEyeEngineBufferNames[k],outcome,m[0],m[1],m[2],m[3],m[4]);
+    }
+    if(meta){fprintf(meta,"]}\n");fclose(meta);}else Log::get().note("eye capture: engine buffer availability manifest file creation failed.");
+    for(int k=0;k<2;++k)
+        Log::get().note("eye capture: %ls input %ls availability: %s, scene frame %u; a written all-clear texture is available ownership data.",
+            g_eyeRunStamp,kEyeInputNames[16+k],edvr::eye_engine_capture::name(g_eyeEngineInputStatus[k]),g_eyeInputsFrame);
     for(int k=0;k<kEyeInputs;++k) {
         auto* texture=g_eyeInputs[k];if(!texture)continue;
         D3D11_TEXTURE2D_DESC d{};texture->GetDesc(&d);
@@ -1984,7 +2036,7 @@ void writeEyeInputs(ID3D11DeviceContext* ctx,const std::wstring& dir) {
                 for(uint32_t y=0;y<d.Height && ok;++y)ok=fwrite(static_cast<const char*>(map.pData)+y*map.RowPitch,1,d.Width*bytes,f)==d.Width*bytes;
                 fclose(f);
                 Log::get().note("eye capture: %ls input %ls %ux%u format %u, scene frame %u: %s.",g_eyeRunStamp,kEyeInputNames[k],d.Width,d.Height,static_cast<unsigned>(d.Format),g_eyeInputsFrame,ok?"written":"write failed");
-            }
+            } else if(k>=16) Log::get().note("eye capture: %ls input %ls unavailable on disk: file creation failed.",g_eyeRunStamp,kEyeInputNames[k]);
             // The MV input's census of the history the pass invalidated
             // (backgroundHistoryHidden's size*2 sentinel), so a dump says in
             // the log how much of the eye NVIDIA was told to start afresh.
@@ -2008,7 +2060,7 @@ void writeEyeInputs(ID3D11DeviceContext* ctx,const std::wstring& dir) {
                                 g_eyeRunStamp,hidden,total,total>0?100.0*hidden/total:0.0,g_eyeInputsFrame);
             }
             ctx->Unmap(texture,0);
-        }
+        } else if(k>=16) Log::get().note("eye capture: %ls input %ls unavailable on disk: format unsupported or staging map failed.",g_eyeRunStamp,kEyeInputNames[k]);
         texture->Release();g_eyeInputs[k]=nullptr;
     }
     celestialMotionWriteDump(ctx,dir.c_str(),g_eyeRunStamp);
@@ -2150,7 +2202,7 @@ void writeEyeDecisionArtifacts(ID3D11DeviceContext* ctx, const std::wstring& dir
         }
         return;
     }
-    fprintf(f, "{\n  \"schema\": 1,\n  \"stamp\": \"%ls\",\n  \"requested\": %d,\n  \"frames\": [\n",
+    fprintf(f, "{\n  \"schema\": 1,\n  \"engine_kind_shift\": 12,\n  \"engine_kind_mask\": 7,\n  \"stamp\": \"%ls\",\n  \"requested\": %d,\n  \"frames\": [\n",
             g_eyeRunStamp, kEyeRun);
     for (int k = 0; k < g_eyeRunTaken; ++k) {
         const EyeDecisionFrame& d = g_eyeDecisions[k];
@@ -4871,7 +4923,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                     endRegion(qs, Region::Prep, ctx);
                     if (haveDepth && e.zPrev) zcWritten = true;
                     if (uiTrack && !uiResolve) uiEvidenceWritten = true;
-                    if(eye==0)stageEyeInputs(ctx,e,depthSrv,coverageMask,p.probe[2],p.probe[3]);
+                    if(eye==0)stageEyeInputs(ctx,e,depthSrv,coverageMask,p.probe[2],p.probe[3],engineBound,engineViews);
                     // What NVIDIA is handed: the union when the mover mask
                     // ran this frame, else the interface's alone (as before
                     // the mover mask existed), else nothing. Engine-record
@@ -7109,6 +7161,10 @@ static void beginEyeRun() {
     applyEngineMotionDiagnostics();   // the census runs for the run
     g_eyeMotionTraceCount = 0;
     g_eyeInputsFrame=0;
+    for(auto& status:g_eyeEngineInputStatus)status=edvr::eye_engine_capture::Result::NotReached;
+    for(auto& status:g_eyeEngineBufferStatus)status=edvr::eye_engine_capture::Result::NotReached;
+    memset(g_eyeEngineBufferMeta,0,sizeof(g_eyeEngineBufferMeta));
+    g_eyeInputCaptureAttempted=false;
     g_eyeRunUntreated=false;
     memset(g_eyeOverviewTaken,0,sizeof(g_eyeOverviewTaken));
     memset(g_eyeTreatedWritten,0,sizeof(g_eyeTreatedWritten));
@@ -7120,6 +7176,7 @@ static void beginEyeRun() {
         g_eyeDecisions[k]=EyeDecisionFrame{};
     }
     for(auto& texture:g_eyeInputs)if(texture){texture->Release();texture=nullptr;}
+    for(auto& buffer:g_eyeEngineBuffers)if(buffer){buffer->Release();buffer=nullptr;}
     memset(g_eyeRawTaken, 0, sizeof(g_eyeRawTaken));
     memset(g_eyeRawInputW, 0, sizeof(g_eyeRawInputW));
     memset(g_eyeRawInputH, 0, sizeof(g_eyeRawInputH));
@@ -7178,6 +7235,10 @@ void temporalPassShutdown() {
     g_eyeRunReady = false;
     g_eyeMotionTraceCount = 0;
     g_eyeInputsFrame=0;
+    for(auto& status:g_eyeEngineInputStatus)status=edvr::eye_engine_capture::Result::NotReached;
+    for(auto& status:g_eyeEngineBufferStatus)status=edvr::eye_engine_capture::Result::NotReached;
+    memset(g_eyeEngineBufferMeta,0,sizeof(g_eyeEngineBufferMeta));
+    g_eyeInputCaptureAttempted=false;
     g_eyeRunUntreated=false;
     memset(g_eyeOverviewTaken,0,sizeof(g_eyeOverviewTaken));
     memset(g_eyeTreatedWritten,0,sizeof(g_eyeTreatedWritten));
@@ -7185,6 +7246,7 @@ void temporalPassShutdown() {
     memset(g_eyeRawWritten,0,sizeof(g_eyeRawWritten));
     for(int k=0;k<kEyeRun;++k) g_eyeDecisions[k]=EyeDecisionFrame{};
     for(auto& texture:g_eyeInputs)if(texture){texture->Release();texture=nullptr;}
+    for(auto& buffer:g_eyeEngineBuffers)if(buffer){buffer->Release();buffer=nullptr;}
     if (g_statsUav) { g_statsUav->Release(); g_statsUav = nullptr; }
     if (g_stats) { g_stats->Release(); g_stats = nullptr; }
     if (g_samp) { g_samp->Release(); g_samp = nullptr; }

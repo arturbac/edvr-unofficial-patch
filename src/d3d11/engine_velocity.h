@@ -18,6 +18,9 @@
 //     validated pose, masked otherwise (engine_velocity_emit.h has the rules).
 //     The engine's own copy then carries it to the GPU: no slot map, no
 //     matching, no readback of write-combined memory.
+//     Primary rigid 42B4130 emissions use the same canonical history through
+//     an emission sink: native records stay unchanged. Verified CPU list
+//     relocation/upload joins certify only EDVR's private clone for patching.
 //  2. DRAW (render thread). The pool families' pixel shaders are substituted
 //     (hash-keyed, dxbc_engine_velocity.h) so the game's own draws write, per
 //     pixel, the t33 slot they drew (odd-coded) and the depth they wrote to
@@ -52,6 +55,7 @@ struct ID3D11Resource;
 struct ID3D11ShaderResourceView;
 struct ID3D11Texture2D;
 struct ID3D11VertexShader;
+struct D3D11_BUFFER_DESC;
 
 namespace edvr {
 
@@ -119,6 +123,17 @@ extern uint32_t g_psShadowProbeN;   // owner thread; the header's sampling count
 void psShadowProbe(ID3D11DeviceContext*);
 void noteResourceMapped(const ID3D11Resource*, void* data, int mapType) noexcept;
 void noteResourceWrite(const ID3D11Resource*) noexcept;
+constexpr unsigned kPrimaryPoolResources=16;
+extern std::atomic<const ID3D11Resource*> primaryPoolResources[kPrimaryPoolResources];
+void notePrimaryBufferCreated(ID3D11Buffer*,const D3D11_BUFFER_DESC&) noexcept;
+void notePrimaryResourceMapped(const ID3D11Resource*,void*,int) noexcept;
+void notePrimaryResourceWritten(const ID3D11Resource*) noexcept;
+void notePrimaryResourceUnknown(const ID3D11Resource*) noexcept;
+inline bool watchesPrimaryResource(const ID3D11Resource* resource) noexcept {
+    if(!resource)return false;
+    for(const auto& slot:primaryPoolResources)if(slot.load(std::memory_order_relaxed)==resource)return true;
+    return false;
+}
 inline bool watchesResource(const ID3D11Resource* resource) noexcept {
     if (!resource) return false;
     for (const auto& w : watch) if (w.load(std::memory_order_relaxed) == resource) return true;
@@ -152,7 +167,9 @@ inline void engineVelocityBeforeDraw(ID3D11DeviceContext* ctx, bool rtv0Eye) {
 // mapped pointer and the map type of a watched source, for the write tee.
 inline void engineVelocityResourceMapped(const ID3D11Resource* resource, void* data, int mapType) {
     using namespace engine_velocity_detail;
-    if (live.load(std::memory_order_relaxed) && watchesResource(resource)) noteResourceMapped(resource, data, mapType);
+    if (!live.load(std::memory_order_relaxed))return;
+    if(watchesPrimaryResource(resource))notePrimaryResourceMapped(resource,data,mapType);
+    if(watchesResource(resource))noteResourceMapped(resource,data,mapType);
 }
 
 // The Unmap/Copy/Update tees (vscreen, owner context; an Unmap before the
@@ -162,7 +179,18 @@ inline void engineVelocityResourceMapped(const ID3D11Resource* resource, void* d
 // the slow half, which keeps, refreshes or drops the eye-frame's snapshot.
 inline void engineVelocityResourceWritten(const ID3D11Resource* resource) {
     using namespace engine_velocity_detail;
-    if (live.load(std::memory_order_relaxed) && watchesResource(resource)) noteResourceWrite(resource);
+    if (!live.load(std::memory_order_relaxed))return;
+    if(!resource || watchesPrimaryResource(resource))notePrimaryResourceWritten(resource);
+    if(watchesResource(resource))noteResourceWrite(resource);
+}
+
+inline void engineVelocityBufferCreated(ID3D11Buffer* buffer,const D3D11_BUFFER_DESC* desc) {
+    if(buffer && desc)
+        engine_velocity_detail::notePrimaryBufferCreated(buffer,*desc);
+}
+inline void engineVelocityResourceUnknown(const ID3D11Resource* resource) {
+    using namespace engine_velocity_detail;
+    if(live.load(std::memory_order_relaxed) && (!resource || watchesPrimaryResource(resource)))notePrimaryResourceUnknown(resource);
 }
 
 // The present-frame clock (device_hook, once per owned Present).

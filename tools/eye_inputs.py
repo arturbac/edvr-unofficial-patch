@@ -13,6 +13,11 @@ grid. UiPrevious is absent when history is invalid. Colour bytes are
 normalized but not gamma-converted; use the saved DXGI format.
 UI's low two bits: 1 floating, 2 attached, 3 smoke;
 its upper six bits are optional fixed bias. Bias is DLSS's actual R8 mask.
+EngineSlots and GameG6, when available, are the exact ownership textures
+consumed by first-frame trained motion preparation (slot code, device depth).
+Their capture log distinguishes an absent binding from a written clear map.
+Decision flags bits 12..14 encode engine kind: 0 unavailable, 1 joined,
+2 masked, 3 nonrig, 4 stale slot depth, 5 corrupt slot, 6 stale stamp.
 WeaponMotion is RGBA16_FLOAT at source-screen size: original post-VS
 previous-minus-current motion XY, source depth Z, validity W (1 valid,
 2 new/rejected, 0 uncovered). ScreenMotion composes it into each eye.
@@ -51,6 +56,32 @@ def _load(path):
     return meta, data
 
 
+def _load_buffer(path):
+    """Actual prepare-time EDVR clone pool/EN, including the consumed SRV range.
+
+    EDVRBUF1 + eight uint32: version, bytes, stride, DXGI format, first
+    element, element count, diagnostic frame, reserved. Payload is the full
+    resource unchanged; EngineNow row 276 carries the actual engine stamp.
+    Availability is explicit in the companion EngineBuffers.json manifest.
+    """
+    data = Path(path).read_bytes()
+    if len(data) < 40 or data[:8] != b'EDVRBUF1':
+        raise ValueError('Not an EDVRBUF1 capture')
+    keys = ('version', 'bytes', 'stride', 'format', 'first_element', 'num_elements', 'frame', 'reserved')
+    meta = dict(zip(keys, struct.unpack_from('<8I', data, 8)))
+    size, stride = meta['bytes'], meta['stride']
+    if (meta['version'] != 1 or stride not in (16, 336) or not size or size % stride
+            or len(data) != 40 + size or meta['first_element'] + meta['num_elements'] > size // stride):
+        raise ValueError('Unsupported version or incomplete buffer/range')
+    return meta, data
+
+
+def read_buffer(path):
+    import numpy as np
+    meta, data = _load_buffer(path)
+    return meta, np.frombuffer(data, '<u4', offset=40).reshape(meta['bytes'] // meta['stride'], meta['stride'] // 4)
+
+
 def read(path):
     import numpy as np
     meta, data = _load(path)
@@ -85,6 +116,24 @@ def read(path):
 def self_test():
     import tempfile
     with tempfile.TemporaryDirectory() as temp:
+        buffer = Path(temp) / 'pool.bin'
+        words = struct.pack('<168I', *range(168))
+        buffer.write_bytes(b'EDVRBUF1' + struct.pack('<8I', 1, 672, 336, 0, 1, 1, 17, 0) + words)
+        meta, data = _load_buffer(buffer)
+        assert meta['first_element'] == 1 and data[40:] == words
+        try:
+            import numpy as np
+        except ImportError:
+            pass
+        else:
+            _, records = read_buffer(buffer)
+            assert records.shape == (2, 84) and records[1, 0] == 84
+        buffer.write_bytes(buffer.read_bytes()[:-1])
+        try:
+            _load_buffer(buffer)
+            raise AssertionError('Incomplete actual pool accepted')
+        except ValueError:
+            pass
         path = Path(temp) / 'screen.bin'
         pixels = struct.pack('<16e', 1.25, -.5, .005, 1, 0, 0, 0, 2,
                              0, 0, 0, 0, -2, 3, .025, 1)
