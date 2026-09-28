@@ -23,15 +23,12 @@
 - Ruled out for that session: a backend evaluation failure as the immediate
   cause, because no backend initialized. Missing shader coverage is proven;
   whether quality settings or a mod produced those variants is not.
-- Next: map the setters -- which functions write the frustum parameters,
-  axes and origin and raise the dirty bits, on what frame cadence (a
-  FindStores-style scan); resolve the +0x870/+0x8B0 ray/frustum blocks;
-  then the consumer-lineage join the review requires before C2. The
-  cache-helper decompile and the dirty-bit mutation protocol are in the
-  cache-helper addendum. The producer probe itself was rebuilt per the
-  review's R1-R6 (gate-only stand-down, per-thread watch ownership,
-  external-thread arm/disarm, mandatory handler registration,
-  module-naming fallbacks, bounded witness collection).
+- Next: read the +0x870/+0x8B0 ray/frustum blocks field-by-field
+  (FUN_1404f3770's output layout), then the consumer-lineage join the
+  review requires before C2. Setter map and hook-cadence consequence are
+  in the setter-map addendum: the refresh FUN_1405921f0 is the natural
+  injection point, mutating before its own finalizer calls so per-item
+  overrides compose in the game's own order.
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable/build
   identities, backend versions, dimensions, formats and mod chain for
@@ -461,3 +458,43 @@ map -- which functions write the frustum parameters, axes and origin and
 raise the dirty bits, and on what frame cadence -- plus the +0x870/+0x8B0
 block semantics (the FUN_1405964c0 ray/frustum consumer) and the
 consumer-lineage join the review requires before C2.
+
+## Setter-map addendum, 2026-09-28: who dirties the camera, and when
+
+A flag-bit scan (OR/AND immediates on the flag word through both base
+conventions; analysis/decomp/flash/camera/camera_flag_bits.txt) finds 41
+operations, and decompiling the raisers
+(analysis/decomp/flash/camera/camera_setters_decomp.txt) completes the
+dirty-bit table with a fourth block: mask 1 is cleared by FUN_1404f3770,
+a 4.5 KB ray/frustum builder that reads near/far (+0x254/+0x258) and has
+27 callers across the render code -- the ray-data finalizer whose output
+the FUN_1405964c0 path consumes (the +0x870/+0x8B0 blocks remain to be
+read field-by-field).
+
+The setters, by cadence:
+
+- Per item class, mid-pass: FUN_14058ef90 (the per-view frame walk) and
+  FUN_140591f30 (per-item prep) poke frustum slots +0x25C and +0x280
+  with per-item values (near/far overrides) and raise 0xC (projection +
+  VP dirty) or 0xD (ray + projection + VP dirty). This is why the
+  refresh runs three times a pass -- the camera's frustum parameters
+  legitimately change between sections -- and why the composer re-flushes
+  ~30 times a frame.
+- Camera translation: FUN_1404f2ac0 takes a new origin float4, deltas it
+  against the stored origin (camera+0x50), applies it through a helper
+  and raises 0xF (everything). Called from FUN_1428a4d30.
+- Auxiliary domains: the shadow/reflection/env composer callers
+  (FUN_143654ff0, FUN_1436597f0, FUN_1436dd650) raise 0xF/0xD on their
+  own camera structs per pass -- full source rewrites, corroborating
+  that each auxiliary domain owns and re-dirties its own camera.
+
+Hook-cadence consequence: the camera's frustum parameters are NOT
+write-once-per-frame -- they are re-poked per item class between refresh
+calls, so a jitter applied once per frame would fight the game's own
+overrides. The refresh FUN_1405921f0 runs after the setters in each
+section and re-derives through the finalizers, which keeps it the
+natural injection point: mutate inside its detour, before its finalizer
+calls, and every downstream consumer in that section derives from the
+jittered values through the game's own path, with the per-item overrides
+composing afterwards in the game's own order. Domain separation falls
+out of which camera struct arrives (view+0x158 vs view+0x250).
