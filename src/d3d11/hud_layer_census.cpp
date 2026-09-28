@@ -52,8 +52,9 @@ int familyOfVs(uint64_t vs) {
     if (vs == kUiVsHolo) return kFamHolo;
     if (vs == kUiVsFlightHud) return kFamFlightHud;
     if (vs == kUiVsSprite) return kFamSprite;
-    // Phase 3: the hologram pass's eleven (holo_families.h, the same list
-    // the crisp take's kHoloGeneric matches) get ONE watch, so their ga
+    // Phase 3: the crisp take's eight hologram families (holo_families.h's
+    // kHoloFamiliesTake, the list the crisp take's kHoloGeneric matches)
+    // get ONE watch, so their ga
     // state lines (first-seen, 64 cap) and window counts double as their
     // G-A measurement. They draw with depth off, so a G-D pair reads
     // on == off, like the sprite's -- that documents exactly that.

@@ -5,8 +5,9 @@
 // the doc's BELIEVED facts about the holo panels (vs 81216C77F90DEDD6),
 // the flight HUD (vs B7790CBFC6554097) and the target sprite (vs
 // E508648660A352B2) each get a measured gate. Phase 3 extends the family
-// watch to the hologram pass's eleven (holo_families.h, one "hologram"
-// family): their ga state lines and window counts double as their G-A
+// watch to the crisp take's eight hologram families (holo_families.h's
+// kHoloFamiliesTake, one "hologram" family): their ga state lines and
+// window counts double as their G-A
 // measurement, and G-D's pairs include them (depth-off, so on == off, like
 // the sprite's). Every line is prefixed
 // "hud layer census:" and names its gate:
@@ -38,7 +39,7 @@
 //
 // WHAT IT COSTS. Unarmed: one bool load per eye draw, beside the draw
 // census's own. Armed: the family tests are three hash compares, the
-// eleven-hash hologram scan and a shape prefilter per eye draw; the state
+// eight-hash hologram scan and a shape prefilter per eye draw; the state
 // reads, the cb0 staging copy,
 // the occlusion pair and the exposure/luma copies run for family and
 // tonemap draws only (tens a frame), the readbacks resolve a frame later

@@ -1,16 +1,25 @@
-// The hologram families' vertex-shader hashes, shared by the two modules
-// that must agree on what a hologram is: ui_depth.cpp's generic
-// hologram/icon depth pass (advanced.temporal_aa_hologram_depth -- the
-// contribution and element-depth re-issues, whose family list these seed)
-// and the crisp-HUD half of fix.ui_quality (ui_layer_math.h's
-// uiLayerFamilyFor, which names all eleven the ONE family kHoloGeneric on
-// the lit HDR target, Phase 3 of docs/cockpit-hud-layer-design-2026-09-27.md).
+// The hologram families' vertex-shader hashes. The two modules that must
+// agree on what a hologram is now give DIFFERENT answers, and both lists
+// live here:
+//   - ui_depth.cpp's generic hologram/icon depth pass
+//     (advanced.temporal_aa_hologram_depth -- the contribution and
+//     element-depth re-issues, whose family lists these seed) covers ALL
+//     ELEVEN: kHoloFamiliesBuiltIn's ten cockpit families plus
+//     kHoloWorldMarkers, radius-clipping the cockpit ones.
+//   - the crisp-HUD half of fix.ui_quality (ui_layer_math.h's
+//     uiLayerFamilyFor, Phase 3 of docs/cockpit-hud-layer-design-2026-09-27.md)
+//     admits ONLY kHoloFamiliesTake's eight proven-safe families, through
+//     uiHoloGenericHash below, naming them the ONE family kHoloGeneric on
+//     the lit HDR target.
+// The take's three refusals are documented with the review's citations
+// below (reviews/crisp-hud-phase3-review-2026-09-28.md, findings R1/R2).
 //
-// They lived file-local in ui_depth.cpp until the take needed the SAME
-// list -- a second spelling of the eleven would have let the take and the
-// depth pass drift apart about what a hologram is. Moved, not copied, in
-// draw_state_describe.h's pattern: ui_depth.cpp includes this header, and
-// the per-family commentary below is its own, moved with the constants.
+// They lived file-local in ui_depth.cpp until the take needed the same
+// names -- spelling both lists here, beside each other, is what keeps the
+// take and the depth pass from drifting apart silently about what a
+// hologram is. Moved, not copied, in draw_state_describe.h's pattern:
+// ui_depth.cpp includes this header, and the per-family commentary below is
+// its own, moved with the constants.
 #pragma once
 
 #include <cstdint>
@@ -66,19 +75,53 @@ constexpr uint32_t kHoloWorldMarkerCount = static_cast<uint32_t>(sizeof(kHoloWor
 // stars behind it. The depth pass refuses it even when named in
 // advanced.temporal_aa_hologram_families (holoBuildFamilyList in
 // ui_depth.cpp), and the crisp take refuses it the same way: it is not one
-// of the eleven uiHoloGenericHash matches, so a canopy draw names no family
-// and stays stock.
+// of the take's eight uiHoloGenericHash matches, so a canopy draw names no
+// family and stays stock.
 constexpr uint64_t kHoloCanopy = 0x8C091FFD08644E02ull;
 
-// The crisp take's whole hologram set: the ten cockpit families plus the
-// world marker -- the hologram pass's eleven. (kHoloPanel is NOT one of
-// them: the take has named it kHolo since Phase 1.) The take has no
-// cockpit-radius concept and needs none: the world marker is covered
-// wherever it draws, exactly as the depth pass covers it.
+// ---------------------------------------------------------------------
+// THE CRISP TAKE's list. The take (ui_layer_math.h's uiLayerFamilyFor,
+// through uiHoloGenericHash below) admits ONLY these eight -- the radar's
+// star icon core, its two stalks, and the five contact markers: families
+// whose PSes sample only material/surface textures through interpolated
+// UVs. The depth pass's three other families are REFUSED from the take,
+// each with the review's citation:
+//
+// REFUSED: the target hologram's sphere (kHoloTargetSphere, R1 of
+// reviews/crisp-hud-phase3-review-2026-09-28.md). Its two
+// premultiplied-quad PSes (EA02FAC2BD6C643C, E95634B0F61D218F)
+// integer-Load scene depth at the SV_Position pixel (ftoi + ld ... t1);
+// the take's viewport remap to the larger HUD layer breaks that addressing
+// (WARP-reproduced: 84% of the controlled image gone at the flight's 2.5x
+// layer scale). Its depth-pass coverage is UNAFFECTED -- only the take
+// refuses it; it stays stock (correct, AA-swimmy) until an equivalent
+// layer-sized depth input exists.
+//
+// REFUSED: the sun's corona family (kHoloCoronaFamily, R2 of the same
+// review). One shader pair paints BOTH the radar icon's glow AND the real
+// sun's corona -- the captured far-star draw's VS b1[125].yzw carries
+// kilometer-scale center and radius. The depth pass radius-clips exactly
+// this ambiguity (that test exists to keep the real sun out:
+// docs/hologram-depth-2026-09-24.md:536-537); the take has no radius
+// concept, and a VS/PS hash alone cannot tell the two uses apart. Until
+// per-draw range discrimination exists the take refuses the family, so the
+// sun can never be taken as HUD; the radar glow's crisp take is the
+// accepted casualty.
+//
+// REFUSED: the world-marker reticle (kHoloWorldMarkerReticle, same
+// review). No evidence either way on screen-space resource reads -- same
+// refusal shape as the sphere: until proven, it stays stock.
+constexpr uint64_t kHoloFamiliesTake[8] = {kHoloIconCore,   kHoloIconStalkA,
+                                           kHoloIconStalkB, kHoloContactA,
+                                           kHoloContactB,   kHoloContactC,
+                                           kHoloContactD,   kHoloContactE};
+
+// The crisp take's whole hologram set: the eight families above.
+// (kHoloPanel is NOT one of them: the take has named it kHolo since
+// Phase 1.) uiLayerFamilyFor names all eight the ONE family kHoloGeneric
+// on the lit HDR target -- one "hologram" row in the 30 s table.
 inline bool uiHoloGenericHash(uint64_t vs) {
-    for (uint64_t h : kHoloFamiliesBuiltIn)
-        if (h == vs) return true;
-    for (uint64_t h : kHoloWorldMarkers)
+    for (uint64_t h : kHoloFamiliesTake)
         if (h == vs) return true;
     return false;
 }

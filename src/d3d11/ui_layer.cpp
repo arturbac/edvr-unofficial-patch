@@ -67,9 +67,9 @@ using Ptr = Microsoft::WRL::ComPtr<T>;
 
 constexpr uint64_t kTotalsMs = 30000;
 constexpr uint32_t kWatchPerFrame = 64;
-// First-seen lines are one per (family, decision, vs, ps): Phase 3's eleven
-// hologram hashes share the one kHoloGeneric row, so each needs its own
-// entry here (48 barely covered the named families and their refusals).
+// First-seen lines are one per (family, decision, vs, ps): Phase 3's eight
+// take hologram hashes share the one kHoloGeneric row, so each needs its
+// own entry here (48 barely covered the named families and their refusals).
 constexpr uint32_t kMaxFamilyLines = 80;
 constexpr uint32_t kMaxAfterLines = 16;
 // The crisp-HUD missing-consumer deadline (review R1): this many consecutive
@@ -2175,8 +2175,8 @@ void uiLayerConfigure(Config& cfg) {
               "stays in the picture for the temporal pass (the game's Status.json says on foot, a "
               "second or so late; the screen's own depth, busy with the world, says so within "
               "two frames); the cockpit's holo panels, the flight HUD, the target sprite and the "
-              "holograms (the radar contacts, the ship and target holograms, the icons -- the "
-              "glass canopy stays) are drawn into a per-eye HDR layer at the "
+              "holograms (the radar's icons and contacts -- the glass canopy stays) are drawn "
+              "into a per-eye HDR layer at the "
               "same size and tonemapped over the finished eye by the game's own tonemap draw "
               "re-issued with the layer as its HDR source (their bloom halo goes with the "
               "upscaled frame; the \"crisp hud\" lines report it). Draws the layer takes get no "
@@ -2234,8 +2234,8 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     f.eyeTarget = kind != 0;
     f.ldrView = kind == 2;
     // The HDR HUD take (Phases 1-3: the cockpit HUD families -- the holo
-    // panels, the flight HUD, the target sprite, and the hologram pass's
-    // eleven as kHoloGeneric): a draw of one into the lit HDR pre-tonemap
+    // panels, the flight HUD, the target sprite, and the crisp take's eight
+    // hologram families as kHoloGeneric): a draw of one into the lit HDR pre-tonemap
     // eye target goes to the eye's HDR HUD layer instead of the kHdrTarget
     // refusal. The take arms with the layer (fix.ui_quality), and every
     // other refusal applies to it exactly as to the LDR take.
@@ -2264,6 +2264,13 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
             f.targetMatchesEye = !sw || !sh || (sw == g_tc.info.a && sh == g_tc.info.b);
             f.late = uiLayerLateFor(g_eye[f.eye].door, seq);
             f.armed = uiLayerArmed(g_eye[f.eye].door, seq);
+            // The crisp take's publication deadline (review crisp-hud-phase3-
+            // 2026-09-28, the missing ship/target mesh holograms): the game's
+            // tonemap ordering varies frame to frame, and content taken after
+            // the eye's re-issue ran can never publish -- the layer clears next
+            // frame and the counters count the draw, not its pixels. Refuse it
+            // to stock instead; the 30 s line names these frames.
+            f.lateTone = f.crispHdr && g_eye[f.eye].hdrToneSeq == seq;
         }
     }
     // The cheap facts first; the state reads only when none of them refused.

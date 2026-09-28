@@ -476,7 +476,20 @@ void testGate() {
     check(hdrWith(UiLayerFamily::kSprite, [](UiLayerDrawFacts& g) { g.blend = UiBlendShape::kMultiply; }) ==
               UiLayerDecision::kBlendRefused,
           "...and for the target sprite (R5, per family)");
-    // Phase 3: the hologram pass's eleven, the one kHoloGeneric family. Their
+    // The crisp publication deadline (review crisp-hud-phase3-2026-09-28, the
+    // missing ship/target mesh holograms): content after the eye's tonemap
+    // re-issue can never publish -- the layer clears next frame. Refuse to
+    // stock; the fact is crisp-scoped, so an LDR draw with it set is unaffected.
+    check(hdrWith(UiLayerFamily::kHolo,
+                  [](UiLayerDrawFacts& g) {
+                      g.blend = UiBlendShape::kPremulOver;
+                      g.lateTone = true;
+                  }) == UiLayerDecision::kToneLate,
+          "a crisp draw after the eye's tonemap re-issue refuses to stock: it cannot publish");
+    check(with([](UiLayerDrawFacts& g) { g.lateTone = true; }) == UiLayerDecision::kRedirect,
+          "the tone-late fact is crisp-scoped: an LDR draw with it set is still taken");
+    // Phase 3: the crisp take's eight hologram families, the one kHoloGeneric
+    // family. Their
     // states are NOT flight-measured; the documented shape is an additive
     // glow with depth off (ui_depth.cpp's generic hologram coverage), and the
     // refusal net owns anything unconvertible, with the reason named.
@@ -1041,23 +1054,39 @@ void testFamilyRule() {
           "...the flight HUD is named, a direct shader");
     f.vs = kUiVsSprite;
     check(uiLayerFamilyFor(f) == UiLayerFamily::kSprite, "...and the target sprite");
-    // Phase 3: the hologram pass's eleven (holo_families.h, the shared list)
-    // each name the one kHoloGeneric family on the lit HDR target; the canopy
-    // is not one of them and names nothing, so it stays stock.
-    const uint64_t kElevenVs[] = {kHoloIconCore,  kHoloCoronaFamily, kHoloIconStalkA,
-                                  kHoloIconStalkB, kHoloTargetSphere, kHoloContactA,
-                                  kHoloContactB,  kHoloContactC,     kHoloContactD,
-                                  kHoloContactE,  kHoloWorldMarkerReticle};
-    for (uint64_t h : kElevenVs) {
+    // Phase 3, corrected by the phase-3 review (R1/R2): the crisp take
+    // admits ONLY the eight proven-safe radar/icon families
+    // (holo_families.h's kHoloFamiliesTake); each names the one kHoloGeneric
+    // family on the lit HDR target. The depth pass's three other families
+    // name nothing here and stay stock: the target sphere (its PSes
+    // integer-Load scene depth at SV_Position pixel coordinates, which the
+    // layer's larger viewport breaks -- R1), the corona family (one shader
+    // pair paints both the radar glow and the real sun's corona -- R2), and
+    // the world-marker reticle (no evidence either way on screen-space
+    // reads). The canopy is not one of them either.
+    const uint64_t kTakeVs[] = {kHoloIconCore,   kHoloIconStalkA, kHoloIconStalkB,
+                                kHoloContactA,   kHoloContactB,   kHoloContactC,
+                                kHoloContactD,   kHoloContactE};
+    for (uint64_t h : kTakeVs) {
         f.vs = h;
         char what[128];
         std::snprintf(what, sizeof(what), "vs %016llX names the hologram family on the HDR target",
                       static_cast<unsigned long long>(h));
         check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kHoloGeneric && why == UiFamilyWhy::kDirect, what);
     }
+    const uint64_t kRefusedVs[] = {kHoloTargetSphere, kHoloCoronaFamily, kHoloWorldMarkerReticle};
+    for (uint64_t h : kRefusedVs) {
+        f.vs = h;
+        char what[128];
+        std::snprintf(what, sizeof(what),
+                      "vs %016llX names no crisp family: the take refuses it, it stays stock",
+                      static_cast<unsigned long long>(h));
+        check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kNone && why == UiFamilyWhy::kNotPostTonemap,
+              what);
+    }
     f.vs = kHoloCanopy;
     check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kNone && why == UiFamilyWhy::kNotPostTonemap,
-          "the canopy is refused: not one of the eleven, it sits in front of the whole sky");
+          "the canopy is refused: not one of the take's eight, it sits in front of the whole sky");
     f.targetKind = 2;
     f.vs = kUiVsPanel;
     f.ps = 0x9107E72CB016CC02ull;

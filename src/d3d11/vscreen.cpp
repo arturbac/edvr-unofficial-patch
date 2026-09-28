@@ -3770,7 +3770,7 @@ __declspec(noinline) void crispHudTonemapReissue(ID3D11DeviceContext* self, char
 // surfaces' content, not the eye's UI. Into an eye target that is not 8-bit
 // UNORM (the lit HDR target -- thousands of scene draws a frame) only the
 // hash compares run, to name the cockpit families the crisp take takes (the
-// three named shaders and the hologram pass's eleven, one family); the
+// three named shaders and the take's eight holograms, one family); the
 // full rules run for the post-tonemap target alone, where a frame has a few
 // dozen draws. The 2D screen's composite is recognised exactly as the panel
 // distance and the curved screen recognise it (srv0IsPanelSized); the rest
@@ -4034,7 +4034,8 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // target, so they need nothing from the family reissue above.
     // uiDepthWantsReissue() answers for that reissue alone; holoOn is this
     // pass's own classification. !layered covers the crisp take: a taken
-    // hologram (the pass's eleven are the take's kHoloGeneric) is not in the
+    // hologram (eight of the pass's eleven are the take's kHoloGeneric) is
+    // not in the
     // eye's colour any more, so its contribution and element-depth re-issues
     // skip it like any taken draw -- the pass's resolve then declines the
     // eye-frame as "nothing listed", which its census line counts (expected

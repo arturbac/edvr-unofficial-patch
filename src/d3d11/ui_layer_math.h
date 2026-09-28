@@ -42,7 +42,7 @@
 #include <cstdint>
 #include <cstring>
 
-#include "holo_families.h"  // the hologram pass's eleven VS hashes: kHoloGeneric's match list
+#include "holo_families.h"  // the crisp take's eight hologram VS hashes: kHoloGeneric's match list
 
 namespace edvr {
 
@@ -562,11 +562,13 @@ enum class UiLayerFamily : uint8_t {
     kHolo,       // cockpit holo panels (vs 81216C77F90DEDD6)
     kFlightHud,  // flight HUD (vs B7790CBFC6554097)
     kSprite,     // target-time sprite (vs E508648660A352B2)
-    kHoloGeneric,  // the hologram pass's eleven (holo_families.h: the radar
-                   // contacts, the ship and target holograms, the icons, and
-                   // the world-marker reticle -- the canopy is not one), Phase
-                   // 3 of the crisp-HUD design. ONE family for eleven hashes:
-                   // the 30 s table prints one row, and the per-draw
+    kHoloGeneric,  // the crisp take's eight (holo_families.h kHoloFamiliesTake:
+                   // the radar's icon core, its two stalks, and the five
+                   // contact markers -- the canopy is not one, and neither
+                   // are the three the phase-3 review refused: the target
+                   // sphere, the corona family, the world-marker reticle),
+                   // Phase 3 of the crisp-HUD design. ONE family for eight
+                   // hashes: the 30 s table prints one row, and the per-draw
                    // first-seen lines name the VS hash (ui_layer.cpp's
                    // noteFamily keys on (family, decision, vs, ps)).
     kAfterUi,    // not the interface at all: an owner draw that WRITES an eye
@@ -707,13 +709,17 @@ inline UiLayerFamily uiLayerFamilyFor(const UiFamilyFacts& f, UiFamilyWhy* why =
         w = UiFamilyWhy::kNotEyeTarget;
     } else if (f.targetKind == 1) {
         w = UiFamilyWhy::kNotPostTonemap;
-        // The hologram pass's eleven join the three named families (Phase 3):
-        // one family, matched by VS hash against holo_families.h's shared
-        // list. The canopy is deliberately NOT on that list -- it sits in
-        // front of the whole sky, and covering it would smear the stars
-        // behind it, the depth pass's own reasoning -- so a canopy draw
-        // matches nothing here and stays stock, exactly as the pass refuses
-        // it.
+        // The crisp take's eight hologram families join the three named
+        // families (Phase 3): one family, matched by VS hash against
+        // holo_families.h's take-only list (kHoloFamiliesTake). The canopy
+        // is deliberately NOT on that list -- it sits in front of the whole
+        // sky, and covering it would smear the stars behind it, the depth
+        // pass's own reasoning -- and neither are the three the phase-3
+        // review refused (the target sphere's pixel-coordinate depth load,
+        // the corona family's shared world/cockpit shader pair, the
+        // world-marker reticle's unproven reads): a draw of one matches
+        // nothing here and stays stock, exactly as the pass's refusals keep
+        // their own scene rendering.
         out = f.vs == kUiVsHolo        ? UiLayerFamily::kHolo
               : f.vs == kUiVsFlightHud ? UiLayerFamily::kFlightHud
               : f.vs == kUiVsSprite    ? UiLayerFamily::kSprite
@@ -885,6 +891,9 @@ enum class UiLayerDecision : uint8_t {
     kTargetSize,     // the target is not the size of the region the game
                      // submits for that eye (the map is target-to-layer)
     kLate,           // its eye's composite already ran this frame (gate G1)
+    kToneLate,       // crisp: its eye's tonemap re-issue already ran this frame --
+                     // content taken now can never publish (the layer clears next
+                     // frame); the draw stays in the game's frame, as stock
     kNotArmed,       // no door frame for this eye last frame (first frames,
                      // key just on, pass not running)
     kMrt,            // more than one render target bound, or PS UAVs
@@ -914,6 +923,8 @@ inline const char* uiLayerDecisionName(UiLayerDecision d) {
         case UiLayerDecision::kTargetSize:
             return "its target is not the size of the eye the game submits";
         case UiLayerDecision::kLate: return "arrived after its eye's composite (gate G1)";
+        case UiLayerDecision::kToneLate:
+            return "arrived after its eye's tonemap re-issue (cannot publish this frame)";
         case UiLayerDecision::kNotArmed: return "layer not armed";
         case UiLayerDecision::kMrt: return "more than one render target, or pixel-shader UAVs";
         case UiLayerDecision::kDepthStencilTest:
@@ -939,6 +950,11 @@ struct UiLayerDrawFacts {
     int eye = -1;                 // 0 left, 1 right, -1 unknown
     bool targetMatchesEye = true; // the target is the submitted region's size
     bool late = false;            // its eye's door already ran this frame
+    bool lateTone = false;        // crisp: its eye's tonemap re-issue already ran this frame
+                                  // (content taken now can never publish -- the game's own
+                                  // tonemap ordering varies frame to frame, and the layer's
+                                  // clear next frame discards it: the missing ship/target
+                                  // mesh holograms, review crisp-hud-phase3-2026-09-28)
     bool armed = false;           // the door and the pass ran for it last frame
     bool mrt = false;            // a second render target, or PS UAVs, bound
     UiDsEffect ds;                // what it does with the bound depth target
@@ -948,7 +964,8 @@ struct UiLayerDrawFacts {
     bool layerReady = true;       // the eye's layer exists at the wanted size
     // The HDR HUD take is armed (with fix.ui_quality) and this is one of the
     // cockpit HUD families (the holo panels, the flight HUD, the target
-    // sprite, and the hologram pass's eleven as kHoloGeneric) drawn into the
+    // sprite, and the crisp take's eight hologram families as kHoloGeneric)
+    // drawn into the
     // lit HDR (pre-tonemap) eye target: the draw goes to the HDR layer, and
     // the tonemap re-issue brings it back over the finished eye. Every other
     // test (eye known, armed, not late, no MRT/UAV, the seeded depth-stencil,
@@ -971,6 +988,7 @@ inline UiLayerDecision uiLayerDecide(const UiLayerDrawFacts& f) {
     if (f.eye < 0 || f.eye > 1) return UiLayerDecision::kNoEye;
     if (!f.targetMatchesEye) return UiLayerDecision::kTargetSize;
     if (f.late) return UiLayerDecision::kLate;
+    if (f.crispHdr && f.lateTone) return UiLayerDecision::kToneLate;
     if (!f.armed) return UiLayerDecision::kNotArmed;
     if (f.mrt) return UiLayerDecision::kMrt;
     if (f.ds.tests() && !f.dsReproducible) return UiLayerDecision::kDepthStencilTest;

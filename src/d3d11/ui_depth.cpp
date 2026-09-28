@@ -5,7 +5,7 @@
 #include "gpu_interval.h"
 #include "ui_content.h"
 #include "holo_material.h"
-#include "holo_families.h"  // the eleven hologram family hashes and the canopy: shared with the crisp take's family rule
+#include "holo_families.h"  // the eleven hologram family hashes and the canopy: the depth pass's lists; the crisp take keeps its own eight there (kHoloFamiliesTake)
 
 #include <windows.h>
 
@@ -65,9 +65,11 @@ constexpr uint64_t kHoloPanel = 0x81216C77F90DEDD6ull;
 // The generic hologram/icon depth pass's other built-in families (the radar's
 // star icon core, its two stalks, the corona family, the target hologram's
 // sphere, the five contact markers), the world-marker reticle, and the canopy
-// it refuses now live in holo_families.h -- shared with the crisp take's
-// family rule (ui_layer_math.h's kHoloGeneric), so the take and this pass
-// read ONE list. Their per-family commentary moved with them.
+// it refuses now live in holo_families.h. They are the DEPTH pass's lists;
+// the crisp take reads the same header but admits only its own eight
+// (kHoloFamiliesTake), so a family the take refuses keeps this pass's
+// coverage untouched. The per-family commentary moved to the header with
+// the constants.
 // The two interface composites drawn through the interface projection: the
 // menu's and the loader's panel (vs A888D51024D9798E, ps 9107E72CB016CC02)
 // and the loader's curved screen (vs 4EF6DDB075A927FA, ps 85565E9261812E2F).
@@ -1298,9 +1300,10 @@ SmokeDepth* smokeDepthFor(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_
 // the eye's finished colour is in hand) is a real share of it, before the
 // temporal pass reads that copy (uiDepthTemporalDepth).
 // The built-in cockpit list (ten families), the world-marker list, and the
-// canopy the pass refuses are holo_families.h's -- one list, shared with the
-// crisp take's family rule; their commentary moved there with them. The
-// world-marker list stays fixed, never extended by
+// canopy the pass refuses are holo_families.h's -- the depth pass's eleven,
+// radius-clip and all. The crisp take's family rule reads the same header
+// but its own shorter list (kHoloFamiliesTake, eight); these eleven are
+// this pass's alone. The world-marker list stays fixed, never extended by
 // advanced.temporal_aa_hologram_families -- see holoWorldMarkerList below.
 uint64_t g_holoFamilies[kMaxHashes];
 uint32_t g_holoFamilyCount = 0;

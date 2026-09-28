@@ -35,9 +35,12 @@
 // the same size (the crisp-HUD half of fix.ui_quality,
 // docs/cockpit-hud-layer-design-2026-09-27.md): the cockpit's HDR HUD
 // families -- the holo panels, the flight HUD, the target sprite, and the
-// hologram pass's eleven (the radar contacts, the ship and target
-// holograms, the icons, the world-marker reticle; NOT the glass canopy,
-// which sits in front of the whole sky and stays) -- which the game draws
+// crisp take's eight hologram families (the radar's icon core, its two
+// stalks, and the five contact markers; NOT the glass canopy, the target
+// sphere, the corona family or the world-marker reticle -- the canopy sits
+// in front of the whole sky and the other three are refused by the phase-3
+// review, reviews/crisp-hud-phase3-review-2026-09-28.md) -- which the game
+// draws
 // into the lit HDR target before exposure and the tonemap.
 // They are tonemapped into the 8-bit layer by the game's own tonemap draw,
 // re-issued once per eye with the layer as its HDR source (the
