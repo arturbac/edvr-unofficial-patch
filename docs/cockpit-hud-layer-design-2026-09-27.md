@@ -562,3 +562,33 @@ Built green, installed to Steam (v0.18.0-rc.2-58-g43ab5364). VERIFY with
 a docked menu open: the menu over the panels and sharp; the log's family
 line should show "decided as the menu panel: N redirected" with the tinted
 PS named, and the crisp hud line clean.
+
+## The main-menu regression, 2026-09-27 evening (84690880)
+
+Sean after the morning install: "Main menu is still being drawn before
+the AA pass" -- and reported all UI menus had taken the layer before.
+Tonight's log (43ab5364): every menu draw left with "eye unknown", 0
+redirected in every window. The diff against rc.2 is additive in the
+layer and nil in ui_depth, and the game has been build 332841 since
+2026-09-19, so the mechanism was in the branch: the crisp tonemap
+admission asked uiDepthEyeOfTarget for the tonemap's LDR output every
+frame, and that ask REGISTERS in ui_depth's per-frame eye table (first
+target of a shape = left, second = right, the third gets "no eye"). The
+main menu runs at 2000x1934 with the menu composite in its own buffer, so
+the tonemap's two outputs held the shape's two slots before the menu's
+target ever asked -- "eye unknown" on every menu draw, forever. In-flight
+the composite writes the tonemap's own output, which is why the cockpit
+never noticed.
+
+The fix: the admission names the eye from the admitted draw's own HDR
+source instead -- it IS an eye's HDR target and the holo take records
+which this frame, exact, no table. The census's two observer lookups get
+uiDepthEyeOfTargetReadOnly (never registers); the layer's decide keeps
+the registering form, as the classifier would. The tinted/cheap pair
+admission from the morning stands. Built green, on Steam as
+v0.18.0-rc.2-60-g84690880.
+
+Verify (one launch): the main menu sharp (taken, not before the AA pass)
+-- the log's "left in the game's frame" line should no longer list menu
+panel with "eye unknown"; then docked, a menu open over the panels: menus
+over the panels, both sharp; the crisp hud line clean.
