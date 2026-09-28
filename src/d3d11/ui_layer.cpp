@@ -427,7 +427,14 @@ struct RouteSlot {
     int eye = 0;
     uint64_t seq = 0;
 };
-constexpr uint32_t kRouteRing = 64;
+constexpr uint32_t kRouteRing = 512;  // live timer slots; one interval each. 64 covered the
+                                      // pre-crisp route (~8/eye-frame); the crisp take adds a
+                                      // seed and a write-back per HUD draw-group (tens a frame
+                                      // at 0.5-quality), and a full ring silently drops whole
+                                      // eye-frames' timings (routeBegin's -1, "no free timer")
+                                      // -- the phase-3 review saw 60,895 of them with the
+                                      // tonemap/coverage timings absent. 512 covers >200
+                                      // intervals a frame with margin.
 RouteSlot g_route[kRouteRing];
 uint32_t g_routeHead = 0, g_routeTail = 0;  // monotonic; a slot is index % kRouteRing
 uint64_t g_routeLatestSeq = 0;              // the newest frame a stage began in
@@ -435,17 +442,31 @@ constexpr size_t kStages = static_cast<size_t>(UiRouteStage::kCount);
 constexpr size_t kRouteTotal = kStages;     // the stats slot of the whole route's sum
 UiRouteSum g_stageSum[kStages][2];
 UiRouteSum g_routeSum[2];
-// One window's per-eye-frame sums, by stage and for the route.
+// One window's per-eye-frame sums, by stage and for the route. Reservoir-
+// sampled (routeSample): the percentiles stay unbiased over the whole 30 s
+// window at ANY interval rate -- the old first-N cap silently kept only the
+// window's first seconds once the rate outgrew it (the phase-3 review
+// measured 60,895 intervals with no free timer and absent tonemap/coverage
+// timings at 125%).
 constexpr uint32_t kRouteSamples = 8192;    // 30 s of both eyes at 136 Hz
 struct RouteStats {
     float v[kRouteSamples];
     uint32_t n = 0;
+    uint64_t seen = 0;     // reservoir R: replace slot j with probability k/seen
+    uint32_t rng = 0x9E3779B9u;  // a per-stat LCG; deterministic is fine for stats
 };
 RouteStats g_routeStats[kStages + 1];
 
 void routeSample(size_t stat, double ms) {
     RouteStats& r = g_routeStats[stat];
-    if (r.n < kRouteSamples) r.v[r.n++] = static_cast<float>(ms);
+    ++r.seen;
+    if (r.n < kRouteSamples) {
+        r.v[r.n++] = static_cast<float>(ms);
+        return;
+    }
+    r.rng = r.rng * 1664525u + 1013904223u;
+    const uint64_t j = (static_cast<uint64_t>(r.rng) * r.seen) >> 32;  // uniform in [0, seen)
+    if (j < kRouteSamples) r.v[j] = static_cast<float>(ms);
 }
 
 // Opens a timer for one stage of one eye-frame; -1 when none could be had
@@ -3367,7 +3388,10 @@ void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     const bool anything = g_win.redirected || g_win.composites || g_win.compositeRefused;
     if (g_target > 0.0f || anything) logTotals(static_cast<double>(now - g_winStartMs) / 1000.0);
     g_win = Window{};
-    for (RouteStats& r : g_routeStats) r.n = 0;
+    for (RouteStats& r : g_routeStats) {
+        r.n = 0;
+        r.seen = 0;  // the reservoir restarts with the window
+    }
     g_winStartMs = now;
 }
 
