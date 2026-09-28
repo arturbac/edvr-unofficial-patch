@@ -2,10 +2,10 @@
 
 ## Status
 
-- **State:** installed `45da6ae3` lacks NGX/FFX; exclude `164641` fallback.
-  Rendering source unchanged; good flights `155419`/`160518` use
-  `--expect-build 8d60b453`. Corrected SDK full gate passed; promotion next.
-  Main separate, SteamVR/OpenXR target.
+- **State:** verified Frontier `be70af2a`; NGX warmed both eyes (`170036`).
+  Rendering source unchanged. New flight: `--expect-build be70af2a`; prior good
+  `155419`/`160518`: `8d60b453`. Exclude `45da6ae3`/`164641` fallback. Main
+  separate; SteamVR/OpenXR target.
 - **Finding:** guarded preservation removes three stale reseeds/eye: four→one
   seed, zero stale/failures. Parent seed median .623→.156 ms/eye; machinery
   .963→.485. Current and earlier Pimax flights differ in dimensions/runtime, so
@@ -23,10 +23,10 @@
   runtime `160131`/`6AA6D378`; user reports fpsVR 8.9–9.6 ms.
   Dimensions/preset/DLSS hash match current, but legacy Valve OpenVR and
   current native OpenXR over SteamVR differ. No exact regression conclusion.
-- **Next:** receipt-guarded corrected promotion/Frontier verify, confirm DLSS
-  engagement, then bounded `tools/cpu_profile.py --gpu` file-mode CPU
-  stacks/native markers/DxgKrnl. Prior capture stopped ARMED, no flight ETL.
-  Provider presence is not GPU busy time; no rendering fix without evidence.
+- **Next:** armed `tools/cpu_profile.py --gpu`, F9 then 180 s early/steady
+  flight; correlate CPU stacks/native markers/DxgKrnl. Prior capture cancelled
+  before flight ETL. Provider presence is not GPU busy time; no rendering fix
+  without evidence.
 - **Environment:** latest RTX 5090 flight uses SteamVR/OpenXR, 2016×1948 input
   → 4032×3896 output/eye, DLSS Performance/preset K, UI 125 5040×4870. Earlier
   Pimax Crystal Super/Pimax OpenXR 90 Hz evidence used
@@ -233,9 +233,12 @@ discriminator.
 Auto-detection omitted NGX/FFX; cause unproven. Good `8d60b453` had NGX
 310.9.1/FFX 3.1.2. Explicit verified `EDVR_NGX_SDK`/`EDVR_FFX_DX11` full gate
 passed (`build/cpu-gpu-capture-sdk-full.log`, UI 2,899/FSR 63, DLSS runtime
-carried); receipt requested/resolved paths correct. Corrected promotion HEAD
-next. Combined smoke: 60 CPU frames/zero lost, Dxg 567919/D3D11 11153/DXGI 4076
-events, coverage only. Stopped ARMED; no flight ETL.
+carried); receipt requested/resolved paths correct. Promotion passed
+(`build/cpu-gpu-capture-sdk-promotion.log`); Frontier `be70af2a` verified,
+INI/DLSS hashes unchanged. Gfx `170036`: NGX initialized 880 ms, warmed eyes
+93/28 ms. Both combined smokes: 60 CPU frames/zero lost, all GPU providers
+observed, coverage only. Original capture cancelled before flight ETL;
+corrected capture armed.
 
 ## Exclusions and next flight
 
