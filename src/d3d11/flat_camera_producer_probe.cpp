@@ -99,16 +99,15 @@ bool prepareRelay(void* trampoline, void*) noexcept {
 
 void disarmWatch(const char* reason) {
     if (!g_probe.armed) return;
-    CONTEXT ctx{};
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (GetThreadContext(GetCurrentThread(), &ctx)) {
-        const uint32_t low = static_cast<uint32_t>(ctx.Dr7 & 0xFFFFFFFFull);
-        const uint32_t high = static_cast<uint32_t>((ctx.Dr7 >> 32) & 0xFFFFFFFFull);
-        ctx.Dr7 = (static_cast<DWORD64>(high) << 32) | prw::disarmSlot0Dr7(low);
-        SetThreadContext(GetCurrentThread(), &ctx);
-    }
+    // Only the flag flips here. The hardware slot is cleared by the VEH in
+    // the faulting thread's own exception context: SetThreadContext from
+    // this (frame) thread would touch the wrong thread's debug registers,
+    // and from inside the handler it would be overwritten by the context
+    // restore on continue -- either way the orphaned watch keeps raising
+    // single-steps nobody claims, and that takes the process down.
     g_probe.armed = false;
-    Log::get().note("flat camera producer: camera-row write watch disarmed (%s; %u hit(s) recorded)",
+    Log::get().note("flat camera producer: camera-row write watch disarmed (%s; %u hit(s) recorded); "
+                    "the hardware slot clears on the next watched write",
                     reason, g_probe.hits);
 }
 
@@ -132,22 +131,44 @@ void armWatch(const void* block, uint64_t frame) {
 
 LONG CALLBACK producerWatchVeh(EXCEPTION_POINTERS* ep) {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
-    if (!(ep->ContextRecord->Dr6 & 1) || !g_probe.armed) return EXCEPTION_CONTINUE_SEARCH;
-    ++g_probe.hits;
-    if (g_probe.hits <= kMaxHits) {
-        char rip[96]; moduleBrief(reinterpret_cast<void*>(ep->ContextRecord->Rip), rip, sizeof(rip));
-        void* frames[8] = {};
-        const USHORT n = CaptureStackBackTrace(0, 8, frames, nullptr);
-        char line[768]{}; size_t used = std::snprintf(line, sizeof(line), "%s", rip);
-        for (USHORT i = 0; i < n && used < sizeof(line) - 96; ++i) {
-            if (!isExecutableAddress(frames[i])) continue;
-            char brief[96]; moduleBrief(frames[i], brief, sizeof(brief));
-            used += static_cast<size_t>(std::snprintf(line + used, sizeof(line) - used, " <- %s", brief));
+    if (!(ep->ContextRecord->Dr6 & 1)) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t watched = g_probe.watchAddress.load(std::memory_order_acquire);
+    if (!watched || static_cast<uintptr_t>(ep->ContextRecord->Dr0) != watched) return EXCEPTION_CONTINUE_SEARCH;
+    // This single-step is ours, and it must never leave unhandled -- not
+    // even after a stand-down, because the hardware slot stays set until it
+    // is cleared right here in the context record the kernel restores on
+    // continue. Clearing it anywhere else (SetThreadContext) is lost.
+    // Dr6 is sticky: clear it first, as pose_reader_watch does, or the
+    // resumed thread re-traps immediately.
+    ep->ContextRecord->Dr6 = 0;
+    if (g_probe.armed) {
+        ++g_probe.hits;
+        if (g_probe.hits <= kMaxHits) {
+            char rip[96]; moduleBrief(reinterpret_cast<void*>(ep->ContextRecord->Rip), rip, sizeof(rip));
+            void* frames[8] = {};
+            const USHORT n = CaptureStackBackTrace(0, 8, frames, nullptr);
+            char line[768]{}; size_t used = std::snprintf(line, sizeof(line), "%s", rip);
+            for (USHORT i = 0; i < n && used < sizeof(line) - 96; ++i) {
+                if (!isExecutableAddress(frames[i])) continue;
+                char brief[96]; moduleBrief(frames[i], brief, sizeof(brief));
+                used += static_cast<size_t>(std::snprintf(line + used, sizeof(line) - used, " <- %s", brief));
+            }
+            Log::get().note("flat camera producer: camera-row writer #%u: %s", g_probe.hits, line);
         }
-        Log::get().note("flat camera producer: camera-row writer #%u: %s", g_probe.hits, line);
+        if (g_probe.hits >= kMaxHits) {
+            g_probe.armed = false;
+            Log::get().note("flat camera producer: camera-row write watch disarmed "
+                            "(the writer budget is full; %u hit(s) recorded)", g_probe.hits);
+        }
+    }
+    if (!g_probe.armed) {
+        const uint32_t low = static_cast<uint32_t>(ep->ContextRecord->Dr7 & 0xFFFFFFFFull);
+        const uint32_t high = static_cast<uint32_t>((ep->ContextRecord->Dr7 >> 32) & 0xFFFFFFFFull);
+        ep->ContextRecord->Dr7 = (static_cast<DWORD64>(high) << 32) | prw::disarmSlot0Dr7(low);
+        ep->ContextRecord->Dr0 = 0;
+        g_probe.watchAddress.store(0, std::memory_order_release);
     }
     ep->ContextRecord->EFlags |= 0x10000; // RF: do not re-trigger on this instruction
-    if (g_probe.hits >= kMaxHits) disarmWatch("the writer budget is full");
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
