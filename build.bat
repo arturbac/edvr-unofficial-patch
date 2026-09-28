@@ -1047,6 +1047,17 @@ python "tools\flat_pixels.py" "%BUILD%\flat-pixel-fixture" --verify-fixture || e
 python "tools\flat_draw_pixels.py" "%BUILD%\flat-pixel-fixture" --verify-fixture || exit /b 1
 exit /b 0
 
+:rig_c2_derive_test
+echo [edvr] === c2_derive_test.exe ===
+if not exist "%OBJ%\c2derive" mkdir "%OBJ%\c2derive"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\c2derive\\" ^
+    /Fe"%BUILD%\c2_derive_test.exe" "tools\c2_derive_test\c2_derive_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: c2 derive test build failed & exit /b 1 )
+"%BUILD%\c2_derive_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_config_test
 echo [edvr] === config_test.exe ===
 REM The real parser over the real shipped edvr.ini. The file's own layout
