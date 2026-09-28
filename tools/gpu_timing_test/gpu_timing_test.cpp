@@ -96,7 +96,7 @@ struct Ops {
 static_assert(std::is_trivially_destructible<GpuTimer>::value,"no context/COM work during process exit");
 struct Fixture {
     Device& d; Ops ops;
-    std::array<GpuTimer,40> timers;
+    std::array<GpuTimer, DisjointClock::kLeases + 8> timers;
     GpuIntervals<2> sampler;
     explicit Fixture(Device& device):d(device){check(gpuTimingBind(d.dev.Get(),d.ctx.Get(),ops.callbacks()),"bind timing owner");}
     ~Fixture(){ops.abandoning=true;gpuTimingAbandon();sampler.reset();for(auto& t:timers)t.reset();}
@@ -185,11 +185,11 @@ void policyCases(Device& d,Runtime& runtime){
         check(f.sampler.begin(f.ctx()),"sampler retries after transient record pressure");f.sampler.end(f.ctx());f.finish();
     }
     {
-        Fixture f(d);for(unsigned i=0;i<32;++i)check(f.begin(i),"fill shared lease table");
+        Fixture f(d);for(unsigned i=0;i<DisjointClock::kLeases;++i)check(f.begin(i),"fill shared lease table");
         check(!f.sampler.begin(f.ctx()),"lease pressure skips sampler");
-        check(f.timers[31].end(f.ctx()),"last borrower ends");f.timers[31].reset(f.ctx());
+        check(f.timers[DisjointClock::kLeases-1].end(f.ctx()),"last borrower ends");f.timers[DisjointClock::kLeases-1].reset(f.ctx());
         check(f.sampler.begin(f.ctx()),"sampler retries after lease release");f.sampler.end(f.ctx());
-        for(unsigned i=1;i<31;++i)check(f.timers[i].end(f.ctx()),"other borrowers end");check(f.timers[0].end(f.ctx()),"parent ends last");
+        for(unsigned i=1;i<DisjointClock::kLeases-1;++i)check(f.timers[i].end(f.ctx()),"other borrowers end");check(f.timers[0].end(f.ctx()),"parent ends last");
         for(int i=0;i<4;++i)f.sampler.poll(f.ctx());
         check(f.sampler.totals.samples==1&&f.sampler.totals.skipped==1,"lease pressure preserves sampler totals");f.finish();
     }
