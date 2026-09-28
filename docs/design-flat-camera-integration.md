@@ -23,12 +23,12 @@
 - Ruled out for that session: a backend evaluation failure as the immediate
   cause, because no backend initialized. Missing shader coverage is proven;
   whether quality settings or a mod produced those variants is not.
-- Next: read the +0x870/+0x8B0 ray/frustum blocks field-by-field
-  (FUN_1404f3770's output layout), then the consumer-lineage join the
-  review requires before C2. Setter map and hook-cadence consequence are
-  in the setter-map addendum: the refresh FUN_1405921f0 is the natural
-  injection point, mutating before its own finalizer calls so per-item
-  overrides compose in the game's own order.
+- Next: C2 -- reducer and WARP geometry/lighting tests of exactly-once
+  jitter through the refresh injection point, cache invalidation,
+  forward/inverse/ray consistency, and proof legacy CB jitter cannot
+  coexist with the upstream injector. The function-level consumer
+  lineage is closed (consumer-lineage addendum); what remains is
+  per-shader runtime evidence.
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable/build
   identities, backend versions, dimensions, formats and mod chain for
@@ -498,3 +498,42 @@ calls, and every downstream consumer in that section derives from the
 jittered values through the game's own path, with the per-item overrides
 composing afterwards in the game's own order. Domain separation falls
 out of which camera struct arrives (view+0x158 vs view+0x250).
+
+## Consumer-lineage addendum, 2026-09-28: everything the refresh feeds
+
+The refresh's remaining consumers are decompiled
+(analysis/decomp/flash/camera/camera_ray_consumer.txt), which closes the
+function-level lineage from the camera struct to every constant block it
+reaches in a pass:
+
+- Scene CB rows 270..273 (view-projection): FUN_140596830 composes from
+  the source axes (+0x20..+0x4C) and the projection (+0x1D0..+0x20C),
+  gated on dirty bit 4.
+- View-constant context +0x40..+0x7C: copied from the cached
+  view-projection (+0x210..+0x24C), gated on bit 8.
+- Frustum-ray CB (slot +0x78): FUN_1405964c0 composes the
+  ray-reconstruction matrix from the +0x870 frustum basis (a 3x4+ block),
+  the view rows (+0x190), the origin (+0x50) and its delta against the
+  +0x8B0 reference point, gated on bit 2. The +0x870 basis is written by
+  the ray-path setters (camera_ray_writers.txt, 168 functions on file
+  for field-level resolution if the mutation design ever needs them);
+  the separately heap-allocated ray blocks behind camera+0x90/+0x98 are
+  FUN_1404f3770's output (dirty bit 1).
+- Depth-parameter CBs (slots +0x60/+0x68): near/far (+0x254/+0x258),
+  the fVar22/fVar23 viewport pair (+0x2A0/+0x2A4) and the
+  resolution-derived terms.
+- Origin copies (slots +0x20/+0x28/+0x30) and the misc blocks
+  (+0x40/+0x48/+0x50/+0x58) from camera +0x50/+0x40/+0x20/+0x30.
+- A screen-size CB (slot +0x80), a further upload (slot +0x178,
+  FUN_140597af0) and a one-byte flag (slot +0x180, FUN_140596ab0).
+
+Lineage verdict for the candidate hook: every constant block the pass
+consumes derives inside FUN_1405921f0 from the camera struct through the
+dirty-flag finalizers -- there is no second path that bypasses it. A
+mutation of the frustum parameters or the source axes/origin inside the
+refresh detour, with bits 4 and 8 (and 2/1 as applicable) raised,
+propagates to the scene CB, the view-constant context, the frustum-ray
+CB and the depth CBs in the same call, through the game's own code.
+What remains unproven is per-shader consumption (which draws bind these
+blocks, and whether legacy CB jitter can coexist) -- that is the C2
+runtime evidence, not more statics.
