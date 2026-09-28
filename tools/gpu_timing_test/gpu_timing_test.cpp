@@ -14,6 +14,7 @@
 #include "../../src/common/gpu_frame_protocol.h"
 extern "C" uint64_t WINAPI edvrGpuFrameEvent(unsigned, unsigned, uint64_t, unsigned, unsigned, void*);
 #include "../../src/d3d11/gpu_interval.h"
+#include "../../src/d3d11/ui_layer_draw_timing.h"
 #include "../../src/d3d11/gpu_disjoint_d3d11.h"
 #include "../../src/common/system_d3d11.h"
 using Microsoft::WRL::ComPtr;
@@ -96,7 +97,7 @@ struct Ops {
 static_assert(std::is_trivially_destructible<GpuTimer>::value,"no context/COM work during process exit");
 struct Fixture {
     Device& d; Ops ops;
-    std::array<GpuTimer,40> timers;
+    std::array<GpuTimer, DisjointClock::kLeases + 8> timers;
     GpuIntervals<2> sampler;
     explicit Fixture(Device& device):d(device){check(gpuTimingBind(d.dev.Get(),d.ctx.Get(),ops.callbacks()),"bind timing owner");}
     ~Fixture(){ops.abandoning=true;gpuTimingAbandon();sampler.reset();for(auto& t:timers)t.reset();}
@@ -185,11 +186,11 @@ void policyCases(Device& d,Runtime& runtime){
         check(f.sampler.begin(f.ctx()),"sampler retries after transient record pressure");f.sampler.end(f.ctx());f.finish();
     }
     {
-        Fixture f(d);for(unsigned i=0;i<32;++i)check(f.begin(i),"fill shared lease table");
+        Fixture f(d);for(unsigned i=0;i<DisjointClock::kLeases;++i)check(f.begin(i),"fill shared lease table");
         check(!f.sampler.begin(f.ctx()),"lease pressure skips sampler");
-        check(f.timers[31].end(f.ctx()),"last borrower ends");f.timers[31].reset(f.ctx());
+        check(f.timers[DisjointClock::kLeases-1].end(f.ctx()),"last borrower ends");f.timers[DisjointClock::kLeases-1].reset(f.ctx());
         check(f.sampler.begin(f.ctx()),"sampler retries after lease release");f.sampler.end(f.ctx());
-        for(unsigned i=1;i<31;++i)check(f.timers[i].end(f.ctx()),"other borrowers end");check(f.timers[0].end(f.ctx()),"parent ends last");
+        for(unsigned i=1;i<DisjointClock::kLeases-1;++i)check(f.timers[i].end(f.ctx()),"other borrowers end");check(f.timers[0].end(f.ctx()),"parent ends last");
         for(int i=0;i<4;++i)f.sampler.poll(f.ctx());
         check(f.sampler.totals.samples==1&&f.sampler.totals.skipped==1,"lease pressure preserves sampler totals");f.finish();
     }
@@ -537,7 +538,244 @@ void controllerCases(Device& d,Runtime& runtime) {
           "native measurement after legacy frame still excludes gaps");
     gpuFrameConfigure(false);gpuFramePresent(f.ctx(),924);gpuFrameAbandon();f.finish();
 }
-void run(){Runtime runtime;Device device(runtime);policyCases(device,runtime);frameDriverCases(device);controllerCases(device,runtime);nativeWork(device);nativeFrameWork(device);std::printf("PASS: %u shared GPU timer lifecycle checks\n",checks);}
+void hdrDrawRouteCases(Device& d) {
+    // This is the same scope helper called after the live HDR target bind and
+    // before restore in uiLayerEnd/guarded decline. The backend is production
+    // GpuTimer, typed WARP COM objects and the shared disjoint lease domain.
+    {
+        Fixture f(d);
+        UiDrawRouteScope scope;
+        unsigned begins = 0, ends = 0, missing = 0;
+        auto begin = [&](UiRouteStage stage, int eye, uint64_t seq) {
+            check(stage == UiRouteStage::kHdrMovedDraw && eye == 0 && seq == 7,
+                  "live helper carries the moved stage, eye and frame into timer begin");
+            ++begins;
+            return f.begin(1) ? 1 : -1;
+        };
+        auto end = [&](int slot) { ++ends; check(f.timers[slot].end(f.ctx()), "live helper closes real timer"); };
+        auto lost = [&](int eye, uint64_t seq) { check(eye == 0 && seq == 7, "disabled coverage retains eye/frame"); ++missing; };
+        const auto commands = f.ops.commands, allocations = f.ops.allocated;
+        check(scope.begin(false, true, 0, true, 0, 7, begin, lost) == UiDrawRouteStart::Declined,
+              "refused live bind opens no interval");
+        scope.end(end);
+        for (unsigned i = 0; i < 40; ++i) {
+            check(scope.begin(true, true, 0, false, 0, 7, begin, lost) == UiDrawRouteStart::Disabled,
+                  "diagnostics-off HDR bind remains untimed");
+            scope.end(end);
+        }
+        check(!begins && !ends && missing == 40 && f.ops.commands == commands &&
+                  f.ops.allocated == allocations,
+              "40 off-window HUD draws add zero query allocations or commands");
+        check(scope.begin(true, false, 0, true, 0, 7, begin, lost) == UiDrawRouteStart::Unchanged,
+              "ordinary LDR primary rendering keeps existing timing policy");
+        scope.end(end);
+        check(scope.begin(true, true, 0, true, 0, 7, begin, lost) == UiDrawRouteStart::Opened,
+              "diagnostic accepted HDR draw opens production interval");
+        check(scope.begin(true, true, 0, true, 0, 7, begin, lost) == UiDrawRouteStart::Declined,
+              "nested bind cannot overwrite an unfinished draw timer");
+        scope.end(end); scope.end(end);
+        double ms = 0;
+        check(begins == 1 && ends == 1 && !scope.active && scope.slot == -1 &&
+                  f.timers[1].poll(f.ctx(), ms) == GpuTimerPoll::Ready && ms > 0,
+              "normal and guarded-cleanup duplicate ends issue one timestamp and measure");
+        check(scope.begin(true, true, 0, true, 0, 7,
+                          [](UiRouteStage, int, uint64_t) { return -1; }, lost) == UiDrawRouteStart::Unavailable,
+              "bounded ring or lease decline remains unavailable");
+        scope.end(end);
+        check(ends == 1, "an unavailable timer never emits an End command");
+        UiRouteStage actual = UiRouteStage::kClear;
+        check(scope.begin(true, true, 1, false, 0, 7,
+                          [&](UiRouteStage stage, int, uint64_t) { actual = stage; return f.begin(2) ? 2 : -1; },
+                          lost) == UiDrawRouteStart::Opened && actual == UiRouteStage::kMultiply,
+              "multiply machinery remains timed with diagnostics off");
+        scope.end(end);
+        check(f.timers[2].poll(f.ctx(), ms) == GpuTimerPoll::Ready, "multiply policy still measures");
+        check(scope.begin(true, true, 0, true, -1, 7, begin, lost) == UiDrawRouteStart::Declined &&
+                  scope.begin(true, true, 0, true, 0, 0, begin, lost) == UiDrawRouteStart::Declined,
+              "invalid eye/frame identity declines before callbacks");
+        check(scope.begin(true, true, 0, true, 0, 7, begin, lost) == UiDrawRouteStart::Opened,
+              "a scope opens before a simulated guarded-bind fault");
+        unsigned cancelled = 0;
+        scope.cancel([&](int slot) { ++cancelled; f.timers[slot].reset(f.ctx()); });
+        scope.cancel([&](int) { ++cancelled; }); scope.end(end);
+        check(cancelled == 1 && ends == 2 && f.timers[1].poll(f.ctx(), ms) == GpuTimerPoll::Invalid,
+              "failed bind cancels once and cannot masquerade as measured zero work");
+        f.finish();
+    }
+    {
+        Fixture f(d);
+        check(f.begin(0), "outer application scope for 40 moved draws");
+        const auto commands = f.ops.commands;
+        for (unsigned i = 1; i <= 40; ++i) {
+            UiDrawRouteScope scope;
+            check(scope.begin(true, true, 0, true, int(i & 1), 8,
+                              [&](UiRouteStage, int, uint64_t) { return f.begin(i) ? int(i) : -1; },
+                              [](int, uint64_t) {}) == UiDrawRouteStart::Opened, "40 draws fit shared lease budget");
+            scope.end([&](int slot) { check(f.timers[slot].end(f.ctx()), "draw ends before outer scope"); });
+        }
+        check(f.ops.commands == commands + 80 && f.ops.active == 1,
+              "40 diagnostic HDR draws add 80 timestamps and no disjoint scopes");
+        check(f.timers[0].end(f.ctx()), "outer frame closes shared frequency");
+        for (unsigned i = 0; i <= 40; ++i) { double ms = 0;
+            check(f.timers[i].poll(f.ctx(), ms) == GpuTimerPoll::Ready, "all bounded draw samples retire"); }
+        f.finish();
+    }
+    {
+        Fixture f(d); f.ops.scripted = false;
+        D3D11_TEXTURE2D_DESC desc{}; desc.Width = desc.Height = 64;
+        desc.MipLevels = desc.ArraySize = 1; desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        ComPtr<ID3D11Texture2D> src, dst;
+        hr(d.dev->CreateTexture2D(&desc, nullptr, &src)); hr(d.dev->CreateTexture2D(&desc, nullptr, &dst));
+        UiDrawRouteScope scope;
+        check(scope.begin(true, true, 0, true, 1, 9,
+                          [&](UiRouteStage, int, uint64_t) { return f.begin(0) ? 0 : -1; },
+                          [](int, uint64_t) {}) == UiDrawRouteStart::Opened, "real WARP diagnostic scope opens");
+        f.ctx()->CopyResource(dst.Get(), src.Get());
+        scope.end([&](int slot) { check(f.timers[slot].end(f.ctx()), "real WARP draw-scope end"); });
+        // Flush belongs to this headless fixture, never the live route helper.
+        f.ctx()->Flush();
+        const uint64_t deadline = GetTickCount64() + 5000;
+        GpuTimerPoll result = GpuTimerPoll::Pending; double ms = -1;
+        do { result = f.timers[0].poll(f.ctx(), ms); if (result == GpuTimerPoll::Pending) Sleep(1); }
+        while (result == GpuTimerPoll::Pending && GetTickCount64() < deadline);
+        check(result == GpuTimerPoll::Ready && ms >= 0, "live scope helper measures actual WARP GPU work");
+        f.finish();
+    }
+    {
+        Fixture f(d);
+        check(f.begin(0), "on/off/on samples borrow an outer scope before delayed polling");
+        struct Pending { unsigned timer; uint64_t seq; UiRouteStage stage; UiRouteCoverageFlags coverage; };
+        std::vector<Pending> pending;
+        UiRouteCoverage coverage;
+        unsigned timer = 1;
+        bool diagnostics = true;
+        for (uint64_t seq = 20; seq <= 22; ++seq) {
+            diagnostics = seq != 21;
+            const unsigned machineryTimer = timer++;
+            check(f.begin(machineryTimer) && f.timers[machineryTimer].end(f.ctx()), "queued machinery interval");
+            pending.push_back({machineryTimer, seq, UiRouteStage::kHdrSeed,
+                               coverage.begin(UiRouteStage::kHdrSeed, 0, seq, diagnostics)});
+            UiDrawRouteScope scope;
+            const auto start = scope.begin(true, true, 0, diagnostics, 0, seq,
+                [&](UiRouteStage stage, int eye, uint64_t frame) {
+                    const unsigned drawTimer = timer++;
+                    pending.push_back({drawTimer, frame, stage, coverage.begin(stage, eye, frame, diagnostics)});
+                    return f.begin(drawTimer) ? int(drawTimer) : -1;
+                }, [&](int eye, uint64_t frame) { coverage.missing(UiRouteStage::kHdrMovedDraw, eye, frame); });
+            check(start == (diagnostics ? UiDrawRouteStart::Opened : UiDrawRouteStart::Disabled),
+                  "direct diagnostics gate follows on/off/on without flushing old samples");
+            scope.end([&](int index) { check(f.timers[index].end(f.ctx()), "queued moved interval ends"); });
+        }
+        diagnostics = false;  // current setting differs from the pending samples' armed epochs
+        f.ops.pendingAll = true; double ms = 0;
+        check(f.timers[pending[0].timer].poll(f.ctx(), ms) == GpuTimerPoll::Pending,
+              "toggle test retains an oldest pending sample");
+        f.ops.pendingAll = false;
+        check(f.timers[0].end(f.ctx()), "delayed sample frequency closes");
+        UiRouteFrameTotals totals; double machinery = -1, combined = -1;
+        unsigned closedArmed = 0, closedUnarmed = 0;
+        for (const auto& p : pending) {
+            check(f.timers[p.timer].poll(f.ctx(), ms) == GpuTimerPoll::Ready, "toggle sample resolves without forced flush");
+            const unsigned closed = totals.add(p.stage, p.seq, ms, true, p.coverage.combined,
+                                                machinery, combined, p.coverage.machinery);
+            if (closed == 3) { ++closedArmed; check(machinery == 1 && combined == 2, "earlier armed frame prices both categories"); }
+            if (closed == 1) { ++closedUnarmed; check(machinery == 1, "off epoch retains only machinery cost"); }
+        }
+        check(!diagnostics && closedArmed == 1 && closedUnarmed == 1 &&
+                  totals.close(23, machinery, combined) == 3 && machinery == 1 && combined == 2,
+              "on/off/on pending queries retain armed samples and exclude unarmed eye-frames");
+        f.finish();
+    }
+    {
+        struct Queued { UiRouteStage stage; int eye; uint64_t seq; UiRouteCoverageFlags flags; };
+        UiRouteCoverage coverage;
+        Queued queued[] = {
+            {UiRouteStage::kHdrSeed, 0, 30, coverage.begin(UiRouteStage::kHdrSeed, 0, 30, true)},
+            {UiRouteStage::kComposite, 0, 30, coverage.begin(UiRouteStage::kComposite, 0, 30, true)},
+            {UiRouteStage::kHdrSeed, 0, 31, coverage.begin(UiRouteStage::kHdrSeed, 0, 31, true)},
+            {UiRouteStage::kComposite, 0, 31, coverage.begin(UiRouteStage::kComposite, 0, 31, true)},
+            {UiRouteStage::kHdrSeed, 1, 30, coverage.begin(UiRouteStage::kHdrSeed, 1, 30, true)}
+        };
+        UiRouteFrameTotals totals; UiRouteSum stageSum; double machinery = -1, combined = -1, stageMs = -1;
+        totals.add(UiRouteStage::kHdrSeed, 30, .1, true, true, machinery, combined);
+        uiRouteAdd(stageSum, 30, .1, true, &stageMs);  // a ready prefix was already consumed
+        for (uint64_t seq : {30ull, 31ull}) {
+            check(coverage.missing(UiRouteStage::kHdrSeed, 0, seq), "successive failed frames update coverage");
+            totals.lost(UiRouteStage::kHdrSeed, seq); uiRouteLost(stageSum, seq);
+            for (auto& q : queued) coverage.apply(q.stage, q.eye, q.seq, q.flags);
+        }
+        check(!queued[0].flags.stage && !queued[0].flags.machinery && !queued[0].flags.combined &&
+                  !queued[2].flags.stage && !queued[2].flags.machinery && !queued[2].flags.combined &&
+                  queued[1].flags.stage && queued[3].flags.stage && queued[4].flags.combined,
+              "queued failed frames stay spoiled without invalidating other stages or the other eye");
+        const auto future = coverage.begin(UiRouteStage::kComposite, 0, 31, true);
+        check(future.stage && !future.machinery && !future.combined,
+              "later successful commands of the failed frame cannot restore completeness");
+        for (const auto& q : queued) {
+            if (q.eye) continue;
+            check(!totals.add(q.stage, q.seq, .2, true, q.flags.combined,
+                              machinery, combined, q.flags.machinery), "neither queued partial total closes as valid");
+            if (q.stage == UiRouteStage::kHdrSeed)
+                check(!uiRouteAdd(stageSum, q.seq, .2, q.flags.stage, &stageMs), "partial stage cannot close as valid");
+        }
+        check(!totals.close(32, machinery, combined) && !uiRouteClose(stageSum, 32, &stageMs),
+              "two failed frames plus a ready prefix produce no misleading partial price");
+        UiRouteCoverage movedOnly;
+        auto beforeToggle = movedOnly.begin(UiRouteStage::kComposite, 0, 40, true);
+        check(movedOnly.movedMissing(0, 40), "disabled draw spoils its armed pending epoch");
+        movedOnly.apply(UiRouteStage::kComposite, 0, 40, beforeToggle);
+        movedOnly.movedMissing(0, 41); movedOnly.apply(UiRouteStage::kComposite, 0, 40, beforeToggle);
+        check(beforeToggle.stage && beforeToggle.machinery && !beforeToggle.combined,
+              "later disabled frame never resurrects an earlier incomplete combined sample");
+        UiRouteCoverage sameFrame;
+        auto primary = sameFrame.begin(UiRouteStage::kHdrMovedDraw, 0, 50, true);
+        auto machineryPart = sameFrame.begin(UiRouteStage::kComposite, 0, 50, true);
+        UiRouteSum movedStage; UiRouteFrameTotals mixed;
+        uiRouteAdd(movedStage, 50, .3, true, &stageMs);
+        mixed.add(UiRouteStage::kHdrMovedDraw, 50, .3, true, true, machinery, combined);
+        sameFrame.missing(UiRouteStage::kHdrMovedDraw, 0, 50);
+        uiRouteLost(movedStage, 50); mixed.lost(UiRouteStage::kHdrMovedDraw, 50);
+        sameFrame.apply(UiRouteStage::kHdrMovedDraw, 0, 50, primary);
+        sameFrame.apply(UiRouteStage::kComposite, 0, 50, machineryPart);
+        sameFrame.missing(UiRouteStage::kHdrMovedDraw, 0, 51);
+        sameFrame.apply(UiRouteStage::kHdrMovedDraw, 0, 50, primary);
+        check(!primary.stage && primary.machinery && !primary.combined && machineryPart.stage &&
+                  machineryPart.machinery && !machineryPart.combined,
+              "same-sequence disabled HDR draw spoils moved coverage without spoiling machinery");
+        mixed.add(UiRouteStage::kComposite, 50, .2, true, machineryPart.combined,
+                  machinery, combined, machineryPart.machinery);
+        check(!uiRouteClose(movedStage, 51, &stageMs) && mixed.close(51, machinery, combined) == 1 &&
+                  machinery == .2,
+              "a consumed moved prefix plus disabled draw yields no partial moved or combined price");
+    }
+    {
+        UiRouteFrameTotals totals[2]; double machinery = -1, combined = -1;
+        check(!totals[0].add(UiRouteStage::kHdrSeed, 10, .4, true, true, machinery, combined) &&
+                  !totals[1].add(UiRouteStage::kComposite, 10, .2, true, true, machinery, combined) &&
+                  !totals[0].add(UiRouteStage::kHdrMovedDraw, 10, 1.3, true, true, machinery, combined) &&
+                  !totals[0].add(UiRouteStage::kComposite, 10, .1, true, true, machinery, combined),
+              "production totals accept interleaved eye and draw samples");
+        check(totals[0].close(11, machinery, combined) == 3 && std::abs(machinery - .5) < 1e-9 &&
+                  std::abs(combined - 1.8) < 1e-9,
+              "machinery excludes moved shading while combined includes it exactly once");
+        check(totals[1].close(11, machinery, combined) == 3 && machinery == .2 && combined == .2,
+              "other eye remains independent");
+        totals[0].add(UiRouteStage::kHdrSeed, 12, .4, true, false, machinery, combined);
+        totals[0].lost(UiRouteStage::kHdrMovedDraw, 12);
+        check(totals[0].close(13, machinery, combined) == 1 && machinery == .4,
+              "diagnostics-off or unavailable moved draw cannot create a partial combined figure");
+        totals[0].add(UiRouteStage::kHdrSeed, 14, .4, true, true, machinery, combined);
+        totals[0].add(UiRouteStage::kHdrMovedDraw, 14, 0, false, true, machinery, combined);
+        check(totals[0].close(15, machinery, combined) == 1 && machinery == .4,
+              "invalid moved interval spoils combined only");
+        totals[0].add(UiRouteStage::kHdrSeed, 16, .4, true, true, machinery, combined);
+        totals[0].lost(UiRouteStage::kHdrSeed, 16);
+        check(totals[0].close(17, machinery, combined) == 0,
+              "missing machinery interval spoils both totals");
+    }
+}
+void run(){Runtime runtime;Device device(runtime);policyCases(device,runtime);frameDriverCases(device);controllerCases(device,runtime);nativeWork(device);nativeFrameWork(device);hdrDrawRouteCases(device);std::printf("PASS: %u shared GPU timer lifecycle checks\n",checks);}
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {

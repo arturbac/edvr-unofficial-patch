@@ -538,6 +538,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\wake_pulse.cpp" ^
     "src\d3d11\hud_grain.cpp" ^
     "src\d3d11\ui_depth.cpp" ^
+    "src\d3d11\hud_layer_census.cpp" ^
     "src\d3d11\ui_layer.cpp" "src\d3d11\ui_surfaces.cpp" "src\d3d11\ui_panel_scale.cpp" ^
     "third_party\dxbc_hash\DxilHash.cpp" ^
     "src\d3d11\backdrop_fix.cpp" ^
@@ -1423,6 +1424,9 @@ if errorlevel 1 ( echo [edvr] ERROR: panel snapshot test build failed & exit /b 
 "%OBJ%\panelsnapshot\eye_panel_snapshot_test.exe" "%OBJ%\panelsnapshot\fixture.bin" || exit /b 1
 python "tools\eye_panel_snapshot.py" --self-test || exit /b 1
 python "tools\eye_panel_snapshot.py" "%OBJ%\panelsnapshot\fixture.bin" --verify-fixture || exit /b 1
+REM The crisp-HUD parity gate (G-F) reads both snapshot formats; gate its
+REM self-test here, after both parents' fixtures ran.
+python "tools\hud_parity.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_vr_census_test
@@ -2346,6 +2350,21 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
 if errorlevel 1 ( echo [edvr] ERROR: LOD governor test build failed & exit /b 1 )
 "%BUILD%\lod_governor_test.exe" --dry-run || exit /b 1
 "%BUILD%\lod_governor_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_ui_layer_coverage_test
+echo [edvr] === ui_layer_coverage_test.exe ===
+REM Exercise the production coverage command cache and shaders on WARP.
+REM Keep the executable outside build so D3D11 comes from System32.
+if not exist "%OBJ%\uicoverage" mkdir "%OBJ%\uicoverage"
+cl.exe /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 ^
+    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\uicoverage\\" /Fe"%OBJ%\uicoverage\coverage_test.exe" ^
+    "tools\ui_layer_coverage_test\coverage_test.cpp" ^
+    /link /INCREMENTAL:NO /OPT:REF d3d11.lib d3dcompiler.lib
+if errorlevel 1 ( echo [edvr] ERROR: UI layer coverage test build failed & exit /b 1 )
+"%OBJ%\uicoverage\coverage_test.exe" --dry-run || exit /b 1
+"%OBJ%\uicoverage\coverage_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_ui_quality_test

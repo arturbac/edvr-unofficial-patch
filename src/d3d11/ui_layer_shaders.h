@@ -192,4 +192,25 @@ inline bool uiLayerLdrView(DXGI_FORMAT view) {
     return view == DXGI_FORMAT_R8G8B8A8_UNORM || view == DXGI_FORMAT_B8G8R8A8_UNORM;
 }
 
+// the crisp-HUD half's of fix.ui_quality coverage pass (ui_layer.cpp's tonemap re-issue): the HDR
+// HUD layer's alpha -- transmittance, the layer's own convention -- written
+// into the 8-bit layer's alpha, replacing it, with the colour channels
+// masked off (the re-issued tonemap draw just wrote them). One full-screen
+// triangle; the two layers are the same size by construction (the caller
+// declines when they are not), so the sample is the pixel itself.
+constexpr char kUiLayerCoverageVsHlsl[] = R"HLSL(
+struct V { float4 p : SV_POSITION; };
+V main(uint id : SV_VertexID) {
+    float2 p = id == 0 ? float2(-1, -1) : (id == 1 ? float2(-1, 3) : float2(3, -1));
+    V v; v.p = float4(p, 0, 1); return v;
+}
+)HLSL";
+
+constexpr char kUiLayerCoveragePsHlsl[] = R"HLSL(
+Texture2D<float4> HdrLayer : register(t0);
+float4 main(float4 p : SV_POSITION) : SV_Target {
+    return float4(0, 0, 0, HdrLayer.Load(int3(p.xy, 0)).a);
+}
+)HLSL";
+
 }  // namespace edvr

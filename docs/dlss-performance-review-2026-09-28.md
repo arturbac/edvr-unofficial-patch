@@ -2,50 +2,39 @@
 
 ## Status
 
-- **State:** review of `v0.17.0` (`e72c17c8`, September 17) through `1d2e60ef`.
-  Frontier flight `20260928_123334` is validated against its own source
-  revision, `538175a8`, not HEAD. Round 1 gates hologram GPU pixel census.
-  Round 2 compacts luminance readbacks and caches private-scatter UAVs; focused
-  rigs, independent review and all 84 full-build jobs pass. Combining latest
-  crisp HUD for Frontier profiling is authorized; main stays separate. Hardware
-  benefit is unflown; no new Frontier flight exists yet.
-- **Finding:** DLSS is the largest measured EDVR GPU item, about 2.7–3.2 ms per
-  stereo pair in the sampled flight. Most logged long caller cycles are
-  dominated by game work before the first submit or after the second, rather
-  than the runtime submit roundtrips.
-- **Graph:** the native CPU graph includes caller work between pose waits,
-  including both submit roundtrips and post-submit work. Its wider boundary
-  than 0.17.0 and the `Submit wall` label can make a comparison misleading. No
-  graph feature or configuration key changed in this review.
-- **Open:** no controlled same-scene 0.17.0 comparison; rare true submit
-  stalls; EDVR Present-tail spikes; hologram/engine feature costs; timer and
-  census observer overhead. Candidates and discriminating evidence below.
-- **Ruled out:** see the recorded exclusions below and the linked engine-motion
-  and terrain investigations. No shader quality, motion-vector or pacing change
-  is justified by these logs alone.
-- **Next flight:** Frontier, fixed scene and settings, diagnostics off then on
-  in one session. Verify the installed build first; compare caller-cycle tails,
-  actual submit roundtrips, post-submit breakdown and existing GPU census. The
-  optimization's removed diagnostic commands need a hardware timing comparison;
-  image equivalence is checked in the WARP rig.
+- **State:** review since `v0.17.0` (`e72c17c8`). Frontier flight
+  `20260928_123334` matches `538175a8`, not HEAD. Rounds 1–2 validate census
+  gating, compact luminance and cached scatter views. Crisp HUD `472ff122` is
+  now combined on the optimization branch; coverage and gated HDR pricing pass
+  focused tests, independent review and all 85 full-build jobs. Main stays
+  separate; no optimized Frontier flight exists yet.
+- **Finding:** DLSS costs about 2.7–3.2 ms/stereo pair. Most logged long cycles
+  are dominated by work before or after submit; ordinary submit p99 is 0.738
+  ms.
+- **Graph:** `Submit wall` uses the wider caller-work boundary than 0.17.0; see
+  the red-bar section. No graph or configuration key was renamed.
+- **Open:** matched 0.17.0 A/B, rare actual submit stalls, Present-tail spikes,
+  crisp moved-shading cost and diagnostic observer overhead.
+- **Ruled out:** see Exclusions and the engine-motion/terrain arcs below.
+- **Next flight:** Frontier, fixed scene; UI quality 100 and 125 separately,
+  diagnostics off then on. Verify build, preserve runtime/preset/dimensions and
+  compare caller-cycle tails, real submits, post-submit phases and GPU prices.
 - **Environment:** RTX 5090, Pimax Crystal Super, Pimax OpenXR, 90 Hz;
   2037×1969 input → 4074×3938 output per eye; DLSS preset K. Installed DLL
   metadata is 310.7.0.0; the flight did not log the runtime's own version or
-  driver version. All flight and installation work in this arc uses Frontier.
+  driver version. New profiling/installations use Frontier; crisp's Steam log
+  is historical evidence.
 
 ## What the current Frontier flight establishes
 
-Both logs match `v0.18.0-rc.3-7-g538175a8` (graphics build `6ABA6DF5`), but
-fail validation against HEAD. Intervening changes concern flat
-camera/menu/config and installer work; the reviewed DLSS, hologram and native
-runtime paths are unchanged. Measurements belong to the flown revision.
+Both logs match `v0.18.0-rc.3-7-g538175a8` (graphics build `6ABA6DF5`), not
+HEAD. Through `1d2e60ef`, intervening flat/menu/config/installer changes leave
+the reviewed DLSS, hologram and native runtime paths unchanged.
 
 The latest sampled GPU census window, at 12:36:05, estimates EDVR at **4.949 ms
 per frame**, comprising door work of 4.083 ms and in-frame work of 0.866 ms.
-The named components below overlap some broader totals and must not be added
-twice. This round-robin census estimates mean cost from selected calls,
-subtracts a timer floor, and is not a synchronized per-frame profile or a proof
-of a regression.
+The round-robin census samples calls and subtracts a timer floor; overlapping
+totals are not additive or a synchronized per-frame regression measurement.
 
 | Measured component | ms per stereo frame | Interpretation |
 | --- | ---: | --- |
@@ -60,25 +49,19 @@ of a regression.
 
 Recent 600-pair temporal-price windows report median preparation **0.16–0.25
 ms**, NGX **2.66–3.23 ms**, and UI resolve **0.27–0.44 ms** per pair. The
-latest corresponding p95 values are 0.46, 3.99 and 0.62 ms. An earlier census
-window had EDVR at 4.387 ms with fewer hologram/UI costs; the scene changed, so
-that is not an A/B comparison. The full-frame price does not alone price all
-new features.
+latest corresponding p95 values are 0.46, 3.99 and 0.62 ms. Earlier EDVR 4.387
+ms came from a different scene. The temporal timer excludes some features.
 
 ### Red bars and actual submit work
 
-The native graph's `Submit wall` label is misleading.
-`NativePerfHistory::cpuFigure` uses ABI-v5 `callerWorkMs`: one pose-wait return
-to the next pose-wait entry. This includes game rendering, both submits and any
-waits inside them, time between eyes, and game/EDVR work after the second
-submit. The following pose wait is excluded. The published cycle is the
-preceding completed cycle. Older runtimes, including 0.17.0, use pre-submit
-application time instead. Benchmark CPU rows still use pre-submit
-`applicationMs`; they cannot be compared directly with the new graph.
+The native graph's `Submit wall` label is misleading: ABI-v5
+`NativePerfHistory::cpuFigure` publishes the preceding cycle's `callerWorkMs`,
+from pose-wait return to next pose-wait entry. It includes rendering, both
+submits and post-submit work, excluding the next pose wait. 0.17.0 and current
+benchmark CPU rows use pre-submit `applicationMs`, a different boundary.
 
 The graph marks values above 1.02 display periods orange and above two periods
-red. At 90 Hz those thresholds are about 11.33 and 22.22 ms. It is not a graph
-of the DLSS evaluation or of the two runtime submit calls alone.
+red: about 11.33 and 22.22 ms at 90 Hz.
 
 The flight counted **340** cycles over two predicted periods; **273** were
 logged because the long-cycle log is rate limited. Their dominant phases were:
@@ -90,16 +73,15 @@ logged because the long-cycle log is rate limited. Their dominant phases were:
 | Following pose wait | 66 |
 | Combined submit roundtrips | 19 |
 
-Of the logged cycles, 172 also have caller work over 22.22 ms, which is
-consistent with a red graph sample. Following-pose-wait dominated cycles are
-not automatically red caller-work samples. Rate limiting prevents deriving a
-complete spike histogram or a strict periodic cadence from these rows.
+172 logged cycles have caller work over 22.22 ms. Pose-wait dominated cycles
+need not be red graph samples. Rate limiting prevents a full histogram or
+strict periodicity claim.
 
 Ordinary combined submit roundtrips in the latest window are **p50/p95/p99
 0.423/0.592/0.738 ms**. The native frame-end overlap summary has **12,625
 overlapped frames, zero synchronous fallbacks and zero failures**. These
-numbers argue against persistent blocking submit or broken overlap as the
-dominant problem in this flight. They do not rule out occasional submit stalls.
+numbers rule out persistent submit blocking or broken overlap as this flight's
+dominant problem, while leaving occasional submit stalls open.
 
 Concrete discriminators from `native_frame_cycle_long`:
 
@@ -115,9 +97,8 @@ window has a post-submit gap p50/p95/p99/max of **2.786/5.250/15.131/60.585
 ms**. Raw DXGI Present is **0.057/0.134/0.299/0.574 ms**; EDVR after raw
 Present is **0.088/0.512/1.044/56.491 ms**; work outside Present is
 **2.526/4.809/13.083/54.665 ms**. These are marginal percentiles/maxima across
-a window, not terms to sum and not a per-cycle attribution of sequence 12363.
-Ordinary Present is cheap, but both game work outside it and EDVR's
-Present-boundary tail deserve spike attribution.
+a window, not additive or attribution of sequence 12363. Both outside-Present
+work and EDVR's Present tail need spike attribution.
 
 ## Source review against 0.17.0
 
@@ -134,22 +115,16 @@ separate-device transfer/compose is outside these game-device timings.
 | UI separation and deferred replay retired | Removes some copies and GPU work. Feature growth is not uniformly additive. |
 | UI resolve/corona hold, temporal total timing and NGX timing | Already present at 0.17.0; may still be expensive, but are not new costs. |
 
-Default motion compiles diagnostic counters/searches out. Previous depth swaps
-textures. NGX creation/mode queries are size/preset gated. The broader compute
-save (23 SRVs, seven UAVs, three CBs) preserves engine-motion state; keep it.
+Motion diagnostic searches compile out; previous depth swaps textures; NGX
+creation/mode queries are size/preset gated. The broader compute save preserves
+engine-motion state and must remain.
 
-The core temporal/NGX evaluation has no explicit Flush or spinning query wait;
-timestamp polls use DONOTFLUSH. There is an exception in the automatically
-armed luminance diagnostic: `luma_probe.cpp:362` switches staging Map from
-DO_NOT_WAIT to blocking after 30 unsuccessful frames. Every two seconds it
-copies the game, DLSS-output and final textures for both eyes at their full
-dimensions, although the CPU reads only a 16×16 grid. At this flight's RGBA8
-sizes that is about 288 MB of logical image data per round before any duplicate
-source/readback effects. The log confirms automatic rounds, but does not say
-whether the blocking fallback occurred. This probe predates 0.17.0, so its
-presence alone cannot establish a new regression. Explicit NGX desk probes also
-have synchronous readbacks. Nonblocking polling still costs commands,
-transfers, mapping and CPU work.
+Temporal/NGX has no explicit Flush/spinning query wait; timestamps poll with
+DONOTFLUSH. Before round 2, automatic luminance readbacks switched Map to
+blocking after 30 failed polls and copied full textures every two seconds,
+although only a 16×16 grid was read (~288 MB/stereo round here). The log proves
+rounds ran, not that blocking occurred. This probe predates 0.17.0; explicit
+NGX desk probes also read synchronously.
 
 ## Optimization with a direct proof of redundant work
 
@@ -203,20 +178,32 @@ per eye, cockpit route median is 0.692–0.701 ms/eye; seed alone is about 0.432
 ms/eye. No unavailable/invalid/late route intervals were reported. The primary
 redirected HDR HUD shading is deliberately untimed, so route totals exclude
 moved rendering. This is not a controlled crisp-on/off result. Before Frontier
-profiling, price those draws and test two source-proven candidates: repeated
-coverage command-list recording and stencil clear before an unconditional
-full-target stencil write. Preserve fallback and lifecycle behavior; prove
-production-path output and state equivalence headlessly.
+profiling, price those draws and test coverage command-list caching with
+production-path output/state equivalence. The stencil-clear candidate has no
+local savings: WARP and hardware both use the fallback seed.
+
+**Combined optimization:** cache each eye's coverage command list, retaining
+the draw and `ExecuteCommandList(TRUE)`. Production-HLSL WARP passes 768 checks
+for dynamic HDR contents, exact pixels, restored state, identities, lifetimes
+and failure retry: four executions need one recording, eight alternating-eye
+executions need two. Add gated primary HDR draw intervals and separate
+`machinery_plus_moved` totals; unarmed/invalid frames are excluded. Diagnostics
+off adds no primary-draw timestamps; shading cost is not net overhead. Pricing
+stays bounded by the 512-interval route ring, 128 shared leases/scope and 8,192
+retained sums/statistic. Missing/invalid/late fields must accompany reported
+medians; incomplete eye-frame sums are discarded. Per-slot completeness keeps
+losses across queued frames/config toggles; 1,183 shared GPU-timer checks pass.
+WARP/RTX seed tests pass 385,610 checks each; the clear remains necessary.
 
 ## Remaining candidates, ordered by useful evidence
 
 | Candidate | Evidence to obtain before another optimization |
 | --- | --- |
-| Post-submit tail | Correlate cycle sequence with `native_post_submit_phase` and Present/capture/reload/transition events; collect per-cycle attribution. |
+| Post-submit tail | Correlate sequence with Present/capture/reload/transition events. CPU/CSwitch stacks must separate monitor `slowSample` (1 s), journal/Status I/O (500 ms, eager 100 ms; enumeration 4 s), config/liveness checks (1 s), menu upload (250 ms) and GPU-drain polling. Cadence alone does not prove a culprit. |
 | Producer synchronization | Keyed-mutex p50/p95/p99/max 0.090/0.252/6.921/14.967 ms in one window; GPU copy p50 0.039 ms. Correlate rare acquire waits with submit stalls before changing ownership/fences. |
-| Automatic luminance probe | Count forced-blocking fallbacks; price sampling/readback and correlate two-second rounds. Reducing on GPU to 16×16 needs format/sample equivalence proof. |
+| Compact luminance probe | Correlate two-second rounds and nonblocking timeout markers with tails; measure row-copy command submission and readback. Exact samples are proved in the rig. |
 | Hologram passes and UI depth | Census separates reissues, final resolve and UI coverage. Compare fixed cockpit scene with pixel census off/on. |
-| Private engine scatter CPU | `engine_velocity_primary_copy.h:155` scans 128 SRVs across six stages plus UAVs; `:322` creates a UAV each application. Price scope and batches before caching; preserve binding safety and pool lifetime. |
+| Private engine scatter CPU | UAV creation is now cached. Price the remaining binding scan (128 SRVs across six stages plus UAVs) before changing safety checks. |
 | Engine snapshots | Use snapshot MB/frame and clear/copy/refresh GPU timers. Optimize proven unchanged ranges; preparation census is not total feature cost. |
 | Timestamp/census overhead | New copy/MV timers add four timestamp commands per eye; timer sweeps run every 100 ms. Measure sweep/poll CPU time and cadence before changing sampling. |
 | DLSS preset/runtime/output area | Hold preset, DLL, dimensions and scene fixed. Quality changes or runtime upgrades are different tests. |
@@ -234,6 +221,11 @@ fields when reading it.
   most logged long cycles are dominated by pre-submit or post-submit phases.
 - ruled out: loss of frame-end overlap in this flight, because 12,625
   overlapping completions have zero failures and zero synchronous fallbacks.
+- ruled out: removing the seed's stencil clear as a local optimization, because
+  matching Frontier log reports feature level `0xC000` and `stencil written one
+  pass per bit`; WARP and RTX 5090 caps also lack specified-stencil-reference
+  support. This fallback needs the clear, and callers already use actual read
+  masks. No production seed change is justified.
 - ruled out: engine-record fetch as the previously observed 3–8 ms prep spike,
   because equally slow historical windows had no engine views; the removed
   stage-B sphere coverage pass was responsible. See
@@ -247,12 +239,14 @@ fields when reading it.
   graph's wider measurement boundary is a confound, not proof that performance
   is unchanged.
 
-On Frontier, validate the build and hold scene, game settings, display rate,
-dimensions, DLSS preset/runtime fixed. After warmup, collect two 30-second
-windows with diagnostics off, then two with it on; exclude toggle-time shader
-compilation. Retain the phase, price, census and snapshot lines named above.
-Hardware comparison is required before calling the patch a frametime win. For
-0.17.0 comparison, also match the CPU measurement boundary.
+On Frontier, validate the build and hold scene, display rate, dimensions and
+DLSS preset/runtime fixed. After warmup, collect two 30-second windows with
+diagnostics off, then two on; exclude toggle-time compilation. Price crisp HUD
+at UI quality 100 and 125 separately, retaining route health, moved-shading,
+phase, census and snapshot lines. Capture CPU/CSwitch stacks if red bars
+remain; the previous ETW provider was registered but externally disabled.
+Hardware A/B is required for a frametime claim; match CPU boundaries when
+comparing 0.17.0.
 
 ## Validation and delivery
 
@@ -265,3 +259,10 @@ Delivery uses clean-commit DLL promotion and the sanctioned Frontier installer,
 preserving the live INI and DLSS runtime. Round 2 passes all 84 full-build
 jobs, including 2,759 luminance and 1,729 engine-velocity checks. Hardware
 improvement remains unflown.
+
+The combined absolute-path full build passes 85 jobs plus four quiet gates,
+including coverage (768), GPU timing (1,183) and seed (385,610) checks, config,
+exports and self-contained installer validation. Receipt source fingerprint:
+`b64e23a47da6c21724ccba6bf2c1cbdc7bd3b2db429b6f76d8af281d5e90172f`. Delivery
+follows clean-commit DLL promotion and Frontier install/verification; no main
+merge or quality/preset/runtime change is part of this pass.

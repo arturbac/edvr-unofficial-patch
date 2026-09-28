@@ -457,6 +457,25 @@ bool nativeTemporalDrawJitter(uint32_t eye, uint64_t* sequence, float* jx, float
   if (h) *h = s.height[eye];
   return true;
 }
+// The HUD layer census's gate G-C (ui_layer.h declares it), at DRAW time:
+// the unjittered signed tangents, the tangent shift the jitter adds (both
+// zero when the pass is not jittering this frame), and the clip planes
+// noteProjection recorded this frame (0/0 while none) -- the census
+// rebuilds the projection the eye's draws should carry from these, the
+// same inputs the game built it from. Same thread rule as the jitter
+// reader above: "no" rather than a re-lock from inside treat().
+bool nativeTemporalProjectionReference(uint32_t eye, float frusta[4], float shift[2], float* nearZ,
+                                       float* farZ) {
+  if (t_insideTreat) return false;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!current || !current->active || !current->begun || eye > 1) return false;
+  const State& s = *current;
+  if (frusta) std::memcpy(frusta, s.frusta[eye], 4 * sizeof(float));
+  if (shift) { shift[0] = s.shift[eye][0]; shift[1] = s.shift[eye][1]; }
+  if (nearZ) *nearZ = s.projectionKnown[eye] ? s.nearZ[eye] : 0.0f;
+  if (farZ) *farZ = s.projectionKnown[eye] ? s.farZ[eye] : 0.0f;
+  return true;
+}
 // fix.ui_quality's panels and instruments (ui_surfaces.h): the size, max over eyes, the
 // runtime's beginFrame says the frame being drawn was rendered for (the
 // host's treatedGeometry: the FOV trim and the cull guard included). Outside
