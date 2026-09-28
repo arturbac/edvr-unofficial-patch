@@ -50,7 +50,7 @@ struct ProbeState {
     bool armed = false;
     uint64_t armedAtMs = 0;
     uint32_t rearmCount = 0, hits = 0;
-    bool handlerInstalled = false;
+    bool handlerInstalled = false, baseNoted = false;
 };
 ProbeState g_probe;
 std::atomic<uintptr_t> g_gate{0};
@@ -177,7 +177,14 @@ void flatCameraProducerProbeFrame(uint64_t frame) {
     if (g_probe.installed.load(std::memory_order_acquire)) return;
     if (g_probe.relay) return; // a failed install is final for the session
     const HMODULE game = GetModuleHandleW(L"EliteDangerous64.exe");
-    if (!game) { g_probe.failReason = "EliteDangerous64.exe is not loaded in this process"; return; }
+    if (!game) {
+        if (!g_probe.baseNoted) {
+            g_probe.baseNoted = true;
+            g_probe.failReason = "EliteDangerous64.exe is not loaded in this process";
+            Log::get().note("flat camera producer: wanted but %s; standing down", g_probe.failReason);
+        }
+        return;
+    }
     const uintptr_t base = reinterpret_cast<uintptr_t>(game);
     if (!sehCheck(base + kUploadRva, kUploadPrologue, sizeof(kUploadPrologue))) {
         g_probe.failReason = "upload helper prologue mismatch at this build (not the Ghidra-verified shape)";
