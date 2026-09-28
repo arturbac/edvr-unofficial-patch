@@ -1530,6 +1530,24 @@ uint32_t g_holoMarkerSampleCount = 0;
 // one above.
 uint64_t g_holoNearLightSamples[kHoloPixelSamples];
 uint32_t g_holoNearLightSampleCount = 0;
+// Pixel counts are census-only: they never feed the render passes. Keep
+// their queries and staging traffic out of ordinary temporal-AA frames.
+bool g_holoDiagnosticsOn = false;
+void holoDiagnosticsConfigure(bool on) {
+    if (on == g_holoDiagnosticsOn) return;
+    g_holoDiagnosticsOn = on;
+    for (auto& s : g_holoScratch) {
+        for (uint32_t i = 0; i < kHoloQueryRing; ++i) {
+            if (s.occlusion[i]) { s.occlusion[i]->Release(); s.occlusion[i] = nullptr; }
+            if (s.markerOcclusion[i]) { s.markerOcclusion[i]->Release(); s.markerOcclusion[i] = nullptr; }
+            if (s.nearLightStage[i]) { s.nearLightStage[i]->Release(); s.nearLightStage[i] = nullptr; }
+            s.occlusionPending[i] = s.markerOcclusionPending[i] = s.nearLightStagePending[i] = false;
+        }
+        s.occlusionNext = s.markerOcclusionNext = s.nearLightStageNext = 0;
+    }
+    g_holoElementQuery = nullptr;
+    g_holoPixelSampleCount = g_holoMarkerSampleCount = g_holoNearLightSampleCount = 0;
+}
 bool     g_holoScratchFailedNoted = false, g_holoFirstDrawNoted = false, g_holoCanopyRefusedNoted = false;
 
 bool holoIsSrgbFormat(DXGI_FORMAT fmt) {
@@ -1627,15 +1645,7 @@ HoloScratch* holoScratchFor(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint3
     if (SUCCEEDED(hr)) hr = dev->CreateTexture2D(&nd, nullptr, &s.nearLightTex);
     if (SUCCEEDED(hr)) hr = dev->CreateUnorderedAccessView(s.nearLightTex, nullptr, &s.nearLightUav);
     if (SUCCEEDED(hr)) hr = dev->CreateShaderResourceView(s.nearLightTex, nullptr, &s.nearLightSrv);
-    // The census staging ring: never fatal to the map itself, so its own
-    // HRESULT never joins the chain above.
-    D3D11_TEXTURE2D_DESC nsd{};
-    nsd.Width = nd.Width; nsd.Height = nd.Height; nsd.MipLevels = nsd.ArraySize = 1;
-    nsd.Format = DXGI_FORMAT_R8_UNORM;
-    nsd.SampleDesc.Count = 1;
-    nsd.Usage = D3D11_USAGE_STAGING;
-    nsd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    for (uint32_t i = 0; i < kHoloQueryRing; ++i) dev->CreateTexture2D(&nsd, nullptr, &s.nearLightStage[i]);
+    // Census staging is allocated lazily only when diagnostics samples it.
     dev->Release();
     if (FAILED(hr) || !s.contribRtv || !s.contribSrv || !s.depthDsv || !s.depthSrv || !s.radiusDsv ||
         !s.nearLightUav || !s.nearLightSrv) {
@@ -2122,6 +2132,7 @@ ID3D11Buffer* holoResolveCb(ID3D11DeviceContext* ctx) {
 // still awaiting its GPU result -- never waited on; the census simply
 // samples fewer eye-frames that window (holoDepthWindowTick).
 ID3D11Query* holoAcquireQuery(ID3D11DeviceContext* ctx, HoloScratch& s) {
+    if (!g_holoDiagnosticsOn || g_holoPixelSampleCount >= kHoloPixelSamples) return nullptr;
     for (uint32_t i = 0; i < kHoloQueryRing; ++i) {
         const uint32_t idx = (s.occlusionNext + i) % kHoloQueryRing;
         if (s.occlusionPending[idx]) continue;
@@ -2146,6 +2157,7 @@ void holoQueryBegan(HoloScratch& s, ID3D11Query* q) {
 // The same ring shape, kept separate from the pair above: a world
 // marker's element-depth pass, not the resolve, and its own sample array.
 ID3D11Query* holoAcquireMarkerQuery(ID3D11DeviceContext* ctx, HoloScratch& s) {
+    if (!g_holoDiagnosticsOn || g_holoMarkerSampleCount >= kHoloPixelSamples) return nullptr;
     for (uint32_t i = 0; i < kHoloQueryRing; ++i) {
         const uint32_t idx = (s.markerOcclusionNext + i) % kHoloQueryRing;
         if (s.markerOcclusionPending[idx]) continue;
@@ -2170,6 +2182,7 @@ void holoMarkerQueryBegan(HoloScratch& s, ID3D11Query* q) {
 // Poll every pending query, DONOTFLUSH: a ready one feeds the census's
 // pixel-count samples, a not-ready one is left for a later frame's poll.
 void holoPollQueries(ID3D11DeviceContext* ctx) {
+    if (!g_holoDiagnosticsOn) return;
     for (auto& s : g_holoScratch) {
         for (uint32_t i = 0; i < kHoloQueryRing; ++i) {
             if (!s.occlusionPending[i] || !s.occlusion[i]) continue;
@@ -2197,10 +2210,24 @@ void holoPollQueries(ID3D11DeviceContext* ctx) {
 // A free ring slot to copy the near-light map into, or null when every
 // slot still awaits a previous frame's poll -- same shape as
 // holoAcquireQuery, for a texture instead of a query.
-ID3D11Texture2D* holoAcquireNearLightStage(HoloScratch& s) {
+ID3D11Texture2D* holoAcquireNearLightStage(ID3D11DeviceContext* ctx, HoloScratch& s) {
+    if (!g_holoDiagnosticsOn || g_holoNearLightSampleCount >= kHoloPixelSamples) return nullptr;
     for (uint32_t i = 0; i < kHoloQueryRing; ++i) {
         const uint32_t idx = (s.nearLightStageNext + i) % kHoloQueryRing;
-        if (s.nearLightStagePending[idx] || !s.nearLightStage[idx]) continue;
+        if (s.nearLightStagePending[idx]) continue;
+        if (!s.nearLightStage[idx]) {
+            D3D11_TEXTURE2D_DESC td{};
+            s.nearLightTex->GetDesc(&td);
+            td.Usage = D3D11_USAGE_STAGING;
+            td.BindFlags = 0;
+            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ID3D11Device* dev = nullptr;
+            ctx->GetDevice(&dev);
+            if (!dev) return nullptr;
+            const HRESULT hr = dev->CreateTexture2D(&td, nullptr, &s.nearLightStage[idx]);
+            dev->Release();
+            if (FAILED(hr)) continue;   // never fatal to the production map
+        }
         s.nearLightStageNext = (idx + 1) % kHoloQueryRing;
         return s.nearLightStage[idx];
     }
@@ -2210,6 +2237,7 @@ ID3D11Texture2D* holoAcquireNearLightStage(HoloScratch& s) {
 // a slot the GPU is still writing is left for a later frame's poll, the
 // same non-stalling shape as the occlusion queries above.
 void holoPollNearLightCounts(ID3D11DeviceContext* ctx) {
+    if (!g_holoDiagnosticsOn) return;
     for (auto& s : g_holoScratch) {
         for (uint32_t i = 0; i < kHoloQueryRing; ++i) {
             if (!s.nearLightStagePending[i] || !s.nearLightStage[i]) continue;
@@ -2262,7 +2290,7 @@ void holoDepthWindowTick(ID3D11DeviceContext* ctx) {
         ? static_cast<double>(nearLightTotal) / g_holoNearLightSampleCount : 0.0;
     // One combined note, not two: the rig (and anything else reading the
     // last logged line) expects a single "hologram depth:" note per tick.
-    Log::get().note("hologram depth: %.0f s, %u frames, listed draws %.2f/frame, resolved "
+    if (g_holoDiagnosticsOn) Log::get().note("hologram depth: %.0f s, %u frames, listed draws %.2f/frame, resolved "
                     "eye-frames %u, stamped pixels/eye-frame p50 %llu (occlusion, %u sampled), "
                     "share test skipped %u (no target view), floor on contribution %u (no display "
                     "view), declined %u (%u nothing listed, %u no private copy, %u no projection, "
@@ -2276,6 +2304,16 @@ void holoDepthWindowTick(ID3D11DeviceContext* ctx) {
                     static_cast<double>(g_holoWindowMarkerDraws) / frames,
                     static_cast<unsigned long long>(markerP50), markerN,
                     nearLightMean, g_holoNearLightSampleCount);
+    else Log::get().note("hologram depth: %.0f s, %u frames, listed draws %.2f/frame, resolved "
+                    "eye-frames %u, share test skipped %u (no target view), floor on contribution %u "
+                    "(no display view), declined %u (%u nothing listed, %u no private copy, %u no projection, "
+                    "%u fault); world markers %.2f draws/frame; GPU pixel census off "
+                    "(advanced.temporal_aa_diagnostics = 0; pixel counts unavailable).",
+                    seconds, g_holoWindowFrames, static_cast<double>(g_holoWindowListed) / frames,
+                    g_holoWindowResolved, g_holoWindowNoTarget, g_holoWindowFloorFallback, declined,
+                    g_holoWindowDeclinedNotCleared, g_holoWindowDeclinedNoPrivate,
+                    g_holoWindowDeclinedNoProjection, g_holoWindowDeclinedFault,
+                    static_cast<double>(g_holoWindowMarkerDraws) / frames);
     g_holoWindowStartMs = now;
     g_holoWindowFrames = g_holoWindowListed = g_holoWindowResolved = 0;
     g_holoWindowNoTarget = g_holoWindowFloorFallback = 0;
@@ -2521,6 +2559,7 @@ uint32_t holoWorldMarkerList(uint64_t* out, uint32_t cap) {
 }
 
 void holoDepthConfigure(Config& cfg) {
+    holoDiagnosticsConfigure(cfg.getBool("advanced.temporal_aa_diagnostics", false));
     const bool on = cfg.getBool("advanced.temporal_aa_hologram_depth", true);
     uint64_t fam[kMaxHashes];
     const uint32_t famCount = holoBuildFamilyList(
@@ -4068,7 +4107,7 @@ bool uiDepthHologramResolve(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* 
 
             // The census copy (a readback and a CPU scan of the map) samples
             // every 16th frame, like the other GPU diagnostics here.
-            ID3D11Texture2D* stage = (g_frame & 15u) == 0 ? holoAcquireNearLightStage(s) : nullptr;
+            ID3D11Texture2D* stage = (g_frame & 15u) == 0 ? holoAcquireNearLightStage(ctx, s) : nullptr;
             if (stage) {
                 ctx->CopyResource(stage, s.nearLightTex);
                 for (uint32_t i = 0; i < kHoloQueryRing; ++i)
