@@ -1014,8 +1014,6 @@ ID3D11ComputeShader* g_cs = nullptr;
 bool                 g_csTried = false;
 ID3D11Buffer*        g_cb = nullptr;
 ID3D11SamplerState*  g_samp = nullptr;
-ID3D11Device* g_flatDevice = nullptr;
-ID3DDeviceContextState* g_flatIsolated = nullptr;
 
 std::mutex   g_geomMutex;
 MenuGeometry g_geom;
@@ -1560,8 +1558,6 @@ bool menuPanelCompositeFlatTexture(ID3D11Texture2D* back) {
     FlatComputeInternalScope internal;
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* context = nullptr;
-    ID3D11DeviceContext1* context1 = nullptr;
-    ID3D11Device1* device1 = nullptr;
     back->GetDevice(&dev);
     if (g_panelDevice && g_panelDevice != dev) {
         menuPanelFlatResize();
@@ -1569,60 +1565,33 @@ bool menuPanelCompositeFlatTexture(ID3D11Texture2D* back) {
         return false;
     }
     if (dev) dev->GetImmediateContext(&context);
-    if (dev) dev->QueryInterface(__uuidof(ID3D11Device1),
-                                 reinterpret_cast<void**>(&device1));
-    if (context) context->QueryInterface(__uuidof(ID3D11DeviceContext1),
-                                        reinterpret_cast<void**>(&context1));
-    if (g_flatDevice != dev) {
-        if (g_flatIsolated) { g_flatIsolated->Release(); g_flatIsolated = nullptr; }
-        if (g_flatDevice) { g_flatDevice->Release(); g_flatDevice = nullptr; }
-    }
-    if (dev && device1 && context1 && !g_flatIsolated) {
-        D3D_FEATURE_LEVEL level = dev->GetFeatureLevel(), selected{};
-        const UINT flags = (dev->GetCreationFlags() & D3D11_CREATE_DEVICE_SINGLETHREADED)
-            ? D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED : 0;
-        if (level >= D3D_FEATURE_LEVEL_11_0 &&
-            SUCCEEDED(device1->CreateDeviceContextState(flags, &level, 1,
-                D3D11_SDK_VERSION, __uuidof(ID3D11Device), &selected, &g_flatIsolated))) {
-            g_flatDevice = dev;
-            g_flatDevice->AddRef();
-        }
-    }
-    if (!g_flatIsolated || !context1) {
-        if (context1) context1->Release();
-        if (device1) device1->Release();
+    if (!dev || !context) {
         if (context) context->Release();
         if (dev) dev->Release();
         return false;
     }
-    struct Isolate {
-        ID3D11DeviceContext1* context;
-        ID3DDeviceContextState* previous = nullptr;
-        explicit Isolate(ID3D11DeviceContext1* c) : context(c) {
-            context->SwapDeviceContextState(g_flatIsolated, &previous);
-            context->ClearState();
-        }
-        ~Isolate() {
-            context->ClearState();
-            context->SwapDeviceContextState(previous, nullptr);
-            if (previous) previous->Release();
-        }
-    };
+    // compositeInner already saves and restores every compute-stage slot it
+    // touches (CSGetShader/CSGetShaderResources/CSGetUnorderedAccessViews/
+    // CSGetConstantBuffers/CSGetSamplers, mirrored going back out) -- the same
+    // protection menuPanelCompositeNative's VR path already relies on by
+    // calling compositeInner directly on the live context. A
+    // CreateDeviceContextState/SwapDeviceContextState detour around that was
+    // redundant on top of protection already proven elsewhere in this file,
+    // and depends on a D3D11.1 feature real games essentially never exercise
+    // -- exactly the kind of corner a translation layer has every reason to
+    // under-test.
     bool copied = false;
     {
-        Isolate isolate(context1);
         // compositeInner expects a packed 3x3 rotation followed by XYZ origin.
         const float identity[12] = {1,0,0, 0,1,0, 0,0,1, 0,0,0};
         ID3D11Texture2D* out = static_cast<ID3D11Texture2D*>(
             compositeInner(back, 0, nullptr, identity, true));
-        if (out && context) {
+        if (out) {
             context->CopyResource(back, out);
             copied = true;
         }
     }
     if (copied) bumpMenuDrawn();
-    context1->Release();
-    device1->Release();
     context->Release();
     dev->Release();
     return copied;
@@ -1636,8 +1605,6 @@ void menuPanelFlatResize() {
     g_panelW = g_panelH = 0;
     g_panelAspect.store(0.0f);
     if (g_cs) { g_cs->Release(); g_cs = nullptr; }
-    if (g_flatIsolated) { g_flatIsolated->Release(); g_flatIsolated = nullptr; }
-    if (g_flatDevice) { g_flatDevice->Release(); g_flatDevice = nullptr; }
     g_csTried = false;
     if (g_cb) { g_cb->Release(); g_cb = nullptr; }
     if (g_samp) { g_samp->Release(); g_samp = nullptr; }
@@ -1888,8 +1855,6 @@ void menuPanelShutdown() {
     if (g_samp) { g_samp->Release(); g_samp = nullptr; }
     if (g_cb) { g_cb->Release(); g_cb = nullptr; }
     if (g_cs) { g_cs->Release(); g_cs = nullptr; }
-    if (g_flatIsolated) { g_flatIsolated->Release(); g_flatIsolated = nullptr; }
-    if (g_flatDevice) { g_flatDevice->Release(); g_flatDevice = nullptr; }
     g_panelW = g_panelH = 0;
     g_panelAspect.store(0.0f);
     g_panelWidthDeg.store(0.0f);
