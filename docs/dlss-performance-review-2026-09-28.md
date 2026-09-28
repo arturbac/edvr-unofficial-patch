@@ -4,9 +4,11 @@
 
 - **State:** review of `v0.17.0` (`e72c17c8`, September 17) through `1d2e60ef`.
   Frontier flight `20260928_123334` is validated against its own source
-  revision, `538175a8`, not HEAD. Validated optimization: gate hologram GPU
-  pixel census behind the existing temporal diagnostics setting; preserve
-  rendering and passive counters. Hardware benefit is unflown.
+  revision, `538175a8`, not HEAD. Round 1 gates hologram GPU pixel census.
+  Round 2 compacts luminance readbacks and caches private-scatter UAVs; focused
+  rigs, independent review and all 84 full-build jobs pass. Combining latest
+  crisp HUD for Frontier profiling is authorized; main stays separate. Hardware
+  benefit is unflown; no new Frontier flight exists yet.
 - **Finding:** DLSS is the largest measured EDVR GPU item, about 2.7–3.2 ms per
   stereo pair in the sampled flight. Most logged long caller cycles are
   dominated by game work before the first submit or after the second, rather
@@ -119,12 +121,9 @@ Present-boundary tail deserve spike attribution.
 
 ## Source review against 0.17.0
 
-The normal full-frame DLSS route is a typed colour copy, one input-resolution
-MV/depth/mask dispatch, NGX evaluation, then a full-output UI resolve or output
-copy. Preparation starts around `temporal_pass.cpp:4786`; NGX evaluation around
-`:4980`; final UI handling around `:5131`. The separate OpenXR device then
-imports/copies/composes the submitted eye. Its producer and compositor timings
-are distinct from game-device DLSS cost.
+Full-frame DLSS runs colour copy → input-sized MV/depth/mask dispatch → NGX →
+output UI resolve/copy (`temporal_pass.cpp:4786`, `:4980`, `:5131`). OpenXR's
+separate-device transfer/compose is outside these game-device timings.
 
 | Since 0.17.0 | Cost and qualification |
 | --- | --- |
@@ -135,14 +134,9 @@ are distinct from game-device DLSS cost.
 | UI separation and deferred replay retired | Removes some copies and GPU work. Feature growth is not uniformly additive. |
 | UI resolve/corona hold, temporal total timing and NGX timing | Already present at 0.17.0; may still be expensive, but are not new costs. |
 
-The default motion shader compiles diagnostic atomics, registration searches
-and engine-kind counters out unless diagnostics/debug/capture is armed. Keep
-this distinction when comparing flights. Previous depth swaps textures rather
-than copying the whole input. NGX optimal-mode queries and feature creation are
-size/preset-generation gated, not ordinary per-frame work. The compute-state
-save now covers 23 SRVs, seven UAVs and three CBs because engine motion
-consumes those slots; shortening it without proving state equivalence would
-undo a correctness fix.
+Default motion compiles diagnostic counters/searches out. Previous depth swaps
+textures. NGX creation/mode queries are size/preset gated. The broader compute
+save (23 SRVs, seven UAVs, three CBs) preserves engine-motion state; keep it.
 
 The core temporal/NGX evaluation has no explicit Flush or spinning query wait;
 timestamp polls use DONOTFLUSH. There is an exception in the automatically
@@ -159,29 +153,60 @@ transfers, mapping and CPU work.
 
 ## Optimization with a direct proof of redundant work
 
-Hologram pixel census results feed only the 30-second log: stamped pixel p50,
-marker pixel p50 and near-light block mean. None feed a shader, geometry,
-depth, mask, resource selection or rendering decision. Before this review,
-every resolved eye and every marker draw attempted an occlusion query; a
-three-slot ring bounded pending queries, but collection continued after the 512
-retained samples filled. Every sixteenth frame also copied each eye's
-near-light map to staging, later mapped it and scanned every block on the CPU.
-Staging resources were allocated during normal rendering. All of this is new
-since 0.17.0.
+Hologram pixel counts feed only the log. Previously each resolved eye/marker
+attempted queries even after 512 retained results; every sixteenth frame also
+copied/mapped/scanned near-light staging. This is new since 0.17.0. Round 1
+gates it behind `advanced.temporal_aa_diagnostics`, retaining rendering and
+passive counters, explicitly labeling unavailable pixels. WARP verifies
+equivalent depth, command removal and live transitions. Hardware benefit and
+the red-bar cause remain unproven.
 
-The narrow patch gates GPU pixel census behind the existing
-`advanced.temporal_aa_diagnostics` setting. Production
-contribution/depth/near-light rendering and passive draw/resolve/decline
-counters remain active. The heartbeat explicitly distinguishes a disabled pixel
-census from measured zero coverage. Diagnostics retain a bounded route to the
-original evidence. The WARP rig must prove both depth output equivalence and
-absence/presence of the actual diagnostic commands, including live setting
-transitions and sampled frame cadence.
+## 2026-09-28: second optimization round and crisp HUD review
 
-This removes known unnecessary commands; it does **not** establish how much the
-headset frame time improves or prove that the removed commands caused the
-reported red bars. Frontier hardware comparison remains the flight gate for
-that claim.
+**Luminance:** keep all historical 16×16 grid pixels and format bytes, but copy
+16 rows into compact staging. At Frontier sizes a stereo round transfers
+288,781,416 → 1,303,680 logical bytes (99.55% less), with six → 96 copy
+commands once per two seconds. The software-driver submission tradeoff is about
+0.034 ms extra per round; it is not a hardware frametime result. All read Maps
+remain nonblocking; after 30 unresolved polls, report `unavailable(timeout)`
+and retry with fresh staging after the normal throttle. The WARP rig passes
+2,759 checks for exact bytes/statistics, formats, dimensions, mip/array and
+failure paths.
+
+**Private scatter:** validated Frontier counters show 108 nonempty scatters,
+3,262 rows; none added in the last steady 30 s. Cache each eye/source's UAV by
+held device/resource identity, keeping binding/descriptor checks and lifecycle
+resets. The production rig verifies four same-pool scatters need one creation
+instead of four; eight alternating-eye scatters need two. All 1,729 checks
+pass. This is conditional factory work, not a demonstrated steady CPU
+bottleneck.
+
+**Crisp HUD (`kimi/crisp-hud-census`, `472ff122`):** folding it into this
+branch does not require merging main. Its accepted draws already skip UI-depth,
+generic hologram and screen-motion reissues. Do not remove `ui_depth.cpp`: the
+layer still uses its classifier/eye table; smoke, reactive/edit masks, fallback
+UI, FSS and planet/solar motion remain. `fix.ui_depth` is already a retired
+key, not an independent current setting.
+
+The latest crisp code admits eight generic hologram families, despite older
+Status wording saying eleven. Sphere `5559BD94B6852E83` stays in-scene because
+its pixel-position depth loads lose 84% of the WARP image at layer size; corona
+`D1281DF454A153AD` shares a shader with the real sun; world reticle
+`71DD8B8B09060A81` lacks resource-safety proof. These retain depth treatment.
+Ownership-based gating is the safe simplification. UI history/resolve can
+potentially be skipped when both current and prior UI/edit evidence are absent,
+with transition invalidation and smoke-mask type 3 preserved; this needs proof.
+
+Crisp's journal records 87 → 72 fps at UI quality 125. A newer Steam flight,
+`20260928_125942`, validates against `472ff122`: at UI quality 100, 4000×3868
+per eye, cockpit route median is 0.692–0.701 ms/eye; seed alone is about 0.432
+ms/eye. No unavailable/invalid/late route intervals were reported. The primary
+redirected HDR HUD shading is deliberately untimed, so route totals exclude
+moved rendering. This is not a controlled crisp-on/off result. Before Frontier
+profiling, price those draws and test two source-proven candidates: repeated
+coverage command-list recording and stencil clear before an unconditional
+full-target stencil write. Preserve fallback and lifecycle behavior; prove
+production-path output and state equivalence headlessly.
 
 ## Remaining candidates, ordered by useful evidence
 
@@ -237,4 +262,6 @@ found no rendering or lifetime blocker. The absolute-path full build passed all
 gates, including 83 jobs, config contract, DLL/export validation and
 self-contained installer checks; it wrote `build/full_build_receipt.json`.
 Delivery uses clean-commit DLL promotion and the sanctioned Frontier installer,
-preserving the live INI and DLSS runtime. Hardware improvement remains unflown.
+preserving the live INI and DLSS runtime. Round 2 passes all 84 full-build
+jobs, including 2,759 luminance and 1,729 engine-velocity checks. Hardware
+improvement remains unflown.

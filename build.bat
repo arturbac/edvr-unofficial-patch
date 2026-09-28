@@ -1197,6 +1197,19 @@ if errorlevel 1 ( echo [edvr] ERROR: ui_depth_test build failed & exit /b 1 )
 )
 exit /b 0
 
+:rig_luma_probe_test
+echo [edvr] === compact luminance diagnostic regression ===
+if not exist "%OBJ%\lumaprobetest" mkdir "%OBJ%\lumaprobetest"
+cl.exe /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 ^
+    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\lumaprobetest\\" /Fe"%OBJ%\lumaprobetest\luma_probe_test.exe" ^
+    "tools\luma_probe_test\luma_probe_test.cpp" ^
+    /link /INCREMENTAL:NO /OPT:REF d3d11.lib dxgi.lib
+if errorlevel 1 ( echo [edvr] ERROR: luma_probe_test build failed & exit /b 1 )
+"%OBJ%\lumaprobetest\luma_probe_test.exe" --dry-run || exit /b 1
+"%OBJ%\lumaprobetest\luma_probe_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_hologram_depth_test
 echo [edvr] === generic hologram/icon depth regression ===
 REM Same shape as :rig_ui_depth: WARP, the production coverage pass

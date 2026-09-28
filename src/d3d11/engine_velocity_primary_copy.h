@@ -285,6 +285,14 @@ inline void endMergeOpaque(void* opaque,bool completed) noexcept {
         }
     } catch(...) {invalidateClaims();}
 }
+// Owned by one eye/source private pool, not by the shared compute cache:
+// left/right alternate every frame. Held resource identity prevents an old
+// view being reused for a different allocation at the same address.
+struct OutputCache {
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11Buffer> pool;
+    ComPtr<ID3D11UnorderedAccessView> view;
+};
 struct GpuCache {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11ComputeShader> shader;
@@ -293,7 +301,7 @@ struct GpuCache {
     uint32_t capacity=0;
 };
 inline GpuCache g_gpu;
-inline bool apply(ID3D11DeviceContext* ctx,ID3D11Buffer* privatePool,ID3D11Buffer* sourcePool,uint32_t frame) noexcept {
+inline bool apply(ID3D11DeviceContext* ctx,ID3D11Buffer* privatePool,ID3D11Buffer* sourcePool,uint32_t frame,OutputCache& output) noexcept {
     auto fail=[](ScatterFailure why){std::lock_guard<std::mutex> lock(g_mutex);++g_stats.scatterFailed;g_stats.lastScatterFailure=why;return false;};
     if(!ctx || !privatePool || !sourcePool || privatePool==sourcePool)return fail(ScatterFailure::Arguments);
     try {
@@ -305,6 +313,7 @@ inline bool apply(ID3D11DeviceContext* ctx,ID3D11Buffer* privatePool,ID3D11Buffe
         if(privateBound(ctx,privatePool))return fail(ScatterFailure::Bound);
         ComPtr<ID3D11Device> device;ctx->GetDevice(&device);
         if(g_gpu.device.Get()!=device.Get()){g_gpu={};g_gpu.device=device;}
+        if(output.device.Get()!=device.Get() || output.pool.Get()!=privatePool)output={};
         if(!g_gpu.shader && FAILED(device->CreateComputeShader(kEnginePrimaryCopyScatterBytecode,sizeof(kEnginePrimaryCopyScatterBytecode),nullptr,&g_gpu.shader)))return fail(ScatterFailure::Shader);
         if(g_gpu.capacity<work.size()) {
             g_gpu.upload.Reset();g_gpu.input.Reset();g_gpu.capacity=0;
@@ -319,7 +328,11 @@ inline bool apply(ID3D11DeviceContext* ctx,ID3D11Buffer* privatePool,ID3D11Buffe
         D3D11_MAPPED_SUBRESOURCE mapped{};
         if(FAILED(ctx->Map(g_gpu.upload.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&mapped)))return fail(ScatterFailure::Map);
         std::memcpy(mapped.pData,work.data(),work.size()*sizeof(Patch));ctx->Unmap(g_gpu.upload.Get(),0);
-        ComPtr<ID3D11UnorderedAccessView> output;if(FAILED(device->CreateUnorderedAccessView(privatePool,nullptr,&output)))return fail(ScatterFailure::View);
+        if(!output.view) {
+            ComPtr<ID3D11UnorderedAccessView> view;
+            if(FAILED(device->CreateUnorderedAccessView(privatePool,nullptr,&view)))return fail(ScatterFailure::View);
+            output.device=device;output.pool=privatePool;output.view=std::move(view);
+        }
         const uint32_t counts[4]={UINT(work.size()),d.ByteWidth/kBytes,0,0};
         if(!g_gpu.count){D3D11_BUFFER_DESC cb{};cb.ByteWidth=16;cb.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
             if(FAILED(device->CreateBuffer(&cb,nullptr,&g_gpu.count)))return fail(ScatterFailure::Counts);}
@@ -330,7 +343,7 @@ inline bool apply(ID3D11DeviceContext* ctx,ID3D11Buffer* privatePool,ID3D11Buffe
         ComPtr<ID3D11UnorderedAccessView> savedOutput;ctx->CSGetUnorderedAccessViews(0,1,&savedOutput);
         ComPtr<ID3D11Buffer> savedCount;ctx->CSGetConstantBuffers(0,1,&savedCount);
         ctx->CSSetShader(g_gpu.shader.Get(),nullptr,0);ctx->CSSetShaderResources(0,1,g_gpu.input.GetAddressOf());
-        ctx->CSSetUnorderedAccessViews(0,1,output.GetAddressOf(),nullptr);ctx->CSSetConstantBuffers(0,1,g_gpu.count.GetAddressOf());
+        ctx->CSSetUnorderedAccessViews(0,1,output.view.GetAddressOf(),nullptr);ctx->CSSetConstantBuffers(0,1,g_gpu.count.GetAddressOf());
         ctx->Dispatch((UINT(work.size())+63)/64,1,1);
         ID3D11UnorderedAccessView* empty=nullptr;ctx->CSSetUnorderedAccessViews(0,1,&empty,nullptr);
         ctx->CSSetShaderResources(0,1,savedInput.GetAddressOf());ctx->CSSetUnorderedAccessViews(0,1,savedOutput.GetAddressOf(),nullptr);

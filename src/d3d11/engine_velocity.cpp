@@ -223,6 +223,7 @@ struct Eye {
     uint32_t gameMarkFrame = ~0u;
     Ptr<ID3D11Buffer> pool;              // the snapshot copies
     Ptr<ID3D11ShaderResourceView> poolSrv;
+    primaryCopy::OutputCache poolOutput; // dies with this eye/source or a pool replacement
     UINT poolBytes = 0;
     Ptr<ID3D11Buffer> scene[2];          // the game's cb1, by present-frame parity
     uint32_t sceneFrame[2] = {~0u, ~0u};
@@ -829,7 +830,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         return false;
     }
     if (!e.pool || e.poolBytes != pd.ByteWidth) {
-        e.pool.Reset(); e.poolSrv.Reset();
+        e.poolOutput = {}; e.pool.Reset(); e.poolSrv.Reset();
         D3D11_BUFFER_DESC d = pd;
         d.Usage = D3D11_USAGE_DEFAULT; d.CPUAccessFlags = 0; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         d.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
@@ -861,7 +862,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         // instead of paying two pairs' worth of overhead for it.
         GpuCensusScope census(ctx, GpuCensusSection::FrameEngineVelocity);
         ctx->CopyResource(e.pool.Get(), poolBuf.Get());
-        if(primaryCopy::apply(ctx,e.pool.Get(),poolBuf.Get(),frame))++g_primaryApplied;
+        if(primaryCopy::apply(ctx,e.pool.Get(),poolBuf.Get(),frame,e.poolOutput))++g_primaryApplied;
         // The copy by region, not resource: our buffer can be a float4
         // larger than the game's (the stamp), which CopyResource would
         // reject. The stamp is this eye-frame's present-frame clock -- the
@@ -959,7 +960,7 @@ void checkSources(ID3D11DeviceContext* ctx, Eye& e, int eye) {
             // snapshot()'s pair.
             GpuCensusScope census(ctx, GpuCensusSection::FrameEngineVelocity);
             ctx->CopyResource(e.pool.Get(), e.poolBuffer.Get());
-            if(primaryCopy::apply(ctx,e.pool.Get(),e.poolBuffer.Get(),e.frame))++g_primaryApplied;
+            if(primaryCopy::apply(ctx,e.pool.Get(),e.poolBuffer.Get(),e.frame,e.poolOutput))++g_primaryApplied;
         }
         endCapture(ctx, refreshTimer);
         e.poolAppendEpoch = wp.appendEpoch;
