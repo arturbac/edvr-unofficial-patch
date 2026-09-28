@@ -592,3 +592,31 @@ Verify (one launch): the main menu sharp (taken, not before the AA pass)
 -- the log's "left in the game's frame" line should no longer list menu
 panel with "eye unknown"; then docked, a menu open over the panels: menus
 over the panels, both sharp; the crisp hud line clean.
+
+## Phase 1 flight 2, 2026-09-28 morning (84690880): the tier variant
+
+Menus fixed and sharp (last night's eye-table fix holds). But the cockpit
+panels were gone at HMD Quality 0.50 + ui_quality 125: the tier flies its
+own tonemap PS (D0A16B9E55BF22CC), the admission's per-PS slot table knew
+only the measured 0.75-tier one, every re-issue declined kNoHdrSlot, and
+every taken panel vanished (4,060/4,062 draws; the window lines named it:
+"0.00 re-issues, 4,060 HDR layers' content never reached a tonemap").
+Sean: the panels gone; the radar, the ship hologram and the target
+hologram still present (the hologram pass's families, never taken) -- the
+ship without its shields (the shield ring is a holo-panel draw, taken and
+lost with them). Exactly the families split the take makes.
+
+The fix (09baba69): the admission finds the HDR source by IDENTITY -- the
+PS slot whose 2D view reads an eye's HDR target this frame, which the holo
+take records -- so the tier and EDHM variants need no table entry. And the
+failure shape hardened: a draw with fresh content but no readable slot
+stands the crisp path down to stock (named once, counted) instead of
+losing the HUD for a session. Phase 0's census never saw this PS because
+flights 1-3 ran 0.75 only -- the tier gap is recorded in the G-B entry's
+risks now.
+
+On Sean's refactor question (HUD and ui_depth sharing a path): the eye
+table regression (observers registering) argues for exactly that direction
+-- the admission now answers its own questions by identity instead. A
+fuller merge of the two passes' recognition is real work and is NOT
+folded into this regression fix; noted for the Phase 2 review.
