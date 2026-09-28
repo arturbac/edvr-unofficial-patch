@@ -23,10 +23,12 @@
 - Ruled out for that session: a backend evaluation failure as the immediate
   cause, because no backend initialized. Missing shader coverage is proven;
   whether quality settings or a mod produced those variants is not.
-- Next: decompile the three cache helpers and their dirty-flag rules;
-  trace camera/generation through derived data, CB writes/binds and
-  handoff to establish consumer lineage; then C2 reducer and WARP
-  geometry/lighting tests. The producer probe itself was rebuilt per the
+- Next: map the setters -- which functions write the frustum parameters,
+  axes and origin and raise the dirty bits, on what frame cadence (a
+  FindStores-style scan); resolve the +0x870/+0x8B0 ray/frustum blocks;
+  then the consumer-lineage join the review requires before C2. The
+  cache-helper decompile and the dirty-bit mutation protocol are in the
+  cache-helper addendum. The producer probe itself was rebuilt per the
   review's R1-R6 (gate-only stand-down, per-thread watch ownership,
   external-thread arm/disarm, mandatory handler registration,
   module-naming fallbacks, bounded witness collection).
@@ -420,3 +422,42 @@ leave inverse/ray data stale. Identify the authoritative inputs, dirty
 flags, regeneration order and any earlier consumers before choosing a
 mutation point; whether the camera pointer distinguishes domains and
 recording/mutation epochs likewise remains to be joined.
+
+## Cache-helper addendum, 2026-09-28: the dirty-flag protocol
+
+The three gate helpers are decompiled
+(analysis/decomp/flash/camera/camera_cache_helpers.txt, script
+CameraCacheHelpers.java). All take camera+0x20 and finalize one derived
+block from the struct's authoritative inputs; the dirty bits live in the
+flag word at camera+0x250:
+
+| Region | Content | Built from | Finalizer | Dirty bit |
+| --- | --- | --- | --- | --- |
+| +0x20..+0x4C | source 3x4 view axes | authoritative input | -- | -- |
+| +0x50/+0x54/+0x58 | source camera origin (stored negated) | authoritative input | -- | -- |
+| +0x190..+0x1CC | view rows (axes + translation row) | axes + origin | FUN_1404f4910 (or inline inside FUN_1404f49f0) | bit 2 |
+| +0x1D0..+0x20C | projection 4x4 | frustum params +0x234..+0x2A0 (kind at +0x244: perspective / ortho / third; oblique-adjust flag at +0x2A0) | FUN_1404f2ff0 | bit 4 |
+| +0x210..+0x24C | view-projection 4x4 (cached) | view rows x projection | FUN_1404f49f0 | bit 8 |
+
+Chaining: FUN_1404f49f0 calls FUN_1404f2ff0 first when bit 4 is set and
+rebuilds the view rows inline when bit 2 is set, then always recomputes
+the cached view-projection and clears bit 8. The composer FUN_140596830
+itself checks bit 4 and calls FUN_1404f2ff0 before reading the
+projection. The refresh FUN_1405921f0 checks bit 8 before copying the
+cached VP into the view-constant context, and the FUN_1405964c0 path
+checks bit 2 before consuming the view rows (+0x190), the origin and the
++0x870/+0x8B0 blocks. The dirty-bit protocol is therefore load-bearing:
+a consumer whose bit is clear reads the cache as-is.
+
+Mutation-protocol consequence for the candidate hook: editing the
+projection 4x4 alone is not enough -- the refresh copies the CACHED VP
+when bit 8 is clear, so a direct projection edit must also set bit 8,
+and editing the frustum parameters must set bits 4 and 8 (plus 2 when
+axes or origin move) or downstream readers consume stale caches. The
+authoritative inputs for jitter are the frustum parameters (near +0x234
+..+0x268) and the axes/origin; the projection, view rows and VP are all
+re-derivable through the game's own finalizers. Still open: the setter
+map -- which functions write the frustum parameters, axes and origin and
+raise the dirty bits, and on what frame cadence -- plus the +0x870/+0x8B0
+block semantics (the FUN_1405964c0 ray/frustum consumer) and the
+consumer-lineage join the review requires before C2.
