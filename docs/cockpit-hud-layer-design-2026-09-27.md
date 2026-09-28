@@ -669,3 +669,31 @@ the identity admission were already in. Full build green both halves
 consolidated verification flight: the 0.50/0.75 tiers, ui_quality 100/125,
 menus over cockpit panels, and feature re-arming (a ui_quality toggle
 mid-flight).
+
+## Phase 2 built, 2026-09-28 (b2c6d6e8 + merge 864c1c1c)
+
+The flight HUD and the target sprite take the HDR layer through the same
+crispHdr gate as the holo panels (the doc's Phase 2, gated on Phase 0's
+measurements). Verified family-agnostic rather than assumed: the take
+branches only on g_draw.hdr; the flight HUD's t0 scene-depth read is
+NDC-derived and survives the remap; the sprite's measured state (depth
+test OFF -- uiLayerDsEffect requires depthEnable for depthWrite, so stock
+performs no depth write; stencil test 0x01 / write 0x05) is covered by the
+on-demand per-bit stencil seed and the existing colourless write-back, the
+path the holo 0x04 stencil write flew with. hud_grain and
+target_indicator brackets nest as before. Rig: 274 checks, 0 failures.
+
+Then origin/main merged into the branch (the Coriolis-blur arc and the
+rc-since-rc2 review round; two conflicts, both in the expected places:
+uiLayerNoteOther's new excluded/panelSized parameters from the F4 fix
+combined with the crisp-pending guard at the call site, and the crisp
+section beside the new signature). Merged build green (config contract
+264/264), installed to Steam as v0.18.0-rc.3-29-g864c1c1c.
+
+Phase 2 flight: HMD 0.5 and 0.75 with DLSS, ui_quality = 100. Eyeball: the
+flight HUD's cockpit fade against a known occluder (its t0 read is
+scale-free by construction); the target sprite's shape and position with a
+target locked (never occluded by construction); no brightness step (the
+G-F budget); the target HOLOGRAM unchanged (Phase 3, not taken). The log:
+"crisp hud" sums all three families (~28-80 draws a frame), declines
+clean, 0 lost; write-backs nonzero with a target locked.
