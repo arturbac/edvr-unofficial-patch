@@ -2,14 +2,18 @@
 
 ## Status
 
-- State: producer discovery landed. The C1 producer probe named the
-  camera-row writer (FUN_140596830, trap RIP `0x596A54`) and its refresh
-  chain (FUN_1405921f0 <- FUN_140594d90 <- FUN_14058ef90); the C1/C2
-  addendum records the verified findings with the 2026-09-28 review's
-  corrections. C1 remains partial (cache helpers FUN_1404f49f0 /
-  FUN_1404f2ff0 / FUN_1404f4910 undecompiled; consumer lineage unjoined;
-  auxiliary composer callers unclassified) and C2 is not demonstrated —
-  do not turn camera mutation on from this evidence.
+- State: producer discovery and function-level lineage landed. The C1
+  producer probe named the camera-row writer (FUN_140596830, trap RIP
+  `0x596A54`) and its refresh chain (FUN_1405921f0 <- FUN_140594d90 <-
+  FUN_14058ef90); the cache helpers, the dirty-flag protocol, the setter
+  map and the refresh's consumers are decompiled and recorded in the
+  addenda, with the field schema corrected to one camera-relative typed
+  table per the C2-plan review. The ray basis (+0x870/+0x8B0) is resolved
+  as a view/origin snapshot written by FUN_1406be790 with no projection
+  dependency. The auxiliary composer callers remain unclassified by
+  behavior, and the complete view/execution lineage (which passes run
+  which refresh on which thread, record vs replay) is not yet joined.
+  C2 is planned, not demonstrated — do not turn camera mutation on.
 - Decision: investigate jittering the game's per-view camera construction
   before it derives raster/lighting data. Preserve the existing frame
   discovery, size negotiation, temporal backends and resource isolation.
@@ -303,56 +307,73 @@ does no blocking readbacks/captures; resolve regressions before promotion.
 C2 is an offline gate: no game session is required or sufficient. Every
 test names its discriminating signature and its stop condition up front,
 because a failed proof here retains the existing adapter unchanged.
+Revised per the C2-plan review: the field schema is the camera-relative
+typed table in the cache-helper addendum; the ray basis is modeled from
+its resolved typed writer; phase, rollback, ownership, lighting and the
+size matrix follow the production policies they must eventually exercise.
 
 ### C2-A: the derive reducer (pure event/matrix rig)
 
 A new rig under `tools/` reimplements ONLY the semantics read out of the
-decompiles -- the projection builder (FUN_1404f2ff0: frustum params
-+0x234..+0x2A0, kind at +0x244, oblique adjust at +0x2A0), the
-view/VP/ray finalizers (FUN_1404f4910 / FUN_1404f49f0 / FUN_1404f3770)
-and the composers (FUN_140596830, FUN_1405964c0) -- each reduction cited
-to its decompile file and line. A divergence between rig and decompile
-is a rig bug, never papered over with a fudge factor.
+decompiles -- the projection builder (FUN_1404f2ff0, all five kind
+branches: 1 ortho, 3 trigonometric, 4/5 custom-matrix from +0x2D0..+0x30C,
+default), the view/VP/ray finalizers (FUN_1404f4910 / FUN_1404f49f0 /
+FUN_1404f3770) and the composers (FUN_140596830, FUN_1405964c0) -- each
+reduction cited to its decompile file and line. A divergence between rig
+and decompile is a rig bug, never papered over with a fudge factor.
 
 | Test | Signature that passes | Stop condition |
 | --- | --- | --- |
-| A1 exactly-once | Jitter at the frustum params; derive twice through the protocol; both VP products identical, and each element's delta equals the analytic partial of the phase (no element carries the phase twice) | Any double-scaled or missing term |
-| A2 bit protocol (negative control) | Mutate without raising bits: downstream blocks read STALE caches, matching the decompile's guard behaviour; with bits 4/8 (2/1 as applicable) raised, every block re-derives | The harness ever re-derives without the bits, or stays stale with them |
-| A3 canonical mutation form | Frustum-param mutation and direct projection-matrix mutation produce identical VP within float tolerance, across the kind branches (perspective/ortho/third) and the oblique path | A branch where they diverge -- that branch forbids direct-matrix edits and must be named |
-| A4 override composition | Mid-pass per-item near/far poke (FUN_140591f30's setter shape) applied after jitter; the section refresh composes override x jitter in the game's order; the jitter term survives unscaled | Jitter scaled, lost, or applied to the pre-override values |
-| A5 generations and replay | Same sources derived twice yield identical blocks; a source generation bump changes them; the injector keys its phase to the source generation, never to wall-frame index | Phase advances without a generation change, or survives one |
-| A6 recovery | Simulated backend failure mid-frame: the next frame carries exactly zero jitter with a named refusal; mid-job disable completes the in-flight frame unjittered | Any mixed-phase frame |
+| A1 exactly-once | Jitter at the frustum params; derive twice through the protocol; both VP products identical, and the resulting raster-pixel shift (after the final projection, per kind branch) equals the phase -- raw matrix coefficients are NOT assumed to survive unscaled through every branch | Any double-scaled, missing, or branch-dependent-untracked term |
+| A2 bit protocol (negative control) | Mutate without raising bits: downstream reads stay STALE, matching the decompile's guard behaviour. With bits raised, the CORRESPONDING blocks re-derive: cached matrices (projection, VP) via 4/8; directly-read parameters are never cached at all; the +0x870/+0x8B0 snapshots are modeled as independently supplied state (FUN_1406be790's semantics), and a stale-snapshot input is a required negative case. Masks 4, 8, C and D are exercised through the observed call sequence | Re-derivation without the bits; staleness with them; a block claimed to re-derive that the sequence never touches |
+| A3 canonical mutation form | Frustum-param mutation and direct projection-matrix mutation produce identical VP within float tolerance across kinds 1, 3 and the default branch; kinds 4/5 (custom-matrix) are either proven equal or explicitly REFUSED by name before mutation | A divergent branch left unnamed, or mutation allowed against an unproven kind |
+| A4 override composition | The ACTUAL setter sequence is modeled: per-item pokes to +0x25C (compound-near) and +0x280 (angular) applied after jitter, then the section refresh; the composed projection carries the override and the jitter term survives in raster-pixel shift | Jitter scaled, lost, or applied to the pre-override values; a test that only pokes near/far (which the real setters do not do) |
+| A5 phase, generation and replay (five cases, replacing source-generation keying) | 1) Repeat derivation within one phase-group execution: same phase, no accumulated offset. 2) New eligible execution with unchanged source bytes (a stationary camera): the sampling sequence CAN advance. 3) Per-item source revision within that execution: affected derivatives rebuild, the group's pixel phase is preserved. 4) Pointer reuse or resource/hook generation change: stale ownership/history rejected even with numerically identical matrices. 5) Deferred recording/replay: recorded phase and identity retained; late/repeated execution cannot masquerade as a fresh derivation or history sample; incompatible reuse is refused by name | Any case answered by wall-frame index or by source-byte freshness alone |
+| A6 failure and disable, split at the consumption boundary | Before any consumer: no camera mutation may reach rendering (clean refusal). After mutation but before consumption: abandon without publishing. After the first consumer: retain the committed phase for the frame's remaining work, forbid legacy takeover, invalidate temporal history, and stop subsequent jitter -- no perfect-rollback claim. Covered at: before preparation, after mutation before consumption, after the first consumer, at backend evaluation, and at handoff | Any mixed-phase frame; any "rollback" that changes already-consumed pixels; legacy path taking over a failed upstream frame |
 
 ### C2-B: WARP geometry and lighting harness
 
 A minimal user-mode D3D11 renderer (WARP device, no game, no EDVR) draws
 known geometry through shaders consuming a 336-row scene CB with camera
 rows 270..275 plus the frustum-ray and depth blocks in the refresh's own
-layout. The derive math runs on CPU per the reducer.
+layout. The derive math runs on CPU per the reducer. Conventions are
+stated up front: pixel-center, depth and matrix conventions, and every
+tolerance.
 
 | Test | Signature that passes | Stop condition |
 | --- | --- | --- |
-| W1 raster shift | Centroid shift of a known grid equals the phase in pixels, both axes, at 1.0x and 0.5x SS, odd extents and crops | Sub-pixel error above tolerance, or a size-dependent shift |
-| W2 forward/inverse/ray | Per-pixel unproject through the frustum-ray path and reproject through VP round-trips within float tolerance, jitter on and off | VP and ray CB disagree anywhere |
-| W3 lighting invariance | Lambert + specular surface lit from the same struct-derived vectors: the lighting buffer is bit-identical with jitter on vs off | Any lighting delta from a camera-only change |
-| W4 reversed-Z / asymmetric | W1 and W2 repeated under reversed depth and an asymmetric (oblique-adjust) frustum | Any failure specific to either convention |
+| W1 raster shift across the size matrix | Centroid shift of a known grid equals the phase in ACTUAL R pixels, at 0.5x, 1.0x, 1.5x and 2.0x, including odd dimensions, asymmetric viewport/crop, and independent R/E/D changes. Supersampled paths (DLSS/DLAA/FSR evaluating at E=R and scaling to D) and TAA (evaluating at D) each follow their negotiated agreement: one final scaling to D, no hidden quality reduction | A size-dependent shift; a path evaluated at the wrong extent; two scalings |
+| W2 forward/inverse/ray | Per-pixel unproject through the frustum-ray path and reproject through VP round-trips within stated tolerance, jitter on and off, including the stale-snapshot negative case (a view-stale +0x870 must be detected, not absorbed) | VP and ray path disagree anywhere; stale basis passing as fresh |
+| W3 lighting at corresponding surface points | Position, normal, view direction and shading compared at CORRESPONDING surface points with explicit tolerances and separate coverage checks (silhouettes legitimately move under jitter); spatially varying lighting, a specular highlight and nonzero translation expose stale rays; authoritative pose/light inputs preserved | Shading divergence beyond tolerance at corresponding points; the scene engineered uniform enough to hide stale reconstruction |
+| W4 reversed-Z / asymmetric | W1 and W2 repeated under reversed depth and an asymmetric (projection-adjust) frustum | Any failure specific to either convention |
 | W5 motion preservation | Two-frame synthetic pan: the camera-only term from VP_prev^-1 x VP_curr equals the pan after the backend's own jitter accounting; per-pixel motion matches analytic reprojection | Motion term polluted by jitter in the backend's own convention |
+| W6 reconfiguration between preparation and consumption | Size, target generation, backend/model or a projection-affecting quality change lands between preparation and handoff: the stale plan is refused by name, no stale history is accepted, resources retire after outstanding users, and resumption on the stable supported replacement is bounded | Any accepted stale plan/history; unbounded re-warming |
 
-### C2-C: coexistence with the legacy CB jitter
+### C2-C: coexistence, ownership and closure with the legacy path
+
+These tests exercise the PRODUCTION selector, ownership, phase and
+closure logic with the game-camera model as input -- not an abstract XOR
+of booleans, and not the legacy adapter's admitted subset as the
+universe of frames.
 
 | Test | Signature that passes | Stop condition |
 | --- | --- | --- |
-| C1 XOR proof | Enumerate the frames the legacy qualified-jitter scopes would have patched; with the injector active, every frame is treated by exactly one path, and any double-candidate frame is refused by name | A frame treated by both, or by neither with AA on |
-| C2 steady-state cost | CPU/GPU cost of the injector vs the adapter at equal scene/size; steady state allocates nothing, performs no blocking readback | A regression the counters cannot explain |
+| C1 single owner | A known legacy pair eligible for both routes gets exactly one selected owner before mutation; legacy graphics AND compute mutations are suppressed under upstream ownership (both paths' scope mutation is covered) | Any frame mutated by both, or ownership assigned after mutation |
+| C2 unknown shaders cannot veto certified lineage | A certified upstream lineage with an unknown or color-only shader variant reaches accepted history WITHOUT legacy admission hashes; legacy observation continues, its refusal does not veto upstream work | The old shader allowlist remaining the effective gate |
+| C3 named safe outcomes | A true late projection rewrite or an uncovered secondary camera invalidates closure/history and produces a NAMED safe outcome (observing, unprepared, unsupported, recovery) -- all valid states, but a stable supported scene must make bounded progress out of them | Silence, or a stable scene parked in observation |
+| C4 interleaved views | Interleaved main/cockpit/auxiliary views and near-plane variants retain group-level ownership; frame-wide counts cannot hide one path jittering a different view | A count that sums over views with mixed ownership |
+| C5 ownership switch | Switching ownership waits for outstanding work, resets history, and preserves original camera inputs for motion reconstruction | A switch that strands in-flight work or poisons the motion inputs |
+| C6 steady-state cost | CPU/GPU cost of the injector vs the adapter at equal scene/size, measured offline; steady state allocates nothing, performs no blocking readback. (Equal-scene GAME cost is C3/C4, not claimed here) | A regression the counters cannot explain |
 
 ### What C2 does not decide
 
-Live activation, per-shader consumption in the real scene, per-ship
-coverage and mod-chain qualification remain C3 (one bounded session:
-producer -> derived data -> scene/depth -> accepted history, no
-duplicate jitter, no uncovered domain) and C4 (qualification matrix).
-The injector's config surface is designed here but defaults off; no
-feature removal or rename is authorized by this plan.
+Live activation, live hook cadence, mod loader order, game performance,
+per-shader consumption in the real scene, per-ship coverage and
+mod-chain qualification remain C3 (one bounded session: producer ->
+derived data -> scene/depth -> accepted history, no duplicate jitter, no
+uncovered domain) and C4 (qualification matrix). The injector's config
+surface is designed here but defaults off; live mutation stays disabled
+until these gates pass; no feature removal or rename is authorized.
 
 Implementing C++ changes requires the full absolute-path `build.bat` and its
 green receipt before commit. Install/verify/log operations use the sanctioned
@@ -478,17 +499,40 @@ recording/mutation epochs likewise remains to be joined.
 
 The three gate helpers are decompiled
 (analysis/decomp/flash/camera/camera_cache_helpers.txt, script
-CameraCacheHelpers.java). All take camera+0x20 and finalize one derived
+CameraCacheHelpers.java). All take **camera+0x20** and finalize one derived
 block from the struct's authoritative inputs; the dirty bits live in the
-flag word at camera+0x250:
+flag word at camera+0x250. Offsets below are camera-relative, with the
+helper-relative evidence named explicitly -- the helpers' base is
+camera+0x20, so helper+X is camera+(X+0x20):
 
-| Region | Content | Built from | Finalizer | Dirty bit |
+| Region (camera-relative) | Content | Built from | Finalizer | Dirty bit |
 | --- | --- | --- | --- | --- |
 | +0x20..+0x4C | source 3x4 view axes | authoritative input | -- | -- |
 | +0x50/+0x54/+0x58 | source camera origin (stored negated) | authoritative input | -- | -- |
 | +0x190..+0x1CC | view rows (axes + translation row) | axes + origin | FUN_1404f4910 (or inline inside FUN_1404f49f0) | bit 2 |
-| +0x1D0..+0x20C | projection 4x4 | frustum params +0x234..+0x2A0 (kind at +0x244: perspective / ortho / third; oblique-adjust flag at +0x2A0) | FUN_1404f2ff0 | bit 4 |
+| +0x1D0..+0x20C | projection 4x4 | frustum parameters below | FUN_1404f2ff0 | bit 4 |
 | +0x210..+0x24C | view-projection 4x4 (cached) | view rows x projection | FUN_1404f49f0 | bit 8 |
+
+The frustum parameters the projection builder reads (helper-relative
+evidence in parentheses; camera+0x244 is inside the cached VP, NOT the
+kind field, and camera+0x2A0/+0x2A4 are float parameters the refresh
+reads directly, NOT the builder's adjust flag):
+
+| Field | Camera-relative | Evidence (helper-relative) |
+| --- | --- | --- |
+| near input | +0x254 | +0x234 (camera_cache_helpers.txt:293) |
+| far input | +0x258 | +0x238 (:306) |
+| compound-near adjustment | +0x25C | +0x23C (:293) |
+| projection kind | +0x264 | +0x244 (:294) |
+| angular input | +0x280 | +0x260 (:404-445) |
+| projection-adjust enable | +0x2C0 | +0x2A0 (:458) |
+| custom matrix data (kinds 4/5) | +0x2D0..+0x30C | +0x2B0..+0x2EC (:313-376) |
+
+The kind selector has FIVE branches, not three: 1 (ortho), 3 (the
+trigonometric branch), 4 and 5 (custom matrix data at +0x2D0..+0x30C,
+kind 5 adding near/far depth terms), and the default identity-ish fallthrough.
+Kinds 4 and 5 are not yet proven and must be included or explicitly
+refused before any mutation.
 
 Chaining: FUN_1404f49f0 calls FUN_1404f2ff0 first when bit 4 is set and
 rebuilds the view rows inline when bit 2 is set, then always recomputes
@@ -505,13 +549,9 @@ projection 4x4 alone is not enough -- the refresh copies the CACHED VP
 when bit 8 is clear, so a direct projection edit must also set bit 8,
 and editing the frustum parameters must set bits 4 and 8 (plus 2 when
 axes or origin move) or downstream readers consume stale caches. The
-authoritative inputs for jitter are the frustum parameters (near +0x234
-..+0x268) and the axes/origin; the projection, view rows and VP are all
-re-derivable through the game's own finalizers. Still open: the setter
-map -- which functions write the frustum parameters, axes and origin and
-raise the dirty bits, and on what frame cadence -- plus the +0x870/+0x8B0
-block semantics (the FUN_1405964c0 ray/frustum consumer) and the
-consumer-lineage join the review requires before C2.
+authoritative inputs for jitter are the frustum parameters (the table
+above) and the axes/origin; the projection, view rows and VP are all
+re-derivable through the game's own finalizers.
 
 ## Setter-map addendum, 2026-09-28: who dirties the camera, and when
 
@@ -528,12 +568,13 @@ read field-by-field).
 The setters, by cadence:
 
 - Per item class, mid-pass: FUN_14058ef90 (the per-view frame walk) and
-  FUN_140591f30 (per-item prep) poke frustum slots +0x25C and +0x280
-  with per-item values (near/far overrides) and raise 0xC (projection +
-  VP dirty) or 0xD (ray + projection + VP dirty). This is why the
-  refresh runs three times a pass -- the camera's frustum parameters
-  legitimately change between sections -- and why the composer re-flushes
-  ~30 times a frame.
+  FUN_140591f30 (per-item prep) poke frustum slots +0x25C (the
+  compound-near adjustment) and +0x280 (the angular input) with per-item
+  values and raise 0xC (projection + VP dirty) or 0xD (ray + projection +
+  VP dirty). The actual near/far inputs (+0x254/+0x258) are not what these
+  pokes touch. This is why the refresh runs three times a pass -- the
+  camera's frustum parameters legitimately change between sections -- and
+  why the composer re-flushes ~30 times a frame.
 - Camera translation: FUN_1404f2ac0 takes a new origin float4, deltas it
   against the stored origin (camera+0x50), applies it through a helper
   and raises 0xF (everything). Called from FUN_1428a4d30.
@@ -565,14 +606,19 @@ reaches in a pass:
   gated on dirty bit 4.
 - View-constant context +0x40..+0x7C: copied from the cached
   view-projection (+0x210..+0x24C), gated on bit 8.
-- Frustum-ray CB (slot +0x78): FUN_1405964c0 composes the
-  ray-reconstruction matrix from the +0x870 frustum basis (a 3x4+ block),
-  the view rows (+0x190), the origin (+0x50) and its delta against the
-  +0x8B0 reference point, gated on bit 2. The +0x870 basis is written by
-  the ray-path setters (camera_ray_writers.txt, 168 functions on file
-  for field-level resolution if the mutation design ever needs them);
-  the separately heap-allocated ray blocks behind camera+0x90/+0x98 are
-  FUN_1404f3770's output (dirty bit 1).
+- Frustum-ray CB (slot +0x78): FUN_1405964c0 composes from the +0x870
+  basis, the view rows (+0x190), the origin (+0x50) and its delta against
+  the +0x8B0 reference point, gated on bit 2. The +0x870/+0x8B0 blocks
+  are now RESOLVED (camera_ray_writers2.txt): FUN_1406be790, called from
+  FUN_140594b60, finalizes the view rows via bit 2 and then copies them
+  inline -- +0x870..+0x8A8 is a view-matrix snapshot (+0x190..+0x1C8) and
+  +0x8B0..+0x8B8 is an origin snapshot (+0x50..+0x58). They carry NO
+  projection dependency, so a projection-only jitter legitimately leaves
+  them unchanged, and the refresh does not regenerate them -- they are
+  refresh-adjacent pass snapshots, not refresh outputs. The separately
+  heap-allocated ray blocks behind camera+0x90/+0x98 are FUN_1404f3770's
+  output (dirty bit 1); the offset scan of other +0x870/+0x8B0 writers
+  stays on file (camera_ray_writers.txt).
 - Depth-parameter CBs (slots +0x60/+0x68): near/far (+0x254/+0x258),
   the fVar22/fVar23 viewport pair (+0x2A0/+0x2A4) and the
   resolution-derived terms.
@@ -581,13 +627,16 @@ reaches in a pass:
 - A screen-size CB (slot +0x80), a further upload (slot +0x178,
   FUN_140597af0) and a one-byte flag (slot +0x180, FUN_140596ab0).
 
-Lineage verdict for the candidate hook: every constant block the pass
-consumes derives inside FUN_1405921f0 from the camera struct through the
-dirty-flag finalizers -- there is no second path that bypasses it. A
-mutation of the frustum parameters or the source axes/origin inside the
-refresh detour, with bits 4 and 8 (and 2/1 as applicable) raised,
-propagates to the scene CB, the view-constant context, the frustum-ray
-CB and the depth CBs in the same call, through the game's own code.
-What remains unproven is per-shader consumption (which draws bind these
-blocks, and whether legacy CB jitter can coexist) -- that is the C2
-runtime evidence, not more statics.
+Lineage verdict for the candidate hook, narrowed by the C2-plan review:
+every PROJECTION-dependent constant block the pass consumes derives
+inside FUN_1405921f0 from the camera struct through the dirty-flag
+finalizers. The view-side snapshots (+0x870/+0x8B0) are written
+alongside by FUN_1406be790 and carry no projection terms; their
+consistency requirement is view-row freshness (the same bit-2 gate), not
+projection regeneration. A mutation of the frustum parameters or the
+source axes/origin inside the refresh detour, with bits 4 and 8 (and
+2/1 as applicable) raised, propagates to the scene CB, the view-constant
+context, the frustum-ray CB and the depth CBs in the same call, through
+the game's own code. What remains unproven is per-shader consumption
+(which draws bind these blocks, and whether legacy CB jitter can
+coexist) -- that is the C2 runtime evidence, not more statics.
