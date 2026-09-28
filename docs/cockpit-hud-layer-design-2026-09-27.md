@@ -721,3 +721,27 @@ target holos up -- present in every frame now (stock in the frames the
 game tonemaps early, crisp where ordering allows; the 30 s "left" line
 names the kToneLate frames), radar icons/contacts crisp, menus over
 panels, the sun never taken (R2's guard).
+
+## The timer fix + the holos' stock state, 2026-09-28 (53fd633f)
+
+The phase-3 flight's follow-ups: Sean saw the ship/target holos in the
+mirror (stock, not taken) and a large perf hit in open space (87 -> 72 fps
+in the expensive window, ~3.3 ms unaccounted inside "door"). Both read:
+
+- The holos are the R1-refused sphere family by design (their per-pixel
+  scene-depth reads break under the layer's viewport scale; taking them
+  lost 84% WARP-reproduced). They render stock everywhere -- visible in
+  mirror and headset, not crisp. kToneLate fired zero times: nothing is
+  silently lost anymore. Crisp wireframe holos need the layer-sized depth
+  input -- the real R1 repair, the next feature chunk.
+- The perf hit is real and was unmeasurable: the route-timer ring (64
+  slots) held one frame of intervals while two frames' worth were
+  unresolved under load -- 60,895 "no free timer", tonemap/coverage
+  timings absent (the phase-3 review's flag). Fixed: kRouteRing 512, and
+  routeSample reservoir-sampled so the 30 s percentiles are unbiased at
+  any interval rate. The next flight's price lines attribute the cost;
+  the moved HUD shading at 5000x4835 (the largest term) is untimed by
+  design -- the fps delta is its honest measure, and ui_quality 100 vs
+  125 is the lever.
+
+Installed to Steam as v0.18.0-rc.3-35-g53fd633f.
