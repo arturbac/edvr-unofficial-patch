@@ -685,3 +685,39 @@ table with taken counts, no refusal naming a hologram, declines clean,
 and the census's ga hologram state lines as the G-A record. Then the
 revisit Sean named: with everything rendered through one path, re-read
 the remaining differences (the lost halo, the translucent regime).
+
+## The phase-3 review round, 2026-09-28 (c4253e6d)
+
+reviews/crisp-hud-phase3-review-2026-09-28.md found two defects and
+nailed the missing-mesh question's shape. Both fixed, and the mesh loss
+localized:
+
+- R1 (P1): the target sphere's PSes integer-Load scene depth at
+  SV_Position pixel coordinates; the layer's larger viewport breaks the
+  addressing (WARP-reproduced). R2 (P2): the corona family paints the
+  radar glow AND the real sun; a hash cannot distinguish the uses and the
+  take has no radius concept. The take now admits only the eight
+  radar/icon hologram families (kHoloFamiliesTake); the sphere, the
+  corona family and the world-marker reticle refuse to stock with the
+  review's citations. The depth pass keeps all eleven and its radius
+  clip, unchanged; the two lists are separate in holo_families.h.
+- The ship/target MESH holograms (kHolo, Phase 1): the review's offline
+  replay of the captured draws (build/review-mesh/REPORT.md, from
+  pool/panels_102548.bin) was CLEAN at every stage -- rasterize, depth,
+  overwrite, the real captured tonemap draw, composite. The session
+  evidence instead: the game's tonemap ordering varies frame to frame,
+  and content taken into the HDR layer AFTER the eye's re-issue can never
+  publish -- the layer clears next frame. The counters counted the draw
+  and the publication while the pixels were discarded. Fixed with a
+  refusal, not a counter: a crisp draw after the eye's tonemap re-issue
+  refuses to stock (kToneLate), so the meshes render exactly as the game
+  drew them in those frames; crisp post-tonemap content would need a
+  second re-issue (new machinery, out of scope).
+
+Rig: 297 checks, 0 failures (the pre-fix rig fails exactly the three new
+refusals -- discriminating evidence). Installed to Steam as
+v0.18.0-rc.3-33-gc4253e6d. Phase 3 re-flight: cockpit with the ship and
+target holos up -- present in every frame now (stock in the frames the
+game tonemaps early, crisp where ordering allows; the 30 s "left" line
+names the kToneLate frames), radar icons/contacts crisp, menus over
+panels, the sun never taken (R2's guard).
