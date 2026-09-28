@@ -117,8 +117,21 @@ inline int flatProjectionRecipeTests() {
         {0x989E043933A369ABull,0xCE844D87026C684Cull,0,FlatProjectionPatchLayout::ForwardDp4,4},
         // Projected effect from the subsequent Epic 85d590e0 run.
         {0x2D8263CC54D55398ull,0x89B662E266E5D73Eull,0,FlatProjectionPatchLayout::ForwardDp4,4},
+        // Epic 20260927_203919, Caspian Explorer and fleet-carrier scene:
+        // colour-only companions verified by bytecode review (clip rows never
+        // read; coordinates from varyings/scalar grids; no depth output).
+        {0x9BFC7FD232328391ull,0xCB7AF179DF4E6A60ull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0x2BB766C168B450A2ull,0x4888F2B05460FA9Bull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0xA47A3315FFF5E2E4ull,0xC67370DE72E4422Cull,0,FlatProjectionPatchLayout::ForwardDp4,4},
+        {0xB43A856E285815E3ull,0x9A664735737E2667ull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0x99B41C87E45319E6ull,0xA9975F91040B0BCDull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0xACE405F428C17EF6ull,0ull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0x72BDD292154158ADull,0x76849D64AC657DB9ull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0xDF3503CD07F9B10Cull,0x02CC981DF36257C3ull,2,FlatProjectionPatchLayout::ForwardColumns,6},
+        {0x66DE2CADB1F4AE6Bull,0x235567BE2840B3EDull,1,FlatProjectionPatchLayout::ForwardColumns,270},
+        {0x66DE2CADB1F4AE6Bull,0x818212B5F404C002ull,1,FlatProjectionPatchLayout::ForwardColumns,270},
     };
-    expect(sizeof(latest)/sizeof(latest[0])==36,"latest supported ordinary pair census size");
+    expect(sizeof(latest)/sizeof(latest[0])==46,"latest supported ordinary pair census size");
     FlatProjectionJitter jitter{};
     expect(flatProjectionJitter(.375f,-.25f,1280,720,jitter),"recipe pixel offset constructed");
     for (const auto& pair : latest) {

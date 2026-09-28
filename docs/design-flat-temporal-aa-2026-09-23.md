@@ -4625,3 +4625,31 @@ Full build green: mono resolve PASS, collector policy PASS, corpus
 openxr_shutdown 63 checks, flat_pixels self-test passed. One transient
 openxr_shutdown WARP-binding flake in an earlier attempt did not
 reproduce in the two following runs.
+
+## 78. Ship-population coverage: the ten-pair triage (2026-09-28)
+
+The supporter's never-starting report
+([reviews/flat-aa-user-log-20260928-030237.md](../reviews/flat-aa-user-log-20260928-030237.md))
+and Sean's same-evening reproduction (Caspian Explorer; the fleet
+carrier also refused) are the same defect class: known VS families with
+NEW pixel-shader companions, refusing generically every frame so the
+runtime holds observation forever (calls=0). Bytecode review of the
+session's ten refusing pairs (18 of 20 stages captured locally):
+every PS is colour-only by the established vetting -- texture
+coordinates from varyings or scalar-built grids, cb1 reads only at
+61/90/210/227..254 (lighting) and 277..279 (orientation dp3), never the
+270..273 clip rows, no depth output. The multi-row-temp verdicts are
+paint-layer/material blends, indexable-temp is array lighting, resinfo
+is an atlas-dimension query, and ps_A9975F91040B0BCD is the decal
+projective-depth family exactly as the already-reciped 0A298DE7/
+D8FCE3CE cases. vs_A47A3315FFF5E2E4 is a partial-z ForwardDp4(0,4);
+vs_ACE405F428C17EF6 and vs_72BDD292154158AD project ForwardColumns
+270..273 behind a cb0[9..11] local pre-transform (the ce715126 block's
+local-transform note); vs_2BB766C168B450A2 is columns 270..273 with a
+harmless resinfo atlas query. Nine pairs reciped and rig-pinned (census
+46); vs_C7FA0C0F5DD49180's blob was never captured, so its pair stays
+refused until a capture supplies it. The review's follow-up notes the
+architectural direction: exact recipes are the current mechanism, ship
+diversity is regression coverage, an upstream flat camera/projection
+hook is the proposed long-term investigation (unvalidated, not
+started), and the refusal is never to be bypassed.
