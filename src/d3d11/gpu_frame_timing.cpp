@@ -3,6 +3,7 @@
 #include "../common/gpu_frame_protocol.h"
 #include "../common/log.h"
 #include "../common/guard.h"
+#include "../openxr/native_cpu_trace.h"
 #include <atomic>
 #include <algorithm>
 #include <limits>
@@ -101,6 +102,27 @@ struct Controller {
         }
         if (result.reason == GpuSpanReason::Valid) ++validCount;
         else ++invalidCount;
+        // One enabled load outside WPR; no timestamp or ETW work while off.
+        auto& trace = openxr::NativeCpuTrace::get();
+        if (trace.enabled()) {
+            static_assert(unsigned(GpuSpanSource::ApplicationRender) == 1 &&
+                          unsigned(GpuSpanReason::CreateFailed) == 13,
+                          "native GPU trace enum contract");
+            LARGE_INTEGER qpc{};
+            QueryPerformanceCounter(&qpc);
+            EdvrNativeGpuCompletionPayload payload{};
+            payload.publicationQpc = uint64_t(qpc.QuadPart);
+            payload.timestampUs = edvrNativeTraceUs(qpc.QuadPart);
+            payload.sequence = result.sequence;
+            payload.sourceFrame = result.sourceFrame;
+            payload.ageMs = result.ageMs;
+            payload.outerMs = result.outerMs;
+            payload.source = uint16_t(result.source);
+            payload.reason = uint16_t(result.reason);
+            payload.version = 1;
+            payload.size = sizeof(payload);
+            trace.emitGpu(payload);
+        }
         AcquireSRWLockExclusive(&g_snapshotLock);
         // Older slots may settle after newer ones. Keep their logged identity,
         // but never let a late result replace a newer frame in the readout.
@@ -204,6 +226,7 @@ bool gpuFrameBind(ID3D11Device* d, ID3D11DeviceContext* c, bool enabled) noexcep
         return false;
     }
     gpuFrameConfigure(enabled);
+    openxr::NativeCpuTrace::get().start();
     if (!enabled) Log::get().note("Render-to-submit GPU: disabled (advanced.app_gpu_timing).");
     Log::get().note("Application-render GPU: owner bound; non-overlapping producer segments "
         "cover game rendering and native treatment, while transfer/runtime waits are excluded.");
@@ -345,6 +368,7 @@ unsigned gpuFrameReadCompletions(uint64_t& cursor, GpuFrameSnapshot* out,
     return count;
 }
 void gpuFrameAbandon() noexcept {
+    openxr::NativeCpuTrace::get().stop();
     auto* c = g_controller.exchange(nullptr, std::memory_order_acq_rel);
     // No controller at all now, so gpuFrameCommandMightAct()'s combined
     // condition is false regardless of the old controller's enabled state.

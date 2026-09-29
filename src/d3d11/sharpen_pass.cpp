@@ -1,3 +1,4 @@
+#include "temporal_shader_bytecode.h"
 #include "sharpen_pass.h"
 #include "../common/native_sharpen.h"
 #include "graphics_runtime.h"
@@ -32,7 +33,7 @@
 #pragma warning(pop)
 
 // The same two files as GPU text, generated at build time.
-#include "fsr_hlsl_gen.h"
+// Fixed shader bytecode is generated during the build. //
 
 namespace edvr {
 namespace {
@@ -47,33 +48,11 @@ namespace {
 // reason. Everything the sharpening itself does is theirs. Not desk-
 // compiled by tools/compile_variants.py (it needs the chunks joined
 // first); the smoke harness compiles and runs it on a real device.
-const char kSharpenMain[] =
-    "Texture2D<float4> Src : register(t0);\n"
-    "RWTexture2D<float4> Dst : register(u0);\n"
-    "cbuffer P : register(b0) { uint4 con; int4 region; int2 outSize; int2 pad0; };\n"
-    "AF4 FsrRcasLoadF(ASU2 p) {\n"
-    "    int2 q = clamp(int2(p), region.xy, region.zw - 1);\n"
-    "    return Src.Load(int3(q, 0));\n"
-    "}\n"
-    "void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}\n"
-    "[numthreads(8,8,1)]\n"
-    "void main(uint3 id : SV_DispatchThreadID) {\n"
-    "    if (id.x >= (uint)outSize.x || id.y >= (uint)outSize.y) return;\n"
-    "    int2 ip = int2(id.xy) + region.xy;\n"
-    "    AF3 c;\n"
-    "    FsrRcasF(c.r, c.g, c.b, AU2(ip), con);\n"
-    "    Dst[id.xy] = float4(c, Src.Load(int3(ip, 0)).a);\n"
-    "}\n";
 
-const char kGpuPrologue[] =
-    "#define A_GPU 1\n"
-    "#define A_HLSL 1\n";
 
-std::string joinChunks(const char* const* chunks) {
-    std::string out;
-    for (const char* const* c = chunks; *c; ++c) out += *c;
-    return out;
-}
+
+
+
 
 // The cbuffer above, laid out to match: 48 bytes, three 16-byte rows.
 struct PassParams {
@@ -287,12 +266,8 @@ void failOnce(const char* what) {
 }
 
 ID3D11ComputeShader* compileShader(ID3D11DeviceContext* ctx) {
-    const std::string hlsl = std::string(kGpuPrologue) + joinChunks(kFfxAChunks) +
-                             "#define FSR_RCAS_F 1\n" +
-                             joinChunks(kFfxFsr1Chunks) + kSharpenMain;
-    return shaderSwapCompileCs(ctx, hlsl.c_str(), hlsl.size(), "main",
-                               "render_sharpen_cs", nullptr,
-                               "render sharpening");
+
+    return shaderSwapCreateCs(ctx, kSharpenBytecode, sizeof(kSharpenBytecode), "render_sharpen_cs", "render sharpening");
 }
 
 bool makeTex(ID3D11Device* dev, uint32_t w, uint32_t h, DXGI_FORMAT texFmt,

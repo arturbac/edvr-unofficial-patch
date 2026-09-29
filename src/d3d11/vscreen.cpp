@@ -73,6 +73,7 @@
 #include "ui_depth.h"
 #include "ui_layer.h"
 #include "ui_layer_math.h"
+#include "hud_layer_census.h"  // advanced.hud_census: the crisp-HUD Phase 0 census gates
 #include "ui_surfaces.h"  // uiAtlasNoteWrite: the glyph atlas instrument's write count
 #include "celestial_motion.h"
 #include "engine_velocity.h"
@@ -1454,6 +1455,11 @@ inline bool foreignContext(ID3D11DeviceContext* self) {
 // the file.
 void* currentRtv0Resource(State* s);
 bool viewportIs(const D3D11_VIEWPORT& v, uint32_t w, uint32_t h);
+// The HUD layer census's G-D colourless re-issue pair, defined beside
+// pureDrawReissue which it uses; the eye-draw branch calls it on the
+// census's say-so.
+void hudCensusGdPair(ID3D11DeviceContext* self, char kind, UINT count, UINT instances,
+                     const DrawArgs& args);
 
 // Record a draw we are about to decline. Cheap by construction: a linear scan
 // of at most eight entries, and GetType is asked ONCE per context rather than
@@ -1682,7 +1688,8 @@ bool drawGateSubscribed(State* s) {
         hudSpriteWantsDraws() || panelUpscaleWantsDraws() || hudGrainWantsDraws() ||
         uiDepthWantsDraws() ||
         sunglareWantsDraws() ||
-        drawCensusArmed() || objectProbeWantsDraws() ||
+        drawCensusArmed() || hudLayerCensusArmed() ||  // review R6: the HUD layer census announces armed and emits windows; without this term it never saw a draw when every other subscriber was off
+        objectProbeWantsDraws() ||
         panelCurveWants() || particleWantsDraws() || backdropWantsDraws() ||
         scrimWantsDraws() || quadProbeWants() || loaderPanelWants() ||
         introProbeWants() || introPanelWants();
@@ -2402,6 +2409,27 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // one call and one bool.
     if (drawCensusArmed()) {
         drawCensusEyeDraw(self, kind, count, instances, s->eyeDrawsThisFrame, args);
+    }
+    // The HUD layer census (hud_layer_census.h): Phase 0 of the crisp-HUD
+    // design, observation only. One bool load while off (the default); when
+    // armed it watches for the three cockpit HUD families, the hologram
+    // families (Phase 3's family watch, one row) and the tonemap,
+    // and for a family draw it picked for its occlusion gate it re-issues
+    // this draw colourlessly (no colour target, writes masked, everything
+    // restored) around pureDrawReissue before the game's own draw runs.
+    if (hudLayerCensusArmed() && self == g_state->ownerCtx) {
+        if (hudLayerCensusEyeDraw(self, kind, count, instances, s->eyeDrawsThisFrame, args)) {
+            hudCensusGdPair(self, kind, count, instances, args);
+        }
+    }
+    // the crisp-HUD half of fix.ui_quality (ui_layer.h): admit the game's tonemap draw for its
+    // re-issue, which tonemaps the HDR HUD layer into the eye's 8-bit layer
+    // right after the draw's own issue (crispHudTonemapReissue below). One
+    // bool load while off (the default); while on, the 3-vertex prefilter
+    // and the structural admission run for a handful of full-screen draws a
+    // frame.
+    if (uiLayerCrispOn() && self == g_state->ownerCtx) {
+        uiLayerCrispNoteEyeDraw(self, kind, count, instances, args.startInstance);
     }
     // The pool probe (object_probe.h): one bool while off; a few t33 reads a
     // frame until the pool is known, then one a second. The bool is now read
@@ -3697,12 +3725,52 @@ __declspec(noinline) void pureDrawReissue(ID3D11DeviceContext* self, char kind, 
     }
 }
 
+// The HUD layer census's G-D pair (hud_layer_census.h): the game's own
+// draw, re-issued twice through pureDrawReissue with NO colour target --
+// once under a write-masked clone of the game's depth-stencil state (its
+// GEQUAL test exactly as submitted, nothing written), once with depth and
+// stencil off (every sample passes) -- each inside an occlusion query, so
+// the rejected share of the family's pixels is measured rather than
+// inferred. The module owns the queries, the cloned states, the OM save
+// and restore, and the answer; this helper is only the bracket the
+// re-issue needs because pureDrawReissue is file-local. NOINLINE for the
+// same reason pureDrawReissue is: it runs for a handful of family draws a
+// frame while armed, and the draw path must not pay its frame for the
+// rest.
+__declspec(noinline) void hudCensusGdPair(ID3D11DeviceContext* self, char kind, UINT count,
+                                          UINT instances, const DrawArgs& args) {
+    HudCensusGdSave save;
+    if (!hudLayerCensusGdBegin(self, save)) return;
+    pureDrawReissue(self, kind, count, instances, args);
+    hudLayerCensusGdSwapToDepthOff(self, save);
+    pureDrawReissue(self, kind, count, instances, args);
+    hudLayerCensusGdEnd(self, save);
+}
+
+// the crisp-HUD half of fix.ui_quality's tonemap re-issue (ui_layer.h): the game's admitted tonemap
+// draw once more through pureDrawReissue, between uiLayerCrispToneBegin's
+// rebind (the HDR HUD layer at the admitted HDR slot, the eye's 8-bit layer
+// as the target, RGB-only) and uiLayerCrispToneEnd's restore and coverage
+// pass. Runs right after the draw's own issue, so every other binding is the
+// game's own. NOINLINE for the same reason pureDrawReissue is: at most two
+// admitted draws a frame while the crisp-HUD half is on, and the draw path must not
+// pay its frame for the rest.
+__declspec(noinline) void crispHudTonemapReissue(ID3D11DeviceContext* self, char kind, UINT count,
+                                                 UINT instances, const DrawArgs& args) {
+    if (uiLayerCrispToneBegin(self)) {
+        GpuCensusScope census(self, GpuCensusSection::FrameUiLayerReissues);
+        pureDrawReissue(self, kind, count, instances, args);
+        uiLayerCrispToneEnd(self);
+    }
+}
+
 // fix.ui_quality (ui_layer.h): which piece of the interface an owner draw is.
 // Asked only while the layer is live. A draw into anything that is not an
 // eye target is none -- the GUI's own draws into its surfaces are the
 // surfaces' content, not the eye's UI. Into an eye target that is not 8-bit
-// UNORM (the lit HDR target -- thousands of scene draws a frame) only three
-// hash compares run, to name the cockpit families the layer leaves; the
+// UNORM (the lit HDR target -- thousands of scene draws a frame) only the
+// hash compares run, to name the cockpit families the crisp take takes (the
+// three named shaders and the take's eight holograms, one family); the
 // full rules run for the post-tonemap target alone, where a frame has a few
 // dozen draws. The 2D screen's composite is recognised exactly as the panel
 // distance and the curved screen recognise it (srv0IsPanelSized); the rest
@@ -3716,6 +3784,10 @@ __declspec(noinline) UiLayerFamily uiLayerFamilyOf(State* s, char kind, UINT cou
     UiFamilyFacts f;
     f.targetKind = uiLayerTargetKind();
     f.vs = bindingShaderHash(BindSlot::Vs);
+    // The target sphere needs exact PS admission for its depth-address remap.
+    // Ordinary HDR draws need no extra hash read.
+    if (f.targetKind == 1 && f.vs == kHoloTargetSphere)
+        f.ps = bindingShaderHash(BindSlot::Ps);
     if (f.targetKind == 2) {
         // ui_depth's exclude list (the null-output mesh B018D143700AB803,
         // which samples a stale surface and draws nothing, and the ini's
@@ -3770,6 +3842,7 @@ bool uiLayerVerdictForwards(DrawVerdict v) {
 // game's own buffer for the draws after it that test it.
 void uiLayerSecondIssues(ID3D11DeviceContext* self, char kind, UINT count, UINT instances,
                          const DrawArgs& args) {
+    if (uiLayerIssueBlocked()) return;
     GpuCensusScope census(self, GpuCensusSection::FrameUiLayerReissues);
     if (uiLayerMultiplyBegin(self)) {
         pureDrawReissue(self, kind, count, instances, args);
@@ -3794,6 +3867,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // compiler must reload across every call, and it was re-reading and
     // re-comparing it at each of a dozen sites per draw.
     const bool owner = self == g_state->ownerCtx;
+    if (owner && uiLayerIssueBlocked()) return;
     struct EffectCaptureScope {
         ID3D11DeviceContext* ctx;
         ~EffectCaptureScope(){if(ctx)objectProbeSourceDrawEnd(ctx);}
@@ -3834,6 +3908,18 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // Off, this is one load; on, eye draws pay a generation compare and, on
     // the post-tonemap target only, the family rules.
     bool uiLayer = false;
+    struct SeedOutcomeScope {
+        bool on, original = false, substituted = false, known = true, redirected = false;
+        ~SeedOutcomeScope() {
+            if (on) uiLayerSeedDrawOutcome(original, substituted, redirected, known);
+        }
+    } seedOutcome{owner && uiLayerSeedDiagnostics()};
+    auto observedDraw = [&]() {
+        if (owner && uiLayerIssueBlocked()) return false;
+        const bool issued = draw();
+        if (seedOutcome.on) seedOutcome.original = seedOutcome.original || issued;
+        return issued;
+    };
     if (owner && uiLayerLive() && g_state->rtv0Eye && v != DrawVerdict::kQuadSkip) {
         const UiLayerFamily uiFamily = uiLayerFamilyOf(g_state, kind, count);
         if (uiFamily != UiLayerFamily::kNone) {
@@ -3856,8 +3942,11 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // never taken (unchanged). verdictForwards/substituted are the same
     // facts the family branch above passes uiLayerDecide, so an after-UI
     // write is governed by the identical rules a real UI draw would be.
-    // Counted, named either way.
-    if (!uiLayer && owner && uiLayerWatching()) {
+    // Counted, named either way. An admitted crisp-HUD tonemap draw is not
+    // shown to it: the tonemap READS the HDR target the HUD families were
+    // taken from, which is exactly what the re-issue re-points -- not a post
+    // pass to name.
+    if (!uiLayer && owner && uiLayerWatching() && !uiLayerCrispPending()) {
         // rc-since-rc2 review F4: the retry preserves the original decision's
         // exclusions -- the shader exclusion (ui_depth's list, as
         // uiLayerFamilyOf reads it) and the held world-screen identity (the
@@ -3866,7 +3955,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         const bool afterExcluded = uiDepthIsExcluded(bindingShaderHash(BindSlot::Vs));
         const bool afterPanelSized = srv0IsPanelSized(g_state, kind, count);
         uiLayer = uiLayerNoteOther(self, count, uiLayerVerdictForwards(v), g_state->curveThisDraw,
-                                   afterExcluded, afterPanelSized);
+                                   afterExcluded, afterPanelSized, instances, static_cast<uint32_t>(v), kind);
     }
     // The sub-draw probe, which also SWALLOWS the game's draw -- it re-issues
     // the surviving index ranges itself. Before the curve substitution
@@ -3874,12 +3963,17 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // The resized panel, which swallows the draw only when it succeeds.
     if (v == DrawVerdict::kLoaderPanel) {
         const bool layered = uiLayer && uiLayerBegin(self);
+        if (seedOutcome.on && layered) seedOutcome.redirected = true;
         const bool swallowed = loaderPanelSubstitute(self, g_state->realDrawIndexedInstanced,
                                                      g_state->qsInstances,
                                                      g_state->qsStartInstance);
+        if (seedOutcome.on) {
+            seedOutcome.substituted = swallowed;
+            seedOutcome.known = !swallowed; // substitute can withhold or issue geometry
+        }
         // The loader panel withholds the draw or forwards the game's own:
         // the second issues repeat the game's own, so they follow it.
-        const bool issued = !swallowed && draw();
+        const bool issued = !swallowed && observedDraw();
         if (layered) {
             uiLayerEnd(self);
             if (issued) uiLayerSecondIssues(self, kind, count, instances, args);
@@ -3887,6 +3981,10 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         return;
     }
     if (v == DrawVerdict::kQuadSkip) {
+        if (seedOutcome.on) {
+            seedOutcome.substituted = true;
+            seedOutcome.known = false; // surviving ranges may issue zero or several commands
+        }
         forwardQuadSkip(self);
         return;
     }
@@ -3896,7 +3994,14 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     if (g_state->curveThisDraw) {
         g_state->curveThisDraw = false;
         const bool layered = uiLayer && uiLayerBegin(self);
+        if (seedOutcome.on && layered) seedOutcome.redirected = true;
         const bool swallowed = panelCurveSubstitute(self, g_state->realDrawIndexedInstanced);
+        if (seedOutcome.on) {
+            seedOutcome.substituted = swallowed;
+            // A successful substitute issues its mesh and can issue the
+            // private motion pass too; original count is not its command count.
+            seedOutcome.known = !swallowed;
+        }
         if (layered) uiLayerEnd(self);
         if (swallowed) return;
     }
@@ -3914,10 +4019,20 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // RemLok scissor, a slot swap) so the layer maps the state the draw is
     // actually issued with, and around nothing but the game's own draw.
     const bool layered = uiLayer && uiLayerBegin(self);
-    const bool originalIssued=draw();
+    if (seedOutcome.on && layered) seedOutcome.redirected = true;
+    const bool originalIssued=observedDraw();
     if (layered) {
         uiLayerEnd(self);
         if (originalIssued) uiLayerSecondIssues(self, kind, count, instances, args);
+    }
+    // the crisp-HUD half of fix.ui_quality: the game's tonemap draw, admitted in the eye-draw branch
+    // while the HDR HUD layer holds this frame's HUD draws, is issued once
+    // more with the layer as its HDR source -- tonemapping the HUD into the
+    // eye's 8-bit layer, which the door's composite shows. AFTER the game's
+    // own issue, so the picture is stock whether or not the re-issue runs;
+    // one bool load for the ordinary draw.
+    if (originalIssued && uiLayerCrispPending()) {
+        crispHudTonemapReissue(self, kind, count, instances, args);
     }
     // A draw the UI layer took is not in the eye's colour at all, so the
     // interface depth below does not re-issue it: its depth and its
@@ -3925,6 +4040,13 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // longer sees.
     if (effectCaptureScope.ctx) objectProbePanelDrawEnd(self);
     if(terrainOriginal)celestialMotionEnd(self);
+    if (owner && uiLayerIssueBlocked()) {
+        // Begin failed with untrusted shader state: close existing brackets,
+        // but issue neither the stock fallback nor any depth/motion replay.
+        if (v == DrawVerdict::kBackdrop) backdropEnd(self);
+        if (v != DrawVerdict::kNone) forwardVerdictEnd(self, v);
+        return;
+    }
     // The interface's alpha-aware depth pass (ui_depth.h): a composite
     // drawn through the interface projection is drawn once more, depth
     // only, right after its own draw and inside the scope that owns the
@@ -3953,7 +4075,13 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // nearest depth into another. Both test only the pass's own radius
     // target, so they need nothing from the family reissue above.
     // uiDepthWantsReissue() answers for that reissue alone; holoOn is this
-    // pass's own classification.
+    // pass's own classification. !layered covers the crisp take: a taken
+    // hologram (eight of the pass's eleven are the take's kHoloGeneric) is
+    // not in the
+    // eye's colour any more, so its contribution and element-depth re-issues
+    // skip it like any taken draw -- the pass's resolve then declines the
+    // eye-frame as "nothing listed", which its census line counts (expected
+    // with the take on, not a pass failure).
     if (!layered && uiDepthScope.holoOn) {
         GpuCensusScope census(self, GpuCensusSection::FrameHologramPasses);
         if (uiDepthHologramContributionBegin(self)) pureDrawReissue(self,kind,count,instances,args);
@@ -4040,7 +4168,7 @@ void STDMETHODCALLTYPE hookedClearDsv(ID3D11DeviceContext* self,
     // target to, which says which way its depth runs. eye_mask learns
     // whether this is a re-clear of a target it already drew its ring
     // into this frame -- which would wipe the ring -- for its summary.
-    if (!foreignContext(self)) {depthProbeNoteClear(dsv, depth);eyeMaskOnClear(dsv);if(uiLayerWatching())uiLayerNoteDepthClear(dsv);}
+    if (!foreignContext(self)) {depthProbeNoteClear(dsv, depth);eyeMaskOnClear(dsv);if(uiLayerWatching())uiLayerNoteDepthClear(dsv, flags, depth, stencil);}
     if (!foreignContext(self) && (flags & D3D11_CLEAR_DEPTH) && flatRuntimeActive()) { ResourceInfo info{}; if (bindingResolve(dsv, &info)) flatRuntimeWritten(static_cast<ID3D11Resource*>(info.resource)); }
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalClearDepth(dsv, flags, depth);
     g_state->realClearDsv(self, dsv, flags, depth, stencil);
@@ -4058,6 +4186,14 @@ void STDMETHODCALLTYPE hookedBegin(ID3D11DeviceContext* self,
     if (drawCensusArmed()) {
         drawCensusQuery('B', async, foreignContext(self));
     }
+    // The HUD layer census's G-D pair declines while any game query is open
+    // on the owner context (hud_layer_census.h says why). Tracked whether or
+    // not the census is armed, so a bracket begun before a live arm still
+    // blocks the pair until it closes (review R7); unarmed, the price is a
+    // pointer append on a <=16-entry set, no query type read.
+    if (!foreignContext(self)) {
+        hudLayerCensusNoteGameQuery(true, async);
+    }
     g_state->realBegin(self, async);
 }
 
@@ -4068,6 +4204,9 @@ void STDMETHODCALLTYPE hookedEnd(ID3D11DeviceContext* self,
     if (gpuFrameInternal()) { g_state->realEnd(self, async); return; }
     if (drawCensusArmed()) {
         drawCensusQuery('E', async, foreignContext(self));
+    }
+    if (!foreignContext(self)) {
+        hudLayerCensusNoteGameQuery(false, async);  // the matching End; unarmed too (R7)
     }
     g_state->realEnd(self, async);
     if(!foreignContext(self))
@@ -4093,6 +4232,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
         g_state->realDrawIndexedInstancedIndirect(self, args, off);
         return;
     }
+    if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawIndexedIndirect, self, static_cast<int>(self->GetType()));
     noteStaleForward(kSlotDrawIndexedInstancedIndirect, reinterpret_cast<const void*>(g_state->realDrawIndexedInstancedIndirect),
@@ -4119,6 +4259,7 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
         g_state->realDrawInstancedIndirect(self, args, off);
         return;
     }
+    if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawIndirect, self, static_cast<int>(self->GetType()));
     noteStaleForward(kSlotDrawInstancedIndirect, reinterpret_cast<const void*>(g_state->realDrawInstancedIndirect),
@@ -4408,6 +4549,7 @@ void STDMETHODCALLTYPE hookedDrawAuto(ID3D11DeviceContext* self) {
         g_state->realDrawAuto(self);
         return;
     }
+    if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
     gpuFrameCommand(self);
     if(self==g_state->ownerCtx)engineVelocityBeforeDraw(self,g_state->rtv0Eye);
     g_state->realDrawAuto(self);
@@ -5106,6 +5248,12 @@ void vScreenRSSetViewportsRaw(ID3D11DeviceContext* ctx, uint32_t n, const D3D11_
     g_state->realRSSetViewports(ctx, n, vps);
 }
 
+void vScreenPSSetShaderResourcesRaw(ID3D11DeviceContext* ctx, uint32_t startSlot, uint32_t n,
+                                    ID3D11ShaderResourceView* const* srvs) {
+    if (!g_state || !g_state->realPSSetShaderResources || !ctx) return;
+    g_state->realPSSetShaderResources(ctx, startSlot, n, srvs);
+}
+
 void vScreenClearRenderTargetViewRaw(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv,
                                      const float colour[4]) {
     if (!g_state || !g_state->realClearRtv || !ctx || !rtv) return;
@@ -5246,6 +5394,7 @@ void vScreenRefreshConfig() {
     objectProbeConfigure(cfg);
     pixelProbeConfigure(cfg);
     lodGovernorConfigure(cfg);
+    hudLayerCensusConfigure(cfg);
     // Every fix.head_offset_* key, on the reload path as well as the startup
     // one. A config reader on only one of the two is a specific repeatable bug
     // -- reload-only means the value stays its C++ initialiser for the whole
@@ -5386,6 +5535,10 @@ void vScreenFrameBoundary() {
         // cross-check and learning, the key's 30-second totals, and the end
         // of this frame's watch for draws after the UI.
         uiLayerFrameBoundary(g_state->ownerCtx);
+        // The HUD layer census's query polls, deferred readbacks and
+        // 30-second window report -- beside the layer's boundary, but gated
+        // only on advanced.hud_census, never on fix.ui_quality.
+        hudLayerCensusFrameBoundary(g_state->ownerCtx);
         screenMotionFrameBoundary(g_state->ownerCtx);
         celestialMotionFrameBoundary(g_state->ownerCtx);
         engineVelocityFrameBoundary(g_state->ownerCtx);
@@ -6428,6 +6581,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     objectProbeConfigure(cfg);
     pixelProbeConfigure(cfg);
     lodGovernorConfigure(cfg);
+    hudLayerCensusConfigure(cfg);
     // installGlitchFrameFix is called before this, deliberately, so this is its
     // settled answer rather than a guess about config it has not read yet.
     g_state->countForFlashFix = glitchFrameNeedsEyeDraws();
@@ -6742,6 +6896,7 @@ void shutdownVScreenFixes() {
     holoShutdown();
     uiDepthShutdown();
     uiLayerShutdown();
+    hudLayerCensusShutdown();
     screenMotionShutdown();
     nightVisionShutdown();
     celestialMotionShutdown();

@@ -223,6 +223,7 @@ struct Eye {
     uint32_t gameMarkFrame = ~0u;
     Ptr<ID3D11Buffer> pool;              // the snapshot copies
     Ptr<ID3D11ShaderResourceView> poolSrv;
+    primaryCopy::OutputCache poolOutput; // dies with this eye/source or a pool replacement
     UINT poolBytes = 0;
     Ptr<ID3D11Buffer> scene[2];          // the game's cb1, by present-frame parity
     uint32_t sceneFrame[2] = {~0u, ~0u};
@@ -829,7 +830,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         return false;
     }
     if (!e.pool || e.poolBytes != pd.ByteWidth) {
-        e.pool.Reset(); e.poolSrv.Reset();
+        e.poolOutput = {}; e.pool.Reset(); e.poolSrv.Reset();
         D3D11_BUFFER_DESC d = pd;
         d.Usage = D3D11_USAGE_DEFAULT; d.CPUAccessFlags = 0; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         d.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
@@ -861,7 +862,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         // instead of paying two pairs' worth of overhead for it.
         GpuCensusScope census(ctx, GpuCensusSection::FrameEngineVelocity);
         ctx->CopyResource(e.pool.Get(), poolBuf.Get());
-        if(primaryCopy::apply(ctx,e.pool.Get(),poolBuf.Get(),frame))++g_primaryApplied;
+        if(primaryCopy::apply(ctx,e.pool.Get(),poolBuf.Get(),frame,e.poolOutput))++g_primaryApplied;
         // The copy by region, not resource: our buffer can be a float4
         // larger than the game's (the stamp), which CopyResource would
         // reject. The stamp is this eye-frame's present-frame clock -- the
@@ -959,7 +960,7 @@ void checkSources(ID3D11DeviceContext* ctx, Eye& e, int eye) {
             // snapshot()'s pair.
             GpuCensusScope census(ctx, GpuCensusSection::FrameEngineVelocity);
             ctx->CopyResource(e.pool.Get(), e.poolBuffer.Get());
-            if(primaryCopy::apply(ctx,e.pool.Get(),e.poolBuffer.Get(),e.frame))++g_primaryApplied;
+            if(primaryCopy::apply(ctx,e.pool.Get(),e.poolBuffer.Get(),e.frame,e.poolOutput))++g_primaryApplied;
         }
         endCapture(ctx, refreshTimer);
         e.poolAppendEpoch = wp.appendEpoch;
@@ -1433,6 +1434,13 @@ void summaryLocked(uint64_t now) {
                     u(copyStats.sourceResets),u(copyStats.copierNoLease),u(copyStats.copierAmbiguous),
                     u(copyStats.copierInvalidRange),u(copyStats.mergePlans),u(copyStats.mergeFailed),
                     u(copyStats.clearCalls),u(copyStats.clearedClaims),u(copyStats.clearFailed));
+    Log::get().note("engine motion: primary copy observer work cumulative: clear calls %llu, no-claim skips %llu, "
+                    "nodes walked %llu; merge calls %llu, started without claims %llu, nodes walked %llu; "
+                    "active source claims %llu, detached plans %llu. Skips do not inspect native dictionaries; "
+                    "clear failures describe attempted observer work, not skipped calls. Merge walks are retained for clear/unwind safety.",
+                    u(copyStats.clearCalls),u(copyStats.clearNoClaims),u(copyStats.clearNodes),
+                    u(copyStats.mergeCalls),u(copyStats.mergeWithoutClaims),u(copyStats.mergeNodes),
+                    u(copyStats.activeClaims),u(copyStats.activePlans));
     Log::get().note("engine motion: emit (%s) over %.0f s, %.0f frames: FUN_144312E00 calls %llu (%llu appended, %llu pool "
                     "records in all); pool records joined %llu (with motion %llu), masked %llu; masked for: first seen %llu, "
                     "gap %llu, reused pointer %llu, pose changed within one frame %llu, previous frame not certified %llu, "

@@ -1,8 +1,10 @@
+#include "fixed_shader_source.h"
 #include "temporal_pass.h"
 #include "temporal_history.h"
 #include "../common/runtime_profile.h"
 #include "draw_census.h"
 #include "eye_engine_capture.h"
+#include "eye_final_capture.h"
 
 #include <algorithm>  // std::sort, the price report's median/p95
 #include <cmath>
@@ -80,83 +82,7 @@ namespace {
 // the own history, so content that leaves the fovea carries NVIDIA's
 // converged pixels into the periphery and decays there over frames instead
 // of stepping at the seam.
-constexpr char kFoveaCsHlsl[] = R"HLSL(
-Texture2D<float4> PERIPH : register(t0);   // the periphery: NVIDIA's reduced DLAA or the own history, any size
-Texture2D<float4> FOVEA  : register(t1);   // NVIDIA's output, native size, valid in the crop
-RWTexture2D<float4> FO   : register(u0);   // the composited native frame, game format
-RWTexture2D<float4> HIST : register(u1);   // the own history being written this frame (mode.y)
-SamplerState SMP : register(s0);           // bilinear clamp, for the periphery upscale
-cbuffer FC : register(b0) {
-    float4 crop;   // output crop x0 y0 x1 y1 in native pixels, x1/y1 exclusive
-    float4 band;   // x the blend band in pixels; y the output width, z the output height; w the periphery's width
-    float4 disc;   // xy the fovea's centre in native pixels, zw its half-extents (the ellipse's semi-axes)
-    float4 mode;   // x 1 = round fovea (else the rectangle); y 1 = write the history too; z 1 = the periphery is smaller than the output (bicubic); w the periphery's height
-};
-// Catmull-Rom through nine bilinear fetches (the pass's own kernel, C = 0.5),
-// for a periphery smaller than the output: sharper than the bilinear
-// upscale, mild ringing, the standard upscaling kernel.
-float4 periphCubic(float2 uv, float2 tsize) {
-    const float C = 0.5;
-    float2 sp = uv * tsize;
-    float2 t1 = floor(sp - 0.5) + 0.5;
-    float2 f = sp - t1;
-    float2 g0 = 1.0 + f;
-    float2 g3 = 2.0 - f;
-    float2 w0 = C * (-g0 * g0 * g0 + 5.0 * g0 * g0 - 8.0 * g0 + 4.0);
-    float2 w1 = (2.0 - C) * f * f * f + (C - 3.0) * f * f + 1.0;
-    float2 h = 1.0 - f;
-    float2 w2 = (2.0 - C) * h * h * h + (C - 3.0) * h * h + 1.0;
-    float2 w3 = C * (-g3 * g3 * g3 + 5.0 * g3 * g3 - 8.0 * g3 + 4.0);
-    float2 w12 = w1 + w2;
-    float2 o12 = w2 / w12;
-    float2 t0 = (t1 - 1.0) / tsize;
-    float2 t3 = (t1 + 2.0) / tsize;
-    float2 t12 = (t1 + o12) / tsize;
-    float4 r = 0.0;
-    r += PERIPH.SampleLevel(SMP, float2(t0.x, t0.y), 0) * w0.x * w0.y;
-    r += PERIPH.SampleLevel(SMP, float2(t12.x, t0.y), 0) * w12.x * w0.y;
-    r += PERIPH.SampleLevel(SMP, float2(t3.x, t0.y), 0) * w3.x * w0.y;
-    r += PERIPH.SampleLevel(SMP, float2(t0.x, t12.y), 0) * w0.x * w12.y;
-    r += PERIPH.SampleLevel(SMP, float2(t12.x, t12.y), 0) * w12.x * w12.y;
-    r += PERIPH.SampleLevel(SMP, float2(t3.x, t12.y), 0) * w3.x * w12.y;
-    r += PERIPH.SampleLevel(SMP, float2(t0.x, t3.y), 0) * w0.x * w3.y;
-    r += PERIPH.SampleLevel(SMP, float2(t12.x, t3.y), 0) * w12.x * w3.y;
-    r += PERIPH.SampleLevel(SMP, float2(t3.x, t3.y), 0) * w3.x * w3.y;
-    return r;
-}
-[numthreads(8, 8, 1)]
-void fovea(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= (uint)band.y || id.y >= (uint)band.z) return;
-    int2 p = int2(id.xy);
-    float b = max(band.x, 1.0);
-    float w;
-    if (mode.x != 0.0) {
-        // The disc: the normalised radius in the ellipse inscribed in the
-        // crop, turned back into pixels inside its edge along the minor axis.
-        float2 n = (float2(p) + 0.5 - disc.xy) / max(disc.zw, 1.0);
-        float d = (1.0 - length(n)) * min(disc.z, disc.w);
-        w = saturate(d / b);
-    } else {
-        float dx = min((float)p.x - crop.x, crop.z - 1.0 - (float)p.x);
-        float dy = min((float)p.y - crop.y, crop.w - 1.0 - (float)p.y);
-        w = saturate(min(dx, dy) / b);     // pixels inside the crop's nearest edge
-    }
-    w = w * w * (3.0 - 2.0 * w);           // smoothstep across the band
-    // The periphery is sampled by normalised uv, so any size lands on the
-    // native output: bicubic when it is smaller, an exact fetch at 1:1 (the
-    // uv lands on texel centres). The fovea is native, read where it is
-    // valid (strictly inside the fovea, where w > 0).
-    float2 uv = (float2(p) + 0.5) / float2(band.y, band.z);
-    float4 per = mode.z != 0.0 ? periphCubic(uv, float2(band.w, mode.w))
-                               : PERIPH.SampleLevel(SMP, uv, 0);
-    float4 fov = w > 0.0 ? FOVEA.Load(int3(p, 0)) : per;
-    float4 o = lerp(per, fov, w);
-    FO[p] = o;
-    // The hand-off into the own history (mode.y, the sharp periphery at 1:1):
-    // inside the fovea and its band the history takes the blended result.
-    if (mode.y != 0.0 && w > 0.0) HIST[p] = float4(o.rgb, 1.0);
-}
-)HLSL";
+
 
 // The steady periphery's reduction (feature 6): the render-size colour,
 // depth and motion the trained path built, resampled down to the
@@ -174,50 +100,7 @@ void fovea(uint3 id : SV_DispatchThreadID) {
 // depth-aware filter does at an edge; the motion is the vector of that
 // nearest sample, scaled into the reduced pixels, so depth and motion stay
 // the same surface's.
-constexpr char kDownCsHlsl[] = R"HLSL(
-Texture2D<float4> DC : register(t0);    // the colour, render size
-Texture2D<float>  DZ : register(t1);    // the depth copy, render size
-Texture2D<float2> DM : register(t2);    // the motion vectors, render pixels
-RWTexture2D<float4> PC : register(u0);  // the reduced colour
-RWTexture2D<float>  PZ : register(u1);  // the reduced depth
-RWTexture2D<float2> PM : register(u2);  // the reduced motion, reduced pixels
-cbuffer DS : register(b0) {
-    float4 dims;   // x reduced width, y reduced height, z render width, w render height
-    float4 par;    // x unused (was the block side), y the scale (reduced / render), zw unused
-};
-[numthreads(8, 8, 1)]
-void down(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= (uint)dims.x || id.y >= (uint)dims.y) return;
-    float2 q = dims.zw / dims.xy;                    // render pixels per reduced pixel, > 1
-    float2 x0 = float2(id.xy) * q;                   // the footprint [x0, x1) in render pixels
-    float2 x1 = x0 + q;
-    int2 k0 = int2(floor(x0));
-    int2 k1 = min(int2(ceil(x1)), int2(dims.zw));    // exclusive
-    float4 c = 0.0;
-    float wsum = 0.0;
-    float zmax = -1.0;
-    float2 mv = 0.0;
-    [loop] for (int y = k0.y; y < k1.y; ++y) {
-        float wy = min((float)y + 1.0, x1.y) - max((float)y, x0.y);
-        [loop] for (int x = k0.x; x < k1.x; ++x) {
-            float wx = min((float)x + 1.0, x1.x) - max((float)x, x0.x);
-            float w = wx * wy;
-            if (w <= 0.0) continue;
-            int2 s = int2(x, y);
-            c += DC.Load(int3(s, 0)) * w;
-            wsum += w;
-            float z = DZ.Load(int3(s, 0));
-            if (z > zmax) {
-                zmax = z;
-                mv = DM.Load(int3(s, 0));
-            }
-        }
-    }
-    PC[id.xy] = c / max(wsum, 1e-6);
-    PZ[id.xy] = max(zmax, 0.0);
-    PM[id.xy] = mv * par.y;
-}
-)HLSL";
+
 
 // The cbuffer above, laid out to match: 528 bytes, thirty-three 16-byte rows
 // (the estimated body, ship and stepped-part rows retired 2026-09-23).
@@ -1577,6 +1460,9 @@ int              g_eyeRunLeft = 0;    // captures still to take
 int              g_eyeRunTaken = 0;
 wchar_t          g_eyeRunStamp[16] = L"";
 bool             g_eyeRunReady = false;
+eye_final_capture::Run g_eyeFinalRun;
+eye_final_capture::Clock g_eyeFinalClock; // boundary clock also advances with AA off
+wchar_t g_eyeFinalStamp[16]=L"";
 bool             g_eyeRunUntreated = false;
 bool             g_eyeOverviewTaken[2] = {};
 bool             g_eyeTreatedWritten[kEyeRun] = {};
@@ -2242,7 +2128,51 @@ void writeEyeDecisionArtifacts(ID3D11DeviceContext* ctx, const std::wstring& dir
 
 // The run's write after its last crop: the sixteen crops (raw C00.., or
 // treated T00..) and the first treated frame whole.
+void writeFinalEyeRun(ID3D11DeviceContext* ctx,const char* reason) {
+    if(!g_eyeFinalRun.armed)return;
+    ID3D11DeviceContext* ownedContext=nullptr;
+    if(g_eyeFinalRun.captureDevice){const bool ran=guarded("eye capture/final flush context",[&]{g_eyeFinalRun.captureDevice->GetImmediateContext(&ownedContext);});ctx=ran?ownedContext:nullptr;}
+    const std::wstring dir=Log::get().dir()+L"\\eyes";
+    CreateDirectoryW(dir.c_str(),nullptr);
+    unsigned copied=0,written=0,missing=0;
+    auto write=[&](eye_final_capture::Image& image,const wchar_t* suffix,int eye) {
+        if(!image.sequence){++missing;return;}
+        if(!image.writable())return; // published resource alone does not prove Copy completed
+        ++copied;
+        wchar_t path[MAX_PATH];
+        _snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_FinalCrisp_%s.bmp",dir.c_str(),g_eyeFinalStamp,suffix);
+        bool ok=false;
+        const bool ran=guarded("eye capture/final readback",[&]{D3D11_TEXTURE2D_DESC d{};image.staging->GetDesc(&d);ok=ctx&&writeEyeBmp(ctx,image.staging,d,eye,path);});
+        ok=ran&&ok;
+        image.status=ok?"written":"readback_or_write_failed";
+        if(ok)++written;
+    };
+    for(unsigned k=0;k<eye_final_capture::Count;++k)
+        for(unsigned eye=0;eye<2;++eye){wchar_t suffix[16];_snwprintf_s(suffix,16,_TRUNCATE,L"%c%02u",eye?L'R':L'L',k);write(g_eyeFinalRun.rows[k].eye[eye],suffix,int(eye));}
+    for(unsigned eye=0;eye<2;++eye)write(g_eyeFinalRun.overview[eye],eye?L"ROverview":L"LOverview",int(eye));
+    wchar_t path[MAX_PATH];_snwprintf_s(path,MAX_PATH,_TRUNCATE,L"%s\\eye_%s_FinalCrisp.json",dir.c_str(),g_eyeFinalStamp);
+    FILE* f=nullptr;_wfopen_s(&f,path,L"wb");bool manifest=false;
+    if(f){
+        fprintf(f,"{\"schema\":1,\"stage\":\"after_ui_layer_composite_before_runtime_menu\",\"stamp\":\"%ls\",\"reason\":\"%s\",\"requested\":16,\"crop_policy\":\"centre_1400_native_pixels_per_eye\",\"crop_coordinates\":\"unflipped_texture_x0_y0_x1_y1\",\"budget_bytes\":%llu,\"reserved_bytes\":%llu,\"blob_cap_bytes\":%llu,\"unmatched\":%u,\"duplicates\":%u,\"images\":[\n",g_eyeFinalStamp,reason,(unsigned long long)eye_final_capture::Budget,(unsigned long long)g_eyeFinalRun.bytes,(unsigned long long)eye_final_capture::BlobCap,g_eyeFinalRun.unmatched,g_eyeFinalRun.duplicates);
+        bool first=true;
+        auto record=[&](const eye_final_capture::Image& image,int index,unsigned eye,uint32_t scene,const wchar_t* suffix){
+            const unsigned k=index<0?0u:unsigned(index);const EyeDecisionFrame& temporal=g_eyeDecisions[k];
+            fprintf(f,"%s{\"index\":%d,\"scheduled\":%s,\"eye\":%u,\"frame\":%u,\"capture_sequence\":%llu,\"source_size\":[%u,%u],\"format\":%u,\"crop\":[%u,%u,%u,%u],\"composite_applied\":%s,\"flip_u\":%s,\"flip_v\":%s,\"status\":\"%s\",\"file\":",first?"":",\n",index,(index<0?g_eyeFinalRun.rows[0].scheduled:g_eyeFinalRun.rows[index].scheduled)?"true":"false",eye,scene,(unsigned long long)image.sequence,image.width,image.height,image.format,image.crop[0],image.crop[1],image.crop[2],image.crop[3],image.composite?"true":"false",image.flipU?"true":"false",image.flipV?"true":"false",image.status);
+            if(!strcmp(image.status,"written"))fprintf(f,"\"eye_%ls_FinalCrisp_%ls.bmp\"",g_eyeFinalStamp,suffix);else fputs("null",f);
+            fprintf(f,",\"capture_epoch\":%u,\"submit_region\":[%u,%u,%u,%u],\"temporal_input_size\":[%u,%u],\"temporal_output_size\":[%u,%u],\"temporal_output_crop\":[%u,%u,%u,%u],\"temporal_reference_eye\":0,\"temporal_mapping\":\"temporal_xy=(native_xy-submit_region_xy0)*temporal_output_size/submit_region_size; P/T_local_xy=temporal_xy-temporal_output_crop_xy; unflipped\"}",g_eyeFinalRun.rows[k].epoch,image.submitRegion[0],image.submitRegion[1],image.submitRegion[2],image.submitRegion[3],temporal.inputW,temporal.inputH,temporal.outputW,temporal.outputH,temporal.outputCrop[0],temporal.outputCrop[1],temporal.outputCrop[2],temporal.outputCrop[3]);first=false;
+        };
+        for(unsigned k=0;k<eye_final_capture::Count;++k)
+            for(unsigned eye=0;eye<2;++eye){wchar_t suffix[16];_snwprintf_s(suffix,16,_TRUNCATE,L"%c%02u",eye?L'R':L'L',k);record(g_eyeFinalRun.rows[k].eye[eye],int(k),eye,g_eyeFinalRun.rows[k].scene,suffix);}
+        for(unsigned eye=0;eye<2;++eye)record(g_eyeFinalRun.overview[eye],-1,eye,g_eyeFinalRun.rows[0].scene,eye?L"ROverview":L"LOverview");
+        fputs("\n]}\n",f);const bool clean=!ferror(f);const int closed=fclose(f);manifest=clean&&closed==0;
+    }
+    Log::get().note("eye capture: FinalCrisp run %ls: reason=%s, scheduled=%u/16, copied=%u, written=%u, missing=%u, unmatched=%u, duplicate=%u, bytes=%llu/%llu; manifest %s. Separate native-pixel crops after crisp composition; T/P/L0 retain temporal-stage semantics.",g_eyeFinalStamp,reason,g_eyeFinalRun.count,copied,written,missing,g_eyeFinalRun.unmatched,g_eyeFinalRun.duplicates,(unsigned long long)g_eyeFinalRun.bytes,(unsigned long long)eye_final_capture::Budget,manifest?"written":"write failed");
+    g_eyeFinalRun.reset();
+    if(ownedContext)guarded("eye capture/final flush context release",[&]{ownedContext->Release();});
+}
+
 void writeEyeRun(ID3D11DeviceContext* ctx, uint32_t cw, uint32_t ch) {
+    g_eyeFinalRun.ready=true;
     const std::wstring dir = Log::get().dir() + L"\\eyes";
     if (!g_eyeDumpDirMade) {
         g_eyeDumpDirMade = true;
@@ -2322,6 +2252,7 @@ void writeEyeRun(ID3D11DeviceContext* ctx, uint32_t cw, uint32_t ch) {
                         wrote, g_eyeRunStamp, g_eyeRunTaken - 1, cw, ch, wroteTreated, g_eyeRunStamp);
     }
     g_eyeRunTaken = 0;
+    if(g_eyeFinalRun.complete())writeFinalEyeRun(ctx,"complete");
 }
 
 // Called at Submit even when temporal AA is disabled. Copies only; no
@@ -2335,6 +2266,8 @@ void captureUntreatedEye(ID3D11Texture2D* tex,int eye,const float* bounds) {
     ID3D11Device* dev=nullptr;ID3D11DeviceContext* ctx=nullptr;
     tex->GetDevice(&dev);if(!dev)return;dev->GetImmediateContext(&ctx);dev->Release();if(!ctx)return;
     g_eyeRunUntreated=true;
+    if(eye==1&&g_eyeRunLeft>0&&g_eyeFinalRun.find(g_eyeFinalClock.epoch)<0)
+        g_eyeFinalRun.schedule(unsigned(g_eyeRunTaken),g_eyeFinalClock.epoch,g_rowsFrame);
     const uint32_t w=region[2]-region[0],h=region[3]-region[1];uint32_t cw=0,ch=0;
     if(!g_eyeOverviewTaken[eye])g_eyeOverviewTaken[eye]=stageEyeCrop(ctx,tex,&g_eyeRunStaging[eye],&cw,&ch,region,w,h);
     if(eye==0 && g_eyeRunLeft>0 && g_eyeRunTaken<kEyeRun) {
@@ -2342,6 +2275,7 @@ void captureUntreatedEye(ID3D11Texture2D* tex,int eye,const float* bounds) {
         if(stageEyeCrop(ctx,tex,&g_eyeRawStaging[k],&cw,&ch,region)) {
             g_eyeRawTaken[k]=true;g_eyeRawInputW[k]=w;g_eyeRawInputH[k]=h;
             g_eyeRunFrames[k]=g_rowsFrame;objectProbeLedgerMark(k);
+            g_eyeFinalRun.schedule(unsigned(k),g_eyeFinalClock.epoch,g_rowsFrame);
             ++g_eyeRunTaken;--g_eyeRunLeft;
             if(g_eyeRunLeft==0){g_eyeRunReady=true;g_eyeRunWidth=cw;g_eyeRunHeight=ch;}
         }
@@ -2360,6 +2294,7 @@ void captureEyeRunRaw(ID3D11DeviceContext* ctx, ID3D11Texture2D* colour) {
     uint32_t cw = 0, ch = 0;
     if (!stageEyeCrop(ctx, colour, &g_eyeRawStaging[k], &cw, &ch)) { g_eyeRunLeft = 0; return; }
     objectProbeLedgerMark(k);   // the ledger's frame for this crop
+    g_eyeFinalRun.schedule(unsigned(k),g_eyeFinalClock.epoch,g_rowsFrame);
     ++g_eyeRunTaken;
     --g_eyeRunLeft;
     if (g_eyeRunLeft > 0) return;
@@ -2376,6 +2311,7 @@ void captureEyeRun(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex) {
         return;
     }
     const int k = g_eyeRunTaken;
+    if(k>=0&&k<kEyeRun)g_eyeFinalRun.schedule(unsigned(k),g_eyeFinalClock.epoch,g_eyeCaptureFrame);
     if (!tex || k < 0 || k >= kEyeRun) {
         if (k >= 0 && k < kEyeRun) ++g_eyeRunTaken;
         g_eyeRunLeft = 0; g_eyeRunReady = g_eyeRunTaken > 0; return;
@@ -4216,14 +4152,11 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
         bool periphOk = false;           // the periphery eval ran and accumulated this frame
         if (foveaWanted && !g_csFovea && !g_csFoveaTried) {
             g_csFoveaTried = true;
-            g_csFovea = shaderSwapCompileCs(ctx, kFoveaCsHlsl, sizeof(kFoveaCsHlsl) - 1,
-                                            "fovea", "temporal_fovea_cs", nullptr,
-                                            "temporal aa");
+            g_csFovea = shaderSwapCreateCs(ctx,kTemporalFoveaBytecode,sizeof(kTemporalFoveaBytecode),"temporal_fovea_cs","temporal aa");
         }
         if (foveaWanted && g_periphSteady && !g_csDown && !g_csDownTried) {
             g_csDownTried = true;
-            g_csDown = shaderSwapCompileCs(ctx, kDownCsHlsl, sizeof(kDownCsHlsl) - 1,
-                                           "down", "temporal_down_cs", nullptr, "temporal aa");
+            g_csDown = shaderSwapCreateCs(ctx,kTemporalDownBytecode,sizeof(kTemporalDownBytecode),"temporal_down_cs","temporal aa");
         }
         if (foveaWanted && g_csFovea) warmNoteFirstTreat();   // before NGX's first ask, below
         if (foveaWanted && g_csFovea && dlaaAvailable(dev, nullptr)) {
@@ -4592,7 +4525,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
         auto applyUiResolve = [&](ID3D11ShaderResourceView* nvidiaOutput, bool withHistory) -> bool {
             if (uiTrack && e.dlSubmitUav && !g_csUiResolveTried) {
                 g_csUiResolveTried = true;
-                g_csUiResolve = shaderSwapCompileCs(ctx, kUiResolve, sizeof(kUiResolve) - 1, "main", "UI resolve", nullptr, "UI resolve");
+                g_csUiResolve = shaderSwapCreateCs(ctx, kUiResolveBytecode, sizeof(kUiResolveBytecode), "UI resolve", "UI resolve");
             }
             const bool debugPaintHere = g_debugMode == 1 || g_debugMode == 3 ||
                                         g_debugMode == 6;
@@ -4767,7 +4700,7 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                                             g_debugMode == 6;
                     if(uiTrack && e.dlSubmitUav && !g_csUiResolveTried) {
                         g_csUiResolveTried=true;
-                        g_csUiResolve=shaderSwapCompileCs(ctx,kUiResolve,sizeof(kUiResolve)-1,"main","UI resolve",nullptr,"UI resolve");
+                        g_csUiResolve=shaderSwapCreateCs(ctx,kUiResolveBytecode,sizeof(kUiResolveBytecode),"UI resolve","UI resolve");
                     }
                     const bool uiResolve=uiTrack && e.dlSubmitUav && g_csUiResolve && !debugPaint;
                     // luma probe stage 0: the texture the game submits.
@@ -6010,6 +5943,8 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
     if (result && ctx && eye == 0 && g_eyeRunLeft > 0) {
         captureEyeRun(ctx, static_cast<ID3D11Texture2D*>(result));
     }
+    if(result&&ctx&&eye==1&&g_eyeRunLeft>0&&g_eyeFinalRun.find(g_eyeFinalClock.epoch)<0)
+        g_eyeFinalRun.schedule(unsigned(g_eyeRunTaken),g_eyeFinalClock.epoch,g_rowsFrame);
     if(eye==1 && ctx && g_eyeRunReady) {
         writeEyeRun(ctx,g_eyeRunWidth,g_eyeRunHeight);g_eyeRunReady=false;
     }
@@ -6021,6 +5956,29 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
 }
 
 }  // namespace
+
+void temporalPassCaptureFinalEye(uint64_t sequence,uint32_t eye,ID3D11Texture2D* texture,
+                                 const uint32_t region[4],bool composite,bool flipU,bool flipV) {
+    if(!g_eyeFinalRun.armed||eye>1)return;
+    const uint32_t epoch=g_eyeFinalClock.epoch;
+    const int index=g_eyeFinalRun.find(epoch);
+    // An unmatched callback is evidence of a door/scene mismatch, not permission
+    // to capture a different frame into the queued temporal slot.
+    if(index<0){++g_eyeFinalRun.unmatched;return;}
+    ID3D11Device* device=nullptr;ID3D11DeviceContext* ctx=nullptr;
+    const bool ran=guarded("eye capture/final crisp",[&]{
+        if(texture){texture->GetDevice(&device);if(device)device->GetImmediateContext(&ctx);}
+        g_eyeFinalRun.capture(epoch,sequence,eye,ctx,texture,region,composite,flipU,flipV);
+        if(g_eyeFinalRun.complete())writeFinalEyeRun(ctx,"complete");
+    });
+    if(!ran&&g_eyeFinalRun.armed){
+        auto& image=g_eyeFinalRun.rows[index].eye[eye];image.sequence=sequence;image.status="capture_fault";
+    }
+    if(g_eyeFinalRun.pendingOwner)guarded("eye capture/final pending owner release",[&]{eye_final_capture::Run::drop(g_eyeFinalRun.pendingOwner);});
+    if(g_eyeFinalRun.pendingDevice)guarded("eye capture/final pending device release",[&]{eye_final_capture::Run::drop(g_eyeFinalRun.pendingDevice);});
+    if(ctx)guarded("eye capture/final context release",[&]{ctx->Release();});
+    if(device)guarded("eye capture/final device release",[&]{device->Release();});
+}
 
 void temporalPassDumpHistory(const char* trigger) {
     std::vector<TemporalHistoryEntry> entries;
@@ -6579,6 +6537,8 @@ void warmTrainedOnce(ID3D11DeviceContext* ctx) {
 }
 
 void temporalPassTick(ID3D11DeviceContext* ctx) {
+    if(ctx&&g_eyeFinalRun.armed&&g_eyeFinalRun.ready&&g_eyeFinalRun.count&&
+       g_eyeFinalClock.epoch>g_eyeFinalRun.rows[g_eyeFinalRun.count-1].epoch)writeFinalEyeRun(ctx,"next_boundary_missing_final");
     if (!ctx || (!detail::g_temporalPassWantedFssChrome && !g_eyeRunReady)) return;
     ID3D11Device* dev = nullptr;
     ctx->GetDevice(&dev);
@@ -6746,6 +6706,7 @@ void temporalPassNoteHead(int eye, const float* prevPose, const float* nowPose,
 }
 
 void temporalPassFrameBoundary() {
+    g_eyeFinalClock.boundary(g_eyeFinalRun.armed);
     if (!detail::g_temporalPassWantedFssChrome) return;
     for (int eye = 0; eye < 2; ++eye) {
         if (g_rigidDraw[eye].seen && g_rigidDraw[eye].frame == g_rowsFrame) {
@@ -7146,6 +7107,7 @@ bool temporalPassPriceWindow(double regionMedianMs[7], double* otherMedianMs,
 
 static void beginEyeRun() {
     if (g_eyeRunLeft > 0 || g_eyeRunReady) return;
+    if(g_eyeFinalRun.armed)writeFinalEyeRun(nullptr,"rearm_missing_final");
     perfMonitorNoteEvent(kEvEyeDump);
     // This request can occur after the trigger frame's scene draws. The eye
     // crops and decision controls include that frame; the accompanying draw
@@ -7156,6 +7118,7 @@ static void beginEyeRun() {
     GetLocalTime(&stm);
     _snwprintf_s(g_eyeRunStamp, 16, _TRUNCATE, L"%02u%02u%02u", static_cast<unsigned>(stm.wHour),
                  static_cast<unsigned>(stm.wMinute), static_cast<unsigned>(stm.wSecond));
+    g_eyeFinalRun.arm();g_eyeFinalClock.reset();wcscpy_s(g_eyeFinalStamp,g_eyeRunStamp);
     g_eyeRunTaken = 0;
     g_eyeRunLeft = kEyeRun;
     applyEngineMotionDiagnostics();   // the census runs for the run
@@ -7191,6 +7154,7 @@ static void beginEyeRun() {
 }
 
 void temporalPassShutdown() {
+    if(g_eyeFinalRun.armed)writeFinalEyeRun(nullptr,"shutdown_missing_final");
     { std::lock_guard<std::mutex> lock(g_temporalHistoryMutex);g_temporalHistory.clear(); }
     dlaaShutdown();
     fsr3Shutdown();

@@ -6,6 +6,43 @@ template<class Check> void runFrameCycleCases(Check check) {
   auto cStorage=std::make_unique<FrameCycleStats>();auto& c=*cStorage; FrameCycleStats::Shape shape{};shape.width[0]=shape.width[1]=2481;
   shape.height[0]=shape.height[1]=2121;shape.outputWidth[0]=shape.outputWidth[1]=3072;
   shape.outputHeight[0]=shape.outputHeight[1]=3264;shape.generation=7;shape.featureEpoch=3;shape.shouldRender=1;shape.sceneReady=1;
+  {
+    FrameCycleStats linked;FrameCycleStats::Completed completed{};
+    auto linkedWait=[&](uint64_t xr,uint64_t gpu,uint64_t base,const FrameCycleStats::Shape& scope,bool ok=true,uint32_t caller=4){
+      auto w=linked.waitCallerBegin(base,4);linked.waitOwnerBegin(w,base+10);linked.waitOwnerEnd(w,base+20);
+      linked.waitCallerEnd(w,xr,base+30,base/1000,caller,scope,ok,gpu);
+    };
+    auto linkedStereo=[&](uint64_t xr,uint64_t base){for(unsigned eye=0;eye<2;++eye){
+      const auto at=base+100+eye*100;auto s=linked.submitCallerBegin(eye,at,4);
+      linked.submitOwnerBegin(s,at+10);linked.submitOwnerEnd(s,at+20);linked.submitCallerEnd(s,eye,xr,at+30,4,0.01,true);
+    }};
+    linkedWait(100,9001,1000,shape);linkedStereo(100,1000);linkedWait(105,9017,2000,shape);
+    check(linked.takeCompleted(completed)&&completed.sequence==100&&completed.producerSequence==9001,
+      "completed cycle retains its explicit producer token, not XR or next-wait token");
+    linkedStereo(105,2000);linkedWait(106,0,3000,shape);
+    check(linked.takeCompleted(completed)&&completed.sequence==105&&completed.producerSequence==9017,
+      "divergent XR and producer counters remain independently linked");
+    linkedStereo(106,3000);linkedWait(107,9100,4000,shape);
+    check(linked.takeCompleted(completed)&&completed.sequence==106&&completed.producerSequence==0,
+      "unavailable producer mapping never inherits a previous token");
+    linkedStereo(107,4000);auto nextGeneration=shape;++nextGeneration.generation;
+    linkedWait(200,9200,5000,nextGeneration);
+    check(!linked.takeCompleted(completed),"generation transition drops previous cycle producer identity");
+    linkedStereo(200,5000);linkedWait(201,9201,6000,nextGeneration);
+    check(linked.takeCompleted(completed)&&completed.sequence==200&&completed.producerSequence==9200,
+      "new generation has only its newly opened producer mapping");
+    linked.reset();check(!linked.takeCompleted(completed),"reset drops completed producer mapping");
+    linkedWait(300,9300,7000,shape);linkedStereo(300,7000);linkedWait(301,9301,8000,shape,false);
+    check(!linked.takeCompleted(completed),"failed wait produces no linked cycle");
+    linkedWait(302,9302,9000,shape);linkedStereo(302,9000);linkedWait(303,9303,10000,shape,true,5);
+    check(!linked.takeCompleted(completed),"foreign caller produces no linked cycle");
+    auto loading=shape;loading.sceneReady=0;
+    linkedWait(400,9400,11000,loading);linkedStereo(400,11000);linkedWait(401,9401,12000,loading);
+    check(linked.takeCompleted(completed)&&completed.producerSequence==0,"loading cycle maps producer as unavailable");
+    linked.reset();auto withheld=shape;withheld.shouldRender=0;
+    linkedWait(500,9500,13000,withheld);linkedStereo(500,13000);linkedWait(501,9501,14000,withheld);
+    check(linked.takeCompleted(completed)&&completed.producerSequence==0,"withheld frame maps producer as unavailable");
+  }
   auto wait=[&](uint64_t seq,uint64_t us,uint64_t ms,uint32_t thread=11){auto t=c.waitCallerBegin(us,thread);c.waitOwnerBegin(t,us+100);c.waitOwnerEnd(t,us+300);c.waitCallerEnd(t,seq,us+500,ms,thread,shape,true);};
   auto submit=[&](uint64_t seq,unsigned eye,uint64_t us,uint32_t thread=11){auto t=c.submitCallerBegin(eye,us,thread);c.submitOwnerBegin(t,us+100);c.submitOwnerEnd(t,us+300);c.submitCallerEnd(t,eye,seq,us+500,thread,0.25,true);};
   double callerWork=-1;

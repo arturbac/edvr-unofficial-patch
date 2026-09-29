@@ -1,3 +1,4 @@
+#include "temporal_shader_bytecode.h"
 #include "fss_theater.h"
 #include "graphics_runtime.h"
 
@@ -20,123 +21,7 @@ namespace {
 // image inside the panel or return black. The surround was black in the
 // game's own render, so the panel's edges land invisibly at first and
 // only head-look reveals the screen.
-constexpr char kTheaterCsHlsl[] = R"HLSL(
-Texture2D<float4> C : register(t0);
-Texture2D<float4> C2 : register(t1);   // the RIGHT eye, for the stitch
-SamplerState S0 : register(s0);
-RWTexture2D<float4> O : register(u0);
-cbuffer P : register(b0) {
-    float4 tans;   // x = left-extent tan, y = right-extent tan,
-                   // z = vertical half tan, w = panel distance
-    float4 m0;     // delta rotation rows (current-head -> frozen-head);
-    float4 m1;     // the rows' .w = this eye's ray origin in frozen-head
-    float4 m2;     // space, translation and eye offset folded in
-    float4 misc;   // x = vertical band (fraction of the texture's height
-                   // the screen shows, centre-cropped), y = half width
-                   // along the surface, z = half height, w = curve
-    float4 hA;     // square->quad homography for the scanner screen's
-    float4 hB;     // quad in the LEFT eye: pu=(hA.x sx + hA.y sy +
-                   // hA.z)/den, pv=(hA.w sx + hB.x sy + hB.y)/den,
-                   // den=hB.z sx + hB.w sy + 1. All-zero hA = no quad;
-                   // the centred band applies.
-    float4 hA2;    // the RIGHT eye's homography. Where valid, the panel's
-    float4 hB2;    // right half samples the right eye instead -- each eye
-                   // is clean on its temporal side, so the nose-mask
-                   // cutouts never reach the screen. All-zero = left only.
-}
-[numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    uint w, h;
-    O.GetDimensions(w, h);
-    if (id.x >= w || id.y >= h) return;
-    float u = (id.x + 0.5) / w;
-    float v = (id.y + 0.5) / h;
-    // View-space ray, OpenVR convention: -Z forward, +Y up, +X right;
-    // pixel rows run top to bottom.
-    float tx = lerp(-tans.x, tans.y, u);
-    float ty = lerp(tans.z, -tans.z, v);
-    float3 dv = float3(tx, ty, -1.0);
-    float3 df = float3(dot(m0.xyz, dv), dot(m1.xyz, dv), dot(m2.xyz, dv));
-    float3 org = float3(m0.w, m1.w, m2.w);
-    float4 outc = float4(0, 0, 0, 1);
-    float su = -1.0, sv = -1.0;
-    if (misc.w > 0.005) {
-        // Curved screen: a vertical cylinder of radius dist/curve whose
-        // arc centre sits at the screen distance; u runs along the arc so
-        // the content keeps its width. The viewer is always inside the
-        // cylinder (zc < R), so the ray's forward intersection is the +
-        // root of the quadratic.
-        float R = tans.w / misc.w;
-        float zc = R - tans.w;
-        float a = df.x * df.x + df.z * df.z;
-        float b = 2.0 * (org.x * df.x + (org.z - zc) * df.z);
-        float c = org.x * org.x + (org.z - zc) * (org.z - zc) - R * R;
-        float disc = b * b - 4.0 * a * c;
-        if (disc > 0 && a > 1e-8) {
-            float t = (-b + sqrt(disc)) / (2.0 * a);
-            if (t > 0) {
-                float3 hit = org + t * df;
-                float th = atan2(hit.x, zc - hit.z);
-                su = (th * R + misc.y) / (2.0 * misc.y);
-                sv = (hit.y + misc.z) / (2.0 * misc.z);
-            }
-        }
-    } else if (df.z < -1e-4) {
-        float t = (-tans.w - org.z) / df.z;
-        if (t > 0) {
-            float3 hit = org + t * df;
-            su = (hit.x + misc.y) / (2.0 * misc.y);
-            sv = (hit.y + misc.z) / (2.0 * misc.z);
-        }
-    }
-    if (su >= 0 && su <= 1 && sv >= 0 && sv <= 1) {
-        // Screen fractions -> content coordinates. With a derived quad,
-        // the square->quad homography rectifies the scanner's screen --
-        // level and fully framed whatever its tilt or the head's pose at
-        // engage; otherwise the centred band. sv runs bottom-up in
-        // space; the homography's sy runs top-down like the texture.
-        float pu, pv;
-        if (hA.x != 0.0 || hA.y != 0.0 || hA.z != 0.0) {
-            float sx = su;
-            float sy = 1.0 - sv;
-            // The stitch: the panel's left half from the left eye, right
-            // half from the right eye when its homography is valid --
-            // each eye clean on its temporal side, so the nasal
-            // hidden-area cutouts (the nose shadow) never reach the
-            // screen. The screen sits at optical-far depth, so the two
-            // eyes' images agree at the seam.
-            bool useR = sx >= 0.5 &&
-                        (hA2.x != 0.0 || hA2.y != 0.0 || hA2.z != 0.0);
-            float den, s2;
-            if (useR) {
-                den = hB2.z * sx + hB2.w * sy + 1.0;
-                pu = (hA2.x * sx + hA2.y * sy + hA2.z) / den;
-                pv = (hA2.w * sx + hB2.x * sy + hB2.y) / den;
-            } else {
-                den = hB.z * sx + hB.w * sy + 1.0;
-                pu = (hA.x * sx + hA.y * sy + hA.z) / den;
-                pv = (hA.w * sx + hB.x * sy + hB.y) / den;
-            }
-            // A sample past the rendered eye means this strip was never
-            // drawn: honest black, not a clamped smear.
-            if (pu < 0.0 || pu > 1.0 || pv < 0.0 || pv > 1.0) {
-                O[id.xy] = float4(0, 0, 0, 1);
-                return;
-            }
-            outc = useR
-                       ? float4(C2.SampleLevel(S0, float2(pu, pv), 0).rgb, 1)
-                       : float4(C.SampleLevel(S0, float2(pu, pv), 0).rgb, 1);
-            O[id.xy] = outc;
-            return;
-        } else {
-            pu = su;
-            pv = 0.5 + (0.5 - sv) * misc.x;
-        }
-        outc = float4(C.SampleLevel(S0, float2(pu, pv), 0).rgb, 1);
-    }
-    O[id.xy] = outc;
-}
-)HLSL";
+
 
 DXGI_FORMAT theaterTypedOf(DXGI_FORMAT f) {
     switch (f) {
@@ -303,9 +188,7 @@ void* theaterInner(void* contentTex, void* contentTexR, int eye,
     }
     if (ok && !g_cs && !g_csTried) {
         g_csTried = true;
-        g_cs = shaderSwapCompileCs(ctx, kTheaterCsHlsl,
-                                   sizeof(kTheaterCsHlsl) - 1, "main",
-                                   "fss_theater_cs", nullptr, "fss theater");
+        g_cs = shaderSwapCreateCs(ctx, kFssTheaterBytecode, sizeof(kFssTheaterBytecode), "fss_theater_cs", "fss theater");
     }
     ok = ok && g_cs != nullptr;
 
@@ -485,9 +368,7 @@ void* theaterInner(void* contentTex, void* contentTexR, int eye,
 void fssTheaterWarm(ID3D11DeviceContext* ctx) {
     if (g_cs || g_csTried) return;
     g_csTried = true;
-    g_cs = shaderSwapCompileCs(ctx, kTheaterCsHlsl, sizeof(kTheaterCsHlsl) - 1,
-                               "main", "fss_theater_cs", nullptr,
-                               "fss theater");
+    g_cs = shaderSwapCreateCs(ctx, kFssTheaterBytecode, sizeof(kFssTheaterBytecode), "fss_theater_cs", "fss theater");
     if (g_cs) {
         Log::get().note(
             "fss theater: shader warmed at session start -- the first "

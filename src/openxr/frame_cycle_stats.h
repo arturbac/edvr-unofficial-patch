@@ -49,7 +49,7 @@ class FrameCycleStats final {
     unsigned(TestPresent)==unsigned(EdvrCpuTestPresent)&&unsigned(MalformedPresent)==unsigned(EdvrCpuMalformedPresent),"native CPU post status ABI");
   struct PostRequest {uint64_t sequence=0,beginUs=0;uint32_t thread=0;};
   struct Completed {
-    uint64_t sequence=0,generation=0,featureEpoch=0,waitReturnUs=0,
+    uint64_t sequence=0,producerSequence=0,generation=0,featureEpoch=0,waitReturnUs=0,
       secondSubmitReturnUs=0,nextWaitEntryUs=0,nextWaitReturnUs=0,
       presentBeginUs=0,presentEndUs=0;
     uint32_t callerThread=0,nextWaitThread=0,sceneReady=0;
@@ -105,13 +105,16 @@ class FrameCycleStats final {
     if(!pendingFrameEndOwnerBegin_||tick<pendingFrameEndOwnerBegin_)return;
     pendingFrameEndOwnerMs_=double(tick-pendingFrameEndOwnerBegin_)*0.001;pendingFrameEndOwnerBegin_=0;
   }
-  void waitCallerEnd(uint64_t token,uint64_t sequence,uint64_t tick,uint64_t nowMs,uint32_t thread,const Shape& shape,bool ok) noexcept {
+  void waitCallerEnd(uint64_t token,uint64_t sequence,uint64_t tick,uint64_t nowMs,uint32_t thread,const Shape& shape,bool ok,uint64_t producerSequence=0) noexcept {
     std::lock_guard<std::mutex> l(m_);completedReady_=false;callerWorkFor_=0;callerWorkMeasured_=false;
     if(!ok||!token||wait_.token!=token||!wait_.open||!ordered(wait_.begin,wait_.ownerBegin,wait_.ownerEnd,tick)||thread!=wait_.thread){advanceWindow(nowMs,shape,sequence);bad(!ok?PartialStereo:BadClock);if(wait_.token==token)wait_={};return;}
     if(current_.active&& !sameShape(current_.shape,shape)){++missing_[ShapeChange];if(windowStartMs_)makeReport(lastAttemptedSequence_,nowMs);current_={};}
     else if(current_.active) finishCurrent(tick,nowMs,thread);
     advanceWindow(nowMs,shape,sequence);
     current_={};current_.active=true;current_.sequence=sequence;current_.waitReturn=tick;
+    // Capture the producer identity when this cycle opens. finishCurrent()
+    // closes it on the NEXT wait; that next wait's token belongs elsewhere.
+    current_.producerSequence=shape.sceneReady&&shape.shouldRender?producerSequence:0;
     current_.waitRound=tick-wait_.begin;current_.waitOwner=wait_.ownerEnd-wait_.ownerBegin;
     current_.callerThread=thread;current_.waitThread=thread;current_.shape=shape;current_.atMs=nowMs;wait_={};
     // The cycle this wait return just closed hands its caller work to the
@@ -174,7 +177,7 @@ class FrameCycleStats final {
   static constexpr unsigned handoffCapacity=16;
   struct Handoff {uint64_t begin=0,end=0;};
   struct Wait {bool open=false;uint64_t token=0,begin=0,ownerBegin=0,ownerEnd=0;uint32_t thread=0;};
-  struct Current {bool active=false,submitOpen=false;uint64_t sequence=0,waitReturn=0,waitRound=0,waitOwner=0,
+  struct Current {bool active=false,submitOpen=false;uint64_t sequence=0,producerSequence=0,waitReturn=0,waitRound=0,waitOwner=0,
     beforeFirst=0,between=0,afterSecond=0,submitToken=0,submitBegin=0,ownerBegin=0,ownerEnd=0,submitReturn[2]{},submitRound[2]{},owner[2]{},atMs=0;
     bool afterSecondReady=false;
     double park[2]{},presentCount=0,rawPresent=0,edvrBeforePresent=0,edvrAfterPresent=0,edvrPresent=0,trailingCallback=0,outsidePresent=0,postResidual=0,beforePresent=0,afterPresent=0,syncNonzeroPresent=0;
@@ -258,6 +261,7 @@ class FrameCycleStats final {
     callerWorkMeasured_=std::isfinite(callerWorkMs_)&&callerWorkMs_>=0;
     if(!admit(s,current_.shape,nowMs))return;
     completed_={};completed_.sequence=current_.sequence;completed_.generation=current_.shape.generation;
+    completed_.producerSequence=current_.producerSequence;
     completed_.featureEpoch=current_.shape.featureEpoch;completed_.waitReturnUs=current_.waitReturn;
     completed_.secondSubmitReturnUs=current_.submitReturn[1];completed_.nextWaitEntryUs=wait_.begin;
     completed_.nextWaitReturnUs=nextWaitReturn;completed_.callerThread=current_.callerThread;

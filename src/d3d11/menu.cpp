@@ -1772,10 +1772,10 @@ void buildMonitor(MenuContent& c) {
         mg.zeroIsValid = nativeGraphs;
         if (nativeGraphs && mg.budgetMs > 0.0f)
             snprintf(mg.label, sizeof(mg.label), "%s, %d samples; predicted period %.1f ms",
-                     g == 0 ? "Producer GPU" : "Submit wall", mg.count, double(mg.budgetMs));
+                     g == 0 ? "Producer GPU" : "Application wall", mg.count, double(mg.budgetMs));
         else if (nativeGraphs)
             snprintf(mg.label, sizeof(mg.label), "%s, %d samples; no runtime reference",
-                     g == 0 ? "Producer GPU" : "Submit wall", mg.count);
+                     g == 0 ? "Producer GPU" : "Application wall", mg.count);
         else snprintf(mg.label, sizeof(mg.label), "%s, last %d frames; the line is the %.1f ms budget",
                  names[g], mg.count, static_cast<double>(mg.budgetMs));
         ++c.graphCount;

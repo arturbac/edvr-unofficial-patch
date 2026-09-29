@@ -1,3 +1,4 @@
+#include "temporal_shader_bytecode.h"
 #include "depth_probe.h"
 
 #include <cmath>
@@ -32,18 +33,7 @@ namespace {
 // The sampler: 256 depth values on a 16x16 grid across the target, read
 // through a view typed to the depth channel. Load, not Sample -- a depth
 // view has no filterable format, and the grid wants exact texels.
-constexpr char kSampleCsHlsl[] = R"HLSL(
-Texture2D<float> D : register(t0);
-RWStructuredBuffer<float> O : register(u0);
-cbuffer P : register(b0) { uint2 size; uint2 pad0; };
-[numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= 16 || id.y >= 16) return;
-    uint2 p = uint2((id.x * 2 + 1) * size.x / 32, (id.y * 2 + 1) * size.y / 32);
-    p = min(p, size - 1);
-    O[id.y * 16 + id.x] = D.Load(int3(int2(p), 0));
-}
-)HLSL";
+
 
 constexpr int      kMaxTargets = 32;   // the cockpit binds shadow maps by the handful
 constexpr uint64_t kSampleIntervalMs = 10000;
@@ -343,9 +333,7 @@ void releaseGpu() {
 bool ensureGpu(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     if (!g_cs && !g_csTried) {
         g_csTried = true;
-        g_cs = shaderSwapCompileCs(ctx, kSampleCsHlsl, sizeof(kSampleCsHlsl) - 1,
-                                   "main", "depth_probe_cs", nullptr,
-                                   "depth probe");
+        g_cs = shaderSwapCreateCs(ctx, kDepthProbeBytecode, sizeof(kDepthProbeBytecode), "depth_probe_cs", "depth probe");
     }
     if (!g_cs) return false;
     if (!g_out) {

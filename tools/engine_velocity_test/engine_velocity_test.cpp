@@ -36,6 +36,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include "allocation_counter.h"
 
 #include "shader_tests.h"
 #include "overlay_depth_gpu_tests.h"

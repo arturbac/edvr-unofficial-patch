@@ -44,6 +44,7 @@ namespace edvr { void temporalPassDumpHistory(const char* trigger); }
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+struct ID3D11Texture2D;
 
 namespace edvr {
 
@@ -91,6 +92,10 @@ void temporalPassFrameBoundary();
 // and per-eye motion metadata in edvr_logs\eyes. The paired run is the
 // default; advanced.eye_run_paired=0 keeps the older single-run selection.
 void temporalPassArmEyeDump();
+// Active eye-run diagnostic only, after the final crisp composition and before
+// the runtime's menu. region is the actual returned texture's unflipped bounds.
+void temporalPassCaptureFinalEye(uint64_t sequence, uint32_t eye, ID3D11Texture2D* texture,
+                                 const uint32_t region[4], bool composite, bool flipU, bool flipV);
 
 // The pass wants the scanner-chrome tracker (vscreen.cpp, beginPanelOverride)
 // running whenever it is on: the FSS's interface takes the head's path
