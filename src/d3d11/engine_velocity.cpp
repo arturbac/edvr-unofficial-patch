@@ -192,8 +192,15 @@ struct PrimaryMap {
     uint64_t sequence=0;
     bool mapped=false;
 };
+// The pool cache holds each registered game buffer by reference (an equal
+// pointer is then the same object), so a slot exists only while the feature is
+// live: notePrimaryBufferCreated refuses a buffer otherwise, and
+// releasePrimaryPoolsLocked lets every one go when the feature stands down.
 PrimaryMap g_primaryMaps[kPrimaryPoolResources];
 uint64_t g_primaryMapSequence=0,g_primaryMapOverflow=0,g_primaryCopyCalls=0,g_primaryApplied=0;
+// The cache-full line is printed once per live period (cleared with the slots);
+// g_primaryMapOverflow, the 30 s line's figure, keeps counting past it.
+bool g_primaryOverflowNoted=false;
 
 // --- Per eye -------------------------------------------------------------------
 enum Invalid : int {
@@ -812,6 +819,11 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
     poolBuf->GetDesc(&pd);
     if (pd.StructureByteStride != emit::kItemBytes || !(pd.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) ||
         pd.ByteWidth < emit::kItemBytes) { invalidate(e, kNoPool); return false; }
+    // The pool's recognition needs no buffer seen at creation: the creation tee
+    // registers only while the feature is live, so a pool the game made before
+    // it went live (the feature switched on mid-session) is nominated here, from
+    // the very buffer this eye-frame's draws read -- the same filter, the same
+    // slot. Its private-copy coverage then starts at the next observed map.
     const bool knownPrimary=watchesPrimaryResource(poolBuf.Get());
     notePrimaryBufferCreated(poolBuf.Get(),pd); // existing buffer on mid-session activation
     if(!knownPrimary && watchesPrimaryResource(poolBuf.Get()))
@@ -1646,7 +1658,16 @@ void summaryLocked(uint64_t now) {
     g_windowStartMs = now;
 }
 
+// Let every registered pool go: the lock-free watch slots first (the Map and
+// Unmap tees stop matching), then the held references. A run of the feature
+// starts and ends here through clearLocked, so it holds no game buffer while off.
+void releasePrimaryPoolsLocked() {
+    for (unsigned i = 0; i < kPrimaryPoolResources; ++i) { primaryPoolResources[i].store(nullptr); g_primaryMaps[i] = {}; }
+    g_primaryOverflowNoted = false;
+}
+
 void clearLocked() {
+    releasePrimaryPoolsLocked();
     for (auto& e : g_eyes) e = Eye{};
     g_sourceDepth.Reset();
     g_sourceNoted = ~0u;
@@ -1742,8 +1763,7 @@ void engineVelocityShutdown() {
     kinematicEvalSetPoolCopyObserver(nullptr);
     kinematicEvalSetMergeObserver(nullptr,nullptr);
     kinematicEvalSetClearObserver(nullptr);
-    primaryCopy::reset();
-    for(unsigned i=0;i<kPrimaryPoolResources;++i){primaryPoolResources[i].store(nullptr);g_primaryMaps[i]={};}
+    primaryCopy::reset();   // its leases hold the mapped pools too; clearLocked below releases the cache's
     if (g_emitAttached) { kinematicEvalEmitDetach(); g_emitAttached = false; }
     g_lookup.store(nullptr, std::memory_order_release);
     g_emitLive.store(false, std::memory_order_release);
@@ -1823,10 +1843,24 @@ void notePrimaryBufferCreated(ID3D11Buffer* buffer,const D3D11_BUFFER_DESC& desc
     if(!buffer || desc.Usage!=D3D11_USAGE_DYNAMIC || desc.StructureByteStride!=336 ||
        !(desc.MiscFlags&D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) || !(desc.CPUAccessFlags&D3D11_CPU_ACCESS_WRITE))return;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    // Live only, judged under the lock: the stand-down clears the slots under
+    // this same lock, so a CreateBuffer that raced it cannot pin a buffer after
+    // the release. The inline caller's unlocked test is only the cheap first cut.
+    if(!live.load(std::memory_order_acquire))return;
     for(auto& slot:g_primaryMaps)if(slot.buffer.Get()==buffer)return;
     unsigned chosen=kPrimaryPoolResources;
     for(unsigned i=0;i<kPrimaryPoolResources;++i)if(!g_primaryMaps[i].buffer){chosen=i;break;}
-    if(chosen==kPrimaryPoolResources){++g_primaryMapOverflow;return;}
+    if(chosen==kPrimaryPoolResources){
+        ++g_primaryMapOverflow;
+        if(!g_primaryOverflowNoted){
+            g_primaryOverflowNoted=true;
+            Log::get().note("engine motion: primary pool cache full (%u game buffers held, the most kept): buffer %p "
+                            "(%u bytes) seen at present frame %u is not tracked, so its private-copy coverage declines. "
+                            "Printed once per run; the 30 s line's \"positive map cache overflow\" keeps counting.",
+                            kPrimaryPoolResources,static_cast<void*>(buffer),static_cast<unsigned>(desc.ByteWidth),frameNow());
+        }
+        return;
+    }
     auto& slot=g_primaryMaps[chosen];slot.buffer=buffer;slot.bytes=desc.ByteWidth;slot.lastFrame=frameNow();
     primaryPoolResources[chosen].store(buffer,std::memory_order_release);
 }

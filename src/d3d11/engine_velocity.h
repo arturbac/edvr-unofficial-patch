@@ -184,7 +184,14 @@ inline void engineVelocityResourceWritten(const ID3D11Resource* resource) {
     if(watchesResource(resource))noteResourceWrite(resource);
 }
 
+// A buffer the game created (device_hook, every successful CreateBuffer). Only
+// while the feature is live: a registered pool is held by reference for the
+// private-copy cache, so with the feature off -- the default -- nothing is
+// registered and no game buffer is kept alive. A pool created before the
+// feature went live is nominated from the t33 binding itself at the first
+// snapshot (engine_velocity.cpp, "existing buffer on mid-session activation").
 inline void engineVelocityBufferCreated(ID3D11Buffer* buffer,const D3D11_BUFFER_DESC* desc) {
+    if(!engine_velocity_detail::live.load(std::memory_order_relaxed))return;
     if(buffer && desc)
         engine_velocity_detail::notePrimaryBufferCreated(buffer,*desc);
 }
