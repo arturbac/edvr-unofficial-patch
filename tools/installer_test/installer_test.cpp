@@ -1094,6 +1094,11 @@ static bool wroteAFile(const ApplyResult& result) {
     return false;
 }
 
+// The rig's stand-ins for the renames are defined with the writer's cases, further
+// down (see "stand-ins for the renames"); the case here that needs them is earlier.
+static unsigned long placeFile(const wchar_t* from, const wchar_t* to);
+static void realRenames();
+
 static void testApply(const std::wstring& scratch) {
     printf("\napplying a plan\n");
     const std::wstring gameDir = joinPath(scratch, L"game");
@@ -1191,10 +1196,24 @@ static void testApply(const std::wstring& scratch) {
         Options second = options;
         second.backupStamp = L"20260827-121500";
         second.repair = true;   // force the writes even though little changed
+
+        // This case is about what the result says once a file HAS been replaced,
+        // so it needs the run to get that far and to fail at the record and not
+        // before. The replaces are therefore stood in for by renames that a
+        // scanner cannot refuse (placeFile waits one out): with the real ones, a
+        // real-time scanner that had d3d11.dll open at the instant of the first
+        // replace made the classic rename fail with "access denied", the run
+        // stopped there with nothing replaced -- `overwrote` false, correctly --
+        // and this check failed 2 runs in 80. That the engine waits such a refusal
+        // out is testApplyPatience's, scripted and on the real files; this case
+        // must not depend on it.
+        replaceHooksForTest(placeFile, placeFile);
         const ApplyResult result = applyPlan(planInstall(again, second, newer), provider(false));
+        realRenames();
         check(!result.ok, "a run that cannot finish fails");
         check(fileExists(joinPath(gameDir, L"edvr_backup\\20260827-121500\\d3d11.dll")),
               "the backups it took are still there afterwards");
+        check(wroteAFile(result), "having replaced files before it did", result.error);
         check(result.overwrote, "and it admits a file had already been replaced");
     }
 
@@ -3010,7 +3029,7 @@ int wmain(int argc, wchar_t** argv) {
     makeTree(scratch);
     edvr::installer::test::nativeContractCases([](bool ok, const char* what) { check(ok, what); });
     edvr::installer::test::nativeBuiltContractCases([](bool ok,const char* what){check(ok,what);},root);
-    edvr::installer::native_apply_cases::run([](bool ok, const char* what) { check(ok, what); }, joinPath(scratch, L"native_apply"));
+    edvr::installer::native_apply_cases::run([](bool ok, const char* what) { check(ok, what); }, joinPath(scratch, L"native_apply"), placeFile);
 
     printf("installer_test: root %ls\n", root.c_str());
 
