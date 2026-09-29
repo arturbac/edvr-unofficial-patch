@@ -157,7 +157,7 @@ const TargetCache& targetOf() {
     g_tc.gen = gen;
     void* rtv = bindingGet(BindSlot::Rtv0);
     ResourceInfo info;
-    if (rtv && bindingResolve(rtv, &info) && info.isTexture2D) {
+    if (rtv && bindingResolveProbe(rtv, &info) && info.isTexture2D) {
         g_tc.ok = true;
         g_tc.resource = info.resource;
         g_tc.w = info.a;
@@ -235,7 +235,7 @@ void noteFamilyState(ID3D11DeviceContext* ctx, int fam, int eye, uint32_t ord, c
     for (int i = 0; i < 4; ++i) {
         void* v = bindingGet(static_cast<BindSlot>(static_cast<uint32_t>(BindSlot::PsSrv0) + i));
         ResourceInfo info;
-        if (v && bindingResolve(v, &info) && info.isTexture2D) {
+        if (v && bindingResolveProbe(v, &info) && info.isTexture2D) {
             fp.srv[i][0] = info.a;
             fp.srv[i][1] = info.b;
             fp.srv[i][2] = info.fmt;
@@ -1237,7 +1237,7 @@ bool hudLayerCensusEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count, 
                 int eye = -1;
                 if (ti.rtvRes) {
                     ResourceInfo ri;
-                    if (bindingResolveResource(ti.rtvRes, &ri) && ri.isTexture2D) {
+                    if (bindingResolveResourceProbe(ti.rtvRes, &ri) && ri.isTexture2D) {
                         eye = uiDepthEyeOfTargetReadOnly(ri.resource);
                     }
                 }

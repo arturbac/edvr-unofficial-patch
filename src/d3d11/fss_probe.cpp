@@ -292,7 +292,7 @@ void fssProbeBegin(ID3D11DeviceContext* ctx) {
             static_cast<uint32_t>(BindSlot::PsSrv0) + g_slot);
         void* bound = bindingGet(slot);
         ResourceInfo info;
-        if (!bindingResolve(bound, &info) || !info.isTexture2D) return;
+        if (!bindingResolveProbe(bound, &info) || !info.isTexture2D) return;
         if (info.fmt != kFmtR11G11B10) {
             // The 6x1 strip at s0 is typeless and its view format is not
             // knowable from the desc; substituting blind would probe the
