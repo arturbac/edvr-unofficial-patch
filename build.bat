@@ -1190,6 +1190,44 @@ if errorlevel 1 ( echo [edvr] ERROR: gate_test build failed & exit /b 1 )
 )
 exit /b 0
 
+:rig_journal_unload_test
+echo [edvr] === journal_unload_test.exe ===
+REM The graphics DLL's pin against a real FreeLibrary (RC4 review 2026-09-29, F1).
+REM d3d11.dll runs its code on threads nobody waits for -- the journal watcher's
+REM worker, and with fix.ui_quality on a fire-and-forget thread-pool callback -- and
+REM a FreeLibrary that unmaps the image under one returns it into unmapped code.
+REM gate_test links journal_watch.cpp into an exe, which is never unloaded, so it
+REM cannot ask. This builds a DLL from the REAL journal_watch.cpp and the REAL pin
+REM (src\common\module_pin.h) and, for the real worker, a CreateThread thread and a
+REM pool callback of ui_surfaces.cpp's shape, blocks each inside the module, calls
+REM FreeLibrary, and requires the module to stay mapped. Without the pin the
+REM CreateThread thread and the pool callback must lose the image, which is what
+REM shows the rig can tell; the real worker does not, because the UCRT's thread
+REM start holds its module, and the rig reports that. It then loads the real
+REM build\d3d11.dll, gives it a device, and reads its own log for the pin line, the
+REM call in initOnceCallback as shipped. Nothing here links d3d11.lib: the exe takes
+REM the proxy by path.
+if not exist "%OBJ%\junload" mkdir "%OBJ%\junload"
+if not exist "%OBJ%\junload\dll" mkdir "%OBJ%\junload\dll"
+if not exist "%OBJ%\junload\host" mkdir "%OBJ%\junload\host"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /LD /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\junload\dll"\ /Fe"%BUILD%\journal_unload_dll.dll" ^
+    "tools\journal_unload_test\journal_unload_dll.cpp" "src\d3d11\journal_watch.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" ^
+    "src\common\proxy.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: journal_unload_dll build failed & exit /b 1 )
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\junload\host"\ /Fe"%BUILD%\journal_unload_test.exe" ^
+    "tools\journal_unload_test\journal_unload_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: journal_unload_test build failed & exit /b 1 )
+"%BUILD%\journal_unload_test.exe" "%BUILD%\d3d11.dll" || (
+    echo [edvr] ERROR: the graphics DLL's pin does not keep its code mapped under a running worker
+    exit /b 1
+)
+exit /b 0
+
 :rig_glitch_test
 echo [edvr] === glitch_test.exe ===
 REM The transition-flash detector, replayed without the game. This repo SHIPS

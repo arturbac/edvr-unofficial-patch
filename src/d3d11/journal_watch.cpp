@@ -250,7 +250,9 @@ struct Session {
 // file call when shutdown returns, and the menu's writer and the panel raster
 // worker are leaked for the same reason (see log.cpp, "deliberately leaked").
 // One per configure, so a worker that is still winding down when the next
-// configure comes cannot touch what the new one is using.
+// configure comes cannot touch what the new one is using. That keeps the DATA
+// alive; the worker's CODE stays mapped by the CRT's thread-start reference and
+// by the graphics DLL's pin (module_pin.h): see startWorker.
 std::atomic<Session*> g_session{nullptr};
 
 // Set by shutdown. A frame that arrives after it starts nothing.
@@ -712,6 +714,17 @@ void workerMain(Session* sp) {
     s.exited.store(true, std::memory_order_release);
 }
 
+// A detached thread that runs this module's code for the whole session, so the
+// module must not be unmapped under it. Two things see to that, and the code is
+// safe on either alone. std::thread starts it through the static UCRT's
+// _beginthreadex, which takes a reference on the module of the thread routine and
+// ends the thread through FreeLibraryAndExitThread (ucrt\startup\thread.cpp): a
+// FreeLibrary during a file call leaves the image mapped. And the graphics DLL is
+// pinned (module_pin.h) at the first device creation, before the first Present
+// tick gets here, which does not depend on the CRT. gate_test's exe cannot be
+// unloaded at all. tools/journal_unload_test loads this code in a DLL and shows
+// both across a FreeLibrary, and shows a CreateThread thread and a pool callback
+// lose the image without the pin. The RC4 review (F1) supposed neither held.
 bool startWorker(Session& s) {
     try {
         std::thread(workerMain, &s).detach();
