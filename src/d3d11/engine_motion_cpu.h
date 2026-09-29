@@ -35,10 +35,12 @@
 // slot from then on. Every other slot is "other threads".
 //
 // THE INSTRUMENT'S OWN COST is calibrated the way the GPU census states its
-// timer floor: null scopes on the render thread at the first frame, both shapes
-// (plain, and with a forward pause), what a null scope RECORDS (it inflates every
-// figure by that much per call) and what it COSTS (wall time per call), and the
-// report multiplies them by the window's call rates.
+// timer floor: null scopes on the render thread at the end of every window, in the
+// CPU state the window ran in, both shapes (plain, and with a forward pause), what
+// a null scope RECORDS (it inflates every figure by that much per call) and what
+// it COSTS (wall time per call), and the report multiplies them by the window's
+// call rates. Four batches of null pairs, the fastest kept: a batch a preemption
+// or a slow clock inflated is not the floor.
 //
 // "THE CODE NEVER RAN" IS NEVER 0.00. A part with no calls in the window on a
 // class of thread prints "-"; a part with calls whose time rounds to nothing
@@ -336,17 +338,18 @@ inline void resetForTest() noexcept {
 // ---- the clock floor -------------------------------------------------------------
 struct Floor {
     bool measured = false;
-    unsigned pairs = 0;
+    unsigned pairs = 0, batches = 0;                // null pairs per batch, and batches (the fastest is kept)
     double plainRecordedNs = 0, plainCostNs = 0;    // enter / leave
     double pausedRecordedNs = 0, pausedCostNs = 0;  // enter / pause / resume / leave
 };
 // Null scopes on the calling thread, into the calibration cell (never reported).
 // Recorded: what a scope with nothing in it writes into its part's ticks, which
 // every real figure includes once per call. Cost: wall time per call, the
-// instrument's own price.
-inline Floor calibrate(int64_t freq, unsigned pairs = 2048) noexcept {
+// instrument's own price. Each shape is run in `batches` batches of `pairs` null
+// pairs and the batch with the least wall time is kept, with its own recorded time.
+inline Floor calibrate(int64_t freq, unsigned pairs = 512, unsigned batches = 4) noexcept {
     Floor f;
-    if (freq <= 0 || pairs == 0) return f;
+    if (freq <= 0 || pairs == 0 || batches == 0) return f;
     Token k;
     Slot* s = t_ctx.slot;
     if (!s) s = registerSlot();
@@ -355,33 +358,39 @@ inline Floor calibrate(int64_t freq, unsigned pairs = 2048) noexcept {
         leave(k);
     }
     const double perNs = 1e9 / static_cast<double>(freq) / static_cast<double>(pairs);
-    {
-        const uint64_t r0 = s->cell[kCal].ticks.load(std::memory_order_relaxed);
-        const int64_t t0 = EDVR_EMCPU_NOW();
-        for (unsigned i = 0; i < pairs; ++i) {
-            enter(k, kCal, false);
-            leave(k);
+    for (int shape = 0; shape < 2; ++shape) {
+        bool have = false;
+        int64_t bestCost = 0;
+        uint64_t bestRecorded = 0;
+        for (unsigned b = 0; b < batches; ++b) {
+            const uint64_t r0 = s->cell[kCal].ticks.load(std::memory_order_relaxed);
+            const int64_t t0 = EDVR_EMCPU_NOW();
+            if (shape == 0) {
+                for (unsigned i = 0; i < pairs; ++i) {
+                    enter(k, kCal, false);
+                    leave(k);
+                }
+            } else {
+                for (unsigned i = 0; i < pairs; ++i) {
+                    enter(k, kCal, false);
+                    pause(k);
+                    resume(k);
+                    leave(k);
+                }
+            }
+            const int64_t t1 = EDVR_EMCPU_NOW();
+            const uint64_t r1 = s->cell[kCal].ticks.load(std::memory_order_relaxed);
+            if (!have || t1 - t0 < bestCost) {
+                have = true;
+                bestCost = t1 - t0;
+                bestRecorded = r1 - r0;
+            }
         }
-        const int64_t t1 = EDVR_EMCPU_NOW();
-        const uint64_t r1 = s->cell[kCal].ticks.load(std::memory_order_relaxed);
-        f.plainCostNs = static_cast<double>(t1 - t0) * perNs;
-        f.plainRecordedNs = static_cast<double>(r1 - r0) * perNs;
-    }
-    {
-        const uint64_t r0 = s->cell[kCal].ticks.load(std::memory_order_relaxed);
-        const int64_t t0 = EDVR_EMCPU_NOW();
-        for (unsigned i = 0; i < pairs; ++i) {
-            enter(k, kCal, false);
-            pause(k);
-            resume(k);
-            leave(k);
-        }
-        const int64_t t1 = EDVR_EMCPU_NOW();
-        const uint64_t r1 = s->cell[kCal].ticks.load(std::memory_order_relaxed);
-        f.pausedCostNs = static_cast<double>(t1 - t0) * perNs;
-        f.pausedRecordedNs = static_cast<double>(r1 - r0) * perNs;
+        (shape == 0 ? f.plainCostNs : f.pausedCostNs) = static_cast<double>(bestCost) * perNs;
+        (shape == 0 ? f.plainRecordedNs : f.pausedRecordedNs) = static_cast<double>(bestRecorded) * perNs;
     }
     f.pairs = pairs;
+    f.batches = batches;
     f.measured = true;
     return f;
 }
@@ -527,14 +536,14 @@ public:
     static constexpr uint64_t kWindowMs = 30000;
 
     // Once per frame, from the Present hook (the render thread). The first call
-    // primes the baselines and calibrates the clock floor; it reports nothing.
+    // primes the baselines; it reports nothing. The clock floor is measured as each
+    // window closes.
     Figures onFrame(int64_t freq, uint64_t nowMs) noexcept {
         Figures fig;
         FrameCut cut;
         cutFrame(cut);
         if (!primed_) {
             primed_ = true;
-            floor_ = calibrate(freq);
             windowStartMs_ = nowMs;
             window_.reset();
             return fig;
@@ -556,6 +565,7 @@ public:
             const Slot* render = g_renderSlot.load(std::memory_order_relaxed);
             report_.renderTid = render ? render->tid.load(std::memory_order_relaxed) : 0;
             report_.overflowThreads = g_overflowThreads.load(std::memory_order_relaxed);
+            floor_ = calibrate(freq);   // in the CPU state the window just ran in
             report_.floor = floor_;
             ready_ = report_.valid;
             windowStartMs_ = nowMs;
@@ -634,10 +644,10 @@ inline size_t formatSummary(char* buf, size_t cap, const WindowReport& r) noexce
         instrumentMsPerFrame(r, &spent, &recorded);
         appendf(buf, cap, len,
                 "Clock floor: a timed scope records %.0f ns and costs %.0f ns (%.0f and %.0f ns with a forward "
-                "pause; %u null pairs), so these figures include about %.3f ms per frame of floor and the "
-                "instrument costs about %.3f ms per frame.",
+                "pause; the fastest of %u batches of %u null pairs, measured as this window closed), so these "
+                "figures include about %.3f ms per frame of floor and the instrument costs about %.3f ms per frame.",
                 r.floor.plainRecordedNs, r.floor.plainCostNs, r.floor.pausedRecordedNs, r.floor.pausedCostNs,
-                r.floor.pairs, recorded, spent);
+                r.floor.batches, r.floor.pairs, recorded, spent);
     } else {
         appendf(buf, cap, len, "Clock floor: not measured.");
     }

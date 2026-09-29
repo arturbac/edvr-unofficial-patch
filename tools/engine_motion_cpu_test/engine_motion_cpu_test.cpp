@@ -35,9 +35,13 @@ namespace rig {
 thread_local bool t_fake = false;
 thread_local int64_t t_now = 0;
 thread_local int64_t t_step = 0;   // ticks each reading advances the fake clock by (0: it only moves when told)
+// A preemption, simulated: after the reading with this ordinal (counted from fake()), the clock jumps a million ticks.
+thread_local int64_t t_reads = 0, t_spikeA = -1, t_spikeB = -1;
 inline int64_t now() {
     if (t_fake) {
         const int64_t v = t_now;
+        ++t_reads;
+        if (t_reads == t_spikeA || t_reads == t_spikeB) t_now += 1000000;
         t_now += t_step;
         return v;
     }
@@ -65,6 +69,9 @@ bool nearly(double a, double b, double eps = 1e-6) { return std::fabs(a - b) <= 
 void fake(int64_t at) {
     rig::t_fake = true;
     rig::t_now = at;
+    rig::t_step = 0;
+    rig::t_reads = 0;
+    rig::t_spikeA = rig::t_spikeB = -1;
 }
 uint64_t ticksOf(const Slot* s, unsigned p) { return s->cell[p].ticks.load(); }
 uint64_t callsOf(const Slot* s, unsigned p) { return s->cell[p].calls.load(); }
@@ -435,7 +442,8 @@ WindowReport sampleReport() {
     r.totalMax = 1.94;
     r.otherThreads = 7;
     r.floor.measured = true;
-    r.floor.pairs = 2048;
+    r.floor.pairs = 512;
+    r.floor.batches = 4;
     r.floor.plainRecordedNs = 34.0;
     r.floor.plainCostNs = 41.0;
     r.floor.pausedRecordedNs = 60.0;
@@ -508,7 +516,8 @@ void neverRanIsNotZero() {
           "text: the summary's other threads, and its call rate counts the clocked scopes only (the evaluator's 5400 counted calls are not in it)");
     check(summary.find("ms per frame over 55.0 clocked calls per frame") != std::string::npos,
           "text: the summary's render thread call rate: 52 draw side + 2 apply + 1 tee + a patch's 0.001");
-    check(summary.find("records 34 ns and costs 41 ns (60 and 79 ns with a forward pause; 2048 null pairs)") != std::string::npos,
+    check(summary.find("records 34 ns and costs 41 ns (60 and 79 ns with a forward pause; the fastest of 4 batches of 512 null pairs, "
+                       "measured as this window closed)") != std::string::npos,
           "text: the summary states the clock floor both shapes");
     double spent = 0, recorded = 0;
     instrumentMsPerFrame(r, &spent, &recorded);
@@ -552,6 +561,7 @@ void worstCaseLengths() {
     r.overflowThreads = 4294967295u;
     r.floor.measured = true;
     r.floor.pairs = 4294967295u;
+    r.floor.batches = 4294967295u;
     r.floor.plainRecordedNs = r.floor.plainCostNs = r.floor.pausedRecordedNs = r.floor.pausedCostNs = 99999.0;
     for (unsigned p = 0; p < kParts; ++p) {
         PartWindow& w = r.part[p];
@@ -592,7 +602,7 @@ void recorderEndToEnd() {
     worker.run([] { fake(0); });
     Figures f = rec.onFrame(kFreq, 1000);
     check(!f.measured, "recorder: the priming frame reports nothing");
-    check(rec.floor().measured && nearly(rec.floor().plainCostNs, 0.0), "recorder: the floor is measured at the first frame (0 on a fake clock)");
+    check(!rec.floor().measured, "recorder: no floor yet at the first frame: it is measured as a window closes");
 
     WindowReport report;
     bool closed = false;
@@ -650,6 +660,9 @@ void recorderEndToEnd() {
     check(report.part[kDraw].renderCalls == 8100, "recorder: three draw-side calls a frame, 2700 frames");
     check(nearly(report.part[kDraw].renderP50, 0.21) && nearly(report.totalP50, 0.21) && nearly(report.totalMax, 0.22),
           "recorder: draw side p50 0.21 ms; the total's max is the patch frame's 0.22");
+    check(report.floor.measured && report.floor.pairs == 512 && report.floor.batches == 4 && nearly(report.floor.plainCostNs, 0.0) &&
+              rec.floor().measured,
+          "recorder: the window's report carries the floor measured as it closed (zero on a clock that never moves)");
     check(!rec.takeReport(report), "recorder: a report is handed over once");
 
     // Nothing at all ran for a window: the report exists and every part reads -.
@@ -720,13 +733,13 @@ void realFloor() {
     resetForTest();
     rig::t_fake = false;
     const Floor f = calibrate(qpcFrequency());
-    check(f.measured && f.pairs == 2048, "floor: measured on the real clock, 2048 pairs");
+    check(f.measured && f.pairs == 512 && f.batches == 4, "floor: measured on the real clock, four batches of 512 pairs");
     check(f.plainCostNs > 0.0 && f.plainCostNs < 20000.0 && f.pausedCostNs > 0.0 && f.pausedCostNs < 40000.0,
           "floor: a null scope costs a plausible number of nanoseconds (0 < cost < 20 us)");
     check(f.plainRecordedNs >= 0.0 && f.pausedRecordedNs >= 0.0, "floor: what a null scope records is never negative");
     std::printf("engine_motion_cpu_test: clock floor on this machine: plain scope records %.1f ns, costs %.1f ns; "
-                "with a forward pause records %.1f ns, costs %.1f ns (%u pairs, QPC %lld Hz)\n",
-                f.plainRecordedNs, f.plainCostNs, f.pausedRecordedNs, f.pausedCostNs, f.pairs,
+                "with a forward pause records %.1f ns, costs %.1f ns (fastest of %u batches of %u pairs, QPC %lld Hz)\n",
+                f.plainRecordedNs, f.plainCostNs, f.pausedRecordedNs, f.pausedCostNs, f.batches, f.pairs,
                 static_cast<long long>(qpcFrequency()));
     const Floor none = calibrate(0);
     check(!none.measured, "floor: no clock rate, no measurement");
@@ -743,11 +756,25 @@ void realFloor() {
     rig::t_step = 3;
     const Floor step = calibrate(10000000);
     rig::t_step = 0;
-    const double pairs = 2048.0;
+    const double pairs = 512.0;
     check(step.measured && nearly(step.plainRecordedNs, 300.0) && nearly(step.plainCostNs, (3.0 + 6.0 * pairs) * 100.0 / pairs),
           "floor: a plain null scope records 300 ns and costs 600 ns (plus the loop's own reading) on a 3-tick-a-reading clock");
     check(nearly(step.pausedRecordedNs, 600.0) && nearly(step.pausedCostNs, (3.0 + 12.0 * pairs) * 100.0 / pairs),
           "floor: a null scope with a forward pause records 600 ns and costs 1200 ns: two more readings, the gap between them out");
+
+    // A batch a preemption inflated is not the floor: the fastest of the four is kept. The clock jumps a million
+    // ticks (100 ms) once inside the first plain batch (reading 300) and once inside the first paused batch
+    // (reading 5000); the answer is the clean one, not an average and not the first batch.
+    fake(0);
+    rig::t_step = 3;
+    rig::t_spikeA = 300;
+    rig::t_spikeB = 5000;
+    const Floor spiked = calibrate(10000000);
+    rig::t_step = 0;
+    rig::t_spikeA = rig::t_spikeB = -1;
+    check(nearly(spiked.plainRecordedNs, 300.0) && nearly(spiked.plainCostNs, (3.0 + 6.0 * pairs) * 100.0 / pairs) &&
+              nearly(spiked.pausedRecordedNs, 600.0) && nearly(spiked.pausedCostNs, (3.0 + 12.0 * pairs) * 100.0 / pairs),
+          "floor: a preempted batch (a 100 ms jump in the first batch of each shape) does not inflate the floor: the fastest batch is kept");
 }
 }  // namespace
 
