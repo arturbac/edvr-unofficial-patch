@@ -2,14 +2,14 @@
 
 ## Status
 
-- **Current flight:** verified `7aaaf39c` profile `035907-fda516`, PID28296,
-  gfx `035926`/runtime `035927_475_28296`; zero lost events, matching PDBs.
-  User reports CPU spikes and fpsVR GPU <=6.8 ms. The recurring handoff blocks
-  ~1.94 ms/frame behind deferred xrEndFrame; exact stacks confirm it defeats
-  post-submit overlap. Actual-host tests and independent review pass for a
-  nonblocking notification; full build/promotion pass and `6eede364` is
-  installed and verified on Frontier. Dump `033645` confirms both cockpit
-  models. Work stays on the separate Frontier branch; main is unchanged.
+- **Current flight:** verified `6eede364`, gfx `045517`/runtime
+  `045520_234_12728`, build `6ABB9884`. User reports mostly steady 90fps with a
+  distant station, fpsVR CPU 7–9ms. Handoff p50/p95 .001/.001ms; 21,558
+  accepted/completed, zero failures. Its former ~1.94ms wait is gone. No new
+  CPU trace. Trailing Present callback p50/p95 2.510/4.902ms can still wait for
+  deferred finish through loadingBoundary; needs stack/QPC witness. Late
+  mover/HUD workload rises. Source remains installed on the separate Frontier
+  branch; main is unchanged.
 - **Conclusion:** no controlled whole-frame performance comparison or exact
   regression conclusion. The new remap follows the earliest stalls; see
   Exclusions for ruled-out causes and the HUD arc for build/fixture evidence.
@@ -22,13 +22,14 @@
   2037×1969→4074×3938/UI5093×4923. Installed DLSS metadata is 310.7.0.0;
   graphics logs omit driver/DLSS versions. Profiling uses Frontier; baseline
   uses Steam.
-- **Next:** fly Frontier with fpsVR, diagnostics OFF and no eye dump to check
-  CPU gain, including the same cockpit/ship approach. Verify the new flight
-  with `tools/edvr_log.py --target frontier --expect-build 6eede364`; later
-  documentation commits do not change the installed code. Review B1/B2 fault
-  recovery remains open before main; B3 timer behavior needs user approval.
-  Allocation dimensions do not prove VRAM pressure. Earlier `1ff8c224` trace
-  `194016-f80584` is recovered; do not repeat it.
+- **Next:** one 60s CPU-only trace of the current 7–9ms scene, diagnostics OFF
+  and no eye dump. Distinguish callback dispatcher wait, treatment/driver work,
+  loading/event work and scheduling; no new build or GPU provider needed.
+  Verify with `tools/edvr_log.py --target frontier --expect-build 6eede364`;
+  docs commits do not change installed code. Review B1/B2 recovery and B3
+  permission remain open. Allocation dimensions do not prove VRAM pressure.
+  Existing profile `035907-fda516` is retained; do not repeat its large GPU
+  trace.
 
 ## Pre-optimization Frontier evidence
 
@@ -325,7 +326,7 @@ passes in `build/dlss-handoff-review-promotion.log`, version
 for Frontier; full output in `build/dlss-handoff-frontier-install.log`. INI
 SHA256 `A2D27168…784273DF` and installed DLSS `BE6E434A…FB6EE6E` remain
 unchanged. Capture helper now expects this code; dry-run starts no trace or
-workload and writes nothing. No post-fix flight yet.
+workload and writes nothing. Post-fix flight is recorded below.
 
 ## 2026-09-29: external review and slices triage
 
@@ -351,3 +352,47 @@ admission/production-test coverage and B8 capture window-close cleanup stay
 open. Build-tool refactors, shader goldens and broad module rewrites are
 deferred; main stays unchanged. The seed saving requires NVIDIA's per-bit
 fallback; specified-stencil-ref devices do not take the same full seed.
+
+## 2026-09-29: handoff flown; remaining CPU attribution
+
+Gfx `045517` and runtime `045520_234_12728` verify installed `6eede364`, PID
+12728, build 6ABB9884 and the Status environment. User reports mostly steady
+90fps with a very distant station, CPU about 7–9ms. Diagnostics OFF; no eye
+dump event. Shader dump was ARMED at startup, so shader-creation/file-write
+boundaries remain a confound. Exclude loading return 10:59:31.792Z and shutdown
+37.314Z. No new WPR capture exists; the station condition is user-reported.
+
+ruled out: the old handoff wait explains remaining CPU, because full window 8
+10:58:43.269–10:59:13.270Z measures .001/.001ms p50/p95 and final notifications
+accepted 21558/completed 21558/rejected 0/invalid 0/cancelled 0. This confirms
+the mechanism, without establishing a controlled whole-frame performance gain.
+Window 8 has 2597 scene-ready cycles: game before first submit 6.001/7.148ms;
+submit roundtrips .277/.487 + .203/.339; trailing callback 2.510/4.902; outside
+Present 2.044/2.616; owner finish 2.824/5.177 and xrEndFrame 2.187/4.694. These
+are wall p50/p95, nested scopes; do not sum quantiles or call them busy.
+
+Source identifies a second possible serialization: after real Present,
+NativeRenderBinding pumps one work item and runs frameWork. Its RenderRoute
+synchronously invokes owner loadingBoundary behind deferred finish and handoff.
+Steady loadingBoundary can return immediately, yet admission already waited.
+Aggregate callback/end-frame similarity is consistent, not an exact witness.
+Next CPU-only trace must join callback QPC to dispatcher wait stack and owner
+finish/waker, versus executing treatment/NGX/driver, loadingStep/event work or
+ready delay. Existing markers/stacks cover all these; no speculative fix.
+
+Workload changes too: mover records 3→117–120/frame, blend binds 29.5k→105–107k
+per roughly 5200 eye-frames; UI redirects 22.4→62–64/frame, writebacks 14.3→31.
+The sparse draw-hook estimate .26→.92–.96ms can include private reissues and
+driver waits, so is not exclusive CPU. Cached old 7aa steady trace now has
+uncapped matching-PDB leaf aggregation: caller EDVR direct self .852ms/frame
+(proxy R1 .6302); largest leaf beginPanelOverride .0530, readPool .0394,
+hookedMap .0374, uiDepthOnEyeDraw .0322. Worker noteDirectBuild .0896 is
+concurrent work, not caller delay. Direct self excludes induced driver work and
+waits; old capture cannot attribute this new flight's total CPU. Artifacts:
+`build/capture_probe/self-{samples,regions}.json`, 1ms sampling interval, zero
+unresolved EDVR PDB symbols. There are 341 missing sample stacks across all
+threads; sampled estimates are not exhaustive exact timings.
+
+Use the existing admin capture helper with `-CaptureSeconds 60` and omit
+`-GpuQueues`: start F9 after loading in the same scene showing 7–9ms. Keep
+diagnostics OFF/no eye dump; let saving finish. It expects installed 6eede364.
