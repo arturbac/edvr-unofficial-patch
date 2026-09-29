@@ -306,29 +306,38 @@ int runConsole(const AppArgs& args) {
     const std::wstring mirrorDir = mirrorDirFor(survey.game);
     const bool canMirror = args.action != AppArgs::Act::Uninstall;
 
-    // A folder with no edvr.ini at all but a mirror outside it is exactly the
-    // folder a game update just wiped. Restored by DEFAULT here -- there is no
+    // A folder with no settings file at all but a mirror outside it is exactly
+    // the folder a game update just wiped. Restored by DEFAULT here -- there is no
     // prompt to answer on a command line -- unless --replace-settings said the
     // opposite: somebody who asked for fresh defaults should not have last
     // week's settings appear anyway. --dry-run promises to touch nothing, and
     // a restore is a write, so it is only ever described there, never done.
-    if (canMirror && !survey.iniPresent && args.keepSettings) {
+    //
+    // "A settings file" and "a mirror of one" are asked in the edition's terms:
+    // the flat edition's is edvr-flat.ini (or the shared edvr.ini it falls back
+    // to), and a mirror holding only edvr-flat.ini is one worth offering.
+    if (canMirror && args.keepSettings) {
         const MirrorInfo mirror = readMirror(mirrorDir);
-        if (mirror.hasIni) {
-            writeOut("This folder has no edvr.ini, but one from an earlier install of it was "
-                     "found outside the game folder (" + toUtf8(mirror.dir) + "), last saved " +
+        if (offerRestore(hasSettingsFor(survey, payload.profile), mirror, payload.profile)) {
+            const std::string wanted = payload.profile == "flat" ? "edvr-flat.ini or edvr.ini" : "edvr.ini";
+            writeOut("This folder has no " + wanted + ", but settings from an earlier install of it "
+                     "were found outside the game folder (" + toUtf8(mirror.dir) + "), last saved " +
                      mirror.savedUtc + ".\r\n");
             if (args.dryRun) {
-                writeOut("  Would restore it before installing -- skipped, this is a dry run. "
-                         "The plan below is for this folder as it is now, with no edvr.ini.\r\n\r\n");
+                writeOut("  Would restore them before installing -- skipped, this is a dry run. "
+                         "The plan below is for this folder as it is now, with no " + wanted +
+                         ".\r\n\r\n");
             } else {
                 std::vector<std::string> notes;
-                if (restoreFromMirror(survey.game.dir, mirror, &notes)) {
-                    for (const std::string& n : notes) writeOut("  " + n + "\r\n");
-                    survey = surveyTarget(game);
-                } else {
-                    writeOut("  Could not restore it -- continuing as a fresh install.\r\n");
+                const bool restored = restoreFromMirror(survey.game.dir, mirror, &notes);
+                for (const std::string& n : notes) writeOut("  " + n + "\r\n");
+                if (!restored) {
+                    writeOut("  Could not restore all of it -- carrying on with what is in the "
+                             "folder now.\r\n");
                 }
+                // Whatever did come back is what the plan is for, whether or not
+                // all of it did.
+                survey = surveyTarget(game);
                 writeOut("\r\n");
             }
         }

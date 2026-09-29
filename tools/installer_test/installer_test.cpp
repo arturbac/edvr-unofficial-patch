@@ -3661,6 +3661,150 @@ static void testFlatSettingsWindow(const std::wstring& root, const std::wstring&
 }
 
 // ---------------------------------------------------------------------------
+// the mirror, when only the flat edition's settings were saved
+//
+// A flat install (or a menu edit under one) mirrors edvr-flat.ini alone, and
+// after a game update wipes the folder that file is all there is to recover. The
+// offer, and the copy back, used to look for edvr.ini and pass by a mirror that
+// held only this one; a flat copy that failed was ignored, and the restore could
+// report success after putting back only the shared file.
+// ---------------------------------------------------------------------------
+
+static bool noteHas(const std::vector<std::string>& notes, const char* needle) {
+    for (const std::string& note : notes)
+        if (note.find(needle) != std::string::npos) return true;
+    return false;
+}
+
+static void testFlatMirror(const std::wstring& scratch) {
+    printf("\nthe mirror, when only the flat edition's settings were saved\n");
+
+    // A fresh flat install on real files, the one this mirrors: edvr-flat.ini, the
+    // record and the base, and no edvr.ini anywhere.
+    const std::wstring dir = joinPath(scratch, L"flatmirror-game");
+    layOutFlatGame(dir);
+    const PayloadInfo flat = flatPayloadFor(kFlatTemplate);
+    const Plan plan = planInstall(diskSurvey(dir), testOptions(), flat);
+    check(!plan.blocked && applyPlan(plan, flatProvider()).ok,
+          "a fresh flat install, the one this test mirrors, applies");
+    check(fileExists(joinPath(dir, L"edvr-flat.ini")) && !fileExists(joinPath(dir, L"edvr.ini")),
+          "it leaves edvr-flat.ini and no edvr.ini");
+
+    const std::wstring root = joinPath(scratch, L"flatmirror-root");
+    removeTree(root);
+    const std::wstring mirrorDir = joinPath(root, L"flatmirror-test");
+    const MirrorResult saved = updateMirror(dir, plan.backupDir, mirrorDir);
+    check(saved.ok && !saved.saved.empty() && saved.saved.front() == "edvr-flat.ini",
+          "updateMirror saves the flat settings");
+    check(!fileExists(joinPath(mirrorDir, L"edvr.ini")), "and there is no edvr.ini in the mirror");
+    const std::string mirroredFlat = readAll(joinPath(mirrorDir, L"edvr-flat.ini"));
+    expectEq(mirroredFlat, readAll(joinPath(dir, L"edvr-flat.ini")), "the mirrored copy matches");
+
+    const MirrorInfo info = readMirror(mirrorDir);
+    check(!info.hasIni && info.hasFlatIni, "readMirror sees the flat settings alone");
+    check(info.holdsSettings(), "which is a mirror with settings in it");
+    check(info.holdsSettingsFor("flat") && !info.holdsSettingsFor("vr"),
+          "settings the flat edition can use and the VR edition cannot");
+    check(!info.savedUtc.empty(), "and it says when they were saved");
+    check(info.hasState && info.hasBaseIni, "with the record and the base beside them");
+
+    {   // The offer, asked as both installers ask it.
+        const std::wstring wipedDir = joinPath(scratch, L"flatmirror-wiped");
+        layOutFlatGame(wipedDir);
+        const Survey wiped = diskSurvey(wipedDir);
+        check(offerRestore(hasSettingsFor(wiped, "flat"), info, "flat"),
+              "a wiped flat folder is offered a mirror that holds only edvr-flat.ini");
+        check(!offerRestore(hasSettingsFor(wiped, "vr"), info, "vr"),
+              "a VR install of it is not: the VR edition cannot use that file");
+        check(!offerRestore(hasSettingsFor(diskSurvey(dir), "flat"), info, "flat"),
+              "a folder that still has its settings is offered nothing");
+
+        writeAll(joinPath(wipedDir, L"edvr.ini"), kSharedIni);
+        check(!offerRestore(hasSettingsFor(diskSurvey(wipedDir), "flat"), info, "flat"),
+              "nor is one that has only the shared edvr.ini the flat runtime falls back to");
+
+        MirrorInfo none;
+        check(!offerRestore(false, none, "flat") && !offerRestore(false, none, "vr"),
+              "an empty mirror is offered to nobody");
+        MirrorInfo vrOnly;
+        vrOnly.hasIni = true;
+        check(offerRestore(false, vrOnly, "vr") && offerRestore(false, vrOnly, "flat"),
+              "a mirror of edvr.ini is offered to a VR install and, as before, to a flat one");
+    }
+
+    {   // The copy, with the flat file alone in the mirror.
+        const std::wstring wipedDir = joinPath(scratch, L"flatmirror-restore");
+        removeTree(wipedDir);
+        makeTree(wipedDir);
+        std::vector<std::string> notes;
+        check(restoreFromMirror(wipedDir, info, &notes), "a flat-only mirror is restored");
+        expectEq(readAll(joinPath(wipedDir, L"edvr-flat.ini")), mirroredFlat,
+                 "edvr-flat.ini comes back byte for byte");
+        check(!fileExists(joinPath(wipedDir, L"edvr.ini")), "and no edvr.ini is made up");
+        check(noteHas(notes, "Restored edvr-flat.ini"), "the notes say what was restored");
+        check(fileExists(joinPath(wipedDir, L"edvr_install\\state.ini")) &&
+                  fileExists(joinPath(wipedDir, L"edvr_install\\edvr.ini.base")),
+              "with the record and the base");
+    }
+
+    {   // A flat copy that fails is a restore that failed: with a directory where the
+        // file has to go, nothing can replace it.
+        const std::wstring blocked = joinPath(scratch, L"flatmirror-blocked");
+        removeTree(blocked);
+        makeTree(joinPath(blocked, L"edvr-flat.ini"));
+        std::vector<std::string> notes;
+        check(!restoreFromMirror(blocked, info, &notes), "a failed flat copy fails a flat-only restore");
+        check(noteHas(notes, "Could not restore edvr-flat.ini"), "and the notes say which file it was");
+        check(!fileExists(joinPath(blocked, L"edvr_install\\state.ini")),
+              "nothing else of a mirror whose settings did not come back is put into the folder");
+    }
+
+    // A mirror holding both files, made by hand: the shared file and the flat one.
+    const std::wstring bothDir = joinPath(root, L"both-mirror");
+    makeTree(bothDir);
+    writeAll(joinPath(bothDir, L"edvr.ini"), kSharedIni);
+    writeAll(joinPath(bothDir, L"edvr-flat.ini"), kFlatOwnIni);
+    writeAll(joinPath(bothDir, L"state.ini"), "[edvr]\r\nversion = 1\r\n");
+    const MirrorInfo both = readMirror(bothDir);
+    check(both.hasIni && both.hasFlatIni, "a mirror can hold both files");
+
+    {
+        const std::wstring wipedDir = joinPath(scratch, L"flatmirror-both");
+        removeTree(wipedDir);
+        makeTree(wipedDir);
+        std::vector<std::string> notes;
+        check(restoreFromMirror(wipedDir, both, &notes), "a mirror of both files restores");
+        expectEq(readAll(joinPath(wipedDir, L"edvr.ini")), kSharedIni, "edvr.ini comes back");
+        expectEq(readAll(joinPath(wipedDir, L"edvr-flat.ini")), kFlatOwnIni, "and edvr-flat.ini");
+    }
+
+    {   // The shared file's success must not hide the flat file's failure.
+        const std::wstring blocked = joinPath(scratch, L"flatmirror-flatblocked");
+        removeTree(blocked);
+        makeTree(joinPath(blocked, L"edvr-flat.ini"));
+        std::vector<std::string> notes;
+        check(!restoreFromMirror(blocked, both, &notes),
+              "edvr.ini restored and edvr-flat.ini not is not a successful restore");
+        expectEq(readAll(joinPath(blocked, L"edvr.ini")), kSharedIni, "the shared file did come back");
+        check(noteHas(notes, "Restored edvr.ini") && noteHas(notes, "Could not restore edvr-flat.ini"),
+              "and the notes name both the one that did and the one that did not");
+        check(fileExists(joinPath(blocked, L"edvr_install\\state.ini")),
+              "the record is restored, since some settings came back");
+    }
+
+    {   // And the other way round.
+        const std::wstring blocked = joinPath(scratch, L"flatmirror-sharedblocked");
+        removeTree(blocked);
+        makeTree(joinPath(blocked, L"edvr.ini"));
+        std::vector<std::string> notes;
+        check(!restoreFromMirror(blocked, both, &notes),
+              "edvr-flat.ini restored and edvr.ini not is not a successful restore either");
+        expectEq(readAll(joinPath(blocked, L"edvr-flat.ini")), kFlatOwnIni, "the flat file did come back");
+        check(noteHas(notes, "Could not restore edvr.ini"), "and the notes say edvr.ini did not");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // reading a DLL to find out whose it is
 // ---------------------------------------------------------------------------
 
@@ -4070,6 +4214,7 @@ int wmain(int argc, wchar_t** argv) {
     testDemotedTrims(root, scratch);
     testFlatSettingsFiles(scratch);
     testFlatSettingsWindow(root, scratch);
+    testFlatMirror(scratch);
     testProbe(scratch);
     testRunState();
     testSettings(root, scratch);

@@ -706,31 +706,47 @@ void runAction(AppArgs::Act action) {
     const std::wstring mirrorDir = mirrorDirFor(g.survey.game);
     const bool canMirror = action != AppArgs::Act::Uninstall;
 
-    // A folder with no edvr.ini at all but a mirror outside it is exactly the
-    // folder a game update just wiped. Asked about, not assumed -- unlike the
+    const PayloadInfo& payload = payloadInfo();
+
+    // A folder with no settings file at all but a mirror outside it is exactly
+    // the folder a game update just wiped. Asked about, not assumed -- unlike the
     // command line there is a window right here to ask in -- and only when
     // "keep my settings" is still checked; unchecking it says fresh defaults
     // are wanted, and old settings reappearing anyway would be worse than not
     // finding the mirror at all.
-    if (canMirror && !g.survey.iniPresent && args.keepSettings) {
+    //
+    // Asked in the edition's terms: the flat edition's file is edvr-flat.ini (or
+    // the shared edvr.ini it falls back to), and a mirror that holds only
+    // edvr-flat.ini is one worth offering.
+    if (canMirror && args.keepSettings) {
         const MirrorInfo mirror = readMirror(mirrorDir);
-        if (mirror.hasIni) {
+        if (offerRestore(hasSettingsFor(g.survey, payload.profile), mirror, payload.profile)) {
+            const std::wstring wanted = payload.profile == "flat" ? L"edvr-flat.ini or edvr.ini"
+                                                                  : L"edvr.ini";
             const std::wstring text =
-                L"This folder has no edvr.ini, but one from an earlier install of it was found "
-                L"outside the game folder, last saved " +
+                L"This folder has no " + wanted + L", but settings from an earlier install of it "
+                L"were found outside the game folder, last saved " +
                 fromUtf8(mirror.savedUtc) +
-                L".\n\nRestore it before installing? It is kept at\n" + mirror.dir +
-                L"\nprecisely so a game update wiping this folder cannot take it too.";
+                L".\n\nRestore them before installing? They are kept at\n" + mirror.dir +
+                L"\nprecisely so a game update wiping this folder cannot take them too.";
             const int answer = MessageBoxW(g.window, text.c_str(), L"EDVR installer",
                                            MB_YESNO | MB_ICONQUESTION);
             if (answer == IDYES) {
-                restoreFromMirror(g.survey.game.dir, mirror, nullptr);
+                std::vector<std::string> notes;
+                const bool restored = restoreFromMirror(g.survey.game.dir, mirror, &notes);
+                if (!restored) {
+                    // Said, not swallowed: some of the saved settings did not come
+                    // back, and carrying on quietly would install over the gap.
+                    std::wstring why = L"Not all of your saved settings could be restored:\n\n";
+                    for (const std::string& n : notes) why += L"\x2022 " + fromUtf8(n) + L"\n";
+                    why += L"\nThe install carries on with what is in the folder now.";
+                    MessageBoxW(g.window, why.c_str(), L"EDVR installer", MB_OK | MB_ICONWARNING);
+                }
+                // Whatever did come back is what the plan is for.
                 g.survey = surveyTarget(g.survey.game);
             }
         }
     }
-
-    const PayloadInfo& payload = payloadInfo();
     const std::string existingProfile = installedProfile(g.survey);
     if (canMirror && !existingProfile.empty() && existingProfile != payload.profile) {
         const std::wstring prompt = L"This folder has the " + fromUtf8(existingProfile) +

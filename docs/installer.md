@@ -167,7 +167,7 @@ installer follows the same split, for every operation, in both installers:
   same merge, so the settings the flat runtime was reading carry over and the
   chain key is forced in; `edvr.ini` is left exactly as it is.
   `--replace-settings` gives fresh defaults instead. `tools/install_edvr.py`
-  seeds the same way.
+  seeds the file too, by copying `edvr.ini` as it stands.
 - **The kept base** (`edvr_install\edvr.ini.base`) is one file for both editions:
   it is the shipped defaults of whichever edition the record says is installed. A
   merge into the other edition's own file does not use it as a base (that would
@@ -179,6 +179,10 @@ installer follows the same split, for every operation, in both installers:
 - **The settings screen** shows and writes the installer's own edition's file;
   under a flat installer with no `edvr-flat.ini` yet it shows what the runtime is
   reading (`edvr.ini`) and the first change starts `edvr-flat.ini` from it.
+- **The mirror** keeps both files, and an `edvr-flat.ini` alone is enough for the
+  restore offer and the copy back. A restore that could not copy back every
+  settings file it holds says which one failed and reports failure, so a flat
+  file lost behind a shared file that did come back is not a success.
 - **The flat archive** ships its defaults as `edvr-flat.ini`, and its installer
   carries them under that name.
 
