@@ -58,6 +58,7 @@
 #include "sharpen_pass.h"      // likewise: warm-up and totals; the sharpening runs at submit
 #include "menu.h"              // the settings menu's reload: its keys, then the row diff
 #include "perf_monitor.h"      // the draw hooks' sampled cost, and the reload as an event
+#include "frame_ticks.h"       // frameTick: the boundary's ticks, timed by name
 #include "temporal_pass.h"     // and the temporal pass: warm-up, the camera capture, totals
 #include "glitch_frame.h"
 #include "transition_flash_prevent.h"
@@ -5523,37 +5524,56 @@ void vScreenFrameBoundary() {
     // The quad probe's readback: a capture taken a few frames ago is decoded
     // here, where the copy has certainly executed and mapping cannot stall
     // the render thread mid-frame.
+    // Each call below is one frame-boundary tick, timed by name (frame_ticks.h):
+    // the LONG FRAME line's slowest three come from these marks.
     if (g_state && g_state->ownerCtx) {
         quadProbeTick(g_state->ownerCtx);
+        frameTick("quad_probe");
         drawCensusTick(g_state->ownerCtx);
+        frameTick("draw_census_tick");
         objectProbeFrameBoundary(g_state->ownerCtx);
+        frameTick("object_probe");
         pixelProbeFrameBoundary(g_state->ownerCtx);
+        frameTick("pixel_probe");
         panelUpscaleFrameEnd();
+        frameTick("panel_upscale");
         wakePulseReport();
+        frameTick("wake_pulse");
         uiDepthFrameBoundary(g_state->ownerCtx);
+        frameTick("ui_depth");
         // fix.ui_quality: the layer's warm compile, the surfaces' five-second
         // cross-check and learning, the key's 30-second totals, and the end
         // of this frame's watch for draws after the UI.
         uiLayerFrameBoundary(g_state->ownerCtx);
+        frameTick("ui_layer");
         // The HUD layer census's query polls, deferred readbacks and
         // 30-second window report -- beside the layer's boundary, but gated
         // only on advanced.hud_census, never on fix.ui_quality.
         hudLayerCensusFrameBoundary(g_state->ownerCtx);
+        frameTick("hud_census");
         screenMotionFrameBoundary(g_state->ownerCtx);
+        frameTick("screen_motion");
         celestialMotionFrameBoundary(g_state->ownerCtx);
+        frameTick("celestial_motion");
         engineVelocityFrameBoundary(g_state->ownerCtx);
+        frameTick("engine_velocity");
         // The sharpening's warm compile and missing-hook note, once a frame,
         // unconditionally -- not nested under any other feature's gate.
         sharpenPassTick(g_state->ownerCtx);
+        frameTick("sharpen_tick");
         // The temporal pass: its warm compile, and this frame's camera
         // rows becoming last frame's.
         temporalPassTick(g_state->ownerCtx);
+        frameTick("temporal_tick");
         temporalPassFrameBoundary();
+        frameTick("temporal_boundary");
         depthProbeFrameBoundary(g_state->ownerCtx);
+        frameTick("depth_probe");
         // Issue #38's per-feature GPU cost census (gpu_census.h): polls every
         // section's timer, rotates which one is actively timed next frame,
         // and every 30 s logs one summary line. Always on, no ini key.
         gpuCensusFrame(g_state->ownerCtx);
+        frameTick("gpu_census");
         // Told to the openvr half whether or not any intro fix is on: the
         // cull guard holds its lie until a scene exists, and that must
         // depend on the GAME reaching one, not on EDVR being configured
@@ -5561,13 +5581,16 @@ void vScreenFrameBoundary() {
         if (g_state->eyeDrawsLastFrame >= kSceneEyeDraws) announceSceneArrived();
         introPanelTick(g_state->ownerCtx,
                        g_state->eyeDrawsLastFrame >= kSceneEyeDraws);
+        frameTick("intro_panel");
         // The same boundary closes the skip's verdict: refused, drawn, or
         // neither, said once when the scene arrives.
         introSkipTick(g_state->eyeDrawsLastFrame >= kSceneEyeDraws);
+        frameTick("intro_skip");
         // The scene flag retires the loader fix when the intro ends: the
         // same boundary the draw hook gates on, read at the frame edge.
         loaderPanelTick(g_state->ownerCtx,
                         g_state->eyeDrawsLastFrame >= kSceneEyeDraws);
+        frameTick("loader_panel");
     }
     State* s = g_state;
     if (!s) return;
@@ -5577,11 +5600,13 @@ void vScreenFrameBoundary() {
     // than about anything decided below. The scene flag is the one the intro
     // fixes above retire on, so the probe's movie account closes with them.
     introProbeFrameBoundary(s->frameNo, s->eyeDrawsLastFrame >= kSceneEyeDraws);
+    frameTick("intro_probe");
 
     // The settlement LOD governor (fix.settlement_detail, shadow only): the
     // frame's draw-builder and part-test counts, the producer's frame work,
     // one policy step, its log lines. One atomic load while it is off.
     lodGovernorFrameBoundary();
+    frameTick("lod_governor");
 
     // The ARRIVAL census (advanced.census_fss_jump): a world-camera jump
     // while the scanner's chrome is up is a zoom's first frame, and the
@@ -5642,12 +5667,19 @@ void vScreenFrameBoundary() {
     // Before this frame's counters are read or reset: a pending census starts
     // here, a running one advances, a spent one writes its tables.
     drawCensusFrameBoundary(s->frameNo);
+    frameTick("draw_census_boundary");
     fssRevealFrameBoundary();
+    frameTick("fss_reveal");
     fssRingFrameBoundary();
+    frameTick("fss_ring");
     fssDumpFrameBoundary(s->ownerCtx);
+    frameTick("fss_dump");
     eyeSplitFrameBoundary(s->ownerCtx);
+    frameTick("eye_split");
     foveationFrameBoundary(s->ownerCtx);
+    frameTick("foveation");
     eyeMaskFrameBoundary(s->ownerCtx);
+    frameTick("eye_mask");
 
     // FSS frame pacing (round 31): the left-only squares are now measured
     // to be runtime-side (both submitted images carry the flicker equally),
@@ -5694,7 +5726,9 @@ void vScreenFrameBoundary() {
             lastQpc.QuadPart = 0;
         }
     }
+    frameTick("fss_pacing");
     remlokFrameBoundary();
+    frameTick("remlok");
 
     // The per-frame invalidation lives in binding_shadow now, and device_hook
     // calls it once for both fixes. Doing it here as well would be harmless but

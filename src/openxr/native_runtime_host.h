@@ -41,6 +41,7 @@
 #include "producer_gpu_timing.h"
 #include "submission_stats.h"
 #include "frame_cycle_stats.h"
+#include "long_cycle_line.h"
 #include "native_cpu_trace.h"
 #include "render_route.h"
 #include "shutdown_trace.h"
@@ -1868,6 +1869,11 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   // own submit stages (xr_end_frame, wait_frame, producer/consumer) are left
   // out: submitSample is one reused buffer that a withheld frame never
   // refills, so a stale zero there would read as a free frame.
+  //
+  // post_second_submit_to_next_wait is cut at Elite's Present from the graphics
+  // half's Present trace (long_cycle_line.h): pre_present, present_hook,
+  // post_present, and the hook's own four parts. The line's text lives there so a
+  // rig can hold it to its format.
   void noteLongCycle(const FrameCycleStats::Completed& c) {
     const auto periodNs=boundary.lastPeriodNs();
     if(periodNs<=0)return; // no real period observed yet to compare against
@@ -1878,16 +1884,9 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(second!=longCycleRateSecond){longCycleRateSecond=second;longCycleRateWindow=0;}
     if(longCycleRateWindow>=4||longCycleLogged>=400)return;
     ++longCycleRateWindow;++longCycleLogged;
-    nativeTracePrintf("native_long_cycle,sequence=%llu,cycle_ms=%.4f,period_ms=%.4f,"
-      "game_before_first_submit=%.4f,first_submit_roundtrip=%.4f,first_submit_owner_body=%.4f,"
-      "between_eye_calls=%.4f,second_submit_roundtrip=%.4f,second_submit_owner_body=%.4f,"
-      "first_submit_render_park=%.4f,second_submit_render_park=%.4f,"
-      "post_second_submit_to_next_wait=%.4f,next_wait_roundtrip=%.4f,next_wait_owner_body=%.4f,units=wall_ms\n",
-      (unsigned long long)submitSample.sequence,c.cycleMs,periodMs,
-      c.beforeFirstMs,c.firstSubmitMs,c.submitOwnerMs[0],
-      c.betweenEyesMs,c.secondSubmitMs,c.submitOwnerMs[1],
-      c.renderParkMs[0],c.renderParkMs[1],
-      c.afterSecondMs,c.nextWaitMs,c.waitOwnerMs);
+    char line[1024];
+    formatLongCycleLine(line,sizeof(line),(unsigned long long)submitSample.sequence,periodMs,c);
+    nativeTracePuts(line);
   }
   // One finished report's cost, microseconds on the frame-cycle clock, into the phase-0 timing. The sink is
   // the runtime's trace (a "periodic work: ..." line like the graphics half's, whose `at` is local time
@@ -1926,13 +1925,9 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       (unsigned long long)r.window,r.valid,r.postValid,r.singlePresentValid,r.zeroPresentValid,r.multiplePresentValid,
       (unsigned long long)r.syncNonzeroPresent,unsigned(timing.presentTraceAvailable()),r.handoffValid,(unsigned long long)r.handoffMissing,
       (unsigned long long)r.handoffInvalid,(unsigned long long)r.handoffOverflow);
-    const char* postReasons[]={"available","provider_missing","provider_version","provider_size","provider_generation",
-      "not_yet_observable","lost_or_inflight_present_history","partial_present","other_present_thread",
-      "failed_present","test_present","malformed_or_overlapping_present"};
-    static_assert(sizeof(postReasons)/sizeof(*postReasons)==FrameCycleStats::PostUnavailableCount,"post-submit rejection names");
     for(unsigned i=1;i<FrameCycleStats::PostUnavailableCount;++i)
       nativeTracePrintf("native_post_submit_unavailable,window=%llu,reason=%s,count=%llu\n",
-        (unsigned long long)r.window,postReasons[i],(unsigned long long)r.postUnavailable[i]);
+        (unsigned long long)r.window,postUnavailableName(i),(unsigned long long)r.postUnavailable[i]);
     const auto postPhase=[&](const char* name,const FrameCycleStats::Dist& d,unsigned samples,unsigned isNested,const char* units="wall_ms"){
       nativeTracePrintf("native_post_submit_phase,window=%llu,name=%s,valid=%u,mean=%.4f,p50=%.4f,p95=%.4f,p99=%.4f,max=%.4f,units=%s,nested=%u\n",
         (unsigned long long)r.window,name,samples,d.mean,d.p50,d.p95,d.p99,d.max,units,isNested);

@@ -58,6 +58,17 @@ class FrameCycleStats final {
     // a single sample, not the window's Dist.
     double cycleMs=0,beforeFirstMs=0,firstSubmitMs=0,betweenEyesMs=0,secondSubmitMs=0,
       afterSecondMs=0,nextWaitMs=0,waitOwnerMs=0,submitOwnerMs[2]{},renderParkMs[2]{};
+    // afterSecondMs (post_second_submit_to_next_wait) cut at Elite's Present, from
+    // the graphics half's Present trace (native_present_trace.h): the game's time
+    // before the hook, the hook (EDVR's work plus the driver's Present), and the
+    // game's time after it. presentSplit is true only for a cycle that held
+    // exactly one valid Present; otherwise the parts stay 0, and presentCount
+    // (0 also when the trace was rejected) with postUnavailable say why.
+    // prePresentMs+presentHookMs+postPresentMs == afterSecondMs, and the four hook
+    // parts sum to presentHookMs: the graphics half's marks are the trace's five.
+    bool presentSplit=false;uint32_t presentCount=0;
+    double prePresentMs=0,presentHookMs=0,hookBeforeRealMs=0,hookRealMs=0,
+      hookAfterRealMs=0,hookCallbackMs=0,postPresentMs=0;
   };
   struct Report {
     uint64_t window=0,firstSequence=0,lastSequence=0,elapsedMs=0,admitted=0;
@@ -274,6 +285,13 @@ class FrameCycleStats final {
     completed_.nextWaitMs=s.nextWait;completed_.waitOwnerMs=s.waitOwner;
     completed_.submitOwnerMs[0]=s.submitOwner[0];completed_.submitOwnerMs[1]=s.submitOwner[1];
     completed_.renderParkMs[0]=s.renderPark[0];completed_.renderParkMs[1]=s.renderPark[1];
+    completed_.presentCount=current_.postValid?uint32_t(s.presentCount):0;
+    if(current_.postValid&&current_.singlePresent) {
+      completed_.presentSplit=true;completed_.prePresentMs=s.beforePresent;completed_.postPresentMs=s.afterPresent;
+      completed_.presentHookMs=double(current_.presentEnd-current_.presentBegin)*toMs;
+      completed_.hookBeforeRealMs=s.edvrBeforePresent;completed_.hookRealMs=s.rawPresent;
+      completed_.hookAfterRealMs=s.edvrAfterPresent;completed_.hookCallbackMs=s.trailingCallback;
+    }
     completedReady_=true;
   }
   bool admit(const Sample&s,const Shape& shape,uint64_t nowMs){
