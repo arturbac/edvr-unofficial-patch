@@ -122,7 +122,10 @@ ID3D11ShaderResourceView* flatSharpenView(ID3D11DeviceContext* ctx,
     texture->GetDevice(&device);
     if (device.Get() != g.device) {
         // A new device is a new session: nothing cached belongs to it, and a
-        // refusal on the old one says nothing about this one.
+        // refusal on the old one says nothing about this one. The pass does the same
+        // for everything it made (sharpen_pass.cpp, adoptDevice): before that it kept
+        // the old device's result texture and handed it back, this wrapper's view over
+        // it failed on the new device, and the sharpening stood down for the session.
         releaseViews();
         g.counts.stoodDown = false;
         g.device = device.Get();
