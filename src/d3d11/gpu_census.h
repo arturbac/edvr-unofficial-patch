@@ -49,8 +49,37 @@ enum class GpuCensusSection : uint8_t {
                               // engineVelocityBeforeDraw's call sites, which mostly return
                               // without reaching the slow path at all
     FrameUiLayerReissues,     // the UI layer's multiply/write-back reissues
+    // Elite's OWN draws that EDVR alters (see AlteredDrawClass below): the game's
+    // draw timed whole, so each figure holds the game's own work in it plus what
+    // EDVR adds by binding its target or swapping its shader. NOT EDVR's cost,
+    // and never part of "EDVR ~X". Per draw like the sections above (K = 8, the
+    // same stride and rotation); they own the line after the main one.
+    AlteredPoolFamily,        // a pool-family draw with EDVR's MRT6 slot target bound and its shaders substituted
+    AlteredTerrain,           // a null-pixel-shader terrain prepass with EDVR's motion target bound and a pixel shader added
+    AlteredUiLayer,           // a UI draw redirected into EDVR's UI layer target (fix.ui_quality)
+    AlteredVerdict,           // a draw wrapped in another fix's state change (RemLok, holo, scrim, particles, the panel ...)
     Count
 };
+
+// Which of the classes above a draw of Elite's is, decided where forwardWithVerdict
+// issues the game's own draw. One class per draw, in this priority: a pool-family
+// draw (only when no verdict claimed it, as engineVelocityBeforeDraw is), a terrain
+// original, a UI-layer redirect, then any other verdict's wrapper. None for a draw
+// EDVR leaves as the game issued it, for a foreign context, and for every reissue.
+enum class AlteredDrawClass : uint8_t { None = 0, PoolFamily, TerrainOriginal, UiLayer, Verdict };
+inline AlteredDrawClass classifyAlteredDraw(bool owner, bool verdictNone, bool poolSubstituted,
+                                            bool terrainOriginal, bool uiLayered) noexcept {
+    if (!owner) return AlteredDrawClass::None;
+    if (verdictNone && poolSubstituted) return AlteredDrawClass::PoolFamily;
+    if (terrainOriginal) return AlteredDrawClass::TerrainOriginal;
+    if (uiLayered) return AlteredDrawClass::UiLayer;
+    if (!verdictNone) return AlteredDrawClass::Verdict;
+    return AlteredDrawClass::None;
+}
+inline GpuCensusSection alteredSectionOf(AlteredDrawClass c) noexcept {
+    return static_cast<GpuCensusSection>(static_cast<int>(GpuCensusSection::AlteredPoolFamily) +
+                                         static_cast<int>(c) - 1);
+}
 
 // Begin around a call site's GPU work, End right after it. Begin ALWAYS
 // counts the occurrence (cheap: one branch and an increment when this is
@@ -79,6 +108,29 @@ public:
 private:
     ID3D11DeviceContext* ctx_;
     GpuCensusSection section_;
+};
+
+// The scope for one of Elite's altered draws: wraps ONLY the game's own real draw
+// call (never the reissues or the extra work the thunk does after it, which have
+// sections of their own), counts the occurrence, and times it on the section's
+// turn. A None class is one compare and nothing else. Defined after
+// gpuCensusBegin/End, which it calls.
+class GpuCensusAlteredScope {
+public:
+    GpuCensusAlteredScope(ID3D11DeviceContext* ctx, AlteredDrawClass c) noexcept
+        : ctx_(ctx), section_(c == AlteredDrawClass::None ? GpuCensusSection::Count : alteredSectionOf(c)) {
+        if (c != AlteredDrawClass::None) open_ = gpuCensusBegin(ctx_, section_);
+    }
+    ~GpuCensusAlteredScope() {
+        if (open_) gpuCensusEnd(ctx_, section_);
+    }
+    GpuCensusAlteredScope(const GpuCensusAlteredScope&) = delete;
+    GpuCensusAlteredScope& operator=(const GpuCensusAlteredScope&) = delete;
+
+private:
+    ID3D11DeviceContext* ctx_;
+    GpuCensusSection section_;
+    bool open_ = false;
 };
 
 // Once a frame, from vScreenFrameBoundary (after the frame's own Begin/End

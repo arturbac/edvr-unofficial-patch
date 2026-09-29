@@ -3794,9 +3794,12 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
             if (on) uiLayerSeedDrawOutcome(original, substituted, redirected, known);
         }
     } seedOutcome{owner && uiLayerSeedDiagnostics()};
-    auto observedDraw = [&]() {
+    // The game's own draw, and only it: the class says which kind of altered draw it is
+    // (gpu_census.h), so the thunk's real-draw call can be timed as that section. Every
+    // other issue through `draw` below passes None and is timed by its own section.
+    auto observedDraw = [&](AlteredDrawClass altered) {
         if (owner && uiLayerIssueBlocked()) return false;
-        const bool issued = draw();
+        const bool issued = draw(altered);
         if (seedOutcome.on) seedOutcome.original = seedOutcome.original || issued;
         return issued;
     };
@@ -3853,7 +3856,10 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         }
         // The loader panel withholds the draw or forwards the game's own:
         // the second issues repeat the game's own, so they follow it.
-        const bool issued = !swallowed && observedDraw();
+        // Altered only when the layer redirected it: a declined substitution issues the
+        // game's own draw untouched, which is not an altered draw.
+        const bool issued = !swallowed &&
+            observedDraw(classifyAlteredDraw(owner, true, false, false, layered));
         if (layered) {
             uiLayerEnd(self);
             if (issued) uiLayerSecondIssues(self, kind, count, instances, args);
@@ -3900,7 +3906,14 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // actually issued with, and around nothing but the game's own draw.
     const bool layered = uiLayer && uiLayerBegin(self);
     if (seedOutcome.on && layered) seedOutcome.redirected = true;
-    const bool originalIssued=observedDraw();
+    // Which kind of altered draw the game's own draw is now (gpu_census.h): a pool-family
+    // draw runs with EDVR's slot target and shaders bound (engineVelocityBeforeDraw ran
+    // for this verdict-free draw just before), a terrain original with its motion target
+    // and pixel shader, a layered UI draw into EDVR's layer, any other verdict inside its
+    // fix's state change. A handful of loads and compares on a draw that is none of them.
+    const AlteredDrawClass altered = classifyAlteredDraw(owner, v == DrawVerdict::kNone,
+                                                         engineVelocityDrawSubstituted(), terrainOriginal, layered);
+    const bool originalIssued=observedDraw(altered);
     if (layered) {
         uiLayerEnd(self);
         if (originalIssued) uiLayerSecondIssues(self, kind, count, instances, args);
@@ -3980,7 +3993,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     if (!terrainOriginal && owner && celestialMotionLive() &&
         celestialMotionBegin(self, bindingShaderHash(BindSlot::Vs))) {
         GpuCensusScope census(self, GpuCensusSection::FrameTerrain);
-        draw();
+        draw(AlteredDrawClass::None);   // a reissue into EDVR's own target: timed as FrameTerrain, not as an altered draw
         celestialMotionEnd(self);
     }
     if (v != DrawVerdict::kNone) {
@@ -3993,7 +4006,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         // re-issue needs is still bound either way.
         if ((v == DrawVerdict::kBackdrop || v == DrawVerdict::kIntroPanel) &&
             splashDimBegin(self)) {
-            draw();
+            draw(AlteredDrawClass::None);
             splashDimEnd(self);
         }
         // Every other verdict's End, in the ladder's old order
@@ -4389,9 +4402,12 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
     const DrawVerdict v = beginPanelOverride(self, 'D', count, 1, args);
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
-    forwardWithVerdict(self, v, 'D', count, 1, args, [&] {
+    forwardWithVerdict(self, v, 'D', count, 1, args, [&](AlteredDrawClass altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
-        g_state->realDraw(self, count, start);
+        {
+            GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
+            g_state->realDraw(self, count, start);
+        }
         if (clock.on) clock.realCall(r0);
         return true;
     });
@@ -4432,9 +4448,12 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
     const DrawVerdict v = beginPanelOverride(self, 'I', count, 1, args);
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
-    forwardWithVerdict(self, v, 'I', count, 1, args, [&] {
+    forwardWithVerdict(self, v, 'I', count, 1, args, [&](AlteredDrawClass altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
-        g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+        {
+            GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
+            g_state->realDrawIndexed(self, count, startIndex, baseVertex);
+        }
         if (clock.on) clock.realCall(r0);
         return true;
     });
@@ -4475,10 +4494,13 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
     const UINT drawn = g_state->glareClamp && g_state->glareClamp < instances
                            ? g_state->glareClamp
                            : instances;
-    forwardWithVerdict(self, v, 'N', perInstance, drawn, args, [&] {
+    forwardWithVerdict(self, v, 'N', perInstance, drawn, args, [&](AlteredDrawClass altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
-        g_state->realDrawInstanced(self, perInstance, drawn, startVertex,
-                                   startInstance);
+        {
+            GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
+            g_state->realDrawInstanced(self, perInstance, drawn, startVertex,
+                                       startInstance);
+        }
         if (clock.on) clock.realCall(r0);
         return true;
     });
@@ -4529,10 +4551,15 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     // verdict, which refreshes rtv0Eye; a draw a verdict claims is left alone.
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
-    forwardWithVerdict(self, v, 'X', perInstance, instances, args, [&] {
+    forwardWithVerdict(self, v, 'X', perInstance, instances, args, [&](AlteredDrawClass altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
-        g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
-                                          baseVertex, startInstance);
+        {
+            // The game's own draw, and only it (gpu_census.h): the weapon and screen motion
+            // reissues below have sections of their own.
+            GpuCensusAlteredScope timed(self, altered);
+            g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex,
+                                              baseVertex, startInstance);
+        }
         // The weapon's temporal-AA motion vectors, from the pool the draw just read.
         if (self == g_state->ownerCtx && !g_state->rtv0Eye &&
             weaponMotionWants(bindingShaderHash(BindSlot::Vs))) {

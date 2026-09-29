@@ -186,13 +186,27 @@ inline void frameTickAppend(char* buf, size_t cap, size_t& len, const char* fmt,
     len = static_cast<size_t>(n) < cap - len ? len + static_cast<size_t>(n) : cap - 1;
 }
 
+// Engine motion's CPU time in one frame (engine_motion_cpu.h): EDVR's own work
+// in its hooks on the game's code, on the thread that called this Present,
+// every call clocked and the frame's own -- exact, not sampled and not held over.
+// It is part of "outside the hook" like the draw hooks, not of the partition.
+struct EngineMotionFrame {
+    bool measured = false;          // false: the priming frame, or no clock rate; no clause
+    double renderMs = 0.0;
+    unsigned long long calls = 0;   // clocked scopes on this thread this frame; 0 = the code never ran
+};
+
 // "EDVR in this frame: ..." -- EDVR's share of one frame, from its summary.
 // frameMs is the frame's length on the same clock the summary was cut with.
 // Draw-hook time is a separate, estimated quantity (perf_monitor.h): it is inside
 // "outside the hook", not part of the partition, and on a frame that was not
 // sampled it is the last sampled frame's figure held over, which the text says.
+// The engine-motion clause is exact for this frame and is the render thread's.
+// No calls reads "none this frame", never 0.00 ms: a 0.00 is code that ran and
+// rounds to nothing. (The call count is not in the clause: the LONG FRAME line
+// is at its size, and the 30 s report carries the rates.)
 inline size_t formatEdvrShare(char* buf, size_t cap, double frameMs, const FrameTickSummary& t,
-                              double drawsMs, bool drawsFresh) {
+                              double drawsMs, bool drawsFresh, const EngineMotionFrame& em = EngineMotionFrame{}) {
     size_t len = 0;
     if (!buf || cap == 0) return 0;
     buf[0] = 0;
@@ -204,7 +218,7 @@ inline size_t formatEdvrShare(char* buf, size_t cap, double frameMs, const Frame
                     "slowest EDVR ticks: ",
                     static_cast<double>(t.hookMs), static_cast<double>(t.boundaryMs),
                     static_cast<double>(t.realMs), drawsMs,
-                    drawsFresh ? "sampled this frame" : "held from an earlier sampled frame", outside);
+                    drawsFresh ? "sampled this frame" : "held over", outside);
     bool any = false;
     for (int i = 0; i < 3; ++i) {
         if (!t.top[i].name) continue;
@@ -214,6 +228,10 @@ inline size_t formatEdvrShare(char* buf, size_t cap, double frameMs, const Frame
     }
     if (!any) frameTickAppend(buf, cap, len, "none recorded");
     frameTickAppend(buf, cap, len, ";");
+    if (em.measured) {
+        if (em.calls) frameTickAppend(buf, cap, len, " engine motion %.2f ms;", em.renderMs);
+        else frameTickAppend(buf, cap, len, " engine motion none this frame;");
+    }
     return len;
 }
 

@@ -22,6 +22,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "../../src/common/system_d3d11.h"
 #include "../../src/common/log.h"
@@ -29,10 +30,14 @@
 using Microsoft::WRL::ComPtr;
 
 namespace edvr {
-// Captures the formatted line instead of writing it anywhere, so the
+// Captures the formatted lines instead of writing them anywhere, so the
 // format checks below can inspect the actual text -- hologram_depth_test's
-// own convention, not tools\ui_depth_test's no-op stub.
+// own convention, not tools\ui_depth_test's no-op stub. g_lastLog is the
+// census's MAIN line ("EDVR GPU census: ..."), which the older checks read;
+// g_lines is every line, in order, for the lines that follow it (the frame
+// gap's, the altered draws').
 std::string g_lastLog;
+std::vector<std::string> g_lines;
 Log& Log::get() { static Log instance; return instance; }
 Log::~Log() = default;
 void Log::note(const char* fmt, ...) {
@@ -41,7 +46,8 @@ void Log::note(const char* fmt, ...) {
     va_start(args, fmt);
     std::vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    g_lastLog = buf;
+    g_lines.push_back(buf);
+    if (std::strncmp(buf, "EDVR GPU census:", 16) == 0) g_lastLog = buf;
     std::fputs(buf, stdout);
     std::fputc('\n', stdout);
 }
@@ -242,6 +248,51 @@ void rotationAndRealTimerCase(Device& d) {
           "calibration: exactly one null pair completed -- the turn's first timed call only, not all four");
     check(st.nullSampler.totals.invalid == 0, "calibration: no invalid/disjoint result on the null pair either");
 
+    // ---- Elite's altered draws (gpu_census.h): the scope counts and times only a classed draw ----
+    check(occurrenceCapFor(GpuCensusSection::AlteredPoolFamily) == 8 && !isDoorSection(GpuCensusSection::AlteredVerdict),
+          "altered: the altered-draw sections are per-draw, K = 8, like the in-frame sections");
+    for (auto& s : g_section) s = SectionState{};
+    g_windowStartMs = GetTickCount64();
+    g_activeSection = static_cast<int>(GpuCensusSection::AlteredPoolFamily);
+    g_activeCalls = g_activeTimed = 0;
+    g_activeStride = 1;
+    g_activeOffset = 0;
+    g_activeNullDone = false;
+    const auto occurrencesEverywhere = [] {
+        uint64_t total = 0;
+        for (const auto& s : g_section) total += s.occurrences;
+        return total;
+    };
+    { GpuCensusAlteredScope untouched(d.ctx.Get(), AlteredDrawClass::None); }
+    check(occurrencesEverywhere() == 0 && g_activeTimed == 0,
+          "altered: a draw EDVR left as the game issued it counts nothing and times nothing");
+    auto& pool = g_section[static_cast<size_t>(GpuCensusSection::AlteredPoolFamily)];
+    for (int i = 0; i < 3; ++i) {
+        GpuCensusAlteredScope timed(d.ctx.Get(), AlteredDrawClass::PoolFamily);
+        d.ctx->ClearRenderTargetView(rtv.Get(), colour);   // stands in for the game's draw
+    }
+    check(pool.occurrences == 3 && g_activeTimed == 3, "altered: three pool-family draws on their section's turn are counted and selected for timing");
+    { GpuCensusAlteredScope other(d.ctx.Get(), AlteredDrawClass::TerrainOriginal); }
+    { GpuCensusAlteredScope other(d.ctx.Get(), AlteredDrawClass::UiLayer); }
+    { GpuCensusAlteredScope other(d.ctx.Get(), AlteredDrawClass::Verdict); }
+    check(g_section[static_cast<size_t>(GpuCensusSection::AlteredTerrain)].occurrences == 1 &&
+              g_section[static_cast<size_t>(GpuCensusSection::AlteredUiLayer)].occurrences == 1 &&
+              g_section[static_cast<size_t>(GpuCensusSection::AlteredVerdict)].occurrences == 1 &&
+              pool.occurrences == 3 && occurrencesEverywhere() == 6 && g_activeTimed == 3,
+          "altered: each class counts in its own section only, and a section that is not on its turn is counted, not timed");
+    // The rotation reaches every section, the altered four included, once a cycle.
+    g_windowFrames = 0;
+    g_activeSection = 0;
+    bool visited[kSections] = {};
+    for (size_t i = 0; i < kSections; ++i) {
+        gpuCensusFrame(d.ctx.Get());
+        visited[static_cast<size_t>(g_activeSection)] = true;
+    }
+    bool all = true;
+    for (bool v : visited) all = all && v;
+    check(all && visited[static_cast<size_t>(GpuCensusSection::AlteredTerrain)],
+          "altered: the frame rotation visits every section, the altered-draw ones too");
+
     gpuCensusShutdown();
     check(gpuTimingShutdown(d.ctx.Get()), "explicit owner shutdown");
 }
@@ -325,10 +376,267 @@ void logFormatCase() {
           "log line: EDVR's corrected total over R is flagged, not hidden");
 }
 
+// ---- 5: the frame gap: fake spans with known GPU ticks, through the census's own intake ------------------
+// A span is 10 ms wide at 10 MHz (100000 ticks); the gap after it is what each case varies.
+constexpr uint64_t kFreq = 10000000;
+constexpr uint64_t kSpanTicks = 100000;
+GpuSpanResult fakeSpan(uint64_t sequence, uint64_t first, uint64_t last, uint64_t freq = kFreq) {
+    GpuSpanResult r;
+    r.sequence = sequence;
+    r.reason = GpuSpanReason::Valid;
+    r.source = GpuSpanSource::ApplicationRender;
+    r.outerMs = freq ? static_cast<double>(last - first) * 1000.0 / static_cast<double>(freq) : 0.0;
+    r.firstTick = first;
+    r.lastTick = last;
+    r.frequency = freq;
+    return r;
+}
+// count frames, sequences firstSeq.., gapTicks(i) after frame i.
+template <class Gap>
+void feedFrames(unsigned count, uint64_t firstSeq, Gap gapTicks) {
+    uint64_t t = 5000000;
+    for (unsigned i = 0; i < count; ++i) {
+        noteApplicationCompletion(fakeSpan(firstSeq + i, t, t + kSpanTicks));
+        t += kSpanTicks + gapTicks(i);
+    }
+}
+void freshWindow(uint64_t start) {
+    for (auto& s : g_section) s = SectionState{};
+    g_windowFrames = 200;
+    g_windowStartMs = start;
+    g_p50Count = 0;
+    g_gap = GpuFrameGap{};
+    g_lines.clear();
+    g_lastLog.clear();
+}
+const std::string* lineWith(const char* prefix) {
+    for (const auto& l : g_lines)
+        if (l.rfind(prefix, 0) == 0) return &l;
+    return nullptr;
+}
+void gapCases() {
+    const uint64_t start = GetTickCount64() - 30000;
+
+    // Saturated: the next frame's first command follows the last one within 0.05 ms, twice by 2 ms.
+    freshWindow(start);
+    feedFrames(100, 1, [](unsigned i) -> uint64_t { return (i == 10 || i == 50) ? 20000 : 500; });
+    logAndResetWindow(start + 30000);
+    check(g_lastLog.find("frame gap p50 0.05 / p95 0.05 ms over 99 pairs;") != std::string::npos,
+          "gap: a saturated GPU (0.05 ms between frames) reads p50 0.05 / p95 0.05 over 99 pairs, on the census line");
+    const std::string* detail = lineWith("EDVR GPU census, frame gap:");
+    check(detail && detail->find("p50 0.05 ms, p95 0.05 ms, max 2.00 ms over 99 pairs of 100 valid frames") != std::string::npos,
+          "gap: the detail line adds the max (the two 2 ms gaps) and the pair and frame counts");
+    check(g_lastLog.find("application render p50 10.000 ms/frame") != std::string::npos,
+          "gap: the same completions still feed the application-render median");
+    check(g_gap.finishWindow().frames == 0, "gap: the window starts over after the line");
+
+    // Starved: the GPU waits 5 ms for the CPU between frames.
+    freshWindow(start);
+    feedFrames(100, 1000, [](unsigned) -> uint64_t { return 50000; });
+    logAndResetWindow(start + 30000);
+    check(g_lastLog.find("frame gap p50 5.00 / p95 5.00 ms over 99 pairs;") != std::string::npos,
+          "gap: a starved GPU (5 ms between frames) reads 5.00");
+
+    // Compositor-sized: about 1 ms. The number is printed as measured, and the line says that it is not proof of idleness.
+    freshWindow(start);
+    feedFrames(60, 1, [](unsigned) -> uint64_t { return 11000; });
+    logAndResetWindow(start + 30000);
+    detail = lineWith("EDVR GPU census, frame gap:");
+    check(g_lastLog.find("frame gap p50 1.10 / p95 1.10 ms over 59 pairs;") != std::string::npos &&
+              detail && detail->find("a gap of about 1 ms is not proof of idleness") != std::string::npos &&
+              detail->find("SteamVR's compositor (another process on the same GPU)") != std::string::npos,
+          "gap: a compositor-sized gap (1.10 ms) is reported, and the line says the compositor shares the GPU");
+    check(detail && detail->find("upper bound on GPU idle, not idle") != std::string::npos,
+          "gap: the wording calls the figure an upper bound on idle, not idle");
+
+    // A missing pair: frame 3 never completes, so 2->3 and 3->4 make no pair. Two pairs, four frames.
+    freshWindow(start);
+    {
+        uint64_t t = 5000000;
+        for (uint64_t seq : {1ull, 2ull, 4ull, 5ull}) {
+            noteApplicationCompletion(fakeSpan(seq, t, t + kSpanTicks));
+            t += kSpanTicks + 1000;
+        }
+    }
+    logAndResetWindow(start + 30000);
+    detail = lineWith("EDVR GPU census, frame gap:");
+    check(g_lastLog.find("over 2 pairs;") != std::string::npos &&
+              detail && detail->find("over 2 pairs of 4 valid frames") != std::string::npos,
+          "gap: a frame that never completes leaves its two pairs unmade, said as fewer pairs than frames");
+
+    // The same frames, the missing one arriving LAST (results complete out of order): each pair is made once.
+    freshWindow(start);
+    {
+        uint64_t t[6];
+        t[0] = 5000000;
+        for (unsigned i = 1; i < 6; ++i) t[i] = t[i - 1] + kSpanTicks + 1000;
+        for (unsigned i : {0u, 1u, 3u, 4u, 2u}) noteApplicationCompletion(fakeSpan(1 + i, t[i], t[i] + kSpanTicks));
+    }
+    logAndResetWindow(start + 30000);
+    detail = lineWith("EDVR GPU census, frame gap:");
+    check(detail && detail->find("over 4 pairs of 5 valid frames") != std::string::npos,
+          "gap: the late frame completes both its pairs, once each, whatever order the results settle in");
+    // A completion repeated is not a second frame.
+    freshWindow(start);
+    noteApplicationCompletion(fakeSpan(7, 5000000, 5100000));
+    noteApplicationCompletion(fakeSpan(7, 5000000, 5100000));
+    noteApplicationCompletion(fakeSpan(8, 5101000, 5201000));
+    logAndResetWindow(start + 30000);
+    detail = lineWith("EDVR GPU census, frame gap:");
+    check(detail && detail->find("over 1 pairs of 2 valid frames") != std::string::npos,
+          "gap: a duplicated completion is one frame, not two");
+
+    // Nothing paired: absent on the census line, never 0.00.
+    freshWindow(start);
+    logAndResetWindow(start + 30000);
+    detail = lineWith("EDVR GPU census, frame gap:");
+    check(g_lastLog.find("frame gap - (no pairs);") != std::string::npos && g_lastLog.find("frame gap p50") == std::string::npos &&
+              detail && detail->find("no pairs this window (0 valid frames") != std::string::npos,
+          "gap: a window with no spans reads '-', not 0.00, on both lines");
+    // One frame alone: valid, but no neighbour.
+    freshWindow(start);
+    noteApplicationCompletion(fakeSpan(9, 5000000, 5100000));
+    logAndResetWindow(start + 30000);
+    check(g_lastLog.find("frame gap - (no pairs);") != std::string::npos, "gap: one frame alone makes no pair");
+
+    // Clock rules: another frequency, overlapping spans, a stall, an invalid span, the other source.
+    freshWindow(start);
+    noteApplicationCompletion(fakeSpan(1, 5000000, 5100000, kFreq));
+    noteApplicationCompletion(fakeSpan(2, 5101000, 5201000, kFreq * 2));   // the clock changed
+    noteApplicationCompletion(fakeSpan(3, 5100000, 5200000, kFreq * 2));   // starts before frame 2 ended: overlap
+    noteApplicationCompletion(fakeSpan(4, 5200000 + 30000000, 5300000 + 30000000, kFreq * 2));   // 3 s gap: a stall
+    GpuSpanResult bad = fakeSpan(5, 0, 0);
+    bad.reason = GpuSpanReason::Disjoint;
+    noteApplicationCompletion(bad);   // not valid: not fed at all
+    GpuSpanResult legacy = fakeSpan(6, 1, 2);
+    legacy.source = GpuSpanSource::RenderToSubmit;
+    noteApplicationCompletion(legacy);   // the other span: not fed
+    logAndResetWindow(start + 30000);
+    detail = lineWith("EDVR GPU census, frame gap:");
+    check(g_lastLog.find("frame gap - (no pairs);") != std::string::npos && detail &&
+              detail->find("no pairs this window (4 valid frames") != std::string::npos &&
+              detail->find("3 pairs rejected as not comparable (overlapping, another clock, or over 1 s)") != std::string::npos,
+          "gap: another clock, an overlap and a stall are rejected, an invalid span and the legacy span never fed");
+    // A span with no ticks (a result from before the fields existed, or a poisoned one) is unusable, not a zero gap.
+    freshWindow(start);
+    noteApplicationCompletion(fakeSpan(1, 0, 0, 0));
+    logAndResetWindow(start + 30000);
+    detail = lineWith("EDVR GPU census, frame gap:");
+    check(detail && detail->find("1 spans unusable") != std::string::npos && g_lastLog.find("frame gap - (no pairs);") != std::string::npos,
+          "gap: a valid span carrying no ticks or frequency is counted unusable, never paired");
+}
+
+// ---- 6: Elite's altered draws: which class a draw is, and the line that reports them ---------------------------
+void alteredClassCases() {
+    using C = AlteredDrawClass;
+    //                      owner, verdictNone, poolSubstituted, terrainOriginal, uiLayered
+    check(classifyAlteredDraw(true, true, false, false, false) == C::None, "class: a plain draw EDVR did not touch is not altered");
+    check(classifyAlteredDraw(true, true, true, false, false) == C::PoolFamily,
+          "class: a verdict-free draw with EDVR's slot target and shaders bound is a pool-family draw");
+    check(classifyAlteredDraw(true, false, true, false, false) == C::Verdict,
+          "class: the pool flag is stale under a verdict (engineVelocityBeforeDraw did not run): the verdict's wrapper, not a pool-family draw");
+    check(classifyAlteredDraw(true, true, false, true, false) == C::TerrainOriginal, "class: a terrain original with the motion target bound");
+    check(classifyAlteredDraw(true, true, false, false, true) == C::UiLayer, "class: a draw redirected into the UI layer");
+    check(classifyAlteredDraw(true, false, false, false, true) == C::UiLayer,
+          "class: a verdict draw the UI layer redirected is the redirect (its target moved)");
+    check(classifyAlteredDraw(true, false, false, false, false) == C::Verdict, "class: any other verdict's wrapper");
+    check(classifyAlteredDraw(true, true, true, true, true) == C::PoolFamily &&
+              classifyAlteredDraw(true, true, false, true, true) == C::TerrainOriginal,
+          "class: one class per draw, in the order pool family, terrain, UI layer, verdict");
+    check(classifyAlteredDraw(false, true, true, true, true) == C::None && classifyAlteredDraw(false, false, false, false, false) == C::None,
+          "class: a foreign (non-owner) context is never counted");
+    check(alteredSectionOf(C::PoolFamily) == GpuCensusSection::AlteredPoolFamily &&
+              alteredSectionOf(C::TerrainOriginal) == GpuCensusSection::AlteredTerrain &&
+              alteredSectionOf(C::UiLayer) == GpuCensusSection::AlteredUiLayer &&
+              alteredSectionOf(C::Verdict) == GpuCensusSection::AlteredVerdict,
+          "class: each class maps to its own section");
+}
+
+void alteredLineCases() {
+    const uint64_t start = GetTickCount64() - 30000;
+    // Pool-family draws: 2000 in 200 frames (10 a frame), four timed at 0.2 ms each: 2.000 ms/frame.
+    // UI-layer draws: 40 (0.20 a frame), two timed at 0.1 ms: 0.020 ms/frame. Terrain and verdict: never ran.
+    freshWindow(start);
+    auto& pool = g_section[static_cast<size_t>(GpuCensusSection::AlteredPoolFamily)];
+    pool.occurrences = 2000;
+    pool.sampler.totals.ms = 0.8;
+    pool.sampler.totals.samples = 4;
+    auto& ui = g_section[static_cast<size_t>(GpuCensusSection::AlteredUiLayer)];
+    ui.occurrences = 40;
+    ui.sampler.totals.ms = 0.2;
+    ui.sampler.totals.samples = 2;
+    logAndResetWindow(start + 30000);
+    const std::string* line = lineWith("EDVR GPU census, Elite's own draws that EDVR alters");
+    check(line != nullptr, "altered line: a line of its own follows the main census line");
+    if (line) {
+        check(line->find("pool-family draws (EDVR's slot target and shaders) 2.000 (10.00/frame)") != std::string::npos,
+              "altered line: pool-family draws: ms/frame with their count a frame");
+        check(line->find("UI draws (redirected to EDVR's layer) 0.020 (0.20/frame)") != std::string::npos,
+              "altered line: UI-layer draws report too");
+        check(line->find("terrain prepasses (EDVR's motion target and shader) -") != std::string::npos &&
+                  line->find("other fix-wrapped draws -") != std::string::npos,
+              "altered line: a class that never ran prints '-', never 0.000");
+        check(line->find("together 2.020 ms/frame") != std::string::npos, "altered line: the classes are disjoint draws, so together is their sum");
+        check(line->find("includes the game's own work in it, not only what EDVR adds") != std::string::npos &&
+                  line->find("the game's draw timed whole") != std::string::npos,
+              "altered line: it says the figures include the game's own work in those draws");
+    }
+    check(g_lastLog.find("EDVR ~0.000 ms/frame") != std::string::npos && g_lastLog.find("pool-family") == std::string::npos,
+          "altered line: the altered draws are not in EDVR's total and not on the main line");
+    check(g_section[static_cast<size_t>(GpuCensusSection::AlteredPoolFamily)].occurrences == 0,
+          "altered line: the window resets the altered sections' occurrences");
+
+    // Nothing ran: all four '-', together 0.000 (a sum, not a measurement), and the wording still says what '-' means.
+    freshWindow(start);
+    logAndResetWindow(start + 30000);
+    line = lineWith("EDVR GPU census, Elite's own draws that EDVR alters");
+    check(line && line->find("pool-family draws (EDVR's slot target and shaders) -, terrain prepasses (EDVR's motion target and shader) -, "
+                             "UI draws (redirected to EDVR's layer) -, other fix-wrapped draws -;") != std::string::npos &&
+              line->find("\"-\" means no such draw ran this window") != std::string::npos,
+          "altered line: a window with no altered draw prints '-' for all four and says what that means");
+    // The timer floor and the spans count include the altered sections' own timers.
+    freshWindow(start);
+    auto& terrain = g_section[static_cast<size_t>(GpuCensusSection::AlteredTerrain)];
+    terrain.occurrences = 20;
+    terrain.sampler.totals.ms = 0.4;
+    terrain.sampler.totals.samples = 2;
+    terrain.nullSampler.totals.ms = 0.1;
+    terrain.nullSampler.totals.samples = 2;
+    logAndResetWindow(start + 30000);
+    line = lineWith("EDVR GPU census, Elite's own draws that EDVR alters");
+    check(line && line->find("terrain prepasses (EDVR's motion target and shader) 0.015 (0.10/frame)") != std::string::npos &&
+              g_lastLog.find("timer floor 50.0 us/pair") != std::string::npos && g_lastLog.find("spans timed 2,") != std::string::npos,
+          "altered line: a class is corrected by its own null pair ((0.4/2 - 0.1/2) x 0.1 = 0.015), and its spans count in the census's totals");
+}
+
+// Every census line at its worst stays under what the log keeps (about 1166 characters of message).
+void lineLengths() {
+    const uint64_t start = GetTickCount64() - 30000;
+    freshWindow(start);
+    for (auto& s : g_section) {
+        s.occurrences = 999999;            // 9999.99 a frame over the 100 frames below
+        s.sampler.totals.ms = 1.0;         // 1 ms a call: 9999.990 ms/frame, four digits before the point
+        s.sampler.totals.samples = 1;
+    }
+    g_windowFrames = 100;
+    for (unsigned i = 0; i < 4000; ++i) g_p50Samples[i] = 99999.0;
+    g_p50Count = 4000;
+    feedFrames(400, 1, [](unsigned i) -> uint64_t { return 1000000ull + i; });
+    logAndResetWindow(start + 30000);
+    size_t longest = 0;
+    for (const auto& l : g_lines) longest = std::max(longest, l.size());
+    std::printf("gpu_census_test: the longest census line at its worst is %zu characters (the log keeps about 1166)\n", longest);
+    check(longest < 1150, "lines: every census line at its worst fits the log's line, not cut");
+}
+
 void run() {
     estimatorMathCases();
     calibrationMathCases();
     logFormatCase();
+    gapCases();
+    alteredClassCases();
+    alteredLineCases();
+    lineLengths();
     Runtime runtime;
     Device device(runtime);
     rotationAndRealTimerCase(device);

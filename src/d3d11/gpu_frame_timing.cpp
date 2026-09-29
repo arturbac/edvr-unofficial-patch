@@ -99,6 +99,7 @@ struct Controller {
             result.sequence <= g_poisoned.load(std::memory_order_acquire)) {
             result.reason = GpuSpanReason::Incomplete;
             result.outerMs = result.leftMs = result.rightMs = 0;
+            result.firstTick = result.lastTick = result.frequency = 0;   // a poisoned frame's clock is no clock
         }
         if (result.reason == GpuSpanReason::Valid) ++validCount;
         else ++invalidCount;
@@ -333,6 +334,7 @@ GpuFrameSnapshot gpuFrameSnapshot() noexcept {
         result.result.sequence <= g_poisoned.load(std::memory_order_acquire)) {
         result.result.reason = GpuSpanReason::Incomplete;
         result.result.outerMs = result.result.leftMs = result.result.rightMs = 0;
+        result.result.firstTick = result.result.lastTick = result.result.frequency = 0;
     }
     return result;
 }
@@ -361,6 +363,7 @@ unsigned gpuFrameReadCompletions(uint64_t& cursor, GpuFrameSnapshot* out,
             out[i].result.sequence <= g_poisoned.load(std::memory_order_acquire)) {
             out[i].result.reason = GpuSpanReason::Incomplete;
             out[i].result.outerMs = out[i].result.leftMs = out[i].result.rightMs = 0;
+            out[i].result.firstTick = out[i].result.lastTick = out[i].result.frequency = 0;
         }
         cursor = item.ordinal;
     }
