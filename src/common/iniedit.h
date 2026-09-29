@@ -183,6 +183,24 @@ bool writeFileAtomic(const std::wstring& path, const std::string& bytes,
                      const AtomicWriteOptions& options = AtomicWriteOptions(),
                      int* tries = nullptr);
 
+// Steps 2 to 4 alone, for a caller that stages its own file (2026-09-29): puts
+// the file at `from` in place of the one at `to`, or at `to` where there is none.
+// The installer's apply engine writes DLLs and renames one over another, and it
+// had the classic rename for both, which is refused with "access denied" for as
+// long as ANY handle to the target is open. A real-time scanner or the search
+// indexer looking at a file that was just read is enough, and the run failed and
+// rolled back over a hold that was gone a few milliseconds later.
+//
+// It renames; it neither writes nor flushes, which whoever staged `from` has done.
+// On failure `from` is where it was and the target is untouched, and deleting
+// `from` is the caller's. `options` is the writer's, `tries` (may be null) gets
+// the attempts made, `code` (may be null) the Windows error of the last one on
+// failure and ERROR_SUCCESS on success. Read-only targets, refusals as
+// unsupported and the seam below are all as for writeFileAtomic.
+bool replaceFileAtomic(const std::wstring& from, const std::wstring& to,
+                       const AtomicWriteOptions& options = AtomicWriteOptions(),
+                       int* tries = nullptr, unsigned long* code = nullptr);
+
 // The rig's seam into steps 2 and 3; nothing in the product calls these.
 //
 // A hook STANDS IN for the rename it is named for. It is called, with the staged

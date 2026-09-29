@@ -19,40 +19,41 @@ changes.*
   frame is GPU-bound, and engine motion costs Elite's render thread
   0.35-0.40 ms p50 (ruled out as the limit). The GPU frame is 12.5-12.7 ms:
   Elite about 6.5, EDVR 6.0-6.2 (upscaler 3.08, UI and hologram passes 2.16,
-  motion 0.46, and 0.3-0.5 inside Elite's own draws). BUILT after it, not
-  flown (branch `claude/engine-clock-sampling`): the engine-motion clock
-  sampled (about 0.12 ms a frame of its own, was 1.17) and the census naming
-  the six "other fix-wrapped draws" fix by fix (last entry).
+  motion 0.46, and 0.3-0.5 inside Elite's own draws). On main since, not
+  flown: the engine-motion clock sampled (about 0.12 ms a frame of its own,
+  was 1.17) and the census naming the six "other fix-wrapped draws" fix by
+  fix (entries below).
 - **Comparing with 0.16.2 in fpsVR:** under OpenVR its CPU frame time is
   poses ready to second submit (0.16.2's `appCpuMs`); on the native runtime
   it tracks Elite's whole frame outside the wait. Compare pre-submit windows.
-- **Open:** issue #38's rc.1 report, 90-99% GPU against 0.16.2's 60-62%. The
-  EDVR GPU census (2026-09-25 entry) is built to split EDVR's cost from the
-  game's; its first flight caught the census itself overcounting engine
-  velocity and screen motion (2026-09-25 entry below), fixed the same day
-  but not yet flown. Separately, the overlap is flown on Pimax
-  OpenXR and SteamVR OpenXR; the Quest runtimes are unflown with it. The depth layer is set aside
-  (Sean, 2026-09-24). No controlled comparison with the old OpenVR path
-  exists; one now needs a v0.16.2 build. A second report (jntracks,
-  2026-09-25 entry) has 0.6.0 in the 90s and 0.18 in the 80s with
-  temporal AA off, at the same 2604x2644 per eye; the runtime path is
-  the only structural difference, and it is unmeasured.
+- **Open:** issue #38 (rc.1 at 90-99% GPU against 0.16.2's 60-62%) and a
+  second report (jntracks: 0.6.0 in the 90s, 0.18 in the 80s with temporal
+  AA off, same 2604x2644 per eye; the runtime path unmeasured). The census,
+  its overcount fixed 2026-09-25, has since flown (the 09-29 entries). The
+  overlap is unflown on the Quest runtimes; the depth layer is set aside
+  (Sean, 2026-09-24); a controlled OpenVR comparison needs a v0.16.2 build.
 - **Closed:** sections 5 and 6 below (the private and producer copies): the
   producer copy measured 0.039 ms p50 per eye at 4100x3962, under the
   0.1 ms bar.
 - **Ruled out:** at the end of each 2026-09-24 entry, and in the 2026-09-29
   ones (the periodic jobs; EDVR's Present hook; EDVR's AA work as the
   stalls' cause; engine motion's CPU as the carrier's limit; the six wrapped
-  draws as the redirected holograms or the depth reissues).
-- **Next** (flight 112704 entry): the GPU is the lever, about 1.6 ms off
-  EDVR's ~6 ms. Sean's pick: the upscaler (3.08 ms; the output size is a
-  setting, foveated DLSS is paused); the UI and hologram passes cut to their
-  footprint (2.16 ms, review P3). The six "other fix-wrapped draws" (1.02 ms
-  whole) are unnamed until the next carrier flight reads the new per-fix
-  census line (last entry says what each answer would mean, and which one
-  flip of `fix.sun_glare` separates them). Any Quest flight with the default
-  build: check the Application-render GPU invalid count stays near zero and
-  `native_frame_end_overlap_summary` reads failures=0.
+  draws as a large EDVR cost, being vivid glare and the scanner-body
+  resolve; for the UI and hologram passes, every cut but one, measured).
+- **UI and hologram passes, 2026-09-29 (entry below):** one exact cut, the
+  UI resolve skipping inputs it was not given (about 0.09 ms a frame); a
+  tile early-out, a groupshared window, R8 history, a composite tile bound,
+  hologram scissors and one shared depth copy measured and ruled out.
+  Largest left: the HDR HUD's depth seed (about 1 ms a frame at the carrier,
+  outside the census) and UI quality 1.25, a setting (1.62x the pixels of
+  1.0).
+- **Next** (flight 132352 entry): the carrier sits at the budget (GPU
+  10.7-11.3 ms, EDVR about 4.8 of it). Open: the HUD depth seed into the
+  census (then UI quality 100 against 125 in one flight), stock glare's
+  extra 2.5 ms, the landing-pad display left out of the UI layer; the output
+  size and foveated DLSS are Sean's levers. Any Quest flight with the
+  default build: check the Application-render GPU invalid count stays near
+  zero and `native_frame_end_overlap_summary` reads failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
   4100x4050 and 2665x2087.
@@ -1443,3 +1444,162 @@ run it would say every frame, or "Sampling is OFF". The census line "EDVR GPU
 census, the other fix-wrapped draws above by the fix that wraps each" sums to the
 classes' "other fix-wrapped draws"; every fix "-" beside 6.00 there means the
 split is dead.
+
+## 2026-09-29: the UI and hologram passes, built, not flown
+
+Branch `claude/ui-holo-passes` from 446d7e7a. Asked for: the UI and hologram
+GPU passes cut to the work they have, the image unchanged (review P3, B-3,
+D-1, D-2, D-4). Nothing merged, installed or flown. Commits 396d8dcd (the rig
+and its goldens, recorded from the unmodified shader first), f282c056 (the
+change), 582193da (the composite bench, this entry) and 8ced6ab5 (the totals
+line). Every number below is an RTX 5090 at the eye's real size, 2016x1948
+in and 4032x3896 out, from `tools\ui_holo_pass_test` (`--bench`,
+`--bench-composite`, `--adapter nvidia`): the median of 25 interleaved rounds
+of 8 dispatches between GPU timestamps, inputs synthetic (a mixed-content
+frame, a HUD's panels over 15% of the eye).
+
+**Built: the UI resolve does not fetch what it was not given.** A load from a
+null view returns zero and is slow on this GPU. Reference (the shader as it
+was) against production, ms an eye:
+
+| state of the inputs | reference | production |
+|---|---|---|
+| everything bound, idle / HUD / menu | 0.145 / 0.143 / 0.165 | 0.144 / 0.142 / 0.170 |
+| source-edit mask unbound, idle / HUD | 0.179 / 0.175 | 0.135 / 0.131 |
+| coverage mask unbound, idle | 0.179 | 0.134 |
+| history unbound, idle | 0.155 | 0.125 |
+| all three unbound (no UI this frame) | 0.245 | 0.109 |
+
+Flight 112704's census read the resolve at 0.55-0.58 ms a frame in its first
+minute (windows ending 11:28:04 and 11:28:34) and 0.33-0.41 after, 0.33-0.37
+through the busiest; the reference's all-unbound and edit-mask-unbound rows
+doubled are 0.49 and 0.36. That is inference, not a measurement: the log does
+not say which inputs were bound. What supports it: the UI content tracker
+read `compared=0` until 11:28:51, and `g_edits[eye].marked` is set only by a
+surface composite whose source changed, so a still HUD leaves the edit mask
+null on most frames. Expected: about 0.09 ms a frame in the busy windows
+(0.357 to about 0.27), up to 0.3 in the first minute's state, nothing when
+every input is bound (parity, 0.144 against 0.145). To read it after a flight:
+`UI resolve totals: N dispatches this session; without the coverage mask a,
+without the source-edit mask b, without history c` (every 20 s while it
+moves) says how often each input was null, which settles the inference; the
+census's UI resolve in the same scene says what it bought.
+
+How: b1.z carries the unbound inputs (bits 1 coverage, 2 source edits, 4
+history; zero is all bound, what a caller with no b1 sends), derived in
+`applyUiResolve` from the views it binds. The shader body is compiled twice,
+once with the bits known zero (the checks fold away) and once asking. Same
+arithmetic, same history layout. Proof, gated in build.bat as
+`:rig_ui_holo_pass_test`: 269 fixtures byte for byte against a frozen copy of
+the shader and against goldens recorded before the change (WARP; the RTX
+passes the pairs too): the corner, tile edges, the corona's edge, none, a
+full-screen menu, jitter to 1.7 and wild, ratios 0.5 to 3, both eyes; each
+input unbound alone equals the reference over zeros (227 runs); bits of zero
+over unbound inputs still equal the reference (98); claiming a bound input
+unbound FAILS 203 of 219 fixtures with content, and each bit fails on the
+named fixture built to need it. Mutation: the marks' halo cut one texel short
+(the resolve's own margin around UI) fails 359 checks, at the corner, the tile
+edges and the goldens. Trace: a build without this has neither the
+totals line nor `UI resolve: not bound on some frames`, a run with every input
+bound shows totals with zeros, and the bytecode header is checked against the
+source, so a stale header fails the rig.
+
+- ruled out: an 8x8 tile early-out for the UI resolve, because there is no
+  corona radius to key a margin on. The corona hold applies to any faint flat
+  pixel anywhere (`corona_smear_level` 64 by default), so every tile needs
+  its raw neighbourhood, and the pass is bandwidth-bound anyway: with the hold
+  off it takes 0.112 ms, 188 MB at 1.7 TB/s, against 0.076 ms for a bare
+  compute copy of the frame.
+- ruled out: a groupshared window for the resolve's taps, because it is
+  slower with the inputs bound. Built and exact (269 fixtures, both adapters);
+  idle 0.141 to 0.149, HUD 0.139 to 0.150, menu 0.156 to 0.205 (0.129, 0.129,
+  0.178 with the fallback taken out): the taps are L1 hits and the pass sits
+  at its bandwidth floor. It only won where inputs were null, which the
+  b1 bits do without it.
+- ruled out: an R8 history for the resolve, because it buys 2-3% (0.140
+  against 0.144 idle, 0.139 against 0.142 HUD; about 0.007 ms a frame) and
+  the pair is shared with the own path's RGBA colour evidence.
+- ruled out: bounding the layer composite to the layer's tiles, because it
+  costs 0.119 ms with an EMPTY layer, 0.120 with a HUD's panels and 0.130
+  covered, against 0.076 for a bare copy of the frame: a perfect skip of
+  empty tiles saves 0.04 ms an eye at most (about 0.07-0.09 a frame), and
+  nothing exact says which tiles are empty (every redirected draw uses the
+  full-eye viewport; the draws' bounds live in the game's own vertex data).
+  The flight agrees: the layer's own composite price is 0.118-0.120 ms an
+  eye-frame in every window from 4 redirected draws a frame to 122. What a
+  skip would rely on holds: over an empty layer the composite returns the
+  frame byte for byte.
+
+Not changed, and why:
+- **Hologram passes and their scratch (D-4).** The scratch is cleared lazily,
+  once an eye-frame at the first listed draw (`holoScratchPrepare`); the
+  near-light pass and the resolve already discard on an empty element depth
+  and read the game's target and display only under flags. What costs (0.126
+  ms a call, 5.5 a frame) is each listed draw's two replays of the game's own
+  geometry, and a scissor to bounds needs bounds nothing on the CPU has.
+- **One scene-depth copy (D-2).** `ui_depth_layer.h:89` copies at the first UI
+  draw of an eye-frame; the layer's seeds copy the depth and stencil as they
+  stand at each seed, and the stencil is rewritten between them by the
+  stencil-only writers the seed arc counts (docs/dlss-performance-review-
+  2026-09-28.md, ruled out: keeping stale depth). Sharing changes pixels.
+- **The reissues (114 a frame, 0.428 ms).** About 4 us each: a small draw and
+  a render-target switch. There is no bound to take; fewer needs merging draws.
+- **"Other fix-wrapped draws" (1.02 ms, 6 a frame)** are Elite's own draws
+  under another fix's state (`AlteredVerdict`, timed as the game's draw and
+  only it), not EDVR's hologram replays: those are the "hologram passes" bucket.
+
+**Largest left, outside this brief.** The layer's HDR HUD depth-stencil seed,
+in no census section: in flight 112704's layer lines it is 0.52-0.53 ms an
+eye-frame median (p95 1.2-1.4) in every window from 11:29:34 to 11:31:34,
+1.04 ms a frame, with 80-122 redirected draws a frame, three seeds and one
+stale per eye-frame (13,782-14,520 seeds, 4,594-4,840 stale a window); at 54
+draws a frame (11:29:04) it is 0.158, and 0.156 in the quiet station flight
+of 09-28. The exact routes to fewer seeds are ruled out in
+docs/dlss-performance-review-2026-09-28.md. Second, `fix.ui_quality` 1.25
+itself: the layer holds 1.62x the pixels of 1.0, and the seed, the
+redirected draws (0.60 ms) and the composite scale with them, roughly 0.7-1.0
+ms a frame by pixel count, unmeasured. That changes the image; Sean's call.
+
+## 2026-09-29: flight 132352, the carrier again, the six draws named
+
+Build a43c94ba on the Frontier install (build matched). Launched with AA off
+(the previous flight's live switch had written it to edvr.ini), so the mip
+bias was 0 all session; DLSS from 13:25:12; at the carrier from about 13:26.
+Sun glare vivid -> stock at 13:27:28 and back at 13:28:13; UI quality
+125 -> 100 at 13:28:29, then a trip through the main menu. F10 at 13:26:45
+(the draw census and 117 eye dumps). Sean: the stock glare made frame times
+worse; CPU frame time good; GPU still hitches; 90 not held.
+
+- **The six wrapped draws, named.** Vivid: `sun glare steady` 0.30-0.46 ms
+  (about 4 a frame) and `scanner-body resolve` 0.04-0.07 ms (2 a frame),
+  both timed whole. Nothing large to cut there.
+- **Stock glare costs more than vivid.** With stock (census window ending
+  13:27:53): the redirected UI draws 2.675 ms (116 a frame) against
+  0.52-0.84 ms with vivid, the census's "game" 8.5 against about 5.9, and
+  the GPU p50 13.1-14.0 ms against about 11.3 before and 10.9-11.0 after.
+  Hypothesis, under test: the stock glare's full-screen overlays are taken
+  into the UI layer and drawn at output size times UI quality.
+- **UI quality 100 against 125: not settled.** The census's timed UI items
+  did not move (resolve 0.26-0.31, composite 0.26-0.30), the comparison
+  crossed a reload, and the part that should shrink, the HUD depth seed
+  (the layer's depth-stencil target is 5040x4870 at 125 here), is not in the
+  census yet.
+- **The end of the flight sat at the budget.** Vivid and UI 100, back at the
+  carrier: runtime window 13:29:09-13:29:39 held 89.9 fps with no late frame
+  while the scene refilled (benchmark GPU 8.8 -> 10.6 ms); the census window
+  ending 13:29:53 read 10.82 ms with the frame gap back to 0.19 ms p50.
+  EDVR 4.75-4.88 ms of it (upscaler 2.93-3.02).
+- **The hitches.** Long frames at the carrier ran 24-41 ms with EDVR's hook
+  0.04-0.28 ms and engine motion at most 0.57 ms in each: Elite's. The
+  233.6 ms at 13:26:45 was the F10 capture and eye dump. Otherwise the GPU
+  median sits at the budget, so ordinary variance crosses 11.1 ms.
+- **UI resolve totals:** 20,494 dispatches, the source-edit mask absent in
+  20,486 and the coverage mask in 15,192, so the null-fetch cut applies
+  almost always. Engine motion on the render thread: 0.12-0.15 ms p50.
+- ruled out: the six "other fix-wrapped draws" as a large EDVR cost, because
+  they are vivid sun glare (0.30-0.46 ms) and the scanner-body resolve
+  (0.04-0.07 ms).
+- Sean's eye dump shows the landing-pad display, which Elite draws in the
+  radar's place while docking, left out of the UI layer (the radar itself is
+  handled correctly); under analysis with the stock-glare question and a
+  census section for the depth seed.
