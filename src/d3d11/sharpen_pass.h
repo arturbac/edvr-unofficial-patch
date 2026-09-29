@@ -30,11 +30,22 @@
 // flat resolve hands the game's output copy, with the same setting and the same
 // pass and no copy of the shader. Its lines say "frame" where VR's say "eye",
 // and its never-ran note names the flat runtime instead of a compositor hook.
+//
+// One device at a time. The game can recreate its D3D11 device in a running
+// process, and nothing this pass makes can be used on another device than its own,
+// so the pass remembers the device of the frame it last worked on and, when a frame
+// arrives from a different one, releases every resource it made (shader, parameter
+// buffer, both eyes' textures and views, the price ring, what it learned about the
+// device's formats) and makes them again on the new device, saying so once per
+// change. The shader's warm compile from the frame boundary follows the same rule:
+// it runs on the device the pass has, or the first device it sees, and never moves
+// the pass to another.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 
+struct ID3D11Device;
 struct ID3D11DeviceContext;
 
 namespace edvr {
@@ -68,6 +79,32 @@ void sharpenPassNeverRanText(char* out, size_t cap, bool flat, bool antiAliasing
                              float strength);
 
 void sharpenPassShutdown();
+
+// Rigs only. The pass keeps everything it makes -- shader, parameter buffer, both
+// eyes' textures and views -- on one D3D11 device, and a frame whose source lives on
+// another device releases all of it and starts over (a view over a texture another
+// device made is refused, which stood the flat sharpening down for the session: RC4
+// review, F5). `true` turns that off and drops what the pass holds, which is how the
+// pass behaved before it existed, so a rig can show the failure the reset prevents;
+// `false` (the default) turns it back on, again from a clean start.
+void sharpenPassDeviceResetOffForTest(bool off);
+
+// Rigs only. What the pass holds and the device each thing was made on (null where it holds
+// nothing), so a rig can assert that a device change released every one of them instead of
+// trusting a driver to refuse the mix: WARP tolerates a shader, buffer or UAV from another
+// device, so a stale one shows nowhere else. Devices are for comparing identity only.
+struct SharpenPassHeld {
+    ID3D11Device* owner = nullptr;          // the device the pass works on
+    ID3D11Device* shader = nullptr;         // the compute shader's
+    ID3D11Device* buffer = nullptr;         // the parameter buffer's
+    ID3D11Device* eyeOut[2] = {};           // each eye's result texture's
+    ID3D11Device* eyeSrcView[2] = {};       // each eye's cached view over its source's
+    ID3D11Device* eyeCopy[2] = {};          // each eye's copy-through texture's
+    bool          shaderTried = false;      // the latch that says a compile was attempted
+    uint32_t      formatSupportAsks = 0;    // how often it asked a device what formats it can store
+    int           queriesInFlight = 0;      // price-ring slots holding a query
+};
+void sharpenPassHeldForTest(SharpenPassHeld* out);
 
 }  // namespace edvr
 
