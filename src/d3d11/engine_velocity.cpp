@@ -197,7 +197,9 @@ struct PrimaryMap {
 // live: notePrimaryBufferCreated refuses a buffer otherwise, and
 // releasePrimaryPoolsLocked lets every one go when the feature stands down.
 PrimaryMap g_primaryMaps[kPrimaryPoolResources];
-uint64_t g_primaryMapSequence=0,g_primaryMapOverflow=0,g_primaryCopyCalls=0,g_primaryApplied=0;
+uint64_t g_primaryMapSequence=0,g_primaryMapOverflow=0,g_primaryApplied=0;   // the engine mutex's
+// Bumped by observePoolCopy on game job threads, which take no engine lock, so atomic.
+std::atomic<uint64_t> g_primaryCopyCalls{0};
 // The cache-full line is printed once per live period (cleared with the slots);
 // g_primaryMapOverflow, the 30 s line's figure, keeps counting past it.
 bool g_primaryOverflowNoted=false;
@@ -509,10 +511,19 @@ void observePrimaryEmit(const emit::PrimaryIdentity& identity, uintptr_t owner, 
                          g_lookup.load(std::memory_order_acquire),*g_table,g_primaryEmit,sink);
 }
 
+// The engine's pool copier (game job threads, once per copy-list entry). No
+// engine lock: everything this touches is primaryCopy's own state -- g_stats,
+// g_pools, g_emissions, g_overflowFrame and g_emissionEpoch, each read and
+// written only under primaryCopy::g_mutex, which copier and invalidateMapped
+// take themselves -- plus the atomic counter and the atomic frame clock. It
+// never reaches g_gpu or g_gpuMutex (apply and reset), and primaryCopy calls
+// nothing back into this file, so the order stays engine g_mutex -> g_gpuMutex
+// -> primaryCopy::g_mutex on the render thread and a job thread holds only the
+// last. The engine mutex is held by the render thread across its D3D calls, so
+// taking it here stalled a job thread behind the slow half for a counter.
 void observePoolCopy(uintptr_t mapped,uint32_t stride,uintptr_t source,uint64_t slot,uint32_t count) noexcept {
     if(!live.load(std::memory_order_acquire))return;
-    std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    ++g_primaryCopyCalls;
+    g_primaryCopyCalls.fetch_add(1,std::memory_order_relaxed);
     if(count==UINT32_MAX || slot>UINT32_MAX){primaryCopy::invalidateMapped(mapped);return;}
     primaryCopy::copier(mapped,stride,source,static_cast<uint32_t>(slot),count,frameNow());
 }
@@ -1432,7 +1443,7 @@ void summaryLocked(uint64_t now) {
                     r(g_primaryEmit.readFaults),r(g_primaryEmit.writeFaults));
     Log::get().note("engine motion: primary private copy cumulative (copier %s, merge %s, clear %s): copier spans %llu, apply successes %llu, "
                     "positive map cache overflow %llu (capacity %u); primary native records are unchanged.",
-                    kinematicEvalPoolCopyStatus(),kinematicEvalMergeStatus(),kinematicEvalClearStatus(),u(g_primaryCopyCalls),u(g_primaryApplied),u(g_primaryMapOverflow),kPrimaryPoolResources);
+                    kinematicEvalPoolCopyStatus(),kinematicEvalMergeStatus(),kinematicEvalClearStatus(),r(g_primaryCopyCalls),u(g_primaryApplied),u(g_primaryMapOverflow),kPrimaryPoolResources);
     const auto copyStats=primaryCopy::stats();
     Log::get().note("engine motion: primary copy certificates cumulative: emissions %llu, native copy ranges %llu, joined slots %llu, "
                     "declined %llu, invalidated %llu, overflow %llu; private scatter batches %llu, rows %llu, empty %llu, "

@@ -70,6 +70,9 @@ Slot g_slots[static_cast<unsigned>(edvr::BindSlot::Count)];
 ID3D11DepthStencilView* g_eyeDsv[2] = {};
 bool g_hookLive = true;
 unsigned g_emitAttaches = 0, g_emitDetaches = 0;
+// The pool copier's observer as configure registers it (copier_tests.h calls it
+// the way the game's job threads do).
+edvr::EnginePoolCopyObserverFn g_poolCopyObserver = nullptr;
 std::vector<std::string> g_log;
 uint64_t g_clock = 1000;
 uint64_t fakeClock() { return g_clock; }
@@ -103,7 +106,7 @@ void kinematicEvalSetEmitObserver(EngineEmitObserverFn) noexcept {}
 void kinematicEvalSetPrimaryEmitObserver(EnginePrimaryEmitObserverFn) noexcept {}
 const char* kinematicEvalPrimaryEmitStatus() noexcept { return "rig: hooked"; }
 void kinematicEvalPrimaryEmitCounters(uint64_t& calls,uint64_t& unowned) noexcept { calls=unowned=0; }
-void kinematicEvalSetPoolCopyObserver(EnginePoolCopyObserverFn) noexcept {}
+void kinematicEvalSetPoolCopyObserver(EnginePoolCopyObserverFn fn) noexcept { lifecycle_fake::g_poolCopyObserver = fn; }
 const char* kinematicEvalPoolCopyStatus() noexcept { return "rig: hooked"; }
 void kinematicEvalSetMergeObserver(EngineMergeBeginFn,EngineMergeEndFn) noexcept {}
 const char* kinematicEvalMergeStatus() noexcept { return "rig: hooked"; }

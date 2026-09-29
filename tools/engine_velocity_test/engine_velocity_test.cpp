@@ -26,7 +26,8 @@
 // save (lifecycle_tests.h), and the primary-pool cache's lifetime -- game
 // buffers held only while the feature is live, released on stand-down, a full
 // cache logged once, a mid-session activation nominating the pool from its
-// binding (pin_tests.h). build.bat links
+// binding (pin_tests.h), and the pool copier's observer running on job threads
+// without the engine mutex (copier_tests.h). build.bat links
 // src\d3d11\engine_velocity.cpp with EDVR_ENGINE_VELOCITY_RIG and the binding
 // shadow external; lifecycle_tests.h supplies the stubs.
 #include <windows.h>
@@ -53,6 +54,7 @@
 #include "actual_vs_link_test.h"
 #include "lifecycle_tests.h"
 #include "pin_tests.h"
+#include "copier_tests.h"
 #include "../../src/common/runtime_profile.h"
 #include "../../src/d3d11/engine_velocity_families.h"   // kSelfMarking
 #include "../../third_party/dxbc_hash/DxilHash.cpp"
@@ -319,6 +321,7 @@ int wmain(int argc, wchar_t** argv) {
     panel_tests::run({device.Get(), context.Get(), &check});
     lifecycle_tests::run({device.Get(), context.Get(), &check});
     pin_tests::run({device.Get(), context.Get(), &check});
+    copier_tests::run({device.Get(), context.Get(), &check});
     if (!realLinkRoot.empty()) {
         const Pair edge{L"vs_DE545DC8EE4FBB87", L"ps_91F8937EDA723663", false};
         check(onePair(device.Get(), context.Get(), realLinkRoot, edge, &check),
