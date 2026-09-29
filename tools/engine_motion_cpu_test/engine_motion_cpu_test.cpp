@@ -473,6 +473,8 @@ void neverRanIsNotZero() {
     const std::string render = line;
     check(render.find("draw side 0.20/0.35/1.20 (52.0; 0.21)") != std::string::npos,
           "text: the draw side line: p50/p95/max, calls per frame, longest call");
+    check(render.find("shader patch 0.00/0.00/0.00 (0.001; 2.10)") != std::string::npos,
+          "text: a rare event (three shader patches in 2700 frames) shows 0.001 calls per frame, not 0.0");
     check(render.find("emit -") != std::string::npos && render.find("jobs -") != std::string::npos,
           "text: a part that never ran on the render thread prints -");
     check(render.find("eval -") != std::string::npos, "text: an evaluator that never ran here prints -");
@@ -502,7 +504,10 @@ void neverRanIsNotZero() {
     check(summary.find("30 s, 2700 frames") != std::string::npos && summary.find("Render thread 4321") != std::string::npos,
           "text: the summary names the window and the render thread");
     check(summary.find("total p50 0.31 / p95 0.52 / max 1.94 ms per frame") != std::string::npos, "text: the summary's render total");
-    check(summary.find("Other threads: 1200.00 ms per s across 7 threads") != std::string::npos, "text: the summary's other threads");
+    check(summary.find("Other threads: 1200.00 ms per s across 7 threads over 2450.0 clocked calls per frame") != std::string::npos,
+          "text: the summary's other threads, and its call rate counts the clocked scopes only (the evaluator's 5400 counted calls are not in it)");
+    check(summary.find("ms per frame over 55.0 clocked calls per frame") != std::string::npos,
+          "text: the summary's render thread call rate: 52 draw side + 2 apply + 1 tee + a patch's 0.001");
     check(summary.find("records 34 ns and costs 41 ns (60 and 79 ns with a forward pause; 2048 null pairs)") != std::string::npos,
           "text: the summary states the clock floor both shapes");
     double spent = 0, recorded = 0;
@@ -530,7 +535,7 @@ void neverRanIsNotZero() {
     check(!anyNumbers && idleRender.find("shader patches this window: none") != std::string::npos,
           "text: a window in which nothing ran prints - for every part and says there were no patches");
     formatSummary(line, sizeof(line), idle);
-    check(std::string(line).find("over 0.0 calls per frame") != std::string::npos &&
+    check(std::string(line).find("over 0.0 clocked calls per frame") != std::string::npos &&
               std::string(line).find("Clock floor: not measured.") != std::string::npos,
           "text: nothing ran, no floor: zero calls per frame and an unmeasured floor, both said");
 }

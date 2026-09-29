@@ -589,6 +589,12 @@ inline void appendf(char* buf, size_t cap, size_t& len, const char* fmt, ...) no
     len = static_cast<size_t>(n) < cap - len ? len + static_cast<size_t>(n) : cap - 1;
 }
 
+// Calls per frame: one decimal, three when it is under 0.1 so a rare event (a shader
+// patch) does not read as 0.0, which would look like code that never ran.
+inline void callsText(char* out, size_t cap, double perFrame) noexcept {
+    std::snprintf(out, cap, perFrame > 0.0 && perFrame < 0.1 ? "%.3f" : "%.1f", perFrame);
+}
+
 // The instrument's own price at this window's call rates, thread-ms per frame:
 // what its clock reads cost (spent), and what they add to the figures (recorded).
 inline void instrumentMsPerFrame(const WindowReport& r, double* spent, double* recorded) noexcept {
@@ -607,8 +613,9 @@ inline size_t formatSummary(char* buf, size_t cap, const WindowReport& r) noexce
     size_t len = 0;
     if (!buf || !cap) return 0;
     buf[0] = 0;
-    uint64_t renderCalls = 0, otherCalls = 0;
+    uint64_t renderCalls = 0, otherCalls = 0;   // the clocked scopes; the evaluator's counted calls are on the parts lines
     for (unsigned p = 0; p < kParts; ++p) {
+        if (!kInfo[p].clocked) continue;
         renderCalls += r.part[p].renderCalls;
         otherCalls += r.part[p].otherCalls;
     }
@@ -617,8 +624,8 @@ inline size_t formatSummary(char* buf, size_t cap, const WindowReport& r) noexce
     appendf(buf, cap, len,
             "engine motion CPU: %.0f s, %u frames; EDVR's own work in its hooks on the game's code, every call "
             "clocked, the game's forwarded code excluded. Render thread %u: total p50 %.2f / p95 %.2f / max %.2f "
-            "ms per frame over %.1f calls per frame. Other threads: %.2f ms per s across %u threads over %.1f "
-            "calls per frame. ",
+            "ms per frame over %.1f clocked calls per frame. Other threads: %.2f ms per s across %u threads over %.1f "
+            "clocked calls per frame. ",
             r.seconds, r.frames, r.renderTid, r.totalP50, r.totalP95, r.totalMax,
             static_cast<double>(renderCalls) / frames, r.otherMs / seconds, r.otherThreads,
             static_cast<double>(otherCalls) / frames);
@@ -655,12 +662,15 @@ inline PatchTotals patchTotals(const WindowReport& r) noexcept {
 inline void appendEvalNote(char* buf, size_t cap, size_t& len, uint64_t calls, double frames, double msPerFrame) noexcept {
     if (!calls) {
         appendf(buf, cap, len, "eval -");
-    } else if (msPerFrame > 0.0) {
-        appendf(buf, cap, len, "eval %.1f calls per frame, not clocked (a pass-through; probe work clocked %.2f ms per frame)",
-                static_cast<double>(calls) / frames, msPerFrame);
-    } else {
-        appendf(buf, cap, len, "eval %.1f calls per frame, not clocked (a pass-through)", static_cast<double>(calls) / frames);
+        return;
     }
+    char perFrame[24];
+    callsText(perFrame, sizeof(perFrame), static_cast<double>(calls) / frames);
+    if (msPerFrame > 0.0)
+        appendf(buf, cap, len, "eval %s calls per frame, not clocked (a pass-through; probe work clocked %.2f ms per frame)",
+                perFrame, msPerFrame);
+    else
+        appendf(buf, cap, len, "eval %s calls per frame, not clocked (a pass-through)", perFrame);
 }
 
 inline size_t formatRenderParts(char* buf, size_t cap, const WindowReport& r) noexcept {
@@ -680,8 +690,10 @@ inline size_t formatRenderParts(char* buf, size_t cap, const WindowReport& r) no
         } else if (!w.renderCalls) {
             appendf(buf, cap, len, "%s -", kInfo[p].name);
         } else {
-            appendf(buf, cap, len, "%s %.2f/%.2f/%.2f (%.1f; %.2f)", kInfo[p].name, w.renderP50, w.renderP95, w.renderMax,
-                    static_cast<double>(w.renderCalls) / frames, w.renderCallMaxMs);
+            char perFrame[24];
+            callsText(perFrame, sizeof(perFrame), static_cast<double>(w.renderCalls) / frames);
+            appendf(buf, cap, len, "%s %.2f/%.2f/%.2f (%s; %.2f)", kInfo[p].name, w.renderP50, w.renderP95, w.renderMax,
+                    perFrame, w.renderCallMaxMs);
         }
     }
     const PatchTotals pt = patchTotals(r);
@@ -712,8 +724,9 @@ inline size_t formatOtherParts(char* buf, size_t cap, const WindowReport& r) noe
         } else if (!w.otherCalls) {
             appendf(buf, cap, len, "%s -", kInfo[p].name);
         } else {
-            appendf(buf, cap, len, "%s %.2f (%.1f; %.2f)", kInfo[p].name, w.otherMs / seconds,
-                    static_cast<double>(w.otherCalls) / frames, w.otherCallMaxMs);
+            char perFrame[24];
+            callsText(perFrame, sizeof(perFrame), static_cast<double>(w.otherCalls) / frames);
+            appendf(buf, cap, len, "%s %.2f (%s; %.2f)", kInfo[p].name, w.otherMs / seconds, perFrame, w.otherCallMaxMs);
         }
     }
     appendf(buf, cap, len, ".");
