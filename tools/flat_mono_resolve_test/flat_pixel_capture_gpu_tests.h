@@ -85,6 +85,10 @@ inline int flatPixelCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* co
     check(poolBuffer && SUCCEEDED(device->CreateShaderResourceView(poolBuffer.Get(),&poolDesc,&poolView)),"pool view retains nonzero first element");
     if(captureFailures)return captureFailures;
     frame.engine={slotView.Get(),poolView.Get(),nowBuffer.Get(),previousBuffer.Get()};
+    // A live frame: history stood, and the raster phase and the phase the camera rows carry are
+    // nonzero (the upstream camera injector). The writer must record all four phases.
+    frame.jitterX=.25f;frame.jitterY=-.375f;frame.previousJitterX=-.125f;frame.previousJitterY=.5f;
+    frame.rowsJitterX=.25f;frame.rowsJitterY=-.375f;frame.previousRowsJitterX=-.125f;frame.previousRowsJitterY=.5f;
     const auto before=edvr::flatMonoResolveStats();
     capture.arm(6);check(capture.active(),"manual arm creates output directory");
     const fs::path directory=capture.directory();
@@ -111,6 +115,13 @@ inline int flatPixelCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* co
     capturedBytes("slots",slots.data(),slots.size()*sizeof(float));capturedBytes("pool",pool,sizeof(pool));
     capturedBytes("scene_now",sceneNow,sizeof(sceneNow));capturedBytes("scene_previous",scenePrevious,sizeof(scenePrevious));
     std::printf("flat pixel fixture: %ls\n",manifest.c_str());
+    {   // The writer records the phases the rows carry (a replay removes them as the shader does).
+        std::ifstream js(manifest,std::ios::binary);
+        const std::string body((std::istreambuf_iterator<char>(js)),std::istreambuf_iterator<char>());
+        check(body.find("\"reset\":true")!=std::string::npos &&
+              body.find("\"jitter\":[0.25,-0.375],\"previous_jitter\":[-0.125,0.5],\"rows_jitter\":[0.25,-0.375],\"previous_rows_jitter\":[-0.125,0.5]")!=std::string::npos,
+              "the manifest records the raster phases and the phases the camera rows carry");
+    }
     // A queued set must not cross a manual rearm into the next directory.
     frame.frame=22;capture.capture(device,context,frame,false,sources);
     capture.arm(23);const fs::path rearmed=capture.directory();capture.poll(context,24);

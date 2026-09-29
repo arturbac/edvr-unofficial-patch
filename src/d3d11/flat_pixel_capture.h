@@ -126,10 +126,13 @@ public:
         if(!packed) {fail("pack-failed");return;}
         bool ok=true;
         for(unsigned i=0;i<used_ && ok;++i)ok=write(directory_+L"\\"+wide(items_[i].filename),payload[i].data(),payload[i].size());
-        char header[1024]{};
-        std::snprintf(header,sizeof(header),"{\n\"version\":2,\"frame_id\":%llu,\"mode\":\"%s\",\"configured_dlss_preset\":%u,\"reset\":%s,\"jitter\":[%.9g,%.9g],\"previous_jitter\":[%.9g,%.9g],\"render_width\":%u,\"render_height\":%u,\"output_width\":%u,\"output_height\":%u,\"binary_version\":\"%s\",\"binary_compiled\":\"%s %s\",\"textures\":[\n",
+        char header[1280]{};
+        // rows_jitter: the raster phase the camera ROWS carry (2026-09-29; nonzero only under the
+        // upstream camera injector), so a replay removes it as the shader does instead of guessing.
+        std::snprintf(header,sizeof(header),"{\n\"version\":2,\"frame_id\":%llu,\"mode\":\"%s\",\"configured_dlss_preset\":%u,\"reset\":%s,\"jitter\":[%.9g,%.9g],\"previous_jitter\":[%.9g,%.9g],\"rows_jitter\":[%.9g,%.9g],\"previous_rows_jitter\":[%.9g,%.9g],\"render_width\":%u,\"render_height\":%u,\"output_width\":%u,\"output_height\":%u,\"binary_version\":\"%s\",\"binary_compiled\":\"%s %s\",\"textures\":[\n",
             static_cast<unsigned long long>(frame_.frame),frame_.mode==FlatMonoResolveMode::Dlaa?"dlaa":"dlss",frame_.configuredDlssPreset,frame_.reset?"true":"false",
             frame_.jitterX,frame_.jitterY,frame_.previousJitterX,frame_.previousJitterY,
+            frame_.rowsJitterX,frame_.rowsJitterY,frame_.previousRowsJitterX,frame_.previousRowsJitterY,
             frame_.renderWidth,frame_.renderHeight,frame_.outputWidth,frame_.outputHeight,EDVR_VERSION_STRING,__DATE__,__TIME__);
         std::string manifest=header;
         for(unsigned i=0;i<used_;++i) {
