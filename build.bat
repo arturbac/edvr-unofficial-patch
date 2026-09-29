@@ -663,7 +663,10 @@ REM does now). A rig that only wants a D3D11 device takes System32's export
 REM through src\common\system_d3d11.h and links without d3d11.lib: an
 REM imported D3D11CreateDevice resolves, for an exe in build\, to
 REM build\d3d11.dll before System32's, and the test runs under EDVR's hooks by
-REM accident.
+REM accident. run_jobs.py refuses, at the plan, any rig that links d3d11.lib
+REM into an output in %BUILD%; a rig that wants System32's checks at run time
+REM which d3d11.dll it runs on (reportSystemD3D11Only), and one that loads the
+REM proxy on purpose checks that none came with its exe (reportNoD3D11Mapped).
 REM The --quiet rigs hold wall-clock intervals to tight bounds; they run alone,
 REM after the rest, with the whole machine. Only their test runs need that, so
 REM each is split (see the rig area below): its compiles run in the pool like
@@ -791,7 +794,7 @@ echo [edvr] === smoke.exe ===
 if not exist "%OBJ%\smoke" mkdir "%OBJ%\smoke"
 cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT /DNDEBUG ^
     /Fo"%OBJ%\smoke\\" /Fe"%BUILD%\smoke.exe" ^
-    "tools\smoke\smoke.cpp" /link /INCREMENTAL:NO d3d11.lib kernel32.lib
+    "tools\smoke\smoke.cpp" /link /INCREMENTAL:NO kernel32.lib
 if errorlevel 1 ( echo [edvr] ERROR: smoke build failed & exit /b 1 )
 echo [edvr] built %BUILD%\smoke.exe
 exit /b 0
@@ -931,7 +934,7 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /I"third_party\openxr\include" ^
     /Fo"%OBJ%\native_temporal\\" /Fe"%BUILD%\native_temporal_gpu_test.exe" ^
     "tools\native_temporal_test\native_temporal_gpu_test.cpp" ^
-    /link /INCREMENTAL:NO kernel32.lib user32.lib d3d11.lib dxgi.lib
+    /link /INCREMENTAL:NO kernel32.lib user32.lib dxgi.lib
 if errorlevel 1 ( echo [edvr] ERROR: native temporal GPU test build failed & exit /b 1 )
 "%BUILD%\native_temporal_gpu_test.exe" --dry-run || exit /b 1
 exit /b 0
@@ -952,7 +955,7 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE ^
     /Fo"%OBJ%\native_sharpen_test\\" /Fe"%BUILD%\native_sharpen_gpu_test.exe" ^
     "tools\native_sharpen_test\native_sharpen_gpu_test.cpp" ^
-    /link /INCREMENTAL:NO kernel32.lib user32.lib d3d11.lib dxgi.lib
+    /link /INCREMENTAL:NO kernel32.lib user32.lib dxgi.lib
 if errorlevel 1 ( echo [edvr] ERROR: native sharpen GPU test build failed & exit /b 1 )
 "%BUILD%\native_sharpen_gpu_test.exe" --dry-run || exit /b 1
 exit /b 0
@@ -1044,7 +1047,7 @@ if not exist "%OBJ%\flat_mono_resolve_test" mkdir "%OBJ%\flat_mono_resolve_test"
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /Fo"%OBJ%\flat_mono_resolve_test\\" ^
     /Fe"%BUILD%\flat_mono_resolve_test.exe" "tools\flat_mono_resolve_test\flat_mono_resolve_test.cpp" ^
-    "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" /link /INCREMENTAL:NO d3d11.lib dxgi.lib d3dcompiler.lib
+    "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib
 if errorlevel 1 ( echo [edvr] ERROR: flat mono resolve test build failed & exit /b 1 )
 "%BUILD%\flat_mono_resolve_test.exe" --dry-run || exit /b 1
 "%BUILD%\flat_mono_resolve_test.exe" --self-test || exit /b 1
@@ -1069,7 +1072,7 @@ if not exist "%OBJ%\c2warp" mkdir "%OBJ%\c2warp"
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\c2warp\\" ^
     /Fe"%BUILD%\c2_warp_test.exe" "tools\c2_warp_test\c2_warp_test.cpp" ^
-    /link /INCREMENTAL:NO d3d11.lib dxgi.lib d3dcompiler.lib
+    /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib
 if errorlevel 1 ( echo [edvr] ERROR: c2 warp test build failed & exit /b 1 )
 "%BUILD%\c2_warp_test.exe" --self-test || exit /b 1
 exit /b 0
@@ -1651,7 +1654,7 @@ exit /b 0
 if not exist "%OBJ%\native_device_test" mkdir "%OBJ%\native_device_test"
 cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT ^
     /Fo"%OBJ%\native_device_test\\" /Fe"%BUILD%\native_device_test.exe" ^
-    "tools\openxr_native_test\native_device_test.cpp" /link /INCREMENTAL:NO d3d11.lib dxgi.lib
+    "tools\openxr_native_test\native_device_test.cpp" /link /INCREMENTAL:NO dxgi.lib
 if errorlevel 1 ( echo [edvr] ERROR: native device test build failed & exit /b 1 )
 "%BUILD%\native_device_test.exe" --dry-run || exit /b 1
 "%BUILD%\native_device_test.exe" --self-test || exit /b 1
@@ -1664,7 +1667,7 @@ cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT /I"third_party\openxr\include" ^
     /Fo"%OBJ%\openxr_binding_test\\" /Fe"%BUILD%\openxr_binding_test.exe" ^
     "tools\openxr_binding_test\openxr_binding_test.cpp" "src\openxr\session_binding.cpp" ^
     "src\openxr\published_session.cpp" "src\common\frame_flag.cpp" ^
-    /link /INCREMENTAL:NO d3d11.lib dxgi.lib
+    /link /INCREMENTAL:NO dxgi.lib
 if errorlevel 1 ( echo [edvr] ERROR: OpenXR binding test build failed & exit /b 1 )
 "%BUILD%\openxr_binding_test.exe" --dry-run || exit /b 1
 "%BUILD%\openxr_binding_test.exe" --self-test || exit /b 1
@@ -1714,7 +1717,7 @@ cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT /I"third_party\openxr\include" ^
     "tools\openxr_proxy_state_test\openxr_proxy_state_test.cpp" ^
     "src\openxr\d3d11_stereo.cpp" "src\openxr\eye_capture.cpp" "src\openxr\skybox_capture.cpp" ^
     "src\openxr\shared_texture_transfer.cpp" "src\openxr\producer_gpu_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
-    /link /INCREMENTAL:NO d3d11.lib dxgi.lib d3dcompiler.lib
+    /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib
 if errorlevel 1 ( echo [edvr] ERROR: OpenXR proxy state test build failed & exit /b 1 )
 "%BUILD%\openxr_proxy_state_test.exe" --dry-run || exit /b 1
 "%BUILD%\openxr_proxy_state_test.exe" --self-test || exit /b 1
@@ -1726,7 +1729,7 @@ REM Actual owned-swapchain Present hook, foreign Init caller and private work.
 cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT /I"third_party\openxr\include" ^
     /Fo"%OBJ%\openxr_present_test\\" /Fe"%BUILD%\openxr_present_test.exe" ^
     "tools\openxr_present_test\openxr_present_test.cpp" ^
-    /link /INCREMENTAL:NO d3d11.lib dxgi.lib user32.lib
+    /link /INCREMENTAL:NO dxgi.lib user32.lib
 if errorlevel 1 ( echo [edvr] ERROR: OpenXR Present test build failed & exit /b 1 )
 "%BUILD%\openxr_present_test.exe" --dry-run || exit /b 1
 "%BUILD%\openxr_present_test.exe" --self-test || exit /b 1
@@ -1741,7 +1744,7 @@ REM Stopped application Present: real graphics callback and native stop coordina
 cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT /I"third_party\openxr\include" ^
     /Fo"%OBJ%\openxr_shutdown_test\\" /Fe"%BUILD%\openxr_shutdown_test.exe" ^
     "tools\openxr_shutdown_test\openxr_shutdown_test.cpp" ^
-    /link /INCREMENTAL:NO d3d11.lib dxgi.lib user32.lib
+    /link /INCREMENTAL:NO dxgi.lib user32.lib
 if errorlevel 1 ( echo [edvr] ERROR: OpenXR stopped-Present shutdown test build failed & exit /b 1 )
 "%BUILD%\openxr_shutdown_test.exe" --dry-run || exit /b 1
 "%BUILD%\openxr_shutdown_test.exe" --self-test || exit /b 1
@@ -2437,7 +2440,7 @@ cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNO
     /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\uiqualitytest\\" /Fe"%BUILD%\ui_quality_test.exe" ^
     "tools\ui_quality_test\ui_quality_test.cpp" ^
-    /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib
+    /link /INCREMENTAL:NO d3dcompiler.lib
 if errorlevel 1 ( echo [edvr] ERROR: ui quality test build failed & exit /b 1 )
 "%BUILD%\ui_quality_test.exe" --dry-run || exit /b 1
 "%BUILD%\ui_quality_test.exe" --self-test || exit /b 1

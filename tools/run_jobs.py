@@ -95,6 +95,13 @@ EDVR_RIG_STEP=run under its group's rule, and reports the two as "x (build)"
 and "x (run)". A rig without that line runs whole under the rule. Run by hand,
 with the variable unset, the rig runs whole.
 
+A rig may not link d3d11.lib into an output directly in %BUILD%. build\\d3d11.dll
+is EDVR's own proxy, and an exe beside it binds a d3d11.dll import to that proxy
+before System32's, so the rig would run under EDVR's hooks by accident. The plan
+refuses such a rig, naming its line and its output, before anything compiles
+(architecture review 2026-09-29, I-8); a rig that needs a device takes System32's
+through src\\common\\system_d3d11.h, or builds its output outside %BUILD%.
+
 --times is where the runner records how long each rig took, and reads it back
 next time so the longest rigs start first. A rig with no record is estimated
 from how many sources its subroutine compiles.
@@ -140,6 +147,15 @@ LABEL = re.compile(r"^:rig_([A-Za-z0-9_]+)(?:\s.*)?$")
 SOURCE = re.compile(r'\.cpp"')
 BUILD_GUARD = 'if "%EDVR_RIG_STEP%"=="build" exit /b 0'
 
+# What d3d11_in_build looks for in a rig's compiler commands: a cl command that
+# links (no /c) d3d11.lib -- after /link, or as a plain input, which cl hands to
+# the linker as well -- into a /Fe output that sits directly in %BUILD%.
+CL_COMMAND = re.compile(r"^\s*cl(?:\.exe)?\s", re.IGNORECASE)
+COMPILE_ONLY = re.compile(r"\s/c(?:\s|$)", re.IGNORECASE)
+EXE_OUTPUT = re.compile(r'/Fe:?\s*"?([^"\s]+)"?', re.IGNORECASE)
+BUILD_ROOT_OUTPUT = re.compile(r"^%BUILD%\\[^\\/]+$", re.IGNORECASE)
+D3D11_LIB = re.compile(r"(?<![\w.-])d3d11\.lib(?![\w.-])", re.IGNORECASE)
+
 # Per-rig timeouts (architecture review 2026-09-29, I-5): a rig that has run
 # before may take three times what it took last time, never less than
 # TIMEOUT_FLOOR seconds; one with no record may take TIMEOUT_UNRECORDED. Past
@@ -177,12 +193,13 @@ PROTECTED_EXE_DIR_ENTRIES = {
 
 
 class Rig:
-    __slots__ = ("label", "line", "sources", "two_step", "group", "after")
+    __slots__ = ("label", "line", "sources", "two_step", "group", "after", "d3d11_in_build")
 
     def __init__(self, label, line, sources=0, two_step=False):
         self.label, self.line, self.sources, self.two_step = label, line, sources, two_step
         self.group = None   # index of its --serial group, if any; set by plan()
         self.after = ()     # labels it must not start before finish; set by plan()
+        self.d3d11_in_build = ()   # (line, output) of each link that binds build\d3d11.dll; see d3d11_in_build()
 
     def __repr__(self):
         return "Rig(%r, %d, %d%s)" % (self.label, self.line, self.sources,
@@ -216,10 +233,53 @@ class Job:
         return "Job(%r)" % self.title
 
 
+def d3d11_in_build(body, first_line):
+    """(line, output) for every compiler command in `body` -- a rig's lines,
+    the first of them line `first_line` of the script -- that links d3d11.lib
+    into an output sitting directly in %BUILD%. build\\d3d11.dll is EDVR's own
+    proxy, and a d3d11.dll import of an exe (or a DLL an exe loads) beside it
+    resolves to that proxy before System32's: the rig then runs under EDVR's
+    hooks by accident (architecture review 2026-09-29, I-8). Such a rig takes
+    Windows' own d3d11 through src\\common\\system_d3d11.h and links without
+    d3d11.lib, or builds its output elsewhere (%OBJ%\\<name>\\). Commands
+    continued with ^ are read as the one command they are."""
+    found, joined, begun = [], "", None
+    for number, line in enumerate(body, first_line):
+        stripped = line.rstrip()
+        if begun is None:
+            begun = number
+        if stripped.endswith("^"):
+            joined += stripped[:-1] + " "
+            continue
+        command, at, joined, begun = joined + stripped, begun, "", None
+        if not CL_COMMAND.match(command) or COMPILE_ONLY.search(command):
+            continue
+        output = EXE_OUTPUT.search(command)
+        if output and BUILD_ROOT_OUTPUT.match(output.group(1)) and D3D11_LIB.search(command):
+            found.append((at, output.group(1)))
+    return tuple(found)
+
+
+def check_system_d3d11(rigs):
+    """Raise ValueError naming every rig whose link binds build\\d3d11.dll (see
+    d3d11_in_build), so a rig that would run under EDVR's hooks by accident
+    stops the build at the plan, before anything compiles."""
+    bound = [(rig, line, output) for rig in rigs for line, output in rig.d3d11_in_build]
+    if not bound:
+        return
+    raise ValueError(
+        "%d rig link(s) put d3d11.lib into an output in %%BUILD%%, where the d3d11.dll import binds "
+        "build\\d3d11.dll (EDVR's own proxy) instead of System32's and the rig runs under EDVR's hooks "
+        "by accident. Create the device through src\\common\\system_d3d11.h and link without d3d11.lib, "
+        "or build the output outside %%BUILD%%:\n%s"
+        % (len(bound), "\n".join("  :rig_%s, line %d: %s" % (rig.label, line, output)
+                                for rig, line, output in bound)))
+
+
 def parse_rigs(text):
     """Every :rig_<label> in the script, in order, with the number of sources
-    its subroutine compiles and whether it honours EDVR_RIG_STEP (the text up
-    to the next label)."""
+    its subroutine compiles, whether it honours EDVR_RIG_STEP, and the links
+    that would bind build\\d3d11.dll (the text up to the next label)."""
     lines = text.splitlines()
     rigs, seen = [], {}
     for number, line in enumerate(lines, 1):
@@ -239,6 +299,7 @@ def parse_rigs(text):
         body = lines[rig.line:end]
         rig.sources = len(SOURCE.findall("\n".join(body)))
         rig.two_step = any(line.strip() == BUILD_GUARD for line in body)
+        rig.d3d11_in_build = d3d11_in_build(body, rig.line + 1)
     return rigs
 
 
@@ -303,7 +364,9 @@ def plan(rigs, quiet, times, serial=(), after=None):
     (see run_group and launchable for how it holds a job back); neither a
     consumer nor a producer may be a --quiet rig, and the whole relation
     must be acyclic -- both raise ValueError here, before anything runs,
-    rather than stranding a job that can never become launchable."""
+    rather than stranding a job that can never become launchable. A rig that
+    links d3d11.lib into %BUILD% is refused the same way (check_system_d3d11)."""
+    check_system_d3d11(rigs)
     after = {label: tuple(producers) for label, producers in (after or {}).items()}
     by_label = {rig.label: rig for rig in rigs}
     for option, labels in ([("--quiet", quiet)] + [("--serial", group) for group in serial]
@@ -928,6 +991,72 @@ def self_test():
             check(False, why)
         except ValueError:
             pass
+
+    # A rig that links d3d11.lib into an output directly in %BUILD% binds
+    # build\d3d11.dll, EDVR's own proxy, and is refused at the plan (I-8).
+    def script_of(*body):
+        return "\n".join(["@echo off", "exit /b 0", ":run_rig", "call :rig_%EDVR_RIG%", "exit /b 0", ""]
+                         + list(body)) + "\n"
+
+    def refusal(*body):
+        """The text of the ValueError plan() raises for a script of these rig
+        lines, or None when the plan accepts it."""
+        try:
+            plan(parse_rigs(script_of(*body)), [], {})
+        except ValueError as error:
+            return str(error)
+        return None
+
+    check(all(rig.d3d11_in_build == () for rig in rigs) and refusal(":rig_ok", "exit /b 0") is None,
+          "a script with no such link plans as before")
+    one = 'cl.exe /nologo /Fe"%BUILD%\\one.exe" "tools\\one\\one.cpp" /link /INCREMENTAL:NO d3d11.lib dxgi.lib'
+    text = refusal(":rig_one", one, "exit /b 0")
+    line = script_of(":rig_one", one, "exit /b 0").splitlines().index(one) + 1
+    check(text is not None and ":rig_one, line %d: %%BUILD%%\\one.exe" % line in text
+          and "system_d3d11.h" in text and "System32" in text,
+          "a d3d11.lib link into %%BUILD%% is refused, naming the rig, its line and its output: %r" % text)
+    check(parse_rigs(script_of(":rig_one", one))[0].d3d11_in_build == ((line, "%BUILD%\\one.exe"),),
+          "parse_rigs records the line and the output")
+    continued = ["cl.exe /nologo /O2 ^", '    /Fo"%OBJ%\\two\\" /Fe"%BUILD%\\two.exe" "tools\\two\\two.cpp" ^',
+                 "    /link /INCREMENTAL:NO kernel32.lib user32.lib d3d11.lib dxgi.lib", "exit /b 0"]
+    text = refusal(":rig_two", *continued)
+    line = script_of(":rig_two", *continued).splitlines().index(continued[0]) + 1
+    check(text is not None and ":rig_two, line %d:" % line in text,
+          "a command continued with ^ is one command, reported at its first line: %r" % text)
+    text = refusal(":rig_three", "for %%T in (a b) do (", '    cl.exe /Fe"%BUILD%\\three_%%T.exe" "t.cpp" /link d3d11.lib', ")",
+                   "exit /b 0")
+    check(text is not None and ":rig_three" in text and "%BUILD%\\three_%%T.exe" in text,
+          "a compile inside a for loop is read too: %r" % text)
+    check(refusal(":rig_four", 'CL.EXE /FE"%build%\\four.exe" "t.cpp" /LINK D3D11.LIB', "exit /b 0") is not None
+          and refusal(":rig_four", 'cl.exe /Fe:"%BUILD%\\four.exe" "t.cpp" /link "C:\\sdk\\um\\x64\\d3d11.lib"',
+                      "exit /b 0") is not None,
+          "case does not matter, and neither does a path before the library's name")
+    check(refusal(":rig_five", 'cl.exe /Fe"%BUILD%\\five.exe" "t.cpp" d3d11.lib /link kernel32.lib', "exit /b 0")
+          is not None
+          and refusal(":rig_five", 'cl.exe /Fe"%BUILD%\\five.exe" "t.cpp" d3d11.lib', "exit /b 0") is not None,
+          "a plain d3d11.lib input, which cl hands to the linker too, is read as well")
+    text = refusal(":rig_a", one, ":rig_b", one.replace("one.exe", "b.exe"), "exit /b 0")
+    check(text is not None and ":rig_a," in text and ":rig_b," in text and text.startswith("2 rig link(s)"),
+          "every offending rig is named: %r" % text)
+    for why, body in (
+            ("an output in a subdirectory of %BUILD% or in %OBJ%",
+             ['cl.exe /Fe"%OBJ%\\x\\x.exe" "t.cpp" /link d3d11.lib', 'cl.exe /Fe"%BUILD%\\sub\\x.exe" "t.cpp" /link d3d11.lib']),
+            ("no d3d11.lib on the link line", ['cl.exe /Fe"%BUILD%\\x.exe" "t.cpp" /link dxgi.lib d3dcompiler.lib']),
+            ("another library whose name ends the same",
+             ['cl.exe /Fe"%BUILD%\\x.exe" "t.cpp" /link xd3d11.lib my-d3d11.lib.txt']),
+            ("d3d11.lib named only in a comment, a compile-only (/c) command or a file name",
+             ["REM this rig used to link d3d11.lib", 'cl.exe /c /Fe"%BUILD%\\x.exe" "t.cpp" d3d11.lib',
+              'cl.exe /Fe"%BUILD%\\y.exe" "tools\\d3d11.lib.cpp" /DD3D11_LIB=1 /link kernel32.lib'])):
+        check(refusal(":rig_ok", *body, "exit /b 0") is None, "not refused: %s" % why)
+    with tempfile.TemporaryDirectory() as scratch:
+        script = Path(scratch) / "build.bat"
+        script.write_text(script_of(":rig_one", one, "exit /b 0"), encoding="utf-8")
+        out = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", write_through=True)   # main writes to .buffer too
+        with contextlib.redirect_stdout(out):
+            code = main(["--script", str(script), "--dry-run"])
+        printed = out.buffer.getvalue().decode("utf-8")
+        check(code == 1 and printed.startswith("[edvr] ERROR: 1 rig link(s) put d3d11.lib") and ":rig_one" in printed,
+              "the runner refuses the script even for a dry run, exit 1: %r %r" % (code, printed))
 
     pool, later = plan(rigs, ["timing"], {})
     check(titles(pool) == ["gamma", "alpha", "beta"], "unknown rigs order by source count: %r" % pool)

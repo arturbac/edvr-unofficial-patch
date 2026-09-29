@@ -15,6 +15,7 @@
 #include "../../src/openxr/graphics_bridge_client.h"
 #include "../../src/openxr/native_graphics_client.h"
 #include "../../src/openxr/native_render_binding.h"
+#include "../../src/common/system_d3d11.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -282,8 +283,10 @@ bool runActual(HMODULE proxy, IDXGISwapChain* chain, ID3D11Device* device, ID3D1
   EdvrRenderBoundaryRequest request{sizeof(request),EDVR_RENDER_BOUNDARY_VERSION_1,device,&PresentHost::callback,&host};
   RenderBoundaryClient missing; check(FAILED(missing.acquire(GetModuleHandleW(L"kernel32.dll"),request))&&!missing.active(),"missing provider rejected without fallback");
   ComPtr<ID3D11Device> otherDevice; ComPtr<ID3D11DeviceContext> otherContext;
-  check(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,
-                                     &otherDevice,nullptr,&otherContext)),"independent same-adapter device");
+  // Windows' own d3d11 through common/system_d3d11.h, never an import: EDVR's proxy sits beside this exe.
+  const auto systemCreate=edvr::systemD3D11CreateDevice(); check(systemCreate!=nullptr,"system D3D11 factory");
+  check(systemCreate&&SUCCEEDED(systemCreate(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,
+                                             &otherDevice,nullptr,&otherContext)),"independent same-adapter device");
   if (otherDevice) { auto foreign=request; foreign.device=otherDevice.Get(); auto rejected=EdvrRenderBoundaryTable{sizeof(EdvrRenderBoundaryTable),EDVR_RENDER_BOUNDARY_VERSION_1}; check(FAILED(reinterpret_cast<decltype(&edvrAcquireRenderBoundary)>(GetProcAddress(proxy,"edvrAcquireRenderBoundary"))(&foreign,&rejected)),"foreign same-adapter device rejected"); }
   RenderBoundaryClient client;
   Event registered;
@@ -566,7 +569,8 @@ void transportContracts(HMODULE proxy, PresentDevice& present, bool available) {
   // forward that call without admitting it as the registered owner's work.
   ComPtr<ID3D11Device> otherDevice; ComPtr<ID3D11DeviceContext> otherContext,otherDeferred;
   ComPtr<ID3D11CommandList> otherList;
-  check(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,
+  const auto systemCreate=edvr::systemD3D11CreateDevice(); check(systemCreate!=nullptr,"system D3D11 factory");
+  check(systemCreate&&SUCCEEDED(systemCreate(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,
       D3D11_SDK_VERSION,&otherDevice,nullptr,&otherContext)),"transport foreign device");
   if (otherDevice&&SUCCEEDED(otherDevice->CreateDeferredContext(0,&otherDeferred))) {
     otherDeferred->ClearState();
@@ -586,6 +590,8 @@ void transportContracts(HMODULE proxy, PresentDevice& present, bool available) {
 int selfTest(const std::wstring& supplied, HookExpectation expectation=HookExpectation::Features) {
   Watchdog watchdog; wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr,exe,MAX_PATH); std::wstring path=supplied;
   if (path.empty()) { path=exe; const auto slash=path.find_last_of(L"\\/"); path=path.substr(0,slash+1)+L"d3d11.dll"; }
+  // The DLL loaded next is the only proxy in this process: no d3d11.dll comes with the exe.
+  check(edvr::reportNoD3D11Mapped("openxr_present_test"),"no d3d11.dll is mapped before the rig loads the proxy");
   HMODULE proxy=LoadLibraryExW(path.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS); check(proxy!=nullptr,"load built graphics proxy"); if (!proxy) return 1;
   nativeGraphicsContracts(proxy,nullptr,nullptr,true);
   NativeGraphicsClient preClient;
