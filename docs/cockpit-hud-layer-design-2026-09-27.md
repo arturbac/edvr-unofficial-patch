@@ -5,12 +5,21 @@
 - **State:** phases 1–3 plus route-pricing fixes through `472ff122` are
   combined into `codex/dlss-performance-review` for Frontier optimization.
   Main remains separate. Holo panels, flight HUD, target sprite and eight
-  generic hologram families take the HDR layer. Sphere, corona and world
-  reticle remain in-scene for the recorded safety reasons; canopy stays out.
+  generic hologram families take the HDR layer. Sphere/corona stay in-scene;
+  canopy stays out. Frontier `be70af2a` dump `174605` now proves the exact
+  world-reticle VS71DD8B8B09060A81/PS2D037A047171BF3B has no screen reads.
+  Narrow paired admission passes WARP/RTX fixture checks in the joint branch;
+  full-build gates pass; live checks remain. Other pixel variants stay stock.
+  stencil81/ref1 needs real seed work.
   Frontier `0229c358` flew with diagnostics off/on: Sean says HUD looked good.
   This is a qualitative visual check, not measured bloom parity. Armed HDR
   shading median .126 ms/eye; machinery .962 ms/eye with seed .612. Joint
-  seed attribution is next; see the combined performance review.
+  guarded seed optimization is installed; see the combined performance review.
+- **Open:** actual ship/target models beside the radar. The saved successful
+  `review-mesh` replay shows surrounding rings, not proof of model admission.
+  Sphere-family depth reads originate in Elite; the larger HUD grid changes
+  their addressing. An actual-DXBC coordinate remap passes 4,907 offline WARP
+  checks; production admission and headset/cost checks remain. See final entry.
 - **Goal:** composite the cockpit HUD after the upscale, at output
   resolution, out of DLSS/FSR history. That means the holo panels, the
   flight HUD and the target sprite. It should be as sharp at HMD Quality
@@ -26,9 +35,8 @@
 - **Prior art:** this is crisp-ui-handoff.md's parked form of Design A
   (lines 184-191: "PARKED, not declined"), with one change. It re-issues
   the game's own tonemap draw instead of transcribing it.
-- **Decisions for Sean:** see "Decisions", before Phase 1.
-- **Next step:** combined Frontier seed cause/subprice and CPU-clear profiling
-  at UI quality 125, then a separate 100/125 comparison. See
+- **Next step:** combined Frontier check of the paired reticle and seed cost
+  at UI quality 125, with fixed shaders compiled during the build. See
   `dlss-performance-review-2026-09-28.md` for the evidence and conditions.
   Revisit halo/translucent-over-bright behavior using the tail checklist.
 
@@ -745,3 +753,37 @@ in the expensive window, ~3.3 ms unaccounted inside "door"). Both read:
   125 is the lever.
 
 Installed to Steam as v0.18.0-rc.3-35-g53fd633f.
+
+## 2026-09-28: actual model surfaces and a narrower repair
+
+The saved `review-mesh` images contain station/health/shield rings with empty
+model interiors. Its `81216/A296` t2 is a HUD atlas. Those tests do not prove
+that the actual ship/target models entered the crisp path.
+
+Verified Frontier `be70af2a` census `174242`, 17:46:05–06: two `5559` quads
+use PS `EA02FAC2BD6C643C`/`E95634B0F61D218F`. t1 is original 2016×1948 R32
+linear depth. t4 is 512×512 depth-like data; shader gradients reconstruct
+edge light, with matching-size t5/t6 on one variant. Four offscreen 512²
+R32 mesh draws (`5B0068AF5630F96B`/`6C416587F7C22B97`, 62688/7584 indices)
+are candidate producers; exact consumer/producer identity remains unproven.
+
+First test an inverse viewport/jitter map at each exact PS's single
+SV_Position→integer t1 load, preserving all UV/material reads and original
+linear-depth encoding. Then take complete composites after DLSS with original
+alpha, occlusion and stencil04 write-back. This targets history smearing
+without another full-eye depth pass. A copied layer-sized R32 input instead
+costs a pass and ~98.2 MB/eye at UI 5040×4870. Neither adds detail to t4.
+
+512→1024/2048 model sources mean 4×/16× pixels plus matching t5/t6 and edge
+width changes; identify producers and price these separately. Latest
+`kToneLate=0` does not justify a second tonemap. Corona remains excluded.
+No production admission change yet. The ignored
+`build/sphere-remap-prototype/RESULT.txt` records 4,907 WARP checks with the
+two real pixel shaders. Both reproduce enlarged-grid loss and recover all
+25,600 controlled pixels. All 64 nonuniform-depth cases preserve stock RGBA
+byte for byte, including translucent alpha, at .5/.75 input scale, UI100/125,
+both jitter signs and subrect/scissor. One MAD repairs only the t1 address;
+512² model data stays unchanged. Actual VS geometry, classifier admission,
+private stencil/write-back, device lifetime and headset performance remain
+unqualified. Fresh post-DLSS composition is the recommendation for history
+smearing; source-image blur is a separate question.

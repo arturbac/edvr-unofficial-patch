@@ -66,6 +66,7 @@ ID3D11Texture2D* scene(uint32_t width, uint32_t height, int eye, bool expected) 
 }  // namespace
 
 namespace edvr {
+ID3D11ComputeShader* shaderSwapCreateCs(ID3D11DeviceContext*,const void*,size_t,const char*,const char*) { std::abort(); }
 Log& Log::get() { static Log log; return log; }
 Log::~Log() = default;
 void Log::note(const char*, ...) {}

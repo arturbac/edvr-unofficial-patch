@@ -1,3 +1,4 @@
+#include "temporal_shader_bytecode.h"
 #include "eye_mask.h"
 
 #include <windows.h>
@@ -116,26 +117,7 @@ float maskedFraction(const EyeMaskGeometry& g) {
 // id/2 is the segment (0..kRingSegments), the low bit picks inner (E) or
 // outer (O) -- see eye_mask.h. The pixel shader is NULL at the draw
 // (depth-only); nothing here compiles one.
-constexpr char kRingVsHlsl[] = R"HLSL(
-cbuffer EyeMaskCB : register(b0) {
-    float2 centre;
-    float2 axes;
-    float outerScale;
-    float depthValue;
-    float segments;
-    float pad0;
-};
-float4 main(uint id : SV_VertexID) : SV_POSITION {
-    uint seg = id / 2;
-    uint parity = id - seg * 2;
-    float theta = float(seg) * (6.283185307179586 / segments);
-    float c = cos(theta);
-    float s = sin(theta);
-    float scale = parity == 0 ? 1.0 : outerScale;
-    float2 p = centre + float2(axes.x * c, axes.y * s) * scale;
-    return float4(p, depthValue, 1.0);
-}
-)HLSL";
+
 
 struct EyeMaskCBuffer {
     float centreX, centreY;
@@ -308,12 +290,8 @@ bool ensureResources(ID3D11Device* device) {
 
     bool ok = false;
     guarded("eye_mask.setup", [&] {
-        ComPtr<ID3DBlob> blob, errors;
-        HRESULT hr = D3DCompile(kRingVsHlsl, sizeof(kRingVsHlsl) - 1, "eye_mask_vs",
-                                nullptr, nullptr, "main", "vs_5_0", 0, 0, &blob, &errors);
-        if (FAILED(hr) || !blob) return;
-        if (FAILED(device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(),
-                                              nullptr, &g_res.vs))) {
+        if (FAILED(device->CreateVertexShader(kEyeMaskRingBytecode,
+                                              sizeof(kEyeMaskRingBytecode), nullptr, &g_res.vs))) {
             return;
         }
 

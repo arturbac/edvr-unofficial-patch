@@ -3784,6 +3784,10 @@ __declspec(noinline) UiLayerFamily uiLayerFamilyOf(State* s, char kind, UINT cou
     UiFamilyFacts f;
     f.targetKind = uiLayerTargetKind();
     f.vs = bindingShaderHash(BindSlot::Vs);
+    // The reticle's captured PS has no screen-space reads; its other PS
+    // variants remain refused. Ordinary HDR draws need no extra hash read.
+    if (f.targetKind == 1 && f.vs == kHoloWorldMarkerReticle)
+        f.ps = bindingShaderHash(BindSlot::Ps);
     if (f.targetKind == 2) {
         // ui_depth's exclude list (the null-output mesh B018D143700AB803,
         // which samples a stale surface and draws nothing, and the ini's

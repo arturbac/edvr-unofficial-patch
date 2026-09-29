@@ -104,6 +104,7 @@ internal static class Report
 
         var analyzer = new CycleAnalyzer(data, pid, QpcUs, traceStartUs, traceEndUs);
         var cycles = validFrames.Select(analyzer.Analyze).ToList();
+        var gpuCompletions = GpuMarkers.Join(data, cycles);
         progress?.Invoke($"cycles: valid={cycles.Count} derived={analyzer.DerivedFrames} " +
                          $"covered={cycles.Count(c => c.Covered)}");
 
@@ -275,6 +276,7 @@ internal static class Report
             },
         };
         if (data.GpuCoverage is not null) report["gpuProviderCoverage"] = data.GpuCoverage.Report(data.EventsLost);
+        report["applicationGpuCompletionCoverage"] = gpuCompletions;
         return report;
     }
 
@@ -912,6 +914,9 @@ internal static class Report
         return new Dictionary<string, object?>
         {
             ["sequence"] = frame.Sequence,
+            ["gpuSequence"] = frame.GpuSequence == 0 ? null : frame.GpuSequence,
+            ["cpuMarkerVersion"] = frame.SchemaVersion,
+            ["applicationGpu"] = cycle.ApplicationGpu,
             ["generation"] = frame.Generation,
             ["featureEpoch"] = frame.FeatureEpoch,
             ["callerThread"] = frame.CallerThread,
@@ -998,6 +1003,8 @@ internal static class Report
         var detail = new Dictionary<string, object?>
         {
             ["sequence"] = cycle.Marker.Sequence,
+            ["gpuSequence"] = cycle.Marker.GpuSequence == 0 ? null : cycle.Marker.GpuSequence,
+            ["cpuMarkerVersion"] = cycle.Marker.SchemaVersion,
             ["generation"] = cycle.Marker.Generation,
             ["featureEpoch"] = cycle.Marker.FeatureEpoch,
             ["callerThread"] = cycle.Marker.CallerThread,
@@ -1006,6 +1013,7 @@ internal static class Report
             ["derived"] = cycle.Derived,
             ["derivationReason"] = cycle.DerivationReason,
             ["covered"] = cycle.Covered,
+            ["applicationGpu"] = cycle.ApplicationGpu,
             ["timestamps"] = new Dictionary<string, object?>
             {
                 ["waitReturnUs"] = cycle.WaitReturnUs,

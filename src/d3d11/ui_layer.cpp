@@ -1,3 +1,4 @@
+#include "temporal_shader_bytecode.h"
 // fix.ui_quality -- the UI layer half. ui_layer.h says what it is and why;
 // ui_layer_math.h holds its arithmetic and ui_layer_shaders.h its composite,
 // both shared with tools/ui_quality_test; ui_panel_scale.* is the other half
@@ -1594,8 +1595,7 @@ bool g_fmtChecked[2] = {}, g_fmtOk[2] = {};
 void compileOnce(ID3D11DeviceContext* ctx) {
     if (g_cs || g_csTried || !ctx) return;
     g_csTried = true;
-    g_cs = shaderSwapCompileCs(ctx, kUiLayerCompositeHlsl, sizeof(kUiLayerCompositeHlsl) - 1,
-                               "main", "ui_layer_composite_cs", nullptr, "ui quality: layer");
+    g_cs = shaderSwapCreateCs(ctx,kUiLayerCompositeBytecode,sizeof(kUiLayerCompositeBytecode),"ui_layer_composite_cs","ui quality: layer");
 }
 
 bool makeTex(ID3D11Device* dev, uint32_t w, uint32_t h, DXGI_FORMAT texFmt, DXGI_FORMAT viewFmt,
@@ -2751,10 +2751,8 @@ bool g_crispDeferredTried = false;
 void compileCoverageOnce(ID3D11DeviceContext* ctx) {
     if ((g_covVs && g_covPs) || g_covTried || !ctx) return;
     g_covTried = true;
-    g_covVs = shaderSwapCompileVs(ctx, kUiLayerCoverageVsHlsl, sizeof(kUiLayerCoverageVsHlsl) - 1,
-                                  "main", "ui_layer_coverage_vs", nullptr, "crisp hud");
-    g_covPs = shaderSwapCompilePs(ctx, kUiLayerCoveragePsHlsl, sizeof(kUiLayerCoveragePsHlsl) - 1,
-                                  "main", "ui_layer_coverage_ps", nullptr, "crisp hud");
+    g_covVs = shaderSwapCreateVs(ctx,kUiLayerCoverageVsBytecode,sizeof(kUiLayerCoverageVsBytecode),"ui_layer_coverage_vs","crisp hud");
+    g_covPs = shaderSwapCreatePs(ctx,kUiLayerCoveragePsBytecode,sizeof(kUiLayerCoveragePsBytecode),"ui_layer_coverage_ps","crisp hud");
     if (!g_covVs || !g_covPs) {
         if (g_covVs) g_covVs->Release();
         if (g_covPs) g_covPs->Release();

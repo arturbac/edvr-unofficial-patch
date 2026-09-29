@@ -1,6 +1,7 @@
 // Production coverage command recording and HLSL on D3D11 WARP.
 #include "../../src/d3d11/ui_layer_coverage.h"
 #include "../../src/d3d11/ui_layer_shaders.h"
+#include "temporal_shader_bytecode.h"
 #include <d3dcompiler.h>
 #include <DirectXPackedVector.h>
 #include <array>
@@ -15,6 +16,13 @@ void check(bool ok, const char* text) { ++checks; if (!ok) { std::fprintf(stderr
 void hr(HRESULT result) { check(SUCCEEDED(result),"D3D operation"); }
 ComPtr<ID3DBlob> compile(const char* text, const char* profile, UINT flags=0) {
     ComPtr<ID3DBlob> code, error;
+    // The live flags-zero path executes the generated payload. The
+    // skip-optimization fixture below remains an independent HLSL variant.
+    if(flags==0 && (text==kUiLayerCoverageVsHlsl || text==kUiLayerCoveragePsHlsl)) {
+        const void* bytes=text==kUiLayerCoverageVsHlsl?static_cast<const void*>(kUiLayerCoverageVsBytecode):kUiLayerCoveragePsBytecode;
+        const size_t size=text==kUiLayerCoverageVsHlsl?sizeof(kUiLayerCoverageVsBytecode):sizeof(kUiLayerCoveragePsBytecode);
+        hr(D3DCreateBlob(size,&code));std::memcpy(code->GetBufferPointer(),bytes,size);return code;
+    }
     const HRESULT result = D3DCompile(text,std::strlen(text),nullptr,nullptr,nullptr,"main",profile,flags,0,&code,&error);
     if (FAILED(result) && error) std::fprintf(stderr,"%s\n",static_cast<const char*>(error->GetBufferPointer()));
     hr(result);return code;

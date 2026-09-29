@@ -31,6 +31,7 @@ import hashlib
 from datetime import datetime, timezone
 import io
 import json
+import math
 import os
 from pathlib import Path, PureWindowsPath
 import shutil
@@ -106,12 +107,33 @@ def build_analyzer(args):
 
 
 def validate_smoke_report(report):
-    """A successful decoder must distinguish our actual busy and Sleep phases."""
+    """Validate actual busy/Sleep CPU phases and explicitly mapped synthetic GPU data."""
     if not report.get("coverageComplete") or report.get("analyzedFrameCount") != 60:
         raise ValueError("Synthetic CPU trace has incomplete coverage or missing frame markers")
     frames = report.get("frames", [])
     if sorted(frame["sequence"] for frame in frames) != list(range(1, 61)):
         raise ValueError("Synthetic CPU trace did not preserve the complete frame sequence")
+    coverage = report.get("applicationGpuCompletionCoverage", {})
+    required_counts = dict(markerCount=60, explicitCpuMappings=60, legacyCpuFrames=0,
+                           unavailableCpuMappings=0, schemaErrors=0, invalidMarkers=0,
+                           duplicateGpuSequences=0, ambiguousCpuSequences=0,
+                           gpuSequencesWithoutCpuWitness=0, eventsLost=0)
+    if (report.get("eventsLost") != 0 or
+            any(coverage.get(key) != value for key, value in required_counts.items()) or
+            coverage.get("cycleStatuses") != {"valid": 60}):
+        raise ValueError("Synthetic GPU completion trace has missing, malformed, lost or ambiguous mappings")
+    for frame in frames:
+        gpu = frame.get("applicationGpu", {})
+        expected_token = 100000 + frame["sequence"]  # intentionally differs from XR
+        expected_ms = 9.0 + ((frame["sequence"] - 1) % 3) * 0.1
+        ms = gpu.get("ms")
+        if (frame.get("cpuMarkerVersion") != 2 or frame.get("gpuSequence") != expected_token or
+                gpu.get("producerSequence") != expected_token or
+                gpu.get("status") != "valid" or gpu.get("valid") is not True or
+                gpu.get("source") != 1 or gpu.get("reason") != 0 or
+                not isinstance(ms, (int, float)) or not math.isfinite(ms) or abs(ms - expected_ms) > 0.000001 or
+                not gpu.get("publicationUs") or not gpu.get("publicationQpc")):
+            raise ValueError("Synthetic GPU decoder did not preserve explicit producer identity and known duration")
     busy = [frame for frame in frames if frame["sequence"] <= 30]
     sleeping = [frame for frame in frames if frame["sequence"] > 30]
     busy_running = sum(frame["runningUs"] for frame in busy)
@@ -122,7 +144,9 @@ def validate_smoke_report(report):
         raise ValueError("Synthetic CPU decoder did not distinguish known busy execution from Sleep")
     if sum(frame.get("sampleStackCount", 0) for frame in busy) == 0:
         raise ValueError("Synthetic CPU trace has no busy-phase sampled stacks")
-    return dict(busy_running_ms=round(busy_running / 1000, 2), sleep_waiting_ms=round(sleep_waiting / 1000, 2))
+    return dict(busy_running_ms=round(busy_running / 1000, 2), sleep_waiting_ms=round(sleep_waiting / 1000, 2),
+                synthetic_gpu_samples=60, synthetic_gpu_ms=[9.0, 9.1, 9.2],
+                gpu_qualification="synthetic fixture durations; no GPU commands or hardware timing")
 
 
 def invoke(command, timeout=120):
@@ -1629,11 +1653,53 @@ def self_test():
     check({"CSwitch", "ReadyThread", "SampledProfile"}.issubset(stacks))
     provider = profile.find("./Profiles/EventProvider")
     check(provider is not None and provider.attrib["Name"].upper() == "D3885FA1-0B70-44F1-AF88-63B2012B111E")
-    report = dict(coverageComplete=True, analyzedFrameCount=60, frames=[
+    report = dict(coverageComplete=True, analyzedFrameCount=60, eventsLost=0,
+                  applicationGpuCompletionCoverage=dict(markerCount=60, explicitCpuMappings=60,
+                      legacyCpuFrames=0, unavailableCpuMappings=0, schemaErrors=0, invalidMarkers=0,
+                      duplicateGpuSequences=0, ambiguousCpuSequences=0, gpuSequencesWithoutCpuWitness=0,
+                      eventsLost=0, cycleStatuses={"valid": 60}), frames=[
         dict(sequence=i, startUs=i * 100000, endUs=(i + 1) * 100000,
+             cpuMarkerVersion=2, gpuSequence=100000+i,
+             applicationGpu=dict(status="valid", valid=True, producerSequence=100000+i,
+                                 source=1, reason=0, ms=9.0+((i-1) % 3)*0.1,
+                                 publicationUs=7000000+i, publicationQpc=70000000+i*10),
              runningUs=100000 if i <= 30 else 0, waitingUs=0 if i <= 30 else 100000,
              sampleStackCount=10 if i <= 30 else 0) for i in range(1, 61)])
     check(validate_smoke_report(report)["busy_running_ms"] == 3000)
+    check(validate_smoke_report(report)["synthetic_gpu_samples"] == 60)
+    for field in ("markerCount", "explicitCpuMappings", "legacyCpuFrames", "unavailableCpuMappings",
+                  "schemaErrors", "invalidMarkers", "duplicateGpuSequences", "ambiguousCpuSequences",
+                  "gpuSequencesWithoutCpuWitness", "eventsLost"):
+        broken = json.loads(json.dumps(report))
+        broken["applicationGpuCompletionCoverage"][field] += 1
+        try:
+            validate_smoke_report(broken)
+            check(False)
+        except ValueError:
+            check(True)
+    for field, value in (("cpuMarkerVersion", 1), ("gpuSequence", 1), ("applicationGpu", {})):
+        broken = json.loads(json.dumps(report)); broken["frames"][0][field] = value
+        try:
+            validate_smoke_report(broken)
+            check(False)
+        except ValueError:
+            check(True)
+    for field, value in (("producerSequence", 1), ("status", "missing_sequence"), ("valid", False),
+                         ("source", 0), ("reason", 5), ("ms", 9.1), ("ms", float("nan")),
+                         ("publicationQpc", 0), ("publicationUs", 0)):
+        broken = json.loads(json.dumps(report)); broken["frames"][0]["applicationGpu"][field] = value
+        try:
+            validate_smoke_report(broken)
+            check(False)
+        except ValueError:
+            check(True)
+    for field in ("applicationGpuCompletionCoverage", "eventsLost"):
+        broken = json.loads(json.dumps(report)); del broken[field]
+        try:
+            validate_smoke_report(broken)
+            check(False)
+        except ValueError:
+            check(True)
     report["frames"][0]["sequence"] = 2
     try:
         validate_smoke_report(report)

@@ -1,3 +1,4 @@
+#include "temporal_shader_bytecode.h"
 #include "fss_ring.h"
 
 #include <windows.h>
@@ -65,104 +66,7 @@ constexpr uint32_t kCbSlots = 4;
 // never set. The soft fade and every lighting term are unchanged; the
 // desk-compile matches the stock output signature exactly. Compiled once
 // at first engage on the paved shader_swap path; null means draw stock.
-constexpr char kCleanPsHlsl[] = R"HLSL(
-// The FSS ring quad's pixel shader (ps 7CECABDE34FFBE9E), transcribed
-// mechanically from docs/shaders/fss-ring-ps.asm with ONE semantic change: the
-// flag byte's bit 4 -- the dissolve's hard-black "unrevealed" state, which
-// collapses the exposure lerp to zero and paints the black squares -- is
-// treated as never set. The soft cb2[46] fade-in and every lighting term
-// are transcribed unchanged.
 
-Texture2D<float4> t0 : register(t0);   // x = ao, yz = packed normal
-Texture2D<float4> t1 : register(t1);   // rgb = albedo, a*255 = flag byte
-Texture2D<float4> t2 : register(t2);   // material (loaded .yzxw)
-Texture2D<float4> t3 : register(t3);   // illumination
-cbuffer CB2 : register(b2) { float4 c[47]; }
-
-struct PsIn {
-    float2 uv   : TEXCOORD0;
-    float3 view : TEXCOORD1;
-};
-struct PsOut {
-    float3 c0 : SV_Target0;
-    float  c1 : SV_Target1;
-};
-
-PsOut main(PsIn i) {
-    float2 fp = floor(i.uv * c[1].xy);
-    uint2  lim = uint2(c[1].xy + float2(-1.0, -1.0));
-    uint2  p = min(lim, uint2(fp));
-
-    float4 alb = t1.Load(int3(p, 0));
-    uint flags = (uint)(alb.w * 255.0 + 0.5);
-
-    float3 na = t0.Load(int3(p, 0)).xyz;
-    float2 n2 = na.yz * 4.0 - 2.0;
-    float  d2 = dot(n2, n2);
-    float  tz = sqrt(max(1.0 - d2 * 0.25, 0.0));
-    float3 ns = normalize(float3(n2 * tz, d2 * 0.5 - 1.0));
-    float3 N = ns.x * c[2].xyz + ns.y * c[3].xyz + ns.z * c[4].xyz;
-    float  ao = clamp(na.x, 0.05, 1.0);
-
-    float4 mat = t2.Load(int3(p, 0)).yzxw;
-
-    float atten, attenS;
-    if (flags & 128u) {
-        atten = 1.0;
-        attenS = 1.0;
-    } else {
-        if (flags & 64u) mat.xy = mat.zz;
-        float fade = 1.0 - mat.w;
-        atten  = 1.0 - fade * c[46].x;
-        attenS = 1.0 - fade * c[46].y;
-    }
-
-    float3 V = normalize(i.view);
-
-    // Stock: float blackFlag = (flags & 4u) ? 0.0 : 1.0;  -- THE SQUARES.
-    const float blackFlag = 1.0;
-
-    if (((flags & 32u) != 0u) && dot(-c[42].xyz, N) < 0.0) N = -N;
-
-    float3 H = normalize(-V - c[42].xyz);
-    float NdL = saturate(dot(N, -c[42].xyz));
-    float NdV = saturate(dot(N, -V));
-    float NdH = saturate(dot(N, H));
-
-    float  dif = NdL * 0.318310;
-    float3 diffuse = alb.xyz * dif;
-
-    float ao2 = ao * ao;
-    float ao4 = ao2 * ao2;
-    float den = min((NdH * ao4 - NdH) * NdH + 1.000001, 1.0);
-    den = den * den * 3.141592;
-    float D = ao4 / den;
-
-    float fh = 1.0 - abs(dot(-c[42].xyz, H));
-    float f2 = fh * fh;
-    float fres = fh * (f2 * f2);
-    float3 F = mat.zxy + (1.0 - mat.zxy) * fres;
-
-    float visL = NdL * (2.0 - ao2) + ao2;
-    float visV = NdV * (2.0 - ao2) + ao2;
-    float3 spec = (D / (visL * visV)) * F * NdL * attenS;
-
-    float3 col = (diffuse * atten + spec) * c[40].xyz;
-    float3 aux = dif * c[40].xyz;
-
-    // Stock: lum = dot(t3.Load(p).xyz, c[44].xyz) -- t3 is the per-eye
-    // illumination map the game fills tile by tile across the build, and
-    // scale = lerp(lum, blackFlag, c[36].x) * c[36].y collapses unfilled
-    // tiles to black. The ring's CONTENT (t1) is complete from the first
-    // frame; only this map staggers in. Full illumination, always:
-    float scale = c[36].y;
-
-    PsOut o;
-    o.c0 = scale * col * c[0].x;
-    o.c1 = dot(scale * aux, float3(0.308600, 0.609400, 0.082000)) * c[0].x;
-    return o;
-}
-)HLSL";
 
 // The G-buffer hold, clean's fourth half (round 28). The two-pass blink
 // dump measured the surviving squares as OSCILLATION: the offscreen ring
@@ -174,21 +78,7 @@ PsOut main(PsIn i) {
 // current texel where it is valid and last frame's where it collapsed,
 // ping-ponged per eye, and the quad (slot 0) and mesh (slot 1) sample
 // the held copy. Compute-stage injection touches no graphics state.
-constexpr char kHoldCsHlsl[] = R"HLSL(
-Texture2D<float4> cur  : register(t0);
-Texture2D<float4> prev : register(t1);
-RWTexture2D<float4> outt : register(u0);
-[numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    uint w, h;
-    cur.GetDimensions(w, h);
-    if (id.x >= w || id.y >= h) return;
-    float4 c = cur[id.xy];
-    float4 p = prev[id.xy];
-    bool valid = dot(abs(c.xyz), 1.0.xxx) > 0.02;
-    outt[id.xy] = valid ? c : p;
-}
-)HLSL";
+
 
 ID3D11ComputeShader* g_holdCs = nullptr;
 bool                 g_holdTried = false;
@@ -285,10 +175,7 @@ ID3D11ShaderResourceView* holdAdvance(ID3D11DeviceContext* ctx,
 
     if (!g_holdCs && !g_holdTried) {
         g_holdTried = true;
-        g_holdCs = shaderSwapCompileCs(ctx, kHoldCsHlsl,
-                                       sizeof(kHoldCsHlsl) - 1, "main",
-                                       "fss_ring_hold_cs", nullptr,
-                                       "fss ring hold");
+        g_holdCs = shaderSwapCreateCs(ctx, kFssRingHoldBytecode, sizeof(kFssRingHoldBytecode), "fss_ring_hold_cs", "fss ring hold");
     }
     if (!g_holdCs) return nullptr;
 
@@ -690,9 +577,7 @@ void fssRingBegin(ID3D11DeviceContext* ctx) {
             if (g_pendingFam == 0) {
                 if (!g_cleanPs && !g_cleanTried) {
                     g_cleanTried = true;
-                    g_cleanPs = shaderSwapCompilePs(
-                        ctx, kCleanPsHlsl, sizeof(kCleanPsHlsl) - 1, "main",
-                        "fss_ring_clean_ps", nullptr, "fss ring clean");
+                    g_cleanPs = shaderSwapCreatePs(ctx, kFssRingCleanBytecode, sizeof(kFssRingCleanBytecode), "fss_ring_clean_ps", "fss ring clean");
                 }
                 if (g_cleanPs) {
                     ctx->PSGetShader(&g_savedPs, nullptr, nullptr);

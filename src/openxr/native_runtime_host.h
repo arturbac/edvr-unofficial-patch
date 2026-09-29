@@ -907,18 +907,21 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       // Start after the route returns so the dispatch/rendezvous is outside
       // the application interval. Direct owner calls have no producer-side
       // route return and therefore do not claim this interval.
+      uint64_t producerSequence=0;
       if(dispatched&&result==vr::VRCompositorError_None&&out.sequence) {
         const auto sequence=timingApplicationSequence.load(std::memory_order_acquire);
         timing.producerResume(sequence);
         const bool opened=timing.applicationSegment(sequence,true);
         timingApplicationOpen.store(opened,std::memory_order_release);
         timingApplicationSequence.store(opened?sequence:0,std::memory_order_release);
+        producerSequence=opened?sequence:0;
       }
       frameCycles.waitCallerEnd(cycleToken,out.sequence,frameCycleUs(),GetTickCount64(),caller,cycleShape,
-        dispatched&&result==vr::VRCompositorError_None&&out.sequence);
+        dispatched&&result==vr::VRCompositorError_None&&out.sequence,producerSequence);
       FrameCycleStats::Completed completed{};
       if(frameCycles.takeCompleted(completed)) {
-        EdvrNativeCpuCompletedFramePayload event{};event.timestampUs=completed.nextWaitReturnUs;
+        EdvrNativeCpuCompletedFramePayloadV2 payload{};auto& event=payload.frame;
+        event.timestampUs=completed.nextWaitReturnUs;payload.gpuSequence=completed.producerSequence;
         event.sequence=completed.sequence;event.generation=completed.generation;event.featureEpoch=completed.featureEpoch;
         event.waitReturnUs=completed.waitReturnUs;event.secondSubmitReturnUs=completed.secondSubmitReturnUs;
         event.nextWaitEntryUs=completed.nextWaitEntryUs;event.nextWaitReturnUs=completed.nextWaitReturnUs;
@@ -927,7 +930,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
         event.status=completed.postUnavailable;event.sceneReady=completed.sceneReady;
         if(completed.postValid)event.flags|=EdvrNativeCpuPostValid;
         if(completed.singlePresent)event.flags|=EdvrNativeCpuSinglePresent;
-        NativeCpuTrace::get().emitFrame(event);
+        NativeCpuTrace::get().emitFrame(payload);
         noteLongCycle(completed);
       }
       frameCycleSequence.store(dispatched&&result==vr::VRCompositorError_None?out.sequence:0,std::memory_order_release);

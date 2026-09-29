@@ -742,17 +742,18 @@ inline UiLayerFamily uiLayerFamilyFor(const UiFamilyFacts& f, UiFamilyWhy* why =
         // holo_families.h's take-only list (kHoloFamiliesTake). The canopy
         // is deliberately NOT on that list -- it sits in front of the whole
         // sky, and covering it would smear the stars behind it, the depth
-        // pass's own reasoning -- and neither are the three the phase-3
+        // pass's own reasoning -- and neither are the two the phase-3
         // review refused (the target sphere's pixel-coordinate depth load,
-        // the corona family's shared world/cockpit shader pair, the
-        // world-marker reticle's unproven reads): a draw of one matches
-        // nothing here and stays stock, exactly as the pass's refusals keep
-        // their own scene rendering.
+        // the corona family's shared world/cockpit shader pair): those draws
+        // match nothing here and stay stock, exactly as the pass's refusals keep
+        // their own scene rendering. The separately measured world-marker
+        // pair has no screen-space reads and is admitted by both hashes.
         out = f.vs == kUiVsHolo        ? UiLayerFamily::kHolo
               : f.vs == kUiVsFlightHud ? UiLayerFamily::kFlightHud
               : f.vs == kUiVsSprite    ? UiLayerFamily::kSprite
-              : uiHoloGenericHash(f.vs) ? UiLayerFamily::kHoloGeneric
-                                       : UiLayerFamily::kNone;
+              : (uiHoloGenericHash(f.vs) ||
+                 (f.vs == kHoloWorldMarkerReticle && f.ps == kHoloWorldMarkerReticlePs))
+                  ? UiLayerFamily::kHoloGeneric : UiLayerFamily::kNone;
         if (out != UiLayerFamily::kNone) w = UiFamilyWhy::kDirect;
     } else if (f.excluded) {
         w = UiFamilyWhy::kExcluded;

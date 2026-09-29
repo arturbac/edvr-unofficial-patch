@@ -1,3 +1,4 @@
+#include "temporal_shader_bytecode.h"
 #include "hud_sprite.h"
 
 #include <windows.h>
@@ -22,7 +23,7 @@
 #include "fsr/ffx_a.h"
 #include "fsr/ffx_fsr1.h"
 
-#include "fsr_hlsl_gen.h"   // the same two files, as HLSL string chunks
+// Fixed shader bytecode is generated during the build. //   // the same two files, as HLSL string chunks
 
 namespace edvr {
 
@@ -67,55 +68,16 @@ constexpr uint32_t kMinSrc = 16;
 // be thrifty with it.
 constexpr uint32_t kMaxAtlas = 24;
 
-const char kGpuPrologue[] =
-    "#define A_GPU 1\n"
-    "#define A_HLSL 1\n";
+
 
 // EASU and RCAS, wrapped in the callbacks AMD's header asks for. Identical
 // in shape to intro_upscale's, because it is the same job: resample a
 // texture we do not own into one we do.
-const char kEasuMain[] =
-    "Texture2D<float4> Src : register(t0);\n"
-    "SamplerState Smp : register(s0);\n"
-    "RWTexture2D<float4> Dst : register(u0);\n"
-    "cbuffer P : register(b0) {\n"
-    "    uint4 con0; uint4 con1; uint4 con2; uint4 con3; uint2 dstSize;\n"
-    "};\n"
-    "AF4 FsrEasuRF(AF2 p) { return Src.GatherRed(Smp, p); }\n"
-    "AF4 FsrEasuGF(AF2 p) { return Src.GatherGreen(Smp, p); }\n"
-    "AF4 FsrEasuBF(AF2 p) { return Src.GatherBlue(Smp, p); }\n"
-    "[numthreads(8,8,1)]\n"
-    "void main(uint3 id : SV_DispatchThreadID) {\n"
-    "    if (id.x >= dstSize.x || id.y >= dstSize.y) return;\n"
-    "    AF3 c;\n"
-    "    FsrEasuF(c, id.xy, con0, con1, con2, con3);\n"
-    "    // ALPHA MATTERS HERE, unlike the intro movie. These are cut-out\n"
-    "    // sprites on a transparent atlas, and EASU has no alpha path -- so\n"
-    "    // alpha is resampled with a plain bilinear tap at the same place.\n"
-    "    float2 uv = (float2(id.xy) + 0.5) / float2(dstSize);\n"
-    "    float a = Src.SampleLevel(Smp, uv, 0).a;\n"
-    "    Dst[id.xy] = float4(c, a);\n"
-    "}\n";
 
-const char kRcasMain[] =
-    "Texture2D<float4> Src : register(t0);\n"
-    "RWTexture2D<float4> Dst : register(u0);\n"
-    "cbuffer P : register(b0) { uint4 con; uint2 dstSize; };\n"
-    "AF4 FsrRcasLoadF(ASU2 p) { return Src.Load(int3(p, 0)); }\n"
-    "void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}\n"
-    "[numthreads(8,8,1)]\n"
-    "void main(uint3 id : SV_DispatchThreadID) {\n"
-    "    if (id.x >= dstSize.x || id.y >= dstSize.y) return;\n"
-    "    AF3 c;\n"
-    "    FsrRcasF(c.r, c.g, c.b, id.xy, con);\n"
-    "    Dst[id.xy] = float4(c, Src.Load(int3(id.xy, 0)).a);\n"
-    "}\n";
 
-std::string joinChunks(const char* const* chunks) {
-    std::string out;
-    for (const char* const* c = chunks; *c; ++c) out += *c;
-    return out;
-}
+
+
+
 
 struct Tex {
     ID3D11Texture2D*           tex = nullptr;
@@ -226,25 +188,16 @@ bool ensureShaders(ID3D11DeviceContext* ctx, ID3D11Device* dev) {
     // forever while the log said sharpening was on. Each piece is checked
     // for itself; all of them are one-time.
     if (!g_csEasu) {
-        const std::string easu = std::string(kGpuPrologue) +
-                                 joinChunks(kFfxAChunks) +
-                                 "#define FSR_EASU_F 1\n" +
-                                 joinChunks(kFfxFsr1Chunks) + kEasuMain;
-        g_csEasu = shaderSwapCompileCs(ctx, easu.c_str(), easu.size(), "main",
-                                       "hud sprite easu", nullptr,
-                                       "hud icons");
+
+        g_csEasu = shaderSwapCreateCs(ctx, kHudSpriteEasuBytecode, sizeof(kHudSpriteEasuBytecode), "hud sprite easu", "hud icons");
         if (!g_csEasu) {
             standDown("EASU would not compile");
             return false;
         }
     }
     if (g_sharpen >= 0.0f && !g_csRcas) {
-        const std::string rcas = std::string(kGpuPrologue) +
-                                 joinChunks(kFfxAChunks) +
-                                 "#define FSR_RCAS_F 1\n" +
-                                 joinChunks(kFfxFsr1Chunks) + kRcasMain;
-        g_csRcas = shaderSwapCompileCs(ctx, rcas.c_str(), rcas.size(), "main",
-                                       "hud sprite rcas", nullptr, "hud icons");
+
+        g_csRcas = shaderSwapCreateCs(ctx, kHudSpriteRcasBytecode, sizeof(kHudSpriteRcasBytecode), "hud sprite rcas", "hud icons");
         if (!g_csRcas) {
             Log::get().note("hud icons: RCAS would not compile; the atlas is "
                             "upscaled without the sharpening pass.");

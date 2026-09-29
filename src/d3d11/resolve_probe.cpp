@@ -1,3 +1,4 @@
+#include "temporal_shader_bytecode.h"
 #include "resolve_probe.h"
 
 #include <windows.h>
@@ -51,47 +52,7 @@ constexpr uint64_t kResolvePs = 0x7CECABDE34FFBE9EULL;
 //
 // Desk-compiled by tools/compile_variants.py before it ships, both
 // variants. The game is never the compiler's first audience.
-constexpr char kProbePsHlsl[] = R"HLSL(
-Texture2D<float4> gt0 : register(t0);
-Texture2D<float4> gt1 : register(t1);
-Texture2D<float4> gt2 : register(t2);
-Texture2D<float4> gt3 : register(t3);
 
-cbuffer Resolve : register(b2) { float4 c[48]; };
-
-struct VSOut {
-    float2 uv  : TEXCOORD0;
-    float3 ray : TEXCOORD1;
-};
-
-struct PSOut {
-    float3 col : SV_TARGET0;
-    float  lum : SV_TARGET1;
-};
-
-PSOut main(VSOut i) {
-    PSOut o;
-    o.lum = 0.0;
-#ifdef PROBE_WHITE
-    // Constant everywhere. The resolve covers the whole screen, so anything
-    // that is NOT this colour afterwards is a region where the write was
-    // rejected downstream of the pixel shader.
-    o.col = float3(1.0, 1.0, 1.0);
-#else
-    int2 px = (int2)floor(i.uv * c[1].xy);
-    px = min(px, (int2)c[1].xy - 1);
-    px = max(px, int2(0, 0));
-    float4 g1 = gt1.Load(int3(px, 0));
-    float4 g2 = gt2.Load(int3(px, 0));
-    float4 g3 = gt3.Load(int3(px, 0));
-    // red = the flag byte (bit 128 bypasses the multiplier below)
-    // green = t2.w, the multiplier that blacks the surface when zero
-    // blue = the shadow mask
-    o.col = float3(g1.w, g2.w, g3.x);
-#endif
-    return o;
-}
-)HLSL";
 
 // The shader modes replace what the pass COMPUTES; the state modes leave
 // the game's own shader alone and change what is allowed to SURVIVE it.
@@ -326,13 +287,11 @@ void resolveProbeBegin(ID3D11DeviceContext* ctx) {
         if (isShaderMode(detail::g_resolveProbeShaderMode)) {
             if (!g_probePs && !g_tried) {
                 g_tried = true;
-                const SwapMacro white[] = {{"PROBE_WHITE", "1"},
-                                           {nullptr, nullptr}};
-                g_probePs = shaderSwapCompilePs(
-                    ctx, kProbePsHlsl, sizeof(kProbePsHlsl) - 1, "main",
-                    "resolve_probe_ps",
-                    detail::g_resolveProbeShaderMode == Mode::kWhite ? white : nullptr,
-                    "resolve probe");
+                const bool white = detail::g_resolveProbeShaderMode == Mode::kWhite;
+                g_probePs = shaderSwapCreatePs(
+                    ctx, white ? kResolveProbeWhiteBytecode : kResolveProbeBytecode,
+                    white ? sizeof(kResolveProbeWhiteBytecode) : sizeof(kResolveProbeBytecode),
+                    "resolve_probe_ps", "resolve probe");
             }
             if (!g_probePs) return;   // shader_swap said why; draw stock
             ctx->PSGetShader(&g_savedPs, nullptr, nullptr);

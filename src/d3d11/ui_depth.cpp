@@ -1,3 +1,5 @@
+#include "temporal_shader_bytecode.h"
+#include "fixed_shader_source.h"
 #include "ui_depth.h"
 #include "ui_depth_layer.h"
 #include "stellar_coverage.h"
@@ -346,39 +348,13 @@ uint32_t g_variantLoggedCount = 0;
 // where the interface covers, and with the mask bound as its colour target
 // it marks the same pixels for NVIDIA. b13 carries (alpha floor, strength);
 // the game's composites declare b2 alone, so b13 is free.
-const char kPanelDepthHlsl[] = EDVR_UI_CHANGE_INPUT
-    "Texture2D<float4> Surf : register(t1);\n"
-    "SamplerState Smp : register(s1);\n"
-    "cbuffer P : register(b13) { float4 floorAndStrength; };\n"
-    "struct In {\n"
-    "    float4 tc0 : TEXCOORD0;\n"
-    "    float3 tc2 : TEXCOORD2;\n"
-    "    float3 tc4 : TEXCOORD4;\n"
-    "    float3 tc5 : TEXCOORD5;\n"
-    "    float2 tc6 : TEXCOORD6;\n"
-    "};\n"
-    "float4 main(In i, out float edit : SV_Target2) : SV_Target0 {\n"
-    "    float a = Surf.Sample(Smp, i.tc6).a;\n"
-    "    edit = uiEdit(i.tc6);\n"
-    "    clip(max(a - floorAndStrength.x, edit - 1.0/255.0));\n"
-    "    return floorAndStrength.w;\n"
-    "}\n";
+
 // These direct screen composites do not add the holo material's glow.
 // Inactive comms icons have alpha below the general 0.5 floor: dropping
 // them gave the visible strokes sky motion (eye_164038). Keep all visible
 // coverage down to one 8-bit alpha step, including their antialiased edges.
 // Sprite/target-marker and hologram thresholds remain separate.
-const char kScreenDepthHlsl[] = EDVR_UI_CHANGE_INPUT
-    "Texture2D<float4> Surf : register(t0);\n"
-    "SamplerState Smp : register(s0);\n"
-    "cbuffer P : register(b13) { float4 floorAndStrength; };\n"
-    "struct In { float2 tc0 : TEXCOORD0; };\n"
-    "float4 main(In i, out float edit : SV_Target2) : SV_Target0 {\n"
-    "    float a = Surf.Sample(Smp, i.tc0).a;\n"
-    "    edit = uiEdit(i.tc0);\n"
-    "    clip(max(a - min(floorAndStrength.x, 1.0 / 255.0), edit - 1.0/255.0));\n"
-    "    return floorAndStrength.w;\n"
-    "}\n";
+
 // Unlike the screen composite, sprite VS E508648660A352B2 explicitly
 // writes clip Z = abs(clip W) (instructions 83..85). Its raster depth is
 // therefore 1 for every visible sprite, not its physical depth. Recover
@@ -387,25 +363,7 @@ const char kScreenDepthHlsl[] = EDVR_UI_CHANGE_INPUT
 // sprite records sit at 16.6 km, exactly over the chevrons with depth 1.
 // The original sprite draw disables depth testing; preserve that visible
 // coverage over nearer scene geometry without replacing its nearer depth.
-const char kSpriteDepthHlsl[] = EDVR_UI_CHANGE_INPUT R"HLSL(
-Texture2D<float4> Surf : register(t0);
-Texture2D<float> SceneDeviceDepth : register(t2);
-SamplerState Smp : register(s0);
-cbuffer P : register(b13) { float4 floorAndStrength; float4 sceneProjection; };
-cbuffer Motion : register(b12) { uint4 motionInfo; };
-struct In { float2 tc0 : TEXCOORD0; float4 pos : SV_Position; };
-float4 main(In i, out float depth : SV_Depth, out float2 motion : SV_Target1, out float edit : SV_Target2) : SV_Target0 {
-    // This composite has no holo glow. Retain its faint antialiased strokes,
-    // but never turn erased scrolling ticks into 32-frame terrain strips.
-    // Departed text is already cleared by the post-resolve influence history.
-    clip(Surf.Sample(Smp, i.tc0).a - min(floorAndStrength.x, 1.0/255.0));
-    edit = uiEdit(i.tc0);
-    float own = sceneProjection.x + sceneProjection.y / max(i.pos.w, 0.000001);
-    depth = max(own, SceneDeviceDepth.Load(int3(int2(i.pos.xy),0)));
-    motion = float2(motionInfo.x+1, depth);
-    return floorAndStrength.w;
-}
-)HLSL";
+
 // The holo material: the cockpit's panels and, instanced from the pool at
 // the target, the target markers. Its depth was written in place by the
 // game's own draw under the writing twin until 2026-09-09, this shader only
@@ -420,29 +378,9 @@ float4 main(In i, out float depth : SV_Depth, out float2 motion : SV_Target1, ou
 // nonzero source coverage, like the comms panel. This includes translucent
 // panel backing; one composited pixel cannot carry both panel and sky
 // motion. Distant markers retain the old cutoff and never stamp their glow.
-const char kHoloDepthBody[] = EDVR_UI_CHANGE_INPUT
-    "SamplerState Smp : register(s1);\n"
-    "cbuffer P : register(b13) { float4 floorAndStrength; float4 sceneProjection; };\n"
-    "cbuffer Motion : register(b12) { uint4 motionInfo; };\n"
-    "struct In {\n"
-    "    float4 tc0 : TEXCOORD0;\n"
-    "    float3 tc4 : TEXCOORD4;\n"
-    "    float3 tc6 : TEXCOORD6;\n"
-    "    float3 tc7 : TEXCOORD7;\n"
-    "    float2 tc8 : TEXCOORD8;\n"
-    "    float4 pos : SV_Position;\n"
-    "};\n"
-    "float4 main(In i, out float2 motion : SV_Target1, out float edit : SV_Target2) : SV_Target0 {\n"
-    "    float a = Surf.Sample(Smp, i.tc8).a;\n"
-    "    float den = i.pos.z - sceneProjection.x;\n"
-    "    bool cockpit = den > 0 && sceneProjection.y > 0 && sceneProjection.y / den < sceneProjection.z;\n"
-    "    edit = uiEdit(i.tc8);\n"
-    "    clip(max(a - (cockpit ? min(floorAndStrength.x, 1.0 / 255.0) : floorAndStrength.x), edit - 1.0/255.0));\n"
-    "    motion = float2(motionInfo.x+1, i.pos.z);\n"
-    "    return floorAndStrength.w;\n"
-    "}\n";
-const std::string kHoloDepthHlsl = "Texture2D<float4> Surf : register(t2);\n" + std::string(kHoloDepthBody);
-const std::string kHoloUnlitDepthHlsl = "Texture2D<float4> Surf : register(t1);\n" + std::string(kHoloDepthBody);
+
+
+
 
 // THE SMOKE'S COVERAGE (kSmokeVs): ps BD801F2FB02522EB register for register
 // -- the sphere test and the soft fade against the depth resolve at t0
@@ -450,77 +388,7 @@ const std::string kHoloUnlitDepthHlsl = "Texture2D<float4> Surf : register(t1);\
 // the alpha their product -- then the pass's depth under the dense core
 // alone. The floor is the interface's capped low: additive smoke is faint by
 // design, and a core above eight percent is the part that shows.
-const char kSmokeDepthHlsl[] =
-    "Texture2D<float4> Depth : register(t0);\n"
-    "Texture2D<float4> Streak : register(t1);\n"
-    "SamplerState Smp0 : register(s0);\n"
-    "SamplerState Smp1 : register(s1);\n"
-    "cbuffer CB1 : register(b1) { float4 cb1[211]; };\n"
-    "cbuffer CB2 : register(b2) { float4 cb2[3]; };\n"
-    "#ifdef CORONA_MOTION\n"
-    "Texture2D<float> SceneDepth : register(t2);\n"
-    "cbuffer Motion : register(b12) { uint4 motionInfo; };\n"
-    "#endif\n"
-    "cbuffer P : register(b13) { float4 floorAndStrength; float4 proj; };\n"
-    "struct In {\n"
-    "    float3 tc0 : TEXCOORD0;\n"
-    "    float3 tc1 : TEXCOORD1;\n"
-    "    float3 tc2 : TEXCOORD2;\n"
-    "    float2 tc3 : TEXCOORD3;\n"
-    "    float4 pos : SV_Position;\n"
-    "};\n"
-    "#ifdef CORONA_MOTION\n"
-    "float4 main(In i, out float oDepth : SV_Depth, out float4 motion : SV_Target1) : SV_Target0 {\n"
-    "#else\n"
-    "float4 main(In i, out float oDepth : SV_Depth) : SV_Target0 {\n"
-    "#endif\n"
-    "    float3 d = i.tc2 - i.tc0;\n"
-    "    float dd = (dot(d, d) - cb1[126].x * cb1[126].x) * 4.0;\n"
-    "    float3 n = normalize(i.tc2);\n"
-    "    float a = dot(-n, d);\n"
-    "    float b = a + a;\n"
-    "    float disc = sqrt(b * b - dd);\n"
-    "    bool hit = 0.0 < disc;\n"
-    "    float t = hit ? (-a * 2.0 + disc) * 0.5 : 0.0;\n"
-    "    float sphereZ = -n.z * t + i.tc2.z;\n"
-    "    float2 uv = i.tc1.xy / i.tc1.z * float2(0.5, -0.5) + 0.5;\n"
-    "    float sceneZ = Depth.Sample(Smp1, uv).x;\n"
-    "    if (sceneZ - sphereZ + cb1[126].x * 0.0001 < 0.0) discard;\n"
-    "    float fade = saturate((sceneZ - i.tc1.z) / (cb1[126].x * 0.4));\n"
-    "    fade = hit ? 1.0 : fade;\n"
-    "    fade *= cb1[126].z * cb2[1].z;\n"
-    "    float2 uv1 = float2(i.tc3.x - cb1[210].y * cb2[1].w, (i.tc3.y + 1.0) * 0.5);\n"
-    "    float2 uv2 = float2(i.tc3.x + cb1[210].y * cb2[2].x, i.tc3.y * 0.5);\n"
-    "    float streak = Streak.Sample(Smp0, uv1).x + Streak.Sample(Smp0, uv2).x;\n"
-    "    float alpha = fade * streak;\n"
-    "    // The mask (the review of 2026-09-10): w is the strength at full\n"
-    "    // opacity, and the value follows the smoke's own alpha up to it,\n"
-    "    // quantised to an ODD quantum -- the pass keeps the camera's path\n"
-    "    // under an odd one (floorBuffer). w of nought is the one-quantum\n"
-    "    // mark of before, as good as unmarked to NVIDIA.\n"
-    "    float q = floor(saturate(alpha * floorAndStrength.w) * 63.0 + 0.5);\n"
-    "    // The dense core (alpha at the floor or above) writes its depth;\n"
-    "    // the fringe under it writes none -- the target is EDVR's own,\n"
-    "    // cleared to the far value, so a far depth changes nothing -- and\n"
-    "    // marks the mask only where the strength gives it a quantum, so\n"
-    "    // the mark fades with the smoke instead of stepping at the floor\n"
-    "    // (the review's second note).\n"
-    "    bool core = alpha >= floorAndStrength.z;\n"
-    "    clip((core || q > 0.0) ? 1.0 : -1.0);\n"
-    "    // The depth from the ribbon's own view depth (TEXCOORD1.z, the\n"
-    "    // value its shader compares with the depth resolve) in the scene's\n"
-    "    // encoding: the raster's z is the vertex shader's clip z plus a\n"
-    "    // constant (15.01, before the divide) whose meaning rests on the\n"
-    "    // matrix the game uploads (the review's lead), while this is exact.\n"
-    "    // The raster's z when no projection is known.\n"
-    "    float own = proj.y != 0.0 ? proj.x + proj.y / max(i.tc1.z, 0.01) : i.pos.z;\n"
-    "    oDepth = core ? own : 0.0;\n"
-    "#ifdef CORONA_MOTION\n"
-    "    bool coronaVisible = core && own >= SceneDepth.Load(int3(int2(i.pos.xy),0));\n"
-    "    motion = float4(motionInfo.x+1u, own, 0.0, coronaVisible ? 1.0 : 0.0);\n"
-    "#endif\n"
-    "    return (4.0 * q + 3.0) / 255.0; // class 3: smoke, not UI evidence\n"
-    "}\n";
+
 
 // THE FLIGHT HUD'S COVERAGE, for the depth pass in the scene's projection.
 //
@@ -545,87 +413,7 @@ const char kSmokeDepthHlsl[] =
 // The opacity calculation follows the captured PS, including its noise,
 // strength, ray length and fade. Only genuinely opaque cores own motion;
 // transparent station detail under the glyph keeps its scene motion.
-const char kHudDepthHlsl[] = R"HLSL(
-Texture2D<float4> Depth : register(t0);
-Texture2D<float4> Noise : register(t1);
-Texture2D<float> SceneDeviceDepth : register(t2);
-SamplerState Smp0 : register(s0);
-SamplerState Smp1 : register(s1);
-cbuffer CB1 : register(b1) { float4 cb1[205]; };
-cbuffer P : register(b13) { float4 floorAndStrength; float4 sceneProjection; };
-struct In {
-    float4 tc0 : TEXCOORD0; float4 tc1 : TEXCOORD1;
-    float4 tc2 : TEXCOORD2; float4 tc5 : TEXCOORD5;
-    float4 tc9 : TEXCOORD9; float4 tc10 : TEXCOORD10;
-    float4 tc13 : TEXCOORD13; float4 tc16 : TEXCOORD16;
-    float2 tc17 : TEXCOORD17; float3 tc18 : TEXCOORD18;
-    float4 pos : SV_Position;
-};
-// ps 8DEF46452FA459F5, instructions 120..131 (repeated for three octaves).
-float hudNoise(float3 p) {
-    float3 cell=floor(p), f=frac(p);
-    float3 u=f*f*(3.0-2.0*f);
-    float2 uv=(cell.xy+cell.z*float2(37,17)+u.xy+0.5)/256.0;
-    float2 n=Noise.SampleLevel(Smp0,uv,-100.0).xy;
-    return lerp(n.y,n.x,u.z);
-}
-float4 main(In i, out float oDepth : SV_Depth) : SV_Target {
-    float2 uv=i.tc1.xy/i.tc1.z*0.5+0.5;
-    float sceneZ=Depth.Sample(Smp1,float2(uv.x,1.0-uv.y)).x;
-    clip(sceneZ-i.tc1.z); clip(i.tc5.w-0.01);
-    float k=cb1[204].x/(cb1[204].x+0.00001);
-    float fade=saturate(length(i.tc10.xyz)*0.05-i.tc13.w*0.5);
-    float near=saturate(i.tc9.w/max(cb1[204].x,0.01));
-    float opacity=k*(near-fade)+fade;
-    float floorAlpha=max(floorAndStrength.x,0.7);
-    clip(opacity-floorAlpha);
-    float3 seg=i.tc5.xyz-i.tc16.xyz; clip(length(seg)-0.01);
-    float3 e=i.tc18-i.tc5.xyz;
-    float t=dot(e,-seg)/(seg.x*seg.x);
-    float dist=t<0.0?length(e):t>1.0?length(i.tc18-i.tc16.xyz):length(e+t*seg);
-    bool screen=i.tc2.w>0.5;
-    float nd=screen?i.tc17.x*2.0-1.0:saturate(dist/i.tc13.w);
-    float q=nd*nd; clip(1.0-q);
-    float3 ray=normalize(i.tc18-i.tc0.xyz);
-    float radius=max(i.tc16.w,0.176809);
-    float halfSpan=max(sqrt(1.0-q)*i.tc13.w/radius,0.000001);
-    float3 origin=i.tc18-ray*(i.tc17.y/radius);
-    float start=-halfSpan, finish=halfSpan;
-    if(screen) {
-        float distance=length(origin-i.tc0.xyz);
-        start=max(i.tc10.w-distance,-halfSpan);
-        finish=min(i.tc1.w-distance,halfSpan);
-    }
-    clip(finish-start);
-    int steps=asint(cb1[203].w); clip(float(steps)-0.5);
-    float step=(finish-start)/float(steps);
-    float strength=min(sqrt(i.tc5.w),1.0);
-    strength=min(strength*strength*(3.0-2.0*strength),1.0);
-    strength*=i.tc0.w*0.2*lerp(cb1[203].x,cb1[202].w,i.tc2.w);
-    strength=saturate(strength*3.333333);
-    strength=strength*strength*(3.0-2.0*strength);
-    float3 axis=normalize(-seg);
-    float transmission=1.0, travel=start;
-    // The original opacity march, including its live noise table. A
-    // geometric upper bound marks pixels whose real opacity may be zero.
-    [loop] for(int n=0;n<steps;++n) {
-        float3 p=ray*travel+origin;
-        float3 offset=axis*length(i.tc13.xyz-p)*0.1;
-        float noise=hudNoise(p*0.25+offset)+0.5*hudNoise(p*0.5+offset)+0.25*hudNoise(p+offset);
-        float density=saturate(noise*0.571429-(travel/halfSpan)*(travel/halfSpan)-q);
-        density=density*density*(3.0-2.0*density);
-        transmission*=exp2(-density*strength*step);
-        travel+=step;
-    }
-    clip(opacity*(1.0-transmission)-floorAlpha);
-    // The resolved depth and clip W support the game's own occlusion test.
-    // They need not share the temporal pass's metre encoding. Preserve the
-    // actual device depth under floating strokes, without re-encoding it.
-    bool attached=i.tc1.z*1.5>=sceneZ;
-    oDepth=attached?i.pos.z:SceneDeviceDepth.Load(int3(int2(i.pos.xy),0));
-    return attached?floorAndStrength.y:floorAndStrength.w;
-}
-)HLSL";
+
 
 // A transcription stands in for the pixel shaders it names -- and, when the
 // game draws a variant none of them names, for any pixel shader of the same
@@ -642,7 +430,7 @@ struct DepthShader {
     uint64_t            ps[kMaxStandIns];  // the game's pixel shaders it stands in for
     uint64_t            vs[kMaxStandIns];  // their vertex families, for a variant
     uint32_t            slot;              // the PS SRV slot its HLSL reads
-    const char*         hlsl;
+    const void*         bytecode;
     size_t              len;
     const char*         name;
     ID3D11PixelShader*  shader;
@@ -650,27 +438,27 @@ struct DepthShader {
 };
 DepthShader g_depthShaders[9] = {
     {{kPanelPs, kPanelPsTinted, kPanelPsCheap, 0}, {kPanelVs, 0, 0, 0}, 1,
-     kPanelDepthHlsl, sizeof(kPanelDepthHlsl) - 1, "ui_depth_panel_ps", nullptr, false},
+     kUiDepthPanelBytecode, sizeof(kUiDepthPanelBytecode), "ui_depth_panel_ps", nullptr, false},
     // The flight HUD's coverage (kHudDepthHlsl): its slot is the depth
     // resolve it tests against, not an interface surface, so no variant of
     // another family can borrow it by slot.
     {{kFlightHudPs, 0, 0, 0}, {kFlightHud, 0, 0, 0}, 0xFFFFu,
-     kHudDepthHlsl, sizeof(kHudDepthHlsl) - 1, "ui_depth_hud_ps", nullptr, false},
+     kUiDepthHudBytecode, sizeof(kUiDepthHudBytecode), "ui_depth_hud_ps", nullptr, false},
     {{kScreenPs, kScreenGammaPs, 0, 0}, {kScreenVs, 0, 0, 0}, 0,
-     kScreenDepthHlsl, sizeof(kScreenDepthHlsl) - 1, "ui_depth_screen_ps", nullptr, false},
+     kUiDepthScreenBytecode, sizeof(kUiDepthScreenBytecode), "ui_depth_screen_ps", nullptr, false},
     {{kHoloPanelPs, 0, 0, 0}, {kHoloPanel, 0, 0, 0}, 2,
-     kHoloDepthHlsl.c_str(), kHoloDepthHlsl.size(), "ui_depth_holo_ps", nullptr, false},
+     kUiDepthHoloBytecode, sizeof(kUiDepthHoloBytecode), "ui_depth_holo_ps", nullptr, false},
     // The drives' smoke: its slot is the depth resolve, as the flight HUD's.
     {{kSmokePs, 0, 0, 0}, {kSmokeVs, 0, 0, 0}, 0xFFFFu,
-     kSmokeDepthHlsl, sizeof(kSmokeDepthHlsl) - 1, "ui_depth_smoke_ps", nullptr, false},
+     kUiDepthSmokeBytecode, sizeof(kUiDepthSmokeBytecode), "ui_depth_smoke_ps", nullptr, false},
     {{kSpritePs, 0, 0, 0}, {kHudSprite, 0, 0, 0}, 0,
-     kSpriteDepthHlsl, sizeof(kSpriteDepthHlsl) - 1, "ui_depth_sprite_ps", nullptr, false},
+     kUiDepthSpriteBytecode, sizeof(kUiDepthSpriteBytecode), "ui_depth_sprite_ps", nullptr, false},
     {{kRingPs,0,0,0},{kRingVs,0,0,0},0xFFFFu,
-     kRingCoverage,sizeof(kRingCoverage)-1,"ring_coverage_ps",nullptr,false},
+     kUiDepthRingBytecode, sizeof(kUiDepthRingBytecode),"ring_coverage_ps",nullptr,false},
     {{kOrbitalPs,0,0,0},{kOrbitalVs,0,0,0},0xFFFFu,
-     kOrbitalCoveragePs,sizeof(kOrbitalCoveragePs)-1,"orbital_coverage_ps",nullptr,false},
+     kUiDepthOrbitalBytecode, sizeof(kUiDepthOrbitalBytecode),"orbital_coverage_ps",nullptr,false},
     {{kHoloUnlitPs,0,0,0},{kHoloPanel,0,0,0},1,
-     kHoloUnlitDepthHlsl.c_str(),kHoloUnlitDepthHlsl.size(),"ui_depth_holo_unlit_ps",nullptr,false},
+     kUiDepthHoloUnlitBytecode, sizeof(kUiDepthHoloUnlitBytecode),"ui_depth_holo_unlit_ps",nullptr,false},
 };
 bool holoShader(const DepthShader* shader) {
     return shader == &g_depthShaders[3] || shader == &g_depthShaders[8];
@@ -1139,8 +927,7 @@ ID3D11DepthStencilState* reissueState(ID3D11DeviceContext* ctx, bool overlay = f
 DepthShader* compiled(ID3D11DeviceContext* ctx, DepthShader& s) {
     if (!s.shader && !s.tried) {
         s.tried = true;
-        s.shader = shaderSwapCompilePs(ctx, s.hlsl, s.len, "main", s.name, nullptr,
-                                       "ui depth");
+        s.shader = shaderSwapCreatePs(ctx, s.bytecode, s.len, s.name, "ui depth");
     }
     return s.shader ? &s : nullptr;
 }
@@ -1814,11 +1601,7 @@ ID3D11BlendState* holoContribBlendFor(ID3D11DeviceContext* ctx, BOOL enable, D3D
 // SV_VertexID trick for a different shape) -- clockwise, so it survives
 // the default (and the resolve's own, CULL_NONE either way) rasterizer
 // state without relying on a y-flip.
-constexpr char kHoloResolveVsHlsl[] =
-    "float4 main(uint id : SV_VertexID) : SV_POSITION {\n"
-    "    float2 uv = float2((id << 1) & 2, id & 2);\n"
-    "    return float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);\n"
-    "}\n";
+
 // Two reads of the frame, for two questions. The holograms draw into the
 // HDR scene target before tonemapping, so their light is compared with
 // that target and never with the tonemapped image: over sky in eye_155832
@@ -1884,60 +1667,7 @@ constexpr char kHoloResolveVsHlsl[] =
 // this, so a bright background showing through a translucent gap (a
 // star, a lit station behind a panel) is still excluded on its own
 // light, not the element's.
-constexpr char kHoloResolvePsHlsl[] =
-    "Texture2D<float4> Contribution : register(t0);\n"
-    "Texture2D<float> ElementDepth : register(t1);\n"
-    "Texture2D<float4> Target : register(t2);\n"
-    "Texture2D<float4> Display : register(t3);\n"
-    "Texture2D<float> NearLight : register(t4);\n"
-    "Texture2D<float> UiMask : register(t5);\n"
-    "cbuffer HoloResolveCB : register(b0) { float floorValue; float share; uint flags; float radiusDepth;\n"
-    "                                       float fillerDepth; float pad0; float pad1; float pad2; };\n"
-    "float3 srgbEncode(float3 c) { c = saturate(c); return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0/2.4) - 0.055; }\n"
-    "void main(float4 pos : SV_POSITION, out float depth : SV_Depth) {\n"
-    "    int3 p = int3(int2(pos.xy), 0);\n"
-    "    if ((flags & 16u) != 0u) {\n"
-    "        uint mv = uint(UiMask.Load(p) * 255.0 + 0.5);\n"
-    "        if ((mv & 1u) != 0u) discard;\n"
-    "    }\n"
-    "    float d = ElementDepth.Load(p);\n"
-    "    if (!(d > 0.0)) discard;\n"
-    "    float3 e = max(Contribution.Load(p).rgb, 0.0);\n"
-    "    bool linearBlend = (flags & 1u) != 0;\n"
-    "    bool haveTarget = (flags & 2u) != 0;\n"
-    "    bool haveDisplay = (flags & 4u) != 0;\n"
-    "    bool displaySrgb = (flags & 8u) != 0;\n"
-    "    float3 dDisplay;\n"
-    "    if (haveDisplay) {\n"
-    "        float3 disp = Display.Load(p).rgb;\n"
-    "        dDisplay = displaySrgb ? srgbEncode(disp) : saturate(disp);\n"
-    "    } else {\n"
-    "        dDisplay = linearBlend ? srgbEncode(e) : saturate(e);\n"
-    "    }\n"
-    "    bool dark = max(max(dDisplay.r, dDisplay.g), dDisplay.b) <= floorValue;\n"
-    "    bool cockpitRange = d > radiusDepth;\n"
-    "    if (dark) {\n"
-    "        if (!cockpitRange) discard;\n"
-    "        uint nw, nh; NearLight.GetDimensions(nw, nh);\n"
-    "        int2 block = int2(pos.xy) / 8;\n"
-    "        bool near = false;\n"
-    "        [unroll] for (int by = -1; by <= 1; ++by)\n"
-    "        [unroll] for (int bx = -1; bx <= 1; ++bx) {\n"
-    "            int2 nb = clamp(block + int2(bx, by), int2(0, 0), int2(nw, nh) - 1);\n"
-    "            if (NearLight.Load(int3(nb, 0)) > 0.5) near = true;\n"
-    "        }\n"
-    "        if (!near) discard;\n"
-    "        depth = fillerDepth;\n"
-    "    } else {\n"
-    "        if (haveTarget) {\n"
-    "            float3 f = max(Target.Load(p).rgb, 0.0);\n"
-    "            float lumaE = dot(e, float3(0.299, 0.587, 0.114));\n"
-    "            float lumaF = dot(f, float3(0.299, 0.587, 0.114));\n"
-    "            if (lumaE < share * lumaF) discard;\n"
-    "        }\n"
-    "        depth = d;\n"
-    "    }\n"
-    "}\n";
+
 
 // Fills the near-light map the resolve above reads: one group per 8x8
 // block and one thread per pixel, each running the SAME "light" test the
@@ -1950,48 +1680,7 @@ constexpr char kHoloResolvePsHlsl[] =
 // ms/frame. The dispatch is exactly the block grid; a pixel past the
 // image's edge Loads element depth 0, never cockpit range, so it is never
 // light.
-constexpr char kHoloNearLightCsHlsl[] =
-    "Texture2D<float4> Contribution : register(t0);\n"
-    "Texture2D<float> ElementDepth : register(t1);\n"
-    "Texture2D<float4> Target : register(t2);\n"
-    "Texture2D<float4> Display : register(t3);\n"
-    "RWTexture2D<float> NearLight : register(u0);\n"
-    "cbuffer HoloResolveCB : register(b0) { float floorValue; float share; uint flags; float radiusDepth;\n"
-    "                                       float fillerDepth; float pad0; float pad1; float pad2; }\n"
-    "float3 srgbEncode(float3 c) { c = saturate(c); return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0/2.4) - 0.055; }\n"
-    "groupshared uint lightAny;\n"
-    "[numthreads(8,8,1)] void main(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupThreadID, uint3 gid : SV_GroupID) {\n"
-    "    if (all(tid.xy == uint2(0, 0))) lightAny = 0;\n"
-    "    GroupMemoryBarrierWithGroupSync();\n"
-    "    bool linearBlend = (flags & 1u) != 0;\n"
-    "    bool haveTarget = (flags & 2u) != 0;\n"
-    "    bool haveDisplay = (flags & 4u) != 0;\n"
-    "    bool displaySrgb = (flags & 8u) != 0;\n"
-    "    int3 p = int3(int2(id.xy), 0);\n"
-    "    float d = ElementDepth.Load(p);\n"
-    "    if (d > radiusDepth) {\n"
-    "        float3 e = max(Contribution.Load(p).rgb, 0.0);\n"
-    "        float3 dDisplay;\n"
-    "        if (haveDisplay) {\n"
-    "            float3 disp = Display.Load(p).rgb;\n"
-    "            dDisplay = displaySrgb ? srgbEncode(disp) : saturate(disp);\n"
-    "        } else {\n"
-    "            dDisplay = linearBlend ? srgbEncode(e) : saturate(e);\n"
-    "        }\n"
-    "        if (max(max(dDisplay.r, dDisplay.g), dDisplay.b) > floorValue) {\n"
-    "            bool ok = true;\n"
-    "            if (haveTarget) {\n"
-    "                float3 f = max(Target.Load(p).rgb, 0.0);\n"
-    "                float lumaE = dot(e, float3(0.299, 0.587, 0.114));\n"
-    "                float lumaF = dot(f, float3(0.299, 0.587, 0.114));\n"
-    "                ok = lumaE >= share * lumaF;\n"
-    "            }\n"
-    "            if (ok) InterlockedOr(lightAny, 1u);\n"
-    "        }\n"
-    "    }\n"
-    "    GroupMemoryBarrierWithGroupSync();\n"
-    "    if (all(tid.xy == uint2(0, 0))) NearLight[gid.xy] = lightAny ? 1.0 : 0.0;\n"
-    "}\n";
+
 
 // A world marker's own true-depth PS, one per matched VS: its input struct
 // must match that VS's exact output signature to link. The reticle's VS
@@ -2000,26 +1689,21 @@ constexpr char kHoloNearLightCsHlsl[] =
 // same clip W, not its reciprocal, as this PS's own SV_Position.w (the
 // sprite depth shader above relies on the same fact, GPU-test verified).
 // depth = a + b / distance is the pass's usual projection pair.
-constexpr char kHoloMarkerReticleDepthPsHlsl[] =
-    "cbuffer HoloMarkerDepthCb : register(b0) { float projA; float projB; float pad0; float pad1; };\n"
-    "struct In { float4 tc6 : TEXCOORD6; float3 tc7 : TEXCOORD7; float4 pos : SV_Position; };\n"
-    "void main(In i, out float depth : SV_Depth) {\n"
-    "    depth = saturate(projA + projB / i.pos.w);\n"
-    "}\n";
+
 // The table: a world-marker VS hash -> its matched PS. kHoloWorldMarkers
 // (classification) can list a hash this table does not -- it then keeps
 // the null PS bound below, so its raster z is whatever that VS itself
 // wrote (0, if it shares the reticle's own "mechanism ii").
 struct HoloMarkerDepthEntry {
     uint64_t            vs;
-    const char*         hlsl;
+    const void*         bytecode;
     size_t              len;
     const char*         name;
     ID3D11PixelShader*  shader;
     bool                tried;
 };
 HoloMarkerDepthEntry g_holoMarkerDepthShaders[1] = {
-    {kHoloWorldMarkerReticle, kHoloMarkerReticleDepthPsHlsl, sizeof(kHoloMarkerReticleDepthPsHlsl) - 1,
+    {kHoloWorldMarkerReticle, kUiHoloMarkerReticleBytecode, sizeof(kUiHoloMarkerReticleBytecode),
      "ui_depth_holo_marker_reticle_ps", nullptr, false},
 };
 
@@ -2027,12 +1711,8 @@ bool holoResolveShaders(ID3D11DeviceContext* ctx, ID3D11VertexShader** vsOut,
                         ID3D11PixelShader** psOut) {
     if (!g_holoResolveTried) {
         g_holoResolveTried = true;
-        g_holoResolveVs = shaderSwapCompileVs(ctx, kHoloResolveVsHlsl, sizeof(kHoloResolveVsHlsl) - 1,
-                                              "main", "ui_depth_holo_resolve_vs", nullptr,
-                                              "hologram depth");
-        g_holoResolvePs = shaderSwapCompilePs(ctx, kHoloResolvePsHlsl, sizeof(kHoloResolvePsHlsl) - 1,
-                                              "main", "ui_depth_holo_resolve_ps", nullptr,
-                                              "hologram depth");
+        g_holoResolveVs = shaderSwapCreateVs(ctx,kUiHoloResolveVsBytecode,sizeof(kUiHoloResolveVsBytecode),"ui_depth_holo_resolve_vs","hologram depth");
+        g_holoResolvePs = shaderSwapCreatePs(ctx,kUiHoloResolvePsBytecode,sizeof(kUiHoloResolvePsBytecode),"ui_depth_holo_resolve_ps","hologram depth");
         if (!g_holoResolveVs || !g_holoResolvePs) {
             Log::get().note("hologram depth: the resolve shader could not be built; the "
                             "generic hologram/icon coverage never reaches the private depth copy.");
@@ -2046,9 +1726,7 @@ bool holoResolveShaders(ID3D11DeviceContext* ctx, ID3D11VertexShader** vsOut,
 ID3D11ComputeShader* holoNearLightShader(ID3D11DeviceContext* ctx) {
     if (!g_holoNearLightTried) {
         g_holoNearLightTried = true;
-        g_holoNearLightCs = shaderSwapCompileCs(ctx, kHoloNearLightCsHlsl, sizeof(kHoloNearLightCsHlsl) - 1,
-                                                "main", "ui_depth_holo_near_light_cs", nullptr,
-                                                "hologram depth");
+        g_holoNearLightCs = shaderSwapCreateCs(ctx,kUiHoloNearLightBytecode,sizeof(kUiHoloNearLightBytecode),"ui_depth_holo_near_light_cs","hologram depth");
         if (!g_holoNearLightCs) {
             Log::get().note("hologram depth: the near-light shader could not be built; every dark "
                             "pixel in cockpit range declines rather than covering unbounded sky.");
@@ -2062,7 +1740,7 @@ ID3D11PixelShader* holoWorldMarkerDepthPs(ID3D11DeviceContext* ctx, uint64_t vsH
         if (e.vs != vsHash) continue;
         if (!e.tried) {
             e.tried = true;
-            e.shader = shaderSwapCompilePs(ctx, e.hlsl, e.len, "main", e.name, nullptr, "hologram depth");
+            e.shader = shaderSwapCreatePs(ctx, e.bytecode, e.len, e.name, "hologram depth");
         }
         return e.shader;
     }
@@ -3369,7 +3047,7 @@ bool uiDepthReissueBegin(ID3D11DeviceContext* ctx) {
             target = g_uiDepth[g_drawEye].acquire(ctx, scene);
         bool holo=false;
         const bool ring=shader==&g_depthShaders[6],orbital=shader==&g_depthShaders[7],sprite=shader==&g_depthShaders[5];
-        if(orbital && !g_orbitalVs) g_orbitalVs.Attach(shaderSwapCompileVs(ctx,kOrbitalCoverageVs,sizeof(kOrbitalCoverageVs)-1,"main","orbital coverage",nullptr,"stellar motion"));
+        if(orbital && !g_orbitalVs) g_orbitalVs.Attach(shaderSwapCreateVs(ctx,kUiOrbitalCoverageVsBytecode,sizeof(kUiOrbitalCoverageVsBytecode),"orbital coverage","stellar motion"));
         if (target && scene && mask && (holoShader(shader) || sprite || ring || (orbital && g_orbitalVs))) {
             holo=g_holoMotion[g_drawEye].prepare(ctx,scene,g_holoDraw,g_cockpitMetres,ring?1:orbital?2:sprite?3:0,shader->slot);
             if(holo && !g_holoNoted) {
@@ -3463,9 +3141,7 @@ bool uiDepthReissueBegin(ID3D11DeviceContext* ctx) {
                 coronaDepth=sceneDepthReadView(ctx,scene,g_drawEye);
                 if (!g_smokeCoronaShader && !g_smokeCoronaCompileTried) {
                     g_smokeCoronaCompileTried=true;
-                    std::string source="#define CORONA_MOTION 1\n";
-                    source += kSmokeDepthHlsl;
-                    g_smokeCoronaShader.Attach(shaderSwapCompilePs(ctx,source.c_str(),source.size(),"main","ui_depth_corona_ps",nullptr,"ui depth corona"));
+                    g_smokeCoronaShader.Attach(shaderSwapCreatePs(ctx,kUiSmokeCoronaBytecode,sizeof(kUiSmokeCoronaBytecode),"ui_depth_corona_ps","ui depth corona"));
                 }
                 if (coronaDepth && g_smokeCoronaShader && g_holoMotion[g_drawEye].prepare(ctx,scene,g_holoDraw,g_cockpitMetres,5,1)) {
                     holo=true; g_coronaMotion=true;

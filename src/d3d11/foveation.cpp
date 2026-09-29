@@ -1,3 +1,4 @@
+#include "temporal_shader_bytecode.h"
 #include "foveation.h"
 
 #include <windows.h>
@@ -1856,23 +1857,13 @@ struct Report {
 // top-left, bottom-right) so a back-face cull keeps it; the first cut of this
 // probe wound it the other way and measured the clear colour as 16x16 blocks
 // in every band.
-const char kProbeVs[] =
-    "float4 main(uint id : SV_VertexID) : SV_Position {\n"
-    "    float2 p = float2(id == 2 ? 3.0 : -1.0, id == 1 ? 3.0 : -1.0);\n"
-    "    return float4(p, 0.5, 1.0);\n"
-    "}\n";
+
 // The pixel shader writes its own position AND counts its invocations per
 // band of four tile rows into a raw buffer. The count is the detector that
 // does not depend on how SV_Position behaves under coarse shading: a 2x2
 // band runs the shader a quarter as often, whatever position it reports.
 // (Measured: the position IS the coarse pixel's, so the two agree.)
-const char kProbePs[] =
-    "RWByteAddressBuffer counts : register(u1);\n"
-    "float2 main(float4 pos : SV_Position) : SV_Target {\n"
-    "    uint band = min(uint(pos.y) / 64u, 7u);\n"
-    "    counts.InterlockedAdd(band * 4u, 1u);\n"
-    "    return pos.xy;\n"
-    "}\n";
+
 
 constexpr uint32_t kPw = 512, kPh = 512, kPtiles = kPw / edvr::kTile, kBands = 8;
 const uint32_t kCodes[kBands]   = {edvr::kRate1x1, edvr::kRate2x1, edvr::kRate1x2, edvr::kRate2x2,
@@ -1883,60 +1874,16 @@ const uint32_t kExpectH[kBands] = {1, 1, 2, 2, 2, 4, 4, 1};
 
 // The same pixel shader, writing depth as well: a pixel shader that
 // outputs SV_Depth is one of the things a driver may hold at full rate.
-const char kProbePsDepth[] =
-    "RWByteAddressBuffer counts : register(u1);\n"
-    "float2 main(float4 pos : SV_Position, out float depth : SV_Depth) : SV_Target {\n"
-    "    uint band = min(uint(pos.y) / 64u, 7u);\n"
-    "    counts.InterlockedAdd(band * 4u, 1u);\n"
-    "    depth = 0.5;\n"
-    "    return pos.xy;\n"
-    "}\n";
+
 
 // The vertex shader with a varying, for the pixel shaders that read one at
 // sample frequency or beside SV_Coverage -- the two shader features a
 // driver holds at full rate by the D3D12 rule, if it applies them here.
-const char kProbeVsUv[] =
-    "struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
-    "V main(uint id : SV_VertexID) {\n"
-    "    V v;\n"
-    "    float2 p = float2(id == 2 ? 3.0 : -1.0, id == 1 ? 3.0 : -1.0);\n"
-    "    v.pos = float4(p, 0.5, 1.0);\n"
-    "    v.uv = p * 0.5 + 0.5;\n"
-    "    return v;\n"
-    "}\n";
-const char kProbePsSample[] =
-    "RWByteAddressBuffer counts : register(u1);\n"
-    "float2 main(float4 pos : SV_Position, sample float2 uv : TEXCOORD0) : SV_Target {\n"
-    "    uint band = min(uint(pos.y) / 64u, 7u);\n"
-    "    counts.InterlockedAdd(band * 4u, 1u);\n"
-    "    return pos.xy + uv * 0.0;\n"
-    "}\n";
-const char kProbePsAlpha[] =
-    "RWByteAddressBuffer counts : register(u1);\n"
-    "float4 main(float4 pos : SV_Position) : SV_Target {\n"
-    "    uint band = min(uint(pos.y) / 64u, 7u);\n"
-    "    counts.InterlockedAdd(band * 4u, 1u);\n"
-    "    return float4(pos.xy, 0.0, 1.0);\n"
-    "}\n";
-const char kProbePsMrt[] =
-    "RWByteAddressBuffer counts : register(u3);\n"
-    "struct O { float2 a : SV_Target0; float4 b : SV_Target1; float4 c : SV_Target2; };\n"
-    "O main(float4 pos : SV_Position) {\n"
-    "    uint band = min(uint(pos.y) / 64u, 7u);\n"
-    "    counts.InterlockedAdd(band * 4u, 1u);\n"
-    "    O o;\n"
-    "    o.a = pos.xy;\n"
-    "    o.b = float4(0.25, 0.5, 0.75, 1.0);\n"
-    "    o.c = float4(1.0, 0.75, 0.5, 0.25);\n"
-    "    return o;\n"
-    "}\n";
-const char kProbePsCoverage[] =
-    "RWByteAddressBuffer counts : register(u1);\n"
-    "float2 main(float4 pos : SV_Position, float2 uv : TEXCOORD0, uint cov : SV_Coverage) : SV_Target {\n"
-    "    uint band = min(uint(pos.y) / 64u, 7u);\n"
-    "    counts.InterlockedAdd(band * 4u, 1u);\n"
-    "    return pos.xy + uv * 0.0 + float(cov & 0u);\n"
-    "}\n";
+
+
+
+
+
 
 // A candidate state for the draw, one per variant: what the game might
 // set that the plain probe never did.
@@ -2106,18 +2053,12 @@ struct ProbeRig {
             snprintf(err, errCap, "the depth-stencil state could not be created");
             return false;
         }
-        psDepth = edvr::shaderSwapCompilePs(ctx, kProbePsDepth, sizeof(kProbePsDepth) - 1, "main",
-                                            "foveation_probe_ps_depth", nullptr, "foveation probe");
-        vsUv = edvr::shaderSwapCompileVs(ctx, kProbeVsUv, sizeof(kProbeVsUv) - 1, "main", "foveation_probe_vs_uv",
-                                         nullptr, "foveation probe");
-        psSample = edvr::shaderSwapCompilePs(ctx, kProbePsSample, sizeof(kProbePsSample) - 1, "main",
-                                             "foveation_probe_ps_sample", nullptr, "foveation probe");
-        psCoverage = edvr::shaderSwapCompilePs(ctx, kProbePsCoverage, sizeof(kProbePsCoverage) - 1, "main",
-                                               "foveation_probe_ps_coverage", nullptr, "foveation probe");
-        psAlpha = edvr::shaderSwapCompilePs(ctx, kProbePsAlpha, sizeof(kProbePsAlpha) - 1, "main",
-                                            "foveation_probe_ps_alpha", nullptr, "foveation probe");
-        psMrt = edvr::shaderSwapCompilePs(ctx, kProbePsMrt, sizeof(kProbePsMrt) - 1, "main",
-                                          "foveation_probe_ps_mrt", nullptr, "foveation probe");
+        psDepth = edvr::shaderSwapCreatePs(ctx, edvr::kFoveationProbeDepthBytecode, sizeof(edvr::kFoveationProbeDepthBytecode), "foveation_probe_ps_depth", "foveation probe");
+        vsUv = edvr::shaderSwapCreateVs(ctx, edvr::kFoveationProbeUvBytecode, sizeof(edvr::kFoveationProbeUvBytecode), "foveation_probe_vs_uv", "foveation probe");
+        psSample = edvr::shaderSwapCreatePs(ctx, edvr::kFoveationProbeSampleBytecode, sizeof(edvr::kFoveationProbeSampleBytecode), "foveation_probe_ps_sample", "foveation probe");
+        psCoverage = edvr::shaderSwapCreatePs(ctx, edvr::kFoveationProbeCoverageBytecode, sizeof(edvr::kFoveationProbeCoverageBytecode), "foveation_probe_ps_coverage", "foveation probe");
+        psAlpha = edvr::shaderSwapCreatePs(ctx, edvr::kFoveationProbeAlphaBytecode, sizeof(edvr::kFoveationProbeAlphaBytecode), "foveation_probe_ps_alpha", "foveation probe");
+        psMrt = edvr::shaderSwapCreatePs(ctx, edvr::kFoveationProbeMrtBytecode, sizeof(edvr::kFoveationProbeMrtBytecode), "foveation_probe_ps_mrt", "foveation probe");
         for (int i = 0; i < 2; ++i) {
             D3D11_TEXTURE2D_DESC md = {};
             md.Width = kPw;
@@ -2280,10 +2221,8 @@ struct ProbeRig {
             r.line("foveation probe: the invocation counter could not be created");
             return false;
         }
-        vs = edvr::shaderSwapCompileVs(ctx, kProbeVs, sizeof(kProbeVs) - 1, "main", "foveation_probe_vs",
-                                       nullptr, "foveation probe");
-        ps = edvr::shaderSwapCompilePs(ctx, kProbePs, sizeof(kProbePs) - 1, "main", "foveation_probe_ps",
-                                       nullptr, "foveation probe");
+        vs = edvr::shaderSwapCreateVs(ctx, edvr::kFoveationProbeVsBytecode, sizeof(edvr::kFoveationProbeVsBytecode), "foveation_probe_vs", "foveation probe");
+        ps = edvr::shaderSwapCreatePs(ctx, edvr::kFoveationProbePsBytecode, sizeof(edvr::kFoveationProbePsBytecode), "foveation_probe_ps", "foveation probe");
         if (!vs || !ps) {
             r.line("foveation probe: the probe's shaders did not compile");
             return false;

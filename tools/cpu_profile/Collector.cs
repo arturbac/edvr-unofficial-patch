@@ -31,6 +31,8 @@ internal sealed class Collected
     public readonly List<ClockMarker> Clocks = [];
     public readonly List<SpanMarker> Spans = [];
     public readonly List<FrameMarker> Frames = [];
+    public readonly List<GpuCompletionMarker> GpuCompletions = [];
+    public int GpuMarkerSchemaErrors;
     public readonly Dictionary<int, ThreadTimeline> Timelines = [];
     public readonly Dictionary<string, long> RawSwitchStates = [];
     public readonly Dictionary<string, long> WaitReasons = [];

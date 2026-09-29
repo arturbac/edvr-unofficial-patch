@@ -247,8 +247,13 @@ REM variant table and the compiler DLL, and is regenerated whenever that key
 REM changes, so stale bytecode cannot survive a source change -- while an
 REM unchanged shader costs nothing instead of the AA variant's 19 s of fxc on
 REM every build (measured 2026-09-15). The generator tests never initialize a GPU.
+REM AMD FSR 1.0 as embeddable HLSL. Generated rather than committed so the
+REM vendored headers stay byte-identical to upstream (src\d3d11\fsr\).
+python "tools\gen_fsr_hlsl.py" --root "%ROOT%" --out "%GEN%"
+if errorlevel 1 ( echo [edvr] ERROR: FSR shader embedding failed & exit /b 1 )
+
 if not exist "%OBJ%\temporalshader" mkdir "%OBJ%\temporalshader"
-cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\temporalshader\\" /Fe"%OBJ%\temporalshader\temporal_shader_build.exe" ^
     "tools\temporal_shader_build\temporal_shader_build.cpp" ^
@@ -259,11 +264,6 @@ if errorlevel 1 ( echo [edvr] ERROR: temporal shader compiler build failed & exi
 "%OBJ%\temporalshader\temporal_shader_build.exe" --output "%GEN%\temporal_shader_bytecode.h" || exit /b 1
 
 echo [edvr] === d3d11.dll ===
-REM AMD FSR 1.0 as embeddable HLSL. Generated rather than committed so the
-REM vendored headers stay byte-identical to upstream (src\d3d11\fsr\).
-python "tools\gen_fsr_hlsl.py" --root "%ROOT%" --out "%GEN%"
-if errorlevel 1 ( echo [edvr] ERROR: FSR shader embedding failed & exit /b 1 )
-
 REM The settings schema -- the installer's window AND the in-headset menu's
 REM row table (docs\settings-menu.md) -- generated from edvr.ini and the
 REM accessor calls in src\, with the gate that keeps it complete. Here,
@@ -814,7 +814,7 @@ if not exist "%OBJ%\vtabletest" mkdir "%OBJ%\vtabletest"
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\vtabletest"\ ^
     /DEDVR_VTABLE_TEST /Fe"%BUILD%\vtable_test.exe" "tools\vtable_test\vtable_test.cpp" ^
-    "src\common\vtable_hook.cpp" "src\common\code_hook.cpp" "src\common\guard.cpp" ^
+    "src\d3d11\shader_swap.cpp" "src\common\vtable_hook.cpp" "src\common\code_hook.cpp" "src\common\guard.cpp" ^
     "src\common\log.cpp" "src\common\config.cpp" ^
     "src\common\proxy.cpp" ^
     /link /INCREMENTAL:NO kernel32.lib user32.lib version.lib
@@ -879,7 +879,7 @@ exit /b 0
 :rig_native_fss_gpu_test
 echo [edvr] === native_fss_gpu_test.exe ===
 if not exist "%OBJ%\native_fss_gpu" mkdir "%OBJ%\native_fss_gpu"
-cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\native_fss_gpu\\" /Fe"%BUILD%\native_fss_gpu_test.exe" ^
     "tools\native_fss_test\native_fss_gpu_test.cpp" "src\d3d11\native_fss.cpp" "src\d3d11\fss_heal.cpp" ^
     "src\common\config.cpp" "src\common\frame_flag.cpp" "src\common\log.cpp" "src\common\guard.cpp" ^
@@ -1185,7 +1185,7 @@ echo [edvr] === private UI depth regression ===
 REM Keep the executable away from build\d3d11.dll: these tests use system
 REM D3D11 WARP and include the production coverage pass directly.
 if not exist "%OBJ%\uidepthtest" mkdir "%OBJ%\uidepthtest"
-cl.exe /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 /wd4702 ^
+cl.exe /I"%GEN%" /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 /wd4702 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\uidepthtest\\" /Fe"%OBJ%\uidepthtest\ui_depth_test.exe" ^
     "tools\ui_depth_test\ui_depth_test.cpp" ^
@@ -1216,7 +1216,7 @@ echo [edvr] === generic hologram/icon depth regression ===
 REM Same shape as :rig_ui_depth: WARP, the production coverage pass
 REM included directly, away from build\d3d11.dll.
 if not exist "%OBJ%\holodepthtest" mkdir "%OBJ%\holodepthtest"
-cl.exe /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 /wd4702 ^
+cl.exe /I"%GEN%" /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 /wd4702 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\holodepthtest\\" /Fe"%OBJ%\holodepthtest\hologram_depth_test.exe" ^
     "tools\hologram_depth_test\hologram_depth_test.cpp" ^
@@ -1233,7 +1233,7 @@ exit /b 0
 echo [edvr] === native motion, fusion and night-vision rigs ===
 
 if not exist "%OBJ%\holomotion" mkdir "%OBJ%\holomotion"
-cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\holomotion\\" /Fe"%OBJ%\holomotion\holo_motion_test.exe" ^
     "tools\holo_motion_test\holo_motion_test.cpp" ^
@@ -1249,7 +1249,7 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_
     /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib || exit /b 1
 "%OBJ%\screenmotion\screen_motion_test.exe" --self-test || exit /b 1
 if not exist "%OBJ%\weaponmotion" mkdir "%OBJ%\weaponmotion"
-cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\weaponmotion\\" /Fe"%OBJ%\weaponmotion\weapon_motion_test.exe" ^
     "tools\weapon_motion_test\weapon_motion_test.cpp" "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
     /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib || exit /b 1
@@ -1262,7 +1262,7 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_
 "%OBJ%\identityfusion\identity_fusion_test.exe" --self-test || exit /b 1
 python "tools\identity_fusion_capture.py" --self-test || exit /b 1
 if not exist "%OBJ%\nightvision" mkdir "%OBJ%\nightvision"
-cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\nightvision\\" /Fe"%OBJ%\nightvision\night_vision_test.exe" ^
     "tools\night_vision_test\night_vision_test.cpp" ^
     /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib || exit /b 1
@@ -1284,7 +1284,7 @@ exit /b 0
 :rig_stellar_motion
 echo [edvr] === stellar motion regression ===
 if not exist "%OBJ%\stellarmotion" mkdir "%OBJ%\stellarmotion"
-cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\stellarmotion\\" /Fe"%OBJ%\stellarmotion\stellar_motion_test.exe" ^
     "tools\stellar_motion_test\stellar_motion_test.cpp" ^
@@ -1298,7 +1298,7 @@ exit /b 0
 :rig_terrain_motion
 echo [edvr] === terrain motion regression ===
 if not exist "%OBJ%\terrainmotion" mkdir "%OBJ%\terrainmotion"
-cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\terrainmotion\\" /Fe"%OBJ%\terrainmotion\celestial_motion_test.exe" ^
     "tools\celestial_motion_test\celestial_motion_test.cpp" ^
@@ -1313,7 +1313,7 @@ exit /b 0
 :rig_depth_scene_pick_test
 echo [edvr] === scene depth selection cache regression ===
 if not exist "%OBJ%\depthscenepick" mkdir "%OBJ%\depthscenepick"
-cl.exe /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 ^
+cl.exe /I"%GEN%" /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\depthscenepick\\" /Fe"%OBJ%\depthscenepick\depth_scene_pick_test.exe" ^
     "tools\depth_scene_pick_test\depth_scene_pick_test.cpp" ^
@@ -2357,7 +2357,7 @@ echo [edvr] === ui_layer_coverage_test.exe ===
 REM Exercise the production coverage command cache and shaders on WARP.
 REM Keep the executable outside build so D3D11 comes from System32.
 if not exist "%OBJ%\uicoverage" mkdir "%OBJ%\uicoverage"
-cl.exe /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 ^
+cl.exe /I"%GEN%" /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\uicoverage\\" /Fe"%OBJ%\uicoverage\coverage_test.exe" ^
     "tools\ui_layer_coverage_test\coverage_test.cpp" ^
@@ -2392,7 +2392,7 @@ REM draws into the frame, a multiply included; a stencil-tested quad drawn
 REM against the layer's seeded copy of a stencil the game wrote matches the
 REM same quad drawn into the frame; the 1.25 box filter; the debug view.
 if not exist "%OBJ%\uiqualitytest" mkdir "%OBJ%\uiqualitytest"
-cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\uiqualitytest\\" /Fe"%BUILD%\ui_quality_test.exe" ^
     "tools\ui_quality_test\ui_quality_test.cpp" ^
@@ -2405,7 +2405,7 @@ REM depth formats, every stencil value class, a scale, a jitter and a reused
 REM seeder, read back texel for texel. Built outside build\ so its imported
 REM D3D11CreateDevice resolves to System32's, not EDVR's proxy.
 if not exist "%OBJ%\uilayerseed" mkdir "%OBJ%\uilayerseed"
-cl.exe /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 ^
+cl.exe /I"%GEN%" /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
     /Fo"%OBJ%\uilayerseed\\" /Fe"%OBJ%\uilayerseed\seed_test.exe" ^
     "tools\ui_layer_seed_test\seed_test.cpp" ^
