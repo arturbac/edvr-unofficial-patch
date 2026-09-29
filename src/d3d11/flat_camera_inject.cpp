@@ -194,7 +194,16 @@ using RefreshFn = void (__fastcall*)(uintptr_t, uintptr_t, uintptr_t);
 void __fastcall refreshDetour(uintptr_t ctx, uintptr_t p2, uintptr_t camera) noexcept {
     const auto forward = reinterpret_cast<RefreshFn>(g_refreshForward.load(std::memory_order_acquire));
     if (!forward) return;
-    g_inject.refreshCalls.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t callNo = g_inject.refreshCalls.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Bounded breadcrumbs (first 8 calls): the 18:03/18:17 crashes died
+    // somewhere inside this detour with RIP landing in this file's own log
+    // strings; the next crash's log must name the stage instead.
+    const bool trace = callNo <= 8;
+    if (trace) {
+        Log::get().note("flat camera inject: refresh call #%llu entered (ctx=%p p2=%p camera=%p)",
+                        (unsigned long long)callNo, reinterpret_cast<void*>(ctx),
+                        reinterpret_cast<void*>(p2), reinterpret_cast<void*>(camera));
+    }
 
     // Admission for THIS call: the injector owns only a kind-3 camera whose
     // frame ownership is Upstream. Anything else passes through untouched
@@ -209,7 +218,9 @@ void __fastcall refreshDetour(uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
             Log::get().note("flat camera inject: camera %p kind %u is not the proven branch (named unsupported; no mutation)",
                             reinterpret_cast<void*>(camera), readable ? kind : 0xffffffffu);
         }
+        if (trace) Log::get().note("flat camera inject: refresh call #%llu forwards unmodified (kind=%u)", (unsigned long long)callNo, kind);
         forward(ctx, p2, camera);
+        if (trace) Log::get().note("flat camera inject: refresh call #%llu returned from forward", (unsigned long long)callNo);
         return;
     }
     if (!g_inject.decisionValid || g_inject.decision.owner != FlatCameraOwner::Upstream) {
@@ -232,6 +243,10 @@ void __fastcall refreshDetour(uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
         forward(ctx, p2, camera);
         return;
     }
+    if (trace) {
+        Log::get().note("flat camera inject: refresh call #%llu injecting phase=(%.5f, %.5f) at %ux%u over bound=(%.5f, %.5f)",
+                        (unsigned long long)callNo, jx, jy, rw, rh, entryX, entryY);
+    }
     // The D3D sign convention W1 proved: content right by jx needs
     // boundX += jx/R_w; content down by jy needs boundY += -jy/R_h.
     const float jitX = entryX + jx / static_cast<float>(rw);
@@ -245,15 +260,19 @@ void __fastcall refreshDetour(uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
         return;
     }
     forward(ctx, p2, camera);
+    if (trace) Log::get().note("flat camera inject: refresh call #%llu returned from forward (mutated)", (unsigned long long)callNo);
     // Restore-after-call: the entry values ARE the authoritative originals.
     // The derived blocks keep this call's jitter (the committed phase); the
     // sources return pristine for the next derivation.
     sehWriteF32(camera + kCamBoundX, entryX);
     sehWriteF32(camera + kCamBoundY, entryY);
     if (haveFlags) sehWriteU32(camera + kCamFlags, flags);
+    if (trace) Log::get().note("flat camera inject: refresh call #%llu restored entry values", (unsigned long long)callNo);
     g_inject.injectedCalls.fetch_add(1, std::memory_order_relaxed);
     flatRuntimeNoteCameraApplied();
+    if (trace) Log::get().note("flat camera inject: refresh call #%llu noted applied; observing ray CB", (unsigned long long)callNo);
     observeRayCb(ctx);
+    if (trace) Log::get().note("flat camera inject: refresh call #%llu complete", (unsigned long long)callNo);
 }
 
 void standDown(const char* why) {
