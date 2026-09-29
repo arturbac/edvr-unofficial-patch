@@ -338,16 +338,6 @@ bool isOpenxrRenderScaleRow(const MenuRowDef& d) {
            strcmp(d.key, "openxr_resolution") == 0;
 }
 
-// The generic per-headset list row (`# ui: ... | headset`): one integer per
-// headset in a `runtime/system:value` list, of which the row shows and edits
-// only the worn headset's entry. The three field-of-view trims are these; the
-// resolution row is a per-headset list too, but it keeps its own width
-// semantics (percentages, megapixels, the runtime's cap) and is handled by
-// everything above rather than by the generic integer row below.
-bool isHeadsetRow(const MenuRowDef& d) {
-    return d.headset && !isOpenxrRenderScaleRow(d);
-}
-
 // fix.temporal_aa_model (the DLSS preset row): NVIDIA's reconstruction
 // model, which only DLSS and DLAA read (temporal_mode.h). It stays on the
 // Performance page under every mode -- rather than dropping out of the list
@@ -591,8 +581,9 @@ bool renderScaleRowPending(const std::string& value) {
 // runtime/system entry, or -- when the system token is empty, so the worn
 // key is the runtime alone -- the runtime-only entry the menu itself wrote
 // for this headset (matched 2 with no system). A runtime-only fallback under
-// a non-empty system token is another key's entry and is left alone. One rule
-// for every per-headset list, so R cannot mean two things on two rows.
+// a non-empty system token is another key's entry and is left alone. (One rule,
+// kept as its own function: the resolution row is the only per-headset row now,
+// but the field-of-view trims had a row that asked the same question.)
 bool wornEntryRemovable(bool headset, uint32_t matched, const std::string& sys) {
     return headset && (matched == 1 || (matched == 2 && sys.empty()));
 }
@@ -696,7 +687,7 @@ const char* openxrResolutionFacts() {
            "Shipped 100% (no entry).  Applies after a game restart.";
 }
 
-// "Saved for: " and the list, for any per-headset row's tooltip: at most four
+// "Saved for: " and the list, for a per-headset row's tooltip: at most four
 // entries, so the ini prose after them is not pushed out of the 1024-byte
 // popup (the log line carries the whole list). The entry in effect for the
 // worn headset -- the exact key, or the runtime-only fallback -- is marked,
@@ -842,147 +833,12 @@ constexpr const char* kEightHeadsets = "Eight headsets saved; remove one in edvr
 // it); said as such rather than as a full list.
 constexpr const char* kNoRuntimeToken = "not written: the runtime's name yields no key";
 
-// ---------------------------------------------------------------------------
-// The generic per-headset row: fix.fov_trim_vertical, _outer and _nasal. One
-// integer per headset, in the same list grammar the resolution uses, of which
-// the row shows and edits only the worn headset's entry. A trim tuned on a
-// Pimax is wrong on a Quest 3, which is what these lists exist for.
-//
-// 0 is "no entry": the value column reads 0, and the list never carries
-// `key:0`, so a row put back to 0 leaves the file as if it had never been set.
-struct HeadsetRowView {
-    bool        headset = false;   // sizing coherent and labels valid
-    std::string rt, sys, key;      // the worn tokens and rt/sys
-    NativeRenderLabels labels{};
-    edvr::native_render::HeadsetEntry entries[edvr::native_render::kHeadsetEntryMax];
-    size_t      entryCount = 0;
-    uint32_t    matched = 0;       // 0 none, 1 runtime/system, 2 runtime-only
-    uint32_t    value = 0;         // the worn headset's entry, 0 when none
-    uint32_t    lo = 0, hi = 0;    // what ONE entry may hold
-};
-
-// The bounds the ui: line declared. `headset` beside `range` is what says the
-// range bounds one entry's value rather than the string, so this is where the
-// generated lo/hi mean degrees.
-uint32_t headsetRowLow(const MenuRowDef& d) {
-    const int lo = d.lo[0] ? atoi(d.lo) : 0;
-    return lo > 0 ? static_cast<uint32_t>(lo) : 0u;
-}
-
-uint32_t headsetRowHigh(const MenuRowDef& d) {
-    const int hi = d.hi[0] ? atoi(d.hi) : 0;
-    return hi > 0 ? static_cast<uint32_t>(hi) : edvr::native_render::kTrimDegreesMax;
-}
-
-HeadsetRowView headsetRowView(const MenuRowDef& d, const std::string& value) {
-    using namespace edvr::native_render;
-    HeadsetRowView v;
-    v.lo = headsetRowLow(d);
-    v.hi = headsetRowHigh(d);
-    v.headset = currentHeadset(&v.rt, &v.sys, nullptr, nullptr, nullptr, &v.labels);
-    v.entryCount = parseHeadsetEntries(value.c_str(), v.entries, nullptr, v.lo, v.hi);
-    if (!v.headset) return v;
-    v.key = headsetKey(v.rt, v.sys);
-    v.value = resolveHeadsetValue(v.entries, v.entryCount, v.rt, v.sys, &v.matched);
-    return v;
-}
-
-// The value column: the worn headset's entry, or `unknown` when no headset is
-// published -- which no number could mean, and which the resolution row says
-// the same way.
-std::string headsetRowValue(const HeadsetRowView& v) {
-    if (!v.headset) return "unknown";
-    char text[16];
-    snprintf(text, sizeof(text), "%u", v.value);
-    return text;
-}
-
-// The always-visible hint under the rows: which key this row is keyed on, and
-// what 0 does, so nobody looks for a "remove" the row does not have.
-std::string headsetRowHint(const HeadsetRowView& v) {
-    if (!v.headset) {
-        return nativeMenuActive() ? "No headset is known yet; try again in a moment."
-                                  : "Native OpenXR only; this runtime ignores it.";
-    }
-    return "This headset: " + v.key + ". " +
-           (v.value ? "0 removes its entry." : "Not set for this headset; Left/Right sets it.");
-}
-
-// The tooltip's facts line, in place of the Text default (no range at all).
-std::string headsetRowFacts(const MenuRowDef& d, const HeadsetRowView& v) {
-    char text[160];
-    snprintf(text, sizeof(text), "Range: %u to %u, for the headset you are wearing.  "
-             "Shipped (no entry).  %s", v.lo, v.hi,
-             d.applies == 1   ? "Applies at once."
-             : d.applies == 2 ? "Takes effect at the next launch."
-                              : "When it applies is not documented.");
-    return text;
-}
-
-// The tooltip's body: the headset this row is keyed on, what it is set to,
-// and every headset the list holds.
-std::string headsetRowTooltip(const MenuRowDef& d, const HeadsetRowView& v) {
-    std::string body;
-    if (!v.headset) {
-        body = nativeMenuActive()
-            ? "This headset: unknown (nothing has published a headset yet)."
-            : "This headset: not read (native OpenXR only; this runtime ignores the key).";
-    } else {
-        body = "This headset: " + v.key + " (" + v.labels.runtimeName + ", ";
-        body += v.sys.empty() ? std::string("runtime reported no system name)")
-                              : std::string(v.labels.systemName) + ")";
-        char digits[16];
-        snprintf(digits, sizeof(digits), "%u", v.value);
-        if (!v.value) {
-            body += std::string(". No entry for it, so ") + d.label + " does nothing here.";
-        } else {
-            body += std::string(". Set to ") + digits;
-            if (v.matched == 2) body += " (runtime-only entry " + v.rt + ":" + digits + ")";
-            body += ".";
-        }
-        body += "\n0 removes this headset's entry and leaves every other headset's alone.";
-    }
-    body += savedForText(v.entries, v.entryCount, v.headset, v.rt, v.sys, v.matched, v.value);
-    return body;
-}
-
-// One Left/Right step: 1, or `mult` with Shift, held inside the row's own
-// bounds. A press never moves against its own direction.
-uint32_t steppedHeadsetValue(const HeadsetRowView& v, int dir, int mult) {
-    const int64_t count = mult > 0 ? mult : 1;
-    int64_t next = static_cast<int64_t>(v.value) + (dir > 0 ? count : -count);
-    if (next < static_cast<int64_t>(v.lo)) next = static_cast<int64_t>(v.lo);
-    if (next > static_cast<int64_t>(v.hi)) next = static_cast<int64_t>(v.hi);
-    return static_cast<uint32_t>(next);
-}
-
-// A typed value for this row: digits only, within the row's bounds. Never the
-// list -- the buffer holds one headset's number.
-bool parseTypedHeadsetValue(const MenuRowDef& d, const std::string& text, uint32_t* out) {
-    std::string digits = text;
-    while (!digits.empty() && digits.front() == ' ') digits.erase(digits.begin());
-    while (!digits.empty() && digits.back() == ' ') digits.pop_back();
-    if (digits.empty() || digits.size() > 5) return false;
-    uint32_t value = 0;
-    for (char c : digits) {
-        if (c < '0' || c > '9') return false;
-        value = value * 10 + static_cast<uint32_t>(c - '0');
-    }
-    if (value < headsetRowLow(d) || value > headsetRowHigh(d)) return false;
-    if (out) *out = value;
-    return true;
-}
-
 // Whether a row that needs a restart has an on-disk value the running game
-// does not have. A per-headset list is compared on the WORN headset's value,
+// does not have. The resolution row is compared on the WORN headset's width,
 // never as text: a hand edit to another headset's entry, or a canonicalising
 // rewrite of the list, changes nothing here and must badge nothing.
 bool rowPending(const MenuRowDef& d, const std::string& value, const std::string& snapshot) {
     if (isOpenxrRenderScaleRow(d)) return renderScaleRowPending(value);
-    if (isHeadsetRow(d)) {
-        const HeadsetRowView now = headsetRowView(d, value);
-        return now.headset && now.value != headsetRowView(d, snapshot).value;
-    }
     return value != snapshot;
 }
 
@@ -2020,18 +1876,14 @@ void buildContent(MenuContent& c) {
                 strncpy(l.left, "Anti-aliasing", sizeof(l.left) - 1);
             }
             const bool openxrScaleRow = isOpenxrRenderScaleRow(d);
-            const bool headsetRow = isHeadsetRow(d);
             // The worn headset's entry, resolved once for every site of this
             // row below (label, value, hint, tooltip, reset prompt).
             const ResolutionView res = openxrScaleRow ? resolutionView(r.value) : ResolutionView{};
-            const HeadsetRowView headsetValue =
-                headsetRow ? headsetRowView(d, r.value) : HeadsetRowView{};
             if (openxrScaleRow) {
                 snprintf(l.left, sizeof(l.left), "%s", openxrResolutionLabel(res).c_str());
             }
-            std::string v = openxrScaleRow  ? openxrResolutionValue(res)
-                            : headsetRow    ? headsetRowValue(headsetValue)
-                                            : displayValue(d, r.value);
+            std::string v = openxrScaleRow ? openxrResolutionValue(res)
+                                           : displayValue(d, r.value);
             if (editingThis) {
                 // What has been typed, with a caret. The raster shows a
                 // typed row in the value colour whatever its kind.
@@ -2041,7 +1893,7 @@ void buildContent(MenuContent& c) {
                 // after-restart value.  The pending badge supplies the same
                 // timing cue as every other restart row, while keeping the
                 // per-eye dimensions readable.
-                if (!openxrScaleRow && !headsetRow) v = displayValue(d, r.snapshot) + " -> " + v;
+                if (!openxrScaleRow) v = displayValue(d, r.snapshot) + " -> " + v;
                 l.badge = kBadgePending;
             } else if (d.applies == 2) {
                 l.badge = kBadgeRestart;
@@ -2079,9 +1931,6 @@ void buildContent(MenuContent& c) {
             if (hi && openxrScaleRow) {
                 snprintf(c.hint, sizeof(c.hint), "%s", openxrResolutionHint(res).c_str());
             }
-            if (hi && headsetRow) {
-                snprintf(c.hint, sizeof(c.hint), "%s", headsetRowHint(headsetValue).c_str());
-            }
             if (hi && isVscreenResolutionRow(d)) {
                 // announce=false: this runs every frame the row is highlighted,
                 // not once at startup, so the resolver must stay silent here.
@@ -2113,8 +1962,6 @@ void buildContent(MenuContent& c) {
                 std::string body;
                 if (openxrScaleRow) {
                     body += openxrResolutionFacts();
-                } else if (headsetRow) {
-                    body += headsetRowFacts(d, headsetValue);
                 } else if (isVscreenResolutionRow(d) && d.lo[0] && d.hi[0]) {
                     body += std::string("\"auto\", or a width in pixels from ") + d.lo +
                             " to " + d.hi + ". The height always follows it at 16:9.  ";
@@ -2128,14 +1975,13 @@ void buildContent(MenuContent& c) {
                     }
                     if (!list.empty()) body += "Choices: " + list + ".  ";
                 }
-                if (!openxrScaleRow && !headsetRow) {
+                if (!openxrScaleRow) {
                     body += std::string("Shipped ") + displayValue(d, d.shipped) + ".  " +
                             (d.applies == 1   ? "Applies at once."
                              : d.applies == 2 ? "Takes effect at the next launch."
                                               : "When it applies is not documented.");
                 }
                 if (openxrScaleRow) body += "\n" + openxrResolutionTooltip(res);
-                if (headsetRow) body += "\n" + headsetRowTooltip(d, headsetValue);
                 if (editingThis) {
                     body += s.editBad ? "\nThat is not a value this key accepts."
                                       : "\nEnter writes it, Escape leaves it alone.";
@@ -2161,26 +2007,6 @@ void buildContent(MenuContent& c) {
                             fallback = after.rt + ":" + digits;
                         }
                         body += "\nPress R again to remove this headset's entry (back to " + fallback + ").";
-                    }
-                } else if (s.resetArmedEntry == i && headsetRow) {
-                    // R clears only the worn headset's entry here too, never
-                    // d.shipped (the empty list, every headset's entry).
-                    if (!headsetValue.headset) {
-                        body += std::string("\nR would remove this headset's entry, but ") +
-                                (nativeMenuActive() ? "no headset is known yet."
-                                                    : "this runtime ignores it (native OpenXR only).");
-                    } else if (!wornEntryRemovable(headsetValue.headset, headsetValue.matched,
-                                                   headsetValue.sys)) {
-                        body += "\nNo entry for this headset; R removes nothing.";
-                    } else {
-                        const HeadsetRowView after = headsetRowView(
-                            d, edvr::native_render::removeHeadsetEntry(
-                                   r.value, headsetValue.rt, headsetValue.sys,
-                                   headsetValue.lo, headsetValue.hi));
-                        char back[32];
-                        snprintf(back, sizeof(back), "%u", after.value);
-                        body += std::string("\nPress R again to remove this headset's entry (back to ") +
-                                back + ").";
                     }
                 } else if (dim) {
                     body += "\nInactive: only DLSS and DLAA read this preset.";
@@ -2327,8 +2153,8 @@ void applyChange(int defIndex, const std::string& fileValue) {
 
 // What one per-headset write needs to know about the row it is changing: the
 // worn key, what that key resolves to now, and what ONE entry may hold. The
-// resolution row fills it from its ResolutionView, a trim row from its
-// HeadsetRowView, and the write below is the same for both.
+// resolution row fills it from its ResolutionView. (The field-of-view trims
+// filled it from a row of their own until 2026-09-29; they are ini-only now.)
 struct HeadsetWrite {
     bool        headset = false;
     std::string rt, sys, key;
@@ -2350,20 +2176,7 @@ HeadsetWrite headsetWriteOf(const ResolutionView& v) {
     return w;
 }
 
-HeadsetWrite headsetWriteOf(const HeadsetRowView& v) {
-    HeadsetWrite w;
-    w.headset = v.headset;
-    w.rt = v.rt;
-    w.sys = v.sys;
-    w.key = v.key;
-    w.matched = v.matched;
-    w.entryValue = v.value;
-    w.lo = v.lo;
-    w.hi = v.hi;
-    return w;
-}
-
-// The write for a per-headset list (fix.openxr_resolution and the trims): the
+// The write for a per-headset list (fix.openxr_resolution): the
 // worn headset's entry merged into the list (every other headset's entry kept
 // -- re-serialised in the canonical `rt/sys:V` spacing and case, never resized
 // or re-keyed -- malformed tokens dropped and named), the whole list written
@@ -2507,20 +2320,6 @@ void stepRow(int defIndex, int dir, int mult) {
         }
         const uint32_t next = steppedResolution(v, dir, mult);
         if (next != v.width) applyResolutionChange(defIndex, v, next);
-        return;
-    }
-    if (isHeadsetRow(d)) {
-        // One number for the worn headset, stepped by 1 within the row's
-        // bounds; the generated row is Text, for which stepping would
-        // otherwise be a no-op.
-        const HeadsetRowView v = headsetRowView(d, cur);
-        if (!v.headset) {
-            g_s.lastWrite = noHeadsetWriteText();
-            g_s.contentDirty = true;
-            return;
-        }
-        const uint32_t next = steppedHeadsetValue(v, dir, mult);
-        if (next != v.value) applyHeadsetChange(defIndex, headsetWriteOf(v), next);
         return;
     }
     switch (d.kind) {
@@ -2825,10 +2624,9 @@ bool editBufferBad() {
     const State& s = g_s;
     if (s.editDef < 0) return false;
     const MenuRowDef& d = kMenuRows[s.editDef];
-    // The per-headset rows take one headset's number -- a width in pixels,
-    // 1..16384, or the row's own range -- never the list.
+    // The per-headset row takes one headset's number -- a width in pixels,
+    // 1..16384 -- never the list.
     if (isOpenxrRenderScaleRow(d)) return !parseTypedWidth(s.editBuf, nullptr);
-    if (isHeadsetRow(d)) return !parseTypedHeadsetValue(d, s.editBuf, nullptr);
     if (isVscreenResolutionRow(d)) return !parseVscreenWidth(s.editBuf, nullptr);
     if (d.kind != MenuKind::Number) return false;
     if (s.editBuf.empty()) return true;
@@ -2862,19 +2660,6 @@ void beginEdit(int entryIndex, int defIndex) {
         }
         char digits[16];
         snprintf(digits, sizeof(digits), "%u", width);
-        seed = digits;
-    } else if (isHeadsetRow(kMenuRows[defIndex])) {
-        // The buffer holds the worn headset's number as digits, never the
-        // list; with no headset to key on the edit is refused and the Status
-        // page says why.
-        const HeadsetRowView v = headsetRowView(kMenuRows[defIndex], seed);
-        if (!v.headset) {
-            s.lastWrite = noHeadsetWriteText();
-            s.contentDirty = true;
-            return;
-        }
-        char digits[16];
-        snprintf(digits, sizeof(digits), "%u", v.value);
         seed = digits;
     }
     s.editEntry = entryIndex;
@@ -2926,14 +2711,6 @@ void commitEdit() {
             s.lastWrite = "not written: needs a width in pixels, 1 to 16384";
         } else if (isVscreenResolutionRow(d)) {
             s.lastWrite = "not written: needs \"auto\" or a width in pixels, 640 to 8192";
-        } else if (isHeadsetRow(d)) {
-            // As above, the dotted key is dropped: the row is highlighted and
-            // the key is the tooltip's title, and the line has to fit the
-            // Status page's 63-byte field.
-            char text[64];
-            snprintf(text, sizeof(text), "not written: needs a number from %u to %u",
-                     headsetRowLow(d), headsetRowHigh(d));
-            s.lastWrite = text;
         } else {
             s.lastWrite = std::string("not written: ") + dottedOf(d) + " needs a number" +
                           (d.lo[0] && d.hi[0] ? std::string(" from ") + d.lo + " to " + d.hi : "");
@@ -2948,17 +2725,6 @@ void commitEdit() {
         const ResolutionView view = resolutionView(g_rows[def].value);
         if (parseTypedWidth(v, &width) && (width != view.width || !view.entryWidth)) {
             applyResolutionChange(def, view, width);
-        }
-        return;
-    }
-    if (isHeadsetRow(d)) {
-        // The typed number is the worn headset's entry; the file gets the
-        // merged list, the other headsets' entries untouched. A typed 0
-        // removes the entry, and is a change whenever there is one to remove.
-        uint32_t value = 0;
-        const HeadsetRowView view = headsetRowView(d, g_rows[def].value);
-        if (parseTypedHeadsetValue(d, v, &value) && value != view.value) {
-            applyHeadsetChange(def, headsetWriteOf(view), value);
         }
         return;
     }
@@ -3049,19 +2815,6 @@ void dispatchNav(MenuNav nav, uint64_t now) {
                             s.contentDirty = true;
                         } else {
                             applyResolutionChange(def, v, 0);
-                        }
-                    } else if (isHeadsetRow(d)) {
-                        // The same rule on a trim: only the worn headset's
-                        // entry goes, never the whole list.
-                        const HeadsetRowView v = headsetRowView(d, g_rows[def].value);
-                        if (!v.headset) {
-                            s.lastWrite = noHeadsetWriteText();
-                            s.contentDirty = true;
-                        } else if (!wornEntryRemovable(v.headset, v.matched, v.sys)) {
-                            s.lastWrite = "no entry to remove for this headset";
-                            s.contentDirty = true;
-                        } else {
-                            applyHeadsetChange(def, headsetWriteOf(v), 0);
                         }
                     } else {
                         applyChange(def, d.shipped);
@@ -3629,25 +3382,10 @@ void menuNoteConfigReloaded() {
         const std::string dotted = dottedOf(d);
         const bool byMenu = (s.menuWroteDotted == dotted);
         const bool openxrScaleRow = isOpenxrRenderScaleRow(d);
-        const bool headsetRow = isHeadsetRow(d);
         if (v != r.value) {
             const std::string was = r.value;
             r.value = v;
-            if (!byMenu && headsetRow) {
-                // The list would toast truncated, and an edit to another
-                // headset's entry means nothing here: toast the worn
-                // headset's own value, or say the list moved without it.
-                const HeadsetRowView now = headsetRowView(d, v);
-                char text[96];
-                if (!now.headset) {
-                    snprintf(text, sizeof(text), "%s: list changed (no headset known)", d.label);
-                } else if (now.value == headsetRowView(d, was).value) {
-                    snprintf(text, sizeof(text), "%s: list changed (not this headset)", d.label);
-                } else {
-                    snprintf(text, sizeof(text), "%s: %u for this headset", d.label, now.value);
-                }
-                changed.push_back(text);
-            } else if (!byMenu && openxrScaleRow) {
+            if (!byMenu && openxrScaleRow) {
                 // The list would toast truncated; say what it means here.
                 // A hand edit that touched only another headset's entry
                 // changes nothing for the worn one, and says so rather
@@ -3842,8 +3580,7 @@ void menuTick(ID3D11Device* dev) {
                 if (s.snapshotTaken) {
                     for (int i = 0; i < kRowDefCount; ++i) {
                         const MenuRowDef& row = kMenuRows[i];
-                        if (row.applies == 2 &&
-                            (isOpenxrRenderScaleRow(row) || isHeadsetRow(row))) {
+                        if (row.applies == 2 && isOpenxrRenderScaleRow(row)) {
                             g_rows[i].pending = rowPending(row, g_rows[i].value,
                                                            g_rows[i].snapshot);
                         }
