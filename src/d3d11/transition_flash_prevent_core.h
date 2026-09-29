@@ -5,11 +5,10 @@
 // back, so tools\transition_flash_prevent_test can drive it without the
 // game. Its first consumer, transition_flash_prevent.cpp (the four-hook
 // compose fix behind advanced.transition_flash_prevent), was removed
-// 2026-09-29 after the flights refuted the chain it hooked
-// (docs/transition-flash.md); what stays is what
-// transition_flash_eye_base_core.h reuses. Comments in the sibling modules
-// that cite transition_flash_prevent.cpp mean that file as it was (git
-// history, before the removal commit).
+// 2026-09-29 (commit 68bddaaa; the file is at 68bddaaa^) after the flights
+// refuted the chain it hooked (docs/transition-flash.md); what stays is what
+// transition_flash_eye_base_core.h reuses. The sibling modules that took
+// their shape from that file say so in their own comments.
 #include <cmath>
 #include <cstdint>
 

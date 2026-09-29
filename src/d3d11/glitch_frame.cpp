@@ -2198,7 +2198,7 @@ SceneGeometryTap recordScenePosition(RingEntry& e,const State* s){
     return {geometryFresh, decision};
 }
 
-// appendLine's own copy for this instrument (transition_flash_prevent.cpp
+// appendLine's own copy for this instrument (transition_flash_eye_base.cpp
 // has one too, for its own dump; see AGENTS.md on copy-culture). Appends
 // one printf-style line plus \r\n to a std::string dump buffer.
 void eyeOriginTraceAppend(std::string& out,const char* fmt,...){
@@ -2214,7 +2214,7 @@ void eyeOriginTraceAppend(std::string& out,const char* fmt,...){
 // One automatic dump file: edvr_logs\flash\eyetrace_HHMMSS_fN.txt, the
 // unique-stack table first (point 4 of the design: this file is read
 // stack-first), then every ring frame inside the folded trigger window.
-// Mirrors transition_flash_prevent.cpp's performDump in shape (same log
+// Mirrors transition_flash_eye_base.cpp's performDump in shape (same log
 // directory accessor, same CreateDirectoryW/CreateFileW pattern) but is
 // this file's own function: that module stays untouched.
 void eyeOriginTracePerformDump(State* s,const eot::PendingWindow& window){
@@ -2358,12 +2358,12 @@ void eyeOriginTraceReport(State* s){
 
 // Called from all three of glitchFrameBoundary's verdict sites (the
 // fix-off path, the disabled-for-session path, and the normal path) with
-// the same withheldClass test transition_flash_prevent.cpp's own tap uses
-// at each -- so one flight needs no key presses -- plus sceneResetVerdict,
-// the narrower test advanced.eye_origin_readers wants (pose_reader_watch_
-// core.h's dumpVerdictTrigger; see the design doc's part C). Off is the
-// only real gate; once on, this runs every boundary call so a pending
-// dump becomes due even on a frame with no new trigger.
+// the same withheldClass test at each -- so one flight needs no key presses
+// -- plus sceneResetVerdict, the narrower test advanced.eye_origin_readers
+// wants (pose_reader_watch_core.h's dumpVerdictTrigger; see the design
+// doc's part C). Off is the only real gate; once on, this runs every
+// boundary call so a pending dump becomes due even on a frame with no new
+// trigger.
 void eyeOriginTraceBoundary(State* s,uint32_t frame,bool withheldClass,bool sceneResetVerdict){
     if(!s->eyeOriginTraceOn)return;
     const bool readersOn=poseReaderWatchOn();
