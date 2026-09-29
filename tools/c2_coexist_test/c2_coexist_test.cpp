@@ -10,9 +10,12 @@
 // C7-C12 are the C3 wiring: the frame protocol and the Legacy fallback
 // hysteresis, the admission table, the frame window, the flush, the census and
 // the text of the new log lines, all through the same header the DLL compiles
-// (src/d3d11/flat_camera_phase.h).
+// (src/d3d11/flat_camera_phase.h). C13-C15 (2026-09-29, the camera path on with
+// no setting): a prologue mismatch and a write-failure stand-down each hand the
+// frame to the draw-time path with a history reset, the write-failure limit's
+// boundary, and the AA-off invariant -- each with its negative control.
 //
-// --self-test runs C1-C12 and prints "c2 coexist: PASS" only when every check
+// --self-test runs C1-C15 and prints "c2 coexist: PASS" only when every check
 // holds. Exit 1 with the failures named otherwise.
 
 #include <chrono>
@@ -617,10 +620,11 @@ void testC11() {
     tick.owner = "upstream"; tick.history = "valid"; tick.closes = 300; tick.cleanCloses = 298;
     tick.flushed = 2; tick.historyResets = 0;
     flatCameraFormatTick(text, sizeof(text), tick);
-    check(has(text, "flat camera inject 5s: refresh-calls=680 injected=515 warming=0 kind-refusals=165 unsupported=0 owner=upstream history=valid trace=off") &&
+    check(has(text, "flat camera inject 5s: refresh-calls=680 injected=515 warming=0 kind-refusals=165 unsupported=0 owner=upstream history=valid closes=300") &&
           has(text, "closes=300 clean-closes=298 stale=0 off-thread=0 not-upstream=0 flushed=2 flush-failed=0 write-failures=0 history-resets=0") &&
-          has(text, "fallback-frames=3/60 fallback=upstream fallbacks=0 set-evicted=0"),
-          "C11 the tick keeps its first nine fields in their old order and appends the wiring's counters and the hysteresis defaults");
+          has(text, "fallback-frames=3/60 fallback=upstream fallbacks=0 set-evicted=0") &&
+          !has(text, "trace"),
+          "C11 the tick keeps its first seven fields in their old order and appends the wiring's counters and the hysteresis defaults, and no trace field (the trace setting is gone)");
     std::printf("  note  %s\n", text);
     FlatCameraTickFields dead;
     flatCameraFormatTick(text, sizeof(text), dead);
@@ -658,7 +662,7 @@ void testC12() {
                 if (observing && flatCameraPhaseEnabled(FlatCameraRoute::Upstream, wanted, observing, plan)) upstreamYieldsToObserving = false;
                 if (flatCameraPhaseEnabled(FlatCameraRoute::None, wanted, observing, plan)) noneNever = false;
             }
-    check(legacyExpr, "C12 Off (key off) and Legacy run the phase machine exactly as the line did before the wiring");
+    check(legacyExpr, "C12 Off (the injector is not wanted) and Legacy run the phase machine exactly as the line did before the wiring");
     check(upstreamIgnoresPlan && upstreamYieldsToObserving,
           "C12 Upstream needs no legacy plan but yields to observation and to the jitter kill switch");
     check(noneNever, "C12 a frame no route may mutate never jitters");
@@ -671,6 +675,133 @@ void testC12() {
             if (carries ? (p.x != 0.25f || p.y != -0.375f) : (p.x != 0.0f || p.y != 0.0f)) rowsOk = false;
         }
     check(rowsOk, "C12 the captured rows carry a phase only on an Upstream frame in which an injection landed");
+}
+
+// C13-C15 (2026-09-29): the camera path is ON with a temporal mode and there is no setting, so the
+// draw-time adapter is only the automatic fallback. These are the ways a frame reaches it.
+
+// One frame's decision as the runtime sees it.
+struct FallbackFrame { FlatCameraRoute route; bool historyReset; bool phaseMachineRuns; };
+
+// A session of `frames` frames. The hook lands an injection on the first `healthy` frames (on all of
+// them when `hookRuns`); after that nothing lands and no kind-3 camera reaches the detour, exactly what
+// the DLL does after a prologue mismatch (the hook is never installed: healthy = 0) or a write-failure
+// stand-down (the gate closes after `healthy` frames). An Upstream frame closes armed, scene named, and
+// lands only while the hook lives; a Legacy frame is the draw-time adapter's, which applies the phase
+// itself and closes clean. Returns how many times the fallback engaged.
+uint64_t fallbackSession(bool hookRuns, uint32_t healthy, uint32_t frames, bool legacyPlan, FallbackFrame* out) {
+    FlatCameraFrameCore core;
+    for (uint32_t i = 0; i < frames; ++i) {
+        core.begin(legacyPlan);
+        const FlatCameraRoute route = core.route();
+        out[i] = {route, core.takeHistoryReset(), flatCameraPhaseEnabled(route, true, false, legacyPlan)};
+        const bool lands = hookRuns || i < healthy;
+        if (route == FlatCameraRoute::Legacy) core.close(false, true, true, true, lands);
+        else core.close(true, lands, lands, true, lands);
+    }
+    return core.fallback().engagements();
+}
+constexpr uint32_t kHealthyStretch = 20;
+constexpr uint32_t kFallbackFrames = kHealthyStretch + kFlatCameraFallbackFramesOn + 1 + 3 * kFlatCameraFallbackFramesOff;
+FallbackFrame g_frames[4][kFallbackFrames];
+
+// C13: a prologue mismatch. The game changed under the hook (an update), so the DLL's install check
+// refuses the refresh's prologue, latches "no hook", and no kind-3 camera ever reaches the detour.
+void testC13() {
+    std::printf("C13 prologue mismatch: the draw-time path takes the frame\n");
+    FallbackFrame* const mismatch = g_frames[0];
+    FallbackFrame* const control = g_frames[1];
+    FallbackFrame* const afterHealthy = g_frames[2];
+    FallbackFrame* const noPlan = g_frames[3];
+    const uint64_t engaged = fallbackSession(false, 0, kFallbackFrames, true, mismatch);
+    bool upstreamFirst = true;
+    for (uint32_t i = 0; i < kFlatCameraFallbackFramesOn; ++i) upstreamFirst = upstreamFirst && mismatch[i].route == FlatCameraRoute::Upstream;
+    check(engaged == 1 && upstreamFirst && mismatch[kFlatCameraFallbackFramesOn].route == FlatCameraRoute::Legacy,
+          "C13 with the hook never running, Upstream is tried for ON frames and then Legacy takes the frame");
+    bool phaseMachineRuns = true, stays = true, noReset = true;
+    for (uint32_t i = 0; i < kFallbackFrames; ++i) {
+        noReset = noReset && !mismatch[i].historyReset;
+        if (i >= kFlatCameraFallbackFramesOn) {
+            phaseMachineRuns = phaseMachineRuns && mismatch[i].phaseMachineRuns;
+            stays = stays && mismatch[i].route == FlatCameraRoute::Legacy;
+        }
+    }
+    check(phaseMachineRuns, "C13 on Legacy the phase machine runs: the draw-time adapter jitters the frame");
+    check(stays, "C13 nothing ever reaches the detour, so the fallback never releases: Legacy for the rest of the session");
+    // A mismatch is decided at the first frame, so no Upstream frame ever closed clean and the
+    // ownership policy holds no Upstream history: the switch owes no history reset (the runtime's own
+    // reset on an unclean frame already covers the three failed ones). The reset is owed, and carried,
+    // when there WAS a clean Upstream history: the same switch after a healthy stretch.
+    check(noReset, "C13 a mismatch from the first frame switches with no ownership history reset: there was no Upstream history");
+    const uint64_t engagedAfter = fallbackSession(false, kHealthyStretch, kFallbackFrames, true, afterHealthy);
+    uint32_t resets = 0, firstReset = 0;
+    for (uint32_t i = 0; i < kFallbackFrames; ++i) if (afterHealthy[i].historyReset) { if (!resets) firstReset = i; ++resets; }
+    check(engagedAfter == 1 && resets == 1 && firstReset == kHealthyStretch + kFlatCameraFallbackFramesOn &&
+          afterHealthy[firstReset].route == FlatCameraRoute::Legacy,
+          "C13 the same switch after a clean Upstream stretch carries exactly one history reset, on the first Legacy frame");
+    // The negative control: with a hook that runs the same frames stay on Upstream, engage nothing, reset nothing.
+    const uint64_t controlEngaged = fallbackSession(true, 0, kFallbackFrames, true, control);
+    bool controlUpstream = true, controlNoReset = true;
+    for (uint32_t i = 0; i < kFallbackFrames; ++i) {
+        controlUpstream = controlUpstream && control[i].route == FlatCameraRoute::Upstream;
+        controlNoReset = controlNoReset && !control[i].historyReset;
+    }
+    check(controlEngaged == 0 && controlUpstream && controlNoReset,
+          "C13 control: with the hook running the same frames stay Upstream with no fallback and no reset, so the switch above is the mismatch's doing");
+    // Without a legacy plan the outcome is named, not silent: no phase at all (C7 covers the decision itself).
+    fallbackSession(false, 0, kFallbackFrames, false, noPlan);
+    check(noPlan[kFlatCameraFallbackFramesOn].route == FlatCameraRoute::None && !noPlan[kFlatCameraFallbackFramesOn].phaseMachineRuns,
+          "C13 with no legacy plan either, the frame goes to None and nothing jitters it");
+}
+
+// C14: write failures. The limit is one named constant; the boundary is 7 keep, 8 stand down; and a
+// stand-down closes the gate for the session, so nothing lands from then on and the same hysteresis
+// hands every frame to the draw-time path, with the one history reset the Upstream history is owed.
+void testC14() {
+    std::printf("C14 write failures: the boundary, and what a stand-down hands over\n");
+    auto boundary = [](bool (*standDown)(uint64_t)) {
+        return !standDown(0) && !standDown(kFlatCameraWriteFailureLimit - 1) &&
+               standDown(kFlatCameraWriteFailureLimit) && standDown(kFlatCameraWriteFailureLimit + 1) && standDown(1000);
+    };
+    check(kFlatCameraWriteFailureLimit == 8, "C14 the limit is 8 failed camera writes in one 5 s window, named in one place");
+    check(boundary(&flatCameraWriteFailureStandDown), "C14 7 failed writes in a window keep the hook, 8 stand it down");
+    // Negative controls: an off-by-one either way, and a strict comparison, all fail the same boundary check.
+    check(!boundary([](uint64_t n) { return n >= kFlatCameraWriteFailureLimit - 1; }), "C14 control: a limit one too low is seen by the boundary check");
+    check(!boundary([](uint64_t n) { return n >= kFlatCameraWriteFailureLimit + 1; }), "C14 control: a limit one too high is seen by the boundary check");
+    check(!boundary([](uint64_t n) { return n > kFlatCameraWriteFailureLimit; }), "C14 control: a strict comparison is seen by the boundary check");
+    // The consequence: the boundary decides whether the gate closes after the healthy stretch.
+    auto outcome = [](uint64_t failuresInWindow, uint32_t* switchedAt, uint32_t* resets, FlatCameraRoute* last) {
+        const bool standsDown = flatCameraWriteFailureStandDown(failuresInWindow);
+        FallbackFrame* const frames = g_frames[0];
+        fallbackSession(!standsDown, kHealthyStretch, kFallbackFrames, true, frames);
+        *switchedAt = 0; *resets = 0;
+        for (uint32_t i = 0; i < kFallbackFrames; ++i) {
+            if (frames[i].route == FlatCameraRoute::Legacy && *switchedAt == 0) *switchedAt = i;
+            if (frames[i].historyReset) ++*resets;
+        }
+        *last = frames[kFallbackFrames - 1].route;
+    };
+    uint32_t at = 0, resets = 0; FlatCameraRoute last = FlatCameraRoute::Off;
+    outcome(kFlatCameraWriteFailureLimit, &at, &resets, &last);
+    check(at == kHealthyStretch + kFlatCameraFallbackFramesOn && resets == 1 && last == FlatCameraRoute::Legacy,
+          "C14 8 failed writes: ON frames after the stand-down the draw-time path takes over with one history reset, and stays there");
+    outcome(kFlatCameraWriteFailureLimit - 1, &at, &resets, &last);
+    check(at == 0 && resets == 0 && last == FlatCameraRoute::Upstream,
+          "C14 control: 7 failed writes stand nothing down, and the same frames stay on Upstream with no reset");
+}
+// C15: the camera path exists with a temporal mode and only then. The AA-off invariant: with the mode
+// off the injector is not wanted, so no hook is installed, nothing is written and no "flat camera" line
+// is logged (every such line is written from flatCameraInjectFrame's paths, which the flat runtime
+// reaches only with a mode selected; flatCameraInjectFrame asks this predicate a second time).
+void testC15() {
+    std::printf("C15 the camera path is on with a temporal mode, and only then\n");
+    check(flatCameraPathWanted(true, true), "C15 the flat profile with a temporal mode selected wants the camera path, with no setting");
+    check(!flatCameraPathWanted(true, false),
+          "C15 the flat profile with the mode OFF does not: nothing installed, nothing written, no \"flat camera\" line");
+    check(!flatCameraPathWanted(false, true) && !flatCameraPathWanted(false, false), "C15 another profile never wants it");
+    auto ignoresMode = [](bool flat, bool) { return flat; };   // what an unconditional "always on" would be
+    check(ignoresMode(true, false) && !flatCameraPathWanted(true, false),
+          "C15 control: a predicate that ignored the mode would want the camera path with the mode off, and the row above sees it");
 }
 
 int runSelfTest() {
@@ -686,6 +817,9 @@ int runSelfTest() {
     testC10();
     testC11();
     testC12();
+    testC13();
+    testC14();
+    testC15();
     if (g_failures == 0) {
         std::printf("c2 coexist: PASS\n");
         return 0;

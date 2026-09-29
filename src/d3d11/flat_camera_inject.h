@@ -9,14 +9,17 @@
 // refresh (FUN_1405921f0) that applies the temporal phase to the camera's
 // frustum parameters, transiently, so every projection-dependent consumer in
 // the call derives from the jittered values through the game's own
-// finalizers. Live mutation only under fix.temporal_aa_camera = on; the hook
-// otherwise sits inert behind its gate for process lifetime (the producer
-// probe's discipline).
+// finalizers. On whenever the flat profile has a temporal mode selected (no
+// setting: the draw-time adapter is only the automatic fallback -- no
+// injectable camera, a prologue mismatch after a game update, or too many
+// failed writes); with the mode off nothing is installed or logged, and a hook
+// that stood down stays inert behind its gate for process lifetime (the
+// producer probe's discipline).
 //
 // The frame protocol flat_runtime drives, in order, once per Present:
 //   flatCameraInjectDisarm()      the Present edge: the frame window closes
 //   flatCameraInjectClose(...)    the frame that ended is closed (history)
-//   flatCameraInjectFrame(n)      owner selection for the new frame, the tick
+//   flatCameraInjectFrame(n, on)  owner selection for the new frame, the tick
 //   flatCameraInjectTakeHistoryReset()  one-shot, honored before the phase
 //   flatCameraInjectRoute()       decides whether the phase machine runs
 //   flatCameraInjectArm()         the phase is chosen: the window opens
@@ -24,7 +27,8 @@ namespace edvr {
 
 // Frame start, called BEFORE the phase machine's beginFrame: ownership begin
 // and selection for the new frame, the hook install (once), the 5s tick.
-void flatCameraInjectFrame(uint64_t frame);
+// temporalModeEnabled: a temporal mode is selected (flatCameraPathWanted).
+void flatCameraInjectFrame(uint64_t frame, bool temporalModeEnabled);
 
 // This frame's route (Off when the injector is not wanted).
 FlatCameraRoute flatCameraInjectRoute();
@@ -49,7 +53,6 @@ void flatCameraInjectClose(bool phaseNonzero, bool applied, bool clean, bool sce
 void flatCameraInjectReset();
 
 // What the rest of flat_runtime needs:
-bool flatCameraInjectWanted();        // the config key is on and the profile is flat
 bool flatCameraInjectUpstreamOwns();  // this frame's ownership decision is Upstream
 bool flatCameraInjectBypassRefusal(const char* reason); // the legacy-only refusal classes
 

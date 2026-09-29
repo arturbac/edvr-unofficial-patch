@@ -333,6 +333,28 @@ inline bool flatCameraFlushDecision(FlatCameraInjectedSet& set, uintptr_t camera
 constexpr uint32_t kFlatCameraFallbackFramesOn = 3;
 constexpr uint32_t kFlatCameraFallbackFramesOff = 60;
 
+// The camera path is on whenever the flat profile has a temporal mode selected
+// (2026-09-29: there is no setting; the draw-time adapter is only the automatic
+// fallback). With the mode off the injector is not wanted: no hook is installed,
+// nothing is written, and no "flat camera" line is logged. What hands a frame to
+// the draw-time adapter, all through the hysteresis above:
+//   no injectable camera      armed scene frames end with nothing landed;
+//   a prologue mismatch       the game changed under the hook (an update): it never
+//                             installs, so nothing ever lands and the same count fills;
+//   failed camera writes      kFlatCameraWriteFailureLimit in one window stands the
+//                             hook down (below), so nothing lands from then on.
+constexpr bool flatCameraPathWanted(bool flatProfile, bool temporalModeEnabled) {
+    return flatProfile && temporalModeEnabled;
+}
+
+// THE write-failure limit, in the one place it lives: this many failed camera
+// writes (a camera the game unmapped under us, a page protection that changed)
+// in one 5 s window stand the hook down for the session.
+constexpr uint64_t kFlatCameraWriteFailureLimit = 8;
+constexpr bool flatCameraWriteFailureStandDown(uint64_t failuresInWindow) {
+    return failuresInWindow >= kFlatCameraWriteFailureLimit;
+}
+
 class FlatCameraFallback {
 public:
     bool active() const { return active_; }
@@ -490,25 +512,25 @@ struct FlatCameraTickFields {
     uint64_t refreshCalls = 0, injected = 0, warming = 0, kindRefusals = 0, unsupported = 0;
     const char* owner = "legacy/none";
     const char* history = "invalid";
-    const char* trace = "off";
     uint64_t closes = 0, cleanCloses = 0, stale = 0, offThread = 0, notUpstream = 0;
     uint64_t flushed = 0, flushFailed = 0, writeFailures = 0, historyResets = 0;
     uint32_t fallbackOn = kFlatCameraFallbackFramesOn, fallbackOff = kFlatCameraFallbackFramesOff;
     bool fallbackActive = false;
     uint64_t fallbacks = 0, setEvicted = 0;
 };
-// The first nine fields, in this order, are the tick as it was before the
-// wiring; a reader of the old line still finds them where they were.
+// The first seven fields, in this order, are the tick as it was before the wiring
+// (its eighth, trace=, went with the trace setting on 2026-09-29: a reader of the
+// old line finds the rest where it was, closes= now following history=).
 inline int flatCameraFormatTick(char* out, size_t size, const FlatCameraTickFields& t) {
     return std::snprintf(out, size,
         "flat camera inject 5s: refresh-calls=%llu injected=%llu warming=%llu "
-        "kind-refusals=%llu unsupported=%llu owner=%s history=%s trace=%s "
+        "kind-refusals=%llu unsupported=%llu owner=%s history=%s "
         "closes=%llu clean-closes=%llu stale=%llu off-thread=%llu not-upstream=%llu "
         "flushed=%llu flush-failed=%llu write-failures=%llu history-resets=%llu "
         "fallback-frames=%u/%u fallback=%s fallbacks=%llu set-evicted=%llu",
         (unsigned long long)t.refreshCalls, (unsigned long long)t.injected,
         (unsigned long long)t.warming, (unsigned long long)t.kindRefusals,
-        (unsigned long long)t.unsupported, t.owner, t.history, t.trace,
+        (unsigned long long)t.unsupported, t.owner, t.history,
         (unsigned long long)t.closes, (unsigned long long)t.cleanCloses,
         (unsigned long long)t.stale, (unsigned long long)t.offThread,
         (unsigned long long)t.notUpstream, (unsigned long long)t.flushed,

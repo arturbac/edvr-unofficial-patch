@@ -493,6 +493,78 @@ static void testShippedIni(const std::wstring& root) {
           "a key this version never shipped is carried, with its note");
     check(moveRep.followed.size() >= 4,
           "the report says the values followed their settings");
+
+    // 2026-09-29: the flat camera path became always-on and its two switches,
+    // fix.temporal_aa_camera and fix.temporal_aa_camera_trace, were removed. A
+    // rig that flew the experiment has both lines, one or both "on". Neither may
+    // be adopted (the shipped file no longer documents either, so nothing reads
+    // them), neither may be eaten (a line somebody put there is how a support
+    // thread starts), and neither may disturb the settings around them. The
+    // base is the shipped file plus the two blocks the previous version carried
+    // right after temporal_aa_model.
+    check(shipped.find("temporal_aa_camera") == std::string::npos,
+          "the shipped ini documents neither retired camera-path switch");
+    // The checkout's line endings are whatever git gave it (LF here, CRLF on a
+    // machine with autocrlf), so the fixture takes them from the file.
+    const std::string eol = shipped.find("\r\n") != std::string::npos ? "\r\n" : "\n";
+    const std::string anchor = "temporal_aa_model = k" + eol;
+    const size_t at = shipped.find(anchor);
+    check(at != std::string::npos, "the shipped ini still has the line the fixture anchors on");
+    if (at != std::string::npos) {
+        const size_t after = at + anchor.size();
+        const std::string previous = shipped.substr(0, after) + eol +
+            "# ui: Camera-path jitter (experimental) | choices off, on | live | menu performance" + eol +
+            "temporal_aa_camera = off" + eol + eol +
+            "# ui: Camera-path jitter trace logging (experimental) | choices off, on | live | menu performance" + eol +
+            "temporal_aa_camera_trace = off" + eol +
+            shipped.substr(after);
+        std::string flown = previous;
+        flown.replace(flown.find("temporal_aa_camera = off"), strlen("temporal_aa_camera = off"),
+                      "temporal_aa_camera = on");
+        flown.replace(flown.find("temporal_aa_camera_trace = off"),
+                      strlen("temporal_aa_camera_trace = off"), "temporal_aa_camera_trace = on");
+        const size_t modelAt = flown.find("temporal_aa_model = k");
+        flown.replace(modelAt, strlen("temporal_aa_model = k"), "temporal_aa_model = l");
+
+        MergeReport camRep;
+        const std::string camMerged = mergeIni(shipped, flown, &previous, {}, &camRep);
+        expectEq(iniValue(camMerged, "fix.temporal_aa_model"), "l",
+                 "the setting next to the retired pair keeps its tuned value");
+        expectEq(iniValue(camMerged, "fix.temporal_aa_camera"), "on",
+                 "a retired camera-path switch is carried with its value, not eaten");
+        expectEq(iniValue(camMerged, "fix.temporal_aa_camera_trace"), "on",
+                 "...and so is the trace switch");
+        check(camRep.retired.size() == 2 && camRep.carried.empty(),
+              "both are reported as retired settings, neither as an unknown key");
+        check(camMerged.find("temporal_aa_camera = on") != std::string::npos &&
+                  camMerged.find("# carried over from your edvr.ini; this version no longer uses it") !=
+                      std::string::npos,
+              "each carried line says this version no longer uses it");
+        check(camMerged.find("# ui: Camera-path jitter") == std::string::npos,
+              "the retired settings' menu rows are not resurrected");
+
+        // Hand-installed, no base copy: the same two lines are still carried and
+        // still inert, only the note differs (the merge cannot know they once
+        // shipped).
+        MergeReport bareRep;
+        const std::string bare = mergeIni(shipped, flown, nullptr, {}, &bareRep);
+        expectEq(iniValue(bare, "fix.temporal_aa_camera"), "on",
+                 "with no base copy a retired switch is still carried");
+        check(bareRep.carried.size() == 2,
+              "and reported as a key this version never shipped");
+
+        // The merge is idempotent on the carried lines: merging again with the
+        // result as the user's file must not duplicate them.
+        MergeReport again;
+        const std::string twice = mergeIni(shipped, camMerged, &shipped, {}, &again);
+        size_t seen = 0, from = 0;
+        while ((from = twice.find("temporal_aa_camera = on", from)) != std::string::npos) {
+            ++seen;
+            from += 1;
+        }
+        check(seen == 1, "a second merge does not duplicate a carried line",
+              std::to_string(seen) + " copies");
+    }
 }
 
 // ---------------------------------------------------------------------------

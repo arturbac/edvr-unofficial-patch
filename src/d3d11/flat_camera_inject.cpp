@@ -144,22 +144,19 @@ struct InjectState {
     // detour reads the decision only after the gate has proved it is on that
     // thread.
     FlatCameraFrameCore core;
-    bool wanted = false;       // cached each frame: the key is on and the profile is flat
+    bool wanted = false;       // cached each frame: the profile is flat and a temporal mode is selected
     FlatCameraGate gate;       // the frame window the detour may inject in
     FlatCameraInjectedSet injected; // cameras this session injected (flush candidates); owner thread only
     FlatCameraCensus census;   // owner thread only; reset every window
     std::atomic<bool> kind3Seen{false}; // a kind-3 camera reached the detour this frame
     uintptr_t gameBase = 0;    // EliteDangerous64.exe, for the census's call-site offsets
     uint64_t frame = 0;
-    // fix.temporal_aa_camera_trace, refreshed per frame. Per-call log
-    // writes are gated behind it: the 2026-09-28 20:09 crash (a null-read
-    // downstream in the camera pipeline, sentinel-caught) came with the
-    // detour doing NOTHING but pass-through plus three note() writes on
-    // the game thread inside the view-constant refresh, so call-path I/O
-    // is the lead suspect and stays off unless a flight explicitly wants
-    // the breadcrumbs. The same information rides out on these fields and
-    // the 5s tick instead.
-    bool trace = false;
+    // No call-path I/O, ever: the 2026-09-28 20:09 crash (a null-read downstream
+    // in the camera pipeline, sentinel-caught) came with the detour doing
+    // NOTHING but pass-through plus three note() writes on the game thread
+    // inside the view-constant refresh. Its per-call breadcrumbs (the old trace
+    // setting, retired 2026-09-29) were deleted with it; everything they said
+    // rides out on the fields below and the 5s tick, census and rows lines.
     // Counters, reported on the cadence tick.
     std::atomic<uint64_t> refreshCalls{0};
     std::atomic<uint64_t> injectedCalls{0};
@@ -194,7 +191,6 @@ struct InjectState {
     uint64_t lastRaySeqReported = 0;
     uintptr_t lastRaySlot = 0;
     uint64_t lastLogMs = 0;
-    uint64_t lastKindRefusalLogMs = 0;
     float lastRay[4] = {};
 };
 InjectState g_inject;
@@ -312,7 +308,7 @@ bool prepareRelay(void* trampoline, void*) noexcept {
 // values cross-check the rig's composeRayCb against the live game, and
 // the slot record is the handle for naming the binding shader next. The
 // reads stay on the call path (plain memory, no I/O); the note is emitted
-// from the 5s tick, or immediately when the trace key is on.
+// from the 5s tick.
 void observeRayCb(uintptr_t ctx) {
     uint64_t lVar4 = 0;
     if (!sehReadU64(ctx + 0x28, &lVar4) || !lVar4) return;
@@ -330,17 +326,7 @@ void observeRayCb(uintptr_t ctx) {
     for (int i = 0; i < 4; ++i) g_inject.lastRay[i] = row[i];
     g_inject.lastRaySlot = static_cast<uintptr_t>(staging);
     const uint64_t n = g_inject.rayCbLogged.fetch_add(1, std::memory_order_relaxed) + 1;
-    g_inject.raySeq.store(n, std::memory_order_relaxed);
-    if (n > 8) return; // bounded: first anchor plus a few material changes
-    if (!g_inject.trace) return; // the tick reports the anchor instead
-    float more[12] = {};
-    for (uint32_t i = 0; i < 12; ++i)
-        if (!sehReadF32(static_cast<uintptr_t>(staging) + 16 + 4 * i, &more[i])) return;
-    Log::get().note("flat camera inject: ray CB slot %p anchors (%llux): "
-        "[%.5f %.5f %.5f %.5f] [%.5f %.5f %.5f %.5f] [%.5f %.5f %.5f %.5f] [%.5f %.5f %.5f %.5f]",
-        reinterpret_cast<void*>(staging), (unsigned long long)n,
-        row[0], row[1], row[2], row[3], more[0], more[1], more[2], more[3],
-        more[4], more[5], more[6], more[7], more[8], more[9], more[10], more[11]);
+    g_inject.raySeq.store(n, std::memory_order_relaxed); // the tick reports the anchor
 }
 
 // The flush: raise the dirty bits (projection and cached VP) on a camera this
@@ -368,27 +354,11 @@ void flushCamera(uintptr_t camera) noexcept {
 void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noexcept {
     g_refreshTls.armed = 0; // a previous body that unwound never disarmed
     const uint64_t callNo = g_inject.refreshCalls.fetch_add(1, std::memory_order_relaxed) + 1;
-    // Breadcrumbs are gated behind the trace key (see InjectState::trace);
-    // the triage fields ride out on the 5s tick either way.
-    const bool trace = g_inject.trace && callNo <= 8;
+    // The triage fields ride out on the 5s tick (the lastcall line); no I/O here.
     g_inject.lastCallNo.store(callNo, std::memory_order_relaxed);
     g_inject.lastCtx.store(ctx, std::memory_order_relaxed);
     g_inject.lastP2.store(p2, std::memory_order_relaxed);
     g_inject.lastCamera.store(camera, std::memory_order_relaxed);
-    if (trace) {
-        uint64_t literal = 0;
-        if (sehReadU64(reinterpret_cast<uintptr_t>(g_inject.relay) + kCallbackLiteral, &literal)) {
-            Log::get().note("flat camera inject: refresh call #%llu entered (ctx=%p p2=%p camera=%p stubA=%p trampoline=%p)",
-                            (unsigned long long)callNo, reinterpret_cast<void*>(ctx),
-                            reinterpret_cast<void*>(p2), reinterpret_cast<void*>(camera),
-                            reinterpret_cast<void*>(literal),
-                            reinterpret_cast<void*>(g_refreshForward.load(std::memory_order_relaxed)));
-        } else {
-            Log::get().note("flat camera inject: refresh call #%llu entered (ctx=%p p2=%p camera=%p; stubA literal unreadable)",
-                            (unsigned long long)callNo, reinterpret_cast<void*>(ctx),
-                            reinterpret_cast<void*>(p2), reinterpret_cast<void*>(camera));
-        }
-    }
 
     // The thread first. The phase machine, the decision, the census and the
     // set of injected cameras belong to the thread that runs Present; a call
@@ -448,17 +418,9 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     // One write, once per such edge, never on a camera never injected.
     if (flatCameraFlushDecision(g_inject.injected, camera, admit)) flushCamera(camera);
     if (admit != FlatCameraAdmit::Inject) {
+        // A camera that is not the proven branch is named by the census (kinds, top cameras),
+        // counted by the tick (kind-refusals, unsupported) and left untouched.
         if (camera) g_inject.census.note(camera, kind, false);
-        if (trace && (admit == FlatCameraAdmit::Unsupported || admit == FlatCameraAdmit::OtherKind ||
-                      admit == FlatCameraAdmit::Unreadable)) {
-            const uint64_t now = GetTickCount64();
-            if (now - g_inject.lastKindRefusalLogMs > 30000) {
-                g_inject.lastKindRefusalLogMs = now;
-                Log::get().note("flat camera inject: camera %p kind %u is not the proven branch (named unsupported; no mutation)",
-                                reinterpret_cast<void*>(camera), readable ? kind : 0xffffffffu);
-            }
-            Log::get().note("flat camera inject: refresh call #%llu forwards unmodified (kind=%u)", (unsigned long long)callNo, kind);
-        }
         return;
     }
 
@@ -508,11 +470,6 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     // bound pair is restored, so it is a flush candidate from here on.
     g_inject.injected.noteInjected(camera);
     g_inject.census.note(camera, kind, true);
-    if (trace) {
-        Log::get().note("flat camera inject: refresh call #%llu injecting phase=(%.5f, %.5f) at %ux%u over bound=(%.5f, %.5f); return %p redirected to stubB",
-                        (unsigned long long)callNo, jx, jy, rw, rh, entryX, entryY,
-                        reinterpret_cast<void*>(realRet));
-    }
 }
 
 // The post-forward half, called by stubB after the body's ret. The entry
@@ -526,13 +483,8 @@ void refreshPost() noexcept {
     sehWriteF32(camera + kCamBoundX, g_refreshTls.entryX);
     sehWriteF32(camera + kCamBoundY, g_refreshTls.entryY);
     if (g_refreshTls.haveFlags) sehWriteU32(camera + kCamFlags, g_refreshTls.flags);
-    const uint64_t callNo = g_refreshTls.callNo;
     g_inject.injectedCalls.fetch_add(1, std::memory_order_relaxed);
     flatRuntimeNoteCameraApplied();
-    if (g_inject.trace && callNo <= 8) {
-        Log::get().note("flat camera inject: refresh call #%llu restored entry values; observing ray CB",
-                        (unsigned long long)callNo);
-    }
     observeRayCb(g_refreshTls.ctx);
 }
 
@@ -544,17 +496,6 @@ void standDown(const char* why) {
 }
 
 } // namespace
-
-bool flatCameraInjectWanted() {
-    if (!runtimeFlatProfile()) return false;
-    return _stricmp(Config::get().getString("fix.temporal_aa_camera", "off").c_str(), "on") == 0;
-}
-
-// Own function: the string temporary needs unwinding, which flatCamera-
-// InjectFrame's readback __try forbids (C2712).
-bool flatCameraInjectTraceWanted() {
-    return _stricmp(Config::get().getString("fix.temporal_aa_camera_trace", "off").c_str(), "on") == 0;
-}
 
 bool flatCameraInjectUpstreamOwns() {
     return g_inject.wanted && g_inject.core.valid() && g_inject.core.route() == FlatCameraRoute::Upstream;
@@ -607,17 +548,20 @@ void flatCameraInjectReset() {
     // still hold the last phase, and their first un-injected call flushes them.
 }
 
-void flatCameraInjectFrame(uint64_t frame) {
-    if (!runtimeFlatProfile()) { standDown("the flat profile is off"); g_inject.wanted = false; g_inject.core.invalidate(); return; }
-    g_inject.wanted = flatCameraInjectWanted();
+void flatCameraInjectFrame(uint64_t frame, bool temporalModeEnabled) {
+    // The camera path is on whenever the flat profile has a temporal mode selected; there is no
+    // key. Not wanted (another profile, or the mode is off) installs nothing, writes nothing and
+    // logs nothing -- the flat runtime returns before it gets here with the mode off, and this
+    // says so a second time. It does NOT stand the hook down: an installed hook keeps its gate (the
+    // frame window lapses by itself with no Present arming it), so selecting a mode again needs
+    // no re-arming. The stand-downs below are for the four things that cannot recover.
+    g_inject.wanted = flatCameraPathWanted(runtimeFlatProfile(), temporalModeEnabled);
     if (!g_inject.wanted) {
-        standDown("fix.temporal_aa_camera is off");
         g_inject.core.invalidate();
         return;
     }
     if (frame != g_inject.frame) {
         g_inject.frame = frame;
-        g_inject.trace = flatCameraInjectTraceWanted();
         // The upstream route is certified per call (the detour re-verifies kind
         // 3); the fallback hysteresis feeds the policy's unsupported input.
         const FlatCameraOwnershipDecision& decision = g_inject.core.begin(flatRuntimeLegacyPlanExists());
@@ -729,7 +673,6 @@ void flatCameraInjectFrame(uint64_t frame) {
         tick.owner = g_inject.core.valid() && g_inject.core.route() == FlatCameraRoute::Upstream
             ? "upstream" : "legacy/none";
         tick.history = g_inject.core.historyValid() ? "valid" : "invalid";
-        tick.trace = g_inject.trace ? "on" : "off";
         tick.closes = g_inject.closes.exchange(0);
         tick.cleanCloses = g_inject.cleanCloses.exchange(0);
         tick.stale = g_inject.staleCalls.exchange(0);
@@ -752,10 +695,15 @@ void flatCameraInjectFrame(uint64_t frame) {
         Log::get().note("%s", census);
         g_inject.census.reset();
         g_inject.windowFrames = 0;
-        // Eight failed writes in one window (a camera the game unmapped under
-        // us, a page protection that changed): the hook stands down by name and
-        // stays inert for the session. The fallback then hands frames to Legacy.
-        if (tick.writeFailures >= 8) standDown("8 or more camera writes failed in one 5s window");
+        // kFlatCameraWriteFailureLimit failed writes in one window (a camera the game
+        // unmapped under us, a page protection that changed): the hook stands down by name
+        // and stays inert for the session. The fallback then hands frames to Legacy.
+        if (flatCameraWriteFailureStandDown(tick.writeFailures)) {
+            char why[96];
+            std::snprintf(why, sizeof(why), "%llu or more camera writes failed in one 5s window",
+                          (unsigned long long)kFlatCameraWriteFailureLimit);
+            standDown(why);
+        }
         // The call triage that used to ride the per-call notes, reported
         // here instead: no I/O on the game's refresh path (the 20:09
         // crash hypothesis).

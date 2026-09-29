@@ -1541,7 +1541,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // will skip must not be jittered at the source); Legacy and Off are exactly
     // the expression this line had before the wiring. A switch of history
     // identity between the two routes resets history once, here.
-    flatCameraInjectFrame(frame + 1);
+    flatCameraInjectFrame(frame + 1,enabled);
     if(flatCameraInjectTakeHistoryReset()) {s.phase.resetHistory();reset();}
     s.phase.beginFrame(flatCameraPhaseEnabled(flatCameraInjectRoute(),wanted,s.observing,s.projection!=nullptr),
         compatible,s.phaseWidth,s.phaseHeight);
@@ -1590,9 +1590,10 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             s.phase.currentX,s.phase.currentY,s.phase.previousX,s.phase.previousY,s.phase.warmFrames,
             (unsigned long long)s.jitteredFrames,(unsigned long long)s.jitterDraws,(unsigned long long)s.jitterDispatches,
             (unsigned long long)s.jitterRefusals,s.jitterReason,s.phase.previousAcceptedValid?1u:0u);
-        // The camera injector's row bookkeeping, every window while the key is on
-        // (zeros included: an absent line is what "the wiring never ran" looks
-        // like). The tripwire is cumulative on purpose -- once it is nonzero it stays.
+        // The camera injector's row bookkeeping, every window while a temporal mode runs
+        // (the camera path is on with it; zeros included: an absent line is what "the
+        // wiring never ran" looks like). The tripwire is cumulative on purpose -- once it
+        // is nonzero it stays.
         if(flatCameraInjectRoute()!=FlatCameraRoute::Off) {
             FlatCameraRowsFields rowsFields;
             rowsFields.frames=s.rows.frames;rowsFields.unjitteredResolves=s.rows.unjittered;
