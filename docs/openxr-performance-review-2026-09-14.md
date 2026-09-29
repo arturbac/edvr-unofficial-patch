@@ -49,13 +49,13 @@ changes.*
   a census section of its own since, built, not flown) and UI quality 1.25, a
   setting (1.62x the pixels of 1.0).
 - **Next** (flight 132352 entry): the carrier sits at the budget (GPU
-  10.7-11.3 ms, EDVR about 4.8 of it). Open: fly the HUD depth seed's census
-  section (branch `claude/ui-seed-census`; then UI quality 100 against 125 in
-  one flight), stock glare's extra 2.5 ms, the landing-pad display left out
-  of the UI layer; the output size and foveated DLSS are Sean's levers. Any
-  Quest flight with the default build: check the Application-render GPU
-  invalid count stays near zero and `native_frame_end_overlap_summary` reads
-  failures=0.
+  10.7-11.3 ms, EDVR about 4.8 of it). Open: fly the seed's census section
+  (on main; UI quality 100 against 125 in one flight) and the landing pad in
+  the layer (built, not flown, `claude/landing-pad-layer`, entry below: +0.9
+  to +1.2 ms a frame at UI 125 while up; WORLD wants one capture with a glare
+  train in a cockpit frame); output size and foveated DLSS are Sean's levers.
+  Any Quest flight with the default build: Application-render GPU invalid
+  count near zero, `native_frame_end_overlap_summary` failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
   4100x4050 and 2665x2087.
@@ -1662,3 +1662,117 @@ Not changed: the 8-bit layer's own seed is not in the census (its route read
 `-` in all 12 windows of 132352, so nothing is lost; it would be a section of
 its own). The layer's route timers and the `HDR seed subprice` diagnostics are
 untouched.
+
+## 2026-09-29: the landing pad in the UI layer (built, not flown)
+
+Branch `claude/landing-pad-layer` from 99c75cb8. Sean approved plan A: the
+radar's contact markers, the landing-pad display's rings and the sun's glare
+train are ONE shader pair (VS 94D5C556DFD6D705 / PS 912477AEF6958379), the
+glare fix claimed the radar's and the pad's draws for a sun, and the layer took
+the pair by vertex-shader hash alone. `src\d3d11\shared_pair.h` says which of
+the three each draw is: RADAR if a radar-only family drew within 250 draws
+before it on its target, else PAD if a console draw (VS 41E245D488BFE83E,
+68DDDEF04D9894AF) did, else WORLD. The glare fix never sees a RADAR or PAD draw
+(no claim, no skip in mode off, no exposure-damper sun scope), and the layer
+takes the pair only as RADAR or PAD, in stock, vivid, realistic and off. Nothing
+merged, installed or flown.
+
+**The capture (Frontier, build a43c94ba, log 143837, game eye 2620x2532, layer
+4032x3896, vivid).** Three censuses, each with DCW watching the pair. The eye
+dumps say which is which, and it is not the order Sean was asked for: census 1
+(14:40:45) is inside the Event Horizon carrier's hangar with the pad display up
+(eye_144045), census 2 (14:41:41) the approach, 383 m off a Victory-class
+carrier, "proceed to landing pad 12", the display up (eye_144141), census 3
+(14:43:11) open space at 38 Lyncis, radar up, the star 3,817 Ls off
+(eye_144311). `python tools\pair_class_scan.py LOG` gives every call:
+
+| census | pair draws (frame 0) | i | calls | the mark |
+|---|---|---|---|---|
+| 1, hangar | 2 an eye | 3392, 94 | 4 PAD | console draw 194-198 back, no radar family |
+| 2, approach | 2 an eye | 3398, 95 | 4 PAD | console draw 224-236 back, no radar family |
+| 3, radar | 1 an eye, all 3 frames | 39 | 6 RADAR | icon core 2 back (the console draws also there, 50 back) |
+
+Censuses 1 and 2 hit the line cap: frame 0 is whole, frame 1 is cut (1176 of
+2289 and 286 of 2950 draws), frame 2 is gone. Census 3 is whole.
+- **The approach uses the same pair as the landed view**: the same two draws an
+  eye, the same shaders, SRVs (two 2048x1024 BC7), blend and depth state.
+- **WORLD is NOT yet trustworthy.** The capture holds no WORLD call and no glare
+  train: the star at 3,817 Ls is a point (a faint streak in the game's frame,
+  drawn by something else), and census 3's one draw an eye is the radar's, two
+  draws after the icon core in the radar's block with its state (ds=02wA,
+  st=04). The 14 older WORLD draws (3 logs) are all from frames with no cockpit
+  section at all (a loading screen, the 08-28 glare work), so they show only
+  that a frame without the HUD's draws reads WORLD. What is untested is a glare
+  train in a cockpit frame with the radar up; a train drawn after the radar's
+  block on the HUD's target would read RADAR. The rule's ordering is the
+  argument against it (the HUD section has its own colour target, the scene
+  draws into another), not a measurement. Wanted: one capture with the sun
+  close enough that its lens flare is drawn, radar up.
+- **Over all 1000-odd logs**: RADAR draws sit 2-6 draws after a radar family
+  (426 draws), PAD draws 15-236 after a console draw (88), so 250 is generous
+  for the radar (16 would do) and needed for the pad; stencil reference 04 in
+  all 384 radar and pad draws that record it, 00 in the 6 WORLD ones (not used).
+- **The DCW b0 dumps add nothing that separates the classes.** b0 is 208 bytes,
+  the same in all three: the sprite camera's basis rows (right and up, equal
+  length 0.956/0.971, orthogonal) and the ship's world offset, with fixed 16x16
+  atlas constants. The glare fix's own billboard shape check accepts all of
+  them. The two draws of a pad pair read one write of it. The per-instance
+  records (position, size, tile, flags) are in a vertex buffer no hook reads.
+
+**Price, on the RTX 5090** (`tools\pair_price_bench`, desk run; the pixel shader
+transcribed from the game's, the census's blend and depth state, R11G11B10 at
+the game's size and RGBA16F + D32S8 at the layer's; the instance data is
+synthetic, ring and crosshair sprites in the display's region, one size
+parameter set so the game-size pair of draws costs the census's 0.154 ms):
+
+| pair of draws, one eye | ms | Mpx shaded |
+|---|---|---|
+| game frame 2016x1948 (the price now) | 0.154 | 18 |
+| layer at UI 100, 4032x3896 (also route b) | 0.30 | 72 |
+| layer at UI 125, 5040x4870 | 0.59-0.75 | 113 |
+
+The vertex work alone is 0.002 ms. Flight 132352 measured the stock windows'
+layer price at 0.36 ms a draw, 0.72 for the pair; the bench, calibrated at the
+game's size only, says 0.59-0.75. UI 100 against 125 is 0.43-0.47 whatever the
+layout (region 0.5x to 4x). Two eyes: the full route at UI 125 costs 1.2-1.5 ms
+a frame against the 0.31 the glare fix's re-issue costs now, so +0.9 to +1.2 net
+while the display is up; at UI 100 it is 0.60, +0.29 net.
+- **Route (a), a scissor to the display's bounds: no source.** The pair's
+  viewport is the whole eye and no scissor is set (`vp=0,0+2620x2532`,
+  `sc=0,0-0,0`), the instance data is in a vertex buffer, b0 is the camera. And
+  with the fill inside the display a scissor saves nothing (bench -2% to +0%);
+  it could save only what leaks past the box (12% at 10% leaked, 45% at 25%),
+  and nothing shows a leak.
+- **Route (b), the pair at 1.0 scale inside a 1.25 layer: not built.** It
+  halves the price (0.30 against 0.59-0.75) but needs a second layer target and
+  a composite input, and is softer than the rest of the layer; it is what UI
+  quality 100 gives every element, for no code. Sean's call, not a quiet choice.
+- **Kept: the full-quality route** (drawn after the panel, jitter-cancelled,
+  through the take the radar already uses).
+
+**What the next flight shows.** With the pad display up, vivid glare, UI 125:
+- `shared pair: radar N, pad N, world N (...)` every 30 s: pad about 4 a frame
+  (10,000 or so in a window), world 0. Its absence means the rule is not
+  running (a build without it, or glare stock with the layer off); zeros mean it
+  ran and saw no pair draw.
+- the layer line's `left in the game's frame: hologram` about 4.00 a frame
+  drops to about 0 and the redirected hologram count rises by the same; the
+  census's `sun glare steady` drops to about 0; the altered class `UI draws
+  (redirected...)` rises by the price above.
+- the eye dump: the rings in FinalCrisp and not in L0, drawn over the panel.
+- In a cockpit frame with the sun's glare train drawn: `world` counts it, and
+  `world draws in a frame whose HUD marks were on another target` says where;
+  a train counted as radar or pad shows as `radar` or `pad` with a distance
+  that is not 2-6 or 15-236 (the first-seen lines name the instance count).
+
+**Proof.** `tools\shared_pair_test` (447 checks): the mark table against the
+take's list; the rule at its edges; the tracker; eleven recorded frames from
+these logs (each class judged against its eye dump) plus constructed controls
+for the window's edge, a stale mark, a mark after the draw and a mark on
+another target; a reference implementation of the rule mutated seven ways, each
+caught by the recordings; the glare claim and the layer's take through
+`uiLayerDecide` in stock, vivid, realistic and off (a radar or pad draw never
+reaches kVerdict; without the guard it does, the control); the 30 s line and
+its absence; a scan of `vscreen.cpp` with ten mutants. `tools\pair_class_scan.py`
+holds the same fixtures in its own self-test. 30 mutants of the production
+sources, run on a scratch copy, are caught (harness: session scratchpad).
