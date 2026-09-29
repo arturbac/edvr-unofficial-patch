@@ -84,6 +84,23 @@ ID3D11Resource* viewResource(ID3D11ShaderResourceView* v, ComPtr<ID3D11Resource>
     return keep.Get();
 }
 
+// A view's identity, not its address. The wrapper releases a view before it makes the next,
+// so an allocator can hand the new one the old one's address, and "the same pointer came
+// back" cannot tell a cached view from one remade every frame (a mutation run found exactly
+// that: two survivors). A tag on the object can: a remade view does not carry it.
+const GUID kViewTag = {0x6f0c2a17, 0x91d4, 0x4c7e, {0xa3, 0x58, 0x1b, 0xe2, 0x0d, 0x74, 0xc9, 0x3a}};
+constexpr UINT32 kViewTagValue = 0xED5F1A7;
+
+void tagView(ID3D11ShaderResourceView* v) {
+    if (v) v->SetPrivateData(kViewTag, sizeof(kViewTagValue), &kViewTagValue);
+}
+
+bool viewIsTagged(ID3D11ShaderResourceView* v) {
+    UINT32 got = 0;
+    UINT size = sizeof(got);
+    return v && SUCCEEDED(v->GetPrivateData(kViewTag, &size, &got)) && got == kViewTagValue;
+}
+
 void printLines(const char* what, const std::string& text, const char* needle) {
     for (const std::string& line : linesWith(text, needle)) {
         std::printf("  log (%s): %s\n", what, line.c_str());
@@ -307,8 +324,10 @@ void wrapperContract() {
         ID3D11ShaderResourceView* v2 = flatSharpenView(ctx, A.plain.Get());
         check(v2 && viewFormat(v2) == DXGI_FORMAT_R8G8B8A8_UNORM,
               "a plain resolve view stays plain");
+        tagView(v2);
         ID3D11ShaderResourceView* v2again = flatSharpenView(ctx, A.plain.Get());
-        check(v2again == v2, "the same texture and format reuse the cached view");
+        check(v2again == v2 && viewIsTagged(v2again),
+              "the same texture and format reuse the cached view (the same object, not one remade)");
 
         // Live: read every frame, clamped, anything unusable is nothing to do.
         cfg.set("fix.render_sharpness", "0.1");
@@ -337,7 +356,8 @@ void wrapperContract() {
             ComPtr<ID3D11Resource> res;
             resultsRight = resultsRight && out && viewResource(out, res) == (isB ? r1.Get() : r0.Get());
             ID3D11ShaderResourceView*& seen = isB ? seenB : seenA;
-            if (i >= 2) stable = stable && out == seen;
+            if (i >= 2) stable = stable && out == seen && viewIsTagged(out);
+            else tagView(out);
             seen = out;
         }
         check(slotsRight, "alternating textures: A is always slot 0, B always slot 1");
