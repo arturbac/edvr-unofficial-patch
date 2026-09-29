@@ -40,7 +40,6 @@
 #include "pixel_probe.h"      // advanced.pixel_probe: who drew this pixel, during an eye dump
 #include "lod_governor.h"     // fix.settlement_detail: the settlement LOD governor
 #include "fss_panel.h"
-#include "fss_probe.h"
 #include "fss_panel_rect.h"
 #include "fss_reveal.h"
 #include "fss_dump.h"
@@ -49,9 +48,7 @@
 #include "resolve_probe.h"
 #include "resolve_bind_fix.h"
 #include "stencil_probe.h"
-#include "fss_ring.h"
 #include "fss_res.h"
-#include "fss_scan.h"
 #include "depth_probe.h"      // Phase 0 item 3: which depth target the eye draws use, and how it reads
 #include "eye_mask.h"          // the lens-ring depth mask: draws past the hooks, once per eye per frame
 #include "sharpen_pass.h"      // likewise: warm-up and totals; the sharpening runs at submit
@@ -455,8 +452,8 @@ struct State {
     uint32_t rtv0ResGen = 0;
     void*    rtv0Res = nullptr;
     // Is the bound offscreen target the FSS body layer? Cached per binding
-    // generation for the scan-dissolve fix's gate and the panel fix's
-    // mode gate.
+    // generation for the panel fix's mode gate. (The "Scan" in the names is
+    // the scan-dissolve fix's, removed 2026-09-29; the cache outlived it.)
     uint32_t fssScanGen = 0;
     bool     fssScanBody = false;
     // The last frame a draw landed in the body layer -- the fact "the FSS
@@ -1520,20 +1517,13 @@ enum class DrawVerdict {
     // (intro_panel.h): forwarded normally, restored after.
     kIntroPanel,
     kGlareClamp, kGlareSteady, kParticle,
-    // The FSS scan dissolve held uniform (fss_scan.h): a body-layer draw
-    // binding the 16x16 matrix, forwarded wrapped in fssScanBegin/End.
-    kFssScan,
     // The FSS panel composite pair (fss_panel.h): forwarded through the
     // replacement vertex shaders, wrapped in fssPanelBegin/End.
     kFssPanel,
-    // The body composite with one sampler slot held flat (fss_probe.h),
-    // wrapped in fssProbeBegin/End. A diagnostic, not a fix.
-    kFssProbe,
     // The body composite pair evaluated at one dissolve moment
     // (fss_reveal.h): eye B drawn with eye A's scene constants, wrapped
     // in fssRevealBegin/End.
     kFssReveal,
-    kFssRing,
     kFssDump,
     // The deferred lighting resolve drawn through a replacement pixel
     // shader (advanced.resolve_probe), wrapped in resolveProbeBegin/End.
@@ -1678,9 +1668,9 @@ bool drawGateSubscribed(State* s) {
         headOffsetGateWantsPanel() || s->censusSkipCount != 0 ||
         s->censusSkipRangeCount != 0 || s->censusSkipOffCount != 0 ||
         s->quadSkipArmed ||
-        s->censusAutoW != 0 || fssResActive() || fssScanWantsDraws() ||
-        fssPanelWantsDraws() || fssProbeWants() || fssRevealWantsDraws() ||
-        fssRingWantsDraws() || fssDumpWantsDraws() ||
+        s->censusAutoW != 0 || fssResActive() ||
+        fssPanelWantsDraws() || fssRevealWantsDraws() ||
+        fssDumpWantsDraws() ||
         eyeSplitWantsDraws() || foveationWantsDraws() || resolveProbeWantsDraws() ||
         stencilProbeWantsDraws() || resolveBindWants() ||
         remlokWantsDraws() || holoWantsDraws() || targetSharpWantsDraws() ||
@@ -2289,14 +2279,13 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
                 return DrawVerdict::kQuadSkip;
             }
         }
-        // The body-layer gate, shared by the scan-dissolve fix and the
-        // panel fix's mode stamp: is the bound target the BODY LAYER --
+        // The body-layer gate, for the panel fix's mode stamp: is the bound
+        // target the BODY LAYER --
         // eye/2-sized, or one of fss_res's inflated textures? Cached per
         // binding generation, so the resolve runs for a handful of scanner
         // draws and for nothing else in the game.
-        if (fssScanWantsDraws() || fssPanelWantsDraws() ||
-            fssProbeWants() || fssRevealWantsDraws() ||
-            fssRingWantsDraws() || fssDumpWantsDraws()) {
+        if (fssPanelWantsDraws() || fssRevealWantsDraws() ||
+            fssDumpWantsDraws()) {
             if (s->fssScanGen != rtvGen) {
                 s->fssScanGen = rtvGen;
                 s->fssScanBody = false;
@@ -2321,9 +2310,6 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
                 // land before the eye composites in the frame, so the
                 // stamp is fresh by the time the composites ask.
                 s->fssBodyFrame = s->frameNo;
-                if (fssScanWantsDraws() && fssScanOnBodyDraw()) {
-                    return DrawVerdict::kFssScan;
-                }
             }
         }
         return DrawVerdict::kNone;
@@ -2585,18 +2571,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         return DrawVerdict::kFssPanel;
     }
 
-    // The composite-input probe (round 9a), behind the same body-frame
-    // gate for the same reason the panel fix wears it: 953C's hash names a
-    // shader, not the scanner, and an hour-old lesson says the difference
-    // is a loading screen's text quad.
-    if (fssProbeWants() && s->fssBodyFrame != 0 &&
-        s->frameNo - s->fssBodyFrame <= 2 &&
-        fssProbeOnEyeDraw(self, kind, count, instances)) {
-        return DrawVerdict::kFssProbe;
-    }
-
-    // The reveal sync, after the probe so a probing session sees the true
-    // draw. Same gate, same recognition shape.
+    // The reveal sync. Same gate, same recognition shape.
     // The reveal's gate covers the ARRIVAL as well as the void: the
     // 2026-08-27 lockstep flight engaged byte-identical and the squares
     // survived -- because the body gate opens at the arrival's END, and
@@ -2615,8 +2590,8 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         return DrawVerdict::kFssReveal;
     }
 
-    // The eye-image dump (round twenty), before the ring feed so a dump
-    // session records the natural state -- run one at a time.
+    // The eye-image dump (round twenty), so a dump session records the
+    // natural state -- run one at a time.
     if (fssDumpWantsDraws() && s->fssBodyFrame != 0 &&
         s->frameNo - s->fssBodyFrame <= 2 &&
         fssDumpOnEyeDraw(self, kind, count, instances)) {
@@ -2655,15 +2630,6 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // being past every fix that swaps a shader.
     if (stencilProbeWantsDraws() && stencilProbeOnEyeDraw(self)) {
         return DrawVerdict::kStencilProbe;
-    }
-
-    // The ring cross-feed (round eighteen), the same gate and shape: the
-    // ring draws' hashes name general pipelines, and only the scanner's
-    // body layer proves the scanner is on screen.
-    if (fssRingWantsDraws() && s->fssBodyFrame != 0 &&
-        s->frameNo - s->fssBodyFrame <= 2 &&
-        fssRingOnEyeDraw(self, kind, count, instances)) {
-        return DrawVerdict::kFssRing;
     }
 
     // The sun-glare element train: off skips it, first:K clamps it, and the
@@ -3651,11 +3617,8 @@ __declspec(noinline) void forwardQuadSkip(ID3D11DeviceContext* self) {
 __declspec(noinline) void forwardVerdictBegin(ID3D11DeviceContext* self, DrawVerdict v) {
     switch (v) {
     case DrawVerdict::kRemlok:       remlokScissorBegin(self); break;
-    case DrawVerdict::kFssScan:      fssScanBegin(self); break;
     case DrawVerdict::kFssPanel:     fssPanelBegin(self); break;
-    case DrawVerdict::kFssProbe:     fssProbeBegin(self); break;
     case DrawVerdict::kFssReveal:    fssRevealBegin(self); break;
-    case DrawVerdict::kFssRing:      fssRingBegin(self); break;
     case DrawVerdict::kFssDump:      fssDumpBegin(self); break;
     case DrawVerdict::kResolveProbe: resolveBindBegin(self); resolveProbeBegin(self); break;
     case DrawVerdict::kStencilProbe: stencilProbeBegin(self); break;
@@ -3685,13 +3648,10 @@ __declspec(noinline) void forwardVerdictEnd(ID3D11DeviceContext* self, DrawVerdi
     case DrawVerdict::kNightVision:  nightVisionEnd(self); break;
     case DrawVerdict::kHolo:         holoEnd(self); break;
     case DrawVerdict::kFssReveal:    fssRevealEnd(self); break;
-    case DrawVerdict::kFssRing:      fssRingEnd(self); break;
     case DrawVerdict::kStencilProbe: stencilProbeEnd(self); break;
     case DrawVerdict::kResolveProbe: resolveProbeEnd(self); resolveBindEnd(self); break;
     case DrawVerdict::kFssDump:      fssDumpEnd(self); break;
-    case DrawVerdict::kFssProbe:     fssProbeEnd(self); break;
     case DrawVerdict::kFssPanel:     fssPanelEnd(self); break;
-    case DrawVerdict::kFssScan:      fssScanEnd(self); break;
     case DrawVerdict::kRemlok:       remlokScissorEnd(self); break;
     default: break;   // kBackdrop: issued inline, before the splash re-issue
     }
@@ -5324,11 +5284,8 @@ void vScreenRefreshConfig() {
     nightVisionConfigure(cfg);
     depthProbeConfigure(cfg);
     backdropConfigure(cfg);
-    fssScanConfigure(cfg);
     fssPanelConfigure(cfg);
-    fssProbeConfigure(cfg);
     fssRevealConfigure(cfg);
-    fssRingConfigure(cfg);
     fssDumpConfigure(cfg);
     eyeSplitConfigure(cfg);
     foveationConfigure(cfg);
@@ -5659,8 +5616,6 @@ void vScreenFrameBoundary() {
     frameTick("draw_census_boundary");
     fssRevealFrameBoundary();
     frameTick("fss_reveal");
-    fssRingFrameBoundary();
-    frameTick("fss_ring");
     fssDumpFrameBoundary(s->ownerCtx);
     frameTick("fss_dump");
     eyeSplitFrameBoundary(s->ownerCtx);
@@ -6557,11 +6512,8 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     nightVisionConfigure(cfg);
     depthProbeConfigure(cfg);
     backdropConfigure(cfg);
-    fssScanConfigure(cfg);
     fssPanelConfigure(cfg);
-    fssProbeConfigure(cfg);
     fssRevealConfigure(cfg);
-    fssRingConfigure(cfg);
     fssDumpConfigure(cfg);
     eyeSplitConfigure(cfg);
     foveationConfigure(cfg);
@@ -6927,12 +6879,9 @@ void shutdownVScreenFixes() {
     loaderPanelShutdown();
     splashDimShutdown();
     backdropShutdown();
-    fssScanShutdown();
     fssPanelShutdown();
-    fssProbeShutdown();
     fssPanelRectShutdown();
     fssRevealShutdown();
-    fssRingShutdown();
     fssDumpShutdown();
     eyeSplitShutdown();
     foveationShutdown();

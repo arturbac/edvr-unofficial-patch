@@ -517,9 +517,9 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\static_prop_gate.cpp" "src\d3d11\cull_gate_probe.cpp" ^
     "src\d3d11\lod_governor.cpp" ^
     "src\d3d11\engine_velocity.cpp" ^
-    "src\d3d11\fss_res.cpp" "src\d3d11\fss_scan.cpp" ^
-    "src\d3d11\fss_panel.cpp" "src\d3d11\fss_probe.cpp" ^
-    "src\d3d11\fss_reveal.cpp" "src\d3d11\fss_ring.cpp" ^
+    "src\d3d11\fss_res.cpp" ^
+    "src\d3d11\fss_panel.cpp" ^
+    "src\d3d11\fss_reveal.cpp" ^
     "src\d3d11\fss_dump.cpp" "src\d3d11\fss_heal.cpp" ^
     "src\d3d11\eye_split.cpp" ^
     "src\d3d11\resolve_probe.cpp" ^
