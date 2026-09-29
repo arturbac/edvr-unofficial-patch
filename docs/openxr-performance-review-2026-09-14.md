@@ -11,16 +11,18 @@ changes.*
   Application-render GPU timing; with the timing retired before Submit
   returns it FLEW CLEAN (flight 124504, Pimax OpenXR: invalid 5, Elite's
   second-Submit park p50 0.16-0.18 ms) and now DEFAULTS ON.
-- **Long cycles, 2026-09-29 (entry below):** the phase-0 flight (SteamVR
-  OpenXR, 4032x3896, 90 Hz) put the largest phase of 47 of 54 logged long
-  cycles in `post_second_submit_to_next_wait`, the window that holds Elite's
-  Present and EDVR's hook on it. The periodic jobs are ruled out as the main
-  cause (2 of 54 coincide). That flight's own 30 s post-submit windows put the
-  tails outside the hook, before and after the Present (Elite's code, and
-  EDVR's other hooks in its D3D11 calls), with EDVR's hook at most 4.4 ms
-  except one 39.4 ms Status.json read. The per-cycle instrument is built and
-  gated, not flown: `native_long_cycle` splits that phase at the Present, and
-  the LONG FRAME line states EDVR's share and names its three slowest ticks.
+- **Long cycles, 2026-09-29 (entries below):** phase 0 ruled out the
+  periodic jobs (2 of 54 long cycles coincide). The split flew the same day
+  (flight 090608, SteamVR OpenXR, 4032x3896, 90 Hz): `present_split=ok` on
+  all 70 long cycles, EDVR's Present hook 7.4 ms across all 70 (ruled out).
+  The time is Elite's `pre_present` and `post_present` windows, which still
+  hold EDVR's draw hooks: those are sampled one frame in 16 and no long frame
+  was sampled. At the fleet carrier both halves sit at the budget: Elite's
+  thread 11.6-12.4 ms a cycle outside the wait (4.4-5.3 ms of it after its
+  Present), the GPU 11.3-12.2 ms (EDVR 5.2-5.35 ms of it).
+- **Comparing with 0.16.2 in fpsVR:** under OpenVR its CPU frame time is
+  poses ready to second submit (0.16.2's `appCpuMs`); on the native runtime
+  it tracks Elite's whole frame outside the wait. Compare pre-submit windows.
 - **Open:** issue #38's rc.1 report, 90-99% GPU against 0.16.2's 60-62%. The
   EDVR GPU census (2026-09-25 entry) is built to split EDVR's cost from the
   game's; its first flight caught the census itself overcounting engine
@@ -36,14 +38,15 @@ changes.*
   producer copy measured 0.039 ms p50 per eye at 4100x3962, under the
   0.1 ms bar.
 - **Ruled out:** at the end of each 2026-09-24 entry, and in the 2026-09-29
-  one (the periodic jobs as the main cause of long frames).
-- **Next flight:** the instrumented build, 5 minutes steady in the phase-0
-  scene: `present_split=ok` on every `native_long_cycle` line, then
-  `hook_after_real` against `pre_present` and `post_present` says whose the
-  window is; the LONG FRAME line's slowest ticks name what in the hook. Also
-  any flight on a Quest runtime with the default build: check the
-  Application-render GPU invalid count stays near zero and
-  `native_frame_end_overlap_summary` reads failures=0.
+  ones (the periodic jobs; EDVR's Present hook).
+- **Next** (flight 090608 entry): a no-build test at the carrier, a minute
+  at a much lower resolution, says whether Elite's thread waits on the GPU;
+  then an exact per-frame figure for EDVR's draw and Create* hooks; then the
+  UI passes cut to the UI's footprint (review P3) and the lean per-draw
+  thunk (A-1); the output size is a setting. Also any flight on a Quest
+  runtime with the default build: check the Application-render GPU invalid
+  count stays near zero and `native_frame_end_overlap_summary` reads
+  failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
   4100x4050 and 2665x2087.
@@ -960,3 +963,91 @@ Read `native_long_cycle`: `present_split=ok` everywhere, then which of
 what; the 5 s gate on those lines will hide some, and an un-gated slow-tick
 line is the next step if it does. If it is `pre_present` or `post_present`, the
 window is Elite's and this arc moves off EDVR's hook.
+
+## 2026-09-29: flight 090608, the split flown at a busy fleet carrier
+
+Build v0.18.0-rc.3-108-gc1408551 on the Frontier install: SteamVR OpenXR
+(`aapvr`), 4032x3896 out and 2016x1948 in per eye, 90 Hz, DLSS performance
+mode with preset K, runtime pacing, `frame_end_overlap` on. Logs
+`edvr_gfx_20260929_090608.log` and
+`edvr_openxr_20260929_090610_039_12932.log`; the busy part is about two and
+a half minutes beside Sean's fleet carrier with many ships about
+(09:08-09:10:30). Sean, reading fpsVR: clearly better than before, still
+about 10.8 ms CPU and GPU with frequent spikes over 11.1; the same scene on
+0.16.2 under SteamOS read a similar GPU time and 5.4-6.2 ms CPU.
+
+- **The split.** `present_split=ok` on all 70 logged long cycles (over twice
+  the period). EDVR's hook work, before plus after the real Present, totals
+  7.4 ms across all 70 and never reaches 2 ms in one; the real Present
+  totals 4.5 ms. The time is `pre_present` (1,631 ms, 36%) and
+  `post_present` (1,594 ms, 35%), then `first_submit_roundtrip` (773 ms,
+  17%), nearly all of it one 748 ms submit at 09:06:40 as the game first
+  rendered in VR (both DLSS features were created in it, in 84 and 70 ms).
+  18 of the 70 fall in the carrier scene: 31-92 ms each, and 159 ms at
+  09:10:29.
+- **What the split cannot clear.** Those two windows hold EDVR's draw hooks
+  as well as Elite's own code. The draw-hook figure is sampled one frame in
+  16 (`kDrawSampleEvery`), each sampled frame estimated from every 64th draw
+  scaled by 64 (`kPerfMonitorDrawTimeStride`), and none of the seven LONG
+  FRAME lines in the carrier scene fell on a sampled frame. The 1800-frame
+  windows there read 0.87-1.45 ms per sampled frame, with maxima of 12.5 ms
+  (window ending 09:08:09) and 14.6 ms (ending 09:09:13); one 0.2 ms call in
+  the stride reads as 13 ms, so the maxima neither clear the hooks nor
+  convict them. One candidate: `engine_velocity.cpp`'s `patchedVsFor`,
+  `patchedPsFor` and `guardedOverlayPsFor` patch a shader and create it
+  inside Elite's draw, on the first draw of each new shader in a family,
+  which a newly arrived ship would trigger.
+- **The steady state at the carrier.** Frame-cycle windows 7-9
+  (09:09:29-09:10:29), p50s: the wait 0.09 ms (no slack; 78.5-84.1 fps);
+  poses to second submit returned 6.6-7.1 ms; the real DXGI Present 0.056 ms
+  and EDVR's hook on it 0.057 ms (`native_post_submit_phase`); then 4.4-4.8
+  ms after the Present before Elite's next WaitGetPoses; cycle 11.6-12.4 ms.
+  The GPU (census at 09:09:39 and 09:10:09): application render p50 12.18
+  and 11.29 ms, EDVR 5.35 and 5.20, the game about 6.8 and 6.1. EDVR's part,
+  same order: upscaler 2.89 and 2.87 (two a frame); UI layer reissues 0.59
+  and 0.36 (107 and 93 a frame); hologram passes 0.39 and 0.44; UI resolve
+  0.32 and 0.33; hologram resolve and celestial 0.29 and 0.27; UI layer
+  composite 0.26 and 0.27; engine velocity 0.22 and 0.26; UI depth coverage
+  0.18 and 0.23; motion prep 0.15 and 0.16. Both halves sit at the 11.1 ms
+  budget. In window 6 (09:08:59), before the scene filled, the wait still
+  had 2.6 ms of slack at 88.8 fps, with 5.2 ms pre-submit and 2.8 ms after
+  the Present, while the application render read 11.0 ms.
+- **fpsVR, 0.16.2 against this build.** Under OpenVR, fpsVR's CPU frame time
+  is poses ready to second submit plus the compositor's submit cost; 0.16.2
+  copies it as `appCpuMs` (`src\common\frame_flag.h` at the tag). The same
+  window here is 6.1-7.1 ms p50 at the carrier (windows 5-9), against
+  5.4-6.2 on 0.16.2. fpsVR's 10.8 ms on this build matches Elite's whole
+  frame outside the wait (11.6 ms) instead, so SteamVR evidently times an
+  OpenXR application over a longer window, one that takes in the 4.4-5.3 ms
+  after the Present. Like for like this build reads 0.5-1 ms higher, about
+  EDVR's sampled draw-hook cost; SteamOS runs Elite through DXVK, so that
+  gap is not cleanly EDVR's.
+- ruled out: EDVR's Present hook as a cause of the long frames, because none
+  of the 70 long cycles in flight 090608 carries 2 ms of it (7.4 ms across
+  all 70); in the steady state it is 0.057 ms p50.
+- ruled out: GPU backpressure in Elite's Present as the carrier's
+  post-submit time, because the real Present is 0.056 ms p50 (p95 0.10)
+  there; the time comes after the Present, in Elite's code and the EDVR
+  hooks its calls reach.
+- ruled out: this build doubling Elite's CPU frame against 0.16.2, because
+  the two fpsVR figures time different windows; the like-for-like window is
+  6.1-7.1 ms against 5.4-6.2.
+
+**Next.** In order of cost:
+1. No build: at the carrier, a minute at a much lower SteamVR resolution (or
+   DLSS ultra performance), then back. If Elite's cycle outside the wait
+   falls with the GPU load, its thread was waiting on the GPU inside its own
+   calls and the GPU is the one limit; if it stays near 11.6 ms, the thread
+   is a limit of its own and GPU savings alone will not reach 90.
+2. An exact per-frame figure for EDVR's draw hooks, split into the
+   pre-submit and after-Present windows and named on long frames: clock only
+   the branches that do EDVR work, as `frame_ticks.h` does for the Present
+   hook, plus the Create* hooks and the lazy engine-velocity patch. One
+   carrier flight then says how much of Elite's 11.6 ms, and of the 31-92 ms
+   frames, is EDVR's.
+3. GPU: the output-resolution UI and hologram passes (1.9-2.0 ms) cut to
+   where the UI is, and the reissues batched (architecture review P3), with
+   no change to the image. CPU: the lean per-draw thunk (review A-1) against
+   the 0.9-1.45 ms of draw hooks.
+4. Settings: the output size. 4032x3896 per eye drives the upscaler, those
+   passes and, through performance mode's half per axis, the game's render.
