@@ -1,4 +1,5 @@
 #include "perf_monitor.h"
+#include "frame_ticks.h"
 #include "gpu_frame_timing.h"
 
 #include <windows.h>
@@ -75,8 +76,13 @@ struct Frame {
     // EDVR's part of the frame.
     uint16_t events = 0;
     float    eventMs = 0.0f;     // the longest event's own duration (a compile, a reload)
+    // cpuBoundaryMs is stamped by the frame boundary AFTER this frame's LONG FRAME
+    // line is written (perfMonitorNoteCpu, at the end of the Present hook), so the
+    // line cannot read it: it reads `ticks` instead, cut at this frame's own edge.
     float    cpuBoundaryMs = 0.0f;
     float    cpuDrawsMs = 0.0f;  // the running sampled figure
+    bool     drawsFresh = false; // ...and whether it was measured in THIS frame
+    FrameTickSummary ticks;      // EDVR's ticks in the Present hook, by name (frame_ticks.h)
     float    doorGpuMs = 0.0f;   // the last completed pair, both eyes
     // The game's own creations in the frame (device_hook.h), for the
     // long-frame line: a busy frame that made a hundred textures was
@@ -470,30 +476,43 @@ void dropLine(const Frame& f, float budgetMs) {
         char callerWork[48];
         if (timing.cpu.callerWorkValid) snprintf(callerWork, sizeof(callerWork), "%.2f ms", double(timing.cpu.callerWorkMs));
         else snprintf(callerWork, sizeof(callerWork), "unavailable");
-        Log::get().note(
-            "monitor: LONG FRAME -- %.1f ms between Presents (%s), no "
-            "WaitGetPoses, CPU busy, compositor, reprojection, or door samples; "
-            "game creations: %u textures, %u buffers, %u shaders (%.1f MB); EDVR events: %s.%s "
-            "runtime sequence %llu, game work %s.",
-            static_cast<double>(f.presentMs), reference,
-            f.createTextures, f.createBuffers, f.createShaders, static_cast<double>(f.createMb), ev, stamp,
-            static_cast<unsigned long long>(timing.cpu.sequence), callerWork);
+        // EDVR's share of THIS frame, from the tick chain cut at its edge. The line
+        // used to carry no share at all, and the boundary figure it might have
+        // carried (cpuBoundaryMs) is written after the line is, so it read 0.00.
+        char share[400];
+        formatEdvrShare(share, sizeof(share), static_cast<double>(f.presentMs), f.ticks,
+                        static_cast<double>(f.cpuDrawsMs), f.drawsFresh);
+        NativeLongFrame line;
+        line.frameMs = static_cast<double>(f.presentMs);
+        line.reference = reference;
+        line.textures = f.createTextures;
+        line.buffers = f.createBuffers;
+        line.shaders = f.createShaders;
+        line.creationMb = static_cast<double>(f.createMb);
+        line.share = share;
+        line.events = ev;
+        line.stamp = stamp;
+        line.sequence = static_cast<unsigned long long>(timing.cpu.sequence);
+        line.gameWork = callerWork;
+        char text[1400];
+        formatNativeLongFrame(text, sizeof(text), line);
+        Log::get().note("%s", text);
         return;
     }
+    char share[400];
+    formatEdvrShare(share, sizeof(share), static_cast<double>(f.presentMs), f.ticks,
+                    static_cast<double>(f.cpuDrawsMs), f.drawsFresh);
     Log::get().note(
         "monitor: LONG FRAME -- %.1f ms between Presents (budget %.1f), of which the thread waited "
         "%.1f in Present (busy %.1f); the game's creations in it: %u "
-        "textures, %u buffers (%.1f MB together), %u shaders; EDVR this frame: boundary %.2f ms, "
-        "draw hooks ~%.2f ms (sampled: every %uth draw of a sampled frame, scaled), "
+        "textures, %u buffers (%.1f MB together), %u shaders; %s "
         "door GPU %.2f ms; EDVR events: %s.%s At most "
         "one of these lines every %u s, %u a session.",
         static_cast<double>(f.presentMs),
         static_cast<double>(budgetMs), static_cast<double>(f.presentWaitMs),
         static_cast<double>(busy > 0.0f ? busy : 0.0f),
         f.createTextures, f.createBuffers, static_cast<double>(f.createMb), f.createShaders,
-        static_cast<double>(f.cpuBoundaryMs),
-        static_cast<double>(f.cpuDrawsMs), static_cast<unsigned>(kPerfMonitorDrawTimeStride),
-        static_cast<double>(f.doorGpuMs), ev, stamp,
+        share, static_cast<double>(f.doorGpuMs), ev, stamp,
         static_cast<unsigned>(kDropLogEveryMs / 1000), kDropLogMax);
 }
 
@@ -699,6 +718,12 @@ void perfMonitorFrame(ID3D11Device* dev) {
         f.presentMs = ms > 0.0 && ms < 5000.0 ? static_cast<float>(ms) : 0.0f;
     }
     s.lastQpc = q;
+    // THE FRAME'S EDGE IS ALSO THE TICK CHAIN'S CUT, on the same clock reading:
+    // the ticks handed over are exactly those measured since the previous frame's
+    // edge, so the frame's own length, EDVR's ticks in it, the real Present and
+    // the rest add up (frame_ticks.h). The stretch since the last mark is the
+    // menu tick's own head; the remainder of this function is marked at its end.
+    f.ticks = g_frameTicks.cut("menu_tick", q, qpcFrequency());
     // The frame's waits: Present's, noted by the swapchain hook a moment
     // ago; WaitGetPoses's, over the channel.
     f.presentWaitMs = s.pendingPresentWaitMs;
@@ -798,6 +823,7 @@ void perfMonitorFrame(ID3D11Device* dev) {
                                                         static_cast<double>(qpcFrequency()))
                                    : 0.0f;
         s.drawsSampled = true;
+        f.drawsFresh = true;
         s.drawWindowMs += s.drawsMsRunning;
         s.drawWindowMaxMs = std::max(s.drawWindowMaxMs, s.drawsMsRunning);
         ++s.drawWindowSamples;
@@ -836,6 +862,9 @@ void perfMonitorFrame(ID3D11Device* dev) {
             guardedBudget(g_budget, [&] { slowSample(dev); });
         }
     }
+    // Everything above ran after the cut, so it belongs to the NEXT frame's ticks:
+    // the ring push, the benchmark bookkeeping, the LONG FRAME line itself.
+    frameTick("perf_monitor");
 }
 
 void perfMonitorNoteEvent(uint32_t bits, double ms) {

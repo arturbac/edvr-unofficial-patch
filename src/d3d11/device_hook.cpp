@@ -68,6 +68,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "flat_temporal.h"   // flat profile discovery at owned Present
 #include "flat_shader_capture.h"
 #include "perf_monitor.h"
+#include "frame_ticks.h"     // g_frameTicks: what the Present hook's own work cost, by name
 #include "vscreen.h"
 #include "glitch_frame.h"
 #include "transition_flash_prevent.h"
@@ -1069,7 +1070,10 @@ HRESULT STDMETHODCALLTYPE hookedFlatResizeBuffers1(IDXGISwapChain3* self, UINT c
 
 HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
                                         UINT flags) {
-    const uint64_t traceBegan = self == g_state->swapChain ? edvrNativeTraceNowUs() : 0;
+    // The hook's entry, one clock read for both clocks that want it: the runtime's
+    // Present trace (microseconds) and the frame-tick chain (frame_ticks.h).
+    const int64_t hookEnter = self == g_state->swapChain ? qpcNow() : 0;
+    const uint64_t traceBegan = hookEnter ? edvrNativeTraceUs(hookEnter) : 0;
     const uint64_t traceToken = self == g_state->swapChain ?
         nativeTimingPresentBegin(g_state->device, traceBegan, GetCurrentThreadId()) : 0;
     VrCensusScope census(VrCensusEvent::PresentEnter, VrCensusEvent::PresentExit,
@@ -1080,6 +1084,9 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
     if (self != g_state->swapChain) {
         return g_state->realPresent(self, syncInterval, flags);
     }
+    // The frame-tick chain starts here (frame_ticks.h): what follows, to this
+    // hook's return, is EDVR's or the driver's; what came before it is the game's.
+    g_frameTicks.enter(hookEnter);
     // The Oculus probe may follow initial device creation. Drain changed
     // routing observations from ordinary execution, never from the loader.
     oculusRouteReport();
@@ -1093,6 +1100,10 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
     const int64_t presentT0 = qpcNow();
     const HRESULT hr = g_state->realPresent(self, syncInterval, flags);
     const int64_t presentT1 = qpcNow();
+    // The hook's own work before the real call is a tick; the real call is not
+    // EDVR's, so it is timed apart and kept out of the slowest three.
+    g_frameTicks.markAt("present_pre", presentT0);
+    g_frameTicks.external(presentT1);
     if (runtimeFlatProfile())
         flatTemporalAfterPresent(g_state->frameCounter, hr, flags);
     if (runtimeFlatProfile()) flatRuntimePresent(self, g_state->frameCounter, hr, flags);
@@ -1101,6 +1112,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
                                    static_cast<double>(qpcFrequency()));
     }
     gameExitProbePresent(hr,flags,g_state->frameCounter);
+    frameTick("game_exit_probe");
     // Bind the first successful owned, non-TEST Present thread even before
     // the paired consumer registers. Exclude registration from Present timing.
     if (SUCCEEDED(hr) && !(flags & DXGI_PRESENT_TEST))
@@ -1111,6 +1123,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         gpuFramePresent(timingContext, g_state->frameCounter + 1);
         timingContext->Release();
     }
+    frameTick("gpu_frame_present");
 
     // OUTSIDE the fault budget, and that is the point. Confirming is a file
     // delete; putting it inside would mean a burst of faults anywhere in the
@@ -1142,6 +1155,10 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
     // just ringed inside it (menuTick runs perfMonitorFrame), so a dropped
     // frame's row says what EDVR's boundary work cost in it.
     const int64_t boundaryT0 = qpcNow();
+    // The sentinel, the frame stamps and the thread note above: one tick. From
+    // here the chain's ticks are the boundary's too (frame_ticks.h).
+    g_frameTicks.markAt("present_post", boundaryT0);
+    g_frameTicks.boundary(true);
     guardedBudget(g_frameBudget, [&] {
         // THE FRAME NUMBER, ADVANCED AND PUBLISHED BEFORE ANYTHING USES IT.
         //
@@ -1164,16 +1181,20 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         // not beside vScreenFrameBoundary below -- that site sits behind the
         // graphicsRuntimeDisabled early return and would skip those presents.
         kinematicEvalProbe.notePresentFrame(static_cast<uint32_t>(g_state->frameCounter));
+        frameTick("kinematic_probe");
         // Engine-record velocity's clock (the emit table's frame stamps and
         // the per-eye snapshots), the same exactly-once-per-owned-present tick.
         engineVelocityNotePresentFrame(static_cast<uint32_t>(g_state->frameCounter));
+        frameTick("engine_velocity_clock");
         // The scheduler stack probe's report tick, same call site and the
         // same one-atomic-load-when-off cost.
         schedulerStackProbe.notePresentFrame(static_cast<uint32_t>(g_state->frameCounter));
+        frameTick("scheduler_probe");
         // The static prop gate's frame clock, journal-boundary poll and 20 s
         // report tick, same call site and the same one-atomic-load-when-off
         // cost.
         staticPropGate.notePresentFrame(static_cast<uint32_t>(g_state->frameCounter));
+        frameTick("static_prop_gate");
         // The write watch's per-frame work, here rather than inside
         // vScreenReclaimTick where the re-arm used to sit behind
         // `if (!g_state) return;`. In the two context probes vScreen never
@@ -1183,6 +1204,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         // tick publishes the frame number whether or not anything is.
         vtableWatchRearm();
         vtableWatchFrameTick(g_state->frameCounter);
+        frameTick("vtable_watch");
         if (graphicsRuntimeDisabled()) return;
         // WHICH VR BACK END THIS ACTUALLY IS, said once near the top of the
         // log. Inside the budget because it reads the process module list;
@@ -1191,6 +1213,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         // it necessary -- a perfect install the game never opened, and eight
         // messages telling its owner the file was missing.
         vrRuntimeTick();
+        frameTick("vr_runtime");
         if (g_state->toggleKey.pressed()) toggleExposureFix();
         // Deliberately not part of the toggle: it reports, it does not change
         // anything, so there is no reason for it to follow the fix being off.
@@ -1292,6 +1315,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
                 "press it again. Said at most %u times a session.",
                 kMissedDumpNotes);
         }
+        frameTick("hotkeys");
         // The player's Elite bindings, re-read when the game rewrites them.
         // Elite saves Options\Bindings the moment a rebind or preset switch
         // is applied, so a slow stat notices within seconds and the adopted
@@ -1313,11 +1337,13 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
                 }
             }
         }
+        frameTick("elite_binds");
         // The game's own journal, polled about once a second: it states the
         // two boundaries EDVR used to infer -- gameplay starting (LoadGame)
         // and on-foot sessions beginning (Disembark, where the game resets
         // its camera view to 0).
         journalWatchTick();
+        frameTick("journal_watch");
         if (journalWatchActive()) {
             const uint32_t d = journalDisembarks();
             if (d != g_state->lastJournalDisembarks) {
@@ -1348,6 +1374,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
                 cameraViewNudgeRescan();
             }
         }
+        frameTick("journal_gate");
         // Camera keys mean the CAMERA only once gameplay has started. Before
         // LoadGame every press is menu navigation -- and the next-view key is
         // typically an arrow, which menus eat by the dozen; counting those
@@ -1434,6 +1461,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
             cameraViewNotePress();
             headOffsetGateViewUnbumped();
         }
+        frameTick("camera_keys_pads");
         // The FSS theater's mode latch: the player's own FSS keys give
         // frame-exact edges -- press enter and the screen is up THIS
         // frame, press quit and it is gone. Underneath, the game's
@@ -1506,11 +1534,17 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
                     byKey ? "your FSS key" : "the game's GuiFocus");
             }
         }
+        frameTick("fss_theater");
         // The settings menu (docs/settings-menu.md): its summon key, its
         // navigation keys and head-aim, its fade, the keyboard gate that
         // follows its draw, and the upload of a fresh raster. One key poll
         // when closed.
+        //
+        // This call holds the monitor's frame clock (perfMonitorFrame), which is
+        // where the frame-tick chain is cut: the tick named "menu_tick" ends there,
+        // "perf_monitor" is the rest of that function, and "menu" is what is left.
         menuTick(g_state->device);
+        frameTick("menu");
         // Reading the view the game is actually on, and telling the gate.
         //
         // The keypress count above stays as the fallback, for when this cannot
@@ -1518,6 +1552,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         // reused, a scan that found nothing. cameraViewCurrent returns -1 in
         // all of those and the gate goes back to counting.
         headOffsetGateSetView(cameraViewCurrent());
+        frameTick("camera_view");
         // One per-frame invalidation for both fixes, before either boundary.
         //
         // This used to be two, with opposite policies: vscreen dropped its
@@ -1526,8 +1561,12 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         // guaranteed the next fix would copy one of them wrongly. device_hook
         // owns the frame; it owns this.
         bindingFrameBoundary();
+        frameTick("binding_boundary");
         exposureFixFrameBoundary();
+        frameTick("exposure_boundary");
         vScreenFrameBoundary();
+        // vScreenFrameBoundary marks its own ticks; this is what is left of it.
+        frameTick("vscreen_rest");
 
         // THE FAST PATROL on the two context hooks, every frame.
         //
@@ -1547,7 +1586,9 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         // These passes vouch NOTHING; see vScreenReclaimTick for why that is
         // the whole safety argument rather than a shortcut.
         vScreenReclaimTick();
+        frameTick("vscreen_reclaim_tick");
         exposureFixReclaimTick();
+        frameTick("exposure_reclaim_tick");
 
         // The multithread-protection sample. One virtual call that reads a
         // flag, per frame, and a line only when the answer differs from last
@@ -1588,6 +1629,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
                     g_state->mtProtected ? "ON" : "off", g_state->mtChanges);
             }
         }
+        frameTick("mt_sample");
         // Polled rather than watched, twice a second by the journal watcher
         // and once a second here. The user is wearing a
         // headset and cannot see a text editor, so the settings that are worth
@@ -1603,6 +1645,7 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         if (menuTakeConfigPollRequest() || dueMs(g_state->configPollMs, kConfigPollMs)) {
             g_state->configPollMs = stampMs();
             vScreenRefreshConfig();
+            frameTick("config_refresh");
             // frame_flag's layout check (frame_flag.h). The VR runtime half
             // can load at any point in the session, so it is asked on this
             // cadence; the first mismatch is said once.
@@ -1656,12 +1699,14 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
             g_state->deviceHook.reclaim("d3d11 device");
             g_state->swapChainHook.reclaim("game swapchain");
             g_state->factoryHook.reclaim("dxgi factory");
+            frameTick("hook_reclaim");
             // vScreen first: its return is the eye-draws-since-last-pass fact
             // the exposure vouch is gated on, because compute silence during
             // a loading screen is ordinary and only compute silence during a
             // RENDERED SCENE is evidence of bypass.
             const bool sceneRendered = vScreenReclaimHooks();
             exposureFixReclaimHooks(sceneRendered);
+            frameTick("context_reclaim");
             // AND THE PROBE HOOK, which nothing else on this path touches.
             //
             // In the two context probes no installer runs, so neither reclaim
@@ -1671,19 +1716,29 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
             // table were therefore the sessions that reported nothing about it.
             // No-op unless a probe actually installed.
             g_state->bareContextHook.censusTick("probe context");
+            frameTick("probe_census");
         }
     });
+    const int64_t boundaryT1 = qpcNow();
+    // Whatever the block did after its last tick (or all of it, when a fault or
+    // graphicsRuntimeDisabled cut it short), and the end of the boundary's ticks.
+    g_frameTicks.markAt("boundary_rest", boundaryT1);
+    g_frameTicks.boundary(false);
     if (qpcFrequency() > 0) {
-        perfMonitorNoteCpu(kCpuBoundary, static_cast<double>(qpcNow() - boundaryT0) * 1000.0 /
+        perfMonitorNoteCpu(kCpuBoundary, static_cast<double>(boundaryT1 - boundaryT0) * 1000.0 /
                                              static_cast<double>(qpcFrequency()));
     }
     const uint64_t traceBodyEnd = edvrNativeTraceNowUs();
     if (SUCCEEDED(hr) && !(flags & DXGI_PRESENT_TEST))
         renderBoundaryPresent(g_state->device);
+    // The callback's end is the trace's end and the last tick's edge: one read.
+    const int64_t callbackEnd = qpcNow();
+    g_frameTicks.markAt("render_callback", callbackEnd);
     const EdvrNativePresentSpan trace{traceBegan, edvrNativeTraceUs(presentT0),
-        edvrNativeTraceUs(presentT1), traceBodyEnd, edvrNativeTraceNowUs(),
+        edvrNativeTraceUs(presentT1), traceBodyEnd, edvrNativeTraceUs(callbackEnd),
         GetCurrentThreadId(), syncInterval, flags, static_cast<int32_t>(hr)};
     nativeTimingNotePresent(g_state->device, traceToken, trace);
+    frameTick("timing_note");
     return hr;
 }
 
