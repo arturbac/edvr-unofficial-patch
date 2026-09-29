@@ -52,10 +52,10 @@ changes.*
   10.7-11.3 ms, EDVR about 4.8 of it). Open: fly the seed's census section
   (on main; UI quality 100 against 125 in one flight) and the landing pad in
   the layer (built, not flown, `claude/landing-pad-layer`, entry below: +0.9
-  to +1.2 ms a frame at UI 125 while up; WORLD wants one capture with a glare
-  train in a cockpit frame); output size and foveated DLSS are Sean's levers.
-  Any Quest flight with the default build: Application-render GPU invalid
-  count near zero, `native_frame_end_overlap_summary` failures=0.
+  to +1.2 ms at UI 125, +0.29 at 100; radar/pad need stencil ref 4, pad window
+  400; WORLD wants a glare-train capture); output size and foveated DLSS are
+  Sean's levers. Any Quest flight with the default build: Application-render
+  GPU invalid count near zero, `native_frame_end_overlap_summary` failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
   4100x4050 and 2665x2087.
@@ -1672,10 +1672,11 @@ glare fix claimed the radar's and the pad's draws for a sun, and the layer took
 the pair by vertex-shader hash alone. `src\d3d11\shared_pair.h` says which of
 the three each draw is: RADAR if a radar-only family drew within 250 draws
 before it on its target, else PAD if a console draw (VS 41E245D488BFE83E,
-68DDDEF04D9894AF) did, else WORLD. The glare fix never sees a RADAR or PAD draw
-(no claim, no skip in mode off, no exposure-damper sun scope), and the layer
-takes the pair only as RADAR or PAD, in stock, vivid, realistic and off. Nothing
-merged, installed or flown.
+68DDDEF04D9894AF) did within 400, else WORLD; and RADAR or PAD stand only with
+stencil reference 4 (Sean's second approval, the addendum below). The glare fix
+never sees a RADAR or PAD draw (no claim, no skip in mode off, no
+exposure-damper sun scope), and the layer takes the pair only as RADAR or PAD,
+in stock, vivid, realistic and off. Nothing merged, installed or flown.
 
 **The capture (Frontier, build a43c94ba, log 143837, game eye 2620x2532, layer
 4032x3896, vivid).** Three censuses, each with DCW watching the pair. The eye
@@ -1713,16 +1714,18 @@ Censuses 1 and 2 hit the line cap: frame 0 is whole, frame 1 is cut (1176 of
   --all`, and steam): RADAR draws sit 2-6 draws after a radar family (469
   draws), so 250 is generous for the radar (16 would do). The pad has only 16
   draws, in two logs (132352 and this capture), the console draw 191-236 draws
-  back: **a margin of 14 against the window of 250**. A busier HUD would push
-  the rings past it and they would read WORLD (left in the game's frame, as
-  today); the 30 s line counts that as a near miss. A pad window of 400 (1.7x)
-  would restore the margin; the approved rule says 250, so it stands, and
-  `kPairPadWindow` is the number to change. 72 more PAD-class calls of 15-98
-  instances, the console 15-39 back, sit in eight logs from 08-23 to 09-01:
-  an older game build whose radar families have other vertex shaders (no radar
-  mark is ever set), not the pad display. Stencil reference 04 in all 427 radar
-  and pad draws that record it, 00 in the 10 WORLD ones that do (a candidate
-  second signal; not used).
+  back: **a margin of 14 against a window of 250**, which is why Sean set the
+  pad's window to 400 (1.7x); a busier HUD past it reads WORLD (the rings stay
+  in the game's frame) and the 30 s line counts that as a near miss. 72 more
+  PAD-class calls of 15-98 instances, the console 15-39 back, sit in eight logs
+  from 08-23 to 09-01. They are not the pad display: all eight are glare-work
+  sessions (VIVID, the world shader compiled, the shader dump armed to "park at
+  a star"), the draw is one an eye a frame with a train's instance count, and
+  the census puts the console draws on the train's own target token. They are
+  very probably suns in cockpit frames that the marks read as PAD (no dump
+  exists for those days): the marks alone can misread a train when the HUD
+  shares its target. Stencil reference 04 in all 427 radar and pad draws that
+  record it, 00 in the 10 WORLD ones that do: the guard below.
 - **The DCW b0 dumps add nothing that separates the classes.** b0 is 208 bytes,
   the same in all three: the sprite camera's basis rows (right and up, equal
   length 0.956/0.971, orthogonal) and the ship's world offset, with fixed 16x16
@@ -1777,22 +1780,100 @@ while the display is up; at UI 100 it is 0.60, +0.29 net.
   that is not 2-6 or 191-236 (the first-seen lines name the instance count).
 - With the pad up, `world draws with a mark on their own target past the
   window` above 0 is the near miss: the pad's rings read WORLD because the
-  console draw sits past 250 (the line gives how far). That is the number
+  console draw sits past 400 (the line gives how far). That is the number
   that says to widen `kPairPadWindow`.
+- The line's stencil clause: `stencil guard (the reference must be 4): N draws
+  the marks called radar (R) or pad (P) went to world, references seen: ...`.
+  With the radar or the pad up it must read 0 and `-`. Above 0 means genuine
+  radar or pad draws miss reference 4: the guard is too strict, and the
+  references name what they carry (`0 x 3`, `5 x 1`, `unreadable x 2`). The
+  first refusal also gets a note of its own.
 
-**Proof.** `tools\shared_pair_test` (476 checks): the mark table against the
-take's list; the rule at its edges (each window at its own edge); the tracker;
-seven recorded frames from the logs (each class judged against its eye dump)
-plus four constructed controls (both windows' edges, a stale mark, a mark after
-the draw, a mark on another target); a reference implementation of the rule
-mutated twelve ways (no radar flag, no console flag, marks on any target,
-marks after the draw, no window, an unbounded window, the console first, a pad
-window of 230 (the recorded pad is 236 back), each window one draw short or
-long), each caught by the recordings; the glare claim and the layer's take
-through `uiLayerDecide` in stock, vivid, realistic and off (a radar or pad draw
-never reaches kVerdict; without the guard it does, the control); the 30 s line
-with its near-miss count, and its absence; a scan of `vscreen.cpp` with ten
-mutants. `tools\pair_class_scan.py` holds the same fixtures in its own
-self-test. 44 mutants of the production sources, run on a scratch copy: 43
-caught; the survivor swaps the pad's window for the radar's, and is equivalent
-while both are 250 (the harness is in the session scratchpad).
+**Proof.** `tools\shared_pair_test` (679 checks, with the stencil guard; the
+addendum below has the rest): the mark table against the take's list; the rule
+at its edges (each window at its own edge); the tracker; seven recorded frames
+from the logs (each class judged against its eye dump, each with the stencil
+reference the census recorded) plus five constructed controls (both windows'
+edges, a stale mark, a mark after the draw, a mark on another target, the
+guard); a reference implementation of the rule mutated seventeen ways, each
+caught by the recordings; the glare claim and the layer's take through
+`uiLayerDecide` in stock, vivid, realistic and off (a radar or pad draw never
+reaches kVerdict; without the guard it does, the control); the 30 s line with
+its near-miss count and its stencil clause, and its absence; a scan of
+`vscreen.cpp` with fifteen mutants. `tools\pair_class_scan.py` holds the same
+fixtures in its own self-test. 71 mutants of the production sources, run on a
+scratch copy, are all caught (the harness is in the session scratchpad).
+
+### Addendum, 2026-09-29: the stencil guard and a pad window of 400 (Sean's second approval)
+
+Two changes to the rule, on the same branch, not flown.
+1. **The stencil guard, fail-safe.** A draw can be called RADAR or PAD only if
+   its stencil reference at draw time is 4. Anything else is WORLD: the game's
+   frame keeps it, the glare fix judges it by its shape as before, the layer
+   leaves it. The reference is read at the draw, from the bound depth-stencil
+   state, the way the census records `st=` (`OMGetDepthStencilState` under a
+   fault budget; `pairReadStencilRef` in `vscreen.cpp`), and only for the pair's
+   own two shaders. A reference that cannot be read (the budget spent, or the
+   call faulted) is WORLD and is counted. There is no default for the argument
+   in the tracker, so a caller that forgot it cannot switch the guard off.
+2. **`kPairPadWindow` is 400**; the radar's window stays 250 (its marks are 2-6
+   draws back). The pad's console draw is 191-236 back, so the margin went from
+   14 draws to 1.7x. No log in the corpus has a call 250-400 draws back, so the
+   window moves nothing there.
+
+What the reference is: the census prints `st=` as the stencil TEST's enable
+flag and then the reference (`st=04`: test off, reference 4). The pair's own
+state has the test off, so the 4 is state the HUD section's earlier stencil
+draws leave behind, and the guard says "drawn inside the HUD section's state"
+and nothing finer. It was 4 in all 427 recorded radar and pad draws (411 radar,
+16 pad) and 0 in all 10 recorded WORLD draws. That is why it works as the
+fail-safe half of the rule: marks near a draw count only when the reference
+agrees. It is NOT a proof about a glare train in a cockpit frame. A train drawn
+inside the HUD section's state would carry 4 too (the constructed control that
+says so reads RADAR), and what the scene pass leaves in the reference at the
+train's slot is unmeasured: no capture of the current build holds a train in a
+cockpit frame. In the older build the census puts the console draws on the
+train's own target token (the 72 calls above), and the marks alone read those
+probable suns as PAD.
+
+The scan over both installs' 1,349 logs, all four runs from one parse:
+
+| rule | radar | pad | world |
+|---|---|---|---|
+| marks only, pad window 250 (the rule before this change) | 469 | 88 | 18 |
+| marks only, pad window 400 | 469 | 88 | 18 |
+| guard, a log with no `st=` column passing (`--stencil unrecorded-pass`) | 469 | 88 | 18 |
+| guard as the draw path has it (no `st=` reads as unreadable) | 411 | 16 | 148 |
+
+The genuine calls do not move: all 427 recorded radar and pad calls carry
+reference 4, none is denied, and the 10 recorded WORLD calls are WORLD by the
+marks. The 130 calls that go to WORLD under the strict guard (58 RADAR, 72
+PAD-class) all sit in twelve logs from 08-23 to 09-01, whose census has no
+`st=` column: the guard reads them as unreadable, as the draw path reads a
+reference it could not get. That is a fact about the log format and no
+evidence about the reference. The 72 are the probable suns, so WORLD is
+probably the right answer for them, for a reason the scan cannot see.
+
+The 30 s line gained the guard's clause (see "What the next flight shows"),
+and the first refusal gets a note of its own. `pair_class_scan.py` applies the
+same guard (`--stencil guard|unrecorded-pass|off`, default guard), names each
+denial with its reference, counts denials in a log's header line, and writes
+`st=N` (or `st=-`) on every pair draw of a fixture it emits.
+
+Rigs, each with its negative control (`tools\shared_pair_test`, 679 checks):
+- the recorded frames classify as before, each with the reference the census
+  recorded; broken by a guard that wants reference 0 (every recording changes);
+- a pad draw 300 back with reference 4 is PAD, one 400 back PAD, one 401 back
+  WORLD: broken by the pad window back at 250, at 399 and at 401;
+- a pad-shaped draw with `st=00` is WORLD: broken by dropping the guard, and by
+  a guard that takes any nonzero reference (reference 8) or lets an unreadable
+  one through;
+- a glare-train draw (15 instances) two draws after a radar family, inside the
+  radar window, with reference 0 is WORLD: broken by dropping the guard. Its
+  twin with reference 4 reads RADAR, the guard's stated limit.
+Each control is held by the production tracker AND broken, at that very draw,
+by its own mutant (13 named controls). Run on the production sources with the
+rig's `--keep-going`, the mutant with the guard dropped fails 57 checks,
+among them `constructed_stencil_guard.txt #112` (the train with reference 0:
+"got radar"), #301 to #303 and #132, #142; the pad window at 250 fails
+`constructed_window_edge.txt #405` (300 back: "got world") and #500.

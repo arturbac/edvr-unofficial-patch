@@ -7,21 +7,33 @@ the evidence and the rule). This is that rule, in Python, over the `DC` lines a 
 capture can be judged the day it is flown:
 
     RADAR  a radar-only family drew within 250 draws before it on the same target
-    PAD    else a console draw did
+    PAD    else a console draw did within 400
     WORLD  else
+    ... and RADAR or PAD stand only if the draw's stencil reference is 4 (the stencil guard); any other
+    reference, or none recorded, is WORLD
 
     python tools\\pair_class_scan.py LOG [LOG ...]
     python tools\\pair_class_scan.py --target frontier --latest 3
     python tools\\pair_class_scan.py --target frontier --all --summary
     python tools\\pair_class_scan.py LOG --window 400 [--pad-window 400]
+    python tools\\pair_class_scan.py LOG --stencil off          # the marks alone (the rule before the guard)
     python tools\\pair_class_scan.py --emit-fixture LOG --census 2 --frame 0 [--noise 12]
     python tools\\pair_class_scan.py --self-test
 
 Every draw of the pair is printed by census and ordinal with its class, how far back the mark that made the
 call was, and the draw's own state (depth-stencil state and stencil reference). WORLD is the call to read
-with care: it is the default when no mark is near, and no capture yet holds a glare train in a cockpit frame
-with the radar up. A census that hit its line cap (its `DC end` line says how many lines were dropped) is
-reported as such: draws late in the census, or in its later frames, may be missing rather than absent.
+with care: it is the default when no mark is near, and no capture of the current build yet holds a glare
+train in a cockpit frame with the radar up. A census that hit its line cap (its `DC end` line says how many
+lines were dropped) is reported as such: draws late in the census, or in its later frames, may be missing
+rather than absent.
+
+THE STENCIL GUARD. The census prints `st=` as the stencil test's enable flag and then the reference in decimal
+(`st=04`: test off, reference 4); the guard reads the reference. A call the marks made RADAR or PAD stays only
+with reference 4, exactly as the draw path does (shared_pair.h); a call sent to WORLD by it says so, with the
+reference. A log from before 2026-09-02 has no `st=` column: the guard reads that as unreadable, the way the
+draw path reads a reference it could not get, so those calls go to WORLD and are named as such. That is a
+statement about the log's format and not evidence about the reference; --stencil unrecorded-pass lets a missing
+column through (a recorded reference must still be 4), and --stencil off drops the guard.
 
 Ordinals: the census's #N is the draw's index in its frame across both eyes, which is what vscreen's
 eyeDrawsThisFrame counts, so the distances here are the ones the draw path measures. The target is the census's
@@ -30,8 +42,9 @@ eyes share, and marks of one eye can then reach the other's draws here (the draw
 itself and cannot). The scan says so when it sees such a token on a pair draw.
 
 --emit-fixture writes (to stdout) the reduction of one census frame that tools\\shared_pair_test reads: the
-marks, the pair's draws, a few other draws, ordinals counted from 1 as the draw path counts them. The classes
-it writes are this tool's own; a fixture is committed only after each class is checked against the eye dump.
+marks, the pair's draws (each with its stencil reference, st=N, or st=- when the log has none), a few other
+draws, ordinals counted from 1 as the draw path counts them. The classes it writes are this tool's own; a
+fixture is committed only after each class is checked against the eye dump.
 
 Read-only: this tool opens logs for reading and writes nothing.
 """
@@ -52,9 +65,12 @@ RADAR_VS = {
     "B932058F26B76691": "contact D",
 }
 CONSOLE_VS = {"41E245D488BFE83E": "console A", "68DDDEF04D9894AF": "console B"}
-# kPairRadarWindow and kPairPadWindow in src/d3d11/shared_pair.h: how far back a mark reaches, in eye draws.
+# kPairRadarWindow, kPairPadWindow and kPairStencilRef in src/d3d11/shared_pair.h: how far back a mark reaches,
+# in eye draws, and the stencil reference a RADAR or PAD call needs.
 WINDOW = 250          # the radar's; --window changes both, --pad-window the pad's alone
-PAD_WINDOW = 250
+PAD_WINDOW = 400
+STENCIL_REF = 4
+STENCIL_MODES = ("guard", "unrecorded-pass", "off")
 
 DC_RE = re.compile(
     r"^\[(?P<t>\d\d:\d\d:\d\d\.\d+)\] DC (?P<frame>\d+) #(?P<ord>\d+) (?P<kind>\w) n=(?P<n>\d+) "
@@ -83,9 +99,15 @@ class Census(object):
 
 
 class Call(object):
-    def __init__(self, draw, cls, radar_back, console_back, ps_known):
+    """One draw of the pair and what was made of it. `by_marks` is the marks' verdict before the stencil guard,
+    `stencil` the reference the census recorded (None: no st= for the draw), `denied` that the guard changed the
+    class (the marks said RADAR or PAD, the reference disagreed or was not recorded)."""
+
+    def __init__(self, draw, cls, radar_back, console_back, ps_known, by_marks=None, stencil=None, denied=False):
         self.draw, self.cls = draw, cls
         self.radar_back, self.console_back, self.ps_known = radar_back, console_back, ps_known
+        self.by_marks = by_marks or cls
+        self.stencil, self.denied = stencil, denied
 
 
 def is_pair(draw):
@@ -93,10 +115,33 @@ def is_pair(draw):
     return draw.vs == PAIR_VS and draw.ps in (PAIR_PS, None)
 
 
-def classify_draws(draws, window=WINDOW, pad_window=PAD_WINDOW):
+def stencil_ref(draw):
+    """The stencil reference the census recorded for a draw, or None when its line has no st= column. The
+    census prints the stencil TEST's enable flag ('0', '1', or '?' with no state bound) and then the reference
+    in decimal: '04' is test off, reference 4; '15' is test on, reference 5."""
+    token = getattr(draw, "st", None)
+    if not token or len(token) < 2 or token[0] not in "01?" or not token[1:].isdigit():
+        return None
+    return int(token[1:])
+
+
+def stencil_verdict(by_marks, ref, mode="guard"):
+    """(class, denied): the marks' verdict through the stencil guard. `mode` is "guard" (the draw path's rule: the
+    reference must be recorded and be 4), "unrecorded-pass" (a log with no st= column passes, a recorded reference
+    must still be 4) or "off" (the marks alone)."""
+    if by_marks == "WORLD" or mode == "off":
+        return by_marks, False
+    if ref is None:
+        return (by_marks, False) if mode == "unrecorded-pass" else ("WORLD", True)
+    if ref == STENCIL_REF:
+        return by_marks, False
+    return "WORLD", True
+
+
+def classify_draws(draws, window=WINDOW, pad_window=PAD_WINDOW, stencil="guard"):
     """The rule over one frame's draws in order: a list of Call, one for each draw of the pair. Marks are
     per target token and only draws before the pair's count; ordinals are the census's #N. `window` is the
-    radar's reach, `pad_window` the pad's."""
+    radar's reach, `pad_window` the pad's, `stencil` the guard's mode (STENCIL_MODES)."""
     last_radar, last_console = {}, {}
     calls = []
     for d in draws:
@@ -110,12 +155,14 @@ def classify_draws(draws, window=WINDOW, pad_window=PAD_WINDOW):
             rb = d.ordinal - radar if radar is not None and radar < d.ordinal else None
             cb = d.ordinal - console if console is not None and console < d.ordinal else None
             if rb is not None and rb <= window:
-                cls = "RADAR"
+                by_marks = "RADAR"
             elif cb is not None and cb <= pad_window:
-                cls = "PAD"
+                by_marks = "PAD"
             else:
-                cls = "WORLD"
-            calls.append(Call(d, cls, rb, cb, d.ps is not None))
+                by_marks = "WORLD"
+            ref = stencil_ref(d)
+            cls, denied = stencil_verdict(by_marks, ref, stencil)
+            calls.append(Call(d, cls, rb, cb, d.ps is not None, by_marks, ref, denied))
     return calls
 
 
@@ -156,6 +203,12 @@ def parse_log(path):
 
 
 def explain(c):
+    if c.denied:
+        marks = ("a radar family %d draws back" % c.radar_back if c.by_marks == "RADAR"
+                 else "a console draw %d draws back" % c.console_back)
+        why = ("this log's census has no st= for it, which the guard reads as unreadable" if c.stencil is None
+               else "the stencil reference is %d, not %d" % (c.stencil, STENCIL_REF))
+        return "the marks said %s (%s) but %s" % (c.by_marks, marks, why)
     if c.cls == "RADAR":
         return "a radar family %d draws back" % c.radar_back
     if c.cls == "PAD":
@@ -166,28 +219,53 @@ def explain(c):
 
 
 def is_near_miss(call):
-    """A WORLD call with a mark of its own on its own target that reached too far back to count."""
-    return call.cls == "WORLD" and bool(call.radar_back or call.console_back)
+    """A WORLD call the marks made, with a mark of its own on its own target that reached too far back to count."""
+    return call.by_marks == "WORLD" and bool(call.radar_back or call.console_back)
 
 
-def scan_log(path, window=WINDOW, out=None, summary_only=False, pad_window=PAD_WINDOW):
-    """Print the pair's calls in one log; returns {"RADAR": n, "PAD": n, "WORLD": n}."""
+def new_totals():
+    return {"RADAR": 0, "PAD": 0, "WORLD": 0, "NEAR": 0, "DENIED": 0, "DENIED_UNRECORDED": 0}
+
+
+def add_totals(a, b):
+    for k in a:
+        a[k] += b[k]
+
+
+def summary_suffix(t):
+    """The header line's tail: near misses, and what the stencil guard changed."""
+    bits = []
+    if t["NEAR"]:
+        bits.append("%d of the world calls have a mark on their own target past the window" % t["NEAR"])
+    if t["DENIED"]:
+        bits.append("the stencil guard sent %d radar/pad call(s) to world: %d with a reference other than %d, %d with "
+                    "none recorded in the log" % (t["DENIED"], t["DENIED"] - t["DENIED_UNRECORDED"], STENCIL_REF,
+                                                  t["DENIED_UNRECORDED"]))
+    return " (%s)" % "; ".join(bits) if bits else ""
+
+
+def scan_log(path, window=WINDOW, out=None, summary_only=False, pad_window=PAD_WINDOW, stencil="guard"):
+    """Print the pair's calls in one log; returns the totals: {"RADAR": n, "PAD": n, "WORLD": n, "NEAR": near
+    misses among the world calls, "DENIED": calls the stencil guard sent to world, "DENIED_UNRECORDED": of
+    those, the ones whose log has no stencil reference}."""
     out = out or sys.stdout
-    totals = {"RADAR": 0, "PAD": 0, "WORLD": 0}
+    totals = new_totals()
     censuses = parse_log(path)
     per_census = []
     for cen in censuses:
         rows = []
         for fr in sorted(cen.frames):
-            for call in classify_draws(cen.frames[fr], window, pad_window):
+            for call in classify_draws(cen.frames[fr], window, pad_window, stencil):
                 rows.append((fr, call))
                 totals[call.cls] += 1
+                totals["NEAR"] += is_near_miss(call)
+                totals["DENIED"] += call.denied
+                totals["DENIED_UNRECORDED"] += call.denied and call.stencil is None
         per_census.append((cen, rows))
     pairs = sum(len(r) for _, r in per_census)
-    near = sum(1 for _, rows in per_census for _fr, call in rows if is_near_miss(call))
     out.write("%s: %d census(es), %d draw(s) of the shared pair: radar %d, pad %d, world %d%s\n"
               % (os.path.basename(path), len(censuses), pairs, totals["RADAR"], totals["PAD"], totals["WORLD"],
-                 " (%d of them with a mark on their own target past the window)" % near if near else ""))
+                 summary_suffix(totals)))
     if summary_only:
         return totals
     for cen, rows in per_census:
@@ -216,8 +294,9 @@ def scan_log(path, window=WINDOW, out=None, summary_only=False, pad_window=PAD_W
 # ------------------------------------------------------------------------------------ fixtures --
 
 def emit_fixture(path, census_no, frame, noise, out=None, title=None):
-    """The reduction of one census frame: every mark, every draw of the pair, and `noise` other draws spread
-    over the frame. Ordinals from 1. The classes are this tool's own; check them before committing."""
+    """The reduction of one census frame: every mark, every draw of the pair (with its stencil reference), and
+    `noise` other draws spread over the frame. Ordinals from 1. The classes are this tool's own; check them
+    before committing."""
     out = out or sys.stdout
     for cen in parse_log(path):
         if cen.number != census_no:
@@ -232,20 +311,24 @@ def emit_fixture(path, census_no, frame, noise, out=None, title=None):
             step = max(1, len(others) // noise)
             keep_others = set(id(d) for d in others[::step][:noise])
         out.write("# %s\n" % (title or "reduced by tools\\pair_class_scan.py --emit-fixture"))
-        out.write("# source: %s census %d (%s) frame %d; ordinals are the census's #N plus one\n"
+        out.write("# source: %s census %d (%s) frame %d; ordinals are the census's #N plus one; st= is the stencil "
+                  "reference the census recorded (st=- when it has none)\n"
                   % (os.path.basename(path), cen.number, cen.t, frame))
         out.write("frame %d\n" % (frame + 1))
         for d in draws:
             if d.vs in RADAR_VS or d.vs in CONSOLE_VS or id(d) in keep_others:
                 out.write("d %d %s %s\n" % (d.ordinal + 1, d.vs, d.r))
             elif id(d) in calls:
-                out.write("p %d %d %s %s\n" % (d.ordinal + 1, d.i, d.r, calls[id(d)].cls.lower()))
+                ref = stencil_ref(d)
+                out.write("p %d %d %s %s st=%s\n" % (d.ordinal + 1, d.i, d.r, calls[id(d)].cls.lower(),
+                                                     "-" if ref is None else ref))
         return
     raise SystemExit("no census %d in %s" % (census_no, path))
 
 
 def parse_fixture(text):
-    """[(frame_id, [entry])] with entry ('d', ordinal, vs, target) or ('p', ordinal, instances, target, expected)."""
+    """[(frame_id, [entry])] with entry ('d', ordinal, vs, target) or ('p', ordinal, instances, target, expected,
+    stencil): stencil is the reference as an int, or None for st=- (not recorded, or unreadable)."""
     frames = []
     cur = None
     for raw in text.splitlines():
@@ -259,13 +342,17 @@ def parse_fixture(text):
         elif parts[0] == "d" and cur is not None:
             cur[1].append(("d", int(parts[1]), parts[2].upper(), parts[3]))
         elif parts[0] == "p" and cur is not None:
-            cur[1].append(("p", int(parts[1]), int(parts[2]), parts[3], parts[4].lower()))
+            if len(parts) < 6 or not parts[5].startswith("st="):
+                raise ValueError("a pair draw needs its stencil reference (st=N, or st=-): %r" % raw)
+            token = parts[5][3:]
+            cur[1].append(("p", int(parts[1]), int(parts[2]), parts[3], parts[4].lower(),
+                           None if token == "-" else int(token)))
         else:
             raise ValueError("bad fixture line: %r" % raw)
     return frames
 
 
-def fixture_calls(entries, window=WINDOW, pad_window=PAD_WINDOW):
+def fixture_calls(entries, window=WINDOW, pad_window=PAD_WINDOW, stencil="guard"):
     """The rule over a fixture frame: [(ordinal, class name in lower case)] for its 'p' entries."""
     last_radar, last_console = {}, {}
     out = []
@@ -277,23 +364,27 @@ def fixture_calls(entries, window=WINDOW, pad_window=PAD_WINDOW):
             elif vs in CONSOLE_VS:
                 last_console[target] = ordinal
         else:
-            _, ordinal, _inst, target, _expected = e
+            _, ordinal, _inst, target, _expected, ref = e
             r, c = last_radar.get(target), last_console.get(target)
             if r is not None and r < ordinal and ordinal - r <= window:
-                out.append((ordinal, "radar"))
+                by_marks = "RADAR"
             elif c is not None and c < ordinal and ordinal - c <= pad_window:
-                out.append((ordinal, "pad"))
+                by_marks = "PAD"
             else:
-                out.append((ordinal, "world"))
+                by_marks = "WORLD"
+            out.append((ordinal, stencil_verdict(by_marks, ref, stencil)[0].lower()))
     return out
 
 
 # ------------------------------------------------------------------------------------ self-test --
 
 def _dc(frame, ordinal, vs, r="@1", n=6, i=1, ph="-", st="04", ds="02wA", kind="N", t="14:40:46.087"):
+    """A census line as the draw census writes it; st=None leaves the st= column out, as a log from before
+    2026-09-02 does."""
     return ("[%s] DC %d #%d %s n=%d i=%d r=%s d=@2 c=@3 s=@4,@5,-,- vs=? vh=%s vb=buf48 sd=8 of=0 tp=4 ia=0,0,0 "
-            "ib=- x=-,-,-,- ph=%s vp=0,0+2620x2532 z=0.000-1.000 sc=0,0-0,0 ds=%s st=%s bm=F pr=- bl=15,2,1/5,2,1 "
-            "sm=FFFFFFFF q=%d\n" % (t, frame, ordinal, kind, n, i, r, vs, ph, ds, st, ordinal * 3))
+            "ib=- x=-,-,-,- ph=%s vp=0,0+2620x2532 z=0.000-1.000 sc=0,0-0,0 ds=%s%s bm=F pr=- bl=15,2,1/5,2,1 "
+            "sm=FFFFFFFF q=%d\n" % (t, frame, ordinal, kind, n, i, r, vs, ph, ds,
+                                    "" if st is None else " st=%s" % st, ordinal * 3))
 
 
 def self_test():
@@ -308,15 +399,15 @@ def self_test():
     radar_vs = "9611A454527F7FEB"
     console_vs = "68DDDEF04D9894AF"
     # 1. the rule on synthetic census lines, with the negative controls
-    def run(lines, window=WINDOW, pad_window=PAD_WINDOW):
+    def run(lines, window=WINDOW, pad_window=PAD_WINDOW, stencil="guard"):
         with tempfile.TemporaryDirectory() as tmp:
             p = os.path.join(tmp, "edvr_gfx_test.log")
             with open(p, "w", encoding="utf-8", newline="") as f:
                 f.write("[14:40:45.959] DC begin census=1 frames=1 frame=100 offscreen=yes\n" + "".join(lines))
             cen = parse_log(p)[0]
-            return classify_draws(cen.frames[0], window, pad_window), cen
+            return classify_draws(cen.frames[0], window, pad_window, stencil), cen
 
-    pair = lambda o, r="@1", i=39, ph=PAIR_PS: _dc(0, o, PAIR_VS, r=r, i=i, ph=ph)
+    pair = lambda o, r="@1", i=39, ph=PAIR_PS, st="04": _dc(0, o, PAIR_VS, r=r, i=i, ph=ph, st=st)
     calls, cen = run([_dc(0, 10, radar_vs), _dc(0, 12, PAIR_VS, i=39, ph=PAIR_PS)])
     check(len(calls) == 1 and calls[0].cls == "RADAR" and calls[0].radar_back == 2, "a radar family two draws back: RADAR")
     calls, _ = run([_dc(0, 10, console_vs), pair(200)])
@@ -327,7 +418,7 @@ def self_test():
     check(calls[0].cls == "WORLD", "no marks: WORLD")
     # negative controls: each thing the rule reads, changed
     calls, _ = run([_dc(0, 10, radar_vs), pair(260)])          # 250 back
-    check(calls[0].cls == "RADAR", "250 draws back is inside the window")
+    check(calls[0].cls == "RADAR", "250 draws back is inside the radar's window")
     calls, _ = run([_dc(0, 10, radar_vs), pair(261)])          # 251 back
     check(calls[0].cls == "WORLD", "251 draws back is outside it")
     calls, _ = run([_dc(0, 10, radar_vs, r="@2"), pair(12, r="@1")])
@@ -343,19 +434,63 @@ def self_test():
     calls, _ = run([_dc(0, 10, radar_vs), pair(14)], window=3)
     check(calls[0].cls == "WORLD", "--window narrows the rule")
     # the two windows are the radar's and the pad's own
-    calls, _ = run([_dc(0, 10, console_vs), pair(260)])        # console 250 back
-    check(calls[0].cls == "PAD", "a console draw 250 back is inside the pad's window")
-    calls, _ = run([_dc(0, 10, console_vs), pair(261)])        # console 251 back: a near miss
-    check(calls[0].cls == "WORLD" and is_near_miss(calls[0]) and calls[0].console_back == 251,
-          "a console draw 251 back is outside it, and the WORLD call carries it as a near miss")
-    calls, _ = run([_dc(0, 10, console_vs), pair(261)], pad_window=400)
-    check(calls[0].cls == "PAD", "--pad-window widens the pad's reach")
-    calls, _ = run([_dc(0, 10, radar_vs), pair(261)], pad_window=400)
+    calls, _ = run([_dc(0, 10, console_vs), pair(410)])        # console 400 back
+    check(calls[0].cls == "PAD", "a console draw 400 back is inside the pad's window")
+    calls, _ = run([_dc(0, 10, console_vs), pair(310)])        # console 300 back
+    check(calls[0].cls == "PAD", "a console draw 300 back is PAD (the window was 250)")
+    calls, _ = run([_dc(0, 10, console_vs), pair(411)])        # console 401 back: a near miss
+    check(calls[0].cls == "WORLD" and is_near_miss(calls[0]) and calls[0].console_back == 401,
+          "a console draw 401 back is outside it, and the WORLD call carries it as a near miss")
+    calls, _ = run([_dc(0, 10, console_vs), pair(411)], pad_window=250)
+    check(calls[0].cls == "WORLD", "--pad-window narrows the pad's reach")
+    calls, _ = run([_dc(0, 10, console_vs), pair(311)], pad_window=250)
+    check(calls[0].cls == "WORLD" and is_near_miss(calls[0]), "a pad window of 250 calls 301 back WORLD (the old rule)")
+    calls, _ = run([_dc(0, 10, radar_vs), pair(261)], pad_window=800)
     check(calls[0].cls == "WORLD", "--pad-window does not widen the radar's")
-    calls, _ = run([_dc(0, 10, console_vs), pair(261)], window=400)
+    calls, _ = run([_dc(0, 10, console_vs), pair(411)], window=800)
     check(calls[0].cls == "WORLD", "--window (the radar's) does not widen the pad's when the pad's is given")
     calls, _ = run([pair(50)])
     check(calls[0].cls == "WORLD" and not is_near_miss(calls[0]), "a world call with no mark at all is not a near miss")
+
+    # the stencil reference as the census prints it: the enable flag, then the reference in decimal
+    for token, want in (("04", 4), ("00", 0), ("15", 5), ("14", 4), ("?0", 0), ("112", 12), ("1255", 255), (None, None),
+                        ("", None), ("x", None), ("4", None), ("0z", None)):
+        d = Draw(1, "t", "N", 6, 1, "@1", PAIR_VS, PAIR_PS, token, None, 1)
+        check(stencil_ref(d) == want, "stencil_ref(%r) is %r, not %r" % (token, want, stencil_ref(d)))
+    # THE STENCIL GUARD: RADAR and PAD stand only with reference 4; anything else, or none recorded, is WORLD
+    calls, _ = run([_dc(0, 10, radar_vs), pair(12, st="04")])
+    check(calls[0].cls == "RADAR" and not calls[0].denied and calls[0].stencil == 4, "reference 4: the radar call stands")
+    calls, _ = run([_dc(0, 10, radar_vs), pair(12, st="14")])
+    check(calls[0].cls == "RADAR", "reference 4 with the stencil test on stands too: the guard reads the reference, not the flag")
+    calls, _ = run([_dc(0, 10, radar_vs), pair(12, i=15, st="00")])
+    check(calls[0].cls == "WORLD" and calls[0].denied and calls[0].by_marks == "RADAR" and calls[0].radar_back == 2
+          and calls[0].stencil == 0,
+          "a glare-train-shaped draw (15 instances) two draws after a radar family with reference 0 (st=00) is WORLD, denied "
+          "by the guard, its marks still recorded")
+    check(not is_near_miss(calls[0]), "a draw the guard denied is not a near miss")
+    calls, _ = run([_dc(0, 10, radar_vs), pair(12, i=15, st="00")], stencil="off")
+    check(calls[0].cls == "RADAR" and not calls[0].denied, "--stencil off: the same draw is RADAR (the marks alone)")
+    calls, _ = run([_dc(0, 10, radar_vs), pair(12, i=15, st="04")])
+    check(calls[0].cls == "RADAR", "...and with reference 4 it is RADAR: the guard is a second line, not a proof")
+    calls, _ = run([_dc(0, 10, console_vs), pair(200, i=3392, st="00")])
+    check(calls[0].cls == "WORLD" and calls[0].denied and calls[0].by_marks == "PAD", "a pad-shaped draw with st=00 is WORLD")
+    calls, _ = run([_dc(0, 10, console_vs), pair(200, i=3392, st="18")])
+    check(calls[0].cls == "WORLD" and calls[0].denied and calls[0].stencil == 8, "a pad-shaped draw with reference 8 is WORLD")
+    calls, _ = run([_dc(0, 10, console_vs), pair(200, i=3392, st="04")])
+    check(calls[0].cls == "PAD", "a pad-shaped draw with st=04 is PAD (the control)")
+    calls, _ = run([pair(50, st="00")])
+    check(calls[0].cls == "WORLD" and not calls[0].denied, "world by the marks stays world and is not a denial")
+    # a log with no st= column (from before 2026-09-02): the guard reads it as unreadable, the way the draw path does
+    calls, _ = run([_dc(0, 10, radar_vs), pair(12, st=None)])
+    check(calls[0].cls == "WORLD" and calls[0].denied and calls[0].stencil is None,
+          "no st= in the census line: the guard reads an unreadable reference and sends the call to WORLD")
+    check("no st=" in explain(calls[0]), "...and says the log has none")
+    calls, _ = run([_dc(0, 10, radar_vs), pair(12, st=None)], stencil="unrecorded-pass")
+    check(calls[0].cls == "RADAR", "--stencil unrecorded-pass: a log with no st= column lets the call stand")
+    calls, _ = run([_dc(0, 10, radar_vs), pair(12, st="00")], stencil="unrecorded-pass")
+    check(calls[0].cls == "WORLD", "--stencil unrecorded-pass still refuses a recorded reference other than 4")
+    calls, _ = run([_dc(0, 10, radar_vs), pair(12, st=None)], stencil="off")
+    check(calls[0].cls == "RADAR", "--stencil off: no guard at all")
 
     # 2. the scan's report and its line-cap warning
     with tempfile.TemporaryDirectory() as tmp:
@@ -370,26 +505,52 @@ def self_test():
         buf = io.StringIO()
         totals = scan_log(p, out=buf)
         text = buf.getvalue()
-        check(totals == {"RADAR": 0, "PAD": 1, "WORLD": 0}, "the scan totals")
+        check((totals["RADAR"], totals["PAD"], totals["WORLD"], totals["DENIED"]) == (0, 1, 0, 0), "the scan totals")
         check("-> PAD" in text and "i=3392" in text, "the report names the call and the instances")
         check("frame 0: 2 of the 5 eye draws are in the log" in text and "99 line(s) dropped" in text
               and "draws after #2 are missing" in text, "a frame the line cap cut is named, with what is missing")
         check("census 1 (14:40:45.959, frame 100)" in text, "the report names the census")
-        check("past the window" not in text.split("\n")[0],
-              "a log with no near miss says nothing about near misses in its header")
+        check("past the window" not in text.split("\n")[0] and "stencil guard" not in text.split("\n")[0],
+              "a log with no near miss and no denial says nothing about them in its header")
         # a near miss is counted in the header line
         with open(p, "w", encoding="utf-8", newline="") as f:
             f.write("[14:40:45.959] DC begin census=1 frames=1 frame=100 offscreen=yes\n")
             f.write(_dc(0, 5, console_vs))
-            f.write(_dc(0, 400, PAIR_VS, i=3392, ph=PAIR_PS))
-            f.write(_dc(0, 401, PAIR_VS, r="@9", i=3392, ph=PAIR_PS))
+            f.write(_dc(0, 500, PAIR_VS, i=3392, ph=PAIR_PS))
+            f.write(_dc(0, 501, PAIR_VS, r="@9", i=3392, ph=PAIR_PS))
         buf = io.StringIO()
         totals = scan_log(p, out=buf)
         head = buf.getvalue().split("\n")[0]
-        check(totals == {"RADAR": 0, "PAD": 0, "WORLD": 2} and "world 2 (1 of them with a mark on their own target past the window)" in head,
+        check((totals["RADAR"], totals["PAD"], totals["WORLD"], totals["NEAR"]) == (0, 0, 2, 1)
+              and "world 2 (1 of the world calls have a mark on their own target past the window)" in head,
               "the header counts the near misses among the world calls (one has a mark of its own, one has none)")
-        check("-> WORLD (the nearest mark is 395 draws back, past the window)" in buf.getvalue(),
+        check("-> WORLD (the nearest mark is 495 draws back, past the window)" in buf.getvalue(),
               "the near miss is explained per call")
+        # the guard's denials are counted in the header line and explained per call
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write("[14:40:45.959] DC begin census=1 frames=1 frame=100 offscreen=yes\n")
+            f.write(_dc(0, 5, console_vs))
+            f.write(_dc(0, 9, PAIR_VS, i=3392, ph=PAIR_PS, st="00"))
+            f.write(_dc(0, 10, PAIR_VS, i=94, ph=PAIR_PS, st="15"))
+            f.write(_dc(0, 11, PAIR_VS, i=94, ph=PAIR_PS, st=None))
+            f.write(_dc(0, 12, PAIR_VS, i=94, ph=PAIR_PS, st="04"))
+        buf = io.StringIO()
+        totals = scan_log(p, out=buf)
+        text = buf.getvalue()
+        head = text.split("\n")[0]
+        check((totals["PAD"], totals["WORLD"], totals["DENIED"], totals["DENIED_UNRECORDED"]) == (1, 3, 3, 1) and
+              "the stencil guard sent 3 radar/pad call(s) to world: 2 with a reference other than 4, 1 with none recorded in the log" in head,
+              "the header counts what the guard sent to world, by cause (%s)" % head)
+        check("the marks said PAD (a console draw 4 draws back) but the stencil reference is 0, not 4" in text and
+              "but the stencil reference is 5, not 4" in text and "has no st= for it" in text,
+              "each denial says what the marks said and what the reference was")
+        buf = io.StringIO()
+        totals = scan_log(p, out=buf, stencil="off")
+        check((totals["PAD"], totals["WORLD"], totals["DENIED"]) == (4, 0, 0) and "stencil guard" not in buf.getvalue().split("\n")[0],
+              "--stencil off shows the marks alone")
+        buf = io.StringIO()
+        totals = scan_log(p, out=buf, stencil="unrecorded-pass")
+        check((totals["PAD"], totals["DENIED"], totals["DENIED_UNRECORDED"]) == (2, 2, 0), "--stencil unrecorded-pass: only the unrecorded call is let through")
         # back to the log the following checks read
         with open(p, "w", encoding="utf-8", newline="") as f:
             f.write("[14:40:45.959] DC begin census=1 frames=1 frame=100 offscreen=yes\n")
@@ -409,12 +570,33 @@ def self_test():
         buf = io.StringIO()
         scan_log(p, out=buf)
         check("are missing" not in buf.getvalue(), "a frame whose every eye draw is in the log carries no warning")
-        # the fixture round trip
+        # the fixture round trip, stencil reference included
         buf = io.StringIO()
         emit_fixture(p, 1, 0, 0, out=buf)
         fx = parse_fixture(buf.getvalue())
         check(len(fx) == 1 and fixture_calls(fx[0][1]) == [(10, "pad")]
-              and fx[0][1][-1][4] == "pad", "a fixture emitted from a census reads back to the same class")
+              and fx[0][1][-1][4] == "pad" and fx[0][1][-1][5] == 4, "a fixture emitted from a census reads back to the same class and reference")
+        check("p 10 3392 @1 pad st=4" in buf.getvalue(), "the emitted fixture line carries the reference (%s)" % buf.getvalue().split("\n")[-2])
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write("[14:40:45.959] DC begin census=1 frames=1 frame=100 offscreen=yes\n")
+            f.write(_dc(0, 5, console_vs))
+            f.write(_dc(0, 9, PAIR_VS, i=3392, ph=PAIR_PS, st=None))
+        buf = io.StringIO()
+        emit_fixture(p, 1, 0, 0, out=buf)
+        fx = parse_fixture(buf.getvalue())
+        check("p 10 3392 @1 world st=-" in buf.getvalue() and fx[0][1][-1][5] is None,
+              "a census with no st= writes st=- and the class the guard gives (world)")
+    try:
+        parse_fixture("frame 1\np 10 3392 @1 pad\n")
+        check(False, "a fixture pair draw with no st= is refused")
+    except ValueError:
+        pass
+    check(fixture_calls([("d", 5, console_vs.upper(), "@1"), ("p", 305, 3392, "@1", "pad", 4)]) == [(305, "pad")] and
+          fixture_calls([("d", 5, console_vs.upper(), "@1"), ("p", 305, 3392, "@1", "world", 0)]) == [(305, "world")] and
+          fixture_calls([("d", 5, console_vs.upper(), "@1"), ("p", 305, 3392, "@1", "world", None)]) == [(305, "world")] and
+          fixture_calls([("d", 5, console_vs.upper(), "@1"), ("p", 305, 3392, "@1", "pad", None)], stencil="off") == [(305, "pad")] and
+          fixture_calls([("d", 5, console_vs.upper(), "@1"), ("p", 406, 3392, "@1", "world", 4)]) == [(406, "world")],
+          "fixture_calls applies the guard (reference 4 stands; 0 and unreadable are world; off shows the marks) and the pad window (401 back is world)")
 
     # 3. the committed fixtures: the rule, against recorded sequences and the class each was judged to be
     fixture_dir = os.path.join(HERE, "shared_pair_test", "fixtures")
@@ -457,6 +639,10 @@ def main(argv=None):
                          "(default %d and %d)" % (WINDOW, PAD_WINDOW))
     ap.add_argument("--pad-window", type=int, default=None,
                     help="draws a console draw reaches, for the pad alone (default: --window, else %d)" % PAD_WINDOW)
+    ap.add_argument("--stencil", choices=STENCIL_MODES, default="guard",
+                    help="the stencil guard: guard (default: RADAR and PAD need reference %d, and a log with no st= "
+                         "column is unreadable), unrecorded-pass (a missing column passes), off (the marks alone)"
+                         % STENCIL_REF)
     ap.add_argument("--emit-fixture", metavar="LOG", help="write one census frame's reduction to stdout")
     ap.add_argument("--census", type=int, help="with --emit-fixture: the census number")
     ap.add_argument("--frame", type=int, default=0, help="with --emit-fixture: the census frame (default 0)")
@@ -486,19 +672,21 @@ def main(argv=None):
         paths += [p for _s, _t, p in chosen]
     if not paths:
         ap.error("name a log, or --target")
-    total = {"RADAR": 0, "PAD": 0, "WORLD": 0}
+    total = new_totals()
     radar_window = args.window if args.window is not None else WINDOW
     pad_window = (args.pad_window if args.pad_window is not None
                   else args.window if args.window is not None else PAD_WINDOW)
+    if args.stencil != "guard":
+        print("stencil guard: %s" % args.stencil)
     for p in paths:
         if not os.path.isfile(p):
             print("no such log: %s" % p, file=sys.stderr)
             return 2
-        t = scan_log(p, radar_window, summary_only=args.summary, pad_window=pad_window)
-        for k in total:
-            total[k] += t[k]
+        add_totals(total, scan_log(p, radar_window, summary_only=args.summary, pad_window=pad_window,
+                                   stencil=args.stencil))
     if len(paths) > 1:
-        print("all %d logs: radar %d, pad %d, world %d" % (len(paths), total["RADAR"], total["PAD"], total["WORLD"]))
+        print("all %d logs: radar %d, pad %d, world %d%s" % (len(paths), total["RADAR"], total["PAD"], total["WORLD"],
+                                                             summary_suffix(total)))
     return 0
 
 

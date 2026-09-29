@@ -1664,6 +1664,23 @@ bool sharedPairWantsDraws() {
     return sunglareWantsDraws() || uiLayerCrispOn();
 }
 
+// The stencil reference a draw of the pair runs with, for the rule's stencil guard (shared_pair.h): read the way
+// the draw census reads its `st=` column (draw_census.cpp: OMGetDepthStencilState under a fault budget). Called
+// only for a draw of the pair itself, a handful a frame. kPairStencilUnknown when it cannot be read (the budget
+// spent, or the call faulted): the rule then calls the draw world and counts it.
+FaultBudget g_pairStencilBudget("vScreen.pairStencil", 5);
+uint32_t pairReadStencilRef(ID3D11DeviceContext* ctx) {
+    UINT ref = 0;
+    bool got = false;
+    guardedBudget(g_pairStencilBudget, [&] {
+        ID3D11DepthStencilState* dss = nullptr;
+        ctx->OMGetDepthStencilState(&dss, &ref);
+        if (dss) dss->Release();
+        got = true;
+    });
+    return got ? static_cast<uint32_t>(ref) : kPairStencilUnknown;
+}
+
 // Does any feature still want to see draws?
 //
 // The forty-term subscriber condition that used to sit inline at the top of
@@ -2323,15 +2340,18 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // below can claim or skip the draw: the marks must see every eye draw, and the class of a
     // draw of VS 94D5C556DFD6D705 / PS 912477AEF6958379 is decided here for the glare claim
     // below and for uiLayerFamilyOf after it. One table lookup a draw while wanted; the pixel
-    // shader's hash is read only for the pair's own vertex shader.
+    // shader's hash is read only for the pair's own vertex shader, and the stencil reference (the rule's
+    // guard: RADAR and PAD stand only with the reference the HUD section leaves) only for the pair's two
+    // shaders together.
     if (s->pairTrackerOn) {
         void* const pairRtv = bindingGet(BindSlot::Rtv0);
         const uint64_t pairVs = bindingGet(BindSlot::Vs) ? bindingShaderHash(BindSlot::Vs) : 0;
         sharedPairNoteEyeDraw(s->frameNo, pairRtv, s->eyeDrawsThisFrame, pairVs);
         if (pairVs == kSharedPairVs) {
+            const uint64_t pairPs = bindingGet(BindSlot::Ps) ? bindingShaderHash(BindSlot::Ps) : 0;
+            const uint32_t pairStencil = isSharedPair(pairVs, pairPs) ? pairReadStencilRef(self) : kPairStencilUnknown;
             s->pairClassThisDraw = sharedPairClassify(
-                s->frameNo, pairRtv, s->eyeDrawsThisFrame, pairVs,
-                bindingGet(BindSlot::Ps) ? bindingShaderHash(BindSlot::Ps) : 0, instances);
+                s->frameNo, pairRtv, s->eyeDrawsThisFrame, pairVs, pairPs, instances, pairStencil);
         }
     }
     // (The temporal pass's camera latch used to fire at the frame's first
