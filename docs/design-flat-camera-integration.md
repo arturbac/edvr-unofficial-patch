@@ -3,25 +3,19 @@
 ## Status
 
 - State: the C2 math and policy checks are established and green in the
-  build pool: the derive reducer (all five projection branches pinned by
-  independently computed fixtures, the bit protocol, canonical mutation
-  form on kind 3, override composition), the WARP raster/ray/lighting
-  proofs across the size matrix, and the coexistence policy's full
-  ownership lifecycle through the real API. The ray CB is composed and
-  consumed under the contract its own products prove (anchoring
-  transform, axes-product rotation, corrupt/stale measurably visible);
-  pinning the reprojection application convention needs the consuming
-  shader disassembled -- a named follow-up. The complete view/execution
-  lineage (which passes run which refresh on which thread, record vs
-  replay) is not yet joined, and auxiliary composer callers remain
-  unclassified by behavior. C3 is planned against this state -- live
-  mutation stays off.
+  build pool (derive reducer, WARP raster/ray/lighting proofs, coexistence
+  ownership lifecycle). Pinning the reprojection convention needs the
+  consuming shader disassembled; the view/execution lineage is not joined
+  and auxiliary composer callers are unclassified. C3, the upstream
+  injector (fix.temporal_aa_camera, default off), is built; its crash is
+  root-caused and fixed (2026-09-29). The fixed build is NOT flown and live
+  mutation stays off until it is.
 - Decision: investigate jittering the game's per-view camera construction
   before it derives raster/lighting data. Preserve the existing frame
   discovery, size negotiation, temporal backends and resource isolation.
-- Motivation: the build-verified 20260928_025912 user log reports zero renderer
-  calls; three recurring unknown projection pairs keep every frame in
-  observation. Sean reproduced non-activation with another ship; its exact
+- Motivation: the build-verified 20260928_025912 user log reports zero
+  renderer calls; three recurring unknown projection pairs keep every frame
+  in observation. Sean reproduced non-activation with another ship; its exact
   shader correspondence remains unverified.
 - Open hypotheses: a common producer covers the derived transforms; camera
   domains and recording epochs can be distinguished before mutation. The
@@ -29,37 +23,34 @@
 - Ruled out for that session: a backend evaluation failure as the immediate
   cause, because no backend initialized. Missing shader coverage is proven;
   whether quality settings or a mod produced those variants is not.
-- Ruled out (the five C3 crashes, root-caused 2026-09-28): a compiled C
-  detour at the mid-function hook site. The relay enters by jmp with the
-  game's live stack; the C prologue's spills land on the game's saved r13
-  and the function's return address, and a call-forward sinks the body
-  0xE0 bytes below its frame so its epilogue pops read the detour's frame
-  (the 19:14 dump: r14 = the call's own return address, RIP = a spilled
-  log-string pointer in .rdata). The restore-after-call semantics stay;
-  the transfer is now generated code: stubA (save/restore all GPRs, exact
-  stack) plus a return-address redirection to stubB, per-thread state in
-  TLS. Details in the file header of src/d3d11/flat_camera_inject.cpp.
-- Open (2026-09-28 20:09 crash): the stub build flew the pass-through
-  path correctly (two refresh calls, kind-0 refusals, no mutation) and the
-  game still crashed ~100 ms later -- a null read at
-  EliteDangerous64.exe+0x4C83379 (mov rcx,[rbx+0x1D0]; rbx=[arg2+0x1A0]
-  arrived null), live chain a virtual call in the camera pipeline,
-  sentinel-caught with full registers/unwind. The pass-through is
-  memory-identical to unhooked, so the lead hypothesis is call-path I/O:
-  three note() writes per traced call on the game thread inside the
-  view-constant refresh. All per-call logging is now gated behind
-  fix.temporal_aa_camera_trace (default off); triage rides the 5s tick.
-  NOTE: the first trace-off flight (03:33) is uninformative -- the TLS
-  index exceeded stubB's disp8 reach that run and the hook never
-  installed. stubB's TLS walk now uses disp32 and the refusal names its
-  values. Discriminator still pending: trace-off with the hook in. If it
-  still crashes, the patch/trampoline alone is implicated -- fly
-  temporal_aa_camera=off (gate closed) next to separate that from stubA.
-- Next: C3, per the C3 wiring plan addendum -- the FUN_1405921f0 detour
-  behind a default-off key, the ownership policy wired into flat_runtime,
-  the classifier's jittered-encoding question answered, then one bounded
-  session against the acceptance criteria there. First flight of the
-  trace-off build: crash or no crash names the hypothesis.
+- Ruled out (the five C3 crashes, 2026-09-28): a compiled C detour at the
+  mid-function hook site; the relay enters by jmp with the game's live
+  stack, so a C prologue's spills land on its saved registers. The transfer
+  is generated code (stubA, a return-address redirection to stubB, TLS
+  state); see the header of src/d3d11/flat_camera_inject.cpp.
+- Root cause of the 20:09, 03:50 and 04:23 crashes (addendum at the end):
+  the stubs called C with no 32-byte ABI home area reserved. refreshPre
+  homes rcx and rdx at [entry rsp+8] and [+0x10], stubA's own saved r15 and
+  r14; the pops handed the game r15 = R0 (the refresh call's return-address
+  slot) and the trampoline's stolen push r15 kept it. All three dumps show
+  rdx = r14 = r15 = R0 and the same null read (+0x4C83379).
+- ruled out: the relay's scratch register (r11 vs rax) as the 20:09/03:50/
+  04:23 crash cause, because the r11-preserving relay (905bddd0) crashed
+  identically; the cause is stubA's missing shadow space.
+- ruled out: call-path log I/O as the crash cause, because the 03:50 flight
+  with per-call logging gated off crashed identically.
+- Corrected: the pass-through was not "memory-identical to unhooked". The
+  property is every register and every stack byte at and above S unchanged
+  at the trampoline, now proven by tools/flat_camera_stub_test (a gate).
+- Fix (built, not flown): both stubs reserve the home area (stubA sub/add
+  rsp,0x20, 111 -> 119 bytes, stubB at offset 168; stubB sub/add rsp,0x38,
+  xmm0 at [rsp+0x20]); emitters in src/d3d11/flat_camera_stubs.h.
+- Next: fly the fixed build once (flat profile, fix.temporal_aa_camera = on,
+  trace key off): no crash at +0x4C83379 and refresh-calls > 0 in the 5s
+  ticks confirm it. Then C3 proper per the wiring plan addendum (ownership
+  wired into flat_runtime, the classifier's jittered-encoding question, one
+  bounded session against its acceptance criteria). A key-off flight cannot
+  separate patch from stub: nothing is installed.
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable/build
   identities, backend versions, dimensions, formats and mod chain for
@@ -826,3 +817,89 @@ context, the frustum-ray CB and the depth CBs in the same call, through
 the game's own code. What remains unproven is per-shader consumption
 (which draws bind these blocks, and whether legacy CB jitter can
 coexist) -- that is the C2 runtime evidence, not more statics.
+
+## Shadow-space addendum, 2026-09-29: why the stub build crashed
+
+The three crashes of the stub build (20:09 with a7d026af, 03:50 with
+436ed3c5, 04:23 with 905bddd0) have one cause: stubA called refreshPre, and
+stubB called refreshPost, with no 32-byte ABI home area reserved.
+
+Evidence:
+
+- The records (the Epic install's edvr_breadcrumbs.txt, lines 1177-1201,
+  1218-1242, 1250-1274): read of address 0x1D0 at EliteDangerous64.exe
+  +0x4C83379 with rbx = 0 (mov rcx,[rbx+0x1D0], rbx = [arg2+0x1A0]), on the
+  Present thread, the same eight-frame chain (+0x4C83379, +0x4C82CDE,
+  +0x594ED5, +0x58F2F4, +0x58F9CF, +0x58AF82, +0x6BF929, +0x594C3E) and the
+  same stale return addresses on the stack (+0x4ED8A4, +0x597B43,
+  +0x592755). Frame 2 (+0x594ED5) lies in FUN_140594d90 between its second
+  and third refresh returns (+0x594EAB, +0x594FE1), most likely the node
+  loop's vtable+0x78 call, which passes the view-constant context (uVar5,
+  analysis/decomp/flash/camera/camera_producer.txt lines 414-430) that the
+  caller keeps in a callee-saved register across the refresh. That use is
+  read from the decompile, not disassembled.
+- In all three, rdx = r14 = r15 = R0 (0x3A3C7FED98, 0x7C6E8FECF8,
+  0x4018FF0F8): the refresh call's return-address slot, one qword below
+  frame 2's rsp, and the first argument stubA passes refreshPre
+  (lea rcx,[rsp+0x88]). An unhooked call leaves no stack address in r15.
+- stubA pushes fifteen registers (r15 at [S-0x78] up to r12 at [S-0x60]),
+  loads the arguments and calls with nothing reserved, so the callee's four
+  home slots ([entry rsp+8, +0x28)) are exactly those four saved slots. The
+  pops restore whatever the callee left there, and the trampoline's stolen
+  push r15 then stores the popped r15 in the game's frame for the game's
+  epilogue to hand back to its caller. r14 and r13 come back from the game's
+  own earlier pushes, so only r15 escapes.
+- refreshPre does write its home slots. The shipped d3d11.dll (build
+  6ABB9147, 905bddd0; refreshPre at RVA 0x701F0, one match in the file) and
+  the compiler listing of flat_camera_inject.cpp at 8fee57c2 with build.bat's
+  flags agree:
+
+      48 8B C4         mov rax,rsp
+      48 89 50 10      mov [rax+10h],rdx    home slot 2 = stubA's saved r14
+      48 89 48 08      mov [rax+8],rcx      home slot 1 = stubA's saved r15
+      55 53 56 57 41 54 41 55 41 56 41 57   push rbp rbx rsi rdi r12-r15
+
+  The prologue does not write slots 3 and 4. refreshPost (RVA 0x70120) opens
+  with mov [rsp+8],rbx; mov [rsp+10h],rsi, which land on stubB's saved xmm0
+  (movaps [rsp],xmm0 with only 0x18 reserved).
+- The r11 theory of 905bddd0 was a coincidence: the 20:09 crash's r11
+  (0x210654F6CA0) is the camera argument the log printed, left by the
+  refresh body, not an inherited frame base.
+- Control: the 03:32 flight had no hook (TLS-index refusal) and ran the same
+  FUN_140594d90 path for 68 s (the producer probe logged the refresh call
+  sites +0x594E13, +0x594EAB and +0x594FE1 under +0x58F2F4).
+
+ruled out: the relay's scratch register (r11 vs rax) as the 20:09/03:50/04:23 crash cause, because the r11-preserving relay (905bddd0) crashed identically; the cause is stubA's missing shadow space
+ruled out: call-path log I/O in the refresh detour as the crash cause, because the 03:50 flight, with per-call logging gated off (83d55974), crashed identically
+
+The 2026-09-28 Status called the pass-through "memory-identical to unhooked".
+It was not: the callee spent memory the stub owned. The property the stubs
+keep is that every register and every stack byte at and above S is unchanged
+when the trampoline is entered (below S is scratch, as for any callee).
+
+The fix (src/d3d11/flat_camera_stubs.h, new; the emitters moved out of
+flat_camera_inject.cpp unchanged, then changed):
+
+- stubA: 48 83 EC 20 (sub rsp,0x20) before the call and 48 83 C4 20 (add
+  rsp,0x20) after it. The argument setup reads [rsp+...] before the sub, so
+  its offsets are unchanged, and 16-byte alignment holds. 111 -> 119 bytes,
+  so kStubBOffset moves 160 -> 168.
+- stubB: sub/add rsp,0x18 -> 0x38, and the xmm0 save moves to [rsp+0x20]
+  (0F 29 44 24 20 and 0F 28 44 24 20, was 0F 29 04 24 and 0F 28 04 24):
+  [rsp, rsp+0x20) is the callee's home area with xmm0 above it. 77 -> 79
+  bytes.
+
+The proof (tools/flat_camera_stub_test, build gate :rig_flat_camera_stub_test).
+The stand-in callees are compiled C++ that take the address of every register
+parameter (so MSVC homes it) and overwrite all four home slots; a calibration
+run confirms that against a caller-provided home area. A harness generated in
+executable memory loads a distinct value into every general register (and
+xmm0 for stubB), enters the real emitted stubs the way the relay and the
+game's redirected return do, and records what comes out: 134 checks over
+three rounds (all fifteen registers, rsp back to S, the three saved qwords at
+[S], [S+8], [S+0x10], the argument setup, the incoming-r11 instrument, stubB's
+TLS walk, xmm0). Against the old stubs it fails 15 checks (r12, r13, r14 and
+r15 come back as the four home-slot sentinels in every round, and xmm0 in
+stubB); against three mutants (stubA reserving only 0x18, xmm0 kept inside
+stubB's home area, a wrong argument slot) it fails 3 each; with the fix it
+passes.
