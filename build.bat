@@ -164,6 +164,7 @@ python tools\build_lock.py --self-test || exit /b 1
 python tools\flash_patch_residual.py --self-test || exit /b 1
 python tools\check_status_blocks.py --self-test || exit /b 1
 python tools\check_status_blocks.py || exit /b 1
+python tools\pair_class_scan.py --self-test || exit /b 1
 
 REM The version baked into both DLLs, printed in the second line of every log.
 REM
@@ -498,6 +499,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\native_render_settings.cpp" ^
     "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_frame_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
     "src\d3d11\gpu_census.cpp" ^
+    "src\d3d11\shared_pair.cpp" ^
     "src\d3d11\d3d11_proxy.cpp" "src\d3d11\device_hook.cpp" ^
     "src\d3d11\graphics_bridge.cpp" ^
     "src\d3d11\render_boundary.cpp" ^
@@ -1664,6 +1666,38 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
 if errorlevel 1 ( echo [edvr] ERROR: GPU census test build failed & exit /b 1 )
 "%OBJ%\gpucensus\gpu_census_test.exe" --dry-run || exit /b 1
 "%OBJ%\gpucensus\gpu_census_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_shared_pair_test
+REM The shared pair's rule (src\d3d11\shared_pair.h): VS 94D5C556DFD6D705 / PS 912477AEF6958379 draws the radar's
+REM contact markers, the landing-pad display's rings and the sun's glare train, and the rule tells them apart. The
+REM mark table, the rule's edges, the per-frame tracker, sequences recorded from the draw census
+REM (tools\shared_pair_test\fixtures) with negative controls, the glare-claim and layer-take gates in every glare
+REM mode, the runtime's 30 s line, and a scan that vscreen.cpp still wires it. No device: the production module is
+REM included directly. Runs from the repository root, where the fixtures and the sources it scans are.
+if not exist "%OBJ%\sharedpair" mkdir "%OBJ%\sharedpair"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\sharedpair\\" ^
+    /Fe"%OBJ%\sharedpair\shared_pair_test.exe" "tools\shared_pair_test\shared_pair_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: shared pair test build failed & exit /b 1 )
+"%OBJ%\sharedpair\shared_pair_test.exe" --dry-run || exit /b 1
+"%OBJ%\sharedpair\shared_pair_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_pair_price_bench
+REM What the shared pair's sprite draws cost at the game's size and in the UI layer's (tools\pair_price_bench). The build
+REM gate runs the bench's self-test on WARP: it draws what it says it draws (covered pixels, the additive blend, the
+REM scissor, the size scaling), exactly. The timing run is a desk check on the RTX, never part of the build.
+if not exist "%OBJ%\pairbench" mkdir "%OBJ%\pairbench"
+cl.exe /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 /wd4702 ^
+    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\pairbench\\" /Fe"%OBJ%\pairbench\pair_price_bench.exe" ^
+    "tools\pair_price_bench\pair_price_bench.cpp" ^
+    /link /INCREMENTAL:NO /OPT:REF d3d11.lib d3dcompiler.lib dxgi.lib
+if errorlevel 1 ( echo [edvr] ERROR: pair_price_bench build failed & exit /b 1 )
+"%OBJ%\pairbench\pair_price_bench.exe" --dry-run || exit /b 1
+"%OBJ%\pairbench\pair_price_bench.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_openvr_abi_test

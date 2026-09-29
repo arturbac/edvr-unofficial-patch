@@ -1,0 +1,22 @@
+# CONSTRUCTED CONTROL, not a capture: the stencil guard. RADAR and PAD stand only with stencil reference 4 (the census's st=04); any other
+# reference, or none readable (st=-), is WORLD. Two targets: @1 has a console draw only (the pad-shaped draws), @2 has radar families only (the
+# train-shaped draws), so the marks' verdict is PAD or RADAR for every draw here and the reference alone decides.
+# Pad-shaped draws (3392 instances, 200 draws after a console draw): reference 4 is PAD (the control); reference 0 (st=00), reference 8 and an
+# unreadable reference are WORLD.
+# Train-shaped draws (15 instances, two draws after a radar family, inside the radar window: the case no capture has shown): reference 0 is
+# WORLD; reference 4 reads RADAR (the guard is a second line, not a proof about a train drawn inside the HUD section's state); an unreadable
+# reference and reference 8 are WORLD.
+frame 1
+d 100 68DDDEF04D9894AF @1
+d 110 9611A454527F7FEB @2
+p 112 15 @2 world st=0
+d 120 9611A454527F7FEB @2
+p 122 15 @2 radar st=4
+d 130 9611A454527F7FEB @2
+p 132 15 @2 world st=-
+d 140 9611A454527F7FEB @2
+p 142 15 @2 world st=8
+p 300 3392 @1 pad st=4
+p 301 3392 @1 world st=0
+p 302 3392 @1 world st=8
+p 303 3392 @1 world st=-

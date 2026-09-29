@@ -52,6 +52,9 @@
 - **Latest journal entry (2026-09-29, built, not flown):** the hologram
   restore fence lifts at the frame boundary (Review B1); ui_holo_test now
   1059 checks on WARP (927 in the entry the Open bullet's figure came from).
+- **The take's eighth family (2026-09-29, built, not flown):** contact E, VS
+  94D5C556DFD6D705, is the shared pair of the radar's markers, the landing pad's
+  rings and the sun's glare: the take names it only as radar or pad (shared_pair.h).
 - **Design background** (the game's tonemap draw, its variants, exposure,
   bloom; measured facts): "Status detail" below, verbatim.
 - **Ruled out:** "Ruled out (do not re-propose)" below; the phase journals

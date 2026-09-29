@@ -43,6 +43,7 @@
 #include <cstring>
 
 #include "holo_families.h"  // the crisp take's eight hologram VS hashes: kHoloGeneric's match list
+#include "shared_pair.h"    // the last of the eight is shared with the sun's glare and the landing pad: its class
 
 namespace edvr {
 
@@ -700,6 +701,11 @@ struct UiFamilyFacts {
     bool excluded = false;        // ui_depth's exclude list
     bool panelSized = false;      // srv0IsPanelSized: the 2D screen's composite
     bool learnedSurface = false;  // a learned interface surface in PS slots 0..3
+    // What shared_pair.h's rule made of this draw, read for the pair's vertex shader (the radar's
+    // contact family E, on the take's list) and kNotPair for every other draw. The take names that
+    // vertex shader only as radar or pad, never as world (the sun's glare train shares it), and a
+    // draw of it that was never classified is not taken either.
+    PairClass pairClass = PairClass::kNotPair;
 };
 
 // How the rule reached its answer, for the family census (ui_layer.cpp).
@@ -748,10 +754,14 @@ inline UiLayerFamily uiLayerFamilyFor(const UiFamilyFacts& f, UiFamilyWhy* why =
         // repaired and all dependencies prepared before redirecting. Unknown
         // sphere variants and the shared world/cockpit corona remain stock.
         // World-marker brackets remain in the original scene.
+        // The last of the eight, VS 94D5C556DFD6D705, is the shared pair (shared_pair.h): the radar's
+        // contact markers, the landing-pad display's rings and the sun's glare train are one shader
+        // pair. The take names it only as the first two -- pairLayerAdmits -- in every glare mode.
+        const bool holoTake = uiHoloGenericHash(f.vs) && (f.vs != kSharedPairVs || pairLayerAdmits(f.pairClass));
         out = f.vs == kUiVsHolo        ? UiLayerFamily::kHolo
               : f.vs == kUiVsFlightHud ? UiLayerFamily::kFlightHud
               : f.vs == kUiVsSprite    ? UiLayerFamily::kSprite
-              : (uiHoloGenericHash(f.vs) ||
+              : (holoTake ||
                  (f.vs == kHoloTargetSphere &&
                   (f.ps == 0xEA02FAC2BD6C643Cull || f.ps == 0xE95634B0F61D218Full)))
                   ? UiLayerFamily::kHoloGeneric : UiLayerFamily::kNone;

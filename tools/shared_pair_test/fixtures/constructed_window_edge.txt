@@ -1,0 +1,16 @@
+# CONSTRUCTED CONTROL, not a capture: each window's edge, all with reference 4 so the marks alone decide. The radar's window is 250: a radar
+# family (contact C) exactly 250 draws back is RADAR, 251 back is WORLD. The pad's window is 400 (Sean, 2026-09-29; it was 250): a console draw
+# exactly 400 back is PAD, 401 back is WORLD, and in the second frame 300 back is PAD (the old window called that WORLD).
+# One target for each mark (the tracker keeps four targets a frame), so the nearest mark of a draw is the one placed for it.
+frame 1
+d 100 68DDDEF04D9894AF @1
+d 101 68DDDEF04D9894AF @2
+d 103 9611A454527F7FEB @3
+d 104 9611A454527F7FEB @4
+p 353 3000 @3 radar st=4
+p 355 3000 @4 world st=4
+p 500 3000 @1 pad st=4
+p 502 3000 @2 world st=4
+frame 2
+d 105 68DDDEF04D9894AF @1
+p 405 3000 @1 pad st=4
