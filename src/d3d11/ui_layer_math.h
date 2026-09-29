@@ -747,13 +747,11 @@ inline UiLayerFamily uiLayerFamilyFor(const UiFamilyFacts& f, UiFamilyWhy* why =
         // considered separately: their original screen-depth address must be
         // repaired and all dependencies prepared before redirecting. Unknown
         // sphere variants and the shared world/cockpit corona remain stock.
-        // The separately measured world-marker
-        // pair has no screen-space reads and is admitted by both hashes.
+        // World-marker brackets remain in the original scene.
         out = f.vs == kUiVsHolo        ? UiLayerFamily::kHolo
               : f.vs == kUiVsFlightHud ? UiLayerFamily::kFlightHud
               : f.vs == kUiVsSprite    ? UiLayerFamily::kSprite
               : (uiHoloGenericHash(f.vs) ||
-                 (f.vs == kHoloWorldMarkerReticle && f.ps == kHoloWorldMarkerReticlePs) ||
                  (f.vs == kHoloTargetSphere &&
                   (f.ps == 0xEA02FAC2BD6C643Cull || f.ps == 0xE95634B0F61D218Full)))
                   ? UiLayerFamily::kHoloGeneric : UiLayerFamily::kNone;

@@ -11,8 +11,8 @@
 //     admits kHoloFamiliesTake's eight proven-safe families, through
 //     uiHoloGenericHash below, naming them the ONE family kHoloGeneric on
 //     the lit HDR target.
-// The take's two refusals are documented with the review's citations
-// below (reviews/crisp-hud-phase3-review-2026-09-28.md, findings R1/R2).
+// Restricted families are documented below, including the review's
+// citations (reviews/crisp-hud-phase3-review-2026-09-28.md, findings R1/R2).
 //
 // They lived file-local in ui_depth.cpp until the take needed the same
 // names -- spelling both lists here, beside each other, is what keeps the
@@ -55,11 +55,6 @@ constexpr uint64_t kHoloContactE     = 0x94D5C556DFD6D705ull;
 // families above -- eye dump eye_163515: sky MV (+0.59,-0.89) against the
 // bracketed ship's (+0.14,+0.27) at 1.65 km, going indistinct with speed.
 constexpr uint64_t kHoloWorldMarkerReticle = 0x71DD8B8B09060A81ull;
-// 2026-09-28 Frontier 174605: this exact pair paints the target triangles.
-// PS reads only interpolants and CB1; VS projects CB0 rows 4/5/7, with z=0.
-// Unlike the sphere, neither shader reads a screen-sized texture. Other PS
-// uses of this VS remain outside the crisp take.
-constexpr uint64_t kHoloWorldMarkerReticlePs = 0x2D037A047171BF3Bull;
 
 // The built-in cockpit list: the ten short-range panel/icon/hologram
 // families above.
@@ -113,15 +108,15 @@ constexpr uint64_t kHoloCanopy = 0x8C091FFD08644E02ull;
 // sun can never be taken as HUD; the radar glow's crisp take is the
 // accepted casualty.
 //
-// The world-marker reticle is separate from this cockpit VS-only list:
-// uiLayerFamilyFor admits its measured VS/PS pair only, on the HDR target.
+// The world-marker reticle stays outside the crisp take. Its pre-existing
+// depth/motion handling is separate from these cockpit families.
 constexpr uint64_t kHoloFamiliesTake[8] = {kHoloIconCore,   kHoloIconStalkA,
                                            kHoloIconStalkB, kHoloContactA,
                                            kHoloContactB,   kHoloContactC,
                                            kHoloContactD,   kHoloContactE};
 
-// The crisp take's VS-only hologram set: the eight families above. The
-// measured reticle pair is checked separately by uiLayerFamilyFor.
+// The crisp take's VS-only hologram set: the eight families above. Exact
+// target-sphere pairs are checked separately by uiLayerFamilyFor.
 // (kHoloPanel is NOT one of them: the take has named it kHolo since
 // Phase 1.) uiLayerFamilyFor names all eight the ONE family kHoloGeneric
 // on the lit HDR target -- one "hologram" row in the 30 s table.

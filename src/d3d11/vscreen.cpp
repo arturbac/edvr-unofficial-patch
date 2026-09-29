@@ -3784,9 +3784,9 @@ __declspec(noinline) UiLayerFamily uiLayerFamilyOf(State* s, char kind, UINT cou
     UiFamilyFacts f;
     f.targetKind = uiLayerTargetKind();
     f.vs = bindingShaderHash(BindSlot::Vs);
-    // The reticle's captured PS has no screen-space reads; its other PS
-    // variants remain refused. Ordinary HDR draws need no extra hash read.
-    if (f.targetKind == 1 && (f.vs == kHoloWorldMarkerReticle || f.vs == kHoloTargetSphere))
+    // The target sphere needs exact PS admission for its depth-address remap.
+    // Ordinary HDR draws need no extra hash read.
+    if (f.targetKind == 1 && f.vs == kHoloTargetSphere)
         f.ps = bindingShaderHash(BindSlot::Ps);
     if (f.targetKind == 2) {
         // ui_depth's exclude list (the null-output mesh B018D143700AB803,

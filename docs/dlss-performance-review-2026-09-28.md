@@ -2,21 +2,26 @@
 
 ## Status
 
-- **Current flight:** verified `6eede364` CPU trace `052039-ca6860`, PID30932,
-  gfx `052105`/runtime `052107_579_30932`, build `6ABB9884`; matching PDBs,
-  zero loss, 5,257 covered cycles. Exact seq8490 caller/owner stacks confirm
-  Present reblocks behind deferred xrEndFrame via loadingBoundary, even when
-  its policy check has no work. Steady callback-site wait .625ms/frame mean.
-  Earlier handoff remains ~.001ms, no failures. A bounded one-use bypass now
-  passes 4,904 focused checks, including the actual registered callback,
-  loading transitions and fatal invalidation; independent review found no
-  blocker. Full validation passed all 86 jobs and installer checks.
+- **Current flight:** verified `c668f83f`, gfx `055138`/runtime
+  `055140_455_44976`, build `6ABBA511`; Sean reports "Much better." All 13,978
+  deferred pairs completed, handoffs completed and Present checks bypassed;
+  zero failures/rejections/cancellations. User now requests removal of the
+  mistaken selector admission; scanner identification is delegated elsewhere.
+- **Diagnosis:** verified `6eede364` CPU trace `052039-ca6860`, PID30932, gfx
+  `052105`/runtime `052107_579_30932`, build `6ABB9884`; matching PDBs, zero
+  loss, 5,257 covered cycles. Exact seq8490 caller/owner stacks confirm Present
+  reblocks behind deferred xrEndFrame via loadingBoundary, even when its policy
+  check has no work. Steady callback-site wait .625ms/frame mean. Earlier
+  handoff remains ~.001ms, no failures. A bounded one-use bypass now passes
+  4,904 focused checks, including the actual registered callback, loading
+  transitions and fatal invalidation; independent review found no blocker. Full
+  validation passed all 86 jobs and installer checks.
 - **Installed:** Frontier `v0.18.0-rc.3-66-gc668f83f`, source `c668f83f`, after
   clean receipt-guarded promotion; payload and native receipt verified.
   INI/DLSS hashes preserved. Source pushed on the separate branch; main
   unchanged.
 - **Conclusion:** two caller waits behind deferred xrEndFrame are confirmed.
-  The handoff fix is flown; the validated Present bypass awaits a flight. No
+  Both handoff and Present fixes are flown with positive feedback. No
   controlled whole-frame regression attribution against 0.17.0 yet. See
   Exclusions for ruled-out causes and the HUD arc for visual evidence.
 - **Baseline:** OpenVR `v0.16.2` Steam graphics `160129`/`6AA6D371`, runtime
@@ -28,10 +33,11 @@
   2037×1969→4074×3938/UI5093×4923. Installed DLSS metadata is 310.7.0.0;
   graphics logs omit driver/DLSS versions. Profiling uses Frontier; baseline
   uses Steam.
-- **Next:** normal comparison flight with fpsVR, diagnostics OFF and no eye
-  dump; check empty-scene CPU time and ship-approach spikes. Use explicit
-  `--expect-build c668f83f` for this installed source. No new capture required
-  for diagnosis. Review B1/B2 recovery and B3 permission remain open.
+- **Next:** the narrow selector unwind passed full validation; commit/push,
+  clean-promote and reinstall Frontier. Holograms/performance fixes are
+  preserved. Use explicit `--expect-build c668f83f` for this installed source.
+  No new capture required for diagnosis. Scanner <> identification belongs to
+  the other agent. Review B1/B2 recovery and B3 permission remain open.
   Allocation stalls and driver work stay separate; sampled direct-self does not
   price induced driver execution. Existing GPU trace `035907-fda516` is
   retained; do not repeat it.
@@ -469,3 +475,27 @@ remain unchanged, as recorded with full DLL hashes in
 Capture helper now expects this source; its CPU-only 60-second dry-run wrote
 nothing, started no workload/session and left no output directory. Next is a
 normal flight; any whole-frame gain remains unmeasured.
+
+## 2026-09-29: Present bypass flown; selector unwind requested
+
+Frontier gfx `055138` and runtime `055140_455_44976`, PID 44976, verify source
+`c668f83f`/build `6ABBA511`. Sean reports "Much better." Runtime teardown
+records 13,978 overlapped pairs, zero synchronous pairs/failures; handoff
+accepted/completed 13,978 with zero rejected/invalid/cancelled-or-failed, and
+Present bypassed 13,978. This proves the new route ran, with positive user
+feedback; no controlled whole-frame gain or exact 0.17.0 regression
+attribution.
+
+The user explicitly requested unwinding only the <> selector experiment and
+will have another agent address it. The attempt admitted world ship brackets
+`71DD8B8B09060A81/2D037A047171BF3B`, not the still-unidentified scanner glyph.
+Remove that crisp admission, extra PS observation and dedicated fixture;
+preserve original world-marker depth/motion, working cockpit holograms, fixed
+shader precompilation, capture infrastructure and all performance fixes. See
+the HUD arc's final entry for exact scope and focused 2,904/0 evidence.
+Independent review found no scope/regression issue. Full validation passed all
+86 jobs in 125.9 s, UI quality 2,907/0, native 4,904/0 and installer gates
+(`build/dlss-selector-unwind-full.log`); receipt input
+`66d05e4444e0f1e7f767c6b6d6d2f69f10d3a4a96aee36ea27f55034ce2cd210`. Clean
+promotion and Frontier installation remain; no additional flight is requested
+for this removal.

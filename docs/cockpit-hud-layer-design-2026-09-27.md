@@ -3,27 +3,26 @@
 ## Status
 
 - **State:** combined Frontier branch `codex/dlss-performance-review` stays
-  separate from main. Installed `7aaaf39c` flight `033435`/dump `033645`
-  confirms both cockpit hologram models in final crisp composition; Sean says
-  they look great. Holo panels, flight HUD, target sprite and eight generic
-  families take the HDR layer. Corona stays in-scene; canopy stays out. Earlier
-  Frontier `be70af2a` dump `174605` proves the exact world-reticle
-  VS71DD8B8B09060A81/PS2D037A047171BF3B has no screen reads. Narrow paired
-  admission passes full gates and is installed in `1ff8c224`. It paints
-  world-space brackets; the desired glyph is scanner-rim yellow <>. Dump
-  `194946` precedes final composition. Other pixel variants stay stock.
-  stencil81/ref1 needs real seed work. Frontier `0229c358` flew with
-  diagnostics off/on: Sean says HUD looked good. This is a qualitative visual
-  check, not measured bloom parity. Armed HDR shading median .126 ms/eye;
-  machinery .962 ms/eye with seed .612. Joint guarded seed optimization is
-  installed; see the combined performance review.
-- **Open:** scanner-rim yellow <> shader remains unidentified. Final overlays
-  alter world brackets and pixels near the distant ship; that does not prove
-  ship mesh admission or explain blur. Sphere depth reads originate in Elite;
-  the coordinate remap passes 927 WARP/RTX checks each and the full build.
-  Current flight confirms model delivery, with first right crop/overview
-  explicitly passthrough. Controlled alpha/occlusion parity remains
-  unqualified.
+  separate from main. Installed `c668f83f` performance flight is verified; Sean
+  reports "Much better." Earlier `7aaaf39c` flight `033435`/dump `033645`
+  confirms both cockpit holograms in final crisp composition; Sean says they
+  look great. Holo panels, flight HUD, target sprite and eight generic families
+  retain their HDR layer. The user requested unwinding the mistaken
+  VS71DD8B8B09060A81/PS2D037A047171BF3B admission: it paints world-space
+  brackets, while scanner-rim yellow <> remains unidentified. That admission,
+  PS observation and dedicated fixture are removed; pre-existing world-marker
+  depth/motion, hologram remaps and general final capture are preserved.
+  Frontier `0229c358` flew with diagnostics off/on: Sean says HUD looked good.
+  This is a qualitative visual check, not measured bloom parity. Armed HDR
+  shading median .126 ms/eye; machinery .962 ms/eye with seed .612. Joint
+  guarded seed optimization is installed; see the combined performance review.
+- **Open:** scanner-rim yellow <> shader remains unidentified and is deferred
+  to another agent at the user's request. Earlier final overlays changed world
+  brackets and nearby pixels; that did not prove ship mesh admission. Sphere
+  depth reads originate in Elite; the coordinate remap passes 927 WARP/RTX
+  checks each and the full build. Current flight confirms model delivery, with
+  first right crop/overview explicitly passthrough. Controlled alpha/occlusion
+  parity remains unqualified.
 - **Goal:** composite the cockpit HUD after the upscale, at output resolution,
   out of DLSS/FSR history. That means the holo panels, the flight HUD and the
   target sprite. It should be as sharp at HMD Quality 0.5-0.75 as at 1.0. Menus
@@ -38,11 +37,10 @@
 - **Prior art:** this is crisp-ui-handoff.md's parked form of Design A (lines
   184-191: "PARKED, not declined"), with one change. It re-issues the game's
   own tonemap draw instead of transcribing it.
-- **Next step:** existing 90 s CPU/GPU capture, quiet cockpit then approach
-  ships, diagnostics OFF, no eye dump. See
-  `dlss-performance-review-2026-09-28.md` for spike chronology and competing
-  causes. Revisit halo/occlusion parity and the scanner glyph only with
-  discriminating pixel evidence.
+- **Next step:** full validation passed; commit/push, promote and install
+  Frontier. Keep scanner identification deferred. See
+  `dlss-performance-review-2026-09-28.md` for the confirmed CPU waits and
+  retained optimizations. Halo/occlusion parity still needs pixel evidence.
 
 - **Tonemap** (vs `2D78DC3FD2C0C543` / ps `99C21CEB7A699821`), MEASURED
   (eye_tonemap_snapshot.h:87,139,170-201):
@@ -861,3 +859,30 @@ bursts correlate with stalls. Exact cause remains open: see the performance
 arc. Next 90 s CPU/GPU trace uses the existing installed build/PDBs,
 diagnostics OFF, no eye dump. Exclude 03:36:45.300–49.772 capture/readback from
 this flight's performance comparison.
+
+## 2026-09-29: mistaken selector admission withdrawn
+
+Sean requested unwinding the <> selector work so another agent can address it.
+The attempted admission added in `1ff8c224` was the world-space bracket pair VS
+`71DD8B8B09060A81` / PS `2D037A047171BF3B`, not the scanner-rim glyph. That
+distinction was already established by his pictures; no new shader admission
+follows from this rollback.
+
+The unwind removes that exact pair from the crisp family rule, its added PS
+constant/observation, dedicated `ui_reticle_test.h` fixture and unused
+fixture-only stencil-reference arguments. A classifier check now requires the
+known pair to remain outside the crisp layer. Preserve its pre-existing
+world-marker depth/motion and flat recipe, the eight safe cockpit families, the
+EA02/E956 target-sphere remap, every precompiled shader, and general final eye
+capture. No selector-specific eye-dump probes were added in this arc.
+
+Focused UI rig passes 2,904 checks, zero failures, and its dry-run creates no
+device/files (`build/diagnostic-focused/selector-unwind-focused.log`). Changed
+graphics code compiles, including `vscreen.cpp`. Independent source/fixture
+review found no scope or regression issue. Full validation passed all 86 jobs
+in 125.9 s, native 4,904/0, UI quality 2,907/0, Python self-tests, production
+DLLs and actual installer resources (`build/dlss-selector-unwind-full.log`).
+Receipt input hash
+`66d05e4444e0f1e7f767c6b6d6d2f69f10d3a4a96aee36ea27f55034ce2cd210`.
+Clean promotion and Frontier install remain; scanner identification stays
+deferred to the other agent.

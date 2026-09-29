@@ -1074,7 +1074,7 @@ void testFamilyRule() {
     // integer-Load scene depth at SV_Position pixel coordinates, which the
     // layer's larger viewport breaks -- R1), the corona family (one shader
     // pair paints both the radar glow and the real sun's corona -- R2).
-    // The measured reticle pair is checked separately; canopy stays out.
+    // World-marker brackets and canopy stay outside the crisp take.
     const uint64_t kTakeVs[] = {kHoloIconCore,   kHoloIconStalkA, kHoloIconStalkB,
                                 kHoloContactA,   kHoloContactB,   kHoloContactC,
                                 kHoloContactD,   kHoloContactE};
@@ -1106,18 +1106,18 @@ void testFamilyRule() {
     check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kNone && why == UiFamilyWhy::kNotPostTonemap,
           "the canopy is refused: not one of the take's eight, it sits in front of the whole sky");
     f.vs = kHoloWorldMarkerReticle;
-    f.ps = kHoloWorldMarkerReticlePs;
-    check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kHoloGeneric && why == UiFamilyWhy::kDirect,
-          "the measured reticle VS/PS pair is taken on HDR");
+    f.ps = 0x2D037A047171BF3Bull;
+    check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kNone && why == UiFamilyWhy::kNotPostTonemap,
+          "world-space bracket VS/PS pair stays outside the crisp HUD layer");
     f.ps ^= 1;
     check(uiLayerFamilyFor(f) == UiLayerFamily::kNone, "an unknown reticle PS stays stock");
     f.ps = 0;
     check(uiLayerFamilyFor(f) == UiLayerFamily::kNone, "a missing reticle PS stays stock");
-    f.ps = kHoloWorldMarkerReticlePs;
+    f.ps = 0x2D037A047171BF3Bull;
     f.targetKind = 0;
     check(uiLayerFamilyFor(f) == UiLayerFamily::kNone, "the reticle pair on a non-eye stays stock");
     f.targetKind = 2;
-    check(uiLayerFamilyFor(f) == UiLayerFamily::kNone, "the reticle pair is HDR-only");
+    check(uiLayerFamilyFor(f) == UiLayerFamily::kNone, "world-space brackets stay stock on the post-tone eye too");
     f.vs = kUiVsPanel;
     f.ps = 0x9107E72CB016CC02ull;
     f.excluded = true;
@@ -2182,7 +2182,7 @@ ComPtr<ID3D11DepthStencilState> stencilState(Gpu& g, bool writer) {
 
 void quadDs(Gpu& g, ID3D11RenderTargetView* rtv, ID3D11DepthStencilView* dsv, ID3D11DepthStencilState* dss,
             const float rect[4], const float colour[4], float ndcX, float ndcY, const D3D11_VIEWPORT& vp,
-            ID3D11BlendState* bs, UINT stencilRef = 4) {
+            ID3D11BlendState* bs) {
     QuadCb q{};
     std::memcpy(q.rect, rect, sizeof(q.rect));
     std::memcpy(q.colour, colour, sizeof(q.colour));
@@ -2190,7 +2190,7 @@ void quadDs(Gpu& g, ID3D11RenderTargetView* rtv, ID3D11DepthStencilView* dsv, ID
     q.jitter[1] = ndcY;
     g.ctx->UpdateSubresource(g.quadCb.Get(), 0, nullptr, &q, 0, 0);
     g.ctx->OMSetRenderTargets(rtv ? 1 : 0, rtv ? &rtv : nullptr, dsv);
-    g.ctx->OMSetDepthStencilState(dss, stencilRef);
+    g.ctx->OMSetDepthStencilState(dss, 4);
     g.ctx->OMSetBlendState(bs, nullptr, 0xFFFFFFFFu);
     g.ctx->RSSetState(g.noCull.Get());
     g.ctx->RSSetViewports(1, &vp);
@@ -2382,7 +2382,6 @@ void testWriteBack(Gpu& g) {
 
 #include "ui_seed_census_test.h"
 #include "ui_seed_freshness_test.h"
-#include "ui_reticle_test.h"
 
 }  // namespace
 
@@ -2428,7 +2427,6 @@ int main(int argc, char** argv) {
         testSeedCensusGpu(g);
         testPrivateDepthRefreshProof(g);
         testSeedFreshnessGpu(g);
-        testReticleGpu(g);
         testSizeChange(g);
     }
     std::printf("ui_quality_test: %u checks, %u failures\n", g_checks, g_fails);

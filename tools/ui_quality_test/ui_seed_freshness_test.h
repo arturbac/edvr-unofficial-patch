@@ -119,10 +119,10 @@ struct FreshWorld {
     }
     void draw(ID3D11DepthStencilView* dst, ID3D11RenderTargetView* colour,
               ID3D11DepthStencilState* state, const float rect[4], uint32_t w, uint32_t h,
-              float ndcX, float ndcY, UINT stencilRef = 4) {
+              float ndcX, float ndcY) {
         const float white[4] = {1, 1, 1, 1};
         const D3D11_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
-        quadDs(gpu, colour, dst, state, rect, white, ndcX, ndcY, vp, nullptr, stencilRef);
+        quadDs(gpu, colour, dst, state, rect, white, ndcX, ndcY, vp, nullptr);
         gpu.ctx->OMSetRenderTargets(0, nullptr, nullptr);
     }
     bool seed(unsigned cache, unsigned game, uint8_t mask, bool depth) {
@@ -177,7 +177,7 @@ struct FreshWorld {
         return true;
     }
     void gameWriter(unsigned game, const D3D11_DEPTH_STENCIL_DESC& d, const float rect[4],
-                    uint32_t viewFlags = 0, bool zeroWork = false, UINT stencilRef = 4) {
+                    uint32_t viewFlags = 0, bool zeroWork = false) {
         auto state = dsState(d);
         const UiDsState description = uiLayerDsStateFrom(&d, viewFlags);
         const UiDsEffect effect = uiLayerDsEffect(description, true);
@@ -192,14 +192,14 @@ struct FreshWorld {
         check(SUCCEEDED(gpu.dev->CreateDepthStencilView(games[game].tex.Get(), &vd, &view)), "game writer view flags");
         CensusCommandSpy spy(gpu.ctx.Get()); check(spy.installed, "real game writer command observation installed");
         g_censusDraws = 0;
-        if (!zeroWork) draw(view.Get(), nullptr, state.Get(), rect, 12, 8, 0, 0, stencilRef);
+        if (!zeroWork) draw(view.Get(), nullptr, state.Get(), rect, 12, 8, 0, 0);
         else {
             // Install the same pipeline first on a target which cannot alter
             // this source, then submit the actual zero-vertex source command.
-            draw(nullptr, nullptr, state.Get(), rect, 12, 8, 0, 0, stencilRef);
+            draw(nullptr, nullptr, state.Get(), rect, 12, 8, 0, 0);
             g_censusDraws = 0;
             gpu.ctx->OMSetRenderTargets(0, nullptr, view.Get());
-            gpu.ctx->OMSetDepthStencilState(state.Get(), stencilRef);
+            gpu.ctx->OMSetDepthStencilState(state.Get(), 4);
             gpu.ctx->Draw(0, 0);
             gpu.ctx->OMSetRenderTargets(0, nullptr, nullptr);
         }
