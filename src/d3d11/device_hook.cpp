@@ -8,6 +8,7 @@
 
 #include "weapon_motion.h"
 #include "input_gate.h"
+#include "focus_target.h"
 #include "oculus_route.h"
 #include "vr_runtime.h"
 
@@ -2891,8 +2892,15 @@ void hookDevice(ID3D11Device* device) {
 // this process is no longer the one that last received input; borrowing
 // the current foreground window's input queue for the call is the
 // standard way around that guard.
+//
+// Only for a top-level window on the desktop, which the game's is (see
+// focus_target.h): a swap chain on any other kind of window is not the game.
 void forceWindowForeground(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) return;
+    if (!focusTargetWindow(hwnd)) {
+        Log::get().note("window: focus-on-launch skipped: the swap chain's window is not a top-level window");
+        return;
+    }
     if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
 
     HWND fg = GetForegroundWindow();

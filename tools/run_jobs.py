@@ -121,6 +121,21 @@ leaves no compilers or test exes running with files in build\\ open. Where it
 cannot (it is already in a job that forbids it) it says so in one line and
 carries on.
 
+Nothing a build runs may touch the desktop, and the runner holds it to that.
+It watches every process the rigs start with tools\\focus_watch.py and, once the
+rigs have finished, fails the build if any of them showed a window, opened a
+console, or moved the keyboard focus to a window of its own: whoever is typing
+into another window loses the keystrokes. The finding names the exe, the rig
+and the chain of parents. (A full build once took the focus a dozen times: the
+graphics proxy under test force-foregrounds the window a swap chain is created
+on, and every rig that made a hidden window of its own for one was taken for the
+game.) The guard prints a line saying how much it saw, so a build log without
+one did not run it; where the desktop cannot be watched it says that instead
+and the build carries on. The runner also sets its own error mode
+(SetErrorMode: no crash, assert or missing-DLL dialog), which every job
+inherits, so a rig that faults ends with its exit code instead of a dialog that
+takes the focus and waits for a click nobody is there to give.
+
 A failing rig stops new launches. The rigs already running finish and print,
 the failed rig's output is printed last so the tail of the build log names the
 failure, and the exit code is 1. --dry-run prints the plan and writes nothing.
@@ -173,6 +188,12 @@ LOG_FILE = "runner_output" # <exe-dir>\edvr_logs\<label>\runner_output[_<step>].
 JOB_KILL_ON_CLOSE = 0x2000      # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 JOB_BREAKAWAY_OK = 0x0800       # JOB_OBJECT_LIMIT_BREAKAWAY_OK
 JOB_EXTENDED_LIMITS = 9         # JobObjectExtendedLimitInformation
+
+# SetErrorMode flags (errhandlingapi.h) that quiet_faults sets for every job.
+SEM_FAILCRITICALERRORS = 0x0001   # no "cannot find the DLL" or critical-error box
+SEM_NOGPFAULTERRORBOX = 0x0002    # no Windows Error Reporting crash dialog
+SEM_NOOPENFILEERRORBOX = 0x8000   # no "cannot open the file" box
+QUIET_FAULTS = SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
 
 # A per-instance exe directory a rig (or a child it stages) made for itself:
 # "<anything>-<pid>-<tick>" or "<anything>_<pid>_<tick>", the shape every
@@ -590,6 +611,84 @@ def contain_children():
     return job
 
 
+def get_error_mode():
+    """This process's error mode (kernel32 GetErrorMode); 0 off Windows."""
+    if os.name != "nt":
+        return 0
+    import ctypes
+    kernel = ctypes.WinDLL("kernel32")
+    kernel.GetErrorMode.restype = ctypes.c_uint
+    return kernel.GetErrorMode()
+
+
+def set_error_mode(mode):
+    """kernel32 SetErrorMode(mode): the mode it replaced; 0 off Windows."""
+    if os.name != "nt":
+        return 0
+    import ctypes
+    kernel = ctypes.WinDLL("kernel32")
+    kernel.SetErrorMode.argtypes = [ctypes.c_uint]
+    kernel.SetErrorMode.restype = ctypes.c_uint
+    return kernel.SetErrorMode(mode)
+
+
+def quiet_faults():
+    """Tell Windows to open no dialog when a process of this build crashes,
+    asserts or cannot load a DLL: the process ends with its exit code and the
+    rig fails in its log. A dialog takes the focus from whoever is typing and
+    holds the build until a click nobody is there to give (or the rig's
+    timeout, which kills it). The mode is inherited by every process this one
+    starts, the rigs' compilers and test exes among them, unless a child asks
+    for the default one, which none of ours does. Returns the mode it replaced,
+    for a caller that means to put it back."""
+    previous = get_error_mode()
+    set_error_mode(previous | QUIET_FAULTS)
+    return previous
+
+
+def focus_guard():
+    """A running focus_watch.FocusWatch over every process this one starts."""
+    import focus_watch
+    return focus_watch.FocusWatch(os.getpid()).start()
+
+
+def start_focus_guard(focus, out):
+    """The watch `focus()` starts; None for no guard, and None with a line
+    saying so where the desktop cannot be watched (not Windows, no window
+    station). A focus_watch.py that will not even import is not that: it
+    raises, and the build fails."""
+    if focus is None:
+        return None
+    try:
+        return focus()
+    except ImportError:
+        raise
+    except Exception as error:
+        emit(out, "[edvr] NOTE: focus guard: this build is NOT being watched (%s: %s)\n"
+             % (type(error).__name__, error))
+        return None
+
+
+def finish_focus_guard(watch, out):
+    """Stop the watch and print what it saw, one [edvr] line at a time. Its
+    findings; [] when there was no watch."""
+    if watch is None:
+        return []
+    findings, text = watch.finish()
+    for line in text.splitlines():
+        emit(out, "[edvr] %s\n" % line)
+    return findings
+
+
+def focus_error(findings):
+    """The line that ends a build the guard failed: who, and what to read."""
+    exes = sorted({finding.culprit[1] for finding in findings})
+    jobs = sorted({finding.job or "(main flow)" for finding in findings})
+    return ("[edvr] ERROR: focus guard: %d finding(s) by %s, in %s: a job of this build put a window on the "
+            "desktop or took the focus from whoever is typing. The list above says which and how; "
+            "tools\\focus_watch.py finds them again.\n" % (len(findings), ", ".join(exes), ", ".join(jobs)))
+
+
 def spawner(script, root, env, exe_dir=None, timeout_for=None):
     """spawn(job) for run_group: runs the job's `build.bat --rig` child and
     returns (exit code, output, limit_hit) as run_rig does, under the
@@ -867,7 +966,10 @@ def describe_timeouts(scale=1.0, override=None):
 
 
 def run(script, jobs, mp, quiet, times_path, dry_run, out, spawn=None, clock=time.monotonic,
-        serial=(), exe_dir=None, after=None, timeout_scale=1.0, timeout_override=None):
+        serial=(), exe_dir=None, after=None, timeout_scale=1.0, timeout_override=None, focus=None):
+    """Run the rigs; the exit code. `focus`, when given, starts the watch that
+    holds every job to leaving the desktop alone (focus_guard is the real one):
+    a finding fails the run even when every rig passed."""
     text = script.read_text(encoding="utf-8", errors="replace")
     rigs = parse_rigs(text)
     labels = tuple(rig.label for rig in rigs)
@@ -898,16 +1000,21 @@ def run(script, jobs, mp, quiet, times_path, dry_run, out, spawn=None, clock=tim
         spawn = spawner(script, script.parent, env, exe_dir, timeout_for)
         # A quiet rig has the machine to itself, so its compiles may use every core.
         quiet_spawn = spawner(script, script.parent, dict(env, CL="/MP"), exe_dir, timeout_for)
-    started = clock()
-    results, failures = run_group(pool, jobs, spawn, out, clock, exe_dir=exe_dir, labels=labels)
-    pool_seconds = clock() - started
-    summed = sum(seconds for _, _, seconds, *_ in results)
-    quiet_results, quiet_failures, quiet_seconds = [], [], 0.0
-    if not failures:
+    watch = start_focus_guard(focus, out)
+    try:
         started = clock()
-        quiet_results, quiet_failures = run_group(later, 1, quiet_spawn, out, clock,
-                                                   exe_dir=exe_dir, labels=labels)
-        quiet_seconds = clock() - started
+        results, failures = run_group(pool, jobs, spawn, out, clock, exe_dir=exe_dir, labels=labels)
+        pool_seconds = clock() - started
+        summed = sum(seconds for _, _, seconds, *_ in results)
+        quiet_results, quiet_failures, quiet_seconds = [], [], 0.0
+        if not failures:
+            started = clock()
+            quiet_results, quiet_failures = run_group(later, 1, quiet_spawn, out, clock,
+                                                       exe_dir=exe_dir, labels=labels)
+            quiet_seconds = clock() - started
+    finally:
+        # Also when a group raised: the watch's threads must not outlive the run.
+        findings = finish_focus_guard(watch, out)
     results += quiet_results
     failures += quiet_failures
     if times_path is not None:
@@ -928,6 +1035,10 @@ def run(script, jobs, mp, quiet, times_path, dry_run, out, spawn=None, clock=tim
     longest = sorted(results, key=lambda entry: -entry[2])[:5]
     emit(out, "[edvr] longest: " + ", ".join("%s %.1f s" % (job.title, seconds)
                                              for job, _, seconds, *_ in longest) + "\n")
+    if findings:
+        emit(out, focus_error(findings))
+        out.flush()
+        return 1
     out.flush()
     return 0
 
@@ -1363,6 +1474,103 @@ def self_test():
         check(code == 1 and "run" not in steps and b"ERROR: beta (build) failed" in out.getvalue(),
               "a failed build step never gets its run step: %r %r" % (steps, out.getvalue()))
 
+        # --- the focus guard: what run() does with a watch and what it finds ---
+        import focus_watch
+
+        def took_the_focus(job, exe="openxr_present_test.exe"):
+            window = {"hwnd": 7, "pid": 41, "exe": exe, "cls": "Static", "title": "EDVR hidden Present fixture",
+                      "rect": [0, 0, 64, 64]}
+            return focus_watch.Finding("foreground", 4.0, window, (41, exe),
+                                       ["%s(41)" % exe, "cmd.exe(40)", "python.exe(1)"], job)
+
+        class FakeWatch:
+            """A watch that was told what it saw, and counts its finishes."""
+            def __init__(self, findings=()):
+                self.findings, self.finished = list(findings), 0
+
+            def finish(self):
+                self.finished += 1
+                return list(self.findings), (
+                    focus_watch.summarize(self.findings, 3.0) + "\nfocus_watch: hooks saw 1 show, 0 console and "
+                    "2 foreground event(s)" if self.findings else
+                    "focus_watch: no window was shown, no console opened and the foreground never moved to a "
+                    "window of the tree in 3 s (hooks saw 0 show, 0 console and 0 foreground event(s))")
+
+        def all_ok(job):
+            return 0, b"ran " + job.title.encode()
+
+        calm = FakeWatch()
+        out = io.BytesIO()
+        code = run(script, 3, 2, [], times, False, out, spawn=all_ok, focus=lambda: calm)
+        text = out.getvalue().decode()
+        check(code == 0 and calm.finished == 1 and "[edvr] focus_watch: no window was shown" in text
+              and text.index("focus_watch: no window") < text.index("[edvr] the pool of"),
+              "a watch that saw nothing passes the run, is stopped once, and its line is in the build log: %r" % text)
+        out = io.BytesIO()
+        code = run(script, 3, 2, [], times, False, out, spawn=all_ok)
+        check(code == 0 and b"focus" not in out.getvalue(),
+              "with no focus argument nothing is watched and nothing is said about it: %r" % out.getvalue())
+
+        taken = FakeWatch([took_the_focus("alpha"), took_the_focus("beta", "openxr_module_test.exe")])
+        out = io.BytesIO()
+        if times.exists():
+            times.unlink()
+        code = run(script, 3, 2, [], times, False, out, spawn=all_ok, focus=lambda: taken)
+        text = out.getvalue().decode()
+        check(code == 1 and taken.finished == 1 and "2 finding(s) in 2 group(s)" in text
+              and "in job alpha" in text and "in job beta" in text
+              and text.rstrip().splitlines()[-1].startswith("[edvr] ERROR: focus guard: 2 finding(s) by "
+                                                            "openxr_module_test.exe, openxr_present_test.exe, in alpha, beta"),
+              "a job that took the focus fails a run in which every rig passed, and the last line says who: %r"
+              % text[-900:])
+        check(set(load_times(times)) >= {"alpha", "beta", "gamma"},
+              "the rigs' times are still recorded when the guard fails the run: %r" % load_times(times))
+
+        taken = FakeWatch([took_the_focus("gamma")])
+        out = io.BytesIO()
+        code = run(script, 3, 2, [], times, False, out, focus=lambda: taken,
+                   spawn=lambda job: (0, b"") if job.rig.label != "beta" else (5, b"beta broke"))
+        text = out.getvalue().decode()
+        lines = text.rstrip().splitlines()
+        check(code == 1 and "1 finding(s) in 1 group(s)" in text and lines[-1].startswith("[edvr] ERROR: beta failed")
+              and text.index("1 finding(s) in 1 group(s)") < text.index("ERROR: beta failed"),
+              "when a rig fails as well, the guard's list is in the log and the failed rig is still the last line: %r"
+              % text[-700:])
+
+        def no_desktop():
+            raise OSError("no window station")
+
+        out = io.BytesIO()
+        code = run(script, 3, 2, [], times, False, out, spawn=all_ok, focus=no_desktop)
+        text = out.getvalue().decode()
+        check(code == 0 and "NOTE: focus guard: this build is NOT being watched (OSError: no window station)" in text,
+              "where the desktop cannot be watched the run says so and carries on: %r" % text)
+
+        def not_importable():
+            raise ImportError("No module named focus_watch")
+
+        try:
+            run(script, 3, 2, [], times, False, io.BytesIO(), spawn=all_ok, focus=not_importable)
+            check(False, "a guard that cannot even be imported must fail the run, not be noted and skipped")
+        except ImportError:
+            pass
+
+        def never_started():
+            raise AssertionError("a dry run starts no watch")
+
+        check(run(script, 3, 2, [], times, True, io.BytesIO(), focus=never_started) == 0,
+              "a dry run starts no watch")
+
+        # main() hands run() the real guard: without it this whole block guards nothing.
+        wired = {}
+        real_run = globals()["run"]
+        globals()["run"] = lambda *args, **kwargs: wired.update(kwargs) or 0
+        try:
+            main(["--script", str(script), "--dry-run"])
+        finally:
+            globals()["run"] = real_run
+        check(wired.get("focus") is focus_guard, "main() passes run() the focus guard: %r" % wired.get("focus"))
+
     # owns_exe_dir_entry / job_exe_dirs / cleanup_job_exe_dirs: the
     # "<label>-" / "<label>_" convention documented for a rig that stages a
     # private directory directly under --exe-dir. No shipped rig does this
@@ -1645,6 +1853,70 @@ def self_test_timeouts(check):
     with scratch_dir("edvr-run-jobs-") as scratch:
         root = Path(scratch)
 
+        # --- the focus guard on real processes ------------------------------------
+        # A rig that puts a window on the desktop fails the run; one that does
+        # not, passes it. The window is 1x1 and off the desktop, shown without
+        # activating: a visible top-level window to Windows, nothing to a person,
+        # and it takes no focus.
+        import focus_watch
+        watched = root / "focus-guard"
+        watched.mkdir()
+        window_script = watched / "window.py"
+        window_script.write_text(focus_watch._CHILD_WINDOW, encoding="utf-8")
+
+        def guard_script(name, *labels):
+            bodies = {"calm": ["echo calm"],
+                      "showy": ['"%s" "%s" visible 2.5' % (sys.executable, window_script)]}
+            lines = ["@echo off", 'if "%~1"=="--rig" goto run_rig', "exit /b 0", ":run_rig",
+                     "call :rig_%~2", "exit /b %errorlevel%"]
+            for label in labels:
+                lines += [":rig_" + label] + bodies[label] + ["exit /b 0"]
+            path = watched / name
+            path.write_text("\r\n".join(lines) + "\r\n", encoding="ascii")
+            return path
+
+        # The window is the watch's own probe (its title says so), which only a watch
+        # under test counts: the guard the build really runs, and any monitor
+        # watching the build from outside, ignore it.
+        def counting_guard():
+            return focus_watch.FocusWatch(os.getpid(), count_probes=True).start()
+
+        out = io.BytesIO()
+        code = run(guard_script("both.bat", "calm", "showy"), 2, 2, [], None, False, out,
+                   timeout_override=120.0, focus=counting_guard)
+        text = out.getvalue().decode("utf-8", "replace")
+        check(code == 1 and "window by python.exe" in text and "in job showy" in text and "in job calm" not in text
+              and text.rstrip().splitlines()[-1].startswith("[edvr] ERROR: focus guard: 1 finding(s) by python.exe, in showy"),
+              "a rig whose process shows a window fails the run, and the guard names the exe and the rig: %r"
+              % text[-900:])
+        real = focus_guard()
+        try:
+            check(isinstance(real, focus_watch.FocusWatch) and real.root == os.getpid() and not real.count_probes,
+                  "the guard the build really runs watches this process's children and ignores the probe window")
+        finally:
+            real.stop()
+        out = io.BytesIO()
+        code = run(guard_script("calm.bat", "calm"), 2, 2, [], None, False, out,
+                   timeout_override=120.0, focus=focus_guard)
+        text = out.getvalue().decode("utf-8", "replace")
+        check(code == 0 and "[edvr] focus_watch: no window was shown" in text and "ERROR" not in text,
+              "a rig that leaves the desktop alone passes, and the log says the guard looked: %r" % text[-600:])
+
+        # A job inherits the runner's error mode, which is how a crash opens no dialog.
+        before_mode = get_error_mode()
+        mode = 0
+        try:
+            quiet_faults()
+            probe = subprocess.run([sys.executable, "-c", "import ctypes; print(ctypes.WinDLL('kernel32').GetErrorMode())"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, timeout=60,
+                                   **child_process_kwargs())
+            mode = int(probe.stdout.strip() or 0)
+        finally:
+            set_error_mode(before_mode)
+        check(mode & QUIET_FAULTS == QUIET_FAULTS,
+              "a job of the runner starts with crash, assert and missing-DLL dialogs off: %#x" % mode)
+        check(get_error_mode() == before_mode, "the case put the error mode back")
+
         def write_script(folder, name, labels, heart):
             """A stand-in for build.bat in `folder`: `--rig <label>` runs
             :rig_<label>. The hung rig sits in a ping, three processes down
@@ -1892,10 +2164,15 @@ def main(argv=None):
             emit(sys.stdout.buffer, "[edvr] NOTE: the runner could not join a job object (%s); if it "
                                     "is killed, the rigs it started will not be.\n" % error)
             sys.stdout.buffer.flush()
+        if os.name == "nt":
+            quiet_faults()
+            emit(sys.stdout.buffer, "[edvr] the jobs run with crash, assert and missing-DLL dialogs off "
+                                    "(error mode 0x%X, inherited)\n" % get_error_mode())
+            sys.stdout.buffer.flush()
     try:
         return run(args.script.resolve(), args.jobs, mp, quiet, args.times, args.dry_run,
                    sys.stdout.buffer, serial=serial, exe_dir=exe_dir, after=after,
-                   timeout_scale=scale, timeout_override=override)
+                   timeout_scale=scale, timeout_override=override, focus=focus_guard)
     except ValueError as error:
         print("[edvr] ERROR: %s" % error)
         return 1

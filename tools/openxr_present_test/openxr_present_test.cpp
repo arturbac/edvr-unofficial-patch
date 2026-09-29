@@ -16,6 +16,7 @@
 #include "../../src/openxr/native_graphics_client.h"
 #include "../../src/openxr/native_render_binding.h"
 #include "../../src/common/system_d3d11.h"
+#include "../../src/d3d11/focus_target.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -587,6 +588,31 @@ void transportContracts(HMODULE proxy, PresentDevice& present, bool available) {
   check(hooks()==0,"transport testing did not activate optional vScreen hooks");
 }
 
+// The rule the proxy's focus-on-launch step goes by (src\d3d11\focus_target.h),
+// on windows that are never shown: the game's kind of window qualifies, the
+// kinds that are not the game's do not, and this rig's own fixture window is
+// one of those. Without that a rig takes the keyboard from whoever is typing.
+void focusTargetContracts(const PresentDevice& present) {
+  const HINSTANCE self=GetModuleHandleW(nullptr);
+  const auto make=[&](DWORD style,HWND parent){
+    return CreateWindowExW(0,L"STATIC",L"EDVR focus target case",style,0,0,64,64,parent,nullptr,self,nullptr);};
+  HWND topLevel=make(WS_POPUP,nullptr);
+  HWND owned=make(WS_POPUP,topLevel);
+  HWND messageOnly=make(WS_POPUP,HWND_MESSAGE);
+  HWND childOfMessage=make(WS_CHILD,messageOnly);
+  HWND childOfTop=make(WS_CHILD,topLevel);
+  check(topLevel&&owned&&messageOnly&&childOfMessage&&childOfTop,"focus target cases: windows created");
+  check(edvr::focusTargetWindow(topLevel),"a top-level window, hidden or not, is what focus-on-launch takes the foreground for");
+  check(edvr::focusTargetWindow(owned),"an owned top-level window is too");
+  check(!edvr::focusTargetWindow(messageOnly),"a message-only window is not");
+  check(!edvr::focusTargetWindow(childOfMessage)&&!edvr::focusTargetWindow(childOfTop),"a child window is not");
+  check(!edvr::focusTargetWindow(nullptr),"no window is not");
+  for (HWND window:{childOfMessage,childOfTop,messageOnly,owned,topLevel}) if (window) DestroyWindow(window);
+  check(topLevel&&!edvr::focusTargetWindow(topLevel),"a destroyed window is not");
+  check(present.window()&&!edvr::focusTargetWindow(present.window()),
+        "the Present fixture's window is one focus-on-launch leaves alone, so a rig never takes the developer's keyboard");
+}
+
 int selfTest(const std::wstring& supplied, HookExpectation expectation=HookExpectation::Features) {
   Watchdog watchdog; wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr,exe,MAX_PATH); std::wstring path=supplied;
   if (path.empty()) { path=exe; const auto slash=path.find_last_of(L"\\/"); path=path.substr(0,slash+1)+L"d3d11.dll"; }
@@ -599,6 +625,7 @@ int selfTest(const std::wstring& supplied, HookExpectation expectation=HookExpec
   check(preClient.acquire(L"d3d11.dll")==E_INVALIDARG&&!preClient.provider(),"native client rejects relative path before device creation");
   auto countsFn=reinterpret_cast<Counts::Fn>(GetProcAddress(proxy,"edvr_selftest_graphics_bridge")); check(countsFn!=nullptr,"graphics bridge counter export exists");
   PresentDevice present; check(SUCCEEDED(present.initialize(proxy,D3D_DRIVER_TYPE_WARP)),"initialize real WARP proxy device"); if (!present.swapchain()) return 1;
+  focusTargetContracts(present);
   if (expectation!=HookExpectation::Features) {
     transportContracts(proxy,present,expectation==HookExpectation::TransportOnly);
     if (failures) return 1;
