@@ -1680,7 +1680,9 @@ realistic.
   classification, in the claim and admit paths the rigs pinned only by
   source scans.
 - Reverted in bad1da80 (Sean: "it's up so rarely") and installed on
-  Frontier.
+  Frontier. Flight 164011 on bad1da80 (build matched; no `shared pair:`
+  lines, glare vivid, world variant created): the glare pinned again (Sean:
+  "That fixed the sun glare").
 - ruled out: the shared-pair rule as wired in 9122f31e, because flight
   162819 unpinned the sun glare in vivid and realistic and did not take the
   pad, though every class it logged was right.
