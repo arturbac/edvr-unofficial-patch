@@ -38,8 +38,9 @@ changes.*
 - **Ruled out:** at the end of each 2026-09-24 entry, and in the 2026-09-29
   ones (the periodic jobs; EDVR's Present hook; EDVR's AA work as the
   stalls' cause; engine motion's CPU as the carrier's limit; the six wrapped
-  draws as a large EDVR cost, being vivid glare and the scanner-body
-  resolve; for the UI and hologram passes, every cut but one, measured).
+  draws as a large EDVR cost, being the pad rings the glare fix claims and
+  the scanner-body resolve; for the UI and hologram passes, every cut but
+  one, measured).
 - **UI and hologram passes, 2026-09-29 (entry below):** one exact cut, the
   UI resolve skipping inputs it was not given (about 0.09 ms a frame); a
   tile early-out, a groupshared window, R8 history, a composite tile bound,
@@ -1598,8 +1599,9 @@ worse; CPU frame time good; GPU still hitches; 90 not held.
   20,486 and the coverage mask in 15,192, so the null-fetch cut applies
   almost always. Engine motion on the render thread: 0.12-0.15 ms p50.
 - ruled out: the six "other fix-wrapped draws" as a large EDVR cost, because
-  they are vivid sun glare (0.30-0.46 ms) and the scanner-body resolve
-  (0.04-0.07 ms).
+  they are the `sun glare steady` row (0.30-0.46 ms) and the scanner-body
+  resolve (0.04-0.07 ms). corrected (the seed-census entry): that glare row
+  was the landing-pad rings, which the glare fix claims by shape, not a sun.
 - Sean's eye dump shows the landing-pad display, which Elite draws in the
   radar's place while docking, left out of the UI layer (the radar itself is
   handled correctly); under analysis with the stock-glare question and a
