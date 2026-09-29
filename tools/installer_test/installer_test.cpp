@@ -475,6 +475,12 @@ static void testShippedIni(const std::wstring& root) {
         "fss_eye_heal = 1\r\n"        // the pre-0.11 pair, both of which
         "fss_reveal_sync = on\r\n"    // now merge into ONE new key
         "fss_eye_glue = stock\r\n"   // a key that never existed: carried, not eaten
+        // The field-of-view trims (2026-09-29) were [fix] keys with menu rows
+        // and are ini-only [experimental] keys now: a per-headset list tuned
+        // for one headset and one for another, and one left as shipped (empty).
+        "fov_trim_vertical = pimax-openxr/pimax-crystal-super:10, virtualdesktopxr/meta-quest-3:5\r\n"
+        "fov_trim_outer = oculus/meta-quest-3:7\r\n"
+        "fov_trim_nasal =\r\n"
         "[advanced]\r\n"
         "cull_guard_percent = 20.0\r\n";
     MergeReport moveRep;
@@ -493,6 +499,42 @@ static void testShippedIni(const std::wstring& root) {
           "a key this version never shipped is carried, with its note");
     check(moveRep.followed.size() >= 4,
           "the report says the values followed their settings");
+
+    // The trims, against the same real file: the tuned lists arrive whole under
+    // [experimental] (commas, slashes, colons and all), the one left empty
+    // stays empty there, and nothing is left under [fix] to shadow them.
+    const std::string tunedTrims =
+        "pimax-openxr/pimax-crystal-super:10, virtualdesktopxr/meta-quest-3:5";
+    expectEq(iniValue(migrated, "experimental.fov_trim_vertical", "<absent>"), tunedTrims,
+             "a tuned per-headset trim list follows the section move whole");
+    expectEq(iniValue(migrated, "experimental.fov_trim_outer", "<absent>"),
+             "oculus/meta-quest-3:7", "and so does a single entry");
+    expectEq(iniValue(migrated, "experimental.fov_trim_nasal", "<absent>"), "",
+             "a trim left as shipped (empty) stays empty under its new name");
+    for (const char* key : {"fix.fov_trim_vertical", "fix.fov_trim_outer", "fix.fov_trim_nasal"}) {
+        expectEq(iniValue(migrated, key, "<absent>"), "<absent>",
+                 (std::string("nothing is left under ") + key + " for the reader to shadow").c_str());
+    }
+
+    // CONTROL: the same merge over the shipped file with its three moved-from
+    // annotations taken out (what a careless edit of the block would leave). The
+    // tuned list is NOT under [experimental]; it is carried under [fix], with a
+    // note, where nothing reads it -- which is what the assertions above would
+    // report if the annotations were lost.
+    std::string unannotated = shipped;
+    for (const char* key : {"vertical", "outer", "nasal"}) {
+        const std::string line = std::string("# moved-from: fix.fov_trim_") + key;
+        const size_t at = unannotated.find(line);
+        if (at != std::string::npos) unannotated.replace(at, line.size(), "# (annotation removed)");
+    }
+    check(unannotated != shipped && unannotated.find("moved-from: fix.fov_trim_") == std::string::npos,
+          "the control's ini really lost its three annotations");
+    MergeReport strandedRep;
+    const std::string stranded = mergeIni(unannotated, oldLayout, nullptr, {}, &strandedRep);
+    check(iniValue(stranded, "experimental.fov_trim_vertical", "<absent>") != tunedTrims,
+          "control: without the annotation the tuned trim list does NOT arrive under [experimental]");
+    expectEq(iniValue(stranded, "fix.fov_trim_vertical", "<absent>"), tunedTrims,
+             "control: it is carried under the old name instead, where nothing reads it");
 }
 
 // ---------------------------------------------------------------------------
@@ -2670,6 +2712,113 @@ static void testMirrorGenerations(const std::wstring& scratch) {
 }
 
 // ---------------------------------------------------------------------------
+// the demoted field-of-view trims, through the mirror and an install
+// ---------------------------------------------------------------------------
+
+// A value somebody tuned under the OLD name has to survive the whole road an
+// update walks: mirrored outside the game folder, restored after a game update
+// wiped it, and merged into the NEW shipped file by the install that follows
+// (which is the only thing that moves it, edvr.ini's `# moved-from:`). Run end to
+// end against the real shipped file, with the shipped file's annotations taken out
+// as the control.
+static void testDemotedTrims(const std::wstring& root, const std::wstring& scratch) {
+    printf("\nthe demoted field-of-view trims through the mirror, a restore and an install\n");
+
+    const std::string shipped = readAll(joinPath(root, L"edvr.ini"));
+    if (shipped.empty()) {
+        fail("read the repository's edvr.ini", "not found next to the repo root");
+        return;
+    }
+    const std::string tuned =
+        "pimax-openxr/pimax-crystal-super:10, virtualdesktopxr/meta-quest-3:5";
+    // Yesterday's install, as the previous version wrote it: the trims under
+    // [fix], the base copy holding the shipped (empty) defaults, and the tuning
+    // somebody did on top of them.
+    const std::string oldBase =
+        "[fix]\r\nfov_trim_vertical =\r\nfov_trim_outer =\r\nfov_trim_nasal =\r\n"
+        "black_void = 1\r\n";
+    const std::string oldUser =
+        "[fix]\r\nfov_trim_vertical = " + tuned + "\r\n"
+        "fov_trim_outer = oculus/meta-quest-3:7\r\nfov_trim_nasal =\r\n"
+        "black_void = 0\r\n";
+
+    const std::wstring gameDir = joinPath(scratch, L"trims-game");
+    const std::wstring mirrorDir = joinPath(scratch, L"trims-mirror\\trims-test");
+    removeTree(joinPath(scratch, L"trims-mirror"));
+    layOutScratchGame(gameDir);
+    makeTree(joinPath(gameDir, L"edvr_install"));
+    writeAll(joinPath(gameDir, L"edvr.ini"), oldUser);
+    writeAll(baseIniPath(gameDir), oldBase);
+    check(updateMirror(gameDir, L"", mirrorDir).ok, "the old-layout settings are mirrored");
+    expectEq(readAll(joinPath(mirrorDir, L"edvr.ini")), oldUser,
+             "the mirror keeps them verbatim, under their old names");
+
+    // Ran twice: once with the shipped file, once with its annotations removed.
+    std::string unannotated = shipped;
+    for (const char* key : {"vertical", "outer", "nasal"}) {
+        const std::string line = std::string("# moved-from: fix.fov_trim_") + key;
+        const size_t at = unannotated.find(line);
+        if (at != std::string::npos) unannotated.replace(at, line.size(), "# (annotation removed)");
+    }
+    check(unannotated != shipped && unannotated.find("moved-from: fix.fov_trim_") == std::string::npos,
+          "the control's ini really lost its three annotations");
+
+    struct Road { const char* name; const std::string* nextIni; bool annotated; };
+    const Road roads[] = {{"shipped edvr.ini", &shipped, true},
+                          {"control, annotations removed", &unannotated, false}};
+    for (const Road& road : roads) {
+        const std::string label = std::string(road.annotated ? "" : "control: ") +
+                                  (road.annotated ? "" : "without the annotation, ");
+        // A game update wipes the folder; only the mirror is left. The restore
+        // puts the old ini and its base back, and the install that follows
+        // merges them into the new file (a plan, and then the real apply).
+        const std::wstring wiped = joinPath(scratch, road.annotated ? L"trims-wiped" : L"trims-wiped-control");
+        layOutScratchGame(wiped);
+        const MirrorInfo info = readMirror(mirrorDir);
+        std::vector<std::string> notes;
+        check(restoreFromMirror(wiped, info, &notes), (label + "the restore succeeds").c_str());
+        expectEq(readAll(joinPath(wiped, L"edvr.ini")), oldUser,
+                 (label + "the restored ini is the old layout, verbatim").c_str());
+        expectEq(readAll(baseIniPath(wiped)), oldBase,
+                 (label + "and its base copy comes back beside it").c_str());
+
+        Survey s = scratchSurvey(wiped);
+        s.iniPresent = true;
+        s.iniText = readAll(joinPath(wiped, L"edvr.ini"));
+        s.baseIniText = readAll(baseIniPath(wiped));
+        const PayloadInfo payload = testPayload(*road.nextIni);
+        const Plan plan = planInstall(s, testOptions(), payload);
+        const std::string planned = plannedIni(plan);
+        check(!planned.empty(), (label + "the install plans to write an ini").c_str());
+        const ApplyResult applied = applyPlan(plan, provider(false));
+        check(applied.ok, (label + "the install applies").c_str(), applied.error);
+        const std::string installed = readAll(joinPath(wiped, L"edvr.ini"));
+        expectEq(installed, planned, (label + "and writes what it planned").c_str());
+
+        expectEq(iniValue(installed, "fix.black_void"), "0",
+                 (label + "another tuned value lands too (the merge ran)").c_str());
+        if (road.annotated) {
+            expectEq(iniValue(installed, "experimental.fov_trim_vertical", "<absent>"), tuned,
+                     "the tuned trim list is under [experimental] after the install");
+            expectEq(iniValue(installed, "experimental.fov_trim_outer", "<absent>"),
+                     "oculus/meta-quest-3:7", "and so is the single entry");
+            expectEq(iniValue(installed, "experimental.fov_trim_nasal", "<absent>"), "",
+                     "the one left empty is still empty there");
+            for (const char* key : {"fix.fov_trim_vertical", "fix.fov_trim_outer", "fix.fov_trim_nasal"}) {
+                expectEq(iniValue(installed, key, "<absent>"), "<absent>",
+                         (std::string("nothing is left under ") + key).c_str());
+            }
+            check(plan.merge.followed.size() >= 3, "the install's report says the trims followed");
+        } else {
+            check(iniValue(installed, "experimental.fov_trim_vertical", "<absent>") != tuned,
+                  "control: the tuned trim list does NOT reach [experimental] without the annotation");
+            expectEq(iniValue(installed, "fix.fov_trim_vertical", "<absent>"), tuned,
+                     "control: it is carried under the old name, where nothing reads it");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // reading a DLL to find out whose it is
 // ---------------------------------------------------------------------------
 
@@ -3045,6 +3194,7 @@ int wmain(int argc, wchar_t** argv) {
     testApplyPatience(scratch);
     testGenerations(scratch);
     testMirrorGenerations(scratch);
+    testDemotedTrims(root, scratch);
     testProbe(scratch);
     testRunState();
     testSettings(root, scratch);

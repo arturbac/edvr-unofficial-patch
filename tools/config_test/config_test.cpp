@@ -48,6 +48,7 @@
 #include "../../src/common/runtime_profile.h"
 #include "../../src/common/temporal_mode.h"
 #include "../../src/common/log.h"
+#include "config_contract_gen.h"   // build\gen: the tables the DLLs register, from the real edvr.ini
 
 using namespace edvr;
 
@@ -797,6 +798,134 @@ int main(int argc, char** argv) {
                       "a real old-line choice still follows the move");
         }
         Config::get().setAuditTables(nullptr, 0, nullptr, 0);
+
+        // --- the demoted field-of-view trims, over the SHIPPED tables --------
+        //
+        // 2026-09-29: fix.fov_trim_vertical / _outer / _nasal moved to
+        // [experimental] (edvr.ini: `# moved-from: fix.fov_trim_*`). Somebody who
+        // set them has them under [fix] in an old-layout edvr.ini, and the DLLs
+        // meet that file whenever they are copied in by hand. The fixture tables
+        // above prove the mechanics; these are the tables the DLLs register --
+        // config_contract_gen.h, generated from the real edvr.ini -- so what is
+        // proven is that the keys which actually moved read through, and that it
+        // is the shipped annotation that carries them.
+        {
+            using contractgen::kKnownKeys;
+            using contractgen::kMovedKeys;
+            constexpr size_t kKnownCount = sizeof(kKnownKeys) / sizeof(kKnownKeys[0]);
+            constexpr size_t kMovedCount = sizeof(kMovedKeys) / sizeof(kMovedKeys[0]);
+            constexpr const char* kTrimList = "pimax-openxr/pimax-crystal-super:10, "
+                                              "virtualdesktopxr/meta-quest-3:5";
+            static const char kOldTrims[] =
+                "[fix]\r\n"
+                "fov_trim_vertical = pimax-openxr/pimax-crystal-super:10, "
+                "virtualdesktopxr/meta-quest-3:5\r\n"
+                "fov_trim_outer = oculus/meta-quest-3:7\r\n"
+                "fov_trim_nasal = pimax-openxr/pimax-crystal-super:5\r\n";
+
+            // The tables carry the three moves, each old [fix] name to its new
+            // [experimental] one, and nothing is left documented under the old.
+            int trimMoves = 0;
+            static const char* filtered[kMovedCount][3];
+            size_t filteredCount = 0;
+            for (size_t i = 0; i < kMovedCount; ++i) {
+                const std::string oldKey = kMovedKeys[i][0], newKey = kMovedKeys[i][1];
+                const bool trim = newKey.rfind("experimental.fov_trim_", 0) == 0;
+                if (trim && oldKey == "fix.fov_trim_" + newKey.substr(strlen("experimental.fov_trim_"))) {
+                    ++trimMoves;
+                } else {
+                    for (int c = 0; c < 3; ++c) filtered[filteredCount][c] = kMovedKeys[i][c];
+                    ++filteredCount;
+                }
+            }
+            if (trimMoves == 3) ok("the shipped moved-from map carries fix.fov_trim_* to experimental.fov_trim_*");
+            else fail("the shipped moved-from map carries the three trims",
+                      std::to_string(trimMoves) + " of 3 moves found in edvr.ini's annotations");
+            int retiredStillKnown = 0;
+            for (size_t i = 0; i < kKnownCount; ++i) {
+                if (strncmp(kKnownKeys[i], "fix.fov_trim_", 13) == 0) ++retiredStillKnown;
+            }
+            if (retiredStillKnown == 0) ok("no fix.fov_trim_* key is still read or documented");
+            else fail("no fix.fov_trim_* key is still read or documented",
+                      std::to_string(retiredStillKnown) + " of them are");
+
+            Config::get().setAuditTables(kKnownKeys, kKnownCount, kMovedKeys, kMovedCount);
+            if (!writeIni(scratch, kOldTrims)) {
+                fail("old-layout fov trim ini", "could not write it");
+            } else {
+                Config::get().init(scratch);
+                expectStr("experimental.fov_trim_vertical", kTrimList,
+                          "an old-layout fov_trim_vertical is read as experimental.fov_trim_vertical");
+                expectStr("experimental.fov_trim_outer", "oculus/meta-quest-3:7",
+                          "an old-layout fov_trim_outer is read as experimental.fov_trim_outer");
+                expectStr("experimental.fov_trim_nasal", "pimax-openxr/pimax-crystal-super:5",
+                          "an old-layout fov_trim_nasal is read as experimental.fov_trim_nasal");
+
+                // Live: an edit to the OLD line under a running game reaches
+                // the new name on the next reload, because the read-through is
+                // resolved at every parse.
+                if (!rewriteIni(scratch, "[fix]\r\nfov_trim_outer = oculus/meta-quest-3:9\r\n") ||
+                    !Config::get().reloadIfChanged()) {
+                    fail("old-layout fov trim reload", "the edit did not reload");
+                } else {
+                    expectStr("experimental.fov_trim_outer", "oculus/meta-quest-3:9",
+                              "an edit to the old line is live: the next reload reads it");
+                    expectStr("experimental.fov_trim_vertical", "<unset>",
+                              "...and a trim no longer in the file is gone, not remembered");
+                }
+                // The shipped default, empty, in an old-layout file: no trim.
+                if (!rewriteIni(scratch, "[fix]\r\nfov_trim_vertical =\r\n") ||
+                    !Config::get().reloadIfChanged()) {
+                    fail("old-layout empty fov trim reload", "the edit did not reload");
+                } else {
+                    expectStr("experimental.fov_trim_vertical", "",
+                              "an old-layout line left empty reads as no trim");
+                }
+                // Both spellings in one file: the new name wins.
+                if (!rewriteIni(scratch,
+                                "[fix]\r\nfov_trim_outer = oculus/meta-quest-3:9\r\n"
+                                "[experimental]\r\nfov_trim_outer = oculus/meta-quest-3:2\r\n") ||
+                    !Config::get().reloadIfChanged()) {
+                    fail("both-layout fov trim reload", "the edit did not reload");
+                } else {
+                    expectStr("experimental.fov_trim_outer", "oculus/meta-quest-3:2",
+                              "when both spellings are set, experimental.fov_trim_outer wins");
+                }
+                // A new-layout file: read directly, and nothing under the old name.
+                if (!rewriteIni(scratch, "[experimental]\r\nfov_trim_vertical = oculus:3\r\n") ||
+                    !Config::get().reloadIfChanged()) {
+                    fail("new-layout fov trim reload", "the edit did not reload");
+                } else {
+                    expectStr("experimental.fov_trim_vertical", "oculus:3",
+                              "a new-layout fov_trim_vertical is read as it stands");
+                    expectStr("fix.fov_trim_vertical", "<unset>",
+                              "...and the retired name reads nothing");
+                }
+            }
+
+            // CONTROL: the same old-layout file, over the same tables minus the
+            // three moves (what edvr.ini without its annotations would generate).
+            // The values are stranded under [fix] and the new names read nothing,
+            // which is exactly what the assertions above would report if the
+            // annotations were lost.
+            Config::get().setAuditTables(kKnownKeys, kKnownCount,
+                                         reinterpret_cast<const char* const(*)[3]>(filtered),
+                                         filteredCount);
+            if (!writeIni(scratch, kOldTrims)) {
+                fail("control fov trim ini", "could not write it");
+            } else {
+                Config::get().init(scratch);
+                expectStr("experimental.fov_trim_vertical", "<unset>",
+                          "control: without the annotation an old-layout fov_trim_vertical is NOT read as the new name");
+                expectStr("experimental.fov_trim_outer", "<unset>",
+                          "control: ...nor fov_trim_outer");
+                expectStr("experimental.fov_trim_nasal", "<unset>",
+                          "control: ...nor fov_trim_nasal");
+                expectStr("fix.fov_trim_outer", "oculus/meta-quest-3:7",
+                          "control: the value sits under the old name, where nothing reads it");
+            }
+            Config::get().setAuditTables(nullptr, 0, nullptr, 0);
+        }
 
         // --- the log directory, and the environment's say over it ----------
         //

@@ -2923,8 +2923,8 @@ bool ensureNative(ID3D11Device* dev, EyeState& e, DXGI_FORMAT viewFmt) {
 // An edge's own half-angle in the RENDERED frame is atan(|tangent|); the
 // region's half-angle at that edge is the frame's own angle there minus
 // reducedTrimDeg -- the caller has already reduced the fovea's edge trim by
-// however much the FOV trim (fix.fov_trim_vertical/_outer/_nasal) already
-// cut that same edge -- floored at 2 degrees so a trim cannot close or
+// however much the FOV trim (experimental.fov_trim_vertical/_outer/_nasal)
+// already cut that same edge -- floored at 2 degrees so a trim cannot close or
 // invert an edge. A trim that reaches (or passes) the frame's own angle
 // leaves the region sitting AT that edge: no periphery strip there.
 float foveaEdgeRegionDeg(float edgeTan, float reducedTrimDeg) {
@@ -4197,9 +4197,10 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                     FoveaRegionMode mode;
                     if (g_foveaEdges) {
                         // vertical, outer, nasal -- kTrimNames' own order. Top
-                        // and bottom both reduce against fovTrim[0]: fix.fov_
-                        // trim_vertical trims the top and bottom equally, so
-                        // there is only the one FOV number for either edge.
+                        // and bottom both reduce against fovTrim[0]:
+                        // experimental.fov_trim_vertical trims the top and
+                        // bottom equally, so there is only the one FOV number
+                        // for either edge.
                         uint32_t fovTrim[3] = {0, 0, 0};
                         nativeFrameFovTrimDegrees(fovTrim);
                         auto reduced = [](float foveaTrimDeg, uint32_t fovTrimDeg) {
@@ -6216,8 +6217,8 @@ void temporalPassConfigure(Config& cfg) {
     g_foveaEdgesNoted[0] = g_foveaEdgesNoted[1] = false;
     g_foveaSizeNoted[0] = g_foveaSizeNoted[1] = false;
     // Edges mode's three trims: plain degrees (not a per-headset list, unlike
-    // fix.fov_trim_vertical/_outer/_nasal, which this reduces against -- see
-    // cropOf/computeFoveaRegion in temporal_pass.cpp). 0..45, default 0.
+    // experimental.fov_trim_vertical/_outer/_nasal, which this reduces against
+    // -- see cropOf/computeFoveaRegion in temporal_pass.cpp). 0..45, default 0.
     float vertTrim = cfg.getFloat("advanced.temporal_aa_fovea_vertical", 0.0f);
     if (!std::isfinite(vertTrim) || vertTrim < 0.0f) vertTrim = 0.0f;
     if (vertTrim > 45.0f) vertTrim = 45.0f;
