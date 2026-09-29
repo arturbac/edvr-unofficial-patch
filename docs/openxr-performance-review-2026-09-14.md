@@ -11,6 +11,16 @@ changes.*
   Application-render GPU timing; with the timing retired before Submit
   returns it FLEW CLEAN (flight 124504, Pimax OpenXR: invalid 5, Elite's
   second-Submit park p50 0.16-0.18 ms) and now DEFAULTS ON.
+- **Long cycles, 2026-09-29 (entry below):** the phase-0 flight (SteamVR
+  OpenXR, 4032x3896, 90 Hz) put the largest phase of 47 of 54 logged long
+  cycles in `post_second_submit_to_next_wait`, the window that holds Elite's
+  Present and EDVR's hook on it. The periodic jobs are ruled out as the main
+  cause (2 of 54 coincide). That flight's own 30 s post-submit windows put the
+  tails outside the hook, before and after the Present (Elite's code, and
+  EDVR's other hooks in its D3D11 calls), with EDVR's hook at most 4.4 ms
+  except one 39.4 ms Status.json read. The per-cycle instrument is built and
+  gated, not flown: `native_long_cycle` splits that phase at the Present, and
+  the LONG FRAME line states EDVR's share and names its three slowest ticks.
 - **Open:** issue #38's rc.1 report, 90-99% GPU against 0.16.2's 60-62%. The
   EDVR GPU census (2026-09-25 entry) is built to split EDVR's cost from the
   game's; its first flight caught the census itself overcounting engine
@@ -25,13 +35,20 @@ changes.*
 - **Closed:** sections 5 and 6 below (the private and producer copies): the
   producer copy measured 0.039 ms p50 per eye at 4100x3962, under the
   0.1 ms bar.
-- **Ruled out:** at the end of each 2026-09-24 entry.
-- **Next flight:** any flight on a Quest runtime with the default build:
-  check the Application-render GPU invalid count stays near zero and
+- **Ruled out:** at the end of each 2026-09-24 entry, and in the 2026-09-29
+  one (the periodic jobs as the main cause of long frames).
+- **Next flight:** the instrumented build, 5 minutes steady in the phase-0
+  scene: `present_split=ok` on every `native_long_cycle` line, then
+  `hook_after_real` against `pre_present` and `post_present` says whose the
+  window is; the LONG FRAME line's slowest ticks name what in the hook. Also
+  any flight on a Quest runtime with the default build: check the
+  Application-render GPU invalid count stays near zero and
   `native_frame_end_overlap_summary` reads failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
   4100x4050 and 2665x2087.
+
+## The original review, 2026-09-14
 
 The first implementation wave is tracked in the [submission optimization
 notes](openxr-submit-performance-2026-09-14.md). The review below retains its
@@ -813,3 +830,133 @@ three newer ones run SteamVR OpenXR (`steamvr-openxr-cv`, 90 Hz).
 - Next evidence: the same place on both builds, with SteamVR's own
   frame timing (GPU and CPU per frame) for each, and main's census line
   on the new build.
+
+## 2026-09-29: phase 0 flown, and the instrument for the post-submit window
+
+Flight 07:02:41-07:09:00 local, Frontier install, build
+`v0.18.0-rc.3-94-g8fee57c2` (both logs' version lines):
+`edvr_gfx_20260929_070241.log` and
+`edvr_openxr_20260929_070243_242_48304.log`. Environment: EDVR's native
+OpenXR runtime onto SteamVR/OpenXR (headset key `steamvr-openxr-aapvr`),
+4032x3896 per eye, 90 Hz, native temporal pass on (`treated=66014`; DLSS mode
+not read for this entry). Phase 0 (`src\common\periodic_work.h`, architecture
+review P1) times each job the frame boundary runs on a timer, so the
+`periodic work:` lines can be laid against LONG FRAME lines.
+
+**Phase-0 results** (the gfx log's `periodic work:` lines):
+
+| job | runs | max | note |
+|---|---|---|---|
+| journal_reglob | 97 | 4.284 ms | every run over 2 ms, typically 2.6-2.7; 1,991-1,992 journal files |
+| journal_status | 3,267 | 39.220 ms at 07:08:22.789 | 4 slow: 39.2, 4.3, 4.3, 3.5 |
+| frame_cycle_report | 10 | 2.065 ms | |
+| luma_round | 1,121 | 0.248 ms | |
+| ui_layer_totals | | 1.033 ms | |
+| xinput_probe | | 1.559 ms | |
+| game_exit_probe | | 0.092 ms | |
+| journal_tail | | 0.059 ms | |
+
+The gfx log holds 23 `LONG FRAME` lines (rate-limited; one is the 1,117 ms
+startup frame). The runtime counted 63 long cycles (over twice the 11.1 ms
+period) and logged 54 (`native_long_cycle_summary,count=63,logged=54`; its
+four-a-second limit withheld 9). Two of the 54 coincide with a job:
+07:08:22.791, cycle 46.2 ms (gfx 50.4 ms), is the Status.json read;
+07:05:15.827, cycle 22.7 ms (gfx 26.4 ms), has a journal re-glob 3 ms away (a
+2.6 ms job cannot make 11.6 ms of excess by itself). No other long cycle is
+within 60 ms of a re-glob beat or of a slow Status read.
+
+- ruled out: EDVR's periodic render-thread jobs as the main cause of long frames, because only 2 of 54 native long cycles coincide with one (Status.json 39.2 ms at 07:08:22.79; journal re-glob at 07:05:15.83)
+
+**Where the long cycles' time is.** The largest phase of 47 of the 54 logged
+long cycles is `post_second_submit_to_next_wait` (`next_wait_roundtrip` 4,
+`game_before_first_submit` 3). That window runs from Elite's second Submit
+returning to its next WaitGetPoses, and holds Elite's Present, which d3d11.dll
+hooks: `hookedPresent` calls the real Present, then the frame boundary (about
+sixty timed calls: hotkeys, the journal poll, the menu, the vScreen boundary,
+the config poll), then the runtime's render callback.
+
+The same runtime log's own post-submit windows (`native_post_submit_phase`,
+12 windows of 30 s, 30,737 cycles, every one a single valid Present) already
+bound EDVR's share from above. Window maxima in ms, read with
+`tools\edvr_log.py --grep`; each column is that phase's own maximum, so the
+rows of one window need not be one cycle:
+
+| window (local, end) | post-submit gap | Submit to Present, outside the hook | Present to next Wait, outside the hook | EDVR hook, after the real Present |
+|---|---|---|---|---|
+| 1 (07:03:03) | 440.2 | 44.3 | 439.8 | 2.5 |
+| 2 (07:03:33) | 49.7 | 47.3 | 10.9 | 3.8 |
+| 3 (07:04:03) | 421.5 | 420.7 | 17.7 | 3.2 |
+| 4 (07:04:33) | 140.5 | 40.3 | 140.4 | 2.6 |
+| 5 (07:05:03) | 82.6 | 6.5 | 82.2 | 2.7 |
+| 6 (07:05:33) | 19.0 | 1.4 | 18.8 | 2.7 |
+| 7 (07:06:03) | 70.2 | 1.7 | 69.8 | 2.7 |
+| 8 (07:06:33) | 12.1 | 3.6 | 8.3 | 2.8 |
+| 9 (07:07:03) | 8.1 | 0.9 | 7.8 | 2.8 |
+| 10 (07:07:33) | 70.1 | 0.6 | 69.8 | 4.4 |
+| 11 (07:08:03) | 7.6 | 0.6 | 7.4 | 2.9 |
+| 12 (07:08:33) | 41.9 | 0.6 | 8.0 | 39.4 |
+
+In every window EDVR's hook before the real Present was at most 0.19 ms, the
+render callback at most 0.12 ms and the driver's Present at most 0.86 ms. In
+windows 1 to 11 the gap's maximum is time outside the hook, after the Present
+(1, 4 to 7, 9 to 11), before it (2, 3) or both (8), and EDVR's hook stays at
+4.4 ms or less. Most hook maxima are the journal re-glob plus the ordinary
+boundary (2.5 to 2.9 ms in windows 1, 4 to 9 and 11, against runs of 2.3 to
+2.8 ms, one every 4 s); windows 2 and 3 (3.8, 3.2) sit above that and are not
+attributed; window 10's 4.4 ms fits the 4.326 ms Status read at 07:07:20.289,
+and window 12's 39.4 ms the 39.220 ms read at 07:08:22.789. So the hook is the
+largest part of the gap in one window of 12.
+
+This is a bound by window. It cannot say what the hook cost in each of the 54
+cycles, or name a tick inside it. And "outside the hook" is everything on the
+render thread that is not the Present hook: Elite's own code, and EDVR's other
+hooks in the D3D11 calls Elite makes (the draw hooks' own cost is sampled one
+frame in 16; the other hooks' is not timed).
+
+**The instrument (built, gates green, not flown).**
+
+- `native_long_cycle` cuts `post_second_submit_to_next_wait` at Elite's
+  Present, per cycle, from the Present trace the runtime already reads
+  (`edvrReadNativePresentTrace`, five marks per Present): `pre_present`
+  (second Submit return to hook entry), `present_hook` (entry to exit),
+  `post_present` (exit to next WaitGetPoses entry), and the hook in four:
+  `hook_before_real`, `hook_real_present`, `hook_after_real` (the frame
+  boundary and the rest of EDVR's work), `hook_render_callback`. The three sum
+  to the phase. `present_split=ok`, or the trace's rejection reason
+  (`provider_missing`, `partial_present`, `multiple_present`, ...) with none of
+  the numbers, follows the phase. Every existing field keeps its name.
+- No interface change. The trace is versioned and size-checked
+  (`EDVR_NATIVE_PRESENT_TRACE_VERSION_1`, 928 bytes), so halves built from
+  different commits fall back as they always did, and an absent or mismatched
+  provider reads as `present_split=provider_missing` or `provider_version`.
+  The render-boundary callback carries no timing.
+- The gfx LONG FRAME line (native, and the non-native branch used when no EDVR
+  runtime is loaded) gains
+  `EDVR in this frame: X ms in the Present hook (frame boundary Y ms), Z ms in
+  the real Present, draw hooks ~D ms (sampled this frame | held from an earlier
+  sampled frame), W ms outside the hook; slowest EDVR ticks: name=ms, ...;`.
+  `src\d3d11\frame_ticks.h` keeps one chain of clock reads across
+  `hookedPresent`, the boundary and `vScreenFrameBoundary` (about 60 named
+  marks a frame, 17 ns each here). It is cut at the monitor's frame edge, so
+  the ticks, the real Present and the rest add up to the frame with nothing
+  left over; the three slowest ticks are kept per frame, the real Present
+  excluded.
+- **Correction.** The native line printed no boundary figure, and the
+  non-native branch printed `cpuBoundaryMs`, which could only read 0.00:
+  `perfMonitorNoteCpu(kCpuBoundary)` writes it at the end of the Present hook,
+  after `perfMonitorFrame` (inside the boundary) has already written the line.
+  The 2026-09-21 forensics in `docs\engine-render-performance-2026-09-19.md`
+  ("EDVR boundary/hook costs ~0.00 ms") read that field, so that reading is
+  void.
+- Rigs: `native_perf_history_test` (the chain, the partition, the top three,
+  odd clocks, the text and its worst-case length against the log's line limit)
+  and `openxr_native_test`'s frame-cycle cases (the split by hand, every
+  rejection reason, the exact line).
+
+**Next flight.** Same scene as phase 0, five minutes steady, on this build.
+Read `native_long_cycle`: `present_split=ok` everywhere, then which of
+`pre_present`, `hook_after_real` and `post_present` is the largest. If it is
+`hook_after_real` in more than a few, the LONG FRAME lines' slowest ticks name
+what; the 5 s gate on those lines will hide some, and an un-gated slow-tick
+line is the next step if it does. If it is `pre_present` or `post_present`, the
+window is Elite's and this arc moves off EDVR's hook.
