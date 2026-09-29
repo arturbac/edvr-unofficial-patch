@@ -154,6 +154,13 @@ bool temporalPassRegistration(char* buf, size_t n, char* buf2, size_t n2, char* 
 bool temporalPassDlaaTotals(uint32_t* frames, double* avgMs, double* maxMs,
                             uint32_t* resets);
 
+// The UI resolve's full-frame dispatches this session, and how many of them
+// lacked each input it can go without (a dispatch lacking two counts once in
+// each): lacked[0] the coverage mask, [1] the source-edit mask, [2] the
+// history. A lacked input is skipped, not read as zeros from a null view
+// (ui_resolve.h). False until one has run.
+bool temporalPassUiResolveTotals(uint64_t* dispatches, uint64_t lacked[3]);
+
 // The trained totals of whichever engine fix.temporal_aa names RIGHT NOW,
 // with the word a display should print for it ("NVIDIA", or "fsr 3.1.2"),
 // and whether that engine is AMD's -- the per-role figures below are

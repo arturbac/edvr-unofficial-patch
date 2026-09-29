@@ -6223,6 +6223,22 @@ void vScreenFrameBoundary() {
                     frames, resets, avgMs, maxMs);
             }
         }
+        // The UI resolve's, the same way: how often it went without an input
+        // it can go without, which it then skips rather than fetches as zeros
+        // (ui_resolve.h; the census's UI resolve price is what that buys).
+        {
+            static uint64_t lastResolveDispatches = 0;
+            uint64_t dispatches = 0, lacked[3] = {};
+            if (temporalPassUiResolveTotals(&dispatches, lacked) && dispatches != lastResolveDispatches) {
+                lastResolveDispatches = dispatches;
+                Log::get().note(
+                    "UI resolve totals: %llu dispatches this session; without the "
+                    "coverage mask %llu, without the source-edit mask %llu, without "
+                    "history %llu (each skipped, not read as zeros from a null view).",
+                    static_cast<unsigned long long>(dispatches), static_cast<unsigned long long>(lacked[0]),
+                    static_cast<unsigned long long>(lacked[1]), static_cast<unsigned long long>(lacked[2]));
+            }
+        }
         // The sharpening's, the same way.
         {
             static uint32_t lastSharpenTreats = 0;

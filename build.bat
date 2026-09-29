@@ -1223,6 +1223,24 @@ if errorlevel 1 ( echo [edvr] ERROR: ui_depth_test build failed & exit /b 1 )
 )
 exit /b 0
 
+:rig_ui_holo_pass_test
+echo [edvr] === UI and hologram pass output-identity rig ===
+REM WARP, the production UI resolve bytecode from %GEN%, away from build\d3d11.dll
+REM (the rig links d3d11.lib). Goldens were recorded from the unmodified shaders.
+if not exist "%OBJ%\uiholopass" mkdir "%OBJ%\uiholopass"
+cl.exe /I"%GEN%" /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 /wd4702 ^
+    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\uiholopass\\" /Fe"%OBJ%\uiholopass\ui_holo_pass_test.exe" ^
+    "tools\ui_holo_pass_test\ui_holo_pass_test.cpp" ^
+    /link /INCREMENTAL:NO /OPT:REF d3d11.lib d3dcompiler.lib dxgi.lib
+if errorlevel 1 ( echo [edvr] ERROR: ui_holo_pass_test build failed & exit /b 1 )
+"%OBJ%\uiholopass\ui_holo_pass_test.exe" --dry-run || exit /b 1
+"%OBJ%\uiholopass\ui_holo_pass_test.exe" --self-test || (
+    echo [edvr] ERROR: the UI and hologram passes no longer match their recorded output
+    exit /b 1
+)
+exit /b 0
+
 :rig_luma_probe_test
 echo [edvr] === compact luminance diagnostic regression ===
 if not exist "%OBJ%\lumaprobetest" mkdir "%OBJ%\lumaprobetest"
