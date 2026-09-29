@@ -2,11 +2,8 @@
 
 ## Status
 
-- **State: camera_view retired 2026-09-29 (code removed, 0fe90f09).**
-  `camera_view.cpp` and `camera_view.h`, cited below as the reader of
-  external-camera mode and as the camera settings probe, are deleted. They read
-  the game's camera-settings records for Explorer Cam's preset count, a read
-  that had been off since build 332753. The code is at `0fe90f09^`.
+- **Retired 2026-09-29 (0fe90f09):** `camera_view.cpp/.h`, cited below as
+  the external-camera reader and settings probe, are deleted (`0fe90f09^`).
 - State: the C2 math and policy checks are established and green in the
   build pool (derive reducer, WARP raster/ray/lighting proofs, coexistence
   ownership lifecycle). Pinning the reprojection convention needs the
@@ -60,10 +57,9 @@
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable/build
   identities, backend versions, dimensions, formats and mod chain for
   qualification.
-- This document extends the [flat AA
-  design](design-flat-temporal-aa-2026-09-23.md) and [architecture
-  review](review-flat-temporal-aa-2026-09-26.md). Its camera milestones below
-  supplement, rather than renumber, their existing gates.
+- Extends the [flat AA design](design-flat-temporal-aa-2026-09-23.md) and
+  [architecture review](review-flat-temporal-aa-2026-09-26.md); the camera
+  milestones below supplement, rather than renumber, their gates.
 
 ## 1. Problem and acceptance requirements
 
