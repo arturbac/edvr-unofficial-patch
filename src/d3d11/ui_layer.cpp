@@ -1001,6 +1001,10 @@ bool dsReproducible(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv, uint3
     return true;
 }
 
+// The bytes one pixel of a depth-stencil target takes in the formats the game uses: what the creation line and
+// the GPU census (which says which size its seed figure was measured at) report the target's memory from.
+uint32_t dsBytesPerPixel(DXGI_FORMAT f) { return f == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ? 8u : 4u; }
+
 // The layer's depth-stencil target, seeded from the game's own at the
 // layer's size with this frame's jitter cancelled: the Seeder maps a layer
 // pixel p to the game pixel floor(p * game / layer + jitter), which is the
@@ -1087,7 +1091,7 @@ bool seedLayerDepth(ID3D11DeviceContext* ctx, Eye& e, LayerDs& l, int eye, uint3
         l.w = outW;
         l.h = outH;
         l.viewFmt = vd.Format;
-        const uint32_t bpp = vd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT ? 8u : 4u;
+        const uint32_t bpp = dsBytesPerPixel(vd.Format);
         Log::get().note("ui quality: layer: %s eye's depth-stencil target created at %ux%u (%s, "
                         "%.1f MB; with the copy of the game's it reads, %.1f MB) -- %s tests "
                         "the game's depth or stencil.",
@@ -1097,6 +1101,12 @@ bool seedLayerDepth(ID3D11DeviceContext* ctx, Eye& e, LayerDs& l, int eye, uint3
                                   uiLayerBytes(td.Width, td.Height, bpp)),
                         who);
     }
+    // The GPU census's section for the HDR HUD layer's seed (issue #38): every seed counted, a few timed on the
+    // section's turn, the target's size noted. The 8-bit layer's seed is counted nowhere, so the section holds one
+    // layer's seeds and the line's figure is that layer's. RAII, so the failed-recording exit below closes it too.
+    // Wrap it around the route interval, not inside it: the census times the call site, the route times its own.
+    GpuCensusSeedScope census(ctx, stage == UiRouteStage::kHdrSeed,
+                              {outW, outH, dsBytesPerPixel(vd.Format), td.Width, td.Height, viewName(vd.Format)});
     // The seed's price (review P3-4): the copy and the Seeder's passes, one
     // interval of this eye-frame's route.
     const int timer = routeBegin(ctx, stage, eye, g_draw.seq);

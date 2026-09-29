@@ -20,6 +20,8 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -91,6 +93,13 @@ ComPtr<ID3D11Texture2D> makeTarget(ID3D11Device* dev, ComPtr<ID3D11RenderTargetV
 
 namespace edvr {
 namespace {
+
+// What the HDR HUD seed's target is at Sean's two UI qualities on his headset (his log: the layer's depth-stencil is
+// 5040x4870 at 125 and 4032x3896 at 100, D32S8 both, 8 bytes a pixel). The game's own depth-stencil is one size in
+// both, since only the layer's follows the key.
+const GpuCensusSeedTarget kSeedAt125 = {5040, 4870, 8, 3024, 2922, "D32_FLOAT_S8X24_UINT"};
+const GpuCensusSeedTarget kSeedAt100 = {4032, 3896, 8, 3024, 2922, "D32_FLOAT_S8X24_UINT"};
+constexpr const char* kSeedDetailPrefix = "EDVR GPU census, the HDR HUD depth-stencil seed above";
 
 // ---- 1: the estimator math, as a pure function -------------------------
 void estimatorMathCases() {
@@ -247,6 +256,47 @@ void rotationAndRealTimerCase(Device& d) {
     check(st.nullSampler.totals.samples == 1,
           "calibration: exactly one null pair completed -- the turn's first timed call only, not all four");
     check(st.nullSampler.totals.invalid == 0, "calibration: no invalid/disjoint result on the null pair either");
+
+    // ---- the HDR HUD seed's scope (gpu_census.h), with a real timer: a sample lands in the seed's own section ----
+    // Drain the door section's four first: outside a native frame span each pending interval holds one of the
+    // disjoint clock's eight records, and the seed's own three (its null pair and two seeds) must not find them gone.
+    {
+        const uint64_t drainBy = GetTickCount64() + 1500;
+        while ((st.sampler.totals.samples < 4 || st.nullSampler.totals.samples < 1) && GetTickCount64() < drainBy) {
+            gpuCensusFrame(d.ctx.Get());
+            Sleep(1);
+        }
+        check(st.sampler.totals.samples == 4, "WARP round trip: the door section's four samples all completed before the seed's are taken");
+        SectionState& seed = g_section[static_cast<size_t>(GpuCensusSection::FrameUiLayerHdrSeed)];
+        g_activeSection = static_cast<int>(GpuCensusSection::FrameUiLayerHdrSeed);
+        g_activeCalls = g_activeTimed = 0;
+        g_activeStride = 1;
+        g_activeOffset = 0;
+        g_activeNullDone = false;
+        for (int eye = 0; eye < 2; ++eye) {   // one seed an eye
+            GpuCensusSeedScope hdr(d.ctx.Get(), true, kSeedAt125);
+            d.ctx->ClearRenderTargetView(rtv.Get(), colour);   // stands in for the copy and the Seeder's passes
+        }
+        {
+            GpuCensusSeedScope ldr(d.ctx.Get(), false, kSeedAt100);   // the 8-bit layer's seed: no section, no timer
+            d.ctx->ClearRenderTargetView(rtv.Get(), colour);
+        }
+        check(seed.occurrences == 2 && g_activeTimed == 2 && g_seedNotes == 2 && !g_seedMixed,
+              "seed scope: two HDR HUD seeds on the section's turn are counted, noted and timed; the 8-bit layer's seed is none of these");
+        d.ctx->Flush();
+        const uint64_t seedDeadline = GetTickCount64() + 1500;
+        while ((seed.sampler.totals.samples < 2 || seed.nullSampler.totals.samples < 1) && GetTickCount64() < seedDeadline) {
+            gpuCensusFrame(d.ctx.Get());
+            if (seed.sampler.totals.samples < 2 || seed.nullSampler.totals.samples < 1) Sleep(1);
+        }
+        check(seed.sampler.totals.samples == 2 && seed.sampler.totals.invalid == 0,
+              "WARP round trip: the two seeds' real Begin/Clear/End pairs completed in the seed's own section");
+        check(seed.nullSampler.totals.samples == 1 && seed.nullPairsTaken == 1,
+              "WARP round trip: the seed's turn took one empty pair, for its own calibration");
+        check(g_section[static_cast<size_t>(GpuCensusSection::FramePlanet)].sampler.totals.samples == 0 &&
+                  g_section[static_cast<size_t>(GpuCensusSection::FrameUiLayerReissues)].sampler.totals.samples == 0,
+              "WARP round trip: no other in-frame section took a sample from the seed's turn");
+    }
 
     // ---- Elite's altered draws (gpu_census.h): the scope counts and times only a classed draw ----
     check(occurrenceCapFor(GpuCensusSection::AlteredPoolFamily) == 8 && !isDoorSection(GpuCensusSection::AlteredFixFirst) &&
@@ -415,6 +465,7 @@ void freshWindow(uint64_t start) {
     g_gap = GpuFrameGap{};
     g_lines.clear();
     g_lastLog.clear();
+    resetSeedNotes();
 }
 const std::string* lineWith(const char* prefix) {
     for (const auto& l : g_lines)
@@ -666,8 +717,8 @@ void alteredFixCases() {
         ++cycle;
         onlyOwners = onlyOwners && turnOwnerOf(static_cast<GpuCensusSection>(at)) == static_cast<GpuCensusSection>(at);
     } while (at != 0 && cycle < 200);
-    check(onlyOwners && cycle == static_cast<unsigned>(kSections) - kAlteredFixCount + 1,
-          "turns: the rotation lands only on turn owners, and a cycle is one turn for each section but the later fix ones (21, as before the split)");
+    check(onlyOwners && cycle == static_cast<unsigned>(kSections) - kAlteredFixCount + 1 && cycle == 22,
+          "turns: the rotation lands only on turn owners, and a cycle is one turn for each section but the later fix ones (22: the 21 there were before the seed section, and its own)");
     for (auto& s : g_section) s = SectionState{};
     g_section[kAlteredFixFirst + 2].occurrences = 7;
     g_section[kAlteredFixFirst + 11].occurrences = 5;
@@ -785,6 +836,274 @@ void alteredFixCases() {
           "fix line: a wrapped draw whose fix has no name shows as the unnamed row, never in another fix's");
 }
 
+// ---- 8: the HDR HUD depth-stencil seed: its section, its item and line, its scope, and the call site that holds it ----
+SectionState& seedSection() { return g_section[static_cast<size_t>(GpuCensusSection::FrameUiLayerHdrSeed)]; }
+// The seed's section as a window would leave it: `occurrences` seeds, `samples` of them timed for `ms` in all.
+void seedRan(unsigned occurrences, double ms, unsigned samples) {
+    SectionState& s = seedSection();
+    s.occurrences = occurrences;
+    s.sampler.totals.ms = ms;
+    s.sampler.totals.samples = samples;
+}
+int indexOfLine(const char* prefix) {
+    for (size_t i = 0; i < g_lines.size(); ++i)
+        if (g_lines[i].rfind(prefix, 0) == 0) return static_cast<int>(i);
+    return -1;
+}
+
+void seedTableCases() {
+    constexpr GpuCensusSection seed = GpuCensusSection::FrameUiLayerHdrSeed;
+    check(!isDoorSection(seed) && occurrenceCapFor(seed) == 8 && turnOwnerOf(seed) == seed,
+          "seed section: an in-frame section like the others: per draw, K = 8, a turn of its own in the rotation");
+    check(static_cast<size_t>(seed) == kDoorSections + 8 && static_cast<size_t>(seed) + 1 == kAlteredFirst &&
+              seed > GpuCensusSection::FrameUiLayerReissues && seed < GpuCensusSection::AlteredPoolFamily,
+          "seed section: the ninth and last in-frame section, so the altered-draw sections still follow the in-frame ones");
+    bool filled = true, distinct = true;
+    for (size_t i = 0; i < kFrameSections; ++i) {
+        filled = filled && kFrameBreakdownNames[i] && kFrameBreakdownNames[i][0];
+        for (size_t j = i + 1; j < kFrameSections; ++j)
+            distinct = distinct && std::strcmp(kFrameBreakdownNames[i], kFrameBreakdownNames[j]) != 0;
+    }
+    check(kFrameSections == 9 && filled && distinct &&
+              std::strcmp(kFrameBreakdownNames[kFrameSections - 1], "HDR HUD depth-stencil seed") == 0,
+          "seed section: nine in-frame items, none alike, the ninth named what the UI layer's own line calls the stage");
+}
+
+void seedLineCases() {
+    const uint64_t start = GetTickCount64() - 30000;
+
+    // The seed ran: 700 seeds in 200 frames (3.50 a frame), 96 timed for 24 ms in all (0.25 each), the turn's empty
+    // pair 0.05 ms. Beside it the planet reissue, 0.200 ms/frame, so the in-frame total must be the two together.
+    freshWindow(start);
+    seedRan(700, 24.0, 96);
+    seedSection().nullSampler.totals.ms = 0.10;
+    seedSection().nullSampler.totals.samples = 2;
+    auto& planet = g_section[static_cast<size_t>(GpuCensusSection::FramePlanet)];
+    planet.occurrences = 20;
+    planet.sampler.totals.ms = 4.0;
+    planet.sampler.totals.samples = 2;
+    gpuCensusNoteSeedTarget(kSeedAt125);
+    gpuCensusNoteSeedTarget(kSeedAt125);   // every seed reports: the same target twice is one target
+    logAndResetWindow(start + 30000);
+    check(g_lastLog.find("UI layer reissues -, HDR HUD depth-stencil seed 0.700 (3.50/frame)") != std::string::npos,
+          "seed line: the seed is the last in-frame item, (0.25 - 0.05) ms x 3.50 a frame = 0.700, with its seeds a frame");
+    check(g_lastLog.find("in-frame 0.900 (") != std::string::npos && g_lastLog.find("EDVR ~0.900 ms/frame = door 0.000 (") != std::string::npos,
+          "seed line: the seed is IN EDVR's in-frame total and in EDVR's total (0.700 + the planet's 0.200), not beside them");
+    const int mainAt = indexOfLine("EDVR GPU census:");
+    check(mainAt >= 0 && indexOfLine(kSeedDetailPrefix) == mainAt + 1,
+          "seed line: its detail line follows the main line at once, before the altered draws' lines");
+    const std::string* detail = lineWith(kSeedDetailPrefix);
+    check(detail != nullptr &&
+              detail->find(": 3.50 seeds a frame, 0.200 ms a seed (96 timed); target 5040x4870 D32_FLOAT_S8X24_UINT (196.4 MB), "
+                           "seeded from the game's 3024x2922.") != std::string::npos,
+          "seed line: the detail line says what it timed: seeds a frame, ms a seed, timed count, the layer's target and its memory, the game's size");
+    check(detail && detail->find("changed inside") == std::string::npos,
+          "seed line: two identical reports are one target, not a change");
+    check(g_seedNotes == 0 && !g_seedMixed && g_seedFirst.layerW == 0,
+          "seed line: the window's reports are cleared with the window");
+
+    // NEGATIVE CONTROL: the seed never ran (the layer off, or no HUD draw that tests the game's depth). '-' on its
+    // item, nothing of it in the total, no line of its own -- and nothing left over from the window before.
+    freshWindow(start);
+    planet.occurrences = 20;
+    planet.sampler.totals.ms = 4.0;
+    planet.sampler.totals.samples = 2;
+    logAndResetWindow(start + 30000);
+    check(g_lastLog.find("UI layer reissues -, HDR HUD depth-stencil seed -") != std::string::npos &&
+              g_lastLog.find("in-frame 0.200 (") != std::string::npos,
+          "seed line (never ran): the item is '-', not 0.000, and the in-frame total is the planet's alone");
+    check(lineWith(kSeedDetailPrefix) == nullptr && g_lastLog.find("seed 0.") == std::string::npos,
+          "seed line (never ran): no detail line, so '-' cannot be read as a measurement");
+    freshWindow(start);
+    seedRan(700, 24.0, 96);
+    gpuCensusNoteSeedTarget(kSeedAt125);
+    logAndResetWindow(start + 30000);
+    g_lines.clear();
+    g_lastLog.clear();
+    g_windowFrames = 200;
+    g_windowStartMs = start;
+    logAndResetWindow(start + 30000);   // the next window: no seed
+    check(lineWith(kSeedDetailPrefix) == nullptr && g_lastLog.find("HDR HUD depth-stencil seed -") != std::string::npos,
+          "seed line (never ran): the window after a window with seeds shows '-' and no stale target");
+
+    // The seeds ran and reported no target: the line says so, never a target that was not reported.
+    freshWindow(start);
+    seedRan(20, 0.4, 2);
+    logAndResetWindow(start + 30000);
+    detail = lineWith(kSeedDetailPrefix);
+    check(detail && detail->find(": 0.10 seeds a frame, 0.200 ms a seed (2 timed); the seeds reported no target.") != std::string::npos &&
+              g_lastLog.find("HDR HUD depth-stencil seed 0.020 (0.10/frame)") != std::string::npos,
+          "seed line (no target reported): the item is a measurement and the line says the seeds reported no target");
+
+    // Seeds counted, none timed (the section's turn came when the timer was busy): 0.000 with its count, and the line says so.
+    freshWindow(start);
+    seedRan(20, 0.0, 0);
+    gpuCensusNoteSeedTarget(kSeedAt100);
+    logAndResetWindow(start + 30000);
+    detail = lineWith(kSeedDetailPrefix);
+    check(g_lastLog.find("HDR HUD depth-stencil seed 0.000 (0.10/frame)") != std::string::npos && detail &&
+              detail->find(": 0.10 seeds a frame, no seed timed this window; target 4032x3896 D32_FLOAT_S8X24_UINT (125.7 MB), "
+                           "seeded from the game's 3024x2922.") != std::string::npos,
+          "seed line (none timed): 0.000 is said to be no timed seed, and UI 100's smaller target reads 125.7 MB");
+
+    // A window the UI quality changed inside: 125 then 100 then 125 again. Both targets are named, in the order seen,
+    // so a figure that mixes two sizes cannot pass for one.
+    freshWindow(start);
+    seedRan(700, 24.0, 96);
+    gpuCensusNoteSeedTarget(kSeedAt125);
+    gpuCensusNoteSeedTarget(kSeedAt100);
+    gpuCensusNoteSeedTarget(kSeedAt125);
+    logAndResetWindow(start + 30000);
+    detail = lineWith(kSeedDetailPrefix);
+    check(detail &&
+              detail->find("the target changed inside this window, so the figure mixes them: first 5040x4870 D32_FLOAT_S8X24_UINT "
+                           "(196.4 MB), seeded from the game's 3024x2922; then 4032x3896 D32_FLOAT_S8X24_UINT (125.7 MB), "
+                           "seeded from the game's 3024x2922.") != std::string::npos,
+          "seed line (mixed): a window with two targets names both, first and then, and says the figure mixes them");
+    // A target with no format name is told as such, not dereferenced.
+    freshWindow(start);
+    seedRan(20, 0.4, 2);
+    gpuCensusNoteSeedTarget({640, 480, 4, 320, 240, nullptr});
+    logAndResetWindow(start + 30000);
+    detail = lineWith(kSeedDetailPrefix);
+    check(detail && detail->find("target 640x480 unknown format (1.2 MB), seeded from the game's 320x240.") != std::string::npos,
+          "seed line: a report with no format name reads 'unknown format'");
+}
+
+// The scope, on a null context: the counting, the noting and the turn's selection are under test, not a timer.
+// (The real timer is in rotationAndRealTimerCase, on WARP.)
+void seedScopeCases() {
+    for (auto& s : g_section) s = SectionState{};
+    resetSeedNotes();
+    g_windowStartMs = GetTickCount64();   // no window closes here
+    const auto occurrencesEverywhere = [] {
+        uint64_t total = 0;
+        for (const auto& s : g_section) total += s.occurrences;
+        return total;
+    };
+    g_activeSection = static_cast<int>(GpuCensusSection::FrameUiLayerHdrSeed);
+    g_activeCalls = g_activeTimed = 0;
+    g_activeStride = 1;
+    g_activeOffset = 0;
+    g_activeNullDone = false;
+    { GpuCensusSeedScope hdr(nullptr, true, kSeedAt125); }
+    check(seedSection().occurrences == 1 && g_seedNotes == 1 && g_activeTimed == 1 && g_activeCalls == 1,
+          "seed scope: an HDR HUD seed on the section's turn is counted, noted, and selected for timing");
+    // NEGATIVE CONTROL: the 8-bit layer's seed. Counted nowhere, noted nowhere, and it takes nothing of the turn.
+    { GpuCensusSeedScope ldr(nullptr, false, kSeedAt100); }
+    check(occurrencesEverywhere() == 1 && g_seedNotes == 1 && !g_seedMixed && g_activeTimed == 1 && g_activeCalls == 1,
+          "seed scope (8-bit layer): the 8-bit UI layer's seed is counted in no section, reports no target, and takes nothing of the turn");
+    // Another section's turn: counted and noted (the target is a fact about every seed), not timed.
+    g_activeSection = static_cast<int>(GpuCensusSection::FramePlanet);
+    g_activeCalls = g_activeTimed = 0;
+    { GpuCensusSeedScope hdr(nullptr, true, kSeedAt100); }
+    check(seedSection().occurrences == 2 && g_seedNotes == 2 && g_seedMixed && g_activeCalls == 0 && g_activeTimed == 0,
+          "seed scope: on another section's turn a seed is counted and its target noted, never timed, and moves no call counter");
+    check(std::strcmp(g_seedFirst.format, "D32_FLOAT_S8X24_UINT") == 0 && g_seedFirst.layerW == 5040 && g_seedFirst.gameW == 3024 &&
+              g_seedOther.layerW == 4032 && g_seedOther.layerH == 3896,
+          "seed scope: the first target and the first different one are kept as reported");
+    // The K cap: nine seeds in a frame on the section's turn are all counted, eight timed.
+    for (auto& s : g_section) s = SectionState{};
+    resetSeedNotes();
+    g_activeSection = static_cast<int>(GpuCensusSection::FrameUiLayerHdrSeed);
+    g_activeCalls = g_activeTimed = 0;
+    g_activeNullDone = false;
+    for (int i = 0; i < 9; ++i) { GpuCensusSeedScope hdr(nullptr, true, kSeedAt125); }
+    check(seedSection().occurrences == 9 && g_activeTimed == 8 && g_seedNotes == 9,
+          "seed scope: nine seeds in one frame are all counted and noted, and the per-draw cap of eight is the most timed");
+}
+
+// The seed's call site, held by a scan of ui_layer.cpp: the scope is constructed ONCE in seedLayerDepth, before the
+// copy, and its layer argument is exactly the HDR HUD stage. gpu_census.h's scope cannot know which layer a seed is
+// for; this is what stops it counting the 8-bit layer's, or nothing at all, and still passing every case above.
+// Returns the first thing wrong, or nullptr.
+std::string withoutLineComments(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (size_t i = 0; i < text.size();) {
+        if (text.compare(i, 2, "//") == 0) {
+            while (i < text.size() && text[i] != '\n') ++i;
+        } else {
+            out += text[i++];
+        }
+    }
+    return out;
+}
+const char* seedWiringProblem(const std::string& raw) {
+    std::string source;
+    for (const char c : raw) if (c != '\r') source += c;
+    const size_t fn = source.find("bool seedLayerDepth(");
+    if (fn == std::string::npos) return "seedLayerDepth is not in the file";
+    const size_t end = source.find("\n}\n", fn);
+    if (end == std::string::npos) return "seedLayerDepth has no end";
+    const std::string body = withoutLineComments(source.substr(fn, end - fn));
+    const std::string name = "GpuCensusSeedScope";
+    const size_t scope = body.find(name);
+    if (scope == std::string::npos) return "the seed does not construct a GpuCensusSeedScope";
+    if (body.find(name, scope + 1) != std::string::npos) return "the seed constructs more than one GpuCensusSeedScope";
+    const size_t stmtEnd = body.find(';', scope);
+    if (stmtEnd == std::string::npos) return "the scope's statement does not end";
+    const std::string stmt = body.substr(scope, stmtEnd - scope);
+    if (stmt.find("stage == UiRouteStage::kHdrSeed") == std::string::npos)
+        return "the scope's layer argument is not 'stage == UiRouteStage::kHdrSeed'";
+    // The target the line reports is the layer's own: its size, its format's bytes, the game's size and the format's name.
+    if (stmt.find("{outW, outH, dsBytesPerPixel(vd.Format), td.Width, td.Height, viewName(vd.Format)}") == std::string::npos)
+        return "the scope's target is not the layer's size, its format's bytes, the game's size and the format's name";
+    const size_t copy = body.find("vScreenCopyResourceRaw(");
+    const size_t exec = body.find("vScreenExecuteCommandListRaw(");
+    if (copy == std::string::npos || exec == std::string::npos) return "the seed's copy or its execute is not in seedLayerDepth";
+    if (scope > copy || scope > exec) return "the scope is entered after the seed's copy: its GPU time is outside the section";
+    return nullptr;
+}
+
+void seedWiringCases() {
+    std::ifstream in("src/d3d11/ui_layer.cpp", std::ios::binary);
+    check(bool(in), "seed wiring: src/d3d11/ui_layer.cpp opens (this rig runs from the repository root, as build.bat does)");
+    const std::string source((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const char* problem = seedWiringProblem(source);
+    check(problem == nullptr, problem ? problem : "seed wiring");
+
+    const std::string head = "GpuCensusSeedScope census(";
+    const size_t at = source.find(head);
+    check(at != std::string::npos, "seed wiring: the scope is named `census` in ui_layer.cpp, so the mutants below can find it");
+    const size_t stmtEnd = source.find(';', at) + 1;
+    const std::string stmt = source.substr(at, stmtEnd - at);
+    const std::string copyCall = "vScreenCopyResourceRaw(ctx, e.dsCopy.Get(), tex.Get());";
+    // Mutants of the call site, each of which must be caught by ITS rule (the message says which), and each a real edit.
+    struct Mutant { const char* name; std::string text; const char* caughtBy; };
+    std::vector<Mutant> mutants;
+    mutants.push_back({"the scope deleted", source.substr(0, at) + source.substr(stmtEnd), "does not construct"});
+    {
+        std::string wrongStage = stmt;
+        wrongStage.replace(wrongStage.find("kHdrSeed"), 8, "kSeed");
+        mutants.push_back({"the 8-bit layer's stage", source.substr(0, at) + wrongStage + source.substr(stmtEnd), "layer argument"});
+        std::string always = stmt;
+        always.replace(always.find("stage == UiRouteStage::kHdrSeed"), 31, "true");
+        mutants.push_back({"the layer argument always true", source.substr(0, at) + always + source.substr(stmtEnd), "layer argument"});
+        std::string swapped = stmt;
+        swapped.replace(swapped.find("{outW, outH,"), 12, "{outH, outW,");
+        mutants.push_back({"the target's width and height swapped", source.substr(0, at) + swapped + source.substr(stmtEnd), "target is not"});
+    }
+    mutants.push_back({"the scope commented out", source.substr(0, at) + "// " + stmt + source.substr(stmtEnd), "does not construct"});
+    mutants.push_back({"the scope constructed twice", source.substr(0, stmtEnd) + "\n    " + stmt + source.substr(stmtEnd), "more than one"});
+    {
+        std::string moved = source.substr(0, at) + source.substr(stmtEnd);
+        const size_t copyAt = moved.find(copyCall);
+        check(copyAt != std::string::npos, "seed wiring: the copy call is spelled as the scan expects");
+        moved.insert(copyAt + copyCall.size(), "\n    " + stmt);
+        mutants.push_back({"the scope entered after the copy", moved, "after the seed's copy"});
+    }
+    for (const auto& m : mutants) {
+        const char* why = seedWiringProblem(m.text);
+        const std::string edited = std::string("seed wiring mutant is a real edit: ") + m.name;
+        const std::string caught = std::string("seed wiring mutant caught by its own rule: ") + m.name;
+        check(m.text != source, edited.c_str());
+        check(why != nullptr && std::strstr(why, m.caughtBy) != nullptr, caught.c_str());
+    }
+    std::printf("gpu_census_test: the seed's call site held by a scan of ui_layer.cpp; %zu mutants of it, each caught by its own rule\n",
+                mutants.size());
+}
+
 // Every census line at its worst stays under what the log keeps (about 1166 characters of message).
 void lineLengths() {
     const uint64_t start = GetTickCount64() - 30000;
@@ -794,6 +1113,10 @@ void lineLengths() {
         s.sampler.totals.ms = 1.0;         // 1 ms a call: 9999.990 ms/frame, four digits before the point
         s.sampler.totals.samples = 1;
     }
+    // The seed's detail line at its widest: two different targets (so it names both) at the largest numbers and the
+    // longest format name the note keeps.
+    gpuCensusNoteSeedTarget({4294967295u, 4294967295u, 4294967295u, 4294967295u, 4294967295u, "1234567890123456789012345678901"});
+    gpuCensusNoteSeedTarget({4294967294u, 4294967294u, 4294967294u, 4294967294u, 4294967294u, "1234567890123456789012345678901"});
     g_windowFrames = 100;
     for (unsigned i = 0; i < 4000; ++i) g_p50Samples[i] = 99999.0;
     g_p50Count = 4000;
@@ -810,6 +1133,13 @@ void lineLengths() {
         std::printf("gpu_census_test: at their worst the classes' line is %zu characters and the fixes' line %zu\n", classes->size(), byFix->size());
         check(byFix->size() < 1100 && byFix->size() > 700, "lines: the fixes' line names all nineteen at their widest and still fits");
     }
+    const std::string* seedDetail = lineWith(kSeedDetailPrefix);
+    check(seedDetail != nullptr, "lines: the seed's detail line was written at the worst case");
+    if (seedDetail) {
+        std::printf("gpu_census_test: at its worst the seed's detail line is %zu characters, and the main line %zu\n", seedDetail->size(), g_lastLog.size());
+        check(seedDetail->size() < 900 && seedDetail->find("the target changed inside this window") != std::string::npos,
+              "lines: the seed's detail line at its widest (two targets named) still fits");
+    }
 }
 
 void run() {
@@ -820,6 +1150,10 @@ void run() {
     alteredClassCases();
     alteredLineCases();
     alteredFixCases();
+    seedTableCases();
+    seedLineCases();
+    seedScopeCases();
+    seedWiringCases();
     lineLengths();
     Runtime runtime;
     Device device(runtime);
