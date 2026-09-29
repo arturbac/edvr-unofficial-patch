@@ -24,6 +24,14 @@ const char* kRunningElsewhere =
     "Elite Dangerous is running, but from a different folder -- this install is not the one in "
     "use, so it can be changed.";
 
+// Said when Windows would not list the running programs. A check that could not
+// run is not a check that passed: a game that is running holds every file this
+// installer touches, and a half-replaced install is worse than none.
+const char* kRunStateUnknown =
+    "Could not tell whether Elite Dangerous is running: Windows would not list the running "
+    "programs. Nothing was changed. Close the game and try again; if this keeps happening, "
+    "restart the installer.";
+
 std::string say(const std::wstring& w) { return toUtf8(w); }
 
 std::vector<std::wstring> subdirsOf(const std::wstring& dir) {
@@ -119,6 +127,7 @@ Survey surveyTarget(const GameInstall& game) {
     const GameRunState running = gameRunState(s.game.dir);
     s.gameRunningHere = running == GameRunState::ThisFolder;
     s.gameRunningElsewhere = running == GameRunState::OtherFolder;
+    s.gameRunStateUnknown = running == GameRunState::Unknown;
 
     s.d3d11 = probeDll(joinPath(game.dir, kD3d11));
     for (const std::wstring& name : filesLike(game.dir, L"d3d11_*.dll")) {
@@ -192,6 +201,11 @@ Plan planInstall(const Survey& s, const Options& o, const PayloadInfo& p) {
         plan.problems.push_back(
             "Elite Dangerous is running. Close it first -- Windows will not let anything replace a "
             "file the game has open, and a half-replaced install is worse than none.");
+        return plan;
+    }
+    if (s.gameRunStateUnknown) {
+        plan.blocked = true;
+        plan.problems.push_back(kRunStateUnknown);
         return plan;
     }
     const bool flat = p.profile == "flat";
@@ -760,6 +774,11 @@ Plan planUninstall(const Survey& s, const Options& o) {
     if (s.gameRunningHere) {
         plan.blocked = true;
         plan.problems.push_back("Elite Dangerous is running. Close it first.");
+        return plan;
+    }
+    if (s.gameRunStateUnknown) {
+        plan.blocked = true;
+        plan.problems.push_back(kRunStateUnknown);
         return plan;
     }
     if (s.gameRunningElsewhere) plan.notes.push_back(kRunningElsewhere);

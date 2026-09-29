@@ -19,8 +19,8 @@
 // were real bugs, and the BOM case files every setting in the file under the
 // wrong section while the file still looks fine.
 //
-// Three more (2026-09-29) are about threads and the log, and read the real log
-// file back rather than counting calls:
+// Four more (2026-09-29) are about threads, the log and the file's sharing, and
+// read the real log file back rather than counting calls:
 //
 //   - a reader thread hammering the getters while the main thread rewrites the
 //     ini and reloads it, so a lock that is missing, or held only around the
@@ -28,7 +28,10 @@
 //   - a malformed value is said once per key per successful parse, however
 //     often it is read -- it was said on every read, 90 to 180 lines a second
 //     for a key read each frame;
-//   - getFloat takes the whole value and only a finite one.
+//   - getFloat takes the whole value and only a finite one;
+//   - a reload leaves edvr.ini open to being replaced: the menu saves by
+//     renaming a temp file over it, and a read that did not share DELETE made
+//     that rename fail while the reload had the file open.
 //
 // Usage: config_test.exe <dir containing edvr.ini> [scratch dir]
 #include <windows.h>
@@ -457,6 +460,101 @@ static void raceCase(const std::wstring& scratch) {
     printf("  info  %ld reads raced %d reloads\n", reader.reads.load(), reloads);
 }
 
+// --- a reload leaves the file replaceable (2026-09-29) ------------------------
+//
+// The in-headset menu saves by writing a temp file and renaming it over
+// edvr.ini, and asks for a reload of the result at once. parse() opened the file
+// with FILE_SHARE_READ | FILE_SHARE_WRITE -- no FILE_SHARE_DELETE -- so a rename
+// that landed while a reload had the file open failed with a sharing violation,
+// and the menu showed a failed write for a file nobody else was holding.
+//
+// The read lasts a few tens of microseconds and cannot be paused from outside,
+// so a second thread does to it what the rename does: it opens the file for
+// DELETE, with every share mode, over and over, and counts the refusals that
+// happen wholly inside a reload. It runs only inside a reload, because a probe
+// that ran while the test itself rewrote the file would collide with the test.
+// A correct parse() is never refused. One without FILE_SHARE_DELETE is refused
+// whenever a probe lands while it holds the handle, which over 300 reloads is
+// hundreds of probes; the threshold below is for a scanner that happens to hold
+// the freshly written file for a moment, not for the bug.
+struct ProbeState {
+    std::atomic<bool> stop{false};
+    std::atomic<bool> inReload{false};
+    std::atomic<long> inside{0};   // probes that ran wholly inside a reload
+    std::atomic<long> refused{0};  // ...and were refused with a sharing violation
+    std::atomic<long> other{0};    // ...and failed some other way
+};
+
+static void probeMain(const std::wstring* path, ProbeState* st) {
+    while (!st->stop.load(std::memory_order_relaxed)) {
+        if (!st->inReload.load(std::memory_order_acquire)) {
+            SwitchToThread();
+            continue;
+        }
+        HANDLE h = CreateFileW(path->c_str(), DELETE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const DWORD code = h == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        if (!st->inReload.load(std::memory_order_acquire)) continue;  // it ended mid-probe
+        st->inside.fetch_add(1);
+        if (code == ERROR_SHARING_VIOLATION) st->refused.fetch_add(1);
+        else if (code != ERROR_SUCCESS) st->other.fetch_add(1);
+    }
+}
+
+static void shareDeleteCase(const std::wstring& scratch) {
+    const std::string one = "[share]\r\nk = 1\r\n";
+    const std::string two = "[share]\r\nk = 2\r\n";
+    if (!rewriteIni(scratch, one)) {
+        fail("config share delete", "could not write the scratch ini");
+        return;
+    }
+    Config::get().init(scratch);
+    const std::wstring path = scratch + L"\\edvr.ini";
+
+    ProbeState st;
+    std::thread probe(probeMain, &path, &st);
+
+    int  reloads = 0;
+    int  unparsed = 0;
+    bool writeFailed = false;
+    for (int i = 0; i < 300; ++i) {
+        if (!rewriteIni(scratch, (i & 1) ? one : two)) {
+            writeFailed = true;
+            break;
+        }
+        st.inReload.store(true, std::memory_order_release);
+        const bool parsed = Config::get().reloadIfChanged();
+        st.inReload.store(false, std::memory_order_release);
+        if (!parsed) ++unparsed;
+        ++reloads;
+    }
+    st.stop.store(true);
+    probe.join();
+
+    const long inside = st.inside.load();
+    const long refused = st.refused.load();
+    if (writeFailed) {
+        fail("config share delete", "could not rewrite the scratch ini");
+    } else if (unparsed) {
+        fail("config share delete", std::to_string(unparsed) + " of " + std::to_string(reloads) +
+                                        " reloads found the file unchanged, so they never read it");
+    } else if (inside < 100) {
+        fail("config share delete", "the probe made only " + std::to_string(inside) +
+                                        " attempts inside 300 reloads; too few to say anything");
+    } else if (refused > 10) {
+        fail("config share delete",
+             std::to_string(refused) + " of " + std::to_string(inside) +
+                 " attempts to open the ini for delete were refused while a reload had it open: "
+                 "Config's read does not share DELETE, so a rename over the ini can fail");
+    } else {
+        ok("a reload leaves edvr.ini open to being replaced (FILE_SHARE_DELETE)");
+    }
+    printf("  info  %ld probes inside %d reloads, %ld refused, %ld failed another way\n", inside,
+           reloads, refused, st.other.load());
+}
+
 int main(int argc, char** argv) {
     // Unbuffered, so a crash does not take the output with it: the first run of
     // this test appeared to die before its first printf, which was only the
@@ -829,6 +927,7 @@ int main(int argc, char** argv) {
         floatCases(scratch);
         noteCases(scratch);
         raceCase(scratch);
+        shareDeleteCase(scratch);
     }
 
     // An old/full INI cannot widen a flat installation, even through numeric

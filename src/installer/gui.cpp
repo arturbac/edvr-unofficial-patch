@@ -380,6 +380,15 @@ void rebuildStatus() {
         running.tone = Tone::Muted;
         running.value = L"running from a different folder \x2014 not this install";
         g.status.push_back(running);
+    } else if (s.gameRunStateUnknown) {
+        // The buttons stay live on purpose: a click re-surveys, which may well
+        // succeed the second time, and when it does not the plan says why it
+        // refuses rather than the buttons being greyed with no reason given.
+        StatusRow running;
+        running.label = L"Elite Dangerous";
+        running.tone = Tone::Warn;
+        running.value = L"could not check whether it is running \x2014 nothing will be installed";
+        g.status.push_back(running);
     }
 }
 

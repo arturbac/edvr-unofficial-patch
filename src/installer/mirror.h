@@ -43,14 +43,21 @@ std::wstring mirrorDirFor(const GameInstall& game,
                           const std::wstring& root = defaultMirrorRoot());
 
 // What the mirror currently holds, read back for a restore offer.
+//
+// edvr.ini and edvr-flat.ini are kept as three generations (iniedit.h,
+// writeGenerations): <name> the newest, <name>.1 and <name>.2 the two before it.
+// An install or repair rotates them, so the settings that stood BEFORE it are
+// still there if it wrote defaults over them; a setting changed in the settings
+// window or the in-headset menu replaces the newest in place. `hasIni` and the
+// restore go by the newest generation that exists and is not empty.
 struct MirrorInfo {
     std::wstring dir;
-    bool         hasIni = false;
+    bool         hasIni = false;         // some generation of edvr.ini
     bool         hasFlatIni = false;     // edvr-flat.ini, the flat profile's own settings
     bool         hasBaseIni = false;
     bool         hasState = false;
     bool         hasBackupPair = false;  // at least one of d3d11.dll / openvr_api.dll
-    std::string  savedUtc;               // the mirrored edvr.ini's own last-write time
+    std::string  savedUtc;               // the newest edvr.ini's last-write time: when it was mirrored
 };
 
 MirrorInfo readMirror(const std::wstring& mirrorDir);
@@ -69,21 +76,30 @@ struct MirrorResult {
 // without a trip through the launcher's file verification). Called after
 // every successful install and repair; backupDir is the plan's own backup
 // folder for that run, so this never guesses which stamp was newest.
+//
+// The checkpoint: an ini that differs from the mirror's newest copy is written
+// as the new newest and the copy it replaces is kept as .1 (and .1 as .2, the
+// oldest dropped), the new one landing on disk before anything older moves.
+// An ini identical to the newest changes nothing, so a run that installed
+// nothing does not age the history out. Every file is written through
+// writeFileAtomic: a failure leaves what was there.
 MirrorResult updateMirror(const std::wstring& gameDir, const std::wstring& backupDir,
                           const std::wstring& mirrorDir);
 
 // Snapshots edvr.ini alone. Called after every settings-window change: the
 // install record and the DLL backups do not move there, and re-copying them
 // on every toggle would be needless disk I/O for files that did not change.
+// Replaces the newest generation in place and leaves .1 and .2 alone: a
+// generation per toggle would push the copy worth keeping out in three.
 MirrorResult updateMirrorIni(const std::wstring& gameDir, const std::wstring& mirrorDir);
 
 // Copies the mirror back into a game folder that has no edvr.ini of its own:
-// edvr.ini to its root, edvr.ini.base and state.ini into edvr_install\ (so the
-// next install still merges as an update instead of starting from scratch),
-// and the backup pair into a fresh edvr_backup\restored-<stamp>\ -- exactly
-// where the installer's own scan for a genuine original openvr_api.dll
-// already looks. Returns false only if the one essential part, edvr.ini,
-// could not be restored.
+// the newest edvr.ini to its root, edvr.ini.base and state.ini into
+// edvr_install\ (so the next install still merges as an update instead of
+// starting from scratch), and the backup pair into a fresh
+// edvr_backup\restored-<stamp>\ -- exactly where the installer's own scan for a
+// genuine original openvr_api.dll already looks. Returns false only if the one
+// essential part, edvr.ini, could not be restored.
 bool restoreFromMirror(const std::wstring& gameDir, const MirrorInfo& info,
                        std::vector<std::string>* notes);
 

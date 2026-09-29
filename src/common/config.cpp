@@ -190,7 +190,14 @@ void Config::parse() {
     // The lock is taken once, below, to swap the result in.
     ValueMap parsed;
 
-    HANDLE f = CreateFileW(m_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    // FILE_SHARE_DELETE, so that reading the ini can never be what stops it being
+    // replaced. The in-headset menu and the installer's settings window both save
+    // by writing a temp file and renaming it over edvr.ini, and the menu asks for
+    // a reload straight after -- so the next save can land while this read has the
+    // file open. Without it that rename failed with a sharing violation, and the
+    // menu reported a failed write for a file nobody else was holding.
+    HANDLE f = CreateFileW(m_path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
         // An ini that is genuinely absent means "all defaults", which is only

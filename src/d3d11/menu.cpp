@@ -1113,15 +1113,15 @@ bool readWhole(const std::wstring& path, std::string* out) {
     return ok && got == size;
 }
 
-bool writeWhole(const std::wstring& path, const std::string& text) {
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return false;
-    DWORD wrote = 0;
-    const BOOL ok = text.empty() ||
-                    WriteFile(f, text.data(), static_cast<DWORD>(text.size()), &wrote, nullptr);
-    CloseHandle(f);
-    return ok && wrote == text.size();
+std::string utf8Of(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    const int need = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    if (need <= 0) return std::string();
+    std::string out(static_cast<size_t>(need), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), &out[0], need,
+                        nullptr, nullptr);
+    return out;
 }
 
 std::wstring stampName() {
@@ -1187,6 +1187,7 @@ std::wstring mirrorDir() {
 
 bool g_backedUp = false;
 bool g_mirrorNoted = false;
+bool g_mirrorFailNoted = false;
 
 bool menuIniWrite(const std::string& dotted, const std::string& value, std::string* err) {
     const std::wstring path = Config::get().path();
@@ -1209,31 +1210,39 @@ bool menuIniWrite(const std::string& dotted, const std::string& value, std::stri
     }
     MergeReport report;
     const std::string updated = mergeIni(source, source, &source, {{dotted, value}}, &report);
-    // Atomic: the whole new file beside the old one, then one replace, so
-    // config.cpp's size check never meets half a save.
-    const std::wstring tmp = path + L".menu-tmp";
-    if (!writeWhole(tmp, updated)) {
-        *err = "the temporary file could not be written beside edvr.ini";
-        return false;
-    }
-    if (!MoveFileExW(tmp.c_str(), path.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(tmp.c_str());
-        *err = "edvr.ini could not be replaced (read-only, or held by an editor?)";
+    // Atomic, through the one writer iniedit owns (the whole new file beside the
+    // old one, flushed, then one replace that is tried again while a reader has
+    // the file for a moment), so config.cpp's size check never meets half a save
+    // and a reload that lands between two writes cannot fail the second.
+    std::wstring why;
+    if (!writeFileAtomic(path, updated, &why)) {
+        *err = "edvr.ini: " + utf8Of(why);
         return false;
     }
     // The mirror of last resort, refreshed so an update that wipes the
-    // folder cannot lose an evening's tuning.
+    // folder cannot lose an evening's tuning. A change made just now, not a
+    // checkpoint: it replaces the newest copy in place and leaves the older
+    // generations the installer keeps (edvr.ini.1, edvr.ini.2) alone. Named for
+    // the file actually written, so the flat profile's edvr-flat.ini lands in
+    // the mirror's edvr-flat.ini rather than over the VR profile's edvr.ini.
     const std::wstring mdir = mirrorDir();
     if (!mdir.empty()) {
-        CopyFileW(path.c_str(), (mdir + L"\\edvr.ini").c_str(), FALSE);
-        if (!g_mirrorNoted) {
-            g_mirrorNoted = true;
-            char utf8[MAX_PATH * 3] = {};
-            WideCharToMultiByte(CP_UTF8, 0, mdir.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
-            Log::get().note("menu: each write is mirrored to %s, the installer's copy outside "
-                            "the game folder.",
-                            utf8);
+        const size_t slash = path.find_last_of(L"\\/");
+        const std::wstring leaf = slash == std::wstring::npos ? path : path.substr(slash + 1);
+        std::wstring mirrorWhy;
+        if (writeGenerations(mdir, leaf, updated, false, &mirrorWhy)) {
+            if (!g_mirrorNoted) {
+                g_mirrorNoted = true;
+                Log::get().note("menu: each write is mirrored to %s, the installer's copy outside "
+                                "the game folder.",
+                                utf8Of(mdir).c_str());
+            }
+        } else if (!g_mirrorFailNoted) {
+            // Once: a mirror that cannot be written fails every write the same
+            // way, and the menu never fails a settings change over its safety net.
+            g_mirrorFailNoted = true;
+            Log::get().note("menu: the mirror copy in %s could not be written: %s.",
+                            utf8Of(mdir).c_str(), utf8Of(mirrorWhy).c_str());
         }
     }
     return true;

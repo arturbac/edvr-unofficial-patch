@@ -18,12 +18,16 @@
 //
 // Usage: installer_test.exe <repo root> <scratch dir>
 #include <windows.h>
+#include <tlhelp32.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cwctype>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "../../src/common/iniedit.h"
 #include "../../src/installer/apply.h"
 #include "../../src/installer/plan.h"
 #include "../../src/installer/probe.h"
@@ -812,6 +816,28 @@ static void testPlanner() {
         check(planUninstall(s, options).blocked, "and nothing is taken back out either");
     }
 
+    {   // The process list could not be read. That is not "the game is stopped":
+        // it used to be, and the installer went on into a folder the game may
+        // have had open. Refused, in words of its own -- closing the game does
+        // not cure a check that could not run.
+        Survey s = baseSurvey(dir);
+        s.gameRunStateUnknown = true;
+        const Plan plan = planInstall(s, options, payload);
+        check(plan.blocked && plan.steps.empty(),
+              "nothing is planned when it cannot be told whether the game is running");
+        check(notesMention(plan, "Could not tell whether Elite Dangerous is running"),
+              "and the report says the check failed, not that the game is running");
+        check(!notesMention(plan, "Elite Dangerous is running. Close it first"),
+              "which is a different message from the one for a game that is");
+        const Plan out = planUninstall(s, options);
+        check(out.blocked && out.steps.empty(), "and nothing is taken back out either");
+        check(notesMention(out, "Could not tell whether Elite Dangerous is running"),
+              "with the same words on the way out");
+        Options repair = options;
+        repair.repair = true;
+        check(planInstall(s, repair, payload).blocked, "a repair is refused the same way");
+    }
+
     {   // The game is running out of the OTHER install. A machine with two of
         // them is somebody's actual setup, and a refusal that went by the
         // executable's name alone stopped the folder nobody was playing from.
@@ -1361,6 +1387,396 @@ static void testMirror(const std::wstring& scratch) {
 }
 
 // ---------------------------------------------------------------------------
+// the one writer of a live file (iniedit.h: writeFileAtomic)
+// ---------------------------------------------------------------------------
+
+// The files in `dir`, by leaf name, sorted and comma-joined: what a write left
+// beside its target.
+static std::string listing(const std::wstring& dir) {
+    std::vector<std::string> names;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW(joinPath(dir, L"*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            names.push_back(toUtf8(fd.cFileName));
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::sort(names.begin(), names.end());
+    std::string out;
+    for (const std::string& n : names) {
+        if (!out.empty()) out += ", ";
+        out += n;
+    }
+    return out;
+}
+
+// `path` held open by a handle of this test's own, as a reader would. With
+// `shareDelete` it lets the file be replaced under it -- which is how Config's
+// read opens edvr.ini now; without, it is how that read used to open it, and how
+// an editor holding a file mid-save does.
+static HANDLE holdOpen(const std::wstring& path, bool shareDelete) {
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | (shareDelete ? FILE_SHARE_DELETE : 0);
+    return CreateFileW(path.c_str(), GENERIC_READ, share, nullptr, OPEN_EXISTING,
+                       FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+static void testAtomicWrite(const std::wstring& scratch) {
+    printf("\nwriting a live file whole\n");
+
+    const std::wstring dir = joinPath(scratch, L"atomic");
+    removeTree(dir);
+    makeTree(dir);
+    const std::wstring target = joinPath(dir, L"edvr.ini");
+
+    {   // The plain cases: the bytes given, none of the old ones, nothing left over.
+        std::wstring why;
+        int tries = -1;
+        check(writeFileAtomic(target, "first\r\n", &why, AtomicWriteOptions(), &tries),
+              "a new file is written", toUtf8(why));
+        expectEq(readAll(target), "first\r\n", "with exactly the bytes given");
+        check(tries == 1, "in one replace", std::to_string(tries) + " tries");
+        expectEq(listing(dir), "edvr.ini", "and nothing else is left beside it");
+
+        check(writeFileAtomic(target, "second, and longer than the first\r\n", &why),
+              "an existing file is replaced", toUtf8(why));
+        expectEq(readAll(target), "second, and longer than the first\r\n",
+                 "with the new bytes");
+        check(writeFileAtomic(target, "3\r\n", &why), "a shorter file replaces a longer one",
+              toUtf8(why));
+        expectEq(readAll(target), "3\r\n", "and leaves no tail of the longer one");
+
+        std::string bytes(2500000, 'x');   // past the one-megabyte write chunk
+        for (size_t i = 0; i < bytes.size(); i += 4093) bytes[i] = static_cast<char>('a' + i % 26);
+        check(writeFileAtomic(target, bytes, &why), "a file of several megabytes is written",
+              toUtf8(why));
+        check(readAll(target) == bytes, "and reads back byte for byte");
+
+        check(writeFileAtomic(target, std::string(), &why), "an empty file can be written",
+              toUtf8(why));
+        std::string got = "not empty";
+        check(readFileBytes(target, &got) && got.empty(), "and reads back as empty");
+        expectEq(listing(dir), "edvr.ini", "with nothing left beside it after all of that");
+    }
+
+    {   // The case config.cpp's FILE_SHARE_DELETE exists for: a reader holds the
+        // file, and the replace goes through anyway.
+        writeAll(target, "held open\r\n");
+        HANDLE reader = holdOpen(target, true);
+        check(reader != INVALID_HANDLE_VALUE, "a reader can hold the target open, sharing DELETE");
+        std::wstring why;
+        int tries = 0;
+        const bool wrote =
+            writeFileAtomic(target, "replaced under the reader\r\n", &why, AtomicWriteOptions(), &tries);
+        check(wrote, "the replace succeeds while a reader that shares DELETE holds the file",
+              toUtf8(why));
+        check(tries == 1, "on the first try: no retry was spent", std::to_string(tries) + " tries");
+        expectEq(readAll(target), "replaced under the reader\r\n", "and the path holds the new bytes");
+        if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
+        expectEq(listing(dir), "edvr.ini", "with nothing left beside it");
+    }
+
+    {   // A reader that does NOT share DELETE refuses the replace, for as long as
+        // it holds on. The writer tries again as it was told to, gives up, and
+        // leaves both the original and the folder as it found them.
+        writeAll(target, "original\r\n");
+        HANDLE reader = holdOpen(target, false);
+        check(reader != INVALID_HANDLE_VALUE, "a reader can hold the target open, not sharing DELETE");
+        AtomicWriteOptions quick;
+        quick.retries = 3;
+        quick.backoffMs = 1;
+        std::wstring why;
+        int tries = 0;
+        const bool wrote = writeFileAtomic(target, "never lands\r\n", &why, quick, &tries);
+        check(!wrote, "a replace the reader refuses fails when its retries are spent");
+        check(tries == 4, "after the first try and the three it was allowed",
+              std::to_string(tries) + " tries");
+        check(!why.empty(), "and says why", "no message");
+        printf("  info  the message: %s\n", toUtf8(why).c_str());
+        expectEq(readAll(target), "original\r\n", "the original is exactly as it was");
+        expectEq(listing(dir), "edvr.ini", "and the temporary file is gone");
+        if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
+        check(writeFileAtomic(target, "lands now\r\n", &why),
+              "once the reader lets go, the same write goes through", toUtf8(why));
+        expectEq(readAll(target), "lands now\r\n", "with the new bytes");
+    }
+
+    {   // The default policy is the one that was asked for: five tries after the
+        // first, and it is what a caller who says nothing gets.
+        const AtomicWriteOptions defaults{};
+        check(defaults.retries == 5 && defaults.backoffMs == 20,
+              "the default is five retries, twenty milliseconds apart");
+    }
+
+    {   // A read-only target is somebody's decision, not a transient: it is
+        // refused, the retries are spent on it (access denied is one of the
+        // codes that can pass), and nothing changes.
+        writeAll(target, "protected\r\n");
+        SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_READONLY);
+        AtomicWriteOptions quick;
+        quick.retries = 2;
+        quick.backoffMs = 1;
+        std::wstring why;
+        int tries = 0;
+        const bool wrote = writeFileAtomic(target, "overwritten\r\n", &why, quick, &tries);
+        check(!wrote, "a read-only file is not replaced");
+        check(tries == 3, "the retries were spent on it", std::to_string(tries) + " tries");
+        expectEq(readAll(target), "protected\r\n", "the file is untouched");
+        expectEq(listing(dir), "edvr.ini", "and no temporary file is left");
+        SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
+    }
+
+    {   // A reader that lets go while the retries are running: the write lands.
+        writeAll(target, "before\r\n");
+        HANDLE reader = holdOpen(target, false);
+        std::thread letGo([reader] {
+            Sleep(60);
+            if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
+        });
+        AtomicWriteOptions patient;
+        patient.retries = 200;   // up to a second: this is not about the default policy
+        patient.backoffMs = 5;
+        std::wstring why;
+        int tries = 0;
+        const bool wrote = writeFileAtomic(target, "after\r\n", &why, patient, &tries);
+        letGo.join();
+        check(wrote, "a reader that lets go while the retries run does not fail the write",
+              toUtf8(why));
+        expectEq(readAll(target), "after\r\n", "and the write landed");
+        expectEq(listing(dir), "edvr.ini", "with nothing left beside it");
+        printf("  info  it landed on try %d\n", tries);
+    }
+
+    {   // A folder that is not there is not a folder to create, and not a failure
+        // to retry: it fails without reaching the replace.
+        const std::wstring missing = joinPath(joinPath(dir, L"no-such-folder"), L"edvr.ini");
+        std::wstring why;
+        int tries = -1;
+        check(!writeFileAtomic(missing, "x", &why, AtomicWriteOptions(), &tries),
+              "a target in a folder that is not there fails");
+        check(tries == 0, "before it reaches the replace", std::to_string(tries) + " tries");
+        check(!why.empty(), "and says why", "no message");
+        check(!dirExists(joinPath(dir, L"no-such-folder")), "and does not make the folder");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the mirror's generations
+// ---------------------------------------------------------------------------
+
+static void testGenerations(const std::wstring& scratch) {
+    printf("\nthe mirror's generations\n");
+
+    const std::wstring dir = joinPath(scratch, L"generations");
+    removeTree(dir);
+    makeTree(dir);
+    const std::wstring name = L"edvr.ini";
+    auto gen = [&](int g) { return readAll(generationPath(dir, name, g)); };
+    auto leafOfNewest = [&]() { return toUtf8(leafOf(newestGeneration(dir, name))); };
+    std::wstring why;
+
+    check(writeGenerations(dir, name, "A\r\n", true, &why), "a first copy is written", toUtf8(why));
+    expectEq(gen(0), "A\r\n", "as the newest");
+    check(!fileExists(generationPath(dir, name, 1)), "with nothing behind it yet");
+
+    check(writeGenerations(dir, name, "B\r\n", true, &why), "a second copy rotates in",
+          toUtf8(why));
+    expectEq(gen(0), "B\r\n", "the newest is the second");
+    expectEq(gen(1), "A\r\n", "and the first is kept as .1");
+
+    check(writeGenerations(dir, name, "C\r\n", true, &why), "a third copy rotates in",
+          toUtf8(why));
+    expectEq(gen(0), "C\r\n", "the newest is the third");
+    expectEq(gen(1), "B\r\n", "the second moved to .1");
+    expectEq(gen(2), "A\r\n", "and the first to .2");
+
+    check(writeGenerations(dir, name, "D\r\n", true, &why), "a fourth copy rotates in",
+          toUtf8(why));
+    expectEq(gen(0), "D\r\n", "the newest is the fourth");
+    expectEq(gen(1), "C\r\n", "the third is .1");
+    expectEq(gen(2), "B\r\n", "the second is .2");
+    check(!fileExists(generationPath(dir, name, 3)),
+          "and there is no .3: three generations, the oldest dropped");
+    expectEq(listing(dir), "edvr.ini, edvr.ini.1, edvr.ini.2",
+             "nothing else is in the folder, no temporary file among it");
+
+    // An install that changed nothing must not age the history out.
+    check(writeGenerations(dir, name, "D\r\n", true, &why), "the same copy again succeeds",
+          toUtf8(why));
+    expectEq(gen(1), "C\r\n", "and pushes nothing down");
+    expectEq(gen(2), "B\r\n", "so the oldest is still there");
+
+    // A change made a moment ago replaces the newest and leaves the history.
+    check(writeGenerations(dir, name, "E\r\n", false, &why), "a change replaces the newest in place",
+          toUtf8(why));
+    expectEq(gen(0), "E\r\n", "the newest is the change");
+    expectEq(gen(1), "C\r\n", "and .1 is what it was");
+    expectEq(gen(2), "B\r\n", "and .2");
+    check(writeGenerations(dir, name, "F\r\n", false, &why), "and another",
+          toUtf8(why));
+    check(gen(0) == "F\r\n" && gen(1) == "C\r\n" && gen(2) == "B\r\n",
+          "still one newest copy and the same two behind it: a generation per tweak would lose them");
+
+    // Which generation a restore reads.
+    expectEq(leafOfNewest(), "edvr.ini", "the newest generation is the newest copy");
+    DeleteFileW(generationPath(dir, name, 0).c_str());
+    expectEq(leafOfNewest(), "edvr.ini.1",
+             "with the newest gone -- a crash between two writes -- the one behind it is read");
+    writeAll(generationPath(dir, name, 0), "");
+    expectEq(leafOfNewest(), "edvr.ini.1", "an empty newest is passed over too");
+    DeleteFileW(generationPath(dir, name, 1).c_str());
+    expectEq(leafOfNewest(), "edvr.ini.2", "and so is a missing .1");
+    DeleteFileW(generationPath(dir, name, 2).c_str());
+    check(newestGeneration(dir, name).empty(), "with nothing but an empty file there is nothing to read");
+    check(generationPath(dir, name, 0) == joinPath(dir, name) &&
+              generationPath(dir, name, 2) == joinPath(dir, name) + L".2",
+          "and the paths are <name>, <name>.1, <name>.2");
+    check(generationPath(dir + L"\\", name, 1) == joinPath(dir, name) + L".1",
+          "whether or not the folder ends in a separator");
+
+    // A rotation that cannot finish changes nothing. .2 is made read-only, so the
+    // move of .1 up onto it is refused: the new copy has been written by then,
+    // and it must not be in the way of a single generation.
+    removeTree(dir);
+    makeTree(dir);
+    writeGenerations(dir, name, "P\r\n", true);
+    writeGenerations(dir, name, "Q\r\n", true);
+    writeGenerations(dir, name, "R\r\n", true);
+    SetFileAttributesW(generationPath(dir, name, 2).c_str(), FILE_ATTRIBUTE_READONLY);
+    check(!writeGenerations(dir, name, "S\r\n", true, &why),
+          "a rotation that cannot move an older copy fails");
+    check(gen(0) == "R\r\n" && gen(1) == "Q\r\n" && gen(2) == "P\r\n",
+          "with every generation exactly as it was");
+    expectEq(listing(dir), "edvr.ini, edvr.ini.1, edvr.ini.2", "and the staged copy is gone");
+    SetFileAttributesW(generationPath(dir, name, 2).c_str(), FILE_ATTRIBUTE_NORMAL);
+    check(writeGenerations(dir, name, "S\r\n", true, &why),
+          "and once the older copy can be moved the same write goes through", toUtf8(why));
+    check(gen(0) == "S\r\n" && gen(1) == "R\r\n" && gen(2) == "Q\r\n", "as three generations");
+
+    // A folder that is not there fails cleanly.
+    check(!writeGenerations(joinPath(dir, L"no-such-folder"), name, "x", true, &why),
+          "a mirror folder that is not there is a failure");
+}
+
+static void testMirrorGenerations(const std::wstring& scratch) {
+    printf("\nthe mirror survives what overwrote it\n");
+
+    const std::wstring gameDir = joinPath(scratch, L"mirrorgen-game");
+    const std::wstring root = joinPath(scratch, L"mirrorgen-root");
+    const std::wstring mirrorDir = joinPath(root, L"mirrorgen-test");
+    removeTree(gameDir);
+    removeTree(root);
+    makeTree(gameDir);
+    const std::wstring liveIni = joinPath(gameDir, L"edvr.ini");
+    auto mirrored = [&](int g) { return readAll(generationPath(mirrorDir, L"edvr.ini", g)); };
+
+    const std::string tuned = "[fix]\r\nshare_exposure = 0\r\nblack_void = 0\r\n";
+    const std::string defaults = "[fix]\r\nshare_exposure = 1\r\nblack_void = 1\r\n";
+
+    // An earlier install mirrored the settings somebody tuned.
+    writeAll(liveIni, tuned);
+    check(updateMirror(gameDir, L"", mirrorDir).ok, "the tuned settings are mirrored");
+    expectEq(mirrored(0), tuned, "as the newest copy");
+
+    // A game update wipes the folder. The person declines the restore -- or it
+    // fails -- and the install writes a fresh ini, which the mirror then takes.
+    // This is the sequence that used to erase the only saved copy.
+    DeleteFileW(liveIni.c_str());
+    writeAll(liveIni, defaults);
+    const MirrorResult afterInstall = updateMirror(gameDir, L"", mirrorDir);
+    check(afterInstall.ok && !afterInstall.saved.empty(), "the fresh install is mirrored");
+    expectEq(mirrored(0), defaults, "the newest copy is what the fresh install wrote");
+    expectEq(mirrored(1), tuned, "and the settings it replaced are still there, as edvr.ini.1");
+
+    // The same install run again, changing nothing, ages nothing.
+    check(updateMirror(gameDir, L"", mirrorDir).ok, "an install that changes nothing is mirrored");
+    expectEq(mirrored(1), tuned, "without pushing the kept copy down");
+
+    // A setting changed afterwards -- the settings window, the in-game menu --
+    // replaces the newest and leaves the kept copy where it is.
+    const std::string touched = defaults + "\r\n[hotkey]\r\nmenu = F8\r\n";
+    writeAll(liveIni, touched);
+    check(updateMirrorIni(gameDir, mirrorDir).ok, "a settings change is mirrored");
+    expectEq(mirrored(0), touched, "as the newest copy");
+    expectEq(mirrored(1), tuned, "and the tuned settings are still edvr.ini.1");
+    check(!fileExists(generationPath(mirrorDir, L"edvr.ini", 2)),
+          "with no generation made for the tweak");
+
+    // The restore reads the newest.
+    {
+        const std::wstring wiped = joinPath(scratch, L"mirrorgen-wiped");
+        removeTree(wiped);
+        makeTree(wiped);
+        const MirrorInfo info = readMirror(mirrorDir);
+        check(info.hasIni, "the mirror offers a restore");
+        std::vector<std::string> notes;
+        check(restoreFromMirror(wiped, info, &notes), "and it restores");
+        expectEq(readAll(joinPath(wiped, L"edvr.ini")), touched, "the newest copy comes back");
+    }
+
+    // Two more installs that change the ini: three generations, the oldest gone.
+    writeAll(liveIni, "[fix]\r\nshare_exposure = 2\r\n");
+    check(updateMirror(gameDir, L"", mirrorDir).ok, "a later install is mirrored");
+    writeAll(liveIni, "[fix]\r\nshare_exposure = 3\r\n");
+    check(updateMirror(gameDir, L"", mirrorDir).ok, "and another");
+    expectEq(mirrored(0), "[fix]\r\nshare_exposure = 3\r\n", "the newest is the last");
+    expectEq(mirrored(1), "[fix]\r\nshare_exposure = 2\r\n", ".1 is the one before it");
+    expectEq(mirrored(2), touched, ".2 is the copy from before that");
+    check(!fileExists(generationPath(mirrorDir, L"edvr.ini", 3)),
+          "and the copy before those is dropped: three generations");
+
+    // A restore after a crash between two writes, or a half-written newest, reads
+    // the copy behind it rather than offering nothing.
+    {
+        DeleteFileW(generationPath(mirrorDir, L"edvr.ini", 0).c_str());
+        const MirrorInfo info = readMirror(mirrorDir);
+        check(info.hasIni, "with the newest missing the mirror still offers a restore");
+        const std::wstring wiped = joinPath(scratch, L"mirrorgen-wiped2");
+        removeTree(wiped);
+        makeTree(wiped);
+        std::vector<std::string> notes;
+        check(restoreFromMirror(wiped, info, &notes), "and restores");
+        expectEq(readAll(joinPath(wiped, L"edvr.ini")), "[fix]\r\nshare_exposure = 2\r\n",
+                 "from the newest copy that is there");
+        writeAll(generationPath(mirrorDir, L"edvr.ini", 0), "");
+        check(readMirror(mirrorDir).hasIni, "an empty newest does not hide the ones behind it");
+    }
+
+    // The flat profile's settings file is kept the same way.
+    {
+        const std::wstring flat = joinPath(gameDir, L"edvr-flat.ini");
+        writeAll(flat, "[fix]\r\nflat = 1\r\n");
+        check(updateMirror(gameDir, L"", mirrorDir).ok, "a flat ini is mirrored");
+        writeAll(flat, "[fix]\r\nflat = 2\r\n");
+        check(updateMirror(gameDir, L"", mirrorDir).ok, "and again");
+        expectEq(readAll(generationPath(mirrorDir, L"edvr-flat.ini", 0)), "[fix]\r\nflat = 2\r\n",
+                 "the flat ini's newest copy");
+        expectEq(readAll(generationPath(mirrorDir, L"edvr-flat.ini", 1)), "[fix]\r\nflat = 1\r\n",
+                 "and the one it replaced");
+    }
+
+    // Read-only on a mirrored copy -- a launcher's verification does that to
+    // files it thinks are its own -- is cleared, as the copy always did.
+    {
+        SetFileAttributesW(generationPath(mirrorDir, L"edvr.ini", 0).c_str(),
+                           FILE_ATTRIBUTE_READONLY);
+        SetFileAttributesW(generationPath(mirrorDir, L"edvr.ini", 2).c_str(),
+                           FILE_ATTRIBUTE_READONLY);
+        writeAll(liveIni, "[fix]\r\nshare_exposure = 4\r\n");
+        check(updateMirror(gameDir, L"", mirrorDir).ok, "a mirror with read-only copies is updated");
+        expectEq(mirrored(0), "[fix]\r\nshare_exposure = 4\r\n", "with the new newest copy");
+    }
+
+    // No temporary file is left in the mirror by any of that.
+    {
+        const std::string files = listing(mirrorDir);
+        check(files.find("edvr-tmp") == std::string::npos, "the mirror holds no temporary file",
+              files);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // reading a DLL to find out whose it is
 // ---------------------------------------------------------------------------
 
@@ -1434,6 +1850,21 @@ static void testRunState() {
     check(runStateOf(name.c_str(), joinPath(joinPath(dir, L"down"), L"..")) ==
               GameRunState::ThisFolder,
           "nor is a path that goes down and comes back up");
+
+    // A process list that could not be taken is not "nobody is running". It
+    // returned NotRunning for years: a failed CreateToolhelp32Snapshot read as
+    // a machine with no game on it. It cannot be made to fail on demand, so the
+    // snapshot is handed in.
+    check(runStateOfSnapshot(INVALID_HANDLE_VALUE, name.c_str(), dir) == GameRunState::Unknown,
+          "a snapshot that could not be taken is not provably stopped");
+    check(runStateOfSnapshot(nullptr, name.c_str(), dir) == GameRunState::Unknown,
+          "nor is a null one");
+    check(runStateOfSnapshot(INVALID_HANDLE_VALUE, L"a-name-nothing-on-this-machine-has.exe",
+                             dir) == GameRunState::Unknown,
+          "whatever name was asked about: with no list there is no answer");
+    check(runStateOfSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0), name.c_str(), dir) ==
+              GameRunState::ThisFolder,
+          "and a snapshot that was taken answers exactly as runStateOf does");
 }
 
 // ---------------------------------------------------------------------------
@@ -1716,6 +2147,9 @@ int wmain(int argc, wchar_t** argv) {
     testFlatPlanner();
     testApply(scratch);
     testMirror(scratch);
+    testAtomicWrite(scratch);
+    testGenerations(scratch);
+    testMirrorGenerations(scratch);
     testProbe(scratch);
     testRunState();
     testSettings(root, scratch);

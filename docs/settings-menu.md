@@ -1095,9 +1095,14 @@ changes because the file did.
   comment untouched.
 - **Re-read before write**, the installer's 2026-08-28 lesson: the file on
   disk is the source, never a cached copy.
-- **Atomic write**: temp file beside the ini, then `MoveFileExW` with
-  replace-and-write-through, so `config.cpp`'s size check never meets half
-  a save and an editor holding the file mid-save cannot lose the write.
+- **Atomic write**: `iniedit`'s `writeFileAtomic` (the installer's settings
+  window uses the same one): a temp file beside the ini, flushed, then
+  `MoveFileExW` with replace-and-write-through, so `config.cpp`'s size check
+  never meets half a save. The replace is tried again (five times, 20 ms
+  apart) on a sharing violation or access denied, and `config.cpp` opens the
+  ini with `FILE_SHARE_DELETE`, so the reload the menu asks for after a write
+  cannot make the next write fail. A read-only ini is left alone and the
+  failure says so.
 - **Apply now**: `Config::get().reloadIfChanged()` is called immediately
   after the write, so the change lands on this frame instead of the next
   poll, and through the same configure path a hand edit takes -- no module
@@ -1108,7 +1113,16 @@ changes because the file did.
   (`%LOCALAPPDATA%\EDVR\<leaf>-<store>\`), so a game update that wipes the
   folder cannot lose an evening's tuning; `mirrorDirFor`'s naming rule
   moves to common with `iniedit` so the DLL and the installer cannot
-  disagree about the folder.
+  disagree about the folder. The copy goes through the atomic writer and
+  replaces the newest generation in place. The mirror keeps three
+  (`edvr.ini`, `edvr.ini.1`, `edvr.ini.2`, in `iniedit`'s `writeGenerations`):
+  an install or repair rotates them, so settings that stood before an install
+  wrote defaults over them (a declined or failed restore, then a fresh
+  install) are still there as `.1`; a menu or settings-window change does not
+  rotate, since three tweaks would push them out. The restore reads the newest
+  generation that is not empty. The file is named for the ini actually
+  written, so the flat profile's `edvr-flat.ini` no longer lands over the
+  mirror's `edvr.ini`.
 - **Log line per change**: `menu: fix.render_sharpness 0.0 -> 0.3 (written;
   live)` or `(written; takes effect at the next launch)`.
 

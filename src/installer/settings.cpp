@@ -11,13 +11,11 @@ namespace {
 
 #include "settings_schema.inc"  // generated: kSettings[]
 
-// Written beside the file and moved into place.
-//
-// This one rewrites the WHOLE of somebody's edvr.ini on every toggle, and the
-// game re-reads that file about once a second. Truncating it first meant a
-// failed write left an empty or half-written settings file with no backup
-// anywhere -- and a poll landing in the gap read a 0-byte ini and dropped every
-// setting to its compiled default until the next reload.
+// The backup folder for this session's first change, and the folder above it.
+// (The write itself is iniedit's writeFileAtomic: this rewrites the WHOLE of
+// somebody's edvr.ini on every toggle, and the game re-reads that file about
+// once a second, so a truncate-then-write left a poll reading a 0-byte ini and
+// dropping every setting to its compiled default until the next reload.)
 bool ensureBackupDir(const std::wstring& path) {
     if (dirExists(path)) return true;
     const size_t slash = path.find_last_of(L"\\/");
@@ -30,26 +28,6 @@ bool ensureBackupDir(const std::wstring& path) {
     }
     return CreateDirectoryW(path.c_str(), nullptr) != 0 ||
            (GetLastError() == ERROR_ALREADY_EXISTS && dirExists(path));
-}
-
-bool writeWhole(const std::wstring& path, const std::string& text) {
-    const std::wstring temp = path + L".edvrnew";
-    HANDLE f = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return false;
-    DWORD written = 0;
-    const BOOL ok = WriteFile(f, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
-    FlushFileBuffers(f);
-    CloseHandle(f);
-    if (!ok || written != text.size()) {
-        DeleteFileW(temp.c_str());
-        return false;
-    }
-    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        DeleteFileW(temp.c_str());
-        return false;
-    }
-    return true;
 }
 
 }  // namespace
@@ -268,9 +246,11 @@ bool SettingsModel::set(size_t index, const std::string& value) {
     MergeReport report;
     const std::string updated = mergeIni(source, source, &source, {{dotted, value}}, &report);
 
-    if (!writeWhole(m_iniPath, updated)) {
-        m_error = "Could not write edvr.ini. If the game folder is under Program Files, run the "
-                  "installer as administrator.";
+    std::wstring why;
+    if (!writeFileAtomic(m_iniPath, updated, &why)) {
+        m_error = "Could not write edvr.ini: " + toUtf8(why) +
+                  ". If the game folder is under Program Files, run the installer as "
+                  "administrator.";
         return false;
     }
     m_text = updated;
