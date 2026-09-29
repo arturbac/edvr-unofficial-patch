@@ -173,6 +173,11 @@ std::string statusReport(const Survey& s, const PayloadInfo& payload) {
         // reads a status that ignores the game they can see running.
         out += "\r\n-  Elite Dangerous is running, but from a different folder. This install is "
                "not the one in use.\r\n";
+    } else if (s.gameRunStateUnknown) {
+        // A check that failed says so. Reading it as "not running" is how the
+        // installer used to walk into a folder the game had open.
+        out += "\r\n!  Could not tell whether Elite Dangerous is running (Windows would not list "
+               "the running programs). Nothing will be installed until that is settled.\r\n";
     }
     return out;
 }

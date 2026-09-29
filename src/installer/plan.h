@@ -58,6 +58,11 @@ struct Survey {
     // executable's name alone stopped the folder nobody was in.
     bool gameRunningHere = false;       // from this folder: nothing here can be written
     bool gameRunningElsewhere = false;  // from another install: this folder is free
+    // The process list could not be read, so whether the game is running is not
+    // known. Refused like gameRunningHere -- a check that failed is not a check
+    // that passed -- but with its own words, since closing the game will not
+    // fix it.
+    bool gameRunStateUnknown = false;
 
     DllInfo              d3d11;       // <game>\d3d11.dll
     DllInfo              openxrLoader; // <game>\Openvr\win64\openxr_loader.dll

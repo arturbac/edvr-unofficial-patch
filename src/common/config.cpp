@@ -190,7 +190,21 @@ void Config::parse() {
     // The lock is taken once, below, to swap the result in.
     ValueMap parsed;
 
-    HANDLE f = CreateFileW(m_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    // FILE_SHARE_DELETE, so that reading the ini does not stop it being deleted or
+    // renamed away, and so that a replace made with POSIX rename semantics
+    // (FileRenameInfoEx, Windows 10 1607+, NTFS) goes through while this read has
+    // it open. The in-headset menu and the installer's settings window both save
+    // by writing a temp file and renaming it over edvr.ini, and the menu asks for
+    // a reload straight after -- so the next save can land while this read has the
+    // file open.
+    //
+    // It is not what carries iniedit's writeFileAtomic past that read today: its
+    // MoveFileExW(REPLACE_EXISTING) is the classic rename, refused with
+    // ERROR_ACCESS_DENIED while ANY handle to the target is open, one that shares
+    // DELETE included (measured on Windows 11 build 26200). The writer's retry
+    // does that, this read holding the file for microseconds; see iniedit.h.
+    HANDLE f = CreateFileW(m_path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
         // An ini that is genuinely absent means "all defaults", which is only

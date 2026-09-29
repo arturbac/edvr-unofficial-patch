@@ -36,6 +36,7 @@
 // names unqualified exactly as it did before the move.
 #pragma once
 
+#include <cstddef>
 #include <map>
 #include <string>
 #include <utility>
@@ -110,5 +111,112 @@ std::string mergeIni(const std::string& next, const std::string& user, const std
 // find out what advanced.real_dll currently says.
 std::string iniValue(const std::string& text, const std::string& dotted,
                      const std::string& fallback = std::string());
+
+// ---------------------------------------------------------------------------
+// Writing a file back, whole (2026-09-29)
+//
+// Two programs write the live edvr.ini -- the installer's settings window and
+// the in-headset menu -- and both refresh the copy the installer keeps outside
+// the game folder. Each carried its own temp-and-rename, and each had a
+// different half of it: one never flushed, the other never retried, and a reader
+// holding the file open at the wrong instant made the rename fail with a sharing
+// violation that the menu showed as a failed write. One writer, here, beside the
+// grammar both of them share.
+//
+// The game re-reads edvr.ini about once a second and Config::parse refuses a
+// file it cannot read whole, so a save that truncates first (or that dies half
+// way) is seen by the very next poll. Every write here is a complete new file,
+// beside the old one, and then one replace: the target is the old bytes or all
+// of the new ones, never a mixture.
+
+struct AtomicWriteOptions {
+    // Tries after the first one, spent only on a sharing violation, an access
+    // denial or a lock violation from the replace: a reader that has the target
+    // open, an editor mid-save, an antivirus scanning the file that was just
+    // written. Each clears in milliseconds. Anything else (no such folder, a
+    // full disk) fails at once. This retry is what carries a write past a
+    // reader that holds the file for a moment.
+    int      retries = 5;
+    unsigned backoffMs = 20;  // slept before each of those tries
+};
+
+// Replaces the file at `path` with `bytes`, all or nothing.
+//
+//   1. the bytes go to <path>.edvr-tmp-<pid>-<tid> in the same folder (one
+//      volume, so the replace is a rename) and are flushed to disk;
+//   2. MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH) puts them in place, tried
+//      again as `options` says;
+//   3. on any failure the temp file is deleted and the target is untouched.
+//
+// That replace is the classic rename, and the classic rename is refused with
+// ERROR_ACCESS_DENIED while ANY other handle to the target is open -- one that
+// shares DELETE included (measured on Windows 11 build 26200 with cmd's move
+// /Y). Only a POSIX-semantics rename (SetFileInformationByHandle with
+// FileRenameInfoEx and FILE_RENAME_FLAG_POSIX_SEMANTICS; Windows 10 1607+, NTFS)
+// goes through under a reader that shares DELETE, and this does not use one: it
+// waits for the reader instead, which for the readers there are (Config's read,
+// a scanner) is microseconds to milliseconds.
+//
+// Does not create folders and does not clear a read-only attribute: a read-only
+// edvr.ini is a decision somebody made, and the failure says so. `error` (which
+// may be null) gets a sentence for a person on failure, ASCII, without the
+// file's name. `tries` (which may be null) gets the number of replace attempts
+// made -- 0 when the temp file could not be written, which is what lets a test
+// tell "retried and gave up" from "never got as far as trying".
+bool writeFileAtomic(const std::wstring& path, const std::string& bytes,
+                     std::wstring* error = nullptr,
+                     const AtomicWriteOptions& options = AtomicWriteOptions(),
+                     int* tries = nullptr);
+
+// The whole file, read with FILE_SHARE_DELETE so that reading it does not stop
+// somebody deleting or renaming it away, and closed before this returns: the
+// hold lasts as long as the read. false when the file is missing, unreadable,
+// over `limit`, or read short; an empty file is true with empty `bytes`.
+bool readFileBytes(const std::wstring& path, std::string* bytes, size_t limit = 64u << 20);
+
+// ---------------------------------------------------------------------------
+// The mirror's generations
+//
+// %LOCALAPPDATA%\EDVR\<leaf>-<store>\ holds the only copy of somebody's settings
+// that a game update cannot reach. It used to be one copy, overwritten in place
+// by every install. A restore that failed, or that the person declined, was
+// followed by a fresh install whose defaults then overwrote the saved settings:
+// the safety net erased by the thing it was there to survive.
+//
+// Now <name> is the newest copy and <name>.1 and <name>.2 are the two before it.
+// Three, not one, because the state worth keeping is the one BEFORE an install
+// replaced it.
+constexpr int kMirrorGenerations = 3;
+
+// <dir>\<name> for generation 0, <dir>\<name>.<n> for the older ones.
+std::wstring generationPath(const std::wstring& dir, const std::wstring& name, int generation);
+
+// The newest generation that exists and is not empty, as a path, or empty when
+// none is. "Not empty" because a restore of a zero-byte file is worse than a
+// restore of the copy behind it, and a copy an older build left half-written is
+// how one gets there.
+std::wstring newestGeneration(const std::wstring& dir, const std::wstring& name);
+
+// Writes `bytes` as the newest generation of <dir>\<name>.
+//
+// The bytes identical to the newest copy: nothing to do, nothing rotates -- an
+// installer run that changed nothing must not age the real history out.
+//
+// `rotate` true: the copy being replaced is kept as .1 (and .1 as .2, the
+// oldest dropped). The new copy is written and flushed to a temp file FIRST and
+// only when that has landed does anything older move: a write that cannot be
+// staged, or whose first move is refused, leaves every generation as it was, and
+// one that fails later loses at most the oldest copy, never the newest. The
+// newest is never absent at any instant: the old copy is written to .1 from the
+// bytes read, not renamed there.
+//
+// `rotate` false: the newest is replaced in place and the older ones are left
+// alone. That is the rule for a change made a moment ago (one slider, one
+// toggle): a generation per tweak would push the copy worth keeping out within
+// three of them.
+//
+// `dir` must exist. Returns true when the newest generation holds `bytes`.
+bool writeGenerations(const std::wstring& dir, const std::wstring& name,
+                      const std::string& bytes, bool rotate, std::wstring* error = nullptr);
 
 }  // namespace edvr

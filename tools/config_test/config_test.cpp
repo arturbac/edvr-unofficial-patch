@@ -19,8 +19,8 @@
 // were real bugs, and the BOM case files every setting in the file under the
 // wrong section while the file still looks fine.
 //
-// Three more (2026-09-29) are about threads and the log, and read the real log
-// file back rather than counting calls:
+// Four more (2026-09-29) are about threads, the log and the file's sharing, and
+// read the real log file back rather than counting calls:
 //
 //   - a reader thread hammering the getters while the main thread rewrites the
 //     ini and reloads it, so a lock that is missing, or held only around the
@@ -28,7 +28,11 @@
 //   - a malformed value is said once per key per successful parse, however
 //     often it is read -- it was said on every read, 90 to 180 lines a second
 //     for a key read each frame;
-//   - getFloat takes the whole value and only a finite one.
+//   - getFloat takes the whole value and only a finite one;
+//   - a reload leaves edvr.ini open to being deleted or renamed (the read
+//     shares DELETE): the menu saves by renaming a temp file over it, and a
+//     read that did not share DELETE held that off while the reload had the
+//     file open.
 //
 // Usage: config_test.exe <dir containing edvr.ini> [scratch dir]
 #include <windows.h>
@@ -457,6 +461,126 @@ static void raceCase(const std::wstring& scratch) {
     printf("  info  %ld reads raced %d reloads\n", reader.reads.load(), reloads);
 }
 
+// --- a reload leaves the file open to being deleted or renamed (2026-09-29) ---
+//
+// Config's read of edvr.ini opened it with FILE_SHARE_READ | FILE_SHARE_WRITE --
+// no FILE_SHARE_DELETE -- so for as long as a reload held the file (tens of
+// microseconds) nothing could delete it, rename it or replace it with POSIX
+// rename semantics, and the in-headset menu, which saves by renaming a temp file
+// over edvr.ini and asks for a reload straight after, could meet that hold on its
+// very next save.
+//
+// What this proves is the share mode, not a replace. iniedit's replace is the
+// classic MoveFileExW, which is refused while ANY handle to the target is open,
+// sharing DELETE or not (installer_test's atomic-write cases print what this
+// machine does), so it is that writer's retry that carries a save past Config's
+// read; the share mode is the half of a POSIX-semantics replace that lives here.
+//
+// The read cannot be paused from outside, so a second thread does to it what a
+// rename would: it opens the file for DELETE, with every share mode, over and
+// over, and counts the refusals that happen wholly inside a reload. It runs only
+// inside a reload, because a probe that ran while the test itself rewrote the
+// file would collide with the test: `busy` is the handshake that makes that so,
+// since a probe thread can be descheduled between opening the file and closing
+// it, and the test must not rewrite the file until that probe is finished.
+// A correct parse() is never refused. One without FILE_SHARE_DELETE is refused
+// whenever a probe lands while it holds the handle, which is hundreds of probes
+// over the run; the threshold below is for a scanner that happens to hold the
+// freshly written file for a moment, not for the bug.
+struct ProbeState {
+    std::atomic<bool> stop{false};
+    std::atomic<bool> inReload{false};
+    std::atomic<bool> busy{false};  // a probe is between its open and its close
+    std::atomic<long> inside{0};    // probes that ran wholly inside a reload
+    std::atomic<long> refused{0};   // ...and were refused with a sharing violation
+    std::atomic<long> other{0};     // ...and failed some other way
+};
+
+static void probeMain(const std::wstring* path, ProbeState* st) {
+    while (!st->stop.load()) {
+        // busy first, then the flag: either this probe sees the reload over and
+        // does nothing, or the test, after ending the reload, sees busy and waits.
+        st->busy.store(true);
+        if (!st->inReload.load()) {
+            st->busy.store(false);
+            SwitchToThread();
+            continue;
+        }
+        HANDLE h = CreateFileW(path->c_str(), DELETE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const DWORD code = h == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        const bool wholly = st->inReload.load();  // false: the reload ended mid-probe
+        st->busy.store(false);
+        if (!wholly) continue;
+        st->inside.fetch_add(1);
+        if (code == ERROR_SHARING_VIOLATION) st->refused.fetch_add(1);
+        else if (code != ERROR_SUCCESS) st->other.fetch_add(1);
+    }
+}
+
+static void shareDeleteCase(const std::wstring& scratch) {
+    const std::string one = "[share]\r\nk = 1\r\n";
+    const std::string two = "[share]\r\nk = 2\r\n";
+    if (!rewriteIni(scratch, one)) {
+        fail("config share delete", "could not write the scratch ini");
+        return;
+    }
+    Config::get().init(scratch);
+    const std::wstring path = scratch + L"\\edvr.ini";
+
+    ProbeState st;
+    std::thread probe(probeMain, &path, &st);
+
+    // At least 300 reloads, and on until the probe has landed 300 times inside
+    // them: a probe thread that is starved by a busy machine (the rigs run in a
+    // pool) gets the time it needs rather than failing the run for want of it.
+    // The cap is what ends a probe that never runs.
+    int  reloads = 0;
+    int  unparsed = 0;
+    bool writeFailed = false;
+    const ULONGLONG t0 = GetTickCount64();
+    for (int i = 0; i < 20000; ++i) {
+        if (i >= 300 && st.inside.load() >= 300) break;
+        if (i >= 300 && GetTickCount64() - t0 > 8000) break;
+        if (!rewriteIni(scratch, (i & 1) ? one : two)) {
+            writeFailed = true;
+            break;
+        }
+        st.inReload.store(true);
+        const bool parsed = Config::get().reloadIfChanged();
+        st.inReload.store(false);
+        while (st.busy.load()) SwitchToThread();  // a probe in flight finishes before the file is rewritten
+        if (!parsed) ++unparsed;
+        ++reloads;
+    }
+    st.stop.store(true);
+    probe.join();
+
+    const long inside = st.inside.load();
+    const long refused = st.refused.load();
+    if (writeFailed) {
+        fail("config share delete", "could not rewrite the scratch ini");
+    } else if (unparsed) {
+        fail("config share delete", std::to_string(unparsed) + " of " + std::to_string(reloads) +
+                                        " reloads found the file unchanged, so they never read it");
+    } else if (inside < 100) {
+        fail("config share delete", "the probe made only " + std::to_string(inside) +
+                                        " attempts inside " + std::to_string(reloads) +
+                                        " reloads; too few to say anything");
+    } else if (refused > 10) {
+        fail("config share delete",
+             std::to_string(refused) + " of " + std::to_string(inside) +
+                 " attempts to open the ini for delete were refused while a reload had it open: "
+                 "Config's read does not share DELETE");
+    } else {
+        ok("a reload leaves edvr.ini open to being deleted or renamed (FILE_SHARE_DELETE)");
+    }
+    printf("  info  %ld probes inside %d reloads, %ld refused, %ld failed another way\n", inside,
+           reloads, refused, st.other.load());
+}
+
 int main(int argc, char** argv) {
     // Unbuffered, so a crash does not take the output with it: the first run of
     // this test appeared to die before its first printf, which was only the
@@ -829,6 +953,7 @@ int main(int argc, char** argv) {
         floatCases(scratch);
         noteCases(scratch);
         raceCase(scratch);
+        shareDeleteCase(scratch);
     }
 
     // An old/full INI cannot widen a flat installation, even through numeric
