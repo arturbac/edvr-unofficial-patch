@@ -89,18 +89,18 @@ constexpr uint64_t kHoloCanopy = 0x8C091FFD08644E02ull;
 // through uiHoloGenericHash below) admits ONLY these eight -- the radar's
 // star icon core, its two stalks, and the five contact markers: families
 // whose PSes sample only material/surface textures through interpolated
-// UVs. Two other depth-pass families are REFUSED from the take,
-// each with the review's citation:
+// UVs. Two other depth-pass families need separate handling:
 //
-// REFUSED: the target hologram's sphere (kHoloTargetSphere, R1 of
-// reviews/crisp-hud-phase3-review-2026-09-28.md). Its two
+// PAIR-GATED: the target hologram's sphere (kHoloTargetSphere, R1 of
+// reviews/crisp-hud-phase3-review-2026-09-28.md). Only its two verified
 // premultiplied-quad PSes (EA02FAC2BD6C643C, E95634B0F61D218F)
 // integer-Load scene depth at the SV_Position pixel (ftoi + ld ... t1);
 // the take's viewport remap to the larger HUD layer breaks that addressing
 // (WARP-reproduced: 84% of the controlled image gone at the flight's 2.5x
-// layer scale). Its depth-pass coverage is UNAFFECTED -- only the take
-// refuses it; it stays stock (correct, AA-swimmy) until an equivalent
-// layer-sized depth input exists.
+// layer scale). uiLayerFamilyFor checks the exact pair separately; the
+// production take prepares a DXBC address remap before admission and
+// validates the original linear-depth SRV at issue. Unsupported bindings
+// retain the stock draw. The VS-only list still refuses all sphere PSes.
 //
 // REFUSED: the sun's corona family (kHoloCoronaFamily, R2 of the same
 // review). One shader pair paints BOTH the radar icon's glow AND the real

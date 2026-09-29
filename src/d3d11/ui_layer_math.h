@@ -743,16 +743,19 @@ inline UiLayerFamily uiLayerFamilyFor(const UiFamilyFacts& f, UiFamilyWhy* why =
         // is deliberately NOT on that list -- it sits in front of the whole
         // sky, and covering it would smear the stars behind it, the depth
         // pass's own reasoning -- and neither are the two the phase-3
-        // review refused (the target sphere's pixel-coordinate depth load,
-        // the corona family's shared world/cockpit shader pair): those draws
-        // match nothing here and stay stock, exactly as the pass's refusals keep
-        // their own scene rendering. The separately measured world-marker
+        // review refused. Two exact target-sphere pixel shaders are now
+        // considered separately: their original screen-depth address must be
+        // repaired and all dependencies prepared before redirecting. Unknown
+        // sphere variants and the shared world/cockpit corona remain stock.
+        // The separately measured world-marker
         // pair has no screen-space reads and is admitted by both hashes.
         out = f.vs == kUiVsHolo        ? UiLayerFamily::kHolo
               : f.vs == kUiVsFlightHud ? UiLayerFamily::kFlightHud
               : f.vs == kUiVsSprite    ? UiLayerFamily::kSprite
               : (uiHoloGenericHash(f.vs) ||
-                 (f.vs == kHoloWorldMarkerReticle && f.ps == kHoloWorldMarkerReticlePs))
+                 (f.vs == kHoloWorldMarkerReticle && f.ps == kHoloWorldMarkerReticlePs) ||
+                 (f.vs == kHoloTargetSphere &&
+                  (f.ps == 0xEA02FAC2BD6C643Cull || f.ps == 0xE95634B0F61D218Full)))
                   ? UiLayerFamily::kHoloGeneric : UiLayerFamily::kNone;
         if (out != UiLayerFamily::kNone) w = UiFamilyWhy::kDirect;
     } else if (f.excluded) {

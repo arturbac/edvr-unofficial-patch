@@ -149,10 +149,48 @@ def validate_smoke_report(report):
                 gpu_qualification="synthetic fixture durations; no GPU commands or hardware timing")
 
 
-def invoke(command, timeout=120):
-    result = subprocess.run([str(x) for x in command], capture_output=True,
-                            text=True, errors="replace", timeout=timeout,
-                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+def invoke(command, timeout=120, preserve_on_interrupt=False, on_progress=None):
+    arguments = [str(x) for x in command]
+    options = dict(text=True, errors="replace",
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if preserve_on_interrupt:
+        # subprocess.run kills its child on KeyboardInterrupt. A WPR stop is
+        # already saving the only trace: keep THAT child, not another stop.
+        deadline = time.monotonic() + timeout
+        interrupted = 0
+        with subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options) as process:
+            def defer_interrupt():
+                nonlocal interrupted
+                interrupted += 1
+                print("[edvr] Ctrl+C deferred while saving; keep this window open. "
+                      "The same WPR stop continues within its original timeout; closing the window cannot be protected.",
+                      flush=True)
+            def progress(phase):
+                if on_progress:
+                    try:
+                        on_progress(phase, process.pid, interrupted)
+                    except KeyboardInterrupt:
+                        defer_interrupt()
+                    except Exception as exc:
+                        print("[edvr] save progress unavailable: " + type(exc).__name__, flush=True)
+            progress("started")
+            while True:
+                try:
+                    stdout, stderr = process.communicate(timeout=max(0, deadline - time.monotonic()))
+                    result = subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+                    break
+                except KeyboardInterrupt:
+                    defer_interrupt()
+                    progress("interrupted")
+                except subprocess.TimeoutExpired as exc:
+                    process.kill()
+                    exc.stdout, exc.stderr = process.communicate()
+                    raise
+                except BaseException:
+                    process.kill()
+                    raise
+    else:
+        result = subprocess.run(arguments, capture_output=True, timeout=timeout, **options)
     if result.returncode:
         raise RuntimeError("Command failed (%s): %s\n%s\n%s" %
                            (result.returncode, subprocess.list2cmdline(command),
@@ -194,7 +232,7 @@ def wpr_commands(wpr, profile, trace, instance, filemode, recordtempto, gpu=Fals
 
 
 def record(wpr, profile, output, instance, workload, runner=invoke, filemode=False, recordtempto=None,
-          on_started=None, on_stopped=None, gpu=False):
+          on_started=None, on_stopped=None, gpu=False, on_save_progress=None):
     commands = wpr_commands(wpr, profile, output, instance, filemode, recordtempto, gpu)
     start, stop, cancel = commands["start"], commands["stop"], commands["cancel"]
     # A failed start can leave partially-created sessions. The randomized
@@ -216,7 +254,13 @@ def record(wpr, profile, output, instance, workload, runner=invoke, filemode=Fal
     except BaseException as exc:
         failure = exc
     try:
-        runner(stop, timeout=180)
+        print("[edvr] saving trace (up to 180 seconds); keep this window open. "
+              "Ctrl+C is deferred during saving; closing the window cannot be protected.", flush=True)
+        runner(stop, timeout=180, preserve_on_interrupt=True, on_progress=on_save_progress)
+    except KeyboardInterrupt:
+        # Custom runners or forced interruption must not cancel an uncertain
+        # stop merely because the caller was interrupted. No resume is inferred.
+        raise
     except BaseException:
         try:
             runner(cancel)
@@ -906,17 +950,31 @@ def capture(args, key_reader=key_is_down):
             write_status(directory, "saving", stop_reason=reason)
             return reason
 
+        def on_save_progress(phase, child_pid, interrupts):
+            details = dict(save_phase=phase, save_child_pid=child_pid,
+                           save_interrupts=interrupts, save_timeout_seconds=180,
+                           save_window_closure_protected=False)
+            if phase == "started":
+                details["save_started_utc"] = utc_now_iso_ms()
+            write_status(directory, "saving", **details)
+
         trace = directory / "flight.etl"
         record(p["wpr"], p["profile"], trace, p["instance"], workload,
               filemode=(p["logging_mode"] == "file"), recordtempto=directory,
-              on_started=on_started, on_stopped=on_stopped, gpu=("gpu" in p))
+              on_started=on_started, on_stopped=on_stopped, gpu=("gpu" in p),
+              on_save_progress=on_save_progress)
         write_status(directory, "analyzing", flight=verified, trace=str(trace))
         report = directory / "report.json"
         print(analyze(p["dotnet"], p["analyzer"], trace, process.pid, report, gpu=("gpu" in p)), flush=True)
         write_status(directory, "complete", report=str(report))
         return 0
     except BaseException as exc:
-        write_status(directory, "failed", error=str(exc))
+        try:
+            stage = json.loads((directory / "status.json").read_text(encoding="utf-8")).get("state", "unknown")
+        except (OSError, ValueError):
+            stage = "unknown"
+        write_status(directory, "failed", error=str(exc) or type(exc).__name__,
+                     error_type=type(exc).__name__, failed_during=stage)
         raise
     finally:
         sampler_stop.set()
@@ -948,6 +1006,67 @@ def self_test():
 
     check(record("wpr", "profile", "out.etl", "EDVRCPU_test", lambda: 42, runner) == 42)
     check([c[1] for c in calls] == ["-start", "-stop"])
+    check(all(c[-2:] == ["-instancename", "EDVRCPU_test"] for c in calls))
+
+    save_process = mock.MagicMock(pid=4321, returncode=0)
+    save_process.__enter__.return_value = save_process
+    save_process.communicate.side_effect = [KeyboardInterrupt(), KeyboardInterrupt(), ("saved", "")]
+    progress = []
+    with mock.patch(__name__ + ".subprocess.Popen", return_value=save_process) as opened, \
+            mock.patch(__name__ + ".time.monotonic", side_effect=[100, 101, 102, 103]):
+        check(invoke(["wpr", "-stop", "only.etl", "-instancename", "private"], timeout=10,
+                     preserve_on_interrupt=True, on_progress=lambda *event: progress.append(event)) == "saved")
+        check(opened.call_count == 1 and not save_process.kill.called)
+        check([call.kwargs["timeout"] for call in save_process.communicate.call_args_list] == [9, 8, 7])
+        check(progress == [("started", 4321, 0), ("interrupted", 4321, 1), ("interrupted", 4321, 2)])
+    process = mock.MagicMock(pid=4321, returncode=0)
+    process.__enter__.return_value = process
+    process.communicate.return_value = ("saved", "")
+    with mock.patch(__name__ + ".subprocess.Popen", return_value=process):
+        check(invoke(["wpr", "-stop"], preserve_on_interrupt=True,
+                     on_progress=lambda *args: (_ for _ in ()).throw(KeyboardInterrupt())) == "saved")
+        check(not process.kill.called)
+    for failure in (subprocess.TimeoutExpired("wpr", 10), RuntimeError("actual stop failure")):
+        process = mock.MagicMock(pid=4321, returncode=1)
+        process.__enter__.return_value = process
+        process.communicate.side_effect = [failure, ("timeout output", "timeout error")]
+        with mock.patch(__name__ + ".subprocess.Popen", return_value=process):
+            try:
+                invoke(["wpr", "-stop"], preserve_on_interrupt=True)
+                check(False)
+            except (subprocess.TimeoutExpired, RuntimeError) as exc:
+                check(exc is failure and process.kill.call_count == 1)
+    calls.clear()
+    def interrupted_stop(command, **kwargs):
+        calls.append(command)
+        if command[1] == "-stop":
+            check(kwargs["preserve_on_interrupt"] is True and kwargs["timeout"] == 180)
+            raise KeyboardInterrupt()
+        return ""
+    try:
+        record("wpr", "profile", "retained.etl", "private_interrupt", lambda: None, interrupted_stop)
+        check(False)
+    except KeyboardInterrupt:
+        check([c[1] for c in calls] == ["-start", "-stop"])
+        check(all(c[-2:] == ["-instancename", "private_interrupt"] for c in calls))
+    calls.clear()
+    def timed_out_stop(command, **kwargs):
+        calls.append(command)
+        if command[1] == "-stop":
+            raise subprocess.TimeoutExpired(command, 180)
+        return ""
+    try:
+        record("wpr", "profile", "out.etl", "private_timeout", lambda: None, timed_out_stop)
+        check(False)
+    except subprocess.TimeoutExpired:
+        check([c[1] for c in calls] == ["-start", "-stop", "-cancel"])
+        check(all(c[-2:] == ["-instancename", "private_timeout"] for c in calls))
+    calls.clear()
+    try:
+        record("wpr", "profile", "out.etl", "private_workload", lambda: (_ for _ in ()).throw(KeyboardInterrupt()), runner)
+        check(False)
+    except KeyboardInterrupt:
+        check([c[1] for c in calls] == ["-start", "-stop"])
 
     # Exercise the actual smoke plumbing with a fake process/analyzer, not a
     # separately rebuilt command. An optional GPU flight must not pass a CPU-only smoke.
@@ -994,7 +1113,18 @@ def self_test():
                     check(False)
                 except ValueError:
                     check(True)
-    check(all(c[-2:] == ["-instancename", "EDVRCPU_test"] for c in calls))
+        interrupted_dir = smoke_dir / "interrupted"
+        interrupt_plan = {**p_smoke, "output": str(interrupted_dir)}
+        with mock.patch(__name__ + ".plan", return_value=interrupt_plan), \
+                mock.patch(__name__ + ".ctypes.windll.shell32.IsUserAnAdmin", return_value=True), \
+                mock.patch(__name__ + ".smoke_test_capture", side_effect=KeyboardInterrupt()):
+            try:
+                capture(argparse.Namespace(dry_run=False, smoke_first=True))
+                check(False)
+            except KeyboardInterrupt:
+                failure = json.loads((interrupted_dir / "status.json").read_text(encoding="utf-8"))
+                check(failure["error"] == failure["error_type"] == "KeyboardInterrupt")
+                check(failure["state"] == "failed" and failure["failed_during"] == "smoke_recording")
     calls.clear()
     try:
         record("wpr", "profile", "out.etl", "EDVRCPU_test", lambda: (_ for _ in ()).throw(ValueError("fixture")), runner)

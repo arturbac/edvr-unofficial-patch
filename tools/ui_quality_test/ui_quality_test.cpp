@@ -1074,6 +1074,13 @@ void testFamilyRule() {
                       static_cast<unsigned long long>(h));
         check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kHoloGeneric && why == UiFamilyWhy::kDirect, what);
     }
+    f.vs = kHoloTargetSphere;
+    for (uint64_t ps : {0xEA02FAC2BD6C643Cull, 0xE95634B0F61D218Full}) {
+        f.ps = ps;
+        check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kHoloGeneric && why == UiFamilyWhy::kDirect,
+              "exact model composite pair is considered for depth-address remap");
+    }
+    f.ps = 0;
     const uint64_t kRefusedVs[] = {kHoloTargetSphere, kHoloCoronaFamily};
     for (uint64_t h : kRefusedVs) {
         f.vs = h;

@@ -3786,7 +3786,7 @@ __declspec(noinline) UiLayerFamily uiLayerFamilyOf(State* s, char kind, UINT cou
     f.vs = bindingShaderHash(BindSlot::Vs);
     // The reticle's captured PS has no screen-space reads; its other PS
     // variants remain refused. Ordinary HDR draws need no extra hash read.
-    if (f.targetKind == 1 && f.vs == kHoloWorldMarkerReticle)
+    if (f.targetKind == 1 && (f.vs == kHoloWorldMarkerReticle || f.vs == kHoloTargetSphere))
         f.ps = bindingShaderHash(BindSlot::Ps);
     if (f.targetKind == 2) {
         // ui_depth's exclude list (the null-output mesh B018D143700AB803,
@@ -3842,6 +3842,7 @@ bool uiLayerVerdictForwards(DrawVerdict v) {
 // game's own buffer for the draws after it that test it.
 void uiLayerSecondIssues(ID3D11DeviceContext* self, char kind, UINT count, UINT instances,
                          const DrawArgs& args) {
+    if (uiLayerIssueBlocked()) return;
     GpuCensusScope census(self, GpuCensusSection::FrameUiLayerReissues);
     if (uiLayerMultiplyBegin(self)) {
         pureDrawReissue(self, kind, count, instances, args);
@@ -3866,6 +3867,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // compiler must reload across every call, and it was re-reading and
     // re-comparing it at each of a dozen sites per draw.
     const bool owner = self == g_state->ownerCtx;
+    if (owner && uiLayerIssueBlocked()) return;
     struct EffectCaptureScope {
         ID3D11DeviceContext* ctx;
         ~EffectCaptureScope(){if(ctx)objectProbeSourceDrawEnd(ctx);}
@@ -3913,6 +3915,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         }
     } seedOutcome{owner && uiLayerSeedDiagnostics()};
     auto observedDraw = [&]() {
+        if (owner && uiLayerIssueBlocked()) return false;
         const bool issued = draw();
         if (seedOutcome.on) seedOutcome.original = seedOutcome.original || issued;
         return issued;
@@ -4037,6 +4040,13 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // longer sees.
     if (effectCaptureScope.ctx) objectProbePanelDrawEnd(self);
     if(terrainOriginal)celestialMotionEnd(self);
+    if (owner && uiLayerIssueBlocked()) {
+        // Begin failed with untrusted shader state: close existing brackets,
+        // but issue neither the stock fallback nor any depth/motion replay.
+        if (v == DrawVerdict::kBackdrop) backdropEnd(self);
+        if (v != DrawVerdict::kNone) forwardVerdictEnd(self, v);
+        return;
+    }
     // The interface's alpha-aware depth pass (ui_depth.h): a composite
     // drawn through the interface projection is drawn once more, depth
     // only, right after its own draw and inside the scope that owns the
@@ -4222,6 +4232,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
         g_state->realDrawIndexedInstancedIndirect(self, args, off);
         return;
     }
+    if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawIndexedIndirect, self, static_cast<int>(self->GetType()));
     noteStaleForward(kSlotDrawIndexedInstancedIndirect, reinterpret_cast<const void*>(g_state->realDrawIndexedInstancedIndirect),
@@ -4248,6 +4259,7 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
         g_state->realDrawInstancedIndirect(self, args, off);
         return;
     }
+    if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawIndirect, self, static_cast<int>(self->GetType()));
     noteStaleForward(kSlotDrawInstancedIndirect, reinterpret_cast<const void*>(g_state->realDrawInstancedIndirect),
@@ -4537,6 +4549,7 @@ void STDMETHODCALLTYPE hookedDrawAuto(ID3D11DeviceContext* self) {
         g_state->realDrawAuto(self);
         return;
     }
+    if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
     gpuFrameCommand(self);
     if(self==g_state->ownerCtx)engineVelocityBeforeDraw(self,g_state->rtv0Eye);
     g_state->realDrawAuto(self);

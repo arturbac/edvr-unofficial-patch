@@ -5,11 +5,12 @@
 - **State:** phases 1–3 plus route-pricing fixes through `472ff122` are
   combined into `codex/dlss-performance-review` for Frontier optimization.
   Main remains separate. Holo panels, flight HUD, target sprite and eight
-  generic hologram families take the HDR layer. Sphere/corona stay in-scene;
+  generic hologram families take the HDR layer. Corona stays in-scene;
   canopy stays out. Frontier `be70af2a` dump `174605` now proves the exact
   world-reticle VS71DD8B8B09060A81/PS2D037A047171BF3B has no screen reads.
-  Narrow paired admission passes WARP/RTX fixture checks in the joint branch;
-  full-build gates pass; live checks remain. Other pixel variants stay stock.
+  Narrow paired admission passes full gates and is installed in `1ff8c224`.
+  It paints world-space brackets; the desired glyph is scanner-rim yellow <>.
+  Dump `194946` precedes final composition. Other pixel variants stay stock.
   stencil81/ref1 needs real seed work.
   Frontier `0229c358` flew with diagnostics off/on: Sean says HUD looked good.
   This is a qualitative visual check, not measured bloom parity. Armed HDR
@@ -19,7 +20,8 @@
   `review-mesh` replay shows surrounding rings, not proof of model admission.
   Sphere-family depth reads originate in Elite; the larger HUD grid changes
   their addressing. An actual-DXBC coordinate remap passes 4,907 offline WARP
-  checks; production admission and headset/cost checks remain. See final entry.
+  checks; production exact-pair admission passes 927 WARP/RTX checks each and
+  the full build. Frontier deployment uses this separate branch. See final entry.
 - **Goal:** composite the cockpit HUD after the upscale, at output
   resolution, out of DLSS/FSR history. That means the holo panels, the
   flight HUD and the target sprite. It should be as sharp at HMD Quality
@@ -35,8 +37,8 @@
 - **Prior art:** this is crisp-ui-handoff.md's parked form of Design A
   (lines 184-191: "PARKED, not declined"), with one change. It re-issues
   the game's own tonemap draw instead of transcribing it.
-- **Next step:** combined Frontier check of the paired reticle and seed cost
-  at UI quality 125, with fixed shaders compiled during the build. See
+- **Next step:** one Frontier flight/eye dump to qualify target-holo alpha,
+  final scanner <> and ship blur at UI quality 125. See
   `dlss-performance-review-2026-09-28.md` for the evidence and conditions.
   Revisit halo/translucent-over-bright behavior using the tail checklist.
 
@@ -787,3 +789,48 @@ both jitter signs and subrect/scissor. One MAD repairs only the t1 address;
 private stencil/write-back, device lifetime and headset performance remain
 unqualified. Fresh post-DLSS composition is the recommendation for history
 smearing; source-image blur is a separate question.
+## 2026-09-28: validated target-hologram admission and final capture
+
+Production remaps only VS5559 with verified EA02/E956 pixel programs. Their
+grey target sphere identity was pixel-probed in Frontier 20260924_155636,
+frame8548/eye0/point3 (hologram-depth arc); red wireframe81216/A296 is a
+different, already admitted family. Exclusive cockpit use, current model
+placement and actual VS geometry remain live qualifications.
+Unknown/linkage/identity/depth/viewport failures keep the complete stock draw.
+
+The bounded cache holds two patched programs and one float4 CB; original
+t1/materials/alpha and512² sources remain intact. The free shader b13 is
+saved/restored independently of the original PS/classes. Preparation precedes
+admission; successful Begin counters prove routing setup, not GPU execution.
+Stock colourless stencil/depth replay uses restored original bindings. One
+bounded restoration retry handles transient setter faults; persistent failure
+retains originals and blocks unsafe owner direct/DrawAuto/indirect/replay
+issues until shutdown. No extra full-eye depth copy or runtime HLSL.
+
+Actual-PS fixtures pass927 checks each on WARP and RTX5090, including64 exact
+nonuniform RGBA cases, original DSV byte equality,
+source/device/cache/allocation failures and before-real-setter faults.
+Classifier4157/0 and FinalCrisp624/0 pass. Full SDK/profile validation,86
+pooled rigs, Python tools and installer resource checks pass in
+`build/dlss-holo-final-full.log`; receipt input
+`665ab62402e1ff2363f8b10b040fa11d7b9d5ef11f7f6aee6830f3f007a7feb1`. Promote
+this same source to Frontier; main stays separate. Headset quality/performance
+remains unqualified.
+
+FinalCrisp adds both-eye native1400² crops and first-pair full overviews after
+`uiLayerComposite`, preserving P/T/L0's earlier stages. AA-independent boundary
+epochs plus native stereo sequence prevent guessed joins and retain the
+sixteenth right eye after old flush. JSON records original-stage sizes/mapping,
+native ROI/region, flips, composition/passthrough and
+copied/written/failed/missing outcomes. Fault-published staging alone is never
+success. Current4032×3896 RGBA8 run costs359.1MiB under512MiB total/64MiB
+per-artifact caps; other formats can explicitly decline. No capture COM/GPU
+work outside an armed dump.
+
+Desired scanner <> centers are(.5861,.5916)/(.5939,.5919); previous probes
+missed both and cannot identify redirected private-HDR contributions.
+Shared94D5 glare remains unadmitted without spatial proof. The next single dump
+must compare FinalCrisp with matched old stages and qualify target-holo
+transparency/occlusion plus ship blur. Saved red hull has82–86% joined engine
+motion; this rejects wholesale missing motion, not wrong vectors. No sharpening
+compensation or source-resolution inflation.

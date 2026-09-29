@@ -58,11 +58,18 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 struct ID3D11DeviceContext;
+struct ID3D11PixelShader;
+
 struct ID3D11Texture2D;
 
 namespace edvr {
+// Successful CreatePS hook only: two exact originals, no disk/HLSL input.
+// The render-owner cache prepares their restricted DXBC remap before a take.
+void uiLayerRememberHoloPs(ID3D11PixelShader* shader, uint64_t hash,
+                           const void* bytes, size_t count, bool linked);
 
 class Config;
 
@@ -71,6 +78,7 @@ extern bool g_uiLayerLive;
 extern bool g_uiLayerWatching;
 extern bool g_uiSeedDiagnostics;
 extern bool g_uiLayerRedirecting;
+extern bool g_uiLayerIssueBlocked;
 extern bool g_uiLayerCrispOn;
 extern bool g_uiLayerCrispPending;
 }  // namespace detail
@@ -78,6 +86,9 @@ extern bool g_uiLayerCrispPending;
 // The draw path's one gate: fix.ui_quality is on, a temporal mode is on, and
 // the layer has not stood down. One load.
 inline bool uiLayerLive() { return detail::g_uiLayerLive; }
+// A persistent driver restoration fault leaves stock shader state untrusted.
+// Owner-context issues stay suppressed until device shutdown, including Begin's fallback.
+inline bool uiLayerIssueBlocked() { return detail::g_uiLayerIssueBlocked; }
 
 // Reads fix.ui_quality, fix.temporal_aa and advanced.temporal_aa_debug
 // (value ui_layer). Live: an "off" composites the frame in flight and
@@ -122,6 +133,8 @@ void uiLayerNoteFamilyProbe(uint64_t vs, uint64_t ps, int family, int why);
 // returns false -- and End is then a no-op -- if the draw's state at the
 // moment of issue refuses (a blend changed by a verdict's own Begin, a seed
 // that failed), in which case the draw goes to the game's frame as always.
+// Exception: uiLayerIssueBlocked suppresses an unsafe issue after both guarded
+// original-shader restoration attempts fault; this is not a stock fallback.
 // Every state change goes through the raw entry points, so the binding
 // shadow keeps describing the game's.
 bool uiLayerBegin(ID3D11DeviceContext* ctx);

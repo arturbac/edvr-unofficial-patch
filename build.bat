@@ -939,7 +939,7 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE ^
     /Fo"%OBJ%\native_sharpen_test\\" /Fe"%BUILD%\native_sharpen_test.exe" ^
     "tools\native_sharpen_test\native_sharpen_test.cpp" "src\d3d11\native_sharpen.cpp" ^
-    "src\common\config.cpp" "src\common\log.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" ^
     /link /INCREMENTAL:NO kernel32.lib user32.lib dxgi.lib
 if errorlevel 1 ( echo [edvr] ERROR: native sharpen contract test build failed & exit /b 1 )
 "%BUILD%\native_sharpen_test.exe" --dry-run || exit /b 1
@@ -2435,4 +2435,19 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
 if errorlevel 1 ( echo [edvr] ERROR: pixel probe test build failed & exit /b 1 )
 "%OBJ%\pixelprobe\pixel_probe_test.exe" --dry-run || exit /b 1
 "%OBJ%\pixelprobe\pixel_probe_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_ui_holo_test
+echo [edvr] === ui_holo_test.exe ===
+REM Actual game DXBC coordinate remap, production cache/binding faults and stock stencil replay.
+if not exist "%OBJ%\uiholo" mkdir "%OBJ%\uiholo"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
+    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /utf-8 ^
+    /Fo"%OBJ%\uiholo\\" /Fe"%OBJ%\uiholo\ui_holo_test.exe" ^
+    "tools\ui_holo_test\ui_holo_test.cpp" "src\common\guard.cpp" ^
+    "third_party\dxbc_hash\DxilHash.cpp" ^
+    /link /INCREMENTAL:NO d3dcompiler.lib
+if errorlevel 1 ( echo [edvr] ERROR: UI hologram test build failed & exit /b 1 )
+"%OBJ%\uiholo\ui_holo_test.exe" --dry-run || exit /b 1
+"%OBJ%\uiholo\ui_holo_test.exe" --self-test || exit /b 1
 exit /b 0

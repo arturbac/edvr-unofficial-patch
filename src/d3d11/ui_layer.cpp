@@ -15,6 +15,7 @@
 #include "ui_layer.h"
 
 #include "ui_layer_math.h"
+#include "ui_holo_remap.h"
 #include "ui_layer_draw_timing.h"
 #include "ui_layer_shaders.h"
 #include "ui_layer_coverage.h"
@@ -49,6 +50,7 @@
 #include <wrl/client.h>
 
 #include <cmath>
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -62,6 +64,7 @@ bool g_uiLayerLive = false;
 bool g_uiLayerWatching = false;
 bool g_uiSeedDiagnostics = false;
 bool g_uiLayerRedirecting = false;
+bool g_uiLayerIssueBlocked = false;
 bool g_uiLayerCrispOn = false;      // the HDR HUD take/re-issue armed this frame (with the layer)
 bool g_uiLayerCrispPending = false; // a tonemap draw was admitted; its re-issue follows its draw
 }  // namespace detail
@@ -128,6 +131,12 @@ void standDown(const char* why) {
     if (g_stoodDown) return;
     g_stoodDown = true;
     refreshLive();
+    if (detail::g_uiLayerIssueBlocked) {
+        Log::get().note("ui quality: layer stood down -- %s. Original hologram shader/b13 state remains "
+                        "untrusted after two restoration attempts; owner draw issues and replay are suppressed "
+                        "until device shutdown, and saved original references are retained.", why ? why : "a restoration fault");
+        return;
+    }
     Log::get().note(
         "ui quality: the layer stands down for the rest of the session -- %s. The UI goes into "
         "the game's frame as before (and gets the UI depth and reactive mask again); the "
@@ -258,6 +267,11 @@ struct Draw {
     bool hdr = false;      // the crisp-HUD half of fix.ui_quality: the draw goes to the HDR HUD layer, not the 8-bit one
     int eye = -1;
     UiLayerFamily family = UiLayerFamily::kNone;
+    uint64_t holoPsHash = 0;
+    ID3D11PixelShader* holoOriginal = nullptr; // borrowed from the game's binding
+    ID3D11PixelShader* holoPatched = nullptr;  // borrowed from the bounded cache
+    ID3D11ShaderResourceView* holoDepthCheck = nullptr; // saved query ref, including a partial SEH getter
+    bool holoRestoreOk = true; // failed restore must never replay a patched PS at stock coordinates
     uint64_t seq = 0;
     const void* targetRes = nullptr;
     uint32_t targetW = 0, targetH = 0;
@@ -288,6 +302,13 @@ struct Draw {
     int wbRouteSlot = -1;
 };
 Draw g_draw;
+ui_holo_remap::Cache g_holoCache;
+ui_holo_remap::Binding g_holoBinding;
+uint64_t g_holoEligible = 0, g_holoPrepared = 0, g_holoTaken = 0, g_holoRefused = 0;
+bool g_holoPrepareNoted[2]{}, g_holoTakeNoted[2]{}, g_holoRefusalNoted[2]{};
+std::atomic<uint64_t> g_holoCaptureCalls{0}, g_holoCaptured{0};
+std::atomic<bool> g_holoCaptureNoted[2]{}, g_holoCaptureRefusalNoted[2]{};
+static_assert(ui_holo_remap::kVs == kHoloTargetSphere, "hologram classifier identity");
 uint64_t g_lastRedirectSeq = 0;
 bool g_familyEngaged[static_cast<size_t>(UiLayerFamily::kCount)] = {};
 uint32_t g_watchBudget = kWatchPerFrame;
@@ -1140,6 +1161,10 @@ const void* dsvResource(ID3D11DepthStencilView* dsv) {
 }
 
 void releaseSaved() {
+    // Keep original shader/CB references after an unrecoverable setter fault.
+    // The owner draw gate stays latched even when the per-draw state is reset.
+    if (!g_holoBinding.needsRestore()) g_holoBinding.clear();
+    ui_holo_remap::release(g_draw.holoDepthCheck);
     for (auto*& r : g_draw.rtv) {
         if (r) r->Release();
         r = nullptr;
@@ -1160,6 +1185,14 @@ UINT boundCount(ID3D11RenderTargetView* const* rtvs) {
 }
 
 void restore(ID3D11DeviceContext* ctx) {
+    // Restore the private shader/CB first, with independent guarded setters:
+    // an OM/RS restoration fault must not leave the game's PS replaced.
+    const auto holoRestore = g_holoBinding.finish(ctx, vScreenPSSetShaderRaw);
+    g_draw.holoRestoreOk = holoRestore.restored;
+    if (!holoRestore.restored) detail::g_uiLayerIssueBlocked = true;
+    if (holoRestore.retried)
+        standDown(holoRestore.restored ? "a hologram shader/b13 restoration fault recovered on the bounded retry"
+                                     : "hologram shader/b13 restoration failed; original state untrusted, owner draw issues suppressed until device shutdown");
     vScreenSetRenderTargetsRaw(ctx, boundCount(g_draw.rtv), g_draw.rtv, g_draw.dsv);
     vScreenRSSetViewportsRaw(ctx, g_draw.vpCount, g_draw.vp);
     if (g_draw.scissorSet) ctx->RSSetScissorRects(g_draw.scCount, g_draw.sc);
@@ -1391,6 +1424,27 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
     // Everything the game had is held: from here on any exit, a fault's
     // included, puts it back (uiLayerBegin).
     g_draw.saved = true;
+    ui_holo_remap::Params holoParams{};
+    if (g_draw.holoPsHash) {
+        const auto& v = g_draw.vp[0];
+        ctx->PSGetShaderResources(1, 1, &g_draw.holoDepthCheck);
+        const bool valid = g_draw.vpCount == 1 && std::isfinite(v.TopLeftX) &&
+            std::isfinite(v.TopLeftY) && std::isfinite(v.Width) && std::isfinite(v.Height) &&
+            v.Width > 0 && v.Height > 0 &&
+            ui_holo_remap::params(g_draw.targetW, g_draw.targetH, layerW, layerH,
+                                  g_draw.jx, g_draw.jy, holoParams) &&
+            ui_holo_remap::depthSource(g_draw.holoDepthCheck, g_draw.targetW, g_draw.targetH);
+        if (!valid) {
+            ++g_holoRefused; ++g_win.refusedAtIssue;
+            const int slot = ui_holo_remap::index(g_draw.holoPsHash);
+            if (!g_holoRefusalNoted[slot]) {
+                Log::get().note("crisp holo remap: refused PS %016llX -- unsupported t1 depth, viewport, or map; stock complete draw retained.",
+                    static_cast<unsigned long long>(g_draw.holoPsHash));
+                g_holoRefusalNoted[slot] = true;
+            }
+            releaseSaved(); return false;
+        }
+    }
     // The layer's depth-stencil target: for a draw that tests, seeded from
     // the game's own first (or again, when stale or short of the bits this
     // draw reads); for a draw that only writes, bound once seeded this frame
@@ -1443,6 +1497,17 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
                                               static_cast<float>(g_draw.targetH), layerW, layerH);
     float cx = 0.0f, cy = 0.0f;
     uiLayerJitterCancel(g_draw.jx, g_draw.jy, m, &cx, &cy);
+    if (g_draw.holoPsHash && !g_holoBinding.begin(ctx, g_draw.holoPatched, g_holoCache.constants(),
+            holoParams, vScreenPSSetShaderRaw, g_draw.holoOriginal)) {
+        ++g_holoRefused; ++g_win.refusedAtIssue;
+        const int slot = ui_holo_remap::index(g_draw.holoPsHash);
+        if (!g_holoRefusalNoted[slot]) {
+            Log::get().note("crisp holo remap: refused PS %016llX at bind (original shader changed or dynamic classes); stock complete draw retained.",
+                static_cast<unsigned long long>(g_draw.holoPsHash));
+            g_holoRefusalNoted[slot] = true;
+        }
+        releaseSaved(); return false;
+    }
     D3D11_VIEWPORT vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
     for (UINT i = 0; i < g_draw.vpCount; ++i) {
         const D3D11_VIEWPORT& g = g_draw.vp[i];
@@ -1542,6 +1607,16 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
             g_draw.targetW, g_draw.targetH, viewName(g_tc.view), static_cast<double>(m.ax),
             static_cast<double>(m.ay), static_cast<double>(cx), static_cast<double>(cy),
             uiBlendShapeName(shape));
+    }
+    if (g_draw.holoPsHash) {
+        ++g_holoTaken; const int slot = ui_holo_remap::index(g_draw.holoPsHash);
+        if (!g_holoTakeNoted[slot]) {
+            Log::get().note("crisp holo remap: admitted VS %016llX PS %016llX eye %d input %ux%u layer %ux%u inverse (%g,%g) bias (%g,%g); original t1/materials/alpha, seeded stencil and stock write-back retained.",
+                static_cast<unsigned long long>(ui_holo_remap::kVs), static_cast<unsigned long long>(g_draw.holoPsHash),
+                g_draw.eye, g_draw.targetW, g_draw.targetH, layerW, layerH,
+                double(holoParams.x), double(holoParams.y), double(holoParams.bx), double(holoParams.by));
+            g_holoTakeNoted[slot] = true;
+        }
     }
     return true;
 }
@@ -2114,6 +2189,11 @@ void logMemory() {
 }
 
 void logTotals(double seconds) {
+    Log::get().note("crisp holo remap: cumulative capture_calls %llu captured %llu eligible %llu prepared %llu admitted %llu refused %llu; two exact PS only, zero admitted means no successful route, no extra scene-depth copy.",
+        static_cast<unsigned long long>(g_holoCaptureCalls.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_holoCaptured.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(g_holoEligible), static_cast<unsigned long long>(g_holoPrepared),
+        static_cast<unsigned long long>(g_holoTaken), static_cast<unsigned long long>(g_holoRefused));
     g_seedCensus.report([](const char* line) { Log::get().note("%s", line); });
     g_hdrSeedGpu.report(g_hdrDrawTimingOn, [](const char* line) { Log::get().note("%s", line); });
     const double frames = g_win.frames ? static_cast<double>(g_win.frames) : 1.0;
@@ -2294,6 +2374,24 @@ void logTotals(double seconds) {
 
 }  // namespace
 
+void uiLayerRememberHoloPs(ID3D11PixelShader* shader, uint64_t hash,
+                           const void* bytes, size_t count, bool linked) {
+    const int slot = ui_holo_remap::index(hash);
+    if (slot < 0) return;
+    g_holoCaptureCalls.fetch_add(1, std::memory_order_relaxed);
+    bool ok = false;
+    const bool ran = guarded("ui.holo.remember", [&] { ok = g_holoCache.remember(shader, hash, bytes, count, linked); });
+    if (ran && ok) {
+        g_holoCaptured.fetch_add(1, std::memory_order_relaxed);
+        if (!g_holoCaptureNoted[slot].exchange(true, std::memory_order_relaxed))
+            Log::get().note("crisp holo remap: captured verified PS %016llX %zu bytes, exact SV_Position ftoi/t1 load and free shader b13; not yet admitted.",
+                static_cast<unsigned long long>(hash), count);
+    } else if (!g_holoCaptureRefusalNoted[slot].exchange(true, std::memory_order_relaxed)) {
+        Log::get().note("crisp holo remap: PS %016llX capture refused (bytes/linkage/private identity unavailable); original shader untouched.",
+            static_cast<unsigned long long>(hash));
+    }
+}
+
 // The crisp take's whole dependency set, established no later than the first
 // HUD take (review R2) -- defined beside the coverage machinery, below.
 bool crispTakeReady(ID3D11DeviceContext* ctx, int eye);
@@ -2418,6 +2516,8 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     g_draw.decided = false;
     g_draw.counted = false;
     g_draw.hdr = false;
+    g_draw.holoPsHash = 0; g_draw.holoOriginal = nullptr; g_draw.holoPatched = nullptr;
+    g_draw.holoRestoreOk = true;
     g_draw.ds = UiDsEffect{};
     g_draw.stencilRead = 0;
     g_draw.shape = UiBlendShape::kRefused;
@@ -2530,6 +2630,33 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
                           (f.blend != UiBlendShape::kMultiply || ensureMult(ctx, g_eye[f.eye], f.eye));
             d = uiLayerDecide(f);
         }
+        if (d == UiLayerDecision::kRedirect && f.crispHdr &&
+            bindingShaderHash(BindSlot::Vs) == ui_holo_remap::kVs) {
+            const uint64_t ps = bindingShaderHash(BindSlot::Ps);
+            ++g_holoEligible;
+            ID3D11PixelShader* original = static_cast<ID3D11PixelShader*>(bindingGet(BindSlot::Ps));
+            ID3D11PixelShader* prepared = nullptr;
+            const bool ran = guarded("ui.holo.prepare", [&] { prepared = g_holoCache.prepare(ctx, original, ps); });
+            if (!ran || !prepared) {
+                ++g_holoRefused; d = UiLayerDecision::kLayerFailed;
+                _snprintf_s(detail, _TRUNCATE, "hologram PS bytecode/device preparation unavailable; stock complete draw retained");
+                const int slot = ui_holo_remap::index(ps);
+                if (slot >= 0 && !g_holoRefusalNoted[slot]) {
+                    Log::get().note("crisp holo remap: prepare refused PS %016llX before admission (verified bytecode, original identity, device or allocation unavailable); stock complete draw retained.",
+                        static_cast<unsigned long long>(ps));
+                    g_holoRefusalNoted[slot] = true;
+                }
+            } else {
+                ++g_holoPrepared; g_draw.holoPsHash = ps;
+                g_draw.holoOriginal = original; g_draw.holoPatched = prepared;
+                const int slot = ui_holo_remap::index(ps);
+                if (!g_holoPrepareNoted[slot]) {
+                    Log::get().note("crisp holo remap: prepared PS %016llX from verified original DXBC before admission; private b13 float4, no runtime HLSL.",
+                        static_cast<unsigned long long>(ps));
+                    g_holoPrepareNoted[slot] = true;
+                }
+            }
+        }
         // What decided it, in the census's own numbers, for the first line.
         char bl[64], ds[256];
         describeBlend(game, bl, sizeof(bl));
@@ -2614,6 +2741,7 @@ bool uiLayerMultiplyBegin(ID3D11DeviceContext* ctx) {
 }
 
 bool uiLayerWriteBackBegin(ID3D11DeviceContext* ctx) {
+    if (!g_draw.holoRestoreOk) return false;
     if (!g_draw.decided || !g_draw.counted || !g_draw.ds.writes() || g_draw.active || !ctx)
         return false;
     bool ok = false;
@@ -3601,6 +3729,8 @@ void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
 }
 
 void uiLayerShutdown() {
+    g_holoBinding.clear(); g_holoCache.reset();
+    detail::g_uiLayerIssueBlocked = false;
     g_privateDepthGuard.reset();
     g_hdrSeedGpu.reset(); // release-only shutdown; the owner/device may already be gone
     g_hdrSeedActive = 0;
