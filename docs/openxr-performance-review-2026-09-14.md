@@ -39,14 +39,15 @@ changes.*
   0.1 ms bar.
 - **Ruled out:** at the end of each 2026-09-24 entry, and in the 2026-09-29
   ones (the periodic jobs; EDVR's Present hook).
-- **Next** (flight 090608 entry): a no-build test at the carrier, a minute
-  at a much lower resolution, says whether Elite's thread waits on the GPU;
-  then an exact per-frame figure for EDVR's draw and Create* hooks; then the
-  UI passes cut to the UI's footprint (review P3) and the lean per-draw
-  thunk (A-1); the output size is a setting. Also any flight on a Quest
-  runtime with the default build: check the Application-render GPU invalid
-  count stays near zero and `native_frame_end_overlap_summary` reads
-  failures=0.
+- **Next** (flight 090608 entry): one instrument build, then a normal
+  carrier flight: the GPU's idle time between frames says which side limits
+  the frame (HMD Quality is already 0.5, so no lower-resolution test), and
+  an exact per-frame figure for EDVR's draw and Create* hooks says whose the
+  stalls are; then the UI passes cut to the UI's footprint (review P3) and
+  the lean per-draw thunk (A-1); the output size is a setting. Also any
+  flight on a Quest runtime with the default build: check the
+  Application-render GPU invalid count stays near zero and
+  `native_frame_end_overlap_summary` reads failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
   4100x4050 and 2665x2087.
@@ -967,9 +968,9 @@ window is Elite's and this arc moves off EDVR's hook.
 ## 2026-09-29: flight 090608, the split flown at a busy fleet carrier
 
 Build v0.18.0-rc.3-108-gc1408551 on the Frontier install: SteamVR OpenXR
-(`aapvr`), 4032x3896 out and 2016x1948 in per eye, 90 Hz, DLSS performance
-mode with preset K, runtime pacing, `frame_end_overlap` on. Logs
-`edvr_gfx_20260929_090608.log` and
+(`aapvr`), 4032x3896 out and 2016x1948 in per eye (Elite's HMD Image Quality
+0.5), 90 Hz, DLSS performance mode with preset K, runtime pacing,
+`frame_end_overlap` on. Logs `edvr_gfx_20260929_090608.log` and
 `edvr_openxr_20260929_090610_039_12932.log`; the busy part is about two and
 a half minutes beside Sean's fleet carrier with many ships about
 (09:08-09:10:30). Sean, reading fpsVR: clearly better than before, still
@@ -1034,11 +1035,18 @@ about 10.8 ms CPU and GPU with frequent spikes over 11.1; the same scene on
   6.1-7.1 ms against 5.4-6.2.
 
 **Next.** In order of cost:
-1. No build: at the carrier, a minute at a much lower SteamVR resolution (or
-   DLSS ultra performance), then back. If Elite's cycle outside the wait
-   falls with the GPU load, its thread was waiting on the GPU inside its own
-   calls and the GPU is the one limit; if it stays near 11.6 ms, the thread
-   is a limit of its own and GPU savings alone will not reach 90.
+1. Which side limits the frame. HMD Image Quality is already 0.5 in these
+   flights, the bottom of the normal DLSS range (below it the served-floor
+   path changes the output too), so there is no lower-resolution test. The
+   log cannot separate it either: when the scene thinned at 09:08:59,
+   Elite's thread fell from 11.4 to 8.1 ms and the GPU from about 11.1-12.3
+   to 10.6-10.7 ms together. Measure it instead: the GPU's idle time between
+   one frame's last EDVR pass and the next frame's first producer run, in
+   the census. Near zero means the GPU is the limit and the thread's excess
+   is waiting on it; a gap means the thread starves the GPU by that much. A
+   free alternative: EDVR's anti-aliasing off for a minute at the carrier
+   (live), reading the time after Elite's Present; it also trims some of
+   EDVR's hook work, so it is not clean.
 2. An exact per-frame figure for EDVR's draw hooks, split into the
    pre-submit and after-Present windows and named on long frames: clock only
    the branches that do EDVR work, as `frame_ticks.h` does for the Present
