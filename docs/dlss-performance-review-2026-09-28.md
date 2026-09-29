@@ -7,9 +7,9 @@
   User reports CPU spikes and fpsVR GPU <=6.8 ms. The recurring handoff blocks
   ~1.94 ms/frame behind deferred xrEndFrame; exact stacks confirm it defeats
   post-submit overlap. Actual-host tests and independent review pass for a
-  nonblocking notification; full validation is green before promotion. Earlier
-  dump `033645` confirms both cockpit models. Work stays on the separate
-  Frontier branch; main is unchanged.
+  nonblocking notification; full build/promotion pass and `6eede364` is
+  installed and verified on Frontier. Dump `033645` confirms both cockpit
+  models. Work stays on the separate Frontier branch; main is unchanged.
 - **Conclusion:** no controlled whole-frame performance comparison or exact
   regression conclusion. The new remap follows the earliest stalls; see
   Exclusions for ruled-out causes and the HUD arc for build/fixture evidence.
@@ -22,11 +22,13 @@
   2037×1969→4074×3938/UI5093×4923. Installed DLSS metadata is 310.7.0.0;
   graphics logs omit driver/DLSS versions. Profiling uses Frontier; baseline
   uses Steam.
-- **Next:** commit/promote/install the validated handoff and B4/B9 changes,
-  then fly Frontier with fpsVR, diagnostics OFF and no eye dump to check gain.
-  Review B1/B2 fault recovery remains open before main; B3 timer behavior needs
-  user approval. Allocation dimensions do not prove VRAM pressure. Earlier
-  `1ff8c224` trace `194016-f80584` is recovered; do not repeat it.
+- **Next:** fly Frontier with fpsVR, diagnostics OFF and no eye dump to check
+  CPU gain, including the same cockpit/ship approach. Verify the new flight
+  with `tools/edvr_log.py --target frontier --expect-build 6eede364`; later
+  documentation commits do not change the installed code. Review B1/B2 fault
+  recovery remains open before main; B3 timer behavior needs user approval.
+  Allocation dimensions do not prove VRAM pressure. Earlier `1ff8c224` trace
+  `194016-f80584` is recovered; do not repeat it.
 
 ## Pre-optimization Frontier evidence
 
@@ -316,6 +318,14 @@ Full `build.bat` validation passes, including 86 pooled rigs, Python gates,
 production DLLs, config contract and installer resources. Log:
 `build/dlss-handoff-review-full.log`; input receipt
 `aee14f4390edea1513b0186f175289688aa3f46e2b746871652fcbb288440702`.
+
+Source commit `6eede364` is pushed separately. Clean receipt-guarded promotion
+passes in `build/dlss-handoff-review-promotion.log`, version
+`v0.18.0-rc.3-63-g6eede364`. Sanctioned installer dry-run/install/verify pass
+for Frontier; full output in `build/dlss-handoff-frontier-install.log`. INI
+SHA256 `A2D27168…784273DF` and installed DLSS `BE6E434A…FB6EE6E` remain
+unchanged. Capture helper now expects this code; dry-run starts no trace or
+workload and writes nothing. No post-fix flight yet.
 
 ## 2026-09-29: external review and slices triage
 
