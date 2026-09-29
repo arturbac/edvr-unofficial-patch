@@ -38,8 +38,8 @@ changes.*
 - **Ruled out:** at the end of each 2026-09-24 entry, and in the 2026-09-29
   ones (the periodic jobs; EDVR's Present hook; EDVR's AA work as the
   stalls' cause; engine motion's CPU as the carrier's limit; the six wrapped
-  draws as the redirected holograms or the depth reissues; for the UI and
-  hologram passes, every cut but one, measured).
+  draws as a large EDVR cost, being vivid glare and the scanner-body
+  resolve; for the UI and hologram passes, every cut but one, measured).
 - **UI and hologram passes, 2026-09-29 (entry below):** one exact cut, the
   UI resolve skipping inputs it was not given (about 0.09 ms a frame); a
   tile early-out, a groupshared window, R8 history, a composite tile bound,
@@ -47,14 +47,13 @@ changes.*
   Largest left: the HDR HUD's depth seed (about 1 ms a frame at the carrier,
   outside the census) and UI quality 1.25, a setting (1.62x the pixels of
   1.0).
-- **Next:** the GPU is the lever, about 1.6 ms off EDVR's ~6 ms at the
-  carrier. The next carrier flight names the six "other fix-wrapped draws"
-  (1.02 ms whole) from the per-fix census line (one `fix.sun_glare` flip
-  separates the candidates) and reads the new "UI resolve totals" line.
-  Sean's settings to weigh: the output size (the upscaler's 3.08 ms) and UI
-  quality 1.0 against 1.25; foveated DLSS is paused. Any Quest flight with
-  the default build: check the Application-render GPU invalid count stays
-  near zero and `native_frame_end_overlap_summary` reads failures=0.
+- **Next** (flight 132352 entry): the carrier sits at the budget (GPU
+  10.7-11.3 ms, EDVR about 4.8 of it). Open: the HUD depth seed into the
+  census (then UI quality 100 against 125 in one flight), stock glare's
+  extra 2.5 ms, the landing-pad display left out of the UI layer; the output
+  size and foveated DLSS are Sean's levers. Any Quest flight with the
+  default build: check the Application-render GPU invalid count stays near
+  zero and `native_frame_end_overlap_summary` reads failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
   4100x4050 and 2665x2087.
@@ -1560,3 +1559,47 @@ docs/dlss-performance-review-2026-09-28.md. Second, `fix.ui_quality` 1.25
 itself: the layer holds 1.62x the pixels of 1.0, and the seed, the
 redirected draws (0.60 ms) and the composite scale with them, roughly 0.7-1.0
 ms a frame by pixel count, unmeasured. That changes the image; Sean's call.
+
+## 2026-09-29: flight 132352, the carrier again, the six draws named
+
+Build a43c94ba on the Frontier install (build matched). Launched with AA off
+(the previous flight's live switch had written it to edvr.ini), so the mip
+bias was 0 all session; DLSS from 13:25:12; at the carrier from about 13:26.
+Sun glare vivid -> stock at 13:27:28 and back at 13:28:13; UI quality
+125 -> 100 at 13:28:29, then a trip through the main menu. F10 at 13:26:45
+(the draw census and 117 eye dumps). Sean: the stock glare made frame times
+worse; CPU frame time good; GPU still hitches; 90 not held.
+
+- **The six wrapped draws, named.** Vivid: `sun glare steady` 0.30-0.46 ms
+  (about 4 a frame) and `scanner-body resolve` 0.04-0.07 ms (2 a frame),
+  both timed whole. Nothing large to cut there.
+- **Stock glare costs more than vivid.** With stock (census window ending
+  13:27:53): the redirected UI draws 2.675 ms (116 a frame) against
+  0.52-0.84 ms with vivid, the census's "game" 8.5 against about 5.9, and
+  the GPU p50 13.1-14.0 ms against about 11.3 before and 10.9-11.0 after.
+  Hypothesis, under test: the stock glare's full-screen overlays are taken
+  into the UI layer and drawn at output size times UI quality.
+- **UI quality 100 against 125: not settled.** The census's timed UI items
+  did not move (resolve 0.26-0.31, composite 0.26-0.30), the comparison
+  crossed a reload, and the part that should shrink, the HUD depth seed
+  (the layer's depth-stencil target is 5040x4870 at 125 here), is not in the
+  census yet.
+- **The end of the flight sat at the budget.** Vivid and UI 100, back at the
+  carrier: runtime window 13:29:09-13:29:39 held 89.9 fps with no late frame
+  while the scene refilled (benchmark GPU 8.8 -> 10.6 ms); the census window
+  ending 13:29:53 read 10.82 ms with the frame gap back to 0.19 ms p50.
+  EDVR 4.75-4.88 ms of it (upscaler 2.93-3.02).
+- **The hitches.** Long frames at the carrier ran 24-41 ms with EDVR's hook
+  0.04-0.28 ms and engine motion at most 0.57 ms in each: Elite's. The
+  233.6 ms at 13:26:45 was the F10 capture and eye dump. Otherwise the GPU
+  median sits at the budget, so ordinary variance crosses 11.1 ms.
+- **UI resolve totals:** 20,494 dispatches, the source-edit mask absent in
+  20,486 and the coverage mask in 15,192, so the null-fetch cut applies
+  almost always. Engine motion on the render thread: 0.12-0.15 ms p50.
+- ruled out: the six "other fix-wrapped draws" as a large EDVR cost, because
+  they are vivid sun glare (0.30-0.46 ms) and the scanner-body resolve
+  (0.04-0.07 ms).
+- Sean's eye dump shows the landing-pad display, which Elite draws in the
+  radar's place while docking, left out of the UI layer (the radar itself is
+  handled correctly); under analysis with the stock-glare question and a
+  census section for the depth seed.
