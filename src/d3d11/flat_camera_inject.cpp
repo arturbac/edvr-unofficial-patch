@@ -69,9 +69,11 @@ namespace {
 //
 // Safety discipline is the producer probe's, learned from its two crashed
 // flights and the probe rebuild: prologue-verified single site, gate-first
-// 44-byte relay, forward through the trampoline, and hold-open for process
-// lifetime -- disable closes the gate and nothing more (no uninstall, no
-// free, ever).
+// relay that preserves EVERY register (the 20:09/03:50 crashes: this
+// pipeline family inherits a frame base in r11 and the unhooked refresh
+// preserves it, so the old r11-gate relay broke the callers' invariant),
+// forward through the trampoline, and hold-open for process lifetime --
+// disable closes the gate and nothing more (no uninstall, no free, ever).
 
 constexpr uintptr_t kRefreshRva = 0x592200;
 // Two site constraints, learned from two refused installs: the function's
@@ -83,12 +85,13 @@ constexpr uintptr_t kRefreshRva = 0x592200;
 // prologue set with mov rax,rsp) must reach the body intact.
 constexpr uint8_t kRefreshPrologue[16] = {0x41, 0x57, 0x48, 0x81, 0xEC, 0xE0, 0x00, 0x00,
                                          0x00, 0x4D, 0x8B, 0xF8, 0x4C, 0x8B, 0xEA, 0x4C};
-constexpr size_t kRelayBytes = 44;
-constexpr uint32_t kOriginalLiteral = 36;
+constexpr size_t kRelayBytes = 46;
+constexpr uint32_t kCallbackLiteral = 24;
+constexpr uint32_t kOriginalLiteral = 38;
 // The generated stubs share the relay's page; every cross-reference is
 // absolute, so placement only needs to stay inside the allocation.
 constexpr uint32_t kStubAOffset = 48;   // 8-aligned, right after the relay
-constexpr uint32_t kStubBOffset = 144;  // after stubA (96 bytes), 8-aligned
+constexpr uint32_t kStubBOffset = 160;  // after stubA (111 bytes), 8-aligned
 
 // The camera struct's fields (camera-relative, the typed table).
 constexpr uint32_t kCamKind = 0x264;
@@ -157,6 +160,12 @@ struct InjectState {
 InjectState g_inject;
 std::atomic<uintptr_t> g_gate{0};
 std::atomic<uintptr_t> g_refreshForward{0};
+// The incoming r11 of the most recent refresh call, captured by stubA's
+// moffs store BEFORE anything can clobber it. The 20:09/03:50 crashes put
+// this pipeline family's r11 convention under suspicion (an inherited
+// frame base the unhooked refresh preserves); the tick prints it -- a
+// stack pointer here is the convention proven in the log.
+std::atomic<uintptr_t> g_lastIncomingR11{0};
 uintptr_t g_stubB = 0;
 uint32_t g_stubATrampOfs = 0;
 
@@ -219,20 +228,28 @@ uint8_t* allocateRelay(uintptr_t target) noexcept {
 }
 
 void buildRelay(uint8_t* code, const void* gate, void* callback) noexcept {
-    // mov r11,&gate; cmp qword ptr[r11],0; je original; jmp [callback];
-    // original: jmp [trampoline]. R11 carries the gate here, NOT the usual
-    // rax: this target established its frame anchor with mov rax,rsp BEFORE
-    // the patch site, so the relay's register clobber must not touch rax --
-    // the trampoline replays the stolen instructions and returns into a body
-    // that reads its frame through rax, and a clobbered rax is a wild frame.
+    // push rax; mov rax,&gate; cmp qword ptr[rax],0; pop rax; jz original;
+    // jmp [callback]; original: jmp [trampoline].
+    //
+    // NO register is left clobbered. The first form carried the gate in r11:
+    // rax was the known constraint (this target's frame anchor is mov rax,rsp
+    // BEFORE the patch site, so rax must survive), but the 20:09/03:50
+    // crashes showed r11 is equally load-bearing here -- this pipeline family
+    // passes a frame base down in r11 (the refresh's caller FUN_140594dc8
+    // spills through [r11+0x10] at entry with no local setup), and the
+    // unhooked refresh never touches r11, so the invariant held until the
+    // relay overwrote it. push/pop rax preserves the anchor AND r11; the cmp
+    // clobbers flags, which is safe because the trampoline's stolen
+    // sub rsp,0xE0 re-sets them before the body can read them.
     const uint8_t body[kRelayBytes] = {
-        0x49,0xBB,0,0,0,0,0,0,0,0, 0x49,0x83,0x3B,0,
-        0x74,0x0E, 0xFF,0x25,0,0,0,0, 0,0,0,0,0,0,0,0,
+        0x50, 0x48,0xB8,0,0,0,0,0,0,0,0, 0x48,0x83,0x38,0,
+        0x58, 0x74,0x0E, 0xFF,0x25,0,0,0,0, 0,0,0,0,0,0,0,0,
         0xFF,0x25,0,0,0,0, 0,0,0,0,0,0,0,0};
     std::memcpy(code, body, sizeof(body));
     const uintptr_t gateAddress = reinterpret_cast<uintptr_t>(gate);
     const uintptr_t callbackAddress = reinterpret_cast<uintptr_t>(callback);
-    std::memcpy(code + 2, &gateAddress, 8); std::memcpy(code + 22, &callbackAddress, 8);
+    std::memcpy(code + 3, &gateAddress, 8);
+    std::memcpy(code + kCallbackLiteral, &callbackAddress, 8);
 }
 
 // A tiny emitter for the two stubs. Fixed byte sequences with immediates
@@ -253,12 +270,14 @@ struct CodeCursor {
 // from the save slots, then restores everything and joins the trampoline
 // with rsp = S: the game body must see a byte-identical stack. Returns
 // the offset of the trampoline literal for prepareRelay.
-uint32_t buildStubA(uint8_t* at, const void* preFn) noexcept {
+uint32_t buildStubA(uint8_t* at, const void* preFn, void* r11Store) noexcept {
     CodeCursor c{at};
     c.b({0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x55});           // push rax rbx rcx rdx rsi rdi rbp
     c.b({0x41,0x50, 0x41,0x51, 0x41,0x52, 0x41,0x53,           // push r8 r9 r10 r11
          0x41,0x54, 0x41,0x55, 0x41,0x56, 0x41,0x57});          // push r12 r13 r14 r15
     // rsp = S-0x78, 16-aligned. Slots: r15@[+0] .. rax@[+0x70].
+    c.b({0x48,0x8B,0x44,0x24,0x20});                            // mov rax,[rsp+0x20]  = saved r11 (incoming!)
+    c.b({0x48,0xA3}); c.u64(reinterpret_cast<uint64_t>(r11Store)); // mov [&g_lastIncomingR11],rax
     c.b({0x48,0x8D,0x8C,0x24}); c.u32(0x88);                    // lea rcx,[rsp+0x88]  = R0 (the game's retaddr slot)
     c.b({0x48,0x8B,0x54,0x24,0x60});                            // mov rdx,[rsp+0x60]  = saved rcx (ctx)
     c.b({0x4C,0x8B,0x44,0x24,0x58});                            // mov r8, [rsp+0x58]  = saved rdx (p2)
@@ -365,7 +384,7 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     g_inject.lastCamera.store(camera, std::memory_order_relaxed);
     if (trace) {
         uint64_t literal = 0;
-        if (sehReadU64(reinterpret_cast<uintptr_t>(g_inject.relay) + 22, &literal)) {
+        if (sehReadU64(reinterpret_cast<uintptr_t>(g_inject.relay) + kCallbackLiteral, &literal)) {
             Log::get().note("flat camera inject: refresh call #%llu entered (ctx=%p p2=%p camera=%p stubA=%p trampoline=%p)",
                             (unsigned long long)callNo, reinterpret_cast<void*>(ctx),
                             reinterpret_cast<void*>(p2), reinterpret_cast<void*>(camera),
@@ -559,7 +578,8 @@ void flatCameraInjectFrame(uint64_t frame) {
         }
         g_stubB = reinterpret_cast<uintptr_t>(g_inject.relay) + kStubBOffset;
         buildRelay(g_inject.relay, &g_gate, g_inject.relay + kStubAOffset);
-        g_stubATrampOfs = buildStubA(g_inject.relay + kStubAOffset, &refreshPre);
+        g_stubATrampOfs = buildStubA(g_inject.relay + kStubAOffset, &refreshPre,
+                                     &g_lastIncomingR11);
         buildStubB(g_inject.relay + kStubBOffset, &refreshPost, _tls_index,
                    static_cast<uint32_t>(tlsStruct - tlsBase));
         if (!g_inject.hook.install(reinterpret_cast<void*>(base + kRefreshRva), g_inject.relay, nullptr,
@@ -577,21 +597,21 @@ void flatCameraInjectFrame(uint64_t frame) {
         // Readback verification: the relay stub, its callback literal, the
         // trampoline's and stubA's first bytes, so a later crash can be
         // compared against what was actually built.
-        uint8_t relayBytes[44] = {};
+        uint8_t relayBytes[46] = {};
         uint64_t callbackLiteral = 0, fwd = g_refreshForward.load(std::memory_order_relaxed);
         uint8_t trampBytes[16] = {};
         uint8_t stubABytes[16] = {};
         __try {
             std::memcpy(relayBytes, g_inject.relay, sizeof(relayBytes));
-            std::memcpy(&callbackLiteral, g_inject.relay + 22, 8);
+            std::memcpy(&callbackLiteral, g_inject.relay + kCallbackLiteral, 8);
             std::memcpy(trampBytes, reinterpret_cast<const void*>(fwd), sizeof(trampBytes));
             std::memcpy(stubABytes, g_inject.relay + kStubAOffset, sizeof(stubABytes));
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
-        char hex1[144]{}, hex2[96]{}, hex3[96]{};
-        for (int i = 0; i < 22; ++i) std::snprintf(hex1 + i * 3, sizeof(hex1) - i * 3, "%02X ", relayBytes[i]);
+        char hex1[192]{}, hex2[96]{}, hex3[96]{};
+        for (int i = 0; i < 46; ++i) std::snprintf(hex1 + i * 3, sizeof(hex1) - i * 3, "%02X ", relayBytes[i]);
         for (int i = 0; i < 16; ++i) std::snprintf(hex2 + i * 3, sizeof(hex2) - i * 3, "%02X ", trampBytes[i]);
         for (int i = 0; i < 16; ++i) std::snprintf(hex3 + i * 3, sizeof(hex3) - i * 3, "%02X ", stubABytes[i]);
-        Log::get().note("flat camera inject: relay[0..21]=%s| stubA=%p trampoline=%p tramp[0..15]=%s stubA[0..15]=%s",
+        Log::get().note("flat camera inject: relay[0..45]=%s| stubA=%p trampoline=%p tramp[0..15]=%s stubA[0..15]=%s",
                         hex1, reinterpret_cast<void*>(callbackLiteral), reinterpret_cast<void*>(fwd), hex2, hex3);
     }
     const uint64_t now = GetTickCount64();
@@ -613,12 +633,13 @@ void flatCameraInjectFrame(uint64_t frame) {
         // crash hypothesis).
         const uint64_t lastNo = g_inject.lastCallNo.load(std::memory_order_relaxed);
         if (lastNo) {
-            Log::get().note("flat camera inject lastcall: #%llu ctx=%p p2=%p camera=%p kind=%u",
+            Log::get().note("flat camera inject lastcall: #%llu ctx=%p p2=%p camera=%p kind=%u r11-in=%p",
                 (unsigned long long)lastNo,
                 reinterpret_cast<void*>(g_inject.lastCtx.load(std::memory_order_relaxed)),
                 reinterpret_cast<void*>(g_inject.lastP2.load(std::memory_order_relaxed)),
                 reinterpret_cast<void*>(g_inject.lastCamera.load(std::memory_order_relaxed)),
-                g_inject.lastKind.load(std::memory_order_relaxed));
+                g_inject.lastKind.load(std::memory_order_relaxed),
+                reinterpret_cast<void*>(g_lastIncomingR11.load(std::memory_order_relaxed)));
         }
         const uint64_t raySeq = g_inject.raySeq.load(std::memory_order_relaxed);
         if (raySeq != g_inject.lastRaySeqReported) {
