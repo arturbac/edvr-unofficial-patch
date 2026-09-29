@@ -1670,22 +1670,25 @@ Sean: the landing pad was still not taken into the layer, and the sun glare
 was no longer pinned -- it moved with the head again in vivid and in
 realistic.
 
-- The rule classified correctly in flight: `shared pair:` pad 2908 and radar
-  6658 per 30 s, world 1188-4784, stencil refusals 0; its first pad draw had
-  a console draw 140 back at stencil 4, its first radar draw a radar family
-  2 back.
-- The glare fix armed as before ("sun glare world: variant 1 CREATED", the
-  billboard watch on the first matched draw) yet did not pin the glare, and
-  the layer did not take the pad: both halves failed downstream of a correct
-  classification, in the claim and admit paths the rigs pinned only by
-  source scans.
+- The rule's first pad and radar draws were classed right: `shared pair:`
+  pad 2908 and radar 6658 per 30 s, world 1188-4784, stencil refusals 0;
+  its first pad draw had a console draw 140 back at stencil 4, its first
+  radar draw a radar family 2 back.
+- The glare train was not (found on review the same day). The glare fix
+  claimed exactly the WORLD class: "sun glare steady" 0.23, 0.61 and 1.94 a
+  frame in the windows where world read 1188, 1610 and 4784, and nothing
+  from 16:30:50, when world read 0 and radar 4574-6658 per 30 s. Sean's
+  glare test fell there (vivid -> stock -> vivid at 16:32:01-05). With the
+  radar up the glare train was classed RADAR and went unclaimed; the
+  stencil guard could not catch it (stencil 4 is state inherited from the
+  HUD's draws). Why the layer did not take the pad was not found.
 - Reverted in bad1da80 (Sean: "it's up so rarely") and installed on
   Frontier. Flight 164011 on bad1da80 (build matched; no `shared pair:`
   lines, glare vivid, world variant created): the glare pinned again (Sean:
   "That fixed the sun glare").
 - ruled out: the shared-pair rule as wired in 9122f31e, because flight
-  162819 unpinned the sun glare in vivid and realistic and did not take the
-  pad, though every class it logged was right.
-- For any later attempt: a rig that drives the real draw path (the glare
-  verdict and the layer's decision over a recorded frame), not a scan of
-  the wiring.
+  162819 unpinned the sun glare in vivid and realistic (its RADAR class
+  took the glare train whenever the radar was up) and did not take the pad.
+- For any later attempt: a census with the sun in view and the radar up,
+  and a rig that drives the real draw path (the glare verdict and the
+  layer's decision over a recorded frame), not a scan of the wiring.
