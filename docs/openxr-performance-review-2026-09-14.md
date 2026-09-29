@@ -16,10 +16,11 @@ changes.*
   across 70 long cycles); 094331 had 138-160 ms stalls with anti-aliasing
   off, so the stalls are Elite's. At the carrier with DLSS both halves sit
   at the budget (Elite's thread 11.6-12.4 ms outside the wait, the GPU
-  11.3-12.2 ms); with AA off both drop to about 5 ms. Part of the AA path's
-  cost is not itemised: about 1.7 ms of GPU inside Elite's own draws (the
-  TAA leg), and engine motion's CPU (1,800-2,900 hook calls a frame at the
-  carrier) has no timer.
+  11.3-12.2 ms); with AA off both drop to about 5 ms. Two parts of the AA
+  path's cost were not itemised: about 1.7 ms of GPU inside Elite's own
+  draws (the TAA leg), and engine motion's CPU (1,800-2,900 hook calls a
+  frame at the carrier). The carrier instruments (last entry) time both and
+  add the GPU's gap between frames: BUILT 2026-09-29, NOT FLOWN.
 - **Comparing with 0.16.2 in fpsVR:** under OpenVR its CPU frame time is
   poses ready to second submit (0.16.2's `appCpuMs`); on the native runtime
   it tracks Elite's whole frame outside the wait. Compare pre-submit windows.
@@ -40,13 +41,15 @@ changes.*
 - **Ruled out:** at the end of each 2026-09-24 entry, and in the 2026-09-29
   ones (the periodic jobs; EDVR's Present hook; EDVR's AA work as the
   stalls' cause).
-- **Next** (094331 entry): one instrument build, then a DLSS flight at the
-  carrier with many ships: engine motion's CPU per frame, the GPU's idle
-  time between frames, and census sections for the Elite draws EDVR alters;
-  the fix follows the figures (the join's per-call cost, the UI passes,
-  review P3, or the output size). Also any flight on a Quest runtime with
-  the default build: check the Application-render GPU invalid count stays
-  near zero and `native_frame_end_overlap_summary` reads failures=0.
+- **Next** (carrier instruments entry): fly the instrument build. DLSS on at
+  the carrier with many ships, two minutes steady, then the same scene with
+  AA off; read the `engine motion CPU` lines, the census's `frame gap` and
+  altered-draw lines, and the LONG FRAME line's `engine motion` field. The
+  entry's table says what reads as GPU-bound and what as CPU-bound, and the
+  fix follows the figures (the join's per-call cost, the UI passes, review
+  P3, or the output size). Also any flight on a Quest runtime with the
+  default build: check the Application-render GPU invalid count stays near
+  zero and `native_frame_end_overlap_summary` reads failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
   4100x4050 and 2665x2087.
@@ -1115,3 +1118,171 @@ many ships about:
    with EDVR's slot bound, and Elite's UI draws in the UI layer.
 Then the fix follows the figures: the join's per-call cost, the UI passes
 (review P3), or the output size.
+
+## 2026-09-29: the carrier instruments, built, not flown
+
+Sean approved the instrument build the 094331 entry asked for. Branch
+`claude/carrier-instrument` (from main c4bbe484): three always-on instruments,
+no config key, each gated by a rig in `build.bat`. Nothing here has flown.
+They answer one question at the busy carrier with DLSS on: is EDVR's GPU work
+the limit (H-GPU, Elite's thread waits inside its own calls) or is EDVR's
+untimed engine-motion CPU work the limit (H-CPU, the GPU waits for the
+thread)? The environment they will be read in: SteamVR OpenXR, Pimax, 4032x3896
+out and 2016x1948 in per eye, 90 Hz, DLSS preset K, `fix.temporal_aa` on
+(engine motion arms with it), `advanced.app_gpu_timing` on (its default; the
+gap needs it).
+
+**1. Engine motion's CPU, per frame, every call clocked.** EDVR's own work in
+fifteen relays into Elite's code and in the draw side, never the game function
+a relay forwards to. A relay is bracketed enter, pause, (game code), resume,
+leave, so the forward is out and a relay the game's code calls is its own part.
+A scope inside EDVR's own work (the shader patch inside the draw side) is
+taken from its parent, so the parts add up with nothing counted twice. Each
+thread writes its own counters (relaxed load, add, store: no lock prefix, no
+shared line); the Present hook cuts the frame, and the thread that cuts is the
+render thread. The parts: emit (FUN_144312E00's bracket and the emit
+observer), rigid emit (FUN_1442B4130), copier, merge, clear, jobs (the six job
+brackets), builder (the draw-item builder, the second direct producer, the part
+test, the LOD setter), draw side (the slow half of `engineVelocityBeforeDraw`,
+lock wait included), apply (`primaryCopy::apply`, inside the draw side), tees
+(Map, Unmap and write tees on watched resources), shader patch (the three lazy
+patches, on a cache miss only). Three lines every 30 s:
+
+```
+engine motion CPU: 30 s, 2700 frames; ... Render thread 4321: total p50 0.31 / p95 0.52 / max 1.94 ms per frame over 68.0 clocked calls per frame. Other threads: 1310.00 ms per s across 7 threads over 2647.0 clocked calls per frame. Clock floor: a timed scope records 12 ns and costs 33 ns (32 and 66 ns with a forward pause; 2048 null pairs), so these figures include about 0.086 ms per frame of floor and the instrument costs about 0.177 ms per frame.
+engine motion CPU, render thread, ms per frame p50/p95/max (calls per frame; longest call ms), "-" = the code never ran on this thread in the window: draw side 0.20/0.35/1.20 (52.0; 0.21), apply 0.08/0.12/0.60 (2.0; 0.50), tees 0.01/0.02/0.05 (14.0; 0.02), shader patch 0.00/0.00/0.00 (0.001; 2.10), emit -, rigid emit -, ...; shader patches this window on every thread: 3, total 4.20 ms, longest 2.10 ms.
+engine motion CPU, other threads (7), ms per s (calls per frame; longest call ms), "-" = the code never ran off the render thread in the window: draw side -, ..., emit 1200.00 (2450.0; 0.04), rigid emit 30.00 (127.0; 0.01), copier 70.00 (40.0; 0.09), ..., eval 5400.0 calls per frame, not clocked (a pass-through).
+```
+
+(Numbers are the rig's sample, not a flight.) The LONG FRAME line's EDVR share
+gains ` engine motion 0.31 ms;` at its end: this frame's own render-thread
+figure, exact, or ` engine motion none this frame;` when no hook ran on the
+render thread. It is inside "outside the hook", like the draw hooks, and the
+draw side is inside the draw-hook estimate too: do not add the two. To keep the
+line under the log's limit the draw-hook freshness wording is now "(held over)"
+(its worst case was 1144 characters; with the clause it is 1154 against a gate
+of 1160 and a real limit of 1166).
+
+What is not clocked: the two evaluator relays are pass-throughs (two loads and
+a call) cheaper than one clock read, so every call is counted and only the
+probe branches are clocked; the line says "not clocked". The quick path of
+`beforeDrawSlow` and the inline half of `engineVelocityBeforeDraw` (compares,
+tens of thousands of draws a frame) are neither clocked nor counted; the
+frame-boundary work (`engineVelocityFrameBoundary`, the views, the summary
+line) is in the tick chain's "slowest EDVR ticks". The flat profile's draws
+go through their own scope: its engine-motion hooks are timed, its draws are
+not counted by section 3.
+
+The instrument's own price is calibrated on the real clock at the first frame,
+the way the census states its timer floor: null scopes, both shapes, what a
+null scope records (every figure includes it once per call) and what it costs.
+On the build machine (QPC 10 MHz, a reading about 16 ns) a plain scope records
+12-19 ns and costs 33-35 ns; one with a forward pause records 32-33 ns and
+costs 66 ns (the rig prints it on every build). At the carrier's 2,930 emit calls a frame that is about 0.19 ms of job-
+thread time a frame; the render thread's draw side is 50-ish calls a frame,
+under 2 us. Each window prints its own figure (the last sentence of line 1).
+
+**2. The GPU's gap between frames.** The Application-render span already
+brackets a frame's producer GPU work on the game's device: its first
+timestamp at the first producer command after the pose wait, its last at the
+end of the final segment, after the door work. The result now carries those two
+raw ticks and the clock's frequency. `gpu_frame_gap.h` pairs frame N's last
+tick with frame N+1's first by consecutive sequence number. The census's clock
+rules hold: validated spans only, one frequency, no negative gap, no gap over
+1 s; results complete out of order, so each pair is made once by whichever
+frame arrives second; a frame with no valid span leaves its two pairs unmade
+(fewer pairs than frames, never bridged). No new GPU work: it reads timestamps
+that already exist. On the main census line, after "application render p50":
+`frame gap p50 0.42 / p95 1.85 ms over 2650 pairs;` (`frame gap - (no pairs);`
+when nothing paired). A line of its own follows with the max, the frame count,
+rejected pairs, and the caveat. **The gap is an upper bound on GPU idle, not
+idle.** SteamVR's compositor is another process on the same GPU and takes its
+turns in that gap; so do the runtime's transfers and the mirror window's
+Present copy. A gap near 1 ms is therefore not proof of idleness. A gap near
+zero is the strong statement: nothing waited.
+
+**3. Sections for the Elite draws EDVR alters.** EDVR's own commands were
+timed; the cost it adds inside Elite's draws was counted as the game's. Four
+classes, from reading `forwardWithVerdict`, each a real per-frame count, one
+class per draw in this priority: pool-family draws with EDVR's MRT6 slot
+target bound and its shaders substituted; terrain prepasses with EDVR's motion
+target bound and a pixel shader added (celestial motion); UI draws redirected
+into EDVR's layer (`fix.ui_quality`); draws wrapped in another fix's state
+change (RemLok, holo, scrim, particles, the panel). Ordinary per-draw census
+sections: K = 8, the existing stride and rotation (21 sections now, so each
+is timed one frame in 21), the null-pair correction, their spans in the timer
+floor and the spans count. Each thunk wraps only its real draw call, so the
+weapon and screen motion reissues after it, and every other issue through the
+same lambda, are never timed as altered. A line after the main one:
+
+```
+EDVR GPU census, Elite's own draws that EDVR alters (each is the game's draw timed whole, so a figure includes the game's own work in it, not only what EDVR adds, and none of it is in EDVR ~X above): pool-family draws (EDVR's slot target and shaders) 2.000 (10.00/frame), terrain prepasses (EDVR's motion target and shader) -, UI draws (redirected to EDVR's layer) 0.020 (0.20/frame), other fix-wrapped draws -; together 2.020 ms/frame; "-" means no such draw ran this window.
+```
+
+These are the game's draws timed whole: the figure includes the game's own work
+in them. It is not EDVR's cost and is never in "EDVR ~X". The AA cost inside
+those draws is what shows when the same scene is flown with AA off and the
+figure drops.
+
+**Flight procedure.** Install the build on Frontier and check the log names it
+(`python tools\edvr_log.py --target frontier --expect-build HEAD --version`,
+exit 0). Same settings as flights 094126 and 094331 (HMD Image Quality 0.5,
+DLSS on). Fly to the busy fleet carrier with many ships about and stay steady
+for at least two minutes: four full 30 s windows, of which the first carries
+the warm-up (the first shader patches, the calibration). Then, in the same
+scene, switch `fix.temporal_aa` off from the menu for a minute: with AA off
+every engine-motion part must read "-" (the relays are closed; a job bracket or
+the evaluator can still run for another consumer of the eval gate, the static
+prop gate or the LOD governor), and the gap and the altered draws give the
+baseline. Read with
+`python tools\edvr_log.py --target frontier --grep "engine motion CPU|EDVR GPU census|LONG FRAME"`.
+
+**Reading H-GPU against H-CPU.** The thresholds are rules of thumb from the
+numbers above (a 11.1 ms period, about 1 ms the compositor and transfers can
+hold), not measurements; the flight sets them.
+
+| Line | H-GPU | H-CPU |
+|---|---|---|
+| census `frame gap` | p50 near 0 (under about 0.3 ms), application render p50 near the 11.1 ms period: the GPU never waited | p50 above the roughly 1 ms the compositor and transfers can hold, p95 several ms, application render well under the period |
+| `engine motion CPU`, render thread | total p50 under about 0.5 ms | total p50 1 ms or more; the parts say where (draw side, apply, tees) |
+| `engine motion CPU`, other threads | ms per s small against the job threads' capacity | hundreds of ms per s in emit, rigid and copier, and the render thread's pre-submit wait absorbing them |
+| LONG FRAME `engine motion X ms` | small on the long frames | large on the long frames |
+| altered draws | the AA leg's figure (the earlier estimate: 1.7 ms) is large and disappears with AA off | small |
+
+A render-thread draw side or apply with a small p50 and a large p95 or max is
+a stall inside the slow half (the engine mutex or primaryCopy's mutex behind a
+job thread, or the driver's queue), not steady work. If the gap is near zero,
+the render thread's engine-motion total is small and the altered draws are
+small, the remainder is Elite's own work at the doubled render size, and the
+output size is the lever. If the gap is large and engine motion is small, the
+wait is Elite's (a pose or job wait) and EDVR is not the limit.
+
+**What appears in the log if the code never ran.** Each figure has its own
+sign. The CPU parts print "-" and the summary reads "over 0.0 clocked calls per
+frame"; the LONG FRAME clause reads "none this frame". The gap prints "frame
+gap - (no pairs)" and the detail line says why. An altered class prints "-".
+No `engine motion CPU` lines at all means the recorder never ran (the Present
+hook's monitor tick did not), and a LONG FRAME line with no engine-motion
+clause is the priming frame or a build without this instrument.
+
+**Rigs.** `engine_motion_cpu_test` (new): exclusive nesting and the forward
+pause, thread attribution, no lost update under four writers and a cutter
+(400,000 calls exact), percentiles in a hostile order, "-" against 0.00, the
+three lines at their worst (693, 973 and 659 of 1150 allowed), the priming
+frame, the 30 s and full-window closes, per-call maxima per window, the clock
+floor exact on a clock that steps and measured on the real one; mutation-checked.
+`native_perf_history_test`: the LONG FRAME clause and its worst case.
+`gpu_census_test`: the gap saturated, starved, compositor-sized, with a missing
+and a late pair, a duplicate, another clock, an overlap, a stall, and every
+census line at its worst (914 of 1150); the class table and its priorities, the
+altered scope's counting and timing, the rotation over 21 sections, the line.
+`gpu_span_state_test`: the tick fields for three and four segments and none for
+a bad or legacy span.
+
+**Found in passing, not changed.** `beforeDrawSlow` reads the clock at entry on
+every visit, including the quick path that returns a few compares later; the
+reading is only used by the slow path. At ten thousand visits a frame that is
+about 0.16 ms of the render thread, and moving the line below the quick-path
+return changes no figure. `primaryBuildObserved` does a relaxed `fetch_add` on a
+shared counter per call from job threads; the new "rigid emit" figure will show
+what that costs.
