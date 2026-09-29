@@ -72,8 +72,24 @@ static void expectEq(const std::string& got, const std::string& want, const char
 static std::string readAll(const std::wstring& path) { return readTextFile(path); }
 
 static bool writeAll(const std::wstring& path, const std::string& text) {
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    // Somebody else having the file open for a moment is a sharing violation here,
+    // or an access denial where they had just deleted it: the real-time scanner and
+    // the search indexer look at every file that was just written, and a helper
+    // that gave up on the first one left the OLD bytes in the file for the case
+    // that followed to trip over ("the original is exactly as it was -- got ''",
+    // three runs in twenty under a stand-in scanner). Tried again for up to two
+    // seconds; any other failure -- no such folder, a read-only file -- is final.
+    HANDLE f = INVALID_HANDLE_VALUE;
+    for (int i = 0; i < 400; ++i) {
+        f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f != INVALID_HANDLE_VALUE) break;
+        const DWORD error = GetLastError();
+        if (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED &&
+            error != ERROR_LOCK_VIOLATION)
+            break;
+        Sleep(5);
+    }
     if (f == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0;
     const BOOL good = WriteFile(f, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
@@ -1438,12 +1454,117 @@ static std::string readThrough(HANDLE h) {
     return out;
 }
 
-// Stand-ins for the POSIX-semantics rename (iniedit.h, posixReplaceForTest): each
-// returns the Windows error the call would have set.
-static unsigned long hookUnsupported() { return ERROR_INVALID_PARAMETER; }
-static unsigned long hookNotUnderstood() { return ERROR_BAD_PATHNAME; }
-static int g_busyCalls = 0;
-static unsigned long hookBusyOnce() { return ++g_busyCalls == 1 ? ERROR_SHARING_VIOLATION : 0; }
+// ---------------------------------------------------------------------------
+// stand-ins for the renames (iniedit.h, replaceHooksForTest)
+//
+// A rig that counts renames must not let the real file system into the count.
+// The real-time scanner and the search indexer have every file that was just
+// written open for a few milliseconds, and the classic rename is refused with a
+// real "access denied" for as long as ANY handle to its target is open: the
+// writer tries again, as it should, and an exact total of two comes out as three.
+// That failed a full build once (2026-09-29), and it reproduces on demand with a
+// process that opens the rig's files and lets go (17 runs in 20). So the cases
+// that count script the answers, and the cases that use the real renames assert
+// what holds however many times a scanner made the writer try.
+
+// What a stand-in does when it is to put the file in place: the real move, tried
+// again until nothing else has the file open, so that a scanner looking at it in
+// the middle of a case costs a few milliseconds and not a count.
+static unsigned long placeFile(const wchar_t* from, const wchar_t* to) {
+    DWORD last = ERROR_SUCCESS;
+    for (int i = 0; i < 400; ++i) {   // two seconds at the most
+        if (MoveFileExW(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            return ERROR_SUCCESS;
+        last = GetLastError();
+        Sleep(5);
+    }
+    return last;
+}
+
+// A stand-in that answers from a script: each call takes the next reply -- 0 puts
+// the file in place, anything else is the Windows error it refuses with -- and
+// once the script is spent every call puts the file in place.
+struct Replies {
+    std::vector<unsigned long> script;
+    size_t                     next = 0;
+};
+static Replies g_posixReplies;
+static Replies g_classicReplies;
+
+static unsigned long reply(Replies& r, const wchar_t* from, const wchar_t* to) {
+    const unsigned long code = r.next < r.script.size() ? r.script[r.next++] : 0;
+    return code != 0 ? code : placeFile(from, to);
+}
+static unsigned long posixReply(const wchar_t* from, const wchar_t* to) {
+    return reply(g_posixReplies, from, to);
+}
+static unsigned long classicReply(const wchar_t* from, const wchar_t* to) {
+    return reply(g_classicReplies, from, to);
+}
+
+// Installs the two scripts, and clears whatever an earlier case left in the counts
+// or in a remembered refusal.
+static void script(const std::vector<unsigned long>& posix,
+                   const std::vector<unsigned long>& classic) {
+    g_posixReplies = Replies();
+    g_posixReplies.script = posix;
+    g_classicReplies = Replies();
+    g_classicReplies.script = classic;
+    replaceHooksForTest(posixReply, classicReply);
+}
+
+// The stand-ins off and the counts cleared: the real renames.
+static void realRenames() { replaceHooksForTest(nullptr, nullptr); }
+
+// `code`, `n` times: a rename that stays refused.
+static std::vector<unsigned long> repeated(unsigned long code, size_t n) {
+    return std::vector<unsigned long>(n, code);
+}
+
+// Two stand-ins for the real-file-system cases that need one of the two renames
+// to answer in a fixed way and the other to be real.
+static unsigned long posixUnsupported(const wchar_t*, const wchar_t*) {
+    return ERROR_INVALID_PARAMETER;
+}
+// A busy answer on every other call: a case where each replace meets one.
+static int g_calls = 0;
+static unsigned long posixEveryOtherBusy(const wchar_t* from, const wchar_t* to) {
+    return (++g_calls % 2) ? ERROR_SHARING_VIOLATION : placeFile(from, to);
+}
+
+// One write, with the numbers a scripted case is asked about. The backoff is a
+// millisecond: nothing scripted waits on a real reader.
+struct Wrote {
+    bool         ok = false;
+    int          tries = -1;
+    std::wstring why;
+};
+static Wrote writeWith(const std::wstring& target, const std::string& bytes, int retries = 5) {
+    AtomicWriteOptions options;
+    options.retries = retries;
+    options.backoffMs = 1;
+    Wrote w;
+    w.ok = writeFileAtomic(target, bytes, &w.why, options, &w.tries);
+    return w;
+}
+
+static std::string counts(int tries) {
+    return std::to_string(tries) + " tries, " + std::to_string(posixReplaceAttempts()) +
+           " POSIX calls, " + std::to_string(classicReplaceAttempts()) + " classic calls, " +
+           (posixReplaceRefused() ? "refusal remembered" : "no refusal remembered");
+}
+
+// The write's tries and the counts since the scripts went in, against what the
+// case says they must be. One line, so a failing case prints all four numbers.
+static void expectCounts(const char* what, const Wrote& w, int tries, int posix, int classic,
+                         bool refused) {
+    const bool good = w.tries == tries && posixReplaceAttempts() == posix &&
+                      classicReplaceAttempts() == classic && posixReplaceRefused() == refused;
+    check(good, what,
+          "got " + counts(w.tries) + "; wanted " + std::to_string(tries) + " tries, " +
+              std::to_string(posix) + " POSIX calls, " + std::to_string(classic) +
+              " classic calls, " + (refused ? "refusal remembered" : "no refusal remembered"));
+}
 
 static void testAtomicWrite(const std::wstring& scratch) {
     printf("\nwriting a live file whole\n");
@@ -1452,7 +1573,12 @@ static void testAtomicWrite(const std::wstring& scratch) {
     removeTree(dir);
     makeTree(dir);
     const std::wstring target = joinPath(dir, L"edvr.ini");
-    posixReplaceForTest(nullptr);   // no stand-in, nothing remembered, nothing counted
+    realRenames();   // no stand-in, nothing remembered, nothing counted
+
+    // What follows uses the REAL renames, and so asserts what holds however many
+    // times a scanner made the writer try: the outcome, the temp file's absence,
+    // and that every attempt asked the POSIX-semantics rename first. The exact
+    // attempt counts of the retry logic are testReplaceScripts', scripted.
 
     {   // The plain cases: the bytes given, none of the old ones, nothing left over.
         std::wstring why;
@@ -1487,7 +1613,9 @@ static void testAtomicWrite(const std::wstring& scratch) {
     {   // A reader that holds the target open and does NOT share DELETE refuses
         // the replace -- either kind of rename -- for as long as it holds on. The
         // writer tries again as it was told to, gives up, and leaves both the
-        // original and the folder as it found them.
+        // original and the folder as it found them. The reader never lets go, so
+        // every attempt fails and the count of them is fixed: no scanner can
+        // change it.
         writeAll(target, "original\r\n");
         HANDLE reader = holdOpen(target, false);
         check(reader != INVALID_HANDLE_VALUE, "a reader not sharing DELETE can hold the target open");
@@ -1496,6 +1624,7 @@ static void testAtomicWrite(const std::wstring& scratch) {
         quick.backoffMs = 1;
         std::wstring why;
         int tries = 0;
+        realRenames();
         const bool wrote = writeFileAtomic(target, "never lands\r\n", &why, quick, &tries);
         printf("  info  reader not sharing DELETE: wrote=%d after %d tries; the message: %s\n",
                wrote ? 1 : 0, tries, toUtf8(why).c_str());
@@ -1505,6 +1634,8 @@ static void testAtomicWrite(const std::wstring& scratch) {
         check(!why.empty(), "and the failure says why", "no message");
         expectEq(readAll(target), "original\r\n", "the original is exactly as it was");
         expectEq(listing(dir), "edvr.ini", "and no temporary file is left");
+        check(posixReplaceAttempts() == tries, "every attempt asked the POSIX-semantics rename, once",
+              std::to_string(posixReplaceAttempts()) + " calls in " + std::to_string(tries) + " tries");
         check(!posixReplaceRefused(),
               "the refusal was of this rename, not of POSIX-semantics renames: nothing is remembered");
         if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
@@ -1514,26 +1645,39 @@ static void testAtomicWrite(const std::wstring& scratch) {
     }
 
     {   // A reader that holds the target open and DOES share DELETE -- which is how
-        // Config's read opens edvr.ini -- is replaced under, on the first attempt,
-        // by the POSIX-semantics rename, and goes on reading the file it opened.
-        // (The classic rename is refused here: measured with cmd's move /Y on
-        // Windows 11 build 26200, which is why this rename exists.)
+        // Config's read opens edvr.ini -- is replaced under by the POSIX-semantics
+        // rename, and goes on reading the file it opened. (The classic rename is
+        // refused here: measured with cmd's move /Y on Windows 11 build 26200,
+        // which is why this rename exists.)
+        //
+        // The reader never lets go, so a write that lands has landed under it,
+        // and no number of retries could have done that for a rename the reader
+        // refuses. How many attempts it took is therefore not what this asserts (a
+        // scanner that has the temp file or the target open for a moment costs
+        // one, and did fail a build); that every attempt asked the POSIX-semantics
+        // rename, and that none needed the classic one, is.
         writeAll(target, "held open\r\n");
         HANDLE reader = holdOpen(target, true);
         check(reader != INVALID_HANDLE_VALUE, "a reader sharing DELETE can hold the target open");
-        const int callsBefore = posixReplaceAttempts();
+        AtomicWriteOptions patient;
+        patient.retries = 100;   // half a second, for a scanner; the reader itself costs none
+        patient.backoffMs = 5;
         std::wstring why;
         int tries = 0;
+        realRenames();
         const bool wrote =
-            writeFileAtomic(target, "replaced under the reader\r\n", &why, AtomicWriteOptions(), &tries);
-        printf("  info  reader sharing DELETE: wrote=%d after %d tries; the message: %s\n",
-               wrote ? 1 : 0, tries, toUtf8(why).c_str());
+            writeFileAtomic(target, "replaced under the reader\r\n", &why, patient, &tries);
+        printf("  info  reader sharing DELETE: wrote=%d after %d tries; POSIX calls %d, classic %d; "
+               "the message: %s\n",
+               wrote ? 1 : 0, tries, posixReplaceAttempts(), classicReplaceAttempts(),
+               toUtf8(why).c_str());
         check(wrote, "the replace succeeds while a reader that shares DELETE holds the file",
               toUtf8(why));
-        check(tries == 1, "on the first attempt: no retry was spent", std::to_string(tries) + " tries");
-        check(posixReplaceAttempts() == callsBefore + 1,
-              "through one call to the POSIX-semantics rename",
-              std::to_string(posixReplaceAttempts() - callsBefore) + " calls");
+        check(posixReplaceAttempts() == tries, "every attempt asked the POSIX-semantics rename, once",
+              std::to_string(posixReplaceAttempts()) + " calls in " + std::to_string(tries) + " tries");
+        check(classicReplaceAttempts() == 0,
+              "and none fell back to the classic rename, which cannot replace under this reader",
+              std::to_string(classicReplaceAttempts()) + " classic calls");
         check(!posixReplaceRefused(),
               "which this volume took: nothing was remembered as unsupported");
         expectEq(readAll(target), "replaced under the reader\r\n", "and the path holds the new bytes");
@@ -1554,6 +1698,8 @@ static void testAtomicWrite(const std::wstring& scratch) {
         // codes that can pass), and nothing changes. It never reaches the
         // POSIX-semantics rename: the classic one is what has been measured to
         // refuse it, and the attribute is not something to test that one on.
+        // Every attempt is refused whatever a scanner does, so the counts are
+        // fixed.
         writeAll(target, "protected\r\n");
         SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_READONLY);
         AtomicWriteOptions quick;
@@ -1561,12 +1707,15 @@ static void testAtomicWrite(const std::wstring& scratch) {
         quick.backoffMs = 1;
         std::wstring why;
         int tries = 0;
-        const int callsBefore = posixReplaceAttempts();
+        realRenames();
         const bool wrote = writeFileAtomic(target, "overwritten\r\n", &why, quick, &tries);
         check(!wrote, "a read-only file is not replaced");
         check(tries == 3, "the retries were spent on it", std::to_string(tries) + " tries");
-        check(posixReplaceAttempts() == callsBefore,
-              "without the POSIX-semantics rename having been asked to");
+        check(posixReplaceAttempts() == 0,
+              "without the POSIX-semantics rename having been asked to",
+              std::to_string(posixReplaceAttempts()) + " calls");
+        check(classicReplaceAttempts() == tries, "every attempt going straight to the classic one",
+              std::to_string(classicReplaceAttempts()) + " calls in " + std::to_string(tries) + " tries");
         expectEq(readAll(target), "protected\r\n", "the file is untouched");
         expectEq(listing(dir), "edvr.ini", "and no temporary file is left");
         SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
@@ -1585,37 +1734,48 @@ static void testAtomicWrite(const std::wstring& scratch) {
         patient.backoffMs = 5;
         std::wstring why;
         int tries = 0;
+        realRenames();
         const bool wrote = writeFileAtomic(target, "after\r\n", &why, patient, &tries);
         letGo.join();
         check(wrote, "a reader that lets go while the retries run does not fail the write",
               toUtf8(why));
         expectEq(readAll(target), "after\r\n", "and the write landed");
+        check(posixReplaceAttempts() == tries, "every attempt asking the POSIX-semantics rename, once",
+              std::to_string(posixReplaceAttempts()) + " calls in " + std::to_string(tries) + " tries");
         expectEq(listing(dir), "edvr.ini", "with nothing left beside it");
         printf("  info  it landed on try %d\n", tries);
     }
 
-    {   // Where the OS or the volume refuses the POSIX-semantics rename as
-        // unsupported, the writer falls back to the classic rename in the same
-        // attempt and does not ask again. The refusal is forced through the seam.
-        posixReplaceForTest(hookUnsupported);
+    {   // Where the POSIX-semantics rename is refused as unsupported the classic
+        // rename does the replace, for real. Only that rename's own answer is
+        // stood in for (the refusal); the replace itself is the operating
+        // system's.
         writeAll(target, "before the fallback\r\n");
+        AtomicWriteOptions patient;
+        patient.retries = 100;
+        patient.backoffMs = 5;
         std::wstring why;
         int tries = 0;
-        check(writeFileAtomic(target, "by the classic rename\r\n", &why, AtomicWriteOptions(), &tries),
+        replaceHooksForTest(posixUnsupported, nullptr);
+        check(writeFileAtomic(target, "by the classic rename\r\n", &why, patient, &tries),
               "a write whose POSIX-semantics rename is refused as unsupported still lands",
               toUtf8(why));
         expectEq(readAll(target), "by the classic rename\r\n", "with the new bytes");
-        check(tries == 1, "in one attempt: the fallback is part of it", std::to_string(tries) + " tries");
-        check(posixReplaceAttempts() == 1, "the POSIX-semantics rename was asked once",
-              std::to_string(posixReplaceAttempts()) + " calls");
-        check(posixReplaceRefused(), "and the refusal is remembered");
+        check(posixReplaceAttempts() == 1 && posixReplaceRefused(),
+              "the POSIX-semantics rename was asked once, and the refusal is remembered",
+              counts(tries));
+        check(classicReplaceAttempts() == tries, "every attempt being the classic rename's",
+              counts(tries));
 
-        check(writeFileAtomic(target, "and again\r\n", &why), "the next write lands too",
-              toUtf8(why));
+        int again = 0;
+        check(writeFileAtomic(target, "and again\r\n", &why, patient, &again),
+              "the next write lands too", toUtf8(why));
         expectEq(readAll(target), "and again\r\n", "with its bytes");
         check(posixReplaceAttempts() == 1,
               "without the POSIX-semantics rename being asked again: a refusal is not retried on every write",
               std::to_string(posixReplaceAttempts()) + " calls");
+        check(classicReplaceAttempts() == tries + again, "the classic one having done both",
+              counts(again));
 
         // The classic rename is what runs now, so a reader that shares DELETE
         // holds it off, as it always did. Where an operating system has taught
@@ -1637,47 +1797,7 @@ static void testAtomicWrite(const std::wstring& scratch) {
         check(posixReplaceAttempts() == 1, "and the POSIX-semantics rename was still not asked for");
         if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
         expectEq(listing(dir), "edvr.ini", "with no temporary file left");
-
-        posixReplaceForTest(nullptr);
-        check(!posixReplaceRefused(), "taking the stand-in out forgets the refusal");
-    }
-
-    {   // An attempt the POSIX-semantics call refuses for a reason that passes is
-        // tried again through that same call, and is not taken for "unsupported".
-        g_busyCalls = 0;
-        posixReplaceForTest(hookBusyOnce);
-        writeAll(target, "before\r\n");
-        AtomicWriteOptions quick;
-        quick.retries = 3;
-        quick.backoffMs = 1;
-        std::wstring why;
-        int tries = 0;
-        const bool wrote = writeFileAtomic(target, "after a busy answer\r\n", &why, quick, &tries);
-        check(wrote, "a busy answer from the POSIX-semantics rename does not fail the write",
-              toUtf8(why));
-        check(tries == 2, "it lands on the second attempt", std::to_string(tries) + " tries");
-        check(posixReplaceAttempts() == 2, "the POSIX-semantics rename having been asked both times",
-              std::to_string(posixReplaceAttempts()) + " calls");
-        check(!posixReplaceRefused(), "and a busy answer is not remembered as a refusal");
-        expectEq(readAll(target), "after a busy answer\r\n", "with the new bytes");
-        posixReplaceForTest(nullptr);
-    }
-
-    {   // An answer it does not understand: the classic rename decides that
-        // attempt, and the next write asks again.
-        posixReplaceForTest(hookNotUnderstood);
-        writeAll(target, "before\r\n");
-        std::wstring why;
-        int tries = 0;
-        check(writeFileAtomic(target, "by the classic rename\r\n", &why, AtomicWriteOptions(), &tries),
-              "a failure the writer does not recognise still lets the write land", toUtf8(why));
-        check(tries == 1, "in one attempt", std::to_string(tries) + " tries");
-        check(!posixReplaceRefused(), "and is not remembered as a refusal");
-        check(writeFileAtomic(target, "and again\r\n", &why), "the next write lands", toUtf8(why));
-        check(posixReplaceAttempts() == 2, "having asked the POSIX-semantics rename each time",
-              std::to_string(posixReplaceAttempts()) + " calls");
-        expectEq(readAll(target), "and again\r\n", "with the new bytes");
-        posixReplaceForTest(nullptr);
+        realRenames();
     }
 
     {   // A folder that is not there is not a folder to create, and not a failure
@@ -1691,6 +1811,204 @@ static void testAtomicWrite(const std::wstring& scratch) {
         check(!why.empty(), "and says why", "no message");
         check(!dirExists(joinPath(dir, L"no-such-folder")), "and does not make the folder");
     }
+    realRenames();
+}
+
+// ---------------------------------------------------------------------------
+// the retry logic, scripted
+//
+// Every case here stands in for BOTH renames (replaceHooksForTest), so the real
+// file system is in none of the counts. Each states exactly what the writer must
+// do -- how many tries, how many times each rename is asked, whether a refusal is
+// remembered -- and each is a case a mutation of the writer must break: retrying
+// on any error, skipping the POSIX-semantics rename, not asking it again on a
+// retry, remembering what it should not, forgetting what it should not.
+
+static void testReplaceScripts(const std::wstring& scratch) {
+    printf("\nthe writer's retries, scripted\n");
+
+    const std::wstring dir = joinPath(scratch, L"scripted");
+    removeTree(dir);
+    makeTree(dir);
+    const std::wstring target = joinPath(dir, L"edvr.ini");
+    const unsigned long kBadPath = ERROR_BAD_PATHNAME;   // an answer nobody recognises
+
+    {   // A clean write asks the POSIX-semantics rename once and never the classic one.
+        script({}, {});
+        writeAll(target, "before\r\n");
+        const Wrote w = writeWith(target, "clean\r\n");
+        check(w.ok, "a clean write lands", toUtf8(w.why));
+        expectCounts("and asked the POSIX-semantics rename once and the classic one never", w, 1, 1,
+                     0, false);
+        expectEq(readAll(target), "clean\r\n", "with the new bytes");
+        expectEq(listing(dir), "edvr.ini", "and no temporary file is left");
+    }
+
+    // Every answer that means "this OS or volume does not do POSIX-semantics
+    // renames": the classic rename does that attempt, the refusal is remembered,
+    // and the next write does not ask again.
+    for (const unsigned long code : {ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+                                     ERROR_INVALID_FUNCTION, ERROR_CALL_NOT_IMPLEMENTED,
+                                     ERROR_INVALID_LEVEL}) {
+        const std::string which = "error " + std::to_string(code) + ": ";
+        script({code}, {});
+        writeAll(target, "before\r\n");
+        const Wrote first = writeWith(target, "by the classic rename\r\n");
+        check(first.ok, (which + "the write lands").c_str(), toUtf8(first.why));
+        expectCounts((which + "refused as unsupported: the classic rename does that attempt, "
+                              "and the refusal is remembered").c_str(),
+                     first, 1, 1, 1, true);
+        expectEq(readAll(target), "by the classic rename\r\n", "with the new bytes");
+        const Wrote second = writeWith(target, "and again\r\n");
+        check(second.ok, "the next write lands", toUtf8(second.why));
+        expectCounts((which + "and the next write does not ask the POSIX-semantics rename again")
+                         .c_str(),
+                     second, 1, 1, 2, true);
+    }
+
+    {   // Refused as unsupported, and then the classic rename is busy once: the
+        // retry goes straight to the classic rename.
+        script({ERROR_INVALID_PARAMETER}, {ERROR_ACCESS_DENIED});
+        writeAll(target, "before\r\n");
+        const Wrote w = writeWith(target, "after one busy answer\r\n");
+        check(w.ok, "a write whose classic rename is busy once lands", toUtf8(w.why));
+        expectCounts("on the second try, without asking the POSIX-semantics rename again", w, 2, 1, 2,
+                     true);
+        expectEq(readAll(target), "after one busy answer\r\n", "with the new bytes");
+    }
+
+    // The documented transient answers, from the POSIX-semantics rename: exactly
+    // one retry, through that same rename, and never the classic one.
+    for (const unsigned long code :
+         {ERROR_SHARING_VIOLATION, ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION}) {
+        const std::string which = "error " + std::to_string(code) + ": ";
+        script({code}, {});
+        writeAll(target, "before\r\n");
+        const Wrote w = writeWith(target, "after one busy answer\r\n");
+        check(w.ok, (which + "a busy answer does not fail the write").c_str(), toUtf8(w.why));
+        expectCounts((which + "exactly one retry, through the POSIX-semantics rename, and no "
+                              "classic rename at all").c_str(),
+                     w, 2, 2, 0, false);
+        expectEq(readAll(target), "after one busy answer\r\n", "with the new bytes");
+        expectEq(listing(dir), "edvr.ini", "and no temporary file is left");
+    }
+
+    {   // An answer the writer does not recognise: the classic rename decides that
+        // attempt, and the next write asks again -- it is not a refusal.
+        script({kBadPath, kBadPath}, {});
+        writeAll(target, "before\r\n");
+        const Wrote first = writeWith(target, "by the classic rename\r\n");
+        check(first.ok, "a failure the writer does not recognise still lets the write land",
+              toUtf8(first.why));
+        expectCounts("in one attempt, and not remembered as a refusal", first, 1, 1, 1, false);
+        const Wrote second = writeWith(target, "and again\r\n");
+        check(second.ok, "the next write lands", toUtf8(second.why));
+        expectCounts("having asked the POSIX-semantics rename each time", second, 1, 2, 2, false);
+        expectEq(readAll(target), "and again\r\n", "with the new bytes");
+    }
+
+    {   // The same answer, and the classic rename busy once: the retry asks the
+        // POSIX-semantics rename AGAIN, because nothing was remembered.
+        script({kBadPath, kBadPath}, {ERROR_ACCESS_DENIED});
+        writeAll(target, "before\r\n");
+        const Wrote w = writeWith(target, "after one busy answer\r\n");
+        check(w.ok, "an unrecognised answer and a busy classic rename still land", toUtf8(w.why));
+        expectCounts("the retry asking the POSIX-semantics rename again", w, 2, 2, 2, false);
+        expectEq(readAll(target), "after one busy answer\r\n", "with the new bytes");
+    }
+
+    // Only the documented transient answers are retried. Every other answer from
+    // the classic rename -- there being nothing to replace, no such folder, a full
+    // disk, a file mapped into a process -- fails the write on the spot.
+    for (const unsigned long code : {ERROR_SHARING_VIOLATION, ERROR_ACCESS_DENIED,
+                                     ERROR_LOCK_VIOLATION}) {
+        const std::string which = "classic error " + std::to_string(code) + ": ";
+        script({ERROR_INVALID_PARAMETER}, {code});
+        writeAll(target, "before\r\n");
+        const Wrote w = writeWith(target, "after one busy answer\r\n");
+        check(w.ok, (which + "a transient answer is retried and the write lands").c_str(),
+              toUtf8(w.why));
+        expectCounts((which + "exactly one retry").c_str(), w, 2, 1, 2, true);
+    }
+    for (const unsigned long code : {ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_DISK_FULL,
+                                     ERROR_USER_MAPPED_FILE, ERROR_INVALID_PARAMETER,
+                                     ERROR_NOT_SUPPORTED}) {
+        const std::string which = "classic error " + std::to_string(code) + ": ";
+        script({ERROR_INVALID_PARAMETER}, {code});
+        writeAll(target, "before\r\n");
+        const Wrote w = writeWith(target, "never lands\r\n");
+        check(!w.ok, (which + "an answer that does not pass fails the write").c_str());
+        expectCounts((which + "at once: one try, no retry").c_str(), w, 1, 1, 1, true);
+        check(!w.why.empty(), "and says why", "no message");
+        expectEq(readAll(target), "before\r\n", "the original is exactly as it was");
+        expectEq(listing(dir), "edvr.ini", "and no temporary file is left");
+    }
+
+    {   // The POSIX-semantics rename refused for a reason that passes, every time:
+        // the retries are spent on it, and the classic rename is never asked.
+        script(repeated(ERROR_SHARING_VIOLATION, 4), {});
+        writeAll(target, "before\r\n");
+        const Wrote w = writeWith(target, "never lands\r\n", 3);
+        check(!w.ok, "a POSIX-semantics rename that stays busy fails the write");
+        expectCounts("after the first try and the three it was allowed, never asking the classic "
+                     "rename", w, 4, 4, 0, false);
+        expectEq(readAll(target), "before\r\n", "the original is exactly as it was");
+        expectEq(listing(dir), "edvr.ini", "and no temporary file is left");
+    }
+
+    {   // The classic rename refused for a reason that passes, every time.
+        script({ERROR_INVALID_PARAMETER}, repeated(ERROR_ACCESS_DENIED, 4));
+        writeAll(target, "before\r\n");
+        const Wrote w = writeWith(target, "never lands\r\n", 3);
+        check(!w.ok, "a classic rename that stays busy fails the write");
+        expectCounts("after the first try and the three it was allowed, the POSIX-semantics rename "
+                     "asked only once", w, 4, 1, 4, true);
+        expectEq(readAll(target), "before\r\n", "the original is exactly as it was");
+        expectEq(listing(dir), "edvr.ini", "and no temporary file is left");
+    }
+
+    {   // A read-only target never reaches the POSIX-semantics rename, whatever it
+        // would have said.
+        script({}, repeated(ERROR_ACCESS_DENIED, 3));
+        writeAll(target, "protected\r\n");
+        SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_READONLY);
+        const Wrote w = writeWith(target, "overwritten\r\n", 2);
+        check(!w.ok, "a read-only file is not replaced");
+        expectCounts("every attempt going straight to the classic rename", w, 3, 0, 3, false);
+        expectEq(readAll(target), "protected\r\n", "the file is untouched");
+        SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
+    }
+
+    {   // A rotation of the mirror's generations under retries: every replace it
+        // makes meets one busy answer first, and the generations are still right.
+        // Nine replaces -- 1 for the first copy, 2 for the second, 3 for each of
+        // the third and the fourth -- each asked twice.
+        const std::wstring gdir = joinPath(scratch, L"scripted-generations");
+        removeTree(gdir);
+        makeTree(gdir);
+        const std::wstring name = L"edvr.ini";
+        std::wstring why;
+        g_calls = 0;
+        replaceHooksForTest(posixEveryOtherBusy, nullptr);
+        check(writeGenerations(gdir, name, "A\r\n", true, &why), "a first copy is written",
+              toUtf8(why));
+        check(writeGenerations(gdir, name, "B\r\n", true, &why), "a second copy rotates in",
+              toUtf8(why));
+        check(writeGenerations(gdir, name, "C\r\n", true, &why), "a third copy rotates in",
+              toUtf8(why));
+        check(writeGenerations(gdir, name, "D\r\n", true, &why), "a fourth copy rotates in",
+              toUtf8(why));
+        check(posixReplaceAttempts() == 18 && classicReplaceAttempts() == 0,
+              "each of the nine replaces asked the POSIX-semantics rename twice, the classic one never",
+              std::to_string(posixReplaceAttempts()) + " POSIX calls, " +
+                  std::to_string(classicReplaceAttempts()) + " classic calls");
+        expectEq(readAll(generationPath(gdir, name, 0)), "D\r\n", "the newest is the fourth");
+        expectEq(readAll(generationPath(gdir, name, 1)), "C\r\n", ".1 is the third");
+        expectEq(readAll(generationPath(gdir, name, 2)), "B\r\n", ".2 is the second");
+        check(!fileExists(generationPath(gdir, name, 3)), "and the first is dropped");
+        expectEq(listing(gdir), "edvr.ini, edvr.ini.1, edvr.ini.2", "with no temporary file left");
+    }
+    realRenames();
 }
 
 // ---------------------------------------------------------------------------
@@ -2301,6 +2619,7 @@ int wmain(int argc, wchar_t** argv) {
     testApply(scratch);
     testMirror(scratch);
     testAtomicWrite(scratch);
+    testReplaceScripts(scratch);
     testGenerations(scratch);
     testMirrorGenerations(scratch);
     testProbe(scratch);
