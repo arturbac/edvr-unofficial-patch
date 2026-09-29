@@ -9,6 +9,7 @@
 #include <limits>
 #include "../common/log.h"
 #include "flat_pixel_capture.h"
+#include "flat_projection_math.h"
 
 namespace edvr {
 namespace {
@@ -45,8 +46,10 @@ FlatMonoResolveStats& stats=*new FlatMonoResolveStats;
 // visible even if ordinary requested resets use their budget first.
 uint32_t resetEventsLogged=0, cameraCutEventsLogged=0;
 constexpr uint32_t kResetEventLogCap=32;
-struct Constants { float camera[6][4], previous[6][4]; uint32_t size[4], flags[4]; float jitter[4]; };
-static_assert(sizeof(Constants)==240, "HLSL cbuffer layout");
+// rowsJitter: the NDC shift the camera rows themselves carry (current xy, previous zw), the shader removes it; all zero
+// when the rows are unjittered, which is every path that does not go through the upstream camera injector.
+struct Constants { float camera[6][4], previous[6][4]; uint32_t size[4], flags[4]; float jitter[4], rowsJitter[4]; };
+static_assert(sizeof(Constants)==256, "HLSL cbuffer layout");
 struct Isolate {
     ID3D11DeviceContext1* context;
     ComPtr<ID3DDeviceContextState> previous;
@@ -80,6 +83,12 @@ bool jitterValid(const FlatMonoResolveFrame& f) {
         std::isfinite(f.previousJitterX) && std::isfinite(f.previousJitterY) &&
         std::abs(f.jitterX)<=.5f && std::abs(f.jitterY)<=.5f &&
         std::abs(f.previousJitterX)<=.5f && std::abs(f.previousJitterY)<=.5f;
+}
+bool rowsJitterValid(const FlatMonoResolveFrame& f) {
+    return std::isfinite(f.rowsJitterX) && std::isfinite(f.rowsJitterY) &&
+        std::isfinite(f.previousRowsJitterX) && std::isfinite(f.previousRowsJitterY) &&
+        std::abs(f.rowsJitterX)<=.5f && std::abs(f.rowsJitterY)<=.5f &&
+        std::abs(f.previousRowsJitterX)<=.5f && std::abs(f.previousRowsJitterY)<=.5f;
 }
 bool resolveModeValid(FlatMonoResolveMode mode) {
     return mode==FlatMonoResolveMode::Taa || mode==FlatMonoResolveMode::Dlaa ||
@@ -304,6 +313,14 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
        f.renderWidth>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || f.renderHeight>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
        f.outputWidth>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || f.outputHeight>D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
        !std::isfinite(f.deltaMs) || f.deltaMs<0 || !cameraValid(f.camera) || !jitterValid(f))return fail(reason,"flat-resolve-invalid-frame");
+    // The phase the rows themselves carry, as the NDC shift the shader removes (flat_camera_phase.h). A phase that
+    // cannot be turned into a shift refuses the frame: reprojecting through rows still carrying it would be the
+    // half-pixel error this exists to remove, silently.
+    FlatProjectionJitter rowsNow{},rowsBefore{};
+    if(!rowsJitterValid(f) ||
+       !flatProjectionJitter(f.rowsJitterX,f.rowsJitterY,f.renderWidth,f.renderHeight,rowsNow) ||
+       !flatProjectionJitter(f.previousRowsJitterX,f.previousRowsJitterY,f.renderWidth,f.renderHeight,rowsBefore))
+        return fail(reason,"flat-resolve-invalid-rows-jitter");
     if(f.mode!=FlatMonoResolveMode::Taa && f.mode!=FlatMonoResolveMode::Dlaa && f.mode!=FlatMonoResolveMode::Dlss &&
        f.mode!=FlatMonoResolveMode::Fsr)return fail(reason,"flat-resolve-invalid-mode");
     // Gate 2 step 2 (design doc section 72): the route table owns the size
@@ -345,6 +362,9 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     constants.flags[0]=reset;constants.flags[1]=engine;constants.flags[2]=taa;
     constants.jitter[0]=f.jitterX;constants.jitter[1]=f.jitterY;
     constants.jitter[2]=f.previousJitterX;constants.jitter[3]=f.previousJitterY;
+    // On a reset the previous rows ARE the current rows (above), so they carry the current phase.
+    constants.rowsJitter[0]=rowsNow.ndcX;constants.rowsJitter[1]=rowsNow.ndcY;
+    constants.rowsJitter[2]=reset?rowsNow.ndcX:rowsBefore.ndcX;constants.rowsJitter[3]=reset?rowsNow.ndcY:rowsBefore.ndcY;
     context->UpdateSubresource(g.constants.Get(),0,nullptr,&constants,0,0);
     context->CopyResource(g.color.texture.Get(),color.Get());
     ID3D11Buffer* cb[]={g.constants.Get(),f.engine.sceneNow,f.engine.scenePrev};
