@@ -3,8 +3,13 @@
 // flash-engine-fix-2026-09-23.md). No Windows header, no game memory, no
 // CodeHook -- everything here takes plain data in and hands plain data
 // back, so tools\transition_flash_prevent_test can drive it without the
-// game. transition_flash_prevent.cpp is the only includer that also touches
-// the process.
+// game. Its first consumer, transition_flash_prevent.cpp (the four-hook
+// compose fix behind advanced.transition_flash_prevent), was removed
+// 2026-09-29 after the flights refuted the chain it hooked
+// (docs/transition-flash.md); what stays is what
+// transition_flash_eye_base_core.h reuses. Comments in the sibling modules
+// that cite transition_flash_prevent.cpp mean that file as it was (git
+// history, before the removal commit).
 #include <cmath>
 #include <cstdint>
 
@@ -169,7 +174,8 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Mode, parsed from advanced.transition_flash_prevent.
+// Mode, parsed from advanced.transition_flash_eye_base (and, until it was
+// removed, advanced.transition_flash_prevent).
 enum class Mode : uint8_t { Off = 0, Watch = 1, On = 2, Alternate = 3 };
 
 // Case-insensitive against off/watch/on/alternate; unrecognised text falls

@@ -56,7 +56,6 @@
 #include "boundary_tick.h"     // one fault budget per boundary tick
 #include "temporal_pass.h"     // and the temporal pass: warm-up, the camera capture, totals
 #include "glitch_frame.h"
-#include "transition_flash_prevent.h"
 #include "pose_reader_watch.h"
 #include "transition_flash_eye_base.h"
 #include "holo_fix.h"
@@ -5274,13 +5273,8 @@ void vScreenRefreshConfig() {
     resolveProbeConfigure(cfg);
     resolveBindConfigure(cfg);
     stencilProbeConfigure(cfg);
-    // advanced.transition_flash_prevent: the engine-side fix (docs/design-
-    // transition-flash-engine-fix-2026-09-23.md). Off leaves this line as
-    // the only thing it does; a non-off value installs its four CodeHooks
-    // the first time this is reached (install or a later reload, whichever
-    // is first), then only moves the live mode.
-    transitionFlashPreventConfigure(cfg);
-    // advanced.eye_origin_readers: the same design doc's parts A2/B (who
+    // advanced.eye_origin_readers: the engine-side fix design doc's
+    // (docs/design-transition-flash-engine-fix-2026-09-23.md) parts A2/B (who
     // reads the pose, and the positioner swap). Off leaves this line as
     // the only thing it does; a non-off value installs its two CodeHooks
     // the first time this is reached, then only moves the live on/off bit
@@ -6374,11 +6368,6 @@ void vScreenFrameBoundary() {
     // The flash detector needs the count for the frame that just ended, to tell
     // a rendered scene from a menu. It has to be told before the counter resets.
     glitchFrameBoundary(sceneDraws);
-    // Publishes the frame number the transition-flash-prevent hooks read
-    // from any thread (they can run on a scheduler job thread, off this
-    // one) and services one deferred ring dump if its due frame has
-    // arrived. Never called from inside a game hook.
-    transitionFlashPreventFrameBoundary(s->frameNo);
     // Publishes the frame number the consumer hook reads (also, possibly, a
     // scheduler job thread), runs the writer watch's own ship-pointer
     // stability gate / arms, re-arms or sweeps it, and services one
@@ -6518,12 +6507,6 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     resolveProbeConfigure(cfg);
     resolveBindConfigure(cfg);
     stencilProbeConfigure(cfg);
-    // advanced.transition_flash_prevent: the engine-side fix (docs/design-
-    // transition-flash-engine-fix-2026-09-23.md). Off leaves this line as
-    // the only thing it does; a non-off value installs its four CodeHooks
-    // the first time this is reached (install or a later reload, whichever
-    // is first), then only moves the live mode.
-    transitionFlashPreventConfigure(cfg);
     // advanced.eye_origin_readers: the same design doc's parts A2/B. See
     // the other call site's comment above.
     poseReaderWatchConfigure(cfg);

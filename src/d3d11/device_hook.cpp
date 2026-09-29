@@ -70,7 +70,6 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "boundary_tick.h"   // one fault budget per frame-boundary tick
 #include "vscreen.h"
 #include "glitch_frame.h"
-#include "transition_flash_prevent.h"
 #include "pose_reader_watch.h"
 #include "transition_flash_eye_base.h"
 #include "vscreen_res.h"
@@ -1139,7 +1138,6 @@ void tickHotkeys() {
     if (g_state->dumpKey.pressed()) {
         dumpCameraRing("the history key");
         temporalPassDumpHistory("the history key");
-        transitionFlashPreventDumpRing("the history key");
         g_state->dumpDueMs = nowMs() + kDumpDelayMs;
     }
     // THE PRESS THAT WENT NOWHERE, said out loud.
@@ -1174,7 +1172,6 @@ void tickHotkeys() {
         dumpCameraRing("a key you pressed two seconds ago",
                        (uint32_t)(kDumpDelayMs / 1000));
         temporalPassDumpHistory("a key you pressed two seconds ago");
-        transitionFlashPreventDumpRing("a key you pressed two seconds ago");
     }
     // The draw census key (issue 69074). Same silent-failure shape as the
     // history key, same cure: a diagnostic keypress that another window
@@ -3147,7 +3144,6 @@ void shutdownDeviceHooks() {
     revertVScreenModeResolution();
     uiPanelScaleShutdown();  // fix.ui_quality's four operands, back to the game's
     shutdownGlitchFrameFix();
-    transitionFlashPreventShutdown();
     poseReaderWatchShutdown();
     transitionFlashEyeBaseShutdown();
     shutdownVScreenFixes();
