@@ -12,15 +12,14 @@ changes.*
   returns it FLEW CLEAN (flight 124504, Pimax OpenXR: invalid 5, Elite's
   second-Submit park p50 0.16-0.18 ms) and now DEFAULTS ON.
 - **Long cycles and the carrier, 2026-09-29 (entries below):** phase 0 ruled
-  out the periodic jobs; flight 090608 ruled out EDVR's Present hook (7.4 ms
-  across 70 long cycles); 094331 had 138-160 ms stalls with anti-aliasing
-  off, so the stalls are Elite's. At the carrier with DLSS both halves sit
-  at the budget (Elite's thread 11.6-12.4 ms outside the wait, the GPU
-  11.3-12.2 ms); with AA off both drop to about 5 ms. Two parts of the AA
-  path's cost were not itemised: about 1.7 ms of GPU inside Elite's own
-  draws (the TAA leg), and engine motion's CPU (1,800-2,900 hook calls a
-  frame at the carrier). The carrier instruments (last entry) time both and
-  add the GPU's gap between frames: BUILT 2026-09-29, NOT FLOWN.
+  out the periodic jobs; flight 090608 ruled out EDVR's Present hook; 094331
+  had 138-160 ms stalls with anti-aliasing off, so the stalls are Elite's.
+  The instruments FLEW (112704): with DLSS at the carrier the GPU never
+  waits between frames (gap p50 0.06-0.10 ms; 4.5 ms with AA off), so the
+  frame is GPU-bound, and engine motion costs Elite's render thread
+  0.35-0.40 ms p50 (ruled out as the limit). The GPU frame is 12.5-12.7 ms:
+  Elite about 6.5, EDVR 6.0-6.2 (upscaler 3.08, UI and hologram passes 2.16,
+  motion 0.46, and 0.3-0.5 inside Elite's own draws).
 - **Comparing with 0.16.2 in fpsVR:** under OpenVR its CPU frame time is
   poses ready to second submit (0.16.2's `appCpuMs`); on the native runtime
   it tracks Elite's whole frame outside the wait. Compare pre-submit windows.
@@ -40,16 +39,15 @@ changes.*
   0.1 ms bar.
 - **Ruled out:** at the end of each 2026-09-24 entry, and in the 2026-09-29
   ones (the periodic jobs; EDVR's Present hook; EDVR's AA work as the
-  stalls' cause).
-- **Next** (carrier instruments entry): fly the instrument build. DLSS on at
-  the carrier with many ships, two minutes steady, then the same scene with
-  AA off; read the `engine motion CPU` lines, the census's `frame gap` and
-  altered-draw lines, and the LONG FRAME line's `engine motion` field. The
-  entry's table says what reads as GPU-bound and what as CPU-bound, and the
-  fix follows the figures (the join's per-call cost, the UI passes, review
-  P3, or the output size). Also any flight on a Quest runtime with the
-  default build: check the Application-render GPU invalid count stays near
-  zero and `native_frame_end_overlap_summary` reads failures=0.
+  stalls' cause; engine motion's CPU as the carrier's limit).
+- **Next** (flight 112704 entry): the GPU is the lever, about 1.6 ms off
+  EDVR's ~6 ms. Sean's pick: the upscaler (3.08 ms; the output size is a
+  setting, foveated DLSS is paused); the UI and hologram passes cut to their
+  footprint (2.16 ms, review P3); naming the six "other fix-wrapped draws"
+  (1.02 ms whole). Also sample the engine-motion clock (~1.17 ms of CPU a
+  frame). Any Quest flight with the default build: check the
+  Application-render GPU invalid count stays near zero and
+  `native_frame_end_overlap_summary` reads failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
   4100x4050 and 2665x2087.
@@ -1292,3 +1290,58 @@ about 0.16 ms of the render thread, and moving the line below the quick-path
 return changes no figure. `primaryBuildObserved` does a relaxed `fetch_add` on a
 shared counter per call from job threads; the new "rigid emit" figure will show
 what that costs.
+
+## 2026-09-29: flight 112704, the carrier instruments flown: GPU-bound
+
+Build v0.18.0-rc.3-158-gcd37e487 on the Frontier install (build matched),
+SteamVR OpenXR (`aapvr`), 4032x3896 out and 2016x1948 in per eye, HMD Image
+Quality 0.5, DLSS performance, preset K, launched in DLSS. Logs
+`edvr_gfx_20260929_112704.log` and
+`edvr_openxr_20260929_112705_668_46812.log`. At the fleet carrier with many
+ships from about 11:29 (emit 2,310-2,968 calls a frame, as busy as 090608),
+then anti-aliasing off at 11:31:36 in the same place.
+
+- **The GPU is the limit.** Census windows ending 11:30:04-11:31:34, DLSS:
+  frame gap p50 0.06-0.10 ms, p95 1.38-1.61 ms (2,297 of 2,297 frames paired
+  in the busiest); after AA off, 4.51-4.63 ms p50. With DLSS the GPU never
+  waits for the next frame's work; without it, it waits about 4.5 ms.
+  Frame-cycle windows w6-w9: cycle 12.67-13.15 ms, 75.7-77.8 fps, the wait
+  0.09 ms; after AA off (w10-w11) 11.12-11.23 ms with 4.4-4.5 ms of slack,
+  87-89 fps.
+- **Engine motion's CPU is small on Elite's thread.** Render thread p50
+  0.35-0.40 ms a frame (p95 1.10-1.22, max 1.65-2.85) over about 1,600
+  clocked calls; the largest parts are the clear observer (0.21 p50, 0.57
+  p95) and merge (0.49 p95). Other threads: 241-273 ms per second across 7
+  threads, about 3.5 ms of job-thread time a frame: clear 144.6 ms/s (702
+  calls a frame, about 2.7 us a call), builder 56.8 (13,425 calls a frame),
+  merge 45.8, emit 23.2. The clock itself costs about 1.17 ms a frame, mostly
+  on those job threads.
+- **Where the GPU frame goes, busiest window (12.726 ms p50).** EDVR ~5.732:
+  upscaler 3.078; UI resolve 0.332, UI layer composite 0.277, UI layer
+  reissues 0.428 (114 a frame), UI depth coverage 0.212; hologram passes
+  0.691 (5.5 a frame), hologram resolve and celestial 0.218; engine velocity
+  0.299, motion prep 0.157. Game ~6.99. Against the AA-off windows
+  (application render 6.46-6.56 ms) the AA path costs 6.0-6.2 ms, so about
+  0.3-0.5 ms of it lies inside Elite's own draws, against the TAA leg's 1.7
+  at twice the render size. Elite's draws that EDVR alters, timed whole:
+  pool-family 0.183 (2,314 a frame), UI draws redirected to EDVR's layer
+  0.600 (112 a frame), other fix-wrapped draws 1.021 (6 a frame).
+- The long frames in the busy windows (22-47 ms) carry engine motion
+  0.33-0.78 ms and draw hooks about 1 ms; the rest is Elite's, as before.
+- ruled out: EDVR's engine-motion CPU as the carrier's limit, because it
+  costs Elite's render thread 0.35-0.40 ms p50 a frame while the GPU never
+  waits between frames (gap p50 0.06-0.10 ms); the thread's extra time with
+  DLSS is mostly waiting on the GPU.
+
+**Next.** The GPU is the lever: EDVR needs about 1.6 ms off its ~6 ms at the
+carrier for the p50 to reach 90 Hz. In rough order of gain:
+1. The upscaler, 3.08 ms: its cost follows the output pixels, a setting;
+   foveated DLSS is built and paused by Sean.
+2. The UI and hologram passes, 2.16 ms: restrict the resolve, composite and
+   hologram passes to where the UI and holograms are (review P3), and look
+   at drawing the redirected UI and the reissues at the render size.
+3. The six "other fix-wrapped draws", 1.02 ms whole: name them and find how
+   much of it is EDVR's.
+Separately: sample the engine-motion clock (every call now, ~1.17 ms of CPU a
+frame) now that it has answered; the clear observer (2.7 us a call on job
+threads) is the CPU item for scenes that are CPU-bound.
