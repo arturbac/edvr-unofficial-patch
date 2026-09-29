@@ -49,7 +49,6 @@ enum class GpuCensusSection : uint8_t {
                               // engineVelocityBeforeDraw's call sites, which mostly return
                               // without reaching the slow path at all
     FrameUiLayerReissues,     // the UI layer's multiply/write-back reissues
-    FrameEyeMask,             // fix.eye_mask's own draw
     Count
 };
 

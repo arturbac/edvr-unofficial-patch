@@ -8,7 +8,6 @@ static const D3D_SHADER_MACRO sunAllFlat[]={{"ALLFLAT","1"},{nullptr,nullptr}};
 static std::vector<Variant> extraVariants() { return {
     {"kBackdropBytecode","backdrop deband","main",nullptr,{},false,edvr::fixed_extra_source::backdrop_fix::kBackdropCsHlsl,"cs_5_0"},
     {"kMenuCompositeBytecode","menu_panel_cs","main",nullptr,{},false,edvr::fixed_extra_source::menu_panel::kCompositeCs,"cs_5_0"},
-    {"kEyeMaskRingBytecode","eye_mask_vs","main",nullptr,{},false,edvr::fixed_extra_source::eye_mask::kRingVsHlsl,"vs_5_0"},
     {"kSplashDimBytecode","splash_dim_ps","main",nullptr,{},false,edvr::fixed_extra_source::splash_dim::kPsHlsl,"ps_5_0"},
     {"kFssHealBytecode","fss_heal_cs","main",nullptr,{},false,edvr::fixed_extra_source::fss_heal::kHealCsHlsl,"cs_5_0"},
     {"kFssMirrorBytecode","fss_mirror_cs","main",nullptr,{},false,edvr::fixed_extra_source::fss_heal::kMirrorCsHlsl,"cs_5_0"},
@@ -35,7 +34,6 @@ static std::vector<Variant> extraVariants() { return {
 static std::vector<LegacyContract> extraLegacyContracts() { return {
     {"backdrop deband","main","cs_5_0",nullptr,0x6D209E9C37D3C19Bull},
     {"menu_panel_cs","main","cs_5_0",nullptr,0xF74E850A81A3B7B0ull},
-    {"eye_mask_vs","main","vs_5_0",nullptr,0xFEB49D764AC19010ull},
     {"splash_dim_ps","main","ps_5_0",nullptr,0x6D672151F841B696ull},
     {"fss_heal_cs","main","cs_5_0",nullptr,0xE8DA07272D9394EBull},
     {"fss_mirror_cs","main","cs_5_0",nullptr,0xCF8ED1F8A5128648ull},

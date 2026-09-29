@@ -393,31 +393,6 @@ const std::string kRcasSource = std::string(kGpuPrologue) + joinChunks(kFfxAChun
 
 }
 
-namespace eye_mask {
-
-constexpr char kRingVsHlsl[] = R"HLSL(
-cbuffer EyeMaskCB : register(b0) {
-    float2 centre;
-    float2 axes;
-    float outerScale;
-    float depthValue;
-    float segments;
-    float pad0;
-};
-float4 main(uint id : SV_VertexID) : SV_POSITION {
-    uint seg = id / 2;
-    uint parity = id - seg * 2;
-    float theta = float(seg) * (6.283185307179586 / segments);
-    float c = cos(theta);
-    float s = sin(theta);
-    float scale = parity == 0 ? 1.0 : outerScale;
-    float2 p = centre + float2(axes.x * c, axes.y * s) * scale;
-    return float4(p, depthValue, 1.0);
-}
-)HLSL";
-
-}
-
 namespace splash_dim {
 
 constexpr char kPsHlsl[] =

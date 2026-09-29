@@ -49,7 +49,6 @@
 #include "stencil_probe.h"
 #include "fss_res.h"
 #include "depth_probe.h"      // Phase 0 item 3: which depth target the eye draws use, and how it reads
-#include "eye_mask.h"          // the lens-ring depth mask: draws past the hooks, once per eye per frame
 #include "sharpen_pass.h"      // likewise: warm-up and totals; the sharpening runs at submit
 #include "menu.h"              // the settings menu's reload: its keys, then the row diff
 #include "perf_monitor.h"      // the draw hooks' sampled cost, and the reload as an event
@@ -2329,13 +2328,6 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         if (depthProbeEyeDrawNeedsNote(eyeDsv))
             depthProbeNoteEyeDraw(self, eyeDsv, s->eyeDrawsThisFrame);
     }
-    // fix.eye_mask's own draw, past every hook below (eye_mask.h): at most
-    // once per eye per frame, so the cheap "already drawn" check runs before
-    // anything else even when the feature is off.
-    if (eyeMaskWantsDraws()) {
-        GpuCensusScope census(self, GpuCensusSection::FrameEyeMask);
-        eyeMaskOnEyeDraw(self, bindingGet(BindSlot::Dsv0));
-    }
     // The interface's depth (ui_depth.h): a composite of a learned surface,
     // or a named family drawn straight into the eye, writes its depth. A
     // flag and not a verdict, so it composes with whatever claims the draw
@@ -4126,10 +4118,8 @@ void STDMETHODCALLTYPE hookedClearDsv(ID3D11DeviceContext* self,
                              foreignContext(self));
     }
     // The depth probe learns which value the game clears an eye-draw
-    // target to, which says which way its depth runs. eye_mask learns
-    // whether this is a re-clear of a target it already drew its ring
-    // into this frame -- which would wipe the ring -- for its summary.
-    if (!foreignContext(self)) {depthProbeNoteClear(dsv, depth);eyeMaskOnClear(dsv);if(uiLayerWatching())uiLayerNoteDepthClear(dsv, flags, depth, stencil);}
+    // target to, which says which way its depth runs.
+    if (!foreignContext(self)) {depthProbeNoteClear(dsv, depth);if(uiLayerWatching())uiLayerNoteDepthClear(dsv, flags, depth, stencil);}
     if (!foreignContext(self) && (flags & D3D11_CLEAR_DEPTH) && flatRuntimeActive()) { ResourceInfo info{}; if (bindingResolve(dsv, &info)) flatRuntimeWritten(static_cast<ID3D11Resource*>(info.resource)); }
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalClearDepth(dsv, flags, depth);
     g_state->realClearDsv(self, dsv, flags, depth, stencil);
@@ -5173,12 +5163,6 @@ void vScreenPSSetShaderRaw(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps,
     g_state->realPSSetShader(ctx, ps, classInstances, numClassInstances);
 }
 
-void vScreenVSSetConstantBuffersRaw(ID3D11DeviceContext* ctx, uint32_t startSlot,
-                                    uint32_t numBuffers, ID3D11Buffer* const* buffers) {
-    if (!g_state || !g_state->realVSSetConstantBuffers || !ctx) return;
-    g_state->realVSSetConstantBuffers(ctx, startSlot, numBuffers, buffers);
-}
-
 void vScreenOMSetBlendStateRaw(ID3D11DeviceContext* ctx, ID3D11BlendState* state,
                                const float blendFactor[4], uint32_t sampleMask) {
     if (!g_state || !g_state->realOMSetBlendState || !ctx) return;
@@ -5287,7 +5271,6 @@ void vScreenRefreshConfig() {
     fssRevealConfigure(cfg);
     fssDumpConfigure(cfg);
     eyeSplitConfigure(cfg);
-    eyeMaskConfigure(cfg);
     resolveProbeConfigure(cfg);
     resolveBindConfigure(cfg);
     stencilProbeConfigure(cfg);
@@ -5498,7 +5481,6 @@ EDVR_BOUNDARY_TICK(tkDrawCensusBoundary, "draw_census_boundary");
 EDVR_BOUNDARY_TICK(tkFssReveal, "fss_reveal");
 EDVR_BOUNDARY_TICK(tkFssDump, "fss_dump");
 EDVR_BOUNDARY_TICK(tkEyeSplit, "eye_split");
-EDVR_BOUNDARY_TICK(tkEyeMask, "eye_mask");
 EDVR_BOUNDARY_TICK(tkFssPacing, "fss_pacing");
 EDVR_BOUNDARY_TICK(tkRemlok, "remlok");
 }  // namespace
@@ -5643,7 +5625,6 @@ void vScreenFrameBoundary() {
     tkFssReveal.run([&] { fssRevealFrameBoundary(); });
     tkFssDump.run([&] { fssDumpFrameBoundary(s->ownerCtx); });
     tkEyeSplit.run([&] { eyeSplitFrameBoundary(s->ownerCtx); });
-    tkEyeMask.run([&] { eyeMaskFrameBoundary(s->ownerCtx); });
 
     // FSS frame pacing (round 31): the left-only squares are now measured
     // to be runtime-side (both submitted images carry the flicker equally),
@@ -6534,7 +6515,6 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     fssRevealConfigure(cfg);
     fssDumpConfigure(cfg);
     eyeSplitConfigure(cfg);
-    eyeMaskConfigure(cfg);
     resolveProbeConfigure(cfg);
     resolveBindConfigure(cfg);
     stencilProbeConfigure(cfg);
@@ -6898,7 +6878,6 @@ void shutdownVScreenFixes() {
     fssRevealShutdown();
     fssDumpShutdown();
     eyeSplitShutdown();
-    eyeMaskShutdown();
     gpuCensusShutdown();
     resolveProbeShutdown();
     resolveBindShutdown();

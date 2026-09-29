@@ -7325,8 +7325,8 @@ extern "C" __declspec(dllexport) void edvrTemporalAaPriceWindow(double* medians7
     edvr::temporalPassPriceWindow(medians7, other, pairs, dropped);
 }
 
-// tools/smoke wires this in next to edvrEyeMaskSelftest, same pattern: pure
-// geometry, no device, one bit per independent check, 63 (all six) is pass.
+// tools/smoke wires this in: pure geometry, no device, one bit per
+// independent check, 63 (all six) is pass.
 // Bit 1: width mode against a rectangle hand-derived from cropOf's own
 // arithmetic before this extraction, checked twice independently -- not
 // the design note's "1128px" figure, which neither derivation reproduced;
@@ -7367,9 +7367,9 @@ extern "C" __declspec(dllexport) unsigned edvrFoveaRegionSelftest() {
     using namespace edvr;
     unsigned bits = 0;
 
-    // Crystal Super-shaped tangents, the same worked example eye_mask.cpp
-    // uses; fw/fh a plausible per-eye render size for it. down/up match
-    // native_temporal.h:21's {left,right,down,up} frusta order.
+    // Crystal Super-shaped tangents; fw/fh a plausible per-eye render size
+    // for it. down/up match native_temporal.h:21's {left,right,down,up}
+    // frusta order.
     const float l = -1.529f, r = 1.032f, down = -1.265f, up = 1.265f;
     const uint32_t fw = 2576, fh = 2544;
 

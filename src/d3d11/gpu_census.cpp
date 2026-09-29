@@ -33,11 +33,11 @@ constexpr const char* kDoorBreakdownNames[8] = {
     "upscaler", "motion prep", "hologram resolve+celestial", "UI resolve",
     "sharpen", "menu", "UI layer composite", "FSS heal"
 };
-// The in-frame breakdown, FrameHologramPasses..FrameEyeMask (indices 9..17).
-constexpr const char* kFrameBreakdownNames[9] = {
+// The in-frame breakdown, FrameHologramPasses..FrameUiLayerReissues (indices 9..16).
+constexpr const char* kFrameBreakdownNames[8] = {
     "hologram passes", "UI depth coverage", "planet", "terrain",
     "screen motion", "weapon motion", "engine velocity",
-    "UI layer reissues", "eye mask"
+    "UI layer reissues"
 };
 
 struct SectionState {
@@ -147,7 +147,7 @@ void logAndResetWindow(uint64_t now) {
     // motion prep, hologram resolve and UI resolve all run INSIDE
     // temporalInner, so DoorTemporalWhole's own ms already include them.
     // Adding those four again would double their cost. The same
-    // reasoning does not apply to "in-frame F": its nine parts are
+    // reasoning does not apply to "in-frame F": its eight parts are
     // independent call sites (no one of them wraps another), so F is
     // their direct sum.
     const Snapshot doorWhole = snapshotOf(g_section[static_cast<size_t>(GpuCensusSection::DoorTemporalWhole)], frames);
@@ -164,7 +164,7 @@ void logAndResetWindow(uint64_t now) {
     }
     double frameTotal = 0.0;
     std::string frameItems;
-    for (int i = 0; i < 9; ++i) {
+    for (int i = 0; i < 8; ++i) {
         const Snapshot s = snapshotOf(g_section[kDoorSections + static_cast<size_t>(i)], frames);
         appendItem(frameItems, kFrameBreakdownNames[i], s);
         frameTotal += s.msPerFrame;

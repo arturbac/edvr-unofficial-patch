@@ -117,17 +117,15 @@ void vScreenSetRenderTargetsRaw(ID3D11DeviceContext* ctx, uint32_t n,
                                 ID3D11RenderTargetView* const* rtvs,
                                 ID3D11DepthStencilView* dsv);
 
-// The same bypass for Draw, the VS/PS stage, a VS constant buffer slot and
-// UpdateSubresource -- everything fix.eye_mask's ring needs past the hook,
-// so the draw census, the eye-draw gate and the temporal pass never see it. Every one null-safe before the hooks are installed (no-op),
-// same as vScreenSetRenderTargetsRaw above.
+// The same bypass for Draw, the VS/PS stage and UpdateSubresource, so the
+// draw census, the eye-draw gate and the temporal pass never see them (the
+// UI-depth passes draw through these). Every one null-safe before the hooks
+// are installed (no-op), same as vScreenSetRenderTargetsRaw above.
 void vScreenDrawRaw(ID3D11DeviceContext* ctx, uint32_t vertexCount, uint32_t startVertex);
 void vScreenVSSetShaderRaw(ID3D11DeviceContext* ctx, ID3D11VertexShader* vs,
                            ID3D11ClassInstance* const* classInstances, uint32_t numClassInstances);
 void vScreenPSSetShaderRaw(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps,
                            ID3D11ClassInstance* const* classInstances, uint32_t numClassInstances);
-void vScreenVSSetConstantBuffersRaw(ID3D11DeviceContext* ctx, uint32_t startSlot,
-                                    uint32_t numBuffers, ID3D11Buffer* const* buffers);
 // The blend state, past the binding shadow's hook: engine-record velocity's
 // derived state for a substituted pool draw, and the game's put back.
 void vScreenOMSetBlendStateRaw(ID3D11DeviceContext* ctx, ID3D11BlendState* state,

@@ -1598,8 +1598,7 @@ ID3D11BlendState* holoContribBlendFor(ID3D11DeviceContext* ctx, BOOL enable, D3D
 }
 
 // The resolve's full-screen triangle, entirely from SV_VertexID -- no
-// vertex buffer, no input layout (eye_mask.cpp's ring uses the same
-// SV_VertexID trick for a different shape) -- clockwise, so it survives
+// vertex buffer, no input layout -- clockwise, so it survives
 // the default (and the resolve's own, CULL_NONE either way) rasterizer
 // state without relying on a y-flip.
 
