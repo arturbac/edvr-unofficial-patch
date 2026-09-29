@@ -254,8 +254,8 @@ struct State {
     // does with the cycle.
     Hotkey extCamPrevKey;
     // The player's own FSS enter/quit keys, adopted from their Elite
-    // bindings like the camera keys above; they give the theater's mode
-    // latch its frame-exact edges.
+    // bindings like the camera keys above; they give the FSS mode latch its
+    // frame-exact edges.
     Hotkey fssEnterKey;
     Hotkey fssQuitKey;
     Hotkey fssZoomStepKey;
@@ -270,7 +270,7 @@ struct State {
     XinputBinding fssZoomStepPad;
     XinputBinding fssZoomPad;
     bool fssZoomPressPending = false;
-    bool     fssTheaterWanted = false;
+    bool     fssModeLatchWanted = false;
     bool     fssModeLatch = false;
     bool     fssLatchByKey = false;
     uint64_t fssLatchMs = 0;
@@ -1103,7 +1103,7 @@ EDVR_BOUNDARY_TICK(tkEliteBinds, "elite_binds");
 EDVR_BOUNDARY_TICK(tkJournalWatch, "journal_watch");
 EDVR_BOUNDARY_TICK(tkJournalGate, "journal_gate");
 EDVR_BOUNDARY_TICK(tkCameraKeysPads, "camera_keys_pads");
-EDVR_BOUNDARY_TICK(tkFssTheater, "fss_theater");
+EDVR_BOUNDARY_TICK(tkFssModeLatch, "fss_mode_latch");
 EDVR_BOUNDARY_TICK(tkMenu, "menu");
 EDVR_BOUNDARY_TICK(tkBindingBoundary, "binding_boundary");
 EDVR_BOUNDARY_TICK(tkExposureBoundary, "exposure_boundary");
@@ -1346,12 +1346,12 @@ void tickCameraKeysPads() {
     }
 }
 
-// The FSS theater's mode latch (tkFssTheater).
-void tickFssTheater() {
+// The FSS mode latch (tkFssModeLatch).
+void tickFssModeLatch() {
     // The same word tickCameraKeysPads reads: key presses mean the game only once
     // gameplay has started (see there for why).
     const bool keysMeanGame = !journalWatchActive() || journalGameplay();
-    // The FSS theater's mode latch: the player's own FSS keys give
+    // The FSS mode latch: the player's own FSS keys give
     // frame-exact edges -- press enter and the screen is up THIS
     // frame, press quit and it is gone. Underneath, the game's
     // GuiFocus is the authority that heals every path a key cannot
@@ -1362,7 +1362,7 @@ void tickFssTheater() {
     // word alone ends it. A quit press suppresses the focus engage
     // until the game agrees the mode ended, so stale status cannot
     // re-open a screen the player just closed.
-    if (g_state->fssTheaterWanted) {
+    if (g_state->fssModeLatchWanted) {
         xinputWatchTick();
         const bool wasLatched = g_state->fssModeLatch;
         bool byKey = false;
@@ -1417,9 +1417,8 @@ void tickFssTheater() {
             ++g_state->fssLatchNotes;
             Log::get().note(
                 g_state->fssModeLatch
-                    ? "fss theater: mode latch OPEN (%s)."
-                    : "fss theater: mode latch closed (%s). Said at "
-                      "most 6 times.",
+                    ? "fss mode latch: OPEN (%s)."
+                    : "fss mode latch: closed (%s). Said at most 6 times.",
                 byKey ? "your FSS key" : "the game's GuiFocus");
         }
     }
@@ -1563,7 +1562,7 @@ void presentFrameBoundary() {
     tkJournalWatch.run([] { journalWatchTick(); });
     tkJournalGate.run(tickJournalGate);
     tkCameraKeysPads.run(tickCameraKeysPads);
-    tkFssTheater.run(tickFssTheater);
+    tkFssModeLatch.run(tickFssModeLatch);
     // The settings menu (docs/settings-menu.md): its summon key, its
     // navigation keys and head-aim, its fade, the keyboard gate that
     // follows its draw, and the upload of a fresh raster. One key poll
@@ -1625,9 +1624,9 @@ void presentFrameBoundary() {
         // stood down there is nothing new to derive from.
         tkConfigRefresh.run([] {
             vScreenRefreshConfig();
-            g_state->fssTheaterWanted =
+            g_state->fssModeLatchWanted =
                 eyeSyncFromConfig(Config::get()).any();
-            journalWatchSetEagerStatus(g_state->fssTheaterWanted);
+            journalWatchSetEagerStatus(g_state->fssModeLatchWanted);
         });
         tkFrameFlagPeer.run(tickFrameFlagPeer);
         // The liveness pass, on the same once-a-second cadence. In-place
@@ -2175,9 +2174,9 @@ State& ensureState() {
         menuAdoptGameBindings(Config::get().getBool("hotkey.read_game_bindings", true), nullptr);
         headOffsetGateSetNextKeyBound(g_state->extCamNextKey.key() != 0);
         journalWatchConfigure();
-        g_state->fssTheaterWanted =
+        g_state->fssModeLatchWanted =
             eyeSyncFromConfig(Config::get()).any();
-        journalWatchSetEagerStatus(g_state->fssTheaterWanted);
+        journalWatchSetEagerStatus(g_state->fssModeLatchWanted);
         g_state->dumpOnExternalCam =
             Config::get().getBool("advanced.dump_camera_on_external_cam", false);
         g_state->holdFramesOnExternalCam = static_cast<uint32_t>(

@@ -380,7 +380,7 @@ bool nearMs(double a, double b) { return std::fabs(a - b) < 1e-5; }
 void frameTicksChain() {
     // Hook 1: entered at 1000; the game's own time before that is not a tick. 10 us of work before the real
     // Present (1000..1010), the real Present 1010..1060, then 30 + 10 us of work after it, then the
-    // boundary: journal_watch 200 us (the slow one), fss_theater 10 us, and the frame edge at 1500 inside the
+    // boundary: journal_watch 200 us (the slow one), fss_mode_latch 10 us, and the frame edge at 1500 inside the
     // menu, which has run 190 us since the last mark.
     FrameTicks t;
     t.enter(1000);
@@ -390,7 +390,7 @@ void frameTicksChain() {
     t.markAt("present_post", 1100);
     t.boundary(true);
     t.markAt("journal_watch", 1300);
-    t.markAt("fss_theater", 1310);
+    t.markAt("fss_mode_latch", 1310);
     FrameTickSummary a = t.cut("menu_tick", 1500, kUs);
     check(nearMs(a.hookMs, 0.45) && nearMs(a.boundaryMs, 0.40) && nearMs(a.realMs, 0.05) &&
           a.marks == 6 && a.hooks == 1,

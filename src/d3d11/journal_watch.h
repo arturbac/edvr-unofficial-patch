@@ -66,7 +66,7 @@ void journalWatchTick();
 bool journalWatchActive();
 
 // Reread Status.json every 100 ms instead of the journal's ~500 ms while
-// true. The FSS theater's mode gate asks for this: its authority signal
+// true. The FSS mode latch asks for this: its authority signal
 // should not lag the player by half a second more than it must. Callable from
 // any thread and cheap when the value has not changed; a change wakes the
 // worker so the new cadence starts at once rather than at its next wake-up.

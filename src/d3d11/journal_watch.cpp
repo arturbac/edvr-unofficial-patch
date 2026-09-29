@@ -40,8 +40,8 @@ constexpr uint32_t kReglobPolls = 8;
 constexpr uint64_t kReglobMs = kReglobPolls * kPollMs;   // 4 s
 
 // Status.json's own clock when a consumer asked for low latency (the FSS
-// theater's mode gate -- a screen that engages a second late is a screen the
-// player watched arrive). Otherwise it rides the journal's kPollMs.
+// mode latch -- a screen that engages a second late is a screen the player
+// watched arrive). Otherwise it rides the journal's kPollMs.
 constexpr uint64_t kStatusEagerMs = 100;
 
 // Consecutive file-op failures before the watcher retires for the session.

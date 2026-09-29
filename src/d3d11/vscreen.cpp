@@ -440,10 +440,10 @@ struct State {
     uint32_t rtv0ResGen = 0;
     void*    rtv0Res = nullptr;
     // Is the bound offscreen target the FSS body layer? Cached per binding
-    // generation for the panel fix's mode gate. (The "Scan" in the names is
-    // the scan-dissolve fix's, removed 2026-09-29; the cache outlived it.)
-    uint32_t fssScanGen = 0;
-    bool     fssScanBody = false;
+    // generation for the panel fix's mode gate: `fssBodyLayerGen` is the
+    // generation the answer describes, `fssBodyLayerBound` the answer.
+    uint32_t fssBodyLayerGen = 0;
+    bool     fssBodyLayerBound = false;
     // The last frame a draw landed in the body layer -- the fact "the FSS
     // is open NOW". The panel fix's shader pair is the engine's GENERAL
     // world-quad pipeline, and recognising it by hash alone moved the
@@ -1691,7 +1691,7 @@ bool drawGateSubscribed(State* s) {
 //
 // What differs from resolving per draw is only the bargain every
 // generation-keyed answer in this file already makes (rtv0Eye,
-// censusAutoMatch, fssScanBody -- all on this slot): within one generation
+// censusAutoMatch, fssBodyLayerBound -- all on this slot): within one generation
 // the pointer is the one the last hooked set recorded, and a bound view holds
 // its resource for its lifetime, so a second resolve can disagree with the
 // first only if the object at that address changed with no hooked set in
@@ -1846,7 +1846,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
             res->Release();
             srv->Release();
         });
-        // The theater's per-draw pipeline (round 45f): every matched
+        // The panel rect's per-draw pipeline (round 45f): every matched
         // composite is handed to the rect deriver with its own draw args
         // and its ordinal within the frame; once per engage the deriver
         // classifies the whole family -- camera-centred records are the
@@ -1869,7 +1869,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
                 if (!s->fssChromeSkipNoted) {
                     s->fssChromeSkipNoted = true;
                     Log::get().note(
-                        "fss theater: the derivation classified the "
+                        "fss panel rect: the derivation classified the "
                         "scanner's scenery quads (mask 0x%X) and they are "
                         "skipped while the screen is up. Said once.",
                         mask);
@@ -2272,25 +2272,25 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         // draws and for nothing else in the game.
         if (fssPanelWantsDraws() || fssRevealWantsDraws() ||
             fssDumpWantsDraws()) {
-            if (s->fssScanGen != rtvGen) {
-                s->fssScanGen = rtvGen;
-                s->fssScanBody = false;
+            if (s->fssBodyLayerGen != rtvGen) {
+                s->fssBodyLayerGen = rtvGen;
+                s->fssBodyLayerBound = false;
                 ResourceInfo info;
                 if (bindingResolve(bindingGet(BindSlot::Rtv0), &info) &&
                     info.isTexture2D) {
                     if (fssResIsInflated(info.resource)) {
-                        s->fssScanBody = true;
+                        s->fssBodyLayerBound = true;
                     } else {
                         uint32_t ew = 0, eh = 0;
                         if (eyeTextureSize(&ew, &eh) &&
                             (info.a == ew / 2 || info.a == (ew + 1) / 2) &&
                             (info.b == eh / 2 || info.b == (eh + 1) / 2)) {
-                            s->fssScanBody = true;
+                            s->fssBodyLayerBound = true;
                         }
                     }
                 }
             }
-            if (s->fssScanBody) {
+            if (s->fssBodyLayerBound) {
                 // The scanner is drawing its body THIS frame -- the fact
                 // the panel fix's recognition is gated on. The body draws
                 // land before the eye composites in the frame, so the
