@@ -4,51 +4,53 @@
 
 - **Retired 2026-09-29 (0fe90f09):** `camera_view.cpp/.h`, cited below as
   the external-camera reader and settings probe, are deleted (`0fe90f09^`).
-- State: the C2 math and policy checks are established and green in the
-  build pool (derive reducer, WARP raster/ray/lighting proofs, coexistence
-  ownership lifecycle). C3, the upstream injector (fix.temporal_aa_camera,
-  default off), is built, its crash fixed and flown clean; its ownership
-  wiring (main 856e72c2) FLEW 2026-09-29 11:35 on Epic and met every pass
-  mark: 0 row-pair mismatches in 35,127 resolves (max 3.7e-7 NDC), history
-  valid in 79 of 92 ticks, legacy never applied (addendum at the end). The
-  view/execution lineage is not joined.
-- Decision: investigate jittering the game's per-view camera construction
-  before it derives raster/lighting data. Preserve the existing frame
-  discovery, size negotiation, temporal backends and resource isolation.
-- Motivation: the build-verified 20260928_025912 user log reports zero
-  renderer calls; three recurring unknown projection pairs keep every frame
-  in observation. Sean reproduced non-activation with another ship.
-- Ruled out for that session: a backend evaluation failure as the immediate
-  cause, because no backend initialized. Missing shader coverage is proven;
-  whether quality settings or a mod produced those variants is not.
-- Ruled out (the five C3 crashes, 2026-09-28): a compiled C detour at the
-  mid-function hook site; the relay enters by jmp with the game's live
-  stack, so a C prologue's spills land on its saved registers. The transfer
-  is generated code (stubA, a return-address redirection to stubB, TLS
-  state); see the header of src/d3d11/flat_camera_inject.cpp.
-- Root cause of the 20:09, 03:50 and 04:23 crashes (shadow-space addendum):
-  the stubs called C with no 32-byte ABI home area reserved, so refreshPre
-  homed rcx and rdx on stubA's saved r15 and r14 and the pops handed the
-  game r15 = R0 (all three dumps: rdx = r14 = r15 = R0, read +0x4C83379).
-- ruled out: the relay's scratch register (r11 vs rax) as the 20:09/03:50/
-  04:23 crash cause, because the r11-preserving relay (905bddd0) crashed
-  identically; the cause is stubA's missing shadow space.
-- ruled out: call-path log I/O as the crash cause, because the 03:50 flight
-  with per-call logging gated off crashed identically.
-- Corrected and fixed (flown clean): the pass-through was not "memory-
-  identical to unhooked"; the property is every register and stack byte at
-  and above S unchanged at the trampoline (tools/flat_camera_stub_test gates
-  it). Both stubs now reserve the home area (flat_camera_stubs.h).
-- corrected: the 08:57 addendum and the earlier "Next" read the tick's
-  history=invalid as the flat temporal pass not taking the injected phase.
-  It does (evidence in Status detail below); the gaps were G1-G4 (wiring
-  addendum).
-- ruled out: the jittered bound pair breaking the ownership classifier's
-  exact encoding (this doc's out[0][2] = 2*dbx*s8) (evidence in Status detail
-  below).
-- Next: Sean's visual verdict; decide main-versus-auxiliary grouping from the
-  census (two kind-3 cameras injected, about 95 and 11 refreshes a frame);
-  the census's injected-per-frame misreads a one-frame window (11:40:59).
+- State 2026-09-29 (branch claude/flat-menu-shimmer, BUILT, NOT FLOWN): the
+  camera path is on whenever a temporal mode is selected on the flat profile.
+  `fix.temporal_aa_camera` and `fix.temporal_aa_camera_trace` are REMOVED
+  (contract 239 -> 237); the per-call trace path is gone, the stand-down
+  latches stay, and the draw-time row adapter is only the automatic fallback
+  (no injectable camera, a prologue mismatch, 8 failed writes in a 5 s
+  window). With Anti-aliasing off none of it runs and no `flat camera inject`
+  line is written. The injector itself FLEW clean 2026-09-29 11:35 on Epic
+  (main 856e72c2): 0 row-pair mismatches in 35,127 resolves, history valid in
+  79 of 92 ticks, legacy never applied. The view/execution lineage is not joined.
+- Krait main-menu shimmer, DIAGNOSED 2026-09-29 (last section): the dashed
+  hull lines are the stale-slot rule refusing 22.5% of the frame, because the
+  hull plating's pixel shader 66DE2CAD/235567BE is not keyed and overdraws
+  keyed draws' engine slots. Built here, none flown: 1A keys that pair for
+  flat; 1B, in the 3D main menu only, a stale slot takes the camera term
+  (`static-scene-frames=K` on the menu HDR copy line; Sean accepted its risk);
+  1C a census of unkeyed pairs; F2 the replay unjitters rows; F3 no reset
+  frame is an F10 sample. Still unkeyed, for later: CAD1F585 (EDHM-patched),
+  BBE58E40/7311054A (SV_Position input).
+- ruled out: an unjittered hull draw as the cause, because the three traced
+  frames' scene rows carry the log's phase to 1e-7 and all 340 camera-bearing
+  scene draws of frame 67592 bind them, the hull pairs are b1-only, and the one
+  other camera serves 9 UI/output draws, none a ship's.
+- ruled out: wrong or zero ship motion at the menu, because the emitted motion
+  is 0.016 px median and 0.028 px at most, the replay matches it to 6e-4 px,
+  and the camera term is valid at 1822 of 1822 sampled stale pixels
+  (0.013 px); the hangar has no turntable.
+- ruled out: a shader fault behind the replay's 0.609 px "error", because it
+  equals |current phase - previous phase| and is 1e-4 px once the rows are
+  unjittered: a tool defect (F2).
+- ruled out: sub-pixel content as the cause of the dashes, because the same
+  seams are continuous lines in DLSS's raw output and dashes in the final
+  image, which equals raw on accepted pixels (110 of 6.4M differ).
+- corrected: the eight `off -> upstream` switches in that session's log were
+  not ships: session start, one resize and six F8 AA toggles. The log holds
+  two menu visits (Cobra Mk V, Krait Mk II); the carrier swap view between
+  them is not the menu contract.
+- Decision: jitter the game's per-view camera construction before it derives
+  raster/lighting data; preserve frame discovery, size negotiation, temporal
+  backends and resource isolation. The 09-28 zero-renderer-calls log that
+  motivated it, the five crashes (root cause: the stubs' missing 32-byte
+  shadow space, fixed, flown clean) and what was ruled out: Status detail.
+- Next: fly the branch. Epic, Krait at the main menu, F8 closed, hands off
+  10 s, F10 once, then 45 s: read the `unkeyed 5s` census, `static-scene-
+  frames` beside `accepted`, and flat_pixels.py on the capture
+  (input_rejection_percent 22.5 -> ~0); then each other ship at the menu.
+  Sean's verdict on the hull lines. Open: main-versus-auxiliary grouping.
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable and
   build identities, backend versions, dimensions, formats and mod chain.
@@ -69,6 +71,34 @@
   bound pair enters only slots [i][0] and [i][1] and c2_derive_test A8 finds
   [i][2], the depth row and rows 273/274 bit-identical over 16 phases at 3
   sizes.
+
+- The 09-28 motivation and its ruled-out line, moved out of Status 2026-09-29, text unchanged:
+  - Motivation: the build-verified 20260928_025912 user log reports zero
+    renderer calls; three recurring unknown projection pairs keep every frame
+    in observation. Sean reproduced non-activation with another ship.
+  - Ruled out for that session: a backend evaluation failure as the immediate
+    cause, because no backend initialized. Missing shader coverage is proven;
+    whether quality settings or a mod produced those variants is not.
+
+- The five crash bullets, moved out of Status 2026-09-29, text unchanged:
+  - Ruled out (the five C3 crashes, 2026-09-28): a compiled C detour at the
+    mid-function hook site; the relay enters by jmp with the game's live
+    stack, so a C prologue's spills land on its saved registers. The transfer
+    is generated code (stubA, a return-address redirection to stubB, TLS
+    state); see the header of src/d3d11/flat_camera_inject.cpp.
+  - Root cause of the 20:09, 03:50 and 04:23 crashes (shadow-space addendum):
+    the stubs called C with no 32-byte ABI home area reserved, so refreshPre
+    homed rcx and rdx on stubA's saved r15 and r14 and the pops handed the
+    game r15 = R0 (all three dumps: rdx = r14 = r15 = R0, read +0x4C83379).
+  - ruled out: the relay's scratch register (r11 vs rax) as the 20:09/03:50/
+    04:23 crash cause, because the r11-preserving relay (905bddd0) crashed
+    identically; the cause is stubA's missing shadow space.
+  - ruled out: call-path log I/O as the crash cause, because the 03:50 flight
+    with per-call logging gated off crashed identically.
+  - Corrected and fixed (flown clean): the pass-through was not "memory-
+    identical to unhooked"; the property is every register and stack byte at
+    and above S unchanged at the trampoline (tools/flat_camera_stub_test gates
+    it). Both stubs now reserve the home area (flat_camera_stubs.h).
 
 ## 1. Problem and acceptance requirements
 
@@ -524,6 +554,12 @@ check survives the injection and nothing is subtracted or loosened.
 
 ### Config surface
 
+**Superseded 2026-09-29: the key below and its trace key were removed** (the
+camera path flew clean, so it is on whenever the flat profile has a temporal
+mode selected; the draw-time adapter is only the automatic fallback; config
+contract 239 -> 237). The text that follows is the design as first written,
+and later sections that say "with the key on" describe the flights as flown.
+
 One new key, default off, named for what the user gets (the config
 contract gate documents it): `fix.temporal_aa_camera = off | on`. `on`
 permits upstream camera jitter for the temporal backends when the frame
@@ -963,7 +999,8 @@ quotes are in the C3 ownership wiring addendum below.
 
 Branch claude/flat-c3-wiring (from main c4bbe484). Built and gated by the full
 build; NOT FLOWN. Everything below stays behind fix.temporal_aa_camera (default
-off) and the flat profile; no VR path is touched and no config key is added.
+off; removed 2026-09-29, the path is now always on with a temporal mode) and
+the flat profile; no VR path is touched and no config key is added.
 
 corrected: the 08:57 addendum above and the earlier Status "Next" said the
 injected phase did not reach the flat temporal pass ("jitter=(0,0)", "the
@@ -1206,3 +1243,110 @@ classifier audit (flight A) was not flown.
   frames=1 and no injection in its top list; the field does not read
   injections over closed frames in a one-frame window.
 - No crash; the log ends in ordinary 5 s ticks at 11:43:04.
+
+## Krait main-menu shimmer, 2026-09-29: the hull refused by the stale-slot rule
+
+Sean saw the Krait Mk II's hull lines dash and shimmer at the main menu with
+the camera path on (Epic, flat, DLSS Quality, game SS 0.75: R=2880x1620,
+D=3840x2160, EDHM chained, build v0.18.0-rc.3-163-g856e72c2), and confirmed
+afterwards it was the main menu, not the carrier shipyard. Evidence: the F10
+pixel capture (frames 67596, a reset frame, and 67611, live at phase
+-0.125/-0.278) in `edvr_logs\flat_pixels\20260929_184056_425_49100_1`, the
+draw capture, and the trace of the three frames before it (67591-67593), now
+in the corpus as flat_trace_67594.bin.
+
+**Diagnosis.**
+
+- The resolver's rejection footprint on frame 67611 is 1,051,680 px, 22.54%,
+  identical (0 mismatches) to the stale-slot set: pixels whose engine slot was
+  written but whose slot depth is not the depth buffer's. engineBefore returns
+  2, prep zeroes the motion and sets the reject, and finish() outputs the raw
+  jittered current frame instead of DLSS's. The replay agrees with the GPU
+  on every one of 8160 sampled pixels (1822 of them `rejected_stale_or_depth`).
+- The mechanism is an unkeyed pixel shader. At all 8 sample points the last
+  G-buffer draw is 66DE2CAD/235567BE where the 16x16 window is 100% stale (3
+  points) and a keyed pair where it is 0% (5 points); the stale masks of the
+  two frames overlap 98.9%, a fixed footprint: two hulls (the front ship 64%,
+  the orange hull at right 22%) plus floor markings, light strips and thin
+  parts. The family's keyed pixel shaders are 864F1F94 and BBDE4E71, not
+  235567BE. The rule is right for moving records (an unpatched occluder leaves
+  stale slots the depth test rejects) and wrong for a static hull.
+- Frame 67592's draws (344 on the render targets): 233 keyed pairs, 55 of a
+  known family vertex shader with an unkeyed pixel shader (AACFDCF2/CAD1F585 x45,
+  66DE2CAD/235567BE x5 = the hull plating, about 70,000 vertices, and
+  BBE58E40/7311054A x5), 56 outside the family. Ship draws are b1-only.
+- Not the injection, the phase or the treatment, so not "some ships" for those
+  reasons: the Cobra Mk V and the Krait match on all three (24.0 and 26.8
+  refresh calls injected a frame, treated 449/450 and 450/450 per tick, movers
+  joined 0.1 a frame) and every family line was keyed. "Some ships" is the
+  ships whose hull pixel shader is outside the table.
+- The phase does land: the three traced frames' scene rows carry (-0.375,-0.056),
+  (0.125,0.278) and (-0.125,-0.278) px, matching the log's sequence to 1e-7;
+  log rows unjittered-resolves 447/450, row-pair mismatches 0,
+  legacy-applied-under-upstream 0.
+- Correction (nothing in this doc had said it): the eight `off -> upstream`
+  lines are session start 12:33:09, a resize 12:33:53 (2560 -> 3840) and six F8
+  AA toggles (12:34:11, 12:35:52, 12:38:38, 12:39:07, 12:39:55, 12:40:46). The
+  log holds two 3D-menu visits, the Cobra Mk V 12:33:41-12:34:33 and the Krait
+  12:40:37-12:41:02; in between the player flew and docked at a fleet carrier,
+  where the Eagle (12:38:37) and Krait (12:39:08) were swapped in and AA was
+  toggled, and that view kept menuA at 4360: it is not the menu contract.
+
+**Built on claude/flat-menu-shimmer** (from main a43c94ba; main merged in
+after). None of it flown. Each item's rig carries a negative control.
+
+- 1A, 71117549: family 66DE2CAD gains `flatPs` 0x235567BE2840B3ED, flat only
+  (the VR profile sees nothing; the harness pins both). Gates: engine_velocity_test
+  (the pair required, `--partial` for corpus logs that lack one), its
+  `--corpus` on the Epic logs, `flat_temporal_test --trace-check` on the new
+  trace (every frame Selected), and a re-key replay of the whole corpus under
+  the keyed table: exactly the three Krait frames move (hull draws 5 a frame,
+  supported draws 233 -> 238, contract hashes change, outcomes do not), nothing
+  else does. Control: replayed unkeyed it reproduces today's hashes. Note:
+  `--trace-migrate` rewrites 0 of 13 files, because a trace records each draw's
+  supported flag and contract kind, so a table change cannot show in it; that
+  is why the re-key replay exists. Keying moves the draws from `screen` to
+  `pool` kind, so they become validated sources and the hash moves.
+- 1C, 2966578b: a fixed 4-entry table of unkeyed (vs, ps) pairs in
+  engine_velocity, printed in the flat 5 s block as `flat engine motion unkeyed
+  5s: live= binds= distinct= overflow= pairs=[...]`; empty prints too, so an
+  absent line means the block never ran. Lifecycle rig: counted, reset per
+  window, a keyed pair never enters.
+- F2, c24d53ff: flat_pixels_engine unjitters the rows (the phase comes from the
+  capture, or from the rows). The replay's 0.609 px "error" was
+  |delta jitter| for (-0.125,-0.278) against (0.125,0.278); on the real
+  capture it is now 8e-5 px, and the self-test asserts both. flat_pixels.py
+  gains a stability report, the shimmer number.
+- F3, 5ec467b6: a reset or zero-phase frame is never an F10 sample, for the
+  pixel and the draw capture (the first frames after an arm were both, so no
+  per-draw camera phase could be read from them).
+- Camera path always on, 54d508ca: as Status says. Rigs C11-C15 in
+  c2_coexist_test: a prologue mismatch goes to the draw-time path after the
+  3-frame hysteresis and stays; a mismatch from the first frame owes no history
+  reset (no Upstream history existed) while the same switch after a clean
+  stretch owes exactly one; the write-failure boundary is 7 keep, 8 stand down,
+  in one named constant; the AA-off predicate. The ini-merge rig carries both
+  dead lines: kept with "no longer uses it", not adopted, not duplicated.
+- 1B, 20372b55: the menu-scoped policy. engineBefore's stale-depth refusal
+  returns the camera term when flags.w is set; the runtime sets it only for a
+  frame whose selected HDR is the verified menu copy's inherited destination.
+  On the real corpus 12 of 12 Selected menu frames qualify and 0 of 27 flight,
+  station and on-foot ones do; on WARP a stale block goes from 16/16 refused to
+  0/16 with a texture equal to the no-slot one, the 26 key-off goldens are
+  unchanged, and the sentinel, sky and corrupt-code refusals stand. Replayed
+  offline on the real Krait capture with `flat_pixels.py --assume-static-scene
+  on`, all 1822 stale samples take the camera term (median 0.0108 px, max
+  0.0252 px). Risk Sean accepted: a moving surface at the menu drawn by an
+  unkeyed pair would ghost where today it aliases. Not covered: any scene that
+  does not come through the menu copy, the carrier shipyard for one.
+
+**What the flight should show.** Family line `patched [.., ps_235567BE2840B3ED]`
+with no `left stock` for it; F10 `input_rejection_percent` falling from 22.5
+(estimated 3-8% with 1A alone, the decals, and about 0 with 1B), and
+`camera_stale_static` in flat_pixels.py's branches only on a capture made with
+the policy on;
+`flat menu HDR copy: ... static-scene-frames=K` with K growing at the menu and
+0 elsewhere. If the code never ran: no `unkeyed 5s` line, or K = 0 while
+`accepted` grows. Still unkeyed and named by the census when drawn: CAD1F585
+(EDHM-patched, key only for EDHM users) and BBE58E40/7311054A (an SV_Position
+input: the harness first).
