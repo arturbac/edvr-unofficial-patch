@@ -45,6 +45,11 @@ def _inside(path, base):
         return False
 
 
+def _ini_name(profile):
+    """The settings file an edition ships and installs: the flat profile has its own."""
+    return "edvr-flat.ini" if profile == "flat" else "edvr.ini"
+
+
 def _files(root, no_dlss, profile="vr"):
     build = root / "build"
     if profile not in ("vr", "flat"):
@@ -66,7 +71,11 @@ def _files(root, no_dlss, profile="vr"):
     if not no_dlss or (build / "nvngx_dlss.dll").is_file():
         result.append((build / "nvngx_dlss.dll", "nvngx_dlss.dll"))
         result.append((build / "NVIDIA-DLSS-LICENSE.txt", "NVIDIA-DLSS-LICENSE.txt"))
-    result.extend([(build / "edvr-flat.ini" if profile == "flat" else root / "edvr.ini", "edvr.ini"),
+    # The flat edition keeps its settings in a file of its own (config.cpp reads
+    # edvr-flat.ini first), so its archive carries that name: a flat archive that
+    # shipped an "edvr.ini" told somebody unpacking it by hand to put the flat
+    # defaults over the VR profile's tuning, where the flat runtime would not read them.
+    result.extend([(build / "edvr-flat.ini" if profile == "flat" else root / "edvr.ini", _ini_name(profile)),
                    (root / "LICENSE", "LICENSE.txt")])
     result.append((root / "third_party" / "dxbc_hash" / "LICENSE.TXT", "DXBC-HASH-LICENSE.txt"))
     # AMD's FSR3 D3D11 port (MIT). Unlike NVIDIA's runtime it ships no DLL --
@@ -214,7 +223,7 @@ def _embedded_resource(executable, resource_id, required=True):
 
 def _validate_installer_resources(executable, files, profile="vr"):
     by_name = {name: source for source, name in files}
-    ids = {101: "d3d11.dll", 103: "edvr.ini", 107: "edvr_profile.ini"}
+    ids = {101: "d3d11.dll", 103: _ini_name(profile), 107: "edvr_profile.ini"}
     if profile == "vr":
         ids.update({102: "openvr/openvr_api.dll", 105: "openvr/openxr_loader.dll",
                     106: "openvr/OPENXR-LOADER-LICENSE.txt"})
@@ -502,6 +511,22 @@ def self_test():
                 names = set(archive.namelist())
                 assert "openvr/openvr_api.dll" not in names and "edvr-flat-installer.exe" in names
                 assert archive.read("edvr_profile.ini") == flat_descriptor
+                # The flat edition's settings file is edvr-flat.ini: the archive names
+                # it so, and carries no edvr.ini (the VR profile's) at all.
+                assert "edvr-flat.ini" in names and "edvr.ini" not in names, names
+                assert archive.read("edvr-flat.ini") == b"[fix]\r\ntemporal_aa = off\r\n"
+            # The installer's own copy of the settings is checked against that same
+            # file, under its own name.
+            resources[103] = b"[fix]\r\ntemporal_aa = dlss\r\n"
+            try:
+                package(root, "1.2.8", no_dlss=True, profile="flat")
+                raise AssertionError("flat installer embedding other settings than edvr-flat.ini accepted")
+            except ValueError as error:
+                assert "edvr-flat.ini" in str(error), str(error)
+            resources[103] = b"[fix]\r\ntemporal_aa = off\r\n"
+            # And the VR archive still ships edvr.ini, under that name.
+            with zipfile.ZipFile(root / "dist" / "edvr-1.2.7.zip") as archive:
+                assert "edvr.ini" in set(archive.namelist()) and "edvr-flat.ini" not in set(archive.namelist())
             with zipfile.ZipFile(root / "dist" / "edvr-flat-installer-1.2.8.zip") as installer_archive:
                 assert set(installer_archive.namelist()) == {"edvr-flat-installer.exe"}
                 assert installer_archive.read("edvr-flat-installer.exe") == b"installer"

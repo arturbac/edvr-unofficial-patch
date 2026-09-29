@@ -157,15 +157,27 @@ const std::vector<SettingDef>& settingDefs() {
     return defs;
 }
 
-bool SettingsModel::load(const std::wstring& gameDir) {
+bool SettingsModel::load(const std::wstring& gameDir, const std::string& profile) {
     m_gameDir = gameDir;
     m_backedUp = false;
-    m_iniPath = joinPath(gameDir, L"edvr.ini");
-    m_text = readTextFile(m_iniPath);
+    m_iniPath = settingsPathFor(gameDir, profile);
+    m_sharedPath = profile == "flat" ? settingsPathFor(gameDir, "vr") : std::wstring();
+    bool fromShared = false;
+    m_text = currentText(&fromShared);
     m_loaded = true;
     m_error.clear();
     refreshRows();
     return true;
+}
+
+std::string SettingsModel::currentText(bool* fromShared) const {
+    *fromShared = false;
+    if (fileExists(m_iniPath)) return readTextFile(m_iniPath);
+    if (!m_sharedPath.empty() && fileExists(m_sharedPath)) {
+        *fromShared = true;
+        return readTextFile(m_sharedPath);
+    }
+    return std::string();
 }
 
 void SettingsModel::refreshRows() {
@@ -212,13 +224,15 @@ bool SettingsModel::set(size_t index, const std::string& value) {
     const SettingDef& def = *m_rows[index].def;
     const std::string dotted = std::string(def.section) + "." + def.key;
 
-    // Re-read the file first: the install/update path rewrites edvr.ini --
-    // migrating renamed keys as it goes -- and a model cached when this
+    // Re-read the file first: the install/update path rewrites the settings file
+    // -- migrating renamed keys as it goes -- and a model cached when this
     // window opened would write that pre-update text straight back over the
     // migration, one stale byte at a time. Measured in the field, 2026-08-28:
     // an update at 21:45:22, a settings save at 21:45:39, and the migrated
     // file was gone.
-    m_text = readTextFile(m_iniPath);
+    const std::string leaf = toUtf8(leafOf(m_iniPath));
+    bool fromShared = false;
+    m_text = currentText(&fromShared);
 
     // The merge engine, used for one value: merging a document with itself is a
     // no-op (installer_test proves it), so the only change is the forced value
@@ -227,18 +241,22 @@ bool SettingsModel::set(size_t index, const std::string& value) {
     // untouched. Exactly what a careful hand edit would do.
     std::string source = m_text;
     if (source.empty()) {
-        m_error = "edvr.ini is not there yet -- install EDVR into this folder first.";
+        m_error = leaf + " is not there yet -- install EDVR into this folder first.";
         return false;
     }
     // One copy of the file as it was when this window opened, before the first
-    // change of the session. The install path backs edvr.ini up; changing a
-    // setting did not, and a settings screen is exactly where somebody changes
-    // several things and then wants the one they had.
+    // change of the session. The install path backs the settings file up;
+    // changing a setting did not, and a settings screen is exactly where
+    // somebody changes several things and then wants the one they had. A flat
+    // file that does not exist yet has nothing to back up -- this change starts
+    // it from the shared edvr.ini, which is not written at all.
     if (!m_backedUp) {
-        const std::wstring backupDir =
-            joinPath(backupRootPath(m_gameDir), L"settings-" + timestampName());
-        if (ensureBackupDir(backupDir)) {
-            CopyFileW(m_iniPath.c_str(), joinPath(backupDir, L"edvr.ini").c_str(), FALSE);
+        if (!fromShared) {
+            const std::wstring backupDir =
+                joinPath(backupRootPath(m_gameDir), L"settings-" + timestampName());
+            if (ensureBackupDir(backupDir)) {
+                CopyFileW(m_iniPath.c_str(), joinPath(backupDir, leafOf(m_iniPath)).c_str(), FALSE);
+            }
         }
         m_backedUp = true;   // tried once; a failure here must not block editing
     }
@@ -248,7 +266,7 @@ bool SettingsModel::set(size_t index, const std::string& value) {
 
     std::wstring why;
     if (!writeFileAtomic(m_iniPath, updated, &why)) {
-        m_error = "Could not write edvr.ini: " + toUtf8(why) +
+        m_error = "Could not write " + leaf + ": " + toUtf8(why) +
                   ". If the game folder is under Program Files, run the installer as "
                   "administrator.";
         return false;

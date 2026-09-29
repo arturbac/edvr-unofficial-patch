@@ -349,10 +349,21 @@ void rebuildStatus() {
         g.status.push_back(orig);
     }
 
+    // The settings of the edition this window installs. The flat edition keeps
+    // its own edvr-flat.ini and only reads the shared edvr.ini until it has one,
+    // so a folder with just that is a flat install with settings still to carry over.
     StatusRow settings;
     settings.label = L"Your settings";
-    settings.tone = s.iniPresent ? Tone::Good : Tone::Muted;
-    settings.value = s.iniPresent ? L"edvr.ini is here and will be kept" : L"no edvr.ini yet";
+    if (payloadInfo().profile == "flat") {
+        settings.tone = hasSettingsFor(s, "flat") ? Tone::Good : Tone::Muted;
+        settings.value = s.flatIniPresent
+                             ? L"edvr-flat.ini is here and will be kept"
+                             : (s.iniPresent ? L"no edvr-flat.ini yet; your edvr.ini will be copied into it"
+                                             : L"no edvr-flat.ini yet");
+    } else {
+        settings.tone = s.iniPresent ? Tone::Good : Tone::Muted;
+        settings.value = s.iniPresent ? L"edvr.ini is here and will be kept" : L"no edvr.ini yet";
+    }
     g.status.push_back(settings);
 
     if (!s.state.chainTarget.empty()) {
@@ -473,8 +484,9 @@ void paintSettingsScreen(HDC dc) {
     RECT note{dp(kMargin + kCardPad), dp(202), dp(kClientWidth - kMargin - kCardPad), dp(222)};
     const std::wstring where =
         g.settings.loaded()
-            ? L"Written into the edvr.ini of the install above, and live within a second. The "
-              L"few that need a game restart are marked."
+            ? L"Written into the " + std::wstring(settingsLeafFor(payloadInfo().profile)) +
+                  L" of the install above, and live within a second. The few that need a game "
+                  L"restart are marked."
             : L"Pick an install above first.";
     ui::drawText(dc, where, note, f.caption, t.subtext, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
@@ -569,7 +581,7 @@ void selectInstall(size_t index) {
     }
     g.survey = surveyTarget(g.installs[index]);
     g.haveSurvey = true;
-    g.settings.load(g.survey.game.dir);
+    g.settings.load(g.survey.game.dir, payloadInfo().profile);
     settingsListSetModel(g.settingsList, &g.settings, mirrorDirFor(g.survey.game));
     showSurvey();
 }

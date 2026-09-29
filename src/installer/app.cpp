@@ -38,6 +38,9 @@ std::string bullets(const char* title, const std::vector<std::string>& items) {
 std::string usageText() {
     const bool flat = payloadInfo().profile == "flat";
     const char* exe = flat ? "edvr-flat-installer.exe" : "edvr-installer.exe";
+    // The settings file of this edition: the flat one keeps its own, so its
+    // options and its mirror are about edvr-flat.ini, never the VR profile's edvr.ini.
+    const std::string ini = toUtf8(settingsLeafFor(payloadInfo().profile));
     std::string out = flat ? "EDVR flat capture qualification installer\r\n" : "EDVR VR installer\r\n";
     out +=
            "\r\n"
@@ -51,13 +54,13 @@ std::string usageText() {
            "                       installer finds your installs itself and uses the only one.\r\n"
            "  --dry-run            say what would happen; touch nothing.\r\n"
            "  --convert-profile    explicitly convert the installed VR/flat edition.\r\n"
-           "  --replace-settings   overwrite edvr.ini instead of keeping your values.\r\n"
-           "  --remove-settings    with --uninstall, delete edvr.ini too.\r\n"
+           "  --replace-settings   overwrite " + ini + " instead of keeping your values.\r\n"
+           "  --remove-settings    with --uninstall, delete the installed edition's settings file too.\r\n"
            "  --help               this.\r\n"
            "\r\n"
-           "  A copy of edvr.ini (and the install record) is kept outside the game folder, in\r\n"
+           "  A copy of " + ini + " (and the install record) is kept outside the game folder, in\r\n"
            "  %LOCALAPPDATA%\\EDVR, so a game update that wipes the folder cannot take it too.\r\n"
-           "  --install restores from it automatically when the folder has no edvr.ini of its\r\n"
+           "  --install restores from it automatically when the folder has no " + ini + " of its\r\n"
            "  own, unless --replace-settings says you want fresh defaults instead.\r\n";
     return out;
 }
@@ -145,6 +148,11 @@ std::string statusReport(const Survey& s, const PayloadInfo& payload) {
         out += "openvr_api.dll    the game's own copy was not found under this folder\r\n";
     }
     out += std::string("edvr.ini          ") + (s.iniPresent ? "present" : "not present") + "\r\n";
+    // The flat profile's own settings file, for the edition that uses it (and
+    // whenever one is there): "not present" beside a present edvr.ini means the
+    // flat edition has yet to start its own from it.
+    if (payload.profile == "flat" || s.flatIniPresent)
+        out += std::string("edvr-flat.ini     ") + (s.flatIniPresent ? "present" : "not present") + "\r\n";
     out += std::string("nvngx_dlss.dll    ") +
            (s.ngx.kind == DllKind::Absent ? std::string("not present (NVIDIA's DLSS runtime)")
                                           : toUtf8(describeDll(s.ngx))) +
@@ -184,7 +192,11 @@ std::string statusReport(const Survey& s, const PayloadInfo& payload) {
 
 std::string planReport(const Plan& plan) {
     std::string out = planSummary(plan);
-    out += bullets("\r\n  Settings kept from your edvr.ini:", plan.merge.kept);
+    // Named for the file the plan works on: the flat edition's is edvr-flat.ini,
+    // and a report about "your edvr.ini" would send somebody to the wrong one.
+    const std::string kept = "\r\n  Settings kept from your " +
+                             (plan.settingsFile.empty() ? std::string("edvr.ini") : plan.settingsFile) + ":";
+    out += bullets(kept.c_str(), plan.merge.kept);
     out += bullets("  New defaults adopted (you had not changed these):", plan.merge.adopted);
     out += bullets("  Set by the installer:", plan.merge.forced);
     out += bullets("  Followed a setting that moved, and still applies:", plan.merge.followed);
