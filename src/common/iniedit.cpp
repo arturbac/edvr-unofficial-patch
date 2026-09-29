@@ -829,6 +829,20 @@ Posix posixReplace(const std::wstring& from, const std::wstring& to, DWORD* code
         }
     }
 
+    // What is asked of the operating system, built before the temp file is opened
+    // so that nothing between the open and the close can throw. A full path, not
+    // whatever the caller passed: with no root directory the name is not relative
+    // to anything useful. The buffer is zeroed, so the name ends in a terminator
+    // as well as a length.
+    const std::wstring name = fullPathOf(to);
+    const size_t nameBytes = name.size() * sizeof(wchar_t);
+    std::vector<unsigned char> buffer(sizeof(RenameInfoEx) + nameBytes, 0);
+    RenameInfoEx* info = reinterpret_cast<RenameInfoEx*>(buffer.data());
+    info->flags = kRenameReplaceIfExists | kRenamePosixSemantics;
+    info->rootDirectory = nullptr;
+    info->fileNameLength = static_cast<DWORD>(nameBytes);
+    memcpy(buffer.data() + offsetof(RenameInfoEx, fileName), name.data(), nameBytes);
+
     // DELETE is the access a rename needs. The share modes leave everybody else
     // free to have the temp file open as well: an antivirus scanning it, most of
     // all, and its being in the way is a wait, not a failure. WRITE_THROUGH is
@@ -847,20 +861,9 @@ Posix posixReplace(const std::wstring& from, const std::wstring& to, DWORD* code
         return passesInMilliseconds(*code) ? Posix::Transient : Posix::Other;
     }
 
-    // A full path, not whatever the caller passed: with no root directory the
-    // name is not relative to anything useful.
-    const std::wstring name = fullPathOf(to);
-    const size_t nameBytes = name.size() * sizeof(wchar_t);
-    std::vector<unsigned char> buffer(sizeof(RenameInfoEx) + nameBytes, 0);
-    RenameInfoEx* info = reinterpret_cast<RenameInfoEx*>(buffer.data());
-    info->flags = kRenameReplaceIfExists | kRenamePosixSemantics;
-    info->rootDirectory = nullptr;
-    info->fileNameLength = static_cast<DWORD>(nameBytes);
-    memcpy(buffer.data() + offsetof(RenameInfoEx, fileName), name.data(), nameBytes);
-
-    // Wine does not always set an error when it refuses a class it does not
-    // implement, so the last error is cleared first, and a failure that left none
-    // is read as the "not implemented" it is.
+    // The last error is cleared first, and a failure that left none is read as
+    // "not implemented", because a Wine that refuses a class it does not know has
+    // not always set one (LLVM's rename guards against the same thing).
     SetLastError(ERROR_SUCCESS);
     const BOOL renamed = SetFileInformationByHandle(
         h, static_cast<FILE_INFO_BY_HANDLE_CLASS>(kFileRenameInfoEx), buffer.data(),

@@ -194,7 +194,8 @@ bool writeFileAtomic(const std::wstring& path, const std::string& bytes,
 typedef unsigned long (*PosixReplaceHook)();
 void posixReplaceForTest(PosixReplaceHook hook);
 
-// How many times the POSIX-semantics call has been made, hooked or not, since
+// How many attempts at the POSIX-semantics rename have been made, hooked or not
+// (an attempt that could not even open the temp file counts), since
 // posixReplaceForTest: 1 after a refusal that is remembered, however many
 // writes follow it.
 int posixReplaceAttempts();
