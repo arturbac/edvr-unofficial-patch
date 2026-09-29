@@ -200,9 +200,22 @@ void __fastcall refreshDetour(uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     // strings; the next crash's log must name the stage instead.
     const bool trace = callNo <= 8;
     if (trace) {
-        Log::get().note("flat camera inject: refresh call #%llu entered (ctx=%p p2=%p camera=%p)",
-                        (unsigned long long)callNo, reinterpret_cast<void*>(ctx),
-                        reinterpret_cast<void*>(p2), reinterpret_cast<void*>(camera));
+        // Canary: the relay's callback literal, read back at every traced
+        // call. The crash signature (RIP at this file's format strings) fits
+        // the literal being overwritten with a string pointer; if it flips,
+        // the log says when and to what.
+        uint64_t literal = 0;
+        if (sehReadU64(reinterpret_cast<uintptr_t>(g_inject.relay) + 22, &literal)) {
+            Log::get().note("flat camera inject: refresh call #%llu entered (ctx=%p p2=%p camera=%p callback-literal=%p forward=%p)",
+                            (unsigned long long)callNo, reinterpret_cast<void*>(ctx),
+                            reinterpret_cast<void*>(p2), reinterpret_cast<void*>(camera),
+                            reinterpret_cast<void*>(literal),
+                            reinterpret_cast<void*>(g_refreshForward.load(std::memory_order_relaxed)));
+        } else {
+            Log::get().note("flat camera inject: refresh call #%llu entered (ctx=%p p2=%p camera=%p; literal unreadable)",
+                            (unsigned long long)callNo, reinterpret_cast<void*>(ctx),
+                            reinterpret_cast<void*>(p2), reinterpret_cast<void*>(camera));
+        }
     }
 
     // Admission for THIS call: the injector owns only a kind-3 camera whose
@@ -349,6 +362,22 @@ void flatCameraInjectFrame(uint64_t frame) {
         Log::get().note("flat camera inject: refresh hook installed at EliteDangerous64.exe+0x%llX; "
                         "kind-3 cameras now get the temporal phase applied transiently at the source",
                         static_cast<unsigned long long>(kRefreshRva));
+        // Readback verification: the relay stub, its callback literal, and the
+        // trampoline's first bytes, so a later crash can be compared against
+        // what was actually built.
+        uint8_t relayBytes[44] = {};
+        uint64_t callbackLiteral = 0, fwd = g_refreshForward.load(std::memory_order_relaxed);
+        uint8_t trampBytes[16] = {};
+        __try {
+            std::memcpy(relayBytes, g_inject.relay, sizeof(relayBytes));
+            std::memcpy(&callbackLiteral, g_inject.relay + 22, 8);
+            std::memcpy(trampBytes, reinterpret_cast<const void*>(fwd), sizeof(trampBytes));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        char hex1[96]{}, hex2[96]{};
+        for (int i = 0; i < 22; ++i) std::snprintf(hex1 + i * 3, sizeof(hex1) - i * 3, "%02X ", relayBytes[i]);
+        for (int i = 0; i < 16; ++i) std::snprintf(hex2 + i * 3, sizeof(hex2) - i * 3, "%02X ", trampBytes[i]);
+        Log::get().note("flat camera inject: relay[0..21]=%s| callback-literal=%p forward(trampoline)=%p tramp[0..15]=%s",
+                        hex1, reinterpret_cast<void*>(callbackLiteral), reinterpret_cast<void*>(fwd), hex2);
     }
     const uint64_t now = GetTickCount64();
     if (now - g_inject.lastLogMs >= 5000) {
