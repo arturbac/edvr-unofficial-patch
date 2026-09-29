@@ -472,7 +472,10 @@ static void raceCase(const std::wstring& scratch) {
 // so a second thread does to it what the rename does: it opens the file for
 // DELETE, with every share mode, over and over, and counts the refusals that
 // happen wholly inside a reload. It runs only inside a reload, because a probe
-// that ran while the test itself rewrote the file would collide with the test.
+// that ran while the test itself rewrote the file would collide with the test:
+// `busy` is the handshake that makes that so, since a probe thread can be
+// descheduled between opening the file and closing it, and the test must not
+// rewrite the file until that probe is finished.
 // A correct parse() is never refused. One without FILE_SHARE_DELETE is refused
 // whenever a probe lands while it holds the handle, which over 300 reloads is
 // hundreds of probes; the threshold below is for a scanner that happens to hold
@@ -480,14 +483,19 @@ static void raceCase(const std::wstring& scratch) {
 struct ProbeState {
     std::atomic<bool> stop{false};
     std::atomic<bool> inReload{false};
-    std::atomic<long> inside{0};   // probes that ran wholly inside a reload
-    std::atomic<long> refused{0};  // ...and were refused with a sharing violation
-    std::atomic<long> other{0};    // ...and failed some other way
+    std::atomic<bool> busy{false};  // a probe is between its open and its close
+    std::atomic<long> inside{0};    // probes that ran wholly inside a reload
+    std::atomic<long> refused{0};   // ...and were refused with a sharing violation
+    std::atomic<long> other{0};     // ...and failed some other way
 };
 
 static void probeMain(const std::wstring* path, ProbeState* st) {
-    while (!st->stop.load(std::memory_order_relaxed)) {
-        if (!st->inReload.load(std::memory_order_acquire)) {
+    while (!st->stop.load()) {
+        // busy first, then the flag: either this probe sees the reload over and
+        // does nothing, or the test, after ending the reload, sees busy and waits.
+        st->busy.store(true);
+        if (!st->inReload.load()) {
+            st->busy.store(false);
             SwitchToThread();
             continue;
         }
@@ -496,7 +504,9 @@ static void probeMain(const std::wstring* path, ProbeState* st) {
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         const DWORD code = h == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-        if (!st->inReload.load(std::memory_order_acquire)) continue;  // it ended mid-probe
+        const bool wholly = st->inReload.load();  // false: the reload ended mid-probe
+        st->busy.store(false);
+        if (!wholly) continue;
         st->inside.fetch_add(1);
         if (code == ERROR_SHARING_VIOLATION) st->refused.fetch_add(1);
         else if (code != ERROR_SUCCESS) st->other.fetch_add(1);
@@ -524,9 +534,10 @@ static void shareDeleteCase(const std::wstring& scratch) {
             writeFailed = true;
             break;
         }
-        st.inReload.store(true, std::memory_order_release);
+        st.inReload.store(true);
         const bool parsed = Config::get().reloadIfChanged();
-        st.inReload.store(false, std::memory_order_release);
+        st.inReload.store(false);
+        while (st.busy.load()) SwitchToThread();  // a probe in flight finishes before the file is rewritten
         if (!parsed) ++unparsed;
         ++reloads;
     }

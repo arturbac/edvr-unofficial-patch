@@ -193,9 +193,11 @@ std::wstring newestGeneration(const std::wstring& dir, const std::wstring& name)
 //
 // `rotate` true: the copy being replaced is kept as .1 (and .1 as .2, the
 // oldest dropped). The new copy is written and flushed to a temp file FIRST and
-// only when that has landed does anything older move, so a write that fails
-// leaves every generation as it was. The newest is never absent at any instant:
-// the old copy is written to .1 from the bytes read, not renamed there.
+// only when that has landed does anything older move: a write that cannot be
+// staged, or whose first move is refused, leaves every generation as it was, and
+// one that fails later loses at most the oldest copy, never the newest. The
+// newest is never absent at any instant: the old copy is written to .1 from the
+// bytes read, not renamed there.
 //
 // `rotate` false: the newest is replaced in place and the older ones are left
 // alone. That is the rule for a change made a moment ago (one slider, one
