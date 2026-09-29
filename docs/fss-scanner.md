@@ -11,7 +11,8 @@ changes.*
   `experimental.fss_theater`, fss_theater.cpp and the export `edvrFssTheater`
   are gone: the theater could only run from a door call the deleted openvr half
   made. The FSS mode latch, `fss_panel_rect`, `fss_eye_sync`, `fss_res`,
-  `fss_panel`, `fss_dump` and `fss_reveal` stay.
+  `fss_panel`, `fss_dump` and `fss_reveal` stay; the latch's frame tick, once
+  `fss_theater`, is `fss_mode_latch` (73b31d3f).
 - **State: the black-square-hunt instruments retired 2026-09-29 (code removed,
   c61c43af).** `fix.fss_scan`, `advanced.fss_scan_level`,
   `experimental.fss_ring_feed` and `advanced.fss_composite_probe` are gone with

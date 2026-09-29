@@ -4,7 +4,9 @@
 
 - **State: the game-memory read retired 2026-09-29 (code removed, 0fe90f09).**
   Explorer Cam counts your camera-key presses and reads nothing from the game.
-  `camera_index_track` and its five sibling keys are gone.
+  `camera_index_track` and its five sibling keys are gone, and so is
+  `fix.head_offset_view_bridge` ("hold through camera gaps"), which only held
+  the read's last view (removed 4aa78e48).
 
 Explorer Cam moves your viewpoint to your commander's head while you are on
 foot in Elite's external camera, which renders in proper stereo. This page
@@ -44,9 +46,9 @@ player observes, and no gameplay data read or written.
    them.
 
    EDVR needs them because on screen, entering the camera looks identical to
-   boarding your ship, and the camera key is how EDVR tells which it was. Near
-   a planet the game also rebuilds its camera data every few seconds, and the
-   next-view key's presses carry "which preset am I on" through the gaps.
+   boarding your ship, and the camera key is how EDVR tells which it was. The
+   next-view keys' presses are how it knows "which preset am I on": it counts
+   them, because it reads nothing from the game to tell it.
 
    If your camera is bound **only to a controller**, bind a keyboard key for it
    in Elite (Options → Controls) for now. EDVR watches the keyboard, and
