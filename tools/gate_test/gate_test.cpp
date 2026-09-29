@@ -33,17 +33,14 @@
 #include "../../src/common/periodic_work.h"
 #include "../../src/common/timing.h"
 #include "../../src/common/log.h"
-// Header-only, so this adds no link dependency: the grouping is pure pointer
-// arithmetic and lives in the header precisely so it can be asserted here.
-#include "../../src/d3d11/camera_view.h"
 #include "../../src/d3d11/head_offset_gate.h"
 // Header-only as well (guard.h and frame_ticks.h): one fault budget per frame-
 // boundary tick, the class device_hook.cpp and vscreen.cpp declare theirs with.
 #include "../../src/d3d11/boundary_tick.h"
-// Linked into this fixture already; the two pure decisions it exposes --
-// journalPickNewest and cameraViewRebuildBackoff -- had no coverage at all
-// until the review rounds on issue #19 found three arithmetic bugs between
-// them, every one of which is one line of table here.
+// Linked into this fixture already; the pure decision it exposes,
+// journalPickNewest, had no coverage at all until the review rounds on
+// issue #19 found arithmetic bugs in it (and in a sibling decision since
+// removed), every one of which is one line of table here.
 #include "../../src/d3d11/journal_watch.h"
 // Same reason: eyeShapedAtScale is the recogniser rule that decides whether
 // the gate is fed at all, and it is inline in the header so this file can
@@ -285,104 +282,6 @@ int eyeShapeChecks() {
         ++bad;
     }
     if (!bad) printf("  ok    the world at a render scale is an eye; six other shapes are not\n");
-    return bad;
-}
-
-// These are not invented shapes. The first is the exact layout from issue #2,
-// which cost that player Explorer Cam for the last twenty-four minutes of a
-// session; the rest are the neighbouring cases that a fix for it must not break.
-// THE MID-REBUILD BACKOFF, as a table.
-//
-// Six lines of arithmetic that had three bugs across two review rounds, none of
-// them visible by reading it. Each group below is one of them.
-int rebuildBackoffChecks() {
-    int bad = 0;
-    auto want = [&](const char* what, CameraViewBackoff got, uint32_t runs,
-                    uint64_t waitMs) {
-        ++g_checks;
-        if (got.runs == runs && got.waitMs == waitMs) return;
-        printf("  FAIL  %s -- got runs=%u wait=%llums, expected runs=%u "
-               "wait=%llums\n",
-               what, got.runs, (unsigned long long)got.waitMs, runs,
-               (unsigned long long)waitMs);
-        ++bad;
-    };
-
-    // A SINGLE GENUINE MOVE IS UNTOUCHED. The first mid-rebuild answer of an
-    // episode waits the flat cooldown, which is the case the rescan budget is
-    // deliberately generous for. dueMs = 0 is "no episode yet".
-    want("first answer waits the flat cooldown",
-         cameraViewRebuildBackoff(0, 0, 100000), 1, 2700);
-
-    // A RUN OF THEM DOUBLES, walked forward the way a station visit does, with
-    // each answer's dueMs carried into the next.
-    uint32_t runs = 0;
-    uint64_t due = 0, now = 100000;
-    {
-        const uint64_t expect[] = {2700, 5400, 10800, 21600, 43200};
-        for (int i = 0; i < 5; ++i) {
-            const CameraViewBackoff bo = cameraViewRebuildBackoff(runs, due, now);
-            char what[96];
-            _snprintf_s(what, _TRUNCATE, "consecutive answer %d doubles the wait",
-                        i + 1);
-            want(what, bo, static_cast<uint32_t>(i + 1), expect[i]);
-            runs = bo.runs;
-            due = bo.dueMs;
-            now = due + 1500;   // the wait, then a 1.5s heap walk
-        }
-    }
-
-    // AND THEN STOPS DOUBLING. kRebuildBackoffMax caps the shift at 4, so 43.2s
-    // is the ceiling however long the episode runs. The cap constant (45s) is a
-    // guard against a future edit to the shift and must never be what binds --
-    // if this ever reads 45000, the two constants have swapped roles.
-    for (int i = 0; i < 3; ++i) {
-        const CameraViewBackoff bo = cameraViewRebuildBackoff(runs, due, now);
-        want("a long episode holds at the ceiling, never 86400", bo, runs + 1,
-             43200);
-        runs = bo.runs;
-        due = bo.dueMs;
-        now = due + 1500;
-    }
-
-    // THE RECOVERY, which is review finding #1. The run count was reset at two
-    // of the seven paths that end an episode, so it stayed high, and the next
-    // single ordinary array move waited 43 seconds -- the forty-second dead
-    // window the rescan budget exists to prevent. A quiet gap must bring it
-    // back to the flat cooldown whichever path ended the episode.
-    want("a quiet gap ends the episode and restores the flat cooldown",
-         cameraViewRebuildBackoff(5, 1000000, 1000000 + 60001), 1, 2700);
-
-    // The boundary, pinned: expiry is strictly greater, so exactly the grace
-    // period is still the same episode.
-    want("exactly the grace period is still the same episode",
-         cameraViewRebuildBackoff(4, 1000000, 1000000 + 60000), 5, 43200);
-
-    // THE WALK MUST NOT COUNT, which is review finding V2. The gap between two
-    // answers is the wait PLUS a heap walk, and the walk's length is a user
-    // setting: at camera_index_mb_per_frame = 8 a 14 GB walk takes 20 seconds.
-    // Measured from the ANSWER, 43.2s + 20s exceeded the 60s grace, so every
-    // episode expired and the backoff silently switched itself off -- the exact
-    // drain it exists to prevent, reintroduced by its own guard. Measured from
-    // the DUE time, the walk is out of the comparison.
-    want("a slow heap walk is not mistaken for a quiet gap",
-         cameraViewRebuildBackoff(4, 1000000, 1000000 + 20000), 5, 43200);
-
-    // dueMs is the caller's carry, and must be now + wait.
-    {
-        const CameraViewBackoff bo = cameraViewRebuildBackoff(0, 0, 500000);
-        ++g_checks;
-        if (bo.dueMs != 500000 + 2700) {
-            printf("  FAIL  dueMs must be now + wait, got %llu\n",
-                   (unsigned long long)bo.dueMs);
-            ++bad;
-        }
-    }
-
-    if (!bad) {
-        printf("  ok    the mid-rebuild backoff doubles, caps, recovers after a "
-               "quiet gap, and never counts the heap walk as quiet\n");
-    }
     return bad;
 }
 
@@ -1177,144 +1076,6 @@ int boundarySourceChecks(const std::string& root) {
                "with %d marks unique across both files; outside them there is only the frame "
                "counter, the graphics-off test and the poll decision\n", declared);
     }
-    return bad;
-}
-
-int cameraRunChecks() {
-    // Real storage, so the addresses are real addresses. The grouping never
-    // dereferences them, but arithmetic on invented pointers is a bad habit to
-    // teach a file that other people will copy from.
-    static uint8_t arena[0x8000];
-    constexpr size_t S = 0x18;      // record stride (6ad.7a)
-    constexpr size_t kGap = 2;      // what camera_view.cpp passes
-    constexpr size_t kOrd = 11;     // the ordinal (6ad.8b)
-    int bad = 0;
-    auto slot = [&](size_t i) -> const uint8_t* { return arena + 0x400 + i * S; };
-
-    // THE FIELD CASE. Slots 0-9 and 11-12 hold records; slot 10 has stopped
-    // carrying the type pointer while the game rebuilds it. The answer lives at
-    // slot 11 and must still be found there.
-    //
-    // Before the fix this produced "10 record(s) -- too short for the ordinal"
-    // and "2 record(s) -- too short for the ordinal", and the feature was over
-    // for the session.
-    {
-        std::vector<const uint8_t*> recs;
-        for (size_t i = 0; i < 10; ++i) recs.push_back(slot(i));
-        recs.push_back(slot(11));
-        recs.push_back(slot(12));
-        const std::vector<CameraViewRun> runs = cameraViewGroupRuns(recs, S, kGap);
-        ++g_checks;
-        if (runs.size() != 1 || runs[0].slots <= kOrd ||
-            runs[0].base + kOrd * S != slot(kOrd)) {
-            printf("  FAIL  one empty slot split the array and lost the ordinal: "
-                   "%zu run(s)", runs.size());
-            for (size_t i = 0; i < runs.size(); ++i) {
-                printf("%s %zu slot(s)/%zu filled", i ? "," : "",
-                       runs[i].slots, runs[i].present);
-            }
-            printf("\n");
-            ++bad;
-        } else {
-            ++g_checks;
-            if (runs[0].present != 12) {
-                printf("  FAIL  the bridged slot was counted as a record: %zu "
-                       "filled, expected 12\n", runs[0].present);
-                ++bad;
-            }
-        }
-
-        // AND THE SAME LAYOUT MUST STILL SPLIT WITH NO TOLERANCE.
-        //
-        // Without this the case above passes whether or not the tolerance does
-        // any work -- which is exactly how the first version of this file came
-        // to pass with the arming rule reverted. This pins the failure to the
-        // thing that was changed: gap 0 is the old code, and the old code has
-        // to be seen losing the ordinal.
-        const std::vector<CameraViewRun> old = cameraViewGroupRuns(recs, S, 0);
-        ++g_checks;
-        if (old.size() != 2 || old[0].slots != 10 || old[1].slots != 2) {
-            printf("  FAIL  this layout does not reproduce the reported split, "
-                   "so the case above proves nothing: %zu run(s)\n", old.size());
-            ++bad;
-        }
-    }
-
-    // A WHOLE ARRAY still groups as one run, and bridging must not inflate it.
-    {
-        std::vector<const uint8_t*> recs;
-        for (size_t i = 0; i < 13; ++i) recs.push_back(slot(i));
-        const std::vector<CameraViewRun> runs = cameraViewGroupRuns(recs, S, kGap);
-        ++g_checks;
-        if (runs.size() != 1 || runs[0].slots != 13 || runs[0].present != 13) {
-            printf("  FAIL  an intact array of 13 grouped as %zu run(s)\n",
-                   runs.size());
-            ++bad;
-        }
-    }
-
-    // A GAP TOO WIDE IS STILL A BOUNDARY. This is what stops the tolerance
-    // becoming "sweep up every object of this type in address order", which is
-    // the bug the run grouping was introduced to fix in the first place (EDVR-118,
-    // where global index 11 read 2210427397).
-    {
-        std::vector<const uint8_t*> recs;
-        for (size_t i = 0; i < 6; ++i) recs.push_back(slot(i));
-        recs.push_back(slot(6 + kGap + 1));      // one slot beyond the tolerance
-        const std::vector<CameraViewRun> runs = cameraViewGroupRuns(recs, S, kGap);
-        ++g_checks;
-        if (runs.size() != 2) {
-            printf("  FAIL  a gap of %zu slots was bridged; %zu run(s), expected 2\n",
-                   kGap + 1, runs.size());
-            ++bad;
-        }
-    }
-
-    // AN UNRELATED OBJECT far away stays its own run, and one that is close but
-    // not on the stride is not a member either -- a heap neighbour at some
-    // arbitrary offset is not the thirteenth camera preset.
-    {
-        std::vector<const uint8_t*> recs;
-        for (size_t i = 0; i < 13; ++i) recs.push_back(slot(i));
-        recs.push_back(slot(13) + 4);            // on no stride boundary
-        recs.push_back(slot(200));               // elsewhere entirely
-        const std::vector<CameraViewRun> runs = cameraViewGroupRuns(recs, S, kGap);
-        ++g_checks;
-        if (runs.size() != 3 || runs[0].slots != 13) {
-            printf("  FAIL  neighbours were absorbed into the array: %zu run(s), "
-                   "first spans %zu slot(s)\n", runs.size(),
-                   runs.empty() ? 0u : runs[0].slots);
-            ++bad;
-        }
-    }
-
-    // A GENUINELY SHORT RUN STAYS SHORT. Bridging must not manufacture the
-    // length that qualifies a run to answer -- "too short for the ordinal" is a
-    // correct refusal and has to survive.
-    {
-        std::vector<const uint8_t*> recs;
-        for (size_t i = 0; i < 4; ++i) recs.push_back(slot(i));
-        const std::vector<CameraViewRun> runs = cameraViewGroupRuns(recs, S, kGap);
-        ++g_checks;
-        if (runs.size() != 1 || runs[0].slots > kOrd) {
-            printf("  FAIL  four records qualified to answer for ordinal %zu\n", kOrd);
-            ++bad;
-        }
-    }
-
-    // NO MATCHES AT ALL is not a crash.
-    {
-        const std::vector<const uint8_t*> none;
-        const std::vector<CameraViewRun> runs = cameraViewGroupRuns(none, S, kGap);
-        ++g_checks;
-        if (!runs.empty()) {
-            printf("  FAIL  an empty match list produced %zu run(s)\n", runs.size());
-            ++bad;
-        }
-    }
-
-    if (bad == 0)
-        printf("  ok    a rebuilt slot does not cost the array its ordinal\n");
     return bad;
 }
 
@@ -2449,113 +2210,6 @@ void runScenarios() {
     sceneFrame(12);
     check(true, "keyless: a deduped journal echo still opens the grace");
 
-    // ------------------------------------------------------- certification
-    //
-    // The pure judgement both flight-caught certification bugs lived in,
-    // replayed on a desk instead of a planet: 6au (rebuild noise counted as
-    // behaviour) and 6aw (a counter steps like a player). The scan machinery
-    // is not needed to prove the rules, which is the whole point of the seam.
-    {
-        int cbad = 0;
-
-        // Legacy bar (no next-view key): three sequential in-camera steps.
-        CameraViewVote legacy{};
-        cameraViewCertStep(&legacy, 0, true, false, false);   // primes
-        bool early = cameraViewCertStep(&legacy, 1, true, false, false);
-        early = early || cameraViewCertStep(&legacy, 2, true, false, false);
-        const bool third = cameraViewCertStep(&legacy, 3, true, false, false);
-        if (early || !third) {
-            printf("  FAIL  the legacy bar did not certify on exactly three "
-                   "sequential in-camera steps\n");
-            ++cbad;
-        }
-
-        // 6au's shape: arbitrary rebuild writes reset and never accumulate.
-        CameraViewVote noise{};
-        cameraViewCertStep(&noise, 6, true, false, false);
-        cameraViewCertStep(&noise, 0, true, false, false);    // 6->0 resets
-        cameraViewCertStep(&noise, 3, true, false, false);    // 0->3 resets
-        if (cameraViewCertStep(&noise, 4, true, false, false)) {
-            printf("  FAIL  rebuild noise accumulated toward certification\n");
-            ++cbad;
-        }
-
-        // 6aw's shape, out of camera: a counter climbing 0,1,2,3,4 with the
-        // player elsewhere certifies nothing, however sequential it is.
-        CameraViewVote counter{};
-        cameraViewCertStep(&counter, 0, false, false, false);
-        bool out = false;
-        for (uint32_t v = 1; v <= 4; ++v) {
-            out = out || cameraViewCertStep(&counter, v, false, false, false);
-        }
-        if (out) {
-            printf("  FAIL  a counter certified while the player was out of "
-                   "the camera\n");
-            ++cbad;
-        }
-
-        // Witnessed bar: two steps landing beside real presses certify...
-        CameraViewVote witnessed{};
-        cameraViewCertStep(&witnessed, 0, true, false, true);
-        const bool w1 = cameraViewCertStep(&witnessed, 1, true, true, true);
-        const bool w2 = cameraViewCertStep(&witnessed, 2, true, true, true);
-        if (w1 || !w2) {
-            printf("  FAIL  the witnessed bar did not certify on exactly two "
-                   "press-coincident steps\n");
-            ++cbad;
-        }
-
-        // ...and the 6aw hole the legacy bar still has is CLOSED by it: an
-        // in-camera counter climbing sequentially with no press near any
-        // step never certifies, however long it runs.
-        CameraViewVote inCam{};
-        cameraViewCertStep(&inCam, 0, true, false, true);
-        bool climbed = false;
-        for (uint32_t v = 1; v <= 5; ++v) {
-            climbed = climbed || cameraViewCertStep(&inCam, v, true, false, true);
-        }
-        if (climbed) {
-            printf("  FAIL  a counter certified under the witnessed bar "
-                   "without a single press\n");
-            ++cbad;
-        }
-
-        // The anchored two-step (keyless): primed at the value the count
-        // predicted, two sequential in-camera steps certify -- the player's
-        // own walk from the opening view to their preset.
-        CameraViewVote anchored{};
-        cameraViewCertStep(&anchored, 0, true, false, false);   // primes
-        anchored.anchored = true;   // primed at the predicted entry view
-        const bool a1 = cameraViewCertStep(&anchored, 1, true, false, false);
-        const bool a2 = cameraViewCertStep(&anchored, 2, true, false, false);
-        if (a1 || !a2) {
-            printf("  FAIL  the anchored bar did not certify on exactly two "
-                   "steps from the predicted view\n");
-            ++cbad;
-        }
-
-        // ...and a broken sequence forfeits the anchor: after noise, the
-        // same candidate is back to the unanchored three-step bar.
-        CameraViewVote forfeited{};
-        cameraViewCertStep(&forfeited, 0, true, false, false);
-        forfeited.anchored = true;
-        cameraViewCertStep(&forfeited, 1, true, false, false);
-        cameraViewCertStep(&forfeited, 5, true, false, false);  // noise: reset
-        cameraViewCertStep(&forfeited, 6, true, false, false);
-        const bool f2 = cameraViewCertStep(&forfeited, 7, true, false, false);
-        if (f2 || forfeited.anchored) {
-            printf("  FAIL  a broken sequence kept its anchor or certified "
-                   "on two post-noise steps\n");
-            ++cbad;
-        }
-
-        if (cbad == 0) {
-            printf("  ok    certification needs the player's finger: presses "
-                   "certify, counters and noise cannot\n");
-        }
-        g_bad += cbad;
-    }
-
     // THE POISONED READER (6aw): the array contains a counter that certifies
     // under shape rules and supplies garbage. A read that DISAGREES while the
     // player is OUT of the camera is impossible for the real preset -- the
@@ -2762,7 +2416,6 @@ void runScenarios() {
     Config::get().set("fix.head_offset_gate", "1");
     headOffsetGateReset();
 
-    g_bad += cameraRunChecks();
     g_bad += eyeShapeChecks();
 }
 
@@ -2802,7 +2455,6 @@ int main(int argc, char** argv) {
     g_bad += timingChecks();
     // Pure decisions over numbers, so they run once here rather than inside
     // the 72/90/120Hz loop below -- there is no frame rate in either.
-    g_bad += rebuildBackoffChecks();
     g_bad += journalPickChecks();
     g_bad += periodicWorkChecks();
     g_bad += loggedNotesChecks();

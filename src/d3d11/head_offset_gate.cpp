@@ -186,10 +186,6 @@ struct Gate {
     uint64_t gateIntentMs = 0;           // ...and when, on the clock
     uint64_t gateIntentGraceMs = 2000;   // how long a press gets to take effect
     bool     gateInCamera = false;       // in the camera, whatever the view
-    // Camera entries (the gateInCamera latch), not the OFFSET arming: the
-    // scan nudge wants the camera edge, before the player has cycled to the
-    // right view.
-    uint32_t gateCameraEnters = 0;
 
     // Set by headOffsetGateSetView. -1 means nobody can tell us, so the
     // keypress count stands.
@@ -357,8 +353,6 @@ void headOffsetGateSetWakeLive(bool known, bool inSupercruise, bool inTunnel) {
     g.gateViewIndex = 0;
     g.gateBridgeStarted = false;
 }
-
-uint32_t headOffsetGateEnterCount() { return g.gateCameraEnters; }
 
 int headOffsetGateCountedView() { return g.gateViewIndex; }
 
@@ -529,8 +523,6 @@ void headOffsetGateViewBumped() { headOffsetGateStepView(+1); }
 void headOffsetGateViewUnbumped() { headOffsetGateStepView(-1); }
 
 void headOffsetGateSetView(int view) { g.viewOverride = view; }
-
-bool headOffsetGateInCamera() { return g.gateInCamera; }
 
 bool headOffsetGatePanelSettled() { return g.panelSettled; }
 
@@ -798,7 +790,6 @@ void headOffsetGateFrame(uint32_t frameNo, uint32_t panelDraws, uint32_t eyeDraw
         if (!g.gateInCamera && entryAsked && panelGoneAWhile &&
             sceneNow && g.gatePanelRun > 30) {
             g.gateInCamera = true;
-            ++g.gateCameraEnters;
             g.gateSinceEnter = 0;
             g.heartbeatMs = stampMs();
             Log::get().note(
@@ -1143,18 +1134,15 @@ void headOffsetGateFrame(uint32_t frameNo, uint32_t panelDraws, uint32_t eyeDraw
     if (!g.gateViewWarned && g.gateInCamera && !viewOk && g.gateWantView > 0 &&
         !g.gateHaveNextKey && g.viewOverride < 0) {
         g.gateViewWarned = true;
-        // Names the CAUSE rather than a setting to change, because the setting
-        // that would change it is not the same in every build. What is true
-        // everywhere is that nothing could say which camera view this is.
+        // Names the CAUSE first: with no view read from the game (that search
+        // was removed 2026-09-29) and no next-view key bound to count, nothing
+        // can say which camera view this is.
         Log::get().note(
-            "head offset: the camera view could not be read from the game, so "
-            "this cannot tell which preset you are on. It wants view %d and is "
-            "assuming %d, so the offset will not engage.\n"
-            "  The search for the view index found nothing usable -- see the "
-            "camera view lines above for how much memory it covered and how "
-            "many attempts it made. After a game update, "
-            "d3d11.camera_index_type_offset no longer points at the right "
-            "thing and needs re-measuring.\n"
+            "head offset: this cannot tell which camera preset you are on. It "
+            "wants view %d and is assuming %d, so the offset will not engage.\n"
+            "  EDVR keeps the count by following your next-camera-view key, "
+            "and none is bound: bind that control in Elite's options (EDVR "
+            "reads Elite's own binding) and it will follow.\n"
             "  advanced.head_offset_view = -1 applies the offset in every camera "
             "preset, including the one that faces back at you.",
             g.gateWantView, g.gateViewIndex);

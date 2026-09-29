@@ -142,14 +142,8 @@ void headOffsetGateSetOnFootLive(bool known, bool onFoot, uint32_t sample);
 // arriving in it is.
 void headOffsetGateSetWakeLive(bool known, bool inSupercruise, bool inTunnel);
 
-// Rising-edge counter of camera entries, for the caller that nudges the
-// view scanner: fresh candidates at every entry is what makes the anchored
-// certification land while the player is still cycling to their view.
-uint32_t headOffsetGateEnterCount();
-
-// The gate's current counted view -- the anchor a candidate record must
-// read at priming time for the two-step anchored certification (0 after a
-// disembark, the last confirmed view within a session).
+// The gate's current counted view (0 after a disembark, the last confirmed
+// view within a session).
 int headOffsetGateCountedView();
 
 // Supply an authoritative view index, or -1 for "not known".
@@ -158,7 +152,9 @@ int headOffsetGateCountedView();
 // view across camera toggles, so there is no moment when the count is known to
 // be right and one missed press desyncs it for the session. A caller that can
 // read the game's own index passes it here and the count stops mattering.
-// Nothing in this module knows or cares how such a caller gets it.
+// Nothing in this module knows or cares how such a caller gets it. (No
+// production caller since the game-memory read was removed 2026-09-29: the
+// count stands, and gate_test still drives this path.)
 void headOffsetGateSetView(int view);
 
 // Is the gate switched on (fix.head_offset_gate)?
@@ -184,17 +180,6 @@ inline bool headOffsetGateWantsPanel() { return detail::g_headOffsetGateWantsPan
 // The caller resets its own counters; this does not touch them.
 void headOffsetGateFrame(uint32_t frameNo, uint32_t panelDraws, uint32_t eyeDraws);
 
-// Is the player in the external camera right now, whatever the view?
-//
-// Exported for camera_view's certification: the true preset can only change
-// while the player is IN the camera pressing the view key -- the game freezes
-// it everywhere else -- so a candidate record whose value moves outside the
-// camera has disqualified itself as the preset for that stretch (6aw: the
-// array contains a counter that rebuilds increment sequentially, and it
-// certified under every shape-based rule; context is the discriminator no
-// observed impostor satisfies).
-bool headOffsetGateInCamera();
-
 // Has the flat panel been composited steadily for a while?
 //
 // This is "the game is drawing the on-foot screen", and it is deliberately NOT
@@ -202,7 +187,7 @@ bool headOffsetGateInCamera();
 // tell those apart. The panel is recognised by its size, which with the
 // resolution fix off is 1920x1080 -- and so is plenty of what the main menu
 // draws. A default install therefore sees a settled "panel" about four seconds
-// after launch, in a menu, with half the game's memory yet to be allocated.
+// after launch, in a menu.
 //
 // TWO WRONG ANSWERS ARE ON RECORD HERE, and the second is the more instructive.
 //
@@ -215,10 +200,10 @@ bool headOffsetGateInCamera();
 // exclusive, so ANDing them asked for a state that barely occurs. The gate's own
 // log proved it by absence: a run of 90 settled panel frames, and no scan.
 //
-// So this stays a weak signal, honestly labelled. What makes the feature work is
-// not this being right; it is that a scan which finds nothing tries again later.
-// Do not add a third condition here without evidence that the state it names
-// actually occurs.
+// So this stays a weak signal, honestly labelled. Its one caller now (the
+// submit hold on the camera key, device_hook.cpp) ORs it with the gate's own
+// external-camera state. Do not add a third condition here without evidence
+// that the state it names actually occurs.
 bool headOffsetGatePanelSettled();
 
 }  // namespace edvr

@@ -507,7 +507,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\vscreen_res.cpp" "src\common\vscreen_auto_state.cpp" ^
     "src\d3d11\binding_shadow.cpp" "src\d3d11\head_offset_gate.cpp" ^
     "src\d3d11\vr_runtime.cpp" ^
-    "src\d3d11\camera_view.cpp" "src\d3d11\journal_watch.cpp" ^
+    "src\d3d11\journal_watch.cpp" ^
     "src\d3d11\elite_binds.cpp" "src\d3d11\draw_census.cpp" ^
     "src\d3d11\object_probe.cpp" ^
     "src\d3d11\pixel_probe.cpp" ^
@@ -1138,7 +1138,7 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     "src\d3d11\head_offset_gate.cpp" "src\d3d11\vr_runtime.cpp" ^
     "src\common\config.cpp" ^
     "src\common\log.cpp" "src\common\frame_flag.cpp" ^
-    "src\d3d11\camera_view.cpp" "src\common\guard.cpp" ^
+    "src\common\guard.cpp" ^
     "src\common\proxy.cpp" "src\d3d11\journal_watch.cpp" ^
     /link /INCREMENTAL:NO kernel32.lib user32.lib version.lib
 if errorlevel 1 ( echo [edvr] ERROR: gate_test build failed & exit /b 1 )

@@ -50,8 +50,8 @@ void vScreenExecuteCommandListRaw(ID3D11DeviceContext*,ID3D11CommandList*,int re
 //
 // It lives HERE because the count is this module's -- it is incremented in
 // beginPanelOverride and handed out at the frame boundary -- and because the
-// alternative is a fourth copy of one measurement. camera_view kept its own
-// (kMenuEyeDraws) and its comment already said what that costs: "a third
+// alternative is a fourth copy of one measurement. camera_view (since removed)
+// kept its own (kMenuEyeDraws) and its comment already said what that costs: "a third
 // number for it would be a third thing to re-measure". glitch_frame's
 // minEyeDraws is deliberately still its own, being a per-fix tunable rather
 // than this fact.
@@ -77,7 +77,7 @@ constexpr uint32_t kSceneEyeDraws = 100;
 // times into one target in one frame.
 //
 // Integer arithmetic on purpose: this is asserted from a test that links
-// nothing, the same reason camera_view's grouping lives in a header.
+// nothing, the same reason camera_view's (since removed) grouping lived in a header.
 inline bool eyeShapedAtScale(uint32_t w, uint32_t h, uint32_t eyeW, uint32_t eyeH) {
     if (!w || !h || !eyeW || !eyeH) return false;
     // Aspect, cross-multiplied rather than divided: within about 1%, which

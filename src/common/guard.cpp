@@ -217,14 +217,14 @@ int guardFilter(unsigned long code, const char* site) {
     // and both of which are the same error it exists to correct -- a sentence
     // asserting something the code never checked.
     //
-    // The first is WHOSE fault is routine. Faulting on memory the game is free
-    // to release is by design at the nine camera_view sites, which walk
-    // gigabytes of a live heap looking for an array. It is not by design at
-    // resubmit/copy, guardCrop/device or any of the other D3D sites, where a
-    // fault means something handed us a resource that was not what it claimed.
-    // Telling the reader of one that the other is routine is how a real report
-    // gets talked out of being filed.
-    const bool scanSite = strncmp(key, "camera_view/", 12) == 0;
+    // The first is WHOSE fault is routine. It was the nine camera_view sites,
+    // which walked gigabytes of a live heap looking for an array and faulted
+    // on pages the game had released, by design; that scanner was removed
+    // 2026-09-29, so the line has no routine case left to describe. At
+    // resubmit/copy, guardCrop/device or any of the D3D sites a fault means
+    // something handed us a resource that was not what it claimed. Telling the
+    // reader of one that the other is routine is how a real report gets
+    // talked out of being filed.
     // The second is what a fault COSTS. For a read probe, abandoning it costs
     // the read. For a copy abandoned part-way, the destination holds whatever
     // got there first and is submitted anyway, so "the rest of that one
@@ -241,12 +241,8 @@ int guardFilter(unsigned long code, const char* site) {
                     "rather than logged; the running total is restated as it doubles, "
                     "so a hard exit cannot eat it.",
                     code, key, where,
-                    scanSite
-                        ? "A few of these are routine at this site: it probes memory "
-                          "the game is free to release, and the camera scan walks "
-                          "gigabytes of it. "
-                        : "This site does NOT fault by design -- it is not one of the "
-                          "memory probes -- so even a couple here are worth a report. ");
+                    "This site does NOT fault by design -- it is not one of the "
+                    "memory probes -- so even a couple here are worth a report. ");
     return EXCEPTION_EXECUTE_HANDLER;
 }
 

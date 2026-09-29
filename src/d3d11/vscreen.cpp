@@ -5,7 +5,6 @@
 #include "gpu_census.h"       // issue #38: the per-feature GPU cost census
 #include "../common/d3d11_gpu_command_slots.h"
 #include "head_offset_gate.h"
-#include "camera_view.h"
 #include "vr_runtime.h"
 
 #include <windows.h>
@@ -5323,7 +5322,6 @@ void vScreenRefreshConfig() {
     // session -- and it cost a flight when fix.head_offset_gate did exactly
     // that.
     headOffsetGateConfigure();
-    cameraViewConfigure();
 
     if (wasVoid != s->blackVoid || wasScale != s->distanceScale) {
         Log::get().note("vScreen config reloaded: black void %s, panel distance x%.3f "
@@ -6006,9 +6004,9 @@ void vScreenFrameBoundary() {
     // WHY THE JOURNAL AND NOT THE COUNT decides that gameplay is happening:
     // every other gameplay signal in the DLL is downstream of this counter,
     // so asking one of them here would be asking the broken thing whether it
-    // is broken. camera_view's own latch is the case in point -- it ORs the
-    // journal with the draw count, and on both of those field sessions the
-    // journal had to carry it, which is itself in the logs.
+    // is broken. The since-removed camera_view's latch was the case in point:
+    // it ORed the journal with the draw count, and on both of those field
+    // sessions the journal had to carry it, which is itself in the logs.
     //
     // WHY A LOW PEAK AFTER LOADGAME IS DIAGNOSTIC AT ALL, given that the
     // count legitimately depends on what the player is doing: the load-in
@@ -6387,20 +6385,6 @@ void vScreenFrameBoundary() {
     // The gate decides on the counts for the frame that just ended, so it is
     // told before they reset -- same rule as the flash detector above.
     headOffsetGateFrame(s->frameNo, s->panelCompositeDraws, sceneDraws);
-    // The first frame the flat panel is seen is the earliest moment the game is
-    // known to be loaded AND the player known to be on foot, which is what the
-    // scan needs. At startup the process holds a fraction of the memory it
-    // reaches in play, and a scan there finds nothing.
-    // Asked every frame the player is settled on foot; the scan itself guards
-    // against running twice. The old trigger was the FIRST panel sighting,
-    // which on a default install is the main menu four seconds after launch --
-    // 5 GB of an eventual 11 GB allocated, and the scan found nothing.
-    // The scan's tick sits beside its trigger, where the frame's counters are.
-    // It was in device_hook, which does not have them -- and the tick needs the
-    // eye-draw count to tell "the game is being played" from "the main menu is
-    // on screen", which is what stops a menu-dweller burning every attempt.
-    cameraViewTick(sceneDraws);
-    if (headOffsetGatePanelSettled()) cameraViewRequestScan();
     s->panelCompositeDraws = 0;
     s->eyeDrawsThisFrame = 0;
     s->sceneDrawsThisFrame = 0;

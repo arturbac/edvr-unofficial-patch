@@ -37,7 +37,6 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "../common/guard.h"
 #include "../common/hotkey.h"
 #include "head_offset_gate.h"
-#include "camera_view.h"
 #include "fss_res.h"
 #include "journal_watch.h"
 #include "ui_surfaces.h"   // the glyph atlas and sizing chain instruments
@@ -289,7 +288,6 @@ struct State {
     uint64_t bindsCheckMs = 0;
     uint32_t lastJournalDisembarks = 0;
     uint32_t lastJournalEmbarks = 0;
-    uint32_t lastCameraEnters = 0;
     // THE frame number for this session, in the numbering every instrument
     // prints: frame N is everything between Present N-1 returning and Present N
     // returning, so this is the frame IN PROGRESS and it starts at 1 -- the
@@ -1107,7 +1105,6 @@ EDVR_BOUNDARY_TICK(tkJournalGate, "journal_gate");
 EDVR_BOUNDARY_TICK(tkCameraKeysPads, "camera_keys_pads");
 EDVR_BOUNDARY_TICK(tkFssTheater, "fss_theater");
 EDVR_BOUNDARY_TICK(tkMenu, "menu");
-EDVR_BOUNDARY_TICK(tkCameraView, "camera_view");
 EDVR_BOUNDARY_TICK(tkBindingBoundary, "binding_boundary");
 EDVR_BOUNDARY_TICK(tkExposureBoundary, "exposure_boundary");
 EDVR_BOUNDARY_TICK(tkVscreenRest, "vscreen_rest");
@@ -1243,22 +1240,12 @@ void tickJournalGate() {
             headOffsetGateNoteEmbark();
         }
     }
-    // The game's live on-foot word, and the camera-entry edge. The first
-    // is what makes a KEYLESS install work at all (the gate turns it into
-    // intent, 6bb); the second nudges the view scanner so fresh
-    // candidates exist while the player is still cycling to their view --
-    // which is what the anchored two-step certification feeds on.
+    // The game's live on-foot word: what makes a KEYLESS install work at all
+    // (the gate turns it into intent, 6bb).
     headOffsetGateSetOnFootLive(journalOnFootKnown(), journalOnFoot(),
                                 journalStatusSamples());
     headOffsetGateSetWakeLive(journalSupercruiseKnown(), journalSupercruise(),
                               journalInJumpTunnel());
-    {
-        const uint32_t entries = headOffsetGateEnterCount();
-        if (entries != g_state->lastCameraEnters) {
-            g_state->lastCameraEnters = entries;
-            cameraViewNudgeRescan();
-        }
-    }
 }
 
 // The camera keys and pads (tkCameraKeysPads), and the two settings only they read.
@@ -1337,26 +1324,13 @@ void tickCameraKeysPads() {
             requestSubmitHold(g_state->holdFramesOnExternalCam);
         }
     }
-    // The next-view key, promoted to the public build on 2026-08-15. It
-    // was deliberately private-only while the game read covered
-    // everything -- but near a planet the read dies for stretches, the
-    // bridge holds the last confirmed view through them, and cycling
-    // during a hold was then INVISIBLE: the offset stayed armed on every
-    // preset the player cycled to. With this bound, the count follows
-    // each press, so the offset drops the moment you cycle off the wanted
-    // view and returns when you cycle back -- read or no read. The press
-    // is also timestamped for the watcher: a candidate record stepping
-    // exactly when the finger does is the certification no impostor has
-    // matched (6aw).
+    // The next-view key, promoted to the public build on 2026-08-15. With
+    // this bound, the count follows each press, so the offset drops the
+    // moment you cycle off the wanted view and returns when you cycle back.
     if (keysMeanGame && g_state->extCamNextKey.pressed()) {
-        cameraViewNotePress();
         headOffsetGateViewBumped();
     }
-    // The witness call is deliberately the same one: what certification
-    // needs is that the player's finger moved at this instant, not which
-    // way round the cycle it sent them.
     if (keysMeanGame && g_state->extCamPrevKey.pressed()) {
-        cameraViewNotePress();
         headOffsetGateViewUnbumped();
     }
     // AND THE SAME PRESSES ON A GAMEPAD. Elite binds the view cycle to
@@ -1365,11 +1339,9 @@ void tickCameraKeysPads() {
     // makes -- which reads downstream as a count that is quietly one or
     // two behind, with nothing to say why (field, 2026-09-02).
     if (keysMeanGame && xinputPressed(g_state->extCamNextPad)) {
-        cameraViewNotePress();
         headOffsetGateViewBumped();
     }
     if (keysMeanGame && xinputPressed(g_state->extCamPrevPad)) {
-        cameraViewNotePress();
         headOffsetGateViewUnbumped();
     }
 }
@@ -1601,13 +1573,6 @@ void presentFrameBoundary() {
     // where the frame-tick chain is cut: the tick named "menu_tick" ends there,
     // "perf_monitor" is the rest of that function, and "menu" is what is left.
     tkMenu.run([] { menuTick(g_state->device); });
-    // Reading the view the game is actually on, and telling the gate.
-    //
-    // The keypress count above stays as the fallback, for when this cannot
-    // answer: an offset a game update has moved, a record that has been
-    // reused, a scan that found nothing. cameraViewCurrent returns -1 in
-    // all of those and the gate goes back to counting.
-    tkCameraView.run([] { headOffsetGateSetView(cameraViewCurrent()); });
     // One per-frame invalidation for both fixes, before either boundary.
     //
     // This used to be two, with opposite policies: vscreen dropped its
@@ -1965,7 +1930,6 @@ void readoptGameBindings() {
             xinputTranslate(fb, &g_state->fssQuitPad);
         }
         headOffsetGateSetNextKeyBound(g_state->extCamNextKey.key() != 0);
-        cameraViewSetPressWitness(g_state->extCamNextKey.key() != 0);
     }
     // Silence here cost a field session: the files changed, the re-read ran,
     // the answers matched -- and nothing said so, which is indistinguishable
@@ -2210,7 +2174,6 @@ State& ensureState() {
         // key and the menu's own keys, which the rules check against.
         menuAdoptGameBindings(Config::get().getBool("hotkey.read_game_bindings", true), nullptr);
         headOffsetGateSetNextKeyBound(g_state->extCamNextKey.key() != 0);
-        cameraViewSetPressWitness(g_state->extCamNextKey.key() != 0);
         journalWatchConfigure();
         g_state->fssTheaterWanted =
             eyeSyncFromConfig(Config::get()).any();
@@ -2224,7 +2187,6 @@ State& ensureState() {
         // than falling back to a heuristic that cannot tell the external camera
         // from the inside of your own ship.
         headOffsetGateSetKeyBound(g_state->externalCamKey.key() != 0);
-        cameraViewConfigure();
     }
     return *g_state;
 }
