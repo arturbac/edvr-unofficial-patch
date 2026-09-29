@@ -1080,11 +1080,27 @@ void testFamilyRule() {
                                 kHoloContactD,   kHoloContactE};
     for (uint64_t h : kTakeVs) {
         f.vs = h;
+        // The eighth, the contact markers' E, is the shared pair (shared_pair.h): the radar's markers, the
+        // landing pad's rings and the sun's glare train are one shader pair, and the take names it only as
+        // radar or pad. Its class is a fact of the draw; the whole table (class x glare mode) is
+        // tools\shared_pair_test's.
+        f.pairClass = h == kHoloContactE ? PairClass::kRadar : PairClass::kNotPair;
         char what[128];
         std::snprintf(what, sizeof(what), "vs %016llX names the hologram family on the HDR target",
                       static_cast<unsigned long long>(h));
         check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kHoloGeneric && why == UiFamilyWhy::kDirect, what);
     }
+    f.vs = kHoloContactE;
+    for (PairClass c : {PairClass::kPad}) {
+        f.pairClass = c;
+        check(uiLayerFamilyFor(f) == UiLayerFamily::kHoloGeneric, "the pair's pad class is taken like its radar class");
+    }
+    for (PairClass c : {PairClass::kWorld, PairClass::kNotPair}) {
+        f.pairClass = c;
+        check(uiLayerFamilyFor(f, &why) == UiLayerFamily::kNone && why == UiFamilyWhy::kNotPostTonemap,
+              "the pair as world, or never classified, is not taken: the sun's glare train shares its vertex shader");
+    }
+    f.pairClass = PairClass::kNotPair;
     f.vs = kHoloTargetSphere;
     for (uint64_t ps : {0xEA02FAC2BD6C643Cull, 0xE95634B0F61D218Full}) {
         f.ps = ps;

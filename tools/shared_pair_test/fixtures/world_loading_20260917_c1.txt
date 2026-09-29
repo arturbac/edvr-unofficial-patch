@@ -1,0 +1,17 @@
+# WORLD by default: a loading-screen frame (the loading composite VS 4EF6DDB075A927FA at its end), a glare train an eye and no cockpit draws -- all this proves is that a frame with no HUD marks is called WORLD
+# source: edvr_gfx_20260917_131324.log census 1 (13:15:04.066) frame 0; ordinals are the census's #N plus one
+frame 1
+d 2 FC1193AFFC596F74 @26
+d 60 DE545DC8EE4FBB87 @26
+d 118 DE545DC8EE4FBB87 @26
+d 176 61AE8EB05FDC18DD @26
+d 234 39CC20727A27FD17 @26
+d 292 BBE58E40FE88EC80 @26
+d 350 DE545DC8EE4FBB87 @30
+d 408 DE545DC8EE4FBB87 @30
+d 466 DE545DC8EE4FBB87 @30
+d 524 4A0748B67A27F71E @30
+d 582 BBE58E40FE88EC80 @30
+d 640 46546443FD3C3F88 @33
+p 654 47 @33 world
+p 671 47 @1260 world

@@ -1,0 +1,7 @@
+# CONSTRUCTED CONTROL, not a capture: the window's edge. A console draw exactly 250 draws before the pair's draw on its target is inside
+# the window (PAD); on the other target the console draw is 251 before, outside it (WORLD).
+frame 1
+d 100 68DDDEF04D9894AF @1
+d 101 68DDDEF04D9894AF @2
+p 350 3000 @1 pad
+p 352 3000 @2 world

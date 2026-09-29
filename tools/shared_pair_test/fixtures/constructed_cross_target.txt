@@ -1,0 +1,26 @@
+# CONSTRUCTED CONTROL, not a capture: radar_space_143837_c3 with eye B's radar and console marks removed. Eye B's pair draw is
+# then a draw with no marks on its own target and eye A's marks 61 draws before it on the OTHER target: the rule reads marks per
+# target, so it must be WORLD (a rule that read marks on any target would call it RADAR).
+frame 1
+d 2 FC1193AFFC596F74 @76
+d 22 EB5234DB6ADB491D @76
+d 42 61AE8EB05FDC18DD @76
+d 62 BBE58E40FE88EC80 @76
+d 82 BFE51414CC3024B4 @80
+d 102 AACFDCF2FB9AD809 @80
+d 122 BBE58E40FE88EC80 @80
+d 141 68DDDEF04D9894AF @83
+d 143 41E245D488BFE83E @83
+d 144 D95905C18B7FAD93 @83
+d 164 81216C77F90DEDD6 @83
+d 184 81216C77F90DEDD6 @83
+d 187 DF3503CD07F9B10C @83
+d 188 5453D19B6D362364 @83
+d 189 A2C2D5510BF1926D @83
+d 191 9611A454527F7FEB @83
+d 192 B932058F26B76691 @83
+d 193 F8D8A92E96419901 @83
+p 195 39 @83 radar
+d 213 B43A856E285815E3 @401
+d 233 2CECEC3065EF0D4A @401
+p 254 39 @401 world
