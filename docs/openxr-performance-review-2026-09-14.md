@@ -44,16 +44,17 @@ changes.*
   UI resolve skipping inputs it was not given (about 0.09 ms a frame); a
   tile early-out, a groupshared window, R8 history, a composite tile bound,
   hologram scissors and one shared depth copy measured and ruled out.
-  Largest left: the HDR HUD's depth seed (about 1 ms a frame at the carrier,
-  outside the census) and UI quality 1.25, a setting (1.62x the pixels of
-  1.0).
+  Largest left: the HDR HUD's depth seed (about 1 ms a frame at the carrier;
+  a census section of its own since, built, not flown) and UI quality 1.25, a
+  setting (1.62x the pixels of 1.0).
 - **Next** (flight 132352 entry): the carrier sits at the budget (GPU
-  10.7-11.3 ms, EDVR about 4.8 of it). Open: the HUD depth seed into the
-  census (then UI quality 100 against 125 in one flight), stock glare's
-  extra 2.5 ms, the landing-pad display left out of the UI layer; the output
-  size and foveated DLSS are Sean's levers. Any Quest flight with the
-  default build: check the Application-render GPU invalid count stays near
-  zero and `native_frame_end_overlap_summary` reads failures=0.
+  10.7-11.3 ms, EDVR about 4.8 of it). Open: fly the HUD depth seed's census
+  section (branch `claude/ui-seed-census`; then UI quality 100 against 125 in
+  one flight), stock glare's extra 2.5 ms, the landing-pad display left out
+  of the UI layer; the output size and foveated DLSS are Sean's levers. Any
+  Quest flight with the default build: check the Application-render GPU
+  invalid count stays near zero and `native_frame_end_overlap_summary` reads
+  failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
   4100x4050 and 2665x2087.
@@ -1603,3 +1604,59 @@ worse; CPU frame time good; GPU still hitches; 90 not held.
   radar's place while docking, left out of the UI layer (the radar itself is
   handled correctly); under analysis with the stock-glare question and a
   census section for the depth seed.
+
+## 2026-09-29: the HDR HUD depth-stencil seed in the census (built, not flown)
+
+Branch `claude/ui-seed-census` from d1eac52b. Asked for: the layer's HDR HUD
+depth-stencil seed as a census section of its own, sampled like the others, so
+the next flight measures UI quality 100 against 125 in one place. Log only:
+the seed, the image and every setting are unchanged. Commit 0a407415 (the
+section, its rig, the call site) and this entry. Nothing merged, installed or
+flown.
+
+**What the log will show.** A ninth in-frame item, last, `HDR HUD depth-stencil
+seed X (n/frame)`, in the in-frame total and in `EDVR ~`; and, only when a seed
+ran, the line after the main one (figures here are the rig's, not a flight's):
+
+    EDVR GPU census, the HDR HUD depth-stencil seed above (the copy of the
+    game's depth-stencil, then the passes that write it into the HUD layer's
+    own): 3.50 seeds a frame, 0.200 ms a seed (96 timed); target 5040x4870
+    D32_FLOAT_S8X24_UINT (196.4 MB), seeded from the game's 3024x2922.
+
+- Counted for every seed, timed on the section's turn (one frame in 22: up to
+  8 seeds and one empty pair), so the cost is a counter a seed and, on that
+  turn, at most nine timestamp pairs. `ms a seed` is the corrected mean, and
+  `seeds a frame` is what to multiply it by.
+- **UI 100 against 125:** the target is on the line (4032x3896, 125.7 MB at
+  100; 5040x4870, 196.4 MB at 125). A window the quality was changed inside
+  says `the target changed inside this window, so the figure mixes them` and
+  names both, so read two clean windows; do not read the straddled one.
+- **What shows if it never runs.** No such item at all: a build without this.
+  `HDR HUD depth-stencil seed -` and no line: no seed ran (the layer is off,
+  or no HUD draw tested the game's depth). `-` while the layer's own line shows
+  `HDR HUD depth-stencil seed .../... (N)` with N above zero: the scope is not
+  wired (the rig's scan of `ui_layer.cpp` fails the build on that).
+  `the seeds reported no target`: the scope ran without its target.
+- **Across builds.** From this build on `EDVR ~` carries the seed and `game ~`
+  no longer does, by the same amount: 0.4-1.0 ms a frame at the carrier (the
+  layer's per-eye-frame medians in flight 132352, 0.19 vivid to 0.50 stock at
+  125, times two eyes). Take it out of a new census before comparing with an
+  old one. Those medians are per eye-frame (1.75-3.0 seeds each here) and the
+  scenes differ (0.39 at UI 100), so they settle nothing about 100 against 125.
+
+Proof (`tools\gpu_census_test`, 134 checks to 180): the section, its item and
+its place; the line, the total, the line's position, its three target states;
+the never-ran control and the window after a window with seeds; the scope on a
+null context (HDR counted, noted and timed on its turn, the 8-bit layer's seed
+counted nowhere, another section's turn, the K cap) and on WARP with real
+timers; worst-case line lengths (main line 967 characters, seed line 539,
+under the 1150 the log keeps). A scan of `ui_layer.cpp` holds the call site
+(one scope, before the copy, the HDR stage, the layer's own size and format)
+with seven mutants of it. 27 mutants of the production sources, run on a
+scratch copy, are all caught, each by the check written for it (one at compile
+time: the section's place is asserted); the unmutated copy passes first.
+
+Not changed: the 8-bit layer's own seed is not in the census (its route read
+`-` in all 12 windows of 132352, so nothing is lost; it would be a section of
+its own). The layer's route timers and the `HDR seed subprice` diagnostics are
+untouched.
