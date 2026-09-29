@@ -130,10 +130,15 @@ uint8_t* allocateRelay(uintptr_t target) noexcept {
 }
 
 void buildRelay(uint8_t* code, const void* gate, void* callback) noexcept {
-    // mov rax,&gate; cmp qword ptr[rax],0; je original; jmp [callback];
-    // original: jmp [trampoline]. The proven 44-byte pose_reader_watch layout.
+    // mov r11,&gate; cmp qword ptr[r11],0; je original; jmp [callback];
+    // original: jmp [trampoline]. R11 carries the gate here, NOT the usual
+    // rax: this target established its frame anchor with mov rax,rsp BEFORE
+    // the patch site, so the relay's register clobber must not touch rax --
+    // the trampoline replays the stolen instructions and returns into a body
+    // that reads its frame through rax, and a clobbered rax is a wild frame
+    // (the 18:03 crash: a call through a garbage "local" into .rdata).
     const uint8_t body[kRelayBytes] = {
-        0x48,0xB8,0,0,0,0,0,0,0,0, 0x48,0x83,0x38,0,
+        0x49,0xBB,0,0,0,0,0,0,0,0, 0x49,0x83,0x3B,0,
         0x74,0x0E, 0xFF,0x25,0,0,0,0, 0,0,0,0,0,0,0,0,
         0xFF,0x25,0,0,0,0, 0,0,0,0,0,0,0,0};
     std::memcpy(code, body, sizeof(body));
