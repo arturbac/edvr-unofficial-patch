@@ -1,12 +1,10 @@
-// The game's HDR -> display tonemap draw, recognised STRUCTURALLY and shared
-// by the two modules that must agree about exactly which draw it is:
-//
-//   * the HUD layer census (hud_layer_census.cpp, Phase 0 of
-//     docs/cockpit-hud-layer-design-2026-09-27.md), which logs every
-//     structure match's exact vs/ps so a variant names itself; and
-//   * the crisp-HUD half's of fix.ui_quality tonemap re-issue (ui_layer.cpp, Phase 1), which re-issues
-//     the admitted draw once per eye with the HDR HUD layer in the HDR source
-//     slot -- and must therefore never guess which slot that is.
+// The game's HDR -> display tonemap draw, recognised STRUCTURALLY, for the
+// crisp-HUD half of fix.ui_quality's tonemap re-issue (ui_layer.cpp, Phase 1),
+// which re-issues the admitted draw once per eye with the HDR HUD layer in
+// the HDR source slot -- and must therefore never guess which slot that is.
+// (It was shared with the HUD layer census, Phase 0 of
+// docs/cockpit-hud-layer-design-2026-09-27.md, removed 2026-09-29; "the
+// census's G-B" below is that census's flight.)
 //
 // The structure (eye_tonemap_snapshot.h:170-191's checks, flight-verified in
 // the census's G-B): a 3-vertex, 1-instance draw (the caller prefilters

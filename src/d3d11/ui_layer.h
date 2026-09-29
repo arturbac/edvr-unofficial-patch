@@ -272,17 +272,4 @@ void uiLayerShutdown();
 bool nativeTemporalDrawJitter(uint32_t eye, uint64_t* sequence, float* jx, float* jy,
                               uint32_t* w, uint32_t* h);
 
-// Defined in native_temporal.cpp beside nativeTemporalDrawJitter, read at
-// DRAW time by the HUD layer census (hud_layer_census.h, gate G-C): the
-// inputs the game's projection for `eye` is built from THIS frame -- the
-// unjittered signed tangents {left,right,down,up}, the tangent shift the
-// pass's jitter adds to both endpoints on each axis, and the clip planes
-// noteProjection recorded (0/0 while none). With those, the projection the
-// eye's draws should carry is reconstructible exactly as the census does;
-// the shift being zero means the pass is not jittering this frame, so a
-// "carries the jitter" verdict is unaskable rather than failed. False
-// before the first frame, or with no native temporal channel.
-bool nativeTemporalProjectionReference(uint32_t eye, float frusta[4], float shift[2], float* nearZ,
-                                       float* farZ);
-
 }  // namespace edvr
