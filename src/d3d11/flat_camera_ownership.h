@@ -117,6 +117,14 @@ inline FlatCameraOwnershipDecision flatCameraOwnerSelect(
             d.owner = FlatCameraOwner::Legacy;
             d.outcome = FlatCameraOutcome::Treated;
             d.reason = "legacy-eligible-upstream-unsupported";
+            // The same history-identity switch the other two Legacy/Upstream
+            // branches make: the fallback hysteresis reaches Legacy through here,
+            // and the frames before it were Upstream's. One-shot by construction:
+            // the first clean close under Legacy moves lastOwner and ends it.
+            if (s.lastOwner == FlatCameraOwner::Upstream) {
+                d.historyReset = true;
+                d.preserveCameraInputs = true;
+            }
         } else {
             d.outcome = FlatCameraOutcome::Unsupported;
             d.reason = "upstream-unsupported-projection-kind";
