@@ -968,6 +968,19 @@ gains the "live" or "restart" word the generator derived.
    and what it saves does not move the frame rate on Elite -- and kept
    both its label and its four presets. A key may carry a `ui:` line or a
    `dev:` line, never both.
+   **Bounds are numbers.** The menu runs a row's bounds through `atof`, so
+   a bound that is a C++ name reads as 0 and one press of Up writes 0. Where
+   the code bounds a read with constants
+   (`getIntInRange("advanced.panel_curvature_segments", kDefaultSegments,
+   kMinSegments, kMaxSegments)`), the key's annotation states the numbers:
+   `# dev: range 1..256`, or `range 1..256` on its `ui:` line. The code's
+   own bounds still win where they are numbers. The generator fails the
+   build, naming the key and the ini line, for a bound that is not a
+   number, a `range` that is not two numbers, a documented default (or
+   `recommended`) outside its bounds, a dotted key that appears twice, and a
+   comment line that starts `# key = ...` (a commented-out setting is
+   written `#key = value`; a sentence that begins that way became a row of
+   its own and cut the paragraph above it off from the real key).
    Instruments that write files or scan memory are still one toggle away,
    which is why the tier exists and is off by default.
 6. **Instruments.** Action rows for the things that today need a hotkey
