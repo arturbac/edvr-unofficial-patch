@@ -7,11 +7,11 @@
 - State: the C2 math and policy checks are established and green in the
   build pool (derive reducer, WARP raster/ray/lighting proofs, coexistence
   ownership lifecycle). C3, the upstream injector (fix.temporal_aa_camera,
-  default off), is built; its crash is root-caused, fixed, and flown clean
-  2026-09-29 (08:49 pass-through, 08:57 cockpit, 552,039 injections). Its
-  ownership is wired into flat_runtime on claude/flat-c3-wiring: built and
-  gated, NOT FLOWN. The view/execution lineage is not joined; auxiliary
-  composer callers are unclassified (the census line decides that).
+  default off), is built, its crash fixed and flown clean; its ownership
+  wiring (main 856e72c2) FLEW 2026-09-29 11:35 on Epic and met every pass
+  mark: 0 row-pair mismatches in 35,127 resolves (max 3.7e-7 NDC), history
+  valid in 79 of 92 ticks, legacy never applied (addendum at the end). The
+  view/execution lineage is not joined.
 - Decision: investigate jittering the game's per-view camera construction
   before it derives raster/lighting data. Preserve the existing frame
   discovery, size negotiation, temporal backends and resource isolation.
@@ -51,9 +51,9 @@
   exact encoding (this doc's out[0][2] = 2*dbx*s8), because the bound pair
   enters only slots [i][0] and [i][1] and c2_derive_test A8 finds [i][2],
   the depth row and rows 273/274 bit-identical over 16 phases at 3 sizes.
-- Next: fly the acceptance session in the C3 ownership wiring addendum
-  (Epic, flat, fix.temporal_aa_camera = on; pass marks and stop conditions
-  there). The census decides main-versus-auxiliary grouping after it.
+- Next: Sean's visual verdict; decide main-versus-auxiliary grouping from the
+  census (two kind-3 cameras injected, about 95 and 11 refreshes a frame);
+  the census's injected-per-frame misreads a one-frame window (11:40:59).
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable and
   build identities, backend versions, dimensions, formats and mod chain.
@@ -1163,3 +1163,37 @@ legacy-applied-under-upstream>0.
   jitter of cameras injected before it (no drain). Both predate the wiring.
 - injected ~83-103 kind-3 cameras per frame means auxiliary cameras (shadow
   and environment passes) are jittered too; the census names them.
+
+## C3 acceptance flight, 2026-09-29 11:35 (Epic, 856e72c2)
+
+`edvr_gfx_20260929_113516.log`, build matched (v0.18.0-rc.3-163-g856e72c2),
+flat profile, `temporal_aa = dlss`, `fix.temporal_aa_camera = on`, about 8
+minutes. Sean flew the procedure mostly as written: he did not start docked
+(so no stationary hangar leg) and had nowhere to dock at the end; the F10
+classifier audit (flight A) was not flown.
+
+- **Pass marks, all met.** 92 inject ticks: `owner=upstream history=valid`
+  in 79, `history=invalid` in 13 (warm-up at the main menu, and the resize at
+  11:40:46-11:40:59). Steady ticks close clean (434/433, 443/443).
+  `flat jitter` live with history-valid=1 in the same 79 ticks, warming in
+  the 13; `flat runtime last=treated-jittered` with accepted history equal to
+  the frames. Rows: 35,149 frames, 35,127 unjittered resolves (22 zero-phase
+  warm-up), 35,127 row pairs, **0 mismatches**, max error 3.738e-07 NDC
+  (tolerance 2e-6). `legacy-applied-under-upstream=0`; legacy preparation
+  skipped 15.4 million times. off-thread 0, not-upstream 0, flushed 19 with
+  no flush or write failure, fallbacks 0 (fallback=upstream every tick).
+- **The resize held.** Around 11:40:46 (the graphics panel and a
+  Supersampling change) the game stopped presenting for a few seconds and
+  kept calling the refresh: 102,491 kind-3 calls in one window with one
+  closed frame, all refused as `stale`, none injected; ownership came back
+  `off -> upstream` at 11:40:59 without a history reset.
+- **The census.** Steady flight (11:38:02): 444 frames, 11 cameras seen, two
+  kind-3 cameras injected: 0x241dc2e2960 at 42,144 calls (about 95 a frame)
+  and 0x241df6d0bb0 at 4,950 (about 11 a frame); kinds 0, 1 and 4 refused.
+  Callers +0x594E13, +0x594EAB and +0x594FE1 at 18,449 each, +0x58DE73 at
+  90. So the auxiliary question is one camera, not dozens; which pass the
+  second camera serves is open.
+- Found: the census line at 11:40:59 prints `injected-per-frame=34657.0` with
+  frames=1 and no injection in its top list; the field does not read
+  injections over closed frames in a one-frame window.
+- No crash; the log ends in ordinary 5 s ticks at 11:43:04.
