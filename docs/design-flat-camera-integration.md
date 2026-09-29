@@ -4,7 +4,7 @@
 
 - **Retired 2026-09-29 (0fe90f09):** `camera_view.cpp/.h`, cited below as
   the external-camera reader and settings probe, are deleted (`0fe90f09^`).
-- State 2026-09-29 (branch claude/flat-menu-shimmer, BUILT, NOT FLOWN): the
+- State 2026-09-29 (main c56e34df, FLOWN 14:58 on Epic, shimmer fixed): the
   camera path is on whenever a temporal mode is selected on the flat profile.
   `fix.temporal_aa_camera` and `fix.temporal_aa_camera_trace` are REMOVED
   (contract 239 -> 237); the per-call trace path is gone, the stand-down
@@ -46,11 +46,11 @@
   backends and resource isolation. The 09-28 zero-renderer-calls log that
   motivated it, the five crashes (root cause: the stubs' missing 32-byte
   shadow space, fixed, flown clean) and what was ruled out: Status detail.
-- Next: fly the branch. Epic, Krait at the main menu, F8 closed, hands off
-  10 s, F10 once, then 45 s: read the `unkeyed 5s` census, `static-scene-
-  frames` beside `accepted`, and flat_pixels.py on the capture
-  (input_rejection_percent 22.5 -> ~0); then each other ship at the menu.
-  Sean's verdict on the hull lines. Open: main-versus-auxiliary grouping.
+- Next: flown and passed (flight 145851 entry at the end): Sean "shimmer
+  fixed"; static-scene-frames 2,480 of 2,481 accepted menu frames; the
+  unkeyed census empty in all 60 ticks; row-pair mismatches 0. Open:
+  main-versus-auxiliary camera grouping; c2_coexist C7's unbounded loop
+  (a mutation hangs the rig instead of failing it).
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable and
   build identities, backend versions, dimensions, formats and mod chain.
@@ -1350,3 +1350,21 @@ the policy on;
 `accepted` grows. Still unkeyed and named by the census when drawn: CAD1F585
 (EDHM-patched, key only for EDHM users) and BBE58E40/7311054A (an SV_Position
 input: the harness first).
+
+## Flight 145851, 2026-09-29: the menu shimmer fixed (Epic, c56e34df)
+
+`edvr_gfx_20260929_145851.log`, build matched (v0.18.0-rc.3-202-gc56e34df),
+flat profile, DLSS. Sean flew the main menu with the Krait and other ships,
+then flew with Sharpening at 0.3: "Yep shimmer fixed".
+
+- The menu-scoped policy ran on the menu: `flat menu HDR copy:
+  accepted=2481 refused=0 static-scene-frames=2480` (15:03:48).
+- The unkeyed census ran in all 60 ticks (`live=1`) and stayed empty
+  (`distinct=0 pairs=[]`): with the Krait's hull pair keyed, no ship shown
+  used a pair the table lacks.
+- `flat camera rows 5s`: 60 ticks, row-pair mismatches 0.
+- Flat sharpening, first flight: the shader warmed at session start; the
+  first sharpened frame at 15:00:48 (RCAS strength 0.30 on 3840x2160, before
+  the game's output copy); measured 0.07 ms a frame (max 0.09).
+- The camera path ran with no key: the removed keys' dead line in Sean's
+  edvr-flat.ini is ignored.
