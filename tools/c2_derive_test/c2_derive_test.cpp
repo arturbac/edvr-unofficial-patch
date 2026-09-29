@@ -10,16 +10,21 @@
 //   refresh ctx copy   FUN_1405921f0  camera_producer.txt:186-249
 //   ray snapshot       FUN_1406be790  camera_ray_writers2.txt:13-30
 //
-// --self-test runs A1-A6 and prints "c2 derive: PASS" only when every check
+// --self-test runs A1-A8 and prints "c2 derive: PASS" only when every check
 // holds. Exit 1 with the failed checks named otherwise.
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
+#include <limits>
 
 #include "c2_derive_model.h"
+#include "../../src/d3d11/flat_camera_phase.h"
 #include "../../src/d3d11/flat_live_phase.h"
+#include "../../src/d3d11/flat_projection_ownership.h"
 
 namespace {
 
@@ -441,6 +446,209 @@ void testA7() {
     check(onoop, "A7 ortho branch: bound-pair mutation is a no-op (mutation must be refused here)");
 }
 
+// ---------------------------------------------------------------------------
+// A8 row provenance (the 2026-09-29 wiring addendum). The phase the injector
+// applies at the source is IN the scene rows the game composes and uploads,
+// it is exactly the legacy scope's shift, it is exactly removable, the
+// measured exact-zero encoding survives it, and the live static-pair check
+// tells a right provenance claim from a wrong one. Everything is computed on
+// the C2 derive model, whose composer is the decompiled FUN_140596830.
+// ---------------------------------------------------------------------------
+// The six camera rows b1[270..275] as the flat runtime captures them: rows
+// 0..3 are the composer's output, row 4 repeats the view direction (the
+// w-column) and row 5 is the camera position.
+void composeCameraRows(Cam& c, float rows[6][4]) {
+    float out[16];
+    composeSceneCb(c, out);
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) rows[i][j] = out[i * 4 + j];
+    rows[4][0] = out[3]; rows[4][1] = out[7]; rows[4][2] = out[11]; rows[4][3] = 0.0f;
+    rows[5][0] = camF(c, kCamOrigin + 0); rows[5][1] = camF(c, kCamOrigin + 4);
+    rows[5][2] = camF(c, kCamOrigin + 8); rows[5][3] = 0.0f;
+}
+
+float maxRowDiff(const float (&a)[6][4], const float (&b)[6][4]) {
+    float worst = 0.0f;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) {
+            const float d = std::fabs(a[i][j] - b[i][j]);
+            if (!(d <= worst)) worst = d;
+        }
+    return worst;
+}
+
+void jitterCamera(const Cam& base, Cam& out, float jx, float jy, float w, float h) {
+    out = base;
+    camU(out, kCamFlags) |= kFlagProj | kFlagVP;
+    camF(out, kCamBoundX) += jx / w;
+    camF(out, kCamBoundY) += -jy / h;
+    derive(out);
+}
+
+void testA8() {
+    std::printf("A8 row provenance: the injected phase is in the uploaded rows and exactly removable\n");
+    struct Size { uint32_t w, h; };
+    static const Size kSizes[] = {{1280, 720}, {2560, 1440}, {3840, 2160}};
+    bool legacyShift = true, removable = true, restKept = true, encodingKept = true,
+         classifierKept = true, notVacuous = true;
+    float worstLegacy = 0.0f, worstBack = 0.0f;
+    int idRef = 0;
+    for (const auto& sz : kSizes) {
+        const float w = static_cast<float>(sz.w), h = static_cast<float>(sz.h);
+        Cam base; makeCamera(base); derive(base);
+        float rows0[6][4]; composeCameraRows(base, rows0);
+        for (uint32_t p = 0; p < 16; ++p) {
+            float jx = 0, jy = 0;
+            edvr::temporalJitter(p, &jx, &jy);
+            Cam jc; jitterCamera(base, jc, jx, jy, w, h);
+            float rowsJ[6][4]; composeCameraRows(jc, rowsJ);
+
+            // The game's shift equals the legacy scope's shift.
+            edvr::FlatProjectionJitter fj{};
+            legacyShift &= edvr::flatProjectionJitter(jx, jy, sz.w, sz.h, fj);
+            float legacy[4][4]; std::memcpy(legacy, rows0, sizeof(legacy));
+            legacyShift &= edvr::flatJitterForwardColumns(legacy, fj);
+            float dl = 0.0f;
+            for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j) { const float d = std::fabs(legacy[i][j] - rowsJ[i][j]); if (!(d <= dl)) dl = d; }
+            if (dl > worstLegacy) worstLegacy = dl;
+            legacyShift &= dl <= 1.0e-6f;
+
+            // The exact-zero encoding is independent of the phase, bit for bit.
+            for (int i = 0; i < 3; ++i) encodingKept &= rowsJ[i][2] == 0.0f && std::memcmp(&rowsJ[i][2], &rows0[i][2], 4) == 0;
+            encodingKept &= std::memcmp(rowsJ[3], rows0[3], sizeof(rowsJ[3])) == 0;       // depth row: no x/y/w to shift
+            encodingKept &= std::memcmp(rowsJ[4], rows0[4], sizeof(rowsJ[4])) == 0;       // repeated view direction
+            for (int i = 0; i < 3; ++i) encodingKept &= std::memcmp(&rowsJ[i][3], &rows0[i][3], 4) == 0; // w-column
+            encodingKept &= rowsJ[3][3] == 0.0f && rowsJ[3][2] > 0.0f;
+
+            // The phase is really there (the test cannot pass on a no-op)...
+            if (std::max(std::fabs(jx), std::fabs(jy)) >= 0.05f) notVacuous &= maxRowDiff(rowsJ, rows0) > 4.0e-6f;
+
+            // ...and unjittering it gives the unjittered rows back.
+            float back[6][4]; std::memcpy(back, rowsJ, sizeof(back));
+            removable &= edvr::flatCameraUnjitterRows(back, jx, jy, sz.w, sz.h);
+            const float db = maxRowDiff(back, rows0);
+            if (db > worstBack) worstBack = db;
+            removable &= db <= 1.0e-6f;
+            for (int i = 0; i < 3; ++i) restKept &= std::memcmp(&back[i][2], &rowsJ[i][2], 8) == 0; // components 2 and 3 untouched
+            restKept &= std::memcmp(back[3], rowsJ[3], sizeof(back[3])) == 0 &&
+                        std::memcmp(back[4], rowsJ[4], sizeof(back[4])) == 0 &&
+                        std::memcmp(back[5], rowsJ[5], sizeof(back[5])) == 0;
+
+            // The classifier reads the same verdict from both.
+            for (const auto* rows : {&rowsJ, &back}) {
+                edvr::FlatProjectionOwnershipInput in{};
+                in.referenceBuffer = in.candidateBuffer = &idRef;
+                in.referenceCamera = in.candidateRows = reinterpret_cast<const unsigned char*>(*rows);
+                in.referenceBytes = in.candidateBytes = sizeof(rowsJ);
+                in.currentReference = in.currentCandidate = true;
+                in.layout = edvr::FlatProjectionOwnershipLayout::CanonicalVsB1;
+                classifierKept &= edvr::flatClassifyProjectionOwnership(in).kind ==
+                                  edvr::FlatProjectionOwnershipKind::CanonicalSceneCamera;
+            }
+        }
+    }
+    std::printf("      worst |game shift - legacy shift| = %.3g, worst |unjittered - original| = %.3g (row units)\n",
+                worstLegacy, worstBack);
+    check(legacyShift, "A8 the game's composed rows shift exactly like the legacy scope (x += ndcX*w, y += ndcY*w), 16 phases x 3 sizes");
+    check(encodingKept, "A8 rows[i][2], the w-column, the depth row and the view-direction row are bit-identical under jitter");
+    check(notVacuous, "A8 the phase is present in the rows (rows differ from the unjittered ones)");
+    check(removable, "A8 unjittering recovers the unjittered rows within 1e-6");
+    check(restKept, "A8 unjittering touches only the x/y components of rows 0..2");
+    check(classifierKept, "A8 the ownership classifier reads CanonicalSceneCamera from jittered and unjittered rows alike");
+
+    // Zero phase is a bit-exact no-op whatever the rows hold; bad input fails without touching them.
+    float junk[6][4];
+    for (int i = 0; i < 6; ++i) for (int j = 0; j < 4; ++j) junk[i][j] = static_cast<float>(i * 4 + j) * 0.37f - 2.0f;
+    junk[1][3] = std::numeric_limits<float>::quiet_NaN();
+    float junkCopy[6][4]; std::memcpy(junkCopy, junk, sizeof(junk));
+    check(edvr::flatCameraUnjitterRows(junk, 0.0f, 0.0f, 1280, 720) && std::memcmp(junk, junkCopy, sizeof(junk)) == 0,
+          "A8 zero phase leaves the rows bit-identical (key-off and legacy frames)");
+    check(!edvr::flatCameraUnjitterRows(junk, 0.25f, 0.25f, 1280, 720) && std::memcmp(junk, junkCopy, sizeof(junk)) == 0,
+          "A8 a non-finite row refuses and leaves the rows untouched");
+    float good[6][4]; { Cam c; makeCamera(c); derive(c); composeCameraRows(c, good); }
+    float goodCopy[6][4]; std::memcpy(goodCopy, good, sizeof(good));
+    check(!edvr::flatCameraUnjitterRows(good, 0.25f, 0.25f, 0, 720) && !edvr::flatCameraUnjitterRows(good, 0.25f, 0.25f, 1280, 0) &&
+          std::memcmp(good, goodCopy, sizeof(good)) == 0, "A8 a zero render extent refuses and leaves the rows untouched");
+
+    // The phase is measurable from one frame's rows (the shift is the x/y
+    // column's component along the view direction), and two frames' measured
+    // difference is the live check of the provenance claim.
+    {
+        const float w = 2560.0f, h = 1440.0f;
+        Cam base; makeCamera(base); derive(base);
+        double mx = 1, my = 1;
+        float rawRows[6][4]; composeCameraRows(base, rawRows);
+        check(edvr::flatCameraMeasureRowShift(rawRows, mx, my) && std::fabs(mx) <= 1.0e-6 && std::fabs(my) <= 1.0e-6,
+              "A8 unjittered rows measure zero shift (right and up are perpendicular to the view direction)");
+        float ax = 0, ay = 0, bx = 0, by = 0;
+        edvr::temporalJitter(5, &ax, &ay);
+        edvr::temporalJitter(6, &bx, &by);
+        Cam ca, cb; jitterCamera(base, ca, ax, ay, w, h); jitterCamera(base, cb, bx, by, w, h);
+        float ra[6][4], rb[6][4];
+        composeCameraRows(ca, ra); composeCameraRows(cb, rb);
+        edvr::FlatProjectionJitter claimA{};
+        edvr::flatProjectionJitter(ax, ay, 2560, 1440, claimA);
+        check(edvr::flatCameraMeasureRowShift(ra, mx, my) && std::fabs(mx - claimA.ndcX) <= 5.0e-7 && std::fabs(my - claimA.ndcY) <= 5.0e-7,
+              "A8 jittered rows measure the phase they carry (2*jx/W, -2*jy/H) within 5e-7");
+        const auto right = edvr::flatCameraCheckRowPair(rb, bx, by, ra, ax, ay, 2560, 1440);
+        check(right.verdict == edvr::FlatCameraPairVerdict::Consistent && right.maxError <= edvr::kFlatCameraPairTolerance,
+              "A8 pair, jittered rows, correct claim: Consistent");
+        const auto noClaim = edvr::flatCameraCheckRowPair(rb, 0.0f, 0.0f, ra, 0.0f, 0.0f, 2560, 1440);
+        check(noClaim.verdict == edvr::FlatCameraPairVerdict::Skipped,
+              "A8 pair with equal claimed phases has no power and is skipped");
+        const auto wrongA = edvr::flatCameraCheckRowPair(rb, bx, by, ra, 0.0f, 0.0f, 2560, 1440);
+        check(wrongA.verdict == edvr::FlatCameraPairVerdict::Inconsistent && wrongA.maxError > 10.0 * edvr::kFlatCameraPairTolerance,
+              "A8 negative control: jittered rows whose previous frame claims no phase are Inconsistent");
+        const auto wrongB = edvr::flatCameraCheckRowPair(rawRows, bx, by, rawRows, ax, ay, 2560, 1440);
+        check(wrongB.verdict == edvr::FlatCameraPairVerdict::Inconsistent,
+              "A8 negative control: unjittered rows that claim a phase are Inconsistent");
+
+        // The camera need not be still: a roll about the view direction, a turn, and a camera with an
+        // off-centre bound of its own all keep the measured difference equal to the claimed one.
+        auto rotateAxes = [&](Cam& c, float angle, bool roll) {
+            // axes rows: x = a[0..2], y = a[4..6], forward = a[8..10]
+            float x[3], y[3], f[3];
+            for (int k = 0; k < 3; ++k) { x[k] = camF(c, kCamAxes + 4 * k); y[k] = camF(c, kCamAxes + 16 + 4 * k); f[k] = camF(c, kCamAxes + 32 + 4 * k); }
+            const float ca2 = std::cos(angle), sa2 = std::sin(angle);
+            for (int k = 0; k < 3; ++k) {
+                if (roll) { camF(c, kCamAxes + 4 * k) = ca2 * x[k] + sa2 * y[k]; camF(c, kCamAxes + 16 + 4 * k) = -sa2 * x[k] + ca2 * y[k]; }
+                else      { camF(c, kCamAxes + 4 * k) = ca2 * x[k] + sa2 * f[k]; camF(c, kCamAxes + 32 + 4 * k) = -sa2 * x[k] + ca2 * f[k]; }
+            }
+        };
+        Cam rolled = base; rotateAxes(rolled, 0.2f, true); derive(rolled);
+        Cam turned = base; rotateAxes(turned, 0.03f, false); derive(turned);
+        // A camera with an off-centre bound of its own (its rows measure that offset on top of the phase).
+        Cam offc = base; camF(offc, kCamBoundX) = 0.013f; camF(offc, kCamBoundY) = -0.007f; camU(offc, kCamFlags) |= kFlagProj | kFlagVP; derive(offc);
+        Cam offcRolled = offc; rotateAxes(offcRolled, -0.15f, true); derive(offcRolled);
+        auto pairWorst = [&](std::initializer_list<Cam*> set, bool& allConsistent) {
+            double worst = 0;
+            for (Cam* prevCam : set)
+                for (Cam* curCam : set) {
+                    Cam pj, cj; jitterCamera(*prevCam, pj, ax, ay, w, h); jitterCamera(*curCam, cj, bx, by, w, h);
+                    float rp[6][4], rc[6][4]; composeCameraRows(pj, rp); composeCameraRows(cj, rc);
+                    const auto r = edvr::flatCameraCheckRowPair(rc, bx, by, rp, ax, ay, 2560, 1440);
+                    allConsistent &= r.verdict == edvr::FlatCameraPairVerdict::Consistent;
+                    worst = std::max(worst, static_cast<double>(r.maxError));
+                }
+            return worst;
+        };
+        bool centredOk = true, offOk = true;
+        const double centredWorst = pairWorst({&base, &rolled, &turned}, centredOk);
+        const double offWorst = pairWorst({&offc, &offcRolled}, offOk);
+        check(centredOk && offOk, "A8 pair stays Consistent across a roll and a turn, for a centred and an off-centre camera (no static camera needed)");
+        // The one thing the pair cannot survive is the camera's OWN off-centre bound changing between the
+        // frames: that reads as an inconsistency, so a camera-type switch can over-report (the reset frame is not checked).
+        Cam pj, cj; jitterCamera(base, pj, ax, ay, w, h); jitterCamera(offc, cj, bx, by, w, h);
+        float rp[6][4], rc[6][4]; composeCameraRows(pj, rp); composeCameraRows(cj, rc);
+        check(edvr::flatCameraCheckRowPair(rc, bx, by, rp, ax, ay, 2560, 1440).verdict == edvr::FlatCameraPairVerdict::Inconsistent,
+              "A8 documented limit: a change of the camera's own off-centre bound between the frames reads as Inconsistent");
+        std::printf("      pair check: error %.3g NDC (correct claim), %.3g (previous claims no phase), %.3g (raw rows claiming a phase), worst over motions %.3g (centred) %.3g (off-centre); tolerance %.3g\n",
+                    static_cast<double>(right.maxError), static_cast<double>(wrongA.maxError), static_cast<double>(wrongB.maxError),
+                    centredWorst, offWorst, edvr::kFlatCameraPairTolerance);
+    }
+}
+
 int runSelfTest() {
     testA1();
     testA2();
@@ -449,6 +657,7 @@ int runSelfTest() {
     testA5();
     testA6();
     testA7();
+    testA8();
     if (g_failures == 0) {
         std::printf("c2 derive: PASS\n");
         return 0;

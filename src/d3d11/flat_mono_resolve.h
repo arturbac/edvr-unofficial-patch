@@ -81,11 +81,20 @@ struct FlatMonoResolveFrame {
     // vendor's queried ranges; the resolver uses it only when the route
     // itself is not refused.
     uint32_t evalWidth = 0, evalHeight = 0;
-    float camera[6][4] = {}, previousCamera[6][4] = {}; // unjittered b1[270..275]
+    float camera[6][4] = {}, previousCamera[6][4] = {}; // b1[270..275], unjittered unless rowsJitter* below says otherwise
     // Actual raster phases in render pixels, positive right/down. Camera rows
     // and engine scene snapshots above remain raw and unjittered. Zero defaults
     // preserve the current runtime until projection coverage is qualified.
     float jitterX = 0, jitterY = 0, previousJitterX = 0, previousJitterY = 0;
+    // The raster phase the ROWS THEMSELVES carry, same unit and sign as the phases
+    // above. Nonzero only when the game derived b1[270..275] from a jittered
+    // frustum (the upstream camera injector, flat_camera_phase.h): rows 0..3 then
+    // hold x += ndcX*w, y += ndcY*w, and the resolver removes it from camera,
+    // previousCamera and the engine's scene snapshots before any reprojection.
+    // Zero (the default, and every path before the C3 wiring) leaves every row
+    // untouched and the shader's arithmetic bit-identical to before the field.
+    // On a reset the previous rows are the current rows, so previous is ignored.
+    float rowsJitterX = 0, rowsJitterY = 0, previousRowsJitterX = 0, previousRowsJitterY = 0;
     EngineVelocityViews engine{};
     uint64_t frame = 0;
     float deltaMs = 0;

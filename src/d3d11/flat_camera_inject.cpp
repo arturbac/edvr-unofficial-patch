@@ -137,11 +137,19 @@ struct InjectState {
     CodeHook hook;
     uint8_t* relay = nullptr;
     const char* failReason = "not attempted";
-    // The ownership machine for the main view-group (auxiliary cameras are
-    // named unsupported this increment, per group reporting).
-    FlatCameraOwnershipState owner{};
-    FlatCameraOwnershipDecision decision{};
-    bool decisionValid = false;
+    // The per-frame ownership protocol (flat_camera_phase.h): the ownership
+    // machine for the main view-group (auxiliary cameras are named unsupported
+    // this increment, per group reporting), this frame's decision, and the
+    // Legacy fallback hysteresis. Written and read on the Present thread; the
+    // detour reads the decision only after the gate has proved it is on that
+    // thread.
+    FlatCameraFrameCore core;
+    bool wanted = false;       // cached each frame: the key is on and the profile is flat
+    FlatCameraGate gate;       // the frame window the detour may inject in
+    FlatCameraInjectedSet injected; // cameras this session injected (flush candidates); owner thread only
+    FlatCameraCensus census;   // owner thread only; reset every window
+    std::atomic<bool> kind3Seen{false}; // a kind-3 camera reached the detour this frame
+    uintptr_t gameBase = 0;    // EliteDangerous64.exe, for the census's call-site offsets
     uint64_t frame = 0;
     // fix.temporal_aa_camera_trace, refreshed per frame. Per-call log
     // writes are gated behind it: the 2026-09-28 20:09 crash (a null-read
@@ -158,6 +166,23 @@ struct InjectState {
     std::atomic<uint64_t> kindRefusals{0};
     std::atomic<uint64_t> unsupportedCameras{0};
     std::atomic<uint64_t> warmingCalls{0};
+    // The wiring's counters (window, exchanged to zero by the tick). Every one
+    // is the count of calls or frames that took the named path, so a path that
+    // never runs prints zero on a line that is present -- the line's absence
+    // is what "the code never ran" looks like.
+    std::atomic<uint64_t> staleCalls{0};       // kind-3 calls with the frame window closed or lapsed
+    std::atomic<uint64_t> offThreadCalls{0};   // calls on a thread other than Present's
+    std::atomic<uint64_t> notUpstreamCalls{0}; // kind-3 calls while another route owns the frame
+    std::atomic<uint64_t> flushed{0};          // dirty bits raised on a camera injected earlier
+    std::atomic<uint64_t> flushFailed{0};      // the same, refused by memory protection
+    std::atomic<uint64_t> writeFailures{0};    // mutation or flush writes that failed (8 in a window stands the hook down)
+    std::atomic<uint64_t> closes{0};           // frames closed through flatCameraInjectClose
+    std::atomic<uint64_t> cleanCloses{0};      // ... of which the phase machine called clean
+    std::atomic<uint64_t> historyResets{0};    // owner switches that reset the runtime's history
+    uint64_t windowFrames = 0;                 // frames begun this window (census denominator)
+    uint32_t ownerNotes = 0;                   // owner-transition notes written (capped)
+    FlatCameraRoute lastRoute = FlatCameraRoute::Off;
+    bool lastFallback = false;
     std::atomic<uint64_t> rayCbLogged{0};
     // Last-call triage for the tick (no call-path I/O).
     std::atomic<uint64_t> lastCallNo{0};
@@ -318,6 +343,22 @@ void observeRayCb(uintptr_t ctx) {
         more[4], more[5], more[6], more[7], more[8], more[9], more[10], more[11]);
 }
 
+// The flush: raise the dirty bits (projection and cached VP) on a camera this
+// session injected and is not injecting now, so the game's own refresh
+// re-derives it from the pristine bound pair the restore left behind. One
+// SEH-guarded write of the flag word the injection itself writes; the body
+// clears the bits as it consumes them, so nothing is restored afterwards.
+// Counted either way, and a failed write counts toward the stand-down.
+void flushCamera(uintptr_t camera) noexcept {
+    uint32_t flags = 0;
+    if (sehReadU32(camera + kCamFlags, &flags) && sehWriteU32(camera + kCamFlags, flags | kFlagProj | kFlagVP)) {
+        g_inject.flushed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    g_inject.flushFailed.fetch_add(1, std::memory_order_relaxed);
+    g_inject.writeFailures.fetch_add(1, std::memory_order_relaxed);
+}
+
 // The pre-forward half, called by stubA with R0 (the game's return-
 // address slot) and the live argument registers. Everything the old
 // detour did before forward() -- admission, the phase, the dirty bits --
@@ -349,15 +390,67 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
         }
     }
 
-    // Admission for THIS call: the injector owns only a kind-3 camera whose
-    // frame ownership is Upstream. Anything else passes through untouched
-    // (and unsupported cameras are counted, not silently jittered).
+    // The thread first. The phase machine, the decision, the census and the
+    // set of injected cameras belong to the thread that runs Present; a call
+    // on any other thread touches none of them (counted, passed through).
+    const FlatCameraGateVerdict gate = g_inject.gate.check(GetCurrentThreadId(), GetTickCount64());
+    if (gate == FlatCameraGateVerdict::OffThread) {
+        g_inject.offThreadCalls.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    // Admission for THIS call (flat_camera_phase.h, flatCameraAdmit): the
+    // injector owns only a kind-3 camera, in an open frame window, on the owner
+    // thread, whose frame ownership is Upstream and whose phase is non-zero.
+    // Anything else passes through untouched and is counted by the reason
+    // (unsupported cameras are named, not silently jittered).
     uint32_t kind = 0;
     const bool readable = camera && sehReadU32(camera + kCamKind, &kind);
     g_inject.lastKind.store(readable ? kind : 0xffffffffu, std::memory_order_relaxed);
-    if (!readable || kind != 3) {
-        g_inject.kindRefusals.fetch_add(1, std::memory_order_relaxed);
-        if (trace) {
+    g_inject.census.noteKind(readable, kind);
+    {
+        // The call site, for the census: [R0] is the return address, and its
+        // offset from the module names which of the refresh's callers this is.
+        uint64_t ret = 0, rva = 0;
+        if (g_inject.gameBase && sehReadU64(r0, &ret) && ret > g_inject.gameBase) rva = ret - g_inject.gameBase;
+        g_inject.census.noteCaller(rva);
+    }
+    // The phase, in RENDER pixels from the validated resolve plan (R5).
+    float jx = 0, jy = 0;
+    uint32_t rw = 0, rh = 0, applied = 0;
+    FlatCameraAdmitInput admission;
+    admission.readable = readable;
+    admission.kind = kind;
+    admission.gate = gate;
+    if (readable && kind == 3) {
+        g_inject.kind3Seen.store(true, std::memory_order_relaxed);
+        flatRuntimePhaseState(&jx, &jy, &rw, &rh, &applied);
+        admission.upstreamOwns = g_inject.core.valid() && g_inject.core.route() == FlatCameraRoute::Upstream;
+        admission.phaseNonzero = rw && rh && (jx != 0.0f || jy != 0.0f);
+    }
+    const FlatCameraAdmit admit = flatCameraAdmit(admission);
+    switch (admit) {
+        case FlatCameraAdmit::Unsupported:
+            g_inject.unsupportedCameras.fetch_add(1, std::memory_order_relaxed);
+            [[fallthrough]];
+        case FlatCameraAdmit::OtherKind:
+        case FlatCameraAdmit::Unreadable:
+            g_inject.kindRefusals.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case FlatCameraAdmit::Warming: g_inject.warmingCalls.fetch_add(1, std::memory_order_relaxed); break;
+        case FlatCameraAdmit::NotUpstream: g_inject.notUpstreamCalls.fetch_add(1, std::memory_order_relaxed); break;
+        case FlatCameraAdmit::GateClosed: g_inject.staleCalls.fetch_add(1, std::memory_order_relaxed); break;
+        case FlatCameraAdmit::Inject:
+        case FlatCameraAdmit::OffThread: break;
+    }
+    // A camera this session injected, now not: its derived blocks still hold
+    // the last phase, and the game re-derives only what its dirty bits name.
+    // One write, once per such edge, never on a camera never injected.
+    if (flatCameraFlushDecision(g_inject.injected, camera, admit)) flushCamera(camera);
+    if (admit != FlatCameraAdmit::Inject) {
+        if (camera) g_inject.census.note(camera, kind, false);
+        if (trace && (admit == FlatCameraAdmit::Unsupported || admit == FlatCameraAdmit::OtherKind ||
+                      admit == FlatCameraAdmit::Unreadable)) {
             const uint64_t now = GetTickCount64();
             if (now - g_inject.lastKindRefusalLogMs > 30000) {
                 g_inject.lastKindRefusalLogMs = now;
@@ -368,19 +461,13 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
         }
         return;
     }
-    if (!g_inject.decisionValid || g_inject.decision.owner != FlatCameraOwner::Upstream) return;
-
-    // The phase, in RENDER pixels from the validated resolve plan (R5).
-    float jx = 0, jy = 0;
-    uint32_t rw = 0, rh = 0, applied = 0;
-    flatRuntimePhaseState(&jx, &jy, &rw, &rh, &applied);
-    if (!rw || !rh || (jx == 0.0f && jy == 0.0f)) {
-        g_inject.warmingCalls.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
 
     float entryX = 0, entryY = 0;
-    if (!sehReadF32(camera + kCamBoundX, &entryX) || !sehReadF32(camera + kCamBoundY, &entryY)) return;
+    if (!sehReadF32(camera + kCamBoundX, &entryX) || !sehReadF32(camera + kCamBoundY, &entryY)) {
+        g_inject.writeFailures.fetch_add(1, std::memory_order_relaxed);
+        g_inject.census.note(camera, kind, false);
+        return;
+    }
     // The D3D sign convention W1 proved: content right by jx needs
     // boundX += jx/R_w; content down by jy needs boundY += -jy/R_h.
     const float jitX = entryX + jx / static_cast<float>(rw);
@@ -393,6 +480,8 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     if (!wroteAll) { // roll back whatever landed; the body runs pristine
         if (wroteX) sehWriteF32(camera + kCamBoundX, entryX);
         if (wroteY) sehWriteF32(camera + kCamBoundY, entryY);
+        g_inject.writeFailures.fetch_add(1, std::memory_order_relaxed);
+        g_inject.census.note(camera, kind, false);
         return;
     }
     // Redirect the body's return to stubB. This must be the LAST step: if
@@ -402,6 +491,8 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
         sehWriteF32(camera + kCamBoundX, entryX);
         sehWriteF32(camera + kCamBoundY, entryY);
         if (haveFlags) sehWriteU32(camera + kCamFlags, flags);
+        g_inject.writeFailures.fetch_add(1, std::memory_order_relaxed);
+        g_inject.census.note(camera, kind, false);
         return;
     }
     g_refreshTls.realRet = realRet;
@@ -413,6 +504,10 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     g_refreshTls.flags = flags;
     g_refreshTls.haveFlags = haveFlags ? 1u : 0u;
     g_refreshTls.armed = 1u;
+    // Committed: this camera now carries a phase the game will keep after the
+    // bound pair is restored, so it is a flush candidate from here on.
+    g_inject.injected.noteInjected(camera);
+    g_inject.census.note(camera, kind, true);
     if (trace) {
         Log::get().note("flat camera inject: refresh call #%llu injecting phase=(%.5f, %.5f) at %ux%u over bound=(%.5f, %.5f); return %p redirected to stubB",
                         (unsigned long long)callNo, jx, jy, rw, rh, entryX, entryY,
@@ -462,33 +557,83 @@ bool flatCameraInjectTraceWanted() {
 }
 
 bool flatCameraInjectUpstreamOwns() {
-    return g_inject.decisionValid && g_inject.decision.owner == FlatCameraOwner::Upstream;
+    return g_inject.wanted && g_inject.core.valid() && g_inject.core.route() == FlatCameraRoute::Upstream;
 }
 
 bool flatCameraInjectBypassRefusal(const char* reason) {
     if (!flatCameraInjectUpstreamOwns() || !reason) return false;
-    // The observation-veto class only: an unknown recipe on a certified
-    // camera lineage. True violations keep refusing in flat_runtime.
-    return std::strcmp(reason, "unknown-scene-projection-recipe") == 0;
+    // The legacy-only classes: reasons that can only arise from the legacy
+    // route's own preparation and binding, which Upstream ownership suppresses
+    // -- an unknown recipe on a certified camera lineage, a private
+    // preparation the frame does not use, a binding it never makes. None of
+    // them may veto a route that does not consume them. True violations (a
+    // scene depth that changed, a render extent that moved, a foreign write)
+    // keep refusing in flat_runtime.
+    return std::strcmp(reason, "unknown-scene-projection-recipe") == 0 ||
+           std::strcmp(reason, "projection-preparation-refused") == 0 ||
+           std::strcmp(reason, "draw-binding-refused") == 0;
+}
+
+FlatCameraRoute flatCameraInjectRoute() {
+    return g_inject.wanted ? g_inject.core.route() : FlatCameraRoute::Off;
+}
+
+bool flatCameraInjectTakeHistoryReset() { return g_inject.wanted && g_inject.core.takeHistoryReset(); }
+
+// The window opens once the frame's phase is chosen; every Present edge closes
+// it, on the thread that runs Present.
+void flatCameraInjectArm() {
+    if (!g_inject.wanted || !g_inject.core.valid()) return;
+    g_inject.gate.arm(GetTickCount64());
+}
+void flatCameraInjectDisarm() { g_inject.gate.disarm(GetCurrentThreadId()); }
+
+void flatCameraInjectClose(bool phaseNonzero, bool applied, bool clean, bool sceneNamed) {
+    if (!g_inject.wanted) return;
+    const bool kind3 = g_inject.kind3Seen.exchange(false, std::memory_order_relaxed);
+    if (!g_inject.core.close(phaseNonzero, applied, clean, sceneNamed, kind3)) return;
+    g_inject.closes.fetch_add(1, std::memory_order_relaxed);
+    if (clean) g_inject.cleanCloses.fetch_add(1, std::memory_order_relaxed);
+}
+
+void flatCameraInjectReset() {
+    g_inject.core.reset();
+    g_inject.gate.disarm(g_inject.gate.ownerThread());
+    g_inject.census.reset();
+    g_inject.windowFrames = 0;
+    g_inject.lastRoute = FlatCameraRoute::Off;
+    g_inject.lastFallback = false;
+    // g_inject.injected is kept on purpose: the cameras this session injected
+    // still hold the last phase, and their first un-injected call flushes them.
 }
 
 void flatCameraInjectFrame(uint64_t frame) {
-    if (!runtimeFlatProfile()) { standDown("the flat profile is off"); return; }
-    if (!flatCameraInjectWanted()) {
+    if (!runtimeFlatProfile()) { standDown("the flat profile is off"); g_inject.wanted = false; g_inject.core.invalidate(); return; }
+    g_inject.wanted = flatCameraInjectWanted();
+    if (!g_inject.wanted) {
         standDown("fix.temporal_aa_camera is off");
-        g_inject.decisionValid = false;
+        g_inject.core.invalidate();
         return;
     }
     if (frame != g_inject.frame) {
         g_inject.frame = frame;
         g_inject.trace = flatCameraInjectTraceWanted();
-        flatCameraOwnerBegin(g_inject.owner);
-        FlatCameraGroupInput in;
-        in.upstreamCertified = true; // the detour re-verifies kind 3 per call
-        in.legacyEligible = flatRuntimeLegacyPlanExists();
-        in.legacyObserving = false;
-        g_inject.decision = flatCameraOwnerSelect(g_inject.owner, in);
-        g_inject.decisionValid = true;
+        // The upstream route is certified per call (the detour re-verifies kind
+        // 3); the fallback hysteresis feeds the policy's unsupported input.
+        const FlatCameraOwnershipDecision& decision = g_inject.core.begin(flatRuntimeLegacyPlanExists());
+        ++g_inject.windowFrames;
+        if (decision.historyReset) g_inject.historyResets.fetch_add(1, std::memory_order_relaxed);
+        const FlatCameraRoute route = g_inject.core.route();
+        const bool fallback = g_inject.core.fallback().active();
+        if ((route != g_inject.lastRoute || fallback != g_inject.lastFallback) && g_inject.ownerNotes < 24) {
+            ++g_inject.ownerNotes;
+            char text[256];
+            flatCameraFormatOwner(text, sizeof(text), frame, flatCameraRouteName(g_inject.lastRoute),
+                                  flatCameraRouteName(route), decision.reason, decision.historyReset, fallback);
+            Log::get().note("%s", text);
+        }
+        g_inject.lastRoute = route;
+        g_inject.lastFallback = fallback;
     }
     if (!g_inject.installed.load(std::memory_order_acquire)) {
         if (g_inject.relay) return; // a failed install is final for the session
@@ -501,6 +646,7 @@ void flatCameraInjectFrame(uint64_t frame) {
             return;
         }
         const uintptr_t base = reinterpret_cast<uintptr_t>(game);
+        g_inject.gameBase = base; // before the hook exists: the detour reads it
         if (!sehCheck(base + kRefreshRva, kRefreshPrologue, sizeof(kRefreshPrologue))) {
             g_inject.failReason = "refresh prologue mismatch at this build (not the Ghidra-verified shape)";
             Log::get().note("flat camera inject: %s; standing down", g_inject.failReason);
@@ -569,17 +715,47 @@ void flatCameraInjectFrame(uint64_t frame) {
     const uint64_t now = GetTickCount64();
     if (now - g_inject.lastLogMs >= 5000) {
         g_inject.lastLogMs = now;
-        Log::get().note("flat camera inject 5s: refresh-calls=%llu injected=%llu warming=%llu "
-                        "kind-refusals=%llu unsupported=%llu owner=%s history=%s trace=%s",
-            (unsigned long long)g_inject.refreshCalls.exchange(0),
-            (unsigned long long)g_inject.injectedCalls.exchange(0),
-            (unsigned long long)g_inject.warmingCalls.exchange(0),
-            (unsigned long long)g_inject.kindRefusals.exchange(0),
-            (unsigned long long)g_inject.unsupportedCameras.exchange(0),
-            g_inject.decisionValid && g_inject.decision.owner == FlatCameraOwner::Upstream
-                ? "upstream" : "legacy/none",
-            g_inject.owner.historyValid ? "valid" : "invalid",
-            g_inject.trace ? "on" : "off");
+        // The tick, its fields and their order in flat_camera_phase.h (the
+        // rig prints the same text). history= is the ownership machine's
+        // verdict on the last CLOSED frame; before the wiring nothing closed a
+        // frame and it read "invalid" forever, which is also what it reads if
+        // flatCameraInjectClose never runs.
+        FlatCameraTickFields tick;
+        tick.refreshCalls = g_inject.refreshCalls.exchange(0);
+        tick.injected = g_inject.injectedCalls.exchange(0);
+        tick.warming = g_inject.warmingCalls.exchange(0);
+        tick.kindRefusals = g_inject.kindRefusals.exchange(0);
+        tick.unsupported = g_inject.unsupportedCameras.exchange(0);
+        tick.owner = g_inject.core.valid() && g_inject.core.route() == FlatCameraRoute::Upstream
+            ? "upstream" : "legacy/none";
+        tick.history = g_inject.core.historyValid() ? "valid" : "invalid";
+        tick.trace = g_inject.trace ? "on" : "off";
+        tick.closes = g_inject.closes.exchange(0);
+        tick.cleanCloses = g_inject.cleanCloses.exchange(0);
+        tick.stale = g_inject.staleCalls.exchange(0);
+        tick.offThread = g_inject.offThreadCalls.exchange(0);
+        tick.notUpstream = g_inject.notUpstreamCalls.exchange(0);
+        tick.flushed = g_inject.flushed.exchange(0);
+        tick.flushFailed = g_inject.flushFailed.exchange(0);
+        tick.writeFailures = g_inject.writeFailures.exchange(0);
+        tick.historyResets = g_inject.historyResets.exchange(0);
+        tick.fallbackActive = g_inject.core.fallback().active();
+        tick.fallbacks = g_inject.core.fallback().engagements();
+        tick.setEvicted = g_inject.injected.evicted();
+        char text[640];
+        flatCameraFormatTick(text, sizeof(text), tick);
+        Log::get().note("%s", text);
+        // The census, every window while the hook is installed, INCLUDING an
+        // empty one (cameras=0): an absent line is what "never ran" looks like.
+        char census[1100];
+        flatCameraFormatCensus(census, sizeof(census), g_inject.census, g_inject.windowFrames, tick.injected);
+        Log::get().note("%s", census);
+        g_inject.census.reset();
+        g_inject.windowFrames = 0;
+        // Eight failed writes in one window (a camera the game unmapped under
+        // us, a page protection that changed): the hook stands down by name and
+        // stays inert for the session. The fallback then hands frames to Legacy.
+        if (tick.writeFailures >= 8) standDown("8 or more camera writes failed in one 5s window");
         // The call triage that used to ride the per-call notes, reported
         // here instead: no I/O on the game's refresh path (the 20:09
         // crash hypothesis).

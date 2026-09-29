@@ -6,6 +6,7 @@
 #include "flat_projection_ownership.h"
 #include "flat_camera_probe.h"
 #include "flat_camera_inject.h"
+#include "flat_camera_phase.h"
 #include "flat_live_phase.h"
 #include "flat_draw_capture.h"
 #include "flat_local_reject.h"
@@ -139,6 +140,17 @@ struct State {
     uint32_t phaseWidth = 0, phaseHeight = 0;
     uint64_t jitteredFrames = 0, jitterDraws = 0, jitterDispatches = 0, jitterRefusals = 0;
     const char* jitterReason = "warming";
+    // The camera injector's rows bookkeeping (docs/design-flat-camera-integration.md,
+    // the C3 wiring), one 5s window at a time. previousRows* is the phase the
+    // previous ACCEPTED frame's camera rows carried, kept beside s.previous.
+    float previousRowsX = 0, previousRowsY = 0;
+    uint32_t rowsMismatchLogged = 0;
+    bool frameHadPhase = false; // the frame began with a non-zero phase (a failed frame's is zeroed by close time)
+    struct RowsWindow {
+        uint64_t frames = 0, unjittered = 0, zeroPhase = 0;
+        uint64_t legacyAppliedUnderUpstream = 0, legacyPrepSkipped = 0;
+        FlatCameraPairStats pairs;
+    } rows;
     struct PhaseFailure {
         char reason[64]{};
         uint64_t calls=0, frames=0, treatedFrames=0, acceptedFrames=0;
@@ -1006,6 +1018,15 @@ const FlatProjectionBindingPlan* qualifyProjection(State& s, FlatProjectionRecip
     if(nonzeroPhase(s) && (width!=s.phaseWidth || height!=s.phaseHeight)) {
         failPhase(s,"render-extent-changed");return nullptr;
     }
+    // Under Upstream ownership nothing consumes the legacy preparation: the
+    // camera was jittered at the source, and the scope that would bind private
+    // rows is suppressed on both the draw and the dispatch path. Private
+    // buffers, shader-identity qualification and their refusals would only
+    // cost work and could veto a route that does not use them (the 08:58:57
+    // projection-preparation-refused observation entry under Upstream). The
+    // depth and extent checks above still run. The F10 audit runs the whole
+    // qualification regardless: it is evidence, not treatment.
+    if(!audit && flatCameraInjectUpstreamOwns()) { ++s.rows.legacyPrepSkipped; return nullptr; }
     FlatComputeInternalScope internal;
     // Recipe hashes come from the observer; verify actual shaders before
     // trusting them in a modded context. Binding happens in the command scope.
@@ -1251,6 +1272,7 @@ void flatRuntimeResize() {
     g_flatRuntimeLive.store(false, std::memory_order_release);
     nativeScale.store(false, std::memory_order_release);
     auto& s = state(); FlatComputeInternalScope guard; s.drawCapture.cancel("resize-or-stop"); flatMonoResolveReset();
+    flatCameraInjectReset(); // history and the decision do not survive a resize; injected cameras stay known for the flush
     finishPhaseCensusFrame(s);
     if(s.phaseCensusFrames || s.phaseFailuresUsed || s.phaseOverflowCalls)
         reportPhaseCensus(s,"resize-or-stop");
@@ -1329,6 +1351,11 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     if (!runtimeFlatProfile() || !swap || (flags & DXGI_PRESENT_TEST)) return;
     auto& s = state(); if (s.thread && !owner()) return;
     s.thread = GetCurrentThreadId();
+    // The Present edge: the frame window the camera injector may inject in
+    // closes here and reopens only once the next frame's phase is chosen, so a
+    // Present that returns early below (mode off, no device, no swap buffer)
+    // can never leave the previous frame's phase injecting.
+    flatCameraInjectDisarm();
     // The camera producer probe's per-Present cadence (config-gated inside).
     flatCameraProducerProbeFrame(frame);
     // Account for the completed frame before mode/resize changes or the next
@@ -1376,6 +1403,13 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     flatMonoResolvePollPixels(s.context.Get(),frame);
     if(s.phase.applied)++s.jitteredFrames;
     s.phase.finish(s.temporalAccepted && SUCCEEDED(hr),s.frameCoverage && !s.prefix.uncertain && !foreignWork.load(std::memory_order_acquire));
+    // The camera injector closes the frame that just ended with the phase
+    // machine's own verdict on it: previousAcceptedValid is exactly finish's
+    // "clean" (backend acceptance, complete coverage, no phase failure). The
+    // phase is the one the frame BEGAN with -- a failed frame's phase has been
+    // zeroed by now, and a frame that failed because nothing landed is the very
+    // frame the fallback must count.
+    flatCameraInjectClose(s.frameHadPhase,s.phase.applied!=0,s.phase.previousAcceptedValid,s.namedDepth!=nullptr);
     const bool wanted=Config::get().getBool("experimental.temporal_aa_jitter",true);
     if(wanted!=s.jitterWanted) { s.phase.resetHistory();reset(); }
     s.jitterWanted=wanted;
@@ -1497,8 +1531,18 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.phaseDepth=static_cast<ID3D11Resource*>(const_cast<void*>(s.previous.depth));
         s.phaseHdr=static_cast<ID3D11Resource*>(const_cast<void*>(s.previous.hdr));
     }
-    s.phase.beginFrame((wanted && !s.observing && s.projection!=nullptr) || flatCameraInjectWanted(),compatible,s.phaseWidth,s.phaseHeight);
+    // The camera injector selects this frame's owner BEFORE the phase machine
+    // begins: the route decides whether a phase is generated at all. Upstream
+    // needs no legacy plan but still yields to observation (a frame the resolve
+    // will skip must not be jittered at the source); Legacy and Off are exactly
+    // the expression this line had before the wiring. A switch of history
+    // identity between the two routes resets history once, here.
     flatCameraInjectFrame(frame + 1);
+    if(flatCameraInjectTakeHistoryReset()) {s.phase.resetHistory();reset();}
+    s.phase.beginFrame(flatCameraPhaseEnabled(flatCameraInjectRoute(),wanted,s.observing,s.projection!=nullptr),
+        compatible,s.phaseWidth,s.phaseHeight);
+    s.frameHadPhase=nonzeroPhase(s);
+    flatCameraInjectArm(); // the phase is chosen: the injector's frame window opens
     s.frameCoverage=true;s.temporalAccepted=false;
     s.jitterReason=nonzeroPhase(s)?"live":"warming";
     if(s.projection)s.projection->enableColdReadback(!nonzeroPhase(s));
@@ -1534,6 +1578,20 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             s.phase.currentX,s.phase.currentY,s.phase.previousX,s.phase.previousY,s.phase.warmFrames,
             (unsigned long long)s.jitteredFrames,(unsigned long long)s.jitterDraws,(unsigned long long)s.jitterDispatches,
             (unsigned long long)s.jitterRefusals,s.jitterReason,s.phase.previousAcceptedValid?1u:0u);
+        // The camera injector's row bookkeeping, every window while the key is on
+        // (zeros included: an absent line is what "the wiring never ran" looks
+        // like). The tripwire is cumulative on purpose -- once it is nonzero it stays.
+        if(flatCameraInjectRoute()!=FlatCameraRoute::Off) {
+            FlatCameraRowsFields rowsFields;
+            rowsFields.frames=s.rows.frames;rowsFields.unjitteredResolves=s.rows.unjittered;
+            rowsFields.zeroPhaseResolves=s.rows.zeroPhase;rowsFields.pairs=s.rows.pairs;
+            rowsFields.legacyAppliedUnderUpstream=s.rows.legacyAppliedUnderUpstream;
+            rowsFields.legacyPrepSkipped=s.rows.legacyPrepSkipped;
+            char rowsText[420];flatCameraFormatRows(rowsText,sizeof(rowsText),rowsFields);
+            Log::get().note("%s",rowsText);
+            const uint64_t tripwire=s.rows.legacyAppliedUnderUpstream;
+            s.rows=State::RowsWindow{};s.rows.legacyAppliedUnderUpstream=tripwire;
+        }
         if(s.spatialFallbacks || s.spatialFallbackFailures)
             Log::get().note("flat runtime spatial fallback cumulative: recovered=%llu failed=%llu history=invalid-on-recovery",
                 (unsigned long long)s.spatialFallbacks,(unsigned long long)s.spatialFallbackFailures);
@@ -1642,6 +1700,8 @@ FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
                     if(projection->active()) {s.phase.noteApplied();++s.jitterDispatches;}
                     else failPhase(s,"compute-binding-refused");
                 }
+                // Tripwire, structurally unreachable: a legacy application under Upstream.
+                if (projection && projection->active() && flatCameraInjectUpstreamOwns()) ++s.rows.legacyAppliedUnderUpstream;
             }
         }
     }
@@ -1851,6 +1911,8 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         if(projection->active()) {s.phase.noteApplied();++s.jitterDraws;}
         else refuseDraw(s,"draw-binding-refused");
     }
+    // Tripwire, structurally unreachable: a legacy application under Upstream.
+    if(projection && projection->active() && flatCameraInjectUpstreamOwns())++s.rows.legacyAppliedUnderUpstream;
     if (!copy) return;
     // Local refusal's observation: no resolve until a qualified, completely
     // covered frame requalifies the contract; the contract observation above
@@ -2011,6 +2073,17 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     f.previousJitterX=f.reset?f.jitterX:s.phase.previousX;
     f.previousJitterY=f.reset?f.jitterY:s.phase.previousY;
     std::memcpy(f.previousCamera, f.reset ? selected.camera : s.previous.camera, sizeof(f.previousCamera));
+    // The phase the captured rows carry. Only the injector writes one into the
+    // game's own upload, so only an Upstream frame in which an injection landed
+    // has any; the resolver removes it from both frames' rows and from the
+    // engine's scene snapshots before any reprojection (flat_camera_phase.h).
+    // Every other route passes zero, and the shader is then bit-identical to
+    // what it was before the field existed.
+    const FlatCameraRoute cameraRoute=flatCameraInjectRoute();
+    const FlatCameraRowsPhase rowsNow=flatCameraRowsPhase(cameraRoute,s.phase.applied,s.phase.currentX,s.phase.currentY);
+    f.rowsJitterX=rowsNow.x;f.rowsJitterY=rowsNow.y;
+    f.previousRowsJitterX=f.reset?rowsNow.x:s.previousRowsX;
+    f.previousRowsJitterY=f.reset?rowsNow.y:s.previousRowsY;
     const auto now = GetTickCount64(); f.deltaMs = s.lastMs ? static_cast<float>(now - s.lastMs) : 16.667f;
     if(s.phase.needsSpatialFallback()) {s.reason="incomplete-jitter-frame";recover(s.reason);refuse(s);return;}
     if (!engineVelocitySourceViews(static_cast<ID3D11Texture2D*>(const_cast<void*>(selected.depth)), &f.engine)) {
@@ -2018,6 +2091,29 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     }
     Ptr<ID3D11ShaderResourceView> engineSlots, enginePool, outputView; Ptr<ID3D11Buffer> nowCb, prevCb;
     engineSlots.Attach(f.engine.slots); enginePool.Attach(f.engine.pool); nowCb.Attach(f.engine.sceneNow); prevCb.Attach(f.engine.scenePrev);
+    if (cameraRoute != FlatCameraRoute::Off) {
+        ++s.rows.frames;
+        if (rowsNow.x != 0.0f || rowsNow.y != 0.0f) ++s.rows.unjittered; else ++s.rows.zeroPhase;
+        // The live proof of the row provenance: two consecutive frames' rows differ
+        // by exactly the difference of the phases they are CLAIMED to carry,
+        // whatever the camera did in between (c2_derive_test A8). A claim that
+        // the rows carry a phase they do not (an injection that missed the camera
+        // the scene reads, say) leaves the claimed difference behind. Counted,
+        // and the first few named; the frame is still resolved -- this is the
+        // evidence, not a gate.
+        if (!f.reset) {
+            const FlatCameraPairResult pair = flatCameraCheckRowPair(f.camera, f.rowsJitterX, f.rowsJitterY,
+                f.previousCamera, f.previousRowsJitterX, f.previousRowsJitterY, f.renderWidth, f.renderHeight);
+            s.rows.pairs.note(pair);
+            if (pair.verdict == FlatCameraPairVerdict::Inconsistent && s.rowsMismatchLogged < 8) {
+                ++s.rowsMismatchLogged;
+                char text[320];
+                flatCameraFormatRowsMismatch(text, sizeof(text), s.prefix.frame, f.rowsJitterX, f.rowsJitterY,
+                    f.previousRowsJitterX, f.previousRowsJitterY, pair.maxError);
+                Log::get().note("%s", text);
+            }
+        }
+    }
     if (!flatMonoResolve(s.device.Get(), ctx, f, &outputView, &s.reason)) {
         const char* temporalReason=s.reason;
         const char* fallbackReason=nullptr;
@@ -2038,6 +2134,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     s.reason = nonzeroPhase(s)?"treated-jittered":"treated-zero-jitter";
     ID3D11ShaderResourceView* replacement = outputView.Get(); ctx->PSSetShaderResources(0, 1, &replacement); replaced = true;
     s.previous = selected; s.previousColor = actualColor; s.havePrevious = s.treated = true; s.temporalAccepted=true;s.lastMs = now; ++s.accepted;
+    s.previousRowsX = f.rowsJitterX; s.previousRowsY = f.rowsJitterY; // the phase the rows now stored in s.previous carry
     s.drawCapture.qualify(s.prefix.frame,selected.depth,selected.hdr,selected.renderWidth,selected.renderHeight);
     s.resetMissingWindow += resetMissing; s.resetGapWindow += resetGap; s.resetDepthWindow += resetDepth;
     s.resetColorWindow += resetColor; s.resetExtentWindow += resetExtent;
