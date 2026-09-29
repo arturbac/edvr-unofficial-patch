@@ -56,13 +56,54 @@ extern "C" HRESULT WINAPI edvrAcquireNativeTiming(const EdvrNativeTimingRequest*
   return S_OK;
 }
 
+// ABI provider only: the callback itself is production NativeRenderBinding.
+// Keep the WARP graphics and registration alive until binding.release().
+namespace edvr::openxr::test::binding_fixture {
+struct State {
+  ID3D11Device* device=nullptr;ID3D11DeviceContext* context=nullptr;
+  EdvrRenderBoundaryRequest request{};
+  std::atomic<unsigned> active{0};std::atomic<bool> admitted{false};
+} inline state;
+inline HRESULT WINAPI close(void*) {
+  state.admitted.store(false);return state.active.load()?E_PENDING:S_OK;
+}
+inline HRESULT WINAPI release(void*) {
+  if(state.active.load())return E_PENDING;
+  state.admitted.store(false);state.request={};return S_OK;
+}
+inline HRESULT present() {
+  if(!state.admitted.load())return S_OK;
+  state.active.fetch_add(1);
+  const auto result=state.request.callback(state.request.user,state.device,state.context);
+  state.active.fetch_sub(1);return result;
+}
+}
+#pragma comment(linker, "/export:edvrAcquireNativeGraphics")
+#pragma comment(linker, "/export:edvrAcquireGraphicsBridge")
+#pragma comment(linker, "/export:edvrAcquireRenderBoundary")
+extern "C" HRESULT WINAPI edvrAcquireNativeGraphics(const EdvrNativeGraphicsRequest*,EdvrNativeGraphicsTable* table) {
+  auto& s=edvr::openxr::test::binding_fixture::state;
+  if(!table||!s.device||!s.context)return E_NOINTERFACE;
+  s.device->AddRef();s.context->AddRef();
+  *table={sizeof(*table),EDVR_NATIVE_GRAPHICS_VERSION_1,s.device,s.context};return S_OK;
+}
+extern "C" HRESULT WINAPI edvrAcquireGraphicsBridge(const EdvrGraphicsBridgeRequest*,EdvrGraphicsBridgeTable*) {
+  return E_NOTIMPL; // NativeRenderBinding verifies the export but does not acquire it.
+}
+extern "C" HRESULT WINAPI edvrAcquireRenderBoundary(const EdvrRenderBoundaryRequest* request,EdvrRenderBoundaryTable* table) {
+  using namespace edvr::openxr::test::binding_fixture;
+  if(!request||!table||state.request.callback)return E_PENDING;
+  state.request=*request;state.admitted.store(true);
+  *table={sizeof(*table),EDVR_RENDER_BOUNDARY_VERSION_1,&state,close,release};return S_OK;
+}
+
 namespace edvr::openxr::test {
 namespace overlap_handoff_fixture {
 struct EndBarrier {
   std::mutex mutex;std::condition_variable cv;
   bool blocked=false,entered=false,released=false;
-  unsigned calls=0;
-  void arm() {std::lock_guard<std::mutex> lock(mutex);blocked=true;entered=released=false;}
+  unsigned calls=0;XrResult result=XR_SUCCESS;
+  void arm(XrResult outcome=XR_SUCCESS) {std::lock_guard<std::mutex> lock(mutex);blocked=true;entered=released=false;result=outcome;}
   bool awaitEntry() {
     std::unique_lock<std::mutex> lock(mutex);
     return cv.wait_for(lock,std::chrono::seconds(2),[&]{return entered;});
@@ -73,7 +114,7 @@ inline XrResult XRAPI_PTR endFrame(XrSession,const XrFrameEndInfo*) {
   if(!active)return XR_SUCCESS;
   std::unique_lock<std::mutex> lock(active->mutex);++active->calls;
   if(active->blocked){active->entered=true;active->cv.notify_all();active->cv.wait(lock,[&]{return active->released;});}
-  return XR_SUCCESS;
+  return active->result;
 }
 }
 // launch_fixture::Fixture builds its NativeRuntimeHost as a direct member, on
@@ -206,6 +247,21 @@ template<class Check> void runFrameEndOverlapCases(Check check) {
     return true;
   };
 
+  // Run the actual registered NativeRenderBinding callback, not a copy of
+  // its frame-work policy. The ABI fixture above only delivers registration.
+  binding_fixture::state.device=producer.Get();binding_fixture::state.context=producerContext.Get();
+  wchar_t providerPath[MAX_PATH]{};GetModuleFileNameW(nullptr,providerPath,MAX_PATH);
+  NativeRenderBinding presentBinding;
+  unsigned presentFallbacks=0;
+  check(presentBinding.acquire(providerPath,[&]{
+    if(h.consumeOverlappedPresent())return;
+    ++presentFallbacks;
+    if(!f.route.invoke([&]{h.loadingBoundary();}))throw std::runtime_error("fixture loading boundary unavailable");
+  })==S_OK,"actual NativeRenderBinding registers its frame callback");
+  f.route.present=&presentBinding.work();
+  check(binding_fixture::present()==S_OK&&presentBinding.waitForRender()&&presentFallbacks==1,
+    "no-Submit Present retains synchronous loading notification");
+
   // --- Pair 1: eligible for the overlap (separate device, runtime pacing,
   // frameEndOverlapEnabled) -- the second Submit must defer.
   bool firstWaitOk=false;
@@ -255,6 +311,7 @@ template<class Check> void runFrameEndOverlapCases(Check check) {
   check(h.submitEye(h.compositorGeneration,vr::Eye_Right,&rightTexture,nullptr,vr::Submit_Default)==vr::VRCompositorError_None,
     "frame_end_overlap sync pair second eye finishes inline");
   check(h.frameEndOverlapCount==1&&h.frameEndSyncCount==1,"frame_end_overlap second pair took the synchronous path");
+  check(!h.consumeOverlappedPresent(),"overlap-off pair retains synchronous Present loading work");
   unsigned publishCount=0;for(const auto& e:timing_fixture::state.log)if(e.tag=="publishCpu")++publishCount;
   check(publishCount==1&&!timing_fixture::state.log.empty()&&timing_fixture::state.log[0].tag!="publishCpu",
     "frame_end_overlap (d): the synchronous path still publishes exactly once, and not as its first call -- "
@@ -287,6 +344,20 @@ template<class Check> void runFrameEndOverlapCases(Check check) {
   bool overlapped=false;
   {std::unique_lock<std::mutex> lock(returnedMutex);overlapped=returnedCv.wait_for(lock,std::chrono::seconds(2),[&]{return returned;});}
   check(overlapped&&cpuWork==32640,"PostPresentHandoff and caller CPU work finish while xrEndFrame is blocked");
+  std::mutex presentReturnedMutex;std::condition_variable presentReturnedCv;bool presentReturned=false,returnedWhileHeld=false;
+  std::thread releaseStuckPresent([&]{
+    std::unique_lock<std::mutex> lock(presentReturnedMutex);
+    returnedWhileHeld=presentReturnedCv.wait_for(lock,std::chrono::seconds(2),[&]{return presentReturned;});
+    if(!returnedWhileHeld)f.endBarrier.release(); // bounded failure instead of a hung rig
+  });
+  const auto fallbackBefore=presentFallbacks;
+  const auto callbackResult=binding_fixture::present();
+  unsigned presentCpuWork=0;for(unsigned i=0;i<256;++i)presentCpuWork+=i;
+  {std::lock_guard<std::mutex> lock(presentReturnedMutex);presentReturned=true;presentReturnedCv.notify_all();}
+  releaseStuckPresent.join();
+  check(callbackResult==S_OK&&returnedWhileHeld&&presentCpuWork==32640&&presentFallbacks==fallbackBefore,
+    "actual Present binding callback and caller CPU work return before blocked xrEndFrame");
+  check(!h.consumeOverlappedPresent(),"the Present bypass token is one-use and independent of handoff");
   bool nextWaitOk=false,finishBeforeWait=false;
   std::thread nextWait([&]{
     h.clearOverlapHandoff();
@@ -328,6 +399,31 @@ template<class Check> void runFrameEndOverlapCases(Check check) {
   check(laterAdmissionObserved&&f.owner.invoke([]{}),"later caller admission precedes delayed owner publication");
   check(h.handoff(h.compositorGeneration)&&h.overlapHandoffAccepted.load()==1,
     "invalidated Submit epoch cannot resurrect asynchronous handoff admission");
+  check(!h.consumeOverlappedPresent(),"delayed publication cannot resurrect a stale Present token");
+
+  // Loading-policy changes must invalidate a real pair's token before their
+  // public calls can enqueue. Exercise the production callbacks afterwards.
+  auto policyPair=[&]{
+    bool opened=false;
+    if(!f.owner.invoke([&]{opened=openFrame();})||!opened)return false;
+    h.frameWithheld=true;
+    return h.submitEye(h.compositorGeneration,vr::Eye_Left,&leftTexture,nullptr,vr::Submit_Default)==vr::VRCompositorError_None&&
+      h.submitEye(h.compositorGeneration,vr::Eye_Right,&rightTexture,nullptr,vr::Submit_Default)==vr::VRCompositorError_None&&f.owner.invoke([]{});
+  };
+  check(policyPair(),"clearSubmitted transition starts from a real deferred pair");
+  const auto emptyBefore=h.loadingEmpty;const auto policyFallbackBefore=presentFallbacks;
+  h.clearSubmitted(h.compositorGeneration);
+  check(binding_fixture::present()==S_OK&&presentFallbacks==policyFallbackBefore+1&&h.loadingEmpty==emptyBefore+1,
+    "clearSubmitted invalidation preserves actual Present's synchronous empty loading frame");
+  check(policyPair()&&h.clearSkybox(h.compositorGeneration),"clearSkybox follows a real deferred pair");
+  const auto clearFallbackBefore=presentFallbacks;
+  check(binding_fixture::present()==S_OK&&presentFallbacks==clearFallbackBefore+1,
+    "clearSkybox policy change preserves synchronous Present loading notification");
+  check(policyPair()&&h.setSkybox(h.compositorGeneration+1,nullptr,0)==vr::VRCompositorError_InvalidTexture,
+    "invalid-generation skybox request cannot preserve a prior pair token");
+  const auto setFallbackBefore=presentFallbacks;
+  check(binding_fixture::present()==S_OK&&presentFallbacks==setFallbackBefore+1,
+    "setSkybox caller invalidates admission before owner validation");
 
   // Borrowed-device capture and turbo each execute a real pair, so their
   // unchanged synchronous path is tested rather than just its config flag.
@@ -341,6 +437,7 @@ template<class Check> void runFrameEndOverlapCases(Check check) {
     "borrowed-device pair stays synchronous");
   check(h.handoff(h.compositorGeneration)&&h.overlapHandoffAccepted.load()==1,
     "borrowed-device handoff does not use async admission");
+  check(!h.consumeOverlappedPresent(),"borrowed-device pair has no Present bypass");
   h.startupOptions.separateDevice=true;
   check(f.route.invoke([&]{h.captured.shutdown();check(h.captured.initializeShared(producer.Get(),consumer.Get(),&h.graphicsCalls)==S_OK,
     "handoff fixture restores separate capture");}),"separate capture restored on owner");
@@ -352,6 +449,7 @@ template<class Check> void runFrameEndOverlapCases(Check check) {
     h.submitEye(h.compositorGeneration,vr::Eye_Right,&rightTexture,nullptr,vr::Submit_Default)==vr::VRCompositorError_None,
     "turbo pair stays synchronous");
   check(h.handoff(h.compositorGeneration)&&h.overlapHandoffAccepted.load()==1,"turbo handoff remains synchronous");
+  check(!h.consumeOverlappedPresent(),"turbo pair has no Present bypass");
   check(f.owner.invoke([&]{h.boundary.drain();h.pacer.bind(nullptr,XR_NULL_HANDLE);}),"turbo pacer drained and unbound");
   requestedPacing=FramePacing::Runtime;
 
@@ -392,6 +490,9 @@ template<class Check> void runFrameEndOverlapCases(Check check) {
   check(stopped&&shutdownFinished,"owner shutdown finishes the active pair before releasing host resources");
   check(h.overlapHandoffAccepted.load()==2&&h.overlapHandoffCompleted.load()==1&&
     h.overlapHandoffInvalid.load()==0&&!h.handoff(h.compositorGeneration),"stopped owner cannot accept another handoff");
+  check(!h.consumeOverlappedPresent(),"shutdown clears an unconsumed Present token");
+  check(presentBinding.close()==S_OK&&presentBinding.release()==S_OK,"actual Present binding retires after owner shutdown");
+  f.route.present=nullptr;binding_fixture::state.device=nullptr;binding_fixture::state.context=nullptr;
   h.fss.close();h.temporal.close();h.sharpen.close();h.menu.close();h.timing.close();
 
   // Also cancel the deferred finish BEFORE it starts. Hold the active second
@@ -447,6 +548,35 @@ template<class Check> void runFrameEndOverlapCases(Check check) {
   check(cancelledStopped&&sawPendingFallback&&completedFallback,
     "shutdown finalizer completes the cancelled queued frame finish before releasing resources");
   cancelledHost.timing.close();
+
+  // A failed deferred finish retires a still-unconsumed Present token through
+  // its existing fatal publication, so it cannot authorize a later bypass.
+  OwnerBuiltFixture failed;
+  check(failed.route.bind()&&failed.owner.start()&&failed.owner.invoke([&]{failed.build();}),
+    "failed-finish actual host constructed");
+  auto& failedHost=*failed.hostPtr;
+  failedHost.startupOptions.separateDevice=true;failedHost.externalDevice=producer.Get();
+  check(failed.route.invoke([&]{check(failedHost.captured.initializeShared(producer.Get(),consumer.Get(),&failedHost.graphicsCalls)==S_OK,
+    "failed-finish shared producer capture initialized");}),"failed-finish capture rendezvous");
+  check(failed.owner.invoke([&]{
+    check(failedHost.boundary.waitAndBegin()==XR_SUCCESS,"failed-finish frame admitted");
+    failedHost.boundary.setGeometryReady(true);failedHost.frameWithheld=true;
+    failedHost.frameSpace=failedHost.seated.space();failedHost.frameGeometryAvailable=true;
+  }),"failed-finish frame owner invocation");
+  failed.endBarrier.arm(XR_ERROR_RUNTIME_FAILURE);
+  check(failedHost.submitEye(failedHost.compositorGeneration,vr::Eye_Left,&leftTexture,nullptr,vr::Submit_Default)==vr::VRCompositorError_None&&
+    !failedHost.consumeOverlappedPresent(),"partial pair cannot bypass Present loading work");
+  check(failedHost.submitEye(failedHost.compositorGeneration,vr::Eye_Right,&rightTexture,nullptr,vr::Submit_Default)==vr::VRCompositorError_None&&
+    failed.endBarrier.awaitEntry(),"failed finish is deferred through actual captured stereo pair");
+  bool failureTokenPublished=false;
+  {std::lock_guard<std::mutex> lock(failedHost.overlapHandoffMutex);
+    failureTokenPublished=failedHost.overlapPresentAvailable&&failedHost.overlapPresentEpoch==failedHost.overlapHandoffEpoch;}
+  check(failureTokenPublished,"valid deferred pair publishes an unconsumed token before its XR result");
+  failed.endBarrier.release();
+  check(failed.owner.invoke([]{})&&failedHost.serviceFailed&&!failedHost.consumeOverlappedPresent(),
+    "deferred XR failure publishes fatal and retires Present admission");
+  check(failed.owner.stop([&]{check(failedHost.captured.shutdownShared()==S_OK,"failed-finish shared capture retires on owner");}),
+    "failed-finish service joins before host fixture destruction");
   treatment_fixture::state={};timing_fixture::state.log.clear();
 }
 } // namespace edvr::openxr::test

@@ -306,11 +306,24 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   // the owner-only pendingFrameEnd fields is inspected by that caller.
   std::mutex overlapHandoffMutex;
   uint64_t overlapHandoffGeneration=0,overlapHandoffEpoch=0;
+  uint64_t overlapPresentEpoch=0;
+  bool overlapPresentAvailable=false;
+  std::atomic<uint64_t> overlapPresentBypassed{0};
   std::atomic<uint64_t> overlapHandoffAccepted{0},overlapHandoffCompleted{0},
     overlapHandoffRejected{0},overlapHandoffInvalid{0},overlapHandoffCancelledOrFailed{0};
   uint64_t clearOverlapHandoff() {
     std::lock_guard<std::mutex> lock(overlapHandoffMutex);overlapHandoffGeneration=0;
+    overlapPresentAvailable=false;
     return ++overlapHandoffEpoch;
+  }
+  // This pair's finish already owns sceneSubmitted (or fatal failure). Its
+  // first Present need not enqueue a redundant loading check behind that
+  // finish. Independent of handoff consumption; read only published values.
+  bool consumeOverlappedPresent() {
+    std::lock_guard<std::mutex> lock(overlapHandoffMutex);
+    if(!overlapPresentAvailable||overlapPresentEpoch!=overlapHandoffEpoch)return false;
+    overlapPresentAvailable=false;
+    overlapPresentBypassed.fetch_add(1,std::memory_order_relaxed);return true;
   }
   RuntimeGate gate; uint64_t runtimeGeneration=0;
   // frameViews is the projection the XR layer advertises: the located one,
@@ -1274,7 +1287,10 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(deferred){
       pendingFrameEndFinish=true;pendingFrameEndEye=eye;pendingFrameEndSequence=timingSequence;++frameEndOverlapCount;
       std::lock_guard<std::mutex> lock(overlapHandoffMutex);
-      if(overlapHandoffEpoch==admission)overlapHandoffGeneration=generation;
+      if(overlapHandoffEpoch==admission) {
+        overlapHandoffGeneration=generation;
+        overlapPresentEpoch=admission;overlapPresentAvailable=true;
+      }
     }
     const bool pairSync=!deferred&&published==vr::VRCompositorError_None&&pairReady;
     if(pairSync)++frameEndSyncCount;
@@ -1454,6 +1470,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     }
   }
   bool clearSubmitted(uint64_t generation) override {
+    clearOverlapHandoff();
     if(!service.isOwner()) {bool result=false;return service.invoke([&]{result=clearSubmitted(generation);})&&result;}
     if(GetCurrentThreadId()!=ownerThread)return false;
     auto operation=gate.tryEnter(runtimeGeneration);
@@ -1469,9 +1486,11 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   }
   vr::EVRCompositorError setSkybox(uint64_t generation,const vr::Texture_t* textures,uint32_t count) override {
     if(!service.isOwner()) {
+      clearOverlapHandoff();
       auto result=vr::VRCompositorError_InvalidTexture;
       return renderRoute.invoke([&]{result=setSkybox(generation,textures,count);})?result:vr::VRCompositorError_InvalidTexture;
     }
+    clearOverlapHandoff();
     auto operation=gate.tryEnter(runtimeGeneration);
     if(!operation||generation!=compositorGeneration||!poses.read().connected||!state.running()||state.terminal()||serviceStopped||serviceFailed)
       return vr::VRCompositorError_InvalidTexture;
@@ -1482,6 +1501,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     return result;
   }
   bool clearSkybox(uint64_t generation) override {
+    clearOverlapHandoff();
     if(!service.isOwner()){bool result=false;return service.invoke([&]{result=clearSkybox(generation);})&&result;}
     auto operation=gate.tryEnter(runtimeGeneration);
     if(!operation||generation!=compositorGeneration||!poses.read().connected)return false;
@@ -2150,6 +2170,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   ~NativeRuntimeHost() {close();}
   void invalidateEyeTreatments() { temporal.invalidate(); sharpen.invalidate(); fss.invalidate(); deferredEye={}; }
   void publishFatalFailure(XrResult error,const char* operation) noexcept {
+    clearOverlapHandoff();
     if(serviceFailed)return;
     serviceFailed=true;
     serviceStopped=false;
@@ -2180,6 +2201,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       (unsigned long long)geometryGeneration,int(r));
   }
   bool prepareSessionRestart() {
+    clearOverlapHandoff();
     if(GetCurrentThreadId()!=ownerThread||state.running()||state.terminal()||!session)return false;
     if(lastPublishedFrameSequence==(std::numeric_limits<uint64_t>::max)())return false;
     frameSequenceOffset=lastPublishedFrameSequence;
@@ -2240,6 +2262,8 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       (unsigned long long)overlapHandoffAccepted.load(),(unsigned long long)overlapHandoffCompleted.load(),
       (unsigned long long)overlapHandoffRejected.load(),(unsigned long long)overlapHandoffInvalid.load(),
       (unsigned long long)overlapHandoffCancelledOrFailed.load());
+    if(tracing)nativeTracePrintf("native_overlap_present_summary,bypassed=%llu\n",
+      (unsigned long long)overlapPresentBypassed.load());
     if(tracing) { const auto producerGpu=producerTiming.summary();
       nativeTracePrintf("native_producer_gpu_summary,windows=%llu,samples=%llu,disjoint_invalid=%llu\n",
         (unsigned long long)producerGpu.windows,(unsigned long long)producerGpu.samples,(unsigned long long)producerGpu.disjointInvalid); }

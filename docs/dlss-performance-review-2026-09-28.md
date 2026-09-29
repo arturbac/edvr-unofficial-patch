@@ -2,17 +2,20 @@
 
 ## Status
 
-- **Current flight:** verified `6eede364`, gfx `045517`/runtime
-  `045520_234_12728`, build `6ABB9884`. User reports mostly steady 90fps with a
-  distant station, fpsVR CPU 7–9ms. Handoff p50/p95 .001/.001ms; 21,558
-  accepted/completed, zero failures. Its former ~1.94ms wait is gone. No new
-  CPU trace. Trailing Present callback p50/p95 2.510/4.902ms can still wait for
-  deferred finish through loadingBoundary; needs stack/QPC witness. Late
-  mover/HUD workload rises. Source remains installed on the separate Frontier
-  branch; main is unchanged.
-- **Conclusion:** no controlled whole-frame performance comparison or exact
-  regression conclusion. The new remap follows the earliest stalls; see
-  Exclusions for ruled-out causes and the HUD arc for build/fixture evidence.
+- **Current flight:** verified `6eede364` CPU trace `052039-ca6860`, PID30932,
+  gfx `052105`/runtime `052107_579_30932`, build `6ABB9884`; matching PDBs,
+  zero loss, 5,257 covered cycles. Exact seq8490 caller/owner stacks confirm
+  Present reblocks behind deferred xrEndFrame via loadingBoundary, even when
+  its policy check has no work. Steady callback-site wait .625ms/frame mean.
+  Earlier handoff remains ~.001ms, no failures. A bounded one-use bypass now
+  passes 4,904 focused checks, including the actual registered callback,
+  loading transitions and fatal invalidation; independent review found no
+  blocker. Full validation passed all 86 jobs and installer checks. Clean
+  promotion and Frontier install remain. Main unchanged.
+- **Conclusion:** two caller waits behind deferred xrEndFrame are confirmed.
+  The handoff fix is flown; the validated Present bypass awaits a flight. No
+  controlled whole-frame regression attribution against 0.17.0 yet. See
+  Exclusions for ruled-out causes and the HUD arc for visual evidence.
 - **Baseline:** OpenVR `v0.16.2` Steam graphics `160129`/`6AA6D371`, runtime
   `160131`/`6AA6D378`; user reports 8.9–9.6 ms. Dimensions/preset/DLSS hash
   match, but legacy Valve OpenVR differs from native OpenXR over SteamVR.
@@ -22,14 +25,11 @@
   2037×1969→4074×3938/UI5093×4923. Installed DLSS metadata is 310.7.0.0;
   graphics logs omit driver/DLSS versions. Profiling uses Frontier; baseline
   uses Steam.
-- **Next:** one 60s CPU-only trace of the current 7–9ms scene, diagnostics OFF
-  and no eye dump. Distinguish callback dispatcher wait, treatment/driver work,
-  loading/event work and scheduling; no new build or GPU provider needed.
-  Verify with `tools/edvr_log.py --target frontier --expect-build 6eede364`;
-  docs commits do not change installed code. Review B1/B2 recovery and B3
-  permission remain open. Allocation dimensions do not prove VRAM pressure.
-  Existing profile `035907-fda516` is retained; do not repeat its large GPU
-  trace.
+- **Next:** clean promotion and Frontier install, then a normal comparison
+  flight. No new capture required for diagnosis. Review B1/B2 recovery and B3
+  permission remain open. Allocation stalls and driver work stay separate;
+  sampled direct-self does not price induced driver execution. Existing GPU
+  trace `035907-fda516` is retained; do not repeat it.
 
 ## Pre-optimization Frontier evidence
 
@@ -396,3 +396,59 @@ threads; sampled estimates are not exhaustive exact timings.
 Use the existing admin capture helper with `-CaptureSeconds 60` and omit
 `-GpuQueues`: start F9 after loading in the same scene showing 7–9ms. Keep
 diagnostics OFF/no eye dump; let saving finish. It expects installed 6eede364.
+
+## 2026-09-29: CPU trace confirms redundant Present rendezvous
+
+`052039-ca6860` is complete, expected `6eede364`, PID 30932; both PDBs match
+age 6, zero lost events, 5,257/5,257 valid derived/covered cycles, valid clocks
+(.9 us max residual), no region unknown/residual. Capture 11:22:41.360Z through
+save start 11:23:41.501Z; later loading at 11:23:52.771Z/save tail is excluded.
+Full scene-ready window 5 ends 11:23:27.792Z: game-before-submit 6.415/7.841 ms
+p50/p95, 2,618 cycles. No GPU provider; elapsed GPU markers are not busy time.
+
+Hypothesis CONFIRMED before code edit. Seq 8490, UTC 11:22:54.197841Z: Present
+begins at QPC 577878165638 us; caller parks at 165733.8→167736.1 us (2.0023 ms;
+later QPC values omit the common prefix 577878). Stack `_Cnd_wait ->
+RenderThreadDispatcher::invokeOwner:113 -> RenderRoute::invoke:43 -> loading
+lambda -> NativeRenderBinding::callback:100 -> renderBoundaryPresent:189 ->
+hookedPresent:1683`. Owner 49972 is sampled at 166774.6 us inside
+NVIDIA/D3D11/vrclient -> SessionState::finish:305 (xrEndFrame) ->
+finishPendingFrameEndBody:1341 -> OwnerService::run. It wakes the caller
+through OwnerService::complete:144 at 167736.1 us; Present ends at 167762 us.
+Steady 5,062-cycle site mean .6248 ms/frame, p50 .6049, p95 1.006, max 5.5634.
+This resolves the aggregate ambiguity; loading callback reserializes finish.
+Exact witness: `build/capture_probe/current/callback-witness.json`; spans and
+uncapped samples are beside it. Steady seq 7454–12515 covers
+11:22:42.006392–11:23:39.991580Z. Caller 28384 averages running 9.1158 ms,
+ready .7308, blocked 1.6106; callback park is .6248, next pose wait .5161.
+Direct EDVR self ~.8497 (R1 proxy .6586), game executable ~4.4577 sampled
+ms/frame; induced driver work remains outside self totals. Separate seq9081 has
+a 97.2233 ms graphics-memory texture-create wait, not this recurring cause.
+
+Bounded design: this successful deferred pair already has finishSubmitTail's
+sceneSubmitted (or fatal failure), leaving no loading work for its Present. Use
+an independent one-use epoch-protected token, not owner LoadingState reads.
+Invalidate on frame admission, loading-policy changes, failure/restart/stop.
+Keep normal synchronous loading boundaries for every other case. General async
+loading work is unsafe because graphics calls require an explicit borrowed
+render boundary. Fixture must exercise actual NativeRenderBinding callback,
+held xrEndFrame, producer progress, next-Wait ordering and loading fallback. No
+whole-frame saving claimed before flying the validated change.
+
+Implemented without new queued work or owner-only caller reads. The token is
+published only with an accepted deferred finish and consumed independently of
+handoff. Public loading mutations invalidate before dispatch; fatal failure,
+restart, stop and close retire it. No-token Presents retain the existing
+borrowed render boundary. The final focused native rig passes 4,904 checks,
+zero failures (`build/capture_probe/present-bypass-focused.log`); actual
+binding callback returns before held xrEndFrame, one-use/epoch invalidation and
+next-Wait FIFO pass, and loading/failure/queue/shutdown cases retain their
+contracts. Independent source/fixture review found no production blocker.
+
+Full absolute-path validation passed (`build/dlss-present-overlap-full.log`):
+86 pooled jobs in 116.5 s, native 4,904/0, UI quality 4,159/0, Python
+self-tests, production DLLs, 264-key config contract and actual self-contained
+installer resource checks. Receipt input hash
+`45f4e404fdec842db22dc993da1dd4146e9de077309cc03aa2f242cd79b37791`; NGX/FFX and
+optimized profiling-symbol build context unchanged. Commit this validated
+source before receipt-guarded clean DLL promotion; Frontier only.
