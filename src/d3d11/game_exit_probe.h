@@ -1,6 +1,7 @@
 #pragma once
 #include "../common/game_call_probe.h"
 #include "../common/log.h"
+#include "../common/periodic_work.h"
 #include "../openxr/native_module.h"
 
 namespace edvr {
@@ -21,6 +22,8 @@ inline void gameExitProbePresent(HRESULT presentResult,UINT flags,uint64_t frame
     static uint64_t lastPoll=0;
     static bool polled=false, armed=false, complete=false;
     static GameExitProbeSchedule schedule;
+    // Phase-0 timing (src/common/periodic_work.h) of the once-a-second lookup below, the one thing here that takes the loader lock.
+    static PeriodicWork work{"game_exit_probe"};
     const uint64_t now=GetTickCount64();
     if(complete || (polled && (now<lastPoll || now-lastPoll<1000)))return;
     polled=true;lastPoll=now;
@@ -29,11 +32,16 @@ inline void gameExitProbePresent(HRESULT presentResult,UINT flags,uint64_t frame
         Log::get().note("game exit probe: armed; native CPU status checked at most once per second after owned Present, independent running/stopped stack budgets, no process termination.");
     }
     HMODULE module=nullptr;
-    if(!GetModuleHandleExW(0,L"openvr_api.dll",&module))return;
-    const auto statusFn=reinterpret_cast<decltype(&edvrGetNativeRuntimeStatus)>(GetProcAddress(module,"edvrGetNativeRuntimeStatus"));
     EdvrNativeRuntimeStatus status{sizeof(status),EDVR_NATIVE_MODULE_VERSION_1};
-    const HRESULT result=statusFn?statusFn(&status):E_NOINTERFACE;
-    FreeLibrary(module); // balanced transient reference; never loads a runtime
+    HRESULT result=E_NOINTERFACE;
+    {
+        // Timed however it is left: a lookup that finds no runtime is a run too.
+        PeriodicWorkScope timing(work);
+        if(!GetModuleHandleExW(0,L"openvr_api.dll",&module))return;
+        const auto statusFn=reinterpret_cast<decltype(&edvrGetNativeRuntimeStatus)>(GetProcAddress(module,"edvrGetNativeRuntimeStatus"));
+        result=statusFn?statusFn(&status):E_NOINTERFACE;
+        FreeLibrary(module); // balanced transient reference; never loads a runtime
+    }
     if(result!=S_OK || status.size!=sizeof(status) || status.version!=EDVR_NATIVE_MODULE_VERSION_1)return;
     const unsigned sample=schedule.take(now,status.phase);if(!sample)return;
     const auto stack=captureGameCallStack();

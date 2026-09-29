@@ -26,6 +26,8 @@
 
 #include "../../src/common/config.h"
 #include "../../src/common/frame_flag.h"
+#include "../../src/common/guard.h"
+#include "../../src/common/periodic_work.h"
 #include "../../src/common/timing.h"
 #include "../../src/common/log.h"
 // Header-only, so this adds no link dependency: the grouping is pure pointer
@@ -460,6 +462,444 @@ int journalPickChecks() {
     if (!bad) {
         printf("  ok    the journal pick prefers provenance over recency, in any "
                "order, and a crashed session's journal never wins\n");
+    }
+    return bad;
+}
+
+// PHASE-0 TIMING FOR PERIODIC WORK (src/common/periodic_work.h), as a table.
+//
+// It is tested here because this rig already links the biggest operation it
+// times (journal_watch.cpp), the real log and the guard, and is where the
+// cadence arithmetic (timing.h) is already asserted -- so no build step changes.
+// What is under test is the window and threshold logic, which is pure: the
+// clock, the local time of day and the log all arrive as arguments, so a fake
+// clock walks whole 30 s windows in microseconds and the rig can count exactly
+// how often the local clock was read.
+int periodicWorkChecks() {
+    int bad = 0;
+    auto verify = [&](bool ok, const char* what) {
+        ++g_checks;
+        if (ok) return;
+        printf("  FAIL  %s\n", what);
+        ++bad;
+    };
+    auto verifyText = [&](const std::string& got, const char* want, const char* what) {
+        ++g_checks;
+        if (got == want) return;
+        printf("  FAIL  %s\n          got:      %s\n          expected: %s\n", what,
+               got.c_str(), want);
+        ++bad;
+    };
+
+    constexpr int64_t kFreq = 10000000;   // 10 MHz, a usual QueryPerformanceFrequency
+    std::vector<std::string> lines;       // everything the operation wrote
+    int wallCalls = 0;                    // how often the local clock was read
+    PeriodicWallClock wall;               // what the fake local clock answers
+    auto setWall = [&](unsigned h, unsigned m, unsigned s, unsigned ms) {
+        wall.hour = h;
+        wall.minute = m;
+        wall.second = s;
+        wall.millis = ms;
+    };
+    auto reset = [&] {
+        lines.clear();
+        wallCalls = 0;
+    };
+    // One finished run of `ticks` (10,000 ticks = 1 ms here), completed at t.
+    auto run = [&](PeriodicWork& w, int64_t ticks, double atSeconds, uint64_t context = 0) {
+        w.record(ticks, static_cast<int64_t>(atSeconds * static_cast<double>(kFreq)), kFreq,
+                 context, [&] { ++wallCalls; return wall; },
+                 [&](const char* line) { lines.push_back(line); });
+    };
+
+    // A QUIET OPERATION writes one summary per 30 s window and nothing before it.
+    {
+        reset();
+        PeriodicWork w("op_quiet");
+        setWall(12, 34, 56, 789);
+        for (int i = 0; i < 30; ++i) run(w, 5000, i);   // 0.5 ms once a second, t = 0..29 s
+        verify(lines.empty(), "nothing is written while the window is still open");
+        run(w, 5000, 30);   // the 31st run, exactly 30 s after the window's first
+        verify(lines.size() == 1, "the first run at or past 30 s closes the window with one summary");
+        if (lines.size() == 1) {
+            verifyText(lines[0],
+                       "periodic work: op_quiet n=31 total=15.500 max=0.500 at 12:34:56.789 "
+                       "slow=0",
+                       "the summary's exact form");
+        }
+        verify(wallCalls == 1,
+               "31 unremarkable runs read the local clock once, for the window's first");
+        verify(w.runs() == 0, "a closed window starts empty");
+    }
+
+    // THE LOCAL CLOCK IS READ ONLY FOR A NEW MAXIMUM OR A SLOW RUN, and once
+    // when a run is both. The threshold is exact: 20,000 ticks is 2.0 ms.
+    {
+        reset();
+        PeriodicWork w("op_wall");
+        struct Step {
+            int64_t ticks;
+            int calls;   // total local-clock reads expected after this run
+            const char* why;
+        };
+        const Step steps[] = {
+            {10000, 1, "the first run of a window is its maximum, so it reads the clock"},
+            {9000, 1, "a shorter run does not"},
+            {8000, 1, "nor does another"},
+            {15000, 2, "a new maximum does"},
+            {15000, 2, "a tie is not a new maximum"},
+            {19999, 3, "1.9999 ms is a new maximum, and is not slow"},
+            {20000, 4, "2.0000 ms is slow AND a new maximum, and reads the clock once for both"},
+            {20000, 5, "a slow run that is not a maximum still needs its time of day"},
+        };
+        double at = 1.0;
+        for (const Step& step : steps) {
+            run(w, step.ticks, at);
+            at += 1.0;
+            verify(wallCalls == step.calls, step.why);
+        }
+        verify(w.slowRuns() == 2, "2.0000 ms is slow and 1.9999 ms is not");
+        verify(lines.size() == 1,
+               "the second slow run, a second after the first, is counted but not written");
+    }
+
+    // SLOW RUNS: written at once, at most one line per operation per 10 s, each
+    // carrying its own context; and the summary's time and context are the
+    // SLOWEST run's, not the last one's.
+    {
+        reset();
+        PeriodicWork w("journal_reglob", "files");
+        setWall(10, 0, 0, 100);
+        run(w, 34120, 100.0, 1893);   // 3.412 ms: the window's maximum
+        setWall(10, 0, 5, 100);
+        run(w, 25000, 105.0, 9);      // 2.5 ms, five seconds on: counted, not written
+        setWall(10, 0, 9, 900);
+        run(w, 25000, 109.9, 9);      // 9.9 s after the last WRITTEN line: still not
+        setWall(10, 0, 10, 100);
+        run(w, 25000, 110.0, 9);      // exactly 10 s after it: written
+        verify(lines.size() == 2, "slow lines are limited to one per 10 s, and 10 s is enough");
+        if (lines.size() == 2) {
+            verifyText(lines[0], "periodic work: journal_reglob SLOW ms=3.412 at 10:00:00.100 files=1893",
+                       "the first slow line, with its own context");
+            verifyText(lines[1], "periodic work: journal_reglob SLOW ms=2.500 at 10:00:10.100 files=9",
+                       "the next one, ten seconds later");
+        }
+        setWall(10, 0, 30, 0);
+        run(w, 1000, 130.0, 9);   // 0.1 ms, thirty seconds after the window opened
+        verify(lines.size() == 3, "the window closes on the first run 30 s after it opened");
+        if (lines.size() == 3) {
+            verifyText(lines[2],
+                       "periodic work: journal_reglob n=5 total=11.012 max=3.412 at "
+                       "10:00:00.100 slow=4 files=1893",
+                       "the summary names the slowest run's time and context, and counts every "
+                       "slow run including the withheld ones");
+        }
+
+        // ONLY IF IT RAN: the closed window is empty, and the next opens with the
+        // next run, so the next summary is 30 s after THAT, not after this one.
+        verify(w.runs() == 0, "the window is closed and empty after its summary");
+        lines.clear();
+        setWall(11, 11, 11, 111);
+        run(w, 1000, 131.0, 1);
+        run(w, 1000, 160.9, 1);
+        verify(lines.empty(), "29.9 s into the next window: nothing");
+        run(w, 1000, 161.0, 1);
+        verify(lines.size() == 1, "30 s into it: the summary");
+        if (lines.size() == 1) {
+            verifyText(lines[0],
+                       "periodic work: journal_reglob n=3 total=0.300 max=0.100 at "
+                       "11:11:11.111 slow=0 files=1",
+                       "the second window is its own, not a continuation");
+        }
+    }
+
+    // STATE IS PER INSTANCE: two operations do not share a slow-line limit or a
+    // window.
+    {
+        reset();
+        PeriodicWork a("op_a"), b("op_b");
+        setWall(9, 0, 0, 0);
+        run(a, 30000, 0.0);   // 3 ms: slow, written
+        run(b, 30000, 1.0);   // 3 ms on ANOTHER operation a second later: written too
+        verify(lines.size() == 2, "each operation has its own slow-line limit");
+        verify(a.runs() == 1 && b.runs() == 1 && a.slowRuns() == 1 && b.slowRuns() == 1,
+               "and its own window");
+    }
+
+    // A clock that misbehaves must not crash it or manufacture a slow run.
+    {
+        reset();
+        PeriodicWork w("op_odd");
+        w.record(-5, 0, 0, 0, [&] { ++wallCalls; return wall; },
+                 [&](const char* line) { lines.push_back(line); });
+        verify(w.runs() == 1 && w.slowRuns() == 0 && lines.empty(),
+               "a negative duration and a zero clock rate are clamped, not believed");
+    }
+
+    // THE PRODUCTION BINDING reads the real clock in real milliseconds. With no
+    // log open the line it writes goes nowhere, which is fine here: what is
+    // asserted is the unit, the mistake a fake clock cannot catch (ticks read
+    // as milliseconds looks fine until a flight).
+    {
+        PeriodicWork real("gate_test_real");
+        {
+            PeriodicWorkScope scope(real);
+            Sleep(20);
+        }
+        const double gotMs = static_cast<double>(real.maxTicks()) * 1000.0 /
+                             static_cast<double>(qpcFrequency());
+        verify(real.runs() == 1, "a scope records exactly one run");
+        verify(gotMs >= 10.0 && gotMs < 5000.0,
+               "a scope around a 20 ms sleep reads about 20, in milliseconds and not ticks");
+    }
+
+    if (!bad) {
+        printf("  ok    periodic-work timing: a summary per 30 s window and only if it ran, "
+               "slow runs written at once and limited to one per 10 s, the local clock read "
+               "only for a new maximum or a slow run, and 2.0000 ms exactly slow\n");
+    }
+    return bad;
+}
+
+std::string readWholeFile(const std::wstring& path) {
+    std::string out;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return out;
+    char buf[8192];
+    DWORD got = 0;
+    while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got > 0) out.append(buf, got);
+    CloseHandle(f);
+    return out;
+}
+
+std::vector<std::string> splitLines(const std::string& text) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start < text.size()) {
+        size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        size_t stop = end;
+        if (stop > start && text[stop - 1] == '\r') --stop;
+        out.push_back(text.substr(start, stop - start));
+        start = end + 1;
+    }
+    return out;
+}
+
+// This executable's own file name, which is the module a fault inside the rig's
+// own code must be attributed to.
+std::string ownModuleLeaf() {
+    wchar_t path[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return std::string();
+    const wchar_t* slash = wcsrchr(path, L'\\');
+    const wchar_t* leaf = slash ? slash + 1 : path;
+    std::string out;
+    for (; *leaf; ++leaf) out.push_back(*leaf < 0x80 ? static_cast<char>(*leaf) : '?');
+    return out;
+}
+
+// " at HH:MM:SS.mmm" in a periodic-work line, zero-padded as the log's own
+// prefix is, so the two can be read side by side.
+bool hasTimeOfDay(const std::string& line) {
+    const size_t at = line.find(" at ");
+    if (at == std::string::npos) return false;
+    const std::string t = line.substr(at + 4, 12);
+    if (t.size() != 12) return false;
+    for (size_t i = 0; i < t.size(); ++i) {
+        if (i == 2 || i == 5) {
+            if (t[i] != ':') return false;
+        } else if (i == 8) {
+            if (t[i] != '.') return false;
+        } else if (t[i] < '0' || t[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// THE NOTES AS THEY REACH A REAL LOG FILE: where a caught fault happened
+// (src/common/guard.h), and the periodic-work lines written through the
+// production binding (src/common/periodic_work.h).
+//
+// The fault half is the case R4 / A-9 asked for. A site is a budget's name, and
+// deviceHook.frameBoundary covers the whole frame boundary, so a fault anywhere
+// in it used to say only that name. The rig faults on purpose inside guarded()
+// -- the real template, the real filter, the real Log -- closes the log and
+// reads the file back, so what is asserted is the text a reporter would paste.
+int loggedNotesChecks() {
+    int bad = 0;
+    auto verify = [&](bool ok, const char* what) {
+        ++g_checks;
+        if (ok) return;
+        printf("  FAIL  %s\n", what);
+        ++bad;
+    };
+
+    wchar_t tmp[MAX_PATH];
+    const DWORD tn = GetTempPathW(MAX_PATH, tmp);
+    if (tn == 0 || tn >= MAX_PATH) {
+        printf("  FAIL  no temp folder to write the notes' log in\n");
+        return 1;
+    }
+    const std::wstring dir =
+        std::wstring(tmp) + L"edvr_gate_test_notes_" + std::to_wstring(GetCurrentProcessId());
+    // A log.enabled = 0 in whatever ini this rig was pointed at would turn every
+    // assertion below into "the file is empty", which reads as a failure of the
+    // code and not of the setup.
+    Config::get().set("log.enabled", "1");
+    if (!Log::get().open(dir, L"gatenotes")) {
+        printf("  FAIL  could not open a log in %ls to read the notes back\n", dir.c_str());
+        return 1;
+    }
+
+    // One pointer per site: sites are compared by address, as they are in the
+    // product, where each is a literal at one call.
+    static const char kOk[] = "gate_test/no_fault";
+    static const char kAv[] = "gate_test/fault_note";
+    static const char kPrivate[] = "gate_test/fault_private";
+    static const char kLegacy[] = "gate_test/legacy";
+
+    const bool okRan = guarded(kOk, [] {});
+    const uintptr_t lowAddress = 0x10;
+    auto writeLow = [lowAddress] { *reinterpret_cast<volatile int*>(lowAddress) = 1; };
+    const bool av1 = guarded(kAv, writeLow);
+    const bool av2 = guarded(kAv, writeLow);
+    const bool av3 = guarded(kAv, writeLow);
+
+    // A fault in code that is in no module: a page EDVR-style code would sit in,
+    // holding one illegal instruction. Written, then made executable, so this
+    // does not ask for a page that is writable and executable at once.
+    bool privateRan = true;
+    if (void* page = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)) {
+        const unsigned char ud2[] = {0x0F, 0x0B};
+        memcpy(page, ud2, sizeof(ud2));
+        DWORD previous = 0;
+        VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &previous);
+        privateRan = guarded(kPrivate, [page] { reinterpret_cast<void (*)()>(page)(); });
+        VirtualFree(page, 0, MEM_RELEASE);
+    }
+
+    // A caller that reaches the filter with only a code, as the three rigs that
+    // stub it do not but a future caller might.
+    const int legacyVerdict = guardFilter(0xC0000005UL, kLegacy);
+
+    // The periodic-work line through the production binding: a real clock, the
+    // real local time of day, the real log. A 50 ms window instead of 30 s so
+    // the summary can be reached without a half-minute sleep; the slow-run line
+    // needs no such help.
+    PeriodicWorkPolicy quick;
+    quick.summaryEveryMs = 50;
+    PeriodicWork realWork("gate_test_e2e", "ctx", quick);
+    {
+        PeriodicWorkScope scope(realWork, 5);
+        Sleep(10);   // >= 2 ms: written the moment the scope closes
+    }
+    Sleep(60);
+    {
+        PeriodicWorkScope scope(realWork, 6);   // past the window: the summary
+    }
+
+    Log::get().close();
+
+    std::string text;
+    {
+        WIN32_FIND_DATAW fd{};
+        HANDLE find = FindFirstFileW((dir + L"\\edvr_gatenotes_*.log").c_str(), &fd);
+        if (find != INVALID_HANDLE_VALUE) {
+            do {
+                const std::wstring path = dir + L"\\" + fd.cFileName;
+                text += readWholeFile(path);
+                DeleteFileW(path.c_str());
+            } while (FindNextFileW(find, &fd));
+            FindClose(find);
+        }
+    }
+    RemoveDirectoryW(dir.c_str());
+    const std::vector<std::string> log = splitLines(text);
+    auto linesWith = [&](const char* a, const char* b) {
+        std::vector<const std::string*> found;
+        for (const std::string& line : log) {
+            if (line.find(a) != std::string::npos && line.find(b) != std::string::npos) {
+                found.push_back(&line);
+            }
+        }
+        return found;
+    };
+
+    verify(!log.empty(), "the log file was written and read back");
+    verify(okRan, "a block that does not fault runs to the end and reports true");
+    verify(!av1 && !av2 && !av3, "a faulting block is absorbed and reports false");
+    verify(!privateRan, "so is a fault in code that is in no module");
+    verify(legacyVerdict == EXCEPTION_EXECUTE_HANDLER, "the filter's verdict is unchanged");
+
+    const std::string exe = ownModuleLeaf();
+    verify(!exe.empty(), "this executable's own name could be read");
+
+    // The access violation: three faults at one site.
+    const auto absorbed = linesWith("FAULT ABSORBED", "site=gate_test/fault_note");
+    verify(absorbed.size() == 1, "three faults at one site write one FAULT ABSORBED line, as ever");
+    if (absorbed.size() == 1) {
+        const std::string& n = *absorbed[0];
+        verify(n.find("exception=0xC0000005 site=gate_test/fault_note at=0x") != std::string::npos,
+               "the note gives the faulting address right after the site");
+        verify(n.find(exe + "+0x") != std::string::npos,
+               "...names the module the fault is in and an offset into it");
+        verify(n.find("access=write data=0x0000000000000010 (no module: not mapped)") !=
+                   std::string::npos,
+               "...and, for an access violation, what was touched and how");
+        verify(n.find("[truncated]") == std::string::npos,
+               "...without the line being clipped");
+        verify(n.find("THIS DID NOT CRASH THE GAME") != std::string::npos,
+               "...and the verdict text is still there");
+    }
+    const auto totals = linesWith("FAULT TOTAL", "site=gate_test/fault_note");
+    verify(totals.size() == 1, "the total is restated at 2 and not at 3");
+    if (totals.size() == 1) {
+        const std::string& n = *totals[0];
+        verify(n.find(": 2 absorbed so far") != std::string::npos, "...and it is the count of 2");
+        verify(n.find("Latest fault at=0x") != std::string::npos &&
+                   n.find(exe + "+0x") != std::string::npos,
+               "...carrying the latest fault's location, so a shared budget shows where it moved");
+    }
+
+    // The fault in no module.
+    const auto priv = linesWith("FAULT ABSORBED", "site=gate_test/fault_private");
+    verify(priv.size() == 1, "a fault in a private page is reported once");
+    if (priv.size() == 1) {
+        const std::string& n = *priv[0];
+        verify(n.find("exception=0xC000001D") != std::string::npos, "...as an illegal instruction");
+        verify(n.find("no module: private region 0x") != std::string::npos,
+               "...saying there is no module and giving the region it is in");
+        verify(n.find("access=") == std::string::npos, "...with no data address, it is not a memory fault");
+    }
+
+    // A code-only caller keeps the note it always had.
+    const auto legacy = linesWith("FAULT ABSORBED", "site=gate_test/legacy");
+    verify(legacy.size() == 1 && legacy[0]->find(" at=") == std::string::npos,
+           "a caller with only a code gets the note it always did, without a location");
+
+    // The periodic-work lines, through the real binding and the real log.
+    const auto slowLine = linesWith("periodic work: gate_test_e2e SLOW ms=", " ctx=5");
+    verify(slowLine.size() == 1, "a slow run through the production binding is written at once");
+    if (slowLine.size() == 1) {
+        verify(hasTimeOfDay(*slowLine[0]), "...with a zero-padded time of day");
+    }
+    // Only the shape here: which run is the slowest, and so whose context the
+    // summary carries, is decided by real sleeps on a loaded machine. The fake
+    // clock cases above pin that exactly.
+    const auto summary = linesWith("periodic work: gate_test_e2e n=2 total=", " slow=");
+    verify(summary.size() == 1, "the window's summary reaches the log through the real binding");
+    if (summary.size() == 1) {
+        verify(hasTimeOfDay(*summary[0]), "...with a zero-padded time of day");
+        verify(summary[0]->find(" ctx=") != std::string::npos, "...and the operation's context");
+    }
+
+    if (!bad) {
+        printf("  ok    a caught fault's note names its address, module and offset (and what "
+               "an access violation touched), once per site and restated with the latest "
+               "location; periodic-work lines reach the log through the real binding\n");
     }
     return bad;
 }
@@ -1517,6 +1957,8 @@ int main(int argc, char** argv) {
     // the 72/90/120Hz loop below -- there is no frame rate in either.
     g_bad += rebuildBackoffChecks();
     g_bad += journalPickChecks();
+    g_bad += periodicWorkChecks();
+    g_bad += loggedNotesChecks();
     const uint32_t rates[] = {72, 90, 120};
     for (uint32_t hz : rates) {
         const int before = g_bad;

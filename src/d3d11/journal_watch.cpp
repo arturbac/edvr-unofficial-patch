@@ -10,6 +10,7 @@
 
 #include "../common/config.h"
 #include "../common/log.h"
+#include "../common/periodic_work.h"
 
 namespace edvr {
 namespace {
@@ -110,6 +111,16 @@ struct State {
 };
 State g_s;
 
+// Phase-0 timing for the three things this module does on Elite's render thread
+// (src/common/periodic_work.h says what is written and why). Each is timed
+// separately because they run on different clocks and cost different things: the
+// Status.json read as often as every 100 ms, the tail slice every 500 ms, and
+// the directory walk every four seconds, whose price grows with every journal
+// the player has ever kept.
+PeriodicWork g_workStatus{"journal_status"};
+PeriodicWork g_workTail{"journal_tail", "bytes"};
+PeriodicWork g_workReglob{"journal_reglob", "files"};
+
 void closeFile() {
     if (g_s.handle != INVALID_HANDLE_VALUE) {
         CloseHandle(g_s.handle);
@@ -132,7 +143,11 @@ uint64_t asU64(const FILETIME& t) {
 // creation time rather than write time, is journalPickNewest in the header --
 // where the reasoning sits beside the decision it argues for, and where a
 // fixture can reach it.
-std::wstring newestJournal(bool& ours) {
+//
+// `enumerated` is how many journal files the walk found, for the phase-0
+// timing: the walk's cost is the number of files in the folder.
+std::wstring newestJournal(bool& ours, size_t& enumerated) {
+    enumerated = 0;
     // The walk collects; journalPickNewest decides. The decision is a pure
     // function over times so it can be put in a table -- see its header.
     WIN32_FIND_DATAW fd{};
@@ -148,6 +163,7 @@ std::wstring newestJournal(bool& ours) {
         write.push_back(asU64(fd.ftLastWriteTime));
     } while (FindNextFileW(find, &fd));
     FindClose(find);
+    enumerated = names.size();
 
     const JournalPick pick = journalPickNewest(
         creation.data(), write.data(), names.size(), asU64(g_s.notBefore));
@@ -414,6 +430,7 @@ void journalWatchTick() {
     constexpr uint64_t kStatusEagerMs = 100;
     if (dueMs(s.statusMs, s.eagerStatus ? kStatusEagerMs : kPollMs)) {
         s.statusMs = stampMs();
+        PeriodicWorkScope timing(g_workStatus);
         pollStatus();
     }
 
@@ -424,7 +441,16 @@ void journalWatchTick() {
     if (s.handle == INVALID_HANDLE_VALUE || dueMs(s.reglobMs, kReglobMs)) {
         s.reglobMs = stampMs();
         bool ours = false;
-        const std::wstring newest = newestJournal(ours);
+        std::wstring newest;
+        {
+            // The walk and the pick only, not the file open below: that runs
+            // when the journal CHANGES, which is once in a while, not on the
+            // four-second beat this is timing.
+            PeriodicWorkScope timing(g_workReglob);
+            size_t enumerated = 0;
+            newest = newestJournal(ours, enumerated);
+            timing.setContext(enumerated);
+        }
         if (!newest.empty() && newest != s.file) {
             closeFile();
             s.file = newest;
@@ -511,6 +537,10 @@ void journalWatchTick() {
 
     // Read whatever has appeared since last time.
     {
+        // Timed to the end of the block whichever way it is left: the failed
+        // reads that return or retire below are runs too. The bytes read are
+        // its context, which is what tells a slow slice from a large one.
+        PeriodicWorkScope timing(g_workTail);
         LARGE_INTEGER pos;
         pos.QuadPart = static_cast<LONGLONG>(s.offset);
         if (!SetFilePointerEx(s.handle, pos, nullptr, FILE_BEGIN)) {
@@ -523,6 +553,7 @@ void journalWatchTick() {
             if (++s.faults > kMaxFaults) goto retire;
             return;
         }
+        timing.setContext(got);
         if (got > 0) {
             s.offset += got;
             scanEvents(buf, got);
