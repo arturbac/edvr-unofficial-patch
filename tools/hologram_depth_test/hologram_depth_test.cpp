@@ -494,6 +494,25 @@ int main() {
         check(std::fabs(depths[0][1] - kNear5m) < 1e-5f && std::fabs(depths[0][6] - kFillerDepth) < 1e-5f,
               "census policy: bright depth and dark filler remain correct");
 
+        // A scratch resize drops every query ring, the marker's included (it
+        // used to release only the resolve's and leak the marker queries).
+        // The census-on pass above left a marker query in the ring; hold one
+        // reference of my own across the resize and read what is left.
+        {
+            ID3D11Query* marker = nullptr;
+            for (auto* q : g_holoScratch[0].markerOcclusion) if (q) { marker = q; break; }
+            check(marker != nullptr, "resize: the census-on pass left a marker query to watch");
+            if (marker) {
+                marker->AddRef();
+                HoloScratch* resized = holoScratchFor(ctx.Get(), 0, 9, 9);
+                check(resized != nullptr && resized->w == 9, "resize: the scratch is remade at the new size");
+                const ULONG mine = (marker->AddRef(), marker->Release());
+                check(mine == 1, "resize: the marker query ring's reference is released, not leaked");
+                marker->Release();
+                check(holoScratchFor(ctx.Get(), 0, 8, 8) != nullptr, "resize: back to the test's size");
+            }
+        }
+
         // Fill the census quota: the render path still runs, but no new
         // query or copy may be issued to throw its result away.
         g_holoPixelSampleCount = g_holoMarkerSampleCount = g_holoNearLightSampleCount = kHoloPixelSamples;

@@ -1344,6 +1344,7 @@ HoloScratch* holoScratchFor(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint3
     if (s.nearLightTex) s.nearLightTex->Release();
     for (uint32_t i = 0; i < kHoloQueryRing; ++i) if (s.nearLightStage[i]) s.nearLightStage[i]->Release();
     for (uint32_t i = 0; i < kHoloQueryRing; ++i) if (s.occlusion[i]) s.occlusion[i]->Release();
+    for (uint32_t i = 0; i < kHoloQueryRing; ++i) if (s.markerOcclusion[i]) s.markerOcclusion[i]->Release();
     s = HoloScratch();
     ID3D11Device* dev = nullptr;
     ctx->GetDevice(&dev);
