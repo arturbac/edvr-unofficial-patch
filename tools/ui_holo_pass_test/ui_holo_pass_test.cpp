@@ -56,9 +56,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
+#include "../../src/d3d11/fixed_shader_source.h"   // kUiLayerCompositeHlsl, for --bench-composite
 #include "../../src/d3d11/ui_resolve.h"
 #include "temporal_shader_bytecode.h"  // edvr::kUiResolveBytecode, from build\gen
 #include "ui_resolve_reference.h"      // edvr_reference::kUiResolveReference, the shader as it was
@@ -429,9 +431,9 @@ ComPtr<ID3D11ComputeShader> shaderFromBytecode(ID3D11Device* dev, const unsigned
 }
 
 // The build's own compile of a fixed shader: entry main, cs_5_0, flags zero.
-ComPtr<ID3DBlob> compileBlob(const char* source, const D3D_SHADER_MACRO* defines, const char* what) {
+ComPtr<ID3DBlob> compileBlob(const char* source, const D3D_SHADER_MACRO* defines, const char* what, const char* profile = "cs_5_0") {
     ComPtr<ID3DBlob> code, errors;
-    const HRESULT r = D3DCompile(source, std::strlen(source), what, defines, nullptr, "main", "cs_5_0", 0, 0, &code, &errors);
+    const HRESULT r = D3DCompile(source, std::strlen(source), what, defines, nullptr, "main", profile, 0, 0, &code, &errors);
     if (FAILED(r)) {
         std::printf("FAIL: compiling %s (0x%08lX): %s\n", what, static_cast<unsigned long>(r),
                     errors ? static_cast<const char*>(errors->GetBufferPointer()) : "no message");
@@ -889,19 +891,184 @@ void runBench(Device& d, ID3D11ComputeShader* refCs, ID3D11ComputeShader* curCs)
     }
 }
 
+// ------------------------------------------------------------------ the UI layer composite, at the eye's size
+
+// One timestamped batch of whatever `fn` issues, in milliseconds per call.
+double timeFn(Device& d, int batch, const std::function<void()>& fn) {
+    ID3D11DeviceContext* ctx = d.ctx.Get();
+    D3D11_QUERY_DESC qd{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+    ComPtr<ID3D11Query> disjoint, t0, t1;
+    hr(d.dev->CreateQuery(&qd, &disjoint), "disjoint query");
+    qd.Query = D3D11_QUERY_TIMESTAMP;
+    hr(d.dev->CreateQuery(&qd, &t0), "timestamp query");
+    hr(d.dev->CreateQuery(&qd, &t1), "timestamp query");
+    ctx->Begin(disjoint.Get());
+    ctx->End(t0.Get());
+    for (int i = 0; i < batch; ++i) fn();
+    ctx->End(t1.Get());
+    ctx->End(disjoint.Get());
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dd{};
+    while (ctx->GetData(disjoint.Get(), &dd, sizeof(dd), 0) == S_FALSE) {}
+    UINT64 a = 0, b = 0;
+    while (ctx->GetData(t0.Get(), &a, sizeof(a), 0) == S_FALSE) {}
+    while (ctx->GetData(t1.Get(), &b, sizeof(b), 0) == S_FALSE) {}
+    return dd.Disjoint ? -1.0 : static_cast<double>(b - a) / static_cast<double>(dd.Frequency) * 1000.0 / batch;
+}
+
+// The layer composite (kUiLayerCompositeHlsl, as ui_layer.cpp runs it) over an
+// eye-sized frame with a UI-quality-125% RGBA16F layer that is empty (cleared to
+// the "nothing here" value), holds a HUD's worth of panels, or is covered; and,
+// beside it, what a bare full-eye read and write costs. Desk numbers for the
+// performance review: what would a composite that skipped the layer's empty
+// tiles save? Nothing here is production code.
+void runCompositeBench(Device& d) {
+    if (d.warp) std::puts("note: --bench-composite on WARP times a CPU; use --adapter nvidia.");
+    ID3D11Device* dev = d.dev.Get();
+    ID3D11DeviceContext* ctx = d.ctx.Get();
+    const int fw = 4032, fh = 3896, lw = 5040, lh = 4870;
+
+    std::vector<uint8_t> frameData(static_cast<size_t>(fw) * fh * 4);
+    Rng rng(4242);
+    for (auto& b : frameData) b = static_cast<uint8_t>(rng.next() >> 24);
+    auto frame = tex(dev, fw, fh, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE, frameData.data(), fw * 4);
+    auto out = tex(dev, fw, fh, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, nullptr, 0);
+    auto frameV = srvOf(dev, frame.Get());
+    auto outU = uavOf(dev, out.Get());
+
+    struct Layer { ComPtr<ID3D11Texture2D> t; ComPtr<ID3D11ShaderResourceView> srv; ComPtr<ID3D11RenderTargetView> rtv; };
+    auto makeLayer = [&]() {
+        Layer l;
+        l.t = tex(dev, lw, lh, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, nullptr, 0);
+        l.srv = srvOf(dev, l.t.Get());
+        hr(dev->CreateRenderTargetView(l.t.Get(), nullptr, &l.rtv), "layer RTV");
+        return l;
+    };
+    Layer empty = makeLayer(), hud = makeLayer(), full = makeLayer();
+
+    static const char kVs[] =
+        "float4 main(uint id : SV_VertexID) : SV_POSITION { float2 p = id == 0 ? float2(-1,-1) : (id == 1 ? float2(-1,3) : float2(3,-1)); return float4(p,0,1); }";
+    static const char kPs[] =
+        "float4 main(float4 p : SV_POSITION) : SV_Target { return float4(0.20, 0.35, 0.55, 0.35); }";
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    {
+        ComPtr<ID3DBlob> v = compileBlob(kVs, nullptr, "layer bench vs", "vs_5_0");
+        hr(dev->CreateVertexShader(v->GetBufferPointer(), v->GetBufferSize(), nullptr, &vs), "VS");
+        ComPtr<ID3DBlob> p = compileBlob(kPs, nullptr, "layer bench ps", "ps_5_0");
+        hr(dev->CreatePixelShader(p->GetBufferPointer(), p->GetBufferSize(), nullptr, &ps), "PS");
+    }
+    D3D11_RASTERIZER_DESC rd{};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    rd.ScissorEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> rs;
+    hr(dev->CreateRasterizerState(&rd, &rs), "rasterizer state");
+
+    auto paint = [&](Layer& l, const std::vector<D3D11_RECT>& panels) {
+        const FLOAT clear[4] = {0.f, 0.f, 0.f, 1.f};   // "nothing here": no colour, fully transparent
+        ctx->ClearRenderTargetView(l.rtv.Get(), clear);
+        ID3D11RenderTargetView* rtv = l.rtv.Get();
+        ctx->OMSetRenderTargets(1, &rtv, nullptr);
+        D3D11_VIEWPORT vp{0.f, 0.f, static_cast<float>(lw), static_cast<float>(lh), 0.f, 1.f};
+        ctx->RSSetViewports(1, &vp);
+        ctx->RSSetState(rs.Get());
+        ctx->VSSetShader(vs.Get(), nullptr, 0);
+        ctx->PSSetShader(ps.Get(), nullptr, 0);
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        for (const auto& r : panels) { ctx->RSSetScissorRects(1, &r); ctx->Draw(3, 0); }
+        ctx->ClearState();
+    };
+    static const float box[6][4] = {{0.06f, 0.62f, 0.22f, 0.90f}, {0.78f, 0.62f, 0.94f, 0.90f}, {0.42f, 0.78f, 0.58f, 0.96f},
+                                    {0.03f, 0.25f, 0.09f, 0.45f}, {0.91f, 0.25f, 0.97f, 0.45f}, {0.44f, 0.06f, 0.56f, 0.12f}};
+    std::vector<D3D11_RECT> panels;
+    for (const auto& b : box)
+        panels.push_back({static_cast<LONG>(b[0] * lw), static_cast<LONG>(b[1] * lh), static_cast<LONG>(b[2] * lw), static_cast<LONG>(b[3] * lh)});
+    paint(empty, {});
+    paint(hud, panels);
+    paint(full, {{0, 0, lw, lh}});
+
+    ComPtr<ID3D11ComputeShader> cs = shaderFromSource(dev, edvr::kUiLayerCompositeHlsl, nullptr, "UI layer composite");
+    static const char kCopyCs[] =
+        "Texture2D<float4> F : register(t0); RWTexture2D<float4> O : register(u0);"
+        "[numthreads(8,8,1)] void main(uint3 id : SV_DispatchThreadID) { O[id.xy] = F.Load(int3(id.xy, 0)); }";
+    ComPtr<ID3D11ComputeShader> copyCs = shaderFromSource(dev, kCopyCs, nullptr, "bare copy");
+
+    struct Params {
+        int32_t region[4];
+        float uv[4];
+        float layerSize[2];
+        uint32_t outSize[2];
+        uint32_t mode, useMult, pad[2];
+    } p{{0, 0, fw, fh}, {0.f, 0.f, 1.f, 1.f}, {static_cast<float>(lw), static_cast<float>(lh)}, {static_cast<uint32_t>(fw), static_cast<uint32_t>(fh)}, 0, 0, {0, 0}};
+    static_assert(sizeof(Params) == 64, "the composite's cbuffer is 64 bytes");
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = sizeof(Params);
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA pd{&p, 0, 0};
+    ComPtr<ID3D11Buffer> cb;
+    hr(dev->CreateBuffer(&bd, &pd, &cb), "composite cbuffer");
+
+    auto composite = [&](Layer& l) {
+        ID3D11ShaderResourceView* srvs[3] = {frameV.Get(), l.srv.Get(), nullptr};
+        ID3D11UnorderedAccessView* uav = outU.Get();
+        ID3D11Buffer* cbp = cb.Get();
+        ctx->CSSetShader(cs.Get(), nullptr, 0);
+        ctx->CSSetShaderResources(0, 3, srvs);
+        ctx->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+        ctx->CSSetConstantBuffers(0, 1, &cbp);
+        ctx->Dispatch(static_cast<UINT>((fw + 7) / 8), static_cast<UINT>((fh + 7) / 8), 1);
+        ctx->ClearState();
+    };
+    auto bareCopy = [&]() {
+        ID3D11ShaderResourceView* srv = frameV.Get();
+        ID3D11UnorderedAccessView* uav = outU.Get();
+        ctx->CSSetShader(copyCs.Get(), nullptr, 0);
+        ctx->CSSetShaderResources(0, 1, &srv);
+        ctx->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+        ctx->Dispatch(static_cast<UINT>((fw + 7) / 8), static_cast<UINT>((fh + 7) / 8), 1);
+        ctx->ClearState();
+    };
+    const std::vector<std::pair<const char*, std::function<void()>>> runs = {
+        {"CopyResource frame -> out (the floor's floor)", [&]() { ctx->CopyResource(out.Get(), frame.Get()); }},
+        {"bare compute copy frame -> out", bareCopy},
+        {"composite, layer empty (cleared, never drawn)", [&]() { composite(empty); }},
+        {"composite, layer with a HUD's panels (15%)", [&]() { composite(hud); }},
+        {"composite, layer covered", [&]() { composite(full); }},
+    };
+    for (int i = 0; i < 40; ++i)
+        for (const auto& r : runs) timeFn(d, 4, r.second);
+    std::vector<std::vector<double>> ms(runs.size());
+    for (int round = 0; round < 25; ++round)
+        for (size_t k = 0; k < runs.size(); ++k) {
+            const double t = timeFn(d, 8, runs[k].second);
+            if (t > 0) ms[k].push_back(t);
+        }
+    std::printf("ms per call, one eye: frame %dx%d, layer %dx%d RGBA16F\n", fw, fh, lw, lh);
+    for (size_t k = 0; k < runs.size(); ++k) std::printf("  %-52s %8.4f\n", runs[k].first, median(ms[k]));
+
+    // What an empty layer does to the frame: nothing. (The composite of a layer
+    // that is all "nothing here" is the frame, bit for bit: l = (0,0,0,1) exactly,
+    // c = 0 + f * 1 * 1.) The bench is only worth reading if that holds.
+    composite(empty);
+    const std::vector<uint8_t> got = readBytes(d, out.Get(), 4);
+    check(got == frameData, "a composite over an empty layer returns the frame byte for byte");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool selfTest = false, dry = false, print = false, nvidia = false, stats = false, bench = false;
+    bool selfTest = false, dry = false, print = false, nvidia = false, stats = false, bench = false, benchComposite = false;
     int fuzz = 240;
     const char* usage =
-        "usage: ui_holo_pass_test --self-test|--dry-run|--print-goldens|--stats|--bench [--fuzz N] [--adapter nvidia]";
+        "usage: ui_holo_pass_test --self-test|--dry-run|--print-goldens|--stats|--bench|--bench-composite [--fuzz N] [--adapter nvidia]";
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--self-test")) selfTest = true;
         else if (!std::strcmp(argv[i], "--dry-run")) dry = true;
         else if (!std::strcmp(argv[i], "--print-goldens")) print = true;
         else if (!std::strcmp(argv[i], "--stats")) stats = true;
         else if (!std::strcmp(argv[i], "--bench")) bench = true;
+        else if (!std::strcmp(argv[i], "--bench-composite")) benchComposite = true;
         else if (!std::strcmp(argv[i], "--fuzz") && i + 1 < argc) fuzz = std::max(0, std::atoi(argv[++i]));
         else if (!std::strcmp(argv[i], "--adapter") && i + 1 < argc && !std::strcmp(argv[i + 1], "nvidia")) { nvidia = true; ++i; }
         else { std::puts(usage); return 2; }
@@ -910,10 +1077,15 @@ int main(int argc, char** argv) {
         std::puts("Would compare the production UI resolve against its frozen reference on WARP, byte for byte, over the fixtures and fuzz cases; writes no files.");
         return 0;
     }
-    if (!selfTest && !print && !stats && !bench) { std::puts(usage); return 2; }
+    if (!selfTest && !print && !stats && !bench && !benchComposite) { std::puts(usage); return 2; }
 
     Device d = makeDevice(nvidia);
     ID3D11Device* dev = d.dev.Get();
+    if (benchComposite) {
+        runCompositeBench(d);
+        if (g_failures) { std::printf("FAILED: %d of %d checks\n", g_failures, g_checks); return 1; }
+        return 0;
+    }
 
     // The reference must be the shader it claims to be, and the bytecode header
     // must be the production source compiled; otherwise a green run says nothing.

@@ -40,11 +40,19 @@ changes.*
 - **Ruled out:** at the end of each 2026-09-24 entry, and in the 2026-09-29
   ones (the periodic jobs; EDVR's Present hook; EDVR's AA work as the
   stalls' cause; engine motion's CPU as the carrier's limit).
+- **UI and hologram passes, 2026-09-29 (last entry):** branch
+  `claude/ui-holo-passes`, built, NOT FLOWN. One exact cut only: the UI resolve
+  skips inputs it was not given (about 0.09 ms a frame when the edit mask is
+  null). Ruled out, measured: a tile early-out, a groupshared window, an R8
+  history, a composite tile bound (all bandwidth-bound). Largest left: the HDR
+  layer's depth seed (0.53 ms an eye-frame, outside the census) and UI quality
+  1.25 itself, a setting (about 1.6x the pixels of 1.0).
 - **Next** (flight 112704 entry): the GPU is the lever, about 1.6 ms off
   EDVR's ~6 ms. Sean's pick: the upscaler (3.08 ms; the output size is a
   setting, foveated DLSS is paused); the UI and hologram passes cut to their
-  footprint (2.16 ms, review P3); naming the six "other fix-wrapped draws"
-  (1.02 ms whole). Also sample the engine-motion clock (~1.17 ms of CPU a
+  footprint (2.16 ms, review P3; see the bullet above); naming the six "other
+  fix-wrapped draws" (1.02 ms whole; Elite's own draws). Also sample the
+  engine-motion clock (~1.17 ms of CPU a
   frame). Any Quest flight with the default build: check the
   Application-render GPU invalid count stays near zero and
   `native_frame_end_overlap_summary` reads failures=0.
@@ -1345,3 +1353,112 @@ carrier for the p50 to reach 90 Hz. In rough order of gain:
 Separately: sample the engine-motion clock (every call now, ~1.17 ms of CPU a
 frame) now that it has answered; the clear observer (2.7 us a call on job
 threads) is the CPU item for scenes that are CPU-bound.
+
+## 2026-09-29: the UI and hologram passes, built, not flown
+
+Branch `claude/ui-holo-passes` from 446d7e7a. Asked for: the UI and hologram
+GPU passes cut to the work they have, the image unchanged (review P3, B-3,
+D-1, D-2, D-4). Nothing merged, installed or flown. Commits 396d8dcd (the rig
+and its goldens, recorded from the unmodified shader first) and f282c056 (the
+change). Every number below is an RTX 5090 at the eye's real size, 2016x1948
+in and 4032x3896 out, from `tools\ui_holo_pass_test` (`--bench`,
+`--bench-composite`, `--adapter nvidia`): the median of 25 interleaved rounds
+of 8 dispatches between GPU timestamps, inputs synthetic (a mixed-content
+frame, a HUD's panels over 15% of the eye).
+
+**Built: the UI resolve does not fetch what it was not given.** A load from a
+null view returns zero and is slow on this GPU. Reference (the shader as it
+was) against production, ms an eye:
+
+| state of the inputs | reference | production |
+|---|---|---|
+| everything bound, idle / HUD / menu | 0.145 / 0.143 / 0.165 | 0.144 / 0.142 / 0.170 |
+| source-edit mask unbound, idle / HUD | 0.179 / 0.175 | 0.135 / 0.131 |
+| coverage mask unbound, idle | 0.179 | 0.134 |
+| history unbound, idle | 0.155 | 0.125 |
+| all three unbound (no UI this frame) | 0.245 | 0.109 |
+
+Flight 112704's census read the resolve at 0.55-0.58 ms a frame in its first
+minute (windows ending 11:28:04 and 11:28:34) and 0.33-0.41 after, 0.33-0.37
+through the busiest; the reference's all-unbound and edit-mask-unbound rows
+doubled are 0.49 and 0.36. That is inference, not a measurement: the log does
+not say which inputs were bound. What supports it: the UI content tracker
+read `compared=0` until 11:28:51, and `g_edits[eye].marked` is set only by a
+surface composite whose source changed, so a still HUD leaves the edit mask
+null on most frames. Expected: about 0.09 ms a frame in the busy windows
+(0.357 to about 0.27), up to 0.3 in the first minute's state, nothing when
+every input is bound (parity, 0.144 against 0.145). To read it after a flight:
+`UI resolve: not bound on some frames: ...` in the log, and the census's UI
+resolve in the same scene.
+
+How: b1.z carries the unbound inputs (bits 1 coverage, 2 source edits, 4
+history; zero is all bound, what a caller with no b1 sends), derived in
+`applyUiResolve` from the views it binds. The shader body is compiled twice,
+once with the bits known zero (the checks fold away) and once asking. Same
+arithmetic, same history layout. Proof, gated in build.bat as
+`:rig_ui_holo_pass_test`: 269 fixtures byte for byte against a frozen copy of
+the shader and against goldens recorded before the change (WARP; the RTX
+passes the pairs too): the corner, tile edges, the corona's edge, none, a
+full-screen menu, jitter to 1.7 and wild, ratios 0.5 to 3, both eyes; each
+input unbound alone equals the reference over zeros (227 runs); bits of zero
+over unbound inputs still equal the reference (98); claiming a bound input
+unbound FAILS 203 of 219 fixtures with content, and each bit fails on the
+named fixture built to need it. Trace: a build without this has no
+`UI resolve: not bound` line, and the bytecode header is checked against the
+source, so a stale header fails the rig.
+
+- ruled out: an 8x8 tile early-out for the UI resolve, because there is no
+  corona radius to key a margin on. The corona hold applies to any faint flat
+  pixel anywhere (`corona_smear_level` 64 by default), so every tile needs
+  its raw neighbourhood, and the pass is bandwidth-bound anyway: with the hold
+  off it takes 0.112 ms, 188 MB at 1.7 TB/s, against 0.076 ms for a bare
+  compute copy of the frame.
+- ruled out: a groupshared window for the resolve's taps, because it is
+  slower with the inputs bound. Built and exact (269 fixtures, both adapters);
+  idle 0.141 to 0.149, HUD 0.139 to 0.150, menu 0.156 to 0.205 (0.129, 0.129,
+  0.178 with the fallback taken out): the taps are L1 hits and the pass sits
+  at its bandwidth floor. It only won where inputs were null, which the
+  b1 bits do without it.
+- ruled out: an R8 history for the resolve, because it buys 2-3% (0.140
+  against 0.144 idle, 0.139 against 0.142 HUD; about 0.007 ms a frame) and
+  the pair is shared with the own path's RGBA colour evidence.
+- ruled out: bounding the layer composite to the layer's tiles, because it
+  costs 0.119 ms with an EMPTY layer, 0.120 with a HUD's panels and 0.130
+  covered, against 0.076 for a bare copy of the frame: a perfect skip of
+  empty tiles saves 0.04 ms an eye at most (about 0.07-0.09 a frame), and
+  nothing exact says which tiles are empty (every redirected draw uses the
+  full-eye viewport; the draws' bounds live in the game's own vertex data).
+  The flight agrees: the layer's own composite price is 0.118-0.120 ms an
+  eye-frame in every window from 4 redirected draws a frame to 122. What a
+  skip would rely on holds: over an empty layer the composite returns the
+  frame byte for byte.
+
+Not changed, and why:
+- **Hologram passes and their scratch (D-4).** The scratch is cleared lazily,
+  once an eye-frame at the first listed draw (`holoScratchPrepare`); the
+  near-light pass and the resolve already discard on an empty element depth
+  and read the game's target and display only under flags. What costs (0.126
+  ms a call, 5.5 a frame) is each listed draw's two replays of the game's own
+  geometry, and a scissor to bounds needs bounds nothing on the CPU has.
+- **One scene-depth copy (D-2).** `ui_depth_layer.h:89` copies at the first UI
+  draw of an eye-frame; the layer's seeds copy the depth and stencil as they
+  stand at each seed, and the stencil is rewritten between them by the
+  stencil-only writers the seed arc counts (docs/dlss-performance-review-
+  2026-09-28.md, ruled out: keeping stale depth). Sharing changes pixels.
+- **The reissues (114 a frame, 0.428 ms).** About 4 us each: a small draw and
+  a render-target switch. There is no bound to take; fewer needs merging draws.
+- **"Other fix-wrapped draws" (1.02 ms, 6 a frame)** are Elite's own draws
+  under another fix's state (`AlteredVerdict`, timed as the game's draw and
+  only it), not EDVR's hologram replays: those are the "hologram passes" bucket.
+
+**Largest left, outside this brief.** The layer's HDR HUD depth-stencil seed,
+in no census section: in flight 112704's layer lines it is 0.52-0.53 ms an
+eye-frame median (p95 1.2-1.4) in every window from 11:29:34 to 11:31:34,
+1.04 ms a frame, with 80-122 redirected draws a frame, three seeds and one
+stale per eye-frame (13,782-14,520 seeds, 4,594-4,840 stale a window); at 54
+draws a frame (11:29:04) it is 0.158, and 0.156 in the quiet station flight
+of 09-28. The exact routes to fewer seeds are ruled out in
+docs/dlss-performance-review-2026-09-28.md. Second, `fix.ui_quality` 1.25
+itself: the layer holds 1.62x the pixels of 1.0, and the seed, the
+redirected draws (0.60 ms) and the composite scale with them, roughly 0.7-1.0
+ms a frame by pixel count, unmeasured. That changes the image; Sean's call.
