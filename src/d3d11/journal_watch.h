@@ -141,7 +141,20 @@ bool journalInJumpTunnel();
 // writes nothing to the log on the way out. What the accessors last said stays
 // what they say, and a later tick starts nothing. Like the menu's writer and the
 // panel raster worker, the state it uses is never freed, so a worker still
-// finishing after this returns has nothing to fault on.
+// finishing after this returns has no data to fault on.
+//
+// Its CODE is a separate matter, and nothing here keeps it mapped. Two things
+// do. The worker is a std::thread, and the static UCRT's _beginthreadex holds a
+// reference on the module of its thread routine and ends the thread through
+// FreeLibraryAndExitThread (ucrt\startup\thread.cpp), so a FreeLibrary during a
+// file call leaves the image mapped and the unload completes on the worker's own
+// thread once it has stopped. And the graphics DLL is pinned
+// (src/common/module_pin.h) at the first device creation, long before the first
+// tick starts the worker, which does not lean on the CRT. The RC4 review (F1)
+// took the detached worker to have neither; tools/journal_unload_test loads this
+// code in a DLL, blocks the worker inside a file call, calls FreeLibrary, and
+// shows both. A host that runs the worker without the pin owns nothing but the
+// CRT's reference.
 void journalWatchShutdown();
 
 // WHICH JOURNAL IS THIS SESSION'S, as a pure decision over times alone.
