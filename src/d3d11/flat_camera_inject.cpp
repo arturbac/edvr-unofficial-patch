@@ -33,12 +33,15 @@ namespace {
 // for process lifetime -- disable closes the gate and nothing more (no
 // uninstall, no free, ever).
 
-constexpr uintptr_t kRefreshRva = 0x5921f9;
-// The function's own first instruction is a conditional jump CodeHook
-// cannot move; the hook sits one instruction later, after the param_2
-// null check (a null param_2 is no refresh anyway).
-constexpr uint8_t kRefreshPrologue[16] = {0x48, 0x8B, 0xC4, 0x41, 0x55, 0x41, 0x56, 0x41,
-                                         0x57, 0x48, 0x81, 0xEC, 0xE0, 0x00, 0x00, 0x00};
+constexpr uintptr_t kRefreshRva = 0x592200;
+// Two site constraints, learned from two refused installs: the function's
+// second instruction is a conditional jump CodeHook will not move, and the
+// patch site must be eight-byte aligned for the atomic store. +0x592200 is
+// the first site satisfying both (push r15; sub rsp,0xE0; register moves
+// after that replay inside the trampoline). The detour's arguments arrive
+// in rcx/rdx/r8 untouched either way.
+constexpr uint8_t kRefreshPrologue[16] = {0x41, 0x57, 0x48, 0x81, 0xEC, 0xE0, 0x00, 0x00,
+                                         0x00, 0x4D, 0x8B, 0xF8, 0x4C, 0x8B, 0xEA, 0x4C};
 constexpr size_t kRelayBytes = 44;
 constexpr uint32_t kOriginalLiteral = 36;
 
