@@ -19,7 +19,10 @@ changes.*
   frame is GPU-bound, and engine motion costs Elite's render thread
   0.35-0.40 ms p50 (ruled out as the limit). The GPU frame is 12.5-12.7 ms:
   Elite about 6.5, EDVR 6.0-6.2 (upscaler 3.08, UI and hologram passes 2.16,
-  motion 0.46, and 0.3-0.5 inside Elite's own draws).
+  motion 0.46, and 0.3-0.5 inside Elite's own draws). BUILT after it, not
+  flown (branch `claude/engine-clock-sampling`): the engine-motion clock
+  sampled (about 0.12 ms a frame of its own, was 1.17) and the census naming
+  the six "other fix-wrapped draws" fix by fix (last entry).
 - **Comparing with 0.16.2 in fpsVR:** under OpenVR its CPU frame time is
   poses ready to second submit (0.16.2's `appCpuMs`); on the native runtime
   it tracks Elite's whole frame outside the wait. Compare pre-submit windows.
@@ -39,14 +42,16 @@ changes.*
   0.1 ms bar.
 - **Ruled out:** at the end of each 2026-09-24 entry, and in the 2026-09-29
   ones (the periodic jobs; EDVR's Present hook; EDVR's AA work as the
-  stalls' cause; engine motion's CPU as the carrier's limit).
+  stalls' cause; engine motion's CPU as the carrier's limit; the six wrapped
+  draws as the redirected holograms or the depth reissues).
 - **Next** (flight 112704 entry): the GPU is the lever, about 1.6 ms off
   EDVR's ~6 ms. Sean's pick: the upscaler (3.08 ms; the output size is a
   setting, foveated DLSS is paused); the UI and hologram passes cut to their
-  footprint (2.16 ms, review P3); naming the six "other fix-wrapped draws"
-  (1.02 ms whole). Also sample the engine-motion clock (~1.17 ms of CPU a
-  frame). Any Quest flight with the default build: check the
-  Application-render GPU invalid count stays near zero and
+  footprint (2.16 ms, review P3). The six "other fix-wrapped draws" (1.02 ms
+  whole) are unnamed until the next carrier flight reads the new per-fix
+  census line (last entry says what each answer would mean, and which one
+  flip of `fix.sun_glare` separates them). Any Quest flight with the default
+  build: check the Application-render GPU invalid count stays near zero and
   `native_frame_end_overlap_summary` reads failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
@@ -1345,3 +1350,96 @@ carrier for the p50 to reach 90 Hz. In rough order of gain:
 Separately: sample the engine-motion clock (every call now, ~1.17 ms of CPU a
 frame) now that it has answered; the clear observer (2.7 us a call on job
 threads) is the CPU item for scenes that are CPU-bound.
+
+## 2026-09-29: the engine-motion clock sampled, the fix-wrapped draws named (built, not flown)
+
+Branch `claude/engine-clock-sampling`, on main 446d7e7a; both changes are the
+two Sean approved after flight 112704.
+
+**The clock costs about 0.12 ms a frame, not 1.17.** The flown instrument
+clocked every hook call on every thread: 17,499 a frame on the job threads
+(13,425 the builder) and about 1,600 on the render thread. Now
+(`engine_motion_cpu.h`):
+- The render thread (whoever calls Present) is clocked on every call of every
+  frame, so its figures and the LONG FRAME "engine motion" clause are exact and
+  unchanged.
+- Every other thread is clocked only on sampled frames, one in 32 at a random
+  place in each block of 32 (a fixed stride would alias with anything Elite
+  does every N frames). On the other 31 a hook is a load of one gate word, a
+  thread-id compare (from the TEB, no call) and a branch: no clock read, no
+  slot, no count. A scope decides once, at entry. The evaluator relays (counted,
+  never clocked) count on sampled frames only.
+- The other threads' figures are per SAMPLED frame (thread-ms mean, p50, p95,
+  max; calls per sampled frame); the window totals keep a scope that straddled a
+  cut. If the thread-id read ever disagreed with `GetCurrentThreadId` the
+  scheme drops to clocking everything and the summary says "Sampling is OFF".
+- Four 30 s lines: the scheme and totals; the clock and what the instrument
+  costs at this window's rates weighted by the sampled fraction; the render
+  thread's parts; the other threads' parts. The job bracket in
+  `kinematic_eval_hook.cpp` takes its own two readings and shares them
+  (`pauseAt`/`resumeAt`), so the L1 job statistics do not depend on sampling.
+- What a null scope RECORDS is now measured with a random wait between the
+  scopes, median batch: back to back, three 33 ns scopes make one 100 ns QPC
+  tick and one rig run read 0.2 ns where the next read 12-16, the same code.
+
+Cost, rig on this machine: a clocked scope costs 33.4 ns and records 15-16 (66
+and 32 with a forward pause); a skipped scope 0.6 ns, a counted call 0.4. At
+the 11:30:34 window's rates (render thread 1,045 plain and 557 paused calls a
+frame; job threads 702 plain and 16,797 paused; 14,850 evaluator counts) the
+model gives 1.21 ms for the flown scheme (its own line said 1.172) and 0.12 for
+one in 32 (render thread 0.072, the price of keeping it exact; others 0.05).
+One in 16, the first suggestion, gives 0.155, over the 0.15 target; one in 32
+holds 0.140 even with a skipped scope priced at 1.5 ns, 2.6 times the measured.
+The floor is a hot loop: the flight's own clock line, computed the same way
+from that window's rates, is the check.
+
+**The census names the fix-wrapped draws.** "Other fix-wrapped draws" is now
+one section per fix, 19 (the 18 verdicts that reach the altered-draw site, and
+an "unnamed" row that shows if a wrapped draw's fix has no name). They share one
+turn (the rotation stays 21 long, so nothing else is sampled less), one K of 8,
+one stride from all their calls together and one empty timer pair a turn. The
+classes' line is unchanged, its "other fix-wrapped draws" now their sum (1.021
+compares directly); a line after it gives each fix's ms and calls a frame, "-"
+where none ran (937 characters worst case). `vscreen.cpp` maps `DrawVerdict` to
+fix in a switch with C4062 an error: a verdict added without a name does not
+compile. Nothing renders differently.
+
+**Which code wraps the six: not established.** No log counts draws by verdict.
+What flight 112704 says (windows 11:27:34-11:32:34): 2.00-2.83 a frame in menus,
+4.96, 7.76, 8.03 as ships gathered, then exactly 6.00 for three windows (0.92-1.02
+ms with DLSS) and still 6.00 with AA off at 2.416 ms (0.40 ms a draw against
+0.17). The cost per draw rose 0.07 to 0.17 ms as the count fell: large
+translucent draws, fill-bound. The UI layer's line in the same window reads
+"left in the game's frame: hologram 4.00 a frame (another fix swallows or
+re-issues it)": four radar-family draws a frame (icon core, stalks, contact
+markers) arrive under a verdict that does not forward, so they are in this class.
+- ruled out: the six as the holograms redirected into EDVR's layer, because a
+  redirected draw is class UiLayer (tested before Verdict in
+  `classifyAlteredDraw`) and that is the 0.600 ms row; and as the hologram depth
+  reissues (5.5 a frame, 0.691 ms), because those are EDVR's own draws with their
+  own section, not the game's.
+- Candidates, each with the row that shows it: the sun glare train (`sun glare
+  steady`; the log has VIVID and the world variant created at 11:27:29; matcher
+  kind N, 6 indices, 2+ instances, 2048x1024 BC7 in PS slots 0 and 1); the radar's
+  contact markers caught by that same shape (instanced quads, one instance a
+  contact: also `sun glare steady`, the four hologram draws inside the six);
+  particles; night vision; the HUD and holo verdicts. `unnamed fix` above zero is
+  a verdict with no name. If `sun glare steady` reads 6.00, one live flip of
+  `fix.sun_glare` to stock in the same place separates the two: the "hologram ...
+  left" line vanishing with the redirected holograms up by 4.00 says the glare
+  matcher is catching the radar, and the row's cost stock against vivid is what
+  EDVR's substitution adds.
+
+Tests: `engine_motion_cpu_test` 144 checks (sampled frames exact; unsampled
+frames read no clock, take no slot, count nothing; gate, schedule, fold over
+sampled frames, a straddling scope, the fallback, the cost model reproducing
+1.17, the four lines' worst case 991 characters), 44 mutants, all caught;
+`gpu_census_test` 134 checks, 21 mutants, all caught.
+
+What the next flight's log must show: the summary reads "Other threads (N) are
+clocked only on the M sampled frames (one in 32" with M about 3% of the frames
+and the clock line "the instrument costs about 0.12 ms"; if sampling had not
+run it would say every frame, or "Sampling is OFF". The census line "EDVR GPU
+census, the other fix-wrapped draws above by the fix that wraps each" sums to the
+classes' "other fix-wrapped draws"; every fix "-" beside 6.00 there means the
+split is dead.

@@ -3608,6 +3608,53 @@ __declspec(noinline) void forwardVerdictEnd(ID3D11DeviceContext* self, DrawVerdi
     }
 }
 
+// The census's name for the fix that wraps a draw of this verdict (gpu_census.h, the split
+// of "other fix-wrapped draws"). No default, and C4062 is an error here: a verdict added to
+// DrawVerdict without a name is a compile error, never a wrapped draw in the wrong row. The
+// four that never reach the altered-draw site (forwardWithVerdict returns, or forwards a
+// declined substitution untouched, before it) are named so the switch is exhaustive; "unnamed"
+// is what would show if one ever did. constexpr, so the pairs are proved right below.
+#pragma warning(push)
+#pragma warning(error : 4062)
+constexpr AlteredFix alteredFixOf(DrawVerdict v) noexcept {
+    switch (v) {
+    case DrawVerdict::kPanel:        return AlteredFix::Panel;
+    case DrawVerdict::kRemlok:       return AlteredFix::Remlok;
+    case DrawVerdict::kHolo:         return AlteredFix::Holo;
+    case DrawVerdict::kTargetSharp:  return AlteredFix::TargetSharp;
+    case DrawVerdict::kNightVision:  return AlteredFix::NightVision;
+    case DrawVerdict::kHudSprite:    return AlteredFix::HudSprite;
+    case DrawVerdict::kPanelUpscale: return AlteredFix::PanelUpscale;
+    case DrawVerdict::kHudGrain:     return AlteredFix::HudGrain;
+    case DrawVerdict::kIntroPanel:   return AlteredFix::IntroPanel;
+    case DrawVerdict::kGlareClamp:   return AlteredFix::GlareClamp;
+    case DrawVerdict::kGlareSteady:  return AlteredFix::GlareSteady;
+    case DrawVerdict::kParticle:     return AlteredFix::Particle;
+    case DrawVerdict::kFssPanel:     return AlteredFix::FssPanel;
+    case DrawVerdict::kFssReveal:    return AlteredFix::FssReveal;
+    case DrawVerdict::kFssDump:      return AlteredFix::FssDump;
+    case DrawVerdict::kResolveBind:  return AlteredFix::ResolveBind;
+    case DrawVerdict::kScrim:        return AlteredFix::Scrim;
+    case DrawVerdict::kBackdrop:     return AlteredFix::Backdrop;
+    case DrawVerdict::kNone:
+    case DrawVerdict::kSkip:
+    case DrawVerdict::kQuadSkip:
+    case DrawVerdict::kLoaderPanel:  return AlteredFix::Unnamed;
+    }
+    return AlteredFix::Unnamed;
+}
+#pragma warning(pop)
+static_assert(alteredFixOf(DrawVerdict::kPanel) == AlteredFix::Panel && alteredFixOf(DrawVerdict::kRemlok) == AlteredFix::Remlok &&
+                  alteredFixOf(DrawVerdict::kHolo) == AlteredFix::Holo && alteredFixOf(DrawVerdict::kTargetSharp) == AlteredFix::TargetSharp &&
+                  alteredFixOf(DrawVerdict::kNightVision) == AlteredFix::NightVision && alteredFixOf(DrawVerdict::kHudSprite) == AlteredFix::HudSprite &&
+                  alteredFixOf(DrawVerdict::kPanelUpscale) == AlteredFix::PanelUpscale && alteredFixOf(DrawVerdict::kHudGrain) == AlteredFix::HudGrain &&
+                  alteredFixOf(DrawVerdict::kIntroPanel) == AlteredFix::IntroPanel && alteredFixOf(DrawVerdict::kGlareClamp) == AlteredFix::GlareClamp &&
+                  alteredFixOf(DrawVerdict::kGlareSteady) == AlteredFix::GlareSteady && alteredFixOf(DrawVerdict::kParticle) == AlteredFix::Particle &&
+                  alteredFixOf(DrawVerdict::kFssPanel) == AlteredFix::FssPanel && alteredFixOf(DrawVerdict::kFssReveal) == AlteredFix::FssReveal &&
+                  alteredFixOf(DrawVerdict::kFssDump) == AlteredFix::FssDump && alteredFixOf(DrawVerdict::kResolveBind) == AlteredFix::ResolveBind &&
+                  alteredFixOf(DrawVerdict::kScrim) == AlteredFix::Scrim && alteredFixOf(DrawVerdict::kBackdrop) == AlteredFix::Backdrop,
+              "each verdict that can reach the altered-draw site names its own census row");
+
 // forwardWithVerdict's re-issue of the game's own draw, straight to the
 // runtime, for the rare passes that draw it again (the tone separation, the
 // interface depth re-issues). A NOINLINE
@@ -3797,7 +3844,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // The game's own draw, and only it: the class says which kind of altered draw it is
     // (gpu_census.h), so the thunk's real-draw call can be timed as that section. Every
     // other issue through `draw` below passes None and is timed by its own section.
-    auto observedDraw = [&](AlteredDrawClass altered) {
+    auto observedDraw = [&](AlteredDraw altered) {
         if (owner && uiLayerIssueBlocked()) return false;
         const bool issued = draw(altered);
         if (seedOutcome.on) seedOutcome.original = seedOutcome.original || issued;
@@ -3911,9 +3958,11 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // for this verdict-free draw just before), a terrain original with its motion target
     // and pixel shader, a layered UI draw into EDVR's layer, any other verdict inside its
     // fix's state change. A handful of loads and compares on a draw that is none of them.
-    const AlteredDrawClass altered = classifyAlteredDraw(owner, v == DrawVerdict::kNone,
-                                                         engineVelocityDrawSubstituted(), terrainOriginal, layered);
-    const bool originalIssued=observedDraw(altered);
+    // A Verdict-class draw also carries the fix that wraps it (alteredFixOf): the census names each.
+    const AlteredDrawClass alteredClass = classifyAlteredDraw(owner, v == DrawVerdict::kNone,
+                                                              engineVelocityDrawSubstituted(), terrainOriginal, layered);
+    const bool originalIssued=observedDraw(alteredClass == AlteredDrawClass::Verdict
+                                               ? AlteredDraw(alteredClass, alteredFixOf(v)) : AlteredDraw(alteredClass));
     if (layered) {
         uiLayerEnd(self);
         if (originalIssued) uiLayerSecondIssues(self, kind, count, instances, args);
@@ -4402,7 +4451,7 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
     const DrawVerdict v = beginPanelOverride(self, 'D', count, 1, args);
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
-    forwardWithVerdict(self, v, 'D', count, 1, args, [&](AlteredDrawClass altered) {
+    forwardWithVerdict(self, v, 'D', count, 1, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
@@ -4448,7 +4497,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
     const DrawVerdict v = beginPanelOverride(self, 'I', count, 1, args);
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
-    forwardWithVerdict(self, v, 'I', count, 1, args, [&](AlteredDrawClass altered) {
+    forwardWithVerdict(self, v, 'I', count, 1, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
@@ -4494,7 +4543,7 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
     const UINT drawn = g_state->glareClamp && g_state->glareClamp < instances
                            ? g_state->glareClamp
                            : instances;
-    forwardWithVerdict(self, v, 'N', perInstance, drawn, args, [&](AlteredDrawClass altered) {
+    forwardWithVerdict(self, v, 'N', perInstance, drawn, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             GpuCensusAlteredScope timed(self, altered);   // the game's own draw, and only it (gpu_census.h)
@@ -4551,7 +4600,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     // verdict, which refreshes rtv0Eye; a draw a verdict claims is left alone.
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
-    forwardWithVerdict(self, v, 'X', perInstance, instances, args, [&](AlteredDrawClass altered) {
+    forwardWithVerdict(self, v, 'X', perInstance, instances, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
             // The game's own draw, and only it (gpu_census.h): the weapon and screen motion

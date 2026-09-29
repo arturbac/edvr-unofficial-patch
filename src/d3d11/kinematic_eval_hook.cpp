@@ -518,12 +518,17 @@ uintptr_t __fastcall bracket(uint32_t job,uintptr_t a,uintptr_t b,
     // read never serializes a torn snapshot. No drain: the finishing thread
     // may itself be inside an observed job, so draining could self-deadlock.
     const uint64_t gen=kinematicEvalProbe.jobGeneration();
-    // The pause and the resume ARE the bracket's own two clock readings (both
-    // QPC), so the instrument adds only its enter and its leave here, and the
-    // timed region is unchanged.
-    const int64_t start=engineMotion.pause();
+    // The bracket takes its own two clock readings (the job statistics below
+    // need them on every call) and hands the same two to the instrument, so a
+    // sampled frame adds only the instrument's enter and its leave here, and a
+    // frame it does not clock adds nothing (engine_motion_cpu.h: pauseAt and
+    // resumeAt read no clock). The timed region is unchanged.
+    const int64_t start=qpcNow();
+    engineMotion.pauseAt(start);
     const uintptr_t result=forward(a,b,c,d);
-    const int64_t elapsed=engineMotion.resume()-start;
+    const int64_t stop=qpcNow();
+    engineMotion.resumeAt(stop);
+    const int64_t elapsed=stop-start;
     if(queueArmed) {
         // Exit read after the timing stops: the measured region stays the
         // job body alone. A torn/missing exit read drops the pair.

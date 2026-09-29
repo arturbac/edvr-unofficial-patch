@@ -40,17 +40,28 @@ constexpr const char* kFrameBreakdownNames[8] = {
     "screen motion", "weapon motion", "engine velocity",
     "UI layer reissues"
 };
-// Elite's own draws that EDVR alters, AlteredPoolFamily..AlteredVerdict (indices 17..20):
-// the game's draws timed whole (gpu_census.h), so they are reported on their own line and
-// never summed into EDVR's total.
+// Elite's own draws that EDVR alters (gpu_census.h): the game's draws timed whole, so they are
+// reported on their own lines and never summed into EDVR's total. AlteredPoolFamily,
+// AlteredTerrain and AlteredUiLayer are one class each (indices 17..19); the draws another fix
+// wraps are one section per fix from AlteredFixFirst on (indices 20..38), reported as one item
+// on the classes' line (their sum) and one by one on the line after it.
 constexpr size_t kAlteredFirst = static_cast<size_t>(GpuCensusSection::AlteredPoolFamily);
-constexpr size_t kAlteredSections = kSections - kAlteredFirst;
-constexpr const char* kAlteredNames[4] = {
+constexpr size_t kAlteredClassSections = static_cast<size_t>(GpuCensusSection::AlteredFixFirst) - kAlteredFirst;
+constexpr size_t kAlteredFixFirst = static_cast<size_t>(GpuCensusSection::AlteredFixFirst);
+constexpr const char* kAlteredNames[3] = {
     "pool-family draws (EDVR's slot target and shaders)", "terrain prepasses (EDVR's motion target and shader)",
-    "UI draws (redirected to EDVR's layer)", "other fix-wrapped draws"
+    "UI draws (redirected to EDVR's layer)"
 };
-static_assert(kAlteredSections == 4, "one name for each altered-draw section");
+constexpr const char* kAlteredFixSumName = "other fix-wrapped draws";
+// The fix names, in AlteredFix's order: fixed strings, never built from a draw.
+constexpr const char* kAlteredFixNames[kAlteredFixCount] = {
+    "panel distance", "RemLok overlay", "loading hologram", "target indicator", "night vision", "HUD sprites",
+    "holo panel", "HUD grain", "intro panel", "sun glare clamp", "sun glare steady", "particles",
+    "FSS panel", "FSS reveal", "FSS dump", "scanner-body resolve", "loading scrim", "menu backdrop", "unnamed fix"
+};
+static_assert(kAlteredClassSections == 3, "one name for each altered-draw class");
 static_assert(kAlteredFirst == kDoorSections + 8, "the altered sections follow the eight in-frame sections");
+static_assert(kAlteredFixFirst + kAlteredFixCount == kSections, "the fix sections are the last ones");
 
 struct SectionState {
     // Capacity 8 covers both K=2 (door) and K=8 (per-draw) sections; a door
@@ -76,6 +87,7 @@ struct SectionState {
     double nullBaseMs = 0.0;
     unsigned nullBaseSamples = 0;
     uint32_t turns = 0;              // turns taken, for the sampling offset
+    uint32_t nullPairsTaken = 0;     // empty pairs begun into this section's nullSampler, ever (the rig reads which section keeps a turn's)
 };
 SectionState g_section[kSections];
 
@@ -137,7 +149,9 @@ double correctedMsPerCall(double timedMeanMs, double nullMeanMs) noexcept {
     return std::max(0.0, timedMeanMs - nullMeanMs);
 }
 
-Snapshot snapshotOf(const SectionState& st, uint64_t frames) noexcept {
+// `nullSt` is the section whose empty pairs calibrate this one: itself for every section but the
+// fix sections, which share a turn and so one null pair a turn, taken into the first of them.
+Snapshot snapshotOf(const SectionState& st, const SectionState& nullSt, uint64_t frames) noexcept {
     Snapshot s;
     s.occurred = st.occurrences > 0;
     if (!s.occurred) return s;
@@ -145,13 +159,35 @@ Snapshot snapshotOf(const SectionState& st, uint64_t frames) noexcept {
     const double windowMs = t.ms - st.baseMs;
     const unsigned windowSamples = t.samples >= st.baseSamples ? t.samples - st.baseSamples : 0;
     const double msPerOccurrence = windowSamples ? windowMs / static_cast<double>(windowSamples) : 0.0;
-    const auto& nt = st.nullSampler.totals;
-    const double nullWindowMs = nt.ms - st.nullBaseMs;
-    const unsigned nullWindowSamples = nt.samples >= st.nullBaseSamples ? nt.samples - st.nullBaseSamples : 0;
+    const auto& nt = nullSt.nullSampler.totals;
+    const double nullWindowMs = nt.ms - nullSt.nullBaseMs;
+    const unsigned nullWindowSamples = nt.samples >= nullSt.nullBaseSamples ? nt.samples - nullSt.nullBaseSamples : 0;
     const double nullMsPerOccurrence = nullWindowSamples ? nullWindowMs / static_cast<double>(nullWindowSamples) : 0.0;
     s.perFrame = frames ? static_cast<double>(st.occurrences) / static_cast<double>(frames) : 0.0;
     s.msPerFrame = correctedMsPerCall(msPerOccurrence, nullMsPerOccurrence) * s.perFrame;
     return s;
+}
+Snapshot snapshotOf(const SectionState& st, uint64_t frames) noexcept { return snapshotOf(st, st, frames); }
+// A fix section's figure: calibrated by the null pairs of the turn it shares.
+Snapshot fixSnapshot(size_t i, uint64_t frames) noexcept {
+    return snapshotOf(g_section[kAlteredFixFirst + i], g_section[kAlteredFixFirst], frames);
+}
+
+// The section the rotation's turn is for, and the calls per frame that decide its stride: for the
+// fix sections' shared turn that is every fix's, together.
+uint64_t turnOccurrences(GpuCensusSection owner) noexcept {
+    if (owner != GpuCensusSection::AlteredFixFirst) return g_section[static_cast<size_t>(owner)].occurrences;
+    uint64_t total = 0;
+    for (size_t i = 0; i < static_cast<size_t>(kAlteredFixCount); ++i) total += g_section[kAlteredFixFirst + i].occurrences;
+    return total;
+}
+// The next section to hold a turn: the fix sections after the first are not turns of their own.
+int nextTurnOwner(int current) noexcept {
+    int next = current;
+    do {
+        next = (next + 1) % static_cast<int>(kSections);
+    } while (turnOwnerOf(static_cast<GpuCensusSection>(next)) != static_cast<GpuCensusSection>(next));
+    return next;
 }
 
 void appendItem(std::string& out, const char* name, const Snapshot& s) {
@@ -199,14 +235,27 @@ void logAndResetWindow(uint64_t now) {
     }
 
     // Elite's own draws that EDVR alters (gpu_census.h): the game's draw timed whole, so
-    // these are NOT EDVR's cost and stay out of both totals above.
+    // these are NOT EDVR's cost and stay out of both totals above. The draws another fix wraps
+    // are one item on this line (their sum: what the line said before it was split) and are
+    // named fix by fix on the line after it.
     double alteredTotal = 0.0;
     std::string alteredItems;
-    for (size_t i = 0; i < kAlteredSections; ++i) {
+    for (size_t i = 0; i < kAlteredClassSections; ++i) {
         const Snapshot s = snapshotOf(g_section[kAlteredFirst + i], frames);
         appendItem(alteredItems, kAlteredNames[i], s);
         alteredTotal += s.msPerFrame;
     }
+    Snapshot fixSum;
+    std::string fixItems;
+    for (size_t i = 0; i < static_cast<size_t>(kAlteredFixCount); ++i) {
+        const Snapshot s = fixSnapshot(i, frames);
+        appendItem(fixItems, kAlteredFixNames[i], s);
+        fixSum.occurred = fixSum.occurred || s.occurred;
+        fixSum.msPerFrame += s.msPerFrame;
+        fixSum.perFrame += s.perFrame;
+    }
+    appendItem(alteredItems, kAlteredFixSumName, fixSum);
+    alteredTotal += fixSum.msPerFrame;
 
     uint64_t spansTimed = 0, spansSkipped = 0;
     for (const auto& st : g_section) {
@@ -280,6 +329,11 @@ void logAndResetWindow(uint64_t now) {
         "includes the game's own work in it, not only what EDVR adds, and none of it is in EDVR ~%.3f above): "
         "%s; together %.3f ms/frame; \"-\" means no such draw ran this window.",
         doorTotal + frameTotal, alteredItems.c_str(), alteredTotal);
+    // The "other fix-wrapped draws" above, one fix at a time: which code wraps the draws that cost.
+    Log::get().note(
+        "EDVR GPU census, the other fix-wrapped draws above by the fix that wraps each (the same draws, the game's own "
+        "work in each figure as above): %s; \"-\" means no draw of that fix ran this window.",
+        fixItems.c_str());
     char gapDetail[900];
     formatGapDetail(gapDetail, sizeof(gapDetail), gap);
     Log::get().note("%s", gapDetail);
@@ -304,7 +358,8 @@ bool gpuCensusBegin(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept
     if (section >= GpuCensusSection::Count) return false;
     SectionState& st = g_section[static_cast<size_t>(section)];
     ++st.occurrences;   // Cheap and unconditional: the estimate needs every occurrence counted.
-    if (static_cast<int>(section) != g_activeSection) return false;
+    const GpuCensusSection owner = turnOwnerOf(section);
+    if (static_cast<int>(owner) != g_activeSection) return false;
     const unsigned call = g_activeCalls++;
     if (call < g_activeOffset || (call - g_activeOffset) % g_activeStride != 0) return false;
     if (g_activeTimed >= occurrenceCapFor(section)) return false;   // K reached: counted, not timed
@@ -316,8 +371,10 @@ bool gpuCensusBegin(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept
         // (logAndResetWindow's "timer floor", snapshotOf's correction). Begin
         // and End are safe unconditionally either way (gpu_census.h).
         g_activeNullDone = true;
-        st.nullSampler.begin(ctx);
-        st.nullSampler.end(ctx);
+        SectionState& nullSt = g_section[static_cast<size_t>(owner)];   // the turn's owner keeps the turn's pair
+        ++nullSt.nullPairsTaken;
+        nullSt.nullSampler.begin(ctx);
+        nullSt.nullSampler.end(ctx);
     }
     if (!st.sampler.begin(ctx)) {
         ++st.skippedThisWindow;
@@ -340,10 +397,11 @@ void gpuCensusFrame(ID3D11DeviceContext* ctx) noexcept {
     ++g_windowFrames;
 
     // Next frame's section, and its stride from this window's calls per frame.
-    g_activeSection = (g_activeSection + 1) % static_cast<int>(kSections);
+    g_activeSection = nextTurnOwner(g_activeSection);
     SectionState& next = g_section[static_cast<size_t>(g_activeSection)];
     const unsigned cap = occurrenceCapFor(static_cast<GpuCensusSection>(g_activeSection));
-    const double perFrame = static_cast<double>(next.occurrences) / static_cast<double>(g_windowFrames);
+    const double perFrame = static_cast<double>(turnOccurrences(static_cast<GpuCensusSection>(g_activeSection))) /
+                            static_cast<double>(g_windowFrames);
     g_activeStride = perFrame > cap ? static_cast<unsigned>(perFrame / cap) : 1u;
     g_activeOffset = g_activeStride > 1 ? next.turns % g_activeStride : 0u;
     ++next.turns;
