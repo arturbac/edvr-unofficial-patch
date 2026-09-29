@@ -24,6 +24,7 @@
 #include "engine_velocity_emit.h"
 #include "engine_velocity_primary_copy.h"
 #include "engine_velocity_families.h"
+#include "engine_velocity_unkeyed.h"
 #include "engine_velocity_state.h"
 #include "engine_motion_cpu.h"   // the CPU instrument: the draw side, apply, the tees and the lazy patches are timed here
 #include "exposure_fix.h"   // lookupShaderHash: the PS shadow probe reads the registry
@@ -141,6 +142,10 @@ struct FamilyState {
     uint64_t selfMarkedLatched = 0;                // ...of those, the draws that latched the game's texture for the eye-frame
 };
 FamilyState g_families[kFamilyCount];
+// The flat census: every unkeyed (vs, ps) pair of a known family that bound in the
+// current 5 s window, four named at most. Written by the slow half and read by
+// engineVelocityFormatUnkeyed, both under g_mutex.
+engine_velocity_unkeyed::Table g_unkeyed;
 
 // What EDVR bound in place of the game's state, and at which generation of
 // the game's own binding, so a later look can tell whether it is still bound.
@@ -1252,6 +1257,7 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
         } else if (!anyKeyedPs(psHash)) {
             ++fam.unkeyedPsDraws;
             fam.unkeyedPsHash = psHash;
+            g_unkeyed.note(vsHash, psHash);
         }
         restore(ctx);
         return;
@@ -1704,6 +1710,7 @@ void clearLocked() {
         s.derived = s.valid = false; s.reason.clear(); s.binds = 0; s.unkeyedPsDraws = 0; s.selfMarked = 0; s.selfMarkedLatched = 0;
     }
     for (auto& d : familyDraws) d = 0;
+    g_unkeyed.reset();
     // g_bound stays: only the owner thread may put the game's state back
     // (engineVelocityFrameBoundary, g_anyBound says it is owed); it holds its
     // own references to the blend states, so the cache can go.
@@ -1723,6 +1730,13 @@ void clearLocked() {
 using namespace engine_velocity_detail;
 
 bool engineVelocityActive() noexcept { return live.load(std::memory_order_acquire); }
+
+int engineVelocityFormatUnkeyed(char* out, size_t size) {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    const int n = g_unkeyed.format(out, size, live.load(std::memory_order_acquire));
+    g_unkeyed.reset();
+    return n;
+}
 
 namespace engine_velocity_detail {
 // The emit's want on the shared hook set; quiet on a retry.

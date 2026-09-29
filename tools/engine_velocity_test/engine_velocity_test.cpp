@@ -55,6 +55,7 @@
 #include "lifecycle_tests.h"
 #include "pin_tests.h"
 #include "copier_tests.h"
+#include "unkeyed_tests.h"
 #include "../../src/common/runtime_profile.h"
 #include "../../src/d3d11/engine_velocity_families.h"   // kSelfMarking
 #include "../../third_party/dxbc_hash/DxilHash.cpp"
@@ -377,6 +378,7 @@ int wmain(int argc, wchar_t** argv) {
     lifecycle_tests::run({device.Get(), context.Get(), &check});
     pin_tests::run({device.Get(), context.Get(), &check});
     copier_tests::run({device.Get(), context.Get(), &check});
+    unkeyed_tests::run({&check});
     if (!realLinkRoot.empty()) {
         const Pair edge{L"vs_DE545DC8EE4FBB87", L"ps_91F8937EDA723663", false};
         check(onePair(device.Get(), context.Get(), realLinkRoot, edge, &check),

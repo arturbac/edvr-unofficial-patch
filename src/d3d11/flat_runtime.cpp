@@ -1573,6 +1573,14 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             (unsigned long long)s.hdrCopiesAccepted,(unsigned long long)s.hdrCopiesRefused);
         Log::get().note("flat menu HDR copy: accepted=%llu refused=%llu; source requires current scene/depth/camera provenance",
             (unsigned long long)s.menuCopiesAccepted,(unsigned long long)s.menuCopiesRefused);
+        // The census of unkeyed pairs, every window while a temporal mode runs (empty
+        // included: an absent line is what "this block never ran" looks like). A pair
+        // named here draws in a known pool family with no keyed pixel shader, so its
+        // pixels have no engine slot (engine_velocity_unkeyed.h).
+        {
+            char unkeyed[560]; engineVelocityFormatUnkeyed(unkeyed,sizeof(unkeyed));
+            Log::get().note("%s",unkeyed);
+        }
         Log::get().note("flat jitter: enabled=%u wanted=%u phase=(%.5g,%.5g) previous=(%.5g,%.5g) warm=%u frames=%llu draws=%llu dispatches=%llu refusals=%llu state=%s history-valid=%u",
             enabled?1u:0u,s.jitterWanted?1u:0u,
             s.phase.currentX,s.phase.currentY,s.phase.previousX,s.phase.previousY,s.phase.warmFrames,
