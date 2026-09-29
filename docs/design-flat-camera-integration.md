@@ -8,8 +8,8 @@
   consuming shader disassembled; the view/execution lineage is not joined
   and auxiliary composer callers are unclassified. C3, the upstream
   injector (fix.temporal_aa_camera, default off), is built; its crash is
-  root-caused and fixed (2026-09-29). The fixed build is NOT flown and live
-  mutation stays off until it is.
+  root-caused, fixed and FLOWN CLEAN 2026-09-29 08:49 (pass-through only:
+  the main menu offers no kind-3 camera; addendum at the end).
 - Decision: investigate jittering the game's per-view camera construction
   before it derives raster/lighting data. Preserve the existing frame
   discovery, size negotiation, temporal backends and resource isolation.
@@ -42,15 +42,15 @@
 - Corrected: the pass-through was not "memory-identical to unhooked". The
   property is every register and every stack byte at and above S unchanged
   at the trampoline, now proven by tools/flat_camera_stub_test (a gate).
-- Fix (built, not flown): both stubs reserve the home area (stubA sub/add
-  rsp,0x20, 111 -> 119 bytes, stubB at offset 168; stubB sub/add rsp,0x38,
-  xmm0 at [rsp+0x20]); emitters in src/d3d11/flat_camera_stubs.h.
-- Next: fly the fixed build once (flat profile, fix.temporal_aa_camera = on,
-  trace key off): no crash at +0x4C83379 and refresh-calls > 0 in the 5s
-  ticks confirm it. Then C3 proper per the wiring plan addendum (ownership
-  wired into flat_runtime, the classifier's jittered-encoding question, one
-  bounded session against its acceptance criteria). A key-off flight cannot
-  separate patch from stub: nothing is installed.
+- Fix (flown clean, pass-through): both stubs reserve the home area (stubA
+  sub/add rsp,0x20, 111 -> 119 bytes, stubB at offset 168; stubB sub/add
+  rsp,0x38, xmm0 at [rsp+0x20]); emitters in src/d3d11/flat_camera_stubs.h.
+- Next: a flat flight past the main menu into the cockpit and space (same
+  settings) to reach kind-3 cameras: `flat camera inject 5s: ... injected=`
+  above zero with no crash exercises the mutation path the main menu never
+  reached. Then C3 proper per the wiring plan addendum (ownership wired into
+  flat_runtime, the classifier's jittered-encoding question, one bounded
+  session against its acceptance criteria).
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable/build
   identities, backend versions, dimensions, formats and mod chain for
@@ -903,3 +903,20 @@ r15 come back as the four home-slot sentinels in every round, and xmm0 in
 stubB); against three mutants (stubA reserving only 0x18, xmm0 kept inside
 stubB's home area, a wrong argument slot) it fails 3 each; with the fix it
 passes.
+
+### 2026-09-29 08:49 flight: the stub fix flown clean (Epic, flat)
+
+Build v0.18.0-rc.3-110-g8879596a (edvr_log.py --expect-build matched),
+edvr_gfx_20260929_084913.log, 08:49:13 to 08:50:16; flat profile with
+fix.temporal_aa_camera = on and the trace key off, at the main menu. The
+refresh hook installed at +0x592200 with the fixed stubs, and the 5 s ticks
+counted refresh-calls=2538 in the last window (lastcall #21732 in all):
+roughly 21,700 calls through stubA and stubB where each of the three earlier
+fix-less flights crashed within about a second of its first calls. No crash:
+the breadcrumbs end in `gfx: alive, frame 32903`. Sean: "It did not crash and
+F8 menu works at main menu." The flat renderer treated 902 frames.
+
+What it does not show: injected=0 (warming=1269, kind-refusals=1269), because
+every camera at the main menu is kind 0, so only the pass-through path ran.
+The mutation path needs kind-3 cameras, which the next flight (cockpit and
+space) should reach.
