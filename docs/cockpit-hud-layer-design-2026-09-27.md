@@ -49,6 +49,19 @@
   `dlss-performance-review-2026-09-28.md` for the confirmed CPU waits and
   retained optimizations. Halo/occlusion parity still needs pixel evidence.
 
+- **Latest journal entry (2026-09-29, built, not flown):** the hologram
+  restore fence lifts at the frame boundary (Review B1); ui_holo_test now
+  1059 checks on WARP (927 in the entry the Open bullet's figure came from).
+- **Design background** (the game's tonemap draw, its variants, exposure,
+  bloom; measured facts): "Status detail" below, verbatim.
+- **Ruled out:** "Ruled out (do not re-propose)" below; the phase journals
+  after "Decisions" hold the flights.
+
+## Status detail (moved out of Status 2026-09-29)
+
+Moved verbatim out of the Status block (the design background bullets); the
+summary above points here.
+
 - **Tonemap** (vs `2D78DC3FD2C0C543` / ps `99C21CEB7A699821`), MEASURED
   (eye_tonemap_snapshot.h:87,139,170-201):
   - a 3-vertex full-screen triangle, unblended, no DSV;

@@ -41,16 +41,11 @@
   it). Both stubs now reserve the home area (flat_camera_stubs.h).
 - corrected: the 08:57 addendum and the earlier "Next" read the tick's
   history=invalid as the flat temporal pass not taking the injected phase.
-  It does. 085700.log, 08:59:01 / 08:59:06 / 08:59:11: `flat jitter: ...
-  phase=(-0.125,-0.27778) ... state=live history-valid=1` (and (0,-0.16667),
-  (-0.25,0.16667)); `flat runtime: last=treated-jittered ...
-  accepted-history-5s=320` (419, 425); the same seconds' `flat camera inject
-  5s: ... owner=upstream history=invalid`. The tick's history= mirrored an
-  ownership close nobody called; the gaps were G1-G4 (wiring addendum).
+  It does (evidence in Status detail below); the gaps were G1-G4 (wiring
+  addendum).
 - ruled out: the jittered bound pair breaking the ownership classifier's
-  exact encoding (this doc's out[0][2] = 2*dbx*s8), because the bound pair
-  enters only slots [i][0] and [i][1] and c2_derive_test A8 finds [i][2],
-  the depth row and rows 273/274 bit-identical over 16 phases at 3 sizes.
+  exact encoding (this doc's out[0][2] = 2*dbx*s8) (evidence in Status detail
+  below).
 - Next: Sean's visual verdict; decide main-versus-auxiliary grouping from the
   census (two kind-3 cameras injected, about 95 and 11 refreshes a frame);
   the census's injected-per-frame misreads a one-frame window (11:40:59).
@@ -60,6 +55,20 @@
 - Extends the [flat AA design](design-flat-temporal-aa-2026-09-23.md) and
   [architecture review](review-flat-temporal-aa-2026-09-26.md); the camera
   milestones below supplement, rather than renumber, their gates.
+
+## Status detail (moved out of Status 2026-09-29)
+
+- corrected (evidence): 085700.log, 08:59:01 / 08:59:06 / 08:59:11: `flat
+  jitter: ... phase=(-0.125,-0.27778) ... state=live history-valid=1` (and
+  (0,-0.16667), (-0.25,0.16667)); `flat runtime: last=treated-jittered ...
+  accepted-history-5s=320` (419, 425); the same seconds' `flat camera inject
+  5s: ... owner=upstream history=invalid`. The tick's history= mirrored an
+  ownership close nobody called; the gaps were G1-G4 (wiring addendum).
+- ruled out (evidence): the jittered bound pair breaking the ownership
+  classifier's exact encoding (this doc's out[0][2] = 2*dbx*s8), because the
+  bound pair enters only slots [i][0] and [i][1] and c2_derive_test A8 finds
+  [i][2], the depth row and rows 273/274 bit-identical over 16 phases at 3
+  sizes.
 
 ## 1. Problem and acceptance requirements
 

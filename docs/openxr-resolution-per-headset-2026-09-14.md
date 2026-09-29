@@ -58,6 +58,8 @@
   corrected here), openxr-runtime-inventory-2026-09-12.md and
   openxr-native-discovery-2026-09-13.md (fixture values).
 
+## Overview and revision history
+
 Design for setting the OpenXR render resolution per headset and runtime, so
 that a value chosen on the Quest 3 cannot follow Sean onto the Pimax, or onto
 the same Quest 3 through a different streaming app. It replaces the unreleased

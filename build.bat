@@ -162,6 +162,8 @@ python tools\build_diff.py --self-test || exit /b 1
 python tools\build_receipt.py --self-test || exit /b 1
 python tools\build_lock.py --self-test || exit /b 1
 python tools\flash_patch_residual.py --self-test || exit /b 1
+python tools\check_status_blocks.py --self-test || exit /b 1
+python tools\check_status_blocks.py || exit /b 1
 
 REM The version baked into both DLLs, printed in the second line of every log.
 REM
@@ -546,6 +548,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\dlaa.cpp" ^
     "src\d3d11\fsr3_engine.cpp" ^
     "src\d3d11\sharpen_pass.cpp" ^
+    "src\d3d11\flat_sharpen.cpp" ^
     "src\d3d11\loader_panel.cpp" ^
     "src\d3d11\splash_dim.cpp" ^
     "src\d3d11\billboard_fix.cpp" ^
@@ -943,6 +946,49 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /link /INCREMENTAL:NO kernel32.lib user32.lib dxgi.lib
 if errorlevel 1 ( echo [edvr] ERROR: native sharpen GPU test build failed & exit /b 1 )
 "%BUILD%\native_sharpen_gpu_test.exe" --dry-run || exit /b 1
+exit /b 0
+
+:rig_flat_sharpen_test
+echo [edvr] === flat_sharpen_test.exe, flat_sharpen_pass_test.exe ===
+REM The flat profile's sharpening (docs\anti-aliasing.md, "Flat sharpening"), in two
+REM rigs. flat_sharpen_test: the wrapper against a stubbed pass, and the flat panel's
+REM row table against the flat profile's key gate -- a row whose key the gate refuses
+REM reads 0 and does nothing, silently, so it fails the build here. flat_sharpen_pass_test:
+REM the shipped RCAS pass on WARP against a CPU implementation of AMD's RCAS, with five
+REM deliberately broken twins that must each fail. Neither links an import library for
+REM the D3D11 runtime: both take Windows' own d3d11 (common\system_d3d11.h).
+if not exist "%OBJ%\flat_sharpen_test" mkdir "%OBJ%\flat_sharpen_test"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\flat_sharpen_test\\" /Fe"%BUILD%\flat_sharpen_test.exe" ^
+    "tools\flat_sharpen_test\flat_sharpen_test.cpp" "src\d3d11\flat_sharpen.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib user32.lib dxgi.lib
+if errorlevel 1 ( echo [edvr] ERROR: flat sharpen contract test build failed & exit /b 1 )
+"%BUILD%\flat_sharpen_test.exe" --dry-run || exit /b 1
+"%BUILD%\flat_sharpen_test.exe" --self-test "%ROOT%" "%GEN%" || (
+    echo [edvr] ERROR: the flat profile's sharpening or its panel row is wrong
+    exit /b 1
+)
+if not exist "%OBJ%\flat_sharpen_pass_test" mkdir "%OBJ%\flat_sharpen_pass_test"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" ^
+    /Fo"%OBJ%\flat_sharpen_pass_test\\" /Fe"%BUILD%\flat_sharpen_pass_test.exe" ^
+    "tools\flat_sharpen_test\flat_sharpen_pass_test.cpp" "src\d3d11\flat_sharpen.cpp" ^
+    "src\d3d11\sharpen_pass.cpp" "src\d3d11\shader_swap.cpp" ^
+    "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib user32.lib dxgi.lib
+if errorlevel 1 ( echo [edvr] ERROR: flat sharpen pass test build failed & exit /b 1 )
+"%BUILD%\flat_sharpen_pass_test.exe" --dry-run || exit /b 1
+"%BUILD%\flat_sharpen_pass_test.exe" --self-test || (
+    echo [edvr] ERROR: the sharpening pass disagrees with AMD's RCAS, or a broken twin passed
+    exit /b 1
+)
+"%BUILD%\flat_sharpen_pass_test.exe" --self-test-working || (
+    echo [edvr] ERROR: a flat session that sharpens its frames said the never-ran note
+    exit /b 1
+)
 exit /b 0
 
 :rig_openxr_trace_test

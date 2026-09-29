@@ -105,9 +105,10 @@ static std::wstring widen(const char* p) {
 
 // A scratch ini written from a literal, for the cases the real file cannot
 // contain without being wrong.
-static bool writeIni(const std::wstring& dir, const char* body) {
+static bool writeIni(const std::wstring& dir, const char* body,
+                     const wchar_t* leaf = L"edvr.ini") {
     CreateDirectoryW(dir.c_str(), nullptr);
-    const std::wstring path = dir + L"\\edvr.ini";
+    const std::wstring path = dir + L"\\" + leaf;
     HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
@@ -125,8 +126,9 @@ static bool writeIni(const std::wstring& dir, const char* body) {
 // its reloads without saying so, and a test of what a reload does to a reader
 // would be testing almost nothing. Each call stamps a time one second on from
 // the last, so every reload that follows is a parse.
-static bool rewriteIni(const std::wstring& dir, const std::string& body) {
-    if (!writeIni(dir, body.c_str())) return false;
+static bool rewriteIni(const std::wstring& dir, const std::string& body,
+                       const wchar_t* leaf = L"edvr.ini") {
+    if (!writeIni(dir, body.c_str(), leaf)) return false;
     static ULONGLONG stamp = 0;
     if (!stamp) {
         FILETIME now;
@@ -137,7 +139,7 @@ static bool rewriteIni(const std::wstring& dir, const std::string& body) {
     FILETIME ft;
     ft.dwLowDateTime = static_cast<DWORD>(stamp & 0xFFFFFFFFull);
     ft.dwHighDateTime = static_cast<DWORD>(stamp >> 32);
-    HANDLE f = CreateFileW((dir + L"\\edvr.ini").c_str(), FILE_WRITE_ATTRIBUTES,
+    HANDLE f = CreateFileW((dir + L"\\" + leaf).c_str(), FILE_WRITE_ATTRIBUTES,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
@@ -1014,6 +1016,11 @@ int main(int argc, char** argv) {
     expectStr("hotkey.menu", "F8", "flat scope permits the temporal menu hotkey");
     Config::get().set("fix.temporal_aa_model", "m");
     expectStr("fix.temporal_aa_model", "m", "flat scope permits the DLSS model");
+    // The flat panel's Sharpening row and the flat sharpening both read this key
+    // through the generic getter. Unlisted, it would read 0 here whatever the file
+    // says: no error, no log line, a row that does nothing.
+    Config::get().set("fix.render_sharpness", "0.3");
+    expectFloat("fix.render_sharpness", 0.3f, "flat scope permits the sharpening setting");
     expectStr("hotkey.toggle_exposure", "", "flat menu exception leaves unrelated hotkeys suppressed");
     const struct { const char* name; unsigned full, fovea; bool known; } presets[] = {
         {"auto",0,0,true},{"default",0,0,true},{"j",10,10,true},
@@ -1032,6 +1039,7 @@ int main(int argc, char** argv) {
     expectBool("advanced.d3d11_fixes", false, "bad descriptor disables graphics hooks");
     expectStr("hotkey.menu", "", "invalid profile cannot open temporal menu");
     expectStr("fix.temporal_aa_model", "off", "invalid profile cannot select a DLSS model");
+    expectFloat("fix.render_sharpness", 0.0f, "invalid profile cannot sharpen");
     expectStr("advanced.real_dll", "d3d11_edhm.dll", "bad descriptor preserves mod chaining");
     if (Config::get().getString("experimental.temporal_aa_jitter", "on") == "off")
         ok("invalid profile suppresses flat jitter");
@@ -1046,6 +1054,37 @@ int main(int argc, char** argv) {
     if (Config::get().getString("experimental.temporal_aa_jitter", "off") == "on")
         ok("VR profile reads explicit jitter setting");
     else fail("VR profile jitter", "flat exception changed VR scope");
+    expectFloat("fix.render_sharpness", 0.3f, "VR profile still reads the sharpening setting");
+
+    // The flat panel writes the Sharpening row into edvr-flat.ini and asks for a
+    // reload; the flat sharpening reads the key every frame. Live means that file,
+    // read first (config.cpp), moves the value on the next reload -- not the
+    // edvr.ini beside it, which a flat install falls back to and a VR one owns.
+    if (argc >= 3) {
+        const std::wstring flatDir = widen(argv[2]) + L"_flatsharp";
+        g_runtimeProfile = RuntimeProfile::Flat;
+        const wchar_t* flatLeaf = L"edvr-flat.ini";
+        // The descriptor beside the inis is what makes init() pick the flat file:
+        // without it the profile reads as the legacy VR one and edvr.ini wins.
+        if (!writeIni(flatDir, descriptor, L"edvr_profile.ini") ||
+            !rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0.9\r\n") ||
+            !rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0.4\r\n", flatLeaf)) {
+            fail("flat sharpening reload", "could not write the scratch inis");
+        } else {
+            Config::get().init(flatDir);
+            if (!runtimeFlatProfile()) fail("flat sharpening reload", "the descriptor did not select flat");
+            expectFloat("fix.render_sharpness", 0.4f,
+                        "the flat file is read first: its 0.4, not edvr.ini's 0.9");
+            if (!rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0\r\n", flatLeaf) ||
+                !Config::get().reloadIfChanged())
+                fail("flat sharpening reload", "a panel write of 0 did not reload");
+            else expectFloat("fix.render_sharpness", 0.0f, "a panel write of 0 is live");
+            if (!rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0.65\r\n", flatLeaf) ||
+                !Config::get().reloadIfChanged())
+                fail("flat sharpening reload", "a panel write of 0.65 did not reload");
+            else expectFloat("fix.render_sharpness", 0.65f, "a panel write of 0.65 is live");
+        }
+    }
     g_runtimeProfile = savedProfile;
 
     if (g_fails) {

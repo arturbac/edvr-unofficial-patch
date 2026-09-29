@@ -6239,20 +6239,10 @@ void vScreenFrameBoundary() {
                     static_cast<unsigned long long>(lacked[1]), static_cast<unsigned long long>(lacked[2]));
             }
         }
-        // The sharpening's, the same way.
-        {
-            static uint32_t lastSharpenTreats = 0;
-            uint32_t treated = 0;
-            double avgMs = 0.0, maxMs = 0.0;
-            if (sharpenPassTotals(&treated, &avgMs, &maxMs) &&
-                treated != lastSharpenTreats) {
-                lastSharpenTreats = treated;
-                Log::get().note(
-                    "render sharpening totals: %u eye-submits sharpened this "
-                    "session, %.2f ms per eye on average (max %.2f).",
-                    treated, avgMs, maxMs);
-            }
-        }
+        // The sharpening's, the same way. Worded for the profile (VR counts
+        // eye-submits, flat counts frames), which is why it lives beside the
+        // pass and not here.
+        sharpenPassNoteTotals();
 
         // What we DECLINED, its own line and only while it moved.
         //

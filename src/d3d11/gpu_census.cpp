@@ -7,6 +7,7 @@
 #include <d3d11.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace edvr {
@@ -34,18 +35,21 @@ constexpr const char* kDoorBreakdownNames[8] = {
     "upscaler", "motion prep", "hologram resolve+celestial", "UI resolve",
     "sharpen", "menu", "UI layer composite", "FSS heal"
 };
-// The in-frame breakdown, FrameHologramPasses..FrameUiLayerReissues (indices 9..16).
-constexpr const char* kFrameBreakdownNames[8] = {
+// The in-frame breakdown, FrameHologramPasses..FrameUiLayerHdrSeed (indices 9..17): the item names, in the
+// sections' order. "HDR HUD depth-stencil seed" is the name the UI layer's own 30 s line gives the same stage.
+constexpr const char* kFrameBreakdownNames[] = {
     "hologram passes", "UI depth coverage", "planet", "terrain",
     "screen motion", "weapon motion", "engine velocity",
-    "UI layer reissues"
+    "UI layer reissues", "HDR HUD depth-stencil seed"
 };
+constexpr size_t kFrameSections = sizeof(kFrameBreakdownNames) / sizeof(kFrameBreakdownNames[0]);
 // Elite's own draws that EDVR alters (gpu_census.h): the game's draws timed whole, so they are
 // reported on their own lines and never summed into EDVR's total. AlteredPoolFamily,
-// AlteredTerrain and AlteredUiLayer are one class each (indices 17..19); the draws another fix
-// wraps are one section per fix from AlteredFixFirst on (indices 20..38), reported as one item
+// AlteredTerrain and AlteredUiLayer are one class each (indices 18..20); the draws another fix
+// wraps are one section per fix from AlteredFixFirst on (indices 21..39), reported as one item
 // on the classes' line (their sum) and one by one on the line after it.
 constexpr size_t kAlteredFirst = static_cast<size_t>(GpuCensusSection::AlteredPoolFamily);
+constexpr size_t kSeedSection = static_cast<size_t>(GpuCensusSection::FrameUiLayerHdrSeed);
 constexpr size_t kAlteredClassSections = static_cast<size_t>(GpuCensusSection::AlteredFixFirst) - kAlteredFirst;
 constexpr size_t kAlteredFixFirst = static_cast<size_t>(GpuCensusSection::AlteredFixFirst);
 constexpr const char* kAlteredNames[3] = {
@@ -60,7 +64,8 @@ constexpr const char* kAlteredFixNames[kAlteredFixCount] = {
     "FSS panel", "FSS reveal", "FSS dump", "scanner-body resolve", "loading scrim", "menu backdrop", "unnamed fix"
 };
 static_assert(kAlteredClassSections == 3, "one name for each altered-draw class");
-static_assert(kAlteredFirst == kDoorSections + 8, "the altered sections follow the eight in-frame sections");
+static_assert(kAlteredFirst == kDoorSections + kFrameSections, "one name for each in-frame section, and the altered sections follow them");
+static_assert(kSeedSection == kAlteredFirst - 1, "the seed is the last in-frame section, so its item is the last of the in-frame ones");
 static_assert(kAlteredFixFirst + kAlteredFixCount == kSections, "the fix sections are the last ones");
 
 struct SectionState {
@@ -138,6 +143,7 @@ struct Snapshot {
     bool occurred = false;
     double msPerFrame = 0.0;
     double perFrame = 0.0;
+    unsigned samples = 0;   // the timed occurrences that completed this window (what the figure is a mean of)
 };
 
 // A section's corrected ms per call. The null mean is the timer pair's own
@@ -165,6 +171,7 @@ Snapshot snapshotOf(const SectionState& st, const SectionState& nullSt, uint64_t
     const double nullMsPerOccurrence = nullWindowSamples ? nullWindowMs / static_cast<double>(nullWindowSamples) : 0.0;
     s.perFrame = frames ? static_cast<double>(st.occurrences) / static_cast<double>(frames) : 0.0;
     s.msPerFrame = correctedMsPerCall(msPerOccurrence, nullMsPerOccurrence) * s.perFrame;
+    s.samples = windowSamples;
     return s;
 }
 Snapshot snapshotOf(const SectionState& st, uint64_t frames) noexcept { return snapshotOf(st, st, frames); }
@@ -201,6 +208,63 @@ void appendItem(std::string& out, const char* name, const Snapshot& s) {
     out += buf;
 }
 
+// The HDR HUD seed's target as this window's seeds reported it (GpuCensusSeedScope): the first, and the first that
+// differed from it, so a window the UI quality changed inside says so instead of averaging two sizes into one figure
+// without a word.
+struct SeedGeometry {
+    uint32_t layerW = 0, layerH = 0, bytesPerPixel = 0, gameW = 0, gameH = 0;
+    char format[32] = {};
+};
+SeedGeometry g_seedFirst, g_seedOther;
+bool g_seedMixed = false;    // a seed this window reported a target unlike the first one's
+uint64_t g_seedNotes = 0;    // seeds this window that reported a target
+
+bool sameGeometry(const SeedGeometry& a, const SeedGeometry& b) noexcept {
+    return a.layerW == b.layerW && a.layerH == b.layerH && a.bytesPerPixel == b.bytesPerPixel &&
+           a.gameW == b.gameW && a.gameH == b.gameH && std::strcmp(a.format, b.format) == 0;
+}
+void resetSeedNotes() noexcept {
+    g_seedFirst = SeedGeometry{};
+    g_seedOther = SeedGeometry{};
+    g_seedMixed = false;
+    g_seedNotes = 0;
+}
+// "5040x4870 D32_FLOAT_S8X24_UINT (196.4 MB), seeded from the game's 4032x3896": the memory is the layer target's
+// (decimal MB, as the UI layer's own creation line counts it).
+void describeSeedGeometry(char* out, size_t n, const SeedGeometry& g) {
+    const double mb = static_cast<double>(g.layerW) * static_cast<double>(g.layerH) * static_cast<double>(g.bytesPerPixel) / 1.0e6;
+    std::snprintf(out, n, "%ux%u %s (%.1f MB), seeded from the game's %ux%u", g.layerW, g.layerH, g.format, mb, g.gameW, g.gameH);
+}
+// The line after the main one when the seed ran this window: what the item timed and on what. Three states of the
+// target are told apart, none of them silent: one geometry, a window that saw two (the UI quality was changed inside
+// it, so the figure mixes them), and seeds that ran without reporting one (the scope entered without a target).
+void formatSeedDetail(char* out, size_t n, const Snapshot& s, uint64_t notes, bool mixed,
+                      const SeedGeometry& first, const SeedGeometry& other) {
+    char cost[64];
+    if (s.samples > 0 && s.perFrame > 0.0) {
+        std::snprintf(cost, sizeof(cost), "%.3f ms a seed (%u timed)", s.msPerFrame / s.perFrame, s.samples);
+    } else {
+        std::snprintf(cost, sizeof(cost), "no seed timed this window");
+    }
+    char target[448];
+    if (notes == 0) {
+        std::snprintf(target, sizeof(target), "the seeds reported no target");
+    } else if (!mixed) {
+        char one[160];
+        describeSeedGeometry(one, sizeof(one), first);
+        std::snprintf(target, sizeof(target), "target %s", one);
+    } else {
+        char a[160], b[160];
+        describeSeedGeometry(a, sizeof(a), first);
+        describeSeedGeometry(b, sizeof(b), other);
+        std::snprintf(target, sizeof(target), "the target changed inside this window, so the figure mixes them: first %s; then %s", a, b);
+    }
+    std::snprintf(out, n,
+                  "EDVR GPU census, the HDR HUD depth-stencil seed above (the copy of the game's depth-stencil, then the passes "
+                  "that write it into the HUD layer's own): %.2f seeds a frame, %s; %s.",
+                  s.perFrame, cost, target);
+}
+
 void logAndResetWindow(uint64_t now) {
     const uint64_t frames = g_windowFrames;
     const double seconds = static_cast<double>(now - g_windowStartMs) / 1000.0;
@@ -211,7 +275,7 @@ void logAndResetWindow(uint64_t now) {
     // motion prep, hologram resolve and UI resolve all run INSIDE
     // temporalInner, so DoorTemporalWhole's own ms already include them.
     // Adding those four again would double their cost. The same
-    // reasoning does not apply to "in-frame F": its eight parts are
+    // reasoning does not apply to "in-frame F": its nine parts are
     // independent call sites (no one of them wraps another), so F is
     // their direct sum.
     const Snapshot doorWhole = snapshotOf(g_section[static_cast<size_t>(GpuCensusSection::DoorTemporalWhole)], frames);
@@ -228,10 +292,12 @@ void logAndResetWindow(uint64_t now) {
     }
     double frameTotal = 0.0;
     std::string frameItems;
-    for (int i = 0; i < 8; ++i) {
-        const Snapshot s = snapshotOf(g_section[kDoorSections + static_cast<size_t>(i)], frames);
+    Snapshot seedSnap;
+    for (size_t i = 0; i < kFrameSections; ++i) {
+        const Snapshot s = snapshotOf(g_section[kDoorSections + i], frames);
         appendItem(frameItems, kFrameBreakdownNames[i], s);
         frameTotal += s.msPerFrame;
+        if (kDoorSections + i == kSeedSection) seedSnap = s;
     }
 
     // Elite's own draws that EDVR alters (gpu_census.h): the game's draw timed whole, so
@@ -321,6 +387,14 @@ void logAndResetWindow(uint64_t now) {
         seconds, static_cast<unsigned long long>(frames), doorTotal + frameTotal, doorTotal,
         doorItems.c_str(), frameTotal, frameItems.c_str(), rBuf, gapBrief, floorBuf,
         static_cast<unsigned long long>(spansTimed), static_cast<unsigned long long>(spansSkipped));
+    // The HDR HUD seed's own line, only when a seed ran: "-" on the main line alone means none did (the layer is
+    // off, or it drew no HUD that tests the game's depth or stencil); a line here means the item above is a
+    // measurement, and says which target it was taken on.
+    if (seedSnap.occurred) {
+        char seedDetail[1024];
+        formatSeedDetail(seedDetail, sizeof(seedDetail), seedSnap, g_seedNotes, g_seedMixed, g_seedFirst, g_seedOther);
+        Log::get().note("%s", seedDetail);
+    }
     // Elite's own draws that EDVR alters: what the AA path's GPU cost looks like from
     // outside, inside draws the census would otherwise count as the game's. Each is the
     // game's draw timed whole, so the figures INCLUDE the game's own work in those draws.
@@ -347,6 +421,7 @@ void logAndResetWindow(uint64_t now) {
         st.occurrences = 0;
         st.skippedThisWindow = 0;
     }
+    resetSeedNotes();
     g_windowFrames = 0;
     g_windowStartMs = now;
     g_p50Count = 0;
@@ -381,6 +456,23 @@ bool gpuCensusBegin(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept
         return false;
     }
     return true;
+}
+
+void gpuCensusNoteSeedTarget(const GpuCensusSeedTarget& target) noexcept {
+    SeedGeometry g;
+    g.layerW = target.layerW;
+    g.layerH = target.layerH;
+    g.bytesPerPixel = target.bytesPerPixel;
+    g.gameW = target.gameW;
+    g.gameH = target.gameH;
+    std::snprintf(g.format, sizeof(g.format), "%s", target.format ? target.format : "unknown format");
+    if (g_seedNotes == 0) {
+        g_seedFirst = g;
+    } else if (!g_seedMixed && !sameGeometry(g_seedFirst, g)) {
+        g_seedMixed = true;
+        g_seedOther = g;
+    }
+    ++g_seedNotes;
 }
 
 void gpuCensusEnd(ID3D11DeviceContext* ctx, GpuCensusSection section) noexcept {
@@ -425,6 +517,7 @@ void gpuCensusFrame(ID3D11DeviceContext* ctx) noexcept {
 
 void gpuCensusShutdown() noexcept {
     for (auto& st : g_section) { st.sampler.reset(); st.nullSampler.reset(); }
+    resetSeedNotes();
 }
 
 } // namespace edvr

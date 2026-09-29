@@ -53,6 +53,9 @@ enum class GpuCensusSection : uint8_t {
                               // engineVelocityBeforeDraw's call sites, which mostly return
                               // without reaching the slow path at all
     FrameUiLayerReissues,     // the UI layer's multiply/write-back reissues
+    FrameUiLayerHdrSeed,      // the HDR HUD layer's depth-stencil seed: the copy of the game's depth-stencil and the
+                              // Seeder's passes into the layer's own target (ui_layer.cpp seedLayerDepth), counted
+                              // once for each seed and only for that layer (GpuCensusSeedScope below)
     // Elite's OWN draws that EDVR alters (see AlteredDrawClass below): the game's
     // draw timed whole, so each figure holds the game's own work in it plus what
     // EDVR adds by binding its target or swapping its shader. NOT EDVR's cost,
@@ -195,6 +198,40 @@ private:
     ID3D11DeviceContext* ctx_;
     GpuCensusSection section_;
     bool open_ = false;
+};
+
+// The target one HDR HUD seed was written to and the game buffer it was read from: what the 30 s line needs
+// to say which size its figure was measured at (fix.ui_quality changes the layer's size, so the same section
+// times a different amount of work at 100 than at 125). `format` names the layer target's depth-stencil
+// format; the census copies it, so a literal or any string alive for the call will do.
+struct GpuCensusSeedTarget {
+    uint32_t layerW = 0, layerH = 0;   // the layer's own depth-stencil target (what the seed writes)
+    uint32_t bytesPerPixel = 0;        // that target's format: depth plus stencil, so its memory is w x h x this
+    uint32_t gameW = 0, gameH = 0;     // the game's depth-stencil (what the seed reads, copied first)
+    const char* format = nullptr;
+};
+void gpuCensusNoteSeedTarget(const GpuCensusSeedTarget& target) noexcept;
+
+// The scope for a UI layer seed: ONE statement at the top of the seed, RAII so both of its exits close the
+// span. It times the HDR HUD layer's seed on GpuCensusSection::FrameUiLayerHdrSeed and notes the target it
+// wrote; a seed of any other layer (the 8-bit UI layer's) is counted nowhere and noted nowhere, so this
+// section can never hold a mix of the two. The stage test is the caller's one argument (`hdrHudLayer`), and
+// gpu_census_test holds both halves: the scope's own behaviour, and a scan that the seed still constructs
+// it with that argument.
+class GpuCensusSeedScope {
+public:
+    GpuCensusSeedScope(ID3D11DeviceContext* ctx, bool hdrHudLayer, const GpuCensusSeedTarget& target) noexcept
+        : ctx_(ctx), section_(hdrHudLayer ? GpuCensusSection::FrameUiLayerHdrSeed : GpuCensusSection::Count) {
+        if (hdrHudLayer) gpuCensusNoteSeedTarget(target);
+        gpuCensusBegin(ctx_, section_);
+    }
+    ~GpuCensusSeedScope() { gpuCensusEnd(ctx_, section_); }
+    GpuCensusSeedScope(const GpuCensusSeedScope&) = delete;
+    GpuCensusSeedScope& operator=(const GpuCensusSeedScope&) = delete;
+
+private:
+    ID3D11DeviceContext* ctx_;
+    GpuCensusSection section_;
 };
 
 // Once a frame, from vScreenFrameBoundary (after the frame's own Begin/End
