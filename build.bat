@@ -305,16 +305,13 @@ python "tools\gen_exports.py" --source "%SystemRoot%\System32\d3d11.dll" ^
     --extra-export edvrAcquireNativeGraphics ^
     --extra-export edvr_selftest_graphics_bridge ^
     --extra-export edvrFssHealLeft ^
-    --extra-export edvrFssTheater ^
     --extra-export edvrTemporalAa ^
     --extra-export edvrEyeCaptureUntreated ^
-    --extra-export edvrEyeCaptureArm ^
     --extra-export edvrTemporalAaNoteHead ^
     --extra-export edvrSharpen ^
     --extra-export edvrDepthProbeSelftest ^
     --extra-export edvrDlaaAvailable ^
     --extra-export edvrDlaaCounts ^
-    --extra-export edvrMenuPanel ^
     --extra-export edvrAcquireNativeMenu ^
     --extra-export edvrAcquireNativeTemporal ^
     --extra-export edvrAcquireNativeSharpen ^
@@ -528,7 +525,6 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\resolve_probe.cpp" ^
     "src\d3d11\stencil_probe.cpp" ^
     "src\d3d11\resolve_bind_fix.cpp" ^
-    "src\d3d11\fss_theater.cpp" ^
     "src\d3d11\xinput_watch.cpp" ^
     "src\d3d11\fss_panel_rect.cpp" ^
     "src\d3d11\panel_curve.cpp" "src\d3d11\screen_motion.cpp" "src\d3d11\weapon_motion.cpp" ^

@@ -1661,7 +1661,6 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
                 }
             }
             g_state->fssTheaterWanted =
-                Config::get().getFloat("experimental.fss_theater", 0.0f) > 0.0f ||
                 eyeSyncFromConfig(Config::get()).any();
             journalWatchSetEagerStatus(g_state->fssTheaterWanted);
             // The liveness pass, on the same once-a-second cadence. In-place
@@ -2119,7 +2118,6 @@ State& ensureState() {
         cameraViewSetPressWitness(g_state->extCamNextKey.key() != 0);
         journalWatchConfigure();
         g_state->fssTheaterWanted =
-            Config::get().getFloat("experimental.fss_theater", 0.0f) > 0.0f ||
             eyeSyncFromConfig(Config::get()).any();
         journalWatchSetEagerStatus(g_state->fssTheaterWanted);
         g_state->dumpOnExternalCam =

@@ -52,8 +52,7 @@
 #include "fss_ring.h"
 #include "fss_res.h"
 #include "fss_scan.h"
-#include "fss_theater.h"  // the warm-up; the theater itself runs at submit
-#include "depth_probe.h"       // Phase 0 item 3: which depth target the eye draws use, and how it reads
+#include "depth_probe.h"      // Phase 0 item 3: which depth target the eye draws use, and how it reads
 #include "eye_mask.h"          // the lens-ring depth mask: draws past the hooks, once per eye per frame
 #include "sharpen_pass.h"      // likewise: warm-up and totals; the sharpening runs at submit
 #include "menu.h"              // the settings menu's reload: its keys, then the row diff
@@ -471,8 +470,7 @@ struct State {
     uint32_t fssChromeFrame = 0;
     int      fssHealOn = 0;
     int      censusFssJump = 0;
-    int      fssTheaterOn = 0;
-    uint32_t fssJumpFrame = 0;   // the zoom-start camera jump, for the
+    uint32_t fssJumpFrame = 0;  // the zoom-start camera jump, for the
                                  // reveal's arrival window
     bool     fssArrivalOpen = false;
     uint32_t fssArrivalRecogs = 0;
@@ -1817,7 +1815,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // free. The temporal pass asks too (temporalPassWantsFssChrome): the
     // scanner's interface takes the head's path while the screen is up,
     // and the stamp this tracker bumps is how the pass knows it is.
-    if ((s->fssHealOn || s->censusFssJump || s->fssTheaterOn ||
+    if ((s->fssHealOn || s->censusFssJump ||
          temporalPassWantsFssChrome()) &&
         kind == 'X' && count == 6) {
         bool chromeMatched = false;
@@ -1871,7 +1869,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         // scenery (the neon frame) and their ordinals land in a skip
         // mask. Until a derivation publishes, nothing is skipped and the
         // centred band crops -- both fail-safe.
-        if (chromeMatched && (s->fssTheaterOn || s->fssHealOn) &&
+        if (chromeMatched && s->fssHealOn &&
             deviceHookFssModeLatch()) {
             if (s->fssChromeSkipFrame != s->frameNo) {
                 s->fssChromeSkipFrame = s->frameNo;
@@ -2296,17 +2294,9 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         // eye/2-sized, or one of fss_res's inflated textures? Cached per
         // binding generation, so the resolve runs for a handful of scanner
         // draws and for nothing else in the game.
-        // The theater is in this list on its own feet: on 2026-08-26 it
-        // rode the gate implicitly and died silently the first flight all
-        // six neighbours were off.
-        if (s->fssTheaterOn || fssScanWantsDraws() || fssPanelWantsDraws() ||
+        if (fssScanWantsDraws() || fssPanelWantsDraws() ||
             fssProbeWants() || fssRevealWantsDraws() ||
             fssRingWantsDraws() || fssDumpWantsDraws()) {
-            // Warmed here because this is the first draw-path site the
-            // theater owns: the compile lands on some menu frame at
-            // session start instead of stalling the submit thread 142 ms
-            // at the first zoom (measured 2026-08-26).
-            if (s->fssTheaterOn) fssTheaterWarm(self);
             if (s->fssScanGen != rtvGen) {
                 s->fssScanGen = rtvGen;
                 s->fssScanBody = false;
@@ -4651,7 +4641,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     // The rect deriver's capture runs INSIDE beginPanelOverride (the
     // chrome tracker's matched branch), so its draw-args stash must land
     // before the call.
-    if (g_state->fssTheaterOn || g_state->fssHealOn) {
+    if (g_state->fssHealOn) {
         fssPanelRectDrawArgs(baseVertex, startInstance);
     }
     // The sub-draw probe re-issues this draw from the verdict path, which
@@ -5372,7 +5362,6 @@ void vScreenRefreshConfig() {
     menuNoteConfigReloaded();
     {
         s->censusFssJump = cfg.getInt("advanced.census_fss_jump", 0) ? 1 : 0;
-        s->fssTheaterOn = cfg.getFloat("experimental.fss_theater", 0.0f) > 0.0f;
         // Defaulted to 1 because the key moved to [experimental] and now ships
         // commented out: this default is what everybody runs. Moving a setting out
         // of [fix] is a decision about where it is configured, not a decision to
@@ -6595,8 +6584,6 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     {
         g_state->censusFssJump =
             cfg.getInt("advanced.census_fss_jump", 0) ? 1 : 0;
-        g_state->fssTheaterOn =
-            cfg.getFloat("experimental.fss_theater", 0.0f) > 0.0f;
         const int n = eyeSyncFromConfig(cfg).healMode;
         if (g_state->fssHealOn != n) {
             g_state->fssHealOn = n;

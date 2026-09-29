@@ -451,7 +451,7 @@ static void selfTest() {
     coreLegacy.insert(coreLegacy.end(), originalCore.begin(), originalCore.end());
     coreLegacy.insert(coreLegacy.end(), originalExtra.begin(), originalExtra.end());
     auto coreFixed = fixedVariants(extractCore(edvr::kTemporalCsHlsl));
-    check(originalCore.size() == 33 && originalExtra.size() == 36 && coreFixed.size() == 76 && coreLegacy.size() == coreFixed.size(), "all fixed shader contracts including diagnostic variants are registered");
+    check(originalCore.size() == 33 && originalExtra.size() == 35 && coreFixed.size() == 75 && coreLegacy.size() == coreFixed.size(), "all fixed shader contracts including diagnostic variants are registered");
     for(size_t i=0;i<coreFixed.size();++i)for(size_t j=0;j<i;++j)
         check(std::strcmp(coreFixed[i].symbol,coreFixed[j].symbol)!=0,"generated shader symbols do not collide");
     using ReflectFn = HRESULT(WINAPI*)(LPCVOID, SIZE_T, REFIID, void**);
@@ -561,7 +561,7 @@ static void selfTest() {
         throw;
     }
     check(DeleteFileW(target.c_str()) && RemoveDirectoryW(parent.c_str()), "self-test cleanup");
-    std::puts("PASS: 76 fixed-shader original-source hashes, byte parity and SM5 reflection; temporal shader compiler, CLI, byte round-trip, engine-motion core text, atomic output, reuse key "
+    std::puts("PASS: 75 fixed-shader original-source hashes, byte parity and SM5 reflection; temporal shader compiler, CLI, byte round-trip, engine-motion core text, atomic output, reuse key "
               "and dry-run invariants");
 }
 
