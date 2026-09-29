@@ -55,6 +55,7 @@
 #include <cstring>
 #include <vector>
 
+#include "../../src/common/system_d3d11.h"
 #include "../../src/common/temporal_math.h"
 #include "../../src/d3d11/ui_layer_seed.h"
 #include "../../src/d3d11/ui_layer_seed_census.h"
@@ -1546,10 +1547,15 @@ bool compile(const char* src, size_t len, const char* entry, const char* profile
 
 bool setup(Gpu& g, bool hardware) {
     D3D_FEATURE_LEVEL fl{};
-    if (FAILED(D3D11CreateDevice(nullptr, hardware ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP, nullptr,
-                                 0, nullptr, 0, D3D11_SDK_VERSION, &g.dev, &fl, &g.ctx))) {
+    // Windows' own d3d11 through common/system_d3d11.h, never an import: EDVR's proxy sits beside this exe.
+    const auto createDevice = edvr::systemD3D11CreateDevice();
+    if (!createDevice ||
+        FAILED(createDevice(nullptr, hardware ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP, nullptr,
+                            0, nullptr, 0, D3D11_SDK_VERSION, &g.dev, &fl, &g.ctx))) {
         return false;
     }
+    check(edvr::reportSystemD3D11Only("ui_quality_test"),
+          "the rig runs on System32's d3d11.dll and on no other d3d11.dll");
     ComPtr<ID3DBlob> v, p;
     if (!compile(kQuadHlsl, sizeof(kQuadHlsl) - 1, "vsMain", "vs_5_0", &v) ||
         !compile(kQuadHlsl, sizeof(kQuadHlsl) - 1, "psMain", "ps_5_0", &p)) {

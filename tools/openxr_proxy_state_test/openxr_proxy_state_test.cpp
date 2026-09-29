@@ -3,6 +3,7 @@
 #include "../../src/openxr/d3d11_stereo.h"
 #include "../../src/d3d11/binding_shadow.h"
 #include "../../src/openxr/render_thread_dispatcher.h"
+#include "../../src/common/system_d3d11.h"
 #include <d3dcompiler.h>
 #include <cstdio>
 #include <cstring>
@@ -183,7 +184,10 @@ void bridgeContracts(HMODULE proxy, BridgeCounts counts) {
 
     ComPtr<ID3D11Device> otherDevice;
     ComPtr<ID3D11DeviceContext> otherContext, deferred, otherDeferred;
-    check(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+    // Windows' own d3d11 through common/system_d3d11.h, never an import: EDVR's proxy sits beside this exe.
+    const auto systemCreate = edvr::systemD3D11CreateDevice();
+    check(systemCreate != nullptr, "system D3D11 factory");
+    check(systemCreate && SUCCEEDED(systemCreate(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
         D3D11_SDK_VERSION, &otherDevice, nullptr, &otherContext)), "independent same-adapter device");
     check(SUCCEEDED(runtime.device->CreateDeferredContext(0, &deferred)), "private recording context");
     if (!otherDevice || !deferred) return;
@@ -389,6 +393,8 @@ void threadedRenderer(HMODULE proxy, BridgeCounts counts) {
 }
 
 int selfTest(const wchar_t* path) {
+    // The DLL loaded next is the only proxy in this process: no d3d11.dll comes with the exe.
+    check(edvr::reportNoD3D11Mapped("openxr_proxy_state_test"), "no d3d11.dll is mapped before the rig loads the proxy");
     // The actual hook-owning DLL stays loaded until this isolated child exits.
     HMODULE proxy = LoadLibraryExW(path, nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);

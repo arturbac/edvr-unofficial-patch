@@ -15,6 +15,7 @@
 #include <cmath>
 #include "../../src/common/config.h"
 #include "../../src/common/log.h"
+#include "../../src/common/system_d3d11.h"
 using Microsoft::WRL::ComPtr;
 namespace {
 int failures=0,backendCalls=0;
@@ -107,11 +108,14 @@ int main(int argc,char** argv) {
     if(argc!=2 || (std::strcmp(argv[1],"--self-test") && std::strcmp(argv[1],"--dry-run"))){std::puts("usage: flat_mono_resolve_test --self-test|--dry-run");return 2;}
     if(!std::strcmp(argv[1],"--dry-run")){std::puts("Would exercise mono resolve WARP shaders, backend inputs and state restoration; writes no files.");return 0;}
     ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;D3D_FEATURE_LEVEL level{};
-    HRESULT hr=D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,D3D11_CREATE_DEVICE_DEBUG,nullptr,0,D3D11_SDK_VERSION,
+    // Windows' own d3d11 through common/system_d3d11.h, never an import: EDVR's proxy sits beside this exe.
+    const auto createDevice=edvr::systemD3D11CreateDevice();check(createDevice!=nullptr,"system D3D11 factory");if(!createDevice)return 1;
+    HRESULT hr=createDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,D3D11_CREATE_DEVICE_DEBUG,nullptr,0,D3D11_SDK_VERSION,
         device.GetAddressOf(),&level,context.GetAddressOf());
-    if(FAILED(hr))hr=D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,
+    if(FAILED(hr))hr=createDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,
         device.GetAddressOf(),&level,context.GetAddressOf());
     check(SUCCEEDED(hr),"WARP device");if(FAILED(hr))return 1;
+    check(edvr::reportSystemD3D11Only("flat_mono_resolve_test"),"the rig runs on System32's d3d11.dll and on no other d3d11.dll");
     ComPtr<ID3D11InfoQueue> messages;device.As(&messages);
     projectionScopeTests(device.Get(), context.Get());
     projectionRuntimeTests(device.Get(), context.Get());
