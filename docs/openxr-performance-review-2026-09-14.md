@@ -1359,8 +1359,9 @@ threads) is the CPU item for scenes that are CPU-bound.
 Branch `claude/ui-holo-passes` from 446d7e7a. Asked for: the UI and hologram
 GPU passes cut to the work they have, the image unchanged (review P3, B-3,
 D-1, D-2, D-4). Nothing merged, installed or flown. Commits 396d8dcd (the rig
-and its goldens, recorded from the unmodified shader first) and f282c056 (the
-change). Every number below is an RTX 5090 at the eye's real size, 2016x1948
+and its goldens, recorded from the unmodified shader first), f282c056 (the
+change), 582193da (the composite bench, this entry) and 8ced6ab5 (the totals
+line). Every number below is an RTX 5090 at the eye's real size, 2016x1948
 in and 4032x3896 out, from `tools\ui_holo_pass_test` (`--bench`,
 `--bench-composite`, `--adapter nvidia`): the median of 25 interleaved rounds
 of 8 dispatches between GPU timestamps, inputs synthetic (a mixed-content
@@ -1405,7 +1406,9 @@ full-screen menu, jitter to 1.7 and wild, ratios 0.5 to 3, both eyes; each
 input unbound alone equals the reference over zeros (227 runs); bits of zero
 over unbound inputs still equal the reference (98); claiming a bound input
 unbound FAILS 203 of 219 fixtures with content, and each bit fails on the
-named fixture built to need it. Trace: a build without this has neither the
+named fixture built to need it. Mutation: the marks' halo cut one texel short
+(the resolve's own margin around UI) fails 359 checks, at the corner, the tile
+edges and the goldens. Trace: a build without this has neither the
 totals line nor `UI resolve: not bound on some frames`, a run with every input
 bound shows totals with zeros, and the bytecode header is checked against the
 source, so a stale header fails the rig.
