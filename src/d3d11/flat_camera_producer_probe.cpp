@@ -373,7 +373,7 @@ void standDown(const char* why) {
 void flatCameraProducerProbeFrame(uint64_t frame) {
     g_frame.store(frame, std::memory_order_release);
     if (!runtimeFlatProfile()) { standDown("the flat profile is off"); return; }
-    const bool wanted = _stricmp(Config::get().getString("advanced.flat_camera_producer_probe", "off").c_str(), "off") != 0;
+    const bool wanted = Config::get().getBool("advanced.flat_camera_producer_probe", false); // "0" and "false" are off; this arms game-code patching
     if (!wanted) { standDown("advanced.flat_camera_producer_probe is off"); return; }
     if (g_probe.installed.load(std::memory_order_acquire)) { processWatches(); return; }
     if (g_probe.relay) return; // a failed install is final for the session

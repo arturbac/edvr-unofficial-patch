@@ -1376,7 +1376,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     flatMonoResolvePollPixels(s.context.Get(),frame);
     if(s.phase.applied)++s.jitteredFrames;
     s.phase.finish(s.temporalAccepted && SUCCEEDED(hr),s.frameCoverage && !s.prefix.uncertain && !foreignWork.load(std::memory_order_acquire));
-    const bool wanted=_stricmp(Config::get().getString("experimental.temporal_aa_jitter","on").c_str(),"off")!=0;
+    const bool wanted=Config::get().getBool("experimental.temporal_aa_jitter",true);
     if(wanted!=s.jitterWanted) { s.phase.resetHistory();reset(); }
     s.jitterWanted=wanted;
     // Partial temporal AA: read live, same idiom as jitter above. Unlike
@@ -1384,7 +1384,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // no history reset -- it only gates refuseDraw, checked fresh on every
     // draw from here on. The on->off transition ends observation explicitly:
     // off's per-frame retry resumes (reviews/flat-temporal-main-review-2026-09-26.md).
-    const bool partialWanted=_stricmp(Config::get().getString("experimental.temporal_aa_partial","on").c_str(),"off")!=0;
+    const bool partialWanted=Config::get().getBool("experimental.temporal_aa_partial",true);
     const bool observingAfterToggle = flatObservationToggle(s.observing, s.partialWanted, partialWanted);
     if (s.observing && !observingAfterToggle)
         Log::get().note("flat coverage: observation ended by setting change at frame=%llu; per-frame attempts resume",
