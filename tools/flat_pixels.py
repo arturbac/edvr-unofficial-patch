@@ -495,9 +495,10 @@ def verify_fixture(capture_dir):
     if path.resolve().parent.parent.parent != capture_dir.resolve():
         raise CaptureError("fixture pointer resolves outside capture root")
     meta = load_manifest(path)
-    # The writer records the raster phases and the phases the camera rows carry (2026-09-29).
+    # A live frame (2026-09-29): the writer's first sample is never a reset frame, and it
+    # records the raster phases and the phases the camera rows carry.
     expected_metadata = {
-        "frame_id": 7, "mode": "dlss", "reset": True,
+        "frame_id": 7, "mode": "dlss", "reset": False,
         "configured_dlss_preset": 11, "jitter": [0.25, -0.375],
         "previous_jitter": [-0.125, 0.5],
         "rows_jitter": [0.25, -0.375], "previous_rows_jitter": [-0.125, 0.5],
@@ -825,7 +826,7 @@ def self_test():
                                     "width": 17, "height": 3, "row_stride": 17 * bpp,
                                     "byte_size": len(pixels)})
         fixture_manifest = {"version": 1, "frame_id": 7, "mode": "dlss",
-                            "configured_dlss_preset": 11, "reset": True,
+                            "configured_dlss_preset": 11, "reset": False,
                             "jitter": [0.25, -0.375], "previous_jitter": [-0.125, 0.5],
                             "rows_jitter": [0.25, -0.375], "previous_rows_jitter": [-0.125, 0.5],
                             "render_width": 17, "render_height": 3,

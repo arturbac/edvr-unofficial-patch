@@ -92,7 +92,15 @@ inline int flatPixelCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* co
     const auto before=edvr::flatMonoResolveStats();
     capture.arm(6);check(capture.active(),"manual arm creates output directory");
     const fs::path directory=capture.directory();
-    capture.capture(device,context,frame,true,sources);
+    // A reset frame is never a sample (2026-09-29): nothing is copied, and the arm stays open
+    // for the next frame. The frame right after an F10 arm was one, at phase (0,0).
+    {
+        edvr::FlatMonoResolveFrame resetFrame=frame;resetFrame.frame=6;
+        capture.capture(device,context,resetFrame,true,sources);context->Flush();
+        for(unsigned i=0;i<20;++i){capture.poll(context,6);Sleep(1);}
+        check(capture.active() && !fs::exists(directory/L"frame_6.json"),"a reset frame is never a sample and the arm stays open");
+    }
+    capture.capture(device,context,frame,false,sources);
     // Captures must retain the bytes at the resolve, not contents when polled.
     const uint32_t clearedPool[4][84]{};
     context->UpdateSubresource(poolBuffer.Get(),0,nullptr,clearedPool,0,0);
@@ -118,15 +126,30 @@ inline int flatPixelCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* co
     {   // The writer records the phases the rows carry (a replay removes them as the shader does).
         std::ifstream js(manifest,std::ios::binary);
         const std::string body((std::istreambuf_iterator<char>(js)),std::istreambuf_iterator<char>());
-        check(body.find("\"reset\":true")!=std::string::npos &&
+        check(body.find("\"reset\":false")!=std::string::npos &&
               body.find("\"jitter\":[0.25,-0.375],\"previous_jitter\":[-0.125,0.5],\"rows_jitter\":[0.25,-0.375],\"previous_rows_jitter\":[-0.125,0.5]")!=std::string::npos,
               "the manifest records the raster phases and the phases the camera rows carry");
+    }
+    {   // The second sample follows the first on the next live frame; later ones keep the old spacing.
+        edvr::FlatPixelCapture burst;
+        burst.arm(500);const fs::path burstDir=burst.directory();
+        auto sampleAt=[&](uint64_t number,bool reset){
+            frame.frame=number;burst.capture(device,context,frame,reset,sources);context->Flush();
+            for(unsigned attempt=0;attempt<120 && burst.active() && !fs::exists(burstDir/(L"frame_"+std::to_wstring(number)+L".json")) && attempt<120;++attempt)
+                {burst.poll(context,number);Sleep(1);}
+            return fs::exists(burstDir/(L"frame_"+std::to_wstring(number)+L".json"));
+        };
+        check(!sampleAt(501,true),"burst: a reset frame is not sample 1");
+        check(sampleAt(502,false),"burst: the first live frame is sample 1");
+        check(sampleAt(503,false),"burst: the second sample follows on the next live frame");
+        check(!sampleAt(504,false),"burst: the third sample waits out the old spacing");
+        burst.cancel();
     }
     // A queued set must not cross a manual rearm into the next directory.
     frame.frame=22;capture.capture(device,context,frame,false,sources);
     capture.arm(23);const fs::path rearmed=capture.directory();capture.poll(context,24);
     check(!fs::exists(rearmed/L"frame_22.json"),"rearm cannot publish prior pending frame");
-    frame.frame=24;frame.engine={};capture.capture(device,context,frame,true,sources);context->Flush();
+    frame.frame=24;frame.engine={};capture.capture(device,context,frame,false,sources);context->Flush();
     const auto absentManifest=rearmed/L"frame_24.json";
     for(unsigned attempt=0;attempt<120 && !fs::exists(absentManifest);++attempt) {capture.poll(context,25);Sleep(1);}
     std::ifstream absentFile(absentManifest,std::ios::binary);

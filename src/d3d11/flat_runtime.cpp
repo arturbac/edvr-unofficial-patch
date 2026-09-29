@@ -9,6 +9,7 @@
 #include "flat_camera_phase.h"
 #include "flat_live_phase.h"
 #include "flat_draw_capture.h"
+#include "flat_pixel_capture_policy.h"
 #include "flat_local_reject.h"
 #include "flat_trace.h"
 #include "flat_dlss_negotiate.h"
@@ -1399,7 +1400,10 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     if (s.device && actualDevice.Get() != s.device.Get()) { flatRuntimeResize(); s.thread = GetCurrentThreadId(); }
     if (!s.device) { swap->GetDevice(IID_PPV_ARGS(&s.device)); if (s.device) s.device->GetImmediateContext(&s.context); }
     if (!s.device || !s.context) return;
-    s.drawCapture.present(s.context.Get(),frame);
+    // The completed frame is a draw-capture sample only if it was live: the resolver did not reset
+    // it, and it ran at a nonzero phase unless the jitter is off on purpose. The two frames after an
+    // F10 arm were neither, and their constants carry no phase (2026-09-29).
+    s.drawCapture.present(s.context.Get(),frame,flatCaptureFrameLive(flatMonoResolveLastReset(),s.frameHadPhase,s.jitterWanted));
     flatMonoResolvePollPixels(s.context.Get(),frame);
     if(s.phase.applied)++s.jitteredFrames;
     s.phase.finish(s.temporalAccepted && SUCCEEDED(hr),s.frameCoverage && !s.prefix.uncertain && !foreignWork.load(std::memory_order_acquire));

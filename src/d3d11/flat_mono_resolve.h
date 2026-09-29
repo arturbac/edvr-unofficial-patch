@@ -149,8 +149,14 @@ struct FlatMonoResolveStats {
     uint64_t invalidPreviousCameras = 0, formatChanges = 0, cameraCuts = 0;
     uint64_t backendFailures = 0;
     uint64_t currentContinueRun = 0, longestContinueRun = 0;
+    // The last resolve's EFFECTIVE reset (the requested one, or a lost history, a frame gap, an
+    // invalid previous camera, a format change or a camera cut): what the pixel capture writes
+    // as "reset" and what decides whether the frame is a live sample.
+    bool lastReset = false;
 };
 FlatMonoResolveStats flatMonoResolveStats();
+// Whether the last resolve reset (flatCaptureFrameLive, flat_pixel_capture_policy.h).
+bool flatMonoResolveLastReset();
 // Owner thread, before rasterization. Validates planned dimensions/mode/source
 // metadata, allocates renderer resources including the spatial fallback output,
 // then checks external backend availability. A Ready result proves fallback

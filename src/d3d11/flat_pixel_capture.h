@@ -83,8 +83,9 @@ public:
         if(!ensureDirectory(Config::get().logDir()) || !ensureDirectory(root) || !ensureDirectory(directory_)) {
             stop("failed-directory");return;
         }
-        Log::get().note("flat pixels: armed frame=%llu samples=4 spacing=15 byte-cap=%llu timeout-frames=900 timeout-ms=30000 directory=%ls; native matched DLSS/DLAA textures, no rendering changes",
-            static_cast<unsigned long long>(frame),static_cast<unsigned long long>(FlatPixelCapturePolicy::maxBytes),directory_.c_str());
+        Log::get().note("flat pixels: armed frame=%llu samples=4 first=next-live-frame second=+%u then spacing=%u byte-cap=%llu timeout-frames=900 timeout-ms=30000 directory=%ls; native matched DLSS/DLAA textures, no rendering changes; a reset frame is never a sample",
+            static_cast<unsigned long long>(frame),FlatPixelCapturePolicy::secondSpacing,FlatPixelCapturePolicy::laterSpacing,
+            static_cast<unsigned long long>(FlatPixelCapturePolicy::maxBytes),directory_.c_str());
     }
     void poll(ID3D11DeviceContext* context,uint64_t frame) {
         if(!policy_.active)return;
@@ -170,7 +171,9 @@ public:
         if(policy_.copied>=FlatPixelCapturePolicy::maxSamples)stop("complete");
     }
     void capture(ID3D11Device* device,ID3D11DeviceContext* context,const FlatMonoResolveFrame& frame,bool reset,ID3D11Texture2D* const* textures) {
-        if(!policy_.due(frame.frame))return;
+        // A reset frame is not a sample (2026-09-29): the frame two after an F10 arm was one, at
+        // phase (0,0) with no history, and said nothing about the running image.
+        if(!policy_.due(frame.frame,!reset))return;
         const uint64_t now=GetTickCount64();
         if(policy_.expired(frame.frame,now)) {stop("expired-arm");return;}
         uint64_t bytes=0;
@@ -223,7 +226,7 @@ public:
         if(frame.engine.sceneNow && !addBuffer("scene_now",frame.engine.sceneNow)) {stop("failed-scene-now");return;}
         if(frame.engine.scenePrev && !addBuffer("scene_previous",frame.engine.scenePrev)) {stop("failed-scene-previous");return;}
         if(!policy_.fits(bytes)) {stop("byte-cap");return;}
-        if(!policy_.reserve(frame.frame,now,bytes))return;
+        if(!policy_.reserve(frame.frame,now,bytes,!reset))return;
         for(unsigned i=0;i<used_;++i) {
             auto& item=items_[i];HRESULT hr;
             if(item.isBuffer) {

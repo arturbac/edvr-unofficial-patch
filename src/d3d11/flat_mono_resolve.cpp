@@ -231,6 +231,7 @@ bool inputTexture(ID3D11ShaderResourceView* view,uint32_t width,uint32_t height,
 } // namespace
 
 FlatMonoResolveStats flatMonoResolveStats() { return stats; }
+bool flatMonoResolveLastReset() { return stats.lastReset; }
 FlatMonoResolvePreflightResult flatMonoResolvePreflight(ID3D11Device* device,
     ID3D11DeviceContext* context,const FlatMonoResolvePreflight& planned) {
     FlatMonoResolvePreflightResult result{};
@@ -348,6 +349,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     if(!requestedReset && !lostHistory && !frameGap && !invalidPreviousCamera && !formatChange)
         for(unsigned i=0;i<3;++i)if(std::abs(f.camera[5][i]-f.previousCamera[5][i])>50)cameraCut=true;
     const bool reset=requestedReset || lostHistory || frameGap || invalidPreviousCamera || formatChange || cameraCut;
+    stats.lastReset=reset;
     const bool engine=f.engine.slots && f.engine.pool && f.engine.sceneNow && f.engine.scenePrev;
     if(!reset && !engine)return fail(reason,"flat-resolve-engine-source-views-unavailable");
     // All external backend work is inside the same complete state isolation.
