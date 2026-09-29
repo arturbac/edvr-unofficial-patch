@@ -1109,17 +1109,24 @@ changes because the file did.
 - **Re-read before write**, the installer's 2026-08-28 lesson: the file on
   disk is the source, never a cached copy.
 - **Atomic write**: `iniedit`'s `writeFileAtomic` (the installer's settings
-  window uses the same one): a temp file beside the ini, flushed, then
-  `MoveFileExW` with replace-and-write-through, so `config.cpp`'s size check
-  never meets half a save. The replace is tried again (five times, 20 ms
-  apart) on a sharing violation or access denied: the classic rename is
-  refused with access denied while ANY handle to the ini is open, one that
-  shares `FILE_SHARE_DELETE` included (measured on Windows 11 build 26200), so
-  the reload the menu asks for after a write can meet the next write for the
-  microseconds it holds the file, and it is the retry that carries the write
-  past it. `config.cpp` opens the ini with `FILE_SHARE_DELETE` as well, which
-  matters only to a POSIX-semantics rename (`FileRenameInfoEx`, not used
-  here). A read-only ini is left alone and the failure says so.
+  window uses the same one): a temp file beside the ini, flushed, then renamed
+  over it, so `config.cpp`'s size check never meets half a save. The classic
+  rename (`MoveFileExW` with replace-and-write-through) is refused with access
+  denied while ANY handle to the ini is open, one that shares
+  `FILE_SHARE_DELETE` included (measured on Windows 11 build 26200 with cmd's
+  `move /Y`), and the reload the menu asks for after a write holds the ini for
+  microseconds. So the rename is done with POSIX semantics first
+  (`SetFileInformationByHandle`, `FileRenameInfoEx`, replace-if-exists and
+  POSIX-semantics flags; Windows 10 1607+ on NTFS): the ini's name moves to the
+  new file at once and a reader that shares `FILE_SHARE_DELETE` -- which
+  `config.cpp`'s read now does -- goes on reading the old one, so the write
+  lands on the first attempt. Where the OS or the volume refuses that as
+  unsupported the writer falls back to `MoveFileExW` in the same attempt and
+  remembers the refusal for the process. Either way an attempt refused for a
+  reason that passes (a sharing violation, access denied, a lock violation --
+  a reader that does not share `FILE_SHARE_DELETE`, a scanner on the temp file)
+  is tried again, five times, 20 ms apart. A read-only ini goes straight to
+  the classic rename, is left alone, and the failure says so.
 - **Apply now**: `Config::get().reloadIfChanged()` is called immediately
   after the write, so the change lands on this frame instead of the next
   poll, and through the same configure path a hand edit takes -- no module

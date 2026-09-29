@@ -29,10 +29,10 @@
 //     often it is read -- it was said on every read, 90 to 180 lines a second
 //     for a key read each frame;
 //   - getFloat takes the whole value and only a finite one;
-//   - a reload leaves edvr.ini open to being deleted or renamed (the read
-//     shares DELETE): the menu saves by renaming a temp file over it, and a
-//     read that did not share DELETE held that off while the reload had the
-//     file open.
+//   - a reload leaves edvr.ini open to being replaced, renamed or deleted (the
+//     read shares DELETE): the menu saves by renaming a temp file over it with
+//     POSIX semantics, and a read that did not share DELETE held that off while
+//     the reload had the file open.
 //
 // Usage: config_test.exe <dir containing edvr.ini> [scratch dir]
 #include <windows.h>
@@ -461,7 +461,7 @@ static void raceCase(const std::wstring& scratch) {
     printf("  info  %ld reads raced %d reloads\n", reader.reads.load(), reloads);
 }
 
-// --- a reload leaves the file open to being deleted or renamed (2026-09-29) ---
+// --- a reload leaves the file open to being replaced (2026-09-29) --------------
 //
 // Config's read of edvr.ini opened it with FILE_SHARE_READ | FILE_SHARE_WRITE --
 // no FILE_SHARE_DELETE -- so for as long as a reload held the file (tens of
@@ -470,11 +470,12 @@ static void raceCase(const std::wstring& scratch) {
 // over edvr.ini and asks for a reload straight after, could meet that hold on its
 // very next save.
 //
-// What this proves is the share mode, not a replace. iniedit's replace is the
-// classic MoveFileExW, which is refused while ANY handle to the target is open,
-// sharing DELETE or not (installer_test's atomic-write cases print what this
-// machine does), so it is that writer's retry that carries a save past Config's
-// read; the share mode is the half of a POSIX-semantics replace that lives here.
+// What this proves is the share mode; the replace itself is installer_test's
+// (its atomic-write cases replace a file under a reader that opens it this way).
+// iniedit's replace is a POSIX-semantics rename, which goes through under a
+// handle that shares DELETE and is refused under one that does not; the classic
+// MoveFileExW it falls back to is refused while ANY handle to the target is open.
+// The share mode is the half of that which lives here.
 //
 // The read cannot be paused from outside, so a second thread does to it what a
 // rename would: it opens the file for DELETE, with every share mode, over and
@@ -575,7 +576,7 @@ static void shareDeleteCase(const std::wstring& scratch) {
                  " attempts to open the ini for delete were refused while a reload had it open: "
                  "Config's read does not share DELETE");
     } else {
-        ok("a reload leaves edvr.ini open to being deleted or renamed (FILE_SHARE_DELETE)");
+        ok("a reload leaves edvr.ini open to being replaced (FILE_SHARE_DELETE)");
     }
     printf("  info  %ld probes inside %d reloads, %ld refused, %ld failed another way\n", inside,
            reloads, refused, st.other.load());
