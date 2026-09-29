@@ -636,7 +636,7 @@ void appendPrice(std::string& s, size_t stat) {
         return;
     }
     const double p95 = uiLayerPercentile(r.v, r.n, 0.95);  // sorts; the median reads the same order
-    const double med = uiLayerPercentile(r.v, r.n, 0.5);
+    const double med = uiLayerSortedPercentile(r.v, r.n, 0.5);
     char buf[64];
     _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%.3f/%.3f (%u)", med, p95, r.n);
     s += buf;

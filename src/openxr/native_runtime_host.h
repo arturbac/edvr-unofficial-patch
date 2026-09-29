@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include "../common/frame_flag.h"
 #include "native_device.h"
 #include "native_menu_client.h"
@@ -299,6 +300,18 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   uint64_t pendingFrameEndSequence=0;
   bool pendingFrameEndPublished=false;
   uint64_t frameEndOverlapCount=0,frameEndSyncCount=0,frameEndInlineAtCloseCount=0,frameEndFailureCount=0;
+  // A completed producer pair may hand off without waiting for its queued XR
+  // finish. Publication and queue admission share this mutex: a later caller
+  // wait/submit clears admission before it can enqueue a new frame. None of
+  // the owner-only pendingFrameEnd fields is inspected by that caller.
+  std::mutex overlapHandoffMutex;
+  uint64_t overlapHandoffGeneration=0,overlapHandoffEpoch=0;
+  std::atomic<uint64_t> overlapHandoffAccepted{0},overlapHandoffCompleted{0},
+    overlapHandoffRejected{0},overlapHandoffInvalid{0},overlapHandoffCancelledOrFailed{0};
+  uint64_t clearOverlapHandoff() {
+    std::lock_guard<std::mutex> lock(overlapHandoffMutex);overlapHandoffGeneration=0;
+    return ++overlapHandoffEpoch;
+  }
   RuntimeGate gate; uint64_t runtimeGeneration=0;
   // frameViews is the projection the XR layer advertises: the located one,
   // always, so every runtime composes it the way it composes an untouched
@@ -708,6 +721,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     return cancelled.load(std::memory_order_acquire)?vr::VRInitError_Init_ShuttingDown:vr::VRInitError_Init_HmdNotFound;
   }
   bool stop()noexcept override {
+    clearOverlapHandoff();
     ++stops;
     nativeTracePrintf("service_shutdown_entry,source=runtime_backend,stops=%llu\n",(unsigned long long)stops);
     if(runtimeGeneration)gate.requestStop(runtimeGeneration);
@@ -882,6 +896,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   CompositorRead compositorRead() const override {return poses.read();}
   void compositorUnsupported(unsigned slot) noexcept override {nativeTracePrintf("compositor_unavailable,slot=%u\n",slot);}
   vr::EVRCompositorError waitPoses(uint64_t generation,CompositorRead& out) override {
+    clearOverlapHandoff();
     if(!service.isOwner()) {
       const uint64_t callerBegan=frameCycleUs();const DWORD caller=GetCurrentThreadId();
       const auto postRequest=frameCycles.postRequest();
@@ -1191,6 +1206,14 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   }
   vr::EVRCompositorError submitEye(uint64_t generation,vr::EVREye eye,const vr::Texture_t* texture,
       const vr::VRTextureBounds_t* bounds,vr::EVRSubmitFlags flags) override {
+    const auto admission=clearOverlapHandoff();
+    return submitEyeAdmitted(generation,eye,texture,bounds,flags,admission);
+  }
+  // Carry the caller's admission through the synchronous owner rendezvous.
+  // A later admission may invalidate it before this owner job publishes its
+  // pair; that must not resurrect stale asynchronous handoff eligibility.
+  vr::EVRCompositorError submitEyeAdmitted(uint64_t generation,vr::EVREye eye,const vr::Texture_t* texture,
+      const vr::VRTextureBounds_t* bounds,vr::EVRSubmitFlags flags,uint64_t admission) {
     if(!service.isOwner()) {
       auto result=vr::VRCompositorError_InvalidTexture;
       const auto sequence=timingApplicationSequence.load(std::memory_order_acquire);
@@ -1207,7 +1230,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
         timing.applicationSegment(sequence,false);
       if(sequence) timing.producerPause(sequence);
       RenderRoute::Park cyclePark;
-      const bool dispatched=renderRoute.invoke([&]{frameCycleSubmitToken.store(cycleToken,std::memory_order_release);frameCycles.submitOwnerBegin(cycleToken,frameCycleUs());result=submitEye(generation,eye,texture,bounds,flags);frameCycles.submitOwnerEnd(cycleToken,frameCycleUs());frameCycleSubmitToken.store(0,std::memory_order_release);},&cyclePark);
+      const bool dispatched=renderRoute.invoke([&]{frameCycleSubmitToken.store(cycleToken,std::memory_order_release);frameCycles.submitOwnerBegin(cycleToken,frameCycleUs());result=submitEyeAdmitted(generation,eye,texture,bounds,flags,admission);frameCycles.submitOwnerEnd(cycleToken,frameCycleUs());frameCycleSubmitToken.store(0,std::memory_order_release);},&cyclePark);
       // Admission after the route returns excludes the rendezvous itself and
       // permits the next between-eye game interval. A completed pair retires
       // the timing context, in which case this callback correctly returns 0.
@@ -1248,7 +1271,11 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     const bool eligible=published==vr::VRCompositorError_None&&pairReady&&
       separateGraphics()&&!boundary.turbo()&&frameEndOverlapEnabled&&!pendingFrameEndFinish;
     const bool deferred=eligible&&service.submit([this]{finishPendingFrameEnd();});
-    if(deferred){pendingFrameEndFinish=true;pendingFrameEndEye=eye;pendingFrameEndSequence=timingSequence;++frameEndOverlapCount;}
+    if(deferred){
+      pendingFrameEndFinish=true;pendingFrameEndEye=eye;pendingFrameEndSequence=timingSequence;++frameEndOverlapCount;
+      std::lock_guard<std::mutex> lock(overlapHandoffMutex);
+      if(overlapHandoffEpoch==admission)overlapHandoffGeneration=generation;
+    }
     const bool pairSync=!deferred&&published==vr::VRCompositorError_None&&pairReady;
     if(pairSync)++frameEndSyncCount;
     const auto r=deferred?vr::VRCompositorError_None:
@@ -1463,7 +1490,29 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   bool handoff(uint64_t generation) override {
     if(!service.isOwner()) {
       const auto began=frameCycleUs();const auto sequence=frameCycleSequence.load(std::memory_order_acquire);
-      const DWORD caller=GetCurrentThreadId();bool result=false;
+      const DWORD caller=GetCurrentThreadId();bool asynchronous=false,accepted=false;
+      {
+        std::lock_guard<std::mutex> lock(overlapHandoffMutex);
+        if(generation&&overlapHandoffGeneration==generation) {
+          overlapHandoffGeneration=0;asynchronous=true;
+          // The host outlives the service's active requests, cancellation and
+          // owner finalizer. Capture values only; the deferred finish is ahead
+          // of this request in the same FIFO, and still has close()'s fallback.
+          try {
+            accepted=service.submit([this,generation]{
+              if(!handoff(generation))overlapHandoffInvalid.fetch_add(1,std::memory_order_relaxed);
+            },[this](bool success){
+              (success?overlapHandoffCompleted:overlapHandoffCancelledOrFailed).fetch_add(1,std::memory_order_relaxed);
+            });
+          } catch(...) {}
+          (accepted?overlapHandoffAccepted:overlapHandoffRejected).fetch_add(1,std::memory_order_relaxed);
+        }
+      }
+      if(asynchronous) {
+        frameCycles.noteHandoff(began,frameCycleUs(),sequence,caller,accepted);
+        return accepted;
+      }
+      bool result=false;
       const bool dispatched=service.invoke([&]{result=handoff(generation);});
       frameCycles.noteHandoff(began,frameCycleUs(),sequence,caller,dispatched&&result);
       return dispatched&&result;
@@ -2140,6 +2189,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     return true;
   }
   bool close() {
+    clearOverlapHandoff();
     // A pacer wait kicked by the last frame's finish() must not be left
     // running past this point: stop() below joins the FramePacer thread, and
     // a still-pending xrWaitFrame would otherwise hang it, or worse, race
@@ -2186,6 +2236,10 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(tracing)nativeTracePrintf("native_frame_end_overlap_summary,overlapped=%llu,synchronous=%llu,inline_at_close=%llu,failures=%llu\n",
       (unsigned long long)frameEndOverlapCount,(unsigned long long)frameEndSyncCount,
       (unsigned long long)frameEndInlineAtCloseCount,(unsigned long long)frameEndFailureCount);
+    if(tracing)nativeTracePrintf("native_overlap_handoff_summary,accepted=%llu,completed=%llu,rejected=%llu,invalid=%llu,cancelled_or_failed=%llu\n",
+      (unsigned long long)overlapHandoffAccepted.load(),(unsigned long long)overlapHandoffCompleted.load(),
+      (unsigned long long)overlapHandoffRejected.load(),(unsigned long long)overlapHandoffInvalid.load(),
+      (unsigned long long)overlapHandoffCancelledOrFailed.load());
     if(tracing) { const auto producerGpu=producerTiming.summary();
       nativeTracePrintf("native_producer_gpu_summary,windows=%llu,samples=%llu,disjoint_invalid=%llu\n",
         (unsigned long long)producerGpu.windows,(unsigned long long)producerGpu.samples,(unsigned long long)producerGpu.disjointInvalid); }

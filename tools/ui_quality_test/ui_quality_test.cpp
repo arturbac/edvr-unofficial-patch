@@ -679,6 +679,17 @@ void testGate() {
         check(std::fabs(uiLayerPercentile(one, 1, 0.95) - 0.25) < 1e-6 &&
                   uiLayerPercentile(nullptr, 0, 0.5) == 0.0,
               "one sample is its own percentile; none reads 0");
+        float even[4] = {9.0f, 1.0f, 1.0f, 5.0f};
+        const double evenP95 = uiLayerPercentile(even, 4, 0.95);
+        check(std::fabs(evenP95 - 8.4) < 1e-9 && uiLayerSortedPercentile(even, 4, 0.5) == 3.0,
+              "one sorted snapshot preserves even-count median and duplicate order statistics");
+        float fullWindow[8192];
+        for (uint32_t i = 0; i < 8192; ++i) fullWindow[i] = static_cast<float>((8191 - i) / 4);
+        const double fullP95 = uiLayerPercentile(fullWindow, 8192, 0.95);
+        check(fullP95 == 1945.0 && uiLayerSortedPercentile(fullWindow, 8192, 0.5) == 1023.5 &&
+                  uiLayerSortedPercentile(nullptr, 0, 0.5) == 0.0 &&
+                  uiLayerSortedPercentile(one, 1, 0.5) == 0.25,
+              "full 8192-sample route window reuses its sort with unchanged interpolation");
         check(std::strcmp(uiRouteStageName(UiRouteStage::kSeed), "depth-stencil seed") == 0 &&
                   std::strcmp(uiRouteStageName(UiRouteStage::kComposite), "composite") == 0,
               "the price line's stage names");

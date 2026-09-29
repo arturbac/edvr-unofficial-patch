@@ -2,11 +2,14 @@
 
 ## Status
 
-- **Current flight:** Frontier `7aaaf39c` gfx `033435`/runtime
-  `033436_691_11608` confirms both cockpit models in final composition. CPU
-  spikes worsen approaching ships; exact stall cause remains unresolved. See
-  the 2026-09-29 entry for chronology, limits and discriminators. Work stays on
-  the separate Frontier branch; main is unchanged.
+- **Current flight:** verified `7aaaf39c` profile `035907-fda516`, PID28296,
+  gfx `035926`/runtime `035927_475_28296`; zero lost events, matching PDBs.
+  User reports CPU spikes and fpsVR GPU <=6.8 ms. The recurring handoff blocks
+  ~1.94 ms/frame behind deferred xrEndFrame; exact stacks confirm it defeats
+  post-submit overlap. Actual-host tests and independent review pass for a
+  nonblocking notification; full validation is green before promotion. Earlier
+  dump `033645` confirms both cockpit models. Work stays on the separate
+  Frontier branch; main is unchanged.
 - **Conclusion:** no controlled whole-frame performance comparison or exact
   regression conclusion. The new remap follows the earliest stalls; see
   Exclusions for ruled-out causes and the HUD arc for build/fixture evidence.
@@ -19,10 +22,11 @@
   2037×1969→4074×3938/UI5093×4923. Installed DLSS metadata is 310.7.0.0;
   graphics logs omit driver/DLSS versions. Profiling uses Frontier; baseline
   uses Steam.
-- **Next:** existing helper, 90 s CPU/GPU capture on installed `7aaaf39c`,
-  quiet cockpit then approach ships, diagnostics OFF and no eye dump. Keep the
-  window open through Saving. Earlier `1ff8c224` trace `194016-f80584` is
-  recovered; do not repeat it for saving.
+- **Next:** commit/promote/install the validated handoff and B4/B9 changes,
+  then fly Frontier with fpsVR, diagnostics OFF and no eye dump to check gain.
+  Review B1/B2 fault recovery remains open before main; B3 timer behavior needs
+  user approval. Allocation dimensions do not prove VRAM pressure. Earlier
+  `1ff8c224` trace `194016-f80584` is recovered; do not repeat it.
 
 ## Pre-optimization Frontier evidence
 
@@ -158,7 +162,8 @@ user cancelled investigation.
 - ruled out: settings causing `45da6ae3` DLSS failure: SDK absent; exclude
   `164641` fallback.
 - ruled out: diagnostics ON required for reds: steady OFF3/ON0; no causality.
-- ruled out: lost overlap: >12,000 completions/flight, zero sync failures.
+- ruled out: lost deferred completions: >12,000/flight, zero sync failures;
+  this does not rule out caller handoff serializing behind those completions.
 - ruled out: DLSS-only exhaust blur: user sees it off; capture cancelled.
 - ruled out: removing seed clear: Frontier `0xC000` needs per-bit fallback;
   WARP/RTX lack specified-stencil-ref support.
@@ -194,29 +199,22 @@ resolution.
 
 ## 2026-09-28: recovered latest flight and corrected selector identity
 
-Frontier `1ff8c224` gfx194044/runtime194045_548_19952 verifies. Capture
-`frontier-cpu-gpu-20260928-194016-f80584` was interrupted by the user while
-saving. WPR was closed; 9,694,085,120B ETL decodes successfully in134s,5.28GB
-peak. `report-recovered.json` has15,382 covered/derived cycles, zero loss,
-15,365 valid explicit GPU joins/17 unavailable, zero malformed/ambiguous; one
-GPU witness has no completed CPU cycle at the boundary. PDBs match2/2. Original
-failed status is preserved beside separate `recovery-status.json`. Smoke had
-actually passed60 mapped synthetic samples. Save helper now defers Ctrl+C for
-the SAME stop child within180s; window closure remains unprotected. Typed
-errors/progress and220 self-tests pass; this did not alter the ETL.
+Frontier `1ff8c224` gfx194044/runtime194045_548_19952 verifies. Interrupted
+capture `194016-f80584` was recovered: 15,382 covered cycles, zero loss, 15,365
+valid GPU joins/17 unavailable, matching PDBs. Original failed status is
+preserved beside `recovery-status.json` and `report-recovered.json`. Save now
+defers Ctrl+C for the same stop child within180s (220 checks); window closure
+remains unprotected (review B8).
 
-Quiet01:43:01–31 UTC: GPU9.129/10.648/11.719ms p50/p95/p99,2.71%>11.111.
-Target01:44:20–49:11.136/13.508/14.466,51.15%>. Rise begins01:43:55, before
-first world-reticle redirect01:44:17.669. No strict alternating cadence. Worst
-pre-targetGPU24.77–27.43ms includesR1 game-worker waits14–17ms; elapsed query
-segments are not GPU busy time. Other tails lack large waits; worker joins are
-not the whole cause. Loading from01:44:50.169 and exit are excluded. Individual
-full driver stacks are not available in this report. Mixed-target HUD
-seeds1→~3.73/eye, parent seed median.154→.754ms/eye; target sprites also
-increase, so there is no exclusive reticle attribution. All native benchmark
-windows are scope-changed partials, diagnosticsOFF. Nightvision precompiled
-creation.259ms versus prior46ms compile;28 first-use CreateShader
-successes.129–.655ms, without the corresponding compile hitches.
+Quiet01:43:01–31 UTC versus target01:44:20–49 query p50/p95/p99:
+9.129/10.648/11.719→11.136/13.508/14.466ms. Rise begins01:43:55 before first
+world-reticle redirect01:44:17.669. No strict alternating cadence. Pre-target
+query tails24.77–27.43ms include game-worker waits14–17ms; other tails do not.
+Loading from01:44:50.169 is excluded. Mixed-target seeds 1→~3.73/eye and seed
+median.154→.754ms also coincide with more sprites; no exclusive reticle
+attribution or controlled benchmark. DiagnosticsOFF. Nightvision creation.259ms
+replaces prior46ms compile; 28 shader creates .129–.655ms remain without
+corresponding HLSL compile hitches.
 
 Second verified gfx194646, dump194946, is separate from this ETW flight. User
 pictures specify yellow <> on the scanner rim; the admitted71DD/2D03
@@ -255,19 +253,91 @@ Present max 1.114 ms versus outside-Present 226.314 ms in the later window;
 these are aggregates, not an exact-cycle attribution. Native benchmark omits
 post-submit/submit waits, so 4–6 ms medians do not refute fpsVR spikes.
 
-Intercepted resource bursts include 41 textures/169.5MB at 03:35:57 and 50
-textures + 16 buffers/907.4MB at 03:36:03; counters include EDVR. Owner Map max
-6.396 ms is also unpriced by origin. DLSS median 3.23–3.38/p95 4.26–4.48
-ms/stereo stays steady. HUD window 03:36:35 has 58.78 redirects, 29.12 stock
-writebacks/stereo, 2.367 seeds/eye; seed .493/1.536 and machinery .971/2.023 ms
-median/p95 per eye. Four remap draws/stereo, zero refusals; two shaders
-prepared once. Different workload prevents exclusive remap-cost attribution.
-Diagnostics OFF, all 20 benchmark rows scope-changed: no controlled baseline.
+Resource bursts reach 907.4MB and owner Map6.396ms, origin unpriced. DLSS
+median3.23–3.38/p954.26–4.48ms/stereo stays steady. HUD03:36:35: 58.78
+redirects/29.12 stock writebacks/stereo,2.367seeds/eye; seed.493/1.536 and
+machinery.971/2.023ms median/p95/eye. Four remap draws, zero refusals, two
+shaders prepared once. Workload differs, diagnosticsOFF, 20 scope-changed
+benchmark rows: no exclusive remap cost or controlled baseline.
 
-Next 90 s trace uses the verified helper/PDBs without a rebuild. Quiet cockpit
-then approach ships, diagnostics OFF throughout, no eye dump. Discriminators:
-running stacks game/EDVR/driver; blocked stacks+wakers allocation/Map versus
-worker joins; ready delay for scheduling; caller handoff wait paired with owner
-finishPair/xrEndFrame and GPU queues for backpressure. Query spans include CPU
-submission gaps; distinguish packet execution from elapsed durations. Existing
-instrumentation covers these causes. No speculative rendering change.
+The next completed trace uses existing instrumentation: caller running, ready
+and blocked stacks+wakers; owner finish and GPU submission queues.
+DiagnosticsOFF, no eye dump; query spans can include CPU submission gaps.
+
+## 2026-09-29: completed profile proves handoff serialization
+
+`035907-fda516` verifies installed `7aaaf39c`, PID 28296, gfx `035926`/runtime
+`035927_475_28296`. Capture complete, 5,861 derived/covered cycles, zero loss,
+5,845 valid GPU joins/16 unavailable, two matching PDBs. Use UTC 10:01:03.105
+through 10:02:16.042; loading UI returns afterward. User reports mainly CPU
+spikes, fpsVR GPU <=6.8 ms. Query median 12.761 ms includes submission gaps,
+not GPU busy time. No approach timestamp established.
+
+Hypothesis CONFIRMED before editing: PostPresentHandoff reblocks the producer
+behind the deferred frame end. Steady 4,846 cycles show ~1.944 ms/frame at this
+wait site; proxy self samples ~.826 ms/frame in full interior windows. Exact
+sequences 9570/10000/10239 wait 2.103/1.919/1.935 ms: `_Cnd_wait ->
+OwnerService::invoke -> NativeRuntimeHost::handoff ->
+OpenVRCompositor::PostPresentHandoff -> game4e1abb`. On 10239 owner 51836 is
+inside SteamVR xrEndFrame through finishPendingFrameEndBody; caller 50772 later
+runs 3.435 ms after Present. Source handoff only validates/increments a
+counter. A nonblocking notification can permit real game work to overlap; do
+not claim a measured whole-frame saving before flying the change.
+
+Separate 10240 hitch: 291.728 ms cycle, query 12.883 ms, 201.961 ms longest
+wait through game CreateTexture2D/D3D11/NVIDIA/dxgkrnl/dxgmms2, woken by PID
+4/TID 160. Game-owned queues receive no submissions for 290–301 ms. Actual
+created RT 4862×2735 fmt27 follows that wait; a preceding RT/depth burst has
+2917×1671/2674×1671. Gfx identifies 4862×2735 as scanner chrome; engine panel
+sizing is ×2.5000, but this oversized surface fails the sizing-chain gate. Its
+original stage and memory budget are not established. The FSS hook only doubles
+exact half-eye sizes, excluding these odd physical dimensions. Seq 8908
+producer-copy driver wait 14.153 ms wakes from NVIDIA worker 50000; next queue
+submission follows .256 ms later. These are CPU underfeeding witnesses, not
+proof of GPU busy time or paging exhaustion.
+
+Artifacts: `build/capture_probe/handoff-witnesses.json`, retained ETLX, and
+`build/gpu-approach/allocation-witness.jsonl`. Keep the handoff change scoped
+to valid overlapped pairs; preserve synchronous paths, lifetime, generation,
+frame completion and next-operation ordering. Test with blocked fake XR.
+
+Implemented one-use admission for successful separate-device overlapped pairs.
+Queue the value-only handoff behind finish and ahead of subsequent caller
+operations; synchronous/borrowed/turbo paths retain validation. A mutex and
+caller-operation epoch prevent stale publication. Actual-host tests hold XR end
+open while real PostPresentHandoff and producer work return; also cover FIFO,
+invalid generations, queue full, cancellation and close fallback. Focused
+native: 4,877 checks/zero failures; independent review finds no must-fix
+defect. This preserves existing serial frame admissions, without claiming
+concurrent Wait/Submit support. New close summary distinguishes
+accepted/completed/rejected/invalid/cancelled-or-failed jobs.
+
+Full `build.bat` validation passes, including 86 pooled rigs, Python gates,
+production DLLs, config contract and installer resources. Log:
+`build/dlss-handoff-review-full.log`; input receipt
+`aee14f4390edea1513b0186f175289688aa3f46e2b746871652fcbb288440702`.
+
+## 2026-09-29: external review and slices triage
+
+Read both main-checkout review files (snapshot 7aaaf39c), including raw X1–X3.
+B4 repeats a percentile sort; preserve exact interpolation while sorting once.
+B9 own-query comparisons can be skipped only with no own handles. Preserve
+pre-arm game-query tracking: an already-open query can outlive any arm grace
+period. Case-fold accepted census values without changing flat-profile policy.
+B4/B9 implemented; production-header UI rig passes 4,156 checks and both
+graphics source files compile. Partial query creation conservatively keeps the
+scan enabled until every handle is released.
+
+B3 confirms detailed route timers run with diagnosticsOFF. Existing key says
+off reports machinery; requested permission before gating it. Basic application
+frametime is separate. Review estimates and capped samples do not establish
+these costs as the cause of multi-millisecond storms.
+
+B1/B2 remain before-main fault-recovery work: retained dirty PS/b13 must be
+restored before unblocking draws; clearing the latch alone is unsafe. Shared
+HDR/LDR budgets and retained HDR resources also need scoped recovery tests. No
+fault signature in this flight establishes them as its timing cause. B5/B6
+admission/production-test coverage and B8 capture window-close cleanup stay
+open. Build-tool refactors, shader goldens and broad module rewrites are
+deferred; main stays unchanged. The seed saving requires NVIDIA's per-bit
+fallback; specified-stencil-ref devices do not take the same full seed.

@@ -616,7 +616,13 @@ bool gdQueryTypeBlocks(D3D11_QUERY t) {
     }
 }
 
+// Conservative presence: set before creation (including partial failure),
+// cleared only after releaseGpu has reset every owned query. Render-owner
+// serialization is the same as the query handles and game-open-query list.
+bool g_gdOwnQueriesMayExist = false;
+
 bool isOwnQuery(const void* q) {
+    if (!g_gdOwnQueriesMayExist) return false;
     for (const auto& p : g_gdPairs)
         if (p.a.Get() == q || p.b.Get() == q) return true;
     return false;
@@ -1042,6 +1048,7 @@ void releaseGpu() {
         p.b.Reset();
         p.pending = false;
     }
+    g_gdOwnQueriesMayExist = false;
     for (auto& e : g_gdDerived) e = GdDerived{};
     g_ge = GeSample{};
 }
@@ -1165,7 +1172,8 @@ void logWindow(double secs) {
 }  // namespace
 
 void hudLayerCensusConfigure(Config& cfg) {
-    const std::string v = cfg.getString("advanced.hud_census", "off");
+    std::string v = cfg.getString("advanced.hud_census", "off");
+    for (char& c : v) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
     const bool on = v == "on" || v == "1" || v == "true" || v == "yes";
     if (on == detail::g_hudLayerCensusOn) return;
     if (on) {
@@ -1281,6 +1289,7 @@ bool hudLayerCensusGdBegin(ID3D11DeviceContext* ctx, HudCensusGdSave& save) {
                 qd.Query = D3D11_QUERY_OCCLUSION;
                 Ptr<ID3D11Device> dev;
                 ctx->GetDevice(&dev);
+                g_gdOwnQueriesMayExist = true;
                 if (!dev || FAILED(dev->CreateQuery(&qd, &g_gdPairs[i].a)) ||
                     FAILED(dev->CreateQuery(&qd, &g_gdPairs[i].b))) {
                     gdDisable("occlusion query creation failed");

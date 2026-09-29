@@ -1205,18 +1205,23 @@ inline bool uiRouteClose(UiRouteSum& s, uint64_t oldestPendingSeq, double* close
     return true;
 }
 
-// v[0..n) sorted in place, one percentile read off by linear interpolation
+// Reads an already-sorted v[0..n), one percentile by linear interpolation
 // between the two bracketing order statistics (temporal_pass.cpp's
 // windowPercentile, the definition numpy uses).
-inline double uiLayerPercentile(float* v, uint32_t n, double frac) {
+inline double uiLayerSortedPercentile(const float* v, uint32_t n, double frac) {
     if (!v || !n) return 0.0;
-    std::sort(v, v + n);
     const double pos = frac * static_cast<double>(n - 1);
     uint32_t lo = static_cast<uint32_t>(pos);
     if (lo > n - 1) lo = n - 1;
     const uint32_t hi = lo + 1 < n ? lo + 1 : lo;
     const double t = pos - static_cast<double>(lo);
     return static_cast<double>(v[lo]) * (1.0 - t) + static_cast<double>(v[hi]) * t;
+}
+
+inline double uiLayerPercentile(float* v, uint32_t n, double frac) {
+    if (!v || !n) return 0.0;
+    std::sort(v, v + n);
+    return uiLayerSortedPercentile(v, n, frac);
 }
 
 }  // namespace edvr
