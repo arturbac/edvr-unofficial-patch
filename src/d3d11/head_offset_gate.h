@@ -91,8 +91,8 @@ void headOffsetGateViewBumped();
 void headOffsetGateViewUnbumped();
 
 // Tell the gate whether hotkey.external_camera_next is CONFIGURED. Same
-// distinction as headOffsetGateSetKeyBound: the bridge's log line and the
-// dead-config warning need to know a key exists before its first press.
+// distinction as headOffsetGateSetKeyBound: the dead-config warning needs to
+// know a key exists before its first press.
 void headOffsetGateSetNextKeyBound(bool bound);
 
 // A new on-foot session has begun.
@@ -105,12 +105,12 @@ void headOffsetGateSetNextKeyBound(bool bound);
 // headOffsetGateViewUnbumped.
 //
 // A wake is the boundary that really does reset it; see
-// headOffsetGateSetWakeLive. What survives here is the bridge and grace
-// bookkeeping, which is about the READ dying across a landing and has
-// nothing to do with the count. Two detectors call this for the same landing --
-// the journal's Disembark (authoritative, wired in device_hook) and the
-// panel-return heuristic (fallback, internal) -- and it dedupes, so the
-// first to speak does the work. `source` names the caller in the log.
+// headOffsetGateSetWakeLive. What is left here is the dedupe and the arming
+// grace, and neither has anything to do with the count. Two detectors call
+// this for the same landing -- the journal's Disembark (authoritative, wired
+// in device_hook) and the panel-return heuristic (fallback, internal) -- and
+// it dedupes, so the first to speak does the work. `source` names the caller
+// in the log.
 // `journalSaysSo` marks the authoritative caller: besides the deduped reset
 // it opens the arming grace for the stale-status window that follows a real
 // disembark (Status.json answers "not on foot" for ~6 more seconds).
@@ -142,20 +142,12 @@ void headOffsetGateSetOnFootLive(bool known, bool onFoot, uint32_t sample);
 // arriving in it is.
 void headOffsetGateSetWakeLive(bool known, bool inSupercruise, bool inTunnel);
 
-// The gate's current counted view (0 after a disembark, the last confirmed
-// view within a session).
-int headOffsetGateCountedView();
-
-// Supply an authoritative view index, or -1 for "not known".
+// The gate's current counted view: the keypress count, put back to 0 by a wake
+// and by stepping out of a vehicle past the end of the on-foot cycle.
 //
-// Counting keypresses works and has no origin (6ac.6d): the game REMEMBERS the
-// view across camera toggles, so there is no moment when the count is known to
-// be right and one missed press desyncs it for the session. A caller that can
-// read the game's own index passes it here and the count stops mattering.
-// Nothing in this module knows or cares how such a caller gets it. (No
-// production caller since the game-memory read was removed 2026-09-29: the
-// count stands, and gate_test still drives this path.)
-void headOffsetGateSetView(int view);
+// No production caller. It stays as gate_test's one window onto the live count
+// (the ring, the vehicle clamp and the wake reset are all asserted through it).
+int headOffsetGateCountedView();
 
 // Is the gate switched on (fix.head_offset_gate)?
 //

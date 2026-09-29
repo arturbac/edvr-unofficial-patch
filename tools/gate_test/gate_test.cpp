@@ -202,8 +202,17 @@ void begin(bool keyBound) {
     headOffsetGateReset();
     headOffsetGateConfigure();
     headOffsetGateSetKeyBound(keyBound);
-    headOffsetGateSetView(-1);   // nothing supplying an index unless said
     g_frame = 0;
+}
+
+// Put the counted view on `view` the way a player does: by cycling with the
+// next-view key from wherever the count is. The count is the only source of
+// the view (the read of the game's own index was removed 2026-09-29), so a
+// scenario that needs "the camera is on view N" gets there by presses.
+void countedViewIs(int view) {
+    for (int i = 0; i < 64 && headOffsetGateCountedView() != view; ++i) {
+        headOffsetGateViewBumped();
+    }
 }
 
 // Enter the camera the way a set-up player does: on foot, press the key, the
@@ -222,18 +231,9 @@ void enterCamera() {
     sceneFrame(12);
 }
 
-// ------------------------------------------------------- grouping scan matches
-//
-// The other half of the feature, and the half that failed in the field first.
-//
-// The gate scenarios above all begin by being TOLD a view index. Supplying one
-// means picking the camera settings array out of a heap full of objects of the
-// same type, and the picking is pure address arithmetic -- so it is testable
-// here, without a game, and it is where the first user-reported bug was.
-//
 // ------------------------------------------------- what counts as an eye
 //
-// The third thing the gate depends on and does not own: whether a draw is
+// The one thing the gate depends on and does not own: whether a draw is
 // going into an eye texture at all. It cannot arm if the count it reads is
 // starved, and on 2026-08-19 a rig starved it by rendering the world at a
 // scale -- 1626x1774 into a 2112x2304 the headset was handed. eyeShapedAtScale
@@ -1729,11 +1729,12 @@ void runScenarios() {
     // shape still passed.
     //
     // The game REMEMBERS the camera view across uses, so a player who cycled to
-    // view 1 earlier has the live index reading 1 while they walk around. The
-    // view gate then passes, and the arming rule is the ONLY thing left between
-    // walking into your own ship and the offset applying in your cockpit.
+    // the wanted view earlier has the count sitting on it while they walk
+    // around. The view gate then passes, and the arming rule is the ONLY thing
+    // left between walking into your own ship and the offset applying in your
+    // cockpit.
     begin(/*keyBound=*/false);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     panelFrame(200);
     sceneFrame(600);
     check(false, "boarding a ship, view already the wanted one, no key bound");
@@ -1744,14 +1745,14 @@ void runScenarios() {
     // be set by the first press, so a correctly configured player ran the weak
     // path until they happened to press it -- which is when they needed it.
     begin(/*keyBound=*/true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     panelFrame(200);
     sceneFrame(600);
     check(false, "key bound but never pressed, wanted view, boarding a ship");
 
     // THE HAPPY PATH. Key bound, key pressed, panel stops, scene appears.
     begin(true);
-    headOffsetGateSetView(g_wantView);        // the game says view 1
+    countedViewIs(g_wantView);                // cycled to the wanted view
     enterCamera();
     check(true, "entering the camera on the wanted view");
 
@@ -1774,7 +1775,7 @@ void runScenarios() {
     // sequence reaches, and where a fix for the starvation itself belongs is
     // in the recogniser (vscreen.cpp), not here.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     starvedPanelFor(3000);
     headOffsetGateKeyPressed();
     starvedPanelFrame(2);            // the game takes a few frames to change mode
@@ -1795,64 +1796,26 @@ void runScenarios() {
     // camera view faces back at the commander, and placing the viewpoint at
     // their head there means facing the wrong way.
     begin(true);
-    headOffsetGateSetView(g_otherView);
+    countedViewIs(g_otherView);
     enterCamera();
-    check(false, "in the camera on view 0 when the offset is for view 1");
+    check(false, "in the camera on another view when the offset is for the "
+                 "wanted one");
 
-    // ...and it engages the moment the view becomes the wanted one, with no
-    // further keypress.
-    headOffsetGateSetView(g_wantView);
+    // ...and it engages the moment the count reaches the wanted view, with no
+    // further press of the camera key.
+    countedViewIs(g_wantView);
     sceneFrame(2);
     check(true, "the view changed to the wanted one while in the camera");
 
     // ...and disengages again on the way past.
-    headOffsetGateSetView(g_otherView);
+    countedViewIs(g_otherView);
     sceneFrame(2);
     check(false, "the view changed away again while in the camera");
 
-    // ----------------------------------------------------------- view bridge
-    //
-    // The read DYING mid-camera is routine near a planet: the game rebuilds
-    // its camera records every ten to thirty seconds (6ar-6at), and the strict
-    // drop landed exactly when the player was sitting still in the wanted
-    // view, supplying none of the presses re-certification needs. The bridge
-    // holds the last confirmed view for a bounded window; the first re-read
-    // corrects it that frame; expiry restores the strict drop; and 0 in the
-    // config restores the old rule entirely. Each property pinned. The hold is
-    // the half that fails against the pre-bridge build.
-    begin(true);
-    headOffsetGateSetView(g_wantView);
-    enterCamera();
-    check(true, "in the camera on the wanted view, read alive");
-    headOffsetGateSetView(-1);            // the rebuild takes the read away
-    sceneFrame(200);                      // well inside the bridge window
-    check(true, "the read died mid-use and the offset held: the bridge");
-    headOffsetGateSetView(g_otherView);   // it returns saying the player moved
-    sceneFrame(2);
-    check(false, "the returning read named a different view and won at once");
-    headOffsetGateSetView(g_wantView);
-    sceneFrame(2);
-    check(true, "back on the wanted view");
-    headOffsetGateSetView(-1);
-    sceneFrame(2800);                     // the old TTL would have expired here
-    check(true, "the hold has no clock: a long dead-read stretch stays on");
-
-    Config::get().set("fix.head_offset_view_bridge", "0");
-    begin(true);
-    headOffsetGateSetView(g_wantView);
-    enterCamera();
-    check(true, "in the camera, bridge configured off");
-    headOffsetGateSetView(-1);
-    sceneFrame(2);
-    check(false, "with the bridge off, losing the read drops the offset at once");
-    Config::get().set("fix.head_offset_view_bridge", "1");
-
     // THE RELANDING CASE, corrected twice by the field (sixth and ninth
-    // flights of 2026-08-15). The first version held the old view across the
-    // whole absence, on "the game freezes the view while the camera is
-    // closed" -- and the ninth flight showed the offset applied on preset 0
-    // at re-entry, which was read as the game RESETTING its view across a
-    // vehicle leg.
+    // flights of 2026-08-15). The ninth flight showed the offset applied on
+    // preset 0 at re-entry after a vehicle leg, which was read as the game
+    // RESETTING its view across the leg.
     //
     // THAT READING WAS WRONG, and the field said so on 2026-09-02:
     // disembarking and re-embarking leave the on-foot preset exactly where
@@ -1861,16 +1824,14 @@ void runScenarios() {
     // wired up -- one uncounted press looks identical to a reset if you only
     // ever check where you ended up.
     //
-    // So a landing holds the view, and a LOW OR HIGH WAKE is the boundary
+    // So a landing keeps the count, and a LOW OR HIGH WAKE is the boundary
     // that really zeroes it: entering supercruise or jumping rebuilds the
     // camera and the preset goes with it. Both halves are asserted below.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     enterCamera();
     check(true, "in the camera on the wanted view");
-    headOffsetGateSetView(-1);            // the rebuild takes the read away
     sceneFrame(20);
-    check(true, "holding on the bridge");
     headOffsetGateKeyPressed();           // leave the camera for the ship
     sceneFrame(1);
     check(false, "left the camera");
@@ -1879,16 +1840,16 @@ void runScenarios() {
     headOffsetGateKeyPressed();           // re-enter the camera
     panelFrame(2);
     sceneFrame(12);
-    check(true, "a landing keeps the camera preset, so the held view arms "
-                "again at re-entry");
+    check(true, "a landing keeps the camera preset, so the counted view "
+                "arms again at re-entry");
 
-    // AND THE HOLD HAS NO CLOCK AT ALL: staying in the camera on the held
-    // view for as long as the player wishes is the product requirement
-    // (2026-08-15) -- the wall-clock TTL greeted every relanding with a dead
-    // bridge, and the in-camera budget contradicted indefinite stays. An
-    // hour of frames on the hold stays on.
+    // AND A CAMERA STINT HAS NO CLOCK AT ALL: staying in the camera on the
+    // wanted view for as long as the player wishes is the product requirement
+    // (2026-08-15). A wall-clock limit tried on the hold greeted every
+    // relanding with an expired view, and an in-camera budget contradicted
+    // indefinite stays. An hour of frames stays on.
     sceneFrame(324000);
-    check(true, "an hour in the camera on the held view is still on");
+    check(true, "an hour in the camera on the counted view is still on");
 
     // NOW THE BOUNDARY THAT DOES RESET IT. A first sample is not an edge --
     // arriving already in supercruise tells you nothing about a transition --
@@ -1906,8 +1867,7 @@ void runScenarios() {
     check(false, "view 1 is not the wanted one either");
     headOffsetGateViewBumped();           // cycle: 1 -> 2
     sceneFrame(2);
-    check(true, "two presses reach the wanted view and the offset arms, "
-                "read or no read");
+    check(true, "two presses reach the wanted view and the offset arms");
 
     // LEAVING SUPERCRUISE IS A BOUNDARY TOO (field, 2026-09-02). Dropping out
     // rebuilds the scene as surely as entering does, so the edge counts in
@@ -1935,17 +1895,16 @@ void runScenarios() {
     // to on-foot and coming straight back is the case the game genuinely
     // remembers across, and no vehicle scene intervenes.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     enterCamera();
-    headOffsetGateSetView(-1);
     sceneFrame(20);
-    check(true, "in the camera, read dead, holding");
+    check(true, "in the camera on the wanted view");
     headOffsetGateKeyPressed();           // out to on-foot
     panelFrame(60);                       // walking about: panel, no vehicle
     headOffsetGateKeyPressed();           // straight back in
     panelFrame(2);
     sceneFrame(12);
-    check(true, "a same-session toggle keeps the held view and re-arms");
+    check(true, "a same-session toggle keeps the counted view and re-arms");
 
     // THE ON-FOOT RING IS 0..5 AND ROLLS OVER AT BOTH ENDS. The gate cares
     // about no other context: an SRV's ring is 8 and a ship's up to 11, and a
@@ -1989,30 +1948,16 @@ void runScenarios() {
     for (int i = 0; i < 8; ++i) headOffsetGateViewBumped();
     checkView(2, "on foot, eight presses wrap twice and land on 2");
 
-    // A READ FROM A LONGER RING IS FOLDED, NOT TAKEN RAW. 8 is an SRV index;
-    // on foot it can only mean 2. Clamping would have said 5, which is a real
-    // preset and the wrong one -- the failure mode worth a test of its own.
-    begin(true);
-    enterCamera();
-    headOffsetGateSetView(8);
-    sceneFrame(2);
-    checkView(2, "a read of 8 folds into the on-foot ring as 2");
-    headOffsetGateSetView(11);
-    sceneFrame(2);
-    checkView(5, "and 11 folds to 5");
-
     // THE JOURNAL'S BOUNDARY AND THE HEURISTIC'S ARE ONE EVENT. Disembark
     // (wired from device_hook) and the panel-return heuristic mark the same
     // landing seconds apart, and the dedupe means it is announced once rather
-    // than twice. Neither touches the counted view any more -- what they still
-    // do is retire the bridge, which is about the READ dying across a landing
-    // and was never about the count.
+    // than twice. Neither touches the counted view: a landing keeps the
+    // on-foot preset, and only a wake resets it.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     enterCamera();
-    headOffsetGateSetView(-1);
     sceneFrame(20);
-    check(true, "in the camera, read dead, holding");
+    check(true, "in the camera on the wanted view");
     headOffsetGateKeyPressed();               // out to the ship
     sceneFrame(2000);                         // the leg
     headOffsetGateNewFootSession("test: journal Disembark");
@@ -2032,9 +1977,8 @@ void runScenarios() {
     // AN IDLE STRETCH (map, menu) is not a vehicle leg and must not reset:
     // neither panel nor scene accrues toward the session boundary.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     enterCamera();
-    headOffsetGateSetView(-1);
     sceneFrame(20);
     headOffsetGateKeyPressed();           // out to on-foot
     panelFrame(30);
@@ -2044,7 +1988,7 @@ void runScenarios() {
     panelFrame(2);
     sceneFrame(12);
     check(true, "a long menu stretch does not start a new session, and the "
-                "held view still arms");
+                "counted view still arms");
 
     // --------------------------------------------------------- keyless mode
     //
@@ -2055,7 +1999,7 @@ void runScenarios() {
     // stopped, so boarding's stale second of "on foot" cannot arm the
     // offset into the boarding animation.
     begin(false);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     headOffsetGateSetOnFootLive(true, true, 1);
     panelFrame(200);
     sceneFrame(6);                            // panel stops: entering the camera
@@ -2077,7 +2021,7 @@ void runScenarios() {
     // a certified entry with the read alive and view 2 on screen never
     // latched. The keyless window must outlast the cadence it waits on.
     begin(false);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     headOffsetGateSetOnFootLive(true, true, 1);
     panelFrame(200);
     sceneFor(1000);      // in the camera, sample pending: the measured +90
@@ -2091,7 +2035,7 @@ void runScenarios() {
     // and the only on-foot samples are from BEFORE the panel stopped --
     // stale. No fresh sample, no arming, however on-foot the old one says.
     begin(false);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     headOffsetGateSetOnFootLive(true, true, 1);
     panelFrame(200);
     sceneFrame(30);                           // boarding: no fresh sample yet
@@ -2101,7 +2045,7 @@ void runScenarios() {
     // No live context at all (no Status.json, watcher off): keyless stays
     // the dead configuration it always was.
     begin(false);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     panelFrame(200);
     sceneFrame(30);
     check(false, "keyless with no live context: nothing can arm, as before");
@@ -2114,7 +2058,7 @@ void runScenarios() {
     headOffsetGateReset();
     headOffsetGateConfigure();
     headOffsetGateSetKeyBound(false);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     g_frame = 0;
     headOffsetGateSetOnFootLive(true, true, 1);
     panelFrame(200);
@@ -2134,7 +2078,6 @@ void runScenarios() {
     // running (10:57:12). Until the flag has been seen TRUE this foot
     // session, false describes the PREVIOUS leg, not a boarding.
     begin(true);
-    headOffsetGateSetView(g_wantView);
     headOffsetGateSetOnFootLive(true, false, 1);   // in the ship
     sceneFrame(2000);                              // the leg
     headOffsetGateNewFootSession("test: journal Disembark");
@@ -2160,7 +2103,7 @@ void runScenarios() {
     // sample agree forfeits every fast entry (11:02:28 armed only because
     // the player took 6.7 s to reach the camera).
     begin(false);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     headOffsetGateSetOnFootLive(true, false, 1);   // in the ship
     sceneFrame(2000);                              // the leg
     headOffsetGateNewFootSession("test: journal Disembark", true);
@@ -2173,7 +2116,7 @@ void runScenarios() {
     // The grace is a window, not a licence: expired with the status never
     // confirming, entries revert to needing the fresh sample.
     begin(false);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     headOffsetGateSetOnFootLive(true, false, 1);
     sceneFrame(2000);
     headOffsetGateNewFootSession("test: journal Disembark", true);
@@ -2186,7 +2129,7 @@ void runScenarios() {
 
     // Embark cancels the grace: boarding again is not a camera entry.
     begin(false);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     headOffsetGateSetOnFootLive(true, false, 1);
     sceneFrame(2000);
     headOffsetGateNewFootSession("test: journal Disembark", true);
@@ -2200,7 +2143,7 @@ void runScenarios() {
     // heuristic spoke first, the journal's echo is a duplicate reset but
     // not duplicate news about the status file lagging.
     begin(false);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     headOffsetGateSetOnFootLive(true, false, 1);
     sceneFrame(2000);                              // the leg
     panelFrame(30);                                // heuristic fires the reset
@@ -2210,46 +2153,12 @@ void runScenarios() {
     sceneFrame(12);
     check(true, "keyless: a deduped journal echo still opens the grace");
 
-    // THE POISONED READER (6aw): the array contains a counter that certifies
-    // under shape rules and supplies garbage. A read that DISAGREES while the
-    // player is OUT of the camera is impossible for the real preset -- the
-    // game freezes the view there -- so the gate must keep the confirmed
-    // value and distrust the reader, and the next entry must arm on the held
-    // view, not the poison.
-    begin(true);
-    headOffsetGateSetView(g_wantView);
-    enterCamera();
-    check(true, "in the camera on the wanted view, read alive");
-    headOffsetGateKeyPressed();           // leave the camera
-    sceneFrame(1);
-    check(false, "left the camera");
-    headOffsetGateSetView(0);             // a suspect reader says 0 out here
-    sceneFrame(50);                       // refused: the view cannot change here
-    headOffsetGateSetView(-1);            // the poisoned reader dies (6aw did)
-    sceneFrame(50);
-    panelFrame(200);
-    headOffsetGateKeyPressed();           // re-enter
-    panelFrame(2);
-    sceneFrame(12);
-    check(true, "an out-of-camera read naming another view was refused, and "
-                "the entry armed on the confirmed view instead of the poison");
-    // In the camera a live reader is believed again -- the player can
-    // genuinely cycle here -- so a disagreeing in-camera read syncs and the
-    // wrong view correctly drops the offset.
-    headOffsetGateSetView(0);
-    sceneFrame(2);
-    check(false, "the same read in the camera syncs, and the wrong view "
-                 "drops the offset as ever");
-    headOffsetGateSetView(g_wantView);
-    sceneFrame(2);
-    check(true, "and back on the wanted view it returns");
-
     // ------------------------------------------------------------------ exits
     //
     // THE KEYED EXIT, which is the only exit render state cannot supply:
     // leaving the camera for a ship produces no panel frame ever.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     enterCamera();
     check(true, "in the camera");
     headOffsetGateKeyPressed();
@@ -2263,7 +2172,7 @@ void runScenarios() {
     // camera session, so the next press was born already past its grace period
     // and was discarded on the frame it was made.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     enterCamera();
     check(true, "first entry");
     headOffsetGateKeyPressed();      // leave
@@ -2277,7 +2186,7 @@ void runScenarios() {
 
     // THE PANEL COMING BACK is first person again, so the offset comes off.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     enterCamera();
     check(true, "in the camera");
     panelFrame(3);
@@ -2292,7 +2201,7 @@ void runScenarios() {
     // NEITHER PANEL NOR SCENE for a long stretch -- a menu, a load screen --
     // drops the latch rather than carrying it into whatever comes back.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     enterCamera();
     check(true, "in the camera");
     idleFrame(400);
@@ -2306,7 +2215,7 @@ void runScenarios() {
     // The panel being up is proof the player is not in the camera, so there is
     // nothing to toggle out of.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     panelFrame(200);
     headOffsetGateKeyPressed();      // the player presses...
     panelFrame(1);
@@ -2317,7 +2226,7 @@ void runScenarios() {
 
     // ...and three presses is no different from one, for the same reason.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     panelFrame(200);
     headOffsetGateKeyPressed();
     headOffsetGateKeyPressed();
@@ -2329,7 +2238,7 @@ void runScenarios() {
     // But IN the camera, a second press still means leave -- that is the case
     // the panel cannot answer, and the toggle has to survive there.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     enterCamera();
     check(true, "in the camera");
     headOffsetGateKeyPressed();
@@ -2344,7 +2253,7 @@ void runScenarios() {
     // panel's return then ate the pending intent as well, so the entry the
     // player actually asked for was discarded too.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     panelFrame(200);
     headOffsetGateKeyPressed();      // a real entry press, pending
     sceneFrame(1);                   // one frame without the panel
@@ -2363,7 +2272,7 @@ void runScenarios() {
     // the offset applied in a cockpit, which is the outcome this gate exists to
     // prevent.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     panelFrame(200);                 // on foot
     sceneFor(1333);                  // board the ship: a full scene, no panel.
                                      // "within about three seconds" is the
@@ -2383,7 +2292,7 @@ void runScenarios() {
     begin(true);
     panelFrame(200);
     headOffsetGateKeyPressed();
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     panelFrame(400);                 // the panel never stops: it did not enter
     sceneFrame(12);
     check(false, "a press that never entered the camera expired");
@@ -2394,7 +2303,7 @@ void runScenarios() {
     // take a bare early return, leaving gateInCamera true -- so re-enabling it
     // republished a stale latch wherever the player had gone by then.
     begin(true);
-    headOffsetGateSetView(g_wantView);
+    countedViewIs(g_wantView);
     enterCamera();
     check(true, "in the camera");
     {
@@ -2480,8 +2389,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     printf("  ok    %d assertion(s) total: the offset arms only where it "
-           "should, the view index survives the array being rebuilt, and every "
-           "verdict is identical at 72, 90 and 120Hz\n", g_checks);
+           "should, the counted view survives a landing and resets on a wake, "
+           "and every verdict is identical at 72, 90 and 120Hz\n", g_checks);
     printf("\nGATE TEST PASSED\n");
     return 0;
 }
