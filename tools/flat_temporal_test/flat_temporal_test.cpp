@@ -1244,6 +1244,13 @@ void flatRuntimeMenuCopyTests() {
               std::memcmp(result.second.camera, baseline.rows, sizeof(result.second.camera)) == 0 &&
               result.first->menuCopiesAccepted == 1 && result.first->menuCopiesRefused == 0,
               "verified menu copy transfers current scene lineage independently of copy b1");
+        // The menu-scoped stale-slot policy asks exactly this: the selected HDR is the copy's inherited
+        // destination. The copy's SOURCE (0x2800, an ordinary scene HDR) and no pointer at all are not.
+        check(flatFrameThroughMenuCopy(*result.first, result.second.hdr),
+              "a frame selected through a verified menu copy qualifies for the menu's stale-slot policy");
+        check(!flatFrameThroughMenuCopy(*result.first, MonoFixture::token(0x2800)) &&
+              !flatFrameThroughMenuCopy(*result.first, nullptr),
+              "the copy's source HDR and a null HDR do not qualify: it is the inherited destination that does");
     }
     for (Scenario s : {SourceDepth, SourceViewport, SourceStale, SourceLayout,
                        SourceCameraChange, SourceExplicitWrite,
@@ -1255,11 +1262,16 @@ void flatRuntimeMenuCopyTests() {
               result.second.reason == FlatMonoReason::ConflictingHdr &&
               result.first->selectedConflict.cause != FlatRuntimeConflict::None,
               "menu copy refuses invalid source, prior destination, alias and unverified views");
+        check(!flatFrameThroughMenuCopy(*result.first, result.second.hdr) &&
+              !flatFrameThroughMenuCopy(*result.first, MonoFixture::token(0x2600)),
+              "a refused menu copy never qualifies a frame for the menu's stale-slot policy");
     }
     auto overwritten = replay(PostCopyDestinationCompute);
     check(!overwritten.second.selected() && overwritten.first->menuCopiesAccepted == 1 &&
           overwritten.first->selectedConflict.cause == FlatRuntimeConflict::ExplicitWrite,
           "compute overwrite after accepted menu copy invalidates inherited HDR before tone");
+    check(!flatFrameThroughMenuCopy(*overwritten.first, overwritten.second.hdr),
+          "a frame whose inherited HDR was overwritten before tone is not selected, carries no HDR and does not qualify");
     auto depth = replay(SourceDepth);
     check(depth.first->selectedConflict.cause == FlatRuntimeConflict::DepthMismatch &&
           depth.first->selectedConflict.current.dsv == MonoFixture::token(0xDEAD),
@@ -1362,9 +1374,19 @@ void testFrameContractTrace() {
         check(parsed && framesReplayed == 1 && framesMatched == 1 && wantHash == cur.contractHash,
               "trace round-trip replays to an identical frame contract");
     }
-    // Committed corpus: every trace replays to its recorded contract hashes.
-    // The gate must not silently pass: a missing corpus, an unreadable entry,
-    // an empty directory or a manifest mismatch all fail the build.
+}
+
+// Committed corpus: every trace replays to its recorded contract hashes.
+// The gate must not silently pass: a missing corpus, an unreadable entry,
+// an empty directory or a manifest mismatch all fail the build.
+//
+// Its own function since 2026-09-29: with the round-trip block above it shared one
+// stack frame (a MonoFixture, an event table, two replay prefixes and two contracts,
+// each ~100 KB), and the classification below tipped that frame past the 1 MB
+// default stack -- a stack overflow before the first line printed. The replay state
+// lives on the heap here for the same reason.
+void testFrameContractCorpus() {
+    using namespace edvr;
     namespace fs = std::filesystem;
     const fs::path dir("tools/flat_temporal_test/traces");
     const fs::path manifestPath = dir / "manifest.txt";
@@ -1373,12 +1395,16 @@ void testFrameContractTrace() {
         return;
     }
     // The manifest pins the required scenarios: one "file frames scenario
-    // [selected]" per line, '#' for comments. Adding a file never replaces a
-    // required one. A trailing "selected" makes every frame of that trace replay to
+    // [selected] [static]" per line, '#' for comments. Adding a file never replaces a
+    // required one. A "selected" flag makes every frame of that trace replay to
     // a Selected mono frame (the trace was captured on a treated stretch and must
-    // stay one), not merely to its recorded hash.
+    // stay one), not merely to its recorded hash. A "static" flag says the trace is the
+    // 3D main menu: every Selected frame of it came through the verified menu HDR copy
+    // (FlatMonoResolveFrame::staticScene); and a trace WITHOUT it must have none, which
+    // is the corpus holding "flag 0 everywhere else" on real flight, station and
+    // on-foot frames.
     std::map<std::string, uint32_t> required;
-    std::set<std::string> mustSelect;
+    std::set<std::string> mustSelect, mustStatic;
     {
         std::ifstream mf(manifestPath);
         std::string line;
@@ -1391,8 +1417,9 @@ void testFrameContractTrace() {
                 check(false, "trace corpus manifest line malformed");
                 continue;
             }
-            if (iss >> flag) {
+            while (iss >> flag) {
                 if (flag == "selected") mustSelect.insert(name);
+                else if (flag == "static") mustStatic.insert(name);
                 else check(false, "trace corpus manifest line carries an unknown flag");
             }
             required[name] = frames;
@@ -1400,6 +1427,7 @@ void testFrameContractTrace() {
     }
     check(!required.empty(), "trace corpus manifest names no traces");
     uint32_t files = 0, framesMatched = 0, framesTotal = 0;
+    uint32_t menuSelected = 0, menuStatic = 0, otherSelected = 0, otherStatic = 0, menuFiles = 0;
     for (const auto& entry : fs::directory_iterator(dir)) {
         if (entry.path().extension() != ".bin") continue;
         std::ifstream file(entry.path(), std::ios::binary | std::ios::ate);
@@ -1411,11 +1439,18 @@ void testFrameContractTrace() {
         const std::string name = entry.path().filename().string();
         auto wanted = required.find(name);
         check(wanted != required.end(), "trace corpus file is not in the manifest");
-        FlatRuntimePrefix replay{};
-        FlatFrameContract rc{};
+        auto replayHeap = std::make_unique<FlatRuntimePrefix>();
+        auto contractHeap = std::make_unique<FlatFrameContract>();
+        FlatRuntimePrefix& replay = *replayHeap;
+        FlatFrameContract& rc = *contractHeap;
+        // A frame's state is reset from a fresh heap object: `x = T{}` would build a ~100 KB temporary on the stack.
+        auto freshReplay = [&]() { auto z = std::make_unique<FlatRuntimePrefix>(); replay = *z; };
+        auto freshContract = [&]() { auto z = std::make_unique<FlatFrameContract>(); rc = *z; };
         FlatTraceFrameHeader cur{};
         uint32_t fileFrames = 0;
         const bool needSelected = mustSelect.count(name) != 0;
+        const bool isMenu = mustStatic.count(name) != 0;
+        menuFiles += isMenu;
         auto finish = [&]() {
             if (!cur.eventCount) return;
             ++framesTotal; ++fileFrames;
@@ -1424,13 +1459,22 @@ void testFrameContractTrace() {
             if (needSelected)
                 check(rc.produced && rc.copiesUsed && rc.copies[0].selected(),
                       "a corpus trace marked selected replays every frame to a Selected mono frame");
+            // The menu-scoped stale-slot policy's classification, on the frames a resolve would take.
+            if (rc.produced && rc.copiesUsed && rc.copies[0].selected()) {
+                const bool through = flatFrameThroughMenuCopy(replay, rc.copies[0].hdr);
+                (isMenu ? menuSelected : otherSelected) += 1;
+                (isMenu ? menuStatic : otherStatic) += through;
+                check(through == isMenu,
+                      isMenu ? "every Selected frame of a main-menu trace came through the verified menu HDR copy"
+                             : "no Selected frame of a flight, station or on-foot trace came through the menu HDR copy");
+            }
         };
         const bool parsed = flatTraceParse(bytes.data(), bytes.size(),
             [&](const FlatTraceFrameHeader& h) {
                 finish(); cur = h;
-                replay = FlatRuntimePrefix{}; replay.frame = h.frame; replay.output = h.output;
+                freshReplay(); replay.frame = h.frame; replay.output = h.output;
                 replay.width = h.width; replay.height = h.height; replay.format = h.format;
-                rc = FlatFrameContract{};
+                freshContract();
             },
             [&](const FlatTraceEvent& e) {
                 if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); return; }
@@ -1455,6 +1499,12 @@ void testFrameContractTrace() {
           "trace corpus replays to the recorded frame contracts");
     std::printf("frame-contract corpus: %u file(s), %u/%u frames replay identical\n",
                 files, framesMatched, framesTotal);
+    // Both sides of the classification must be populated, or "flag 0 elsewhere" proves nothing.
+    check(menuFiles && menuSelected && otherSelected,
+          "the corpus holds Selected frames both in the main menu and outside it");
+    std::printf("menu-scoped stale-slot policy: %u/%u Selected frames of %u main-menu trace(s) qualify; "
+                "%u/%u Selected frames of the other traces do\n",
+                menuStatic, menuSelected, menuFiles, otherStatic, otherSelected);
 }
 
 // reviews/flat-temporal-main-review-2026-09-26.md, G1-1: run one MonoFixture
@@ -1974,6 +2024,47 @@ void testFlatDlssNegotiate() {
     }
 }
 
+// The menu-scoped stale-slot policy has three links: the classification (flatFrameThroughMenuCopy,
+// held on the real corpus above), the resolver's cbuffer (held by the WARP fixture in
+// flat_mono_resolve_test), and the two lines that join them, which no rig can reach because the
+// flat runtime needs a game. Held here by a source scan of exactly those lines -- without them the
+// policy would be built, tested and never on. The scan runs on a copy with each line removed
+// first, so it is known to be able to fail.
+void testStaticSceneWiring() {
+    auto slurp = [](const char* path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string runtimeCpp = slurp("src/d3d11/flat_runtime.cpp");
+    const std::string resolveCpp = slurp("src/d3d11/flat_mono_resolve.cpp");
+    check(!runtimeCpp.empty() && !resolveCpp.empty(), "the runtime and resolver sources are readable from the repo root");
+    struct Link { const std::string* text; const char* needle; const char* what; };
+    const Link links[] = {
+        {&runtimeCpp, "f.staticScene=flatFrameThroughMenuCopy(s.prefix,selected.hdr);",
+         "the flat runtime sets the resolve frame's staticScene from the selected frame's own prefix"},
+        {&runtimeCpp, "if(f.staticScene)++s.staticSceneFrames;",
+         "the flat runtime counts the frames it hands the resolver with the policy on"},
+        {&runtimeCpp, "static-scene-frames=%llu",
+         "the menu HDR copy line carries the static-scene-frames field"},
+        {&resolveCpp, "constants.flags[3]=f.staticScene?1u:0u;",
+         "the resolver hands the frame's staticScene to the shader as flags.w"},
+    };
+    for (const Link& link : links) {
+        const size_t at = link.text->find(link.needle);
+        check(at != std::string::npos && link.text->find(link.needle, at + 1) == std::string::npos, link.what);
+        // Control: with the line removed the same scan reports it missing.
+        std::string without = *link.text;
+        if (at != std::string::npos) without.erase(at, std::strlen(link.needle));
+        check(without.find(link.needle) == std::string::npos,
+              "static scene wiring control: a source with the line removed no longer contains it");
+    }
+    // The runtime's assignment sits in the frame-building scope, before the resolve call it feeds.
+    const size_t assign = runtimeCpp.find("f.staticScene=flatFrameThroughMenuCopy(");
+    const size_t resolve = runtimeCpp.find("flatMonoResolve(s.device.Get(), ctx, f,");
+    check(assign != std::string::npos && resolve != std::string::npos && assign < resolve,
+          "the staticScene assignment precedes the resolve call that reads it");
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
         return flatShaderClassifierSweep(argv[2]);
@@ -2017,9 +2108,11 @@ int main(int argc, char** argv) {
     flatRuntimeImageCopyTests();
     flatRuntimeMenuCopyTests();
     testFrameContractTrace();
+    testFrameContractCorpus();
     testFrameContractOutcomes();
     testFrameContractHashCoverage();
     testHullPairKeying();
+    testStaticSceneWiring();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

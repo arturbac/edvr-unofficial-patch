@@ -361,7 +361,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     Constants constants{};std::memcpy(constants.camera,f.camera,sizeof(f.camera));
     std::memcpy(constants.previous,reset?f.camera:f.previousCamera,sizeof(f.previousCamera));
     constants.size[0]=f.renderWidth;constants.size[1]=f.renderHeight;constants.size[2]=evalW;constants.size[3]=evalH;
-    constants.flags[0]=reset;constants.flags[1]=engine;constants.flags[2]=taa;
+    constants.flags[0]=reset;constants.flags[1]=engine;constants.flags[2]=taa;constants.flags[3]=f.staticScene?1u:0u;
     constants.jitter[0]=f.jitterX;constants.jitter[1]=f.jitterY;
     constants.jitter[2]=f.previousJitterX;constants.jitter[3]=f.previousJitterY;
     // On a reset the previous rows ARE the current rows (above), so they carry the current phase.

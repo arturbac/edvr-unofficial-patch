@@ -95,6 +95,12 @@ struct FlatMonoResolveFrame {
     // untouched and the shader's arithmetic bit-identical to before the field.
     // On a reset the previous rows are the current rows, so previous is ignored.
     float rowsJitterX = 0, rowsJitterY = 0, previousRowsJitterX = 0, previousRowsJitterY = 0;
+    // The 3D main menu (2026-09-29): the frame's contract came through the verified menu HDR copy, so
+    // the scene is a ship on its pedestal and nothing moves but the camera. Only then does a pixel whose
+    // engine slot was overdrawn by a draw that never wrote it (an unkeyed hull) take the camera term
+    // instead of refusing history. False (the default, and every frame outside that menu) leaves the
+    // shader's arithmetic bit-identical to before the field.
+    bool staticScene = false;
     EngineVelocityViews engine{};
     uint64_t frame = 0;
     float deltaMs = 0;

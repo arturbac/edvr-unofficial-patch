@@ -6,7 +6,7 @@ inline constexpr char kFlatMonoShaderSource[] = R"HLSL(
 cbuffer Mono : register(b0) {
     float4 now[6]; float4 old[6];
     uint4 size; // render width/height, output width/height
-    uint4 flags; // reset, complete engine views, TAA, reserved
+    uint4 flags; // reset, complete engine views, TAA, static scene (w: only ever nonzero in the 3D main menu)
     float4 jitter; // current xy, previous zw; actual raster phase in render pixels
     float4 rowsJitter; // NDC shift the camera rows themselves carry: current xy, previous zw; all zero = unjittered rows
 };
@@ -60,7 +60,13 @@ uint engineBefore(int2 q,float2 uv,float depth,out float4 before) {
     if(flags.y==0)return 0;
     float2 es=Slots.Load(int3(q,0));
     if(!(es.x>=1))return 0;
-    if(!(depth>0) || asuint(depth)!=asuint(es.y) || es.x>=4294967296.0)return 2;
+    if(!(depth>0) || es.x>=4294967296.0)return 2;
+    // A slot written by a keyed draw that something has since drawn over: the pixel's owner is not the
+    // one that wrote the slot, so its record says nothing about it. Everywhere but the 3D main menu that
+    // is not knowable and history is refused. In the menu (flags.w, set by the runtime only for a frame
+    // whose contract came through the verified menu copy) nothing on screen moves but the camera, so the
+    // pixel takes the camera term -- an unkeyed hull that overdraws a keyed one no longer aliases.
+    if(asuint(depth)!=asuint(es.y))return flags.w!=0?0:2;
     uint code=uint(es.x);
     if(float(code)!=es.x || (code&1)==0)return 2;
     uint count,stride; Pool.GetDimensions(count,stride);

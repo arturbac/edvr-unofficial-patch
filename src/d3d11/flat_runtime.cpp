@@ -130,6 +130,7 @@ struct State {
     uint32_t unknownProjectionBytesSaved=0,unknownProjectionBytesFailed=0,unknownProjectionStagesAbsent=0;
     uint64_t hdrCopiesAccepted=0,hdrCopiesRefused=0;
     uint64_t menuCopiesAccepted=0,menuCopiesRefused=0;
+    uint64_t staticSceneFrames=0;
     FlatMonoResolvePreflight plannedResolve{};
     FlatMonoResolvePreflightResult resolvePreflight{};
     bool haveResolvePlan = false;
@@ -1575,8 +1576,12 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         else reportUnknownProjection(s,"5s");
         Log::get().note("flat HDR image continuation: accepted=%llu refused=%llu; source writes require current matching scene provenance",
             (unsigned long long)s.hdrCopiesAccepted,(unsigned long long)s.hdrCopiesRefused);
-        Log::get().note("flat menu HDR copy: accepted=%llu refused=%llu; source requires current scene/depth/camera provenance",
-            (unsigned long long)s.menuCopiesAccepted,(unsigned long long)s.menuCopiesRefused);
+        // static-scene-frames: frames the resolver was handed with the menu's stale-slot policy on
+        // (FlatMonoResolveFrame::staticScene, set from an accepted copy). Zero while accepted grows
+        // is what "the policy never ran" looks like: no menu frame reached the resolver, and the
+        // flat runtime line's last= and accepted counts say why.
+        Log::get().note("flat menu HDR copy: accepted=%llu refused=%llu static-scene-frames=%llu; source requires current scene/depth/camera provenance",
+            (unsigned long long)s.menuCopiesAccepted,(unsigned long long)s.menuCopiesRefused,(unsigned long long)s.staticSceneFrames);
         // The census of unkeyed pairs, every window while a temporal mode runs (empty
         // included: an absent line is what "this block never ran" looks like). A pair
         // named here draws in a known pool family with no keyed pixel shader, so its
@@ -1985,6 +1990,12 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     nativeScale.store(f.renderWidth >= f.outputWidth && f.renderHeight >= f.outputHeight,
                       std::memory_order_release);
     f.configuredDlssPreset=s.preset;
+    // The 3D main menu: this frame's contract came through the verified menu HDR copy (the acceptance
+    // the "flat menu HDR copy" line counts). Nothing but the camera moves there, so a pixel whose engine
+    // slot an unkeyed draw overdrew takes the camera term instead of refusing history. False for every
+    // other frame, and the shader is then bit-identical to what it was before the field.
+    f.staticScene=flatFrameThroughMenuCopy(s.prefix,selected.hdr);
+    if(f.staticScene)++s.staticSceneFrames;
     // Metadata is frozen from the qualified handoff for a future frame's
     // preflight. It cannot authorize jitter in this already rendered frame.
     Ptr<ID3D11Texture2D> colorTexture;

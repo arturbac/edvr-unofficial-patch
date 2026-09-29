@@ -665,6 +665,71 @@ int main(int argc,char** argv) {
                   "rows-jitter: a rows phase outside half a pixel or not finite refuses the frame before any backend work");
         }
         g.rowsJitterX=g.rowsJitterY=g.previousRowsJitterX=g.previousRowsJitterY=0;
+
+        // ---- The menu's stale-slot policy (flags.w = FlatMonoResolveFrame::staticScene, 2026-09-29). ----
+        // A slot written by a keyed draw and then overdrawn by one that never wrote it (the Krait's unkeyed hull):
+        // the slot's depth is not the pixel's, so its record says nothing about it. Outside the 3D main menu that
+        // pixel's history is refused (rejection mask up, motion zero). With staticScene the pixel takes the camera
+        // term -- the very motion a pixel with no slot at all takes -- so with the policy on the whole texture must
+        // equal the no-slot texture. The real camera above is moved and turned, so the camera term is not zero and
+        // "equals the camera term" cannot be met by a refused pixel's zero. Only the stale-depth refusal is relaxed: a
+        // corrupt code, a sky pixel and the out-of-range sentinel stay refused, and a fresh joined slot keeps its record.
+        {
+            const UINT block0=4,blockSize=4;                      // the stale block: texels (4..7, 4..7)
+            auto texel=[&](UINT x,UINT y){return size_t(y)*w+x;};
+            auto put=[&](UINT x,UINT y,float code,float slotDepth){slots[texel(x,y)*2]=code;slots[texel(x,y)*2+1]=slotDepth;};
+            auto upload=[&]{context->UpdateSubresource(slotTexture.Get(),0,nullptr,slots.data(),w*8,0);};
+            // Beside the block: the pixels the policy must NOT touch. Three stay refused with it on -- a corrupt (even)
+            // code, the out-of-range sentinel on a stale depth, and a sky pixel (depth 0) with a stale slot -- and one
+            // fresh joined slot keeps its record's exact motion.
+            auto others=[&]{put(2,2,2,.01f);put(13,3,4294967296.0f,.02f);put(12,12,1,.02f);put(8,8,1,.01f);};
+            z[texel(12,12)]=0.0f;context->UpdateSubresource(depth.Get(),0,nullptr,z.data(),w*4,0);
+            auto staleBlock=[&]{for(UINT y=block0;y<block0+blockSize;++y)for(UINT x=block0;x<block0+blockSize;++x)put(x,y,1,.02f);};
+            auto noSlots=[&]{for(size_t i=0;i<slots.size();i+=2){slots[i]=-1;slots[i+1]=.01f;}};
+            // The refused frames just above skipped frame numbers, so the next resolve is a counted reset
+            // (motion zero, everything refused). One warm-up frame absorbs it; the three below are continuous.
+            noSlots();others();upload();
+            resolveWith(epicNow,epicPrev,sceneNowReal.Get(),scenePrevReal.Get(),0,0,0,0,"static scene: warm-up frame");
+            noSlots();staleBlock();others();upload();
+            g.staticScene=false;
+            const auto off=resolveWith(epicNow,epicPrev,sceneNowReal.Get(),scenePrevReal.Get(),0,0,0,0,"static scene: stale block, policy off");
+            const bool offReset=backendReset;
+            g.staticScene=true;
+            const auto on=resolveWith(epicNow,epicPrev,sceneNowReal.Get(),scenePrevReal.Get(),0,0,0,0,"static scene: stale block, policy on");
+            const bool onReset=backendReset;
+            g.staticScene=false;
+            noSlots();others();upload();                          // the same frame with no stale block: the camera term
+            const auto bare=resolveWith(epicNow,epicPrev,sceneNowReal.Get(),scenePrevReal.Get(),0,0,0,0,"static scene: no stale block, the camera term");
+            check(!offReset && !onReset && !backendReset,
+                  "static scene: the three frames are continuous, so no reset frame (everything refused) can hide the policy");
+            auto inBlock=[&](size_t t){const UINT x=UINT(t%w),y=UINT(t/w);return x>=block0 && x<block0+blockSize && y>=block0 && y<block0+blockSize;};
+            unsigned rejectedOff=0,rejectedOn=0,differOff=0,differOffOutside=0;
+            for(size_t t=0;t<off.mask.size()&&t<on.mask.size()&&t<bare.mask.size();++t){
+                if(inBlock(t)){rejectedOff+=off.mask[t]!=0;rejectedOn+=on.mask[t]!=0;}
+                if(off.mask[t]!=bare.mask[t]){++differOff;if(!inBlock(t))++differOffOutside;}}
+            const unsigned blockTexels=blockSize*blockSize;
+            check(rejectedOff==blockTexels,"static scene: with the policy off every texel of the stale block is refused");
+            check(rejectedOn==0,"static scene: with the policy on no texel of the stale block is refused");
+            check(differOff==blockTexels && differOffOutside==0,
+                  "static scene negative control: the policy off differs from the no-slot frame at the stale block's texels and nowhere else");
+            float blockMotion=0;for(UINT y=block0;y<block0+blockSize;++y)for(UINT x=block0;x<block0+blockSize;++x)
+                for(unsigned c=0;c<2;++c)blockMotion=std::max(blockMotion,std::abs(bare.motion[texel(x,y)*2+c]));
+            check(blockMotion>.05f,"static scene: the camera term at the stale block is not zero, so a refused pixel's zero cannot pass for it");
+            check(on.mask==bare.mask && maxDiff(on,bare)<=kSame,
+                  "static scene: with the policy on a stale slot is exactly a pixel with no slot, texture-wide, block motion the camera term");
+            check(off.reject==0 && on.reject==0 && on.px==off.px && on.py==off.py,
+                  "static scene: a fresh joined slot keeps its record and its exact motion with the policy on or off");
+            const size_t corrupt=texel(2,2),sentinel=texel(13,3),sky=texel(12,12);
+            check(off.mask[corrupt]!=0 && on.mask[corrupt]!=0 && off.mask[sentinel]!=0 && on.mask[sentinel]!=0 &&
+                  off.mask[sky]!=0 && on.mask[sky]!=0,
+                  "static scene: a corrupt code, the out-of-range sentinel and a sky pixel with a stale slot stay refused with the policy on");
+            std::printf("flat mono resolve: static scene: stale block %u/%u texels refused with the policy off, %u/%u with it on; "
+                        "on vs no-slot texture difference %.5f px, block camera motion %.3f px\n",
+                        rejectedOff,blockTexels,rejectedOn,blockTexels,maxDiff(on,bare),blockMotion);
+            // Leave the fixture as the pixel-capture tests below expect it.
+            noSlots();upload();z[texel(12,12)]=.01f;context->UpdateSubresource(depth.Get(),0,nullptr,z.data(),w*4,0);
+            g.staticScene=false;
+        }
     }
     context->ClearState();
     failures+=flatPixelCaptureGpuTests(device.Get(),context.Get());

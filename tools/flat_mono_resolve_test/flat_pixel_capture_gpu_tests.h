@@ -89,6 +89,7 @@ inline int flatPixelCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* co
     // nonzero (the upstream camera injector). The writer must record all four phases.
     frame.jitterX=.25f;frame.jitterY=-.375f;frame.previousJitterX=-.125f;frame.previousJitterY=.5f;
     frame.rowsJitterX=.25f;frame.rowsJitterY=-.375f;frame.previousRowsJitterX=-.125f;frame.previousRowsJitterY=.5f;
+    frame.staticScene=true; // the 3D main menu's stale-slot policy was on for this frame: the writer must say so
     const auto before=edvr::flatMonoResolveStats();
     capture.arm(6);check(capture.active(),"manual arm creates output directory");
     const fs::path directory=capture.directory();
@@ -129,6 +130,8 @@ inline int flatPixelCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* co
         check(body.find("\"reset\":false")!=std::string::npos &&
               body.find("\"jitter\":[0.25,-0.375],\"previous_jitter\":[-0.125,0.5],\"rows_jitter\":[0.25,-0.375],\"previous_rows_jitter\":[-0.125,0.5]")!=std::string::npos,
               "the manifest records the raster phases and the phases the camera rows carry");
+        check(body.find("\"static_scene\":true")!=std::string::npos && body.find("\"static_scene\":false")==std::string::npos,
+              "the manifest records that the frame took the main menu's stale-slot policy");
     }
     {   // The second sample follows the first on the next live frame; later ones keep the old spacing.
         edvr::FlatPixelCapture burst;
@@ -149,13 +152,15 @@ inline int flatPixelCaptureGpuTests(ID3D11Device* device,ID3D11DeviceContext* co
     frame.frame=22;capture.capture(device,context,frame,false,sources);
     capture.arm(23);const fs::path rearmed=capture.directory();capture.poll(context,24);
     check(!fs::exists(rearmed/L"frame_22.json"),"rearm cannot publish prior pending frame");
-    frame.frame=24;frame.engine={};capture.capture(device,context,frame,false,sources);context->Flush();
+    frame.frame=24;frame.engine={};frame.staticScene=false;capture.capture(device,context,frame,false,sources);context->Flush();
     const auto absentManifest=rearmed/L"frame_24.json";
     for(unsigned attempt=0;attempt<120 && !fs::exists(absentManifest);++attempt) {capture.poll(context,25);Sleep(1);}
     std::ifstream absentFile(absentManifest,std::ios::binary);
     const std::string absentJson((std::istreambuf_iterator<char>(absentFile)),std::istreambuf_iterator<char>());
     check(absentJson.find("\"complete\":false")!=std::string::npos && absentJson.find("\"buffers\":[]")!=std::string::npos &&
         !fs::exists(rearmed/L"frame_24_slots.bin"),"absent engine views explicitly recorded without invented resources");
+    check(absentJson.find("\"static_scene\":false")!=std::string::npos && absentJson.find("\"static_scene\":true")==std::string::npos,
+        "a frame outside the menu records the policy as off");
     capture.poll(context,923);
     check(!capture.active(),"frame boundary expires arm even with no qualified resolve");
     capture.arm(924);capture.cancel();

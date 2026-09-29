@@ -3,6 +3,8 @@
 Usage: python tools/flat_pixels.py CAPTURE_DIR [--output PREVIEW_DIR] [--dry-run]
 CAPTURE_DIR may be one session or its flat_pixels parent. A normal invocation
 prints JSON statistics only. Previews are written only with --output.
+--assume-static-scene on|off replays the engine analysis with the 3D main menu's stale-slot
+policy forced (the capture's own flag is "static_scene"; captures before it read as off).
 """
 
 from __future__ import annotations
@@ -111,6 +113,11 @@ def load_manifest(path):
         previous_rows_jitter = _number_pair(manifest["previous_rows_jitter"], "previous_rows_jitter")
     if type(manifest.get("reset")) is not bool:
         raise CaptureError(f"{path}: reset must be a boolean")
+    # The 3D main menu's stale-slot policy was on for this frame (2026-09-29, flags.w of the prep
+    # shader). Absent in every capture made before the field, which is the policy off.
+    static_scene = manifest.get("static_scene", False)
+    if type(static_scene) is not bool:
+        raise CaptureError(f"{path}: static_scene must be a boolean")
     if manifest.get("mode") not in ("dlss", "dlaa"):
         raise CaptureError(f"{path}: mode must be dlss or dlaa")
     for field in ("binary_version", "binary_compiled"):
@@ -228,7 +235,7 @@ def load_manifest(path):
         "path": path, "version": version, "frame_id": frame, "jitter": jitter,
         "previous_jitter": previous_jitter, "reset": manifest["reset"],
         "rows_jitter": rows_jitter, "previous_rows_jitter": previous_rows_jitter,
-        "mode": manifest["mode"],
+        "static_scene": static_scene, "mode": manifest["mode"],
         "binary_version": manifest.get("binary_version"),
         "binary_compiled": manifest.get("binary_compiled"),
         "configured_dlss_preset": preset,
@@ -274,7 +281,10 @@ def _mask_row(rejection, geometry, y):
             (rejection[y1, x0] != 0) | (rejection[y1, x1] != 0))
 
 
-def analyze(meta, rois=None, unjitter=True):
+def analyze(meta, rois=None, unjitter=True, static_scene=None):
+    """`static_scene` None replays the frame as the capture declares its stale-slot policy;
+    True/False forces it (flat_pixels_engine.analyze). The rejection statistics below are
+    what the GPU produced and do not change with it."""
     if np is None:
         raise CaptureError("NumPy is required for capture analysis")
     rejection = _open_texture(meta, "rejection")
@@ -322,7 +332,7 @@ def analyze(meta, rois=None, unjitter=True):
         from flat_pixels_engine import analyze as analyze_engine
         requested = rois if rois else [("full", (0, 0, meta["render_width"], meta["render_height"]))]
         try:
-            result["engine_analysis"] = analyze_engine(meta, requested, unjitter)
+            result["engine_analysis"] = analyze_engine(meta, requested, unjitter, static_scene)
         except ValueError as exc:
             raise CaptureError(str(exc)) from exc
     return result
@@ -459,11 +469,11 @@ def write_previews(meta, directory):
     write_png(directory / "raw_final_diff_x8.png", width, meta["output_height"], difference_rows())
 
 
-def run(capture_dir, output=None, dry_run=False, rois=None):
+def run(capture_dir, output=None, dry_run=False, rois=None, static_scene=None):
     if np is None:
         raise CaptureError("NumPy is required; use the bundled Codex Python or install NumPy")
     manifests = [load_manifest(p) for p in _manifest_paths(capture_dir)]
-    results = [analyze(m, rois) for m in manifests]
+    results = [analyze(m, rois, static_scene=static_scene) for m in manifests]
     summary = {"frames": results, "stability": stability(manifests),
                "preview_scale": "absolute RGBA difference x8; alpha difference copied into RGB"}
     if output is not None:
@@ -775,6 +785,54 @@ def self_test():
         assert branches["engine_joined"] == 1 and branches["camera_unmarked_record"] == 1
         assert branches["rejected_masked_record"] == 1 and branches["rejected_corrupt_code"] == 1
         assert branches["rejected_stale_or_depth"] == 1 and branches["camera_no_slot"] == 1
+        assert "camera_stale_static" not in branches and complete_meta["static_scene"] is False
+        # The 3D main menu's stale-slot policy (2026-09-29): the twin of flags.w in the prep shader.
+        # The stale pixel (1,1) takes the camera term and nothing else moves; the capture's own flag
+        # drives it, a replay override can force it either way, and a capture without the field is off.
+        whole = [("whole", (0, 0, rw, rh))]
+        static_manifest = json.loads(json.dumps(complete))
+        static_manifest["static_scene"] = True
+        v2_path.write_text(json.dumps(static_manifest), encoding="utf-8")
+        static_meta = load_manifest(v2_path)
+        assert static_meta["static_scene"] is True
+        static_engine = analyze(static_meta, whole)["engine_analysis"]
+        static_branches = static_engine["rois"][0]["branch_counts"]
+        assert static_branches.get("rejected_stale_or_depth", 0) == 0 and static_branches["camera_stale_static"] == 1
+        for kept in ("engine_joined", "camera_unmarked_record", "rejected_masked_record",
+                     "rejected_corrupt_code", "camera_no_slot"):
+            assert static_branches[kept] == 1, (kept, static_branches)
+        assert static_engine["static_scene"] == {"declared": True, "replayed_as": True}
+        # The negative control: forced off, the same capture refuses the stale pixel again.
+        forced_off = analyze(static_meta, whole, static_scene=False)["engine_analysis"]
+        assert forced_off["rois"][0]["branch_counts"] == branches
+        assert forced_off["static_scene"] == {"declared": True, "replayed_as": False}
+        # An older capture (no field) asked what the policy would have done.
+        assumed = analyze(complete_meta, whole, static_scene=True)["engine_analysis"]
+        assert assumed["rois"][0]["branch_counts"]["camera_stale_static"] == 1
+        assert assumed["static_scene"] == {"declared": False, "replayed_as": True}
+        v2_path.write_text(json.dumps({**complete, "static_scene": "yes"}), encoding="utf-8")
+        try:
+            load_manifest(v2_path)
+            raise AssertionError("a non-boolean static_scene was accepted")
+        except CaptureError:
+            pass
+        # Only the stale-depth refusal is relaxed, in the shader's order: the sky (depth 0) and the
+        # out-of-range sentinel refuse first; a stale slot with a malformed even code is stale first.
+        edge_slots = np.asarray([[[1, .4], [2, .4], [4294967296.0, .4]],
+                                 [[1, .4], [2, .5], [3, .5]]], dtype="<f4")
+        edge_depth = np.full((rh, rw), .5, dtype="<f4")
+        edge_depth[1, 0] = 0.0
+        (v2_session / "frame_7_slots.bin").write_bytes(edge_slots.tobytes())
+        (v2_session / "frame_7_depth.bin").write_bytes(edge_depth.tobytes())
+        for flag, want in ((False, {"rejected_stale_or_depth": 4, "rejected_corrupt_code": 1, "engine_joined": 1}),
+                           (True, {"camera_stale_static": 2, "rejected_stale_or_depth": 2,
+                                   "rejected_corrupt_code": 1, "engine_joined": 1})):
+            v2_path.write_text(json.dumps({**complete, "static_scene": flag}), encoding="utf-8")
+            got = analyze(load_manifest(v2_path), whole)["engine_analysis"]["rois"][0]["branch_counts"]
+            assert got == want, (flag, got, want)
+        (v2_session / "frame_7_slots.bin").write_bytes(slots.tobytes())
+        (v2_session / "frame_7_depth.bin").write_bytes(np.full((rh, rw), .5, dtype="<f4").tobytes())
+        v2_path.write_text(json.dumps(complete), encoding="utf-8")
         complete["buffers"][0]["stride"] = 168
         v2_path.write_text(json.dumps(complete), encoding="utf-8")
         stride_meta = load_manifest(v2_path)
@@ -959,6 +1017,10 @@ def main(argv=None):
     parser.add_argument("--roi", action="append", nargs=4, metavar=("X", "Y", "W", "H"), type=int,
                         help="repeatable ROI in render/input pixels; default samples the full frame")
     parser.add_argument("--verify-fixture", action="store_true", help="verify the real WARP writer fixture")
+    parser.add_argument("--assume-static-scene", choices=("on", "off"),
+                        help="replay every frame as if the 3D main menu's stale-slot policy were on (or off) "
+                             "instead of as the capture declares it: what would it have done on a capture "
+                             "made before it existed. The rejection statistics stay what the GPU produced.")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -978,7 +1040,8 @@ def main(argv=None):
             if min(x, y) < 0 or min(width, height) < 1:
                 raise CaptureError("ROI coordinates must be nonnegative and dimensions positive")
             rois.append((f"roi_{index + 1}", (x, y, width, height)))
-        print(json.dumps(run(args.capture_dir, args.output, args.dry_run, rois), indent=2))
+        assumed = None if args.assume_static_scene is None else args.assume_static_scene == "on"
+        print(json.dumps(run(args.capture_dir, args.output, args.dry_run, rois, assumed), indent=2))
         return 0
     except (CaptureError, OSError) as exc:
         print(f"flat_pixels: {exc}", file=sys.stderr)

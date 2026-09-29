@@ -204,10 +204,18 @@ def unjitter_rows(rows, ndc, first=0, count=4):
     return out
 
 
-def analyze(meta, rois, unjitter=True):
+def analyze(meta, rois, unjitter=True, static_scene=None):
     """`unjitter=False` is the replay this tool made before the camera injector: the rows
     are used as captured. Under the injector they carry the phase, and that replay is off
-    by exactly |current phase - previous phase| on every pixel (the self-test pins it)."""
+    by exactly |current phase - previous phase| on every pixel (the self-test pins it).
+
+    `static_scene` is flags.w of the prep shader, the 3D main menu's stale-slot policy: a
+    slot that something else has drawn over takes the camera term instead of refusing
+    history. None replays the frame as the capture declares it (False for a capture made
+    before the flag existed); True or False forces it, so an old capture can be asked what
+    the policy would have done, and a new one what it would have done without."""
+    declared_static = bool(meta.get("static_scene", False))
+    static = declared_static if static_scene is None else bool(static_scene)
     rw, rh = meta["render_width"], meta["render_height"]
     now = np.asarray(meta["camera"], dtype=np.float32)
     old = np.asarray(meta["previous_camera"] or meta["camera"], dtype=np.float32)
@@ -265,11 +273,19 @@ def analyze(meta, rois, unjitter=True):
                     branch = "camera_engine_incomplete"
                 else:
                     code_f, slot_z = slots[py, px]
+                    depth_stale = bool(np.asarray(z).view(np.uint32) != np.asarray(slot_z).view(np.uint32))
+                    # The shader's order (engineBefore): sky and the out-of-range sentinel refuse
+                    # first; then a slot the pixel's own depth disagrees with -- refused, or the
+                    # camera term in the 3D main menu; then a malformed code.
                     if not (code_f >= 1):
                         branch = "camera_no_slot"
-                    elif z <= 0 or np.asarray(z).view(np.uint32) != np.asarray(slot_z).view(np.uint32):
+                    elif z <= 0:
                         branch = "rejected_stale_or_depth"
-                    elif code_f >= 4294967296 or not float(code_f).is_integer() or int(code_f) % 2 == 0:
+                    elif code_f >= 4294967296:
+                        branch = "rejected_stale_or_depth" if depth_stale else "rejected_corrupt_code"
+                    elif depth_stale:
+                        branch = "camera_stale_static" if static else "rejected_stale_or_depth"
+                    elif not float(code_f).is_integer() or int(code_f) % 2 == 0:
                         branch = "rejected_corrupt_code"
                     elif pool_stride != 336:
                         branch = "rejected_pool_stride"
@@ -330,6 +346,7 @@ def analyze(meta, rois, unjitter=True):
                        "records_used": sorted(slots_used), "rejection_mismatch_pixels": reject_mismatch,
                        "motion_comparison": comparisons})
     return {"engine_complete": complete, "input_grid": "render pixels",
+            "static_scene": {"declared": declared_static, "replayed_as": static},
             "sampling": "exact when step=1; otherwise regular grid and sampled counts",
             "rows_jitter": {"source": rows_source, "ndc_now": [float(v) for v in ndc_now],
                             "ndc_previous": [float(v) for v in ndc_old]},
