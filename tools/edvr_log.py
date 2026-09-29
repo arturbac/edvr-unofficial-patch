@@ -489,8 +489,7 @@ PAIR_TOLERANCE_S = 900.0    # a runtime log opens within seconds of its graphics
 # The operations the source times, in the order they are listed. A new one
 # still tallies when it appears; this only lets "not seen" name what is absent.
 KNOWN_OPS = {"gfx": ("journal_status", "journal_tail", "journal_reglob",
-                     "xinput_probe", "game_exit_probe", "luma_round",
-                     "ui_layer_totals"),
+                     "xinput_probe", "luma_round", "ui_layer_totals"),
              "rt": ("frame_cycle_report",)}
 SRC_LABEL = {"gfx": "LONG FRAME", "rt": "native_long_cycle"}
 MATCHED_ROWS = 30   # rows of section 3; a busy flight has more matches than a reader needs

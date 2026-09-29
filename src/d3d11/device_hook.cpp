@@ -1,7 +1,6 @@
 #include "../common/vr_census.h"
 #include "device_hook.h"
 #include "ui_layer.h"
-#include "game_exit_probe.h"
 #include "gpu_timing.h"
 #include "gpu_frame_timing.h"
 #include "native_timing.h"
@@ -1763,8 +1762,6 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         perfMonitorNotePresentWait(static_cast<double>(presentT1 - presentT0) * 1000.0 /
                                    static_cast<double>(qpcFrequency()));
     }
-    gameExitProbePresent(hr,flags,g_state->frameCounter);
-    frameTick("game_exit_probe");
     // Bind the first successful owned, non-TEST Present thread even before
     // the paired consumer registers. Exclude registration from Present timing.
     if (SUCCEEDED(hr) && !(flags & DXGI_PRESENT_TEST))
