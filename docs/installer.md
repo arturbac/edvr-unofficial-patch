@@ -299,6 +299,18 @@ dumps, post-crash alert banners, and active process guards) are documented in
   rollback restores the bytes of files that were replaced or deleted. Writes go
   to a temp file and are moved into place, so a failure part-way cannot leave a
   truncated DLL where a working one was.
+- **A file that is busy for a moment does not fail the run.** A real-time
+  scanner, the search indexer or a backup tool has a file it just looked at open
+  for a few milliseconds, and the classic rename refuses to replace a file while
+  ANY handle to it is open. Writing a DLL over another, and moving the game's
+  runtime aside, go through the same replace as the settings writer
+  (`replaceFileAtomic`): a POSIX-semantics rename first, which goes through
+  under a reader that shares delete access, the classic one where the volume
+  cannot do that, and either tried again for up to two seconds while the answer
+  is a sharing violation, access denied or a lock violation. Until 2026-09-29
+  the first refusal failed the run and rolled it back with "Access is denied";
+  the rig, under a stand-in for a scanner, saw it in a few runs in a hundred.
+  Copies, deletes and the rollback itself still do not wait.
 - **Uninstall never leaves the folder without an `openvr_api.dll`.** If the
   game's original is missing it is restored from an EDVR backup, and if there
   is no backup either, ours stays where it is with an explanation — removing it

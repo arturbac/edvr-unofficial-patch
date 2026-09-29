@@ -1135,7 +1135,9 @@ changes because the file did.
   reason that passes (a sharing violation, access denied, a lock violation --
   a reader that does not share `FILE_SHARE_DELETE`, a scanner on the temp file)
   is tried again, five times, 20 ms apart. A read-only ini goes straight to
-  the classic rename, is left alone, and the failure says so.
+  the classic rename, is left alone, and the failure says so. The installer's
+  apply engine uses the replace half on its own (`replaceFileAtomic`), waiting
+  up to two seconds instead: see `installer.md`.
 - **Apply now**: `Config::get().reloadIfChanged()` is called immediately
   after the write, so the change lands on this frame instead of the next
   poll, and through the same configure path a hand edit takes -- no module
