@@ -1074,6 +1074,17 @@ if errorlevel 1 ( echo [edvr] ERROR: c2 warp test build failed & exit /b 1 )
 "%BUILD%\c2_warp_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_flat_camera_stub_test
+echo [edvr] === flat_camera_stub_test.exe ===
+if not exist "%OBJ%\flatcamerastub" mkdir "%OBJ%\flatcamerastub"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"%ROOT%" /Fo"%OBJ%\flatcamerastub\\" ^
+    /Fe"%BUILD%\flat_camera_stub_test.exe" "tools\flat_camera_stub_test\flat_camera_stub_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: flat camera stub test build failed & exit /b 1 )
+"%BUILD%\flat_camera_stub_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_c2_coexist_test
 echo [edvr] === c2_coexist_test.exe ===
 if not exist "%OBJ%\c2coexist" mkdir "%OBJ%\c2coexist"

@@ -6,7 +6,6 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
-#include <initializer_list>
 #include <intrin.h>
 
 #include "../common/code_hook.h"
@@ -14,12 +13,19 @@
 #include "../common/log.h"
 #include "../common/runtime_profile.h"
 #include "flat_camera_ownership.h"
+#include "flat_camera_stubs.h"
 #include "flat_runtime.h"
 
 extern "C" DWORD _tls_index; // CRT-provided once a __declspec(thread) exists
 
 namespace edvr {
 namespace {
+
+// The generated stubs live in flat_camera_stubs.h so the rig can run them.
+using camera_stubs::buildStubA;
+using camera_stubs::buildStubB;
+using camera_stubs::kStubAOffset;
+using camera_stubs::kStubBOffset;
 
 // The upstream camera injector (docs/design-flat-camera-integration.md, C3
 // wiring plan addendum). One CodeHook on the game's view-constant refresh
@@ -46,10 +52,19 @@ namespace {
 //
 // So the detour is generated code, built at install:
 //   stubA (the relay's callback): push all fifteen GPRs (landing
-//     16-aligned), call refreshPre, pop every register -- r15 included,
-//     because the trampoline's stolen "push r15" must save the GAME's
-//     r15 -- and jmp to the trampoline with rsp = S exactly. The body
-//     then runs byte-identical to unhooked.
+//     16-aligned), call refreshPre with the ABI's 32-byte home area
+//     reserved (sub/add rsp,0x20 around the call), pop every register --
+//     r15 included, because the trampoline's stolen "push r15" must save
+//     the GAME's r15 -- and jmp to the trampoline with rsp = S exactly.
+//     The body then sees every register, and every stack byte at and
+//     above S, as the unhooked call left them (the stack below S is
+//     scratch, as it is for any callee). The home area is the lesson of
+//     the 20:09/03:50/04:23 crashes: the first stubs called C with none
+//     reserved, refreshPre's MSVC prologue homed rcx and rdx onto stubA's
+//     own saved r15 and r14, and the pops handed the game r15 = R0
+//     (design-flat-camera-integration.md, 2026-09-29). The stubs are in
+//     flat_camera_stubs.h; tools/flat_camera_stub_test runs them against
+//     callees that spend their home slots.
 //   refreshPre: the pre-forward half (admission, the phase, the dirty
 //     bits) plus the redirection that gives the post-half control: the
 //     body's ret pops whatever sits at [R0], so stubB's address goes
@@ -58,10 +73,10 @@ namespace {
 //     exactly as found and the body returns straight to its caller.
 //   stubB: the body's ret lands here with rsp = R0+8 and the game's
 //     return state in every register. It preserves rax/xmm0 and the
-//     scratch set, calls refreshPost (restore-after-call, counters, the
-//     ray CB observation), then jumps to the real return address from
-//     TLS. r11 alone carries the TLS walk: it has no ABI role across a
-//     return.
+//     scratch set, calls refreshPost with its own 32-byte home area
+//     reserved (restore-after-call, counters, the ray CB observation),
+//     then jumps to the real return address from TLS. r11 alone carries
+//     the TLS walk: it has no ABI role across a return.
 // Single-level per thread: the refresh is not recursive (the C2 lineage
 // and the decompile agree), so one TLS slot per thread suffices. A body
 // that unwound instead of returning would leave the armed flag set; the
@@ -69,11 +84,12 @@ namespace {
 //
 // Safety discipline is the producer probe's, learned from its two crashed
 // flights and the probe rebuild: prologue-verified single site, gate-first
-// relay that preserves EVERY register (the 20:09/03:50 crashes: this
-// pipeline family inherits a frame base in r11 and the unhooked refresh
-// preserves it, so the old r11-gate relay broke the callers' invariant),
-// forward through the trampoline, and hold-open for process lifetime --
-// disable closes the gate and nothing more (no uninstall, no free, ever).
+// relay that preserves EVERY register (it costs one push and pop; 905bddd0
+// made it so on the theory that r11 was load-bearing in the 20:09/03:50
+// crashes, and the 04:23 flight crashed identically -- the cause was the
+// missing home area above), forward through the trampoline, and hold-open
+// for process lifetime -- disable closes the gate and nothing more (no
+// uninstall, no free, ever).
 
 constexpr uintptr_t kRefreshRva = 0x592200;
 // Two site constraints, learned from two refused installs: the function's
@@ -88,10 +104,9 @@ constexpr uint8_t kRefreshPrologue[16] = {0x41, 0x57, 0x48, 0x81, 0xEC, 0xE0, 0x
 constexpr size_t kRelayBytes = 46;
 constexpr uint32_t kCallbackLiteral = 24;
 constexpr uint32_t kOriginalLiteral = 38;
-// The generated stubs share the relay's page; every cross-reference is
-// absolute, so placement only needs to stay inside the allocation.
-constexpr uint32_t kStubAOffset = 48;   // 8-aligned, right after the relay
-constexpr uint32_t kStubBOffset = 160;  // after stubA (111 bytes), 8-aligned
+// The stubs' page offsets (kStubAOffset, kStubBOffset) come from
+// flat_camera_stubs.h with their sizes; the rig checks both against the
+// emitters.
 
 // The camera struct's fields (camera-relative, the typed table).
 constexpr uint32_t kCamKind = 0x264;
@@ -161,10 +176,11 @@ InjectState g_inject;
 std::atomic<uintptr_t> g_gate{0};
 std::atomic<uintptr_t> g_refreshForward{0};
 // The incoming r11 of the most recent refresh call, captured by stubA's
-// moffs store BEFORE anything can clobber it. The 20:09/03:50 crashes put
-// this pipeline family's r11 convention under suspicion (an inherited
-// frame base the unhooked refresh preserves); the tick prints it -- a
-// stack pointer here is the convention proven in the log.
+// moffs store BEFORE anything can clobber it. It was added when the r11
+// convention was suspected in the 20:09/03:50 crashes (an inherited frame
+// base the unhooked refresh preserves); that suspicion is retired (the cause
+// was stubA's home area), and the tick still prints the value, one store
+// per call.
 std::atomic<uintptr_t> g_lastIncomingR11{0};
 uintptr_t g_stubB = 0;
 uint32_t g_stubATrampOfs = 0;
@@ -233,14 +249,15 @@ void buildRelay(uint8_t* code, const void* gate, void* callback) noexcept {
     //
     // NO register is left clobbered. The first form carried the gate in r11:
     // rax was the known constraint (this target's frame anchor is mov rax,rsp
-    // BEFORE the patch site, so rax must survive), but the 20:09/03:50
-    // crashes showed r11 is equally load-bearing here -- this pipeline family
-    // passes a frame base down in r11 (the refresh's caller FUN_140594dc8
-    // spills through [r11+0x10] at entry with no local setup), and the
-    // unhooked refresh never touches r11, so the invariant held until the
-    // relay overwrote it. push/pop rax preserves the anchor AND r11; the cmp
-    // clobbers flags, which is safe because the trampoline's stolen
-    // sub rsp,0xE0 re-sets them before the body can read them.
+    // BEFORE the patch site, so rax must survive), and 905bddd0 also kept r11
+    // on the theory that this pipeline family passes a frame base in it
+    // (FUN_140594dc8 spills through [r11+0x10] at entry). That theory was not
+    // the crash: the 04:23 flight crashed identically with this relay, and
+    // the cause was stubA's missing home area (see the header comment). The
+    // relay stays as it is because it costs one push and pop and leaves the
+    // caller nothing to depend on. The cmp clobbers flags, which is safe
+    // because the trampoline's stolen sub rsp,0xE0 re-sets them before the
+    // body can read them.
     const uint8_t body[kRelayBytes] = {
         0x50, 0x48,0xB8,0,0,0,0,0,0,0,0, 0x48,0x83,0x38,0,
         0x58, 0x74,0x0E, 0xFF,0x25,0,0,0,0, 0,0,0,0,0,0,0,0,
@@ -250,71 +267,6 @@ void buildRelay(uint8_t* code, const void* gate, void* callback) noexcept {
     const uintptr_t callbackAddress = reinterpret_cast<uintptr_t>(callback);
     std::memcpy(code + 3, &gateAddress, 8);
     std::memcpy(code + kCallbackLiteral, &callbackAddress, 8);
-}
-
-// A tiny emitter for the two stubs. Fixed byte sequences with immediates
-// appended through u32/u64; every offset below is derived from the byte
-// counts in the comments, and buildStubA returns the literal offset it
-// actually used so prepareRelay patches the same place.
-struct CodeCursor {
-    uint8_t* p;
-    void b(std::initializer_list<uint8_t> vs) { for (const uint8_t v : vs) *p++ = v; }
-    void u32(uint32_t v) { std::memcpy(p, &v, 4); p += 4; }
-    void u64(uint64_t v) { std::memcpy(p, &v, 8); p += 8; }
-};
-
-// stubA -- the relay's callback. Entered by jmp with rsp = S (the game's
-// stack at the hook site; S = 8 mod 16, the ABI's post-call alignment
-// minus the two pushes the game made before the patch). Saves every GPR
-// (fifteen pushes keep the alignment), sets up refreshPre's arguments
-// from the save slots, then restores everything and joins the trampoline
-// with rsp = S: the game body must see a byte-identical stack. Returns
-// the offset of the trampoline literal for prepareRelay.
-uint32_t buildStubA(uint8_t* at, const void* preFn, void* r11Store) noexcept {
-    CodeCursor c{at};
-    c.b({0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x55});           // push rax rbx rcx rdx rsi rdi rbp
-    c.b({0x41,0x50, 0x41,0x51, 0x41,0x52, 0x41,0x53,           // push r8 r9 r10 r11
-         0x41,0x54, 0x41,0x55, 0x41,0x56, 0x41,0x57});          // push r12 r13 r14 r15
-    // rsp = S-0x78, 16-aligned. Slots: r15@[+0] .. rax@[+0x70].
-    c.b({0x48,0x8B,0x44,0x24,0x20});                            // mov rax,[rsp+0x20]  = saved r11 (incoming!)
-    c.b({0x48,0xA3}); c.u64(reinterpret_cast<uint64_t>(r11Store)); // mov [&g_lastIncomingR11],rax
-    c.b({0x48,0x8D,0x8C,0x24}); c.u32(0x88);                    // lea rcx,[rsp+0x88]  = R0 (the game's retaddr slot)
-    c.b({0x48,0x8B,0x54,0x24,0x60});                            // mov rdx,[rsp+0x60]  = saved rcx (ctx)
-    c.b({0x4C,0x8B,0x44,0x24,0x58});                            // mov r8, [rsp+0x58]  = saved rdx (p2)
-    c.b({0x4C,0x8B,0x4C,0x24,0x38});                            // mov r9, [rsp+0x38]  = saved r8  (camera)
-    c.b({0x49,0xBB}); c.u64(reinterpret_cast<uint64_t>(preFn)); // mov r11,&refreshPre
-    c.b({0x41,0xFF,0xD3});                                      // call r11
-    c.b({0x41,0x5F, 0x41,0x5E, 0x41,0x5D, 0x41,0x5C,           // pop r15 r14 r13 r12
-         0x41,0x5B, 0x41,0x5A, 0x41,0x59, 0x41,0x58});          // pop r11 r10 r9 r8
-    c.b({0x5D, 0x5F, 0x5E, 0x5A, 0x59, 0x5B, 0x58});            // pop rbp rdi rsi rdx rcx rbx rax
-    c.b({0xFF,0x25}); c.u32(0);                                 // jmp [rip+0]
-    const uint32_t literalOfs = static_cast<uint32_t>(c.p - at);
-    c.u64(0);                                                   // trampoline literal, patched by prepareRelay
-    return literalOfs;
-}
-
-// stubB -- the body's redirected return. Entered by the body's ret with
-// rsp = R0+8 (16-aligned) and the game's return state in every register.
-// Preserves rax/xmm0 and the scratch registers around refreshPost, then
-// jumps to the real return address from TLS. r11 has no ABI role across a
-// return, so it alone carries the TLS walk; _tls_index is process-
-// constant after CRT init and is baked in as an immediate.
-void buildStubB(uint8_t* at, const void* postFn, uint32_t tlsIndex, uint32_t tlsRealRetOfs) noexcept {
-    CodeCursor c{at};
-    c.b({0x50, 0x51, 0x52});                                    // push rax rcx rdx
-    c.b({0x41,0x50, 0x41,0x51, 0x41,0x52, 0x41,0x53});          // push r8 r9 r10 r11
-    c.b({0x48,0x83,0xEC,0x18});                                 // sub rsp,0x18 (16-aligned from here)
-    c.b({0x0F,0x29,0x04,0x24});                                 // movaps [rsp],xmm0
-    c.b({0x49,0xBB}); c.u64(reinterpret_cast<uint64_t>(postFn));// mov r11,&refreshPost
-    c.b({0x41,0xFF,0xD3});                                      // call r11
-    c.b({0x0F,0x28,0x04,0x24});                                 // movaps xmm0,[rsp]
-    c.b({0x48,0x83,0xC4,0x18});                                 // add rsp,0x18
-    c.b({0x41,0x5B, 0x41,0x5A, 0x41,0x59, 0x41,0x58});          // pop r11 r10 r9 r8
-    c.b({0x5A, 0x59, 0x58});                                    // pop rdx rcx rax
-    c.b({0x65,0x4C,0x8B,0x1C,0x25}); c.u32(0x58);               // mov r11,gs:[0x58] (TLS array)
-    c.b({0x4F,0x8B,0x9B}); c.u32(tlsIndex * 8);                 // mov r11,[r11+tlsIndex*8] (disp32: the index is per-process, seen > 15)
-    c.b({0x4F,0x8B,0x9B}); c.u32(tlsRealRetOfs);                // mov r11,[r11+tlsRealRetOfs]
-    c.b({0x41,0xFF,0xE3});                                      // jmp r11
 }
 
 bool prepareRelay(void* trampoline, void*) noexcept {
