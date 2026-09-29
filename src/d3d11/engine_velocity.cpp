@@ -192,8 +192,17 @@ struct PrimaryMap {
     uint64_t sequence=0;
     bool mapped=false;
 };
+// The pool cache holds each registered game buffer by reference (an equal
+// pointer is then the same object), so a slot exists only while the feature is
+// live: notePrimaryBufferCreated refuses a buffer otherwise, and
+// releasePrimaryPoolsLocked lets every one go when the feature stands down.
 PrimaryMap g_primaryMaps[kPrimaryPoolResources];
-uint64_t g_primaryMapSequence=0,g_primaryMapOverflow=0,g_primaryCopyCalls=0,g_primaryApplied=0;
+uint64_t g_primaryMapSequence=0,g_primaryMapOverflow=0,g_primaryApplied=0;   // the engine mutex's
+// Bumped by observePoolCopy on game job threads, which take no engine lock, so atomic.
+std::atomic<uint64_t> g_primaryCopyCalls{0};
+// The cache-full line is printed once per live period (cleared with the slots);
+// g_primaryMapOverflow, the 30 s line's figure, keeps counting past it.
+bool g_primaryOverflowNoted=false;
 
 // --- Per eye -------------------------------------------------------------------
 enum Invalid : int {
@@ -502,10 +511,19 @@ void observePrimaryEmit(const emit::PrimaryIdentity& identity, uintptr_t owner, 
                          g_lookup.load(std::memory_order_acquire),*g_table,g_primaryEmit,sink);
 }
 
+// The engine's pool copier (game job threads, once per copy-list entry). No
+// engine lock: everything this touches is primaryCopy's own state -- g_stats,
+// g_pools, g_emissions, g_overflowFrame and g_emissionEpoch, each read and
+// written only under primaryCopy::g_mutex, which copier and invalidateMapped
+// take themselves -- plus the atomic counter and the atomic frame clock. It
+// never reaches g_gpu or g_gpuMutex (apply and reset), and primaryCopy calls
+// nothing back into this file, so the order stays engine g_mutex -> g_gpuMutex
+// -> primaryCopy::g_mutex on the render thread and a job thread holds only the
+// last. The engine mutex is held by the render thread across its D3D calls, so
+// taking it here stalled a job thread behind the slow half for a counter.
 void observePoolCopy(uintptr_t mapped,uint32_t stride,uintptr_t source,uint64_t slot,uint32_t count) noexcept {
     if(!live.load(std::memory_order_acquire))return;
-    std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    ++g_primaryCopyCalls;
+    g_primaryCopyCalls.fetch_add(1,std::memory_order_relaxed);
     if(count==UINT32_MAX || slot>UINT32_MAX){primaryCopy::invalidateMapped(mapped);return;}
     primaryCopy::copier(mapped,stride,source,static_cast<uint32_t>(slot),count,frameNow());
 }
@@ -812,6 +830,11 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
     poolBuf->GetDesc(&pd);
     if (pd.StructureByteStride != emit::kItemBytes || !(pd.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) ||
         pd.ByteWidth < emit::kItemBytes) { invalidate(e, kNoPool); return false; }
+    // The pool's recognition needs no buffer seen at creation: the creation tee
+    // registers only while the feature is live, so a pool the game made before
+    // it went live (the feature switched on mid-session) is nominated here, from
+    // the very buffer this eye-frame's draws read -- the same filter, the same
+    // slot. Its private-copy coverage then starts at the next observed map.
     const bool knownPrimary=watchesPrimaryResource(poolBuf.Get());
     notePrimaryBufferCreated(poolBuf.Get(),pd); // existing buffer on mid-session activation
     if(!knownPrimary && watchesPrimaryResource(poolBuf.Get()))
@@ -1420,7 +1443,7 @@ void summaryLocked(uint64_t now) {
                     r(g_primaryEmit.readFaults),r(g_primaryEmit.writeFaults));
     Log::get().note("engine motion: primary private copy cumulative (copier %s, merge %s, clear %s): copier spans %llu, apply successes %llu, "
                     "positive map cache overflow %llu (capacity %u); primary native records are unchanged.",
-                    kinematicEvalPoolCopyStatus(),kinematicEvalMergeStatus(),kinematicEvalClearStatus(),u(g_primaryCopyCalls),u(g_primaryApplied),u(g_primaryMapOverflow),kPrimaryPoolResources);
+                    kinematicEvalPoolCopyStatus(),kinematicEvalMergeStatus(),kinematicEvalClearStatus(),r(g_primaryCopyCalls),u(g_primaryApplied),u(g_primaryMapOverflow),kPrimaryPoolResources);
     const auto copyStats=primaryCopy::stats();
     Log::get().note("engine motion: primary copy certificates cumulative: emissions %llu, native copy ranges %llu, joined slots %llu, "
                     "declined %llu, invalidated %llu, overflow %llu; private scatter batches %llu, rows %llu, empty %llu, "
@@ -1646,7 +1669,16 @@ void summaryLocked(uint64_t now) {
     g_windowStartMs = now;
 }
 
+// Let every registered pool go: the lock-free watch slots first (the Map and
+// Unmap tees stop matching), then the held references. A run of the feature
+// starts and ends here through clearLocked, so it holds no game buffer while off.
+void releasePrimaryPoolsLocked() {
+    for (unsigned i = 0; i < kPrimaryPoolResources; ++i) { primaryPoolResources[i].store(nullptr); g_primaryMaps[i] = {}; }
+    g_primaryOverflowNoted = false;
+}
+
 void clearLocked() {
+    releasePrimaryPoolsLocked();
     for (auto& e : g_eyes) e = Eye{};
     g_sourceDepth.Reset();
     g_sourceNoted = ~0u;
@@ -1742,8 +1774,7 @@ void engineVelocityShutdown() {
     kinematicEvalSetPoolCopyObserver(nullptr);
     kinematicEvalSetMergeObserver(nullptr,nullptr);
     kinematicEvalSetClearObserver(nullptr);
-    primaryCopy::reset();
-    for(unsigned i=0;i<kPrimaryPoolResources;++i){primaryPoolResources[i].store(nullptr);g_primaryMaps[i]={};}
+    primaryCopy::reset();   // its leases hold the mapped pools too; clearLocked below releases the cache's
     if (g_emitAttached) { kinematicEvalEmitDetach(); g_emitAttached = false; }
     g_lookup.store(nullptr, std::memory_order_release);
     g_emitLive.store(false, std::memory_order_release);
@@ -1823,10 +1854,24 @@ void notePrimaryBufferCreated(ID3D11Buffer* buffer,const D3D11_BUFFER_DESC& desc
     if(!buffer || desc.Usage!=D3D11_USAGE_DYNAMIC || desc.StructureByteStride!=336 ||
        !(desc.MiscFlags&D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) || !(desc.CPUAccessFlags&D3D11_CPU_ACCESS_WRITE))return;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    // Live only, judged under the lock: the stand-down clears the slots under
+    // this same lock, so a CreateBuffer that raced it cannot pin a buffer after
+    // the release. The inline caller's unlocked test is only the cheap first cut.
+    if(!live.load(std::memory_order_acquire))return;
     for(auto& slot:g_primaryMaps)if(slot.buffer.Get()==buffer)return;
     unsigned chosen=kPrimaryPoolResources;
     for(unsigned i=0;i<kPrimaryPoolResources;++i)if(!g_primaryMaps[i].buffer){chosen=i;break;}
-    if(chosen==kPrimaryPoolResources){++g_primaryMapOverflow;return;}
+    if(chosen==kPrimaryPoolResources){
+        ++g_primaryMapOverflow;
+        if(!g_primaryOverflowNoted){
+            g_primaryOverflowNoted=true;
+            Log::get().note("engine motion: primary pool cache full (%u game buffers held, the most kept): buffer %p "
+                            "(%u bytes) seen at present frame %u is not tracked, so its private-copy coverage declines. "
+                            "Printed once per run; the 30 s line's \"positive map cache overflow\" keeps counting.",
+                            kPrimaryPoolResources,static_cast<void*>(buffer),static_cast<unsigned>(desc.ByteWidth),frameNow());
+        }
+        return;
+    }
     auto& slot=g_primaryMaps[chosen];slot.buffer=buffer;slot.bytes=desc.ByteWidth;slot.lastFrame=frameNow();
     primaryPoolResources[chosen].store(buffer,std::memory_order_release);
 }
