@@ -45,7 +45,8 @@ changes.*
   - Sidecar timing, PDH sampling, direct swapchain output, the PP-off
     fold, depth layers, the quad menu: excluded from initial parity.
   - FSS theater, gaze foveation, `[experimental]` features: deferred from
-    parity, not abandoned. Supersample resolve: retired 2026-09-16 rather
+    parity; the theater and foveation were then removed, 2026-09-29
+    (6ecbd241, 184eee7f). Supersample resolve: retired 2026-09-16 rather
     than ported.
 - **Next flight:** Per "Approval boundary" (2026-09-14): desktop checks
   continue while Sean is away; individual headset checks no longer gate each

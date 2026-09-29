@@ -398,8 +398,8 @@ game's open of the launch movie with "not found" through its import table; the
 default, `screen`, does not. Some advanced settings, all off by default, hook
 the game for diagnosis or experiments, and `edvr.ini` describes each. Explorer
 Cam ([explorer-cam.md](explorer-cam.md)) changes the headset position the game
-is told about; its read of one number from the game's memory is off by default
-(`camera_index_track = 0`). The cull guard
+is told about, and it reads nothing from the game's memory: it counts your
+camera-key presses. The cull guard
 ([above](#over-a-planet)) changes the field of view the game is told the
 headset shows; the game then draws the wider view itself, and EDVR submits only
 the true region, copied from the game's own frame. The cull guard edits
@@ -445,8 +445,7 @@ follows at 16:9. These safeguards are the reason to trust it:
 
 If you would rather EDVR changed as little of the game as possible, set
 `vscreen_res_width` to `1920` (the stock size, meaning "do not patch"), keep
-`settlement_detail` at `game`, `intro_video` at `screen` and
-`camera_index_track` at `0`, and leave `temporal_aa`, `ui_quality`,
-`static_prop_updates` and the advanced settings off. The two import redirects
-above still apply, because they are how EDVR takes over VR startup and the
-menu's keyboard.
+`settlement_detail` at `game` and `intro_video` at `screen`, and leave
+`temporal_aa`, `ui_quality`, `static_prop_updates` and the advanced settings
+off. The two import redirects above still apply, because they are how EDVR
+takes over VR startup and the menu's keyboard.

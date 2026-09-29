@@ -5,6 +5,15 @@
 *Updated 2026-09-15. Historical findings summarize the journal below; the
 current timing and overlay qualification is linked separately.*
 
+- **State: the door GPU bracket retired 2026-09-29 (code removed, e3109af4).**
+  `edvrDoorGpuBegin` and `edvrDoorGpuEnd` (nothing called them once the legacy
+  openvr half went), the per-eye query ring behind them and the Monitor's
+  "EDVR's GPU time at the door" tile are gone. The paragraph on it below is
+  history.
+- **State: `edvrMenuPanel` retired 2026-09-29 (code removed, 6ecbd241).** The
+  export, and `edvrEyeCaptureArm` and `edvrFssTheater` with it, had no caller
+  once the legacy openvr half was deleted. The design text on the export and on
+  the door lambda below is history.
 - **2026-09-24:** the Performance page's Foveation centre row is gone
   with its key (`experimental.foveation_centre`, retired).
 - **2026-09-23, later:** the Monitor page drops the rows the compositor's

@@ -30,9 +30,10 @@ top and the standout findings; update it as entries are added.*
     named remaining qualification work, not yet done as one pass.
   - Matched-resolution performance/quality parity vs. the legacy path:
     named open at several checkpoints (VDXR, native timing, DLSS).
-  - `[experimental]` features (FSS theater, gaze foveation) are explicitly
+  - `[experimental]` features (FSS theater, gaze foveation) were explicitly
     excluded from this parity work; supersample resolve was retired
-    2026-09-16.
+    2026-09-16, and the theater and foveation were removed 2026-09-29
+    (6ecbd241, 184eee7f).
 - **Ruled out:**
   - The new outer GPU-timing instrument as the cause of head-movement
     shimmering — "rules out the new outer instrument as a necessary

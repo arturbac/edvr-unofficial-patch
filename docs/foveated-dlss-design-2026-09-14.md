@@ -2,6 +2,10 @@
 
 ## Status
 
+- **State: the desk self-test retired 2026-09-29 (code removed, 72247cdf).**
+  `edvrFoveaRegionSelftest` (run by tools/smoke, cited below) and the DLAA desk
+  probes are deleted. The pure fovea geometry they covered is production code
+  and stays.
 - **State (2026-09-17 15:00, PAUSED by Sean: the head lead FLOWN 13:15 on
   v0.17.0-rc.3-93-g17fc607 slides as designed but jitters the crop 1 px
   per slide (scaleTo's even-floor of the output base, eye run 131504);
@@ -50,7 +54,8 @@
   inverted edge mapping caught and fixed in 8e99777, journal).
   Product shape once it pays (Sean): the eye mask toggle and trim give
   way to a DLSS rectangle, wide/narrow presets, one per-headset size;
-  gaze later where the headset publishes it; fix.eye_mask keys stay.
+  gaze later where the headset publishes it; fix.eye_mask keys were to
+  stay (removed 2026-09-29, d923a6f6).
 - **Next, on resume (journal, the PAUSED entry):** merge origin/main into
   the branch, build, smoke, install 2101149 to Frontier, push HEAD:main;
   then the same hangar yaw with lead 6 against 0 flipped live: the

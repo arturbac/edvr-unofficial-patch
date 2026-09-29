@@ -1,5 +1,11 @@
 # Explorer Cam
 
+## Status
+
+- **State: the game-memory read retired 2026-09-29 (code removed, 0fe90f09).**
+  Explorer Cam counts your camera-key presses and reads nothing from the game.
+  `camera_index_track` and its five sibling keys are gone.
+
 Explorer Cam moves your viewpoint to your commander's head while you are on
 foot in Elite's external camera, which renders in proper stereo. This page
 covers setting it up and what it does under the hood; the
@@ -96,16 +102,15 @@ These safeguards are the reason to trust it:
 - Your viewpoint moves at most 10 m per axis. Beyond that it clamps, because
   refusing outright would snap the view, which is worse when you are wearing
   the headset.
-- It counts your camera-key presses, and since build 332753 that is all it
-  does. Reading the preset from the game is off by default (`camera_index_track
-  = 0`). The read was a correction on top of the press count, and better where
-  it worked, because it needs no key bound and cannot drift. But finding the
-  records means walking every page the game holds, eleven to seventeen
-  gigabytes, and a failed search retries four times. Build 332753 moved the
+- It counts your camera-key presses, and that is all it does: it reads
+  nothing from the game's memory. It used to read the preset from the game as
+  well, a correction on top of the press count that was better where it
+  worked, because it needed no key bound and could not drift. But finding the
+  records meant walking every page the game holds, eleven to seventeen
+  gigabytes, and a failed search retried four times. Build 332753 moved the
   marker, so on that build it read fifty to seventy gigabytes per session and
-  found nothing. Turning it back on needs a marker measured on your own build;
-  [build-332753.md](build-332753.md) has one for 332753 and shows how it was
-  arrived at.
+  found nothing. It shipped off from then on and was removed 2026-09-29;
+  [build-332753.md](build-332753.md) records how the marker was measured.
 - It expires. The two halves of EDVR agree once a frame about which mode you
   are in. If the deciding half stops running, the half that moves your view
   stops trusting it within about a second and puts your viewpoint back.

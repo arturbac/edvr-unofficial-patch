@@ -7,6 +7,17 @@
 journal entry. Restates the journal below; update it whenever this doc
 changes.*
 
+- **State: the theater retired 2026-09-29 (code removed, 6ecbd241).**
+  `experimental.fss_theater`, fss_theater.cpp and the export `edvrFssTheater`
+  are gone: the theater could only run from a door call the deleted openvr half
+  made. The FSS mode latch, `fss_panel_rect`, `fss_eye_sync`, `fss_res`,
+  `fss_panel`, `fss_dump` and `fss_reveal` stay.
+- **State: the black-square-hunt instruments retired 2026-09-29 (code removed,
+  c61c43af).** `fix.fss_scan`, `advanced.fss_scan_level`,
+  `experimental.fss_ring_feed` and `advanced.fss_composite_probe` are gone with
+  fss_scan, fss_probe and fss_ring (1,608 lines). `fss_eye_sync` (heal and
+  lockstep) superseded all four. The entries below that flew them are history;
+  the code is at `c61c43af^`.
 - **State:** SOLVED and shipped, field-verified 2026-08-27. Findings
   1-2 (the zoomed body renders mono, at half eye resolution) are
   addressed by the opt-in `fix.fss_res`. The "black squares" hunt ran

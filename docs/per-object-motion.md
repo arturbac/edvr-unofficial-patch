@@ -5,6 +5,14 @@
 *Rewritten 2026-09-23 at the retirement (the last entry below). The journal
 is history: the paths it builds were removed from the code that day.*
 
+- **State: two cited probes retired 2026-09-29 (code removed, d38272de).**
+  stencil_probe.cpp and resolve_probe.h, cited below as evidence, are deleted
+  with `advanced.stencil_probe` and `advanced.resolve_probe`; the code is at
+  `d38272de^`.
+- **State: the v1 and v2 readers retired 2026-09-29 (code removed, e9dc9ae8).**
+  `tools/object_classification.py` reads schema v3 only, the only one the DLL
+  has written since 2026-09-23. The journal line below that says it reads all
+  three describes the tool as it was.
 - **State:** RETIRED 2026-09-23 (Sean's teardown). Every path here that
   ESTIMATED a per-object transform is gone from the code: tier 2's body
   path and its occupancy grid, the second body, the stepped parts, the

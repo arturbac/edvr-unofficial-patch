@@ -6,6 +6,11 @@
 first capture) and 2026-09-10 (second capture). It restates the journal
 below and is not new evidence; update it whenever this doc changes.*
 
+- **State: the eye-split instrument retired 2026-09-29 (code removed,
+  d38272de).** `advanced.eye_split` (step 3 of the capture recipe),
+  `tools/diff_eye_split.py` (step 4 of the analysis) and the `eye_split.cpp`
+  and `resolve_probe.h` line cites below refer to deleted code, which is at
+  `d38272de^`. Any further dump needs that code restored or a new instrument.
 - **State:** Issue #23, two captures in. The pass is named and measured:
   Elite's ambient occlusion is HBAO, three compute dispatches per eye per
   frame (`FB277B33F0865348`, `9347F8FC2DCE0248`, `D31E7812990B19A6`). Of
