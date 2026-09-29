@@ -310,8 +310,6 @@ python "tools\gen_exports.py" --source "%SystemRoot%\System32\d3d11.dll" ^
     --extra-export edvrTemporalAaNoteHead ^
     --extra-export edvrSharpen ^
     --extra-export edvrDepthProbeSelftest ^
-    --extra-export edvrDlaaAvailable ^
-    --extra-export edvrDlaaCounts ^
     --extra-export edvrAcquireNativeMenu ^
     --extra-export edvrAcquireNativeTemporal ^
     --extra-export edvrAcquireNativeSharpen ^

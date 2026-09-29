@@ -240,41 +240,4 @@ bool dlaaPeripheryTotals(int eye, uint32_t* evaluations, double* avgMs, double* 
 
 void dlaaShutdown();
 
-// The moving-crop probe (docs/performance.md, feature 6 and Phase 0 item
-// 16), a desk experiment for the smoke harness: does NVIDIA's history
-// survive a crop that moves with the gaze when the shift is folded into
-// the motion vectors? Runs a synthetic scene through DLAA on a 512x384
-// crop of a 1280x960 frame under six conditions and writes a multi-line
-// report into `report`. Returns 1 when a moved crop converges like a
-// still one (a pan), 2 when it converges like a fresh history (a reset
-// per move), 3 when it is worse than a fresh history (a smear), 4 when
-// the scene did not discriminate (the still crop's history did not beat
-// its first frame, so nothing can be placed against it), 0 when the
-// probe could not run (the report says why).
-int dlaaCropProbe(ID3D11Device* dev, ID3D11DeviceContext* ctx, char* report,
-                  uint32_t reportBytes);
-
-// The motion probe (2026-09-05): does NVIDIA's model behave the same on a
-// fovea crop as on the full frame while the content MOVES? The crop probe's
-// synthetic scene pans 6 px/frame for eighteen frames and then stands still
-// for eighteen; the full frame, the crop (a feature of the crop's size, output
-// sub-rectangles, a fixed base) and a half-size frame reduced the way the
-// steady periphery is are evaluated on identical inputs, and the error in the
-// crop's interior is recorded after every frame. Returns 1 when the crop
-// matches the full frame under motion and after it (any softening seen in the
-// field is the model's own), 2 when the crop is softer under motion, 3 when it
-// recovers slower after the pan stops, 4 when the scene did not discriminate,
-// 0 when the probe could not run (the report says why).
-int dlaaMotionProbe(ID3D11Device* dev, ID3D11DeviceContext* ctx, char* report,
-                    uint32_t reportBytes);
-
-// The cost probe (2026-09-05): NVIDIA's price per evaluation, per mode and
-// model, at the Pimax Crystal Super's sizes -- the full frame at Quality 1.0
-// and 0.65 under each model, the periphery variants, the flown fovea crop --
-// so the fovea design's trade (a crop's price against its lost history) is
-// priced rather than assumed. Synchronous timestamp queries; a desk tool.
-// Returns 1 when at least one case ran, 0 otherwise (the report says why).
-int dlaaCostProbe(ID3D11Device* dev, ID3D11DeviceContext* ctx, char* report,
-                  uint32_t reportBytes);
-
 }  // namespace edvr
