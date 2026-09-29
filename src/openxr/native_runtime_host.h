@@ -27,6 +27,7 @@
 #include <memory>
 #include <mutex>
 #include "../common/frame_flag.h"
+#include "../common/periodic_work.h"
 #include "native_device.h"
 #include "native_menu_client.h"
 #include "native_temporal_client.h"
@@ -243,6 +244,11 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
   FrameCycleStats frameCycles;
   std::atomic<bool> frameCycleEnabledNoted{false},frameCycleFirstNoted{false},postSubmitFirstNoted{false};
   std::atomic<uint64_t> frameCycleWaitToken{0},frameCycleSubmitToken{0},frameCycleSequence{0};
+  // Phase-0 timing (src/common/periodic_work.h) of the 30 s frame-cycle report: built by makeReport's sorts
+  // inside frameCycles.waitCallerEnd and written by reportFrameCycles, both on Elite's thread, the only user
+  // of this instance. Summaries and SLOW lines go to the runtime's own trace (recordFrameCycleReport): this
+  // DLL has no edvr::Log. Context: the samples the report sorted.
+  PeriodicWork frameCycleReportWork{"frame_cycle_report","samples"};
   // native_long_cycle: count is every completed cycle past the threshold,
   // logged or not; logged is how many printed, capped at 4/s (rateSecond/
   // rateWindow, a GetTickCount64()/1000 bucket) and 400 a session.
@@ -944,8 +950,12 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
         timingApplicationSequence.store(opened?sequence:0,std::memory_order_release);
         producerSequence=opened?sequence:0;
       }
-      frameCycles.waitCallerEnd(cycleToken,out.sequence,frameCycleUs(),GetTickCount64(),caller,cycleShape,
+      // waitCallerEnd is where a finished 30 s window becomes its report (makeReport's 28 sorts), so its
+      // duration is the build half of the report's cost; reportFrameCycles below adds the write half.
+      const uint64_t cycleEndBegan=frameCycleUs();
+      frameCycles.waitCallerEnd(cycleToken,out.sequence,cycleEndBegan,GetTickCount64(),caller,cycleShape,
         dispatched&&result==vr::VRCompositorError_None&&out.sequence,producerSequence);
+      const uint64_t cycleEndUs=frameCycleUs()-cycleEndBegan;
       FrameCycleStats::Completed completed{};
       if(frameCycles.takeCompleted(completed)) {
         EdvrNativeCpuCompletedFramePayloadV2 payload{};auto& event=payload.frame;
@@ -962,7 +972,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
         noteLongCycle(completed);
       }
       frameCycleSequence.store(dispatched&&result==vr::VRCompositorError_None?out.sequence:0,std::memory_order_release);
-      reportFrameCycles();
+      reportFrameCycles(cycleEndUs);
       return dispatched?result:vr::VRCompositorError_InvalidTexture;
     }
     if(!frameCycleWaitToken.load(std::memory_order_acquire))frameCycles.noteDirectOwner();
@@ -1879,9 +1889,19 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
       c.renderParkMs[0],c.renderParkMs[1],
       c.afterSecondMs,c.nextWaitMs,c.waitOwnerMs);
   }
-  void reportFrameCycles() {
+  // One finished report's cost, microseconds on the frame-cycle clock, into the phase-0 timing. The sink is
+  // the runtime's trace (a "periodic work: ..." line like the graphics half's, whose `at` is local time
+  // while this file's own prefix is UTC).
+  void recordFrameCycleReport(uint64_t us,uint64_t samples) {
+    frameCycleReportWork.record(int64_t(us),int64_t(frameCycleUs()),1000000,samples,
+      []{SYSTEMTIME st{};GetLocalTime(&st);PeriodicWallClock at;at.hour=st.wHour;at.minute=st.wMinute;at.second=st.wSecond;at.millis=st.wMilliseconds;return at;},
+      [](const char* line){nativeTracePrintf("%s\n",line);});
+  }
+  // buildUs: what the caller spent in frameCycles.waitCallerEnd, where this report was built (0 when unknown).
+  void reportFrameCycles(uint64_t buildUs=0) {
     if(!frameCycleFirstNoted&&frameCycles.firstComplete()) {frameCycleFirstNoted=true;nativeTracePrintf("native_frame_cycle,first_complete=1\n");}
     FrameCycleStats::Report r{};if(!frameCycles.takeReport(r))return;
+    const uint64_t writeBegan=frameCycleUs();
     const auto& c=r.cycle;const double validSum=c.mean*double(r.valid);
     nativeTracePrintf("native_frame_cycle_window,window=%llu,boundary=host_wait_return_to_next_host_wait_return,admitted=%llu,valid=%u,first=%llu,last=%llu,elapsed_ms=%llu,valid_cycle_sum_ms=%.3f,caller_wait_fps=%.3f,valid_sample_fps=%.3f,caller_thread=%u,wait_thread=%u,thread_consistent=%u,input=%ux%u/%ux%u,output=%ux%u/%ux%u,pacing=%u,should_render=%u,scene_ready=%u,generation=%llu,feature_epoch=%llu,missing_clock=%llu,missing_reentrant=%llu,missing_thread=%llu,missing_sequence=%llu,missing_partial=%llu,missing_duplicate_eye=%llu,missing_direct_owner=%llu,missing_scope=%llu,missing_overflow=%llu,late_frames=%llu,frame_end_overlap=%u\n",
       (unsigned long long)r.window,(unsigned long long)r.admitted,r.valid,(unsigned long long)r.firstSequence,(unsigned long long)r.lastSequence,(unsigned long long)r.elapsedMs,validSum,
@@ -1930,6 +1950,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     postPhase("post_present_handoff",r.handoffNested,r.handoffValid,1);
     postPhase("handoff_count",r.handoffCount,r.handoffValid,1,"calls");
     reportPerformanceMetrics(r.window);
+    recordFrameCycleReport(buildUs+(frameCycleUs()-writeBegan),r.valid);
   }
   void reportSubmitStats() {
     const auto wall=submitStats.distribution(&SubmissionStats::Sample::submitMs);

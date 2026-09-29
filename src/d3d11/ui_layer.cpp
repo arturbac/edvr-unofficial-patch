@@ -42,6 +42,7 @@
 #include "../common/config.h"
 #include "../common/guard.h"
 #include "../common/log.h"
+#include "../common/periodic_work.h"
 #include "../common/temporal_mode.h"
 
 #include <windows.h>
@@ -647,6 +648,12 @@ void appendPrice(std::string& s, size_t stat) {
 
 uint64_t g_winStartMs = 0;
 uint64_t g_sessionRedirected = 0;
+// Phase-0 timing (src/common/periodic_work.h) of the 30 s totals and price
+// lines, built on Elite's thread at the frame boundary: appendPrice sorts up
+// to kRouteSamples floats for each of the price stats. Context: the samples
+// held then (what the sorts had to order). One run per window that logs, so
+// nothing is written while fix.ui_quality is off and nothing was redirected.
+PeriodicWork g_workTotals{"ui_layer_totals", "samples"};
 
 // First-seen lines, deduplicated.
 struct FamilySeen {
@@ -3761,7 +3768,12 @@ void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     if (!g_winStartMs) g_winStartMs = now;
     if (now - g_winStartMs < kTotalsMs) return;
     const bool anything = g_win.redirected || g_win.composites || g_win.compositeRefused;
-    if (g_target > 0.0f || anything) logTotals(static_cast<double>(now - g_winStartMs) / 1000.0);
+    if (g_target > 0.0f || anything) {
+        uint64_t samples = 0;  // what logTotals is about to sort
+        for (const RouteStats& r : g_routeStats) samples += r.n;
+        PeriodicWorkScope timing(g_workTotals, samples);
+        logTotals(static_cast<double>(now - g_winStartMs) / 1000.0);
+    }
     g_win = Window{};
     g_seedCensus.nextWindow();
     for (RouteStats& r : g_routeStats) {

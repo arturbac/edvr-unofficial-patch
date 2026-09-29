@@ -11,6 +11,9 @@ namespace edvr {
 std::vector<std::string> testLog;
 Log& Log::get() { static Log log; return log; }
 Log::~Log() = default;
+// periodic_work.h's production clock (luma_probe.cpp times its rounds with it).
+int64_t qpcNow() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+int64_t qpcFrequency() { LARGE_INTEGER t; QueryPerformanceFrequency(&t); return t.QuadPart; }
 void Log::note(const char* fmt, ...) {
     char line[1024]; va_list args; va_start(args, fmt);
     vsnprintf(line, sizeof(line), fmt, args); va_end(args);
@@ -118,6 +121,7 @@ void equivalence(ID3D11Device* dev, ID3D11DeviceContext* ctx, DXGI_FORMAT f, UIN
     std::vector<uint8_t> bytes; fillPixels(bytes, kind, w, h);
     auto src = texture(dev, w, h, f, bytes, bpp, mipArray);
     g_eyes[0] = EyeState{}; g_eyes[0].armed = true;
+    const uint64_t timed0 = g_workRound.runs();
     {
         CommandSpy spy(ctx, w, h, f, bpp);
         lumaProbeSample(ctx, src.Get(), 0, 0);
@@ -126,6 +130,8 @@ void equivalence(ID3D11Device* dev, ID3D11DeviceContext* ctx, DXGI_FORMAT f, UIN
         lumaProbeSample(ctx, src.Get(), 0, 0);
         check(spy.copies == 16, "stage sampled once per round");
     }
+    check(g_workRound.runs() == timed0 + 1,
+          "phase-0 timing: the stage copy is one luma_round run, the repeat sample none");
     auto& slot = g_eyes[0].stages[0];
     // A blocking reference read is a desk-test wait, outside production.
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -149,6 +155,7 @@ void equivalence(ID3D11Device* dev, ID3D11DeviceContext* ctx, DXGI_FORMAT f, UIN
         lumaProbeEnd(ctx, 0);
         check(spy.maps == 1 && spy.copies == 0, "ready stage polled once, no extra transfer");
     }
+    check(g_workRound.runs() == timed0 + 2, "phase-0 timing: the readback poll is one more luma_round run");
     check(slot.mean == float(sum / 256) && slot.maxLuma == maximum && slot.blackPct == float(black) * 100 / 256,
           "mean/max/near-black percentage exactly match historical full-texture grid");
     check(!g_eyes[0].armed && g_eyes[0].haveLastReport, "report starts two-second throttle");
@@ -157,6 +164,7 @@ void equivalence(ID3D11Device* dev, ID3D11DeviceContext* ctx, DXGI_FORMAT f, UIN
         lumaProbeSample(ctx, src.Get(), 0, 0); lumaProbeEnd(ctx, 0);
         check(spy.copies == 0 && spy.maps == 0 && !g_eyes[0].armed, "throttle performs no diagnostic commands");
     }
+    check(g_workRound.runs() == timed0 + 2, "phase-0 timing: a throttled pass times nothing");
 }
 
 void submissionBenchmark(ID3D11Device* dev, ID3D11DeviceContext* ctx, UINT w, UINT h) {

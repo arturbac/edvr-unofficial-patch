@@ -1,5 +1,6 @@
 #include "luma_probe.h"
 #include "../common/log.h"
+#include "../common/periodic_work.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -166,6 +167,24 @@ struct EyeState {
 EyeState g_eyes[2];
 bool g_armedLogged = false;
 
+// Stages copied into staging and not yet read: the round's stages in flight.
+uint64_t pendingStages(const EyeState& es) {
+    uint64_t n = 0;
+    for (const auto& s : es.stages) {
+        if (s.status == SlotStatus::Pending) ++n;
+    }
+    return n;
+}
+
+// Phase-0 timing (src/common/periodic_work.h): what the probe costs the render
+// thread. One run per call that does work -- a stage's staging copies (and its
+// staging texture when one is made), or a readback poll with its decode and
+// report line -- so a frame's share can be laid against a LONG FRAME line.
+// Calls that do nothing (not armed, throttled, stage already sampled) are not
+// runs. The context is the stages in flight: 1 to 3 on a copy call, the
+// number polled on a readback call.
+PeriodicWork g_workRound{"luma_round", "stages"};
+
 void noteArmedOnce() {
     if (g_armedLogged) return;
     g_armedLogged = true;
@@ -317,6 +336,9 @@ void lumaProbeSample(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, int eye, in
         slot.status = SlotStatus::Unsupported;
         return;
     }
+    // From here the call does the work: the device lookup, a staging texture
+    // when the size changed, sixteen row copies. Timed however it is left.
+    PeriodicWorkScope timing(g_workRound);
     if (!slot.staging || slot.width != td.Width || slot.height != td.Height || slot.format != td.Format) {
         Ptr<ID3D11Device> dev;
         ctx->GetDevice(&dev);
@@ -357,6 +379,7 @@ void lumaProbeSample(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, int eye, in
     }
     slot.status = SlotStatus::Pending;
     slot.waitFrames = 0;
+    timing.setContext(pendingStages(es));
 }
 
 void lumaProbeEnd(ID3D11DeviceContext* ctx, int eye) {
@@ -365,6 +388,8 @@ void lumaProbeEnd(ID3D11DeviceContext* ctx, int eye) {
     EyeState& es = g_eyes[eye];
     if (!ctx) return;   // try again once a frame hands us a context
     if (es.armed) {
+        // One run: the nonblocking polls, the decode and the report line.
+        PeriodicWorkScope timing(g_workRound, pendingStages(es));
         ++es.endsSinceArm;
         bool allResolved = true;
         for (auto& slot : es.stages) {

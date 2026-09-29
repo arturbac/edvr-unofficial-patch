@@ -650,7 +650,11 @@ int selfTest() {
     EdvrNativePresentTrace present{sizeof(present),EDVR_NATIVE_PRESENT_TRACE_VERSION_1,1,0,1,1};
     present.spans[0]={2100,2200,2400,2500,2600,7,0,0,0};
     auto w=cycleHost->frameCycles.waitCallerBegin(3000,7,&present);cycleHost->frameCycles.waitOwnerBegin(w,3001);cycleHost->frameCycles.waitOwnerEnd(w,3002);cycleHost->frameCycles.waitCallerEnd(w,3,3003,31002,7,shape,true);
-    cycleHost->reportFrameCycles();
+    cycleHost->reportFrameCycles(500);
+    check(cycleHost->frameCycleReportWork.runs()==1&&cycleHost->frameCycleReportWork.maxTicks()>=500,
+      "phase-0 timing: a finished frame-cycle report is one frame_cycle_report run, its build time included");
+    cycleHost->reportFrameCycles(500);
+    check(cycleHost->frameCycleReportWork.runs()==1,"phase-0 timing: no report ready is not a run");
     check(cycleHost->frameCycleFirstNoted.load(),"production frame-cycle report path reachable");
     check(cycleHost->postSubmitFirstNoted.load(),"production post-submit report path reachable with accepted Present sample");
   }
