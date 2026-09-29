@@ -136,6 +136,19 @@ bool sourceGatesSharpenRow(const std::string& menuCpp) {
            menuCpp.find("if (isSharpenRow(kMenuRows[defIndex]) && sharpenRowDisabled()) {") != std::string::npos;
 }
 
+// The one line that hands the resolve's output to the sharpening: flat_runtime.cpp, where the
+// game's output copy's first input is swapped for it. The rig cannot run the flat runtime, and
+// without this line the wrapper is never reached (a flat log would say so after 30 s, in the
+// never-ran note, but a merge that drops the line is cheaper to catch here). What the call
+// returns must be what the copy is bound to.
+bool sourceHandsResolveToSharpen(const std::string& runtimeCpp) {
+    const size_t inc = runtimeCpp.find("#include \"flat_sharpen.h\"");
+    const size_t call = runtimeCpp.find("replacement = flatSharpenView(ctx, outputView.Get());");
+    if (inc == std::string::npos || call == std::string::npos || inc > call) return false;
+    const size_t bind = runtimeCpp.find("PSSetShaderResources(0, 1, &replacement)", call);
+    return bind != std::string::npos && bind - call < 200;
+}
+
 bool schemaHasRow(const std::string& schema, const char* section, const char* key) {
     const std::string needle = std::string("{\"") + section + "\", \"" + key + "\",";
     return schema.find(needle) != std::string::npos;
@@ -202,6 +215,27 @@ void panelTable(const std::string& root, const std::string& gen) {
     }
     check(at != std::string::npos && !sourceBuildsFlatPageFromTable(hardCoded),
           "control: a page built from a key list in menu.cpp is caught");
+
+    // The flat runtime hands its resolve to the sharpening, and binds what comes back.
+    const std::string runtimeCpp = readWholeFile(std::wstring(root.begin(), root.end()) +
+                                                 L"\\src\\d3d11\\flat_runtime.cpp");
+    check(!runtimeCpp.empty(), "flat_runtime.cpp is readable from the repo root");
+    check(sourceHandsResolveToSharpen(runtimeCpp),
+          "flat_runtime.cpp binds the game's output copy to what flatSharpenView returns for the resolve");
+    {
+        std::string dropped = runtimeCpp;
+        const char* from = "replacement = flatSharpenView(ctx, outputView.Get());";
+        const size_t i = dropped.find(from);
+        if (i != std::string::npos) dropped.replace(i, std::strlen(from), "replacement = outputView.Get();");
+        check(i != std::string::npos && !sourceHandsResolveToSharpen(dropped),
+              "control: a runtime that binds the resolve's own view again is caught");
+        std::string noInclude = runtimeCpp;
+        const char* inc = "#include \"flat_sharpen.h\"";
+        const size_t j = noInclude.find(inc);
+        if (j != std::string::npos) noInclude.replace(j, std::strlen(inc), "");
+        check(j != std::string::npos && !sourceHandsResolveToSharpen(noInclude),
+              "control: a runtime without the sharpening's header is caught");
+    }
 
     // The Sharpening row's dimming is asked in all three places, in the profile's terms.
     check(sourceGatesSharpenRow(menuCpp), "menu.cpp dims, refuses steps and refuses typing on the Sharpening row through flatSharpenRowDim");
