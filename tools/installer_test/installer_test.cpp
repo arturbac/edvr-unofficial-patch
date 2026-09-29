@@ -1086,6 +1086,14 @@ static void layOutScratchGame(const std::wstring& gameDir) {
     writeAll(joinPath(gameDir, L"Openvr\\win64\\openvr_api.dll"), "THE-GAMES-OWN-RUNTIME");
 }
 
+// Whether the run got as far as writing a file: a step that completed is the run's
+// own account of it, and `overwrote` is what that account must agree with.
+static bool wroteAFile(const ApplyResult& result) {
+    for (const std::string& line : result.done)
+        if (line.rfind("wrote ", 0) == 0) return true;
+    return false;
+}
+
 static void testApply(const std::wstring& scratch) {
     printf("\napplying a plan\n");
     const std::wstring gameDir = joinPath(scratch, L"game");
@@ -1979,6 +1987,57 @@ static void testReplaceScripts(const std::wstring& scratch) {
         SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
     }
 
+    {   // The replace on its own, for a caller that staged its file (the apply
+        // engine): it renames and nothing else, reports what the writer reports --
+        // the tries, and the Windows error of the last refusal -- and on failure
+        // leaves the staged file where it was for its owner to delete.
+        const std::wstring staged = joinPath(dir, L"staged.tmp");
+        AtomicWriteOptions quick;
+        quick.retries = 3;
+        quick.backoffMs = 1;
+        int tries = -1;
+        unsigned long code = 99;
+
+        writeAll(target, "before\r\n");
+        writeAll(staged, "staged\r\n");
+        script({ERROR_ACCESS_DENIED}, {});
+        check(replaceFileAtomic(staged, target, quick, &tries, &code),
+              "a staged file is put in place over the target after one busy answer");
+        check(tries == 2 && code == ERROR_SUCCESS, "having made two tries, and reporting no error",
+              std::to_string(tries) + " tries, error " + std::to_string(code));
+        expectCounts("asking the POSIX-semantics rename twice and the classic one never",
+                     Wrote{true, tries, {}}, 2, 2, 0, false);
+        expectEq(readAll(target), "staged\r\n", "the target holds the staged bytes");
+        check(!fileExists(staged), "and the staged file is gone: it was renamed, not copied");
+
+        writeAll(target, "before\r\n");
+        writeAll(staged, "staged\r\n");
+        script(repeated(ERROR_SHARING_VIOLATION, 4), {});
+        tries = -1;
+        code = ERROR_SUCCESS;
+        check(!replaceFileAtomic(staged, target, quick, &tries, &code),
+              "a target that stays busy is not replaced");
+        check(tries == 4 && code == ERROR_SHARING_VIOLATION,
+              "after the first try and the three it was allowed, reporting the last error",
+              std::to_string(tries) + " tries, error " + std::to_string(code));
+        expectEq(readAll(target), "before\r\n", "the target is exactly as it was");
+        expectEq(readAll(staged), "staged\r\n", "and the staged file is where it was");
+
+        script({ERROR_INVALID_PARAMETER}, {ERROR_FILE_NOT_FOUND});
+        tries = -1;
+        code = ERROR_SUCCESS;
+        check(!replaceFileAtomic(staged, target, quick, &tries, &code),
+              "an answer that is not a hold fails at once");
+        check(tries == 1 && code == ERROR_FILE_NOT_FOUND,
+              "in one try, reporting the classic rename's error",
+              std::to_string(tries) + " tries, error " + std::to_string(code));
+
+        script({}, {});
+        check(replaceFileAtomic(staged, target, quick), "the tries and the error are optional");
+        expectEq(readAll(target), "staged\r\n", "and the file still lands");
+        expectEq(listing(dir), "edvr.ini", "with nothing left beside it");
+    }
+
     {   // A rotation of the mirror's generations under retries: every replace it
         // makes meets one busy answer first, and the generations are still right.
         // Nine replaces -- 1 for the first copy, 2 for the second, 3 for each of
@@ -2008,6 +2067,350 @@ static void testReplaceScripts(const std::wstring& scratch) {
         check(!fileExists(generationPath(gdir, name, 3)), "and the first is dropped");
         expectEq(listing(gdir), "edvr.ini, edvr.ini.1, edvr.ini.2", "with no temporary file left");
     }
+    realRenames();
+}
+
+// ---------------------------------------------------------------------------
+// the apply engine's replaces (apply.h: replacePatienceForTest)
+//
+// The engine writes a DLL by staging it beside the target and replacing the
+// target, and it moves the game's runtime aside with a rename over whatever is at
+// the new name. Both are iniedit's replace, so a file that something else has open
+// for a moment is waited out and does not fail the run. The classic rename is
+// refused with "access denied" while ANY handle to its target is open, and the
+// engine used to give up on the first refusal, roll the run back and report that
+// it could not finish: under a stand-in for a real-time scanner it lost the first
+// replace of the pair in 2 runs in 80 (2026-09-29), and a person's antivirus
+// holds a file it has just looked at in the same way.
+//
+// The scripted cases stand in for BOTH renames, so the real file system is in none
+// of their counts, and each is one that a mutation of the engine must break:
+// replacing by the classic rename, not waiting, waiting on an answer that is not a
+// hold, reporting the wrong file, forgetting a file that was replaced. The two at
+// the end use the real renames on the real files and assert what holds however
+// often a scanner made the engine try.
+
+// The plan a repair makes of the pair: the graphics DLL and the runtime, each
+// written over the one that is there.
+static Plan pairPlan(const std::wstring& dir) {
+    Plan plan;
+    plan.backupDir = joinPath(dir, L"edvr_backup");
+    Step graphics;
+    graphics.action = Action::WritePayload;
+    graphics.item = "d3d11";
+    graphics.to = joinPath(dir, L"d3d11.dll");
+    plan.steps.push_back(graphics);
+    Step runtime;
+    runtime.action = Action::WritePayload;
+    runtime.item = "openvr";
+    runtime.to = joinPath(dir, L"openvr_api.dll");
+    plan.steps.push_back(runtime);
+    return plan;
+}
+
+// An install's first move: the game's runtime renamed aside, and, with `thenOurs`,
+// ours written where it was.
+static Plan asidePlan(const std::wstring& dir, bool thenOurs) {
+    Plan plan;
+    plan.backupDir = joinPath(dir, L"edvr_backup");
+    Step aside;
+    aside.action = Action::Rename;
+    aside.from = joinPath(dir, L"openvr_api.dll");
+    aside.to = joinPath(dir, L"openvr_api_orig.dll");
+    aside.required = true;
+    plan.steps.push_back(aside);
+    if (thenOurs) {
+        Step ours;
+        ours.action = Action::WritePayload;
+        ours.item = "openvr";
+        ours.to = joinPath(dir, L"openvr_api.dll");
+        plan.steps.push_back(ours);
+    }
+    return plan;
+}
+
+// An uninstall's move: the game's runtime renamed back over ours, which is a file
+// that is there.
+static Plan restorePlan(const std::wstring& dir) {
+    Plan plan;
+    plan.backupDir = joinPath(dir, L"edvr_backup");
+    Step back;
+    back.action = Action::Rename;
+    back.from = joinPath(dir, L"openvr_api_orig.dll");
+    back.to = joinPath(dir, L"openvr_api.dll");
+    back.required = true;
+    plan.steps.push_back(back);
+    return plan;
+}
+
+// The pair an install would replace; `withOrig` adds the game's own runtime under
+// the name it is kept by, as it stands when there is something to put back.
+static void layOutPair(const std::wstring& dir, bool withOrig = false) {
+    removeTree(dir);
+    makeTree(dir);
+    writeAll(joinPath(dir, L"d3d11.dll"), "OLD-GRAPHICS");
+    writeAll(joinPath(dir, L"openvr_api.dll"), "OLD-RUNTIME");
+    if (withOrig) writeAll(joinPath(dir, L"openvr_api_orig.dll"), "THE-GAMES-OWN-RUNTIME");
+}
+
+// How often each rename was asked since the scripts went in, against what the case
+// says. One line, so a failing case prints all three numbers.
+static void expectAttempts(const std::string& what, int posix, int classic, bool refused) {
+    const auto shown = [](int p, int c, bool r) {
+        return std::to_string(p) + " POSIX calls, " + std::to_string(c) + " classic calls, " +
+               (r ? "refusal remembered" : "no refusal remembered");
+    };
+    check(posixReplaceAttempts() == posix && classicReplaceAttempts() == classic &&
+              posixReplaceRefused() == refused,
+          what.c_str(),
+          "got " + shown(posixReplaceAttempts(), classicReplaceAttempts(), posixReplaceRefused()) +
+              "; wanted " + shown(posix, classic, refused));
+}
+
+static bool mentions(const std::string& text, const char* needle) {
+    return text.find(needle) != std::string::npos;
+}
+
+// The operating system's words for `code`, which is what the engine's failure says
+// when it says why. Asked of the same API in the same way, so that a language other
+// than English changes both sides of the comparison and not the answer.
+static std::string windowsText(unsigned long code) {
+    char* message = nullptr;
+    const DWORD n = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), reinterpret_cast<char*>(&message),
+        0, nullptr);
+    std::string out;
+    if (n && message) out.assign(message, n);
+    if (message) LocalFree(message);
+    while (!out.empty() && (out.back() == '\r' || out.back() == '\n' || out.back() == ' '))
+        out.pop_back();
+    return out;
+}
+
+static void testApplyPatience(const std::wstring& scratch) {
+    printf("\nthe apply engine's replaces\n");
+
+    const std::wstring dir = joinPath(scratch, L"apply-patience");
+    const std::wstring d3d11 = joinPath(dir, L"d3d11.dll");
+    const std::wstring runtime = joinPath(dir, L"openvr_api.dll");
+    const std::wstring orig = joinPath(dir, L"openvr_api_orig.dll");
+    const std::string newGraphics = "TEST-D3D11-PAYLOAD";
+    const std::string newRuntime = "TEST-OPENVR-PAYLOAD";
+    const std::string pairListing = "d3d11.dll, openvr_api.dll";
+
+    // A refusal that is never lifted must not cost the rig two seconds a case:
+    // three tries after the first, a millisecond apart. (The product's own numbers
+    // are what the two real-file cases at the end run with.)
+    replacePatienceForTest(3, 1);
+
+    {   // Nothing in the way: each of the two writes asks the POSIX-semantics rename
+        // once, and the classic one is never asked.
+        layOutPair(dir);
+        script({}, {});
+        const ApplyResult r = applyPlan(pairPlan(dir), provider(false));
+        check(r.ok, "a pair that nothing holds is replaced", r.error);
+        expectEq(readAll(d3d11), newGraphics, "with the new graphics DLL");
+        expectEq(readAll(runtime), newRuntime, "and the new runtime");
+        expectAttempts("each write asked the POSIX-semantics rename once and the classic one never",
+                       2, 0, false);
+        expectEq(listing(dir), pairListing, "and no staged file is left beside them");
+    }
+
+    // The answers that mean "held for a moment", on the first replace: it is asked
+    // again, through the same rename, and the run lands. "Access denied" is the
+    // one the real rename gives under a scanner.
+    for (const unsigned long code :
+         {ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION}) {
+        const std::string which = "error " + std::to_string(code) + ": ";
+        layOutPair(dir);
+        script({code}, {});
+        const ApplyResult r = applyPlan(pairPlan(dir), provider(false));
+        check(r.ok, (which + "a file that is busy once does not fail the run").c_str(), r.error);
+        expectAttempts(which + "one retry of the first replace, through the POSIX-semantics "
+                               "rename, and no classic rename at all",
+                       3, 0, false);
+        expectEq(readAll(d3d11), newGraphics, "the new graphics DLL is in place");
+        expectEq(readAll(runtime), newRuntime, "and so is the new runtime");
+        expectEq(listing(dir), pairListing, "with no staged file left");
+    }
+
+    {   // Where the volume does not do POSIX-semantics renames the classic rename
+        // does them, and its busy answers are waited out in the same way.
+        layOutPair(dir);
+        script({ERROR_INVALID_PARAMETER}, {ERROR_ACCESS_DENIED});
+        const ApplyResult r = applyPlan(pairPlan(dir), provider(false));
+        check(r.ok, "without POSIX-semantics renames a busy classic rename is waited out", r.error);
+        expectAttempts("the POSIX-semantics rename asked once and remembered as unsupported; the "
+                       "classic one refused once, then twice more for the two writes",
+                       1, 3, true);
+        expectEq(readAll(d3d11), newGraphics, "the new graphics DLL is in place");
+        expectEq(readAll(runtime), newRuntime, "and so is the new runtime");
+    }
+
+    {   // The first file held for good: three tries after the first are all the rig
+        // allows. The run fails, names the file, is rolled back, never gets to the
+        // second, and does not claim a file was replaced -- because none was.
+        layOutPair(dir);
+        script(repeated(ERROR_ACCESS_DENIED, 8), {});
+        const ApplyResult r = applyPlan(pairPlan(dir), provider(false));
+        check(!r.ok, "a file that stays held fails the run");
+        check(r.rolledBack, "which is rolled back", r.error);
+        check(!r.overwrote, "and does not claim that a file had been replaced: none had");
+        check(mentions(r.error, "d3d11.dll"), "the failure names the file", r.error);
+        check(mentions(r.error, windowsText(ERROR_ACCESS_DENIED).c_str()),
+              "and says what the operating system said", r.error);
+        expectAttempts("the first try and the three it was allowed, and the second file never reached",
+                       4, 0, false);
+        expectEq(readAll(d3d11), "OLD-GRAPHICS", "the graphics DLL is exactly as it was");
+        expectEq(readAll(runtime), "OLD-RUNTIME", "and so is the runtime");
+        expectEq(listing(dir), pairListing, "with no staged file left");
+    }
+
+    {   // An answer that is not a hold -- the disk is full -- fails the run at once:
+        // waiting on it would only be slow.
+        layOutPair(dir);
+        script({ERROR_DISK_FULL}, {ERROR_DISK_FULL});
+        const ApplyResult r = applyPlan(pairPlan(dir), provider(false));
+        check(!r.ok, "a replace refused for a reason that does not pass fails the run");
+        check(r.rolledBack, "which is rolled back", r.error);
+        check(!r.overwrote, "and does not claim that a file had been replaced");
+        check(mentions(r.error, windowsText(ERROR_DISK_FULL).c_str()),
+              "saying what the operating system said", r.error);
+        expectAttempts("after one try of each rename, without waiting", 1, 1, false);
+        expectEq(readAll(d3d11), "OLD-GRAPHICS", "the graphics DLL is exactly as it was");
+        expectEq(listing(dir), pairListing, "with no staged file left");
+    }
+
+    {   // The second file held for good, after the first was replaced: the first is
+        // put back, and the result says a file had already been replaced.
+        layOutPair(dir);
+        script({0, ERROR_SHARING_VIOLATION, ERROR_SHARING_VIOLATION, ERROR_SHARING_VIOLATION,
+                ERROR_SHARING_VIOLATION},
+               {});
+        const ApplyResult r = applyPlan(pairPlan(dir), provider(false));
+        check(!r.ok, "a second file that stays held fails the run");
+        check(r.rolledBack, "which is rolled back", r.error);
+        check(r.overwrote, "and admits that the first file had already been replaced");
+        check(wroteAFile(r), "which the steps it completed agree with");
+        check(mentions(r.error, "openvr_api.dll"), "the failure names the second file", r.error);
+        check(mentions(r.error, windowsText(ERROR_SHARING_VIOLATION).c_str()),
+              "and says what the operating system said", r.error);
+        expectAttempts("one try for the first file, and the first and the three allowed for the second",
+                       5, 0, false);
+        expectEq(readAll(d3d11), "OLD-GRAPHICS", "the graphics DLL is back to what it was");
+        expectEq(readAll(runtime), "OLD-RUNTIME", "and the runtime never left");
+        expectEq(listing(dir), pairListing, "with no staged file left");
+    }
+
+    {   // The rename that moves the game's runtime aside waits in the same way.
+        layOutPair(dir);
+        script({ERROR_ACCESS_DENIED}, {});
+        const ApplyResult r = applyPlan(asidePlan(dir, true), provider(false));
+        check(r.ok, "a rename that is busy once does not fail the run", r.error);
+        expectAttempts("one retry of the rename, and one try for the write after it", 3, 0, false);
+        expectEq(readAll(orig), "OLD-RUNTIME", "the game's runtime is under its new name");
+        expectEq(readAll(runtime), newRuntime, "and ours is in its place");
+        expectEq(listing(dir), "d3d11.dll, openvr_api.dll, openvr_api_orig.dll",
+                 "with no staged file left");
+    }
+
+    {   // The same rename refused for good, and nothing after it: nothing moved, and
+        // nothing is claimed.
+        layOutPair(dir);
+        script(repeated(ERROR_SHARING_VIOLATION, 8), {});
+        const ApplyResult r = applyPlan(asidePlan(dir, false), provider(false));
+        check(!r.ok, "a rename that stays refused fails the run");
+        check(r.rolledBack, "which is rolled back", r.error);
+        check(!r.overwrote, "and does not claim that a file had been replaced");
+        check(mentions(r.error, "openvr_api.dll"), "the failure names the file it could not move",
+              r.error);
+        check(mentions(r.error, windowsText(ERROR_SHARING_VIOLATION).c_str()),
+              "and says what the operating system said", r.error);
+        expectAttempts("the first try and the three it was allowed", 4, 0, false);
+        expectEq(readAll(runtime), "OLD-RUNTIME", "the game's runtime is where it was");
+        check(!fileExists(orig), "with nothing under the new name");
+    }
+
+    {   // An uninstall's rename puts the game's runtime back over ours, which is a
+        // file that is there: a replace, and it waits in the same way.
+        layOutPair(dir, true);
+        script({ERROR_ACCESS_DENIED}, {});
+        const ApplyResult r = applyPlan(restorePlan(dir), provider(false));
+        check(r.ok, "a rename over an existing file that is busy once does not fail the run",
+              r.error);
+        expectAttempts("one retry, through the POSIX-semantics rename", 2, 0, false);
+        expectEq(readAll(runtime), "THE-GAMES-OWN-RUNTIME", "the game's runtime is back");
+        check(!fileExists(orig), "and is no longer under the other name");
+    }
+
+    // The product's own patience from here on, for the real files.
+    replacePatienceForTest(-1, 0);
+
+    {   // A reader that shares DELETE has the graphics DLL open for the whole run,
+        // as a real-time scanner or the indexer does. The classic rename is refused
+        // for as long as it holds on (measured: Windows 11 build 26200), so the
+        // engine used to fail here at once; the POSIX-semantics rename goes through
+        // under it, and the reader goes on seeing the file it opened. The reader
+        // never lets go, so this asserts the outcome and not how often the engine
+        // tried.
+        layOutPair(dir);
+        realRenames();
+        HANDLE reader = holdOpen(d3d11, true);
+        check(reader != INVALID_HANDLE_VALUE, "a reader sharing DELETE can hold the graphics DLL open");
+        const ApplyResult r = applyPlan(pairPlan(dir), provider(false));
+        check(r.ok, "the pair is replaced under a reader that shares DELETE", r.error);
+        expectEq(readAll(d3d11), newGraphics, "the path holds the new graphics DLL");
+        expectEq(readThrough(reader), "OLD-GRAPHICS", "while the reader still sees the file it opened");
+        expectEq(readAll(runtime), newRuntime, "and the runtime is replaced");
+        check(!posixReplaceRefused(), "which this volume took: nothing was remembered as unsupported");
+        if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
+        expectEq(listing(dir), pairListing, "with no staged file left");
+    }
+
+    {   // The same hold on the other kind of replace: the uninstall's rename of the
+        // game's runtime back over ours, while a reader that shares DELETE has ours
+        // open.
+        layOutPair(dir, true);
+        realRenames();
+        HANDLE reader = holdOpen(runtime, true);
+        check(reader != INVALID_HANDLE_VALUE, "a reader sharing DELETE can hold our runtime open");
+        const ApplyResult r = applyPlan(restorePlan(dir), provider(false));
+        check(r.ok, "the game's runtime is renamed back over ours under such a reader", r.error);
+        expectEq(readAll(runtime), "THE-GAMES-OWN-RUNTIME", "the path holds the game's runtime");
+        expectEq(readThrough(reader), "OLD-RUNTIME", "while the reader still sees the file it opened");
+        check(!fileExists(orig), "and it is no longer under the other name");
+        if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
+    }
+
+    {   // A reader that does NOT share DELETE refuses both kinds of rename until it
+        // lets go, and here it lets go while the engine is waiting: the run lands.
+        // That is what the wait is for. The reader is released once the engine has
+        // asked a second time, so the case waits on the engine and not on a clock
+        // (the bound is only so that an engine that never asks again fails this
+        // case and does not hang it), and the engine runs with the product's own
+        // patience.
+        layOutPair(dir);
+        realRenames();
+        HANDLE reader = holdOpen(d3d11, false);
+        check(reader != INVALID_HANDLE_VALUE, "a reader not sharing DELETE can hold the graphics DLL open");
+        std::thread letGo([reader] {
+            for (int i = 0; i < 3000 && posixReplaceAttempts() < 2; ++i) Sleep(1);
+            Sleep(20);
+            if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
+        });
+        const ApplyResult r = applyPlan(pairPlan(dir), provider(false));
+        letGo.join();
+        check(r.ok, "a reader that lets go while the engine waits does not fail the run", r.error);
+        check(posixReplaceAttempts() >= 3,
+              "after the first replace was refused at least once, and the second one asked",
+              std::to_string(posixReplaceAttempts()) + " calls");
+        expectEq(readAll(d3d11), newGraphics, "the graphics DLL is replaced");
+        expectEq(readAll(runtime), newRuntime, "and so is the runtime");
+        expectEq(listing(dir), pairListing, "with no staged file left");
+    }
+
+    replacePatienceForTest(-1, 0);
     realRenames();
 }
 
@@ -2620,6 +3023,7 @@ int wmain(int argc, wchar_t** argv) {
     testMirror(scratch);
     testAtomicWrite(scratch);
     testReplaceScripts(scratch);
+    testApplyPatience(scratch);
     testGenerations(scratch);
     testMirrorGenerations(scratch);
     testProbe(scratch);

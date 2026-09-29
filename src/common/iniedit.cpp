@@ -956,6 +956,16 @@ bool writeFileAtomic(const std::wstring& path, const std::string& bytes, std::ws
     return false;
 }
 
+bool replaceFileAtomic(const std::wstring& from, const std::wstring& to,
+                       const AtomicWriteOptions& options, int* tries, unsigned long* code) {
+    DWORD last = ERROR_SUCCESS;
+    int made = 0;
+    const bool replaced = replaceFile(from, to, options, &made, &last);
+    if (tries) *tries = made;
+    if (code) *code = replaced ? ERROR_SUCCESS : last;
+    return replaced;
+}
+
 void replaceHooksForTest(ReplaceHook posix, ReplaceHook classic) {
     g_posixHook.store(posix);
     g_classicHook.store(classic);
