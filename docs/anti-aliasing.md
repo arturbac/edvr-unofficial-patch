@@ -2214,10 +2214,10 @@ runtime returns before the resolve: nothing to sharpen, and the panel
 row dims like the DLSS preset row (it stays on the page and stops
 taking steps and typing). VR is unchanged; only the wording of the
 pass's log lines follows the profile. Cost is unmeasured in flat. VR's
-records are 0.04 ms an eye at the flight above and RCAS 0.23 ms an eye
-at 5792x5356 (`crisp-ui-handoff.md`); by pixel count that is a few
-hundredths of a millisecond at 1080p to 1440p, an estimate the
-"measured" line will replace.
+records are 0.04 ms an eye (the second build's flight, in "Feature B")
+and RCAS 0.23 ms an eye at 5792x5356 (`crisp-ui-handoff.md`); by pixel
+count that is a few hundredths of a millisecond at 1080p to 1440p, an
+estimate the "measured" line will replace.
 
 **Warm-up and ticks in flat, traced.** The pass's session hooks are in
 `vscreen.cpp` and all run in flat. `installVScreenFixes` (called from
