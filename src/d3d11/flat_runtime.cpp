@@ -18,6 +18,7 @@
 #include "exposure_fix.h"
 #include "device_hook.h"
 #include "dlaa.h"
+#include "flat_sharpen.h"
 #include "../common/config.h"
 #include "../common/log.h"
 #include "../common/runtime_profile.h"
@@ -2132,7 +2133,10 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         return;
     }
     s.reason = nonzeroPhase(s)?"treated-jittered":"treated-zero-jitter";
-    ID3D11ShaderResourceView* replacement = outputView.Get(); ctx->PSSetShaderResources(0, 1, &replacement); replaced = true;
+    // fix.render_sharpness: the resolve's output through the shared RCAS pass, before the game's own copy
+    // samples it (flat_sharpen.h). The interface is drawn after that copy, so it is never sharpened. At 0,
+    // after a refusal or for a view the pass cannot use this is the resolve's own view; never in place.
+    ID3D11ShaderResourceView* replacement = flatSharpenView(ctx, outputView.Get()); ctx->PSSetShaderResources(0, 1, &replacement); replaced = true;
     s.previous = selected; s.previousColor = actualColor; s.havePrevious = s.treated = true; s.temporalAccepted=true;s.lastMs = now; ++s.accepted;
     s.previousRowsX = f.rowsJitterX; s.previousRowsY = f.rowsJitterY; // the phase the rows now stored in s.previous carry
     s.drawCapture.qualify(s.prefix.frame,selected.depth,selected.hdr,selected.renderWidth,selected.renderHeight);

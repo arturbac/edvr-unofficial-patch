@@ -25,8 +25,14 @@
 // export it resolves by GetProcAddress and stands down without in the
 // theater's "mismatched pair?" voice. Null from the export means "forward
 // what you had", and every refusal says why once.
+//
+// The flat profile calls the same export (flat_sharpen.cpp), on the frame the
+// flat resolve hands the game's output copy, with the same setting and the same
+// pass and no copy of the shader. Its lines say "frame" where VR's say "eye",
+// and its never-ran note names the flat runtime instead of a compositor hook.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 struct ID3D11DeviceContext;
@@ -46,9 +52,20 @@ void sharpenPassConfigure(Config& cfg);
 // and the missing-hook note.
 void sharpenPassTick(ID3D11DeviceContext* ctx);
 
-// For the periodic totals line: how many eye-submits have been sharpened,
-// and the measured price. False when nothing has run.
+// For the periodic totals line: how many eye-submits (flat: frames) have been
+// sharpened, and the measured price. False when nothing has run.
 bool sharpenPassTotals(uint32_t* treated, double* avgMs, double* maxMs);
+
+// The periodic totals line itself, said only while the count moved. Called from
+// the frame boundary's 30-second report; the wording is the profile's.
+void sharpenPassNoteTotals();
+
+// The note the tick says, once, when the setting has been on for 30 seconds and
+// nothing has been sharpened. Pure, so a rig can read every wording: VR names the
+// missing compositor hook; flat has no hook and names the anti-aliasing that is
+// off, or the flat runtime that handed over no resolved frame.
+void sharpenPassNeverRanText(char* out, size_t cap, bool flat, bool antiAliasingOn,
+                             float strength);
 
 void sharpenPassShutdown();
 

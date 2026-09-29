@@ -94,6 +94,11 @@ inline const char* runtimeProfileName() {
 // Flat owns a separate mono adapter. Generic setting reads cannot activate the
 // stereo pipeline or unrelated fixes; the mono adapter explicitly reads the
 // desired mode through requestedTemporalMode().
+//
+// A key the flat panel shows must be listed here or its getter reads 0 and the
+// row does nothing, with no line in the log. The panel's rows are the table in
+// menu_flat_rows.h, and tools\flat_sharpen_test fails the build for any of
+// them this function refuses.
 inline bool runtimeProfileAllowsKey(const char* key) {
     if (runtimeVrProfile()) return true;
     if (!key) return false;
@@ -106,6 +111,7 @@ inline bool runtimeProfileAllowsKey(const char* key) {
         std::strcmp(key, "fix.temporal_aa_camera") == 0 ||
         std::strcmp(key, "fix.temporal_aa_camera_trace") == 0 ||
         std::strcmp(key, "hotkey.dump_draws") == 0 ||
+        std::strcmp(key, "fix.render_sharpness") == 0 ||
         std::strcmp(key, "experimental.temporal_aa_jitter") == 0 ||
         std::strcmp(key, "experimental.temporal_aa_partial") == 0);
 }

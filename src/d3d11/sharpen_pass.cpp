@@ -4,6 +4,7 @@
 #include "graphics_runtime.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -15,7 +16,9 @@
 #include "../common/frame_flag.h"   // glitchConsumerPresent: is a compositor hook alive
 #include "../common/guard.h"
 #include "../common/log.h"
+#include "../common/runtime_profile.h"   // runtimeFlatProfile: what a "pass" is counted in
 #include "../common/supersample_math.h"   // supersampleRegionFromBounds: the eye's pixels
+#include "../common/temporal_mode.h"      // temporalModeEnabled: why the flat pass may never run
 #include "../common/timing.h"
 #include "shader_swap.h"
 #include "gpu_timing.h"
@@ -72,6 +75,13 @@ float stopsOf(float strength) {
     if (strength < 0.0f) strength = 0.0f;
     return 2.0f * (1.0f - strength);
 }
+
+// What one pass is counted in. VR sharpens each eye it submits; the flat
+// profile sharpens one frame a call (flat_sharpen.h), and its log says frames,
+// because "per eye" there would read as a stereo pair that does not exist.
+bool flatPass() { return runtimeFlatProfile(); }
+const char* perUnit() { return flatPass() ? "frame" : "eye"; }
+const char* unitsSharpened() { return flatPass() ? "frames" : "eye-submits"; }
 
 // The format allowlist, shared with the temporal pass (temporal_pass.cpp)
 // -- typeless and UNORM families read and written through the family's
@@ -195,11 +205,11 @@ void maybeLogTiming() {
     if (g_timeLogged || g_timeCount < 120) return;
     g_timeLogged = true;
     Log::get().note(
-        "render sharpening: measured %.2f ms per eye on average (max %.2f) "
+        "render sharpening: measured %.2f ms per %s on average (max %.2f) "
         "at %ux%u -- one dispatch of AMD's RCAS at strength %.2f (%.2f "
         "stops; render_sharpness moves it, live).",
-        g_timeSum / static_cast<double>(g_timeCount), g_timeMax, g_lastW,
-        g_lastH, static_cast<double>(g_lastStrength),
+        g_timeSum / static_cast<double>(g_timeCount), perUnit(), g_timeMax,
+        g_lastW, g_lastH, static_cast<double>(g_lastStrength),
         static_cast<double>(stopsOf(g_lastStrength)));
 }
 
@@ -597,16 +607,20 @@ void* sharpenInner(void* srcTex, int eye, const float* bounds, float strength) {
                 Log::get().note(
                     "render sharpening: first sharpened frame -- AMD's RCAS at "
                     "strength %.2f (%.2f stops) over a %ux%u %s (DXGI_FORMAT "
-                    "%d) frame, read and written through %s views%s, the last "
-                    "pass before the frame leaves. render_sharpness moves the "
-                    "strength, live.",
+                    "%d) frame, read and written through %s views%s, %s. "
+                    "render_sharpness moves the strength, live.",
                     static_cast<double>(strength),
                     static_cast<double>(stopsOf(strength)), regionW, regionH,
                     formatName(sd.Format), static_cast<int>(sd.Format),
                     formatName(viewFmt),
                     viaCopy ? " (copied out first: the source refuses a "
                               "shader view)"
-                            : "");
+                            : "",
+                    flatPass()
+                        ? "on the temporal resolve's output, before the game's "
+                          "own output copy -- the interface is drawn after it "
+                          "and is not sharpened"
+                        : "the last pass before the frame leaves");
             }
         } else {
             failOnce("the parameter buffer could not be written");
@@ -639,22 +653,57 @@ void sharpenPassTick(ID3D11DeviceContext* ctx) {
             g_warmNoted = true;
             Log::get().note(
                 "render sharpening: shader warmed at session start -- the "
-                "first sharpened eye pays no compile.");
+                "first sharpened %s pays no compile.",
+                perUnit());
         }
     }
-    // The other half's absence, said from this side (the resolve's note,
-    // for the same reason).
-    if (!g_noHookNoted && !glitchConsumerPresent() && !nativeSharpenActive() &&
-        elapsedMs(g_firstTickMs, kNoHookNoteMs)) {
-        g_noHookNoted = true;
-        Log::get().note(
-            "render sharpening: fix.render_sharpness is %.2f, but no "
-            "compositor hook has announced itself after %llu s. The pass "
-            "runs inside the openvr_api.dll half's Submit hook -- install "
-            "that file, or restart the game with the setting on so the hook "
-            "installs for it. Nothing is sharpened until then.",
-            static_cast<double>(g_strength),
-            static_cast<unsigned long long>(kNoHookNoteMs / 1000));
+    if (g_noHookNoted || !elapsedMs(g_firstTickMs, kNoHookNoteMs)) return;
+    // The flat profile has no compositor hook to wait for: the pass runs from
+    // the flat runtime, on a frame it has resolved, so what it can be waiting
+    // on is a frame -- and it is said only if none has come (g_treats).
+    // Otherwise the other half's absence, said from this side (the resolve's
+    // note, for the same reason).
+    const bool say = flatPass()
+        ? g_treats == 0
+        : !glitchConsumerPresent() && !nativeSharpenActive();
+    if (!say) return;
+    g_noHookNoted = true;
+    char text[640];
+    sharpenPassNeverRanText(text, sizeof(text), flatPass(),
+                            temporalModeEnabled(Config::get().requestedTemporalMode()),
+                            g_strength);
+    Log::get().note("%s", text);
+}
+
+void sharpenPassNeverRanText(char* out, size_t cap, bool flat, bool antiAliasingOn,
+                             float strength) {
+    const unsigned long long seconds = kNoHookNoteMs / 1000;
+    if (!out || !cap) return;
+    if (!flat) {
+        snprintf(out, cap,
+                 "render sharpening: fix.render_sharpness is %.2f, but no "
+                 "compositor hook has announced itself after %llu s. The pass "
+                 "runs inside the openvr_api.dll half's Submit hook -- install "
+                 "that file, or restart the game with the setting on so the hook "
+                 "installs for it. Nothing is sharpened until then.",
+                 static_cast<double>(strength), seconds);
+    } else if (!antiAliasingOn) {
+        snprintf(out, cap,
+                 "render sharpening: fix.render_sharpness is %.2f, but no frame "
+                 "has been sharpened after %llu s: anti-aliasing is off "
+                 "(fix.temporal_aa), and in the flat profile the sharpening runs "
+                 "on the temporal pass's output. Turn on TAA, DLSS or FSR and it "
+                 "applies at once.",
+                 static_cast<double>(strength), seconds);
+    } else {
+        snprintf(out, cap,
+                 "render sharpening: fix.render_sharpness is %.2f, but no frame "
+                 "has been sharpened after %llu s, with anti-aliasing on. The "
+                 "flat runtime has handed the sharpening no resolved frame -- "
+                 "read its 'flat runtime:' lines for why it refuses or falls "
+                 "back, and note that a frame it falls back on is left as it "
+                 "is.",
+                 static_cast<double>(strength), seconds);
     }
 }
 
@@ -666,17 +715,30 @@ bool sharpenPassTotals(uint32_t* treated, double* avgMs, double* maxMs) {
     return true;
 }
 
+void sharpenPassNoteTotals() {
+    static uint32_t lastTreats = 0;
+    uint32_t treated = 0;
+    double avgMs = 0.0, maxMs = 0.0;
+    if (!sharpenPassTotals(&treated, &avgMs, &maxMs) || treated == lastTreats) return;
+    lastTreats = treated;
+    Log::get().note(
+        "render sharpening totals: %u %s sharpened this session, %.2f ms per "
+        "%s on average (max %.2f).",
+        treated, unitsSharpened(), avgMs, perUnit(), maxMs);
+}
+
 void sharpenPassShutdown() {
     if (g_treats > 0) {
         Log::get().note(
-            "render sharpening: %u eye-submits sharpened this session%s.",
-            g_treats, g_timeCount ? "" : " (no timing sample completed)");
+            "render sharpening: %u %s sharpened this session%s.",
+            g_treats, unitsSharpened(),
+            g_timeCount ? "" : " (no timing sample completed)");
         if (g_timeCount) {
             Log::get().note(
-                "render sharpening: measured %.2f ms per eye on average (max "
+                "render sharpening: measured %.2f ms per %s on average (max "
                 "%.2f) over %u timed passes.",
-                g_timeSum / static_cast<double>(g_timeCount), g_timeMax,
-                g_timeCount);
+                g_timeSum / static_cast<double>(g_timeCount), perUnit(),
+                g_timeMax, g_timeCount);
         }
     }
     for (EyeState& e : g_eye) releaseEye(e);

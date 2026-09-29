@@ -30,6 +30,7 @@
 #include "elite_binds.h"
 #include "flat_runtime.h"
 #include "input_gate.h"
+#include "menu_flat_rows.h"
 #include "menu_keys.h"
 #include "menu_panel.h"
 #include "native_menu.h"
@@ -360,6 +361,20 @@ bool dlssPresetDisabled() {
     if (runtimeFlatProfile()) return !flatDlssSelected();
     return temporalEngineFor(Config::get().getString("fix.temporal_aa", "off")) !=
            TemporalEngine::Nvidia;
+}
+
+// fix.render_sharpness (the Sharpening row). VR sharpens whatever it submits,
+// so there its row never dims. The flat profile sharpens the temporal pass's
+// output (flat_sharpen.h), so with anti-aliasing off there is nothing for it
+// to act on: the row stays on the panel, dimmed, and stops responding, the way
+// the DLSS preset row does under a mode that does not read it.
+bool isSharpenRow(const MenuRowDef& d) {
+    return strcmp(d.section, "fix") == 0 && strcmp(d.key, "render_sharpness") == 0;
+}
+
+bool sharpenRowDisabled() {
+    return flatSharpenRowDim(runtimeFlatProfile(),
+                             temporalModeEnabled(Config::get().requestedTemporalMode()));
 }
 
 // The on-foot panel's width: "auto", or a width in pixels -- never a list, so
@@ -1393,9 +1408,10 @@ void buildPages() {
         p.name = "Flat graphics";
         for (int i = 0; i < kRowDefCount; ++i) {
             const MenuRowDef& d = kMenuRows[i];
-            if (strcmp(d.section, "fix") != 0) continue;
-            if (strcmp(d.key, "temporal_aa") != 0 &&
-                strcmp(d.key, "temporal_aa_model") != 0) continue;
+            // The rows are the table in menu_flat_rows.h, which a rig checks
+            // against the flat profile's key gate: a row listed there whose key
+            // is refused fails the build instead of reading a silent 0.
+            if (!flatPageHasRow(d.section, d.key)) continue;
             Entry e;
             e.kind = EntryKind::Setting;
             e.def = i;
@@ -1989,7 +2005,9 @@ void buildContent(MenuContent& c) {
             const RowState& r = g_rows[e.def];
             const bool editingThis = (s.editEntry == i);
             const bool dlssRow = isDlssPresetRow(d);
-            const bool dim = dlssRow && dlssPresetDisabled();
+            const bool sharpenRow = isSharpenRow(d);
+            const bool dim = (dlssRow && dlssPresetDisabled()) ||
+                             (sharpenRow && sharpenRowDisabled());
             l.dim = dim;
             strncpy(l.left, d.label, sizeof(l.left) - 1);
             if (dlssRow) {
@@ -2055,7 +2073,9 @@ void buildContent(MenuContent& c) {
                       : dim       ? kMenuDim
                                   : kMenuRow;
             if (hi && dim && runtimeFlatProfile())
-                snprintf(c.hint, sizeof(c.hint), "Choose DLSS to change its model preset.");
+                snprintf(c.hint, sizeof(c.hint), "%s",
+                         sharpenRow ? "Turn anti-aliasing on to sharpen."
+                                    : "Choose DLSS to change its model preset.");
             if (hi && openxrScaleRow) {
                 snprintf(c.hint, sizeof(c.hint), "%s", openxrResolutionHint(res).c_str());
             }
@@ -2470,6 +2490,11 @@ void stepRow(int defIndex, int dir, int mult) {
         g_s.contentDirty = true;
         return;
     }
+    if (isSharpenRow(d) && sharpenRowDisabled()) {
+        g_s.lastWrite = "Sharpening is inactive: turn anti-aliasing on above first.";
+        g_s.contentDirty = true;
+        return;
+    }
     if (isOpenxrRenderScaleRow(d)) {
         // A width for the worn headset, stepped by 100 px on the grid of
         // round hundreds (steppedResolution); the generated row is Text,
@@ -2818,6 +2843,13 @@ bool editBufferBad() {
 void beginEdit(int entryIndex, int defIndex) {
     State& s = g_s;
     std::string seed = g_rows[defIndex].value;
+    // A typed value is a change like a step is: the dimmed Sharpening row takes
+    // neither (stepRow says why).
+    if (isSharpenRow(kMenuRows[defIndex]) && sharpenRowDisabled()) {
+        s.lastWrite = "Sharpening is inactive: turn anti-aliasing on above first.";
+        s.contentDirty = true;
+        return;
+    }
     if (isOpenxrRenderScaleRow(kMenuRows[defIndex])) {
         // The buffer holds the worn headset's width as digits, never the
         // list (so kEditMax cannot cut it); with no headset to key on the
