@@ -1149,7 +1149,7 @@ lock wait included), apply (`primaryCopy::apply`, inside the draw side), tees
 patches, on a cache miss only). Three lines every 30 s:
 
 ```
-engine motion CPU: 30 s, 2700 frames; ... Render thread 4321: total p50 0.31 / p95 0.52 / max 1.94 ms per frame over 68.0 clocked calls per frame. Other threads: 1310.00 ms per s across 7 threads over 2647.0 clocked calls per frame. Clock floor: a timed scope records 12 ns and costs 33 ns (32 and 66 ns with a forward pause; 2048 null pairs), so these figures include about 0.086 ms per frame of floor and the instrument costs about 0.177 ms per frame.
+engine motion CPU: 30 s, 2700 frames; ... Render thread 4321: total p50 0.31 / p95 0.52 / max 1.94 ms per frame over 68.0 clocked calls per frame. Other threads: 1310.00 ms per s across 7 threads over 2647.0 clocked calls per frame. Clock floor: a timed scope records 12 ns and costs 33 ns (32 and 66 ns with a forward pause; the fastest of 4 batches of 512 null pairs, measured as this window closed), so these figures include about 0.086 ms per frame of floor and the instrument costs about 0.177 ms per frame.
 engine motion CPU, render thread, ms per frame p50/p95/max (calls per frame; longest call ms), "-" = the code never ran on this thread in the window: draw side 0.20/0.35/1.20 (52.0; 0.21), apply 0.08/0.12/0.60 (2.0; 0.50), tees 0.01/0.02/0.05 (14.0; 0.02), shader patch 0.00/0.00/0.00 (0.001; 2.10), emit -, rigid emit -, ...; shader patches this window on every thread: 3, total 4.20 ms, longest 2.10 ms.
 engine motion CPU, other threads (7), ms per s (calls per frame; longest call ms), "-" = the code never ran off the render thread in the window: draw side -, ..., emit 1200.00 (2450.0; 0.04), rigid emit 30.00 (127.0; 0.01), copier 70.00 (40.0; 0.09), ..., eval 5400.0 calls per frame, not clocked (a pass-through).
 ```
@@ -1169,18 +1169,23 @@ probe branches are clocked; the line says "not clocked". The quick path of
 `beforeDrawSlow` and the inline half of `engineVelocityBeforeDraw` (compares,
 tens of thousands of draws a frame) are neither clocked nor counted; the
 frame-boundary work (`engineVelocityFrameBoundary`, the views, the summary
-line) is in the tick chain's "slowest EDVR ticks". The flat profile's draws
-go through their own scope: its engine-motion hooks are timed, its draws are
-not counted by section 3.
+line) is in the tick chain's "slowest EDVR ticks". The flat profile never
+reaches the monitor tick (it has no LONG FRAME line either), so none of the
+`engine motion CPU` lines print there, and its draws go through their own
+scope, so section 3 does not count them.
 
-The instrument's own price is calibrated on the real clock at the first frame,
-the way the census states its timer floor: null scopes, both shapes, what a
-null scope records (every figure includes it once per call) and what it costs.
+The instrument's own price is calibrated on the real clock as each window
+closes, the way the census states its timer floor: null scopes on the render
+thread in the CPU state the window ran in (a clock that idled at the menu is
+not the flight's), both shapes, four batches each with the fastest kept (a
+batch a preemption inflated is not the floor), what a null scope records
+(every figure includes it once per call) and what it costs.
 On the build machine (QPC 10 MHz, a reading about 16 ns) a plain scope records
 12-19 ns and costs 33-35 ns; one with a forward pause records 32-33 ns and
 costs 66 ns (the rig prints it on every build). At the carrier's 2,930 emit calls a frame that is about 0.19 ms of job-
 thread time a frame; the render thread's draw side is 50-ish calls a frame,
-under 2 us. Each window prints its own figure (the last sentence of line 1).
+under 2 us. Each window prints its own figure (the last sentence of line 1); the
+calibration itself is about 0.2 ms once a window, on the render thread.
 
 **2. The GPU's gap between frames.** The Application-render span already
 brackets a frame's producer GPU work on the game's device: its first
@@ -1270,7 +1275,8 @@ pause, thread attribution, no lost update under four writers and a cutter
 (400,000 calls exact), percentiles in a hostile order, "-" against 0.00, the
 three lines at their worst (693, 973 and 659 of 1150 allowed), the priming
 frame, the 30 s and full-window closes, per-call maxima per window, the clock
-floor exact on a clock that steps and measured on the real one; mutation-checked.
+floor exact on a clock that steps (and unmoved by a simulated preemption) and
+measured on the real one; mutation-checked (eleven mutants, all caught).
 `native_perf_history_test`: the LONG FRAME clause and its worst case.
 `gpu_census_test`: the gap saturated, starved, compositor-sized, with a missing
 and a late pair, a duplicate, another clock, an overlap, a stall, and every
