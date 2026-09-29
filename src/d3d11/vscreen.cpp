@@ -42,10 +42,7 @@
 #include "fss_panel_rect.h"
 #include "fss_reveal.h"
 #include "fss_dump.h"
-#include "eye_split.h"
-#include "resolve_probe.h"
 #include "resolve_bind_fix.h"
-#include "stencil_probe.h"
 #include "fss_res.h"
 #include "depth_probe.h"      // Phase 0 item 3: which depth target the eye draws use, and how it reads
 #include "sharpen_pass.h"      // likewise: warm-up and totals; the sharpening runs at submit
@@ -1533,13 +1530,10 @@ enum class DrawVerdict {
     // in fssRevealBegin/End.
     kFssReveal,
     kFssDump,
-    // The deferred lighting resolve drawn through a replacement pixel
-    // shader (advanced.resolve_probe), wrapped in resolveProbeBegin/End.
-    kResolveProbe,
-    // One named draw re-issued with a different stencil REFERENCE and
-    // nothing else changed (advanced.stencil_probe), wrapped in
-    // stencilProbeBegin/End.
-    kStencilProbe,
+    // The deferred lighting resolve drawn with the scanner-body fix's
+    // input lend (fix.scanner_body, resolve_bind_fix.h), wrapped in
+    // resolveBindBegin/End.
+    kResolveBind,
     // A batched draw re-issued without some of its quads (advanced.
     // census_skip_quad). Swallows the game's draw and makes up to two of its
     // own, so it must not be combined with anything that also draws.
@@ -1679,8 +1673,7 @@ bool drawGateSubscribed(State* s) {
         s->censusAutoW != 0 || fssResActive() ||
         fssPanelWantsDraws() || fssRevealWantsDraws() ||
         fssDumpWantsDraws() ||
-        eyeSplitWantsDraws() || resolveProbeWantsDraws() ||
-        stencilProbeWantsDraws() || resolveBindWants() ||
+        resolveBindWants() ||
         remlokWantsDraws() || holoWantsDraws() || targetSharpWantsDraws() ||
         hudSpriteWantsDraws() || panelUpscaleWantsDraws() || hudGrainWantsDraws() ||
         uiDepthWantsDraws() ||
@@ -2590,38 +2583,17 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         return DrawVerdict::kFssDump;
     }
 
-    // The eye split (the black planet, 2026-08-30): note which target this
-    // draw lands in, so the frame boundary knows what to copy. Passive by
-    // construction -- it returns no verdict and changes no binding, so it
-    // composes with every fix below it and records the frame as the game
-    // actually renders it. It is gated by nothing but its own arming: the
-    // whole point is that it needs no knowledge of which draw is the body,
-    // every previous guess at that having been wrong.
-    if (eyeSplitWantsDraws()) eyeSplitOnEyeDraw(self);
-
-    // The resolve probe (the black planet, 2026-08-30): recognised by its
-    // PIXEL shader hash, so it is asked LAST -- every fix above it that
-    // swaps a shader has already had its say, and this one replaces the
-    // whole pass rather than composing with anything.
+    // The scanner-body fix's resolve (the black planet, 2026-08-30):
+    // recognised by its PIXEL shader hash, so it is asked LAST -- every fix
+    // above it that swaps a shader has already had its say.
     // resolveBindShadowSaysNo (resolve_bind_fix.h) is the fix's own first
     // answer from the shadow, inline: a held shader whose hash is not the
     // resolve's is a false the call gives without touching anything.
-    if ((resolveProbeWantsDraws() && resolveProbeOnEyeDraw(self)) ||
-        (resolveBindWants() &&
-         !resolveBindShadowSaysNo(bindingGet(BindSlot::Ps) != nullptr,
-                                  bindingShaderHash(BindSlot::Ps)) &&
-         resolveBindOnEyeDraw(self))) {
-        return DrawVerdict::kResolveProbe;
-    }
-
-    // The stencil probe (the black planet, 2026-08-31), asked after the
-    // resolve probe because the two name different draws and the resolve is
-    // the more specific claim. This one changes no shader and swallows no
-    // draw -- it re-binds the game's own state with one number altered -- so
-    // it composes with everything and needs no place in the order beyond
-    // being past every fix that swaps a shader.
-    if (stencilProbeWantsDraws() && stencilProbeOnEyeDraw(self)) {
-        return DrawVerdict::kStencilProbe;
+    if (resolveBindWants() &&
+        !resolveBindShadowSaysNo(bindingGet(BindSlot::Ps) != nullptr,
+                                 bindingShaderHash(BindSlot::Ps)) &&
+        resolveBindOnEyeDraw(self)) {
+        return DrawVerdict::kResolveBind;
     }
 
     // The sun-glare element train: off skips it, first:K clamps it, and the
@@ -3609,8 +3581,7 @@ __declspec(noinline) void forwardQuadSkip(ID3D11DeviceContext* self) {
 // Now the common draw pays one compare (v != kNone) and the rare one pays a
 // call into a switch. Exactly the same functions run for every verdict, in
 // the same order: each ladder rung was independent and v is a single value,
-// so at most one rung fired -- except kResolveProbe, which fired two in a
-// fixed order and fires the same two in the same order here. kBackdrop's End
+// so at most one rung fired. kBackdrop's End
 // is NOT here: it must precede the splash re-issue, which needs the draw
 // callable, so it stays inline in forwardWithVerdict. kNone, kPanel,
 // kIntroPanel and kGlareClamp had no rung and have no case.
@@ -3620,8 +3591,7 @@ __declspec(noinline) void forwardVerdictBegin(ID3D11DeviceContext* self, DrawVer
     case DrawVerdict::kFssPanel:     fssPanelBegin(self); break;
     case DrawVerdict::kFssReveal:    fssRevealBegin(self); break;
     case DrawVerdict::kFssDump:      fssDumpBegin(self); break;
-    case DrawVerdict::kResolveProbe: resolveBindBegin(self); resolveProbeBegin(self); break;
-    case DrawVerdict::kStencilProbe: stencilProbeBegin(self); break;
+    case DrawVerdict::kResolveBind:  resolveBindBegin(self); break;
     case DrawVerdict::kHolo:         holoBegin(self); break;
     case DrawVerdict::kTargetSharp:  targetSharpBegin(self); break;
     case DrawVerdict::kNightVision:  nightVisionBegin(self); break;
@@ -3648,8 +3618,7 @@ __declspec(noinline) void forwardVerdictEnd(ID3D11DeviceContext* self, DrawVerdi
     case DrawVerdict::kNightVision:  nightVisionEnd(self); break;
     case DrawVerdict::kHolo:         holoEnd(self); break;
     case DrawVerdict::kFssReveal:    fssRevealEnd(self); break;
-    case DrawVerdict::kStencilProbe: stencilProbeEnd(self); break;
-    case DrawVerdict::kResolveProbe: resolveProbeEnd(self); resolveBindEnd(self); break;
+    case DrawVerdict::kResolveBind:  resolveBindEnd(self); break;
     case DrawVerdict::kFssDump:      fssDumpEnd(self); break;
     case DrawVerdict::kFssPanel:     fssPanelEnd(self); break;
     case DrawVerdict::kRemlok:       remlokScissorEnd(self); break;
@@ -5268,10 +5237,7 @@ void vScreenRefreshConfig() {
     fssPanelConfigure(cfg);
     fssRevealConfigure(cfg);
     fssDumpConfigure(cfg);
-    eyeSplitConfigure(cfg);
-    resolveProbeConfigure(cfg);
     resolveBindConfigure(cfg);
-    stencilProbeConfigure(cfg);
     // advanced.eye_origin_readers: the engine-side fix design doc's
     // (docs/design-transition-flash-engine-fix-2026-09-23.md) parts A2/B (who
     // reads the pose, and the positioner swap). Off leaves this line as
@@ -5472,7 +5438,6 @@ EDVR_BOUNDARY_TICK(tkLodGovernor, "lod_governor");
 EDVR_BOUNDARY_TICK(tkDrawCensusBoundary, "draw_census_boundary");
 EDVR_BOUNDARY_TICK(tkFssReveal, "fss_reveal");
 EDVR_BOUNDARY_TICK(tkFssDump, "fss_dump");
-EDVR_BOUNDARY_TICK(tkEyeSplit, "eye_split");
 EDVR_BOUNDARY_TICK(tkFssPacing, "fss_pacing");
 EDVR_BOUNDARY_TICK(tkRemlok, "remlok");
 }  // namespace
@@ -5616,7 +5581,6 @@ void vScreenFrameBoundary() {
     tkDrawCensusBoundary.run([&] { drawCensusFrameBoundary(s->frameNo); });
     tkFssReveal.run([&] { fssRevealFrameBoundary(); });
     tkFssDump.run([&] { fssDumpFrameBoundary(s->ownerCtx); });
-    tkEyeSplit.run([&] { eyeSplitFrameBoundary(s->ownerCtx); });
 
     // FSS frame pacing (round 31): the left-only squares are now measured
     // to be runtime-side (both submitted images carry the flicker equally),
@@ -6487,10 +6451,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     fssPanelConfigure(cfg);
     fssRevealConfigure(cfg);
     fssDumpConfigure(cfg);
-    eyeSplitConfigure(cfg);
-    resolveProbeConfigure(cfg);
     resolveBindConfigure(cfg);
-    stencilProbeConfigure(cfg);
     // advanced.eye_origin_readers: the same design doc's parts A2/B. See
     // the other call site's comment above.
     poseReaderWatchConfigure(cfg);
@@ -6844,11 +6805,8 @@ void shutdownVScreenFixes() {
     fssPanelRectShutdown();
     fssRevealShutdown();
     fssDumpShutdown();
-    eyeSplitShutdown();
     gpuCensusShutdown();
-    resolveProbeShutdown();
     resolveBindShutdown();
-    stencilProbeShutdown();
     billboardShutdown();
     // Both halves of the intro. Neither was on this roll-call, so a session
     // that ended without a rendered scene ever arriving -- quitting from the

@@ -1,7 +1,6 @@
 #pragma once
 // Build-only registry and independent original call contracts.
 #include "../../src/d3d11/fixed_extra_shader_source.h"
-static const D3D_SHADER_MACRO resolveWhite[]={{"PROBE_WHITE","1"},{nullptr,nullptr}};
 static const D3D_SHADER_MACRO sunNoGate[]={{"NOGATE","1"},{nullptr,nullptr}};
 static const D3D_SHADER_MACRO sunAllWorld[]={{"ALLWORLD","1"},{nullptr,nullptr}};
 static const D3D_SHADER_MACRO sunAllFlat[]={{"ALLFLAT","1"},{nullptr,nullptr}};
@@ -13,8 +12,6 @@ static std::vector<Variant> extraVariants() { return {
     {"kFssMirrorBytecode","fss_mirror_cs","main",nullptr,{},false,edvr::fixed_extra_source::fss_heal::kMirrorCsHlsl,"cs_5_0"},
     {"kFssSeriesBytecode","fss_series_cs","main",nullptr,{},false,edvr::fixed_extra_source::fss_dump::kSeriesCsHlsl,"cs_5_0"},
     {"kDepthProbeBytecode","depth_probe_cs","main",nullptr,{},false,edvr::fixed_extra_source::depth_probe::kSampleCsHlsl,"cs_5_0"},
-    {"kResolveProbeBytecode","resolve_probe_ps","main",nullptr,{},false,edvr::fixed_extra_source::resolve_probe::kProbePsHlsl,"ps_5_0"},
-    {"kResolveProbeWhiteBytecode","resolve_probe_ps","main",resolveWhite,{},false,edvr::fixed_extra_source::resolve_probe::kProbePsHlsl,"ps_5_0"},
     {"kSharpenBytecode","render_sharpen_cs","main",nullptr,{},false,edvr::fixed_extra_source::sharpen_pass::kRcasSource.c_str(),"cs_5_0"},
     {"kHudSpriteEasuBytecode","hud sprite easu","main",nullptr,{},false,edvr::fixed_extra_source::hud_sprite::kEasuSource.c_str(),"cs_5_0"},
     {"kHudSpriteRcasBytecode","hud sprite rcas","main",nullptr,{},false,edvr::fixed_extra_source::hud_sprite::kRcasSource.c_str(),"cs_5_0"},
@@ -39,8 +36,6 @@ static std::vector<LegacyContract> extraLegacyContracts() { return {
     {"fss_mirror_cs","main","cs_5_0",nullptr,0xCF8ED1F8A5128648ull},
     {"fss_series_cs","main","cs_5_0",nullptr,0x39D22A2CEC2CA3B4ull},
     {"depth_probe_cs","main","cs_5_0",nullptr,0x81178F52E95106A3ull},
-    {"resolve_probe_ps","main","ps_5_0",nullptr,0xFD04E71DDC43975Aull},
-    {"resolve_probe_ps","main","ps_5_0",resolveWhite,0xFD04E71DDC43975Aull},
     {"render_sharpen_cs","main","cs_5_0",nullptr,0x55C78550EA904C99ull},
     {"hud sprite easu","main","cs_5_0",nullptr,0xD693C1B6B1A51624ull},
     {"hud sprite rcas","main","cs_5_0",nullptr,0xABA93E5D6D353D5Eull},

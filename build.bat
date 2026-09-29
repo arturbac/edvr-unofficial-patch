@@ -521,9 +521,6 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\fss_panel.cpp" ^
     "src\d3d11\fss_reveal.cpp" ^
     "src\d3d11\fss_dump.cpp" "src\d3d11\fss_heal.cpp" ^
-    "src\d3d11\eye_split.cpp" ^
-    "src\d3d11\resolve_probe.cpp" ^
-    "src\d3d11\stencil_probe.cpp" ^
     "src\d3d11\resolve_bind_fix.cpp" ^
     "src\d3d11\xinput_watch.cpp" ^
     "src\d3d11\fss_panel_rect.cpp" ^
@@ -2096,18 +2093,6 @@ REM match LedgerDraw in src\d3d11\object_probe.cpp byte for byte -- a field
 REM one off reads as a plausible table of draws. It fails HERE.
 python "%ROOT%\tools\eye_run_ledger.py" --self-test || (
     echo [edvr] ERROR: the eye-run ledger tool failed its own test
-    exit /b 1
-)
-
-echo [edvr] === eye-split diff self-test ===
-REM The tool that compares the two eyes of one frame. It registers the
-REM eyes before it compares them, because their projections are off-centre
-REM by different amounts and far content does not land on the same pixel in
-REM both. A sign flip in that step reads as plausible either way, and once
-REM cost a fix built on tiles that had landed on the Milky Way band. It
-REM fails HERE, not in the next report somebody trusts.
-python "tools\diff_eye_split.py" --self-test || (
-    echo [edvr] ERROR: the eye-split diff tool failed its own test
     exit /b 1
 )
 
