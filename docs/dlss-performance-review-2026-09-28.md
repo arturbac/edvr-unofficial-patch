@@ -10,8 +10,11 @@
   Earlier handoff remains ~.001ms, no failures. A bounded one-use bypass now
   passes 4,904 focused checks, including the actual registered callback,
   loading transitions and fatal invalidation; independent review found no
-  blocker. Full validation passed all 86 jobs and installer checks. Clean
-  promotion and Frontier install remain. Main unchanged.
+  blocker. Full validation passed all 86 jobs and installer checks.
+- **Installed:** Frontier `v0.18.0-rc.3-66-gc668f83f`, source `c668f83f`, after
+  clean receipt-guarded promotion; payload and native receipt verified.
+  INI/DLSS hashes preserved. Source pushed on the separate branch; main
+  unchanged.
 - **Conclusion:** two caller waits behind deferred xrEndFrame are confirmed.
   The handoff fix is flown; the validated Present bypass awaits a flight. No
   controlled whole-frame regression attribution against 0.17.0 yet. See
@@ -25,11 +28,13 @@
   2037×1969→4074×3938/UI5093×4923. Installed DLSS metadata is 310.7.0.0;
   graphics logs omit driver/DLSS versions. Profiling uses Frontier; baseline
   uses Steam.
-- **Next:** clean promotion and Frontier install, then a normal comparison
-  flight. No new capture required for diagnosis. Review B1/B2 recovery and B3
-  permission remain open. Allocation stalls and driver work stay separate;
-  sampled direct-self does not price induced driver execution. Existing GPU
-  trace `035907-fda516` is retained; do not repeat it.
+- **Next:** normal comparison flight with fpsVR, diagnostics OFF and no eye
+  dump; check empty-scene CPU time and ship-approach spikes. Use explicit
+  `--expect-build c668f83f` for this installed source. No new capture required
+  for diagnosis. Review B1/B2 recovery and B3 permission remain open.
+  Allocation stalls and driver work stay separate; sampled direct-self does not
+  price induced driver execution. Existing GPU trace `035907-fda516` is
+  retained; do not repeat it.
 
 ## Pre-optimization Frontier evidence
 
@@ -452,3 +457,15 @@ installer resource checks. Receipt input hash
 `45f4e404fdec842db22dc993da1dd4146e9de077309cc03aa2f242cd79b37791`; NGX/FFX and
 optimized profiling-symbol build context unchanged. Commit this validated
 source before receipt-guarded clean DLL promotion; Frontier only.
+
+Clean source `c668f83f` pushed to `origin/codex/dlss-performance-review`;
+receipt-guarded `--dll-only` promotion passed with `v0.18.0-rc.3-66-gc668f83f`
+(`build/dlss-present-overlap-promotion.log`). Frontier dry-run, install,
+payload verify and native-receipt verify passed; receipt
+`edvr_native_receipt.json.pre-c668f83f-20260929-054723.bak` records the
+matching pair. Both DLL version resources agree. INI and installed DLSS SHA256
+remain unchanged, as recorded with full DLL hashes in
+`build/dlss-present-overlap-frontier-install.log`. Steam and main unchanged.
+Capture helper now expects this source; its CPU-only 60-second dry-run wrote
+nothing, started no workload/session and left no output directory. Next is a
+normal flight; any whole-frame gain remains unmeasured.
