@@ -1545,12 +1545,6 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(!operation||generation!=compositorGeneration||state.frameOpen())return false;
     ++compositorHandoffs;return true; // the completed pair already ended its frame
   }
-  XrResult drawDiagnosticEye(unsigned eye,ID3D11Texture2D*& out) {
-    out=nullptr;
-    if(GetCurrentThreadId()!=ownerThread||eye>=2)return XR_ERROR_CALL_ORDER_INVALID;
-    auto operation=gate.tryEnter(runtimeGeneration);
-    return operation?stereo.drawEye(eye,frameViews[eye],out):XR_ERROR_CALL_ORDER_INVALID;
-  }
   XrResult closeDiagnosticFrame() {
     if(GetCurrentThreadId()!=ownerThread)return XR_ERROR_CALL_ORDER_INVALID;
     auto operation=gate.tryEnter(runtimeGeneration);
