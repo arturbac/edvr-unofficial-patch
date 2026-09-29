@@ -7,7 +7,6 @@
 #include "native_timing.h"
 #include "../common/native_present_trace.h"
 
-#include "shader_sig.h"
 #include "weapon_motion.h"
 #include "input_gate.h"
 #include "oculus_route.h"
@@ -692,11 +691,6 @@ HRESULT STDMETHODCALLTYPE hookedCreateVS(ID3D11Device* self, const void* bytecod
         captureFlatShader('v', hash, bytecode, len);
         rememberFlatProbeShader('v', hash, bytecode, len);
         registerShaderHash(*out, hash);
-        // ...and its INPUT SIGNATURE, which is a different question from its
-        // identity: whether the panel composite's shader reads the z of the
-        // vertices it is handed decides whether the curved screen is possible
-        // at all. See shader_sig.h.
-        shaderSigRegister(*out, bytecode, static_cast<size_t>(len));
         engineVelocityRememberVs(static_cast<ID3D11VertexShader*>(*out),hash,bytecode,static_cast<size_t>(len),linkage!=nullptr);
         weaponMotionRememberShader(static_cast<ID3D11VertexShader*>(*out),hash,bytecode,static_cast<size_t>(len));
         EyeDrawSnapshot::rememberShader(hash, bytecode, static_cast<size_t>(len));
