@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "../c2_derive_test/c2_derive_model.h"
+#include "../../src/common/system_d3d11.h"
 #include "../../src/common/temporal_math.h"
 #include "../../src/d3d11/flat_live_phase.h"
 
@@ -157,10 +158,18 @@ bool compileShader(const char* src, const char* entry, const char* target, ID3DB
 
 bool gpuInit(Gpu& g) {
     UINT flags = 0;
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
-                                 nullptr, 0, D3D11_SDK_VERSION, &g.dev, nullptr, &g.ctx))) {
+    // Windows' own d3d11 through common/system_d3d11.h, never an import: EDVR's proxy sits beside this exe.
+    const auto createDevice = edvr::systemD3D11CreateDevice();
+    if (!createDevice || FAILED(createDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags,
+                                             nullptr, 0, D3D11_SDK_VERSION, &g.dev, nullptr, &g.ctx))) {
         std::printf("  FAIL  WARP device creation\n");
         return false;
+    }
+    static bool reported = false;
+    if (!reported) {
+        reported = true;
+        check(edvr::reportSystemD3D11Only("c2_warp_test"),
+              "the rig runs on System32's d3d11.dll and on no other d3d11.dll");
     }
     ID3DBlob* blob = nullptr;
     if (!compileShader(kVsSrc, "main", "vs_4_0", &blob)) return false;
