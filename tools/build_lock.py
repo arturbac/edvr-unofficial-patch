@@ -18,11 +18,22 @@ How the lock works (architecture review 2026-09-29, I-6):
   * It names its OWNER: this helper's parent process, the cmd.exe running
     build.bat, which is alive for the whole build (the helper itself exits
     at once), with that process's creation time so a reused pid cannot pass
-    for it. A lock whose owner is no longer running is taken over at once: a
-    build that was killed, or whose terminal was closed, blocks nobody.
+    for it.
+  * A lock is STALE, and the next --acquire (or --wait) takes it, when
+      - its owner is no longer running: a build that was killed, or whose
+        terminal was closed, blocks nobody, however young the lock;
+      - its owner is this very shell: cmd runs batch files one at a time, so
+        a build starting in the shell that took the lock means the earlier
+        build there is over (Ctrl+C then Y skips build.bat's own release and
+        leaves the shell open);
+      - it has stood for 30 minutes (STALE_SECONDS), whether or not its
+        owner still runs. A full build takes minutes and every rig has a
+        timeout, so a lock that old is an abandoned one: the ceiling that
+        keeps a shell left open from blocking every build on the machine.
+    Otherwise it is HELD.
   * A lock with no owner fields (written by an older copy of this tool,
-    which other worktrees keep running until they merge main) keeps the old
-    rule: it is refused for STALE_SECONDS (30 minutes) after it was taken.
+    which other worktrees keep running until they merge main) is judged by
+    the age rule alone.
   * A stale lock is taken down with an atomic rename to a tombstone named
     after the lock's own bytes, so however many builds find it stale in the
     same instant, exactly one removes it and none removes a fresh lock.
@@ -56,13 +67,15 @@ import threading
 import time
 from pathlib import Path
 
-# Generous past the ~2-4 minutes an observed full build takes, so a machine
-# under heavy multi-agent load never reclaims a lock out from under a build
-# that is genuinely still running -- Sean's own manual polling used a 20
-# minute cap; this is that plus margin. It is now only the rule for a lock
-# that names no owner (an older copy of this tool wrote it, or the owner
-# could not be established); a lock with a live owner is held however old it
-# is, and one whose owner is gone is stale however young.
+# Generous past the ~2-4 minutes an observed full build takes (every rig now
+# times out within 15 minutes), so a machine under heavy multi-agent load
+# never reclaims a lock out from under a build that is genuinely still
+# running -- Sean's own manual polling used a 20 minute cap; this is that
+# plus margin. It is the whole rule for a lock that names no owner (an older
+# copy of this tool wrote it, or the owner could not be established), and
+# the ceiling for one whose owner is running: past it the lock is abandoned,
+# a shell left open by an interrupted build included. A lock whose owner is
+# gone, or is the shell asking, is stale however young.
 STALE_SECONDS = 30 * 60
 # A lock file that is still empty or unparseable this young is being
 # written by the acquirer that just created it.
@@ -237,11 +250,13 @@ def find_owner():
     return (ppid, created), None
 
 
-def _resolve_owner(owner):
+def _resolve_owner(owner, say=True):
+    """`owner` as given, or (_AUTO) this helper's parent; None when it cannot
+    be established, said on stderr unless `say` is off."""
     if owner is not _AUTO:
         return owner
     owner, why_not = find_owner()
-    if owner is None:
+    if owner is None and say:
         print("[edvr] NOTE: the build lock cannot track its owner here (%s); a killed "
               "build will hold it for up to %d min." % (why_not, STALE_SECONDS // 60),
               file=sys.stderr)
@@ -315,28 +330,43 @@ def _minutes(info, now=None):
     return max(0, int(((time.time() if now is None else now) - started) // 60)) if started else 0
 
 
-def assess(lock, now=None):
+def assess(lock, now=None, caller=None, alive=None):
     """(FREE | HELD | STALE, why) for a lock as _read returned it (None: no
-    file). HELD is the one verdict that makes an acquirer stop."""
+    file). HELD is the one verdict that makes an acquirer stop.
+
+    `caller` is the (pid, creation time) of the shell asking, None when it is
+    not known. `alive` says whether an owner still runs, (pid, creation time)
+    -> ALIVE | DEAD | UNKNOWN; it defaults to owner_state. With `now`, these
+    are what the self-test drives it through without a clock or a process."""
     now = time.time() if now is None else now
+    alive = owner_state if alive is None else alive
     if lock is None:
         return FREE, "there is no lock"
     if lock.info is None:
         if now - lock.mtime < GRACE_SECONDS:
             return HELD, "the lock file is still being written"
         return STALE, "the lock file is empty or unreadable"
-    owner = _owner_of(lock.info)
-    if owner is not None:
-        state = owner_state(*owner)
-        if state == ALIVE:
-            return HELD, "owner pid %d is running" % owner[0]
-        if state == DEAD:
-            return STALE, "owner pid %d is no longer running" % owner[0]
-        # UNKNOWN: fall through to the age rule, the safe one.
     age = now - _started(lock.info)
+    ceiling = "%d min" % (STALE_SECONDS // 60)
+    owner = _owner_of(lock.info)
+    if owner is None:
+        if age < STALE_SECONDS:
+            return HELD, "it names no owner, so it stands until %s after it was taken" % ceiling
+        return STALE, "no release within %s" % ceiling
+    if owner == caller:
+        # cmd runs one batch file at a time and this shell is now running
+        # another: the build that took the lock here is over, and Ctrl+C
+        # then Y (which skips build.bat's release) is how it ended.
+        return STALE, "the previous build in this shell must have been interrupted"
+    state = alive(*owner)
+    if state == DEAD:
+        return STALE, "owner pid %d is no longer running" % owner[0]
+    what = ("owner pid %d is running" % owner[0] if state == ALIVE
+            else "it cannot be told whether owner pid %d is running" % owner[0])
     if age < STALE_SECONDS:
-        return HELD, "it names no owner, so it stands until %d min after it was taken" % (STALE_SECONDS // 60)
-    return STALE, "no release within %d min" % (STALE_SECONDS // 60)
+        # UNKNOWN is judged by the same age, the safe rule.
+        return HELD, what + ("" if state == ALIVE else ", so it stands until %s after it was taken" % ceiling)
+    return STALE, "%s, but the lock is over %s old: no build runs that long, so it was abandoned" % (what, ceiling)
 
 
 def _record(note, owner):
@@ -432,7 +462,7 @@ def _sweep_tombstones(path, now=None):
 # The three operations.
 # --------------------------------------------------------------------------
 
-def _refuse(path, lock, why, owner=None):
+def _refuse(path, lock, why):
     info = lock.info or {}
     note = info.get("note") if isinstance(info.get("note"), str) and info.get("note") else "no note"
     print(
@@ -440,20 +470,18 @@ def _refuse(path, lock, why, owner=None):
         "Wait for it to finish, then run build.bat again -- two builds at once "
         "contend for the same cores, which is how the vtable_test timing gate has "
         "flaked before. Run \"python tools\\build_lock.py --wait\" to block until "
-        "it is free, then retry. (Lock file: %s)" % (note, _minutes(info), why, path),
+        "it is free, then retry. The lock frees itself when that build's shell "
+        "exits, when a build starts in the shell that took it (an interrupted build "
+        "there is over), and %d min after it was taken. (Lock file: %s)"
+        % (note, _minutes(info), why, STALE_SECONDS // 60, path),
         file=sys.stderr)
-    if owner is not None and _owner_of(info) == owner:
-        # The shell this command runs in is the one that took the lock: a build
-        # interrupted here (Ctrl+C, then Y, skips build.bat's own release).
-        print("[edvr] The lock belongs to this very shell (pid %d). If that build was "
-              "interrupted here, run \"python tools\\build_lock.py --release\" in this "
-              "window to clear it." % owner[0], file=sys.stderr)
 
 
-def acquire(path, note, owner=_AUTO, dry_run=False):
+def acquire(path, note, owner=_AUTO, dry_run=False, alive=None):
     """Take the lock, or refuse (return 1) when a build holds it. Takes over a
-    stale one. With dry_run, says which of those would happen and writes
-    nothing -- no lock, no tombstone."""
+    stale one, an interrupted build's in this very shell included. With
+    dry_run, says which of those would happen and writes nothing -- no lock,
+    no tombstone. `alive` is assess's (the self-test's seam)."""
     owner = _resolve_owner(owner)
     record = _record(note, owner)
     took_over = None
@@ -471,9 +499,9 @@ def acquire(path, note, owner=_AUTO, dry_run=False):
                 print("[edvr] dry run: the build lock is free; --acquire would take it.")
                 return 0
             continue              # released between our create and our read
-        verdict, why = assess(lock)
+        verdict, why = assess(lock, caller=owner, alive=alive)
         if verdict == HELD:
-            _refuse(path, lock, why, owner)
+            _refuse(path, lock, why)
             return 1
         if dry_run:
             print("[edvr] dry run: the build lock is stale (%s); --acquire would take it over." % why)
@@ -514,51 +542,108 @@ def release(path, owner=_AUTO, dry_run=False):
     return 0
 
 
-def wait(path, timeout, poll=None):
-    """Block until the lock is free (or stale), then return 0; 1 after
-    `timeout` seconds (0: no limit)."""
+def wait(path, timeout, poll=None, owner=_AUTO, alive=None, clock=time.time, sleep=time.sleep):
+    """Block until the lock is free or stale -- a lock this very shell took
+    is stale, so waiting on your own interrupted build ends at once -- then
+    return 0; 1 after `timeout` seconds (0: no limit). `clock` and `sleep`
+    are the self-test's seam, as `alive` is assess's: it drives half an hour
+    of polling without waiting for any of it."""
     poll = POLL_SECONDS if poll is None else poll
-    deadline = time.time() + timeout if timeout else None
+    caller = _resolve_owner(owner, say=False)
+    deadline = clock() + timeout if timeout else None
     while True:
-        if assess(_read(path))[0] != HELD:
+        if assess(_read(path), now=clock(), caller=caller, alive=alive)[0] != HELD:
             return 0
         pause = poll
         if deadline is not None:
-            remaining = deadline - time.time()
+            remaining = deadline - clock()
             if remaining <= 0:
                 print("[edvr] ERROR: still locked after %ds; giving up." % timeout,
                       file=sys.stderr)
                 return 1
             pause = min(poll, remaining)
-        time.sleep(pause)
+        sleep(pause)
 
 
 # --------------------------------------------------------------------------
 # Self-test.
 # --------------------------------------------------------------------------
 
-_RACER = (
-    "import sys, time\n"
+# Owner ids no real process has. The thread races give every thread one of its
+# own, and an `alive` that reads them as running, so each thread is a separate
+# shell (a lock the very shell asking took counts as abandoned: see assess).
+_FAKE_PID = 1 << 30
+
+# A stand-in for one cmd.exe: a process that stays up and answers, per request
+# line on stdin (a JSON object), "<op> <exit code>":
+#   acquire | release   runs this tool on the request's lock as its child, as
+#                       cmd.exe runs build.bat's helper, so the lock's owner is
+#                       the stand-in
+#   race                calls acquire itself, as its own owner, once the clock
+#                       passes "start", so every stand-in starts together
+_SHELL = (
+    "import contextlib, io, json, os, subprocess, sys, time\n"
     "sys.path.insert(0, sys.argv[1])\n"
     "import build_lock\n"
     "from pathlib import Path\n"
-    "start = float(sys.argv[3])\n"
-    "while time.time() < start:\n"
-    "    pass\n"
-    "sys.exit(build_lock.acquire(Path(sys.argv[2]), 'racer-' + sys.argv[4]))\n")
-
-# A stand-in for build.bat's cmd.exe: runs this tool once per line on stdin,
-# so the helper's parent is a process the test can keep alive, or let die.
-_BATCH = (
-    "import subprocess, sys\n"
-    "tool, lock = sys.argv[1], sys.argv[2]\n"
+    "me = (os.getpid(), build_lock.probe_process(os.getpid())[1])\n"
+    "print('ready', os.getpid(), flush=True)\n"
     "for line in sys.stdin:\n"
-    "    op = line.strip()\n"
-    "    if op:\n"
-    "        rc = subprocess.run([sys.executable, tool, '--' + op, '--lock-file', lock,\n"
+    "    request = json.loads(line)\n"
+    "    op, lock = request['op'], request['lock']\n"
+    "    if op == 'race':\n"
+    "        while time.time() < request['start']:\n"
+    "            pass\n"
+    "        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):\n"
+    "            rc = build_lock.acquire(Path(lock), 'racer', owner=me)\n"
+    "    else:\n"
+    "        rc = subprocess.run([sys.executable, build_lock.__file__, '--' + op, '--lock-file', lock,\n"
     "                             '--note', 'stand-in'], stdout=subprocess.DEVNULL,\n"
     "                            stderr=subprocess.DEVNULL).returncode\n"
-    "        print(op, rc, flush=True)\n")
+    "    print(op, rc, flush=True)\n")
+
+
+class _StandIn:
+    """One stand-in cmd.exe (see _SHELL)."""
+
+    def __init__(self, tools_dir):
+        self.process = subprocess.Popen(
+            [sys.executable, "-c", _SHELL, tools_dir], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, text=True, bufsize=1)
+        self.pid = self.process.pid       # until it says: a venv's launcher is not the interpreter
+        self.started = False
+
+    def ready(self):
+        """Block until it has imported this module and is reading requests;
+        `pid` is then the pid of the process that will own the locks."""
+        if not self.started:
+            words = self.process.stdout.readline().split()
+            if len(words) == 2 and words[0] == "ready":
+                self.pid = int(words[1])
+            self.started = True
+
+    def send(self, op, lock, **more):
+        self.ready()
+        self.process.stdin.write(json.dumps(dict(more, op=op, lock=str(lock))) + "\n")
+        self.process.stdin.flush()
+
+    def reply(self):
+        """(op, exit code) of its next answer; (None, None) if it is gone."""
+        words = self.process.stdout.readline().split()
+        return (words[0], int(words[1])) if len(words) == 2 else (None, None)
+
+    def ask(self, op, lock):
+        self.send(op, lock)
+        return self.reply()
+
+    def close(self):
+        """End it -- as a build's shell ends, without a release -- and wait."""
+        with contextlib.suppress(OSError, ValueError):
+            self.process.stdin.close()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            self.process.wait(30)
+        with contextlib.suppress(OSError, ValueError):
+            self.process.stdout.close()
 
 
 def self_test():
@@ -571,6 +656,19 @@ def self_test():
     tool = Path(__file__).resolve()
     tools_dir = str(tool.parent)
     windows = _kernel32() is not None
+
+    # The stand-in shells need a moment to start (each imports this module).
+    # Starting them first lets the in-process cases below cover it.
+    shells = [_StandIn(tools_dir) for _ in range(4)] if windows else []
+
+    def stop_hung_shells():
+        for shell in shells:
+            with contextlib.suppress(OSError):
+                shell.process.kill()
+
+    watchdog = threading.Timer(90, stop_hung_shells)      # a hang fails the test, not the build
+    watchdog.daemon = True
+    watchdog.start()
 
     def quiet(function, *args, **kwargs):
         """(result, stdout, stderr) of a call: the tool's messages are its
@@ -591,6 +689,18 @@ def self_test():
     def listing(path):
         return sorted(entry.name for entry in path.parent.iterdir())
 
+    def clocked():
+        """(clock, sleep, naps): a clock that starts at the real time and
+        moves only when `sleep` is called, so wait() can be taken through half
+        an hour of polling without any of it being waited for."""
+        now, naps = [time.time()], []
+
+        def sleep(seconds):
+            naps.append(seconds)
+            now[0] += seconds
+
+        return (lambda: now[0]), sleep, naps
+
     with tempfile.TemporaryDirectory(prefix="edvr-build-lock-") as scratch:
         counter = [0]
 
@@ -602,6 +712,13 @@ def self_test():
 
         def tombstones(path):
             return [name for name in listing(path) if ".stale-" in name]
+
+        def waited(path, timeout, **more):
+            """(exit code, seconds) of a wait() on a clock of its own: the
+            seconds are those it would have spent polling."""
+            clock, sleep, naps = clocked()
+            rc = quiet(wait, path, timeout, 5, clock=clock, sleep=sleep, **more)[0]
+            return rc, sum(naps)
 
         # --- the plain cycle, on a lock with no owner tracking ---------------
         path = new_lock()
@@ -616,11 +733,14 @@ def self_test():
         check(rc == 1 and "another build is already running" in err
               and "build_lock.py --wait" in err and "first" in err,
               "a held lock refuses a second acquire and says how to wait: %r" % err)
+        check("frees itself when that build's shell exits" in err and "interrupted build" in err
+              and "and %d min after it was taken" % (STALE_SECONDS // 60) in err,
+              "the refusal says when a lock frees itself: %r" % err)
         check(path.read_bytes() == before, "a refused acquire leaves the lock alone")
         check(quiet(release, path, owner=None)[0] == 0 and not path.exists(),
               "release removes the lock")
         check(quiet(release, path, owner=None)[0] == 0, "releasing a clear lock is a no-op")
-        check(quiet(wait, path, 1, 0.05)[0] == 0, "wait returns once nothing holds the lock")
+        check(waited(path, 60, owner=None) == (0, 0), "wait returns at once when nothing holds the lock")
 
         # --- locks written by an older copy of this tool ---------------------
         old_fresh = {"started": tick(60), "note": "old build", "pid": 4242}
@@ -631,7 +751,13 @@ def self_test():
         rc, _, err = quiet(acquire, path, "new", owner=None)
         check(rc == 1 and "old build" in err and path.read_bytes() == before,
               "a fresh old-format lock is still refused: %r" % err)
-        check(quiet(wait, path, 1, 0.05)[0] == 1, "wait still sees a fresh old-format lock")
+        rc, seconds = waited(path, 60, owner=None)
+        check(rc == 1 and 59 <= seconds <= 61,
+              "wait keeps waiting on a fresh old-format lock, then gives up: %r %r" % (rc, seconds))
+        put(path, dict(old_fresh, started=tick(STALE_SECONDS - 120)))
+        rc, seconds = waited(path, 600, owner=None)
+        check(rc == 0 and 100 <= seconds <= 130,
+              "wait returns when the 30 minute rule frees an old-format lock: %r %r" % (rc, seconds))
         path = new_lock()
         put(path, old_stale)
         rc, out, _ = quiet(acquire, path, "new", owner=None)
@@ -691,6 +817,39 @@ def self_test():
         check(rc == 1 and (listing(path), path.read_bytes()) == seen,
               "--dry-run reaches acquire through the command line")
 
+        # --- how an owner is judged, with no processes behind it ----------------
+        lock = _Lock(b"", {"started": 1000.0, "note": "n", "pid": 1, "owner_pid": 7, "owner_created": 9},
+                     1000.0, 0)
+        def says(state):
+            return lambda pid, created: state
+
+        up, down, unsure = says(ALIVE), says(DEAD), says(UNKNOWN)
+        shell = (7, 9)
+        elsewhere = (8, 9)
+        check(assess(lock, now=1000.0 + STALE_SECONDS - 1, caller=elsewhere, alive=up)[0] == HELD
+              and assess(lock, now=1000.0 + 5, caller=elsewhere, alive=up)[0] == HELD,
+              "a lock whose owner is running is held for STALE_SECONDS")
+        verdict, why = assess(lock, now=1000.0 + STALE_SECONDS + 1, caller=elsewhere, alive=up)
+        check(verdict == STALE and "abandoned" in why and "30 min" in why and "pid 7 is running" in why,
+              "and stale after it, though the owner still runs: %r %r" % (verdict, why))
+        check(assess(lock, now=1000.0 + STALE_SECONDS * 50, caller=None, alive=up)[0] == STALE,
+              "however long it has been held, and whether or not the caller is known")
+        check(assess(lock, now=1000.0 + 5, caller=elsewhere, alive=down)[0] == STALE
+              and assess(lock, now=1000.0 + STALE_SECONDS * 2, caller=elsewhere, alive=down)[0] == STALE,
+              "a lock whose owner is gone is stale at any age")
+        verdict, why = assess(lock, now=1000.0 + 5, caller=shell, alive=up)
+        check(verdict == STALE and "previous build in this shell must have been interrupted" in why,
+              "a lock the caller's own shell took is stale, however young: %r %r" % (verdict, why))
+        check(assess(lock, now=1000.0 + 5, caller=shell, alive=down)[0] == STALE,
+              "... and however its owner reads")
+        check(assess(lock, now=1000.0 + 5, caller=(7, 10), alive=up)[0] == HELD
+              and assess(lock, now=1000.0 + 5, caller=(6, 9), alive=up)[0] == HELD,
+              "the shell is the pid AND the creation time: a pid reused since is another shell")
+        check(assess(lock, now=1000.0 + 5, caller=elsewhere, alive=unsure)[0] == HELD
+              and assess(lock, now=1000.0 + STALE_SECONDS + 1, caller=elsewhere, alive=unsure)[0] == STALE,
+              "an owner that cannot be read is judged by age alone")
+        check(assess(None)[0] == FREE, "no lock is free")
+
         # --- owners (Windows) ------------------------------------------------------
         if windows:
             state, mine = probe_process(os.getpid())
@@ -698,20 +857,25 @@ def self_test():
                   "this process reads as alive with a creation time: %r %r" % (state, mine))
             me = (os.getpid(), mine)
             stranger = (99999999, 1)
-            sleeper = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
-                                       stdin=subprocess.PIPE)
-            try:
-                state, created = probe_process(sleeper.pid)
-                check(state == ALIVE and created is not None, "a running child reads as alive")
-                gone = (sleeper.pid, created)
-                check(owner_state(*gone) == ALIVE, "owner_state agrees while it runs")
-            finally:
-                sleeper.stdin.close()
-                sleeper.wait()
-            check(owner_state(*gone) == DEAD, "and dead once it has exited")
+            check(owner_state(*me) == ALIVE and owner_state(me[0], me[1] + 1) == DEAD,
+                  "a live pid with another creation time is a reused pid, so dead")
             check(probe_process(99999999)[0] == DEAD, "a pid nothing runs under is dead")
+            # A child that has exited while this process still holds its handle:
+            # its pid stays valid, and it reads as dead.
+            exited = subprocess.Popen([sys.executable, "-c", "pass"])
+            exited.wait(30)
+            state, created = probe_process(exited.pid)
+            check(state == DEAD and created is not None,
+                  "a child that has exited reads as dead, its creation time still readable: %r %r"
+                  % (state, created))
+            gone = (exited.pid, created)
+            check(owner_state(*gone) == DEAD, "owner_state agrees")
+            shells[0].ready()
+            state, created = probe_process(shells[0].pid)
+            check(state == ALIVE and created is not None and owner_state(shells[0].pid, created) == ALIVE,
+                  "a running child reads as alive: %r %r" % (state, created))
 
-            # a live owner refuses, whoever asks; the record carries the owner
+            # a running owner refuses, whoever asks; the record carries the owner
             path = new_lock()
             check(quiet(acquire, path, "mine", owner=me)[0] == 0, "acquire with an owner")
             record = json.loads(path.read_text(encoding="utf-8"))
@@ -720,18 +884,24 @@ def self_test():
                   "the owner is recorded beside the legacy fields: %r" % record)
             before = path.read_bytes()
             rc, _, err = quiet(acquire, path, "theirs", owner=stranger)
-            check(rc == 1 and ("owner pid %d is running" % me[0]) in err and path.read_bytes() == before
-                  and "this very shell" not in err,
+            check(rc == 1 and ("owner pid %d is running" % me[0]) in err and path.read_bytes() == before,
                   "a lock whose owner is running is refused: %r" % err)
-            rc, _, err = quiet(acquire, path, "same shell", owner=me)
-            check(rc == 1 and "this very shell" in err and "--release" in err and path.read_bytes() == before,
-                  "a refusal says so when the lock is the caller's own shell's (an interrupted build): %r" % err)
-            check(quiet(wait, path, 1, 0.05)[0] == 1, "wait keeps waiting on a running owner")
-            # ... however old it is: the age rule is for locks without an owner
-            put(path, dict(record, started=tick(STALE_SECONDS * 4)))
+            rc, _, err = quiet(acquire, path, "theirs", owner=(me[0], me[1] + 1))
+            check(rc == 1 and path.read_bytes() == before,
+                  "a shell with the owner's pid and another creation time is another shell: refused")
+            # ... for up to STALE_SECONDS: past that it is abandoned, owner or no
+            put(path, dict(record, started=tick(STALE_SECONDS - 60)))
             check(quiet(acquire, path, "theirs", owner=stranger)[0] == 1,
-                  "a lock whose owner is running is held however old it is")
+                  "a lock 29 minutes old whose owner is running is still held")
+            put(path, dict(record, started=tick(STALE_SECONDS + 60)))
+            rc, out, _ = quiet(acquire, path, "theirs", owner=stranger)
+            check(rc == 0 and "took over" in out and "abandoned" in out and "mine" in out
+                  and len(tombstones(path)) == 1
+                  and json.loads(path.read_text(encoding="utf-8"))["note"] == "theirs",
+                  "a lock 31 minutes old is taken over though its owner is running: %r %r" % (rc, out))
             # release belongs to the owner alone
+            path = new_lock()
+            quiet(acquire, path, "mine", owner=me)
             rc, _, err = quiet(release, path, owner=stranger)
             check(rc == 0 and path.exists() and "not releasing" in err,
                   "a non-owner's release warns and leaves the lock: %r" % err)
@@ -741,6 +911,36 @@ def self_test():
                   "the right pid with another creation time is not the owner")
             check(quiet(release, path, owner=me)[0] == 0 and not path.exists(),
                   "the owner's release removes it")
+
+            # --- the same shell: an interrupted build ---------------------------------
+            # cmd runs one batch file at a time, so a build that starts in the
+            # shell whose earlier build left the lock behind (Ctrl+C, then Y,
+            # skips build.bat's release) is the only build there is.
+            path = new_lock()
+            quiet(acquire, path, "interrupted build", owner=me)
+            before = path.read_bytes()
+            rc, out, _ = quiet(acquire, path, "x", owner=me, dry_run=True)
+            check(rc == 0 and path.read_bytes() == before and tombstones(path) == []
+                  and "would take it over" in out and "this shell" in out,
+                  "a dry run over this shell's own lock writes and removes nothing: %r" % out)
+            rc, out, err = quiet(acquire, path, "the next build", owner=me)
+            check(rc == 0 and err == "" and out.count("\n") == 1 and out.startswith("[edvr] took over")
+                  and "the previous build in this shell must have been interrupted" in out
+                  and "interrupted build" in out and len(tombstones(path)) == 1
+                  and json.loads(path.read_text(encoding="utf-8"))["note"] == "the next build",
+                  "this shell's own lock is taken over at once, in one line: %r %r" % (rc, out))
+            before = path.read_bytes()
+            check(quiet(acquire, path, "another shell", owner=stranger)[0] == 1 and path.read_bytes() == before,
+                  "and it is this shell's again: another shell is refused")
+            rc, seconds = waited(path, 600, owner=stranger)
+            check(rc == 1 and 599 <= seconds <= 601,
+                  "wait keeps waiting on a running owner's lock for another shell: %r %r" % (rc, seconds))
+            check(waited(path, 600, owner=me) == (0, 0),
+                  "wait ends at once for the shell whose own lock it is")
+            put(path, dict(json.loads(path.read_text(encoding="utf-8")), started=tick(STALE_SECONDS - 120)))
+            rc, seconds = waited(path, 600, owner=stranger)
+            check(rc == 0 and 100 <= seconds <= 130,
+                  "wait ends when a running owner's lock reaches the ceiling: %r %r" % (rc, seconds))
 
             # a dead owner: taken over at once, whatever the age; so is a reused pid
             for label, dead in (("has exited", gone), ("pid was reused (creation time differs)", (me[0], me[1] + 10))):
@@ -756,7 +956,7 @@ def self_test():
             path = new_lock()
             put(path, {"started": tick(), "note": "killed build", "pid": 1,
                        "owner_pid": gone[0], "owner_created": gone[1]})
-            check(quiet(wait, path, 1, 0.05)[0] == 0, "wait returns as soon as the owner is dead")
+            check(waited(path, 600, owner=stranger) == (0, 0), "wait returns as soon as the owner is dead")
             seen = (listing(path), path.read_bytes())
             rc, out, _ = quiet(acquire, path, "next", owner=me, dry_run=True)
             check(rc == 0 and (listing(path), path.read_bytes()) == seen and "would take it over" in out,
@@ -815,6 +1015,16 @@ def self_test():
                   "a lock that is not the one judged stale is put back: %r" % listing(path))
 
             # --- the O_EXCL race: many at once, exactly one wins -------------------
+            # Threads, each its own shell (an owner of its own, read as running):
+            # the exclusivity is the file system's, and threads reach it as
+            # processes do.
+            def fake_alive(pid, created):
+                return ALIVE if pid >= _FAKE_PID else owner_state(pid, created)
+
+            def dead_lock(path):
+                put(path, {"started": tick(), "note": "killed build", "pid": 1,
+                           "owner_pid": gone[0], "owner_created": gone[1]})
+
             def race(threads, prepare=None):
                 path = new_lock()
                 if prepare:
@@ -824,7 +1034,8 @@ def self_test():
 
                 def runner(index):
                     gate.wait()
-                    results[index] = acquire(path, "thread-%d" % index, owner=me)
+                    results[index] = acquire(path, "thread-%d" % index,
+                                             owner=(_FAKE_PID + index, 1), alive=fake_alive)
 
                 pool = [threading.Thread(target=runner, args=(i,)) for i in range(threads)]
                 out, err = io.StringIO(), io.StringIO()
@@ -834,10 +1045,6 @@ def self_test():
                     for thread in pool:
                         thread.join(60)
                 return path, results
-
-            def dead_lock(path):
-                put(path, {"started": tick(), "note": "killed build", "pid": 1,
-                           "owner_pid": gone[0], "owner_created": gone[1]})
 
             for round_number in range(4):
                 path, results = race(16)
@@ -853,66 +1060,76 @@ def self_test():
                       "16 threads taking over one dead owner's lock: exactly one wins, one tombstone: %r %r"
                       % (results, tombstones(path)))
 
-            def process_race(count, prepare=None):
-                path = new_lock()
-                if prepare:
-                    prepare(path)
-                start = time.time() + 1.5
-                children = [subprocess.Popen(
-                    [sys.executable, "-c", _RACER, tools_dir, str(path), repr(start), str(i)],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for i in range(count)]
-                codes = [child.wait(60) for child in children]
-                return path, codes
+            # --- processes: stand-in shells, started once and reused ----------------
+            def shell_race(path):
+                """Every stand-in acquires `path` at the same instant, as the
+                shell of a build each: their exit codes."""
+                for shell in shells:
+                    shell.ready()
+                start = time.time() + 0.05
+                for shell in shells:
+                    shell.send("race", path, start=start)
+                return [shell.reply()[1] for shell in shells]
 
-            path, codes = process_race(6)
-            check(codes.count(0) == 1 and codes.count(1) == 5 and path.is_file(),
-                  "6 processes acquiring a free lock: exactly one wins: %r" % (codes,))
-            path, codes = process_race(6, dead_lock)
-            check(codes.count(0) == 1 and codes.count(1) == 5 and len(tombstones(path)) == 1,
-                  "6 processes taking over one dead lock: exactly one wins: %r %r" % (codes, tombstones(path)))
+            path = new_lock()
+            codes = shell_race(path)
+            check(codes.count(0) == 1 and codes.count(1) == len(shells) - 1 and path.is_file(),
+                  "%d processes acquiring a free lock: exactly one wins: %r" % (len(shells), codes))
+            path = new_lock()
+            dead_lock(path)
+            codes = shell_race(path)
+            check(codes.count(0) == 1 and codes.count(1) == len(shells) - 1 and len(tombstones(path)) == 1,
+                  "%d processes taking over one dead lock: exactly one wins: %r %r"
+                  % (len(shells), codes, tombstones(path)))
 
             # --- end to end through the command line: the owner is the helper's parent
+            holder, other_shell, third_shell = shells[0], shells[1], shells[2]
+            state, holder_created = probe_process(holder.pid)
             path = new_lock()
-            batch = subprocess.Popen([sys.executable, "-c", _BATCH, str(tool), str(path)],
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
-            try:
-                batch.stdin.write("acquire\n")
-                batch.stdin.flush()
-                check(batch.stdout.readline().split() == ["acquire", "0"] and path.is_file(),
-                      "the stand-in build acquires")
-                info = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-                if info.get("owner_pid") != batch.pid:
-                    print("build_lock: NOTE: %s; the end-to-end owner checks are skipped" %
-                          ("no owner recorded (launcher parent?)" if "owner_pid" not in info
-                           else "the owner is not the stand-in's pid %d: %r" % (batch.pid, info)))
-                else:
-                    check(info.get("pid") != batch.pid,
-                          "the legacy pid is the helper's own, the owner the helper's parent")
-                    helper = [sys.executable, str(tool), "--lock-file", str(path)]
-                    check(subprocess.run(helper + ["--acquire"], stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL).returncode == 1,
-                          "while the stand-in build lives, another acquire is refused")
-                    subprocess.run(helper + ["--release"], stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL)
-                    check(path.is_file(), "a release from another process leaves the lock")
-                    batch.stdin.write("release\n")
-                    batch.stdin.flush()
-                    check(batch.stdout.readline().split() == ["release", "0"] and not path.exists(),
-                          "the build's own release removes it")
-                    batch.stdin.write("acquire\n")
-                    batch.stdin.flush()
-                    check(batch.stdout.readline().split() == ["acquire", "0"] and path.is_file(),
-                          "acquire again, then the stand-in build dies without releasing")
-            finally:
-                batch.stdin.close()
-                batch.wait(30)
-            if path.is_file() and json.loads(path.read_text(encoding="utf-8")).get("owner_pid") == batch.pid:
+            check(holder.ask("acquire", path) == ("acquire", 0) and path.is_file(),
+                  "the stand-in build acquires")
+            info = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+            owned = "owner_pid" in info
+            if not owned:
+                # A venv's python.exe or the py launcher stands between the
+                # stand-in and the helper and exits with it (see find_owner).
+                print("build_lock: NOTE: no owner recorded (launcher parent?); "
+                      "the end-to-end owner checks are skipped")
+            else:
+                check(info["owner_pid"] == holder.pid and info.get("pid") != holder.pid,
+                      "the owner is the helper's parent, the stand-in build, and the legacy pid the helper's own: %r"
+                      % (info,))
+                before = path.read_bytes()
+                other_shell.send("acquire", path)
+                third_shell.send("release", path)
+                check(other_shell.reply() == ("acquire", 1),
+                      "while the stand-in build lives, another shell's acquire is refused")
+                check(third_shell.reply() == ("release", 0) and path.read_bytes() == before,
+                      "a release from another shell leaves the lock")
+                check(holder.ask("release", path) == ("release", 0) and not path.exists(),
+                      "the build's own release removes it")
+                # the build is interrupted: it acquired and never released, and
+                # the next build starts in the same shell
+                check(holder.ask("acquire", path) == ("acquire", 0) and path.is_file(),
+                      "acquire again, then that build is interrupted without a release")
+                check(holder.ask("acquire", path) == ("acquire", 0) and len(tombstones(path)) == 1
+                      and json.loads(path.read_text(encoding="utf-8")).get("owner_pid") == holder.pid,
+                      "the next build in the same shell takes the lock over at once")
+            # the shell itself ends with the lock held (killed, or its window closed)
+            holder.close()
+            check(owner_state(holder.pid, holder_created) == DEAD,
+                  "a shell that has exited reads as dead")
+            if owned:
                 started = time.monotonic()
                 rc, out, _ = quiet(acquire, path, "after the kill", owner=me)
                 check(rc == 0 and time.monotonic() - started < 3 and "took over" in out,
                       "once the build that held the lock has exited, the next acquire takes over at once: %r" % out)
         else:
             print("build_lock: NOTE: not Windows; the owner cases are skipped")
+
+    watchdog.cancel()
+    for shell in shells:
+        shell.close()
 
     # --- which parent is a launcher --------------------------------------------
     py = r"C:\Python312\python.exe"
@@ -937,11 +1154,12 @@ def main(argv=None):
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--acquire", action="store_true",
-                        help="take the lock, or refuse if another build holds it")
+                        help="take the lock, or refuse if another build holds it "
+                             "(a stale lock is taken over)")
     action.add_argument("--release", action="store_true",
                         help="drop the lock, if it is this build's")
     action.add_argument("--wait", action="store_true",
-                        help="block until the lock is free, then exit 0")
+                        help="block until the lock is free or stale, then exit 0")
     action.add_argument("--self-test", action="store_true")
     parser.add_argument("--note", default="",
                         help="shown to whoever hits the lock while --acquire holds it")

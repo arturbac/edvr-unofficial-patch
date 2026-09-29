@@ -1034,16 +1034,25 @@ def self_test():
     plan(rigs, [], {})
 
     # A fake spawner: records start order and the peak concurrency, fails the
-    # rig named "alpha" at once, and makes the others take a moment.
+    # rig named "alpha" at once, and makes the others take a moment. The
+    # moment is not a sleep to be outwaited: the others wait until a second
+    # rig is up (an event, so a runner that never runs two at once is caught
+    # without a clock) and then linger briefly, which is all a runner that
+    # starts one rig too many needs to be seen doing it.
     lock = threading.Lock()
     starts, active, peak = [], [0], [0]
+    two_up = threading.Event()
 
     def fake_spawn(job):
         with lock:
             starts.append(job.title)
             active[0] += 1
             peak[0] = max(peak[0], active[0])
-        time.sleep(0.2 if job.rig.label != "alpha" else 0.0)
+            if active[0] >= 2:
+                two_up.set()
+        if job.rig.label != "alpha":
+            two_up.wait(2.0)
+            time.sleep(0.02)
         with lock:
             active[0] -= 1
         return (7, b"alpha says no") if job.rig.label == "alpha" else (0, b"%s ok" % job.rig.label.encode())
@@ -1074,7 +1083,7 @@ def self_test():
     # gamma ends.
     starts.clear()
     together, held = [False], [0]
-    sleeps = {"gamma": 0.4, "alpha": 0.2}
+    timing_up = threading.Event()
 
     def serial_spawn(job):
         with lock:
@@ -1082,7 +1091,12 @@ def self_test():
             if job.constrained:
                 held[0] += 1
                 together[0] |= held[0] > 1
-        time.sleep(sleeps.get(job.rig.label, 0.05))
+        if job.rig.label == "timing":
+            timing_up.set()
+        if job.rig.label == "gamma":
+            # gamma outlasts everything that can run beside it: until timing
+            # has started (2 s at most, which only a broken runner spends)
+            timing_up.wait(2.0)
         with lock:
             if job.constrained:
                 held[0] -= 1
@@ -1108,14 +1122,20 @@ def self_test():
 
     starts.clear()
     alpha_done, order_ok = [False], [True]
+    gamma_up = threading.Event()
 
     def after_spawn(job):
         with lock:
             starts.append(job.title)
             if job.rig.label == "gamma" and not alpha_done[0]:
                 order_ok[0] = False
-        time.sleep(0.15 if job.rig.label == "alpha" else 0.0)
+        if job.rig.label == "gamma":
+            gamma_up.set()
         if job.rig.label == "alpha":
+            # alpha lingers until gamma has started, if it is going to: a
+            # runner that lets gamma go early shows it at once, and a correct
+            # one leaves gamma waiting out the linger (0.05 s, not a hazard)
+            gamma_up.wait(0.05)
             with lock:
                 alpha_done[0] = True
         return 0, b""
@@ -1451,111 +1471,81 @@ def self_test_timeouts(check):
 
     tools_dir = os.path.dirname(os.path.abspath(__file__))
 
-    def heartbeat_stops(path, quiet_for=1.6, limit=15.0):
-        """True once the file at `path` has stopped growing for `quiet_for`
-        seconds, i.e. whatever was appending to it is gone."""
-        deadline = time.monotonic() + limit
-        size, changed = -1, time.monotonic()
-        while time.monotonic() < deadline:
-            now = os.path.getsize(path) if os.path.exists(path) else -1
-            if now != size:
-                size, changed = now, time.monotonic()
-            elif time.monotonic() - changed >= quiet_for:
-                return True
-            time.sleep(0.1)
+    # How these cases tell a process tree that is alive from one that is gone,
+    # without waiting out a quiet spell: the hung rig's grandchild (a ping)
+    # appends to a heartbeat file through its shell's redirection, and Windows
+    # will not rename a file some process holds open without sharing it for
+    # delete. The file is held while the tree lives and free the moment its
+    # last member is gone.
+    def held(path):
+        probe = path + ".probe"
+        try:
+            os.rename(path, probe)
+        except PermissionError:
+            return True
+        except FileNotFoundError:
+            return False
+        try:
+            os.rename(probe, path)
+        except OSError:
+            pass
         return False
 
-    def heartbeat_starts(path, limit=10.0):
+    def released(path, limit=15.0):
+        """True once no process holds `path` open any more, i.e. the tree
+        that was appending to it is gone; waits up to `limit` seconds."""
         deadline = time.monotonic() + limit
-        while time.monotonic() < deadline:
+        while True:
+            if not held(path):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
+    def heartbeat_starts(path, limit=10.0):
+        """True once the file at `path` has something in it -- the grandchild
+        has started -- waiting up to `limit` seconds (0: look once)."""
+        deadline = time.monotonic() + limit
+        while True:
             if os.path.exists(path) and os.path.getsize(path) > 0:
                 return True
-            time.sleep(0.1)
-        return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
 
     with scratch_dir("edvr-run-jobs-") as scratch:
         root = Path(scratch)
-        heart = os.path.join(scratch, "heartbeat.txt")
-        # Stand-ins for build.bat: `--rig <label>` runs :rig_<label>. The hung
-        # rig sits in a ping, three processes down from the runner (rig cmd.exe,
-        # an inner cmd.exe, ping.exe), which appends a line a second to `heart`.
-        bodies = {
-            "ok": ["echo before from ok", "echo finished ok 1>&2", "exit /b 0"],
-            "fail": ["echo before from fail", "exit /b 5"],
-            "hang": ["echo before the hang", 'cmd /d /c ping -n 300 127.0.0.1 >> "' + heart + '"',
-                     "echo finished hang", "exit /b 0"],
-        }
 
-        def write_script(name, labels):
+        def write_script(folder, name, labels, heart):
+            """A stand-in for build.bat in `folder`: `--rig <label>` runs
+            :rig_<label>. The hung rig sits in a ping, three processes down
+            from the runner (rig cmd.exe, an inner cmd.exe, ping.exe), which
+            appends a line a second to `heart`. It says "finished hang" only
+            if the ping ran to its end. taskkill /T ends a tree leaf first, so
+            a rig whose ping was killed can run one more line before it is
+            killed itself (seen under load): that line must not be a print,
+            which is what the errorlevel test is for -- a killed ping exits 1."""
+            bodies = {
+                "ok": ["echo before from ok", "echo finished ok 1>&2", "exit /b 0"],
+                "fail": ["echo before from fail", "exit /b 5"],
+                "hang": ["echo before the hang", 'cmd /d /c ping -n 300 127.0.0.1 >> "' + heart + '"',
+                         "if errorlevel 1 exit /b 1", "echo finished hang", "exit /b 0"],
+            }
             lines = ["@echo off", 'if "%~1"=="--rig" goto run_rig', "exit /b 0", ":run_rig",
                      "call :rig_%~2", "exit /b %errorlevel%"]
             for label in labels:
                 lines += [":rig_" + label] + bodies[label]
-            path = root / name
+            path = folder / name
             path.write_text("\r\n".join(lines) + "\r\n", encoding="ascii")
             return path
 
-        script = write_script("build.bat", ("ok", "fail", "hang"))
-        pool_script = write_script("pool.bat", ("ok", "hang"))
-        ok, fail, hang = (Job(Rig(label, 1)) for label in ("ok", "fail", "hang"))
-        env = dict(os.environ)
-
-        # Normal jobs are unaffected: output merged, exit codes carried, the
-        # log file holds exactly what the report prints, nothing marks them.
-        spawn = spawner(script, root, env, scratch, lambda job: 120.0)
-        code, output, hit = spawn(ok)
-        log = rig_log_path(scratch, ok)
-        check(code == 0 and hit is None and b"before from ok" in output and b"finished ok" in output,
-              "a normal rig runs as before, stderr merged into its output: %r %r" % (code, output))
-        check(os.path.isfile(log) and Path(log).read_bytes() == output,
-              "its output is the same bytes in its log file: %s" % log)
-        code, output, hit = spawn(fail)
-        check(code == 5 and hit is None and b"before from fail" in output,
-              "a failing rig still fails with its own exit code: %r %r" % (code, output))
-        before = sorted(os.listdir(scratch))
-        code, output, hit = spawner(script, root, env, None, None)(ok)
-        check(code == 0 and b"finished ok" in output and hit is None and sorted(os.listdir(scratch)) == before,
-              "without --exe-dir or a timeout the output is still captured, leaving no file: %r" % output)
-
-        # The whole path: run() -> rig_timeout -> spawner -> run_rig -> kill_tree.
-        times = root / "rig_times.json"
-        out = io.BytesIO()
-        outcome = []
-        begun = time.monotonic()
-        worker = threading.Thread(
-            target=lambda: outcome.append(run(pool_script, 2, 2, [], times, False, out, exe_dir=scratch,
-                                              timeout_override=4.0)), daemon=True)
-        worker.start()
-        hang_log = rig_log_path(scratch, hang)
-        streamed = False
-        while worker.is_alive() and time.monotonic() - begun < 3.5:
-            if os.path.isfile(hang_log) and b"before the hang" in Path(hang_log).read_bytes():
-                streamed = worker.is_alive()
-                break
-            time.sleep(0.05)
-        check(streamed, "a rig's output is in its log file while the rig is still running")
-        worker.join(4.0 + KILL_WAIT + 30)
-        took = time.monotonic() - begun
-        check(outcome == [1] and not worker.is_alive(),
-              "a hung rig fails the run instead of hanging it: %r" % (outcome,))
-        text = out.getvalue().decode("utf-8", "replace")
-        check("--- hang:" in text and "TIMEOUT (limit 4 s)" in text and "hang TIMED OUT after 4 s" in text
-              and "ERROR: hang TIMED OUT after 4 s" in text and "before the hang" in text
-              and "finished hang" not in text and "Its whole log: " + hang_log in text
-              and "--- ok:" in text and "before from ok" in text,
-              "the report names the TIMEOUT, prints the partial output and the log, and the other rig ran: %r"
-              % text[-900:])
-        check(took < 4.0 + 12.0, "killed and reported within a bound: %.1f s" % took)
-        check(heartbeat_starts(heart), "the rig's grandchild had started before the kill")
-        check(heartbeat_stops(heart), "the rig's whole process tree is gone after the timeout")
-        check(os.path.isfile(hang_log) and b"before the hang" in Path(hang_log).read_bytes()
-              and b"finished hang" not in Path(hang_log).read_bytes(),
-              "the hung rig's partial output survives in its log")
-        check("hang" not in load_times(times) and "ok" in load_times(times),
-              "a killed rig records no time; the rig that passed does: %r" % load_times(times))
-
-        # A runner that dies takes its children with it (the job object).
-        heart2 = os.path.join(scratch, "heartbeat2.txt")
+        # A runner that dies takes its children with it (the job object). The
+        # stand-in runner is started first, so its start-up (it imports this
+        # module) is spent while the cases below run; it is judged after them.
+        # Its heartbeat file has a directory of its own: the case that lists
+        # `scratch` must not see it appear.
+        os.mkdir(os.path.join(scratch, "job-object"))
+        heart2 = os.path.join(scratch, "job-object", "heartbeat.txt")
         fake_runner = (
             "import subprocess, sys, time\n"
             "sys.path.insert(0, sys.argv[1])\n"
@@ -1572,6 +1562,88 @@ def self_test_timeouts(check):
         runner = subprocess.Popen([sys.executable, "-c", fake_runner, tools_dir, heart2],
                                   stdout=subprocess.PIPE, text=True)
         try:
+            script = write_script(root, "build.bat", ("ok", "fail", "hang"), os.path.join(scratch, "unused.txt"))
+            ok, fail = Job(Rig("ok", 1)), Job(Rig("fail", 1))
+            env = dict(os.environ)
+
+            # Normal jobs are unaffected: output merged, exit codes carried, the
+            # log file holds exactly what the report prints, nothing marks them.
+            spawn = spawner(script, root, env, scratch, lambda job: 120.0)
+            code, output, hit = spawn(ok)
+            log = rig_log_path(scratch, ok)
+            check(code == 0 and hit is None and b"before from ok" in output and b"finished ok" in output,
+                  "a normal rig runs as before, stderr merged into its output: %r %r" % (code, output))
+            check(os.path.isfile(log) and Path(log).read_bytes() == output,
+                  "its output is the same bytes in its log file: %s" % log)
+            code, output, hit = spawn(fail)
+            check(code == 5 and hit is None and b"before from fail" in output,
+                  "a failing rig still fails with its own exit code: %r %r" % (code, output))
+            before = sorted(os.listdir(scratch))
+            code, output, hit = spawner(script, root, env, None, None)(ok)
+            check(code == 0 and b"finished ok" in output and hit is None and sorted(os.listdir(scratch)) == before,
+                  "without --exe-dir or a timeout the output is still captured, leaving no file: %r" % output)
+
+            # The whole path: run() -> rig_timeout -> spawner -> run_rig -> kill_tree.
+            # The rig that hangs is killed at the timeout, one second here: a rig
+            # that gets going takes ~40 ms. A machine so loaded that the hung rig
+            # did not get going (its first line streamed, its grandchild started)
+            # or the rig beside it did not finish within the second has shown
+            # nothing about the kill, so the case is run again with a limit
+            # neither can miss; the checks read the last run.
+            def hung_pool(limit):
+                folder = root / ("pool-%d" % limit)
+                folder.mkdir()
+                heart = str(folder / "heartbeat.txt")
+                pool_script = write_script(folder, "pool.bat", ("ok", "hang"), heart)
+                hang = Job(Rig("hang", 1))
+                times = folder / "rig_times.json"
+                out = io.BytesIO()
+                outcome = []
+                worker = threading.Thread(
+                    target=lambda: outcome.append(run(pool_script, 2, 2, [], times, False, out,
+                                                      exe_dir=str(folder), timeout_override=float(limit))),
+                    daemon=True)
+                begun = time.monotonic()
+                worker.start()
+                hang_log = rig_log_path(str(folder), hang)
+                streamed = False
+                while worker.is_alive():
+                    if os.path.isfile(hang_log) and b"before the hang" in Path(hang_log).read_bytes():
+                        streamed = worker.is_alive()
+                        break
+                    time.sleep(0.01)
+                worker.join(limit + KILL_WAIT + 30)
+                return {"limit": limit, "heart": heart, "log": hang_log, "streamed": streamed,
+                        "outcome": outcome, "alive": worker.is_alive(), "took": time.monotonic() - begun,
+                        "text": out.getvalue().decode("utf-8", "replace"),
+                        "recorded": load_times(times)}
+
+            seen = hung_pool(1)
+            if not (seen["streamed"] and heartbeat_starts(seen["heart"], 0) and "ok" in seen["recorded"]):
+                seen = hung_pool(4)
+            limit, hang_log = seen["limit"], seen["log"]
+            check(seen["streamed"], "a rig's output is in its log file while the rig is still running")
+            check(seen["outcome"] == [1] and not seen["alive"],
+                  "a hung rig fails the run instead of hanging it: %r" % (seen["outcome"],))
+            text = seen["text"]
+            check("--- hang:" in text and "TIMEOUT (limit %d s)" % limit in text
+                  and "hang TIMED OUT after %d s" % limit in text
+                  and "ERROR: hang TIMED OUT after %d s" % limit in text and "before the hang" in text
+                  and "finished hang" not in text and "Its whole log: " + hang_log in text
+                  and "--- ok:" in text and "before from ok" in text,
+                  "the report names the TIMEOUT, prints the partial output and the log, and the other rig ran: %r"
+                  % text[-900:])
+            check(seen["took"] < limit + 12.0, "killed and reported within a bound: %.1f s" % seen["took"])
+            check(heartbeat_starts(seen["heart"]), "the rig's grandchild had started before the kill")
+            check(released(seen["heart"]), "the rig's whole process tree is gone after the timeout")
+            check(os.path.isfile(hang_log) and b"before the hang" in Path(hang_log).read_bytes()
+                  and b"finished hang" not in Path(hang_log).read_bytes(),
+                  "the hung rig's partial output survives in its log")
+            recorded = seen["recorded"]
+            check("hang" not in recorded and "ok" in recorded,
+                  "a killed rig records no time; the rig that passed does: %r" % recorded)
+
+            # The stand-in runner, started above, is judged now.
             first = runner.stdout.readline().strip()
             if first.startswith("uncontained 5 "):
                 # ERROR_ACCESS_DENIED: an enclosing job forbids nesting. The runner
@@ -1582,9 +1654,10 @@ def self_test_timeouts(check):
                 check(first == "contained", "the runner joins a job object: %r" % first)
                 if first == "contained":
                     check(heartbeat_starts(heart2), "the stand-in runner's child is running")
+                    check(held(heart2), "and holds its heartbeat file open, which is how the tree is told from a dead one")
                     runner.kill()
                     runner.wait(30)
-                    check(heartbeat_stops(heart2),
+                    check(released(heart2),
                           "when the runner is killed the job object takes its children with it")
         finally:
             runner.kill()
