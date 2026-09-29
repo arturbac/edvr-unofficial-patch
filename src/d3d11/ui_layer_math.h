@@ -916,7 +916,6 @@ enum class UiLayerDecision : uint8_t {
     kHdrTarget,      // drawn into the lit HDR target BEFORE exposure and the
                      // tonemap: the layer is composited after both, so taking
                      // it would lose the game's exposure, tonemap and bloom
-    kVrs,            // variable-rate shading is bound for the eye (foveation)
     kNoEye,          // the eye could not be told
     kTargetSize,     // the target is not the size of the region the game
                      // submits for that eye (the map is target-to-layer)
@@ -948,7 +947,6 @@ inline const char* uiLayerDecisionName(UiLayerDecision d) {
         case UiLayerDecision::kNotEyeTarget: return "not drawn into an eye target";
         case UiLayerDecision::kHdrTarget:
             return "drawn into the HDR target before the tonemap (left in the picture)";
-        case UiLayerDecision::kVrs: return "variable-rate shading bound for the eye";
         case UiLayerDecision::kNoEye: return "eye unknown";
         case UiLayerDecision::kTargetSize:
             return "its target is not the size of the eye the game submits";
@@ -976,7 +974,6 @@ struct UiLayerDrawFacts {
                                   // foot, or the screen's own depth is busy
     bool eyeTarget = false;       // an eye-sized 2D colour target
     bool ldrView = false;         // ... viewed as 8-bit UNORM (post-tonemap)
-    bool vrs = false;             // variable-rate shading bound
     int eye = -1;                 // 0 left, 1 right, -1 unknown
     bool targetMatchesEye = true; // the target is the submitted region's size
     bool late = false;            // its eye's door already ran this frame
@@ -1014,7 +1011,6 @@ inline UiLayerDecision uiLayerDecide(const UiLayerDrawFacts& f) {
     // unless the HDR HUD take owns this family (the cockpit HUD families: the
     // holo panels, the flight HUD, the target sprite, the holograms).
     if (!f.ldrView && !f.crispHdr) return UiLayerDecision::kHdrTarget;
-    if (f.vrs) return UiLayerDecision::kVrs;
     if (f.eye < 0 || f.eye > 1) return UiLayerDecision::kNoEye;
     if (!f.targetMatchesEye) return UiLayerDecision::kTargetSize;
     if (f.late) return UiLayerDecision::kLate;

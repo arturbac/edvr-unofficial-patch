@@ -44,7 +44,6 @@
 #include "fss_reveal.h"
 #include "fss_dump.h"
 #include "eye_split.h"
-#include "foveation.h"        // feature 2: the shading-rate image, bound at eye draws
 #include "resolve_probe.h"
 #include "resolve_bind_fix.h"
 #include "stencil_probe.h"
@@ -1683,7 +1682,7 @@ bool drawGateSubscribed(State* s) {
         s->censusAutoW != 0 || fssResActive() ||
         fssPanelWantsDraws() || fssRevealWantsDraws() ||
         fssDumpWantsDraws() ||
-        eyeSplitWantsDraws() || foveationWantsDraws() || resolveProbeWantsDraws() ||
+        eyeSplitWantsDraws() || resolveProbeWantsDraws() ||
         stencilProbeWantsDraws() || resolveBindWants() ||
         remlokWantsDraws() || holoWantsDraws() || targetSharpWantsDraws() ||
         hudSpriteWantsDraws() || panelUpscaleWantsDraws() || hudGrainWantsDraws() ||
@@ -2031,15 +2030,6 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         s->rtv0Cand = -1;
         s->rtv0Eye = targetIsEyeSized(bindingGet(BindSlot::Rtv0), &s->rtv0Cand);
         s->rtv0EyeGen = rtvGen;
-    }
-    // Foveated shading (foveation.h): the shading-rate image follows the
-    // census's verdict on slot 0 -- bound for an eye-sized target, cleared
-    // for anything else. One compare per draw once the answer is known, and
-    // it changes no binding of the game's, so everything below composes
-    // with it.
-    if (foveationWantsDraws()) {
-        foveationOnDraw(self, s->rtv0Eye, bindingGet(BindSlot::Rtv0), rtvGen,
-                         kind, count, instances);
     }
     // The intro probe, ABOVE the eye gate and deliberately. Its subject is the
     // startup sequence, and for the whole of the sequence's first phase there
@@ -3192,7 +3182,6 @@ void STDMETHODCALLTYPE hookedClearState(ID3D11DeviceContext* self) {
         flatTemporalViewport(0, nullptr);
         flatTemporalClearBindings();
     }
-    foveationOnClearState();
     // ClearState changes bindings, not resource contents. Retain the
     // captured weapon vertices and attachment inputs across this call.
     s->realClearState(self);
@@ -5298,7 +5287,6 @@ void vScreenRefreshConfig() {
     fssRevealConfigure(cfg);
     fssDumpConfigure(cfg);
     eyeSplitConfigure(cfg);
-    foveationConfigure(cfg);
     eyeMaskConfigure(cfg);
     resolveProbeConfigure(cfg);
     resolveBindConfigure(cfg);
@@ -5510,7 +5498,6 @@ EDVR_BOUNDARY_TICK(tkDrawCensusBoundary, "draw_census_boundary");
 EDVR_BOUNDARY_TICK(tkFssReveal, "fss_reveal");
 EDVR_BOUNDARY_TICK(tkFssDump, "fss_dump");
 EDVR_BOUNDARY_TICK(tkEyeSplit, "eye_split");
-EDVR_BOUNDARY_TICK(tkFoveation, "foveation");
 EDVR_BOUNDARY_TICK(tkEyeMask, "eye_mask");
 EDVR_BOUNDARY_TICK(tkFssPacing, "fss_pacing");
 EDVR_BOUNDARY_TICK(tkRemlok, "remlok");
@@ -5656,7 +5643,6 @@ void vScreenFrameBoundary() {
     tkFssReveal.run([&] { fssRevealFrameBoundary(); });
     tkFssDump.run([&] { fssDumpFrameBoundary(s->ownerCtx); });
     tkEyeSplit.run([&] { eyeSplitFrameBoundary(s->ownerCtx); });
-    tkFoveation.run([&] { foveationFrameBoundary(s->ownerCtx); });
     tkEyeMask.run([&] { eyeMaskFrameBoundary(s->ownerCtx); });
 
     // FSS frame pacing (round 31): the left-only squares are now measured
@@ -6548,7 +6534,6 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     fssRevealConfigure(cfg);
     fssDumpConfigure(cfg);
     eyeSplitConfigure(cfg);
-    foveationConfigure(cfg);
     eyeMaskConfigure(cfg);
     resolveProbeConfigure(cfg);
     resolveBindConfigure(cfg);
@@ -6913,7 +6898,6 @@ void shutdownVScreenFixes() {
     fssRevealShutdown();
     fssDumpShutdown();
     eyeSplitShutdown();
-    foveationShutdown();
     eyeMaskShutdown();
     gpuCensusShutdown();
     resolveProbeShutdown();

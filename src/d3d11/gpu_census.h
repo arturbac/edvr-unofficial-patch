@@ -50,7 +50,6 @@ enum class GpuCensusSection : uint8_t {
                               // without reaching the slow path at all
     FrameUiLayerReissues,     // the UI layer's multiply/write-back reissues
     FrameEyeMask,             // fix.eye_mask's own draw
-    FrameFoveation,           // the foveated shading-rate mask's culled-strip clear
     Count
 };
 

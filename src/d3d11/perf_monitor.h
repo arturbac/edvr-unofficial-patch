@@ -18,7 +18,6 @@
 //   VRAM                             IDXGIAdapter3::QueryVideoMemoryInfo,
 //                                    once a second
 //   GPU load and temperature         NvAPI, once a second, NVIDIA only --
-//                                    the same library the foveation loads,
 //                                    two entry points; elsewhere "n/a"
 //   EDVR's own passes                the temporal, DLSS and sharpen totals
 //                                    those passes already keep

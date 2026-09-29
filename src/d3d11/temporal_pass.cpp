@@ -2960,9 +2960,9 @@ struct FoveaRegion {
 // l,r,down,up: this eye's four frame tangents. fw,fh: the frame those
 // tangents describe, in pixels. eyeIndex: 0 the left eye (its outer edge
 // is the left/l tangent, its nasal edge the right/r), 1 the right eye (the
-// reverse) -- confirmed by foveation.cpp's own mirrored tangent build (*l
-// = eye==0 ? -outer : -inner, *r = eye==0 ? inner : outer) and
-// frame_flag.h's "0 left, 1 right". minPx: the smallest crop worth
+// reverse) -- confirmed by the mirrored tangent build of the since-removed
+// shading-rate module (*l = eye==0 ? -outer : -inner, *r = eye==0 ? inner :
+// outer) and frame_flag.h's "0 left, 1 right". minPx: the smallest crop worth
 // NVIDIA's seam (128 today, cropOf's own floor); under it, ok is false and
 // the caller runs full-frame -- same as an unreachable r<=l or up<=down
 // frame, and the same as the mode being off (widthDeg <= 0 and not
@@ -7219,14 +7219,6 @@ void temporalPassShutdown() {
     if (g_csFast) { g_csFast->Release(); g_csFast = nullptr; }
 }
 
-bool temporalPassEyeOffset(int eye, float out[3]) {
-    if (eye < 0 || eye > 1 || !out) return false;
-    const EyeState& e = g_eye[eye];
-    if (e.eyeOff[0] == 0.0f && e.eyeOff[1] == 0.0f && e.eyeOff[2] == 0.0f) return false;
-    memcpy(out, e.eyeOff, sizeof(e.eyeOff));
-    return true;
-}
-
 }  // namespace edvr
 
 namespace edvr {
@@ -7342,7 +7334,7 @@ extern "C" __declspec(dllexport) void edvrTemporalAaPriceWindow(double* medians7
 // Bit 2: foveaEdgeRegionDeg's reduced-trim arithmetic, directly, on three
 // edges that do not hit the 2 degree floor.
 // Bit 4: edges mode's left/right trim-role swap between the two eyes
-// (eye 0 = left, outer edge at its l tangent -- foveation.cpp:924-925)
+// (eye 0 = left, outer edge at its l tangent)
 // produces a mirror image of the same physical crop. y is untouched by
 // the swap and comes out bit-identical; x is checked with a small pixel
 // tolerance (two independent tangent-to-pixel paths land ~2px apart at

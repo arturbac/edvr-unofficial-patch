@@ -119,8 +119,7 @@ void vScreenSetRenderTargetsRaw(ID3D11DeviceContext* ctx, uint32_t n,
 
 // The same bypass for Draw, the VS/PS stage, a VS constant buffer slot and
 // UpdateSubresource -- everything fix.eye_mask's ring needs past the hook,
-// so the draw census, the eye-draw gate, foveation and the temporal pass
-// never see it. Every one null-safe before the hooks are installed (no-op),
+// so the draw census, the eye-draw gate and the temporal pass never see it. Every one null-safe before the hooks are installed (no-op),
 // same as vScreenSetRenderTargetsRaw above.
 void vScreenDrawRaw(ID3D11DeviceContext* ctx, uint32_t vertexCount, uint32_t startVertex);
 void vScreenVSSetShaderRaw(ID3D11DeviceContext* ctx, ID3D11VertexShader* vs,
