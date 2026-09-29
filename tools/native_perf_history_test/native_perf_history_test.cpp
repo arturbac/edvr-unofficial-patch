@@ -515,8 +515,34 @@ void frameShareText() {
           n == std::strlen(text),
           "LONG FRAME share: the hook's ms, the boundary's, the real Present's, the draw hooks', the rest, and three named ticks");
     formatEdvrShare(text, sizeof(text), 26.4, s, 0.10, false);
-    check(std::strstr(text, "draw hooks ~0.10 ms (held from an earlier sampled frame)") != nullptr,
+    check(std::strstr(text, "draw hooks ~0.10 ms (held over)") != nullptr,
           "LONG FRAME share: a draw-hook figure not measured this frame says it is held over");
+
+    // Engine motion's clause (engine_motion_cpu.h): exact for the frame, at the end of the share, the
+    // rest of the text unchanged. No calls says so, never 0.00 ms; an unmeasured frame has no clause.
+    const std::string plain = [&] {
+        formatEdvrShare(text, sizeof(text), 26.4, s, 0.10, true);
+        return std::string(text);
+    }();
+    EngineMotionFrame em;
+    em.measured = true;
+    em.renderMs = 0.31;
+    em.calls = 118;
+    n = formatEdvrShare(text, sizeof(text), 26.4, s, 0.10, true, em);
+    check(std::string(text) == plain + " engine motion 0.31 ms;" && n == std::strlen(text),
+          "LONG FRAME share: engine motion's clause is this frame's render-thread ms, after the ticks");
+    em.calls = 0;
+    em.renderMs = 0.0;
+    formatEdvrShare(text, sizeof(text), 26.4, s, 0.10, true, em);
+    check(std::string(text) == plain + " engine motion none this frame;" && std::strstr(text, "0.00 ms") == nullptr,
+          "LONG FRAME share: engine motion's code that never ran on this thread says none, not 0.00 ms");
+    em.calls = 1;
+    formatEdvrShare(text, sizeof(text), 26.4, s, 0.10, true, em);
+    check(std::string(text) == plain + " engine motion 0.00 ms;",
+          "LONG FRAME share: engine motion that ran once and rounds to nothing is 0.00 ms, not none");
+    EngineMotionFrame off;
+    formatEdvrShare(text, sizeof(text), 26.4, s, 0.10, true, off);
+    check(std::string(text) == plain, "LONG FRAME share: an unmeasured frame (the priming one) has no engine motion clause");
     FrameTickSummary none;
     formatEdvrShare(text, sizeof(text), 12.0, none, 0.0, false);
     check(std::strstr(text, "slowest EDVR ticks: none recorded;") != nullptr &&
@@ -541,25 +567,37 @@ void nativeLongFrameFits() {
     worst.top[0] = {"exposure_reclaim_tick", 4999.99f};
     worst.top[1] = {"engine_velocity_clock", 4999.99f};
     worst.top[2] = {"draw_census_boundary", 4999.99f};
-    char share[400];
-    formatEdvrShare(share, sizeof(share), 4999.9, worst, 4999.99, false);
-    NativeLongFrame line;
-    line.frameMs = 4999.9;
-    const std::string reference(79, 'r'), events(199, 'e'), stamp(219, 's'), gameWork(47, 'g');
-    line.reference = reference.c_str();
-    line.textures = line.buffers = line.shaders = 4294967295u;
-    line.creationMb = 123456.7;
-    line.share = share;
-    line.events = events.c_str();
-    line.stamp = stamp.c_str();
-    line.sequence = 18446744073709551615ull;
-    line.gameWork = gameWork.c_str();
+    EngineMotionFrame motion;   // the widest clause: every digit at its largest
+    motion.measured = true;
+    motion.renderMs = 4999.99;
+    motion.calls = 18446744073709551615ull;
+    // Both draw-hook wordings, each with the widest engine motion clause: whichever is longer must fit.
+    for (int fresh = 0; fresh < 2; ++fresh) {
+        char share[400];
+        formatEdvrShare(share, sizeof(share), 4999.9, worst, 4999.99, fresh != 0, motion);
+        NativeLongFrame line;
+        line.frameMs = 4999.9;
+        const std::string reference(79, 'r'), events(199, 'e'), stamp(219, 's'), gameWork(47, 'g');
+        line.reference = reference.c_str();
+        line.textures = line.buffers = line.shaders = 4294967295u;
+        line.creationMb = 123456.7;
+        line.share = share;
+        line.events = events.c_str();
+        line.stamp = stamp.c_str();
+        line.sequence = 18446744073709551615ull;
+        line.gameWork = gameWork.c_str();
+        char text[1400];
+        const size_t n = formatNativeLongFrame(text, sizeof(text), line);
+        std::printf("native_perf_history_test: the LONG FRAME line at its worst, draw hooks %s, is %zu characters "
+                    "(the log keeps about 1166; the gate is 1160)\n", fresh ? "sampled" : "held over", n);
+        check(std::strstr(share, " engine motion 4999.99 ms;") != nullptr,
+              "LONG FRAME line at its worst: the engine motion clause is in it, whole");
+        const std::string tail = std::string("runtime sequence 18446744073709551615, game work ") + gameWork + ".";
+        check(n == std::strlen(text) && n < 1160 && std::string(text).size() >= tail.size() &&
+              std::string(text).compare(std::string(text).size() - tail.size(), tail.size(), tail) == 0,
+              "LONG FRAME line at its worst fits the log's line, sequence and game work intact");
+    }
     char text[1400];
-    const size_t n = formatNativeLongFrame(text, sizeof(text), line);
-    const std::string tail = std::string("runtime sequence 18446744073709551615, game work ") + gameWork + ".";
-    check(n == std::strlen(text) && n < 1160 && std::string(text).size() >= tail.size() &&
-          std::string(text).compare(std::string(text).size() - tail.size(), tail.size(), tail) == 0,
-          "LONG FRAME line at its worst fits the log's line, sequence and game work intact");
 
     // And the ordinary line reads as the old one did, the share added before the events.
     NativeLongFrame plain;

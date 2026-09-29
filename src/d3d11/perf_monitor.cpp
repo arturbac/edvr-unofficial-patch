@@ -1,4 +1,5 @@
 #include "perf_monitor.h"
+#include "engine_motion_cpu.h"
 #include "frame_ticks.h"
 #include "gpu_frame_timing.h"
 
@@ -81,6 +82,11 @@ struct Frame {
     float    cpuDrawsMs = 0.0f;  // the running sampled figure
     bool     drawsFresh = false; // ...and whether it was measured in THIS frame
     FrameTickSummary ticks;      // EDVR's ticks in the Present hook, by name (frame_ticks.h)
+    // Engine motion's CPU time on this thread in THIS frame (engine_motion_cpu.h),
+    // every call clocked: exact for the frame, cut at the same edge as `ticks`.
+    bool     emMeasured = false;
+    float    emMs = 0.0f;
+    uint32_t emCalls = 0;
     // The game's own creations in the frame (device_hook.h), for the
     // long-frame line: a busy frame that made a hundred textures was
     // streaming, whatever else it looked like.
@@ -89,6 +95,23 @@ struct Frame {
     uint32_t createShaders = 0;
     float    createMb = 0.0f;
 };
+
+// Engine motion's CPU instrument (engine_motion_cpu.h): cut once a frame at the
+// Present hook's edge, folded and logged every 30 s. Static: its window holds a
+// few hundred KB of per-frame samples.
+emcpu::Recorder g_engineMotion;
+
+// The 30 s report: three lines, each short of the log line's limit
+// (tools\engine_motion_cpu_test holds the worst case).
+void logEngineMotion(const emcpu::WindowReport& r) {
+    char text[1400];
+    emcpu::formatSummary(text, sizeof(text), r);
+    Log::get().note("%s", text);
+    emcpu::formatRenderParts(text, sizeof(text), r);
+    Log::get().note("%s", text);
+    emcpu::formatOtherParts(text, sizeof(text), r);
+    Log::get().note("%s", text);
+}
 
 // ---- NvAPI, the two entry points the page wants ---------------------------
 typedef void* (*PFN_NvQueryInterface)(uint32_t id);
@@ -425,8 +448,12 @@ void dropLine(const Frame& f, float budgetMs) {
         // used to carry no share at all, and the boundary figure it might have
         // carried (cpuBoundaryMs) is written after the line is, so it read 0.00.
         char share[400];
+        EngineMotionFrame motion;
+        motion.measured = f.emMeasured;
+        motion.renderMs = static_cast<double>(f.emMs);
+        motion.calls = f.emCalls;
         formatEdvrShare(share, sizeof(share), static_cast<double>(f.presentMs), f.ticks,
-                        static_cast<double>(f.cpuDrawsMs), f.drawsFresh);
+                        static_cast<double>(f.cpuDrawsMs), f.drawsFresh, motion);
         NativeLongFrame line;
         line.frameMs = static_cast<double>(f.presentMs);
         line.reference = reference;
@@ -445,8 +472,12 @@ void dropLine(const Frame& f, float budgetMs) {
         return;
     }
     char share[400];
+    EngineMotionFrame motion;
+    motion.measured = f.emMeasured;
+    motion.renderMs = static_cast<double>(f.emMs);
+    motion.calls = f.emCalls;
     formatEdvrShare(share, sizeof(share), static_cast<double>(f.presentMs), f.ticks,
-                    static_cast<double>(f.cpuDrawsMs), f.drawsFresh);
+                    static_cast<double>(f.cpuDrawsMs), f.drawsFresh, motion);
     Log::get().note(
         "monitor: LONG FRAME -- %.1f ms between Presents (budget %.1f), of which the thread waited "
         "%.1f in Present (busy %.1f); the game's creations in it: %u "
@@ -669,6 +700,17 @@ void perfMonitorFrame(ID3D11Device* dev) {
     // the rest add up (frame_ticks.h). The stretch since the last mark is the
     // menu tick's own head; the remainder of this function is marked at its end.
     f.ticks = g_frameTicks.cut("menu_tick", q, qpcFrequency());
+    // Engine motion's hooks, cut at the same edge (engine_motion_cpu.h): this
+    // thread is the render thread, the one that calls Present. The figures are
+    // this frame's own, every call clocked -- what the LONG FRAME line reads.
+    {
+        const emcpu::Figures em = g_engineMotion.onFrame(qpcFrequency(), nowMs());
+        f.emMeasured = em.measured;
+        f.emMs = static_cast<float>(em.renderMs);
+        f.emCalls = em.renderCalls > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(em.renderCalls);
+        emcpu::WindowReport report;
+        if (g_engineMotion.takeReport(report)) logEngineMotion(report);
+    }
     // The frame's waits: Present's, noted by the swapchain hook a moment
     // ago; WaitGetPoses's, over the channel.
     f.presentWaitMs = s.pendingPresentWaitMs;

@@ -2202,6 +2202,28 @@ if errorlevel 1 ( echo [edvr] ERROR: engine velocity test build failed & exit /b
 "%OBJ%\enginevelocity\engine_velocity_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_engine_motion_cpu_test
+echo [edvr] === engine_motion_cpu_test.exe ===
+REM Build gate for engine motion's CPU instrument (src\d3d11\engine_motion_cpu.h,
+REM docs\openxr-performance-review-2026-09-14.md, the 2026-09-29 carrier entry):
+REM the header-only accumulator and its fold, driven with a fake clock so every
+REM figure is exact -- exclusive nesting and the forward pause, thread attribution
+REM (render thread and the rest), no lost update under four writers and a cutter,
+REM the window's percentiles, "-" for code that never ran against 0.00 for code
+REM that ran, the three report lines at their worst against the log line's limit,
+REM the priming frame, the 30 s and full-window closes, the clock floor measured
+REM on the real clock. It links nothing of the DLL.
+if not exist "%OBJ%\enginemotioncpu" mkdir "%OBJ%\enginemotioncpu"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /utf-8 ^
+    /Fo"%OBJ%\enginemotioncpu\\" /Fe"%OBJ%\enginemotioncpu\engine_motion_cpu_test.exe" ^
+    "tools\engine_motion_cpu_test\engine_motion_cpu_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: engine motion CPU test build failed & exit /b 1 )
+"%OBJ%\enginemotioncpu\engine_motion_cpu_test.exe" --dry-run || exit /b 1
+"%OBJ%\enginemotioncpu\engine_motion_cpu_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_kinematic_probe_test
 echo [edvr] === kinematic_probe_test.exe ===
 REM Build gate for the KinematicEvalProbe's observe/clock logic: the
