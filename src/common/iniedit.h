@@ -119,8 +119,8 @@ std::string iniValue(const std::string& text, const std::string& dotted,
 // the in-headset menu -- and both refresh the copy the installer keeps outside
 // the game folder. Each carried its own temp-and-rename, and each had a
 // different half of it: one never flushed, the other never retried, and a reader
-// holding the file open at the wrong instant made the rename fail with a sharing
-// violation that the menu showed as a failed write. One writer, here, beside the
+// holding the file open at the wrong instant made the classic rename fail with a
+// refusal that the menu showed as a failed write. One writer, here, beside the
 // grammar both of them share.
 //
 // The game re-reads edvr.ini about once a second and Config::parse refuses a
@@ -132,10 +132,10 @@ std::string iniValue(const std::string& text, const std::string& dotted,
 struct AtomicWriteOptions {
     // Tries after the first one, spent only on a sharing violation, an access
     // denial or a lock violation from the replace: a reader that has the target
-    // open, an editor mid-save, an antivirus scanning the file that was just
-    // written. Each clears in milliseconds. Anything else (no such folder, a
-    // full disk) fails at once. This retry is what carries a write past a
-    // reader that holds the file for a moment.
+    // open without sharing DELETE, an editor mid-save, an antivirus scanning the
+    // file that was just written. Each clears in milliseconds. Anything else (no
+    // such folder, a full disk) fails at once. A reader that DOES share DELETE
+    // does not need this: see the replace, below.
     int      retries = 5;
     unsigned backoffMs = 20;  // slept before each of those tries
 };
@@ -143,19 +143,34 @@ struct AtomicWriteOptions {
 // Replaces the file at `path` with `bytes`, all or nothing.
 //
 //   1. the bytes go to <path>.edvr-tmp-<pid>-<tid> in the same folder (one
-//      volume, so the replace is a rename) and are flushed to disk;
-//   2. MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH) puts them in place, tried
-//      again as `options` says;
-//   3. on any failure the temp file is deleted and the target is untouched.
+//      volume, so the replace is a rename) and are flushed to disk. The flush
+//      is before the replace, and it is where the durability lives: on one
+//      volume MOVEFILE_WRITE_THROUGH adds little to a rename;
+//   2. the temp file is renamed over the target with POSIX semantics
+//      (SetFileInformationByHandle with FileRenameInfoEx and the flags
+//      FILE_RENAME_FLAG_REPLACE_IF_EXISTS and FILE_RENAME_FLAG_POSIX_SEMANTICS;
+//      Windows 10 1607+, NTFS), through a handle opened write-through, which is
+//      what MOVEFILE_WRITE_THROUGH asks of the classic one. The target's name
+//      moves to the new file at once, and a reader that has the old one open and
+//      shares DELETE goes on reading it: the replace goes through under such a
+//      reader on the first attempt;
+//   3. where the OS or the volume refuses that as unsupported (older Windows,
+//      FAT and exFAT, some network shares: ERROR_INVALID_PARAMETER,
+//      ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION and their kind) it falls back
+//      to the classic MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH) in the same
+//      attempt, and remembers the refusal for the process so it is not asked
+//      again on every write. A failure it does not recognise falls back for that
+//      attempt only. A read-only target goes straight to the classic rename, so
+//      it is refused exactly as it always was;
+//   4. a replace refused for a reason that passes -- a sharing violation, an
+//      access denial, a lock violation -- is tried again as `options` says;
+//   5. on any failure the temp file is deleted and the target is untouched.
 //
-// That replace is the classic rename, and the classic rename is refused with
-// ERROR_ACCESS_DENIED while ANY other handle to the target is open -- one that
-// shares DELETE included (measured on Windows 11 build 26200 with cmd's move
-// /Y). Only a POSIX-semantics rename (SetFileInformationByHandle with
-// FileRenameInfoEx and FILE_RENAME_FLAG_POSIX_SEMANTICS; Windows 10 1607+, NTFS)
-// goes through under a reader that shares DELETE, and this does not use one: it
-// waits for the reader instead, which for the readers there are (Config's read,
-// a scanner) is microseconds to milliseconds.
+// Why 2: the classic rename is refused with ERROR_ACCESS_DENIED while ANY other
+// handle to the target is open, one that shares DELETE included (measured on
+// Windows 11 build 26200 with cmd's move /Y), so before it only the retry got a
+// menu write past Config's read of the file. A reader that does NOT share DELETE
+// still refuses both kinds of rename, and the retry waits for it.
 //
 // Does not create folders and does not clear a read-only attribute: a read-only
 // edvr.ini is a decision somebody made, and the failure says so. `error` (which
@@ -168,10 +183,31 @@ bool writeFileAtomic(const std::wstring& path, const std::string& bytes,
                      const AtomicWriteOptions& options = AtomicWriteOptions(),
                      int* tries = nullptr);
 
+// The rig's seam into step 2; nothing in the product calls these.
+//
+// `hook`, when set, is called INSTEAD of the POSIX-semantics call and returns the
+// Windows error that call stands in for: ERROR_INVALID_PARAMETER (and its kind)
+// makes the writer act as though the volume refused the rename as unsupported,
+// any other non-zero value is an attempt refused for that reason, and 0 lets the
+// real call go ahead. Calling this at all -- with a null hook too -- forgets a
+// remembered refusal and zeroes the attempt count.
+typedef unsigned long (*PosixReplaceHook)();
+void posixReplaceForTest(PosixReplaceHook hook);
+
+// How many times the POSIX-semantics call has been made, hooked or not, since
+// posixReplaceForTest: 1 after a refusal that is remembered, however many
+// writes follow it.
+int posixReplaceAttempts();
+
+// Whether a refusal as unsupported has been remembered, so that later writes go
+// straight to the classic rename.
+bool posixReplaceRefused();
+
 // The whole file, read with FILE_SHARE_DELETE so that reading it does not stop
-// somebody deleting or renaming it away, and closed before this returns: the
-// hold lasts as long as the read. false when the file is missing, unreadable,
-// over `limit`, or read short; an empty file is true with empty `bytes`.
+// somebody replacing, renaming or deleting it, and closed before this returns:
+// the hold lasts as long as the read. false when the file is missing,
+// unreadable, over `limit`, or read short; an empty file is true with empty
+// `bytes`.
 bool readFileBytes(const std::wstring& path, std::string* bytes, size_t limit = 64u << 20);
 
 // ---------------------------------------------------------------------------
