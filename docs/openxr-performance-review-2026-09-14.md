@@ -1700,18 +1700,29 @@ Censuses 1 and 2 hit the line cap: frame 0 is whole, frame 1 is cut (1176 of
   train: the star at 3,817 Ls is a point (a faint streak in the game's frame,
   drawn by something else), and census 3's one draw an eye is the radar's, two
   draws after the icon core in the radar's block with its state (ds=02wA,
-  st=04). The 14 older WORLD draws (3 logs) are all from frames with no cockpit
-  section at all (a loading screen, the 08-28 glare work), so they show only
-  that a frame without the HUD's draws reads WORLD. What is untested is a glare
+  st=04). The 18 older WORLD draws (4 logs: a main menu, a loading screen, the
+  08-28 glare work) are all from frames with no radar or console draw anywhere
+  in them, no near miss among them, so they show only that a frame without the
+  HUD's draws reads WORLD. What is untested is a glare
   train in a cockpit frame with the radar up; a train drawn after the radar's
   block on the HUD's target would read RADAR. The rule's ordering is the
   argument against it (the HUD section has its own colour target, the scene
   draws into another), not a measurement. Wanted: one capture with the sun
   close enough that its lens flare is drawn, radar up.
-- **Over all 1000-odd logs**: RADAR draws sit 2-6 draws after a radar family
-  (426 draws), PAD draws 15-236 after a console draw (88), so 250 is generous
-  for the radar (16 would do) and needed for the pad; stencil reference 04 in
-  all 384 radar and pad draws that record it, 00 in the 6 WORLD ones (not used).
+- **Over both installs' 1,349 logs** (`pair_class_scan.py --target frontier
+  --all`, and steam): RADAR draws sit 2-6 draws after a radar family (469
+  draws), so 250 is generous for the radar (16 would do). The pad has only 16
+  draws, in two logs (132352 and this capture), the console draw 191-236 draws
+  back: **a margin of 14 against the window of 250**. A busier HUD would push
+  the rings past it and they would read WORLD (left in the game's frame, as
+  today); the 30 s line counts that as a near miss. A pad window of 400 (1.7x)
+  would restore the margin; the approved rule says 250, so it stands, and
+  `kPairPadWindow` is the number to change. 72 more PAD-class calls of 15-98
+  instances, the console 15-39 back, sit in eight logs from 08-23 to 09-01:
+  an older game build whose radar families have other vertex shaders (no radar
+  mark is ever set), not the pad display. Stencil reference 04 in all 427 radar
+  and pad draws that record it, 00 in the 10 WORLD ones that do (a candidate
+  second signal; not used).
 - **The DCW b0 dumps add nothing that separates the classes.** b0 is 208 bytes,
   the same in all three: the sprite camera's basis rows (right and up, equal
   length 0.956/0.971, orthogonal) and the ship's world offset, with fixed 16x16
@@ -1763,16 +1774,25 @@ while the display is up; at UI 100 it is 0.60, +0.29 net.
 - In a cockpit frame with the sun's glare train drawn: `world` counts it, and
   `world draws in a frame whose HUD marks were on another target` says where;
   a train counted as radar or pad shows as `radar` or `pad` with a distance
-  that is not 2-6 or 15-236 (the first-seen lines name the instance count).
+  that is not 2-6 or 191-236 (the first-seen lines name the instance count).
+- With the pad up, `world draws with a mark on their own target past the
+  window` above 0 is the near miss: the pad's rings read WORLD because the
+  console draw sits past 250 (the line gives how far). That is the number
+  that says to widen `kPairPadWindow`.
 
-**Proof.** `tools\shared_pair_test` (447 checks): the mark table against the
-take's list; the rule at its edges; the tracker; eleven recorded frames from
-these logs (each class judged against its eye dump) plus constructed controls
-for the window's edge, a stale mark, a mark after the draw and a mark on
-another target; a reference implementation of the rule mutated seven ways, each
-caught by the recordings; the glare claim and the layer's take through
-`uiLayerDecide` in stock, vivid, realistic and off (a radar or pad draw never
-reaches kVerdict; without the guard it does, the control); the 30 s line and
-its absence; a scan of `vscreen.cpp` with ten mutants. `tools\pair_class_scan.py`
-holds the same fixtures in its own self-test. 30 mutants of the production
-sources, run on a scratch copy, are caught (harness: session scratchpad).
+**Proof.** `tools\shared_pair_test` (476 checks): the mark table against the
+take's list; the rule at its edges (each window at its own edge); the tracker;
+seven recorded frames from the logs (each class judged against its eye dump)
+plus four constructed controls (both windows' edges, a stale mark, a mark after
+the draw, a mark on another target); a reference implementation of the rule
+mutated twelve ways (no radar flag, no console flag, marks on any target,
+marks after the draw, no window, an unbounded window, the console first, a pad
+window of 230 (the recorded pad is 236 back), each window one draw short or
+long), each caught by the recordings; the glare claim and the layer's take
+through `uiLayerDecide` in stock, vivid, realistic and off (a radar or pad draw
+never reaches kVerdict; without the guard it does, the control); the 30 s line
+with its near-miss count, and its absence; a scan of `vscreen.cpp` with ten
+mutants. `tools\pair_class_scan.py` holds the same fixtures in its own
+self-test. 44 mutants of the production sources, run on a scratch copy: 43
+caught; the survivor swaps the pad's window for the radar's, and is equivalent
+while both are 250 (the harness is in the session scratchpad).

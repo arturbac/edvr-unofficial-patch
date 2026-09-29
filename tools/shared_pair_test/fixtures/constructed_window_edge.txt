@@ -1,7 +1,12 @@
-# CONSTRUCTED CONTROL, not a capture: the window's edge. A console draw exactly 250 draws before the pair's draw on its target is inside
-# the window (PAD); on the other target the console draw is 251 before, outside it (WORLD).
+# CONSTRUCTED CONTROL, not a capture: each window's edge. A console draw exactly 250 draws before the pair's draw on its target is inside
+# the pad's window (PAD); on the second target the console draw is 251 before, outside it (WORLD). The same for the radar's window: a
+# radar family (contact C) exactly 250 back is RADAR, 251 back is WORLD.
 frame 1
 d 100 68DDDEF04D9894AF @1
 d 101 68DDDEF04D9894AF @2
+d 103 9611A454527F7FEB @3
+d 104 9611A454527F7FEB @4
 p 350 3000 @1 pad
 p 352 3000 @2 world
+p 353 3000 @3 radar
+p 355 3000 @4 world

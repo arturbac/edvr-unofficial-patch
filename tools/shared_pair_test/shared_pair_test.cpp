@@ -15,8 +15,9 @@
 //      implementation of the rule, holds the same fixtures in its own --self-test;
 //   5. NEGATIVE CONTROLS: an independent reference implementation of the rule, mutated one way at a time
 //      (no radar flag, no console flag, marks on any target, marks after the draw, no window, an unbounded
-//      window, the console first); each mutant must disagree with the recordings somewhere, so the recordings
-//      are known to be sensitive to every part of the rule;
+//      window, the console first, a pad window of 230 -- the recorded pad is 236 draws back -- and each window
+//      one draw short or one draw long); each mutant must disagree with the recordings somewhere, so the
+//      recordings are known to be sensitive to every part of the rule;
 //   6. the gates: which classes the glare fix may claim and the layer take, uiLayerFamilyFor with the pair's
 //      class, and uiLayerDecide with the pair and a glare verdict, in stock, vivid, realistic and off -- a
 //      radar or pad draw must never reach kVerdict ("another fix swallows it"), and the control shows what the
@@ -121,7 +122,30 @@ void ruleCases() {
     check(pairClassFor(100, 200, 0) == PairClass::kWorld && pairClassFor(100, 0, 200) == PairClass::kWorld,
           "rule: a mark after the draw does not count");
     check(pairClassFor(100, 100, 0) == PairClass::kWorld, "rule: a mark at the draw's own ordinal is not before it");
-    check(kPairWindow == 250, "rule: the window is 250 draws");
+    // The two windows are the approved 250 and are pinned here, in constructed_window_edge.txt and in the
+    // reference below: a change to either is a decision, and this is where it announces itself.
+    check(kPairRadarWindow == 250 && kPairPadWindow == 250, "rule: both windows are 250 draws, as approved");
+    // Each window has its own edge, moving with its own constant: the pad's window does not stretch the radar's.
+    check(pairClassFor(100 + kPairRadarWindow, 100, 0) == PairClass::kRadar &&
+              pairClassFor(101 + kPairRadarWindow, 100, 0) == PairClass::kWorld,
+          "rule: the radar's window ends at kPairRadarWindow");
+    check(pairClassFor(100 + kPairPadWindow, 0, 100) == PairClass::kPad &&
+              pairClassFor(101 + kPairPadWindow, 0, 100) == PairClass::kWorld,
+          "rule: the pad's window ends at kPairPadWindow");
+    check(pairClassFor(101 + kPairRadarWindow, 100, 101) == PairClass::kPad,
+          "rule: a radar family just past its window and a console draw just inside the pad's is pad");
+    {
+        PairEvidence ev;
+        check(pairNearestMark(ev) == 0, "near miss: no marks, no near miss");
+        ev.radarBack = 300;
+        check(pairNearestMark(ev) == 300, "near miss: the radar family alone");
+        ev.consoleBack = 280;
+        check(pairNearestMark(ev) == 280, "near miss: the nearer of the two");
+        ev.radarBack = 270;
+        check(pairNearestMark(ev) == 270, "near miss: the nearer of the two, the other way round");
+        ev.radarBack = 0;
+        check(pairNearestMark(ev) == 280, "near miss: the console draw alone");
+    }
     check(!pairGlareMayClaim(PairClass::kRadar) && !pairGlareMayClaim(PairClass::kPad) &&
               pairGlareMayClaim(PairClass::kWorld) && pairGlareMayClaim(PairClass::kNotPair),
           "gates: the glare fix never sees a radar or pad draw; it judges a world draw and a non-pair draw as before");
@@ -272,7 +296,10 @@ std::vector<PairClass> productionClasses(const Frame& fr, PairEvidence* last = n
 }
 
 // The reference: the rule written again, plainly, with switches to break one part of it at a time.
-enum class Mutant { kNone, kNoRadar, kNoConsole, kAnyTarget, kMarksAfter, kNoWindow, kUnboundedWindow, kConsoleFirst };
+enum class Mutant {
+    kNone, kNoRadar, kNoConsole, kAnyTarget, kMarksAfter, kNoWindow, kUnboundedWindow, kConsoleFirst,
+    kPadNarrow, kPadShort, kPadLong, kRadarShort, kRadarLong
+};
 const char* mutantName(Mutant m) {
     switch (m) {
         case Mutant::kNoRadar: return "no radar flag";
@@ -282,12 +309,27 @@ const char* mutantName(Mutant m) {
         case Mutant::kNoWindow: return "a window of zero";
         case Mutant::kUnboundedWindow: return "an unbounded window";
         case Mutant::kConsoleFirst: return "the console tested before the radar";
+        case Mutant::kPadNarrow: return "a pad window of 230 (the recorded pad is 236 draws back)";
+        case Mutant::kPadShort: return "a pad window of 249";
+        case Mutant::kPadLong: return "a pad window of 251";
+        case Mutant::kRadarShort: return "a radar window of 249";
+        case Mutant::kRadarLong: return "a radar window of 251";
         default: return "none";
     }
 }
 std::vector<PairClass> referenceClasses(const Frame& fr, Mutant m) {
     std::vector<PairClass> out;
-    const uint32_t window = m == Mutant::kNoWindow ? 0u : m == Mutant::kUnboundedWindow ? 0xFFFFFFFFu : 250u;
+    uint32_t radarWindow = 250u, padWindow = 250u;
+    switch (m) {
+        case Mutant::kNoWindow: radarWindow = padWindow = 0u; break;
+        case Mutant::kUnboundedWindow: radarWindow = padWindow = 0xFFFFFFFFu; break;
+        case Mutant::kPadNarrow: padWindow = 230u; break;
+        case Mutant::kPadShort: padWindow = 249u; break;
+        case Mutant::kPadLong: padWindow = 251u; break;
+        case Mutant::kRadarShort: radarWindow = 249u; break;
+        case Mutant::kRadarLong: radarWindow = 251u; break;
+        default: break;
+    }
     for (size_t i = 0; i < fr.entries.size(); ++i) {
         const Entry& p = fr.entries[i];
         if (p.kind != 'p') continue;
@@ -298,8 +340,9 @@ std::vector<PairClass> referenceClasses(const Frame& fr, Mutant m) {
             const bool before = m == Mutant::kMarksAfter ? true : d.ordinal < p.ordinal;
             const bool sameTarget = m == Mutant::kAnyTarget ? true : d.target == p.target;
             const uint32_t back = d.ordinal < p.ordinal ? p.ordinal - d.ordinal : d.ordinal - p.ordinal;
-            if (!before || !sameTarget || back > window) continue;
             const PairMark mark = pairMarkOf(d.vs);
+            const uint32_t window = mark == PairMark::kRadar ? radarWindow : padWindow;
+            if (!before || !sameTarget || back > window) continue;
             if (mark == PairMark::kRadar && m != Mutant::kNoRadar) radar = true;
             if (mark == PairMark::kConsole && m != Mutant::kNoConsole) console = true;
         }
@@ -340,7 +383,8 @@ void fixtureCases() {
 
     // NEGATIVE CONTROLS: break the rule one way at a time; the recordings must notice every one.
     for (Mutant m : {Mutant::kNoRadar, Mutant::kNoConsole, Mutant::kAnyTarget, Mutant::kMarksAfter, Mutant::kNoWindow,
-                     Mutant::kUnboundedWindow, Mutant::kConsoleFirst}) {
+                     Mutant::kUnboundedWindow, Mutant::kConsoleFirst, Mutant::kPadNarrow, Mutant::kPadShort,
+                     Mutant::kPadLong, Mutant::kRadarShort, Mutant::kRadarLong}) {
         unsigned disagreements = 0;
         for (const Fixture& fx : fixtures)
             for (const Frame& fr : fx.frames) {
@@ -483,8 +527,9 @@ void runtimeCases() {
     check(sharedPairClassify(frame, &eyeB, 60, kSharedPairVs, kSharedPairPs, 8) == PairClass::kWorld, "runtime: a draw on a target with no marks is world");
     lines = takeLines();
     check(hasLine(lines, "the first draw of the radar class: 39 instances, a radar family drew 2 draws before it") &&
-              hasLine(lines, "the first draw of the world class: 8 instances, no radar family or console draw within 250 draws before it on its target; the frame's HUD marks are on another target"),
-          "runtime: the first radar and the first world draw are named, the world one with the marks-elsewhere note");
+              hasLine(lines, "the first draw of the world class: 8 instances, no radar family within 250 and no console draw within 250 draws before it on its target; the frame's HUD marks are on another target.") &&
+              !hasLine(lines, "the nearest mark on its own target"),
+          "runtime: the first radar and the first world draw are named, the world one with the marks-elsewhere note and, having no mark of its own, no near-miss note");
     check(sharedPairClassify(frame, &eyeA, 193, kSharedPairVs, kSharedPairPs, 39) == PairClass::kRadar && takeLines().empty(),
           "runtime: a class is named once, not at every draw");
 
@@ -511,6 +556,39 @@ void runtimeCases() {
     sharedPairFrameBoundary(155000, false);
     sharedPairFrameBoundary(186000, true);        // ran only in the last frame of a window: still a line
     check(takeLines().size() == 1, "runtime: one active frame in a window is enough for its line");
+
+    // A NEAR MISS: a world call with a mark of its own on its own target, past the window. The first one is
+    // named with how far back the mark was, and the 30 s line counts them; a world draw with no mark of its own
+    // and a radar draw are not near misses. This is where a window that is too short for a busier HUD would show.
+    sharedPairShutdown();
+    takeLines();
+    ++frame;
+    sharedPairNoteEyeDraw(frame, &eyeA, 10, kHoloContactB);
+    sharedPairNoteEyeDraw(frame, &eyeA, 20, kPairConsoleVsA);
+    check(sharedPairClassify(frame, &eyeA, 300, kSharedPairVs, kSharedPairPs, 60) == PairClass::kWorld,
+          "runtime: a radar family 290 and a console draw 280 draws back are past both windows: world");
+    lines = takeLines();
+    check(hasLine(lines, "the first draw of the world class: 60 instances, no radar family within 250 and no console draw within 250 draws before it on its target; the nearest mark on its own target is 280 draws back, past the window.") &&
+              !hasLine(lines, "HUD marks are on another target"),
+          "runtime: the first world draw names its near miss and how far back the nearest mark was");
+    check(sharedPairClassify(frame, &eyeA, 320, kSharedPairVs, kSharedPairPs, 60) == PairClass::kWorld &&
+              sharedPairClassify(frame, &eyeB, 330, kSharedPairVs, kSharedPairPs, 60) == PairClass::kWorld && takeLines().empty(),
+          "runtime: a second near miss, and a world draw on a target with no marks of its own, are not named again");
+    sharedPairNoteEyeDraw(frame, &eyeB, 335, kHoloContactC);
+    check(sharedPairClassify(frame, &eyeB, 337, kSharedPairVs, kSharedPairPs, 39) == PairClass::kRadar &&
+              hasLine(takeLines(), "the first draw of the radar class"),
+          "runtime: a radar draw after the world ones");
+    sharedPairFrameBoundary(200000, true);
+    sharedPairFrameBoundary(230000, true);
+    lines = takeLines();
+    check(lines.size() == 1 && lines[0].rfind("shared pair: radar 1, pad 0, world 3 (30 s; ", 0) == 0 &&
+              lines[0].find("1 world draws in a frame whose HUD marks were on another target") != std::string::npos &&
+              lines[0].find("2 world draws with a mark on their own target past the window (280-300 draws back)") != std::string::npos,
+          "runtime: the line counts the near misses (2 of the 3 world draws) and how far back their marks were; the draw with no mark of its own and the radar draw are not among them");
+    sharedPairFrameBoundary(260000, true);
+    lines = takeLines();
+    check(lines.size() == 1 && lines[0].find("0 world draws with a mark on their own target past the window (- draws back)") != std::string::npos,
+          "runtime: the next window starts from zero near misses");
     sharedPairShutdown();
     takeLines();
 }

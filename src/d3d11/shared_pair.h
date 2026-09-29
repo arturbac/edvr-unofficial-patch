@@ -22,12 +22,24 @@
 // draw census's #N), "the same target" is the bound colour target view, and only draws BEFORE it count: the
 // families are drawn in a fixed order and the pair is drawn after them.
 //
-// WHAT THE CAPTURES SAY (a43c94ba, 2026-09-29; all 1000-odd logs on the Frontier install):
-//   RADAR  426 draws: the nearest radar-family draw before it is 2 to 6 draws back, always (so 250 is generous
+// WHAT THE CAPTURES SAY (`python tools\pair_class_scan.py --target frontier --all`, and steam: 1,349 graphics
+// logs, both installs, to 2026-09-29; the game build of 2026-09-02 and later unless said):
+//   RADAR  469 draws: the nearest radar-family draw before it is 2 to 6 draws back, always (so 250 is generous
 //          for the radar; 16 would do).
-//   PAD     88 draws: the nearest console draw is 15 to 236 back (the 250 is needed here).
-//   WORLD   14 draws, all from frames with NO cockpit section (a loading screen, the 08-28 glare work): so far
-//          WORLD only proves that a frame without the HUD's draws is called WORLD.
+//   PAD     16 draws, in two logs (flight 132352 and capture 143837): the landing-pad display's own two draws an
+//          eye, 3226-3398 instances then 94-182, the nearest console draw 191 to 236 back. THE MARGIN IS 14
+//          DRAWS: a busier HUD between the console draws and the pad would put it past the window, and the draw
+//          would read WORLD (the pad's rings then stay in the game's frame, as today, and the 30 s line counts
+//          it as a near miss: "world draws with a mark on their own target past the window"). A window of 400
+//          would leave a margin of 1.7x; the approved rule says 250, so it is 250, and kPairPadWindow is the one
+//          number to change (the rig pins both windows at 250 in its rule cases, in
+//          constructed_window_edge.txt and in its reference, so a change is a deliberate edit there too).
+//   WORLD   18 draws in four logs (a main menu, a loading screen, the 08-28 glare work), every one from a frame
+//          with NO radar or console draw anywhere in it, no near miss among them: so far WORLD only proves that
+//          a frame without the HUD's draws is called WORLD.
+//   Logs before 2026-09-02 (another game build: the radar's families have other vertex shaders there, so no
+//   radar mark is ever set) hold 72 more PAD-class calls of 15-98 instances, the console 15-39 draws back:
+//   those are not the pad display.
 // The console draws (VS 41E245D488BFE83E and 68DDDEF04D9894AF) are ALSO drawn in a plain cockpit frame with the
 // radar up, which is why the radar test comes first. The cockpit's HUD section is drawn into its own colour
 // target (a capture: scene draws into one target, the holograms into another, one depth buffer for both), and
@@ -50,7 +62,10 @@ constexpr uint64_t kSharedPairPs = 0x912477AEF6958379ull;
 // The console's own draws, present in the pad display's frames and in ordinary cockpit frames alike.
 constexpr uint64_t kPairConsoleVsA = 0x41E245D488BFE83Eull;
 constexpr uint64_t kPairConsoleVsB = 0x68DDDEF04D9894AFull;
-constexpr uint32_t kPairWindow = 250;                              // draws, on the same target
+// How far back a mark reaches, in eye draws on the same target: the radar's and the console's own numbers (see
+// the pad's margin above). 250 each, as approved.
+constexpr uint32_t kPairRadarWindow = 250;
+constexpr uint32_t kPairPadWindow = 250;
 
 // Which marks a draw sets. The radar-only list is the radar's families without the pair's own vertex shader:
 // the icon core, its two stalks, the contact markers A to D (holo_families.h). The corona family is not on it
@@ -109,8 +124,8 @@ inline bool isSharedPair(uint64_t vs, uint64_t ps) noexcept { return vs == kShar
 // The rule itself, on two ordinals: the last radar-family draw and the last console draw on this draw's target
 // before it (0: none). Ordinals count from 1.
 inline PairClass pairClassFor(uint32_t ordinal, uint32_t lastRadar, uint32_t lastConsole) noexcept {
-    if (lastRadar != 0 && lastRadar < ordinal && ordinal - lastRadar <= kPairWindow) return PairClass::kRadar;
-    if (lastConsole != 0 && lastConsole < ordinal && ordinal - lastConsole <= kPairWindow) return PairClass::kPad;
+    if (lastRadar != 0 && lastRadar < ordinal && ordinal - lastRadar <= kPairRadarWindow) return PairClass::kRadar;
+    if (lastConsole != 0 && lastConsole < ordinal && ordinal - lastConsole <= kPairPadWindow) return PairClass::kPad;
     return PairClass::kWorld;
 }
 
@@ -121,12 +136,22 @@ inline PairClass pairClassFor(uint32_t ordinal, uint32_t lastRadar, uint32_t las
 constexpr bool pairGlareMayClaim(PairClass c) noexcept { return c != PairClass::kRadar && c != PairClass::kPad; }
 constexpr bool pairLayerAdmits(PairClass c) noexcept { return c == PairClass::kRadar || c == PairClass::kPad; }
 
-// How far back each mark was, for the log and the scan tool (0: no mark in the window).
+// How far back the last mark of each kind on the draw's target was, for the log and the scan tool: the distance
+// whether or not it is inside the window (0: no such mark before the draw), so a draw that just missed reads.
 struct PairEvidence {
     uint32_t radarBack = 0;
     uint32_t consoleBack = 0;
     bool marksElsewhere = false;   // the frame has marks on another target (the HUD's own, when this draw is not)
 };
+
+// The nearest mark of either kind on the draw's own target, 0 if there is none. For a WORLD call it is a NEAR
+// MISS when nonzero: a mark was there and reached too far back to count (a window that is too short for a
+// busier HUD shows up here first, as a pad's rings staying in the game's frame).
+inline uint32_t pairNearestMark(const PairEvidence& ev) noexcept {
+    if (ev.radarBack == 0) return ev.consoleBack;
+    if (ev.consoleBack == 0) return ev.radarBack;
+    return ev.radarBack < ev.consoleBack ? ev.radarBack : ev.consoleBack;
+}
 
 // The per-frame state: the last radar and console ordinal on each target drawn into. Four targets are plenty
 // (two eyes, and a target the marks were seen on for each); a fifth is not tracked and reads as no marks.

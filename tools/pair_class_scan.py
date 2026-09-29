@@ -13,7 +13,7 @@ capture can be judged the day it is flown:
     python tools\\pair_class_scan.py LOG [LOG ...]
     python tools\\pair_class_scan.py --target frontier --latest 3
     python tools\\pair_class_scan.py --target frontier --all --summary
-    python tools\\pair_class_scan.py LOG --window 400
+    python tools\\pair_class_scan.py LOG --window 400 [--pad-window 400]
     python tools\\pair_class_scan.py --emit-fixture LOG --census 2 --frame 0 [--noise 12]
     python tools\\pair_class_scan.py --self-test
 
@@ -52,7 +52,9 @@ RADAR_VS = {
     "B932058F26B76691": "contact D",
 }
 CONSOLE_VS = {"41E245D488BFE83E": "console A", "68DDDEF04D9894AF": "console B"}
-WINDOW = 250
+# kPairRadarWindow and kPairPadWindow in src/d3d11/shared_pair.h: how far back a mark reaches, in eye draws.
+WINDOW = 250          # the radar's; --window changes both, --pad-window the pad's alone
+PAD_WINDOW = 250
 
 DC_RE = re.compile(
     r"^\[(?P<t>\d\d:\d\d:\d\d\.\d+)\] DC (?P<frame>\d+) #(?P<ord>\d+) (?P<kind>\w) n=(?P<n>\d+) "
@@ -78,7 +80,6 @@ class Census(object):
         self.lines_cap = None     # `DC end`'s lines= (the cap it hit, when it hit it)
         self.dropped = 0          # `DC end`'s overflow=
         self.frame_draws = {}     # census frame -> the eye draws the census counted (`DC frame N draws=`)
-        self.frame_draws = {}     # census frame -> the eye draws the census counted (`DC frame N draws=`)
 
 
 class Call(object):
@@ -92,9 +93,10 @@ def is_pair(draw):
     return draw.vs == PAIR_VS and draw.ps in (PAIR_PS, None)
 
 
-def classify_draws(draws, window=WINDOW):
+def classify_draws(draws, window=WINDOW, pad_window=PAD_WINDOW):
     """The rule over one frame's draws in order: a list of Call, one for each draw of the pair. Marks are
-    per target token and only draws before the pair's count; ordinals are the census's #N."""
+    per target token and only draws before the pair's count; ordinals are the census's #N. `window` is the
+    radar's reach, `pad_window` the pad's."""
     last_radar, last_console = {}, {}
     calls = []
     for d in draws:
@@ -109,7 +111,7 @@ def classify_draws(draws, window=WINDOW):
             cb = d.ordinal - console if console is not None and console < d.ordinal else None
             if rb is not None and rb <= window:
                 cls = "RADAR"
-            elif cb is not None and cb <= window:
+            elif cb is not None and cb <= pad_window:
                 cls = "PAD"
             else:
                 cls = "WORLD"
@@ -163,7 +165,12 @@ def explain(c):
     return "no radar family or console draw before it on its target"
 
 
-def scan_log(path, window=WINDOW, out=None, summary_only=False):
+def is_near_miss(call):
+    """A WORLD call with a mark of its own on its own target that reached too far back to count."""
+    return call.cls == "WORLD" and bool(call.radar_back or call.console_back)
+
+
+def scan_log(path, window=WINDOW, out=None, summary_only=False, pad_window=PAD_WINDOW):
     """Print the pair's calls in one log; returns {"RADAR": n, "PAD": n, "WORLD": n}."""
     out = out or sys.stdout
     totals = {"RADAR": 0, "PAD": 0, "WORLD": 0}
@@ -172,13 +179,15 @@ def scan_log(path, window=WINDOW, out=None, summary_only=False):
     for cen in censuses:
         rows = []
         for fr in sorted(cen.frames):
-            for call in classify_draws(cen.frames[fr], window):
+            for call in classify_draws(cen.frames[fr], window, pad_window):
                 rows.append((fr, call))
                 totals[call.cls] += 1
         per_census.append((cen, rows))
     pairs = sum(len(r) for _, r in per_census)
-    out.write("%s: %d census(es), %d draw(s) of the shared pair: radar %d, pad %d, world %d\n"
-              % (os.path.basename(path), len(censuses), pairs, totals["RADAR"], totals["PAD"], totals["WORLD"]))
+    near = sum(1 for _, rows in per_census for _fr, call in rows if is_near_miss(call))
+    out.write("%s: %d census(es), %d draw(s) of the shared pair: radar %d, pad %d, world %d%s\n"
+              % (os.path.basename(path), len(censuses), pairs, totals["RADAR"], totals["PAD"], totals["WORLD"],
+                 " (%d of them with a mark on their own target past the window)" % near if near else ""))
     if summary_only:
         return totals
     for cen, rows in per_census:
@@ -256,7 +265,7 @@ def parse_fixture(text):
     return frames
 
 
-def fixture_calls(entries, window=WINDOW):
+def fixture_calls(entries, window=WINDOW, pad_window=PAD_WINDOW):
     """The rule over a fixture frame: [(ordinal, class name in lower case)] for its 'p' entries."""
     last_radar, last_console = {}, {}
     out = []
@@ -272,7 +281,7 @@ def fixture_calls(entries, window=WINDOW):
             r, c = last_radar.get(target), last_console.get(target)
             if r is not None and r < ordinal and ordinal - r <= window:
                 out.append((ordinal, "radar"))
-            elif c is not None and c < ordinal and ordinal - c <= window:
+            elif c is not None and c < ordinal and ordinal - c <= pad_window:
                 out.append((ordinal, "pad"))
             else:
                 out.append((ordinal, "world"))
@@ -299,13 +308,13 @@ def self_test():
     radar_vs = "9611A454527F7FEB"
     console_vs = "68DDDEF04D9894AF"
     # 1. the rule on synthetic census lines, with the negative controls
-    def run(lines, window=WINDOW):
+    def run(lines, window=WINDOW, pad_window=PAD_WINDOW):
         with tempfile.TemporaryDirectory() as tmp:
             p = os.path.join(tmp, "edvr_gfx_test.log")
             with open(p, "w", encoding="utf-8", newline="") as f:
                 f.write("[14:40:45.959] DC begin census=1 frames=1 frame=100 offscreen=yes\n" + "".join(lines))
             cen = parse_log(p)[0]
-            return classify_draws(cen.frames[0], window), cen
+            return classify_draws(cen.frames[0], window, pad_window), cen
 
     pair = lambda o, r="@1", i=39, ph=PAIR_PS: _dc(0, o, PAIR_VS, r=r, i=i, ph=ph)
     calls, cen = run([_dc(0, 10, radar_vs), _dc(0, 12, PAIR_VS, i=39, ph=PAIR_PS)])
@@ -333,6 +342,20 @@ def self_test():
     check(len(calls) == 1 and not calls[0].ps_known and calls[0].cls == "RADAR", "an unread pixel shader still counts as the pair's")
     calls, _ = run([_dc(0, 10, radar_vs), pair(14)], window=3)
     check(calls[0].cls == "WORLD", "--window narrows the rule")
+    # the two windows are the radar's and the pad's own
+    calls, _ = run([_dc(0, 10, console_vs), pair(260)])        # console 250 back
+    check(calls[0].cls == "PAD", "a console draw 250 back is inside the pad's window")
+    calls, _ = run([_dc(0, 10, console_vs), pair(261)])        # console 251 back: a near miss
+    check(calls[0].cls == "WORLD" and is_near_miss(calls[0]) and calls[0].console_back == 251,
+          "a console draw 251 back is outside it, and the WORLD call carries it as a near miss")
+    calls, _ = run([_dc(0, 10, console_vs), pair(261)], pad_window=400)
+    check(calls[0].cls == "PAD", "--pad-window widens the pad's reach")
+    calls, _ = run([_dc(0, 10, radar_vs), pair(261)], pad_window=400)
+    check(calls[0].cls == "WORLD", "--pad-window does not widen the radar's")
+    calls, _ = run([_dc(0, 10, console_vs), pair(261)], window=400)
+    check(calls[0].cls == "WORLD", "--window (the radar's) does not widen the pad's when the pad's is given")
+    calls, _ = run([pair(50)])
+    check(calls[0].cls == "WORLD" and not is_near_miss(calls[0]), "a world call with no mark at all is not a near miss")
 
     # 2. the scan's report and its line-cap warning
     with tempfile.TemporaryDirectory() as tmp:
@@ -352,6 +375,29 @@ def self_test():
         check("frame 0: 2 of the 5 eye draws are in the log" in text and "99 line(s) dropped" in text
               and "draws after #2 are missing" in text, "a frame the line cap cut is named, with what is missing")
         check("census 1 (14:40:45.959, frame 100)" in text, "the report names the census")
+        check("past the window" not in text.split("\n")[0],
+              "a log with no near miss says nothing about near misses in its header")
+        # a near miss is counted in the header line
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write("[14:40:45.959] DC begin census=1 frames=1 frame=100 offscreen=yes\n")
+            f.write(_dc(0, 5, console_vs))
+            f.write(_dc(0, 400, PAIR_VS, i=3392, ph=PAIR_PS))
+            f.write(_dc(0, 401, PAIR_VS, r="@9", i=3392, ph=PAIR_PS))
+        buf = io.StringIO()
+        totals = scan_log(p, out=buf)
+        head = buf.getvalue().split("\n")[0]
+        check(totals == {"RADAR": 0, "PAD": 0, "WORLD": 2} and "world 2 (1 of them with a mark on their own target past the window)" in head,
+              "the header counts the near misses among the world calls (one has a mark of its own, one has none)")
+        check("-> WORLD (the nearest mark is 395 draws back, past the window)" in buf.getvalue(),
+              "the near miss is explained per call")
+        # back to the log the following checks read
+        with open(p, "w", encoding="utf-8", newline="") as f:
+            f.write("[14:40:45.959] DC begin census=1 frames=1 frame=100 offscreen=yes\n")
+            f.write(_dc(0, 5, console_vs))
+            f.write(_dc(0, 9, PAIR_VS, i=3392, ph=PAIR_PS))
+            f.write("[14:40:46.234] DC frame 0 draws=5 off=0 copies=0 disp=0 clears=0 unseen=0\n")
+            f.write("[14:40:46.350] DC end census=1 draws=5 off=0 copies=0 disp=0 unseen=0 lines=16384 interned=2048 "
+                    "overflow=99 truncated=0\n")
         # ... and a frame the log kept whole is not
         with open(p, "w", encoding="utf-8", newline="") as f:
             f.write("[14:40:45.959] DC begin census=1 frames=1 frame=100 offscreen=yes\n")
@@ -406,7 +452,11 @@ def main(argv=None):
     ap.add_argument("--latest", type=int, default=1, help="with --target: how many of the newest logs (default 1)")
     ap.add_argument("--all", action="store_true", help="with --target: every graphics log")
     ap.add_argument("--summary", action="store_true", help="one line a log")
-    ap.add_argument("--window", type=int, default=WINDOW, help="draws a mark reaches (default %d)" % WINDOW)
+    ap.add_argument("--window", type=int, default=None,
+                    help="draws a mark reaches, for the radar's and (unless --pad-window says otherwise) the pad's "
+                         "(default %d and %d)" % (WINDOW, PAD_WINDOW))
+    ap.add_argument("--pad-window", type=int, default=None,
+                    help="draws a console draw reaches, for the pad alone (default: --window, else %d)" % PAD_WINDOW)
     ap.add_argument("--emit-fixture", metavar="LOG", help="write one census frame's reduction to stdout")
     ap.add_argument("--census", type=int, help="with --emit-fixture: the census number")
     ap.add_argument("--frame", type=int, default=0, help="with --emit-fixture: the census frame (default 0)")
@@ -437,11 +487,14 @@ def main(argv=None):
     if not paths:
         ap.error("name a log, or --target")
     total = {"RADAR": 0, "PAD": 0, "WORLD": 0}
+    radar_window = args.window if args.window is not None else WINDOW
+    pad_window = (args.pad_window if args.pad_window is not None
+                  else args.window if args.window is not None else PAD_WINDOW)
     for p in paths:
         if not os.path.isfile(p):
             print("no such log: %s" % p, file=sys.stderr)
             return 2
-        t = scan_log(p, args.window, summary_only=args.summary)
+        t = scan_log(p, radar_window, summary_only=args.summary, pad_window=pad_window)
         for k in total:
             total[k] += t[k]
     if len(paths) > 1:
