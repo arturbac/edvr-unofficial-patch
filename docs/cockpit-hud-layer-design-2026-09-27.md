@@ -212,7 +212,10 @@ For Sean, before Phase 1 -- ANSWERED 2026-09-27:
 4. The memory budget: +128-200 MB per eye on a Crystal-class output.
    ACCEPTED (the configure and layer lines report the actual numbers).
 5. Default: off until flown on Pimax and Quest. STANDS -- fix.ui_quality
-   defaults off, so the take defaults off with it.
+   defaults off, so the take defaults off with it. SUPERSEDED 2026-09-29:
+   Sean ships fix.ui_quality at 100, so the take is on by default (with
+   fix.temporal_aa on) before those flights; ui-layer-2026-09-23.md, journal
+   2026-09-29.
 
 ## Phase 0 built, 2026-09-27
 

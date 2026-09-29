@@ -390,10 +390,11 @@ bit.
 Other fixes do more too, and each is described in full. The resolution fix
 (below) rewrites twelve numbers in the game's code. The settlement detail fix,
 set to `auto` or `reduced`, hooks the game's own detail setter and changes one
-number, the game's level-of-detail distance. `ui_quality` (off by default)
-sizes panels inside the game's own panel code, and `static_prop_updates` (off
-by default) hooks the game's update of settlement structures and props and
-skips it for those that have not changed. `intro_video = skip` answers the
+number, the game's level-of-detail distance. `ui_quality` (100 by default;
+`off` leaves the panels alone) sizes panels inside the game's own panel code,
+and `static_prop_updates` (off by default) hooks the game's update of
+settlement structures and props and skips it for those that have not
+changed. `intro_video = skip` answers the
 game's open of the launch movie with "not found" through its import table; the
 default, `screen`, does not. Some advanced settings, all off by default, hook
 the game for diagnosis or experiments, and `edvr.ini` describes each. Explorer

@@ -1136,10 +1136,12 @@ REM The real parser over the real shipped edvr.ini. The file's own layout
 REM depends on two parser properties -- repeated section headers, last value
 REM wins -- that were originally read out of config.cpp rather than observed,
 REM and every symptom of either being false shows up in the game rather than
-REM in a build.
+REM in a build. It also registers the generated config_contract_gen.h tables
+REM (the moved-from map parsed from the real edvr.ini), so a moved key's read-
+REM through is proven against what actually shipped, not a fixture.
 if not exist "%OBJ%\cfgtest" mkdir "%OBJ%\cfgtest"
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
-    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\cfgtest"\ ^
+    /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /Fo"%OBJ%\cfgtest"\ ^
     /Fe"%BUILD%\config_test.exe" "tools\config_test\config_test.cpp" ^
     "src\common\config.cpp" "src\common\log.cpp" ^
     /link /INCREMENTAL:NO kernel32.lib

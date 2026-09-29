@@ -66,14 +66,16 @@ key that does not say is a WARNING, listed, and the row wears a "?" badge
 until the sentence is written.
 
 A `headset` token says the value is a PER-HEADSET LIST -- `runtime/system:value`
-entries separated by commas, as fix.openxr_resolution and the field-of-view
-trims carry -- so `range` on the same line bounds one entry's value rather than
-the string. The in-headset menu shows and edits the entry for the headset being
-worn, and this window edits the raw list as text, because on the desktop nothing
-knows which headset that is:
+entries separated by commas, as fix.openxr_resolution carries -- so `range` on
+the same line bounds one entry's value rather than the string. The in-headset
+menu shows and edits the entry for the headset being worn, and this window edits
+the raw list as text, because on the desktop nothing knows which headset that is:
 
-    # ui: Trim view, top and bottom | range 0..30 | headset | live | menu performance
-    fov_trim_vertical =
+    # ui: OpenXR resolution | headset | restart | menu performance
+    openxr_resolution =
+
+The field-of-view trims were the other such rows, with a range, until 2026-09-29
+(see OFF_MENU below): they are ini-only now, under [experimental].
 
 WHAT THE GENERATOR REFUSES (the menu cannot repair any of these at run time)
 
@@ -136,6 +138,19 @@ UI_SECTIONS = ('fix', 'advanced', 'experimental', 'menu')
 # would reach for while wearing the headset. Both are Fix tier: neither is a
 # developer instrument, and neither is hidden behind menu.developer.
 MENU_ROW_SECTIONS = ('fix', 'menu')
+# Settings that were taken off every menu on purpose, and must stay off.
+#
+# The three field-of-view trims were [fix] rows on the Performance page until
+# 2026-09-29, when they were demoted to [experimental] as ini-only keys (a
+# per-headset list is set once and edited in the file; the row that edited the
+# worn headset's entry is gone from the menu). Two innocent-looking edits would
+# put a row back without anybody deciding to: a `# ui:` line pasted back with
+# the key, and dropping the `# dev: hidden` above it -- the menu's developer
+# tier lists every [experimental] key the code reads, so a bare key becomes a
+# read-only row of its own. Either is a build error here, naming the key. To put
+# one back on a menu, change this list in the same commit.
+OFF_MENU = ('experimental.fov_trim_vertical', 'experimental.fov_trim_outer',
+            'experimental.fov_trim_nasal')
 
 READ_RE = re.compile(
     r'get(Bool|Int|Float|String)([A-Za-z]*)\s*\(\s*"([^"]+)"\s*,\s*([^;]*?)\)', re.S)
@@ -481,11 +496,11 @@ def apply_annotation(setting, text):
             setting.percent = True
         elif lower == 'headset':
             # The value is a per-headset list -- `runtime/system:value`
-            # entries, one per headset, as fix.openxr_resolution and the
-            # field-of-view trims are. `range` bounds ONE entry's value; the
-            # in-headset menu shows and edits the entry for the headset being
-            # worn, and the installer's window edits the raw list as text,
-            # because on the desktop nothing knows which headset that is.
+            # entries, one per headset, as fix.openxr_resolution is. `range`
+            # bounds ONE entry's value; the in-headset menu shows and edits
+            # the entry for the headset being worn, and the installer's window
+            # edits the raw list as text, because on the desktop nothing knows
+            # which headset that is.
             setting.headset = True
         elif lower == 'restart':
             setting.applies = 'restart'
@@ -875,6 +890,28 @@ def run(root, out, check):
             devSilent.append(s)
         menuRows.append((s, s.section, 'Advanced' if s.section == 'advanced' else 'Experimental'))
 
+    # ---- what was taken off the menu stays off it (OFF_MENU) ---------------
+    onMenu = []
+    seenOff = set()
+    for s in list(exposed) + [row[0] for row in menuRows]:
+        dotted = '%s.%s' % (s.section, s.key)
+        if dotted in OFF_MENU and id(s) not in seenOff:
+            seenOff.add(id(s))
+            onMenu.append(s)
+    if onMenu:
+        print('gen_settings_schema: ERROR: %d setting(s) that were taken off the menu have a row '
+              'again.' % len(onMenu))
+        print()
+        print('The field-of-view trims are set in edvr.ini only (demoted from [fix] to')
+        print('[experimental] on 2026-09-29). A `# ui:` line above one, or a bare key with no')
+        print('`# dev: hidden` -- the developer tier lists every [experimental] key the code')
+        print('reads -- gives it a row. Restore `# dev: hidden`, or, to put a row back on')
+        print('purpose, take the key out of OFF_MENU in tools/gen_settings_schema.py:')
+        print()
+        for s in onMenu:
+            print('  edvr.ini:%d  %s.%s' % (s.line, s.section, s.key))
+        return 1
+
     # ---- the bounds the menu will clamp to --------------------------------
     #
     # Every row either schema carries, once each. The menu runs a row's bounds
@@ -1194,20 +1231,71 @@ def self_test():
     expect_in(name, wrote, 'SettingKind::Text, "", "",')
     expect_not_in(name, wrote, 'MenuKind::Number')
 
-    # The field-of-view trims' shape: the same empty live text key, plus a
+    # A per-headset degrees list with a range (the shape the field-of-view
+    # trims had on the Performance page): the same empty live text key, plus a
     # `headset` token and a range. The range must reach both rows as ONE
     # entry's bounds -- the flag beside it is what says so -- and the kind must
     # stay Text, because the value is a list and a number box cannot hold one.
+    # The trims themselves are ini-only now (OFF_MENU); this keeps the token
+    # and its range honest for the next per-headset row.
     name = 'headset-range'
     wrote = case(name, ('[fix]\n'
-                        '# Take degrees off the top and the bottom edge of each eye, per\n'
-                        '# headset. Live.\n'
-                        '# ui: Trim view, top and bottom | range 0..30 | headset | live | menu performance\n'
-                        'fov_trim_vertical =\n'),
-                 {'a.cpp': 'const std::string v = cfg.getString("fix.fov_trim_vertical", "");\n'}, 0)
+                        '# Take degrees off an edge of each eye, per headset. Live.\n'
+                        '# ui: Edge trim | range 0..30 | headset | live | menu performance\n'
+                        'edge_trim =\n'),
+                 {'a.cpp': 'const std::string v = cfg.getString("fix.edge_trim", "");\n'}, 0)
     expect_in(name, wrote, 'MenuKind::Text, "", "0", "30", 2, "", false, true, 1,')
     expect_in(name, wrote, 'SettingKind::Text, "", "",\n     "0", "30", 2, "", true, false, false, true,')
     expect_not_in(name, wrote, 'MenuKind::Number')
+
+    # The demoted field-of-view trims (OFF_MENU, 2026-09-29) have NO row in
+    # either schema. The fixture is the shape of the shipped block: [experimental],
+    # the moved-from lines, `# dev: hidden`, no ui: line, each key read as text.
+    # Three controls beside it must each FAIL the generator, naming the key: the
+    # same block without `# dev: hidden` (the developer tier would list the key
+    # as a read-only row), with a `# ui:` line pasted back, and both.
+    def trim_block(hidden, ui):
+        text = '[experimental]\n'
+        for edge, key in (('top AND bottom', 'fov_trim_vertical'),
+                          ('outer', 'fov_trim_outer'), ('inner', 'fov_trim_nasal')):
+            text += ('# Take degrees off the %s edge of each eye, per headset. Live.\n'
+                     '# moved-from: fix.%s\n' % (edge, key))
+            pasted = ui and key == 'fov_trim_outer'
+            if pasted:
+                # A ui: line and a dev: line together are a different error
+                # (bothAnnotated), so the pasted key carries the ui: line alone.
+                text += '# ui: Trim view, outer edges | range 0..30 | live\n'
+            elif hidden:
+                text += '# dev: hidden\n'
+            text += '%s =\n\n' % key
+        return text
+    trim_reads = {'a.cpp': ('const std::string v = cfg.getString("experimental.fov_trim_vertical", "");\n'
+                            'const std::string o = cfg.getString("experimental.fov_trim_outer", "");\n'
+                            'const std::string n = cfg.getString("experimental.fov_trim_nasal", "");\n')}
+    name = 'off-menu-trims'
+    wrote = case(name, trim_block(True, False), trim_reads, 0)
+    expect_not_in(name, wrote, 'fov_trim')
+    name = 'off-menu-trims-dev-row'
+    said = case(name, trim_block(False, False), trim_reads, 1)
+    expect_in(name, said, 'taken off the menu have a row again')
+    for key in ('fov_trim_vertical', 'fov_trim_outer', 'fov_trim_nasal'):
+        expect_in(name, said, 'experimental.' + key)
+    name = 'off-menu-trims-ui-row'
+    said = case(name, trim_block(True, True), trim_reads, 1)
+    expect_in(name, said, 'taken off the menu have a row again')
+    expect_in(name, said, 'experimental.fov_trim_outer')
+    expect_not_in(name, said, 'experimental.fov_trim_vertical')
+    # The mechanism the guard leans on, stated on its own: a bare [experimental]
+    # key the code reads is a developer-tier row, and `# dev: hidden` is what
+    # removes it. (Any other key, so the guard is not what is being tested.)
+    other_reads = {'a.cpp': 'const std::string v = cfg.getString("experimental.some_probe", "");\n'}
+    other = '[experimental]\n# A probe. Live.\n%ssome_probe =\n'
+    name = 'dev-tier-row'
+    wrote = case(name, other % '', other_reads, 0)
+    expect_in(name, wrote, 'MenuTier::Experimental')
+    name = 'dev-tier-hidden'
+    wrote = case(name, other % '# dev: hidden\n', other_reads, 0)
+    expect_not_in(name, wrote, 'some_probe')
 
     # `# retired-default: X` is the installer merge's annotation, not prose.
     # Both shapes the tree has had: a block that ends in one (camera_index_track,

@@ -12,11 +12,11 @@ and the ruled-out list: "Status detail", straight after this block.*
     e3109af4) and the `edvrMenuPanel` export with `edvrEyeCaptureArm` and
     `edvrFssTheater` (6ecbd241). Their design text below is history.
   - Performance page: one `UI quality` row (`fix.ui_quality`, off / 100% /
-    125%) drives the cockpit panels' size and the UI layer; BUILT, NOT FLOWN
-    as of its 2026-09-23 entry. The `HUD quality` row, `advanced.ui_replay`
-    (retired 48ad7689) and the Foveation centre row
-    (`experimental.foveation_centre`) are gone. `fix.settlement_detail` has
-    a row (choices game, auto=Auto, reduced).
+    125%; default 100) drives the cockpit panels' size and the UI layer;
+    BUILT, NOT FLOWN as of its 2026-09-23 entry. Gone: the `HUD quality` row,
+    `advanced.ui_replay` (retired 48ad7689), the Foveation centre row
+    (`experimental.foveation_centre`) and the three `Trim view` rows (ini-only
+    since 2026-09-29). `fix.settlement_detail` has a row (game, auto, reduced).
   - Monitor page drops the rows the compositor's frame timing filled
     instead of showing "--" (frame_flag v34).
   - Single-line overlay: fits its text, keeps its font size across OpenXR
@@ -67,6 +67,24 @@ ruled-out list); the summary above points here.
 
 ### Dated change notes
 
+- **2026-09-29:** the `UI quality` row's shipped value is `100` (it shipped
+  `off`), and the value read when the ini has no line is `100` too, so the
+  row's `R` (reset to the shipped value) writes `100`. A new install, and an
+  update whose file never touched the key, get the interface panels at HMD
+  Quality 1.0's size and, with `fix.temporal_aa` on, the UI layer; a file that
+  set the key keeps its value (docs/ui-layer-2026-09-23.md, journal
+  2026-09-29, says what the merge does and does not distinguish).
+- **2026-09-29:** the Performance page's three `Trim view` rows are gone.
+  `fix.fov_trim_vertical`, `_outer` and `_nasal` are now the ini-only
+  `experimental.fov_trim_vertical`, `_outer` and `_nasal` (each `# dev:
+  hidden`, so not even a developer-tier row), with the same per-headset lists,
+  ranges and live behaviour; an old `[fix]` line still reads through, and the
+  installer's merge moves it (eye-mask-2026-09-16.md, journal 2026-09-29).
+  The generic per-headset row (`isHeadsetRow` and everything only it used)
+  left menu.cpp with them; the `OpenXR res.` row keeps the per-headset
+  machinery it shares (`applyHeadsetChange`, `wornEntryRemovable`,
+  `savedForText`). `tools/gen_settings_schema.py` refuses to emit a row for
+  the three (OFF_MENU).
 - **State: the door GPU bracket retired 2026-09-29 (code removed, e3109af4).**
   `edvrDoorGpuBegin` and `edvrDoorGpuEnd` (nothing called them once the legacy
   openvr half went), the per-eye query ring behind them and the Monitor's
@@ -748,7 +766,7 @@ they were there (flown 2026-09-07).
    the ini's own order:
    `temporal_aa`, `temporal_aa_model` (labelled **DLSS preset**, default K),
    `render_sharpness`, `foveation`, `settlement_detail`,
-   `ui_quality` (labelled **UI quality**, off / 100% / 125%, default off:
+   `ui_quality` (labelled **UI quality**, off / 100% / 125%, default 100:
    the interface panels' size and the UI layer, one row), and `render_scale`
    when its branch lands. Costs where they are measured:
    the temporal pass's own timing, NVIDIA's pass per eye, the sharpen's
