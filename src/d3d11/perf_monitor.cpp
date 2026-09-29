@@ -101,11 +101,15 @@ struct Frame {
 // few hundred KB of per-frame samples.
 emcpu::Recorder g_engineMotion;
 
-// The 30 s report: three lines, each short of the log line's limit
-// (tools\engine_motion_cpu_test holds the worst case).
+// The 30 s report: four lines, each short of the log line's limit
+// (tools\engine_motion_cpu_test holds the worst case): the scheme and the totals,
+// the clock's floor and what the instrument costs, the render thread's parts
+// (every call clocked), the other threads' parts (the sampled frames only).
 void logEngineMotion(const emcpu::WindowReport& r) {
     char text[1400];
     emcpu::formatSummary(text, sizeof(text), r);
+    Log::get().note("%s", text);
+    emcpu::formatClock(text, sizeof(text), r);
     Log::get().note("%s", text);
     emcpu::formatRenderParts(text, sizeof(text), r);
     Log::get().note("%s", text);
