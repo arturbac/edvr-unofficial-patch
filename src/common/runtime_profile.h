@@ -104,6 +104,7 @@ inline bool runtimeProfileAllowsKey(const char* key) {
         std::strcmp(key, "hotkey.menu") == 0 ||
         std::strcmp(key, "fix.temporal_aa_model") == 0 ||
         std::strcmp(key, "fix.temporal_aa_camera") == 0 ||
+        std::strcmp(key, "fix.temporal_aa_camera_trace") == 0 ||
         std::strcmp(key, "hotkey.dump_draws") == 0 ||
         std::strcmp(key, "experimental.temporal_aa_jitter") == 0 ||
         std::strcmp(key, "experimental.temporal_aa_partial") == 0);

@@ -125,6 +125,15 @@ struct InjectState {
     FlatCameraOwnershipDecision decision{};
     bool decisionValid = false;
     uint64_t frame = 0;
+    // fix.temporal_aa_camera_trace, refreshed per frame. Per-call log
+    // writes are gated behind it: the 2026-09-28 20:09 crash (a null-read
+    // downstream in the camera pipeline, sentinel-caught) came with the
+    // detour doing NOTHING but pass-through plus three note() writes on
+    // the game thread inside the view-constant refresh, so call-path I/O
+    // is the lead suspect and stays off unless a flight explicitly wants
+    // the breadcrumbs. The same information rides out on these fields and
+    // the 5s tick instead.
+    bool trace = false;
     // Counters, reported on the cadence tick.
     std::atomic<uint64_t> refreshCalls{0};
     std::atomic<uint64_t> injectedCalls{0};
@@ -132,6 +141,15 @@ struct InjectState {
     std::atomic<uint64_t> unsupportedCameras{0};
     std::atomic<uint64_t> warmingCalls{0};
     std::atomic<uint64_t> rayCbLogged{0};
+    // Last-call triage for the tick (no call-path I/O).
+    std::atomic<uint64_t> lastCallNo{0};
+    std::atomic<uintptr_t> lastCtx{0};
+    std::atomic<uintptr_t> lastP2{0};
+    std::atomic<uintptr_t> lastCamera{0};
+    std::atomic<uint32_t> lastKind{0};
+    std::atomic<uint64_t> raySeq{0};
+    uint64_t lastRaySeqReported = 0;
+    uintptr_t lastRaySlot = 0;
     uint64_t lastLogMs = 0;
     uint64_t lastKindRefusalLogMs = 0;
     float lastRay[4] = {};
@@ -293,10 +311,12 @@ bool prepareRelay(void* trampoline, void*) noexcept {
 
 // The ray CB observation: after the original refresh returns, read the
 // slot record at lVar4+0x78 (lVar4 = *(ctx+0x28) per the refresh's own
-// layout) and log the composition's first floats when they materially
+// layout) and record the composition's first floats when they materially
 // change. This is the follow-up that pins the consumer: the composed
 // values cross-check the rig's composeRayCb against the live game, and
-// the slot record is the handle for naming the binding shader next.
+// the slot record is the handle for naming the binding shader next. The
+// reads stay on the call path (plain memory, no I/O); the note is emitted
+// from the 5s tick, or immediately when the trace key is on.
 void observeRayCb(uintptr_t ctx) {
     uint64_t lVar4 = 0;
     if (!sehReadU64(ctx + 0x28, &lVar4) || !lVar4) return;
@@ -312,8 +332,11 @@ void observeRayCb(uintptr_t ctx) {
                         std::fabs(row[3] - g_inject.lastRay[3]);
     if (g_inject.rayCbLogged.load(std::memory_order_relaxed) != 0 && drift < 1e-3f) return;
     for (int i = 0; i < 4; ++i) g_inject.lastRay[i] = row[i];
+    g_inject.lastRaySlot = static_cast<uintptr_t>(staging);
     const uint64_t n = g_inject.rayCbLogged.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_inject.raySeq.store(n, std::memory_order_relaxed);
     if (n > 8) return; // bounded: first anchor plus a few material changes
+    if (!g_inject.trace) return; // the tick reports the anchor instead
     float more[12] = {};
     for (uint32_t i = 0; i < 12; ++i)
         if (!sehReadF32(static_cast<uintptr_t>(staging) + 16 + 4 * i, &more[i])) return;
@@ -333,9 +356,13 @@ void observeRayCb(uintptr_t ctx) {
 void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noexcept {
     g_refreshTls.armed = 0; // a previous body that unwound never disarmed
     const uint64_t callNo = g_inject.refreshCalls.fetch_add(1, std::memory_order_relaxed) + 1;
-    // Bounded breadcrumbs (first 8 calls): the next crash's log must name
-    // the stage, and these lines carry the register triage with it.
-    const bool trace = callNo <= 8;
+    // Breadcrumbs are gated behind the trace key (see InjectState::trace);
+    // the triage fields ride out on the 5s tick either way.
+    const bool trace = g_inject.trace && callNo <= 8;
+    g_inject.lastCallNo.store(callNo, std::memory_order_relaxed);
+    g_inject.lastCtx.store(ctx, std::memory_order_relaxed);
+    g_inject.lastP2.store(p2, std::memory_order_relaxed);
+    g_inject.lastCamera.store(camera, std::memory_order_relaxed);
     if (trace) {
         uint64_t literal = 0;
         if (sehReadU64(reinterpret_cast<uintptr_t>(g_inject.relay) + 22, &literal)) {
@@ -356,15 +383,18 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     // (and unsupported cameras are counted, not silently jittered).
     uint32_t kind = 0;
     const bool readable = camera && sehReadU32(camera + kCamKind, &kind);
+    g_inject.lastKind.store(readable ? kind : 0xffffffffu, std::memory_order_relaxed);
     if (!readable || kind != 3) {
         g_inject.kindRefusals.fetch_add(1, std::memory_order_relaxed);
-        const uint64_t now = GetTickCount64();
-        if (now - g_inject.lastKindRefusalLogMs > 30000) {
-            g_inject.lastKindRefusalLogMs = now;
-            Log::get().note("flat camera inject: camera %p kind %u is not the proven branch (named unsupported; no mutation)",
-                            reinterpret_cast<void*>(camera), readable ? kind : 0xffffffffu);
+        if (trace) {
+            const uint64_t now = GetTickCount64();
+            if (now - g_inject.lastKindRefusalLogMs > 30000) {
+                g_inject.lastKindRefusalLogMs = now;
+                Log::get().note("flat camera inject: camera %p kind %u is not the proven branch (named unsupported; no mutation)",
+                                reinterpret_cast<void*>(camera), readable ? kind : 0xffffffffu);
+            }
+            Log::get().note("flat camera inject: refresh call #%llu forwards unmodified (kind=%u)", (unsigned long long)callNo, kind);
         }
-        if (trace) Log::get().note("flat camera inject: refresh call #%llu forwards unmodified (kind=%u)", (unsigned long long)callNo, kind);
         return;
     }
     if (!g_inject.decisionValid || g_inject.decision.owner != FlatCameraOwner::Upstream) return;
@@ -433,7 +463,7 @@ void refreshPost() noexcept {
     const uint64_t callNo = g_refreshTls.callNo;
     g_inject.injectedCalls.fetch_add(1, std::memory_order_relaxed);
     flatRuntimeNoteCameraApplied();
-    if (callNo <= 8) {
+    if (g_inject.trace && callNo <= 8) {
         Log::get().note("flat camera inject: refresh call #%llu restored entry values; observing ray CB",
                         (unsigned long long)callNo);
     }
@@ -452,6 +482,12 @@ void standDown(const char* why) {
 bool flatCameraInjectWanted() {
     if (!runtimeFlatProfile()) return false;
     return _stricmp(Config::get().getString("fix.temporal_aa_camera", "off").c_str(), "on") == 0;
+}
+
+// Own function: the string temporary needs unwinding, which flatCamera-
+// InjectFrame's readback __try forbids (C2712).
+bool flatCameraInjectTraceWanted() {
+    return _stricmp(Config::get().getString("fix.temporal_aa_camera_trace", "off").c_str(), "on") == 0;
 }
 
 bool flatCameraInjectUpstreamOwns() {
@@ -474,6 +510,7 @@ void flatCameraInjectFrame(uint64_t frame) {
     }
     if (frame != g_inject.frame) {
         g_inject.frame = frame;
+        g_inject.trace = flatCameraInjectTraceWanted();
         flatCameraOwnerBegin(g_inject.owner);
         FlatCameraGroupInput in;
         in.upstreamCertified = true; // the detour re-verifies kind 3 per call
@@ -556,7 +593,7 @@ void flatCameraInjectFrame(uint64_t frame) {
     if (now - g_inject.lastLogMs >= 5000) {
         g_inject.lastLogMs = now;
         Log::get().note("flat camera inject 5s: refresh-calls=%llu injected=%llu warming=%llu "
-                        "kind-refusals=%llu unsupported=%llu owner=%s history=%s",
+                        "kind-refusals=%llu unsupported=%llu owner=%s history=%s trace=%s",
             (unsigned long long)g_inject.refreshCalls.exchange(0),
             (unsigned long long)g_inject.injectedCalls.exchange(0),
             (unsigned long long)g_inject.warmingCalls.exchange(0),
@@ -564,7 +601,27 @@ void flatCameraInjectFrame(uint64_t frame) {
             (unsigned long long)g_inject.unsupportedCameras.exchange(0),
             g_inject.decisionValid && g_inject.decision.owner == FlatCameraOwner::Upstream
                 ? "upstream" : "legacy/none",
-            g_inject.owner.historyValid ? "valid" : "invalid");
+            g_inject.owner.historyValid ? "valid" : "invalid",
+            g_inject.trace ? "on" : "off");
+        // The call triage that used to ride the per-call notes, reported
+        // here instead: no I/O on the game's refresh path (the 20:09
+        // crash hypothesis).
+        const uint64_t lastNo = g_inject.lastCallNo.load(std::memory_order_relaxed);
+        if (lastNo) {
+            Log::get().note("flat camera inject lastcall: #%llu ctx=%p p2=%p camera=%p kind=%u",
+                (unsigned long long)lastNo,
+                reinterpret_cast<void*>(g_inject.lastCtx.load(std::memory_order_relaxed)),
+                reinterpret_cast<void*>(g_inject.lastP2.load(std::memory_order_relaxed)),
+                reinterpret_cast<void*>(g_inject.lastCamera.load(std::memory_order_relaxed)),
+                g_inject.lastKind.load(std::memory_order_relaxed));
+        }
+        const uint64_t raySeq = g_inject.raySeq.load(std::memory_order_relaxed);
+        if (raySeq != g_inject.lastRaySeqReported) {
+            g_inject.lastRaySeqReported = raySeq;
+            Log::get().note("flat camera inject ray CB: slot %p anchors (%llux): [%.5f %.5f %.5f %.5f]",
+                reinterpret_cast<void*>(g_inject.lastRaySlot), (unsigned long long)raySeq,
+                g_inject.lastRay[0], g_inject.lastRay[1], g_inject.lastRay[2], g_inject.lastRay[3]);
+        }
     }
 }
 

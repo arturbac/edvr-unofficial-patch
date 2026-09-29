@@ -39,12 +39,24 @@
   the transfer is now generated code: stubA (save/restore all GPRs, exact
   stack) plus a return-address redirection to stubB, per-thread state in
   TLS. Details in the file header of src/d3d11/flat_camera_inject.cpp.
+- Open (2026-09-28 20:09 crash): the stub build flew the pass-through
+  path correctly (two refresh calls, kind-0 refusals, no mutation) and the
+  game still crashed ~100 ms later -- a null read at
+  EliteDangerous64.exe+0x4C83379 (mov rcx,[rbx+0x1D0]; rbx=[arg2+0x1A0]
+  arrived null), live chain a virtual call in the camera pipeline,
+  sentinel-caught with full registers/unwind. The pass-through is
+  memory-identical to unhooked, so the lead hypothesis is call-path I/O:
+  three note() writes per traced call on the game thread inside the
+  view-constant refresh. All per-call logging is now gated behind
+  fix.temporal_aa_camera_trace (default off); triage rides the 5s tick.
+  Discriminator for the next flight: trace off. If it still crashes, the
+  patch/trampoline alone is implicated -- fly temporal_aa_camera=off
+  (gate closed) next to separate that from stubA.
 - Next: C3, per the C3 wiring plan addendum -- the FUN_1405921f0 detour
   behind a default-off key, the ownership policy wired into flat_runtime,
   the classifier's jittered-encoding question answered, then one bounded
   session against the acceptance criteria there. First flight of the
-  stub build: confirm no crash, then read the bounded breadcrumbs (call
-  args, kind, redirect/restore lines) and the 5s counters.
+  trace-off build: crash or no crash names the hypothesis.
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable/build
   identities, backend versions, dimensions, formats and mod chain for
