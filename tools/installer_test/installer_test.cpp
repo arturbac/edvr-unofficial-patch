@@ -1229,11 +1229,13 @@ static void testApply(const std::wstring& scratch) {
         again.openxrLoader.kind=DllKind::Foreign;
         // The build machine may well have Elite running -- it did the day this
         // was written. It cannot be running from this scratch folder, so the
-        // survey reads it as somebody else's and plans anyway; both flags are
-        // cleared regardless, because this case is about the ini merge over a
-        // folder a previous run really wrote and nothing else.
+        // survey reads it as somebody else's and plans anyway; all three flags
+        // are cleared regardless (the third is a process list Windows would not
+        // give), because this case is about the ini merge over a folder a
+        // previous run really wrote and nothing else.
         again.gameRunningHere = false;
         again.gameRunningElsewhere = false;
+        again.gameRunStateUnknown = false;
         Options second = options;
         second.backupStamp = L"20260827-120200";
         const Plan plan = planInstall(again, second, newer);
@@ -1413,9 +1415,10 @@ static std::string listing(const std::wstring& dir) {
 }
 
 // `path` held open by a handle of this test's own, as a reader would. With
-// `shareDelete` it lets the file be replaced under it -- which is how Config's
-// read opens edvr.ini now; without, it is how that read used to open it, and how
-// an editor holding a file mid-save does.
+// `shareDelete` it is how Config's read opens edvr.ini now; without, how that
+// read used to open it, and how an editor holding a file mid-save does. Either
+// way the classic replace is refused for as long as the handle is open -- what
+// the share mode changes is only what ELSE can be done to the file meanwhile.
 static HANDLE holdOpen(const std::wstring& path, bool shareDelete) {
     const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | (shareDelete ? FILE_SHARE_DELETE : 0);
     return CreateFileW(path.c_str(), GENERIC_READ, share, nullptr, OPEN_EXISTING,
@@ -1460,46 +1463,39 @@ static void testAtomicWrite(const std::wstring& scratch) {
         expectEq(listing(dir), "edvr.ini", "with nothing left beside it after all of that");
     }
 
-    {   // The case config.cpp's FILE_SHARE_DELETE exists for: a reader holds the
-        // file, and the replace goes through anyway.
-        writeAll(target, "held open\r\n");
-        HANDLE reader = holdOpen(target, true);
-        check(reader != INVALID_HANDLE_VALUE, "a reader can hold the target open, sharing DELETE");
-        std::wstring why;
-        int tries = 0;
-        const bool wrote =
-            writeFileAtomic(target, "replaced under the reader\r\n", &why, AtomicWriteOptions(), &tries);
-        // Success while the reader is STILL holding the file is the point: no
-        // number of retries could have got it through if the reader refused, so
-        // how many were spent is left as information (a scanner touching the
-        // temp file can cost one).
-        check(wrote, "the replace succeeds while a reader that shares DELETE holds the file",
-              toUtf8(why));
-        printf("  info  it took %d %s\n", tries, tries == 1 ? "try" : "tries");
-        expectEq(readAll(target), "replaced under the reader\r\n", "and the path holds the new bytes");
-        if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
-        expectEq(listing(dir), "edvr.ini", "with nothing left beside it");
-    }
-
-    {   // A reader that does NOT share DELETE refuses the replace, for as long as
-        // it holds on. The writer tries again as it was told to, gives up, and
-        // leaves both the original and the folder as it found them.
+    // A reader that holds the target open refuses the replace for as long as it
+    // holds on -- whether or not it shares DELETE (measured: cmd's move /Y is
+    // refused with "Access is denied" under both on Windows 11 build 26200; only a
+    // POSIX-semantics rename would get through the sharing one). The writer tries
+    // again as it was told to, gives up, and leaves both the original and the
+    // folder as it found them. Run for a reader of each kind: the point is what
+    // the writer does, not which of the two the operating system refuses.
+    for (const bool shareDelete : {false, true}) {
+        const char* kind = shareDelete ? "a reader sharing DELETE" : "a reader not sharing DELETE";
         writeAll(target, "original\r\n");
-        HANDLE reader = holdOpen(target, false);
-        check(reader != INVALID_HANDLE_VALUE, "a reader can hold the target open, not sharing DELETE");
+        HANDLE reader = holdOpen(target, shareDelete);
+        check(reader != INVALID_HANDLE_VALUE, (std::string(kind) + " can hold the target open").c_str());
         AtomicWriteOptions quick;
         quick.retries = 3;
         quick.backoffMs = 1;
         std::wstring why;
         int tries = 0;
         const bool wrote = writeFileAtomic(target, "never lands\r\n", &why, quick, &tries);
-        check(!wrote, "a replace the reader refuses fails when its retries are spent");
-        check(tries == 4, "after the first try and the three it was allowed",
-              std::to_string(tries) + " tries");
-        check(!why.empty(), "and says why", "no message");
-        printf("  info  the message: %s\n", toUtf8(why).c_str());
-        expectEq(readAll(target), "original\r\n", "the original is exactly as it was");
-        expectEq(listing(dir), "edvr.ini", "and the temporary file is gone");
+        printf("  info  %s: wrote=%d after %d tries; the message: %s\n", kind, wrote ? 1 : 0,
+               tries, toUtf8(why).c_str());
+        if (wrote) {
+            // Only a reader that shares DELETE could be got past, and only by an
+            // operating system whose MoveFileExW replaces with POSIX semantics.
+            // Either answer is legitimate; a half state is not.
+            check(shareDelete, "a reader that does not share DELETE is not replaced under");
+            expectEq(readAll(target), "never lands\r\n", "the replace put the new bytes in place");
+        } else {
+            check(tries == 4, "the first try and the three it was allowed were spent",
+                  std::to_string(tries) + " tries");
+            check(!why.empty(), "and the failure says why", "no message");
+            expectEq(readAll(target), "original\r\n", "the original is exactly as it was");
+        }
+        expectEq(listing(dir), "edvr.ini", "and no temporary file is left");
         if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
         check(writeFileAtomic(target, "lands now\r\n", &why),
               "once the reader lets go, the same write goes through", toUtf8(why));
@@ -1531,9 +1527,11 @@ static void testAtomicWrite(const std::wstring& scratch) {
         SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
     }
 
-    {   // A reader that lets go while the retries are running: the write lands.
+    // A reader that lets go while the retries are running: the write lands. This
+    // is what the retry is for, and what carries the menu past Config's read.
+    for (const bool shareDelete : {false, true}) {
         writeAll(target, "before\r\n");
-        HANDLE reader = holdOpen(target, false);
+        HANDLE reader = holdOpen(target, shareDelete);
         std::thread letGo([reader] {
             Sleep(60);
             if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
@@ -1545,7 +1543,10 @@ static void testAtomicWrite(const std::wstring& scratch) {
         int tries = 0;
         const bool wrote = writeFileAtomic(target, "after\r\n", &why, patient, &tries);
         letGo.join();
-        check(wrote, "a reader that lets go while the retries run does not fail the write",
+        check(wrote, shareDelete ? "a reader sharing DELETE that lets go during the retries does not "
+                                   "fail the write"
+                                 : "a reader not sharing DELETE that lets go during the retries "
+                                   "does not fail the write",
               toUtf8(why));
         expectEq(readAll(target), "after\r\n", "and the write landed");
         expectEq(listing(dir), "edvr.ini", "with nothing left beside it");
@@ -1657,6 +1658,27 @@ static void testGenerations(const std::wstring& scratch) {
     check(writeGenerations(dir, name, "S\r\n", true, &why),
           "and once the older copy can be moved the same write goes through", toUtf8(why));
     check(gen(0) == "S\r\n" && gen(1) == "R\r\n" && gen(2) == "Q\r\n", "as three generations");
+
+    // The LAST step of a rotation being refused -- the newest is read-only, so the
+    // new copy cannot take its place -- has already kept the copy being replaced
+    // as .1. The same write tried again must not push another real copy out to
+    // make room for that duplicate.
+    removeTree(dir);
+    makeTree(dir);
+    writeGenerations(dir, name, "P\r\n", true);
+    writeGenerations(dir, name, "Q\r\n", true);
+    writeGenerations(dir, name, "R\r\n", true);
+    SetFileAttributesW(generationPath(dir, name, 0).c_str(), FILE_ATTRIBUTE_READONLY);
+    check(!writeGenerations(dir, name, "S\r\n", true, &why),
+          "a write whose last step is refused fails");
+    check(gen(0) == "R\r\n" && gen(1) == "R\r\n" && gen(2) == "Q\r\n",
+          "leaving the newest intact, with the copy it kept and the one behind that");
+    SetFileAttributesW(generationPath(dir, name, 0).c_str(), FILE_ATTRIBUTE_NORMAL);
+    check(writeGenerations(dir, name, "S\r\n", true, &why),
+          "and once the newest can be replaced the same write goes through", toUtf8(why));
+    check(gen(0) == "S\r\n" && gen(1) == "R\r\n" && gen(2) == "Q\r\n",
+          "without pushing a real copy out for the duplicate");
+    expectEq(listing(dir), "edvr.ini, edvr.ini.1, edvr.ini.2", "and no temporary file is left");
 
     // A folder that is not there fails cleanly.
     check(!writeGenerations(joinPath(dir, L"no-such-folder"), name, "x", true, &why),

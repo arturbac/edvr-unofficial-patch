@@ -1099,10 +1099,14 @@ changes because the file did.
   window uses the same one): a temp file beside the ini, flushed, then
   `MoveFileExW` with replace-and-write-through, so `config.cpp`'s size check
   never meets half a save. The replace is tried again (five times, 20 ms
-  apart) on a sharing violation or access denied, and `config.cpp` opens the
-  ini with `FILE_SHARE_DELETE`, so the reload the menu asks for after a write
-  cannot make the next write fail. A read-only ini is left alone and the
-  failure says so.
+  apart) on a sharing violation or access denied: the classic rename is
+  refused with access denied while ANY handle to the ini is open, one that
+  shares `FILE_SHARE_DELETE` included (measured on Windows 11 build 26200), so
+  the reload the menu asks for after a write can meet the next write for the
+  microseconds it holds the file, and it is the retry that carries the write
+  past it. `config.cpp` opens the ini with `FILE_SHARE_DELETE` as well, which
+  matters only to a POSIX-semantics rename (`FileRenameInfoEx`, not used
+  here). A read-only ini is left alone and the failure says so.
 - **Apply now**: `Config::get().reloadIfChanged()` is called immediately
   after the write, so the change lands on this frame instead of the next
   poll, and through the same configure path a hand edit takes -- no module

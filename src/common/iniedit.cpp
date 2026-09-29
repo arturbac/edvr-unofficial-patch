@@ -789,8 +789,9 @@ bool writeFileAtomic(const std::wstring& path, const std::string& bytes, std::ws
 
 bool readFileBytes(const std::wstring& path, std::string* bytes, size_t limit) {
     bytes->clear();
-    // FILE_SHARE_DELETE: reading a file must never be what makes somebody's
-    // atomic replace of it fail.
+    // FILE_SHARE_DELETE: reading a file must not stop somebody deleting or
+    // renaming it away. (A classic replace is refused while any handle to the
+    // target is open; this one is closed again below, so the hold is the read.)
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -860,25 +861,36 @@ bool writeGenerations(const std::wstring& dir, const std::wstring& name,
 
     const AtomicWriteOptions options{};
     DWORD code = 0;
-    for (int g = kMirrorGenerations - 1; g >= 2; --g) {
-        const std::wstring from = generationPath(dir, name, g - 1);
-        if (!pathExists(from)) continue;
-        if (!replaceFile(from, generationPath(dir, name, g), options, nullptr, &code)) {
+
+    // Generation 1 already holds the copy being replaced: an earlier attempt at
+    // this same write got that far and failed on its last step (the newest was
+    // read-only, or held). Moving it up again would push a real older copy out
+    // for a duplicate, and each retry would push out another.
+    std::string behind;
+    const bool alreadyKept =
+        readFileBytes(generationPath(dir, name, 1), &behind) && behind == old;
+
+    if (!alreadyKept) {
+        for (int g = kMirrorGenerations - 1; g >= 2; --g) {
+            const std::wstring from = generationPath(dir, name, g - 1);
+            if (!pathExists(from)) continue;
+            if (!replaceFile(from, generationPath(dir, name, g), options, nullptr, &code)) {
+                DeleteFileW(staged.c_str());
+                setError(error, withCode(L"an older copy could not be moved up", code));
+                return false;
+            }
+        }
+
+        // The copy being replaced becomes generation 1. Written from the bytes
+        // just read rather than renamed, so the newest never goes missing: a
+        // crash at any point leaves <name> in place, and a restore that reads it
+        // finds a whole file.
+        std::wstring why;
+        if (!writeFileAtomic(generationPath(dir, name, 1), old, &why)) {
             DeleteFileW(staged.c_str());
-            setError(error, withCode(L"an older copy could not be moved up", code));
+            setError(error, L"the copy being replaced could not be kept: " + why);
             return false;
         }
-    }
-
-    // The copy being replaced becomes generation 1. Written from the bytes just
-    // read rather than renamed, so the newest never goes missing: a crash at any
-    // point leaves <name> in place, and a restore that reads it finds a whole
-    // file.
-    std::wstring why;
-    if (!writeFileAtomic(generationPath(dir, name, 1), old, &why)) {
-        DeleteFileW(staged.c_str());
-        setError(error, L"the copy being replaced could not be kept: " + why);
-        return false;
     }
 
     int made = 0;

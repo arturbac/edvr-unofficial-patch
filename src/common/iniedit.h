@@ -131,10 +131,11 @@ std::string iniValue(const std::string& text, const std::string& dotted,
 
 struct AtomicWriteOptions {
     // Tries after the first one, spent only on a sharing violation, an access
-    // denial or a lock violation from the replace: a reader that opened the file
-    // without FILE_SHARE_DELETE, an editor mid-save, an antivirus scanning the
-    // file that was just written. Each clears in milliseconds. Anything else
-    // (no such folder, a full disk) fails at once.
+    // denial or a lock violation from the replace: a reader that has the target
+    // open, an editor mid-save, an antivirus scanning the file that was just
+    // written. Each clears in milliseconds. Anything else (no such folder, a
+    // full disk) fails at once. This retry is what carries a write past a
+    // reader that holds the file for a moment.
     int      retries = 5;
     unsigned backoffMs = 20;  // slept before each of those tries
 };
@@ -147,6 +148,15 @@ struct AtomicWriteOptions {
 //      again as `options` says;
 //   3. on any failure the temp file is deleted and the target is untouched.
 //
+// That replace is the classic rename, and the classic rename is refused with
+// ERROR_ACCESS_DENIED while ANY other handle to the target is open -- one that
+// shares DELETE included (measured on Windows 11 build 26200 with cmd's move
+// /Y). Only a POSIX-semantics rename (SetFileInformationByHandle with
+// FileRenameInfoEx and FILE_RENAME_FLAG_POSIX_SEMANTICS; Windows 10 1607+, NTFS)
+// goes through under a reader that shares DELETE, and this does not use one: it
+// waits for the reader instead, which for the readers there are (Config's read,
+// a scanner) is microseconds to milliseconds.
+//
 // Does not create folders and does not clear a read-only attribute: a read-only
 // edvr.ini is a decision somebody made, and the failure says so. `error` (which
 // may be null) gets a sentence for a person on failure, ASCII, without the
@@ -158,9 +168,10 @@ bool writeFileAtomic(const std::wstring& path, const std::string& bytes,
                      const AtomicWriteOptions& options = AtomicWriteOptions(),
                      int* tries = nullptr);
 
-// The whole file, read with FILE_SHARE_DELETE so that reading it never stands in
-// the way of somebody's replace. false when it is missing, unreadable, over
-// `limit`, or read short; an empty file is true with empty `bytes`.
+// The whole file, read with FILE_SHARE_DELETE so that reading it does not stop
+// somebody deleting or renaming it away, and closed before this returns: the
+// hold lasts as long as the read. false when the file is missing, unreadable,
+// over `limit`, or read short; an empty file is true with empty `bytes`.
 bool readFileBytes(const std::wstring& path, std::string* bytes, size_t limit = 64u << 20);
 
 // ---------------------------------------------------------------------------
