@@ -49,9 +49,12 @@
   three note() writes per traced call on the game thread inside the
   view-constant refresh. All per-call logging is now gated behind
   fix.temporal_aa_camera_trace (default off); triage rides the 5s tick.
-  Discriminator for the next flight: trace off. If it still crashes, the
-  patch/trampoline alone is implicated -- fly temporal_aa_camera=off
-  (gate closed) next to separate that from stubA.
+  NOTE: the first trace-off flight (03:33) is uninformative -- the TLS
+  index exceeded stubB's disp8 reach that run and the hook never
+  installed. stubB's TLS walk now uses disp32 and the refusal names its
+  values. Discriminator still pending: trace-off with the hook in. If it
+  still crashes, the patch/trampoline alone is implicated -- fly
+  temporal_aa_camera=off (gate closed) next to separate that from stubA.
 - Next: C3, per the C3 wiring plan addendum -- the FUN_1405921f0 detour
   behind a default-off key, the ownership policy wired into flat_runtime,
   the classifier's jittered-encoding question answered, then one bounded

@@ -293,7 +293,7 @@ void buildStubB(uint8_t* at, const void* postFn, uint32_t tlsIndex, uint32_t tls
     c.b({0x41,0x5B, 0x41,0x5A, 0x41,0x59, 0x41,0x58});          // pop r11 r10 r9 r8
     c.b({0x5A, 0x59, 0x58});                                    // pop rdx rcx rax
     c.b({0x65,0x4C,0x8B,0x1C,0x25}); c.u32(0x58);               // mov r11,gs:[0x58] (TLS array)
-    c.b({0x4F,0x8B,0x5B}); c.b({static_cast<uint8_t>(tlsIndex * 8)}); // mov r11,[r11+tlsIndex*8]
+    c.b({0x4F,0x8B,0x9B}); c.u32(tlsIndex * 8);                 // mov r11,[r11+tlsIndex*8] (disp32: the index is per-process, seen > 15)
     c.b({0x4F,0x8B,0x9B}); c.u32(tlsRealRetOfs);                // mov r11,[r11+tlsRealRetOfs]
     c.b({0x41,0xFF,0xE3});                                      // jmp r11
 }
@@ -545,8 +545,13 @@ void flatCameraInjectFrame(uint64_t frame) {
         const uintptr_t tlsBase = tlsArray ? tlsArray[_tls_index] : 0;
         const uintptr_t tlsStruct = reinterpret_cast<uintptr_t>(&g_refreshTls);
         if (!tlsBase || tlsStruct < tlsBase || tlsStruct - tlsBase > 0xFFFFFFFFull ||
-            _tls_index == 0 || _tls_index * 8 > 0x7F) {
-            g_inject.failReason = "the thread-local the return stub needs is outside its reach";
+            _tls_index == 0) {
+            static char tlsDetail[160];
+            std::snprintf(tlsDetail, sizeof(tlsDetail),
+                "the thread-local the return stub needs is outside its reach "
+                "(tlsBase=%p tlsStruct=%p tlsIndex=%u)",
+                reinterpret_cast<void*>(tlsBase), reinterpret_cast<void*>(tlsStruct), _tls_index);
+            g_inject.failReason = tlsDetail;
             Log::get().note("flat camera inject: %s; standing down", g_inject.failReason);
             VirtualFree(g_inject.relay, 0, MEM_RELEASE);
             g_inject.relay = reinterpret_cast<uint8_t*>(1);
