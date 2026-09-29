@@ -1388,8 +1388,10 @@ surface composite whose source changed, so a still HUD leaves the edit mask
 null on most frames. Expected: about 0.09 ms a frame in the busy windows
 (0.357 to about 0.27), up to 0.3 in the first minute's state, nothing when
 every input is bound (parity, 0.144 against 0.145). To read it after a flight:
-`UI resolve: not bound on some frames: ...` in the log, and the census's UI
-resolve in the same scene.
+`UI resolve totals: N dispatches this session; without the coverage mask a,
+without the source-edit mask b, without history c` (every 20 s while it
+moves) says how often each input was null, which settles the inference; the
+census's UI resolve in the same scene says what it bought.
 
 How: b1.z carries the unbound inputs (bits 1 coverage, 2 source edits, 4
 history; zero is all bound, what a caller with no b1 sends), derived in
@@ -1403,8 +1405,9 @@ full-screen menu, jitter to 1.7 and wild, ratios 0.5 to 3, both eyes; each
 input unbound alone equals the reference over zeros (227 runs); bits of zero
 over unbound inputs still equal the reference (98); claiming a bound input
 unbound FAILS 203 of 219 fixtures with content, and each bit fails on the
-named fixture built to need it. Trace: a build without this has no
-`UI resolve: not bound` line, and the bytecode header is checked against the
+named fixture built to need it. Trace: a build without this has neither the
+totals line nor `UI resolve: not bound on some frames`, a run with every input
+bound shows totals with zeros, and the bytecode header is checked against the
 source, so a stale header fails the rig.
 
 - ruled out: an 8x8 tile early-out for the UI resolve, because there is no

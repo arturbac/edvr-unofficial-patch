@@ -1265,6 +1265,7 @@ bool                      g_csUiResolveTried = false, g_uiResolveNoted = false;
 ID3D11Buffer*              g_uiResolveTolCb = nullptr;   // UI resolve b1: {tolerance/255, corona hold, inputs not bound (bits), 0}
 static bool                g_coronaHoldNoted = false;    // corona-smear hold: said once, only when the hold written is > 0
 static bool                g_uiResolveUnboundNoted[8] = {};   // one line for each combination of unbound inputs the resolve has run with
+static uint64_t            g_uiResolveDispatches = 0, g_uiResolveLacked[3] = {};   // the full-frame path's dispatches, and how many lacked coverage / source edits / history
 bool                       g_csFoveaTried = false;
 ID3D11Buffer*              g_foveaCb = nullptr;   // its crop and edge band
 bool                       g_foveaNoted = false;
@@ -4564,6 +4565,10 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
             // disagree with the bindings; a resolve whose b1 is missing reads zero
             // and fetches everything, as it always did.
             const uint32_t unboundBits = (srvs[2] ? 0u : 1u) | (srvs[5] ? 0u : 2u) | (srvs[3] ? 0u : 4u);
+            if (withHistory) {   // the fovea call never binds history; its lack is not news
+                ++g_uiResolveDispatches;
+                for (int k = 0; k < 3; ++k) if (unboundBits & (1u << k)) ++g_uiResolveLacked[k];
+            }
             ID3D11UnorderedAccessView* uavs[2] = {
                 e.dlSubmitUav, withHistory ? e.uiHistoryUav[1 - e.uiHistoryRead] : nullptr};
             ctx->CSSetShader(g_csUiResolve, nullptr, 0);
@@ -7076,6 +7081,13 @@ bool temporalPassDlaaTotals(uint32_t* frames, double* avgMs, double* maxMs,
     return true;
 }
 
+bool temporalPassUiResolveTotals(uint64_t* dispatches, uint64_t lacked[3]) {
+    if (g_uiResolveDispatches == 0) return false;
+    if (dispatches) *dispatches = g_uiResolveDispatches;
+    if (lacked) for (int k = 0; k < 3; ++k) lacked[k] = g_uiResolveLacked[k];
+    return true;
+}
+
 bool temporalPassTrainedTotals(uint32_t* frames, double* avgMs, double* maxMs, uint32_t* resets,
                                const char** engineLabel, bool* amd) {
     // The CURRENT engine's price, not "whichever one has a count". Both
@@ -7190,6 +7202,7 @@ void temporalPassShutdown() {
     if (g_uiResolveTolCb) { g_uiResolveTolCb->Release(); g_uiResolveTolCb=nullptr; }
     g_coronaHoldNoted=false;
     for (bool& noted : g_uiResolveUnboundNoted) noted=false;
+    g_uiResolveDispatches=0; for (uint64_t& n : g_uiResolveLacked) n=0;
     if (g_foveaCb) { g_foveaCb->Release(); g_foveaCb = nullptr; }
     if (g_csDown) { g_csDown->Release(); g_csDown = nullptr; }
     if (g_downCb) { g_downCb->Release(); g_downCb = nullptr; }
