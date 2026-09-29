@@ -40,7 +40,7 @@ changes.*
   stalls' cause; engine motion's CPU as the carrier's limit; the six wrapped
   draws as a large EDVR cost, being the pad rings the glare fix claims and
   the scanner-body resolve; for the UI and hologram passes, every cut but
-  one, measured).
+  one, measured; the shared-pair rule as wired in 9122f31e, reverted).
 - **UI and hologram passes, 2026-09-29 (entry below):** one exact cut, the
   UI resolve skipping inputs it was not given (about 0.09 ms a frame); a
   tile early-out, a groupshared window, R8 history, a composite tile bound,
@@ -50,12 +50,11 @@ changes.*
   setting (1.62x the pixels of 1.0).
 - **Next** (flight 132352 entry): the carrier sits at the budget (GPU
   10.7-11.3 ms, EDVR about 4.8 of it). Open: fly the HUD depth seed's census
-  section (branch `claude/ui-seed-census`; then UI quality 100 against 125 in
-  one flight), stock glare's extra 2.5 ms, the landing-pad display left out
-  of the UI layer; the output size and foveated DLSS are Sean's levers. Any
-  Quest flight with the default build: check the Application-render GPU
-  invalid count stays near zero and `native_frame_end_overlap_summary` reads
-  failures=0.
+  section (on main; then UI quality 100 against 125 in one flight) and stock
+  glare's extra 2.5 ms. The landing-pad rule was merged, flown and REVERTED
+  (flight 162819 entry): it unpinned the sun glare. Any Quest flight with
+  the default build: check the Application-render GPU invalid count stays
+  near zero and `native_frame_end_overlap_summary` reads failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
   4100x4050 and 2665x2087.
@@ -1662,3 +1661,29 @@ Not changed: the 8-bit layer's own seed is not in the census (its route read
 `-` in all 12 windows of 132352, so nothing is lost; it would be a section of
 its own). The layer's route timers and the `HDR seed subprice` diagnostics are
 untouched.
+
+## 2026-09-29: flight 162819, the landing-pad rule reverted
+
+Build 9122f31e on the Frontier install (build matched): the landing-pad
+shared-pair rule, merged with its stencil guard and a pad window of 400.
+Sean: the landing pad was still not taken into the layer, and the sun glare
+was no longer pinned -- it moved with the head again in vivid and in
+realistic.
+
+- The rule classified correctly in flight: `shared pair:` pad 2908 and radar
+  6658 per 30 s, world 1188-4784, stencil refusals 0; its first pad draw had
+  a console draw 140 back at stencil 4, its first radar draw a radar family
+  2 back.
+- The glare fix armed as before ("sun glare world: variant 1 CREATED", the
+  billboard watch on the first matched draw) yet did not pin the glare, and
+  the layer did not take the pad: both halves failed downstream of a correct
+  classification, in the claim and admit paths the rigs pinned only by
+  source scans.
+- Reverted in bad1da80 (Sean: "it's up so rarely") and installed on
+  Frontier.
+- ruled out: the shared-pair rule as wired in 9122f31e, because flight
+  162819 unpinned the sun glare in vivid and realistic and did not take the
+  pad, though every class it logged was right.
+- For any later attempt: a rig that drives the real draw path (the glare
+  verdict and the layer's decision over a recorded frame), not a scan of
+  the wiring.
