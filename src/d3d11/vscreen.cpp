@@ -84,7 +84,6 @@
 #include "exposure_fix.h"
 #include "particle_fix.h"
 #include "sunglare_fix.h"
-#include "shared_pair.h"       // the shared pair's three uses: radar, landing pad, sun glare
 #include "graphics_bridge.h"
 #include <intrin.h>
 
@@ -701,14 +700,6 @@ struct State {
     // at the top of every beginPanelOverride, so it can never outlive the draw
     // that set it.
     bool     curveThisDraw = false;
-    // The shared pair (shared_pair.h): which of its three uses this draw is, set in
-    // beginPanelOverride for a draw of VS 94D5C556DFD6D705 / PS 912477AEF6958379 and
-    // read by the glare claim there and by uiLayerFamilyOf; kNotPair for every other
-    // draw, cleared at the top of every beginPanelOverride like curveThisDraw.
-    // pairTrackerOn: the rule's marks are being kept this frame (the glare fix wants
-    // draws, or the layer's HDR take is armed); sampled once a frame with the draw gate.
-    PairClass pairClassThisDraw = PairClass::kNotPair;
-    bool      pairTrackerOn = false;
 
     void*    compositeCb = nullptr;
     uint8_t  shadow[512] = {};
@@ -1657,30 +1648,6 @@ __declspec(noinline) bool ensureOurCompositeCb(ID3D11DeviceContext* self, State*
     return true;
 }
 
-// Does anything need the shared pair's marks kept (shared_pair.h)? The glare fix, which must not claim the
-// radar's or the pad's draws, and the layer's HDR take, which takes the pair only as radar or pad. Both are
-// gate subscribers already; this is the one predicate the frame boundary samples for the tracker.
-bool sharedPairWantsDraws() {
-    return sunglareWantsDraws() || uiLayerCrispOn();
-}
-
-// The stencil reference a draw of the pair runs with, for the rule's stencil guard (shared_pair.h): read the way
-// the draw census reads its `st=` column (draw_census.cpp: OMGetDepthStencilState under a fault budget). Called
-// only for a draw of the pair itself, a handful a frame. kPairStencilUnknown when it cannot be read (the budget
-// spent, or the call faulted): the rule then calls the draw world and counts it.
-FaultBudget g_pairStencilBudget("vScreen.pairStencil", 5);
-uint32_t pairReadStencilRef(ID3D11DeviceContext* ctx) {
-    UINT ref = 0;
-    bool got = false;
-    guardedBudget(g_pairStencilBudget, [&] {
-        ID3D11DepthStencilState* dss = nullptr;
-        ctx->OMGetDepthStencilState(&dss, &ref);
-        if (dss) dss->Release();
-        got = true;
-    });
-    return got ? static_cast<uint32_t>(ref) : kPairStencilUnknown;
-}
-
 // Does any feature still want to see draws?
 //
 // The forty-term subscriber condition that used to sit inline at the top of
@@ -1705,7 +1672,6 @@ bool drawGateSubscribed(State* s) {
         hudSpriteWantsDraws() || panelUpscaleWantsDraws() || hudGrainWantsDraws() ||
         uiDepthWantsDraws() ||
         sunglareWantsDraws() ||
-        sharedPairWantsDraws() ||
         drawCensusArmed() ||
         objectProbeWantsDraws() ||
         panelCurveWants() || particleWantsDraws() || backdropWantsDraws() ||
@@ -1932,7 +1898,6 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // Cleared before anything can set it, on every draw, so a substitution
     // can never be attributed to a draw that did not ask for one.
     s->curveThisDraw = false;
-    s->pairClassThisDraw = PairClass::kNotPair;
     t_uiDepthThisDraw = false;
     // Counting eye draws is not part of the panel distance fix, even though it
     // happens here.
@@ -2336,24 +2301,6 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         return DrawVerdict::kNone;
     }
     ++s->eyeDrawsThisFrame;
-    // The shared pair's rule (shared_pair.h). Right after the counter it reads, before any fix
-    // below can claim or skip the draw: the marks must see every eye draw, and the class of a
-    // draw of VS 94D5C556DFD6D705 / PS 912477AEF6958379 is decided here for the glare claim
-    // below and for uiLayerFamilyOf after it. One table lookup a draw while wanted; the pixel
-    // shader's hash is read only for the pair's own vertex shader, and the stencil reference (the rule's
-    // guard: RADAR and PAD stand only with the reference the HUD section leaves) only for the pair's two
-    // shaders together.
-    if (s->pairTrackerOn) {
-        void* const pairRtv = bindingGet(BindSlot::Rtv0);
-        const uint64_t pairVs = bindingGet(BindSlot::Vs) ? bindingShaderHash(BindSlot::Vs) : 0;
-        sharedPairNoteEyeDraw(s->frameNo, pairRtv, s->eyeDrawsThisFrame, pairVs);
-        if (pairVs == kSharedPairVs) {
-            const uint64_t pairPs = bindingGet(BindSlot::Ps) ? bindingShaderHash(BindSlot::Ps) : 0;
-            const uint32_t pairStencil = isSharedPair(pairVs, pairPs) ? pairReadStencilRef(self) : kPairStencilUnknown;
-            s->pairClassThisDraw = sharedPairClassify(
-                s->frameNo, pairRtv, s->eyeDrawsThisFrame, pairVs, pairPs, instances, pairStencil);
-        }
-    }
     // (The temporal pass's camera latch used to fire at the frame's first
     // eye draw here; since 2026-09-04 the depth probe fires it at the
     // first draw into the scene pair's depth, which is the scene camera's
@@ -2639,11 +2586,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // The train's shape first, inline (sunglare_fix.h): for any other shape
     // sunglareOnEyeDraw answers kStock and this block does nothing, and both
     // calls -- sunglareWantsDraws is cross-TU too -- were made per eye draw.
-    // The pair is shared with the radar's contact markers and the landing-pad display's rings
-    // (shared_pair.h): a draw the rule calls radar or pad is not a sun, whatever its shape, so
-    // the fix never sees it -- no claim, no skip in mode off, no exposure-damper sun scope.
-    if (pairGlareMayClaim(s->pairClassThisDraw) &&
-        sunglareTrainShape(kind, count, instances) && sunglareWantsDraws()) {
+    if (sunglareTrainShape(kind, count, instances) && sunglareWantsDraws()) {
         const SunglareAction a = sunglareOnEyeDraw(kind, count, instances);
         if (a == SunglareAction::kSkip) return DrawVerdict::kSkip;
         if (a != SunglareAction::kStock) {
@@ -3772,11 +3715,6 @@ __declspec(noinline) UiLayerFamily uiLayerFamilyOf(State* s, char kind, UINT cou
     // Ordinary HDR draws need no extra hash read.
     if (f.targetKind == 1 && f.vs == kHoloTargetSphere)
         f.ps = bindingShaderHash(BindSlot::Ps);
-    // The shared pair (radar markers, landing-pad rings, sun glare): the class the draw path
-    // gave it (shared_pair.h). Read for this vertex shader alone; a draw that was never
-    // classified reads kNotPair, which the rule does not take.
-    if (f.targetKind == 1 && f.vs == kSharedPairVs)
-        f.pairClass = s->pairClassThisDraw;
     if (f.targetKind == 2) {
         // ui_depth's exclude list (the null-output mesh B018D143700AB803,
         // which samples a stale surface and draws nothing, and the ini's
@@ -5388,7 +5326,6 @@ void vScreenRefreshConfig() {
     // newly enabled fix its first frame of draws. This runs only on a change
     // -- the reloadIfChanged early return above sees to that.
     drawGateSet(drawGateSubscribed(s));
-    s->pairTrackerOn = sharedPairWantsDraws();
 }
 
 bool vScreenReclaimHooks() {
@@ -5515,7 +5452,6 @@ EDVR_BOUNDARY_TICK(tkTemporalTick, "temporal_tick");
 EDVR_BOUNDARY_TICK(tkTemporalBoundary, "temporal_boundary");
 EDVR_BOUNDARY_TICK(tkDepthProbe, "depth_probe");
 EDVR_BOUNDARY_TICK(tkGpuCensus, "gpu_census");
-EDVR_BOUNDARY_TICK(tkSharedPair, "shared_pair");
 EDVR_BOUNDARY_TICK(tkSceneArrived, "scene_arrived");
 EDVR_BOUNDARY_TICK(tkIntroPanel, "intro_panel");
 EDVR_BOUNDARY_TICK(tkIntroSkip, "intro_skip");
@@ -5564,8 +5500,6 @@ void vScreenFrameBoundary() {
         // section's timer, rotates which one is actively timed next frame,
         // and every 30 s logs one summary line. Always on, no ini key.
         tkGpuCensus.run([&] { gpuCensusFrame(g_state->ownerCtx); });
-        // The shared pair's 30 s line (shared_pair.h): radar N, pad N, world N.
-        tkSharedPair.run([&] { sharedPairFrameBoundary(GetTickCount64(), g_state->pairTrackerOn); });
         // Told to the openvr half whether or not any intro fix is on: the
         // cull guard holds its lie until a scene exists, and that must
         // depend on the GAME reaching one, not on EDVR being configured
@@ -6450,7 +6384,6 @@ void vScreenFrameBoundary() {
     // reasoning, and the arming paths that can fire between two of these
     // raise the gate themselves rather than waiting for the next one.
     drawGateSet(drawGateSubscribed(s));
-    s->pairTrackerOn = sharedPairWantsDraws();
 
     // The steady-state breadcrumb. Rate-limits itself to one line every
     // log.breadcrumb_heartbeat_seconds (30 by default, 0 disables it); this
@@ -6896,7 +6829,6 @@ void shutdownVScreenFixes() {
     fssRevealShutdown();
     fssDumpShutdown();
     gpuCensusShutdown();
-    sharedPairShutdown();
     resolveBindShutdown();
     billboardShutdown();
     // Both halves of the intro. Neither was on this roll-call, so a session

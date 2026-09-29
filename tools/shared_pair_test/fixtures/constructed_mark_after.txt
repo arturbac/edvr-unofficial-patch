@@ -1,6 +1,0 @@
-# CONSTRUCTED CONTROL, not a capture: a radar family and a console draw come AFTER the pair's draw on its target. Only draws before it
-# count, so it is WORLD (a rule that counted marks after the draw, or read the whole frame at once, would call it RADAR).
-frame 1
-p 100 39 @1 world st=4
-d 150 F8D8A92E96419901 @1
-d 152 68DDDEF04D9894AF @1

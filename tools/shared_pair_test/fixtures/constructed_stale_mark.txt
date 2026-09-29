@@ -1,9 +1,0 @@
-# CONSTRUCTED CONTROL, not a capture: pad_hangar_143837_c1's eye A with its console draws moved 372 draws earlier (574 draws before the
-# pair's draws, on the same target). A mark outside the window does not count, so both draws are WORLD (a rule with no upper bound on
-# the window would call them PAD).
-frame 1
-d 1500 68DDDEF04D9894AF @116
-d 1502 41E245D488BFE83E @116
-d 1894 B7790CBFC6554097 @116
-p 2074 3392 @116 world st=4
-p 2075 94 @116 world st=4
