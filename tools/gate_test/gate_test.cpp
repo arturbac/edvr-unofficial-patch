@@ -20,8 +20,10 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -35,6 +37,9 @@
 // arithmetic and lives in the header precisely so it can be asserted here.
 #include "../../src/d3d11/camera_view.h"
 #include "../../src/d3d11/head_offset_gate.h"
+// Header-only as well (guard.h and frame_ticks.h): one fault budget per frame-
+// boundary tick, the class device_hook.cpp and vscreen.cpp declare theirs with.
+#include "../../src/d3d11/boundary_tick.h"
 // Linked into this fixture already; the two pure decisions it exposes --
 // journalPickNewest and cameraViewRebuildBackoff -- had no coverage at all
 // until the review rounds on issue #19 found three arithmetic bugs between
@@ -720,15 +725,28 @@ bool hasTimeOfDay(const std::string& line) {
     return true;
 }
 
+// A body that takes a measurable time on the frame clock, so the mark after it is
+// recorded and outranks the stretches around it: a mark that does not advance the
+// clock records nothing, and only the three slowest stretches are named
+// (frame_ticks.h).
+void spendMicroseconds(int64_t us) {
+    const int64_t start = FrameTicks::now();
+    const int64_t ticks = us * qpcFrequency() / 1000000;
+    while (FrameTicks::now() - start < ticks) {}
+}
+
 // THE NOTES AS THEY REACH A REAL LOG FILE: where a caught fault happened
-// (src/common/guard.h), and the periodic-work lines written through the
-// production binding (src/common/periodic_work.h).
+// (src/common/guard.h), which frame-boundary tick it was (src/d3d11/
+// boundary_tick.h), and the periodic-work lines written through the production
+// binding (src/common/periodic_work.h).
 //
 // The fault half is the case R4 / A-9 asked for. A site is a budget's name, and
-// deviceHook.frameBoundary covers the whole frame boundary, so a fault anywhere
-// in it used to say only that name. The rig faults on purpose inside guarded()
-// -- the real template, the real filter, the real Log -- closes the log and
-// reads the file back, so what is asserted is the text a reporter would paste.
+// deviceHook.frameBoundary covered the whole frame boundary, so a fault anywhere
+// in it said only that name -- and eight faulting frames anywhere stopped every
+// tick in it. The location half is one fault at one site; the tick half is a tick
+// that faults on every frame between two that do not, through the real
+// BoundaryTick, the real guarded() and the real filter. The rig closes the log
+// and reads the file back, so what is asserted is the text a reporter would paste.
 int loggedNotesChecks() {
     int bad = 0;
     auto verify = [&](bool ok, const char* what) {
@@ -785,6 +803,32 @@ int loggedNotesChecks() {
     // A caller that reaches the filter with only a code, as the three rigs that
     // stub it do not but a future caller might.
     const int legacyVerdict = guardFilter(0xC0000005UL, kLegacy);
+
+    // THE FRAME BOUNDARY, ONE TICK FAULTING ON EVERY FRAME.
+    //
+    // Three ticks in the order a frame runs them: one before, one that faults each
+    // time it runs, one after. The production ticks are declared with the same
+    // macro (device_hook.cpp, vscreen.cpp); only these three are run here.
+    EDVR_BOUNDARY_TICK(tickBefore, "gate_test_before");
+    EDVR_BOUNDARY_TICK(tickBad, "gate_test_bad");
+    EDVR_BOUNDARY_TICK(tickAfter, "gate_test_after");
+    int ranBefore = 0, ranBad = 0, ranAfter = 0;
+    const int boundaryFrames = kBoundaryTickFaults + 12;
+    // What the frame-tick chain recorded: the first frame (the bad tick faulting,
+    // so every stretch is timed) and the last (the bad tick long since stood down).
+    FrameTickSummary firstFrame, lastFrame;
+    for (int f = 0; f < boundaryFrames; ++f) {
+        g_frameTicks.enter(FrameTicks::now());
+        tickBefore.run([&] { ++ranBefore; spendMicroseconds(200); });
+        tickBad.run([&] { ++ranBad; writeLow(); });
+        tickAfter.run([&] { ++ranAfter; spendMicroseconds(200); });
+        const FrameTickSummary sum =
+            g_frameTicks.cut("gate_test_rest", FrameTicks::now(), qpcFrequency());
+        if (f == 0) firstFrame = sum;
+        if (f == boundaryFrames - 1) lastFrame = sum;
+    }
+    const bool badDisabled = tickBad.disabled();
+    const bool neighboursLive = !tickBefore.disabled() && !tickAfter.disabled();
 
     // The periodic-work line through the production binding: a real clock, the
     // real local time of day, the real log. A 50 ms window instead of 30 s so
@@ -901,6 +945,237 @@ int loggedNotesChecks() {
         printf("  ok    a caught fault's note names its address, module and offset (and what "
                "an access violation touched), once per site and restated with the latest "
                "location; periodic-work lines reach the log through the real binding\n");
+    }
+
+    // The frame boundary's ticks: the faulting one ran exactly its budget and then
+    // stood down; the ones around it ran on every frame, including the frames it
+    // faulted in and every frame after it stopped.
+    const int badAtStart = bad;
+    verify(ranBad == kBoundaryTickFaults,
+           "a tick that faults on every frame runs exactly its budget of eight, then no more");
+    verify(badDisabled, "...and is then reported as stood down");
+    verify(ranBefore == boundaryFrames && ranAfter == boundaryFrames,
+           "the ticks before and after it ran on every frame, faulting frames included");
+    verify(neighboursLive, "...and neither of them was touched by its budget");
+
+    // The timing marks kept working. On the first frame all three stretches were
+    // timed (a fault takes far longer than a clock tick) and the chain names all
+    // three -- the cut's own stretch is a fourth mark, too short to displace any of
+    // them; on the last the bad tick's stretch is nothing, and the two that ran are
+    // still named.
+    auto named = [](const FrameTickSummary& s, const char* name) {
+        for (const FrameTick& t : s.top) {
+            if (t.name && strcmp(t.name, name) == 0) return true;
+        }
+        return false;
+    };
+    verify(firstFrame.marks >= 3 && named(firstFrame, "gate_test_before") &&
+               named(firstFrame, "gate_test_bad") && named(firstFrame, "gate_test_after"),
+           "the frame-tick chain recorded and named all three ticks on a frame where one faulted");
+    verify(lastFrame.marks >= 2 && named(lastFrame, "gate_test_before") &&
+               named(lastFrame, "gate_test_after"),
+           "...and still names the two that ran once the third has stood down");
+
+    // The notes name the tick that faulted, once, and no other.
+    const auto tickFault = linesWith("FAULT ABSORBED", "site=frameBoundary/gate_test_bad");
+    verify(tickFault.size() == 1, "eight faults in one tick write one FAULT ABSORBED line, named for that tick");
+    if (tickFault.size() == 1) {
+        verify(tickFault[0]->find(" at=0x") != std::string::npos &&
+                   tickFault[0]->find(exe + "+0x") != std::string::npos,
+               "...which also says where in the module it happened");
+    }
+    verify(!linesWith("FAULT TOTAL", "site=frameBoundary/gate_test_bad").empty(),
+           "...and its running total is restated under the same name");
+    const auto disabledLine = linesWith("FEATURE-DISABLED",
+                                        "frameBoundary/gate_test_bad exhausted its fault budget");
+    verify(disabledLine.size() == 1,
+           "the tick that stood down is named on a FEATURE-DISABLED line, once");
+    verify(linesWith("frameBoundary/gate_test_before", "").empty() &&
+               linesWith("frameBoundary/gate_test_after", "").empty(),
+           "no note anywhere names either tick that did not fault");
+    if (bad == badAtStart) {
+        printf("  ok    a frame-boundary tick that faults on every frame stands down alone after "
+               "its own eight: its neighbours run on every frame, the timing marks keep naming "
+               "them, and the notes name the faulting tick and no other\n");
+    }
+    return bad;
+}
+
+// THE BOUNDARY'S UNGUARDED SURFACE, AS SOURCE TEXT.
+//
+// hookedPresent's frame boundary used to sit inside one guarded lambda, so
+// anything added to it was under SEH for free. It is presentFrameBoundary() now,
+// a list of ticks each on a budget of its own (src/d3d11/boundary_tick.h), and a
+// statement added to it OUTSIDE a tick is under nothing at all: the first fault
+// in it is the game's crash, not a FEATURE-DISABLED line. The function may hold
+// exactly three such statements, documented there -- the frame counter, the
+// graphics-off test, and whether the config poll is due -- so this reads the
+// function, removes every tick call, and requires that what is left is those three
+// and nothing else. It also requires that every tick declared in the two files that
+// declare them is run exactly once, that no two share a mark (the mark is the
+// budget's name and the LONG FRAME line's), and that the old shared budgets are gone.
+std::string withoutLineComments(const std::string& src) {
+    std::string out;
+    bool inString = false;
+    for (size_t i = 0; i < src.size(); ++i) {
+        const char c = src[i];
+        if (inString) {
+            out += c;
+            if (c == '\\' && i + 1 < src.size()) out += src[++i];
+            else if (c == '"') inString = false;
+        } else if (c == '"') {
+            inString = true;
+            out += c;
+        } else if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            while (i < src.size() && src[i] != '\n') ++i;
+            out += '\n';
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// The index of the ')' that closes the '(' at `open`, skipping string literals.
+size_t closingParen(const std::string& t, size_t open) {
+    int depth = 0;
+    bool inString = false;
+    for (size_t i = open; i < t.size(); ++i) {
+        const char c = t[i];
+        if (inString) {
+            if (c == '\\') ++i;
+            else if (c == '"') inString = false;
+        } else if (c == '"') {
+            inString = true;
+        } else if (c == '(') {
+            ++depth;
+        } else if (c == ')' && --depth == 0) {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
+std::string withoutSpaces(const std::string& t) {
+    std::string out;
+    for (char c : t) {
+        if (!isspace(static_cast<unsigned char>(c))) out += c;
+    }
+    return out;
+}
+
+int boundarySourceChecks(const std::string& root) {
+    int bad = 0;
+    auto verify = [&](bool ok, const char* what) {
+        ++g_checks;
+        if (ok) return;
+        printf("  FAIL  %s\n", what);
+        ++bad;
+    };
+    const std::wstring base = std::wstring(root.begin(), root.end()) + L"\\src\\d3d11\\";
+    const std::string hookText = withoutLineComments(readWholeFile(base + L"device_hook.cpp"));
+    const std::string screenText = withoutLineComments(readWholeFile(base + L"vscreen.cpp"));
+    if (hookText.empty() || screenText.empty()) {
+        printf("  FAIL  could not read src\\d3d11\\device_hook.cpp and vscreen.cpp under %s\n",
+               root.c_str());
+        return 1;
+    }
+
+    // The function, without its braces.
+    const size_t head = hookText.find("void presentFrameBoundary() {");
+    verify(head != std::string::npos, "device_hook.cpp defines presentFrameBoundary()");
+    std::string body;
+    if (head != std::string::npos) {
+        size_t i = hookText.find('{', head);
+        const size_t begin = i + 1;
+        int depth = 0;
+        bool inString = false;
+        for (; i < hookText.size(); ++i) {
+            const char c = hookText[i];
+            if (inString) {
+                if (c == '\\') ++i;
+                else if (c == '"') inString = false;
+            } else if (c == '"') {
+                inString = true;
+            } else if (c == '{') {
+                ++depth;
+            } else if (c == '}' && --depth == 0) {
+                break;
+            }
+        }
+        body = hookText.substr(begin, i - begin);
+    }
+    // Every tick call out, then what is left.
+    size_t pos = 0;
+    int tickCalls = 0;
+    while ((pos = body.find(".run(", pos)) != std::string::npos) {
+        size_t start = pos;
+        while (start > 0 && (isalnum(static_cast<unsigned char>(body[start - 1])) ||
+                             body[start - 1] == '_')) {
+            --start;
+        }
+        if (body.compare(start, 2, "tk") != 0) {
+            ++pos;
+            continue;
+        }
+        const size_t close = closingParen(body, pos + 4);
+        if (close == std::string::npos) break;
+        size_t end = close + 1;
+        if (end < body.size() && body[end] == ';') ++end;
+        body.erase(start, end - start);
+        pos = start;
+        ++tickCalls;
+    }
+    verify(tickCalls >= 20, "presentFrameBoundary() runs its work as ticks");
+    verify(withoutSpaces(body) ==
+               "++g_state->frameCounter;if(graphicsRuntimeDisabled())return;"
+               "if(menuTakeConfigPollRequest()||dueMs(g_state->configPollMs,kConfigPollMs))"
+               "{g_state->configPollMs=stampMs();}",
+           "outside its ticks presentFrameBoundary() holds only the frame counter, the "
+           "graphics-off test and the config-poll decision -- anything else added there "
+           "runs under no fault budget at all (wrap it in a BoundaryTick)");
+
+    // Every declared tick is run once, and no mark is used twice.
+    std::set<std::string> marks;
+    int declared = 0;
+    for (const std::string* text : {&hookText, &screenText}) {
+        size_t at = 0;
+        while ((at = text->find("EDVR_BOUNDARY_TICK(", at)) != std::string::npos) {
+            const size_t open = at + std::strlen("EDVR_BOUNDARY_TICK");
+            const size_t close = closingParen(*text, open);
+            at = open;
+            if (close == std::string::npos) break;
+            const std::string args = text->substr(open + 1, close - open - 1);
+            const size_t comma = args.find(',');
+            const size_t q1 = args.find('"');
+            const size_t q2 = args.rfind('"');
+            if (comma == std::string::npos || q1 == std::string::npos || q2 <= q1) continue;
+            const std::string id = withoutSpaces(args.substr(0, comma));
+            const std::string mark = args.substr(q1 + 1, q2 - q1 - 1);
+            ++declared;
+            verify(marks.insert(mark).second, "no two frame-boundary ticks share a mark");
+            size_t uses = 0, from = 0;
+            while ((from = text->find(id + ".run(", from)) != std::string::npos) {
+                ++uses;
+                from += id.size();
+            }
+            if (uses != 1) {
+                printf("        tick %s (\"%s\") is run %zu times\n", id.c_str(), mark.c_str(), uses);
+            }
+            verify(uses == 1, "every declared frame-boundary tick is run exactly once");
+        }
+    }
+    verify(declared >= 50, "device_hook.cpp and vscreen.cpp declare their boundary ticks");
+    verify(hookText.find("g_frameBudget") == std::string::npos &&
+               hookText.find("deviceHook.frameBoundary") == std::string::npos,
+           "the boundary's one shared budget is gone");
+    verify(screenText.find("g_cameraBudget") == std::string::npos,
+           "and so is the camera readers' one shared budget");
+
+    if (!bad) {
+        printf("  ok    the frame boundary runs only as ticks, each declared once and run once, "
+               "with %d marks unique across both files; outside them there is only the frame "
+               "counter, the graphics-off test and the poll decision\n", declared);
     }
     return bad;
 }
@@ -2531,6 +2806,7 @@ int main(int argc, char** argv) {
     g_bad += journalPickChecks();
     g_bad += periodicWorkChecks();
     g_bad += loggedNotesChecks();
+    g_bad += boundarySourceChecks(dir);
     const uint32_t rates[] = {72, 90, 120};
     for (uint32_t hz : rates) {
         const int before = g_bad;

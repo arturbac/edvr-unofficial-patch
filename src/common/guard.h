@@ -23,13 +23,14 @@ namespace edvr {
 // one frame, burying whatever was being diagnosed. Later faults at a site
 // already reported are counted instead.
 //
-// WHERE, NOT JUST WHICH SITE. A site is a budget's name, and some budgets cover
-// dozens of unrelated ticks (deviceHook.frameBoundary is the whole frame
-// boundary), so "a fault at site X" used to be all a report could say. The
-// note now also carries the faulting instruction's address as module+offset
-// and, for an access violation, the address it touched. guarded() supplies
-// those through guardFilterAt() below; a caller that reaches this function
-// with only a code gets the old note without the location.
+// WHERE, NOT JUST WHICH SITE. A site is a budget's name, and a budget can cover
+// unrelated work (deviceHook.createShader spans every create hook; the frame
+// boundary was one site for dozens of ticks until each got its own, see
+// src/d3d11/boundary_tick.h), so "a fault at site X" used to be all a report
+// could say. The note now also carries the faulting instruction's address as
+// module+offset and, for an access violation, the address it touched. guarded()
+// supplies those through guardFilterAt() below; a caller that reaches this
+// function with only a code gets the old note without the location.
 //
 // The two-argument signature is deliberate and load-bearing: three test rigs
 // (depth_scene_pick_test, hologram_depth_test, ui_depth_test) define their own
