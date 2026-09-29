@@ -23,6 +23,10 @@ namespace edvr {
 // that, a section's turn also times one empty begin/end pair (nothing
 // between) at its first timed call, in a second sampler; ms/frame above
 // subtracts that pair's own mean cost from the real one's, floored at zero.
+// How many fixes wrap Elite's draws and are named in the census (AlteredFix below: one for each
+// verdict that can reach the altered-draw site, and a last one for "unnamed").
+constexpr int kAlteredFixCount = 19;
+
 enum class GpuCensusSection : uint8_t {
     // Door: once or twice a frame, at Submit. K = 2 (both eyes) while active.
     DoorTemporalWhole = 0,    // the whole temporalInner call, both eyes (edvrTemporalAa)
@@ -57,8 +61,13 @@ enum class GpuCensusSection : uint8_t {
     AlteredPoolFamily,        // a pool-family draw with EDVR's MRT6 slot target bound and its shaders substituted
     AlteredTerrain,           // a null-pixel-shader terrain prepass with EDVR's motion target bound and a pixel shader added
     AlteredUiLayer,           // a UI draw redirected into EDVR's UI layer target (fix.ui_quality)
-    AlteredVerdict,           // a draw wrapped in another fix's state change (RemLok, holo, scrim, particles, the panel ...)
-    Count
+    // A draw wrapped in another fix's state change (RemLok, the loading hologram, scrim,
+    // particles, the panel ...): ONE SECTION PER FIX, kAlteredFixCount of them, in AlteredFix's
+    // order. They share ONE turn in the rotation (the first owns it, turnOwnerOf), one K and one
+    // stride, so the rotation is no longer than it was with a single section for all of them and
+    // every fix's draws are sampled in the same frames.
+    AlteredFixFirst,
+    Count = AlteredFixFirst + kAlteredFixCount
 };
 
 // Which of the classes above a draw of Elite's is, decided where forwardWithVerdict
@@ -76,9 +85,64 @@ inline AlteredDrawClass classifyAlteredDraw(bool owner, bool verdictNone, bool p
     if (!verdictNone) return AlteredDrawClass::Verdict;
     return AlteredDrawClass::None;
 }
-inline GpuCensusSection alteredSectionOf(AlteredDrawClass c) noexcept {
-    return static_cast<GpuCensusSection>(static_cast<int>(GpuCensusSection::AlteredPoolFamily) +
-                                         static_cast<int>(c) - 1);
+
+// The fix that wraps a Verdict-class draw, one name each (gpu_census.cpp's kAlteredFixNames), in
+// the order of the sections that follow AlteredUiLayer. vscreen.cpp maps its DrawVerdict onto
+// these in one switch that must name every verdict (a new one is a compile error there), so a
+// wrapped draw is never attributed to the wrong fix by an enum that grew.
+enum class AlteredFix : uint8_t {
+    Panel = 0,     // the panel-distance override (kPanel)
+    Remlok,        // the RemLok overlay, outer mode (kRemlok)
+    Holo,          // the loading hologram's pattern (kHolo)
+    TargetSharp,   // the target indicator's reconstruction (kTargetSharp)
+    NightVision,   // night vision (kNightVision)
+    HudSprite,     // a HUD sprite atlas, resampled (kHudSprite)
+    PanelUpscale,  // the cockpit holo panel, reconstructed (kPanelUpscale)
+    HudGrain,      // the flight HUD with its noise held flat (kHudGrain)
+    IntroPanel,    // the intro movie's panel (kIntroPanel)
+    GlareClamp,    // the sun glare train, its instance count clamped (kGlareClamp)
+    GlareSteady,   // the sun glare train, world-locked (kGlareSteady)
+    Particle,      // the particle billboards (kParticle)
+    FssPanel,      // the FSS panel composite (kFssPanel)
+    FssReveal,     // the FSS body composite at one dissolve moment (kFssReveal)
+    FssDump,       // the FSS dump pass (kFssDump)
+    ResolveBind,   // the deferred lighting resolve with the scanner-body input lend (kResolveBind)
+    Scrim,         // the loader dialog's dimming wash (kScrim)
+    Backdrop,      // the menu backdrop blit (kBackdrop)
+    Unnamed,       // a verdict nobody gave a name (none reaches the altered-draw site today): visible, never silent
+    Count
+};
+static_assert(static_cast<int>(AlteredFix::Count) == kAlteredFixCount, "one census section for each named fix");
+
+// What the scope is told about a draw: its class, and for the Verdict class the fix that wraps it.
+struct AlteredDraw {
+    AlteredDrawClass cls = AlteredDrawClass::None;
+    AlteredFix fix = AlteredFix::Unnamed;
+    constexpr AlteredDraw() noexcept = default;
+    // Implicit, so a class that names no fix (None, the pool family, terrain, the UI layer) is written as itself.
+    constexpr AlteredDraw(AlteredDrawClass c) noexcept : cls(c) {}
+    constexpr AlteredDraw(AlteredDrawClass c, AlteredFix f) noexcept : cls(c), fix(f) {}
+};
+inline GpuCensusSection alteredFixSectionOf(AlteredFix f) noexcept {
+    return static_cast<GpuCensusSection>(static_cast<int>(GpuCensusSection::AlteredFixFirst) + static_cast<int>(f));
+}
+inline GpuCensusSection alteredSectionOf(AlteredDraw d) noexcept {
+    switch (d.cls) {
+    case AlteredDrawClass::PoolFamily:      return GpuCensusSection::AlteredPoolFamily;
+    case AlteredDrawClass::TerrainOriginal: return GpuCensusSection::AlteredTerrain;
+    case AlteredDrawClass::UiLayer:         return GpuCensusSection::AlteredUiLayer;
+    case AlteredDrawClass::Verdict:         return alteredFixSectionOf(d.fix);
+    case AlteredDrawClass::None:            break;
+    }
+    return GpuCensusSection::Count;
+}
+
+// The rotation gives each section one turn -- except the fix sections, which share one: the turn
+// belongs to the first of them, and a call for any of them is timed on it.
+inline GpuCensusSection turnOwnerOf(GpuCensusSection section) noexcept {
+    return section >= GpuCensusSection::AlteredFixFirst && section < GpuCensusSection::Count
+               ? GpuCensusSection::AlteredFixFirst
+               : section;
 }
 
 // Begin around a call site's GPU work, End right after it. Begin ALWAYS
@@ -117,9 +181,9 @@ private:
 // gpuCensusBegin/End, which it calls.
 class GpuCensusAlteredScope {
 public:
-    GpuCensusAlteredScope(ID3D11DeviceContext* ctx, AlteredDrawClass c) noexcept
-        : ctx_(ctx), section_(c == AlteredDrawClass::None ? GpuCensusSection::Count : alteredSectionOf(c)) {
-        if (c != AlteredDrawClass::None) open_ = gpuCensusBegin(ctx_, section_);
+    GpuCensusAlteredScope(ID3D11DeviceContext* ctx, AlteredDraw d) noexcept
+        : ctx_(ctx), section_(alteredSectionOf(d)) {
+        if (section_ != GpuCensusSection::Count) open_ = gpuCensusBegin(ctx_, section_);
     }
     ~GpuCensusAlteredScope() {
         if (open_) gpuCensusEnd(ctx_, section_);

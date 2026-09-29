@@ -249,8 +249,9 @@ void rotationAndRealTimerCase(Device& d) {
     check(st.nullSampler.totals.invalid == 0, "calibration: no invalid/disjoint result on the null pair either");
 
     // ---- Elite's altered draws (gpu_census.h): the scope counts and times only a classed draw ----
-    check(occurrenceCapFor(GpuCensusSection::AlteredPoolFamily) == 8 && !isDoorSection(GpuCensusSection::AlteredVerdict),
-          "altered: the altered-draw sections are per-draw, K = 8, like the in-frame sections");
+    check(occurrenceCapFor(GpuCensusSection::AlteredPoolFamily) == 8 && !isDoorSection(GpuCensusSection::AlteredFixFirst) &&
+              occurrenceCapFor(alteredFixSectionOf(AlteredFix::Unnamed)) == 8,
+          "altered: the altered-draw sections, the fix ones too, are per-draw, K = 8, like the in-frame sections");
     for (auto& s : g_section) s = SectionState{};
     g_windowStartMs = GetTickCount64();
     g_activeSection = static_cast<int>(GpuCensusSection::AlteredPoolFamily);
@@ -274,13 +275,14 @@ void rotationAndRealTimerCase(Device& d) {
     check(pool.occurrences == 3 && g_activeTimed == 3, "altered: three pool-family draws on their section's turn are counted and selected for timing");
     { GpuCensusAlteredScope other(d.ctx.Get(), AlteredDrawClass::TerrainOriginal); }
     { GpuCensusAlteredScope other(d.ctx.Get(), AlteredDrawClass::UiLayer); }
-    { GpuCensusAlteredScope other(d.ctx.Get(), AlteredDrawClass::Verdict); }
+    { GpuCensusAlteredScope other(d.ctx.Get(), AlteredDraw(AlteredDrawClass::Verdict, AlteredFix::GlareSteady)); }
     check(g_section[static_cast<size_t>(GpuCensusSection::AlteredTerrain)].occurrences == 1 &&
               g_section[static_cast<size_t>(GpuCensusSection::AlteredUiLayer)].occurrences == 1 &&
-              g_section[static_cast<size_t>(GpuCensusSection::AlteredVerdict)].occurrences == 1 &&
+              g_section[static_cast<size_t>(alteredFixSectionOf(AlteredFix::GlareSteady))].occurrences == 1 &&
               pool.occurrences == 3 && occurrencesEverywhere() == 6 && g_activeTimed == 3,
-          "altered: each class counts in its own section only, and a section that is not on its turn is counted, not timed");
-    // The rotation reaches every section, the altered four included, once a cycle.
+          "altered: each class, and each fix, counts in its own section only, and a section that is not on its turn is counted, not timed");
+    // The rotation reaches every TURN once a cycle, the altered-draw ones included; the fix sections after the
+    // first share its turn and are never landed on.
     g_windowFrames = 0;
     g_activeSection = 0;
     bool visited[kSections] = {};
@@ -288,10 +290,15 @@ void rotationAndRealTimerCase(Device& d) {
         gpuCensusFrame(d.ctx.Get());
         visited[static_cast<size_t>(g_activeSection)] = true;
     }
-    bool all = true;
-    for (bool v : visited) all = all && v;
-    check(all && visited[static_cast<size_t>(GpuCensusSection::AlteredTerrain)],
-          "altered: the frame rotation visits every section, the altered-draw ones too");
+    bool ownersVisited = true, membersSkipped = true;
+    for (size_t i = 0; i < kSections; ++i) {
+        if (turnOwnerOf(static_cast<GpuCensusSection>(i)) == static_cast<GpuCensusSection>(i)) ownersVisited = ownersVisited && visited[i];
+        else membersSkipped = membersSkipped && !visited[i];
+    }
+    check(ownersVisited && visited[static_cast<size_t>(GpuCensusSection::AlteredTerrain)] &&
+              visited[static_cast<size_t>(GpuCensusSection::AlteredFixFirst)],
+          "altered: the frame rotation visits every turn, the altered-draw ones and the fix sections' shared one too");
+    check(membersSkipped, "altered: the fix sections after the first are not turns of their own: the rotation never lands on them");
 
     gpuCensusShutdown();
     check(gpuTimingShutdown(d.ctx.Get()), "explicit owner shutdown");
@@ -548,8 +555,8 @@ void alteredClassCases() {
     check(alteredSectionOf(C::PoolFamily) == GpuCensusSection::AlteredPoolFamily &&
               alteredSectionOf(C::TerrainOriginal) == GpuCensusSection::AlteredTerrain &&
               alteredSectionOf(C::UiLayer) == GpuCensusSection::AlteredUiLayer &&
-              alteredSectionOf(C::Verdict) == GpuCensusSection::AlteredVerdict,
-          "class: each class maps to its own section");
+              alteredSectionOf(AlteredDraw(C::Verdict, AlteredFix::Remlok)) == alteredFixSectionOf(AlteredFix::Remlok),
+          "class: each class maps to its own section, and a Verdict draw to its fix's");
 }
 
 void alteredLineCases() {
@@ -609,6 +616,173 @@ void alteredLineCases() {
           "altered line: a class is corrected by its own null pair ((0.4/2 - 0.1/2) x 0.1 = 0.015), and its spans count in the census's totals");
 }
 
+// ---- 7: the draws another fix wraps, named fix by fix ---------------------------------------------------------
+constexpr const char* kFixLinePrefix = "EDVR GPU census, the other fix-wrapped draws above by the fix that wraps each";
+void alteredFixCases() {
+    constexpr int kFixes = kAlteredFixCount;
+    // The names: one for each fix, fixed strings, all different, in the enum's order.
+    bool distinct = true, filled = true;
+    for (int i = 0; i < kFixes; ++i) {
+        filled = filled && kAlteredFixNames[i] && kAlteredFixNames[i][0];
+        for (int j = i + 1; j < kFixes; ++j) distinct = distinct && std::strcmp(kAlteredFixNames[i], kAlteredFixNames[j]) != 0;
+    }
+    check(filled && distinct, "fix names: one non-empty name for each fix, no two alike");
+    check(std::strcmp(kAlteredFixNames[static_cast<int>(AlteredFix::Panel)], "panel distance") == 0 &&
+              std::strcmp(kAlteredFixNames[static_cast<int>(AlteredFix::NightVision)], "night vision") == 0 &&
+              std::strcmp(kAlteredFixNames[static_cast<int>(AlteredFix::GlareSteady)], "sun glare steady") == 0 &&
+              std::strcmp(kAlteredFixNames[static_cast<int>(AlteredFix::Particle)], "particles") == 0 &&
+              std::strcmp(kAlteredFixNames[static_cast<int>(AlteredFix::Unnamed)], "unnamed fix") == 0,
+          "fix names: each name is at its fix's place in the enum's order");
+
+    // Sections: one each, in order, the last of the census.
+    bool sectionsOk = true;
+    for (int i = 0; i < kFixes; ++i) {
+        const GpuCensusSection sec = alteredSectionOf(AlteredDraw(AlteredDrawClass::Verdict, static_cast<AlteredFix>(i)));
+        sectionsOk = sectionsOk && static_cast<int>(sec) == static_cast<int>(GpuCensusSection::AlteredFixFirst) + i &&
+                     sec == alteredFixSectionOf(static_cast<AlteredFix>(i)) && sec < GpuCensusSection::Count;
+    }
+    check(sectionsOk && static_cast<int>(GpuCensusSection::Count) == static_cast<int>(GpuCensusSection::AlteredFixFirst) + kFixes,
+          "fix sections: each fix has its own section, in order, and they are the last of the census");
+    check(alteredSectionOf(AlteredDraw()) == GpuCensusSection::Count &&
+              alteredSectionOf(AlteredDraw(AlteredDrawClass::None, AlteredFix::Remlok)) == GpuCensusSection::Count,
+          "fix sections: a draw of no class has no section, whatever fix it carries");
+    check(alteredSectionOf(AlteredDraw(AlteredDrawClass::Verdict)) == alteredFixSectionOf(AlteredFix::Unnamed),
+          "fix sections: a Verdict draw that names no fix is the unnamed row: visible, not lost");
+    check(alteredSectionOf(AlteredDraw(AlteredDrawClass::PoolFamily, AlteredFix::Remlok)) == GpuCensusSection::AlteredPoolFamily,
+          "fix sections: a fix carried by a class that is not Verdict changes nothing");
+
+    // Turns: the fix sections share the first one's, every other section keeps its own.
+    bool owners = true;
+    for (size_t i = 0; i < kSections; ++i) {
+        const auto sec = static_cast<GpuCensusSection>(i);
+        owners = owners && turnOwnerOf(sec) == (i >= kAlteredFixFirst ? GpuCensusSection::AlteredFixFirst : sec);
+    }
+    check(owners, "turns: the fix sections share the first one's turn and every other section is its own owner");
+    int at = 0;
+    unsigned cycle = 0;
+    bool onlyOwners = true;
+    do {
+        at = nextTurnOwner(at);
+        ++cycle;
+        onlyOwners = onlyOwners && turnOwnerOf(static_cast<GpuCensusSection>(at)) == static_cast<GpuCensusSection>(at);
+    } while (at != 0 && cycle < 200);
+    check(onlyOwners && cycle == static_cast<unsigned>(kSections) - kAlteredFixCount + 1,
+          "turns: the rotation lands only on turn owners, and a cycle is one turn for each section but the later fix ones (21, as before the split)");
+    for (auto& s : g_section) s = SectionState{};
+    g_section[kAlteredFixFirst + 2].occurrences = 7;
+    g_section[kAlteredFixFirst + 11].occurrences = 5;
+    g_section[static_cast<size_t>(GpuCensusSection::AlteredUiLayer)].occurrences = 100;
+    check(turnOccurrences(GpuCensusSection::AlteredFixFirst) == 12 && turnOccurrences(GpuCensusSection::AlteredUiLayer) == 100,
+          "turns: the shared turn's calls are every fix's together, another section's are its own");
+
+    // The shared turn in the rotation and the Begin: one call counter, one K, one stride, one empty pair,
+    // every call counted for its own fix. (A null context: no timer is asked for; the selection is what is under test.)
+    for (auto& s : g_section) s = SectionState{};
+    g_windowStartMs = GetTickCount64();   // no window closes here
+    auto& owner = g_section[kAlteredFixFirst];
+    auto& glare = g_section[static_cast<size_t>(alteredFixSectionOf(AlteredFix::GlareSteady))];
+    auto& particle = g_section[static_cast<size_t>(alteredFixSectionOf(AlteredFix::Particle))];
+    glare.occurrences = 300;   // two fixes: 300 + 100 calls over ten frames, 40 a frame together
+    particle.occurrences = 100;
+    owner.turns = 3;
+    g_windowFrames = 9;        // gpuCensusFrame counts this frame first: 10
+    g_activeSection = static_cast<int>(GpuCensusSection::AlteredUiLayer);
+    gpuCensusFrame(nullptr);
+    check(g_activeSection == static_cast<int>(GpuCensusSection::AlteredFixFirst),
+          "shared turn: the rotation lands on it after the last class");
+    check(g_activeStride == 5 && g_activeOffset == 3 && owner.turns == 4,
+          "shared turn: the stride is every fix's calls together over K (400 over 10 frames, K 8: every 5th), from the shared turn's own count");
+    glare.occurrences = particle.occurrences = 0;
+    std::string timedAt;
+    for (unsigned call = 0; call < 45; ++call) {
+        const GpuCensusSection sec = alteredFixSectionOf(call % 2 ? AlteredFix::Particle : AlteredFix::GlareSteady);
+        const unsigned before = g_activeTimed;
+        gpuCensusBegin(nullptr, sec);
+        if (g_activeTimed > before) timedAt += std::to_string(call) + ",";
+        gpuCensusEnd(nullptr, sec);
+    }
+    check(timedAt == "3,8,13,18,23,28,33,38," && g_activeTimed == 8,
+          "shared turn: one call counter and one K across the fixes: every 5th call from the offset, capped at 8");
+    check(glare.occurrences == 23 && particle.occurrences == 22,
+          "shared turn: each call is counted for its own fix (23 even calls, 22 odd)");
+    check(owner.nullPairsTaken == 1 && glare.nullPairsTaken == 0 && particle.nullPairsTaken == 0 && g_activeNullDone,
+          "shared turn: ONE empty pair for the turn, kept by the first fix's section whichever fix was timed first");
+    // A section that is not the turn's owner is counted and never advances the shared call counter.
+    g_activeCalls = g_activeTimed = 0;
+    const uint64_t uiBefore = g_section[static_cast<size_t>(GpuCensusSection::AlteredUiLayer)].occurrences;
+    check(!gpuCensusBegin(nullptr, GpuCensusSection::AlteredUiLayer) && g_activeCalls == 0 &&
+              g_section[static_cast<size_t>(GpuCensusSection::AlteredUiLayer)].occurrences == uiBefore + 1,
+          "shared turn: a class section's call during the fixes' turn is counted, not timed, and does not move the fixes' call counter");
+    g_activeSection = static_cast<int>(GpuCensusSection::AlteredUiLayer);
+    g_activeCalls = g_activeTimed = 0;
+    const uint64_t particleBefore = particle.occurrences;
+    check(!gpuCensusBegin(nullptr, alteredFixSectionOf(AlteredFix::Particle)) && g_activeCalls == 0 && particle.occurrences == particleBefore + 1,
+          "shared turn: a fix's call during another section's turn is counted, not timed");
+
+    // The window's lines. Glare: 1200 calls over 200 frames (6.00 a frame), four timed at 0.4 ms; particles: 200 calls
+    // (1.00 a frame), one timed at 0.5 ms; the turn's empty pairs (two, 0.1 ms each) are the first fix's.
+    const uint64_t start = GetTickCount64() - 30000;
+    freshWindow(start);
+    auto& owner2 = g_section[kAlteredFixFirst];
+    auto& glare2 = g_section[static_cast<size_t>(alteredFixSectionOf(AlteredFix::GlareSteady))];
+    auto& particle2 = g_section[static_cast<size_t>(alteredFixSectionOf(AlteredFix::Particle))];
+    auto& remlok2 = g_section[static_cast<size_t>(alteredFixSectionOf(AlteredFix::Remlok))];
+    glare2.occurrences = 1200;
+    glare2.sampler.totals.ms = 1.6;
+    glare2.sampler.totals.samples = 4;
+    particle2.occurrences = 200;
+    particle2.sampler.totals.ms = 0.5;
+    particle2.sampler.totals.samples = 1;
+    remlok2.occurrences = 40;   // ran, never timed: 0.000, not '-'
+    owner2.nullSampler.totals.ms = 0.2;
+    owner2.nullSampler.totals.samples = 2;
+    logAndResetWindow(start + 30000);
+    const std::string* classes = lineWith("EDVR GPU census, Elite's own draws that EDVR alters");
+    const std::string* byFix = lineWith(kFixLinePrefix);
+    check(classes != nullptr && byFix != nullptr, "fix line: the classes' line and, after it, a line naming each fix");
+    if (classes && byFix) {
+        check(classes->find("other fix-wrapped draws 2.200 (7.20/frame)") != std::string::npos &&
+                  classes->find("together 2.200 ms/frame") != std::string::npos,
+              "fix line: the classes' line keeps its item, now the fixes' sum: (0.4 - 0.1) x 6.00 + (0.5 - 0.1) x 1.00 = 2.200, 7.20 a frame");
+        check(byFix->find("sun glare steady 1.800 (6.00/frame)") != std::string::npos &&
+                  byFix->find("particles 0.400 (1.00/frame)") != std::string::npos,
+              "fix line: each fix's ms/frame with its calls a frame, corrected by the turn's empty pair (first fix's)");
+        check(byFix->find("RemLok overlay 0.000 (0.20/frame)") != std::string::npos,
+              "fix line: a fix that ran and was never timed reads 0.000 with its calls, like a class does");
+        check(byFix->find("night vision -") != std::string::npos && byFix->find("panel distance -") != std::string::npos &&
+                  byFix->find("unnamed fix -") != std::string::npos,
+              "fix line: a fix that never ran prints '-', including the unnamed row");
+        check(byFix->find("\"-\" means no draw of that fix ran this window") != std::string::npos,
+              "fix line: it says what '-' means");
+        check(byFix->find("sun glare clamp") != std::string::npos && byFix->find("FSS reveal") != std::string::npos &&
+                  byFix->find("scanner-body resolve") != std::string::npos && byFix->find("menu backdrop") != std::string::npos,
+              "fix line: every named fix has its place on the line, ran or not");
+    }
+    check(g_lastLog.find("timer floor 100.0 us/pair") != std::string::npos && g_lastLog.find("spans timed 5,") != std::string::npos,
+          "fix line: the empty pairs kept by the first fix count in the census's timer floor and spans");
+    check(glare2.occurrences == 0 && owner2.occurrences == 0, "fix line: the window resets the fix sections' occurrences");
+
+    // Nothing ran: every fix '-', and the sum item on the classes' line reads '-' too.
+    freshWindow(start);
+    logAndResetWindow(start + 30000);
+    classes = lineWith("EDVR GPU census, Elite's own draws that EDVR alters");
+    byFix = lineWith(kFixLinePrefix);
+    std::string allAbsent;
+    for (int i = 0; i < kFixes; ++i) allAbsent += std::string(i ? ", " : "") + kAlteredFixNames[i] + " -";
+    check(byFix && byFix->find(allAbsent + ";") != std::string::npos,
+          "fix line: a window with no wrapped draw prints all nineteen fixes with '-' in the enum's order");
+    check(classes && classes->find("other fix-wrapped draws -;") != std::string::npos,
+          "fix line: and the classes' line's sum item is '-' too");
+
+    // A Verdict draw that named no fix is the unnamed row.
+    freshWindow(start);
+    g_section[static_cast<size_t>(alteredSectionOf(AlteredDraw(AlteredDrawClass::Verdict)))].occurrences = 20;
+    logAndResetWindow(start + 30000);
+    byFix = lineWith(kFixLinePrefix);
+    check(byFix && byFix->find("unnamed fix 0.000 (0.10/frame)") != std::string::npos,
+          "fix line: a wrapped draw whose fix has no name shows as the unnamed row, never in another fix's");
+}
+
 // Every census line at its worst stays under what the log keeps (about 1166 characters of message).
 void lineLengths() {
     const uint64_t start = GetTickCount64() - 30000;
@@ -627,6 +801,13 @@ void lineLengths() {
     for (const auto& l : g_lines) longest = std::max(longest, l.size());
     std::printf("gpu_census_test: the longest census line at its worst is %zu characters (the log keeps about 1166)\n", longest);
     check(longest < 1150, "lines: every census line at its worst fits the log's line, not cut");
+    const std::string* byFix = lineWith(kFixLinePrefix);
+    const std::string* classes = lineWith("EDVR GPU census, Elite's own draws that EDVR alters");
+    check(byFix && classes, "lines: both altered-draw lines were written at the worst case");
+    if (byFix && classes) {
+        std::printf("gpu_census_test: at their worst the classes' line is %zu characters and the fixes' line %zu\n", classes->size(), byFix->size());
+        check(byFix->size() < 1100 && byFix->size() > 700, "lines: the fixes' line names all nineteen at their widest and still fits");
+    }
 }
 
 void run() {
@@ -636,6 +817,7 @@ void run() {
     gapCases();
     alteredClassCases();
     alteredLineCases();
+    alteredFixCases();
     lineLengths();
     Runtime runtime;
     Device device(runtime);
