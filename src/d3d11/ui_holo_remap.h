@@ -137,12 +137,35 @@ using SetPs=void(*)(ID3D11DeviceContext*,ID3D11PixelShader*,ID3D11ClassInstance*
 inline void directSetPs(ID3D11DeviceContext* c,ID3D11PixelShader* p,ID3D11ClassInstance*const* a,uint32_t n){c->PSSetShader(p,a,n);}
 class Binding {
     ID3D11PixelShader* ps_=nullptr;ID3D11Buffer* cb_=nullptr;
+    // EDVR's own PS and b13 buffer, kept for IDENTITY only: settle() puts the game's state back into a slot
+    // only while that slot still holds these. Never dereferenced or released here; the Cache owns both.
+    const void* patched_=nullptr;const void* constants_=nullptr;
     ID3D11ClassInstance* classes_[D3D11_SHADER_MAX_INTERFACES]{};UINT count_=D3D11_SHADER_MAX_INTERFACES;
     bool shaderSaved_=false,bufferSaved_=false,modified_=false;
+    // One slot of settle(): read what is bound now (releasing whatever the getter took, even when it faulted
+    // after taking it), put the saved original back ONLY if the slot still holds EDVR's object, then let go of
+    // the saved reference. A slot the game has rebound holds the game's own state already. False leaves the
+    // slot, and its saved reference, for the next attempt.
+    bool settleShader(ID3D11DeviceContext* c,SetPs setPs){
+        ID3D11PixelShader* bound=nullptr;
+        const bool read=guarded("ui.holo.settle.get.ps",[&]{c->PSGetShader(&bound,nullptr,nullptr);});
+        const bool ours=bound&&static_cast<const void*>(bound)==patched_;release(bound);
+        if(!read)return false;
+        if(ours&&!guarded("ui.holo.settle.ps",[&]{setPs(c,ps_,classes_,count_);}))return false;
+        release(ps_);for(auto& p:classes_)release(p);count_=D3D11_SHADER_MAX_INTERFACES;shaderSaved_=false;return true;
+    }
+    bool settleBuffer(ID3D11DeviceContext* c){
+        ID3D11Buffer* bound=nullptr;
+        const bool read=guarded("ui.holo.settle.get.cb",[&]{c->PSGetConstantBuffers(13,1,&bound);});
+        const bool ours=bound&&static_cast<const void*>(bound)==constants_;release(bound);
+        if(!read)return false;
+        if(ours&&!guarded("ui.holo.settle.cb",[&]{c->PSSetConstantBuffers(13,1,&cb_);}))return false;
+        release(cb_);bufferSaved_=false;return true;
+    }
 public:
     ~Binding(){clear();}
     bool needsRestore() const {return modified_;}
-    void clear(){release(ps_);release(cb_);for(auto& p:classes_)release(p);count_=D3D11_SHADER_MAX_INTERFACES;shaderSaved_=bufferSaved_=modified_=false;}
+    void clear(){release(ps_);release(cb_);for(auto& p:classes_)release(p);count_=D3D11_SHADER_MAX_INTERFACES;shaderSaved_=bufferSaved_=modified_=false;patched_=constants_=nullptr;}
     bool begin(ID3D11DeviceContext* c,ID3D11PixelShader* patched,ID3D11Buffer* constants,const Params& p,SetPs setPs=directSetPs,ID3D11PixelShader* expected=nullptr){
         if(!c||!patched||!constants||modified_||shaderSaved_||bufferSaved_||
             !std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.bx)||!std::isfinite(p.by)||p.x<=0||p.y<=0)return false;
@@ -150,6 +173,7 @@ public:
         c->PSGetConstantBuffers(13,1,&cb_);bufferSaved_=true;
         if(count_!=0||(expected&&ps_!=expected))return false; // actual variants have no dynamic linkage
         c->UpdateSubresource(constants,0,nullptr,&p,0,0);
+        patched_=patched;constants_=constants; // what settle() will recognise as ours, recorded before either setter can publish
         modified_=true; // either setter can partially publish before a fault
         c->PSSetConstantBuffers(13,1,&constants);setPs(c,patched,nullptr,0);return true;
     }
@@ -164,5 +188,34 @@ public:
         if(restore(c,setPs))return {true,false};
         return {restore(c,setPs),true}; // one bounded attempt, retaining original refs
     }
+    // The catch-up for a finish() that failed twice (the saved references are retained, needsRestore() is
+    // still true), run later on the same context: for each saved slot, put the saved original back ONLY if
+    // the slot still holds EDVR's own object; a slot the game has rebound since holds the game's own state
+    // already, so its saved reference is just released. True when nothing of EDVR's remains bound (every
+    // slot resolved, saved references gone); false keeps whatever is unresolved, references included, for
+    // another attempt. Each getter and setter runs under its own guard, the CB slot even after a PS fault.
+    bool settle(ID3D11DeviceContext* c,SetPs setPs=directSetPs){
+        if(!modified_)return true;
+        if(!c)return false;
+        bool ok=true;
+        if(shaderSaved_)ok=settleShader(c,setPs)&&ok;
+        if(bufferSaved_)ok=settleBuffer(c)&&ok;
+        if(ok)modified_=false;
+        return ok;
+    }
 };
+
+// The frame-boundary rule for the fence a failed restore raises (ui_layer.cpp's g_uiLayerIssueBlocked, which
+// drops the game's own draws on the owner context): one settle() per boundary, and a fence that never settles
+// must not black out the game for good. kSettled: nothing of EDVR's is bound, the binding is cleared, lift the
+// fence. kHold: still unresolved, keep the fence. kFailOpen: the kSettleBoundaries-th boundary in a row
+// failed; lift the fence anyway, the saved references stay retained (needsRestore() stays true) and the
+// caller says so loudly. `failed` is the caller's running count; it is reset whenever the fence lifts.
+inline constexpr unsigned kSettleBoundaries=8;
+enum class Settle {kHold,kSettled,kFailOpen};
+inline Settle settleAtBoundary(Binding& binding,ID3D11DeviceContext* c,SetPs setPs,unsigned& failed){
+    if(binding.settle(c,setPs)){binding.clear();failed=0;return Settle::kSettled;}
+    if(++failed<kSettleBoundaries)return Settle::kHold;
+    failed=0;return Settle::kFailOpen;
+}
 } // namespace edvr::ui_holo_remap

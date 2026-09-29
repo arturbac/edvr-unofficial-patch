@@ -806,7 +806,8 @@ admission; successful Begin counters prove routing setup, not GPU execution.
 Stock colourless stencil/depth replay uses restored original bindings. One
 bounded restoration retry handles transient setter faults; persistent failure
 retains originals and blocks unsafe owner direct/DrawAuto/indirect/replay
-issues until shutdown. No extra full-eye depth copy or runtime HLSL.
+issues until shutdown (since 2026-09-29 only to the next frame boundary; see
+the last section). No extra full-eye depth copy or runtime HLSL.
 
 Actual-PS fixtures pass927 checks each on WARP and RTX5090, including64 exact
 nonuniform RGBA cases, original DSV byte equality,
@@ -892,3 +893,30 @@ verification passed as `v0.18.0-rc.3-68-g967f0519`. Receipt
 and unchanged INI/DLSS hashes are in
 `build/dlss-selector-unwind-frontier-install.log`. Main and Steam unchanged.
 Scanner identification stays deferred to the other agent.
+
+## 2026-09-29: the restore fence lifts at the frame boundary
+
+Review B1. A hologram PS/b13 restore that fails twice (both guarded
+attempts) raises `g_uiLayerIssueBlocked`, and the VR draw thunks then dropped
+every game draw on the owner context until device shutdown: a black or frozen
+headset until a restart, for one rare driver fault. The Phase 3 entry above
+says "until shutdown"; that is now "to the next frame boundary".
+
+`Binding` records EDVR's own patched PS and constants pointers at `begin()`
+(identity only). `Binding::settle` puts the saved PS and b13 back only into a
+slot that still holds those; a slot the game has rebound holds the game's own
+state already and only has its saved reference released. Each getter and
+setter is guarded, and the b13 slot is settled even after a PS fault.
+`uiLayerFrameBoundary` runs it first (`settleAtBoundary`): success clears the
+binding, lifts the fence and logs once; the eighth failed boundary in a row
+lifts the fence anyway with a loud line and keeps the saved references (the
+hologram take then stays refused). The layer itself stays stood down for the
+session either way; toggling `fix.ui_quality` off and on re-arms it as before.
+
+Built, not flown. ui_holo_test went from 927 to 1059 checks on WARP: rebound
+slots left alone, persistent setter and one-shot getter faults, reference
+counts as the leak meter, the seven holds and the eighth fail-open. The glue
+in `ui_layer.cpp` only logs and flips the flag, and no rig compiles that file.
+The trigger is a rare driver fault, so a flight is unlikely to exercise it.
+The log lines to look for are "restored at the frame boundary" and "could
+NOT be put back".

@@ -133,8 +133,11 @@ void standDown(const char* why) {
     refreshLive();
     if (detail::g_uiLayerIssueBlocked) {
         Log::get().note("ui quality: layer stood down -- %s. Original hologram shader/b13 state remains "
-                        "untrusted after two restoration attempts; owner draw issues and replay are suppressed "
-                        "until device shutdown, and saved original references are retained.", why ? why : "a restoration fault");
+                        "untrusted after two restoration attempts; the game's draws and replay on the owner "
+                        "context are suppressed for the rest of this frame, and the frame boundary then puts "
+                        "back whichever of the two is still EDVR's (the saved original references are retained "
+                        "until then) and lifts the suppression. The layer itself stays stood down for the "
+                        "session.", why ? why : "a restoration fault");
         return;
     }
     Log::get().note(
@@ -1162,7 +1165,9 @@ const void* dsvResource(ID3D11DepthStencilView* dsv) {
 
 void releaseSaved() {
     // Keep original shader/CB references after an unrecoverable setter fault.
-    // The owner draw gate stays latched even when the per-draw state is reset.
+    // The owner draw gate stays up, and the references with it, even when the
+    // per-draw state is reset: the frame boundary's settle needs both
+    // (settleIssueFence, below).
     if (!g_holoBinding.needsRestore()) g_holoBinding.clear();
     ui_holo_remap::release(g_draw.holoDepthCheck);
     for (auto*& r : g_draw.rtv) {
@@ -1189,10 +1194,12 @@ void restore(ID3D11DeviceContext* ctx) {
     // an OM/RS restoration fault must not leave the game's PS replaced.
     const auto holoRestore = g_holoBinding.finish(ctx, vScreenPSSetShaderRaw);
     g_draw.holoRestoreOk = holoRestore.restored;
+    // Raises the fence: the game's owner-context draws are dropped until the
+    // frame boundary settles the binding (settleIssueFence).
     if (!holoRestore.restored) detail::g_uiLayerIssueBlocked = true;
     if (holoRestore.retried)
         standDown(holoRestore.restored ? "a hologram shader/b13 restoration fault recovered on the bounded retry"
-                                     : "hologram shader/b13 restoration failed; original state untrusted, owner draw issues suppressed until device shutdown");
+                                     : "hologram shader/b13 restoration failed; original state untrusted, owner draw issues suppressed until the frame boundary puts it back");
     vScreenSetRenderTargetsRaw(ctx, boundCount(g_draw.rtv), g_draw.rtv, g_draw.dsv);
     vScreenRSSetViewportsRaw(ctx, g_draw.vpCount, g_draw.vp);
     if (g_draw.scissorSet) ctx->RSSetScissorRects(g_draw.scCount, g_draw.sc);
@@ -3674,7 +3681,43 @@ ID3D11Texture2D* uiLayerComposite(uint64_t sequence, uint32_t eye, ID3D11Texture
     return result;
 }
 
+namespace {
+// The fence a failed hologram restore raises (detail::g_uiLayerIssueBlocked,
+// set in restore()) holds for the rest of the frame it failed in and is
+// settled HERE, at the next frame boundary, on the owner context: whichever
+// of the hologram PS and b13 is still EDVR's is put back (only where the slot
+// still holds EDVR's own object), the fence lifts and the game's draws
+// resume. The layer itself stays stood down for the session. If eight
+// boundaries in a row cannot do it the fence lifts anyway
+// (ui_holo_remap.h settleAtBoundary): a frozen headset is worse than one
+// draw on a wrong hologram pixel shader. The rule lives in the header so the
+// ui_holo_test rig covers it; this only logs and flips the flag.
+unsigned g_holoSettleFailed = 0;
+void settleIssueFence(ID3D11DeviceContext* ctx) {
+    if (!detail::g_uiLayerIssueBlocked) return;
+    const unsigned failedBefore = g_holoSettleFailed;
+    switch (ui_holo_remap::settleAtBoundary(g_holoBinding, ctx, vScreenPSSetShaderRaw, g_holoSettleFailed)) {
+    case ui_holo_remap::Settle::kHold:
+        return;
+    case ui_holo_remap::Settle::kSettled:
+        Log::get().note("ui quality: the hologram shader/b13 the layer could not put back was restored at the "
+                        "frame boundary (after %u failed boundaries) -- game draws resume; the layer stays "
+                        "stood down (turning fix.ui_quality off and on re-arms it).", failedBefore);
+        break;
+    case ui_holo_remap::Settle::kFailOpen:
+        Log::get().note("ui quality: the hologram shader/b13 could NOT be put back in %u frame boundaries -- "
+                        "the game's draws resume anyway, on possibly wrong hologram pixel shader / b13 state "
+                        "until the game rebinds them; a restart clears it. The saved originals stay held, so "
+                        "the hologram take stays refused. The layer stays stood down.",
+                        ui_holo_remap::kSettleBoundaries);
+        break;
+    }
+    detail::g_uiLayerIssueBlocked = false;
+}
+}  // namespace
+
 void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
+    settleIssueFence(ctx);
     detail::g_uiLayerWatching = false;
     g_watchBudget = kWatchPerFrame;
     // A tonemap admission whose draw never issued (swallowed) does not
@@ -3731,6 +3774,7 @@ void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
 void uiLayerShutdown() {
     g_holoBinding.clear(); g_holoCache.reset();
     detail::g_uiLayerIssueBlocked = false;
+    g_holoSettleFailed = 0;
     g_privateDepthGuard.reset();
     g_hdrSeedGpu.reset(); // release-only shutdown; the owner/device may already be gone
     g_hdrSeedActive = 0;

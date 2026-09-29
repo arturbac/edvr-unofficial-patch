@@ -87,7 +87,11 @@ extern bool g_uiLayerCrispPending;
 // the layer has not stood down. One load.
 inline bool uiLayerLive() { return detail::g_uiLayerLive; }
 // A persistent driver restoration fault leaves stock shader state untrusted.
-// Owner-context issues stay suppressed until device shutdown, including Begin's fallback.
+// Owner-context issues stay suppressed, Begin's fallback included, for the rest
+// of the frame it happened in: uiLayerFrameBoundary then puts back whichever of
+// the hologram PS and b13 is still EDVR's and lifts this (or lifts it anyway
+// after eight failed boundaries). The layer itself stays stood down for the
+// session either way.
 inline bool uiLayerIssueBlocked() { return detail::g_uiLayerIssueBlocked; }
 
 // Reads fix.ui_quality, fix.temporal_aa and advanced.temporal_aa_debug
@@ -134,7 +138,8 @@ void uiLayerNoteFamilyProbe(uint64_t vs, uint64_t ps, int family, int why);
 // moment of issue refuses (a blend changed by a verdict's own Begin, a seed
 // that failed), in which case the draw goes to the game's frame as always.
 // Exception: uiLayerIssueBlocked suppresses an unsafe issue after both guarded
-// original-shader restoration attempts fault; this is not a stock fallback.
+// original-shader restoration attempts fault, until the frame boundary settles
+// it; this is not a stock fallback.
 // Every state change goes through the raw entry points, so the binding
 // shadow keeps describing the game's.
 bool uiLayerBegin(ID3D11DeviceContext* ctx);
@@ -250,8 +255,9 @@ void uiLayerDoorSeen(uint64_t sequence, uint32_t eye, ID3D11Texture2D* source);
 ID3D11Texture2D* uiLayerComposite(uint64_t sequence, uint32_t eye, ID3D11Texture2D* frame,
                                   const uint32_t region[4], const float layerUv[4]);
 
-// Once per frame, from vScreenFrameBoundary: the shader's warm compile, the
-// 30-second totals, the per-frame watch reset.
+// Once per frame, from vScreenFrameBoundary: first, the settle of a fence a
+// failed hologram restore raised (uiLayerIssueBlocked above); then the
+// shader's warm compile, the 30-second totals, the per-frame watch reset.
 void uiLayerFrameBoundary(ID3D11DeviceContext* ctx);
 
 void uiLayerShutdown();
