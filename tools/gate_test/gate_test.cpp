@@ -19,6 +19,7 @@
 // have actually gone wrong, kept as tests so they cannot go wrong quietly again.
 #include <windows.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -1092,6 +1093,577 @@ int timingChecks() {
     return bad;
 }
 
+// THE JOURNAL WATCHER'S WORKER THREAD (src/d3d11/journal_watch.cpp).
+//
+// The watcher's file work -- the Status.json read, the journal open and tail, the
+// directory walk -- used to run on Elite's render thread from the frame boundary.
+// The phase-0 timing of 2026-09-29 (Frontier, v0.18.0-rc.3-94-g8fee57c2) priced
+// it: the re-glob took 2.6 to 4.3 ms on every one of 97 runs against 1,992
+// journals, and one Status.json read took 39.2 ms inside a 46-50 ms frame. It
+// runs on a worker now, and journalWatchTick() only hands results across.
+//
+// This drives the real worker against real files in a temp folder, from a test
+// thread that plays the Present thread. What it pins:
+//
+//   - events written to a journal, and a changed Status.json, still reach every
+//     accessor a consumer reads, and arrive together;
+//   - the tick never waits on file work and never does any: a worker held inside
+//     a file call does not stop 200,000 ticks, and no file call is ever made on
+//     the ticking thread;
+//   - shutdown returns while the worker is still inside a file call (it must
+//     not join: it can run under the loader lock), wakes a worker that would
+//     have slept for ten seconds, and the worker closes the journal on its way
+//     out; a frame after it starts nothing;
+//   - an eager-Status request reaches a worker asleep on the slower cadence;
+//   - eight consecutive file errors retire the watcher, and the consumers are
+//     told;
+//   - a journal that cannot be proved ours is read from its end, and is replaced
+//     by one that is, at a re-glob run by the worker;
+//   - the phase-0 timing lines and the journal's own lines are written from the
+//     worker, through the real log.
+//
+// The worker reads the real clock, so this runs with no fake one installed.
+namespace journalrig {
+
+std::string toUtf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), nullptr, 0,
+                                      nullptr, nullptr);
+    std::string out(n > 0 ? static_cast<size_t>(n) : 0, '\0');
+    if (n > 0) {
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), &out[0], n, nullptr,
+                            nullptr);
+    }
+    return out;
+}
+
+bool writeWhole(const std::wstring& path, const std::string& text) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD wrote = 0;
+    const BOOL ok = WriteFile(f, text.data(), static_cast<DWORD>(text.size()), &wrote, nullptr);
+    CloseHandle(f);
+    return ok && wrote == text.size();
+}
+
+bool appendTo(const std::wstring& path, const std::string& text) {
+    HANDLE f = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD wrote = 0;
+    const BOOL ok = WriteFile(f, text.data(), static_cast<DWORD>(text.size()), &wrote, nullptr);
+    CloseHandle(f);
+    return ok && wrote == text.size();
+}
+
+// One journal line, in the game's own shape: `"event":"NAME"` with no space,
+// which is what the scanner looks for.
+std::string ev(const char* name) {
+    return std::string("{ \"timestamp\":\"2026-09-29T10:00:00Z\", \"event\":\"") + name + "\" }\n";
+}
+
+// A Status.json. flags2 or gui below zero leaves the field out, which is what the
+// game does in a menu.
+std::string statusText(uint32_t flags, int flags2, int gui) {
+    std::string s = "{ \"timestamp\":\"2026-09-29T10:00:00Z\", \"event\":\"Status\", \"Flags\":" +
+                    std::to_string(flags);
+    if (flags2 >= 0) s += ", \"Flags2\":" + std::to_string(flags2);
+    if (gui >= 0) s += ", \"GuiFocus\":" + std::to_string(gui);
+    return s + " }\n";
+}
+
+// The test thread is the Present thread: it makes the same call, at about the
+// same rate, until the condition holds.
+template <class Cond>
+bool tickUntil(Cond cond, DWORD timeoutMs) {
+    const ULONGLONG t0 = GetTickCount64();
+    for (;;) {
+        journalWatchTick();
+        if (cond()) return true;
+        if (GetTickCount64() - t0 >= timeoutMs) return false;
+        Sleep(1);
+    }
+}
+
+bool workerGone(DWORD timeoutMs) {
+    const ULONGLONG t0 = GetTickCount64();
+    while (journalWatchTestWorkerRunning()) {
+        if (GetTickCount64() - t0 >= timeoutMs) return false;
+        Sleep(1);
+    }
+    return true;
+}
+
+// Can the file be opened with no sharing at all? Not while any other handle to
+// it is open, which is what tells whether the worker still holds the journal.
+bool openExclusive(const std::wstring& path) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(f);
+    return true;
+}
+
+// The hook the worker calls before each piece of file work. It records which
+// thread made the call, sleeps if asked (a slow disk), and can hold the worker
+// once (a stuck one) until the rig lets it go.
+struct Witness {
+    std::atomic<DWORD> presenterTid{0};   // the thread that ticks; no file call may come from it
+    std::atomic<int>   calls{0};
+    std::atomic<int>   onPresenter{0};
+    std::atomic<bool>  holdNext{false};
+    std::atomic<DWORD> sleepMs{0};
+    HANDLE             entered = nullptr;   // manual-reset: the worker is now held
+    HANDLE             release = nullptr;   // manual-reset: let it go
+};
+Witness g_w;
+
+void witnessHook(const char*) {
+    ++g_w.calls;
+    if (GetCurrentThreadId() == g_w.presenterTid.load()) ++g_w.onPresenter;
+    if (const DWORD ms = g_w.sleepMs.load()) Sleep(ms);
+    if (g_w.holdNext.exchange(false)) {
+        SetEvent(g_w.entered);
+        // Bounded, so a rig that failed cannot hang the build.
+        WaitForSingleObject(g_w.release, 15000);
+    }
+}
+
+struct Presenter {
+    HANDLE   done = nullptr;
+    uint32_t ticks = 0;
+};
+
+DWORD WINAPI presenterProc(LPVOID arg) {
+    Presenter* p = static_cast<Presenter*>(arg);
+    g_w.presenterTid.store(GetCurrentThreadId());
+    for (uint32_t i = 0; i < p->ticks; ++i) journalWatchTick();
+    SetEvent(p->done);
+    return 0;
+}
+
+DWORD WINAPI shutdownProc(LPVOID arg) {
+    journalWatchShutdown();
+    SetEvent(static_cast<HANDLE>(arg));
+    return 0;
+}
+
+void removeTree(const std::wstring& dir) {
+    WIN32_FIND_DATAW fd{};
+    HANDLE find = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            const std::wstring name = fd.cFileName;
+            if (name == L"." || name == L"..") continue;
+            const std::wstring path = dir + L"\\" + name;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                removeTree(path);
+            } else {
+                DeleteFileW(path.c_str());
+            }
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+    }
+    RemoveDirectoryW(dir.c_str());
+}
+
+}  // namespace journalrig
+
+int journalWorkerChecks() {
+    using namespace journalrig;
+    int bad = 0;
+    auto verify = [&](bool ok, const char* what) {
+        ++g_checks;
+        if (ok) return;
+        printf("  FAIL  %s\n", what);
+        ++bad;
+    };
+    if (edvr::g_clockForTest) {
+        printf("  FAIL  the journal worker reads the real clock, and a fake one is installed\n");
+        return 1;
+    }
+
+    wchar_t tmp[MAX_PATH];
+    const DWORD tn = GetTempPathW(MAX_PATH, tmp);
+    if (tn == 0 || tn >= MAX_PATH) {
+        printf("  FAIL  no temp folder for the journal worker's files\n");
+        return 1;
+    }
+    const std::wstring base =
+        std::wstring(tmp) + L"edvr_gate_test_journal_" + std::to_wstring(GetCurrentProcessId());
+    removeTree(base);
+    CreateDirectoryW(base.c_str(), nullptr);
+    Config::get().set("log.enabled", "1");
+    if (!Log::get().open(base + L"\\logs", L"gatejournal")) {
+        printf("  FAIL  could not open a log in %ls to read the worker's lines back\n", base.c_str());
+        removeTree(base);
+        return 1;
+    }
+    g_w.entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_w.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_w.entered || !g_w.release) {
+        printf("  FAIL  could not create the rig's events\n");
+        Log::get().close();
+        removeTree(base);
+        return 1;
+    }
+
+    // A folder of its own for each scenario, so a journal one leaves behind is
+    // never a candidate in the next.
+    auto makeDir = [&](const wchar_t* leaf) {
+        const std::wstring d = base + L"\\" + leaf;
+        CreateDirectoryW(d.c_str(), nullptr);
+        Config::get().set("d3d11.journal_watch", "1");
+        Config::get().set("d3d11.journal_dir", toUtf8(d).c_str());
+        journalWatchTestSetWorkHook(nullptr);
+        journalWatchSetEagerStatus(false);
+        return d;
+    };
+    auto stopWorker = [&] {
+        journalWatchShutdown();
+        verify(workerGone(10000), "the worker leaves after a shutdown");
+    };
+
+    // ---------------------------------------------------- 1. what reaches the consumers
+    // 5% is a poll every 25 ms and a re-glob every 200 ms: the scenarios that
+    // follow each wait on one, and at 500 ms they would take half a minute.
+    {
+        const std::wstring d = makeDir(L"events");
+        journalWatchTestSetCadencePercent(5);
+        const std::wstring journal = d + L"\\Journal.2026-09-29T100000.01.log";
+        const std::wstring statusFile = d + L"\\Status.json";
+        writeWhole(journal, ev("Fileheader") + ev("Music") + ev("LoadGame"));
+        writeWhole(statusFile, statusText(0x10, 0, 0));
+        journalWatchConfigure();
+        verify(journalWatchActive(), "a folder that exists is watched");
+        verify(!journalWatchTestWorkerRunning(), "configuring starts no thread: the first tick does");
+        verify(!journalGameplay() && journalStatusSamples() == 0,
+               "nothing is known until the worker has read something");
+
+        verify(tickUntil([] { return journalGameplay(); }, 10000),
+               "a LoadGame written to the journal reaches journalGameplay() through the worker");
+        verify(journalWatchTestWorkerRunning(), "the worker is a thread of its own, still running");
+        // The whole first pass arrives as one: Status was read in the same pass
+        // as the journal, so both are here on the tick that shows LoadGame.
+        uint32_t focus = 99;
+        verify(journalStatusSamples() >= 1 && journalOnFootKnown() && !journalOnFoot() &&
+                   journalSupercruiseKnown() && journalSupercruise() && journalFssFocusKnown() &&
+                   !journalFssFocus() && journalGuiFocus(&focus) && focus == 0,
+               "the Status.json read in the same pass arrives with it, all together");
+
+        // A change is what the consumers compare (device_hook.cpp), so a change
+        // is what is asserted. Not "== 1": scanEvents scans the head of a chunk
+        // twice when a carry precedes it, so a Disembark in a later read counts
+        // twice. That is how it was before the worker, and it is not this
+        // change's to alter.
+        appendTo(journal, ev("Disembark"));
+        verify(tickUntil([] { return journalDisembarks() > 0; }, 10000),
+               "an event appended to the journal later is tailed: Disembark");
+        verify(journalEmbarks() == 0, "...and counted as a Disembark, not an Embark");
+        appendTo(journal, ev("Embark"));
+        verify(tickUntil([] { return journalEmbarks() > 0; }, 10000), "Embark");
+
+        // 0x40000010: the FSD-jump bit and the supercruise bit; Flags2 1: on foot.
+        writeWhole(statusFile, statusText(0x40000010u, 1, 9));
+        verify(tickUntil([] { return journalFssFocus(); }, 10000),
+               "a changed Status.json reaches its consumer: GuiFocus 9 is the scanner");
+        verify(journalGuiFocus(&focus) && focus == 9 && journalOnFootKnown() && journalOnFoot() &&
+                   journalSupercruise(),
+               "...and the rest of that sample arrives with it");
+        appendTo(journal, ev("StartJump"));
+        verify(tickUntil([] { return journalInJumpTunnel(); }, 10000),
+               "StartJump, with Status' FSD-jump flag up, is a jump tunnel");
+        appendTo(journal, ev("FSDJump"));
+        verify(tickUntil([] { return !journalInJumpTunnel(); }, 10000), "FSDJump ends it");
+
+        // The menu: Flags and nothing else.
+        writeWhole(statusFile, statusText(0, -1, -1));
+        verify(tickUntil([] { return !journalOnFootKnown() && !journalFssFocusKnown(); }, 10000),
+               "a Status.json without Flags2 or GuiFocus answers not-known");
+        verify(!journalFssFocus() && !journalGuiFocus(nullptr),
+               "...and the scanner is over");
+        DeleteFileW(statusFile.c_str());
+        verify(tickUntil([] { return !journalSupercruiseKnown(); }, 10000),
+               "a Status.json that goes missing drops what was known, after three misses");
+
+        appendTo(journal, ev("Shutdown"));
+        verify(tickUntil([] { return !journalGameplay(); }, 10000), "a Shutdown event ends gameplay");
+        stopWorker();
+    }
+
+    // ------------------------------------- 2. the tick neither waits on file work nor does it
+    {
+        const std::wstring d = makeDir(L"nowait");
+        journalWatchTestSetCadencePercent(100);
+        writeWhole(d + L"\\Journal.2026-09-29T100000.01.log", ev("LoadGame"));
+        writeWhole(d + L"\\Status.json", statusText(0x10, 1, 9));
+        g_w.calls = 0;
+        g_w.onPresenter = 0;
+        g_w.sleepMs = 0;
+        ResetEvent(g_w.entered);
+        ResetEvent(g_w.release);
+        g_w.holdNext = true;
+        journalWatchTestSetWorkHook(&witnessHook);
+        journalWatchConfigure();
+
+        // A thread of its own plays the Present thread, so a tick that did wait
+        // shows up as a timeout here rather than a hung build.
+        Presenter p;
+        p.done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        p.ticks = 200000;
+        HANDLE presenter = CreateThread(nullptr, 0, &presenterProc, &p, 0, nullptr);
+        verify(presenter != nullptr && p.done != nullptr, "the rig's Present-thread stand-in started");
+        verify(WaitForSingleObject(g_w.entered, 10000) == WAIT_OBJECT_0,
+               "the worker reached its first file call and is held inside it");
+        verify(WaitForSingleObject(p.done, 10000) == WAIT_OBJECT_0,
+               "200,000 ticks completed while the worker was held inside a file call");
+        verify(!journalGameplay() && journalStatusSamples() == 0 && journalWatchActive(),
+               "...and answered from what was known, which was nothing new");
+        verify(g_w.calls.load() == 1 && g_w.onPresenter.load() == 0,
+               "the only file call so far is the worker's, and none was made on the ticking thread");
+
+        SetEvent(g_w.release);
+        // From here this thread ticks, and the check below covers it too.
+        g_w.presenterTid = GetCurrentThreadId();
+        verify(tickUntil([] { return journalGameplay(); }, 10000),
+               "let go, the worker finishes the call and its results arrive");
+        verify(g_w.onPresenter.load() == 0 && g_w.calls.load() >= 3,
+               "every file call it made (status, walk, open, tail) came from the worker's thread");
+
+        // The worker is held again inside its next file call, and shutdown is
+        // asked for from a third thread: it must return, not wait for the worker.
+        ResetEvent(g_w.entered);
+        ResetEvent(g_w.release);
+        g_w.holdNext = true;
+        verify(WaitForSingleObject(g_w.entered, 10000) == WAIT_OBJECT_0,
+               "the worker reached its next file call and is held inside it");
+        HANDLE shutdownDone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE stopper = CreateThread(nullptr, 0, &shutdownProc, shutdownDone, 0, nullptr);
+        verify(stopper != nullptr &&
+                   WaitForSingleObject(shutdownDone, 10000) == WAIT_OBJECT_0,
+               "journalWatchShutdown() returns while the worker is still inside a file call");
+        verify(journalWatchTestWorkerRunning(), "...which has not left yet, and shutdown did not wait for it");
+        SetEvent(g_w.release);
+        verify(workerGone(10000), "released, the worker finishes the call and leaves");
+        verify(g_w.onPresenter.load() == 0, "and still no file call came from the ticking thread");
+        journalWatchTestSetWorkHook(nullptr);
+        for (HANDLE h : {presenter, stopper, p.done, shutdownDone}) {
+            if (h) CloseHandle(h);
+        }
+    }
+
+    // ---------------------------------------------------- 3. stop, and stay stopped
+    {
+        const std::wstring d = makeDir(L"stop");
+        // A ten-second poll: a worker that did not wake for the stop would sleep
+        // through the wait below.
+        journalWatchTestSetCadencePercent(2000);
+        const std::wstring journal = d + L"\\Journal.2026-09-29T100000.01.log";
+        writeWhole(journal, ev("LoadGame"));
+        writeWhole(d + L"\\Status.json", statusText(0x10, 1, 0));
+        journalWatchConfigure();
+        verify(tickUntil([] { return journalGameplay(); }, 10000), "the worker's first pass arrives");
+        verify(!openExclusive(journal), "while it runs, the worker holds the journal open");
+        const ULONGLONG t0 = GetTickCount64();
+        journalWatchShutdown();
+        verify(workerGone(4000),
+               "a worker asleep for ten seconds leaves within four of a shutdown: the stop wakes it");
+        const ULONGLONG took = GetTickCount64() - t0;
+        printf("        (the worker was gone %llu ms after the shutdown; its poll was 10 s away)\n",
+               static_cast<unsigned long long>(took));
+        verify(openExclusive(journal), "and it closed the journal on its way out");
+        verify(journalWatchActive() && journalGameplay(),
+               "shutdown leaves the last answers standing, as closing the file always did");
+        for (int i = 0; i < 200; ++i) journalWatchTick();
+        Sleep(50);
+        verify(!journalWatchTestWorkerRunning(), "a frame after shutdown starts nothing");
+    }
+
+    // ------------------------------------------------------------ 4. eager Status reads
+    {
+        const std::wstring d = makeDir(L"eager");
+        // A 5 s poll, and a 1 s eager Status read.
+        journalWatchTestSetCadencePercent(1000);
+        writeWhole(d + L"\\Journal.2026-09-29T100000.01.log", ev("LoadGame"));
+        writeWhole(d + L"\\Status.json", statusText(0x10, 1, 0));
+        journalWatchConfigure();
+        verify(tickUntil([] { return journalStatusSamples() >= 1; }, 10000),
+               "the first Status sample arrives");
+        const ULONGLONG t0 = GetTickCount64();
+        journalWatchSetEagerStatus(true);
+        verify(tickUntil([] { return journalStatusSamples() >= 2; }, 3500),
+               "asking for eager reads makes the next sample come at the eager period, not "
+               "the five-second poll: the request woke a worker asleep until its old due time");
+        printf("        (the second sample came %llu ms after the request; a 5 s poll would be 5000)\n",
+               static_cast<unsigned long long>(GetTickCount64() - t0));
+        journalWatchSetEagerStatus(false);
+        stopWorker();
+    }
+
+    // ------------------------------------------------------ 5. eight file errors retire it
+    {
+        const std::wstring d = makeDir(L"retire");
+        journalWatchTestSetCadencePercent(5);
+        // The journal is held with no sharing, so every open the worker attempts
+        // fails with a sharing violation.
+        const std::wstring journal = d + L"\\Journal.2026-09-29T100000.01.log";
+        HANDLE lock = CreateFileW(journal.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        verify(lock != INVALID_HANDLE_VALUE, "the rig could hold a journal exclusively");
+        journalWatchConfigure();
+        verify(journalWatchActive(), "the watcher starts out active");
+        verify(tickUntil([] { return !journalWatchActive(); }, 15000),
+               "eight consecutive file errors retire it, and the tick tells the consumers");
+        verify(!journalFssFocusKnown() && !journalOnFootKnown() && !journalSupercruiseKnown(),
+               "a retired watcher knows nothing");
+        verify(workerGone(10000), "and the worker has left");
+        for (int i = 0; i < 200; ++i) journalWatchTick();
+        Sleep(50);
+        verify(!journalWatchTestWorkerRunning(), "a retired watcher is not restarted by a later frame");
+        if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
+    }
+
+    // ------------------------------- 6. a journal we cannot prove ours, then one we can
+    {
+        const std::wstring d = makeDir(L"provenance");
+        journalWatchTestSetCadencePercent(5);
+        // Written now, created ten minutes ago: what a crashed session's journal
+        // looks like to a relaunch (issue #19).
+        const std::wstring foreign = d + L"\\Journal.2026-09-29T090000.01.log";
+        {
+            HANDLE f = CreateFileW(foreign.c_str(), GENERIC_WRITE | FILE_WRITE_ATTRIBUTES,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (f != INVALID_HANDLE_VALUE) {
+                const std::string history = ev("LoadGame");
+                DWORD wrote = 0;
+                WriteFile(f, history.data(), static_cast<DWORD>(history.size()), &wrote, nullptr);
+                FILETIME now;
+                GetSystemTimeAsFileTime(&now);
+                ULARGE_INTEGER t;
+                t.LowPart = now.dwLowDateTime;
+                t.HighPart = now.dwHighDateTime;
+                t.QuadPart -= 10ull * 60ull * 10000000ull;
+                FILETIME old;
+                old.dwLowDateTime = t.LowPart;
+                old.dwHighDateTime = t.HighPart;
+                SetFileTime(f, &old, nullptr, nullptr);
+                CloseHandle(f);
+            }
+        }
+        writeWhole(d + L"\\Status.json", statusText(0x10, 1, 0));
+        journalWatchConfigure();
+        // A Status sample arrives only with the pass that adopted the journal, so
+        // by then the worker has the foreign file's end, and nothing written
+        // after this point can be mistaken for history.
+        verify(tickUntil([] { return journalStatusSamples() >= 1; }, 10000), "the first pass arrives");
+        verify(!journalGameplay(),
+               "a journal that cannot be proved ours is read from its end: its LoadGame is history");
+        appendTo(foreign, ev("Embark"));
+        verify(tickUntil([] { return journalEmbarks() > 0; }, 10000),
+               "what is written to it from then on is read");
+        verify(!journalGameplay(), "and the history was not replayed to get there");
+        // The game's own journal appears.
+        Sleep(30);
+        writeWhole(d + L"\\Journal.2026-09-29T100000.01.log", ev("LoadGame"));
+        verify(tickUntil([] { return journalGameplay(); }, 10000),
+               "a journal created after we started replaces it at the worker's next re-glob, "
+               "and is read from the top");
+        stopWorker();
+    }
+
+    // ------------------------------------ 7. the phase-0 timing is written from the worker
+    {
+        const std::wstring d = makeDir(L"timing");
+        journalWatchTestSetCadencePercent(5);
+        writeWhole(d + L"\\Journal.2026-09-29T100000.01.log", ev("LoadGame"));
+        writeWhole(d + L"\\Status.json", statusText(0x10, 1, 0));
+        // Every file call takes 25 ms, well over the 2 ms a run must reach to be
+        // written as slow at once.
+        g_w.calls = 0;
+        g_w.onPresenter = 0;
+        g_w.sleepMs = 25;
+        g_w.presenterTid = GetCurrentThreadId();
+        journalWatchTestSetWorkHook(&witnessHook);
+        journalWatchConfigure();
+        verify(tickUntil([] { return journalGameplay(); }, 10000), "a slow disk delays the arrival, not the tick");
+        stopWorker();
+        journalWatchTestSetWorkHook(nullptr);
+        g_w.sleepMs = 0;
+        verify(g_w.calls.load() >= 3, "the slow file calls were made");
+        // The ticking thread here is this one, and it made none of them.
+        verify(g_w.onPresenter.load() == 0, "and none of them on the thread that ticks");
+    }
+
+    // ------------------------------------------------------------------- done
+    journalWatchTestSetCadencePercent(100);
+    Config::get().set("d3d11.journal_watch", "0");
+    journalWatchConfigure();   // off: the next fixtures see a watcher that is not there
+    verify(!journalWatchActive() && !journalGameplay(), "a disabled watcher answers nothing");
+    Log::get().close();
+
+    std::string text;
+    {
+        WIN32_FIND_DATAW fd{};
+        HANDLE find = FindFirstFileW((base + L"\\logs\\edvr_gatejournal_*.log").c_str(), &fd);
+        if (find != INVALID_HANDLE_VALUE) {
+            do {
+                text += readWholeFile(base + L"\\logs\\" + fd.cFileName);
+            } while (FindNextFileW(find, &fd));
+            FindClose(find);
+        }
+    }
+    removeTree(base);
+    for (HANDLE h : {g_w.entered, g_w.release}) {
+        if (h) CloseHandle(h);
+    }
+    g_w.entered = g_w.release = nullptr;
+
+    const std::vector<std::string> log = splitLines(text);
+    auto linesWith = [&](const char* a, const char* b = "") {
+        size_t n = 0;
+        for (const std::string& line : log) {
+            if (line.find(a) != std::string::npos && line.find(b) != std::string::npos) ++n;
+        }
+        return n;
+    };
+    verify(!log.empty(), "the log file was written and read back");
+    verify(linesWith("journal: watching the game's own event stream") >= 1,
+           "the configure line is in the log");
+    verify(linesWith("journal: reading on its own thread (") >= 1,
+           "the worker says when it starts, so a log without the line means it never ran");
+    verify(linesWith("journal: LoadGame -- gameplay has started") >= 1,
+           "LoadGame's line, written from the worker");
+    verify(linesWith("status: GuiFocus 9 -- the game says the player is in the Full System Scanner.") >= 1 &&
+               linesWith("status: the game says FSS focus ended.") >= 1,
+           "the scanner's entry and exit lines, written from the worker");
+    verify(linesWith("journal: 9 file errors in a row, so the journal is not being read") == 1,
+           "the retirement is said once, with the count that tripped it");
+    verify(linesWith("was written since this process started but created before it") == 1,
+           "the foreign journal's line is written once");
+    verify(linesWith("was created after this process started, so it IS this session's") == 1,
+           "and so is the line that supersedes it");
+    verify(linesWith("periodic work: journal_status SLOW ms=") >= 1,
+           "the Status.json read's phase-0 timing is written from the worker");
+    verify(linesWith("periodic work: journal_reglob SLOW ms=", " files=1") >= 1,
+           "the walk's is, with the number of journals it found");
+    verify(linesWith("periodic work: journal_tail SLOW ms=", " bytes=") >= 1,
+           "the tail read's is, with the bytes it read");
+
+    if (!bad) {
+        printf("  ok    the journal watcher's file work runs on a worker thread of its own: events "
+               "and Status.json changes reach every accessor through it, the tick neither waits on "
+               "file work nor does any, shutdown returns without joining and wakes a sleeping "
+               "worker, eager reads wake it, eight file errors retire it, a journal we cannot "
+               "prove ours is read from its end, and its lines and phase-0 timing come from the "
+               "worker\n");
+    }
+    return bad;
+}
+
 // Every scenario, run at one refresh rate. See g_rateHz.
 void runScenarios() {
 
@@ -1971,6 +2543,9 @@ int main(int argc, char** argv) {
                g_bad == before ? "ok" : "FAIL", g_checks - checksBefore, hz);
     }
     edvr::g_clockForTest = nullptr;
+    // Last, and with the real clock the worker reads: it configures the watcher
+    // and leaves it off, which the fixtures above never see.
+    g_bad += journalWorkerChecks();
 
     if (g_bad) {
         printf("\nGATE TEST FAILED (%d)\n", g_bad);

@@ -39,8 +39,11 @@
 // what lets a rig drive two side by side, or one at a time, with a fake clock
 // and see exactly what a live run would write. record() is the whole decision
 // and is pure: time, the wall clock and the log all come in as arguments.
-// Not thread-safe: one instance belongs to one thread, and every user here is
-// the Present thread.
+// Not thread-safe: one instance belongs to one thread. Every user here is the
+// Present thread except the journal watcher's three. Its file work moved to a
+// worker thread of its own once this timing had priced it (journal_watch.cpp),
+// and the three instances went with it: they still time the work, which is no
+// longer on the frame.
 #pragma once
 
 #include <cstdint>
