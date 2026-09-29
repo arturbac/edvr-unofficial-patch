@@ -983,6 +983,10 @@ if errorlevel 1 ( echo [edvr] ERROR: flat sharpen pass test build failed & exit 
     echo [edvr] ERROR: the sharpening pass disagrees with AMD's RCAS, or a broken twin passed
     exit /b 1
 )
+"%BUILD%\flat_sharpen_pass_test.exe" --self-test-working || (
+    echo [edvr] ERROR: a flat session that sharpens its frames said the never-ran note
+    exit /b 1
+)
 exit /b 0
 
 :rig_openxr_trace_test

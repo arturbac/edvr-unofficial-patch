@@ -23,8 +23,9 @@
 //  - THE LOG, read back from a real file: the flat wording (frames, the game's output copy),
 //    the warm-up line, the first-sharpened-frame line, the totals, the cost line where the
 //    GPU timer answers, and the never-ran note that names anti-aliasing or the flat runtime
-//    where VR's names a compositor hook.
-//   flat_sharpen_pass_test --dry-run | --self-test
+//    where VR's names a compositor hook. A session that DOES sharpen its frames never says
+//    that note: a second run, --self-test-working (the pass latches the note per process).
+//   flat_sharpen_pass_test --dry-run | --self-test | --self-test-working
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -328,6 +329,41 @@ void neverRanWording() {
           "flat, anti-aliasing on: names the flat runtime's lines, not a compositor hook");
 }
 
+// The other half of the never-ran note: a session whose frames ARE sharpened must not say
+// it, however long it runs. The note is for a pass with nothing to work on; said over a
+// working one it would send a reader hunting a fault that is not there. The pass latches
+// the note for the process (it is a session's), so the two halves are two runs of this
+// rig: `--self-test` (nothing sharpened) and `--self-test-working` (this).
+void workingSession(Warp& w) {
+    auto& cfg = edvr::Config::get();
+    cfg.set("fix.render_sharpness", "0.3");
+    cfg.set("fix.temporal_aa", "on");
+    edvr::sharpenPassConfigure(cfg);
+    edvr::flatSharpenReset();
+    edvr::g_clockForTest = fakeClock;
+    g_now = 1000;
+    edvr::sharpenPassTick(w.context.Get());   // the first tick: the warm compile
+    Env e = makeEnv(w.device.Get());
+    ComPtr<ID3D11ShaderResourceView> in = makeSrv(w.device.Get(), e.src.Get(), DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    int sharpened = 0;
+    for (int i = 0; i < 4; ++i) sharpened += edvr::flatSharpenView(w.context.Get(), in.Get()) != in.Get();
+    check(sharpened == 4, "the working session sharpens its frames");
+    g_now += 31000;
+    edvr::sharpenPassTick(w.context.Get());   // 31 s on, frames sharpened: nothing to say
+    g_now += 31000;
+    edvr::sharpenPassTick(w.context.Get());   // and a minute on
+    edvr::g_clockForTest = nullptr;
+}
+
+void workingAssertions(const std::string& log) {
+    check(countLines(log, "render sharpening: first sharpened frame") == 1,
+          "log: the working session's first sharpened frame is said once");
+    check(countLines(log, "no frame has been sharpened") == 0 && countLines(log, "compositor hook") == 0 &&
+              countLines(log, "openvr_api.dll") == 0,
+          "log: a session that sharpens its frames never says the never-ran note");
+    for (const std::string& line : linesWith(log, "render sharpening")) std::printf("  log: %s\n", line.c_str());
+}
+
 void firstFrames(Warp& w) {
     // A run of frames through the wrapper and the real pass, the way the flat runtime
     // drives them: enough that the pass's GPU timer has samples to report.
@@ -340,7 +376,11 @@ void firstFrames(Warp& w) {
     for (int i = 0; i < 600; ++i) {
         ID3D11ShaderResourceView* out = edvr::flatSharpenView(w.context.Get(), in.Get());
         sharpened += out != in.Get();
-        w.context->Flush();   // the timer's queries complete a frame behind; keep it near
+        // A full sync (a copy and a map) every frame: the pass's GPU timer reads its queries a
+        // frame behind, and WARP finishes them on its own thread. Without this the 120th timed
+        // pass lands whenever WARP gets to it, in a later scenario, at a later strength, and the
+        // cost line's figures (and the run's verdict) move from run to run.
+        readBytes(w.device.Get(), w.context.Get(), e.src.Get());
     }
     check(sharpened == 600, "600 frames through the wrapper and the real pass are all sharpened");
     uint32_t treated = 0;
@@ -420,13 +460,20 @@ int main(int argc, char** argv) {
         std::puts("flat_sharpen_pass_test: dry-run (no device, no files)");
         return 0;
     }
-    if (argc != 2 || std::strcmp(argv[1], "--self-test")) {
-        std::puts("usage: flat_sharpen_pass_test --dry-run | --self-test");
+    const bool working = argc == 2 && !std::strcmp(argv[1], "--self-test-working");
+    if (argc != 2 || (!working && std::strcmp(argv[1], "--self-test"))) {
+        std::puts("usage: flat_sharpen_pass_test --dry-run | --self-test | --self-test-working");
         return 2;
     }
     Warp w = makeWarp();
     if (!w.ok) return 1;
     edvr::g_runtimeProfile = edvr::RuntimeProfile::Flat;
+    if (working) {
+        const std::string log = withLog(L"flatsharpenwork", [&] { workingSession(w); });
+        workingAssertions(log);
+        std::printf("flat_sharpen_pass_test (working session): %u checks, %u failures\n", g_checks, g_failures);
+        return g_failures ? 1 : 0;
+    }
     neverRanWording();
     const std::string log = withLog(L"flatsharpenpass", [&] {
         neverRan(w);      // first: nothing has been sharpened yet, which is the point

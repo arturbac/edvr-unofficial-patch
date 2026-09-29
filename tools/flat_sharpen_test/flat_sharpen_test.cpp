@@ -103,6 +103,22 @@ bool sourceBuildsFlatPageFromTable(const std::string& menuCpp) {
            region.find("strcmp(d.key,") == std::string::npos;
 }
 
+// The Sharpening row's dimming is decided in one place (flatSharpenRowDim, whose truth table
+// is checked below) and reached from three: the row's drawing, a step and a typed edit. menu.cpp
+// is 4000 lines of UI the rig cannot draw, so what it can hold is that each site still asks
+// that one question, in the profile's own terms.
+bool sourceGatesSharpenRow(const std::string& menuCpp) {
+    const size_t def = menuCpp.find("bool sharpenRowDisabled() {");
+    if (def == std::string::npos) return false;
+    const size_t defEnd = menuCpp.find("\n}", def);
+    const std::string body = defEnd == std::string::npos ? std::string() : menuCpp.substr(def, defEnd - def);
+    return body.find("flatSharpenRowDim(runtimeFlatProfile(),") != std::string::npos &&
+           body.find("temporalModeEnabled(Config::get().requestedTemporalMode())") != std::string::npos &&
+           menuCpp.find("(sharpenRow && sharpenRowDisabled())") != std::string::npos &&
+           menuCpp.find("if (isSharpenRow(d) && sharpenRowDisabled()) {") != std::string::npos &&
+           menuCpp.find("if (isSharpenRow(kMenuRows[defIndex]) && sharpenRowDisabled()) {") != std::string::npos;
+}
+
 bool schemaHasRow(const std::string& schema, const char* section, const char* key) {
     const std::string needle = std::string("{\"") + section + "\", \"" + key + "\",";
     return schema.find(needle) != std::string::npos;
@@ -169,6 +185,24 @@ void panelTable(const std::string& root, const std::string& gen) {
     }
     check(at != std::string::npos && !sourceBuildsFlatPageFromTable(hardCoded),
           "control: a page built from a key list in menu.cpp is caught");
+
+    // The Sharpening row's dimming is asked in all three places, in the profile's terms.
+    check(sourceGatesSharpenRow(menuCpp), "menu.cpp dims, refuses steps and refuses typing on the Sharpening row through flatSharpenRowDim");
+    auto mutated = [&](const char* from, const char* to) {
+        std::string m = menuCpp;
+        const size_t i = m.find(from);
+        if (i == std::string::npos) return std::string();   // an anchor that moved fails the control below
+        m.replace(i, std::strlen(from), to);
+        return m;
+    };
+    const std::string noDraw = mutated("(sharpenRow && sharpenRowDisabled())", "false");
+    const std::string noStep = mutated("if (isSharpenRow(d) && sharpenRowDisabled()) {", "if (false) {");
+    const std::string noEdit = mutated("if (isSharpenRow(kMenuRows[defIndex]) && sharpenRowDisabled()) {", "if (false) {");
+    const std::string vrDims = mutated("flatSharpenRowDim(runtimeFlatProfile(),", "flatSharpenRowDim(true,");
+    check(!noDraw.empty() && !sourceGatesSharpenRow(noDraw), "control: a row that never dims when drawn is caught");
+    check(!noStep.empty() && !sourceGatesSharpenRow(noStep), "control: a dimmed row that still takes a step is caught");
+    check(!noEdit.empty() && !sourceGatesSharpenRow(noEdit), "control: a dimmed row that still takes typing is caught");
+    check(!vrDims.empty() && !sourceGatesSharpenRow(vrDims), "control: a row asking about a profile other than the running one is caught");
 
     // Every row of the table has a row in the schema the page is built from.
     const std::string schema = readWholeFile(std::wstring(gen.begin(), gen.end()) + L"\\menu_schema.inc");
