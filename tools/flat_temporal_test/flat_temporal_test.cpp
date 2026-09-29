@@ -29,6 +29,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <vector>
 
@@ -1371,20 +1372,28 @@ void testFrameContractTrace() {
         check(false, "trace corpus or its manifest is missing");
         return;
     }
-    // The manifest pins the required scenarios: one "file frames scenario"
-    // per line, '#' for comments. Adding a file never replaces a required one.
+    // The manifest pins the required scenarios: one "file frames scenario
+    // [selected]" per line, '#' for comments. Adding a file never replaces a
+    // required one. A trailing "selected" makes every frame of that trace replay to
+    // a Selected mono frame (the trace was captured on a treated stretch and must
+    // stay one), not merely to its recorded hash.
     std::map<std::string, uint32_t> required;
+    std::set<std::string> mustSelect;
     {
         std::ifstream mf(manifestPath);
         std::string line;
         while (std::getline(mf, line)) {
             if (line.empty() || line[0] == '#') continue;
             std::istringstream iss(line);
-            std::string name, scenario;
+            std::string name, scenario, flag;
             uint32_t frames = 0;
             if (!(iss >> name >> frames >> scenario) || !frames) {
                 check(false, "trace corpus manifest line malformed");
                 continue;
+            }
+            if (iss >> flag) {
+                if (flag == "selected") mustSelect.insert(name);
+                else check(false, "trace corpus manifest line carries an unknown flag");
             }
             required[name] = frames;
         }
@@ -1406,11 +1415,15 @@ void testFrameContractTrace() {
         FlatFrameContract rc{};
         FlatTraceFrameHeader cur{};
         uint32_t fileFrames = 0;
+        const bool needSelected = mustSelect.count(name) != 0;
         auto finish = [&]() {
             if (!cur.eventCount) return;
             ++framesTotal; ++fileFrames;
             if (rc.produced == (cur.produced != 0) &&
                 (!rc.produced || flatFrameContractHash(rc) == cur.contractHash)) ++framesMatched;
+            if (needSelected)
+                check(rc.produced && rc.copiesUsed && rc.copies[0].selected(),
+                      "a corpus trace marked selected replays every frame to a Selected mono frame");
         };
         const bool parsed = flatTraceParse(bytes.data(), bytes.size(),
             [&](const FlatTraceFrameHeader& h) {
@@ -1713,6 +1726,211 @@ int flatTraceMigrate(const char* dirPath) {
     return failed ? 1 : 0;
 }
 
+// ---------------------------------------------------------------------------
+// Re-key replay (2026-09-29, the Krait's hull pair). The corpus replays each
+// frame's RECORDED pool-family decision -- the kFlatTraceSupported flag and
+// key.kind -- which is what keeps a stored hash independent of the keyed table,
+// and what makes --trace-migrate a no-op when the table grows. To ask "what would
+// the frame contract be under table X" the decision has to be taken again:
+// supported from X, kind from flatContractKind with the arguments
+// flat_runtime.cpp passes per draw. A null table replays the recorded decisions.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr uint64_t kHullVs = 0x66DE2CADB1F4AE6Bull, kHullPs = 0x235567BE2840B3EDull;
+bool tableWithoutHullPair(uint64_t vs, uint64_t ps) {
+    return !(vs == kHullVs && ps == kHullPs) && edvr::engine_velocity_family::supportedPair(vs, ps);
+}
+bool tableNow(uint64_t vs, uint64_t ps) { return edvr::engine_velocity_family::supportedPair(vs, ps); }
+struct RekeyFrame {
+    uint64_t frame = 0, storedHash = 0, hash = 0;
+    bool storedProduced = false, produced = false;
+    edvr::FlatMonoReason reason = edvr::FlatMonoReason::InvalidInput;
+    uint32_t supportedDraws = 0, recordCount = 0, hullDraws = 0;
+    // Against the recorded decisions, per draw: the table grew (recorded false,
+    // now true), the table dropped a pair (recorded true, now false), or the
+    // supported flag agrees and flatContractKind still gives another kind.
+    uint32_t grew = 0, dropped = 0, kindDiffers = 0;
+};
+bool rekeyReplay(const std::vector<unsigned char>& bytes, bool (*table)(uint64_t, uint64_t),
+                 std::vector<RekeyFrame>& out) {
+    using namespace edvr;
+    FlatRuntimePrefix replay{};
+    FlatFrameContract rc{};
+    FlatTraceFrameHeader cur{};
+    RekeyFrame row{};
+    auto finish = [&]() {
+        if (!cur.eventCount) return;
+        row.frame = cur.frame; row.storedHash = cur.contractHash; row.storedProduced = cur.produced != 0;
+        row.produced = rc.produced; row.hash = rc.produced ? flatFrameContractHash(rc) : 0;
+        row.reason = rc.copiesUsed ? rc.copies[0].reason : FlatMonoReason::InvalidInput;
+        row.supportedDraws = rc.copiesUsed ? rc.copies[0].supportedDraws : 0;
+        row.recordCount = rc.recordCount;
+        out.push_back(row); row = RekeyFrame{}; cur = FlatTraceFrameHeader{};
+    };
+    const bool parsed = flatTraceParse(bytes.data(), bytes.size(),
+        [&](const FlatTraceFrameHeader& h) {
+            finish(); cur = h;
+            replay = FlatRuntimePrefix{}; replay.frame = h.frame; replay.output = h.output;
+            replay.width = h.width; replay.height = h.height; replay.format = h.format;
+            rc = FlatFrameContract{};
+        },
+        [&](const FlatTraceEvent& e) {
+            if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); return; }
+            if (e.kind == kFlatTraceEventDispatchWritten) { flatRuntimeDispatchObserveWritten(replay, e.key.color); return; }
+            if (e.kind == kFlatTraceEventMarkUncertain) { replay.uncertain = true; return; }
+            if (e.kind == kFlatTraceEventCameraCapture) { ++replay.sequence; return; }
+            FlatRuntimeDraw d = flatTraceEventToDraw(e);
+            if (table) {
+                const bool recordedSupported = d.supported;
+                const auto recordedKind = d.key.kind;
+                d.supported = table(d.key.vs, d.key.ps);
+                d.key.kind = flatContractKind(d.supported, d.key.color, d.key.depth, d.key.width, d.key.height,
+                                              d.key.format, replay.width, replay.height, d.key.color == replay.output);
+                if (d.supported && !recordedSupported) ++row.grew;
+                else if (!d.supported && recordedSupported) ++row.dropped;
+                else if (d.key.kind != recordedKind) ++row.kindDiffers;
+            }
+            if (d.key.vs == kHullVs && d.key.ps == kHullPs) ++row.hullDraws;
+            if (e.flags & kFlatTraceForeignWork) replay.uncertain = true;
+            const bool copy = d.key.vs == flat_mono_detail::kCopyVs &&
+                d.key.ps == flat_mono_detail::kCopyPs && d.key.color == replay.output;
+            if (copy) flatRuntimeObserveContract(replay, d, rc); else flatRuntimeObserve(replay, d);
+        });
+    finish();
+    return parsed;
+}
+bool readTrace(const std::filesystem::path& path, std::vector<unsigned char>& bytes) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) return false;
+    bytes.assign(static_cast<size_t>(file.tellg()), 0);
+    file.seekg(0); file.read(reinterpret_cast<char*>(bytes.data()), std::streamsize(bytes.size()));
+    return bool(file);
+}
+} // namespace
+
+// Diagnostic: one trace file, or every trace in a directory, frame by frame under
+// the recorded decisions, today's table without the hull pair (the control), and
+// today's table. Prints what moved. Nonzero exit when the re-key itself is wrong:
+// a pair the recording held supported that the table no longer does, a contract
+// kind that differs where the supported flag agrees, or an outcome the hull pair
+// changed. A control that differs from the recording because the table has grown
+// since it was made is expected and only counted.
+int flatTraceRekey(const char* path) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> files;
+    if (fs::is_directory(path)) {
+        for (const auto& entry : fs::directory_iterator(path))
+            if (entry.path().extension() == ".bin") files.push_back(entry.path());
+        std::sort(files.begin(), files.end());
+    } else files.push_back(path);
+    uint32_t frames = 0, moved = 0, refused = 0, controlBad = 0, olderTable = 0;
+    for (const auto& file : files) {
+        std::vector<unsigned char> bytes;
+        std::vector<RekeyFrame> recorded, control, now;
+        if (!readTrace(file, bytes) || !rekeyReplay(bytes, nullptr, recorded) ||
+            !rekeyReplay(bytes, tableWithoutHullPair, control) || !rekeyReplay(bytes, tableNow, now) ||
+            recorded.size() != control.size() || control.size() != now.size()) {
+            std::printf("rekey: %s unreadable or malformed\n", file.string().c_str());
+            return 2;
+        }
+        std::printf("%s\n", file.filename().string().c_str());
+        for (size_t i = 0; i < now.size(); ++i) {
+            ++frames;
+            const bool controlOk = control[i].hash == recorded[i].hash && control[i].produced == recorded[i].produced;
+            const bool same = now[i].hash == control[i].hash && now[i].reason == control[i].reason;
+            if (!controlOk) ++olderTable;
+            if (!same) ++moved;
+            if (control[i].reason != now[i].reason) ++refused;
+            std::printf("  frame %llu: stored=%016llx recorded=%016llx control=%016llx now=%016llx reason(control=%s now=%s) "
+                        "supportedDraws(control=%u now=%u) hullDraws=%u vs-recorded(grew=%u dropped=%u kind=%u)%s%s\n",
+                (unsigned long long)now[i].frame, (unsigned long long)recorded[i].storedHash,
+                (unsigned long long)recorded[i].hash, (unsigned long long)control[i].hash,
+                (unsigned long long)now[i].hash,
+                edvr::flatMonoReasonName(control[i].reason), edvr::flatMonoReasonName(now[i].reason),
+                control[i].supportedDraws, now[i].supportedDraws, now[i].hullDraws,
+                control[i].grew, control[i].dropped, control[i].kindDiffers,
+                same ? "" : "  MOVED", controlOk ? "" : "  (control differs from recorded: the table grew since)");
+            if (control[i].dropped || control[i].kindDiffers) ++controlBad;
+        }
+    }
+    std::printf("rekey: %u frame(s), %u moved by the hull pair, %u changed outcome, %u recorded under an older table, "
+                "%u where the re-key disagrees with a recording in a way table growth cannot explain\n",
+                frames, moved, refused, olderTable, controlBad);
+    return (controlBad || refused) ? 1 : 0;
+}
+
+void testHullPairKeying() {
+    using namespace edvr;
+    namespace fs = std::filesystem;
+    using engine_velocity_family::supportedPair;
+    using engine_velocity_family::keyedPs;
+    using engine_velocity_family::familyOfVs;
+    // The table, exactly: the hull pair joined, its siblings and the deferred pairs did not.
+    check(supportedPair(kHullVs, kHullPs), "the Krait hull pair 66DE2CAD/235567BE is keyed for flat");
+    check(supportedPair(kHullVs, 0x864F1F949851B8DEull) && supportedPair(kHullVs, 0xBBDE4E71FB78528Aull),
+          "the family's two earlier pixel shaders are still keyed");
+    check(!supportedPair(0xAACFDCF2FB9AD809ull, 0xCAD1F585EDDC5641ull),
+          "CAD1F585 (EDHM-patched, reads t120) is left for later: unkeyed");
+    check(!supportedPair(0xBBE58E40FE88EC80ull, 0x7311054AB3AAE1DCull),
+          "BBE58E40/7311054A (SV_Position input) is left for later: unkeyed");
+    check(!supportedPair(kHullVs, 0x818212B5F404C002ull), "a third 66DE2CAD pixel shader stays unkeyed");
+    // Flat only: the VR profiles never see it (keyedPs with flat = false).
+    check(keyedPs(familyOfVs(kHullVs), 0x864F1F949851B8DEull, false) &&
+          !keyedPs(familyOfVs(kHullVs), kHullPs, false),
+          "VR does not key the hull pair: only the flat companion slot holds it");
+    // The corpus, re-keyed: the pair may move contracts that hold its draws and nothing else.
+    const fs::path dir("tools/flat_temporal_test/traces");
+    uint32_t files = 0, frames = 0, movedFrames = 0, hullFrames = 0;
+    bool kraitSeen = false;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (entry.path().extension() != ".bin") continue;
+        std::vector<unsigned char> bytes;
+        std::vector<RekeyFrame> recorded, control, now;
+        const bool ok = readTrace(entry.path(), bytes) && rekeyReplay(bytes, nullptr, recorded) &&
+            rekeyReplay(bytes, tableWithoutHullPair, control) && rekeyReplay(bytes, tableNow, now) &&
+            recorded.size() == control.size() && control.size() == now.size();
+        check(ok, "re-key replay parses every corpus trace under all three decisions");
+        if (!ok) continue;
+        ++files;
+        const bool krait = entry.path().filename() == "flat_trace_67594.bin";
+        kraitSeen = kraitSeen || krait;
+        for (size_t i = 0; i < now.size(); ++i) {
+            ++frames;
+            // The re-key's own soundness: a table that only grows never drops a pair a
+            // recording held supported, and flatContractKind reproduces the recorded kind
+            // wherever the supported flag agrees. What the control may differ in is the
+            // draws a LATER table keyed (recordings from before the newest pairs).
+            check(control[i].dropped == 0 && control[i].kindDiffers == 0,
+                  "the re-key reproduces every recorded pool-family decision the table still makes");
+            check(now[i].produced == control[i].produced && now[i].reason == control[i].reason,
+                  "keying the hull pair never changes a frame's selection outcome");
+            if (now[i].hullDraws == 0)
+                check(now[i].hash == control[i].hash,
+                      "a frame with no hull-pair draw is byte-identical under the new table");
+            else {
+                ++hullFrames;
+                if (now[i].produced && now[i].reason == FlatMonoReason::Selected)
+                    check(now[i].hash != control[i].hash &&
+                          now[i].supportedDraws == control[i].supportedDraws + now[i].hullDraws,
+                          "a selected frame's contract gains exactly its hull-pair draws as supported sources");
+            }
+            if (now[i].hash != control[i].hash) ++movedFrames;
+            if (krait) {
+                check(control[i].hash == recorded[i].storedHash && recorded[i].hash == recorded[i].storedHash,
+                      "the Krait trace: the control (today's table without the pair) reproduces the stored hash");
+                check(now[i].reason == FlatMonoReason::Selected && now[i].hullDraws == 5,
+                      "the Krait trace stays Selected under the new table, with its five hull-pair draws");
+                check(now[i].hash != recorded[i].storedHash,
+                      "the Krait trace: the new table moves the contract (negative control: the control does not)");
+            }
+        }
+    }
+    check(kraitSeen, "the Krait trace (flat_trace_67594.bin) is in the corpus");
+    check(files && frames && hullFrames, "the corpus holds frames with hull-pair draws");
+    std::printf("hull pair re-key: %u trace(s), %u frame(s), %u with hull-pair draws, %u contract(s) moved -- only those frames\n",
+                files, frames, hullFrames, movedFrames);
+}
+
 void testFlatDlssNegotiate() {
     using namespace edvr;
     // Gate 2 step 4: the served-floor negotiation, with ranges scaled like
@@ -1763,8 +1981,10 @@ int main(int argc, char** argv) {
         return flatTraceCheck(argv[2]);
     if (argc == 3 && std::strcmp(argv[1], "--trace-migrate") == 0)
         return flatTraceMigrate(argv[2]);
+    if (argc == 3 && std::strcmp(argv[1], "--trace-rekey") == 0)
+        return flatTraceRekey(argv[2]);
     if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) {
-        std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir> | --trace-check <file> | --trace-migrate <dir>");
+        std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir> | --trace-check <file> | --trace-migrate <dir> | --trace-rekey <file|dir>");
         return 2;
     }
     failures += flatProjectionViewportTests();
@@ -1799,6 +2019,7 @@ int main(int argc, char** argv) {
     testFrameContractTrace();
     testFrameContractOutcomes();
     testFrameContractHashCoverage();
+    testHullPairKeying();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

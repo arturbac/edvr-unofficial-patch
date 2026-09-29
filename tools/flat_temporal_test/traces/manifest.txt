@@ -38,3 +38,11 @@ flat_trace_49426.bin 3 edhm-flight-native-taa
 flat_trace_45992.bin 3 stock-flight-res2560x1440-dlss
 flat_trace_52244.bin 3 stock-flight-ss050-dlss
 flat_trace_60043.bin 3 stock-onfoot-station-ss050-dlss
+# Epic install 2026-09-29 12:40 local (18:40 UTC) session, build
+# v0.18.0-rc.3-163-g856e72c2 (trace format EDVRFTR3), EDHM chained, DLSS Quality
+# requested, game supersampling 0.75 (R=2880x1620, D=3840x2160), the main-menu
+# hangar with the Krait Mk II: the F10 trace of the three frames before the
+# capture. It holds the only draws of 66DE2CAD/235567BE (the hull plating, 5 a
+# frame) in the corpus, recorded UNKEYED; the re-key replay in the self-test
+# takes them under the keyed table. "selected": every frame must replay Selected.
+flat_trace_67594.bin 3 epic-menu-krait-ss075-dlss selected
