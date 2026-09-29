@@ -2306,3 +2306,61 @@ In the picture: world edges crisper than at 0, and a menu or HUD edge
 unchanged between 0 and 0.3 (a halo there would mean the interface was
 sharpened, which the order rules out). Then 0.6, for the ringing. Ruled
 out: nothing yet.
+
+**The device changes (RC4 review, F5, 2026-09-29).** The pass kept its shader,
+parameter buffer, both eyes' textures and views, its price ring and its
+format-support answers on one D3D11 device until shutdown, whatever device the
+next frame came from. When the game recreates its device, the next frame got
+device A's result texture back, the wrapper's view over it on device B failed
+(0x887A0005) and the flat sharpening stood down for the session. VR's native
+provider acquires again on a new device and calls the same pass, so VR had the
+same defect. The reviewer's two-device WARP probe reproduced it line for line
+(device B: PASS_THROUGH, refusals 1, stood down); against the fix it gives a
+sharpened view made on B, refusals 0.
+
+The fix is in the pass (`sharpen_pass.cpp`, `adoptDevice`). It holds the device
+it works on, with a reference so the address cannot be recycled, and a frame
+whose source lives on another device releases everything the pass made -- the
+shader and its tried-latch, the parameter buffer, both eyes' result textures,
+cached source views and copy-through textures, the price ring, the
+format-support answers and the reason for a stand-down -- and makes it again on
+the new device, saying so (four notes at most, so two devices trading frames
+cannot fill a log). The session's counters, timing sums and once-per-session
+notes stay. Shutdown releases the reference too. The frame-boundary tick's warm
+compile follows the rule: it warms on the device the pass has, or adopts its
+context's when the pass has none, and never moves the pass.
+
+Rig (`flat_sharpen_pass_test`, the real pass: the wrapper-only two-device case
+stubs it out and could not see this): two WARP devices in one process. A, B, A
+through the pass, each correct against the CPU RCAS reference, each result made
+on the frame's device, and every kind of thing the pass holds (shader, buffer,
+both eyes' results, eye 0's view, eye 1's copy-through texture, the price ring,
+the format asks) made on the new device or gone, none left on the old. A test
+seam, `sharpenPassHeldForTest`, reports each one's device, because WARP
+tolerates a shader or buffer from another device and a stale one shows nowhere
+else. The wrapper is carried across the same changes the way the flat runtime
+carries it (sharpened on each, no stand-down); four changes are four lines and
+six alternating frames end the notes at the fourth; a tick on A then a frame
+from B is a change. CONTROL: `sharpenPassDeviceResetOffForTest` turns the reset
+off, which is the pass as it was: the pass hands B a texture made on A, the
+wrapper stands the sharpening down (sharpened 1, refusals 1), and the rig checks
+that this happens, so the checks with the reset on mean something. 96 checks (37
+before), stable over fifteen runs of both modes.
+
+Mutation run over the shipped pass, fifteen one-line breaks: thirteen killed
+(the reset never done; the shader, the buffer, the eyes, the ring, the shader
+latch and the format answers each not released; the notes uncapped and capped at
+five; the tick not adopting; shutdown keeping its reference; the seam not
+dropping state; the change never said). Two survive: the tick warming on any
+device (unreachable in one thread: a pass with an owner and no shader exists only
+between two lines of one call) and the stand-down reason not forgotten (needs a
+device whose parameter buffer or texture creation fails, which WARP does not
+offer). The rig's first version read a wrapper-owned view after the wrapper's next
+call (good only until then) and crashed one run in six; each view is read where
+it is returned now.
+
+Not flown: a device recreation in a game session has not been seen, only two WARP
+devices in one process. What to look for in a log after one: `render sharpening:
+the D3D device changed (change 1)`, a second `precompiled compute shader
+render_sharpen_cs created`, and no `flat sharpen: a view over the sharpened ...
+could not be made`.

@@ -258,6 +258,7 @@ bool     g_fmtUnknownNoted = false;
 bool     g_fmtChecked[kFormatCount] = {};
 bool     g_fmtSupported[kFormatCount] = {};
 bool     g_fmtUnsupportedNoted[kFormatCount] = {};
+uint32_t g_fmtAsks = 0;   // CheckFormatSupport calls: a new device is asked again (sharpenPassHeldForTest)
 bool     g_firstNoted = false;
 uint32_t g_treats = 0;
 
@@ -273,6 +274,91 @@ void failOnce(const char* what) {
     if (g_failNoted) return;
     g_failNoted = true;
     Log::get().note("render sharpening: %s; the pass stands down.", what);
+}
+
+// THE DEVICE. Everything the pass makes -- the shader, the parameter buffer, both
+// eyes' views and textures, the price ring -- belongs to one D3D11 device, and D3D11
+// refuses to mix devices: a view over a texture another device made fails (the flat
+// wrapper's failed with 0x887A0005 and stood the flat sharpening down for the
+// session), and a shader, buffer or UAV from one device bound on another's context is
+// no better. The game can recreate its device in a running process, and the state
+// above used to be kept until sharpenPassShutdown() whatever device the next frame
+// came from (review RC4, F5; a two-device WARP probe reproduced it).
+//
+// g_owner is the device the state was made on, held with a reference so its address
+// cannot be recycled under the comparison (everything above holds one implicitly,
+// through its own references, so this pins nothing that was not already pinned). A
+// frame from another device, in sharpenInner, releases all of it and starts over.
+// Owner-thread state, like the rest of this file.
+ID3D11Device* g_owner = nullptr;
+uint32_t      g_deviceChanges = 0;
+constexpr uint32_t kMaxDeviceChangeNotes = 4;   // two devices trading frames must not fill a log
+bool          g_deviceResetOff = false;         // rigs only: sharpenPassDeviceResetOffForTest
+
+// Everything above that belongs to a device: the shader and the latch that says it was
+// tried (a compile that failed on the old device says nothing about the new one), the
+// parameter buffer, both eyes' views and textures, the price ring, what was learned about
+// the device's formats, and the reason for a stand-down (the old device's). Not the counters,
+// the timing sums or the once-per-session notes: those are the session's.
+void releaseDeviceState() {
+    for (EyeState& e : g_eye) releaseEye(e);
+    for (QuerySlot& q : g_qring) releaseQuerySlot(q);
+    if (g_cb) { g_cb->Release(); g_cb = nullptr; }
+    if (g_cs) { g_cs->Release(); g_cs = nullptr; }
+    g_csTried = false;
+    for (int i = 0; i < kFormatCount; ++i) {
+        g_fmtChecked[i] = false;
+        g_fmtSupported[i] = false;
+        g_fmtUnsupportedNoted[i] = false;
+    }
+    g_failNoted = false;
+}
+
+// The device a frame's source lives on. The first call adopts it; a different one is a
+// device change: release the old device's state, say so, adopt the new. Off in a rig that
+// asks for the pass as it was before this existed (sharpenPassDeviceResetOffForTest).
+void adoptDevice(ID3D11Device* dev) {
+    if (g_deviceResetOff || !dev || g_owner == dev) return;
+    if (g_owner) {
+        ++g_deviceChanges;
+        if (g_deviceChanges <= kMaxDeviceChangeNotes) {
+            Log::get().note(
+                "render sharpening: the D3D device changed (change %u); the shader, "
+                "the parameter buffer, both eyes' textures and views and the price "
+                "ring made on the old one are released and made again on the new "
+                "one.%s",
+                g_deviceChanges,
+                g_deviceChanges == kMaxDeviceChangeNotes ? " Further changes are not said." : "");
+        }
+        releaseDeviceState();
+        g_owner->Release();
+    }
+    g_owner = dev;
+    dev->AddRef();
+}
+
+// Whether the tick may warm the shader on this context's device: the device the pass works
+// on, or any device while the pass has none yet (which it then adopts, so the warm compile is
+// the first frame's compile and not a wasted one). Never the reverse: a tick on another device
+// does not move the pass -- only a frame does -- or two devices alternating would release and
+// remake the eyes' textures every frame; that tick simply leaves the compile to the first frame.
+bool tickMayWarm(ID3D11DeviceContext* ctx) {
+    if (g_deviceResetOff) return true;
+    ID3D11Device* dev = nullptr;
+    if (!guarded("sharpenPass.tick.device", [&] { ctx->GetDevice(&dev); }) || !dev) {
+        if (dev) dev->Release();
+        return false;
+    }
+    bool may = false;
+    if (!g_owner) {
+        g_owner = dev;
+        dev->AddRef();
+        may = true;
+    } else {
+        may = g_owner == dev;
+    }
+    dev->Release();
+    return may;
 }
 
 ID3D11ComputeShader* compileShader(ID3D11DeviceContext* ctx) {
@@ -413,6 +499,10 @@ void* sharpenInner(void* srcTex, int eye, const float* bounds, float strength) {
         ok = dev != nullptr && ctx != nullptr;
     }
 
+    // Before anything below looks at what the pass already holds: a frame from another
+    // device than the one it was made on finds none of it (adoptDevice).
+    if (ok) adoptDevice(dev);
+
     if (ok) pollTimingRing(ctx);
 
     // A typed UAV store on the family's plain format is what the dispatch
@@ -420,6 +510,7 @@ void* sharpenInner(void* srcTex, int eye, const float* bounds, float strength) {
     // once.
     if (ok && !g_fmtChecked[fmtIndex]) {
         g_fmtChecked[fmtIndex] = true;
+        ++g_fmtAsks;
         UINT support = 0;
         g_fmtSupported[fmtIndex] =
             SUCCEEDED(dev->CheckFormatSupport(viewFmt, &support)) &&
@@ -646,7 +737,7 @@ void sharpenPassConfigure(Config& cfg) {
 void sharpenPassTick(ID3D11DeviceContext* ctx) {
     if (!g_wanted || !ctx) return;
     if (g_firstTickMs == 0) g_firstTickMs = stampMs();
-    if (!g_cs && !g_csTried) {
+    if (!g_cs && !g_csTried && tickMayWarm(ctx)) {
         g_csTried = true;
         g_cs = compileShader(ctx);
         if (g_cs && !g_warmNoted) {
@@ -741,10 +832,43 @@ void sharpenPassShutdown() {
                 g_timeMax, g_timeCount);
         }
     }
-    for (EyeState& e : g_eye) releaseEye(e);
-    for (QuerySlot& q : g_qring) releaseQuerySlot(q);
-    if (g_cb) { g_cb->Release(); g_cb = nullptr; }
-    if (g_cs) { g_cs->Release(); g_cs = nullptr; }
+    releaseDeviceState();
+    if (g_owner) { g_owner->Release(); g_owner = nullptr; }
+}
+
+void sharpenPassDeviceResetOffForTest(bool off) {
+    g_deviceResetOff = off;
+    releaseDeviceState();
+    if (g_owner) { g_owner->Release(); g_owner = nullptr; }
+    g_deviceChanges = 0;
+}
+
+namespace {
+// The device a child was made on, as an identity to compare and nothing more: the pass holds the
+// device (g_owner) for as long as it holds the child, so the pointer is good for the call.
+ID3D11Device* deviceOfChild(ID3D11DeviceChild* child) {
+    if (!child) return nullptr;
+    ID3D11Device* dev = nullptr;
+    child->GetDevice(&dev);
+    if (dev) dev->Release();
+    return dev;
+}
+}  // namespace
+
+void sharpenPassHeldForTest(SharpenPassHeld* out) {
+    if (!out) return;
+    *out = SharpenPassHeld{};
+    out->owner = g_owner;
+    out->shader = deviceOfChild(g_cs);
+    out->buffer = deviceOfChild(g_cb);
+    for (int i = 0; i < 2; ++i) {
+        out->eyeOut[i] = deviceOfChild(g_eye[i].outTex);
+        out->eyeSrcView[i] = deviceOfChild(g_eye[i].srcSrv);
+        out->eyeCopy[i] = deviceOfChild(g_eye[i].copyTex);
+    }
+    out->shaderTried = g_csTried;
+    out->formatSupportAsks = g_fmtAsks;
+    for (const QuerySlot& q : g_qring) out->queriesInFlight += q.inUse ? 1 : 0;
 }
 
 }  // namespace edvr

@@ -441,7 +441,10 @@ void wrapperContract() {
         const FlatSharpenCounts c = flatSharpenCounts();
         check(c.stoodDown && c.refusals == 1 && c.passedStoodDown == 5 && c.sharpened == 0,
               "stood down: counted");
-        // A new device is a new session.
+        // A new device is a new session. This is the wrapper's half only, against a stubbed
+        // pass that hands back whatever texture the rig gives it: what the REAL pass does
+        // with a frame from another device (it used to hand back the old device's result
+        // texture, and this wrapper stood down) is flat_sharpen_pass_test's two-device cases.
         Warp w2 = makeWarp();
         if (w2.ok) {
             Frame F2 = makeFrame(w2.device.Get(), W, H);

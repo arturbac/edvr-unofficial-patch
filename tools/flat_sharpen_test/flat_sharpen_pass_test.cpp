@@ -20,6 +20,13 @@
 //    must each FAIL it: strength inverted (stops = 2*s, not 2*(1-s)), the region shifted
 //    one texel, the result copied back over the source, strength halved, and a wrapper
 //    that hands back the resolve's own view. A rig whose mutants pass proves nothing.
+//  - TWO DEVICES (RC4 review, F5). The pass keeps its resources on one D3D11 device; a frame from
+//    another releases and re-makes them. The real pass, then the wrapper with its state carried
+//    across, run on two WARP devices in one process: A, B, A, correct against the RCAS reference
+//    and made on the frame's own device, with no stand-down; the changes are said, and capped; the
+//    tick's warm compile follows the same rule. The CONTROL switches the reset off
+//    (sharpenPassDeviceResetOffForTest) and shows what it prevents: the pass hands B a texture made
+//    on A, the wrapper cannot view it and stands the sharpening down.
 //  - THE LOG, read back from a real file: the flat wording (frames, the game's output copy),
 //    the warm-up line, the first-sharpened-frame line, the totals, the cost line where the
 //    GPU timer answers, and the never-ran note that names anti-aliasing or the flat runtime
@@ -38,6 +45,7 @@
 #include "../../src/common/timing.h"
 #include "../../src/d3d11/flat_sharpen.h"
 #include "../../src/d3d11/gpu_census.h"
+#include "../../src/d3d11/gpu_timing.h"
 #include "../../src/d3d11/sharpen_pass.h"
 
 using namespace rig;
@@ -427,6 +435,203 @@ void mutants(Warp& w) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// TWO DEVICES. The game can recreate its D3D11 device in a running process, and VR's native
+// provider acquires again on the new one (RC4 review, F5). What the pass made on the first device
+// cannot be used on the second: a view over a texture another device made is refused, which stood
+// the flat sharpening down for the rest of the session, and a shader, buffer or UAV from one device
+// bound on another's context is no better. The pass now releases everything it holds and makes it
+// again when a frame arrives from another device. The wrapper-only two-device case in
+// flat_sharpen_test stubs the pass out and cannot see this; these run the real one.
+//
+// Every scenario opens its own log, so the line counts are exact, and starts the pass fresh:
+// sharpenPassDeviceResetOffForTest(false) drops whatever it holds.
+
+ID3D11Device* deviceOfTexture(void* texture) {
+    ComPtr<ID3D11Device> d;
+    if (texture) static_cast<ID3D11Texture2D*>(texture)->GetDevice(&d);
+    return d.Get();
+}
+
+ID3D11Device* deviceOfView(ID3D11ShaderResourceView* view) {
+    ComPtr<ID3D11Device> d;
+    if (view) view->GetDevice(&d);
+    return d.Get();
+}
+
+void freshPass() {
+    auto& cfg = edvr::Config::get();
+    cfg.set("fix.render_sharpness", "0.6");
+    cfg.set("fix.temporal_aa", "taa");
+    edvr::sharpenPassDeviceResetOffForTest(false);
+    edvr::flatSharpenReset();
+}
+
+// A, then B, then A again, through the real pass and through the wrapper with its own state carried
+// from one device to the other the way the flat runtime carries it (no reset between). Every result is
+// correct against the RCAS reference, is made on the device its frame came from, and nothing stands
+// down. Four device changes in all (A to B, B to A, A to B, B to A), each one said.
+void deviceChange(Warp& a, Warp& b) {
+    freshPass();
+    auto devA = a.device.Get();
+    auto devB = b.device.Get();
+    const Impl real{"the real pass", [](Env& e, float s) { return asTexture(edvrSharpen(e.src.Get(), 0, nullptr, s)); }};
+    std::string why;
+    checkImpl(a, real, true, &why);
+    // Something in every kind of slot A can hold: eye 1 through the copy-through path (a source that
+    // refuses a shader view), on top of eye 0's direct view and result.
+    Env copySource;
+    copySource.bytes = testImage();
+    copySource.src = makeTexture(devA, W, H, DXGI_FORMAT_R8G8B8A8_TYPELESS, 0, &copySource.bytes);
+    check(copySource.src && edvrSharpen(copySource.src.Get(), 1, nullptr, 0.6f) != nullptr,
+          "setup: eye 1 sharpens a source that refuses a shader view, through a copy");
+    edvr::SharpenPassHeld onA;
+    edvr::sharpenPassHeldForTest(&onA);
+    check(onA.owner == devA && onA.shader == devA && onA.buffer == devA && onA.eyeOut[0] == devA &&
+              onA.eyeSrcView[0] == devA && onA.eyeOut[1] == devA && onA.eyeCopy[1] == devA,
+          "setup: everything the pass holds -- shader, buffer, both eyes' results, eye 0's view, eye 1's copy -- was made on A");
+    check(edvr::gpuTimingOwns(a.context.Get()) && !edvr::gpuTimingOwns(b.context.Get()) && onA.queriesInFlight >= 1,
+          "setup: the timing domain is A's, and the price ring holds a query in flight on A");
+    {
+        Env eb = makeEnv(devB);
+        void* r = edvrSharpen(eb.src.Get(), 0, nullptr, 0.6f);
+        check(r != nullptr, "device B: the pass sharpens a frame from a second device");
+        const bool onB = r && deviceOfTexture(r) == devB;
+        check(onB, "...into a texture made on that device, not on the first one");
+        // Every kind of thing the pass held on A is gone or made again on B, none left behind.
+        edvr::SharpenPassHeld held;
+        edvr::sharpenPassHeldForTest(&held);
+        check(held.owner == devB, "after B's first frame the pass works on B");
+        check(held.shader == devB && held.shaderTried, "...its shader was made again, on B");
+        check(held.buffer == devB, "...its parameter buffer was made again, on B");
+        check(held.eyeOut[0] == devB && held.eyeSrcView[0] == devB, "...eye 0's result and its view over the source are B's");
+        check(!held.eyeOut[1] && !held.eyeSrcView[1] && !held.eyeCopy[1],
+              "...eye 1's result, view and copy-through texture, unused on B, are released and not left on A");
+        check(held.formatSupportAsks == onA.formatSupportAsks + 1, "...B was asked what formats it can store");
+        check(held.queriesInFlight == 0, "...and the price ring's queries on A are released");
+        if (onB) checkImpl(b, real, true, &why);   // against the reference, read back on B
+    }
+    checkImpl(a, real, true, &why);                // and back: A's own state is made again
+    {
+        edvr::SharpenPassHeld held;
+        edvr::sharpenPassHeldForTest(&held);
+        check(held.owner == devA && held.shader == devA && held.buffer == devA && held.eyeOut[0] == devA &&
+                  held.eyeSrcView[0] == devA && !held.eyeOut[1] && !held.eyeCopy[1],
+              "back on A: everything the pass holds was made on A, and nothing is left from B");
+    }
+
+    Env ea = makeEnv(devA);
+    Env eb = makeEnv(devB);
+    ComPtr<ID3D11ShaderResourceView> aIn = makeSrv(devA, ea.src.Get(), DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    ComPtr<ID3D11ShaderResourceView> bIn = makeSrv(devB, eb.src.Get(), DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    edvr::flatSharpenReset();
+    // A returned view is the wrapper's own and good until its next call (a device change releases the
+    // old device's), so each is read where it is returned.
+    ID3D11ShaderResourceView* aOut = edvr::flatSharpenView(a.context.Get(), aIn.Get());
+    const bool aSharpened = aOut != aIn.Get() && deviceOfView(aOut) == devA;
+    ID3D11ShaderResourceView* bOut = edvr::flatSharpenView(b.context.Get(), bIn.Get());
+    const bool bSharpened = bOut != bIn.Get() && deviceOfView(bOut) == devB;
+    ID3D11ShaderResourceView* aBack = edvr::flatSharpenView(a.context.Get(), aIn.Get());
+    const bool aBackSharpened = aBack != aIn.Get() && deviceOfView(aBack) == devA;
+    check(aSharpened, "wrapper, device A: a sharpened view, made on A");
+    check(bSharpened, "wrapper, device B after A: a sharpened view, made on B (it stood down here before the fix)");
+    check(aBackSharpened, "wrapper, back on device A: sharpened on A again");
+    const edvr::FlatSharpenCounts c = edvr::flatSharpenCounts();
+    check(c.sharpened == 3 && c.refusals == 0 && !c.stoodDown && c.passedStoodDown == 0,
+          "the wrapper counted three sharpened frames across the changes: no refusal, no stand-down");
+    edvr::sharpenPassDeviceResetOffForTest(false);
+}
+
+void deviceChangeAssertions(const std::string& log) {
+    check(countLines(log, "the D3D device changed (change ") == 4,
+          "log: the four device changes are each said");
+    check(countLines(log, "render_sharpen_cs created") == 5,
+          "log: the shader is made once on the first device and once per change, and not again while the device stays");
+    check(countLines(log, "stands down") == 0 && countLines(log, "standing down") == 0,
+          "log: nothing stood down");
+    for (const std::string& line : linesWith(log, "the D3D device changed")) std::printf("  log: %s\n", line.c_str());
+}
+
+// Two devices trading frames must not fill a log: the first four changes are said and the fourth
+// says the rest are not. Six frames from B, A, B, A, B, A: the first adopts, five changes follow.
+void deviceChangeNotes(Warp& a, Warp& b) {
+    freshPass();
+    Env ea = makeEnv(a.device.Get());
+    Env eb = makeEnv(b.device.Get());
+    int made = 0, wrong = 0;
+    for (int i = 0; i < 6; ++i) {
+        const bool onA = (i & 1) != 0;
+        void* r = edvrSharpen((onA ? ea : eb).src.Get(), 0, nullptr, 0.6f);
+        made += r != nullptr;
+        wrong += r && deviceOfTexture(r) != (onA ? a.device.Get() : b.device.Get());
+    }
+    check(made == 6 && wrong == 0, "six alternating frames are each sharpened on their own device");
+    edvr::sharpenPassDeviceResetOffForTest(false);
+}
+
+void deviceChangeNotesAssertions(const std::string& log) {
+    check(countLines(log, "the D3D device changed (change ") == 4 && countLines(log, "Further changes are not said") == 1,
+          "log: five changes say four lines, the fourth ending the notes");
+}
+
+// The tick's warm compile is on a device too. A tick on A warms the shader on A and adopts A, so a
+// frame from B is a device change: released, said, and the shader made again on B. (A pass that did
+// not adopt A at the tick would take B's first frame for the first device it saw, and run A's warm
+// shader on it.)
+void tickAdoptsItsDevice(Warp& a, Warp& b) {
+    freshPass();
+    edvr::sharpenPassConfigure(edvr::Config::get());
+    edvr::sharpenPassTick(a.context.Get());
+    Env eb = makeEnv(b.device.Get());
+    void* r = edvrSharpen(eb.src.Get(), 0, nullptr, 0.6f);
+    check(r != nullptr && deviceOfTexture(r) == b.device.Get(), "a frame from B after a tick on A is sharpened on B");
+    edvr::sharpenPassDeviceResetOffForTest(false);
+}
+
+void tickAssertions(const std::string& log) {
+    check(countLines(log, "the D3D device changed (change 1)") == 1 && countLines(log, "render_sharpen_cs created") == 2,
+          "log: the tick's device is the pass's, so B's frame is a change and the shader is made again on B");
+}
+
+// CONTROL: the reset switched off is the pass as it was before it existed. The pass keeps A's
+// resources for B's frame, hands B a texture made on A, the wrapper cannot make a view over it on B,
+// and stands the flat sharpening down for the session: the review's probe, line for line. If this
+// ever passes with the reset on, the checks above prove nothing.
+void deviceResetControl(Warp& a, Warp& b) {
+    freshPass();
+    edvr::sharpenPassDeviceResetOffForTest(true);
+    Env ea = makeEnv(a.device.Get());
+    Env eb = makeEnv(b.device.Get());
+    ComPtr<ID3D11ShaderResourceView> aIn = makeSrv(a.device.Get(), ea.src.Get(), DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    ComPtr<ID3D11ShaderResourceView> bIn = makeSrv(b.device.Get(), eb.src.Get(), DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    ID3D11ShaderResourceView* aOut = edvr::flatSharpenView(a.context.Get(), aIn.Get());
+    check(aOut != aIn.Get() && deviceOfView(aOut) == a.device.Get(), "control setup: the first device is sharpened as ever");
+    void* direct = edvrSharpen(eb.src.Get(), 0, nullptr, 0.6f);
+    check(direct != nullptr && deviceOfTexture(direct) == a.device.Get(),
+          "control: without the reset the pass hands device B a texture made on device A");
+    ID3D11ShaderResourceView* bOut = edvr::flatSharpenView(b.context.Get(), bIn.Get());
+    check(bOut == bIn.Get(), "control: ...so device B's frame goes through unsharpened");
+    const edvr::FlatSharpenCounts c = edvr::flatSharpenCounts();
+    check(c.stoodDown && c.refusals == 1 && c.sharpened == 1,
+          "control: ...and the wrapper stands the sharpening down for the session (sharpened 1, refusals 1, stood down)");
+    std::printf("  control: reset off -> device B: %s; counts: sharpened=%llu refusals=%llu stoodDown=%u\n",
+                bOut == bIn.Get() ? "PASS_THROUGH" : "SHARPENED_VIEW",
+                static_cast<unsigned long long>(c.sharpened), static_cast<unsigned long long>(c.refusals),
+                c.stoodDown ? 1u : 0u);
+    edvr::sharpenPassDeviceResetOffForTest(false);   // back on, from a clean start
+    edvr::flatSharpenReset();
+}
+
+// The shutdown at the end of the main log's scenario let go of everything: the shader, the buffer,
+// both eyes' textures and views, the price ring, and the reference on the device it worked on.
+void shutdownReleasedEverything() {
+    edvr::SharpenPassHeld held;
+    edvr::sharpenPassHeldForTest(&held);
+    check(!held.owner && !held.shader && !held.buffer && !held.eyeOut[0] && !held.eyeOut[1] && !held.eyeSrcView[0] &&
+              !held.eyeSrcView[1] && !held.eyeCopy[0] && !held.eyeCopy[1] && held.queriesInFlight == 0,
+          "shutdown released everything the pass held, and its reference on the device");
+}
+
 void logAssertions(const std::string& log) {
     check(countLines(log, "render sharpening: first sharpened frame") == 1 &&
               countLines(log, "before the game's own output copy") >= 1 &&
@@ -456,6 +661,9 @@ void logAssertions(const std::string& log) {
 
 int main(int argc, char** argv) {
     SetErrorMode(3);
+    // Unbuffered, so a crash does not take the output with it: the scenarios that mix two devices
+    // are the ones most likely to fault, and a run that dies should say how far it got.
+    setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc == 2 && !std::strcmp(argv[1], "--dry-run")) {
         std::puts("flat_sharpen_pass_test: dry-run (no device, no files)");
         return 0;
@@ -484,6 +692,24 @@ int main(int argc, char** argv) {
         edvr::sharpenPassShutdown();
     });
     logAssertions(log);
+    shutdownReleasedEverything();
+
+    // Two devices in one process: the real pass on each in turn, the wrapper carried across, the
+    // tick's warm compile, the cap on the notes, and the control with the reset switched off.
+    Warp b = makeWarp();
+    const bool twoDevices = b.ok && b.device.Get() != w.device.Get();
+    check(twoDevices, "a second, distinct WARP device");
+    if (twoDevices) {
+        std::puts("  two devices: A, B, A through the real pass and through the wrapper");
+        deviceChangeAssertions(withLog(L"flatsharpendev", [&] { deviceChange(w, b); }));
+        std::puts("  two devices: the cap on the change notes");
+        deviceChangeNotesAssertions(withLog(L"flatsharpennotes", [&] { deviceChangeNotes(w, b); }));
+        std::puts("  two devices: the tick's warm compile");
+        tickAssertions(withLog(L"flatsharpentick", [&] { tickAdoptsItsDevice(w, b); }));
+        std::puts("  two devices: the control, reset off");
+        const std::string controlLog = withLog(L"flatsharpencontrol", [&] { deviceResetControl(w, b); });
+        for (const std::string& line : linesWith(controlLog, "flat sharpen:")) std::printf("  log (control): %s\n", line.c_str());
+    }
     std::printf("flat_sharpen_pass_test: %u checks, %u failures\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }
