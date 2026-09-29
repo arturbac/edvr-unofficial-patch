@@ -40,6 +40,17 @@ constexpr const char* kFrameBreakdownNames[8] = {
     "screen motion", "weapon motion", "engine velocity",
     "UI layer reissues"
 };
+// Elite's own draws that EDVR alters, AlteredPoolFamily..AlteredVerdict (indices 17..20):
+// the game's draws timed whole (gpu_census.h), so they are reported on their own line and
+// never summed into EDVR's total.
+constexpr size_t kAlteredFirst = static_cast<size_t>(GpuCensusSection::AlteredPoolFamily);
+constexpr size_t kAlteredSections = kSections - kAlteredFirst;
+constexpr const char* kAlteredNames[4] = {
+    "pool-family draws (EDVR's slot target and shaders)", "terrain prepasses (EDVR's motion target and shader)",
+    "UI draws (redirected to EDVR's layer)", "other fix-wrapped draws"
+};
+static_assert(kAlteredSections == 4, "one name for each altered-draw section");
+static_assert(kAlteredFirst == kDoorSections + 8, "the altered sections follow the eight in-frame sections");
 
 struct SectionState {
     // Capacity 8 covers both K=2 (door) and K=8 (per-draw) sections; a door
@@ -187,6 +198,16 @@ void logAndResetWindow(uint64_t now) {
         frameTotal += s.msPerFrame;
     }
 
+    // Elite's own draws that EDVR alters (gpu_census.h): the game's draw timed whole, so
+    // these are NOT EDVR's cost and stay out of both totals above.
+    double alteredTotal = 0.0;
+    std::string alteredItems;
+    for (size_t i = 0; i < kAlteredSections; ++i) {
+        const Snapshot s = snapshotOf(g_section[kAlteredFirst + i], frames);
+        appendItem(alteredItems, kAlteredNames[i], s);
+        alteredTotal += s.msPerFrame;
+    }
+
     uint64_t spansTimed = 0, spansSkipped = 0;
     for (const auto& st : g_section) {
         const auto& t = st.sampler.totals;
@@ -251,6 +272,14 @@ void logAndResetWindow(uint64_t now) {
         seconds, static_cast<unsigned long long>(frames), doorTotal + frameTotal, doorTotal,
         doorItems.c_str(), frameTotal, frameItems.c_str(), rBuf, gapBrief, floorBuf,
         static_cast<unsigned long long>(spansTimed), static_cast<unsigned long long>(spansSkipped));
+    // Elite's own draws that EDVR alters: what the AA path's GPU cost looks like from
+    // outside, inside draws the census would otherwise count as the game's. Each is the
+    // game's draw timed whole, so the figures INCLUDE the game's own work in those draws.
+    Log::get().note(
+        "EDVR GPU census, Elite's own draws that EDVR alters (each is the game's draw timed whole, so a figure "
+        "includes the game's own work in it, not only what EDVR adds, and none of it is in EDVR ~%.3f above): "
+        "%s; together %.3f ms/frame; \"-\" means no such draw ran this window.",
+        doorTotal + frameTotal, alteredItems.c_str(), alteredTotal);
     char gapDetail[900];
     formatGapDetail(gapDetail, sizeof(gapDetail), gap);
     Log::get().note("%s", gapDetail);

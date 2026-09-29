@@ -248,6 +248,51 @@ void rotationAndRealTimerCase(Device& d) {
           "calibration: exactly one null pair completed -- the turn's first timed call only, not all four");
     check(st.nullSampler.totals.invalid == 0, "calibration: no invalid/disjoint result on the null pair either");
 
+    // ---- Elite's altered draws (gpu_census.h): the scope counts and times only a classed draw ----
+    check(occurrenceCapFor(GpuCensusSection::AlteredPoolFamily) == 8 && !isDoorSection(GpuCensusSection::AlteredVerdict),
+          "altered: the altered-draw sections are per-draw, K = 8, like the in-frame sections");
+    for (auto& s : g_section) s = SectionState{};
+    g_windowStartMs = GetTickCount64();
+    g_activeSection = static_cast<int>(GpuCensusSection::AlteredPoolFamily);
+    g_activeCalls = g_activeTimed = 0;
+    g_activeStride = 1;
+    g_activeOffset = 0;
+    g_activeNullDone = false;
+    const auto occurrencesEverywhere = [] {
+        uint64_t total = 0;
+        for (const auto& s : g_section) total += s.occurrences;
+        return total;
+    };
+    { GpuCensusAlteredScope untouched(d.ctx.Get(), AlteredDrawClass::None); }
+    check(occurrencesEverywhere() == 0 && g_activeTimed == 0,
+          "altered: a draw EDVR left as the game issued it counts nothing and times nothing");
+    auto& pool = g_section[static_cast<size_t>(GpuCensusSection::AlteredPoolFamily)];
+    for (int i = 0; i < 3; ++i) {
+        GpuCensusAlteredScope timed(d.ctx.Get(), AlteredDrawClass::PoolFamily);
+        d.ctx->ClearRenderTargetView(rtv.Get(), colour);   // stands in for the game's draw
+    }
+    check(pool.occurrences == 3 && g_activeTimed == 3, "altered: three pool-family draws on their section's turn are counted and selected for timing");
+    { GpuCensusAlteredScope other(d.ctx.Get(), AlteredDrawClass::TerrainOriginal); }
+    { GpuCensusAlteredScope other(d.ctx.Get(), AlteredDrawClass::UiLayer); }
+    { GpuCensusAlteredScope other(d.ctx.Get(), AlteredDrawClass::Verdict); }
+    check(g_section[static_cast<size_t>(GpuCensusSection::AlteredTerrain)].occurrences == 1 &&
+              g_section[static_cast<size_t>(GpuCensusSection::AlteredUiLayer)].occurrences == 1 &&
+              g_section[static_cast<size_t>(GpuCensusSection::AlteredVerdict)].occurrences == 1 &&
+              pool.occurrences == 3 && occurrencesEverywhere() == 6 && g_activeTimed == 3,
+          "altered: each class counts in its own section only, and a section that is not on its turn is counted, not timed");
+    // The rotation reaches every section, the altered four included, once a cycle.
+    g_windowFrames = 0;
+    g_activeSection = 0;
+    bool visited[kSections] = {};
+    for (size_t i = 0; i < kSections; ++i) {
+        gpuCensusFrame(d.ctx.Get());
+        visited[static_cast<size_t>(g_activeSection)] = true;
+    }
+    bool all = true;
+    for (bool v : visited) all = all && v;
+    check(all && visited[static_cast<size_t>(GpuCensusSection::AlteredTerrain)],
+          "altered: the frame rotation visits every section, the altered-draw ones too");
+
     gpuCensusShutdown();
     check(gpuTimingShutdown(d.ctx.Get()), "explicit owner shutdown");
 }
@@ -481,6 +526,89 @@ void gapCases() {
           "gap: a valid span carrying no ticks or frequency is counted unusable, never paired");
 }
 
+// ---- 6: Elite's altered draws: which class a draw is, and the line that reports them ---------------------------
+void alteredClassCases() {
+    using C = AlteredDrawClass;
+    //                      owner, verdictNone, poolSubstituted, terrainOriginal, uiLayered
+    check(classifyAlteredDraw(true, true, false, false, false) == C::None, "class: a plain draw EDVR did not touch is not altered");
+    check(classifyAlteredDraw(true, true, true, false, false) == C::PoolFamily,
+          "class: a verdict-free draw with EDVR's slot target and shaders bound is a pool-family draw");
+    check(classifyAlteredDraw(true, false, true, false, false) == C::Verdict,
+          "class: the pool flag is stale under a verdict (engineVelocityBeforeDraw did not run): the verdict's wrapper, not a pool-family draw");
+    check(classifyAlteredDraw(true, true, false, true, false) == C::TerrainOriginal, "class: a terrain original with the motion target bound");
+    check(classifyAlteredDraw(true, true, false, false, true) == C::UiLayer, "class: a draw redirected into the UI layer");
+    check(classifyAlteredDraw(true, false, false, false, true) == C::UiLayer,
+          "class: a verdict draw the UI layer redirected is the redirect (its target moved)");
+    check(classifyAlteredDraw(true, false, false, false, false) == C::Verdict, "class: any other verdict's wrapper");
+    check(classifyAlteredDraw(true, true, true, true, true) == C::PoolFamily &&
+              classifyAlteredDraw(true, true, false, true, true) == C::TerrainOriginal,
+          "class: one class per draw, in the order pool family, terrain, UI layer, verdict");
+    check(classifyAlteredDraw(false, true, true, true, true) == C::None && classifyAlteredDraw(false, false, false, false, false) == C::None,
+          "class: a foreign (non-owner) context is never counted");
+    check(alteredSectionOf(C::PoolFamily) == GpuCensusSection::AlteredPoolFamily &&
+              alteredSectionOf(C::TerrainOriginal) == GpuCensusSection::AlteredTerrain &&
+              alteredSectionOf(C::UiLayer) == GpuCensusSection::AlteredUiLayer &&
+              alteredSectionOf(C::Verdict) == GpuCensusSection::AlteredVerdict,
+          "class: each class maps to its own section");
+}
+
+void alteredLineCases() {
+    const uint64_t start = GetTickCount64() - 30000;
+    // Pool-family draws: 2000 in 200 frames (10 a frame), four timed at 0.2 ms each: 2.000 ms/frame.
+    // UI-layer draws: 40 (0.20 a frame), two timed at 0.1 ms: 0.020 ms/frame. Terrain and verdict: never ran.
+    freshWindow(start);
+    auto& pool = g_section[static_cast<size_t>(GpuCensusSection::AlteredPoolFamily)];
+    pool.occurrences = 2000;
+    pool.sampler.totals.ms = 0.8;
+    pool.sampler.totals.samples = 4;
+    auto& ui = g_section[static_cast<size_t>(GpuCensusSection::AlteredUiLayer)];
+    ui.occurrences = 40;
+    ui.sampler.totals.ms = 0.2;
+    ui.sampler.totals.samples = 2;
+    logAndResetWindow(start + 30000);
+    const std::string* line = lineWith("EDVR GPU census, Elite's own draws that EDVR alters");
+    check(line != nullptr, "altered line: a line of its own follows the main census line");
+    if (line) {
+        check(line->find("pool-family draws (EDVR's slot target and shaders) 2.000 (10.00/frame)") != std::string::npos,
+              "altered line: pool-family draws: ms/frame with their count a frame");
+        check(line->find("UI draws (redirected to EDVR's layer) 0.020 (0.20/frame)") != std::string::npos,
+              "altered line: UI-layer draws report too");
+        check(line->find("terrain prepasses (EDVR's motion target and shader) -") != std::string::npos &&
+                  line->find("other fix-wrapped draws -") != std::string::npos,
+              "altered line: a class that never ran prints '-', never 0.000");
+        check(line->find("together 2.020 ms/frame") != std::string::npos, "altered line: the classes are disjoint draws, so together is their sum");
+        check(line->find("includes the game's own work in it, not only what EDVR adds") != std::string::npos &&
+                  line->find("the game's draw timed whole") != std::string::npos,
+              "altered line: it says the figures include the game's own work in those draws");
+    }
+    check(g_lastLog.find("EDVR ~0.000 ms/frame") != std::string::npos && g_lastLog.find("pool-family") == std::string::npos,
+          "altered line: the altered draws are not in EDVR's total and not on the main line");
+    check(g_section[static_cast<size_t>(GpuCensusSection::AlteredPoolFamily)].occurrences == 0,
+          "altered line: the window resets the altered sections' occurrences");
+
+    // Nothing ran: all four '-', together 0.000 (a sum, not a measurement), and the wording still says what '-' means.
+    freshWindow(start);
+    logAndResetWindow(start + 30000);
+    line = lineWith("EDVR GPU census, Elite's own draws that EDVR alters");
+    check(line && line->find("pool-family draws (EDVR's slot target and shaders) -, terrain prepasses (EDVR's motion target and shader) -, "
+                             "UI draws (redirected to EDVR's layer) -, other fix-wrapped draws -;") != std::string::npos &&
+              line->find("\"-\" means no such draw ran this window") != std::string::npos,
+          "altered line: a window with no altered draw prints '-' for all four and says what that means");
+    // The timer floor and the spans count include the altered sections' own timers.
+    freshWindow(start);
+    auto& terrain = g_section[static_cast<size_t>(GpuCensusSection::AlteredTerrain)];
+    terrain.occurrences = 20;
+    terrain.sampler.totals.ms = 0.4;
+    terrain.sampler.totals.samples = 2;
+    terrain.nullSampler.totals.ms = 0.1;
+    terrain.nullSampler.totals.samples = 2;
+    logAndResetWindow(start + 30000);
+    line = lineWith("EDVR GPU census, Elite's own draws that EDVR alters");
+    check(line && line->find("terrain prepasses (EDVR's motion target and shader) 0.015 (0.10/frame)") != std::string::npos &&
+              g_lastLog.find("timer floor 50.0 us/pair") != std::string::npos && g_lastLog.find("spans timed 2,") != std::string::npos,
+          "altered line: a class is corrected by its own null pair ((0.4/2 - 0.1/2) x 0.1 = 0.015), and its spans count in the census's totals");
+}
+
 // Every census line at its worst stays under what the log keeps (about 1166 characters of message).
 void lineLengths() {
     const uint64_t start = GetTickCount64() - 30000;
@@ -506,6 +634,8 @@ void run() {
     calibrationMathCases();
     logFormatCase();
     gapCases();
+    alteredClassCases();
+    alteredLineCases();
     lineLengths();
     Runtime runtime;
     Device device(runtime);
