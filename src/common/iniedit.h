@@ -183,22 +183,36 @@ bool writeFileAtomic(const std::wstring& path, const std::string& bytes,
                      const AtomicWriteOptions& options = AtomicWriteOptions(),
                      int* tries = nullptr);
 
-// The rig's seam into step 2; nothing in the product calls these.
+// The rig's seam into steps 2 and 3; nothing in the product calls these.
 //
-// `hook`, when set, is called INSTEAD of the POSIX-semantics call and returns the
-// Windows error that call stands in for: ERROR_INVALID_PARAMETER (and its kind)
-// makes the writer act as though the volume refused the rename as unsupported,
-// any other non-zero value is an attempt refused for that reason, and 0 lets the
-// real call go ahead. Calling this at all -- with a null hook too -- forgets a
-// remembered refusal and zeroes the attempt count.
-typedef unsigned long (*PosixReplaceHook)();
-void posixReplaceForTest(PosixReplaceHook hook);
+// A hook STANDS IN for the rename it is named for. It is called, with the staged
+// file's path and the target's, INSTEAD of the operating system, and returns the
+// Windows error that rename would have set, or 0 for "the file is in place" --
+// the hook having put it there itself, or, in a test that only counts, not
+// having. What it returns is read exactly as the real call's error is: from the
+// POSIX-semantics hook ERROR_INVALID_PARAMETER (and its kind) is a refusal as
+// unsupported, a sharing violation, an access denial or a lock violation passes
+// and is tried again, and anything else is neither. A null hook is the real
+// call. Calling replaceHooksForTest at all -- with both hooks null too --
+// forgets a remembered refusal and zeroes both counts.
+//
+// It exists because the real file system takes part in a count otherwise. The
+// real-time scanner and the search indexer both have every file that was just
+// written open for a few milliseconds, and the classic rename is refused with a
+// real "access denied" for as long as ANY handle to its target is open. The
+// writer then tries again, as it should, and a rig that asserted "two writes, two
+// renames" counted three (2026-09-29). Standing in for the renames takes the file
+// system out of the count and lets a test script the answers instead: "busy
+// once, then fine".
+typedef unsigned long (*ReplaceHook)(const wchar_t* from, const wchar_t* to);
+void replaceHooksForTest(ReplaceHook posix, ReplaceHook classic);
 
-// How many attempts at the POSIX-semantics rename have been made, hooked or not
-// (an attempt that could not even open the temp file counts), since
-// posixReplaceForTest: 1 after a refusal that is remembered, however many
-// writes follow it.
+// How many attempts at each rename have been made, hooked or not, since
+// replaceHooksForTest. An attempt at the POSIX-semantics rename that could not
+// even open the temp file counts. After a refusal as unsupported that is
+// remembered the POSIX side stays where it was, however many writes follow.
 int posixReplaceAttempts();
+int classicReplaceAttempts();
 
 // Whether a refusal as unsupported has been remembered, so that later writes go
 // straight to the classic rename.

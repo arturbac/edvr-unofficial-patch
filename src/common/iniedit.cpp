@@ -779,10 +779,13 @@ static_assert(FileRenameInfoEx == 22, "FileRenameInfoEx is not the class number 
 
 // What this process has learned about POSIX-semantics renames. A refusal as
 // unsupported is kept for good: the operating system does not change under a
-// running game, and a volume that cannot do it once will not the next time.
-std::atomic<bool>             g_posixRefused{false};
-std::atomic<int>              g_posixAttempts{0};
-std::atomic<PosixReplaceHook> g_posixHook{nullptr};
+// running game, and a volume that cannot do it once will not the next time. The
+// attempt counts and the hooks are the rig's (iniedit.h, replaceHooksForTest).
+std::atomic<bool>        g_posixRefused{false};
+std::atomic<int>         g_posixAttempts{0};
+std::atomic<int>         g_classicAttempts{0};
+std::atomic<ReplaceHook> g_posixHook{nullptr};
+std::atomic<ReplaceHook> g_classicHook{nullptr};
 
 // The operating system or the volume saying it does not do this, as against this
 // one rename having been refused. An OS from before 1607 does not know the
@@ -817,16 +820,21 @@ enum class Posix {
     Other,        // failed some other way; the classic rename decides this attempt
 };
 
+// A POSIX-semantics rename's Windows error (0: it worked), read as the writer
+// needs it.
+Posix classifyPosix(DWORD code) {
+    if (code == ERROR_SUCCESS) return Posix::Done;
+    if (refusedAsUnsupported(code)) return Posix::Unsupported;
+    return passesInMilliseconds(code) ? Posix::Transient : Posix::Other;
+}
+
 // One POSIX-semantics rename of `from` over `to`. `code` is the Windows error of
 // a failure.
 Posix posixReplace(const std::wstring& from, const std::wstring& to, DWORD* code) {
     g_posixAttempts.fetch_add(1);
-    if (PosixReplaceHook hook = g_posixHook.load()) {
-        *code = hook();
-        if (*code != ERROR_SUCCESS) {
-            if (refusedAsUnsupported(*code)) return Posix::Unsupported;
-            return passesInMilliseconds(*code) ? Posix::Transient : Posix::Other;
-        }
+    if (ReplaceHook hook = g_posixHook.load()) {
+        *code = hook(from.c_str(), to.c_str());
+        return classifyPosix(*code);
     }
 
     // What is asked of the operating system, built before the temp file is opened
@@ -871,9 +879,7 @@ Posix posixReplace(const std::wstring& from, const std::wstring& to, DWORD* code
     *code = renamed ? ERROR_SUCCESS : GetLastError();  // before CloseHandle can change it
     if (!renamed && *code == ERROR_SUCCESS) *code = ERROR_CALL_NOT_IMPLEMENTED;
     CloseHandle(h);
-    if (renamed) return Posix::Done;
-    if (refusedAsUnsupported(*code)) return Posix::Unsupported;
-    return passesInMilliseconds(*code) ? Posix::Transient : Posix::Other;
+    return classifyPosix(*code);
 }
 
 // One attempt at putting `from` in place of `to`.
@@ -899,6 +905,11 @@ bool replaceOnce(const std::wstring& from, const std::wstring& to, DWORD* code) 
                 // the next attempt asks again.
                 break;
         }
+    }
+    g_classicAttempts.fetch_add(1);
+    if (ReplaceHook hook = g_classicHook.load()) {
+        *code = hook(from.c_str(), to.c_str());
+        return *code == ERROR_SUCCESS;
     }
     if (MoveFileExW(from.c_str(), to.c_str(),
                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -945,13 +956,17 @@ bool writeFileAtomic(const std::wstring& path, const std::string& bytes, std::ws
     return false;
 }
 
-void posixReplaceForTest(PosixReplaceHook hook) {
-    g_posixHook.store(hook);
+void replaceHooksForTest(ReplaceHook posix, ReplaceHook classic) {
+    g_posixHook.store(posix);
+    g_classicHook.store(classic);
     g_posixRefused.store(false);
     g_posixAttempts.store(0);
+    g_classicAttempts.store(0);
 }
 
 int posixReplaceAttempts() { return g_posixAttempts.load(); }
+
+int classicReplaceAttempts() { return g_classicAttempts.load(); }
 
 bool posixReplaceRefused() { return g_posixRefused.load(); }
 
