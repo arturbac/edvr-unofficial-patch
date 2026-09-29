@@ -3,11 +3,12 @@
 ## Status
 
 - **State:** combined Frontier branch `codex/dlss-performance-review` stays
-  separate from main. Installed `c668f83f` performance flight is verified; Sean
-  reports "Much better." Earlier `7aaaf39c` flight `033435`/dump `033645`
-  confirms both cockpit holograms in final crisp composition; Sean says they
-  look great. Holo panels, flight HUD, target sprite and eight generic families
-  retain their HDR layer. The user requested unwinding the mistaken
+  separate from main. Selector unwind `967f0519` is installed and verified.
+  Prior `c668f83f` performance flight is verified; Sean reports "Much better."
+  Earlier `7aaaf39c` flight `033435`/dump `033645` confirms both cockpit
+  holograms in final crisp composition; Sean says they look great. Holo panels,
+  flight HUD, target sprite and eight generic families retain their HDR layer.
+  The user requested unwinding the mistaken
   VS71DD8B8B09060A81/PS2D037A047171BF3B admission: it paints world-space
   brackets, while scanner-rim yellow <> remains unidentified. That admission,
   PS observation and dedicated fixture are removed; pre-existing world-marker
@@ -37,8 +38,8 @@
 - **Prior art:** this is crisp-ui-handoff.md's parked form of Design A (lines
   184-191: "PARKED, not declined"), with one change. It re-issues the game's
   own tonemap draw instead of transcribing it.
-- **Next step:** full validation passed; commit/push, promote and install
-  Frontier. Keep scanner identification deferred. See
+- **Next step:** selector unwind validated, pushed and installed on Frontier.
+  Keep scanner identification deferred to the other agent. See
   `dlss-performance-review-2026-09-28.md` for the confirmed CPU waits and
   retained optimizations. Halo/occlusion parity still needs pixel evidence.
 
@@ -883,6 +884,11 @@ review found no scope or regression issue. Full validation passed all 86 jobs
 in 125.9 s, native 4,904/0, UI quality 2,907/0, Python self-tests, production
 DLLs and actual installer resources (`build/dlss-selector-unwind-full.log`).
 Receipt input hash
-`66d05e4444e0f1e7f767c6b6d6d2f69f10d3a4a96aee36ea27f55034ce2cd210`.
-Clean promotion and Frontier install remain; scanner identification stays
-deferred to the other agent.
+`66d05e4444e0f1e7f767c6b6d6d2f69f10d3a4a96aee36ea27f55034ce2cd210`. Clean
+source `967f0519` is pushed on the separate branch. Receipt-guarded DLL
+promotion passed, and Frontier dry-run/install/payload/native-receipt
+verification passed as `v0.18.0-rc.3-68-g967f0519`. Receipt
+`edvr_native_receipt.json.pre-967f0519-20260929-061148.bak`; full transcript
+and unchanged INI/DLSS hashes are in
+`build/dlss-selector-unwind-frontier-install.log`. Main and Steam unchanged.
+Scanner identification stays deferred to the other agent.

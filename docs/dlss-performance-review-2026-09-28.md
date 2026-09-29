@@ -16,7 +16,7 @@
   4,904 focused checks, including the actual registered callback, loading
   transitions and fatal invalidation; independent review found no blocker. Full
   validation passed all 86 jobs and installer checks.
-- **Installed:** Frontier `v0.18.0-rc.3-66-gc668f83f`, source `c668f83f`, after
+- **Installed:** Frontier `v0.18.0-rc.3-68-g967f0519`, source `967f0519`, after
   clean receipt-guarded promotion; payload and native receipt verified.
   INI/DLSS hashes preserved. Source pushed on the separate branch; main
   unchanged.
@@ -33,11 +33,10 @@
   2037×1969→4074×3938/UI5093×4923. Installed DLSS metadata is 310.7.0.0;
   graphics logs omit driver/DLSS versions. Profiling uses Frontier; baseline
   uses Steam.
-- **Next:** the narrow selector unwind passed full validation; commit/push,
-  clean-promote and reinstall Frontier. Holograms/performance fixes are
-  preserved. Use explicit `--expect-build c668f83f` for this installed source.
-  No new capture required for diagnosis. Scanner <> identification belongs to
-  the other agent. Review B1/B2 recovery and B3 permission remain open.
+- **Next:** selector unwind complete; scanner <> identification belongs to the
+  other agent. Holograms/performance fixes are preserved. Use explicit
+  `--expect-build 967f0519` for this installed source. No new capture required
+  for diagnosis. Review B1/B2 recovery and B3 permission remain open.
   Allocation stalls and driver work stay separate; sampled direct-self does not
   price induced driver execution. Existing GPU trace `035907-fda516` is
   retained; do not repeat it.
@@ -496,6 +495,13 @@ the HUD arc's final entry for exact scope and focused 2,904/0 evidence.
 Independent review found no scope/regression issue. Full validation passed all
 86 jobs in 125.9 s, UI quality 2,907/0, native 4,904/0 and installer gates
 (`build/dlss-selector-unwind-full.log`); receipt input
-`66d05e4444e0f1e7f767c6b6d6d2f69f10d3a4a96aee36ea27f55034ce2cd210`. Clean
-promotion and Frontier installation remain; no additional flight is requested
-for this removal.
+`66d05e4444e0f1e7f767c6b6d6d2f69f10d3a4a96aee36ea27f55034ce2cd210`.
+
+Clean source `967f0519` pushed; receipt-guarded DLL promotion passed as
+`v0.18.0-rc.3-68-g967f0519` (`build/dlss-selector-unwind-promotion.log`).
+Frontier dry-run/install/payload/native-receipt verification passed, with
+receipt `edvr_native_receipt.json.pre-967f0519-20260929-061148.bak` and
+unchanged INI/DLSS hashes (`build/dlss-selector-unwind-frontier-install.log`).
+Capture helper now expects this source; CPU-only dry-run succeeded without
+writes, workloads or trace sessions. Main and Steam unchanged; no additional
+flight is requested for this removal.
