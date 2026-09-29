@@ -164,6 +164,10 @@ python tools\build_lock.py --self-test || exit /b 1
 python tools\flash_patch_residual.py --self-test || exit /b 1
 python tools\check_status_blocks.py --self-test || exit /b 1
 python tools\check_status_blocks.py || exit /b 1
+REM The guard tools\run_jobs.py holds every rig to (no window, no console, no
+REM move of the keyboard focus); its own self-test, run below with the rigs,
+REM starts it on real processes, so this one fails first and fast.
+python tools\focus_watch.py --self-test || exit /b 1
 
 REM The version baked into both DLLs, printed in the second line of every log.
 REM
@@ -662,6 +666,14 @@ REM any other rig's and only its runs wait their turn.
 REM openxr_module_test loads openxr_export_fixture.dll, which
 REM :rig_openxr_exports_test builds; --after holds the reader back until the
 REM writer has actually finished (see the rig rules below).
+REM The runner also fails the build if any process of any rig showed a window,
+REM opened a console or took the keyboard focus from whoever is typing
+REM (tools\focus_watch.py), and its log carries a "focus_watch:" line saying the
+REM guard looked; a log without one did not run it. The graphics proxy takes the
+REM foreground for a swap chain's window at launch (d3d11.focus_on_launch) only if
+REM it is a top-level window on the desktop (src\d3d11\focus_target.h), and a rig
+REM that needs a window for one uses tools\openxr_native_test\present_device.h,
+REM whose window is a child of a message-only one.
 set "RUN_JOBS_ARGS="
 if defined EDVR_JOBS set "RUN_JOBS_ARGS=--jobs %EDVR_JOBS%"
 python tools\run_jobs.py --self-test || exit /b 1
