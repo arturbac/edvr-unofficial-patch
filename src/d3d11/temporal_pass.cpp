@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>   // strtof, advanced.temporal_aa_fovea's "edges" vs a width
 #include <cstring>
+#include <string>    // the UI resolve's unbound-inputs note
 #include <utility>   // std::swap, for the depth carry's pointer swap
 #include <vector>    // the eye dump's row buffer
 #include <mutex>
@@ -1261,8 +1262,9 @@ ID3D11ComputeShader* ownShader(ID3D11DeviceContext* ctx, bool diagnostics) {
 ID3D11ComputeShader*       g_csFovea = nullptr;  // the fovea composite (feature 6)
 ID3D11ComputeShader*       g_csUiResolve = nullptr;
 bool                      g_csUiResolveTried = false, g_uiResolveNoted = false;
-ID3D11Buffer*              g_uiResolveTolCb = nullptr;   // UI resolve b1: {tolerance/255, corona hold, 0, 0}
+ID3D11Buffer*              g_uiResolveTolCb = nullptr;   // UI resolve b1: {tolerance/255, corona hold, inputs not bound (bits), 0}
 static bool                g_coronaHoldNoted = false;    // corona-smear hold: said once, only when the hold written is > 0
+static bool                g_uiResolveUnboundNoted[8] = {};   // one line for each combination of unbound inputs the resolve has run with
 bool                       g_csFoveaTried = false;
 ID3D11Buffer*              g_foveaCb = nullptr;   // its crop and edge band
 bool                       g_foveaNoted = false;
@@ -4555,6 +4557,13 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
                 e.dlMvSrv,
                 uiDepthContentChanges(w, h, eye),
                 resolveScreen};
+            // The inputs left unbound, for b1.z (ui_resolve.h): a fetch from a null
+            // view returns zero and costs the pass 0.04 ms an eye per input on an
+            // RTX 5090, and a still HUD leaves the source-edit mask unbound on
+            // most frames. Read off the very views bound above, so the bits cannot
+            // disagree with the bindings; a resolve whose b1 is missing reads zero
+            // and fetches everything, as it always did.
+            const uint32_t unboundBits = (srvs[2] ? 0u : 1u) | (srvs[5] ? 0u : 2u) | (srvs[3] ? 0u : 4u);
             ID3D11UnorderedAccessView* uavs[2] = {
                 e.dlSubmitUav, withHistory ? e.uiHistoryUav[1 - e.uiHistoryRead] : nullptr};
             ctx->CSSetShader(g_csUiResolve, nullptr, 0);
@@ -4571,10 +4580,21 @@ void* temporalInner(void* srcTex, int eye, const float* bounds,
             if (g_uiResolveTolCb) {
                 D3D11_MAPPED_SUBRESOURCE tm{};
                 if (SUCCEEDED(ctx->Map(g_uiResolveTolCb, 0, D3D11_MAP_WRITE_DISCARD, 0, &tm)) && tm.pData) {
-                    const float resolveData[4] = {uiDepthGhostTolerance() / 255.0f, uiDepthCoronaHold(), 0, 0};
+                    const float resolveData[4] = {uiDepthGhostTolerance() / 255.0f, uiDepthCoronaHold(),
+                                                  static_cast<float>(unboundBits), 0};
                     memcpy(tm.pData, resolveData, sizeof(resolveData));
                     ctx->Unmap(g_uiResolveTolCb, 0);
                     tolCb = g_uiResolveTolCb;
+                    if (unboundBits != 0 && !g_uiResolveUnboundNoted[unboundBits]) {
+                        g_uiResolveUnboundNoted[unboundBits] = true;
+                        std::string names;
+                        const auto add = [&](uint32_t bit, const char* name) {
+                            if (unboundBits & bit) { if (!names.empty()) names += ", "; names += name; }
+                        };
+                        add(1u, "coverage mask"); add(2u, "source-edit mask"); add(4u, "history");
+                        Log::get().note("UI resolve: not bound on some %s: %s. The pass skips those fetches rather than reading zeros from a null view (0.04 ms an eye each on an RTX 5090). Said once for each combination.",
+                                        withHistory ? "frames" : "fovea frames", names.c_str());
+                    }
                     if (!g_coronaHoldNoted && resolveData[1] > 0.0f) {
                         g_coronaHoldNoted = true;
                         Log::get().note("corona smear: the UI resolve holds faint flat glow within a step of the frame's own level, up to %d/255 (advanced.corona_smear_level; 0 turns it off). Said once.",
@@ -7169,6 +7189,7 @@ void temporalPassShutdown() {
     g_csUiResolveTried=g_uiResolveNoted=false;
     if (g_uiResolveTolCb) { g_uiResolveTolCb->Release(); g_uiResolveTolCb=nullptr; }
     g_coronaHoldNoted=false;
+    for (bool& noted : g_uiResolveUnboundNoted) noted=false;
     if (g_foveaCb) { g_foveaCb->Release(); g_foveaCb = nullptr; }
     if (g_csDown) { g_csDown->Release(); g_csDown = nullptr; }
     if (g_downCb) { g_downCb->Release(); g_downCb = nullptr; }

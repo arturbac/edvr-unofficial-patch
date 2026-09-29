@@ -295,7 +295,7 @@ static std::vector<LegacyContract> initialLegacyContracts() {
     static const D3D_SHADER_MACRO night01[] = {{"EDVR_NIGHT_REALISTIC","0"},{"EDVR_NIGHT_PULSE_STABLE","1"},{nullptr,nullptr}};
     static const D3D_SHADER_MACRO night11[] = {{"EDVR_NIGHT_REALISTIC","1"},{"EDVR_NIGHT_PULSE_STABLE","1"},{nullptr,nullptr}};
     return {
-        {"UI resolve","main","cs_5_0",nullptr,0x34EA8555DBBE7C05ull},
+        {"UI resolve","main","cs_5_0",nullptr,0xC2BDB42B78A27FB5ull},
         {"UI source edits","main","cs_5_0",nullptr,0xF9D4871EB8DD272Cull},
         {"holo motion","main","cs_5_0",nullptr,0x4304863E8780F02Eull},
         {"night_vision","main","ps_5_0",night00,0xA810FC6C0DE1C1B7ull},

@@ -3,28 +3,41 @@
 // The UI resolve is the post-DLSS pass that bounds NVIDIA's output against the
 // frame's own raster wherever the interface is (and, at fix.temporal_aa's
 // corona level, holds faint flat glow anywhere). A change to it that is only
-// about WHERE the data comes from -- a groupshared window instead of point
-// taps, an R8 history instead of an RGBA8 one whose only .a is read -- must
-// leave every output byte and every history byte exactly where they were. This
-// rig is that proof, three ways:
+// about WHERE its data comes from -- today, not fetching an input the caller
+// left unbound -- must leave every output byte and every history byte exactly
+// where they were. This rig is that proof, four ways:
 //
 //   goldens   FNV-1a 64 hashes of the output texture and the history the
-//             production shader wrote for fixed fixtures, recorded from the
-//             UNMODIFIED shader (--print-goldens) before the change existed.
+//             unmodified shader wrote for fixed fixtures, recorded before the
+//             change existed (--print-goldens, from the frozen reference).
 //             They are the "before". To re-record after a legitimate change,
 //             check out the commit before it and run --print-goldens; never
-//             paste this build's output over a failure.
-//   fuzz      (added with the change) the same random inputs through a frozen
-//             copy of the old shader and the production bytecode, compared
-//             byte for byte.
-//   control   (added with the change) a deliberately short window must FAIL
-//             the same comparison, so a green run means the fixtures reach the
-//             window's edges.
+//             paste this build's output over a failure. Both the frozen
+//             reference and the production bytecode must reproduce them.
+//   pairs     the same inputs through the frozen reference (ui_resolve_
+//             reference.h, the shader as it was) and the production bytecode,
+//             compared byte for byte, on every fixture and on random fuzz
+//             fixtures (sizes, ratios, jitter -- wild included -- marks,
+//             history, motion, the screen map). The bits that say which inputs
+//             are unbound (b1.z) are derived from the bindings, as
+//             temporal_pass.cpp derives them. Then each input in turn is left
+//             unbound with the rest bound: that must equal the reference over
+//             a texture of zeros in its place.
+//   controls  bits of zero over inputs that really are unbound must still be
+//             the reference (a caller that says nothing is slow, not wrong);
+//             and claiming a bound input unbound must FAIL -- for all three at
+//             once on every fixture that has content, and for each bit on the
+//             named fixtures built to need it -- so a green run means the
+//             fixtures are sensitive to the very thing the bits hide.
+//   trace     the D3D11 debug layer reports nothing, and a stale bytecode
+//             header (build\gen older than ui_resolve.h) fails the run.
 //
-// Runs on WARP by default (the build gate). --adapter nvidia runs the same
-// checks on the RTX (a desk check, never part of the build).
+// Runs on WARP by default (the build gate). --adapter nvidia runs the pairs and
+// controls on the RTX (a desk check, never part of the build); --bench times
+// the reference against the production shader at the eye's real size there,
+// with the bindings of the carrier flight (2026-09-29).
 //
-//   ui_holo_pass_test --self-test | --dry-run | --print-goldens
+//   ui_holo_pass_test --self-test | --dry-run | --print-goldens | --stats | --bench
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -48,6 +61,7 @@
 
 #include "../../src/d3d11/ui_resolve.h"
 #include "temporal_shader_bytecode.h"  // edvr::kUiResolveBytecode, from build\gen
+#include "ui_resolve_reference.h"      // edvr_reference::kUiResolveReference, the shader as it was
 
 using Microsoft::WRL::ComPtr;
 
@@ -109,14 +123,16 @@ uint16_t toHalf(float f) {
 // One fixture: the sizes, the jitter, b1, and which inputs exist and how they
 // are filled. Every fill is a pure function of these fields (and the seed).
 struct Fix {
-    const char* name;
+    std::string name;
     uint32_t seed;
     int w, h, ow, oh;   // the frame's raster (input) size and the output size
     float jx, jy;       // the jitter, in input pixels
     float tol, hold;    // b1: the clamp's tolerance and the hold's limit; tol < 0 leaves b1 unbound
     int content;        // 0 faint sky with stars, 1 bands, 2 bright interior, 3 mixed quadrants
-    int marks;          // 0 none, 1 corner, 2 tile edges, 3 corona edge, 4 whole frame, 5 screen, 6 mixed
-    int hist;           // 0 no history bound, 1 sparse influence, 2 dense influence
+    int marks;          // 0 none (coverage and edits unbound), 1 corner, 2 tile edges, 3 corona edge, 4 whole frame,
+                        // 5 screen, 6 mixed, 7 sparse scatter, 8 random rectangles, 9 a HUD's worth of panels (bench),
+                        // 10 coverage and edits bound but empty (bench)
+    int hist;           // 0 no history bound, 1 sparse influence, 2 dense influence, 3 bound and all zero (bench)
     int motion;         // 0 zero, 1 small, 2 large, 3 hostile (NaN, Inf, huge)
     int rx, ry;         // the screen map's offset of the frame's region
     int sx, sy;         // the screen map's extra size beyond the frame; sx < 0: no screen map
@@ -269,6 +285,43 @@ void fillMarks(const Fix& f, Rng& rng, Inputs& in) {
         for (int x = 0; x < f.w; x += 9) scr(x, f.h - 1, 3);
         scr(0, 0, 3);
     }
+    if (m == 7) {   // sparse scatter: singles anywhere, including the last row and column
+        const int n = std::max(4, f.w * f.h / 60);
+        for (int i = 0; i < n; ++i) {
+            const int x = rng.range(f.w), y = rng.range(f.h), kind = rng.range(4);
+            if (kind == 0) cov(x, y, static_cast<uint8_t>(1 + rng.range(2) + 4 * rng.range(4)));
+            else if (kind == 1) edi(x, y, static_cast<uint8_t>(1 + rng.range(255)));
+            else if (kind == 2) { cov(x, y, static_cast<uint8_t>(rng.range(256))); scr(x, y, 3); }
+            else scr(x, y, 3);
+        }
+    }
+    if (m == 8) {   // a few random rectangles of coverage, some with an edited core
+        const int n = 1 + rng.range(5);
+        for (int i = 0; i < n; ++i) {
+            const int x0 = rng.range(f.w), y0 = rng.range(f.h);
+            const int rw = 1 + rng.range(std::max(1, f.w / 3)), rh = 1 + rng.range(std::max(1, f.h / 3));
+            for (int y = y0; y < y0 + rh; ++y) {
+                for (int x = x0; x < x0 + rw; ++x) {
+                    cov(x, y, static_cast<uint8_t>(1 + rng.range(2) + 4 * rng.range(4)));
+                    if (rng.range(3) == 0) edi(x, y, static_cast<uint8_t>(1 + rng.range(255)));
+                }
+            }
+        }
+    }
+    if (m == 9) {   // a HUD's worth: six panels, about 15% of the eye, half with live text
+        static const float box[6][4] = {{0.06f, 0.62f, 0.22f, 0.90f}, {0.78f, 0.62f, 0.94f, 0.90f}, {0.42f, 0.78f, 0.58f, 0.96f},
+                                        {0.03f, 0.25f, 0.09f, 0.45f}, {0.91f, 0.25f, 0.97f, 0.45f}, {0.44f, 0.06f, 0.56f, 0.12f}};
+        for (int b = 0; b < 6; ++b) {
+            const int x0 = static_cast<int>(box[b][0] * f.w), y0 = static_cast<int>(box[b][1] * f.h);
+            const int x1 = static_cast<int>(box[b][2] * f.w), y1 = static_cast<int>(box[b][3] * f.h);
+            for (int y = y0; y < y1; ++y) {
+                for (int x = x0; x < x1; ++x) {
+                    cov(x, y, ((x ^ y) & 3) == 0 ? 2 : 1);
+                    if (b % 2 == 0 && ((x / 6) ^ (y / 9)) % 5 == 0) edi(x, y, 255);
+                }
+            }
+        }
+    }
 }
 
 Inputs makeInputs(const Fix& f) {
@@ -290,17 +343,24 @@ Inputs makeInputs(const Fix& f) {
     fillMarks(f, rng, in);
     if (f.hist) {
         in.hist.assign(static_cast<size_t>(f.w) * f.h, 0);
-        const int every = f.hist == 1 ? 50 : 3;
-        for (auto& v : in.hist) {
-            if (rng.range(every) == 0) {
-                const int pick = rng.range(6);
-                v = pick == 0 ? 255 : pick == 1 ? 1 : static_cast<uint8_t>(1 + rng.range(255));
+        if (f.hist == 4) {   // last frame's footprint: full influence where the marks are (bench)
+            for (size_t i = 0; i < in.hist.size() && i < in.cover.size(); ++i) {
+                const uint32_t k = in.cover[i] & 3u;
+                if (k == 1u || k == 2u) in.hist[i] = 255;
             }
-        }
-        // A few exact spikes the transported taps land on.
-        if (f.w > 8 && f.h > 8) {
-            in.hist[static_cast<size_t>(2) * f.w + 2] = 255;
-            in.hist[static_cast<size_t>(f.h - 2) * f.w + (f.w - 2)] = 200;
+        } else if (f.hist != 3) {   // 3: bound and all zero (bench)
+            const int every = f.hist == 1 ? 50 : 3;
+            for (auto& v : in.hist) {
+                if (rng.range(every) == 0) {
+                    const int pick = rng.range(6);
+                    v = pick == 0 ? 255 : pick == 1 ? 1 : static_cast<uint8_t>(1 + rng.range(255));
+                }
+            }
+            // A few exact spikes the transported taps land on.
+            if (f.w > 8 && f.h > 8) {
+                in.hist[static_cast<size_t>(2) * f.w + 2] = 255;
+                in.hist[static_cast<size_t>(f.h - 2) * f.w + (f.w - 2)] = 200;
+            }
         }
     }
     in.motion.assign(static_cast<size_t>(f.w) * f.h * 2, 0);
@@ -368,6 +428,27 @@ ComPtr<ID3D11ComputeShader> shaderFromBytecode(ID3D11Device* dev, const unsigned
     return cs;
 }
 
+// The build's own compile of a fixed shader: entry main, cs_5_0, flags zero.
+ComPtr<ID3DBlob> compileBlob(const char* source, const D3D_SHADER_MACRO* defines, const char* what) {
+    ComPtr<ID3DBlob> code, errors;
+    const HRESULT r = D3DCompile(source, std::strlen(source), what, defines, nullptr, "main", "cs_5_0", 0, 0, &code, &errors);
+    if (FAILED(r)) {
+        std::printf("FAIL: compiling %s (0x%08lX): %s\n", what, static_cast<unsigned long>(r),
+                    errors ? static_cast<const char*>(errors->GetBufferPointer()) : "no message");
+        std::exit(1);
+    }
+    return code;
+}
+ComPtr<ID3D11ComputeShader> shaderFromSource(ID3D11Device* dev, const char* source, const D3D_SHADER_MACRO* defines, const char* what) {
+    ComPtr<ID3DBlob> code = compileBlob(source, defines, what);
+    return shaderFromBytecode(dev, static_cast<const unsigned char*>(code->GetBufferPointer()), code->GetBufferSize());
+}
+uint64_t fnvText(const char* s) {
+    uint64_t h = 14695981039346656037ull;
+    for (; *s; ++s) { h ^= static_cast<uint8_t>(*s); h *= 1099511628211ull; }
+    return h;
+}
+
 ComPtr<ID3D11Texture2D> tex(ID3D11Device* dev, int w, int h, DXGI_FORMAT fmt, UINT bind, const void* data, UINT rowBytes) {
     D3D11_TEXTURE2D_DESC d{};
     d.Width = static_cast<UINT>(w);
@@ -424,33 +505,53 @@ struct Result {
     std::vector<uint8_t> influence;  // w*h, the history the pass wrote (its only meaningful channel)
 };
 
-// historyR8: the history the shader reads and writes is R8_UNORM (one channel);
-// otherwise RGBA8 with the influence in alpha, as the pass has always had it.
-Result run(Device& d, ID3D11ComputeShader* cs, const Fix& f, const Inputs& in, bool historyR8) {
+// The layout of the history the shader reads and writes.
+//   RgbaA  RGBA8 with the influence in alpha and junk in the colour channels:
+//          the pass as it has always had it, reference and production alike.
+//   R8     R8_UNORM, for the bench's what-would-R8-buy experiment only.
+enum class Hist { RgbaA, R8 };
+
+// One eye's worth of textures, bound the way temporal_pass.cpp binds them, so a
+// fixture can be dispatched once (run) or timed many times (--bench).
+struct Setup {
+    const Fix* f = nullptr;
+    Hist hist = Hist::R8;
+    ComPtr<ID3D11Texture2D> output, next;
+    ComPtr<ID3D11ShaderResourceView> srv[7];
+    ComPtr<ID3D11UnorderedAccessView> outU, nextU;
+    ComPtr<ID3D11Buffer> cbP, cbR;
+};
+
+// unbind: bit k leaves SRV slot k null even though the fixture has the texture
+// (the bench's way of asking what a resource that is not bound costs).
+// forceBits: the "inputs not bound" bits written to b1.z, in place of the ones
+// the bindings imply (temporal_pass.cpp derives them the same way: coverage is
+// slot 2, history 3, source edits 5); -1 leaves the derived bits. Only a
+// fixture that binds b1 has any.
+void makeSetup(Device& d, const Fix& f, const Inputs& in, Hist hist, Setup& s, uint32_t unbind = 0, int forceBits = -1) {
     ID3D11Device* dev = d.dev.Get();
+    s.f = &f;
+    s.hist = hist;
     auto raw = tex(dev, f.w, f.h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE, in.raw.data(), f.w * 4);
     auto trained = tex(dev, f.ow, f.oh, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE, in.trained.data(), f.ow * 4);
-    auto output = tex(dev, f.ow, f.oh, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, nullptr, 0);
+    s.output = tex(dev, f.ow, f.oh, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, nullptr, 0);
     auto motion = tex(dev, f.w, f.h, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_SHADER_RESOURCE, in.motion.data(), f.w * 4);
-    const DXGI_FORMAT histFmt = historyR8 ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
-    const int histBytes = historyR8 ? 1 : 4;
-    auto next = tex(dev, f.w, f.h, histFmt, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, nullptr, 0);
+    const DXGI_FORMAT histFmt = hist == Hist::R8 ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+    s.next = tex(dev, f.w, f.h, histFmt, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, nullptr, 0);
 
     ComPtr<ID3D11Texture2D> cover, edits, screen, prev;
     if (!in.cover.empty()) cover = tex(dev, f.w, f.h, DXGI_FORMAT_R8_UNORM, D3D11_BIND_SHADER_RESOURCE, in.cover.data(), f.w);
     if (!in.edits.empty()) edits = tex(dev, f.w, f.h, DXGI_FORMAT_R8_UNORM, D3D11_BIND_SHADER_RESOURCE, in.edits.data(), f.w);
     if (!in.screen.empty()) screen = tex(dev, in.screenW, in.screenH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE, in.screen.data(), in.screenW * 8);
     if (!in.hist.empty()) {
-        if (historyR8) {
+        if (hist == Hist::R8) {
             prev = tex(dev, f.w, f.h, histFmt, D3D11_BIND_SHADER_RESOURCE, in.hist.data(), f.w);
         } else {
-            // The colour channels of an old history are never read; fill them
-            // with something that would show if they were.
+            // The channels the shader does not read carry something that would
+            // show if it did.
             std::vector<uint8_t> rgba(static_cast<size_t>(f.w) * f.h * 4);
             for (size_t i = 0; i < in.hist.size(); ++i) {
-                rgba[i * 4] = static_cast<uint8_t>(37 + i);
-                rgba[i * 4 + 1] = static_cast<uint8_t>(91 + 3 * i);
-                rgba[i * 4 + 2] = static_cast<uint8_t>(203 + 7 * i);
+                for (int c = 0; c < 4; ++c) rgba[i * 4 + c] = static_cast<uint8_t>(37 + 54 * c + (3 + 4 * c) * i);
                 rgba[i * 4 + 3] = in.hist[i];
             }
             prev = tex(dev, f.w, f.h, histFmt, D3D11_BIND_SHADER_RESOURCE, rgba.data(), f.w * 4);
@@ -466,46 +567,68 @@ Result run(Device& d, ID3D11ComputeShader* cs, const Fix& f, const Inputs& in, b
     bd.ByteWidth = sizeof(Params);
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     D3D11_SUBRESOURCE_DATA pd{&p, 0, 0};
-    ComPtr<ID3D11Buffer> cbP, cbR;
-    hr(dev->CreateBuffer(&bd, &pd, &cbP), "cbuffer P");
-    if (f.tol >= 0.f) {
-        const float r[4] = {f.tol, f.hold, 0.f, 0.f};
-        D3D11_BUFFER_DESC rd{};
-        rd.ByteWidth = 16;
-        rd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        D3D11_SUBRESOURCE_DATA rdd{r, 0, 0};
-        hr(dev->CreateBuffer(&rd, &rdd, &cbR), "cbuffer R");
+    hr(dev->CreateBuffer(&bd, &pd, &s.cbP), "cbuffer P");
+
+    s.srv[0] = srvOf(dev, raw.Get());
+    s.srv[1] = srvOf(dev, trained.Get());
+    if (cover) s.srv[2] = srvOf(dev, cover.Get());
+    if (prev) s.srv[3] = srvOf(dev, prev.Get());
+    s.srv[4] = srvOf(dev, motion.Get());
+    if (edits) s.srv[5] = srvOf(dev, edits.Get());
+    if (screen) s.srv[6] = srvOf(dev, screen.Get());
+    for (int i = 0; i < 7; ++i) if (unbind & (1u << i)) s.srv[i].Reset();
+    if (f.tol >= 0.f) {   // b1 = {tolerance, hold limit, inputs not bound, 0}
+        int bits = (s.srv[2] ? 0 : 1) | (s.srv[5] ? 0 : 2) | (s.srv[3] ? 0 : 4);
+        if (forceBits >= 0) bits = forceBits;
+        const float limits[4] = {f.tol, f.hold, static_cast<float>(bits), 0.f};
+        D3D11_BUFFER_DESC bd1{};
+        bd1.ByteWidth = 16;
+        bd1.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        D3D11_SUBRESOURCE_DATA pd1{limits, 0, 0};
+        hr(dev->CreateBuffer(&bd1, &pd1, &s.cbR), "cbuffer R");
     }
+    s.outU = uavOf(dev, s.output.Get());
+    s.nextU = uavOf(dev, s.next.Get());
+}
 
-    auto rawV = srvOf(dev, raw.Get()), trainedV = srvOf(dev, trained.Get()), motionV = srvOf(dev, motion.Get());
-    ComPtr<ID3D11ShaderResourceView> coverV, editsV, screenV, prevV;
-    if (cover) coverV = srvOf(dev, cover.Get());
-    if (edits) editsV = srvOf(dev, edits.Get());
-    if (screen) screenV = srvOf(dev, screen.Get());
-    if (prev) prevV = srvOf(dev, prev.Get());
-    auto outU = uavOf(dev, output.Get()), nextU = uavOf(dev, next.Get());
-
+void bindAndClear(Device& d, ID3D11ComputeShader* cs, Setup& s) {
     ID3D11DeviceContext* ctx = d.ctx.Get();
     const FLOAT poison[4] = {1.f, 0.f, 1.f, 0.03f};   // a hole in the dispatch's coverage shows as this
-    ctx->ClearUnorderedAccessViewFloat(outU.Get(), poison);
+    ctx->ClearUnorderedAccessViewFloat(s.outU.Get(), poison);
     const FLOAT zero[4] = {0.f, 0.f, 0.f, 0.f};
-    ctx->ClearUnorderedAccessViewFloat(nextU.Get(), zero);
-    ID3D11ShaderResourceView* srvs[7] = {rawV.Get(), trainedV.Get(), coverV.Get(), prevV.Get(), motionV.Get(), editsV.Get(), screenV.Get()};
-    ID3D11UnorderedAccessView* uavs[2] = {outU.Get(), nextU.Get()};
+    ctx->ClearUnorderedAccessViewFloat(s.nextU.Get(), zero);
+    ID3D11ShaderResourceView* srvs[7];
+    for (int i = 0; i < 7; ++i) srvs[i] = s.srv[i].Get();
+    ID3D11UnorderedAccessView* uavs[2] = {s.outU.Get(), s.nextU.Get()};
     ctx->CSSetShader(cs, nullptr, 0);
     ctx->CSSetShaderResources(0, 7, srvs);
     ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-    ID3D11Buffer* cbs[2] = {cbP.Get(), cbR.Get()};
+    ID3D11Buffer* cbs[2] = {s.cbP.Get(), s.cbR.Get()};
     ctx->CSSetConstantBuffers(0, 2, cbs);
-    ctx->Dispatch(static_cast<UINT>((f.w + 7) / 8), static_cast<UINT>((f.h + 7) / 8), 1);
-    ctx->ClearState();
+}
+void dispatch(Device& d, const Fix& f) {
+    d.ctx->Dispatch(static_cast<UINT>((f.w + 7) / 8), static_cast<UINT>((f.h + 7) / 8), 1);
+}
 
+Result readback(Device& d, Setup& s) {
+    const Fix& f = *s.f;
     Result r;
-    r.out = readBytes(d, output.Get(), 4);
-    const std::vector<uint8_t> h = readBytes(d, next.Get(), histBytes);
+    r.out = readBytes(d, s.output.Get(), 4);
+    const int bytes = s.hist == Hist::R8 ? 1 : 4;
+    const std::vector<uint8_t> h = readBytes(d, s.next.Get(), bytes);
+    const int keep = s.hist == Hist::RgbaA ? 3 : 0;   // alpha in an RGBA8 history, the only channel in R8
     r.influence.resize(static_cast<size_t>(f.w) * f.h);
-    for (size_t i = 0; i < r.influence.size(); ++i) r.influence[i] = h[i * histBytes + (historyR8 ? 0 : 3)];
+    for (size_t i = 0; i < r.influence.size(); ++i) r.influence[i] = h[i * bytes + keep];
     return r;
+}
+
+Result run(Device& d, ID3D11ComputeShader* cs, const Fix& f, const Inputs& in, Hist hist, uint32_t unbind = 0, int forceBits = -1) {
+    Setup s;
+    makeSetup(d, f, in, hist, s, unbind, forceBits);
+    bindAndClear(d, cs, s);
+    dispatch(d, f);
+    d.ctx->ClearState();
+    return readback(d, s);
 }
 
 uint64_t fnv(const std::vector<uint8_t>& a, uint64_t h) {
@@ -574,83 +697,370 @@ const uint64_t kGolden[] = {
     0xd15f5d8cc5a6b07aull,  // production_shape_eighth
 };
 
+// ------------------------------------------------------------------ comparing
+
+struct Diff {
+    size_t outBytes = 0, historyBytes = 0;
+    size_t firstOut = static_cast<size_t>(-1), firstHistory = static_cast<size_t>(-1);
+    bool same() const { return outBytes == 0 && historyBytes == 0; }
+};
+Diff compare(const Result& a, const Result& b) {
+    Diff d;
+    if (a.out.size() != b.out.size() || a.influence.size() != b.influence.size()) {
+        d.outBytes = d.historyBytes = static_cast<size_t>(-1);
+        return d;
+    }
+    for (size_t i = 0; i < a.out.size(); ++i)
+        if (a.out[i] != b.out[i] && d.outBytes++ == 0) d.firstOut = i;
+    for (size_t i = 0; i < a.influence.size(); ++i)
+        if (a.influence[i] != b.influence[i] && d.historyBytes++ == 0) d.firstHistory = i;
+    return d;
+}
+
+// Random fixtures for the pair comparison: sizes on and off the 8-pixel tile
+// edge, the ratios DLSS uses and a few it never does, the jitter DLSS uses and
+// worse (whole pixels, a hair either side of a half pixel, ten pixels, a
+// hundred thousand, NaN), every mark pattern, history and motion.
+Fix randomFix(uint32_t n) {
+    Rng r(n * 2246822519u + 3266489917u);
+    Fix f{};
+    f.name = "fuzz_" + std::to_string(n);
+    f.seed = 5000u + n;
+    static const int edge[] = {7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65};
+    auto size = [&]() { return r.range(3) == 0 ? edge[r.range(12)] : 1 + r.range(140); };
+    f.w = size();
+    f.h = size();
+    static const float scale[] = {1.0f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.0f, 2.0f, 3.0f, 0.75f, 0.5f};
+    const float s = scale[r.range(11)];
+    f.ow = std::max(1, static_cast<int>(static_cast<float>(f.w) * s + 0.5f));
+    f.oh = std::max(1, static_cast<int>(static_cast<float>(f.h) * s + 0.5f) + (r.range(4) == 0 ? r.range(3) - 1 : 0));
+    auto jitter = [&]() -> float {
+        switch (r.range(14)) {
+            case 0: return 0.f;
+            case 1: return static_cast<float>(r.range(2001) - 1000) / 1000.f * 1.7f;
+            case 2: return static_cast<float>(r.range(19) - 9) + 0.5f;
+            case 3: return static_cast<float>(r.range(7) - 3) + 0.5f - 1e-6f;
+            case 4: return static_cast<float>(r.range(7) - 3) - 0.5f + 1e-6f;
+            case 5: return static_cast<float>(r.range(2001) - 1000) / 100.f;
+            case 6: return (r.range(2) ? 1.0e5f : -1.0e5f) + static_cast<float>(r.range(1000)) / 7.f;
+            case 7: return r.range(3) == 0 ? std::nanf("") : 0.5f;
+            default: return static_cast<float>(r.range(1001) - 500) / 1000.f;
+        }
+    };
+    f.jx = jitter();
+    f.jy = jitter();
+    static const float tols[] = {-1.f, 0.f, 2 / 255.f, 12 / 255.f, 12 / 255.f, 40 / 255.f};
+    static const float holds[] = {0.f, 8 / 255.f, 64 / 255.f, 64 / 255.f, 200 / 255.f};
+    f.tol = tols[r.range(6)];
+    f.hold = f.tol < 0.f ? 0.f : holds[r.range(5)];
+    f.content = r.range(4);
+    f.marks = r.range(10) == 0 ? 0 : 1 + r.range(8);
+    f.hist = r.range(3);
+    f.motion = r.range(4);
+    f.rx = r.range(6);
+    f.ry = r.range(6);
+    const bool screen = f.marks == 5 || f.marks == 6 || f.marks == 7 || r.range(4) == 0;
+    f.sx = screen ? f.rx + r.range(4) : -1;
+    f.sy = screen ? f.ry + r.range(4) : 0;
+    return f;
+}
+
+bool upscale(const Fix& f) { return f.ow >= f.w && f.oh >= f.h; }
+bool finiteJitter(const Fix& f) { return std::isfinite(f.jx) && std::isfinite(f.jy); }
+
+// ------------------------------------------------------------------ timing
+
+double median(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v.empty() ? -1.0 : v[v.size() / 2];
+}
+
+// One batch of back-to-back dispatches between two GPU timestamps, in
+// milliseconds per dispatch (-1 when the clock was disjoint).
+double timeBatch(Device& d, ID3D11ComputeShader* cs, Setup& s, int batch) {
+    ID3D11DeviceContext* ctx = d.ctx.Get();
+    bindAndClear(d, cs, s);
+    D3D11_QUERY_DESC qd{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+    ComPtr<ID3D11Query> disjoint, t0, t1;
+    hr(d.dev->CreateQuery(&qd, &disjoint), "disjoint query");
+    qd.Query = D3D11_QUERY_TIMESTAMP;
+    hr(d.dev->CreateQuery(&qd, &t0), "timestamp query");
+    hr(d.dev->CreateQuery(&qd, &t1), "timestamp query");
+    ctx->Begin(disjoint.Get());
+    ctx->End(t0.Get());
+    for (int i = 0; i < batch; ++i) dispatch(d, *s.f);
+    ctx->End(t1.Get());
+    ctx->End(disjoint.Get());
+    ctx->ClearState();
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dd{};
+    while (ctx->GetData(disjoint.Get(), &dd, sizeof(dd), 0) == S_FALSE) {}
+    UINT64 a = 0, b = 0;
+    while (ctx->GetData(t0.Get(), &a, sizeof(a), 0) == S_FALSE) {}
+    while (ctx->GetData(t1.Get(), &b, sizeof(b), 0) == S_FALSE) {}
+    return dd.Disjoint ? -1.0 : static_cast<double>(b - a) / static_cast<double>(dd.Frequency) * 1000.0 / batch;
+}
+
+// Milliseconds per dispatch for several shader/setup pairs: the median over
+// `rounds` rounds, each round one batch of every pair in turn. Interleaved so a
+// clock ramp or a thermal step costs every pair the same, and preceded by a
+// warm-up long enough for the GPU to reach its working clocks.
+std::vector<double> timeInterleaved(Device& d, const std::vector<std::pair<ID3D11ComputeShader*, Setup*>>& runs, int batch, int rounds) {
+    for (int i = 0; i < 40; ++i)
+        for (const auto& r : runs) timeBatch(d, r.first, *r.second, 4);
+    std::vector<std::vector<double>> ms(runs.size());
+    for (int round = 0; round < rounds; ++round) {
+        for (size_t k = 0; k < runs.size(); ++k) {
+            const double t = timeBatch(d, runs[k].first, *runs[k].second, batch);
+            if (t > 0) ms[k].push_back(t);
+        }
+    }
+    std::vector<double> out;
+    for (auto& v : ms) out.push_back(median(v));
+    return out;
+}
+
+// The production shader with a scalar history, for the bench's what-would-R8-buy
+// column only (it was measured and not taken; see the performance review).
+std::string scalarHistory(std::string src) {
+    const struct { const char* from; const char* to; } swaps[] = {
+        {"Texture2D<float4> Previous", "Texture2D<float> Previous"},
+        {"RWTexture2D<float4> Next", "RWTexture2D<float> Next"},
+        {"Previous.Load(int3(q,0)).a", "Previous.Load(int3(q,0))"},
+        {"Previous.Load(int3(corner,0)).a", "Previous.Load(int3(corner,0))"},
+        {"Previous.Load(int3(int2(upper.x,corner.y),0)).a", "Previous.Load(int3(int2(upper.x,corner.y),0))"},
+        {"Previous.Load(int3(int2(corner.x,upper.y),0)).a", "Previous.Load(int3(int2(corner.x,upper.y),0))"},
+        {"Previous.Load(int3(upper,0)).a", "Previous.Load(int3(upper,0))"},
+        {"Next[id.xy]=float4(0,0,0,here?1:stale?max(remaining-1.0/32.0,0):0);", "Next[id.xy]=here?1:stale?max(remaining-1.0/32.0,0):0;"},
+    };
+    for (const auto& s : swaps) {
+        const size_t at = src.find(s.from);
+        if (at == std::string::npos) {
+            std::printf("FAIL: the R8 experiment could not find \"%s\" in the shader\n", s.from);
+            std::exit(1);
+        }
+        src.replace(at, std::strlen(s.from), s.to);
+    }
+    return src;
+}
+
+// The reference against the production shader at the eye's real size (the
+// carrier flight of 2026-09-29: 2016x1948 in, 4032x3896 out, per eye), with the
+// bindings the flight had. Each row: the frozen reference, the production
+// shader, the same with the reference again (drift check), and the production
+// shader over an R8 history (the experiment that was not taken).
+void runBench(Device& d, ID3D11ComputeShader* refCs, ID3D11ComputeShader* curCs) {
+    if (d.warp) std::puts("note: --bench on WARP times a CPU; use --adapter nvidia.");
+    auto r8Cs = shaderFromSource(d.dev.Get(), scalarHistory(edvr::kUiResolve).c_str(), nullptr, "UI resolve, R8 history experiment");
+    const float tol = 12 / 255.f, hold = 64 / 255.f;
+    constexpr uint32_t kCover = 1u << 2, kHistory = 1u << 3, kEdits = 1u << 5;
+    struct Scene { Fix f; uint32_t unbind; };
+    const std::vector<Scene> scenes = {
+        {{"idle, everything bound (empty masks)", 201, 2016, 1948, 4032, 3896, 0.25f, -0.4f, tol, hold, 3, 10, 3, 1, 0, 0, -1, 0}, 0},
+        {{"idle, source-edit mask unbound (a still HUD)", 201, 2016, 1948, 4032, 3896, 0.25f, -0.4f, tol, hold, 3, 10, 3, 1, 0, 0, -1, 0}, kEdits},
+        {{"idle, coverage mask unbound", 201, 2016, 1948, 4032, 3896, 0.25f, -0.4f, tol, hold, 3, 10, 3, 1, 0, 0, -1, 0}, kCover},
+        {{"idle, history unbound (first frame, after a reset)", 201, 2016, 1948, 4032, 3896, 0.25f, -0.4f, tol, hold, 3, 10, 3, 1, 0, 0, -1, 0}, kHistory},
+        {{"idle, all three unbound (no UI this frame)", 206, 2016, 1948, 4032, 3896, 0.25f, -0.4f, tol, hold, 3, 0, 0, 1, 0, 0, -1, 0}, 0},
+        {{"HUD (15% marked), everything bound", 202, 2016, 1948, 4032, 3896, 0.25f, -0.4f, tol, hold, 3, 9, 4, 1, 0, 0, -1, 0}, 0},
+        {{"HUD, source-edit mask unbound (a still HUD)", 202, 2016, 1948, 4032, 3896, 0.25f, -0.4f, tol, hold, 3, 9, 4, 1, 0, 0, -1, 0}, kEdits},
+        {{"HUD + virtual-screen map, edit mask unbound", 203, 2016, 1948, 4032, 3896, 0.25f, -0.4f, tol, hold, 3, 9, 4, 1, 0, 0, 0, 0}, kEdits},
+        {{"menu (whole eye marked), everything bound", 204, 2016, 1948, 4032, 3896, 0.25f, -0.4f, tol, hold, 3, 4, 4, 1, 0, 0, -1, 0}, 0},
+        {{"idle, corona hold off, everything bound", 205, 2016, 1948, 4032, 3896, 0.25f, -0.4f, tol, 0.f, 3, 10, 3, 1, 0, 0, -1, 0}, 0},
+    };
+    std::printf("%-52s %10s %10s %8s %10s\n", "ms per dispatch, one eye", "reference", "production", "gain", "R8 (not shipped)");
+    for (const Scene& scene : scenes) {
+        const Fix& f = scene.f;
+        const Inputs in = makeInputs(f);
+        Setup sRef, sCur, sR8;
+        makeSetup(d, f, in, Hist::RgbaA, sRef, scene.unbind);
+        makeSetup(d, f, in, Hist::RgbaA, sCur, scene.unbind);
+        makeSetup(d, f, in, Hist::R8, sR8, scene.unbind);
+        const std::vector<double> t = timeInterleaved(d, {{refCs, &sRef}, {curCs, &sCur}, {refCs, &sRef}, {r8Cs.Get(), &sR8}}, 8, 25);
+        bindAndClear(d, refCs, sRef);
+        dispatch(d, f);
+        d.ctx->ClearState();
+        const Result ref = readback(d, sRef);
+        bindAndClear(d, curCs, sCur);
+        dispatch(d, f);
+        d.ctx->ClearState();
+        const Result cur = readback(d, sCur);
+        std::printf("%-52s %10.4f %10.4f %7.1f%% %10.4f   (reference again %.4f)\n", f.name.c_str(), t[0], t[1],
+                    t[0] > 0 ? 100.0 * (t[0] - t[1]) / t[0] : 0.0, t[3], t[2]);
+        check(compare(ref, cur).same(), "the bench's eye-sized output and history are byte for byte the reference's");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool selfTest = false, dry = false, print = false, nvidia = false, stats = false;
-    const char* usage = "usage: ui_holo_pass_test --self-test|--dry-run|--print-goldens|--stats [--adapter nvidia]";
+    bool selfTest = false, dry = false, print = false, nvidia = false, stats = false, bench = false;
+    int fuzz = 240;
+    const char* usage =
+        "usage: ui_holo_pass_test --self-test|--dry-run|--print-goldens|--stats|--bench [--fuzz N] [--adapter nvidia]";
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--self-test")) selfTest = true;
         else if (!std::strcmp(argv[i], "--dry-run")) dry = true;
         else if (!std::strcmp(argv[i], "--print-goldens")) print = true;
         else if (!std::strcmp(argv[i], "--stats")) stats = true;
+        else if (!std::strcmp(argv[i], "--bench")) bench = true;
+        else if (!std::strcmp(argv[i], "--fuzz") && i + 1 < argc) fuzz = std::max(0, std::atoi(argv[++i]));
         else if (!std::strcmp(argv[i], "--adapter") && i + 1 < argc && !std::strcmp(argv[i + 1], "nvidia")) { nvidia = true; ++i; }
         else { std::puts(usage); return 2; }
     }
     if (dry) {
-        std::puts("Would run the UI resolve fixtures on WARP and compare every output and history byte; writes no files.");
+        std::puts("Would compare the production UI resolve against its frozen reference on WARP, byte for byte, over the fixtures and fuzz cases; writes no files.");
         return 0;
     }
-    if (!selfTest && !print && !stats) { std::puts(usage); return 2; }
+    if (!selfTest && !print && !stats && !bench) { std::puts(usage); return 2; }
 
     Device d = makeDevice(nvidia);
-    auto cs = shaderFromBytecode(d.dev.Get(), edvr::kUiResolveBytecode, sizeof(edvr::kUiResolveBytecode));
+    ID3D11Device* dev = d.dev.Get();
 
+    // The reference must be the shader it claims to be, and the bytecode header
+    // must be the production source compiled; otherwise a green run says nothing.
+    check(fnvText(edvr_reference::kUiResolveReference) == 0x34EA8555DBBE7C05ull,
+          "the frozen reference is the shader temporal_shader_build pinned before the change");
+    {
+        ComPtr<ID3DBlob> code = compileBlob(edvr::kUiResolve, nullptr, "UI resolve");
+        check(code->GetBufferSize() == sizeof(edvr::kUiResolveBytecode) &&
+                  !std::memcmp(code->GetBufferPointer(), edvr::kUiResolveBytecode, sizeof(edvr::kUiResolveBytecode)),
+              "the bytecode header is current: it is src/d3d11/ui_resolve.h compiled, byte for byte");
+    }
+    auto refCs = shaderFromSource(dev, edvr_reference::kUiResolveReference, nullptr, "UI resolve");
+    auto curCs = shaderFromBytecode(dev, edvr::kUiResolveBytecode, sizeof(edvr::kUiResolveBytecode));
+
+    if (bench) {
+        runBench(d, refCs.Get(), curCs.Get());
+        if (g_failures) { std::printf("FAILED: %d of %d checks\n", g_failures, g_checks); return 1; }
+        return 0;
+    }
+
+    std::vector<Fix> fixes(kFix, kFix + kFixtures);
+    for (int n = 0; n < fuzz; ++n) fixes.push_back(randomFix(static_cast<uint32_t>(n)));
+
+    // What is counted, so the summary can say what the controls saw.
+    size_t pairs = 0, skipRuns = 0, singleUnbindRuns = 0, failSafeRuns = 0, wrongFlagRuns = 0, wrongFlagDiverged = 0, fuzzChanged = 0, fuzzRuns = 0;
     std::vector<uint64_t> got;
-    std::vector<Stats> exercised;
-    for (size_t i = 0; i < kFixtures; ++i) {
-        const Inputs in = makeInputs(kFix[i]);
-        const Result r = run(d, cs.Get(), kFix[i], in, /*historyR8=*/false);
-        got.push_back(hashOf(r));
-        exercised.push_back(statsOf(kFix[i], in, r));
-        if (stats) {
-            const Stats& s = exercised.back();
-            std::printf("%-30s out %4dx%-4d changed %6zu  influence %5zu (decayed/transported %5zu)  holes %zu\n", kFix[i].name,
-                        kFix[i].ow, kFix[i].oh, s.changed, s.influence, s.unmarkedInfluence, s.holes);
+    for (size_t i = 0; i < fixes.size(); ++i) {
+        const Fix& f = fixes[i];
+        const bool named = i < kFixtures;
+        const Inputs in = makeInputs(f);
+        const Result ref = run(d, refCs.Get(), f, in, Hist::RgbaA);
+        const Result cur = run(d, curCs.Get(), f, in, Hist::RgbaA);
+        const Stats st = statsOf(f, in, ref);
+        char label[220];
+
+        // The pair: the production shader, its unbound inputs skipped as the
+        // pass skips them, is the reference byte for byte.
+        const Diff pair = compare(ref, cur);
+        std::snprintf(label, sizeof(label), "%s: the production shader is the reference, byte for byte", f.name.c_str());
+        if (!pair.same())
+            std::printf("  %s differs: %zu output bytes (first at %zu), %zu history bytes (first at %zu)\n", f.name.c_str(),
+                        pair.outBytes, pair.firstOut, pair.historyBytes, pair.firstHistory);
+        check(pair.same(), label);
+        ++pairs;
+        const int unboundBits = (in.cover.empty() ? 1 : 0) | (in.edits.empty() ? 2 : 0) | (in.hist.empty() ? 4 : 0);
+        if (f.tol >= 0.f && unboundBits != 0) ++skipRuns;   // b1 carries the bits: this pair really skipped a fetch
+        if (named) got.push_back(hashOf(ref));
+        if (named && d.warp) {
+            std::snprintf(label, sizeof(label), "%s: the frozen reference reproduces its recorded golden", f.name.c_str());
+            check(hashOf(ref) == kGolden[i], label);
+            std::snprintf(label, sizeof(label), "%s: the production shader reproduces the recorded golden", f.name.c_str());
+            check(hashOf(cur) == kGolden[i], label);
         }
+        if (!named) { ++fuzzRuns; if (st.changed > 0) ++fuzzChanged; }
+
+        // A green run must not be a vacuous one: what each named fixture was
+        // built to reach, it reached.
+        if (named) {
+            std::snprintf(label, sizeof(label), "%s: the dispatch covers every output pixel", f.name.c_str());
+            check(st.holes == 0, label);
+            const bool idle = f.tol < 0.f && f.hold == 0.f && f.marks == 0 && f.hist == 0;
+            std::snprintf(label, sizeof(label), "%s: %s", f.name.c_str(), idle ? "an idle pass is the identity" : "the pass changed pixels");
+            check(idle ? (st.changed == 0 && st.influence == 0) : st.changed > 0, label);
+            if (f.marks != 0) {
+                std::snprintf(label, sizeof(label), "%s: marks leave influence in the history", f.name.c_str());
+                check(st.influence > 0, label);
+            }
+            if (f.hist != 0 && f.motion != 0 && f.w > 8 && f.h > 8) {   // the exact spikes need room
+                std::snprintf(label, sizeof(label), "%s: transport carries influence past the marks", f.name.c_str());
+                check(st.unmarkedInfluence > 0, label);
+            }
+        }
+
+        // One input unbound at a time, the rest bound with their content -- the
+        // state of a still HUD (source edits null, coverage and history bound):
+        // the production shader with that view null must be the reference over a
+        // texture of zeros where the view was.
+        if (f.tol >= 0.f && (named || i % 3 == 0)) {
+            struct Slot { int srv; std::vector<uint8_t> Inputs::* array; const char* name; };
+            static const Slot slots[3] = {{2, &Inputs::cover, "coverage"}, {5, &Inputs::edits, "source edits"}, {3, &Inputs::hist, "history"}};
+            for (const Slot& sl : slots) {
+                if ((in.*(sl.array)).empty()) continue;
+                Inputs zeroed = in;
+                std::fill((zeroed.*(sl.array)).begin(), (zeroed.*(sl.array)).end(), static_cast<uint8_t>(0));
+                const Result refZero = run(d, refCs.Get(), f, zeroed, Hist::RgbaA);
+                const Result curNull = run(d, curCs.Get(), f, in, Hist::RgbaA, 1u << sl.srv);
+                std::snprintf(label, sizeof(label), "%s: %s unbound, the rest bound: the production shader is the reference over zeros", f.name.c_str(), sl.name);
+                check(compare(refZero, curNull).same(), label);
+                ++singleUnbindRuns;
+            }
+        }
+
+        // The controls, on fixtures that bind b1 (the bits travel there).
+        if (f.tol >= 0.f) {
+            // Fail-safe: bits of zero -- what a caller that says nothing sends --
+            // over inputs that really are unbound is the pass as it was (a null
+            // view reads zero), just slower.
+            if (unboundBits != 0) {
+                const Result failSafe = run(d, curCs.Get(), f, in, Hist::RgbaA, 0, 0);
+                std::snprintf(label, sizeof(label), "%s: bits of zero over unbound inputs is the reference too (fail-safe)", f.name.c_str());
+                check(compare(ref, failSafe).same(), label);
+                ++failSafeRuns;
+            }
+            // Negative control: claim every input unbound while they are bound
+            // with content. Fixtures with content must NOT survive it.
+            const bool hasContent = !in.cover.empty() || !in.edits.empty() || !in.hist.empty();
+            if (hasContent) {
+                const Result wrong = run(d, curCs.Get(), f, in, Hist::RgbaA, 0, 7);
+                ++wrongFlagRuns;
+                if (!compare(ref, wrong).same()) ++wrongFlagDiverged;
+            }
+        }
+        if (stats && named)
+            std::printf("%-30s out %4dx%-4d changed %6zu  influence %5zu (decayed/transported %5zu)  unbound bits %d\n", f.name.c_str(),
+                        f.ow, f.oh, st.changed, st.influence, st.unmarkedInfluence, unboundBits);
     }
     if (print) {
-        std::printf("goldens: %zu fixtures\n", got.size());
+        std::printf("goldens: %zu fixtures, from the frozen reference on this adapter\n", got.size());
         for (size_t i = 0; i < got.size(); ++i)
-            std::printf("    0x%016llxull,  // %s\n", static_cast<unsigned long long>(got[i]), kFix[i].name);
+            std::printf("    0x%016llxull,  // %s\n", static_cast<unsigned long long>(got[i]), kFix[i].name.c_str());
     }
     if (selfTest) {
         check(sizeof(kGolden) / sizeof(kGolden[0]) == kFixtures, "the goldens cover every fixture");
-        if (d.warp) {
-            for (size_t i = 0; i < got.size() && i < sizeof(kGolden) / sizeof(kGolden[0]); ++i) {
-                const bool same = got[i] == kGolden[i];
-                if (!same)
-                    std::printf("FAIL: golden %s: got 0x%016llx want 0x%016llx\n", kFix[i].name,
-                                static_cast<unsigned long long>(got[i]), static_cast<unsigned long long>(kGolden[i]));
-                ++g_checks;
-                if (!same) ++g_failures;
-            }
-        } else {
-            // A GPU's float arithmetic is not WARP's (rounding, fused multiply-add,
-            // the unorm conversion), so a hash recorded on WARP does not carry to
-            // hardware. A hardware run compares old against new on the same adapter.
-            std::puts("note: the goldens are WARP's; skipped on this adapter.");
-        }
-        // A green run must not be a vacuous one: what each fixture was built to
-        // reach, it reached.
-        for (size_t i = 0; i < kFixtures; ++i) {
-            const Fix& f = kFix[i];
-            const Stats& s = exercised[i];
-            char label[160];
-            std::snprintf(label, sizeof(label), "%s: the dispatch covers every output pixel", f.name);
-            check(s.holes == 0, label);
-            const bool idle = f.tol < 0.f && f.hold == 0.f && f.marks == 0 && f.hist == 0;
-            std::snprintf(label, sizeof(label), "%s: %s", f.name, idle ? "an idle pass is the identity" : "the pass changed pixels");
-            check(idle ? (s.changed == 0 && s.influence == 0) : s.changed > 0, label);
-            if (f.marks != 0) {
-                std::snprintf(label, sizeof(label), "%s: marks leave influence in the history", f.name);
-                check(s.influence > 0, label);
-            }
-            if (f.hist != 0 && f.motion != 0 && f.w > 8 && f.h > 8) {   // the exact spikes need room
-                std::snprintf(label, sizeof(label), "%s: transport carries influence past the marks", f.name);
-                check(s.unmarkedInfluence > 0, label);
+        if (!d.warp)
+            std::puts("note: the goldens are WARP's; skipped on this adapter (the pairs above are the proof here).");
+        // Each bit, by name, on a fixture whose content it would hide.
+        struct BitCase { const char* fixture; int bit; const char* what; };
+        for (const BitCase& c : {BitCase{"corner_ui", 1, "coverage"}, BitCase{"corner_ui", 2, "source edits"},
+                                 BitCase{"history_dense_large_motion", 4, "history"}, BitCase{"menu_full_frame", 1, "coverage"},
+                                 BitCase{"history_with_ui", 4, "history"}}) {
+            for (size_t i = 0; i < kFixtures; ++i) {
+                if (c.fixture != kFix[i].name) continue;
+                const Fix& f = fixes[i];
+                const Inputs in = makeInputs(f);
+                // Bind everything the fixture has, then claim just this bit.
+                const Result ref = run(d, refCs.Get(), f, in, Hist::RgbaA);
+                const Result wrong = run(d, curCs.Get(), f, in, Hist::RgbaA, 0, c.bit);
+                char label[200];
+                std::snprintf(label, sizeof(label), "CONTROL: %s: claiming the %s unbound over a bound one fails the pair", c.fixture, c.what);
+                check(!compare(ref, wrong).same(), label);
             }
         }
+        check(skipRuns >= 20, "the pairs include 20 or more runs whose b1 bits really skipped a fetch");
+        check(singleUnbindRuns >= 60, "the one-input-unbound pairs ran 60 or more times");
+        check(failSafeRuns >= 20, "the fail-safe control ran 20 or more times");
+        check(wrongFlagRuns > 0 && wrongFlagDiverged * 2 >= wrongFlagRuns, "CONTROL: claiming bound inputs unbound fails at least half the fixtures that have content");
+        check(fuzz == 0 || fuzzChanged * 5 >= fuzzRuns * 3, "the fuzz cases change pixels (not vacuous)");
         if (d.info) {
             const UINT64 n = d.info->GetNumStoredMessagesAllowedByRetrievalFilter();
             UINT64 errors = 0;
@@ -666,8 +1076,14 @@ int main(int argc, char** argv) {
             }
             check(errors == 0, "the D3D11 debug layer reported no errors");
         }
+        std::printf("pairs: %zu fixtures byte for byte against the reference (%zu named, %d fuzz); %zu of them skipped a fetch on b1's bits\n",
+                    pairs, kFixtures, fuzz, skipRuns);
+        std::printf("one input unbound at a time: %zu runs equal the reference over zeros\n", singleUnbindRuns);
+        std::printf("controls: fail-safe (bits of zero over unbound inputs) held on %zu; claiming bound inputs unbound failed %zu of %zu\n",
+                    failSafeRuns, wrongFlagDiverged, wrongFlagRuns);
         if (g_failures) { std::printf("FAILED: %d of %d checks\n", g_failures, g_checks); return 1; }
-        std::printf("PASS: %d checks (%zu UI resolve fixtures, output and history byte for byte).\n", g_checks, kFixtures);
+        std::printf("PASS: %d checks.\n", g_checks);
     }
     return 0;
 }
+
