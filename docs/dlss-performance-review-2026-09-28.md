@@ -2,44 +2,27 @@
 
 ## Status
 
-- **State:** target-hologram admission and FinalCrisp pass the full build;
-  deployment stays Frontier-only on this separate branch. Main is unchanged.
-  Preceding `1ff8c224` flights `194044`/`194646`, eye dump `194946`. Capture
-  `194016-f80584` recovered with 15,382 covered cycles, zero lost events,
-  15,365 valid GPU joins and matching PDBs. Expect `1ff8c224` for these logs.
-  Earlier `174242`/`174605`: `be70af2a`; exclude `45da6ae3`/`164641` fallback.
-- **Finding:** guarded preservation removes three stale reseeds/eye: four→one
-  seed, zero stale/failures. Parent seed median .623→.156 ms/eye; machinery
-  .963→.485. Current and earlier Pimax flights differ in dimensions/runtime, so
-  these are stage results, not a controlled whole-frame saving.
-- **Correctness:** guarded optimization passes 2,896 WARP/RTX checks with exact
-  legacy pixels/depth, four→one seed/eye for captured stencil-only writes.
-  Private-write/read-only-view/late replay frames keep legacy invalidation.
-- **Open:** GPU storms include game-worker waits before the new world marker
-  appears, plus a sustained targeting/HUD-seed rise. Elapsed queries are not
-  GPU busy time. Desired selector is yellow <> on the scanner rim; current
-  dumps precede final HUD composition. World brackets are different. Ship blur
-  and selector need final-image checks. Sampled red hull has82–86% joined
-  engine motion; this does not prove vector accuracy. Exhaust capture
-  cancelled.
-- **Ruled out:** see Exclusions and the engine-motion/terrain arcs.
-- **Baseline:** original OpenVR `v0.16.2` Steam graphics `160129`/`6AA6D371`,
-  runtime `160131`/`6AA6D378`; user reports fpsVR 8.9–9.6 ms.
-  Dimensions/preset/DLSS hash match current, but legacy Valve OpenVR and
-  current native OpenXR over SteamVR differ. No exact regression conclusion.
-- **Next:** one Frontier flight with the promoted branch build; check target
-  hologram transparency/occlusion and take one eye dump with scanner <> and
-  space ship visible. Compare FinalCrisp with old stages and inspect seed
-  costs. Preserve the recovered flight; no repeat is needed for saving. The
-  helper now defers Ctrl+C during the same bounded stop command; window closure
-  is unprotected. GPU joins use explicit producer IDs; old V1 stays
-  unavailable.
-- **Environment:** latest RTX 5090 flight uses SteamVR/OpenXR, 2016×1948 input
-  → 4032×3896 output/eye, DLSS Performance/preset K, UI 125 5040×4870. Earlier
-  Pimax Crystal Super/Pimax OpenXR 90 Hz evidence used
-  2037×1969→4074×3938/UI5093×4923. Installed DLSS metadata remains 310.7.0.0;
-  graphics logs do not read driver/DLSS versions. New profiling/installations
-  use Frontier; the requested original baseline uses Steam.
+- **Current flight:** Frontier `7aaaf39c` gfx `033435`/runtime
+  `033436_691_11608` confirms both cockpit models in final composition. CPU
+  spikes worsen approaching ships; exact stall cause remains unresolved. See
+  the 2026-09-29 entry for chronology, limits and discriminators. Work stays on
+  the separate Frontier branch; main is unchanged.
+- **Conclusion:** no controlled whole-frame performance comparison or exact
+  regression conclusion. The new remap follows the earliest stalls; see
+  Exclusions for ruled-out causes and the HUD arc for build/fixture evidence.
+- **Baseline:** OpenVR `v0.16.2` Steam graphics `160129`/`6AA6D371`, runtime
+  `160131`/`6AA6D378`; user reports 8.9–9.6 ms. Dimensions/preset/DLSS hash
+  match, but legacy Valve OpenVR differs from native OpenXR over SteamVR.
+- **Environment:** RTX 5090 SteamVR/OpenXR, 2016×1948 input → 4032×3896
+  output/eye, DLSS Performance/preset K, UI 125 5040×4870. Earlier Pimax
+  Crystal Super/Pimax OpenXR 90 Hz evidence used
+  2037×1969→4074×3938/UI5093×4923. Installed DLSS metadata is 310.7.0.0;
+  graphics logs omit driver/DLSS versions. Profiling uses Frontier; baseline
+  uses Steam.
+- **Next:** existing helper, 90 s CPU/GPU capture on installed `7aaaf39c`,
+  quiet cockpit then approach ships, diagnostics OFF and no eye dump. Keep the
+  window open through Saving. Earlier `1ff8c224` trace `194016-f80584` is
+  recovered; do not repeat it for saving.
 
 ## Pre-optimization Frontier evidence
 
@@ -141,46 +124,32 @@ frames/zero loss, provider coverage only. Corrected flight follows.
 
 ## 2026-09-28: completed trace and visual dump
 
-`174242`/runtime `174244_204_43604` verify `be70af2a`; `174605` has 16 paired
-DLSS-success/history frames, no resets. Original/offline trace reports agree.
-User started F9 while loading. Loading 23:43:55–23:44:30: 20 caller reds;
-steady 23:44:30–23:46:05: three among 8,494 cycles. ETW cycle N matches log
-long-cycle next-wait sequence N+1. Exclude dump/exit from steady comparison.
+`174242`/runtime `174244_204_43604` verify `be70af2a`; dump `174605` has 16
+paired DLSS-success/history frames, no resets. F9 started while loading:
+23:43:55–23:44:30 has 20 caller reds, steady 23:44:30–23:46:05 has three among
+8,494 cycles. ETW cycle N matches next-wait log sequence N+1.
 
-Loading cycle5600:451.389 ms,449.983 waiting in game SleepConditionVariableSRW.
-Steady8385:222.029 ms after-Present, including165.496 ms CreateTexture2D wait
-through proxy/D3D11/NVIDIA/VidMM. Nearby allocations~1.03GiB/usage9–10GiB do
-not prove budget exhaustion. Steady11170:66.610 ms pre-Present,52.042 running;
-nightvision compile46 ms/43 caller compiler samples corroborate a hitch. Other
-first-use compiles: resolve157 ms, content22 ms, holo motion122/123 ms.
-Checkpoint embeds76 fixed/finite variants with exact
-source/flags/macros/profile and stage checks. Arbitrary-float macros and
-game-DXBC transforms remain dynamic; driver shader creation remains runtime.
+Cycle5600 waits449.983/451.389 ms in game SleepConditionVariableSRW. Steady8385
+includes165.496 ms CreateTexture2D wait through D3D11/NVIDIA/VidMM in222.029 ms
+post-Present. Nearby~1.03GiB allocations/9–10GiB usage do not prove budget
+exhaustion. Steady11170 compiler samples corroborate46 ms nightvision compile.
+Other first-use compiles reach157 ms. Checkpoint embeds 76 finite variants with
+exact source/flags/macros/profile/stage checks; arbitrary-float macros,
+game-DXBC transforms and driver creation remain runtime.
 
-Game3D submit→completion p50/p95/p99/max .835/5.797/7.023/15.431 ms includes
-queue delay. No game3D submissions during allocation/compiler waits; system
-copy preemption is not attributable to game3D. Ready tails do not support
-pervasive scheduler starvation. Individual GPU-query samples were missing.
+Game3D submit→completion .835/5.797/7.023/15.431 ms p50/p95/p99/max includes
+queue delay; no game3D submissions during allocation/compiler waits. System
+copy preemption is not attributed to game3D. Ready tails do not establish
+pervasive scheduler starvation. Individual query samples were missing. New ETW
+uses explicit producer IDs, not coincident XR/D3D query counters;
+Analyzer531/wrapper204 checks and60-sample transport smoke pass. V1
+unavailable.
 
-New ETW completions explicitly join the producer ID retained by a completed CPU
-cycle; XR and D3D11 query counters diverge. Native benchmark's existing shared
-producer domain is unaffected. Analyzer531/wrapper204 checks reject false
-numeric matches; V1 is unavailable. Smoke requires60 synthetic mapped
-durations, proving transport only. Default capture uses CPU stacks/existing
-queries/matching optimized PDBs; GPU queues optional.
-
-Selector: saved VS71DD/PS2D03 has no texture/screen reads; CB0 projection,
-depthOFF, scaled-additive blend, stencil81/ref1/EQUAL/KEEP. This resolves the
-parked screen-read uncertainty. Narrow exact-pair crisp admission passes 4,152
-WARP and 4,152 RTX fixture checks; live checks remain. Unknown PS stays stock.
-Stencil import adds fixture seed work: count it live. Correction: on the native
-SteamVR/OpenXR path, P/T/L0 precede final crisp composition in
-`native_sharpen.cpp`; L0 is not the final application image.
-
-Exhaust: captured cores have engine motion; identical PSb2 does not explain
-blur. Geometry/PSb1/textures and outside-hull glow remain unqualified. User
-observed the blur with DLSS off and cancelled capture; leave rendering
-unchanged.
+Saved VS71DD/PS2D03 has no screen reads, depthOFF, scaled-additive blend,
+stencil81/ref1/EQUAL/KEEP. Exact-pair admission passes4,152 WARP/RTX each;
+unknown PS stays stock. This is world brackets, not scanner <>. P/T/L0 precede
+final crisp composition in `native_sharpen.cpp`. Exhaust blur persists DLSSoff;
+user cancelled investigation.
 
 ## Exclusions and next flight
 
@@ -212,19 +181,16 @@ unchanged.
 - unresolved: regression versus0.17.0: no matched flight pair; graph boundary
   change does not prove unchanged performance.
 
-SteamVR/OpenXR capture must correlate sequence/Present/stacks. Periodic monitor
-1 s/journal 500 ms/eager 100 ms/config 1 s/menu 250 ms/GPU polling remain
-hypotheses; earlier ETW was externally disabled. Separate keyed-mutex waits
-from fast producer copies.
+Correlate exact sequence/Present/stacks before assigning periodic polling,
+keyed-mutex, allocation or worker waits. Earlier externally disabled ETW is not
+evidence of fast execution.
 
 ## 2026-09-28: validated checkpoint
 
-`1ff8c224` full/promotion gates pass
-(`build/dlss-crisp-storm-{full,promotion}.log`), NGX/FFX paths verified and
-optimized PDBs matched. Receipt input
-`6c68764e80938c3b1ab1e43458ac2bd977b8aa2a7e18006738b11e21a769e3a2`.
-Installed/pushed separately. Graph is `Application wall`. Actual hologram
-admission remained separate; no storm resolution was claimed.
+`1ff8c224` full/promotion gates pass in
+`build/dlss-crisp-storm-{full,promotion}.log`; NGX/FFX and optimized PDBs
+verify. Installed/pushed separately. Graph is `Application wall`; no storm
+resolution.
 
 ## 2026-09-28: recovered latest flight and corrected selector identity
 
@@ -259,18 +225,49 @@ desired scanner selector, because the user pictures establish the distinction.
 Correction: `captureEyeRun(result)` runs before `uiLayerComposite` in the
 native path; P/T/L0 cannot qualify final crisp pixels. Add a matched final
 capture rather than infer success/refusal from those images. Actual hologram
-admission was explicitly requested. Full SDK/profile build
-`build/dlss-holo-final-full.log` passes production, all86 pooled rigs, Python
-tools and installer resources; receipt input
-`665ab62402e1ff2363f8b10b040fa11d7b9d5ef11f7f6aee6830f3f007a7feb1`. Remap927
-WARP/RTX each, classifier4157, FinalCrisp624, capture wrapper220; independent
-review clears fault/lifecycle issues. See the HUD arc's final entry for
-semantic evidence, state guards and capture limits. No whole-frame saving
-claimed. Existing probes miss scanner centers(.5861,.5916)/(.5939,.5919) and
-cannot identify private HDR; shared94D5 remains unadmitted.
+admission was explicitly requested. Full build and fixture results are recorded
+in the HUD arc (`build/dlss-holo-final-full.log`); see its final entry for
+semantic evidence, guards and capture limits. No whole-frame saving claimed.
+Existing probes miss scanner centers(.5861,.5916)/(.5939,.5919) and cannot
+identify private HDR; shared94D5 remains unadmitted.
 
-Tight red-hull ROI in16487/88/89/95/502 has82–86% joined engine motion
-coverage. ruled out: wholesale missing hull motion in this dump, because most
-sampled red hull pixels have engine joins. Join classification does not prove
-correct vectors or explain blur. Ship/selector final checks remain; no
-sharpening.
+Tight red-hull ROI in16487/88/89/95/502 has82–86% joined engine motion. ruled
+out: wholesale missing hull motion here; joins do not prove accurate vectors or
+explain blur. No sharpening.
+
+## 2026-09-29: holograms confirmed; ship-approach CPU stalls unresolved
+
+Frontier gfx `033435`/runtime `033436_691_11608` verify installed `7aaaf39c`
+(`6ABB2662`, PID11608), SteamVR/OpenXR at the Status dimensions. User confirms
+good holograms and fpsVR CPU yellow spikes >11.1 ms, worse approaching ships.
+Final dump `033645` writes 34/34, scenes 12224–12239/native 10555–10570 match;
+32 composition true, first right crop/overview passthrough. Both models are
+absent P/T/L0 and visible Final. Scanner contacts overlap the yellow <>;
+existing probes miss it. Final changes world brackets and 30–34% bright pixels
+in a compact ship ROI with sharpening OFF: overlay contribution, not proof of
+ship mesh admission. Exclude 03:36:45.300–49.772 capture/readback.
+
+ruled out: new remap causing the earlier storm, because its first admission is
+03:36:00.207, after 140/142/231 ms post-submit stalls at 03:35:57–58. Of 38
+logged pre-dump long cycles, 35 are post-submit dominant. Pre-submit median
+.645→4.118 ms and post-submit 1.232→5.533 across adjacent30 s windows. Raw
+Present max 1.114 ms versus outside-Present 226.314 ms in the later window;
+these are aggregates, not an exact-cycle attribution. Native benchmark omits
+post-submit/submit waits, so 4–6 ms medians do not refute fpsVR spikes.
+
+Intercepted resource bursts include 41 textures/169.5MB at 03:35:57 and 50
+textures + 16 buffers/907.4MB at 03:36:03; counters include EDVR. Owner Map max
+6.396 ms is also unpriced by origin. DLSS median 3.23–3.38/p95 4.26–4.48
+ms/stereo stays steady. HUD window 03:36:35 has 58.78 redirects, 29.12 stock
+writebacks/stereo, 2.367 seeds/eye; seed .493/1.536 and machinery .971/2.023 ms
+median/p95 per eye. Four remap draws/stereo, zero refusals; two shaders
+prepared once. Different workload prevents exclusive remap-cost attribution.
+Diagnostics OFF, all 20 benchmark rows scope-changed: no controlled baseline.
+
+Next 90 s trace uses the verified helper/PDBs without a rebuild. Quiet cockpit
+then approach ships, diagnostics OFF throughout, no eye dump. Discriminators:
+running stacks game/EDVR/driver; blocked stacks+wakers allocation/Map versus
+worker joins; ready delay for scheduling; caller handoff wait paired with owner
+finishPair/xrEndFrame and GPU queues for backpressure. Query spans include CPU
+submission gaps; distinguish packet execution from elapsed durations. Existing
+instrumentation covers these causes. No speculative rendering change.

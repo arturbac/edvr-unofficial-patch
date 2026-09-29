@@ -2,31 +2,32 @@
 
 ## Status
 
-- **State:** phases 1–3 plus route-pricing fixes through `472ff122` are
-  combined into `codex/dlss-performance-review` for Frontier optimization.
-  Main remains separate. Holo panels, flight HUD, target sprite and eight
-  generic hologram families take the HDR layer. Corona stays in-scene;
-  canopy stays out. Frontier `be70af2a` dump `174605` now proves the exact
-  world-reticle VS71DD8B8B09060A81/PS2D037A047171BF3B has no screen reads.
-  Narrow paired admission passes full gates and is installed in `1ff8c224`.
-  It paints world-space brackets; the desired glyph is scanner-rim yellow <>.
-  Dump `194946` precedes final composition. Other pixel variants stay stock.
-  stencil81/ref1 needs real seed work.
-  Frontier `0229c358` flew with diagnostics off/on: Sean says HUD looked good.
-  This is a qualitative visual check, not measured bloom parity. Armed HDR
-  shading median .126 ms/eye; machinery .962 ms/eye with seed .612. Joint
-  guarded seed optimization is installed; see the combined performance review.
-- **Open:** actual ship/target models beside the radar. The saved successful
-  `review-mesh` replay shows surrounding rings, not proof of model admission.
-  Sphere-family depth reads originate in Elite; the larger HUD grid changes
-  their addressing. An actual-DXBC coordinate remap passes 4,907 offline WARP
-  checks; production exact-pair admission passes 927 WARP/RTX checks each and
-  the full build. Frontier deployment uses this separate branch. See final entry.
-- **Goal:** composite the cockpit HUD after the upscale, at output
-  resolution, out of DLSS/FSR history. That means the holo panels, the
-  flight HUD and the target sprite. It should be as sharp at HMD Quality
-  0.5-0.75 as at 1.0. Menus already leave the upscaler through
-  `fix.ui_quality`'s layer.
+- **State:** combined Frontier branch `codex/dlss-performance-review` stays
+  separate from main. Installed `7aaaf39c` flight `033435`/dump `033645`
+  confirms both cockpit hologram models in final crisp composition; Sean says
+  they look great. Holo panels, flight HUD, target sprite and eight generic
+  families take the HDR layer. Corona stays in-scene; canopy stays out. Earlier
+  Frontier `be70af2a` dump `174605` proves the exact world-reticle
+  VS71DD8B8B09060A81/PS2D037A047171BF3B has no screen reads. Narrow paired
+  admission passes full gates and is installed in `1ff8c224`. It paints
+  world-space brackets; the desired glyph is scanner-rim yellow <>. Dump
+  `194946` precedes final composition. Other pixel variants stay stock.
+  stencil81/ref1 needs real seed work. Frontier `0229c358` flew with
+  diagnostics off/on: Sean says HUD looked good. This is a qualitative visual
+  check, not measured bloom parity. Armed HDR shading median .126 ms/eye;
+  machinery .962 ms/eye with seed .612. Joint guarded seed optimization is
+  installed; see the combined performance review.
+- **Open:** scanner-rim yellow <> shader remains unidentified. Final overlays
+  alter world brackets and pixels near the distant ship; that does not prove
+  ship mesh admission or explain blur. Sphere depth reads originate in Elite;
+  the coordinate remap passes 927 WARP/RTX checks each and the full build.
+  Current flight confirms model delivery, with first right crop/overview
+  explicitly passthrough. Controlled alpha/occlusion parity remains
+  unqualified.
+- **Goal:** composite the cockpit HUD after the upscale, at output resolution,
+  out of DLSS/FSR history. That means the holo panels, the flight HUD and the
+  target sprite. It should be as sharp at HMD Quality 0.5-0.75 as at 1.0. Menus
+  already leave the upscaler through `fix.ui_quality`'s layer.
 - **Why:** field reports on 2026-09-27.
   - One user's HUD is soft and smears below HMD Quality 1.0. Their rc.2
     logs show a DLSS input of 65-85% with `fix.ui_quality` off; 1.0
@@ -34,13 +35,14 @@
   - Another user found "the cockpit panel is not excluded from the AA
     pass". That is correct and by design: the layer refuses these
     families as `kHdrTarget` (`ui_layer_math.h:913`).
-- **Prior art:** this is crisp-ui-handoff.md's parked form of Design A
-  (lines 184-191: "PARKED, not declined"), with one change. It re-issues
-  the game's own tonemap draw instead of transcribing it.
-- **Next step:** one Frontier flight/eye dump to qualify target-holo alpha,
-  final scanner <> and ship blur at UI quality 125. See
-  `dlss-performance-review-2026-09-28.md` for the evidence and conditions.
-  Revisit halo/translucent-over-bright behavior using the tail checklist.
+- **Prior art:** this is crisp-ui-handoff.md's parked form of Design A (lines
+  184-191: "PARKED, not declined"), with one change. It re-issues the game's
+  own tonemap draw instead of transcribing it.
+- **Next step:** existing 90 s CPU/GPU capture, quiet cockpit then approach
+  ships, diagnostics OFF, no eye dump. See
+  `dlss-performance-review-2026-09-28.md` for spike chronology and competing
+  causes. Revisit halo/occlusion parity and the scanner glyph only with
+  discriminating pixel evidence.
 
 - **Tonemap** (vs `2D78DC3FD2C0C543` / ps `99C21CEB7A699821`), MEASURED
   (eye_tonemap_snapshot.h:87,139,170-201):
@@ -49,15 +51,15 @@
     t1 the HDR source; PS b2 at least 256 bytes;
   - the output is the RGBA8 eye.
 - **Variants:** under EDHM and the settings tiers the tone PS varies. The
-  flat-AA arc's tone admission identifies them by VS set and per-PS HDR
-  slot (design-flat-temporal-aa-2026-09-23.md sections 63-65). Reuse that
-  rather than one hash.
+  flat-AA arc's tone admission identifies them by VS set and per-PS HDR slot
+  (design-flat-temporal-aa-2026-09-23.md sections 63-65). Reuse that rather
+  than one hash.
 - **Exposure:** `fix.share_exposure` copies eye 0's exposure over eye 1's
-  (exposure_fix.h). A re-issue that binds the game's own exposure SRV
-  inherits it.
-- **Bloom:** BELIEVED baked into the HDR source by the composite pass. It
-  is computed from the HDR target, so it includes the HUD. That is the
-  HUD's halo, measured in the input frame of eye dump 123118.
+  (exposure_fix.h). A re-issue that binds the game's own exposure SRV inherits
+  it.
+- **Bloom:** BELIEVED baked into the HDR source by the composite pass. It is
+  computed from the HDR target, so it includes the HUD. That is the HUD's halo,
+  measured in the input frame of eye dump 123118.
 
 ## Ruled out (do not re-propose)
 
@@ -834,3 +836,28 @@ must compare FinalCrisp with matched old stages and qualify target-holo
 transparency/occlusion plus ship blur. Saved red hull has82–86% joined engine
 motion; this rejects wholesale missing motion, not wrong vectors. No sharpening
 compensation or source-resolution inflation.
+
+## 2026-09-29: final capture confirms cockpit hologram admission
+
+Frontier `7aaaf39c` gfx `033435`/runtime `033436_691_11608` verifies. Sean
+reports both holograms look great. Dump `033645` writes all 34 FinalCrisp
+images, matches 16 stereo pairs (scene 12224–12239/native 10555–10570), no
+missing/unmatched/duplicate images. Both target and own-ship models are absent
+from matched P/T/L0 and visible/detailed in final composition. First right
+crop/overview report passthrough; later pairs report composition. This is
+qualitative model validation, not a controlled alpha/occlusion test.
+
+The scanner yellow <> remains visible before final composition. Added contacts
+overlap its region, so final changed pixels do not identify its shader; current
+probe positions miss it and saved E508 changes no pixels there. World brackets
+and 30–34% of bright pixels in a compact distant-ship ROI change with final
+composition while sharpening is OFF. That establishes overlay contribution, not
+actual ship mesh admission. No broader shader admission follows from it.
+
+CPU spikes worsen approaching ships. The earliest 140–231 ms post-submit
+cluster precedes the first model remap, ruling out this new route as its cause.
+DLSS stage time remains stable, HUD seed workload increases, and resource
+bursts correlate with stalls. Exact cause remains open: see the performance
+arc. Next 90 s CPU/GPU trace uses the existing installed build/PDBs,
+diagnostics OFF, no eye dump. Exclude 03:36:45.300–49.772 capture/readback from
+this flight's performance comparison.
