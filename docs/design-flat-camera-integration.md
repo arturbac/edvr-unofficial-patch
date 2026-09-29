@@ -8,8 +8,8 @@
   consuming shader disassembled; the view/execution lineage is not joined
   and auxiliary composer callers are unclassified. C3, the upstream
   injector (fix.temporal_aa_camera, default off), is built; its crash is
-  root-caused, fixed and FLOWN CLEAN 2026-09-29 08:49 (pass-through only:
-  the main menu offers no kind-3 camera; addendum at the end).
+  root-caused, fixed, and flown clean 2026-09-29: 08:49 pass-through, 08:57
+  cockpit with 552,039 injections and no crash (addenda at the end).
 - Decision: investigate jittering the game's per-view camera construction
   before it derives raster/lighting data. Preserve the existing frame
   discovery, size negotiation, temporal backends and resource isolation.
@@ -45,12 +45,12 @@
 - Fix (flown clean, pass-through): both stubs reserve the home area (stubA
   sub/add rsp,0x20, 111 -> 119 bytes, stubB at offset 168; stubB sub/add
   rsp,0x38, xmm0 at [rsp+0x20]); emitters in src/d3d11/flat_camera_stubs.h.
-- Next: a flat flight past the main menu into the cockpit and space (same
-  settings) to reach kind-3 cameras: `flat camera inject 5s: ... injected=`
-  above zero with no crash exercises the mutation path the main menu never
-  reached. Then C3 proper per the wiring plan addendum (ownership wired into
-  flat_runtime, the classifier's jittered-encoding question, one bounded
-  session against its acceptance criteria).
+- Next: C3 proper per the wiring plan addendum. The injector owns the jitter
+  (owner=upstream) but reports history=invalid and the flat runtime still
+  says jitter=(0,0): wire that ownership into flat_runtime so the temporal
+  pass consumes the injected phase as valid history, settle the classifier's
+  jittered-encoding question, then one bounded session against the
+  acceptance criteria.
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable/build
   identities, backend versions, dimensions, formats and mod chain for
@@ -920,3 +920,21 @@ What it does not show: injected=0 (warming=1269, kind-refusals=1269), because
 every camera at the main menu is kind 0, so only the pass-through path ran.
 The mutation path needs kind-3 cameras, which the next flight (cockpit and
 space) should reach.
+
+### 2026-09-29 08:57 flight: injection exercised, no crash (Epic, flat, cockpit)
+
+Same build (8879596a, matched) and settings, edvr_gfx_20260929_085700.log,
+08:57:00 to 09:00:01, into the cockpit. Over the 37 five-second ticks:
+refresh-calls=823,592, injected=552,039, warming=48,246,
+kind-refusals=223,307, unsupported=0. The first injection came at 08:57:51
+(the cockpit); steady windows ran ~56,000 calls and ~44,000 injections per
+5 s. No crash; breadcrumbs end in `gfx: alive, frame 55762`. The flat
+renderer treated 5,780 frames (longest streak 5,300). Sean: "seemed to
+behave normally".
+
+What it shows: the mutation path, the part the pass-through flight could not
+reach, runs stably at full rate through the fixed stubs. What it does not
+show: a working temporal result from the injected phase. The ticks read
+owner=upstream history=invalid and the flat runtime line reads jitter=(0,0),
+so the jitter is applied upstream while the flat temporal pass does not yet
+take it as valid history. That wiring is the next step (Status).
