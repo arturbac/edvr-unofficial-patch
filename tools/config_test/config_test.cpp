@@ -119,6 +119,32 @@ static bool writeIni(const std::wstring& dir, const char* body,
     return true;
 }
 
+// The text of a file under the repo root, or empty: for the checks that hold
+// the shipped ini and the code that reads it to one answer.
+static std::string readRepoFile(const std::wstring& root, const wchar_t* relative) {
+    std::string out;
+    HANDLE f = CreateFileW((root + L"\\" + relative).c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return out;
+    char buf[8192];
+    DWORD got = 0;
+    while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got > 0) out.append(buf, got);
+    CloseHandle(f);
+    return out;
+}
+
+// The literal a getString call falls back to for `key`: its second argument.
+// "<no such read>" when the call is not in the source, so a rename fails loudly.
+static std::string codeFallbackOf(const std::string& source, const char* key) {
+    const std::string needle = std::string("getString(\"") + key + "\", \"";
+    const size_t at = source.find(needle);
+    if (at == std::string::npos) return "<no such read>";
+    const size_t begin = at + needle.size();
+    const size_t end = source.find('"', begin);
+    return end == std::string::npos ? "<unterminated>" : source.substr(begin, end - begin);
+}
+
 // writeIni, then a last-write time no earlier write has carried.
 //
 // reloadIfChanged() decides by comparing last-write times, and two writes inside
@@ -665,12 +691,45 @@ int main(int argc, char** argv) {
     // post-tonemap UI drawn into a per-eye layer after the upscale. Values
     // off | 100 | 125 (percent of HMD Quality 1.0; ui_layer_math.h parses
     // them, and the first spellings 1.0 / 1.25, for one release). Ships live
-    // in [fix], default off (the interface is drawn as today).
+    // in [fix]; the default is 100 since 2026-09-29 (the interface as at HMD
+    // Quality 1.0), off before that.
     // fix.hud_quality, the surfaces' own key for one day, is gone: absorbed.
-    expectStr("fix.ui_quality", "off",
-              "ui quality ships live in [fix] and defaults off");
+    expectStr("fix.ui_quality", "100",
+              "ui quality ships live in [fix] and defaults to 100");
     expectStr("fix.hud_quality", "<unset>",
               "...and the separate HUD key it absorbed is gone");
+    // A file with no such line -- a hand-copied DLL over an old ini, a deleted
+    // line -- gets the code's fallback, and that has to be the shipped default or
+    // those installs run something the file never said. The read is in
+    // ui_layer.cpp; the rig takes the literal from the call itself.
+    {
+        const std::string shippedUiQuality = Config::get().getString("fix.ui_quality", "<unset>");
+        const std::string uiLayerSource = readRepoFile(dir, L"src\\d3d11\\ui_layer.cpp");
+        if (uiLayerSource.empty()) {
+            fail("ui_layer.cpp is readable from the repo root", "could not read it");
+        } else {
+            const std::string fallback = codeFallbackOf(uiLayerSource, "fix.ui_quality");
+            if (fallback == shippedUiQuality) {
+                ok("the code's fallback for fix.ui_quality is the shipped default");
+            } else {
+                fail("the code's fallback for fix.ui_quality is the shipped default",
+                     "ui_layer.cpp falls back to \"" + fallback + "\", the ini ships \"" +
+                         shippedUiQuality + "\"");
+            }
+            // CONTROL: the same source with the fallback put back to off.
+            std::string reverted = uiLayerSource;
+            const std::string from = "getString(\"fix.ui_quality\", \"" + fallback + "\")";
+            const size_t at = reverted.find(from);
+            if (at != std::string::npos) reverted.replace(at, from.size(), "getString(\"fix.ui_quality\", \"off\")");
+            if (at != std::string::npos && codeFallbackOf(reverted, "fix.ui_quality") != shippedUiQuality) {
+                ok("control: a fallback put back to off is caught");
+            } else {
+                fail("control: a fallback put back to off is caught",
+                     at == std::string::npos ? "the call was not found to alter"
+                                             : "the reverted source still matched the ini");
+            }
+        }
+    }
 
     // The Explorer Cam block, under a SECOND [fix] and a second [hotkey].
     // This is the claim that a repeated section header is not a parse error

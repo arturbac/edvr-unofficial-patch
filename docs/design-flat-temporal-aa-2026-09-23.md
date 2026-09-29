@@ -4625,7 +4625,8 @@ F1-F6, all fixed without a flight:
   ui_depth shader exclusion and the held world-screen identity
   (panel-sized SRV while the screen shows the world) -- via
   uiLayerAfterWritePreserved, facts gathered at the vscreen call site.
-  VR-only path (fix.ui_quality, off by default); flat does not use it.
+  VR-only path (fix.ui_quality, off by default then, 100 since 2026-09-29);
+  flat does not use it.
   Rig: the test traverses the original kWorldScreen decision and the
   retry gate together.
 - F5 (negotiated E one frame late): negotiation now completes BEFORE the

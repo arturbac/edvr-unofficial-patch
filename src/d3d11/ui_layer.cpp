@@ -2425,7 +2425,10 @@ void uiLayerConfigure(Config& cfg) {
     g_hdrDrawTimingOn = cfg.getBool("advanced.temporal_aa_diagnostics", false);
     detail::g_uiSeedDiagnostics = g_hdrDrawTimingOn;
     g_seedCensus.configure(g_hdrDrawTimingOn);
-    const std::string text = cfg.getString("fix.ui_quality", "off");
+    // The fallback, for an ini with no such line (a hand-copied DLL over an old
+    // file, a deleted line), is the shipped default: 100 since 2026-09-29. A line
+    // that is present and not off/100/125 is refused below and reads as off.
+    const std::string text = cfg.getString("fix.ui_quality", "100");
     bool recognized = true;
     const char* newSpelling = nullptr;
     const float target = uiQualityParse(text.c_str(), &recognized, &newSpelling);

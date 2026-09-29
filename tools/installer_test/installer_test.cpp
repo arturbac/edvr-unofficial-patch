@@ -537,6 +537,61 @@ static void testShippedIni(const std::wstring& root) {
              "control: it is carried under the old name instead, where nothing reads it");
 }
 
+// A shipped default that CHANGED, against the real edvr.ini: fix.ui_quality went
+// from off to 100 on 2026-09-29. What an existing install does with it is a
+// property of the merge, not of this key, and it is pinned here so a change of that
+// behaviour is a decision. The previous version's file is the shipped one with the
+// old default written back.
+static void testChangedDefault(const std::wstring& root) {
+    printf("\na shipped default that changed (fix.ui_quality: off -> 100), against the real edvr.ini\n");
+    const std::string shipped = readAll(joinPath(root, L"edvr.ini"));
+    if (shipped.empty()) {
+        fail("read the repository's edvr.ini", "not found next to the repo root");
+        return;
+    }
+    expectEq(iniValue(shipped, "fix.ui_quality", "<absent>"), "100", "the shipped default is 100");
+    std::string previous = shipped;
+    const size_t at = previous.find("\nui_quality = 100");
+    check(at != std::string::npos, "the shipped ini has the line this case reverts");
+    if (at == std::string::npos) return;
+    previous.replace(at, strlen("\nui_quality = 100"), "\nui_quality = off");
+    expectEq(iniValue(previous, "fix.ui_quality", "<absent>"), "off", "the previous version's file ships off");
+
+    // An install that never touched it, with the base copy the installer keeps: the
+    // new default is adopted, and the report says so. Somebody who typed `off` on
+    // purpose is the same bytes and gets the same answer: the merge cannot tell.
+    MergeReport untouched;
+    const std::string adopted = mergeIni(shipped, previous, &previous, {}, &untouched);
+    expectEq(iniValue(adopted, "fix.ui_quality", "<absent>"), "100",
+             "an install that never touched it (base copy kept) is moved to the new default");
+    bool reported = false;
+    for (const std::string& line : untouched.adopted) reported |= line.find("fix.ui_quality = 100") == 0;
+    check(reported, "and the report says the default moved");
+
+    // With no base copy (a hand-installed rig): compared against the NEW defaults, so
+    // the old default reads as a choice and is kept. The merge over-preserves.
+    MergeReport handInstalled;
+    const std::string kept = mergeIni(shipped, previous, nullptr, {}, &handInstalled);
+    expectEq(iniValue(kept, "fix.ui_quality", "<absent>"), "off",
+             "with no base copy the same file keeps its off");
+    check(handInstalled.twoWay, "and the report says it compared against the new defaults");
+
+    // A value they chose is theirs either way.
+    std::string chose125 = previous;
+    chose125.replace(chose125.find("\nui_quality = off"), strlen("\nui_quality = off"), "\nui_quality = 125");
+    MergeReport chosen;
+    expectEq(iniValue(mergeIni(shipped, chose125, &previous, {}, &chosen), "fix.ui_quality", "<absent>"),
+             "125", "a value somebody chose (125) survives");
+
+    // A line they deleted stays deleted (commented out): the runtime then uses the
+    // code's fallback, which is the shipped default (tools/config_test checks it).
+    std::string deleted = previous;
+    deleted.replace(deleted.find("\nui_quality = off"), strlen("\nui_quality = off"), "\n#ui_quality = off");
+    MergeReport removed;
+    expectEq(iniValue(mergeIni(shipped, deleted, &previous, {}, &removed), "fix.ui_quality", "<absent>"),
+             "<absent>", "a line they commented out stays commented out");
+}
+
 // ---------------------------------------------------------------------------
 // the planner
 // ---------------------------------------------------------------------------
@@ -3184,6 +3239,7 @@ int wmain(int argc, wchar_t** argv) {
 
     testMerge();
     testShippedIni(root);
+    testChangedDefault(root);
     testPlanner();
     testNativePlanner();
     testFlatPlanner();
