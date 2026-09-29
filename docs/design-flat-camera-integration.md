@@ -29,10 +29,22 @@
 - Ruled out for that session: a backend evaluation failure as the immediate
   cause, because no backend initialized. Missing shader coverage is proven;
   whether quality settings or a mod produced those variants is not.
+- Ruled out (the five C3 crashes, root-caused 2026-09-28): a compiled C
+  detour at the mid-function hook site. The relay enters by jmp with the
+  game's live stack; the C prologue's spills land on the game's saved r13
+  and the function's return address, and a call-forward sinks the body
+  0xE0 bytes below its frame so its epilogue pops read the detour's frame
+  (the 19:14 dump: r14 = the call's own return address, RIP = a spilled
+  log-string pointer in .rdata). The restore-after-call semantics stay;
+  the transfer is now generated code: stubA (save/restore all GPRs, exact
+  stack) plus a return-address redirection to stubB, per-thread state in
+  TLS. Details in the file header of src/d3d11/flat_camera_inject.cpp.
 - Next: C3, per the C3 wiring plan addendum -- the FUN_1405921f0 detour
   behind a default-off key, the ownership policy wired into flat_runtime,
   the classifier's jittered-encoding question answered, then one bounded
-  session against the acceptance criteria there.
+  session against the acceptance criteria there. First flight of the
+  stub build: confirm no crash, then read the bounded breadcrumbs (call
+  args, kind, redirect/restore lines) and the 5s counters.
 - Environment: Windows x64, D3D11 flat mono; headset/runtime N/A. VR
   comparison: EDVR's OpenVR/OpenXR route. Record GPU/driver, executable/build
   identities, backend versions, dimensions, formats and mod chain for
