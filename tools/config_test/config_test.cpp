@@ -19,13 +19,26 @@
 // were real bugs, and the BOM case files every setting in the file under the
 // wrong section while the file still looks fine.
 //
+// Three more (2026-09-29) are about threads and the log, and read the real log
+// file back rather than counting calls:
+//
+//   - a reader thread hammering the getters while the main thread rewrites the
+//     ini and reloads it, so a lock that is missing, or held only around the
+//     lookup and not the copy, shows as a wrong value or a crash;
+//   - a malformed value is said once per key per successful parse, however
+//     often it is read -- it was said on every read, 90 to 180 lines a second
+//     for a key read each frame;
+//   - getFloat takes the whole value and only a finite one.
+//
 // Usage: config_test.exe <dir containing edvr.ini> [scratch dir]
 #include <windows.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <cwctype>
 #include <string>
+#include <thread>
 
 #include "../../src/common/config.h"
 #include "../../src/common/runtime_profile.h"
@@ -98,6 +111,350 @@ static bool writeIni(const std::wstring& dir, const char* body) {
     WriteFile(f, body, static_cast<DWORD>(strlen(body)), &written, nullptr);
     CloseHandle(f);
     return true;
+}
+
+// writeIni, then a last-write time no earlier write has carried.
+//
+// reloadIfChanged() decides by comparing last-write times, and two writes inside
+// one clock tick -- 15 ms unless something has raised the timer rate -- carry the
+// same one. A loop that rewrites the file and reloads would then skip most of
+// its reloads without saying so, and a test of what a reload does to a reader
+// would be testing almost nothing. Each call stamps a time one second on from
+// the last, so every reload that follows is a parse.
+static bool rewriteIni(const std::wstring& dir, const std::string& body) {
+    if (!writeIni(dir, body.c_str())) return false;
+    static ULONGLONG stamp = 0;
+    if (!stamp) {
+        FILETIME now;
+        GetSystemTimeAsFileTime(&now);
+        stamp = (static_cast<ULONGLONG>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    }
+    stamp += 10000000ull;  // 100 ns ticks: one second
+    FILETIME ft;
+    ft.dwLowDateTime = static_cast<DWORD>(stamp & 0xFFFFFFFFull);
+    ft.dwHighDateTime = static_cast<DWORD>(stamp >> 32);
+    HANDLE f = CreateFileW((dir + L"\\edvr.ini").c_str(), FILE_WRITE_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    const BOOL stamped = SetFileTime(f, nullptr, nullptr, &ft);
+    CloseHandle(f);
+    return stamped != FALSE;
+}
+
+// Every edvr_<tag>_*.log in `dir`, gone: so "the newest" below is provably THIS
+// run's, and the scratch directory does not grow with every build.
+static void deleteLogs(const std::wstring& dir, const wchar_t* tag) {
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"\\edvr_" + tag + L"_*.log").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        DeleteFileW((dir + L"\\" + fd.cFileName).c_str());
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+// The newest edvr_<tag>_*.log in `dir`, whole; empty if there is none. Close the
+// log first: it is written by a flusher thread and only close() drains it.
+static std::string readNewestLog(const std::wstring& dir, const wchar_t* tag) {
+    std::string body;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"\\edvr_" + tag + L"_*.log").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return body;
+    std::wstring newest = fd.cFileName;
+    while (FindNextFileW(h, &fd)) newest = fd.cFileName;
+    FindClose(h);
+    HANDLE f = CreateFileW((dir + L"\\" + newest).c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return body;
+    char chunk[65536];
+    DWORD got = 0;
+    while (ReadFile(f, chunk, sizeof(chunk), &got, nullptr) && got) body.append(chunk, got);
+    CloseHandle(f);
+    return body;
+}
+
+static int countOf(const std::string& haystack, const char* needle) {
+    int n = 0;
+    for (size_t at = haystack.find(needle); at != std::string::npos;
+         at = haystack.find(needle, at + 1)) {
+        ++n;
+    }
+    return n;
+}
+
+// --- getFloat: the whole value, and a finite one (2026-09-29) --------------
+//
+// strtof stops at the first character it cannot use and accepts "nan" and
+// "inf". getFloat asked only that SOMETHING parsed, so "1.5x" read as 1.5 and
+// "2,75" as 2 -- the truncation getInt was cured of -- and a NaN walked past
+// every range test a caller wrote, because it compares false against all of
+// them. A refused value is the caller's default, which is what expectFloat's
+// -999999 sentinel stands for.
+static void floatCases(const std::wstring& scratch) {
+    static const char kIni[] =
+        "[flt]\r\n"
+        "nan = nan\r\n"
+        "inf = inf\r\n"
+        "neginf = -inf\r\n"
+        "overflow = 1e999\r\n"      // strtof answers infinity, not an error
+        "junk = 1.5x\r\n"
+        "comma = 2,75\r\n"          // the comma locale the comment on getFloat names
+        "good = 1.5\r\n"
+        "neg = -0.25\r\n"
+        "whole = 2\r\n"
+        "exponent = 1e-3\r\n";
+    if (!writeIni(scratch, kIni)) {
+        fail("float scratch ini", "could not write it");
+        return;
+    }
+    Config::get().init(scratch);
+    expectFloat("flt.nan", -999999.0f, "getFloat refuses nan");
+    expectFloat("flt.inf", -999999.0f, "...and inf");
+    expectFloat("flt.neginf", -999999.0f, "...and -inf");
+    expectFloat("flt.overflow", -999999.0f, "...and a value too big for a float");
+    expectFloat("flt.junk", -999999.0f, "...and a number with a letter after it");
+    expectFloat("flt.comma", -999999.0f, "...and a decimal written with a comma");
+    expectFloat("flt.good", 1.5f, "getFloat still reads a plain decimal");
+    expectFloat("flt.neg", -0.25f, "...a negative one");
+    expectFloat("flt.whole", 2.0f, "...a whole number");
+    expectFloat("flt.exponent", 0.001f, "...and an exponent");
+}
+
+// --- a malformed value is said once per parse, however often it is read -----
+//
+// The getters noted it on EVERY read. A key read each frame wrote the same line
+// 90 to 180 times a second until log.max_mb, and then the flight logged
+// nothing. The property is read off the real log file, because a counter would
+// only prove that a counter was incremented.
+//
+// The same session covers the config audit's queue, whose flush now takes an
+// atomic flag and a lock instead of reading a vector: findings raised before
+// the log opens are written when it does, exactly once, and a reload that
+// finds the same lines does not write them again.
+//
+// Three parses, one log:
+//   1. malformed values, log CLOSED for the first hundred reads, then open.
+//      Nothing can be written while it is closed, and that must not use up the
+//      key's one note -- most keys are first read before Log::open.
+//   2. the same values again, rewritten: a new parse, so one more note.
+//   3. valid values: nothing to say.
+// So each malformed key appears twice in the file, not 0, 1 or 200.
+static void noteCases(const std::wstring& scratch) {
+    static const char* kKnown[] = {"experimental.zeta", "once.flag", "once.count",
+                                   "once.scale", "once.range", "once.rangebad"};
+    static const char* kMoved[][3] = {{"fix.zeta", "experimental.zeta", ""}};
+    const std::string first =
+        "[once]\r\n"
+        "flag = maybe\r\n"          // getBool
+        "count = 4w\r\n"            // getInt
+        "scale = 1,5\r\n"           // getFloat
+        "range = 999\r\n"           // getIntInRange, past the top
+        "rangebad = twelve\r\n"     // getIntInRange, not a number
+        "[fix]\r\n"
+        "zeta = 7\r\n"              // a moved key: the audit says so
+        "mystery2 = 9\r\n";         // a key nothing reads: the audit says so
+    const std::string second = first + "# written again, same values\r\n";
+    const std::string valid =
+        "[once]\r\n"
+        "flag = yes\r\n"
+        "count = 4\r\n"
+        "scale = 1.5\r\n"
+        "range = 7\r\n"
+        "rangebad = 8\r\n";
+
+    Config& cfg = Config::get();
+    // Reads every key 100 times and counts the answers that are not the ones a
+    // caller must get: the default for a malformed value, the clamp for an
+    // out-of-range one. Saying less must not change what is returned.
+    auto readRound = [&cfg](bool valid_) {
+        int wrong = 0;
+        for (int i = 0; i < 100; ++i) {
+            // A default that is NOT the answer, so a value read as absent shows.
+            if (cfg.getBool("once.flag", !valid_) != true) ++wrong;
+            if (cfg.getInt("once.count", 5) != (valid_ ? 4 : 5)) ++wrong;
+            if (cfg.getFloat("once.scale", 0.5f) != (valid_ ? 1.5f : 0.5f)) ++wrong;
+            if (cfg.getIntInRange("once.range", 5, 1, 10) != (valid_ ? 7 : 10)) ++wrong;
+            if (cfg.getIntInRange("once.rangebad", 5, 1, 10) != (valid_ ? 8 : 5)) ++wrong;
+        }
+        return wrong;
+    };
+
+    Log::get().close();                 // whatever an earlier case left open
+    deleteLogs(scratch, L"noteonce");
+    cfg.setAuditTables(kKnown, 6, kMoved, 1);
+    auto finish = [&]() {
+        Log::get().close();
+        cfg.setAuditTables(nullptr, 0, nullptr, 0);
+    };
+
+    if (!rewriteIni(scratch, first)) {
+        fail("note cases", "could not write the scratch ini");
+        finish();
+        return;
+    }
+    cfg.init(scratch);                  // parse 1: the audit's findings queue
+    int wrong = readRound(false);       // log closed: nothing to write, nothing spent
+    if (!Log::get().open(scratch, L"noteonce")) {
+        fail("note cases", "the log would not open in the scratch dir");
+        finish();
+        return;
+    }
+    wrong += readRound(false);          // parse 1, log open
+    if (!rewriteIni(scratch, second) || !cfg.reloadIfChanged()) {
+        fail("note cases", "the second write did not reload");
+        finish();
+        return;
+    }
+    wrong += readRound(false);          // parse 2
+    if (!rewriteIni(scratch, valid) || !cfg.reloadIfChanged()) {
+        fail("note cases", "the third write did not reload");
+        finish();
+        return;
+    }
+    wrong += readRound(true);           // parse 3: valid, so silent
+    finish();
+
+    if (wrong) {
+        fail("note cases", std::to_string(wrong) + " reads returned something other than "
+                           "the default, the clamp or the value");
+    } else {
+        ok("saying a malformed value once changes nothing a getter returns");
+    }
+
+    const std::string body = readNewestLog(scratch, L"noteonce");
+    if (body.empty()) {
+        fail("note cases", "could not read the log back");
+        return;
+    }
+    static const struct { const char* needle; int want; const char* what; } kNeeds[] = {
+        {"once.flag = \"maybe\"", 2,
+         "a malformed yes/no is noted once per parse, not once per read"},
+        {"once.count = \"4w\"", 2, "...a malformed integer"},
+        {"once.scale = \"1,5\"", 2, "...a malformed float"},
+        {"once.range = 999 is outside", 2, "...an out-of-range bounded integer"},
+        {"once.rangebad = \"twelve\"", 2, "...a malformed bounded integer"},
+        {"fix.zeta has moved to experimental.zeta", 1,
+         "an audit finding raised before the log opened is written once, and not "
+         "again by a reload"},
+        {"does not read: fix.mystery2", 1, "...and so is the audit's dead-line note"},
+    };
+    for (const auto& n : kNeeds) {
+        const int got = countOf(body, n.needle);
+        if (got == n.want) ok(n.what);
+        else fail(n.what, std::string("\"") + n.needle + "\" appears " +
+                              std::to_string(got) + " times in the log, wanted " +
+                              std::to_string(n.want));
+    }
+}
+
+// --- reads that race a reload (2026-09-29) ----------------------------------
+//
+// parse() swaps a freshly parsed map in and frees the old one. The render
+// thread does that whenever the ini's write time moves -- an in-VR menu write
+// does it -- while the OpenXR owner thread's deferred frame end reads
+// advanced.app_gpu_timing on its own. With no lock a read that straddled the
+// swap walked nodes that were being freed. And getString called the audit's
+// flush, which mutated a shared vector from whichever thread happened to read.
+//
+// The reader hammers four keys and a fifth that is never present; the main
+// thread alternates the file between two contents and reloads each time. Every
+// key has one of two legal values (the bool has one: both contents spell it
+// false, and the reader's default is true, so an absent key reads as true).
+// Anything else -- a default where a value should be, a torn string, an access
+// violation -- is the failure. The outcome for a correct build is
+// deterministic: the reader either only ever sees a whole map, or it does not.
+struct RaceReader {
+    std::atomic<bool> stop{false};
+    std::atomic<long> reads{0};
+    // Written by the reader thread alone; the main thread reads them after join().
+    long        bad = 0;
+    std::string firstBad;
+};
+
+static void raceReaderMain(RaceReader* r) {
+    Config& c = Config::get();
+    long n = 0;
+    auto flag = [r](const std::string& what) {
+        if (++r->bad == 1) r->firstBad = what;
+    };
+    while (!r->stop.load(std::memory_order_relaxed)) {
+        if (c.getBool("race.flag", true)) flag("race.flag read true: the key vanished");
+        const int count = c.getInt("race.count", -1);
+        if (count != 7 && count != 9) flag("race.count = " + std::to_string(count));
+        const float scale = c.getFloat("race.scale", -1.0f);
+        if (scale != 1.5f && scale != 2.5f) flag("race.scale = " + std::to_string(scale));
+        const std::string name = c.getString("race.name", "<none>");
+        if (name != "alpha" && name != "bravo") flag("race.name = \"" + name + "\"");
+        if (c.getInt("race.absent", -1) != -1) flag("race.absent found a value");
+        r->reads.store(++n, std::memory_order_relaxed);
+    }
+}
+
+static void raceCase(const std::wstring& scratch) {
+    const auto content = [](const char* flag, int count, const char* scale, const char* name) {
+        std::string s = "[race]\r\n";
+        s += std::string("flag = ") + flag + "\r\n";
+        s += "count = " + std::to_string(count) + "\r\n";
+        s += std::string("scale = ") + scale + "\r\n";
+        s += std::string("name = ") + name + "\r\n";
+        // A deeper tree takes longer to walk and to free, which is what widens
+        // the window that the lock has to close.
+        for (int i = 0; i < 64; ++i) s += "pad" + std::to_string(i) + " = " + name + "\r\n";
+        return s;
+    };
+    const std::string a = content("off", 7, "1.5", "alpha");
+    const std::string b = content("no", 9, "2.5", "bravo");
+
+    if (!rewriteIni(scratch, a)) {
+        fail("config race", "could not write the scratch ini");
+        return;
+    }
+    Config::get().init(scratch);
+
+    RaceReader reader;
+    std::thread thread(raceReaderMain, &reader);
+
+    // Do not start reloading until the reader is demonstrably running: a thread
+    // that has not been scheduled yet would make the loop below a test of nothing.
+    const ULONGLONG t0 = GetTickCount64();
+    while (reader.reads.load() < 1000 && GetTickCount64() - t0 < 5000) Sleep(1);
+    const bool started = reader.reads.load() >= 1000;
+
+    int  reloads = 0;
+    int  unparsed = 0;
+    bool writeFailed = false;
+    if (started) {
+        const ULONGLONG t1 = GetTickCount64();
+        while (reloads < 300 && GetTickCount64() - t1 < 1500) {
+            if (!rewriteIni(scratch, (reloads & 1) ? a : b)) {
+                writeFailed = true;
+                break;
+            }
+            if (!Config::get().reloadIfChanged()) ++unparsed;
+            ++reloads;
+        }
+    }
+    reader.stop.store(true);
+    thread.join();
+
+    if (!started) {
+        fail("config race", "the reader thread did not get going within 5 s");
+    } else if (writeFailed) {
+        fail("config race", "could not rewrite the scratch ini");
+    } else if (reloads < 20) {
+        fail("config race", "only " + std::to_string(reloads) + " reloads ran in 1.5 s; "
+                            "too few to say anything about a race");
+    } else if (unparsed) {
+        fail("config race", std::to_string(unparsed) + " of " + std::to_string(reloads) +
+                            " reloads found the file unchanged, so they never parsed");
+    } else if (reader.bad) {
+        fail("config race", std::to_string(reader.bad) + " bad reads; the first: " +
+                            reader.firstBad);
+    } else {
+        ok("reads racing reloads only ever see one whole map or the other");
+    }
+    printf("  info  %ld reads raced %d reloads\n", reader.reads.load(), reloads);
 }
 
 int main(int argc, char** argv) {
@@ -461,6 +818,17 @@ int main(int argc, char** argv) {
                 }
             }
         }
+    }
+
+    // --- floats, notes and threads (2026-09-29) ----------------------------
+    //
+    // Before the profile cases below: those switch g_runtimeProfile to flat and
+    // invalid, under which these scratch keys would read as suppressed.
+    if (argc >= 3) {
+        const std::wstring scratch = widen(argv[2]);
+        floatCases(scratch);
+        noteCases(scratch);
+        raceCase(scratch);
     }
 
     // An old/full INI cannot widen a flat installation, even through numeric
