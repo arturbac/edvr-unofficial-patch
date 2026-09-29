@@ -1415,15 +1415,35 @@ static std::string listing(const std::wstring& dir) {
 }
 
 // `path` held open by a handle of this test's own, as a reader would. With
-// `shareDelete` it is how Config's read opens edvr.ini now; without, how that
-// read used to open it, and how an editor holding a file mid-save does. Either
-// way the classic replace is refused for as long as the handle is open -- what
-// the share mode changes is only what ELSE can be done to the file meanwhile.
+// `shareDelete` it is how Config's read opens edvr.ini now: the POSIX-semantics
+// replace goes through under it (the classic one is refused while ANY handle is
+// open, share mode or not -- measured on Windows 11 build 26200). Without, it is
+// how that read used to open it, and how an editor holding a file mid-save does:
+// both kinds of rename are refused for as long as it is open.
 static HANDLE holdOpen(const std::wstring& path, bool shareDelete) {
     const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | (shareDelete ? FILE_SHARE_DELETE : 0);
     return CreateFileW(path.c_str(), GENERIC_READ, share, nullptr, OPEN_EXISTING,
                        FILE_ATTRIBUTE_NORMAL, nullptr);
 }
+
+// What the file behind an open handle says, from its start: the file the reader
+// opened, whatever has been done to its name since.
+static std::string readThrough(HANDLE h) {
+    std::string out;
+    LARGE_INTEGER zero{};
+    if (h == INVALID_HANDLE_VALUE || !SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) return out;
+    char buffer[256];
+    DWORD got = 0;
+    while (ReadFile(h, buffer, sizeof(buffer), &got, nullptr) && got) out.append(buffer, got);
+    return out;
+}
+
+// Stand-ins for the POSIX-semantics rename (iniedit.h, posixReplaceForTest): each
+// returns the Windows error the call would have set.
+static unsigned long hookUnsupported() { return ERROR_INVALID_PARAMETER; }
+static unsigned long hookNotUnderstood() { return ERROR_BAD_PATHNAME; }
+static int g_busyCalls = 0;
+static unsigned long hookBusyOnce() { return ++g_busyCalls == 1 ? ERROR_SHARING_VIOLATION : 0; }
 
 static void testAtomicWrite(const std::wstring& scratch) {
     printf("\nwriting a live file whole\n");
@@ -1432,6 +1452,7 @@ static void testAtomicWrite(const std::wstring& scratch) {
     removeTree(dir);
     makeTree(dir);
     const std::wstring target = joinPath(dir, L"edvr.ini");
+    posixReplaceForTest(nullptr);   // no stand-in, nothing remembered, nothing counted
 
     {   // The plain cases: the bytes given, none of the old ones, nothing left over.
         std::wstring why;
@@ -1463,43 +1484,62 @@ static void testAtomicWrite(const std::wstring& scratch) {
         expectEq(listing(dir), "edvr.ini", "with nothing left beside it after all of that");
     }
 
-    // A reader that holds the target open refuses the replace for as long as it
-    // holds on -- whether or not it shares DELETE (measured: cmd's move /Y is
-    // refused with "Access is denied" under both on Windows 11 build 26200; only a
-    // POSIX-semantics rename would get through the sharing one). The writer tries
-    // again as it was told to, gives up, and leaves both the original and the
-    // folder as it found them. Run for a reader of each kind: the point is what
-    // the writer does, not which of the two the operating system refuses.
-    for (const bool shareDelete : {false, true}) {
-        const char* kind = shareDelete ? "a reader sharing DELETE" : "a reader not sharing DELETE";
+    {   // A reader that holds the target open and does NOT share DELETE refuses
+        // the replace -- either kind of rename -- for as long as it holds on. The
+        // writer tries again as it was told to, gives up, and leaves both the
+        // original and the folder as it found them.
         writeAll(target, "original\r\n");
-        HANDLE reader = holdOpen(target, shareDelete);
-        check(reader != INVALID_HANDLE_VALUE, (std::string(kind) + " can hold the target open").c_str());
+        HANDLE reader = holdOpen(target, false);
+        check(reader != INVALID_HANDLE_VALUE, "a reader not sharing DELETE can hold the target open");
         AtomicWriteOptions quick;
         quick.retries = 3;
         quick.backoffMs = 1;
         std::wstring why;
         int tries = 0;
         const bool wrote = writeFileAtomic(target, "never lands\r\n", &why, quick, &tries);
-        printf("  info  %s: wrote=%d after %d tries; the message: %s\n", kind, wrote ? 1 : 0,
-               tries, toUtf8(why).c_str());
-        if (wrote) {
-            // Only a reader that shares DELETE could be got past, and only by an
-            // operating system whose MoveFileExW replaces with POSIX semantics.
-            // Either answer is legitimate; a half state is not.
-            check(shareDelete, "a reader that does not share DELETE is not replaced under");
-            expectEq(readAll(target), "never lands\r\n", "the replace put the new bytes in place");
-        } else {
-            check(tries == 4, "the first try and the three it was allowed were spent",
-                  std::to_string(tries) + " tries");
-            check(!why.empty(), "and the failure says why", "no message");
-            expectEq(readAll(target), "original\r\n", "the original is exactly as it was");
-        }
+        printf("  info  reader not sharing DELETE: wrote=%d after %d tries; the message: %s\n",
+               wrote ? 1 : 0, tries, toUtf8(why).c_str());
+        check(!wrote, "a replace that reader refuses fails when the retries are spent");
+        check(tries == 4, "the first try and the three it was allowed were spent",
+              std::to_string(tries) + " tries");
+        check(!why.empty(), "and the failure says why", "no message");
+        expectEq(readAll(target), "original\r\n", "the original is exactly as it was");
         expectEq(listing(dir), "edvr.ini", "and no temporary file is left");
+        check(!posixReplaceRefused(),
+              "the refusal was of this rename, not of POSIX-semantics renames: nothing is remembered");
         if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
         check(writeFileAtomic(target, "lands now\r\n", &why),
               "once the reader lets go, the same write goes through", toUtf8(why));
         expectEq(readAll(target), "lands now\r\n", "with the new bytes");
+    }
+
+    {   // A reader that holds the target open and DOES share DELETE -- which is how
+        // Config's read opens edvr.ini -- is replaced under, on the first attempt,
+        // by the POSIX-semantics rename, and goes on reading the file it opened.
+        // (The classic rename is refused here: measured with cmd's move /Y on
+        // Windows 11 build 26200, which is why this rename exists.)
+        writeAll(target, "held open\r\n");
+        HANDLE reader = holdOpen(target, true);
+        check(reader != INVALID_HANDLE_VALUE, "a reader sharing DELETE can hold the target open");
+        const int callsBefore = posixReplaceAttempts();
+        std::wstring why;
+        int tries = 0;
+        const bool wrote =
+            writeFileAtomic(target, "replaced under the reader\r\n", &why, AtomicWriteOptions(), &tries);
+        printf("  info  reader sharing DELETE: wrote=%d after %d tries; the message: %s\n",
+               wrote ? 1 : 0, tries, toUtf8(why).c_str());
+        check(wrote, "the replace succeeds while a reader that shares DELETE holds the file",
+              toUtf8(why));
+        check(tries == 1, "on the first attempt: no retry was spent", std::to_string(tries) + " tries");
+        check(posixReplaceAttempts() == callsBefore + 1,
+              "through one call to the POSIX-semantics rename",
+              std::to_string(posixReplaceAttempts() - callsBefore) + " calls");
+        check(!posixReplaceRefused(),
+              "which this volume took: nothing was remembered as unsupported");
+        expectEq(readAll(target), "replaced under the reader\r\n", "and the path holds the new bytes");
+        expectEq(readThrough(reader), "held open\r\n", "while the reader still sees the file it opened");
+        if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
+        expectEq(listing(dir), "edvr.ini", "with nothing left beside it");
     }
 
     {   // The default policy is the one that was asked for: five tries after the
@@ -1511,7 +1551,9 @@ static void testAtomicWrite(const std::wstring& scratch) {
 
     {   // A read-only target is somebody's decision, not a transient: it is
         // refused, the retries are spent on it (access denied is one of the
-        // codes that can pass), and nothing changes.
+        // codes that can pass), and nothing changes. It never reaches the
+        // POSIX-semantics rename: the classic one is what has been measured to
+        // refuse it, and the attribute is not something to test that one on.
         writeAll(target, "protected\r\n");
         SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_READONLY);
         AtomicWriteOptions quick;
@@ -1519,19 +1561,21 @@ static void testAtomicWrite(const std::wstring& scratch) {
         quick.backoffMs = 1;
         std::wstring why;
         int tries = 0;
+        const int callsBefore = posixReplaceAttempts();
         const bool wrote = writeFileAtomic(target, "overwritten\r\n", &why, quick, &tries);
         check(!wrote, "a read-only file is not replaced");
         check(tries == 3, "the retries were spent on it", std::to_string(tries) + " tries");
+        check(posixReplaceAttempts() == callsBefore,
+              "without the POSIX-semantics rename having been asked to");
         expectEq(readAll(target), "protected\r\n", "the file is untouched");
         expectEq(listing(dir), "edvr.ini", "and no temporary file is left");
         SetFileAttributesW(target.c_str(), FILE_ATTRIBUTE_NORMAL);
     }
 
-    // A reader that lets go while the retries are running: the write lands. This
-    // is what the retry is for, and what carries the menu past Config's read.
-    for (const bool shareDelete : {false, true}) {
+    {   // A reader that does not share DELETE and lets go while the retries are
+        // running: the write lands. This is what the retry is for.
         writeAll(target, "before\r\n");
-        HANDLE reader = holdOpen(target, shareDelete);
+        HANDLE reader = holdOpen(target, false);
         std::thread letGo([reader] {
             Sleep(60);
             if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
@@ -1543,14 +1587,97 @@ static void testAtomicWrite(const std::wstring& scratch) {
         int tries = 0;
         const bool wrote = writeFileAtomic(target, "after\r\n", &why, patient, &tries);
         letGo.join();
-        check(wrote, shareDelete ? "a reader sharing DELETE that lets go during the retries does not "
-                                   "fail the write"
-                                 : "a reader not sharing DELETE that lets go during the retries "
-                                   "does not fail the write",
+        check(wrote, "a reader that lets go while the retries run does not fail the write",
               toUtf8(why));
         expectEq(readAll(target), "after\r\n", "and the write landed");
         expectEq(listing(dir), "edvr.ini", "with nothing left beside it");
         printf("  info  it landed on try %d\n", tries);
+    }
+
+    {   // Where the OS or the volume refuses the POSIX-semantics rename as
+        // unsupported, the writer falls back to the classic rename in the same
+        // attempt and does not ask again. The refusal is forced through the seam.
+        posixReplaceForTest(hookUnsupported);
+        writeAll(target, "before the fallback\r\n");
+        std::wstring why;
+        int tries = 0;
+        check(writeFileAtomic(target, "by the classic rename\r\n", &why, AtomicWriteOptions(), &tries),
+              "a write whose POSIX-semantics rename is refused as unsupported still lands",
+              toUtf8(why));
+        expectEq(readAll(target), "by the classic rename\r\n", "with the new bytes");
+        check(tries == 1, "in one attempt: the fallback is part of it", std::to_string(tries) + " tries");
+        check(posixReplaceAttempts() == 1, "the POSIX-semantics rename was asked once",
+              std::to_string(posixReplaceAttempts()) + " calls");
+        check(posixReplaceRefused(), "and the refusal is remembered");
+
+        check(writeFileAtomic(target, "and again\r\n", &why), "the next write lands too",
+              toUtf8(why));
+        expectEq(readAll(target), "and again\r\n", "with its bytes");
+        check(posixReplaceAttempts() == 1,
+              "without the POSIX-semantics rename being asked again: a refusal is not retried on every write",
+              std::to_string(posixReplaceAttempts()) + " calls");
+
+        // The classic rename is what runs now, so a reader that shares DELETE
+        // holds it off, as it always did. Where an operating system has taught
+        // MoveFileExW POSIX semantics that is not so, and either answer is fine;
+        // what matters is that the POSIX-semantics call is not made.
+        HANDLE reader = holdOpen(target, true);
+        AtomicWriteOptions quick;
+        quick.retries = 3;
+        quick.backoffMs = 1;
+        int heldTries = 0;
+        const bool wrote = writeFileAtomic(target, "under the reader\r\n", &why, quick, &heldTries);
+        printf("  info  classic rename under a reader sharing DELETE: wrote=%d after %d tries\n",
+               wrote ? 1 : 0, heldTries);
+        if (!wrote) {
+            check(heldTries == 4, "the classic rename spent the first try and the three it was allowed",
+                  std::to_string(heldTries) + " tries");
+            expectEq(readAll(target), "and again\r\n", "and left the file as it was");
+        }
+        check(posixReplaceAttempts() == 1, "and the POSIX-semantics rename was still not asked for");
+        if (reader != INVALID_HANDLE_VALUE) CloseHandle(reader);
+        expectEq(listing(dir), "edvr.ini", "with no temporary file left");
+
+        posixReplaceForTest(nullptr);
+        check(!posixReplaceRefused(), "taking the stand-in out forgets the refusal");
+    }
+
+    {   // An attempt the POSIX-semantics call refuses for a reason that passes is
+        // tried again through that same call, and is not taken for "unsupported".
+        g_busyCalls = 0;
+        posixReplaceForTest(hookBusyOnce);
+        writeAll(target, "before\r\n");
+        AtomicWriteOptions quick;
+        quick.retries = 3;
+        quick.backoffMs = 1;
+        std::wstring why;
+        int tries = 0;
+        const bool wrote = writeFileAtomic(target, "after a busy answer\r\n", &why, quick, &tries);
+        check(wrote, "a busy answer from the POSIX-semantics rename does not fail the write",
+              toUtf8(why));
+        check(tries == 2, "it lands on the second attempt", std::to_string(tries) + " tries");
+        check(posixReplaceAttempts() == 2, "the POSIX-semantics rename having been asked both times",
+              std::to_string(posixReplaceAttempts()) + " calls");
+        check(!posixReplaceRefused(), "and a busy answer is not remembered as a refusal");
+        expectEq(readAll(target), "after a busy answer\r\n", "with the new bytes");
+        posixReplaceForTest(nullptr);
+    }
+
+    {   // An answer it does not understand: the classic rename decides that
+        // attempt, and the next write asks again.
+        posixReplaceForTest(hookNotUnderstood);
+        writeAll(target, "before\r\n");
+        std::wstring why;
+        int tries = 0;
+        check(writeFileAtomic(target, "by the classic rename\r\n", &why, AtomicWriteOptions(), &tries),
+              "a failure the writer does not recognise still lets the write land", toUtf8(why));
+        check(tries == 1, "in one attempt", std::to_string(tries) + " tries");
+        check(!posixReplaceRefused(), "and is not remembered as a refusal");
+        check(writeFileAtomic(target, "and again\r\n", &why), "the next write lands", toUtf8(why));
+        check(posixReplaceAttempts() == 2, "having asked the POSIX-semantics rename each time",
+              std::to_string(posixReplaceAttempts()) + " calls");
+        expectEq(readAll(target), "and again\r\n", "with the new bytes");
+        posixReplaceForTest(nullptr);
     }
 
     {   // A folder that is not there is not a folder to create, and not a failure

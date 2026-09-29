@@ -55,6 +55,7 @@
 #include "menu.h"              // the settings menu's reload: its keys, then the row diff
 #include "perf_monitor.h"      // the draw hooks' sampled cost, and the reload as an event
 #include "frame_ticks.h"       // frameTick: the boundary's ticks, timed by name
+#include "boundary_tick.h"     // one fault budget per boundary tick
 #include "temporal_pass.h"     // and the temporal pass: warm-up, the camera capture, totals
 #include "glitch_frame.h"
 #include "transition_flash_prevent.h"
@@ -988,7 +989,23 @@ bool g_transportSelected = false;
 // the same probe, and a fault resolving a view should disable view resolution
 // for both rather than one fix's copy path.
 FaultBudget g_panelCbBudget("vScreen.panelBuffer", 5);  // reading the panel's transform
-FaultBudget g_cameraBudget("vScreen.cameraRead", 5);    // reading the scene camera
+
+// The scene camera's readers, one budget each.
+//
+// "vScreen.cameraRead" was one budget for seven readers of five mapped buffers,
+// and the camera block ran four of them in one guarded lambda, so a fault in the
+// first skipped the three after it on that Unmap and five faults anywhere stopped
+// every one of them for the session, with a note that said only "cameraRead". A
+// reader that faults is a reader whose input was wrong; it is no evidence about the
+// others, and a diagnostic's fault must not stand down a feature's feed. The unit
+// is the CONSUMER: sunglareSceneRows reads two buffers and has one budget.
+FaultBudget g_glitchCameraBudget("vScreen.glitchCamera", 5);          // the flash detector's camera history
+FaultBudget g_glitchPoolBudget("vScreen.glitchPool", 5);              // ...and its scene instance pool
+FaultBudget g_sunglareDumpBudget("vScreen.sunglareDump", 5);          // the world shader's desk-side buffer dump
+FaultBudget g_sunglareRowsBudget("vScreen.sunglareRows", 5);          // ...and its live true-camera feed
+FaultBudget g_temporalCameraBudget("vScreen.temporalCamera", 5);      // the temporal pass's camera rows
+FaultBudget g_particleCaptureBudget("vScreen.particleCapture", 5);    // the particle billboards' constants
+FaultBudget g_billboardCaptureBudget("vScreen.billboardCapture", 5);  // the glare billboards' constants
 
 // Is this target the shape of the on-foot panel rather than of an eye?
 //
@@ -2039,7 +2056,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         if (s->rtv0SizeGen != rtvGen) {
             s->rtv0SizeGen = rtvGen;
             ResourceInfo info;
-            if (bindingResolve(bindingGet(BindSlot::Rtv0), &info) &&
+            if (bindingResolveProbe(bindingGet(BindSlot::Rtv0), &info) &&
                 info.isTexture2D) {
                 s->rtv0W = info.a;
                 s->rtv0H = info.b;
@@ -2067,7 +2084,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // than what a clip left.
     if (quadProbeWants()) {
         ResourceInfo info;
-        if (bindingResolve(bindingGet(BindSlot::Rtv0), &info) &&
+        if (bindingResolveProbe(bindingGet(BindSlot::Rtv0), &info) &&
             info.isTexture2D) {
             quadProbeOnDraw(self, info.a, info.b, kind, count, instances,
                             s->qsStartIndex, s->qsBaseVertex);
@@ -2096,7 +2113,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         if(objectProbeLedgerActive()) {
             objectProbeNoteGuiSourceDraw(self,kind,count,instances,args.startInstance,args.start,args.base);
             ResourceInfo source;
-            if(bindingResolve(bindingGet(BindSlot::Rtv0),&source) && source.isTexture2D &&
+            if(bindingResolveProbe(bindingGet(BindSlot::Rtv0),&source) && source.isTexture2D &&
                source.a==(s->panelW?s->panelW:1920) && source.b==(s->panelH?s->panelH:1080))
                 objectProbeNoteSourceDraw(self,kind,count,instances,args.startInstance,args.start,args.base);
         }
@@ -2182,7 +2199,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
                 s->censusAutoGen = rtvGen;
                 ResourceInfo info;
                 s->censusAutoMatch =
-                    bindingResolve(bindingGet(BindSlot::Rtv0), &info) &&
+                    bindingResolveProbe(bindingGet(BindSlot::Rtv0), &info) &&
                     info.isTexture2D && info.a == s->censusAutoW &&
                     info.b == s->censusAutoH;
             }
@@ -2224,7 +2241,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         // discipline. The counting above must see skipped draws too.
         if (s->censusSkipOffCount) {
             ResourceInfo info;
-            if (bindingResolve(bindingGet(BindSlot::Rtv0), &info) &&
+            if (bindingResolveProbe(bindingGet(BindSlot::Rtv0), &info) &&
                 info.isTexture2D) {
                 for (uint32_t i = 0; i < s->censusSkipOffCount; ++i) {
                     const State::OffSkip& o = s->censusSkipOff[i];
@@ -2273,7 +2290,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         if (s->quadSkipArmed && s->eyeDrawsLastFrame < kSceneEyeDraws &&
             kind == s->quadSkip.kind && count == s->quadSkip.n) {
             ResourceInfo info;
-            if (bindingResolve(bindingGet(BindSlot::Rtv0), &info) &&
+            if (bindingResolveProbe(bindingGet(BindSlot::Rtv0), &info) &&
                 info.isTexture2D && info.a == s->quadSkip.w &&
                 info.b == s->quadSkip.h) {
                 return DrawVerdict::kQuadSkip;
@@ -2460,7 +2477,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
                     continue;
                 }
                 ResourceInfo info;
-                if (!bindingResolve(bound, &info) || !info.isTexture2D) {
+                if (!bindingResolveProbe(bound, &info) || !info.isTexture2D) {
                     srvOk = false;
                     break;
                 }
@@ -2901,7 +2918,7 @@ void STDMETHODCALLTYPE hookedClearRtv(ID3D11DeviceContext* self,
     // nothing at all while the setting is empty, which is the shipped state.
     if (s->clearProbeW && rtv && c && s->clearProbeSeen < 8) {
         ResourceInfo info{};
-        if (bindingResolve(rtv, &info) && info.isTexture2D &&
+        if (bindingResolveProbe(rtv, &info) && info.isTexture2D &&
             info.a == s->clearProbeW && info.b == s->clearProbeH) {
             ++s->clearProbeSeen;
             Log::get().note("clear probe: %ux%u cleared to r=%.4f g=%.4f "
@@ -2916,7 +2933,7 @@ void STDMETHODCALLTYPE hookedClearRtv(ID3D11DeviceContext* self,
     // answer it with EDVR's own answer.
     if (introProbeWants() && rtv && c) {
         ResourceInfo info{};
-        if (bindingResolve(rtv, &info) && info.isTexture2D) {
+        if (bindingResolveProbe(rtv, &info) && info.isTexture2D) {
             introProbeOnClear(info.a, info.b, c);
         }
     }
@@ -3435,7 +3452,7 @@ void STDMETHODCALLTYPE hookedUnmap(ID3D11DeviceContext* self, ID3D11Resource* re
     // narrower guard here.
     if (glitchFrameInstalled()) glitchFrameInvalidatePool(res);
     if(res==s->scenePoolResource && s->scenePoolData){
-        guardedBudget(g_cameraBudget,[&]{glitchFrameObservePool(res,s->scenePoolData,s->scenePoolBytes);});
+        guardedBudget(g_glitchPoolBudget,[&]{glitchFrameObservePool(res,s->scenePoolData,s->scenePoolBytes);});
         s->scenePoolResource=nullptr;s->scenePoolData=nullptr;s->scenePoolBytes=0;
     }
     // The census CB watch reads the write BEFORE the real Unmap, exactly as
@@ -3459,14 +3476,23 @@ void STDMETHODCALLTYPE hookedUnmap(ID3D11DeviceContext* self, ID3D11Resource* re
     if (res == s->camResource && s->camData) {
         // Same rule as above: read before forwarding, because after the real
         // Unmap the memory is no longer ours to look at.
-        guardedBudget(g_cameraBudget, [&] {
+        //
+        // Four readers of one block, each on a budget of its own and each run
+        // whatever the ones before it did (g_glitchCameraBudget says why).
+        guardedBudget(g_glitchCameraBudget, [&] {
             glitchFrameObserve(s->camData, s->camBytes, s->camResource);
+        });
+        guardedBudget(g_sunglareDumpBudget, [&] {
             // The world shader's desk-side offset hunt: one whole-buffer
             // dump of the big scene block per session.
             sunglareSceneDump(s->camData, s->camBytes);
+        });
+        guardedBudget(g_sunglareRowsBudget, [&] {
             // And the live feed: the true view matrix at offset 932 of
             // the same block, named by the two-shot dump.
             sunglareSceneRows(s->camData, s->camBytes);
+        });
+        guardedBudget(g_temporalCameraBudget, [&] {
             // The same rows, kept pending for the temporal pass's camera
             // motion source until the frame's first eye draw claims them.
             temporalPassNoteSceneWrite(s->camResource, s->camData, s->camBytes);
@@ -3476,7 +3502,7 @@ void STDMETHODCALLTYPE hookedUnmap(ID3D11DeviceContext* self, ID3D11Resource* re
         s->camBytes = 0;
     }
     if (res == s->sceneCbResource && s->sceneCbData) {
-        guardedBudget(g_cameraBudget, [&] {
+        guardedBudget(g_sunglareRowsBudget, [&] {
             sunglareSceneRows(s->sceneCbData, s->sceneCbBytes);
         });
         s->sceneCbResource = nullptr;
@@ -3484,14 +3510,14 @@ void STDMETHODCALLTYPE hookedUnmap(ID3D11DeviceContext* self, ID3D11Resource* re
         s->sceneCbBytes = 0;
     }
     if (res == s->partResource && s->partData) {
-        guardedBudget(g_cameraBudget,
+        guardedBudget(g_particleCaptureBudget,
                       [&] { particleCapture(s->partData, s->partBytes); });
         s->partResource = nullptr;
         s->partData = nullptr;
         s->partBytes = 0;
     }
     if (res == s->bbResource && s->bbData) {
-        guardedBudget(g_cameraBudget,
+        guardedBudget(g_billboardCaptureBudget,
                       [&] { billboardCapture(s->bbData, s->bbBytes); });
         s->bbResource = nullptr;
         s->bbData = nullptr;
@@ -5466,77 +5492,107 @@ void vScreenReclaimTick() {
     }
 }
 
+// The boundary's module ticks, each on a fault budget of its own (boundary_tick.h),
+// named "frameBoundary/<mark>" after the mark the LONG FRAME line reports for the
+// same work. One call is one tick, except where a comment at the call says
+// otherwise; a module that faults stands down alone. The rest of the function --
+// the frame accounting between these calls -- is not on one of them: device_hook
+// runs the whole function as its vscreen_rest tick, which answers for that.
+namespace {
+EDVR_BOUNDARY_TICK(tkQuadProbe, "quad_probe");
+EDVR_BOUNDARY_TICK(tkDrawCensusTick, "draw_census_tick");
+EDVR_BOUNDARY_TICK(tkObjectProbe, "object_probe");
+EDVR_BOUNDARY_TICK(tkPixelProbe, "pixel_probe");
+EDVR_BOUNDARY_TICK(tkPanelUpscale, "panel_upscale");
+EDVR_BOUNDARY_TICK(tkWakePulse, "wake_pulse");
+EDVR_BOUNDARY_TICK(tkUiDepth, "ui_depth");
+EDVR_BOUNDARY_TICK(tkUiLayer, "ui_layer");
+EDVR_BOUNDARY_TICK(tkHudCensus, "hud_census");
+EDVR_BOUNDARY_TICK(tkScreenMotion, "screen_motion");
+EDVR_BOUNDARY_TICK(tkCelestialMotion, "celestial_motion");
+EDVR_BOUNDARY_TICK(tkEngineVelocity, "engine_velocity");
+EDVR_BOUNDARY_TICK(tkSharpenTick, "sharpen_tick");
+EDVR_BOUNDARY_TICK(tkTemporalTick, "temporal_tick");
+EDVR_BOUNDARY_TICK(tkTemporalBoundary, "temporal_boundary");
+EDVR_BOUNDARY_TICK(tkDepthProbe, "depth_probe");
+EDVR_BOUNDARY_TICK(tkGpuCensus, "gpu_census");
+EDVR_BOUNDARY_TICK(tkSceneArrived, "scene_arrived");
+EDVR_BOUNDARY_TICK(tkIntroPanel, "intro_panel");
+EDVR_BOUNDARY_TICK(tkIntroSkip, "intro_skip");
+EDVR_BOUNDARY_TICK(tkLoaderPanel, "loader_panel");
+EDVR_BOUNDARY_TICK(tkIntroProbe, "intro_probe");
+EDVR_BOUNDARY_TICK(tkLodGovernor, "lod_governor");
+EDVR_BOUNDARY_TICK(tkDrawCensusBoundary, "draw_census_boundary");
+EDVR_BOUNDARY_TICK(tkFssReveal, "fss_reveal");
+EDVR_BOUNDARY_TICK(tkFssDump, "fss_dump");
+EDVR_BOUNDARY_TICK(tkEyeSplit, "eye_split");
+EDVR_BOUNDARY_TICK(tkFoveation, "foveation");
+EDVR_BOUNDARY_TICK(tkEyeMask, "eye_mask");
+EDVR_BOUNDARY_TICK(tkFssPacing, "fss_pacing");
+EDVR_BOUNDARY_TICK(tkRemlok, "remlok");
+}  // namespace
+
 void vScreenFrameBoundary() {
     // The quad probe's readback: a capture taken a few frames ago is decoded
     // here, where the copy has certainly executed and mapping cannot stall
     // the render thread mid-frame.
     // Each call below is one frame-boundary tick, timed by name (frame_ticks.h):
-    // the LONG FRAME line's slowest three come from these marks.
+    // the LONG FRAME line's slowest three come from these marks. Each also runs on
+    // a fault budget of its own (boundary_tick.h), so a module that faults stands
+    // down alone; what is left of the function is device_hook's vscreen_rest tick.
     if (g_state && g_state->ownerCtx) {
-        quadProbeTick(g_state->ownerCtx);
-        frameTick("quad_probe");
-        drawCensusTick(g_state->ownerCtx);
-        frameTick("draw_census_tick");
-        objectProbeFrameBoundary(g_state->ownerCtx);
-        frameTick("object_probe");
-        pixelProbeFrameBoundary(g_state->ownerCtx);
-        frameTick("pixel_probe");
-        panelUpscaleFrameEnd();
-        frameTick("panel_upscale");
-        wakePulseReport();
-        frameTick("wake_pulse");
-        uiDepthFrameBoundary(g_state->ownerCtx);
-        frameTick("ui_depth");
+        tkQuadProbe.run([&] { quadProbeTick(g_state->ownerCtx); });
+        tkDrawCensusTick.run([&] { drawCensusTick(g_state->ownerCtx); });
+        tkObjectProbe.run([&] { objectProbeFrameBoundary(g_state->ownerCtx); });
+        tkPixelProbe.run([&] { pixelProbeFrameBoundary(g_state->ownerCtx); });
+        tkPanelUpscale.run([&] { panelUpscaleFrameEnd(); });
+        tkWakePulse.run([&] { wakePulseReport(); });
+        tkUiDepth.run([&] { uiDepthFrameBoundary(g_state->ownerCtx); });
         // fix.ui_quality: the layer's warm compile, the surfaces' five-second
         // cross-check and learning, the key's 30-second totals, and the end
         // of this frame's watch for draws after the UI.
-        uiLayerFrameBoundary(g_state->ownerCtx);
-        frameTick("ui_layer");
+        tkUiLayer.run([&] { uiLayerFrameBoundary(g_state->ownerCtx); });
         // The HUD layer census's query polls, deferred readbacks and
         // 30-second window report -- beside the layer's boundary, but gated
         // only on advanced.hud_census, never on fix.ui_quality.
-        hudLayerCensusFrameBoundary(g_state->ownerCtx);
-        frameTick("hud_census");
-        screenMotionFrameBoundary(g_state->ownerCtx);
-        frameTick("screen_motion");
-        celestialMotionFrameBoundary(g_state->ownerCtx);
-        frameTick("celestial_motion");
-        engineVelocityFrameBoundary(g_state->ownerCtx);
-        frameTick("engine_velocity");
+        tkHudCensus.run([&] { hudLayerCensusFrameBoundary(g_state->ownerCtx); });
+        tkScreenMotion.run([&] { screenMotionFrameBoundary(g_state->ownerCtx); });
+        tkCelestialMotion.run([&] { celestialMotionFrameBoundary(g_state->ownerCtx); });
+        tkEngineVelocity.run([&] { engineVelocityFrameBoundary(g_state->ownerCtx); });
         // The sharpening's warm compile and missing-hook note, once a frame,
         // unconditionally -- not nested under any other feature's gate.
-        sharpenPassTick(g_state->ownerCtx);
-        frameTick("sharpen_tick");
+        tkSharpenTick.run([&] { sharpenPassTick(g_state->ownerCtx); });
         // The temporal pass: its warm compile, and this frame's camera
         // rows becoming last frame's.
-        temporalPassTick(g_state->ownerCtx);
-        frameTick("temporal_tick");
-        temporalPassFrameBoundary();
-        frameTick("temporal_boundary");
-        depthProbeFrameBoundary(g_state->ownerCtx);
-        frameTick("depth_probe");
+        tkTemporalTick.run([&] { temporalPassTick(g_state->ownerCtx); });
+        tkTemporalBoundary.run([&] { temporalPassFrameBoundary(); });
+        tkDepthProbe.run([&] { depthProbeFrameBoundary(g_state->ownerCtx); });
         // Issue #38's per-feature GPU cost census (gpu_census.h): polls every
         // section's timer, rotates which one is actively timed next frame,
         // and every 30 s logs one summary line. Always on, no ini key.
-        gpuCensusFrame(g_state->ownerCtx);
-        frameTick("gpu_census");
+        tkGpuCensus.run([&] { gpuCensusFrame(g_state->ownerCtx); });
         // Told to the openvr half whether or not any intro fix is on: the
         // cull guard holds its lie until a scene exists, and that must
         // depend on the GAME reaching one, not on EDVR being configured
         // to do anything about the intro.
-        if (g_state->eyeDrawsLastFrame >= kSceneEyeDraws) announceSceneArrived();
-        introPanelTick(g_state->ownerCtx,
-                       g_state->eyeDrawsLastFrame >= kSceneEyeDraws);
-        frameTick("intro_panel");
+        tkSceneArrived.run([&] {
+            if (g_state->eyeDrawsLastFrame >= kSceneEyeDraws) announceSceneArrived();
+        });
+        tkIntroPanel.run([&] {
+            introPanelTick(g_state->ownerCtx,
+                           g_state->eyeDrawsLastFrame >= kSceneEyeDraws);
+        });
         // The same boundary closes the skip's verdict: refused, drawn, or
         // neither, said once when the scene arrives.
-        introSkipTick(g_state->eyeDrawsLastFrame >= kSceneEyeDraws);
-        frameTick("intro_skip");
+        tkIntroSkip.run([&] {
+            introSkipTick(g_state->eyeDrawsLastFrame >= kSceneEyeDraws);
+        });
         // The scene flag retires the loader fix when the intro ends: the
         // same boundary the draw hook gates on, read at the frame edge.
-        loaderPanelTick(g_state->ownerCtx,
-                        g_state->eyeDrawsLastFrame >= kSceneEyeDraws);
-        frameTick("loader_panel");
+        tkLoaderPanel.run([&] {
+            loaderPanelTick(g_state->ownerCtx,
+                            g_state->eyeDrawsLastFrame >= kSceneEyeDraws);
+        });
     }
     State* s = g_state;
     if (!s) return;
@@ -5545,14 +5601,14 @@ void vScreenFrameBoundary() {
     // and its timing, and both are about the frame that has just ENDED rather
     // than about anything decided below. The scene flag is the one the intro
     // fixes above retire on, so the probe's movie account closes with them.
-    introProbeFrameBoundary(s->frameNo, s->eyeDrawsLastFrame >= kSceneEyeDraws);
-    frameTick("intro_probe");
+    tkIntroProbe.run([&] {
+        introProbeFrameBoundary(s->frameNo, s->eyeDrawsLastFrame >= kSceneEyeDraws);
+    });
 
     // The settlement LOD governor (fix.settlement_detail, shadow only): the
     // frame's draw-builder and part-test counts, the producer's frame work,
     // one policy step, its log lines. One atomic load while it is off.
-    lodGovernorFrameBoundary();
-    frameTick("lod_governor");
+    tkLodGovernor.run([&] { lodGovernorFrameBoundary(); });
 
     // The ARRIVAL census (advanced.census_fss_jump): a world-camera jump
     // while the scanner's chrome is up is a zoom's first frame, and the
@@ -5612,18 +5668,12 @@ void vScreenFrameBoundary() {
 
     // Before this frame's counters are read or reset: a pending census starts
     // here, a running one advances, a spent one writes its tables.
-    drawCensusFrameBoundary(s->frameNo);
-    frameTick("draw_census_boundary");
-    fssRevealFrameBoundary();
-    frameTick("fss_reveal");
-    fssDumpFrameBoundary(s->ownerCtx);
-    frameTick("fss_dump");
-    eyeSplitFrameBoundary(s->ownerCtx);
-    frameTick("eye_split");
-    foveationFrameBoundary(s->ownerCtx);
-    frameTick("foveation");
-    eyeMaskFrameBoundary(s->ownerCtx);
-    frameTick("eye_mask");
+    tkDrawCensusBoundary.run([&] { drawCensusFrameBoundary(s->frameNo); });
+    tkFssReveal.run([&] { fssRevealFrameBoundary(); });
+    tkFssDump.run([&] { fssDumpFrameBoundary(s->ownerCtx); });
+    tkEyeSplit.run([&] { eyeSplitFrameBoundary(s->ownerCtx); });
+    tkFoveation.run([&] { foveationFrameBoundary(s->ownerCtx); });
+    tkEyeMask.run([&] { eyeMaskFrameBoundary(s->ownerCtx); });
 
     // FSS frame pacing (round 31): the left-only squares are now measured
     // to be runtime-side (both submitted images carry the flicker equally),
@@ -5633,7 +5683,7 @@ void vScreenFrameBoundary() {
     // premise, and this measures it from our own clock: frame-to-frame
     // deltas while the body-frame gate is warm, one summary line when the
     // scanner goes quiet. Log-only, no keys.
-    {
+    tkFssPacing.run([&] {
         static LARGE_INTEGER lastQpc = {};
         static uint32_t frames = 0, slow = 0;
         static double sumMs = 0.0, maxMs = 0.0;
@@ -5669,10 +5719,8 @@ void vScreenFrameBoundary() {
             maxMs = 0.0;
             lastQpc.QuadPart = 0;
         }
-    }
-    frameTick("fss_pacing");
-    remlokFrameBoundary();
-    frameTick("remlok");
+    });
+    tkRemlok.run([&] { remlokFrameBoundary(); });
 
     // The per-frame invalidation lives in binding_shadow now, and device_hook
     // calls it once for both fixes. Doing it here as well would be harmless but

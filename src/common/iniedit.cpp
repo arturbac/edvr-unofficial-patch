@@ -3,8 +3,12 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstddef>
+#include <cstring>
 #include <set>
+#include <vector>
 
 namespace edvr {
 namespace {
@@ -746,17 +750,171 @@ bool stageFile(const std::wstring& path, const std::string& bytes, std::wstring*
     return true;
 }
 
-// MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH), tried again while the failure
-// is one that passes. `tries` (may be null) gets the number of calls made.
+// --- the POSIX-semantics replace ---------------------------------------------
+//
+// Nothing here comes from winbase.h. It gives FILE_RENAME_INFO's flags member and
+// the FILE_RENAME_FLAG_* values only under SDK-version tests -- spelled with a
+// macro, _WIN32_WINNT_WIN10_RS1, that the 10.0.26100.0 headers never define, so
+// they read as true today by accident -- and FileRenameInfoEx only under
+// NTDDI_VERSION. The layout and the values are the operating system's own and do
+// not move, so they are written out here, and no SDK setting can take them away.
+
+// FILE_RENAME_INFO as FileRenameInfoEx reads it: a DWORD of flags comes first.
+struct RenameInfoEx {
+    DWORD  flags;
+    HANDLE rootDirectory;   // null: fileName is a full path
+    DWORD  fileNameLength;  // in bytes, not counting a terminator
+    WCHAR  fileName[1];
+};
+const DWORD kRenameReplaceIfExists = 0x00000001;  // FILE_RENAME_FLAG_REPLACE_IF_EXISTS
+const DWORD kRenamePosixSemantics = 0x00000002;   // FILE_RENAME_FLAG_POSIX_SEMANTICS
+// FILE_INFO_BY_HANDLE_CLASS::FileRenameInfoEx, counting from FileBasicInfo = 0
+// (minwinbase.h, Windows SDK 10.0.26100.0).
+const int kFileRenameInfoEx = 22;
+#if defined(NTDDI_WIN10_RS1) && (NTDDI_VERSION >= NTDDI_WIN10_RS1)
+// Where the SDK does name it (the same condition it declares it under), it has to
+// agree with the number above.
+static_assert(FileRenameInfoEx == 22, "FileRenameInfoEx is not the class number iniedit passes");
+#endif
+
+// What this process has learned about POSIX-semantics renames. A refusal as
+// unsupported is kept for good: the operating system does not change under a
+// running game, and a volume that cannot do it once will not the next time.
+std::atomic<bool>             g_posixRefused{false};
+std::atomic<int>              g_posixAttempts{0};
+std::atomic<PosixReplaceHook> g_posixHook{nullptr};
+
+// The operating system or the volume saying it does not do this, as against this
+// one rename having been refused. An OS from before 1607 does not know the
+// information class at all (ERROR_INVALID_PARAMETER); FAT, exFAT and some network
+// shares answer not-supported or invalid-function.
+bool refusedAsUnsupported(DWORD code) {
+    return code == ERROR_INVALID_PARAMETER || code == ERROR_NOT_SUPPORTED ||
+           code == ERROR_INVALID_FUNCTION || code == ERROR_CALL_NOT_IMPLEMENTED ||
+           code == ERROR_INVALID_LEVEL;
+}
+
+bool isReadOnly(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY) != 0;
+}
+
+// The absolute form of `path`, or `path` itself when Windows will not give one.
+std::wstring fullPathOf(const std::wstring& path) {
+    const DWORD need = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (need == 0) return path;
+    std::wstring out(need, L'\0');
+    const DWORD got = GetFullPathNameW(path.c_str(), need, &out[0], nullptr);
+    if (got == 0 || got >= need) return path;
+    out.resize(got);
+    return out;
+}
+
+enum class Posix {
+    Done,         // the file is in place
+    Unsupported,  // this operating system or volume does not do it
+    Transient,    // refused for a reason that passes; the caller tries again
+    Other,        // failed some other way; the classic rename decides this attempt
+};
+
+// One POSIX-semantics rename of `from` over `to`. `code` is the Windows error of
+// a failure.
+Posix posixReplace(const std::wstring& from, const std::wstring& to, DWORD* code) {
+    g_posixAttempts.fetch_add(1);
+    if (PosixReplaceHook hook = g_posixHook.load()) {
+        *code = hook();
+        if (*code != ERROR_SUCCESS) {
+            if (refusedAsUnsupported(*code)) return Posix::Unsupported;
+            return passesInMilliseconds(*code) ? Posix::Transient : Posix::Other;
+        }
+    }
+
+    // What is asked of the operating system, built before the temp file is opened
+    // so that nothing between the open and the close can throw. A full path, not
+    // whatever the caller passed: with no root directory the name is not relative
+    // to anything useful. The buffer is zeroed, so the name ends in a terminator
+    // as well as a length.
+    const std::wstring name = fullPathOf(to);
+    const size_t nameBytes = name.size() * sizeof(wchar_t);
+    std::vector<unsigned char> buffer(sizeof(RenameInfoEx) + nameBytes, 0);
+    RenameInfoEx* info = reinterpret_cast<RenameInfoEx*>(buffer.data());
+    info->flags = kRenameReplaceIfExists | kRenamePosixSemantics;
+    info->rootDirectory = nullptr;
+    info->fileNameLength = static_cast<DWORD>(nameBytes);
+    memcpy(buffer.data() + offsetof(RenameInfoEx, fileName), name.data(), nameBytes);
+
+    // DELETE is the access a rename needs. The share modes leave everybody else
+    // free to have the temp file open as well: an antivirus scanning it, most of
+    // all, and its being in the way is a wait, not a failure. WRITE_THROUGH is
+    // what the classic path's MOVEFILE_WRITE_THROUGH asks for: the data was
+    // flushed before (stageFile), this asks that the rename be written through
+    // too. OPEN_REPARSE_POINT so that, as with MoveFileExW, it is the named entry
+    // that moves and not whatever it might point at.
+    HANDLE h = CreateFileW(from.c_str(), DELETE | SYNCHRONIZE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH |
+                               FILE_FLAG_OPEN_REPARSE_POINT,
+                           nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        *code = GetLastError();
+        return passesInMilliseconds(*code) ? Posix::Transient : Posix::Other;
+    }
+
+    // The last error is cleared first, and a failure that left none is read as
+    // "not implemented", because a Wine that refuses a class it does not know has
+    // not always set one (LLVM's rename guards against the same thing).
+    SetLastError(ERROR_SUCCESS);
+    const BOOL renamed = SetFileInformationByHandle(
+        h, static_cast<FILE_INFO_BY_HANDLE_CLASS>(kFileRenameInfoEx), buffer.data(),
+        static_cast<DWORD>(buffer.size()));
+    *code = renamed ? ERROR_SUCCESS : GetLastError();  // before CloseHandle can change it
+    if (!renamed && *code == ERROR_SUCCESS) *code = ERROR_CALL_NOT_IMPLEMENTED;
+    CloseHandle(h);
+    if (renamed) return Posix::Done;
+    if (refusedAsUnsupported(*code)) return Posix::Unsupported;
+    return passesInMilliseconds(*code) ? Posix::Transient : Posix::Other;
+}
+
+// One attempt at putting `from` in place of `to`.
+bool replaceOnce(const std::wstring& from, const std::wstring& to, DWORD* code) {
+    // A read-only target goes straight to the classic rename, which refuses it
+    // with ERROR_ACCESS_DENIED as it always has. Whether a POSIX-semantics rename
+    // honours the attribute is not something to find out on somebody's settings.
+    if (!g_posixRefused.load() && !isReadOnly(to)) {
+        switch (posixReplace(from, to, code)) {
+            case Posix::Done:
+                return true;
+            case Posix::Transient:
+                // Held by something that will let go. *code says so, and the
+                // caller tries again -- through this same call.
+                return false;
+            case Posix::Unsupported:
+                // This operating system or volume does not do it, and asking
+                // again on every write would only repeat the answer.
+                g_posixRefused.store(true);
+                break;
+            case Posix::Other:
+                // Not understood. The classic rename decides this attempt, and
+                // the next attempt asks again.
+                break;
+        }
+    }
+    if (MoveFileExW(from.c_str(), to.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return true;
+    }
+    *code = GetLastError();
+    return false;
+}
+
+// replaceOnce, tried again while the failure is one that passes. `tries` (may be
+// null) gets the number of attempts made.
 bool replaceFile(const std::wstring& from, const std::wstring& to,
                  const AtomicWriteOptions& options, int* tries, DWORD* code) {
     for (int attempt = 1;; ++attempt) {
         if (tries) *tries = attempt;
-        if (MoveFileExW(from.c_str(), to.c_str(),
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-            return true;
-        }
-        *code = GetLastError();
+        if (replaceOnce(from, to, code)) return true;
         if (attempt > options.retries || !passesInMilliseconds(*code)) return false;
         Sleep(options.backoffMs);
     }
@@ -787,11 +945,22 @@ bool writeFileAtomic(const std::wstring& path, const std::string& bytes, std::ws
     return false;
 }
 
+void posixReplaceForTest(PosixReplaceHook hook) {
+    g_posixHook.store(hook);
+    g_posixRefused.store(false);
+    g_posixAttempts.store(0);
+}
+
+int posixReplaceAttempts() { return g_posixAttempts.load(); }
+
+bool posixReplaceRefused() { return g_posixRefused.load(); }
+
 bool readFileBytes(const std::wstring& path, std::string* bytes, size_t limit) {
     bytes->clear();
-    // FILE_SHARE_DELETE: reading a file must not stop somebody deleting or
-    // renaming it away. (A classic replace is refused while any handle to the
-    // target is open; this one is closed again below, so the hold is the read.)
+    // FILE_SHARE_DELETE: reading a file must not stop somebody replacing,
+    // renaming or deleting it. (A POSIX-semantics replace goes through under a
+    // reader that shares DELETE and a classic one does not; either way this handle
+    // is closed again below, so the hold lasts as long as the read.)
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
