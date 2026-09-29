@@ -1207,6 +1207,431 @@ static void testFlatPlanner() {
 }
 
 // ---------------------------------------------------------------------------
+// the flat edition's own settings file (edvr-flat.ini)
+//
+// The flat runtime reads edvr-flat.ini first and falls back to edvr.ini only
+// while there is none (config.cpp). The installer used to merge into and edit
+// edvr.ini for a flat install: it reported success while the game went on
+// reading the old flat file, and where there was no flat file it changed the VR
+// profile's tuning. Every case here holds one rule: an operation of an edition
+// changes the file THAT edition's runtime reads, and the other edition's file
+// is left byte for byte as it was.
+// ---------------------------------------------------------------------------
+
+// What each shipped edition's defaults look like, in miniature, and the two files
+// a folder can hold: the VR profile's edvr.ini and the flat profile's own, chosen
+// to differ from each other in every way a wrong-file merge could show.
+static const char* kFlatTemplate =
+    "# EDVR flat settings.\r\n"
+    "\r\n"
+    "[fix]\r\n"
+    "temporal_aa = off\r\n"
+    "temporal_aa_model = k\r\n"
+    "\r\n"
+    "[advanced]\r\n"
+    "real_dll =\r\n";
+
+// The same file a version later: one default moved and one setting arrived.
+static const char* kFlatTemplateNewer =
+    "# EDVR flat settings.\r\n"
+    "\r\n"
+    "[fix]\r\n"
+    "temporal_aa = off\r\n"
+    "temporal_aa_model = l\r\n"
+    "render_sharpness = 0\r\n"
+    "\r\n"
+    "[advanced]\r\n"
+    "real_dll =\r\n";
+
+// The VR profile's edvr.ini -- or, in a folder from before the profiles had files
+// of their own, the one file both read. It carries a section and a value that no
+// flat file above has.
+static const char* kSharedIni =
+    "[fix]\r\n"
+    "temporal_aa = dlaa\r\n"
+    "temporal_aa_model = k\r\n"
+    "black_void = 0\r\n"
+    "\r\n"
+    "[hotkey]\r\n"
+    "menu = F5\r\n"
+    "\r\n"
+    "[advanced]\r\n"
+    "real_dll =\r\n";
+
+// The flat profile's own edvr-flat.ini, tuned differently.
+static const char* kFlatOwnIni =
+    "# EDVR flat settings.\r\n"
+    "\r\n"
+    "[fix]\r\n"
+    "temporal_aa = fsr\r\n"
+    "temporal_aa_model = k\r\n"
+    "\r\n"
+    "[advanced]\r\n"
+    "real_dll =\r\n";
+
+static const char kFlatGraphicsBytes[] = "TEST-FLAT-D3D11-PAYLOAD";
+
+static PayloadInfo flatPayloadFor(const std::string& iniText) {
+    PayloadInfo p = testPayload(iniText);
+    p.profile = "flat";
+    p.descriptorText = "[install]\r\nschema = 1\r\nprofile = flat\r\n";
+    p.descriptorSha = sha256Bytes(p.descriptorText.data(), p.descriptorText.size());
+    p.nativeGraphicsValid = true;
+    p.haveOpenvr = false;
+    p.haveOpenxrLoader = false;
+    p.haveOpenxrLicense = false;
+    p.nativePairValid = false;
+    p.d3d11Sha = sha256Bytes(kFlatGraphicsBytes, sizeof(kFlatGraphicsBytes) - 1);
+    return p;
+}
+
+// The payload the flat installer carries, for an apply on real files.
+static PayloadProvider flatProvider() {
+    return [](const std::string& item, const void** data, size_t* size) {
+        static const char kProfile[] = "[install]\r\nschema = 1\r\nprofile = flat\r\n";
+        if (item == "d3d11") {
+            *data = kFlatGraphicsBytes;
+            *size = sizeof(kFlatGraphicsBytes) - 1;
+            return true;
+        }
+        if (item == "profile") {
+            *data = kProfile;
+            *size = sizeof(kProfile) - 1;
+            return true;
+        }
+        return false;
+    };
+}
+
+// The live file `leaf` in `dir` named by any step -- read, replaced, moved,
+// removed. A backup's copy under edvr_backup\ is a different path and does not
+// count: what is asked is whether the plan reaches the file the game reads.
+static bool touchesLive(const Plan& plan, const std::wstring& dir, const wchar_t* leaf) {
+    const std::wstring live = joinPath(dir, leaf);
+    for (const Step& step : plan.steps) {
+        if (_wcsicmp(step.from.c_str(), live.c_str()) == 0 ||
+            _wcsicmp(step.to.c_str(), live.c_str()) == 0)
+            return true;
+    }
+    return false;
+}
+
+// The text a plan would write to the live file `leaf`.
+static std::string plannedText(const Plan& plan, const wchar_t* leaf) {
+    for (const Step& step : plan.steps) {
+        if (step.action == Action::WriteText && _wcsicmp(leafOf(step.to).c_str(), leaf) == 0)
+            return step.text;
+    }
+    return std::string();
+}
+
+// A flat edition installed here already, a version ago: its d3d11.dll, its
+// descriptor, its record, and the shipped defaults it was installed with as the
+// base of the next merge.
+static Survey installedFlatSurvey(const std::wstring& dir, const PayloadInfo& installedWith) {
+    Survey s = baseSurvey(dir);
+    s.haveOpenvrDir = false;
+    s.d3d11 = fakeDll(DllKind::Edvr, joinPath(dir, L"d3d11.dll"), "an-older-flat-d3d11");
+    s.descriptorPresent = true;
+    s.descriptorSha = installedWith.descriptorSha;
+    s.state.present = true;
+    s.state.profile = "flat";
+    s.state.descriptorSha = installedWith.descriptorSha;
+    s.state.d3d11Installed = true;
+    s.state.d3d11Sha = "an-older-flat-d3d11";
+    s.baseIniText = installedWith.iniText;
+    return s;
+}
+
+static void testFlatSettingsPlanner() {
+    printf("\nthe flat edition's settings file: planning\n");
+    const std::wstring dir = L"C:\\Games\\ED\\Products\\elite-dangerous-odyssey-64";
+    const PayloadInfo flatOld = flatPayloadFor(kFlatTemplate);
+    const PayloadInfo flatNew = flatPayloadFor(kFlatTemplateNewer);
+    const Options options = testOptions();
+
+    {   // The legacy shared-INI install: a flat install from before edvr-flat.ini
+        // existed has only edvr.ini. The flat runtime has been reading it, so its
+        // settings carry over into a file of the flat edition's own -- and edvr.ini
+        // itself is not touched by anything the plan does.
+        Survey s = installedFlatSurvey(dir, flatOld);
+        s.iniPresent = true;
+        s.iniText = kSharedIni;
+        const Plan plan = planInstall(s, options, flatNew);
+        check(!plan.blocked, "a flat update over a legacy shared edvr.ini plans");
+        expectEq(plan.settingsFile, "edvr-flat.ini", "and says the file it works on is edvr-flat.ini");
+        check(hasStep(plan, Action::WriteText, nullptr, L"edvr-flat.ini"),
+              "it writes the flat edition's own edvr-flat.ini");
+        check(!touchesLive(plan, dir, L"edvr.ini"),
+              "and nothing in the plan reads, backs up, replaces or removes edvr.ini");
+        const std::string seeded = plannedText(plan, L"edvr-flat.ini");
+        expectEq(iniValue(seeded, "fix.temporal_aa"), "dlaa",
+                 "the setting the flat runtime was reading carries over");
+        expectEq(iniValue(seeded, "fix.render_sharpness"), "0",
+                 "and the setting that arrived in this version is adopted beside it");
+        check(!hasStep(plan, Action::Backup, L"edvr-flat.ini", nullptr),
+              "a file that is new has nothing to back up");
+        check(notesMention(plan, "Creating edvr-flat.ini from your edvr.ini"),
+              "the report says where the new file came from");
+        check(plan.nextState.iniSha == sha256Bytes(seeded.data(), seeded.size()),
+              "the record names the hash of the flat file it writes");
+        check(!plan.nothingToDo, "and a run that has only the seeding to do is not 'nothing to do'");
+    }
+
+    {   // The same, asked for fresh defaults: the shared file is not read into the
+        // new one, and is still not touched.
+        Survey s = installedFlatSurvey(dir, flatOld);
+        s.iniPresent = true;
+        s.iniText = kSharedIni;
+        Options fresh = options;
+        fresh.keepSettings = false;
+        const Plan plan = planInstall(s, fresh, flatNew);
+        const std::string written = plannedText(plan, L"edvr-flat.ini");
+        expectEq(iniValue(written, "fix.temporal_aa"), "off",
+                 "--replace-settings gives the flat file the shipped defaults, not edvr.ini's");
+        check(!touchesLive(plan, dir, L"edvr.ini"), "and still leaves edvr.ini alone");
+        check(notesMention(plan, "every setting at its default"), "and says so");
+    }
+
+    {   // Two deliberately different files. The flat update merges the FLAT one
+        // and the VR profile's tuning is not read into it, let alone written.
+        Survey s = installedFlatSurvey(dir, flatOld);
+        s.iniPresent = true;
+        s.iniText = kSharedIni;
+        s.flatIniPresent = true;
+        s.flatIniText = kFlatOwnIni;
+        const Plan plan = planInstall(s, options, flatNew);
+        check(!plan.blocked, "a flat update over two different files plans");
+        const std::string merged = plannedText(plan, L"edvr-flat.ini");
+        expectEq(iniValue(merged, "fix.temporal_aa"), "fsr", "the flat file's own setting is kept");
+        expectEq(iniValue(merged, "fix.temporal_aa_model"), "l",
+                 "a default the flat file had not changed moves with the new version");
+        expectEq(iniValue(merged, "fix.render_sharpness"), "0", "and the new setting arrives");
+        expectEq(iniValue(merged, "hotkey.menu", "<absent>"), "<absent>",
+                 "nothing of the VR profile's tuning is merged into it");
+        expectEq(iniValue(merged, "fix.black_void", "<absent>"), "<absent>",
+                 "not a single one of its values");
+        check(hasStep(plan, Action::Backup, L"edvr-flat.ini", L"edvr-flat.ini"),
+              "the flat file is backed up before it is changed");
+        check(!touchesLive(plan, dir, L"edvr.ini"), "and edvr.ini is not in the plan at all");
+    }
+
+    {   // Asked for fresh defaults with two files: the flat one is replaced, after
+        // a backup of it, and only that one.
+        Survey s = installedFlatSurvey(dir, flatOld);
+        s.iniPresent = true;
+        s.iniText = kSharedIni;
+        s.flatIniPresent = true;
+        s.flatIniText = kFlatOwnIni;
+        Options fresh = options;
+        fresh.keepSettings = false;
+        const Plan plan = planInstall(s, fresh, flatNew);
+        expectEq(iniValue(plannedText(plan, L"edvr-flat.ini"), "fix.temporal_aa"), "off",
+                 "the flat file is replaced by the shipped defaults");
+        check(hasStep(plan, Action::Backup, L"edvr-flat.ini", L"edvr-flat.ini"),
+              "after a copy of it goes to the backup folder");
+        check(!touchesLive(plan, dir, L"edvr.ini"), "and edvr.ini is not touched");
+    }
+
+    {   // Nothing installed and no settings at all: the defaults go to the flat
+        // file, and edvr.ini is not created.
+        Survey s = baseSurvey(dir);
+        s.haveOpenvrDir = false;
+        const Plan plan = planInstall(s, options, flatOld);
+        check(hasStep(plan, Action::WriteText, nullptr, L"edvr-flat.ini"),
+              "a fresh flat install writes edvr-flat.ini");
+        check(!touchesLive(plan, dir, L"edvr.ini"), "and does not create edvr.ini");
+        expectEq(iniValue(plannedText(plan, L"edvr-flat.ini"), "fix.temporal_aa_model"), "k",
+                 "with the shipped defaults in it");
+    }
+
+    {   // A flat file that already says what it should: left alone, and said once.
+        Survey s = installedFlatSurvey(dir, flatOld);
+        s.d3d11.sha256 = flatOld.d3d11Sha;
+        s.state.d3d11Sha = flatOld.d3d11Sha;
+        s.flatIniPresent = true;
+        s.flatIniText = kFlatTemplate;
+        s.iniPresent = true;
+        s.iniText = kSharedIni;
+        const Plan plan = planInstall(s, options, flatOld);
+        check(plan.nothingToDo, "an up-to-date flat install has nothing to do");
+        check(!hasStep(plan, Action::WriteText, nullptr, L"edvr-flat.ini"),
+              "it does not rewrite edvr-flat.ini");
+        check(notesMention(plan, "edvr-flat.ini already says what it should"),
+              "and names the file that needed nothing");
+    }
+
+    {   // A graphics mod in the d3d11.dll slot: the chain decision forces
+        // advanced.real_dll into the file the flat runtime reads. In edvr.ini it
+        // would change nothing the flat edition does.
+        Survey s = baseSurvey(dir);
+        s.haveOpenvrDir = false;
+        s.d3d11 = fakeDll(DllKind::D3d11Provider, joinPath(dir, L"d3d11.dll"), "edhm", L"3Dmigoto");
+        s.iniPresent = true;
+        s.iniText = kSharedIni;
+        const Plan plan = planInstall(s, options, flatOld);
+        check(hasStep(plan, Action::Rename, L"d3d11.dll", L"d3d11_edhm.dll"),
+              "a flat install chains to the mod already in the slot");
+        expectEq(iniValue(plannedText(plan, L"edvr-flat.ini"), "advanced.real_dll"),
+                 "d3d11_edhm.dll", "and the chain target is in the file the flat runtime reads");
+        check(!touchesLive(plan, dir, L"edvr.ini"), "not in edvr.ini, which is left alone");
+    }
+
+    {   // The mirror image: the VR edition works on edvr.ini and leaves the flat
+        // profile's file exactly as it is.
+        const PayloadInfo vr = testPayload(kNextIni);
+        Survey s = baseSurvey(dir);
+        s.iniPresent = true;
+        s.iniText = kSharedIni;
+        s.flatIniPresent = true;
+        s.flatIniText = kFlatOwnIni;
+        const Plan plan = planInstall(s, options, vr);
+        check(!plan.blocked, "a VR install beside a flat profile's file plans");
+        expectEq(plan.settingsFile, "edvr.ini", "and says its file is edvr.ini");
+        check(hasStep(plan, Action::WriteText, nullptr, L"edvr.ini"), "it writes edvr.ini");
+        check(!touchesLive(plan, dir, L"edvr-flat.ini"),
+              "and the flat profile's edvr-flat.ini is not in the plan at all");
+    }
+
+    {   // A base is the defaults of the file the record's edition wrote. Merging
+        // into the OTHER edition's own file it is no base at all: here the record
+        // says flat while the VR file has black_void = 0, which the flat defaults
+        // in the base happen to say too. Read as a base, that would call the
+        // person's choice untouched and hand back the VR default of 1.
+        const PayloadInfo vr = testPayload("[fix]\r\nblack_void = 1\r\n");
+        Survey s = baseSurvey(dir);
+        s.state.present = true;
+        s.state.profile = "flat";
+        s.baseIniText = "[fix]\r\nblack_void = 0\r\n";
+        s.iniPresent = true;
+        s.iniText = "[fix]\r\nblack_void = 0\r\n";
+        Options convert = options;
+        convert.convertProfile = true;
+        const Plan plan = planInstall(s, convert, vr);
+        check(!plan.blocked, "a flat to VR conversion plans");
+        // Kept means the plan either leaves the file alone or writes it with the
+        // person's value; what it must not do is write the VR default over it.
+        const std::string written = plannedText(plan, L"edvr.ini");
+        expectEq(iniValue(written.empty() ? s.iniText : written, "fix.black_void"), "0",
+                 "the VR file's value is kept, not read against the flat edition's defaults");
+        check(plan.merge.twoWay, "the merge says it had no base to go on");
+    }
+
+    {   // ...but the shared file a flat install seeds from IS described by the base
+        // whichever edition the record names: it is the one file every edition
+        // before this wrote. Here the record says VR, the base holds the VR
+        // defaults, and the person's one real choice (black_void) is the only
+        // thing that carries over from it.
+        const PayloadInfo flat = flatPayloadFor("[fix]\r\nblack_void = 5\r\ntemporal_aa = off\r\n");
+        Survey s = baseSurvey(dir);
+        s.state.present = true;
+        s.state.profile = "vr";
+        s.baseIniText = "[fix]\r\nblack_void = 1\r\ntemporal_aa = dlaa\r\n";
+        s.iniPresent = true;
+        s.iniText = "[fix]\r\nblack_void = 0\r\ntemporal_aa = dlaa\r\n";   // black_void is theirs; temporal_aa the VR default
+        Options convert = options;
+        convert.convertProfile = true;
+        s.state.openvrInstalled = true;
+        s.state.openvrSha = "installed-vr";
+        s.state.openvrOrigSha = "game-vr";
+        s.openvrCurrent = fakeDll(DllKind::Edvr, joinPath(s.game.openvrDir, L"openvr_api.dll"), "installed-vr");
+        s.openvrOrig = fakeDll(DllKind::OpenVrRuntime, joinPath(s.game.openvrDir, L"openvr_api_orig.dll"), "game-vr");
+        const Plan plan = planInstall(s, convert, flat);
+        check(!plan.blocked, "a VR to flat conversion over a shared edvr.ini plans",
+              plan.problems.empty() ? std::string() : plan.problems.front());
+        const std::string seeded = plannedText(plan, L"edvr-flat.ini");
+        expectEq(iniValue(seeded, "fix.black_void"), "0", "what the person chose in edvr.ini carries into edvr-flat.ini");
+        expectEq(iniValue(seeded, "fix.temporal_aa"), "off",
+                 "and what they never chose is the flat edition's default, not the VR one");
+        check(!touchesLive(plan, dir, L"edvr.ini"), "with edvr.ini itself untouched");
+    }
+
+    // ---- uninstall: each edition removes its own file and no other ----
+    auto installedFlat = [&](bool sharedToo, bool flatToo) {
+        Survey s = baseSurvey(dir);
+        s.haveOpenvrDir = false;
+        s.d3d11 = fakeDll(DllKind::Edvr, joinPath(dir, L"d3d11.dll"), flatOld.d3d11Sha);
+        s.descriptorPresent = true;
+        s.descriptorSha = flatOld.descriptorSha;
+        s.state.present = true;
+        s.state.profile = "flat";
+        s.state.descriptorSha = flatOld.descriptorSha;
+        s.iniPresent = sharedToo;
+        s.iniText = sharedToo ? kSharedIni : "";
+        s.flatIniPresent = flatToo;
+        s.flatIniText = flatToo ? kFlatOwnIni : "";
+        return s;
+    };
+    Options withSettings = options;
+    withSettings.removeSettings = true;
+
+    {
+        const Survey s = installedFlat(true, true);
+        const Plan kept = planUninstall(s, options);
+        check(!hasStep(kept, Action::Delete, L"edvr-flat.ini", nullptr) &&
+                  !hasStep(kept, Action::Delete, L"edvr.ini", nullptr),
+              "a flat uninstall removes neither settings file by default");
+        check(notesMention(kept, "Leaving edvr-flat.ini in place"), "and names the flat one it left");
+
+        const Plan removed = planUninstall(s, withSettings);
+        check(hasStep(removed, Action::Delete, L"edvr-flat.ini", nullptr),
+              "asked to remove settings, a flat uninstall removes edvr-flat.ini");
+        check(hasStep(removed, Action::Backup, L"edvr-flat.ini", L"edvr-flat.ini"),
+              "after a copy of it goes to the backup folder");
+        check(!touchesLive(removed, dir, L"edvr.ini"),
+              "and never touches the VR profile's edvr.ini");
+    }
+
+    {   // A flat install that never got a file of its own was reading the shared
+        // edvr.ini, which the VR profile uses too: not the flat edition's to remove.
+        const Survey s = installedFlat(true, false);
+        const Plan plan = planUninstall(s, withSettings);
+        check(!hasStep(plan, Action::Delete, L"edvr.ini", nullptr),
+              "a legacy flat install's shared edvr.ini is not removed with it");
+        check(notesMention(plan, "edvr.ini was left in place"), "and the report says why");
+        check(hasStep(plan, Action::Delete, L"d3d11.dll", nullptr), "the rest of the uninstall still happens");
+    }
+
+    {   // The VR edition's uninstall removes edvr.ini and leaves the flat file.
+        Survey s = baseSurvey(dir);
+        s.d3d11 = fakeDll(DllKind::Edvr, joinPath(dir, L"d3d11.dll"), "vr-graphics");
+        s.openvrCurrent = fakeDll(DllKind::Edvr, joinPath(s.game.openvrDir, L"openvr_api.dll"), "vr-runtime");
+        s.openvrOrig = fakeDll(DllKind::OpenVrRuntime, joinPath(s.game.openvrDir, L"openvr_api_orig.dll"), "game-vr");
+        s.state.present = true;
+        s.iniPresent = true;
+        s.iniText = kSharedIni;
+        s.flatIniPresent = true;
+        s.flatIniText = kFlatOwnIni;
+        const Plan plan = planUninstall(s, withSettings);
+        check(hasStep(plan, Action::Delete, L"edvr.ini", nullptr),
+              "a VR uninstall asked to remove settings removes edvr.ini");
+        check(!touchesLive(plan, dir, L"edvr-flat.ini"),
+              "and never touches the flat profile's edvr-flat.ini");
+    }
+
+    {   // Without a record of the chain, a flat uninstall finds the mod it moved
+        // aside by reading the file the flat runtime reads.
+        Survey s = installedFlat(true, true);
+        s.iniText = kSharedIni;   // real_dll is empty here
+        s.flatIniText = "[advanced]\r\nreal_dll = d3d11_edhm.dll\r\n";
+        s.otherD3d11.push_back(fakeDll(DllKind::D3d11Provider, joinPath(dir, L"d3d11_edhm.dll"),
+                                       "edhm-sha", L"3Dmigoto"));
+        const Plan plan = planUninstall(s, options);
+        check(hasStep(plan, Action::Rename, L"d3d11_edhm.dll", L"d3d11.dll"),
+              "the mod the flat file names is put back under its own name");
+        Survey vr = baseSurvey(dir);
+        vr.d3d11 = fakeDll(DllKind::Edvr, joinPath(dir, L"d3d11.dll"), "vr-graphics");
+        vr.iniPresent = true;
+        vr.iniText = "[advanced]\r\nreal_dll = d3d11_edhm.dll\r\n";
+        vr.flatIniPresent = true;
+        vr.flatIniText = kFlatOwnIni;   // real_dll empty in the flat file
+        vr.otherD3d11.push_back(s.otherD3d11.front());
+        check(hasStep(planUninstall(vr, options), Action::Rename, L"d3d11_edhm.dll", L"d3d11.dll"),
+              "a VR uninstall reads edvr.ini for it, whatever the flat file says");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // apply, for real, in a scratch folder
 // ---------------------------------------------------------------------------
 
@@ -2946,6 +3371,440 @@ static void testDemotedTrims(const std::wstring& root, const std::wstring& scrat
 }
 
 // ---------------------------------------------------------------------------
+// the flat edition's settings file, on real files
+// ---------------------------------------------------------------------------
+
+static void layOutFlatGame(const std::wstring& dir) {
+    removeTree(dir);
+    makeTree(dir);
+    writeAll(joinPath(dir, L"EliteDangerous64.exe"), "not really the game");
+}
+
+// The file the flat runtime reads (config.cpp): edvr-flat.ini first, edvr.ini only
+// while there is none.
+static std::wstring flatRuntimeReads(const std::wstring& dir) {
+    const std::wstring flat = joinPath(dir, L"edvr-flat.ini");
+    return fileExists(flat) ? flat : joinPath(dir, L"edvr.ini");
+}
+
+// A survey of a scratch folder as a later run would take it -- what is on disk --
+// with the facts that depend on the machine (is Elite running, which revision the
+// executable is) fixed by the case.
+static Survey diskSurvey(const std::wstring& dir) {
+    Survey s = baseSurvey(dir);
+    s.haveOpenvrDir = false;
+    const std::wstring graphics = joinPath(dir, L"d3d11.dll");
+    s.d3d11 = fileExists(graphics) ? fakeDll(DllKind::Edvr, graphics, sha256File(graphics))
+                                   : fakeDll(DllKind::Absent, graphics, "");
+    const std::wstring ini = joinPath(dir, L"edvr.ini");
+    const std::wstring flatIni = joinPath(dir, L"edvr-flat.ini");
+    s.iniPresent = fileExists(ini);
+    if (s.iniPresent) s.iniText = readAll(ini);
+    s.flatIniPresent = fileExists(flatIni);
+    if (s.flatIniPresent) s.flatIniText = readAll(flatIni);
+    s.baseIniText = readAll(baseIniPath(dir));
+    s.state = readState(dir);
+    const std::wstring descriptor = joinPath(dir, L"edvr_profile.ini");
+    s.descriptorPresent = fileExists(descriptor);
+    if (s.descriptorPresent) s.descriptorSha = sha256File(descriptor);
+    return s;
+}
+
+static void testFlatSettingsFiles(const std::wstring& scratch) {
+    printf("\nthe flat edition's settings file, on real files\n");
+    const PayloadInfo flatOld = flatPayloadFor(kFlatTemplate);
+    const PayloadInfo flatNew = flatPayloadFor(kFlatTemplateNewer);
+    const Options options = testOptions();
+    auto gameAt = [](const std::wstring& dir) {
+        GameInstall game;
+        game.dir = dir;
+        game.source = L"Test";
+        game.product = L"elite-dangerous-odyssey-64";
+        game.odyssey = true;
+        return game;
+    };
+
+    {   // The survey reads both files, each as itself.
+        const std::wstring dir = joinPath(scratch, L"flatset-survey");
+        layOutFlatGame(dir);
+        writeAll(joinPath(dir, L"edvr.ini"), kSharedIni);
+        writeAll(joinPath(dir, L"edvr-flat.ini"), kFlatOwnIni);
+        const Survey both = surveyTarget(gameAt(dir));
+        check(both.iniPresent && both.iniText == kSharedIni, "the survey reads edvr.ini as itself");
+        check(both.flatIniPresent && both.flatIniText == kFlatOwnIni,
+              "and edvr-flat.ini as itself");
+        check(hasSettingsFor(both, "vr") && hasSettingsFor(both, "flat"),
+              "each edition finds its settings");
+
+        DeleteFileW(joinPath(dir, L"edvr-flat.ini").c_str());
+        const Survey legacy = surveyTarget(gameAt(dir));
+        check(legacy.iniPresent && !legacy.flatIniPresent && legacy.flatIniText.empty(),
+              "a folder from before edvr-flat.ini has only the shared file");
+        check(hasSettingsFor(legacy, "vr") && hasSettingsFor(legacy, "flat"),
+              "which both editions read");
+
+        DeleteFileW(joinPath(dir, L"edvr.ini").c_str());
+        writeAll(joinPath(dir, L"edvr-flat.ini"), kFlatOwnIni);
+        const Survey flatOnly = surveyTarget(gameAt(dir));
+        check(!flatOnly.iniPresent && flatOnly.flatIniPresent, "a flat-only folder is read as one");
+        check(!hasSettingsFor(flatOnly, "vr") && hasSettingsFor(flatOnly, "flat"),
+              "and has settings for the flat edition alone");
+
+        DeleteFileW(joinPath(dir, L"edvr-flat.ini").c_str());
+        const Survey empty = surveyTarget(gameAt(dir));
+        check(!hasSettingsFor(empty, "vr") && !hasSettingsFor(empty, "flat"),
+              "an empty folder has settings for neither");
+    }
+
+    {   // A legacy shared-INI flat install, end to end: survey, plan, apply, and a
+        // later update and uninstall. The flat runtime read edvr.ini until now;
+        // from here on it reads edvr-flat.ini, and edvr.ini -- the VR profile's --
+        // is byte for byte what it was throughout.
+        const std::wstring dir = joinPath(scratch, L"flatset-legacy");
+        layOutFlatGame(dir);
+        writeAll(joinPath(dir, L"edvr.ini"), kSharedIni);
+        Survey s = surveyTarget(gameAt(dir));
+        s.eliteKind = EliteExeKind::OdysseyQualified;
+        s.gameRunningHere = s.gameRunningElsewhere = s.gameRunStateUnknown = false;
+        const Plan plan = planInstall(s, options, flatOld);
+        check(!plan.blocked, "a flat install over a legacy shared edvr.ini plans",
+              plan.problems.empty() ? std::string() : plan.problems.front());
+        const ApplyResult result = applyPlan(plan, flatProvider());
+        check(result.ok, "and applies", result.error);
+        expectEq(readAll(joinPath(dir, L"edvr.ini")), kSharedIni,
+                 "edvr.ini is exactly as the VR profile left it");
+        const std::string flatText = readAll(joinPath(dir, L"edvr-flat.ini"));
+        expectEq(iniValue(flatText, "fix.temporal_aa"), "dlaa",
+                 "edvr-flat.ini carries the setting the flat runtime was reading");
+        check(flatRuntimeReads(dir) == joinPath(dir, L"edvr-flat.ini"),
+              "and it is the file the flat runtime reads from now on");
+        const InstallState state = readState(dir);
+        check(state.present && state.profile == "flat", "the record says flat");
+        check(state.iniSha == sha256Bytes(flatText.data(), flatText.size()),
+              "and holds the hash of edvr-flat.ini, the file that was written");
+        expectEq(readAll(baseIniPath(dir)), kFlatTemplate,
+                 "the kept base is the flat edition's shipped file");
+
+        // A later update, with defaults that moved: the flat file merges.
+        Options second = options;
+        second.backupStamp = L"20260827-121500";
+        const Plan update = planInstall(diskSurvey(dir), second, flatNew);
+        check(!update.blocked && !touchesLive(update, dir, L"edvr.ini"),
+              "a later flat update plans without touching edvr.ini");
+        check(applyPlan(update, flatProvider()).ok, "and applies");
+        expectEq(readAll(joinPath(dir, L"edvr.ini")), kSharedIni, "edvr.ini is still exactly as it was");
+        const std::string updated = readAll(joinPath(dir, L"edvr-flat.ini"));
+        expectEq(iniValue(updated, "fix.render_sharpness"), "0", "the flat file took the new setting");
+        expectEq(iniValue(updated, "fix.temporal_aa"), "dlaa", "and kept the one it carried over");
+        expectEq(readAll(joinPath(dir, L"edvr_backup\\20260827-121500\\edvr-flat.ini")), flatText,
+                 "with the flat file as it was in the backup folder");
+        check(!fileExists(joinPath(dir, L"edvr_backup\\20260827-121500\\edvr.ini")),
+              "and no copy of edvr.ini, which nothing replaced");
+
+        // The uninstall, asked to remove settings, removes the flat edition's.
+        Options gone = options;
+        gone.backupStamp = L"20260827-123000";
+        gone.removeSettings = true;
+        const ApplyResult removed = applyPlan(planUninstall(diskSurvey(dir), gone), flatProvider());
+        check(removed.ok, "the flat uninstall applies", removed.error);
+        check(!fileExists(joinPath(dir, L"edvr-flat.ini")), "edvr-flat.ini goes with the flat edition");
+        expectEq(readAll(joinPath(dir, L"edvr_backup\\20260827-123000\\edvr-flat.ini")), updated,
+                 "after a copy of it went to the backup folder");
+        expectEq(readAll(joinPath(dir, L"edvr.ini")), kSharedIni,
+                 "and edvr.ini, which is the VR profile's, is left exactly as it was");
+        check(!fileExists(joinPath(dir, L"d3d11.dll")), "the rest of the flat edition is gone too");
+    }
+
+    {   // Two deliberately different files, end to end: the flat install merges the
+        // flat file, and replacing settings replaces that one and only that one.
+        const std::wstring dir = joinPath(scratch, L"flatset-two");
+        layOutFlatGame(dir);
+        writeAll(joinPath(dir, L"edvr.ini"), kSharedIni);
+        writeAll(joinPath(dir, L"edvr-flat.ini"), kFlatOwnIni);
+        const Plan plan = planInstall(diskSurvey(dir), options, flatOld);
+        check(!plan.blocked && applyPlan(plan, flatProvider()).ok,
+              "a flat install over two different files applies");
+        expectEq(readAll(joinPath(dir, L"edvr.ini")), kSharedIni, "edvr.ini is byte for byte the same");
+        const std::string merged = readAll(joinPath(dir, L"edvr-flat.ini"));
+        expectEq(iniValue(merged, "fix.temporal_aa"), "fsr", "the flat file keeps its own setting");
+        expectEq(iniValue(merged, "hotkey.menu", "<absent>"), "<absent>",
+                 "and takes nothing from edvr.ini");
+
+        Options fresh = options;
+        fresh.backupStamp = L"20260827-124500";
+        fresh.keepSettings = false;
+        check(applyPlan(planInstall(diskSurvey(dir), fresh, flatOld), flatProvider()).ok,
+              "asked for fresh defaults, the run applies");
+        expectEq(iniValue(readAll(joinPath(dir, L"edvr-flat.ini")), "fix.temporal_aa"), "off",
+                 "the flat file has the shipped defaults");
+        expectEq(readAll(joinPath(dir, L"edvr_backup\\20260827-124500\\edvr-flat.ini")), merged,
+                 "with what it held in the backup folder");
+        expectEq(readAll(joinPath(dir, L"edvr.ini")), kSharedIni, "and edvr.ini is still untouched");
+    }
+
+    {   // The VR edition beside a flat profile's file: it updates edvr.ini and the
+        // flat file is exactly what it was.
+        const std::wstring dir = joinPath(scratch, L"flatset-vr");
+        layOutScratchGame(dir);
+        writeAll(joinPath(dir, L"edvr.ini"), kBaseIni);
+        writeAll(joinPath(dir, L"edvr-flat.ini"), kFlatOwnIni);
+        Survey s = scratchSurvey(dir);
+        s.iniPresent = true;
+        s.iniText = readAll(joinPath(dir, L"edvr.ini"));
+        s.flatIniPresent = true;
+        s.flatIniText = readAll(joinPath(dir, L"edvr-flat.ini"));
+        const ApplyResult result = applyPlan(planInstall(s, options, testPayload(kNextIni)), provider(false));
+        check(result.ok, "a VR install beside a flat profile's file applies", result.error);
+        expectEq(iniValue(readAll(joinPath(dir, L"edvr.ini")), "fix.sun_glare"), "vivid",
+                 "the VR file took the new setting");
+        expectEq(readAll(joinPath(dir, L"edvr-flat.ini")), kFlatOwnIni,
+                 "and the flat file is byte for byte the same");
+    }
+}
+
+// The settings window: it reads and writes the file its edition's runtime reads.
+static void testFlatSettingsWindow(const std::wstring& root, const std::wstring& scratch) {
+    printf("\nthe settings window and the flat edition's file\n");
+    const std::string shipped = readAll(joinPath(root, L"edvr.ini"));
+    if (shipped.empty()) {
+        fail("read the repository edvr.ini", "not found");
+        return;
+    }
+    auto rowFor = [](const SettingsModel& model, const char* key) {
+        for (size_t i = 0; i < model.rows().size(); ++i)
+            if (std::string(model.rows()[i].def->key) == key) return i;
+        return static_cast<size_t>(-1);
+    };
+    const std::string flatOwn = "[fix]\r\nblack_void = 0\r\n";
+
+    {   // Two files: the flat model shows the flat file's value and writes only
+        // there; the VR model beside it does the reverse.
+        const std::wstring dir = joinPath(scratch, L"flatset-window-two");
+        removeTree(dir);
+        makeTree(dir);
+        writeAll(joinPath(dir, L"edvr.ini"), shipped);
+        writeAll(joinPath(dir, L"edvr-flat.ini"), flatOwn);
+
+        SettingsModel flat;
+        flat.load(dir, "flat");
+        const size_t toggle = rowFor(flat, "black_void");
+        if (toggle == static_cast<size_t>(-1)) {
+            fail("find the setting to exercise", "black_void is not exposed");
+            return;
+        }
+        check(flat.iniPath() == joinPath(dir, L"edvr-flat.ini"), "the flat window's file is edvr-flat.ini");
+        expectEq(flat.rows()[toggle].value, "0", "it shows the flat file's value, not edvr.ini's");
+        check(flat.set(toggle, "1"), "a change in the flat window is written", flat.lastError());
+        expectEq(iniValue(readAll(joinPath(dir, L"edvr-flat.ini")), "fix.black_void"), "1",
+                 "to edvr-flat.ini");
+        expectEq(readAll(joinPath(dir, L"edvr.ini")), shipped, "and edvr.ini is byte for byte the same");
+        const std::wstring backups = joinPath(dir, L"edvr_backup");
+        const std::wstring stamp = firstSubdirLike(backups, L"settings-*");
+        check(!stamp.empty() && readAll(joinPath(joinPath(backups, stamp), L"edvr-flat.ini")) == flatOwn,
+              "with the flat file as it was in the settings backup");
+
+        SettingsModel vr;
+        vr.load(dir);
+        check(vr.iniPath() == joinPath(dir, L"edvr.ini"), "the VR window's file is edvr.ini");
+        const std::string flatAfter = readAll(joinPath(dir, L"edvr-flat.ini"));
+        check(vr.set(rowFor(vr, "black_void"), "0"), "a change in the VR window is written", vr.lastError());
+        expectEq(iniValue(readAll(joinPath(dir, L"edvr.ini")), "fix.black_void"), "0", "to edvr.ini");
+        expectEq(readAll(joinPath(dir, L"edvr-flat.ini")), flatAfter,
+                 "and edvr-flat.ini is exactly what the flat window left");
+    }
+
+    {   // A legacy folder: only the shared edvr.ini. The flat window shows what the
+        // flat runtime is reading, and the first change starts edvr-flat.ini from
+        // it, leaving edvr.ini as it is.
+        const std::wstring dir = joinPath(scratch, L"flatset-window-legacy");
+        removeTree(dir);
+        makeTree(dir);
+        writeAll(joinPath(dir, L"edvr.ini"), shipped);
+        SettingsModel flat;
+        flat.load(dir, "flat");
+        const size_t toggle = rowFor(flat, "black_void");
+        if (toggle == static_cast<size_t>(-1)) {
+            fail("find the setting to exercise", "black_void is not exposed");
+            return;
+        }
+        expectEq(flat.rows()[toggle].value, iniValue(shipped, "fix.black_void"),
+                 "with no edvr-flat.ini yet the window shows the shared file's value");
+        check(flat.set(toggle, "0"), "the first change succeeds", flat.lastError());
+        check(fileExists(joinPath(dir, L"edvr-flat.ini")), "and starts edvr-flat.ini");
+        const std::string started = readAll(joinPath(dir, L"edvr-flat.ini"));
+        expectEq(iniValue(started, "fix.black_void"), "0", "with the change in it");
+        check(started.size() == shipped.size(),
+              "and every other setting carried over from the shared file: one character differs");
+        expectEq(readAll(joinPath(dir, L"edvr.ini")), shipped, "while edvr.ini is exactly as it was");
+        check(firstSubdirLike(joinPath(dir, L"edvr_backup"), L"settings-*").empty(),
+              "a file that did not exist has nothing to back up");
+        check(flat.set(toggle, "1"), "the next change succeeds too", flat.lastError());
+        expectEq(iniValue(readAll(joinPath(dir, L"edvr-flat.ini")), "fix.black_void"), "1",
+                 "and lands in the flat file");
+        expectEq(readAll(joinPath(dir, L"edvr.ini")), shipped, "with edvr.ini untouched again");
+    }
+
+    {   // Nothing at all: the window says which file is missing.
+        const std::wstring dir = joinPath(scratch, L"flatset-window-none");
+        removeTree(dir);
+        makeTree(dir);
+        SettingsModel flat;
+        flat.load(dir, "flat");
+        const size_t toggle = rowFor(flat, "black_void");
+        if (toggle == static_cast<size_t>(-1)) return;
+        check(!flat.set(toggle, "0"), "a change with no settings file anywhere fails");
+        check(flat.lastError().find("edvr-flat.ini is not there yet") != std::string::npos,
+              "and names edvr-flat.ini, the file that is missing", flat.lastError());
+        check(!fileExists(joinPath(dir, L"edvr-flat.ini")) && !fileExists(joinPath(dir, L"edvr.ini")),
+              "without creating either");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the mirror, when only the flat edition's settings were saved
+//
+// A flat install (or a menu edit under one) mirrors edvr-flat.ini alone, and
+// after a game update wipes the folder that file is all there is to recover. The
+// offer, and the copy back, used to look for edvr.ini and pass by a mirror that
+// held only this one; a flat copy that failed was ignored, and the restore could
+// report success after putting back only the shared file.
+// ---------------------------------------------------------------------------
+
+static bool noteHas(const std::vector<std::string>& notes, const char* needle) {
+    for (const std::string& note : notes)
+        if (note.find(needle) != std::string::npos) return true;
+    return false;
+}
+
+static void testFlatMirror(const std::wstring& scratch) {
+    printf("\nthe mirror, when only the flat edition's settings were saved\n");
+
+    // A fresh flat install on real files, the one this mirrors: edvr-flat.ini, the
+    // record and the base, and no edvr.ini anywhere.
+    const std::wstring dir = joinPath(scratch, L"flatmirror-game");
+    layOutFlatGame(dir);
+    const PayloadInfo flat = flatPayloadFor(kFlatTemplate);
+    const Plan plan = planInstall(diskSurvey(dir), testOptions(), flat);
+    check(!plan.blocked && applyPlan(plan, flatProvider()).ok,
+          "a fresh flat install, the one this test mirrors, applies");
+    check(fileExists(joinPath(dir, L"edvr-flat.ini")) && !fileExists(joinPath(dir, L"edvr.ini")),
+          "it leaves edvr-flat.ini and no edvr.ini");
+
+    const std::wstring root = joinPath(scratch, L"flatmirror-root");
+    removeTree(root);
+    const std::wstring mirrorDir = joinPath(root, L"flatmirror-test");
+    const MirrorResult saved = updateMirror(dir, plan.backupDir, mirrorDir);
+    check(saved.ok && !saved.saved.empty() && saved.saved.front() == "edvr-flat.ini",
+          "updateMirror saves the flat settings");
+    check(!fileExists(joinPath(mirrorDir, L"edvr.ini")), "and there is no edvr.ini in the mirror");
+    const std::string mirroredFlat = readAll(joinPath(mirrorDir, L"edvr-flat.ini"));
+    expectEq(mirroredFlat, readAll(joinPath(dir, L"edvr-flat.ini")), "the mirrored copy matches");
+
+    const MirrorInfo info = readMirror(mirrorDir);
+    check(!info.hasIni && info.hasFlatIni, "readMirror sees the flat settings alone");
+    check(info.holdsSettings(), "which is a mirror with settings in it");
+    check(info.holdsSettingsFor("flat") && !info.holdsSettingsFor("vr"),
+          "settings the flat edition can use and the VR edition cannot");
+    check(!info.savedUtc.empty(), "and it says when they were saved");
+    check(info.hasState && info.hasBaseIni, "with the record and the base beside them");
+
+    {   // The offer, asked as both installers ask it.
+        const std::wstring wipedDir = joinPath(scratch, L"flatmirror-wiped");
+        layOutFlatGame(wipedDir);
+        const Survey wiped = diskSurvey(wipedDir);
+        check(offerRestore(hasSettingsFor(wiped, "flat"), info, "flat"),
+              "a wiped flat folder is offered a mirror that holds only edvr-flat.ini");
+        check(!offerRestore(hasSettingsFor(wiped, "vr"), info, "vr"),
+              "a VR install of it is not: the VR edition cannot use that file");
+        check(!offerRestore(hasSettingsFor(diskSurvey(dir), "flat"), info, "flat"),
+              "a folder that still has its settings is offered nothing");
+
+        writeAll(joinPath(wipedDir, L"edvr.ini"), kSharedIni);
+        check(!offerRestore(hasSettingsFor(diskSurvey(wipedDir), "flat"), info, "flat"),
+              "nor is one that has only the shared edvr.ini the flat runtime falls back to");
+
+        MirrorInfo none;
+        check(!offerRestore(false, none, "flat") && !offerRestore(false, none, "vr"),
+              "an empty mirror is offered to nobody");
+        MirrorInfo vrOnly;
+        vrOnly.hasIni = true;
+        check(offerRestore(false, vrOnly, "vr") && offerRestore(false, vrOnly, "flat"),
+              "a mirror of edvr.ini is offered to a VR install and, as before, to a flat one");
+    }
+
+    {   // The copy, with the flat file alone in the mirror.
+        const std::wstring wipedDir = joinPath(scratch, L"flatmirror-restore");
+        removeTree(wipedDir);
+        makeTree(wipedDir);
+        std::vector<std::string> notes;
+        check(restoreFromMirror(wipedDir, info, &notes), "a flat-only mirror is restored");
+        expectEq(readAll(joinPath(wipedDir, L"edvr-flat.ini")), mirroredFlat,
+                 "edvr-flat.ini comes back byte for byte");
+        check(!fileExists(joinPath(wipedDir, L"edvr.ini")), "and no edvr.ini is made up");
+        check(noteHas(notes, "Restored edvr-flat.ini"), "the notes say what was restored");
+        check(fileExists(joinPath(wipedDir, L"edvr_install\\state.ini")) &&
+                  fileExists(joinPath(wipedDir, L"edvr_install\\edvr.ini.base")),
+              "with the record and the base");
+    }
+
+    {   // A flat copy that fails is a restore that failed: with a directory where the
+        // file has to go, nothing can replace it.
+        const std::wstring blocked = joinPath(scratch, L"flatmirror-blocked");
+        removeTree(blocked);
+        makeTree(joinPath(blocked, L"edvr-flat.ini"));
+        std::vector<std::string> notes;
+        check(!restoreFromMirror(blocked, info, &notes), "a failed flat copy fails a flat-only restore");
+        check(noteHas(notes, "Could not restore edvr-flat.ini"), "and the notes say which file it was");
+        check(!fileExists(joinPath(blocked, L"edvr_install\\state.ini")),
+              "nothing else of a mirror whose settings did not come back is put into the folder");
+    }
+
+    // A mirror holding both files, made by hand: the shared file and the flat one.
+    const std::wstring bothDir = joinPath(root, L"both-mirror");
+    makeTree(bothDir);
+    writeAll(joinPath(bothDir, L"edvr.ini"), kSharedIni);
+    writeAll(joinPath(bothDir, L"edvr-flat.ini"), kFlatOwnIni);
+    writeAll(joinPath(bothDir, L"state.ini"), "[edvr]\r\nversion = 1\r\n");
+    const MirrorInfo both = readMirror(bothDir);
+    check(both.hasIni && both.hasFlatIni, "a mirror can hold both files");
+
+    {
+        const std::wstring wipedDir = joinPath(scratch, L"flatmirror-both");
+        removeTree(wipedDir);
+        makeTree(wipedDir);
+        std::vector<std::string> notes;
+        check(restoreFromMirror(wipedDir, both, &notes), "a mirror of both files restores");
+        expectEq(readAll(joinPath(wipedDir, L"edvr.ini")), kSharedIni, "edvr.ini comes back");
+        expectEq(readAll(joinPath(wipedDir, L"edvr-flat.ini")), kFlatOwnIni, "and edvr-flat.ini");
+    }
+
+    {   // The shared file's success must not hide the flat file's failure.
+        const std::wstring blocked = joinPath(scratch, L"flatmirror-flatblocked");
+        removeTree(blocked);
+        makeTree(joinPath(blocked, L"edvr-flat.ini"));
+        std::vector<std::string> notes;
+        check(!restoreFromMirror(blocked, both, &notes),
+              "edvr.ini restored and edvr-flat.ini not is not a successful restore");
+        expectEq(readAll(joinPath(blocked, L"edvr.ini")), kSharedIni, "the shared file did come back");
+        check(noteHas(notes, "Restored edvr.ini") && noteHas(notes, "Could not restore edvr-flat.ini"),
+              "and the notes name both the one that did and the one that did not");
+        check(fileExists(joinPath(blocked, L"edvr_install\\state.ini")),
+              "the record is restored, since some settings came back");
+    }
+
+    {   // And the other way round.
+        const std::wstring blocked = joinPath(scratch, L"flatmirror-sharedblocked");
+        removeTree(blocked);
+        makeTree(joinPath(blocked, L"edvr.ini"));
+        std::vector<std::string> notes;
+        check(!restoreFromMirror(blocked, both, &notes),
+              "edvr-flat.ini restored and edvr.ini not is not a successful restore either");
+        expectEq(readAll(joinPath(blocked, L"edvr-flat.ini")), kFlatOwnIni, "the flat file did come back");
+        check(noteHas(notes, "Could not restore edvr.ini"), "and the notes say edvr.ini did not");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // reading a DLL to find out whose it is
 // ---------------------------------------------------------------------------
 
@@ -3262,6 +4121,35 @@ static void testLogBundle(const std::wstring& scratch) {
     check(bundleHas(names, "edvr_FATAL.txt"), "the fatal note is in");
     check(bundleHas(names, "edvr.ini"), "the settings file is in");
 
+    {   // A flat install's logs are found where ITS settings file says: edvr-flat.ini
+        // (edvr.ini only while it has none). The VR profile's log.dir, which the
+        // flat runtime never reads, does not send the bundle to the wrong folder.
+        const std::wstring flat = joinPath(scratch, L"flatlogs");
+        const std::wstring flatLogs = joinPath(flat, L"flat_logs_here");
+        removeTree(flat);
+        makeTree(flatLogs);
+        writeAll(joinPath(flat, L"EliteDangerous64.exe"), "not really the game");
+        writeAll(joinPath(flat, L"edvr_profile.ini"), "[install]\r\nschema = 1\r\nprofile = flat\r\n");
+        writeAll(joinPath(flat, L"edvr.ini"), "[log]\r\ndir = " + toUtf8(joinPath(flat, L"vr_logs_nowhere")) + "\r\n");
+        writeAll(joinPath(flat, L"edvr-flat.ini"), "[log]\r\ndir = " + toUtf8(flatLogs) + "\r\n");
+        writeAll(joinPath(flatLogs, L"edvr_gfx_20260827_140000.log"), "the flat session");
+        const LogBundle flatBundle = collectLogs(flat, scratch);
+        check(flatBundle.ok, "a flat install's bundle is written", flatBundle.error);
+        const std::vector<std::string> flatNames = zipEntryNames(flatBundle.zipPath);
+        check(bundleHas(flatNames, "edvr_gfx_20260827_140000.log"),
+              "with the log from the folder edvr-flat.ini names");
+        check(bundleHas(flatNames, "edvr-flat.ini"), "and the flat settings file");
+
+        // Without a flat file yet, the flat runtime is reading edvr.ini, so that is
+        // where log.dir comes from.
+        DeleteFileW(joinPath(flat, L"edvr-flat.ini").c_str());
+        writeAll(joinPath(flat, L"edvr.ini"), "[log]\r\ndir = " + toUtf8(flatLogs) + "\r\n");
+        const LogBundle legacyBundle = collectLogs(flat, scratch);
+        check(legacyBundle.ok, "a legacy flat install's bundle is written", legacyBundle.error);
+        check(bundleHas(zipEntryNames(legacyBundle.zipPath), "edvr_gfx_20260827_140000.log"),
+              "with the log from the folder the shared edvr.ini names");
+    }
+
     // A folder with nothing to collect says so rather than writing an empty zip.
     const std::wstring bare = joinPath(scratch, L"barelogs");
     removeTree(bare);
@@ -3315,6 +4203,7 @@ int wmain(int argc, wchar_t** argv) {
     testPlanner();
     testNativePlanner();
     testFlatPlanner();
+    testFlatSettingsPlanner();
     testApply(scratch);
     testMirror(scratch);
     testAtomicWrite(scratch);
@@ -3323,6 +4212,9 @@ int wmain(int argc, wchar_t** argv) {
     testGenerations(scratch);
     testMirrorGenerations(scratch);
     testDemotedTrims(root, scratch);
+    testFlatSettingsFiles(scratch);
+    testFlatSettingsWindow(root, scratch);
+    testFlatMirror(scratch);
     testProbe(scratch);
     testRunState();
     testSettings(root, scratch);

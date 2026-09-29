@@ -685,6 +685,17 @@ def restore_native(receipt_path, dry_run=False):
         return 1
 
 
+def _rc3_flat_ini_target(target):
+    """The file an RC3 flat receipt recorded as its `ini` entry.
+
+    RC3's `--profile flat --ini` wrote the shared edvr.ini and journaled that
+    exact path in a version-2 flat receipt; the flat profile now keeps its
+    settings in edvr-flat.ini (_ini_target). Both are version 2, so the
+    receipt cannot say which it is except by the path it names, and an RC3
+    install must still be restorable with `--restore-native`."""
+    return os.path.join(target, "edvr.ini")
+
+
 def _validate_v2_receipt(r):
     if not isinstance(r, dict) or r.get("version") != 2 or r.get("kind") not in (NATIVE_KIND, FLAT_KIND) or r.get("state") != "installed":
         raise ValueError("receipt is not an installed EDVR v2 package")
@@ -697,8 +708,16 @@ def _validate_v2_receipt(r):
     required = {"runtime", "graphics", "loader", "notice", "config"} if r["kind"] == NATIVE_KIND else {"graphics", "profile"}
     targets = {key: paths[key + "_target"] for key in ("runtime", "graphics", "loader", "notice") if key + "_target" in paths}
     if r["kind"] == NATIVE_KIND: targets["config"] = paths["config"]
+    ini_target = _ini_target(target, "flat" if r["kind"] == FLAT_KIND else "vr")
+    if r["kind"] == FLAT_KIND:
+        # The one legacy shape accepted: a flat `ini` entry whose recorded
+        # target is EXACTLY <target>\edvr.ini. Every other check below still
+        # runs on it, and any other path, for any kind, is refused as before.
+        legacy = _rc3_flat_ini_target(target)
+        if any(e["key"] == "ini" and e.get("target") == os.path.abspath(legacy) for e in files):
+            ini_target = legacy
     targets.update(profile=os.path.join(target, PROFILE_FILE),
-                   ini=_ini_target(target, "flat" if r["kind"] == FLAT_KIND else "vr"),
+                   ini=ini_target,
                    dlss=os.path.join(target, "nvngx_dlss.dll"))
     keys = [e["key"] for e in files]
     if len(keys) != len(set(keys)) or not required.issubset(keys) or set(keys) - targets.keys():
@@ -1987,6 +2006,90 @@ def self_test():
             assert Path(fgame, "edvr-flat.ini").read_bytes() == b"[user]\nkeep=1\n"
             assert Path(fgame, "edvr.ini").read_bytes() == b"[user]\nkeep=1\n"
             assert xr_snapshot() == before_xr, "flat --ini changed Openvr"
+
+            # An RC3 flat install made with --ini journaled the shared edvr.ini
+            # as its `ini` entry (the flat profile had no file of its own
+            # then). --restore-native must still take such an install back --
+            # and only that shape: every other ini path stays refused.
+            def rc3_flat_install(name, ini_relative, installed=b"[fix]\r\ntemporal_aa = off\r\n",
+                                 user=b"[user]\nkeep=rc3\n"):
+                game = os.path.join(flat_tmp, name)
+                os.makedirs(os.path.join(game, "Openvr", "win64"))
+                Path(game, GAME_EXE).write_bytes(b"GAME")
+                live = {"graphics": (Path(game, "d3d11.dll"), b"RC3-FLAT-GRAPHICS"),
+                        "profile": (Path(game, PROFILE_FILE), profile_bytes("flat")),
+                        "ini": (Path(game, ini_relative), installed)}
+                sources = {"graphics": os.path.abspath(os.path.join(froot, "build", "d3d11.dll")),
+                           "profile": "generated",
+                           "ini": os.path.abspath(os.path.join(froot, "build", "edvr-flat.ini"))}
+                entries = []
+                for key, (path, data) in live.items():
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
+                    entry = {"key": key, "source": sources[key], "target": os.path.abspath(str(path)),
+                             "backup": None, "before_sha256": None, "installed_sha256": sha256(str(path))}
+                    if key == "ini":
+                        backup = Path(str(path) + ".pre-rc3-20260929-101500.bak")
+                        backup.write_bytes(user)
+                        entry["backup"] = os.path.abspath(str(backup))
+                        entry["before_sha256"] = sha256(str(backup))
+                    entries.append(entry)
+                receipt = os.path.join(game, "edvr_flat_receipt.json")
+                Path(receipt).write_text(json.dumps({
+                    "version": 2, "kind": FLAT_KIND, "target": os.path.abspath(game),
+                    "root": os.path.abspath(froot), "state": "installed", "files": entries}),
+                    encoding="utf-8")
+                return game, receipt
+
+            rc3_game, rc3_receipt = rc3_flat_install("rc3game", "edvr.ini")
+            assert verify_native_receipt(rc3_receipt, rc3_game)["kind"] == FLAT_KIND, \
+                "an RC3 flat receipt naming edvr.ini is refused"
+            rc3_before = sorted((str(p.relative_to(rc3_game)), p.read_bytes())
+                                for p in Path(rc3_game).rglob("*") if p.is_file())
+            assert restore_native(rc3_receipt, True) == 0
+            assert rc3_before == sorted((str(p.relative_to(rc3_game)), p.read_bytes())
+                                        for p in Path(rc3_game).rglob("*") if p.is_file()), \
+                "the RC3 restore dry run wrote files"
+            assert restore_native(rc3_receipt) == 0, "an RC3 flat install cannot be restored"
+            assert Path(rc3_game, "edvr.ini").read_bytes() == b"[user]\nkeep=rc3\n", \
+                "the RC3 restore did not put the user's edvr.ini back"
+            assert not Path(rc3_game, "d3d11.dll").exists() and not Path(rc3_game, PROFILE_FILE).exists()
+            assert not Path(rc3_game, "edvr-flat.ini").exists(), "restoring RC3 created edvr-flat.ini"
+            for name, ini_relative in (("rc3-sibling", "edvr-other.ini"),
+                                       ("rc3-nested", os.path.join("Openvr", "win64", "edvr.ini")),
+                                       ("rc3-case", "EDVR.INI")):
+                bad_game, bad_receipt = rc3_flat_install(name, ini_relative)
+                try:
+                    verify_native_receipt(bad_receipt, bad_game)
+                    raise AssertionError("a flat receipt naming %s was accepted" % ini_relative)
+                except ValueError:
+                    pass
+                assert restore_native(bad_receipt) == 1, "restored from a receipt naming " + ini_relative
+                assert Path(bad_game, "d3d11.dll").read_bytes() == b"RC3-FLAT-GRAPHICS", \
+                    "a refused receipt still changed files"
+
+            # The legacy shape is accepted on its PATH only: every other check
+            # still runs on it. A live edvr.ini that is no longer what the
+            # receipt installed, and a backup that is the live file itself, are
+            # refused as they are for any other target.
+            tamper_game, tamper_receipt = rc3_flat_install("rc3-changed", "edvr.ini")
+            Path(tamper_game, "edvr.ini").write_bytes(b"[user]\nedited=after-the-install\n")
+            try:
+                verify_native_receipt(tamper_receipt, tamper_game)
+                raise AssertionError("an RC3 receipt whose edvr.ini changed was accepted")
+            except ValueError:
+                pass
+            alias_game, alias_receipt = rc3_flat_install("rc3-alias", "edvr.ini")
+            alias = json.loads(Path(alias_receipt).read_text(encoding="utf-8"))
+            next(e for e in alias["files"] if e["key"] == "ini")["backup"] = \
+                os.path.abspath(os.path.join(alias_game, "edvr.ini"))
+            Path(alias_receipt).write_text(json.dumps(alias), encoding="utf-8")
+            try:
+                verify_native_receipt(alias_receipt, alias_game)
+                raise AssertionError("an RC3 receipt whose backup is the live edvr.ini was accepted")
+            except ValueError:
+                pass
+
             Path(fgame, "d3d11.dll").write_bytes(b"FOREIGN-GRAPHICS")
             before = snapshot()
             try:
