@@ -37,20 +37,13 @@ this doc changes. Last updated 2026-09-29 for flat sharpening.*
   - `shimmer_rest_still`/`_moving` past the Quest 3's tracker floor:
     left as "the next flight's question" at retirement. The lean own
     shader's price: one flight, `advanced.temporal_aa_diagnostics` live.
-- **Ruled out:**
-  - MSAA from outside a deferred renderer: structurally unreachable.
-  - Conservative rasterisation for the menu-ship seam: flown 2026-09-03,
-    reverted the same day (no effect, new artifacts).
-  - The rest lock (`shimmer_rest`): retired 2026-09-04 (TAA integrates
-    the wander; it never engaged on the Quest 3's tracker). Five TAA
-    levers (2026-09-04 cleanup): the rest snap, HUD depth layers, the
-    assumed HUD distance, `camera` motion, the transposed-reading A/B.
-  - Full per-object motion matrices: declined (per-object-motion.md).
-  - Feature A on the native runtime: not ported (the submit blit
-    minifies an oversize eye with one bilinear tap, d3d11_stereo.cpp).
-  - A failed mid-ladder query hiding the mode that serves a 40% input
-    (the 2026-09-23 hardening's cause): the 15:34 modes line answered
-    all four, and no mode serves between a third and a half.
+- **Ruled out** (each with its reason, verbatim, in `## Status detail`
+  below): MSAA from outside a deferred renderer; conservative
+  rasterisation for the menu-ship seam (flown 2026-09-03, reverted); the
+  rest lock (retired 2026-09-04) and the five TAA levers of the
+  2026-09-04 cleanup; full per-object motion matrices (declined);
+  Feature A on the native runtime (not ported); a failed mid-ladder
+  query hiding the mode that serves a 40% input (2026-09-23 hardening).
 - **Environment:** Native SteamVR is measured; OpenComposite's OpenXR
   leg is unverified. Pimax Crystal Super (~42 px/deg, tracking floor
   0.53 arcmin/frame) vs. Quest 3 (~20-40.6 px/deg, never under 1.9).
@@ -64,6 +57,24 @@ this doc changes. Last updated 2026-09-29 for flat sharpening.*
   "Phase 0" the unmeasured; "Phasing" the build order. Linked:
   performance.md, per-object-motion.md, rest-lock-handoff.md, and the
   two 2026-09-04 reviews (motion vectors; far-warp darkness).
+
+## Status detail (moved out of Status 2026-09-29)
+
+Ruled out, moved verbatim from Status:
+
+- MSAA from outside a deferred renderer: structurally unreachable.
+- Conservative rasterisation for the menu-ship seam: flown 2026-09-03,
+  reverted the same day (no effect, new artifacts).
+- The rest lock (`shimmer_rest`): retired 2026-09-04 (TAA integrates
+  the wander; it never engaged on the Quest 3's tracker). Five TAA
+  levers (2026-09-04 cleanup): the rest snap, HUD depth layers, the
+  assumed HUD distance, `camera` motion, the transposed-reading A/B.
+- Full per-object motion matrices: declined (per-object-motion.md).
+- Feature A on the native runtime: not ported (the submit blit
+  minifies an oversize eye with one bilinear tap, d3d11_stereo.cpp).
+- A failed mid-ladder query hiding the mode that serves a 40% input
+  (the 2026-09-23 hardening's cause): the 15:34 modes line answered
+  all four, and no mode serves between a third and a half.
 
 ## The ask
 

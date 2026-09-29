@@ -2,8 +2,70 @@
 
 ## Status
 
-*Updated 2026-09-15. Historical findings summarize the journal below; the
-current timing and overlay qualification is linked separately.*
+*Updated 2026-09-29 (previously 2026-09-15). Historical findings summarize
+the journal below; the current timing and overlay qualification is linked separately. Dated notes
+and the ruled-out list: "Status detail", straight after this block.*
+
+- **Current code state (2026-09-29; dated notes in Status detail):**
+  - Retired 2026-09-29: the door GPU bracket (`edvrDoorGpuBegin`/`End`, the
+    per-eye query ring, the Monitor's "EDVR's GPU time at the door" tile;
+    e3109af4) and the `edvrMenuPanel` export with `edvrEyeCaptureArm` and
+    `edvrFssTheater` (6ecbd241). Their design text below is history.
+  - Performance page: one `UI quality` row (`fix.ui_quality`, off / 100% /
+    125%) drives the cockpit panels' size and the UI layer; BUILT, NOT FLOWN
+    as of its 2026-09-23 entry. The `HUD quality` row, `advanced.ui_replay`
+    (retired 48ad7689) and the Foveation centre row
+    (`experimental.foveation_centre`) are gone. `fix.settlement_detail` has
+    a row (choices game, auto=Auto, reduced).
+  - Monitor page drops the rows the compositor's frame timing filled
+    instead of showing "--" (frame_flag v34).
+  - Single-line overlay: fits its text, keeps its font size across OpenXR
+    resolutions, shows application GPU/CPU timings. Full desktop gates
+    passed; headset checks: [combined test guide](native-render-benchmark-2026-09-15.md).
+- **State:** Supersedes and extends Feature 4 of performance.md
+  (2026-09-05), which now points here. Written 2026-09-07 on branch
+  `claude/ingame-settings-menu-78317d` off main `5e2d545`; claims are
+  marked MEASURED (desk or field log) or BELIEVED (inference, gated in
+  "Phase 0"). Phase A (the menu) was BUILT and UNFLOWN per the 2026-09-07
+  status note, then FLOWN that evening on a Pimax Crystal Super under
+  SteamVR — panel holds still, keys private, rows write the ini — and
+  has taken fixes through 2026-09-11 (see Detail). The 2026-09-07 claim
+  that every Phase 0 gate was open is not revisited later, though gates
+  get dated measurements below.
+- **Open:**
+  - The four items under "Open questions for Sean" (F8 vs a chord as
+    summon key; `keyboard = private` as default; where `developer`
+    lives; which `[fix]` rows get the `menu` token) — "Settings sketch"
+    already ships F8 and `private`, so those two may be settled without
+    this section saying so.
+  - Whether the 2026-09-10 DirectInput8Create-capture fix (see Ruled
+    out) has itself been confirmed by a flight is not stated.
+  - Phase 0 gates with no dated measurement here: G4 (GDI cost and
+    legibility), G6 (`aim = both` tuning), G11 (focus/Alt-Tab), G14 (the
+    leak audit).
+- **Ruled out:** four entries (shared-DirectInput-vtable door, `menu.aim =
+  both` default, `Compositor_FrameTiming` at the modern offsets, the
+  climbing "with EDVR" drop count): "Ruled out" in Status detail.
+- **Environment:** The DirectInput8Create fix is stated
+  runtime-independent ("applies to both SteamVR and OpenComposite"); the
+  first flight (2026-09-07) was a Pimax Crystal Super under SteamVR;
+  later entries (2026-09-08 on) say "the Steam copy" or "Sean's rig"
+  without restating the headset. The shared-vtable door held on the
+  install tested first but not the Steam copy, where Steam's overlay may
+  hand out private per-device tables.
+- **Detail:** "The keyboard gate" for the three doors and fail-open
+  rules; "Navigation and interaction" for the DirectInput finding, the
+  footer fix, "Your Elite keys (2026-09-11)" and the Tab-follows-page-pair
+  fix; "What it shows" for the Monitor page's `Compositor_FrameTiming`
+  finding; "Phase 0 -- what must be measured before code depends on it"
+  for gates G1-G14; "Open questions for Sean"; "Phasing" for phases A/B/C.
+
+## Status detail (moved out of Status 2026-09-29)
+
+Moved verbatim out of the Status block (dated change notes, then the
+ruled-out list); the summary above points here.
+
+### Dated change notes
 
 - **State: the door GPU bracket retired 2026-09-29 (code removed, e3109af4).**
   `edvrDoorGpuBegin` and `edvrDoorGpuEnd` (nothing called them once the legacy
@@ -30,27 +92,9 @@ current timing and overlay qualification is linked separately.*
   OpenXR resolutions and shows application GPU/CPU elapsed timings. Full
   desktop gates passed; headset checks remain in the
   [combined test guide](native-render-benchmark-2026-09-15.md).
-- **State:** Supersedes and extends Feature 4 of performance.md
-  (2026-09-05), which now points here. Written 2026-09-07 on branch
-  `claude/ingame-settings-menu-78317d` off main `5e2d545`; claims are
-  marked MEASURED (desk or field log) or BELIEVED (inference, gated in
-  "Phase 0"). Phase A (the menu) was BUILT and UNFLOWN per the 2026-09-07
-  status note, then FLOWN that evening on a Pimax Crystal Super under
-  SteamVR — panel holds still, keys private, rows write the ini — and
-  has taken fixes through 2026-09-11 (see Detail). The 2026-09-07 claim
-  that every Phase 0 gate was open is not revisited later, though gates
-  get dated measurements below.
-- **Open:**
-  - The four items under "Open questions for Sean" (F8 vs a chord as
-    summon key; `keyboard = private` as default; where `developer`
-    lives; which `[fix]` rows get the `menu` token) — "Settings sketch"
-    already ships F8 and `private`, so those two may be settled without
-    this section saying so.
-  - Whether the 2026-09-10 DirectInput8Create-capture fix (see Ruled
-    out) has itself been confirmed by a flight is not stated.
-  - Phase 0 gates with no dated measurement here: G4 (GDI cost and
-    legibility), G6 (`aim = both` tuning), G11 (focus/Alt-Tab), G14 (the
-    leak audit).
+
+### Ruled out
+
 - **Ruled out:**
   - The shared-DirectInput-vtable door, on the Steam install: the menu
     reported "keys private" while Tab still reached the ship
@@ -66,19 +110,9 @@ current timing and overlay qualification is linked separately.*
   - The climbing "with EDVR" drop count on the second flight (2026-09-07):
     a ring-buffer bug (record written to the wrong entry), not real
     menu-caused drops.
-- **Environment:** The DirectInput8Create fix is stated
-  runtime-independent ("applies to both SteamVR and OpenComposite"); the
-  first flight (2026-09-07) was a Pimax Crystal Super under SteamVR;
-  later entries (2026-09-08 on) say "the Steam copy" or "Sean's rig"
-  without restating the headset. The shared-vtable door held on the
-  install tested first but not the Steam copy, where Steam's overlay may
-  hand out private per-device tables.
-- **Detail:** "The keyboard gate" for the three doors and fail-open
-  rules; "Navigation and interaction" for the DirectInput finding, the
-  footer fix, "Your Elite keys (2026-09-11)" and the Tab-follows-page-pair
-  fix; "What it shows" for the Monitor page's `Compositor_FrameTiming`
-  finding; "Phase 0 -- what must be measured before code depends on it"
-  for gates G1-G14; "Open questions for Sean"; "Phasing" for phases A/B/C.
+
+### Dated change notes, continued
+
 - **2026-09-23:** `fix.settlement_detail` added to the Performance page's
   row list below, alongside its promotion to a first-class fix (README,
   docs/fixes.md). The `# ui:` annotation that generates its row for the
@@ -111,6 +145,8 @@ current timing and overlay qualification is linked separately.*
   developer tier no longer has the row, and the cockpit HUD stays in the
   picture the upscaler reconstructs.
 
+## The ask
+
 *A design document, written before the code. It supersedes and extends
 Feature 4 of [performance.md](performance.md) (2026-09-05), which stays as
 the origin and now points here. Claims about EDVR cite the source; claims
@@ -120,8 +156,6 @@ a gate below that turns it into a measurement before code may depend on
 it); what can only be settled with a headset on is collected under Phase 0.
 Written 2026-09-07 on branch `claude/ingame-settings-menu-78317d` off main
 `5e2d545`.*
-
-## The ask
 
 Sean, 2026-09-07: an in-game menu that lets players switch settings
 quickly, "similar to what's in OpenXR Toolkit", fleshed out from the

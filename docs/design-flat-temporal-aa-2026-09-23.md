@@ -4,6 +4,73 @@
 
 - **State:** merged to main at `dacb7a56` (2026-09-25, includes main
   `a4cdb045`) after Sean's go-ahead; the caveats below remain the open
+  qualification record. Latest analyzed Epic build is `d0898e1b`. The
+  section-by-section chronology (sections 26-77) is verbatim in Status detail
+  below; the evidence is in sections 1-78.
+- Established or qualified: camera ownership/jitter (26-28); F8 and menu
+  treatment (34-37); cockpit projection and smoother DLSS edges (40-43); PS91
+  motion ownership and rigid BFE shell motion (49-51); on-foot weapon camera
+  and scoped admission (56-57); tone admission, FLOWN at the EDHM main menu
+  (63-64); one-raster-phase local refusal, FLOWN in 69 (streak 3349, DLSS,
+  zero unknown-pair captures); gate 1 contract and reducer (70, 73; 6/6 traces
+  replay byte-identical); gate 2 routing, retirement, negotiation (72, 74;
+  04:58 and 09:55 2026-09-27 flights FLOWN); six review fixes (77, no flight).
+- Open in the journal: section 75's success-status Present fix (13:00 flight
+  storm-free, present-not-ok=0; the deliberate confirming flight is not
+  recorded; the 0.5x canopy flicker is a separate scintillation family,
+  CLOSED live 2026-09-27 evening, section 76 session 3); section 76's gate-2
+  matrix cells still open at its end; section 78 (2026-09-28): nine of ten
+  refusing ship pairs reciped and rig-pinned (census 46), the tenth
+  (vs_C7FA0C0F5DD49180) refused until its blob is captured; the upstream
+  camera hook proposed there is now design-flat-camera-integration.md.
+- **Priority (Sean):** performance over code sharing. Share math/backends where
+  cheap; keep separate frame scheduling/capture paths when that avoids copies,
+  synchronization or additional per-draw work. Defer broad core extraction
+  until flat capture establishes the necessary boundary.
+- **Recommendation:** two installer artifacts, one graphics implementation, one
+  temporal pipeline, separate VR and mono frame adapters. Flat installs enable
+  only temporal AA and its required support services.
+- **Open:** station/on-foot projection coverage and mixed-camera HDR ownership,
+  corona-smear regression and mod effect ordering. Scene/depth identity, camera
+  encoding and handoff have flight evidence; correct motion for every rendered
+  surface and VR regression remain unqualified.
+- **Ruled-out pointer:** the kinematic arc's Status records rejected motion
+  estimates and the nonexistent engine velocity buffer. Reuse engine-record
+  motion; do not revive estimation or the retired deferred UI replay.
+- **Next:** the earlier flight list (sections 57, 68) is verbatim in Status
+  detail and was overtaken by sections 69-77; candidates now are the open
+  items in State above (section-75 confirming flight, section-76 matrix
+  cells, a flight of the section-77 fixes and section-78 recipes).
+  Existing evidence does not justify ignoring the alternate projection.
+  Preserve high-G motion and strict depth ownership; do not repeat qualified
+  PS91/BFE or stale-resize hypotheses. The separate menu hangar-floor P1
+  defect remains open. VR still needs regression tests; the concourse NPC
+  observation on `d9f86b09` belongs to the main/openxr-perf-gaps line.
+- **Test target (Sean):** use the Epic installation for all in-game tests.
+  Odyssey is under `C:\Program Files\Epic Games\EliteDangerous\Products`.
+  Preserve its existing INI; F10 is the flat default when dump_draws is absent.
+- **Compatibility decision:** the prototype accepts an absent profile
+  descriptor as legacy VR so manual installations keep working. An existing
+  invalid descriptor disables fixes, preserving forwarding/chaining. New
+  installers and developer verification require `edvr_profile.ini`.
+- **Environment:** initial qualification is Windows, Elite's D3D11 renderer,
+  mono SDR output. Record game/patch builds, GPU/driver, display/render sizes,
+  window mode, installed mods and backend DLL versions. Headset/runtime are N/A
+  for flat. VR regression records the actual runtime/headset/per-eye size.
+  Other colour spaces and rendering routes require separate qualification.
+
+## Status detail (moved out of Status 2026-09-29)
+
+*Note: the section 75 sentence below ("awaiting the confirming flight") is
+superseded by section 75's own same-day addendum (the 13:00 flight ran
+storm-free; the canopy flicker is the separate scintillation family, CLOSED
+live 2026-09-27 evening); the Status summary above reflects that. The Next
+text repeats a typo ("qualify it then)." twice) kept as originally written.*
+
+### State (as of section 77)
+
+- **State:** merged to main at `dacb7a56` (2026-09-25, includes main
+  `a4cdb045`) after Sean's go-ahead; the caveats below remain the open
   qualification record. Latest analyzed Epic build is `d0898e1b`; section 57
   records the on-foot refusal cascade (the laser-rifle weapon pass's second
   camera vetoed every on-foot frame), its scoped admission, and exact recipes
@@ -89,20 +156,9 @@
   depth-output and multi-row texcoord detection, the stamp over-read,
   after-UI exclusion preservation, negotiation-before-eval ordering, and
   the analyzer's legacy-layout gate.
-- **Priority (Sean):** performance over code sharing. Share math/backends where
-  cheap; keep separate frame scheduling/capture paths when that avoids copies,
-  synchronization or additional per-draw work. Defer broad core extraction
-  until flat capture establishes the necessary boundary.
-- **Recommendation:** two installer artifacts, one graphics implementation, one
-  temporal pipeline, separate VR and mono frame adapters. Flat installs enable
-  only temporal AA and its required support services.
-- **Open:** station/on-foot projection coverage and mixed-camera HDR ownership,
-  corona-smear regression and mod effect ordering. Scene/depth identity, camera
-  encoding and handoff have flight evidence; correct motion for every rendered
-  surface and VR regression remain unqualified.
-- **Ruled-out pointer:** the kinematic arc's Status records rejected motion
-  estimates and the nonexistent engine velocity buffer. Reuse engine-record
-  motion; do not revive estimation or the retired deferred UI replay.
+
+### Next (as of section 68/69)
+
 - **Next:** fly the Epic install on foot in the hangar and concourse. The
   section-57 admission should end the hdr-camera-changed refusal cascade;
   confirm treated streaks resume on foot, watch the weapon itself for local
@@ -118,23 +174,6 @@
   (a storm that survives the slot fix is a genuine alias; qualify it then).
   qualify it then). The section-57 on-foot hangar/concourse flight stands
   behind it.
-  Existing evidence does not justify ignoring the alternate projection.
-  Preserve high-G motion and strict depth ownership; do not repeat qualified
-  PS91/BFE or stale-resize hypotheses. The separate menu hangar-floor P1
-  defect remains open. VR still needs regression tests; the concourse NPC
-  observation on `d9f86b09` belongs to the main/openxr-perf-gaps line.
-- **Test target (Sean):** use the Epic installation for all in-game tests.
-  Odyssey is under `C:\Program Files\Epic Games\EliteDangerous\Products`.
-  Preserve its existing INI; F10 is the flat default when dump_draws is absent.
-- **Compatibility decision:** the prototype accepts an absent profile
-  descriptor as legacy VR so manual installations keep working. An existing
-  invalid descriptor disables fixes, preserving forwarding/chaining. New
-  installers and developer verification require `edvr_profile.ini`.
-- **Environment:** initial qualification is Windows, Elite's D3D11 renderer,
-  mono SDR output. Record game/patch builds, GPU/driver, display/render sizes,
-  window mode, installed mods and backend DLL versions. Headset/runtime are N/A
-  for flat. VR regression records the actual runtime/headset/per-eye size.
-  Other colour spaces and rendering routes require separate qualification.
 
 ## 1. Product and packaging
 
