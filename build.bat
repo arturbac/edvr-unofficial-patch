@@ -237,6 +237,7 @@ set CFLAGS=/nologo /c /O2 /MT /std:c++17 /EHs /W4 /GR- %EDVR_CPU_COMPILE% ^
 echo.
 REM The runtime config audit data: known keys + the moved-from map,
 REM generated from the same sources the late contract check verifies.
+python "tools\check_config_contract.py" --self-test || exit /b 1
 python "tools\check_config_contract.py" --quiet --emit "%GEN%\config_contract_gen.h"
 if errorlevel 1 ( echo [edvr] ERROR: contract header generation failed & exit /b 1 )
 
@@ -249,6 +250,7 @@ REM unchanged shader costs nothing instead of the AA variant's 19 s of fxc on
 REM every build (measured 2026-09-15). The generator tests never initialize a GPU.
 REM AMD FSR 1.0 as embeddable HLSL. Generated rather than committed so the
 REM vendored headers stay byte-identical to upstream (src\d3d11\fsr\).
+python "tools\gen_fsr_hlsl.py" --self-test || exit /b 1
 python "tools\gen_fsr_hlsl.py" --root "%ROOT%" --out "%GEN%"
 if errorlevel 1 ( echo [edvr] ERROR: FSR shader embedding failed & exit /b 1 )
 
@@ -291,6 +293,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
+python "tools\gen_exports.py" --self-test || exit /b 1
 python "tools\gen_exports.py" --source "%SystemRoot%\System32\d3d11.dll" ^
     --tag d3d11 --out "%GEN%" ^
     --wrap D3D11CreateDevice --wrap D3D11CreateDeviceAndSwapChain ^
@@ -355,6 +358,7 @@ REM Without any SDK the build still succeeds, since the code compiles
 REM either way, but says so loudly: that build has no DLAA and its
 REM installer carries no runtime, which is not a release (package.bat
 REM refuses it unless told --no-dlss).
+python "tools\fetch_ngx.py" --self-test || exit /b 1
 set NGX=
 if defined EDVR_NGX_SDK set NGX=%EDVR_NGX_SDK%
 if not defined NGX if exist "%ROOT%\third_party\ngx\include\nvsdk_ngx.h" set NGX=%ROOT%\third_party\ngx
@@ -2029,10 +2033,12 @@ REM there and a missing key falls back to its default. Only run when python is
 REM available; a missing interpreter must not stop a build.
 echo.
 echo [edvr] === install-read check ===
+python "tools\check_install_reads.py" --self-test || exit /b 1
 python "tools\check_install_reads.py"
 if errorlevel 1 ( echo [edvr] ERROR: a config reader runs only on the reload path & exit /b 1 )
 
 echo [edvr] === exit-path check ===
+python "tools\check_exit_paths.py" --self-test || exit /b 1
 python "tools\check_exit_paths.py"
 if errorlevel 1 ( echo [edvr] ERROR: cleanup that matters runs only on FreeLibrary & exit /b 1 )
 
@@ -2146,6 +2152,19 @@ python "tools\reflow_notes.py" --self-test || (
     echo [edvr] ERROR: the reflow tool failed its own test
     exit /b 1
 )
+
+echo [edvr] === desk script self-tests ===
+REM The scripts run by hand on what a session leaves behind (a shader family's
+REM HLSL, a DXBC dump, the eye run's crops, the FSS dumps). Each has a fixture
+REM test now; they need no build products, only numpy and Pillow, which the
+REM eye-snapshot readers above already need.
+python "tools\compile_variants.py" --self-test || exit /b 1
+python "tools\dxbc_disasm.py" --self-test || exit /b 1
+python "tools\eye_bmp_to_png.py" --self-test || exit /b 1
+python "tools\diff_eye_dump.py" --self-test || exit /b 1
+python "tools\eye_run_fit.py" --self-test || exit /b 1
+python "tools\eye_run_shimmer.py" --self-test || exit /b 1
+python "tools\eye_run_spin.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_kinematic_json_test
