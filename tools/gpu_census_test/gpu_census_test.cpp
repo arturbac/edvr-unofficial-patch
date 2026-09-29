@@ -760,6 +760,8 @@ void alteredFixCases() {
     }
     check(g_lastLog.find("timer floor 100.0 us/pair") != std::string::npos && g_lastLog.find("spans timed 5,") != std::string::npos,
           "fix line: the empty pairs kept by the first fix count in the census's timer floor and spans");
+    check(g_lastLog.find("EDVR ~0.000 ms/frame") != std::string::npos && g_lastLog.find("sun glare") == std::string::npos,
+          "fix line: the fixes' draws are the game's, timed whole: not in EDVR's total and not on the main line");
     check(glare2.occurrences == 0 && owner2.occurrences == 0, "fix line: the window resets the fix sections' occurrences");
 
     // Nothing ran: every fix '-', and the sum item on the classes' line reads '-' too.
