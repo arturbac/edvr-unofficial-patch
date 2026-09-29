@@ -1,5 +1,6 @@
 #include "gpu_census.h"
 #include "gpu_interval.h"
+#include "gpu_frame_gap.h"
 #include "gpu_frame_timing.h"
 #include "../common/log.h"
 #include <windows.h>
@@ -93,6 +94,22 @@ uint64_t g_p50Cursor = 0;
 constexpr unsigned kP50Capacity = 8192;
 double g_p50Samples[kP50Capacity];
 unsigned g_p50Count = 0;
+
+// The gap between consecutive frames of the game device's GPU work, from the
+// same completions (gpu_frame_gap.h says what it is and is not: an upper bound
+// on idle, with the compositor's share inside it). Fed with the Application-
+// render spans' own first and last GPU ticks, so it follows the census's clock
+// rules: validated spans only, one frequency, no overlap, no stall.
+GpuFrameGap g_gap;
+
+// One completion, as gpuCensusFrame reads it from the ring: a valid
+// Application-render span feeds both this window's render-time median and the
+// frame gap. Separate from the ring read so the rig can hand it fake spans.
+void noteApplicationCompletion(const GpuSpanResult& r) {
+    if (r.reason != GpuSpanReason::Valid || r.source != GpuSpanSource::ApplicationRender) return;
+    if (g_p50Count < kP50Capacity) g_p50Samples[g_p50Count++] = r.outerMs;
+    g_gap.feed(r.sequence, r.firstTick, r.lastTick, r.frequency);
+}
 
 struct Snapshot {
     bool occurred = false;
@@ -220,13 +237,23 @@ void logAndResetWindow(uint64_t now) {
         std::snprintf(rBuf, sizeof(rBuf), "-");
     }
 
+    // The gap between consecutive frames of the game device's GPU work
+    // (gpu_frame_gap.h): its p50/p95 and pair count ride on this line; the line
+    // after it says what the figure is and is not (the compositor's share is in it).
+    const GpuFrameGap::Report gap = g_gap.finishWindow();
+    char gapBrief[96];
+    formatGapBrief(gapBrief, sizeof(gapBrief), gap);
+
     Log::get().note(
         "EDVR GPU census: %.0f s, %llu frames; EDVR ~%.3f ms/frame = door %.3f "
-        "(%s) + in-frame %.3f (%s); application render p50 %s; "
+        "(%s) + in-frame %.3f (%s); application render p50 %s; %s; "
         "timer floor %s; spans timed %llu, failed %llu.",
         seconds, static_cast<unsigned long long>(frames), doorTotal + frameTotal, doorTotal,
-        doorItems.c_str(), frameTotal, frameItems.c_str(), rBuf, floorBuf,
+        doorItems.c_str(), frameTotal, frameItems.c_str(), rBuf, gapBrief, floorBuf,
         static_cast<unsigned long long>(spansTimed), static_cast<unsigned long long>(spansSkipped));
+    char gapDetail[900];
+    formatGapDetail(gapDetail, sizeof(gapDetail), gap);
+    Log::get().note("%s", gapDetail);
 
     for (auto& st : g_section) {
         st.baseMs = st.sampler.totals.ms;
@@ -301,9 +328,8 @@ void gpuCensusFrame(ID3D11DeviceContext* ctx) noexcept {
     const unsigned n = gpuFrameReadCompletions(g_p50Cursor, completions, 32, dropped);
     for (unsigned i = 0; i < n; ++i) {
         const GpuFrameSnapshot& c = completions[i];
-        if (!c.haveResult || c.result.reason != GpuSpanReason::Valid ||
-            c.result.source != GpuSpanSource::ApplicationRender) continue;
-        if (g_p50Count < kP50Capacity) g_p50Samples[g_p50Count++] = c.result.outerMs;
+        if (!c.haveResult) continue;
+        noteApplicationCompletion(c.result);
     }
 
     if (now - g_windowStartMs < 30000) return;
