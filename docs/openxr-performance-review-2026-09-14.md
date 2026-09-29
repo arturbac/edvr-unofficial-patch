@@ -11,15 +11,15 @@ changes.*
   Application-render GPU timing; with the timing retired before Submit
   returns it FLEW CLEAN (flight 124504, Pimax OpenXR: invalid 5, Elite's
   second-Submit park p50 0.16-0.18 ms) and now DEFAULTS ON.
-- **Long cycles, 2026-09-29 (entries below):** phase 0 ruled out the
-  periodic jobs (2 of 54 long cycles coincide). The split flew the same day
-  (flight 090608, SteamVR OpenXR, 4032x3896, 90 Hz): `present_split=ok` on
-  all 70 long cycles, EDVR's Present hook 7.4 ms across all 70 (ruled out).
-  The time is Elite's `pre_present` and `post_present` windows, which still
-  hold EDVR's draw hooks: those are sampled one frame in 16 and no long frame
-  was sampled. At the fleet carrier both halves sit at the budget: Elite's
-  thread 11.6-12.4 ms a cycle outside the wait (4.4-5.3 ms of it after its
-  Present), the GPU 11.3-12.2 ms (EDVR 5.2-5.35 ms of it).
+- **Long cycles and the carrier, 2026-09-29 (entries below):** phase 0 ruled
+  out the periodic jobs; flight 090608 ruled out EDVR's Present hook (7.4 ms
+  across 70 long cycles); 094331 had 138-160 ms stalls with anti-aliasing
+  off, so the stalls are Elite's. At the carrier with DLSS both halves sit
+  at the budget (Elite's thread 11.6-12.4 ms outside the wait, the GPU
+  11.3-12.2 ms); with AA off both drop to about 5 ms. Part of the AA path's
+  cost is not itemised: about 1.7 ms of GPU inside Elite's own draws (the
+  TAA leg), and engine motion's CPU (1,800-2,900 hook calls a frame at the
+  carrier) has no timer.
 - **Comparing with 0.16.2 in fpsVR:** under OpenVR its CPU frame time is
   poses ready to second submit (0.16.2's `appCpuMs`); on the native runtime
   it tracks Elite's whole frame outside the wait. Compare pre-submit windows.
@@ -38,16 +38,15 @@ changes.*
   producer copy measured 0.039 ms p50 per eye at 4100x3962, under the
   0.1 ms bar.
 - **Ruled out:** at the end of each 2026-09-24 entry, and in the 2026-09-29
-  ones (the periodic jobs; EDVR's Present hook).
-- **Next** (flight 090608 entry): one instrument build, then a normal
-  carrier flight: the GPU's idle time between frames says which side limits
-  the frame (HMD Quality is already 0.5, so no lower-resolution test), and
-  an exact per-frame figure for EDVR's draw and Create* hooks says whose the
-  stalls are; then the UI passes cut to the UI's footprint (review P3) and
-  the lean per-draw thunk (A-1); the output size is a setting. Also any
-  flight on a Quest runtime with the default build: check the
-  Application-render GPU invalid count stays near zero and
-  `native_frame_end_overlap_summary` reads failures=0.
+  ones (the periodic jobs; EDVR's Present hook; EDVR's AA work as the
+  stalls' cause).
+- **Next** (094331 entry): one instrument build, then a DLSS flight at the
+  carrier with many ships: engine motion's CPU per frame, the GPU's idle
+  time between frames, and census sections for the Elite draws EDVR alters;
+  the fix follows the figures (the join's per-call cost, the UI passes,
+  review P3, or the output size). Also any flight on a Quest runtime with
+  the default build: check the Application-render GPU invalid count stays
+  near zero and `native_frame_end_overlap_summary` reads failures=0.
 - **Environment:** the numbers in the entry are Pimax Crystal Super, 90 Hz,
   separate device: Pimax OpenXR at 2600x2514, SteamVR OpenXR (`aapvr`) at
   4100x4050 and 2665x2087.
@@ -1059,3 +1058,60 @@ about 10.8 ms CPU and GPU with frequent spikes over 11.1; the same scene on
    the 0.9-1.45 ms of draw hooks.
 4. Settings: the output size. 4032x3896 per eye drives the upscaler, those
    passes and, through performance mode's half per axis, the game's render.
+
+## 2026-09-29: flights 094126 and 094331, anti-aliasing off at the carrier
+
+Same build (v0.18.0-rc.3-108-gc1408551) and install, HMD Image Quality 0.5,
+with `fix.temporal_aa` switched live from the menu. 094126: DLSS, then TAA
+at 09:41:57 (Elite's render grew to 4032x3896), off at 09:42:31, DLSS again
+at 09:43:08. 094331: DLSS, then off at 09:44:16 (the render stayed
+2016x1948) to the end at 09:45:44; its busy stretch is the last half
+minute. Sean, reading fpsVR with AA off in a similar carrier scene: GPU 2.4
+ms, CPU 4-5 ms. The mip bias (-1, `advanced.texture_lod_bias = auto`) is
+set at launch from the launch mode, so every leg had the same one.
+
+- **With AA off the carrier has headroom on both sides.** 094331's busy
+  stretch: pre-submit (benchmark CPU) 3.2-3.5 ms p50, application render
+  5.1-6.0 ms p50 (benchmark, 09:45:26-09:45:40); its last full window
+  (09:44:51-09:45:21) read 88.4 fps with 5.6 ms of slack in the wait.
+  fpsVR's 4-5 ms CPU again matches Elite's frame outside the wait; its 2.4
+  ms GPU is below EDVR's own 5-6 ms, and what fpsVR times on the native
+  runtime is not established.
+- **The census misses part of the AA cost.** 094126's TAA leg against its
+  off leg, adjacent minutes at the same 4032x3896 render: application render
+  10.95-11.12 against 7.13-7.47 ms (benchmark), about 3.7 ms, of which the
+  census itemised 1.96 (TAA window, 09:42:27). About 1.7 ms landed inside
+  Elite's own draws, where the census counts it as the game's. Candidates:
+  the pool-family draws that record EDVR's slot and depth, and Elite's UI
+  draws that EDVR takes into its output-size UI layer.
+- **Engine motion's CPU is untimed, and the carrier is its worst case.** The
+  emit hook (FUN_144312E00) ran 1,801-2,930 calls a frame, with 431-1,152
+  records joined a frame, at the carrier in flight 090608
+  (09:08:08-09:10:08), against 127 and 105 in 094126's TAA leg; with AA off
+  it does not run. No timer covers it or the copy observers: the draw-hook
+  figure is EDVR's time in Direct3D draw calls, and these relays run inside
+  Elite's own code. At 1-1.5 us a call they would be 2-4 ms of Elite's
+  thread at the carrier.
+- So the carrier's DLSS frame is either GPU-bound (EDVR's GPU work past the
+  budget, Elite's thread waiting inside its own calls) or bound by EDVR's
+  untimed CPU work (the GPU waiting on the thread). Switching AA off removes
+  both at once, and engine motion has no switch of its own (it arms with
+  the mode, `temporal_pass.cpp`).
+- ruled out: EDVR's anti-aliasing work as the cause of the long stalls,
+  because 094331 logged 160 and 138 ms stalls (09:44:56, 09:45:40) with
+  `fix.temporal_aa` off, while EDVR's draw hooks read 0.02-0.36 ms a sampled
+  frame; the stalls are Elite's. The 441 and 191 ms at 09:44:16-20 and the
+  1.2 s at 09:42:07 are the mode switches.
+
+**Next.** One instrument build, then one DLSS flight at the carrier with
+many ships about:
+1. Engine motion's CPU per frame: the emit relay, the copy observers
+   (clear, merge, copier) and the pool-family draw recording, timed on the
+   thread that runs them and summed per frame, in a 30 s line and the LONG
+   FRAME line's EDVR share.
+2. The GPU's idle time between frames, in the census: near zero means the
+   GPU is the limit; a gap means the thread is.
+3. Census sections for the Elite draws EDVR alters: the pool-family draws
+   with EDVR's slot bound, and Elite's UI draws in the UI layer.
+Then the fix follows the figures: the join's per-call cost, the UI passes
+(review P3), or the output size.
