@@ -26,17 +26,12 @@ changes.*
 - **Comparing with 0.16.2 in fpsVR:** under OpenVR its CPU frame time is
   poses ready to second submit (0.16.2's `appCpuMs`); on the native runtime
   it tracks Elite's whole frame outside the wait. Compare pre-submit windows.
-- **Open:** issue #38's rc.1 report, 90-99% GPU against 0.16.2's 60-62%. The
-  EDVR GPU census (2026-09-25 entry) is built to split EDVR's cost from the
-  game's; its first flight caught the census itself overcounting engine
-  velocity and screen motion (2026-09-25 entry below), fixed the same day
-  but not yet flown. Separately, the overlap is flown on Pimax
-  OpenXR and SteamVR OpenXR; the Quest runtimes are unflown with it. The depth layer is set aside
-  (Sean, 2026-09-24). No controlled comparison with the old OpenVR path
-  exists; one now needs a v0.16.2 build. A second report (jntracks,
-  2026-09-25 entry) has 0.6.0 in the 90s and 0.18 in the 80s with
-  temporal AA off, at the same 2604x2644 per eye; the runtime path is
-  the only structural difference, and it is unmeasured.
+- **Open:** issue #38 (rc.1 at 90-99% GPU against 0.16.2's 60-62%) and a
+  second report (jntracks: 0.6.0 in the 90s, 0.18 in the 80s with temporal
+  AA off, same 2604x2644 per eye; the runtime path unmeasured). The census,
+  its overcount fixed 2026-09-25, has since flown (the 09-29 entries). The
+  overlap is unflown on the Quest runtimes; the depth layer is set aside
+  (Sean, 2026-09-24); a controlled OpenVR comparison needs a v0.16.2 build.
 - **Closed:** sections 5 and 6 below (the private and producer copies): the
   producer copy measured 0.039 ms p50 per eye at 4100x3962, under the
   0.1 ms bar.
