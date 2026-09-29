@@ -1,7 +1,8 @@
 // Describing a draw's bound D3D11 state as log text, shared by the modules
 // that report on the game's draws: fix.ui_quality's layer (ui_layer.cpp,
-// whose refusal lines name the state that decided them) and the HUD layer
-// census (hud_layer_census.cpp, whose first-state lines do the same).
+// whose refusal lines name the state that decided them) and holo_families.h;
+// the HUD layer census (removed 2026-09-29) was a third, whose first-state
+// lines did the same.
 //
 // These five lived file-local in ui_layer.cpp until the census needed the
 // exact vocabulary the layer's lines already spoke -- a second spelling of

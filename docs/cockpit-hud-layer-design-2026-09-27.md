@@ -2,6 +2,12 @@
 
 ## Status
 
+- **State: the census retired 2026-09-29 (code removed, 7027e549).**
+  `advanced.hud_census` and hud_layer_census.cpp are deleted; Sean chose
+  deletion over a compile-out switch, so there is no diagnostics build flag.
+  Phase 0 below and the flights that ran it (the last, 0229c358) are history.
+  The code is at `7027e549^`.
+
 - **State:** combined Frontier branch `codex/dlss-performance-review` stays
   separate from main. Selector unwind `967f0519` is installed and verified.
   Prior `c668f83f` performance flight is verified; Sean reports "Much better."

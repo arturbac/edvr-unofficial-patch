@@ -6,6 +6,15 @@
 file's own log) and its header redirect notices. It restates the journal
 below and is not new evidence; update it whenever this doc changes.*
 
+- **State: Feature 2 (variable-rate shading) retired 2026-09-29 (code removed,
+  184eee7f).** foveation.cpp, `experimental.foveation` and the seven
+  `advanced.foveation_*` keys are gone. The Feature 2 and Feature 3 text below
+  (rings, distance, passes, outer rate) is history. DLSS where you look
+  (Feature 6, `temporal_aa_fovea_*`) stays.
+- **State: the desk probes retired 2026-09-29 (code removed, 72247cdf).**
+  `dlaaMotionProbe`, `dlaaCropProbe` and `edvrDlaaCostProbe`, which the smoke
+  harness ran and the Feature 6 entries below cite, are deleted with
+  tools/smoke's trained-pass block. The fovea geometry they exercised stays.
 - **2026-09-23:** feature 3's eye-tracked centre is gone from
   foveation.cpp (frame_flag v34): its gaze came from the legacy openvr
   half, and nothing has published one since that proxy was deleted, so the

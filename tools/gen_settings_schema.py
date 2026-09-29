@@ -1210,8 +1210,8 @@ def self_test():
     expect_not_in(name, wrote, 'MenuKind::Number')
 
     # `# retired-default: X` is the installer merge's annotation, not prose.
-    # Both shapes the tree has: a block that ends in one (camera_index_track),
-    # and a key whose block is ONLY the line (fps_overlay_pitch), which must
+    # Both shapes the tree has had: a block that ends in one (camera_index_track,
+    # removed 2026-09-29), and a key whose block is ONLY the line (fps_overlay_pitch), which must
     # inherit the shared block above the previous key rather than show the
     # annotation as its hint and its detail.
     name = 'retired-default-not-prose'

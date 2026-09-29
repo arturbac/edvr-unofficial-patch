@@ -28,7 +28,6 @@
 #include "binding_shadow.h"
 #include "depth_probe.h"   // depthProbeDrawsAtSize: the world-screen gate's own count
 #include "device_hook.h"   // deviceHookHmdQuality, for the configure line
-#include "foveation.h"     // whether a shading-rate image is bound for the eye
 #include "gpu_timing.h"
 #include "gpu_census.h"    // issue #38: the per-feature GPU cost census
 #include "graphics_runtime.h"
@@ -2556,9 +2555,6 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     f.crispHdr = detail::g_uiLayerCrispOn && f.eyeTarget && !f.ldrView &&
                  (family == UiLayerFamily::kHolo || family == UiLayerFamily::kFlightHud ||
                   family == UiLayerFamily::kSprite || family == UiLayerFamily::kHoloGeneric);
-    // A shading-rate image bound for the eye (or possibly bound) would shade
-    // the layer -- a different size -- through the eye's tiles.
-    f.vrs = detail::g_foveationBound != nullptr || detail::g_foveationBoundUnknown;
     uint64_t seq = 0;
     float jx = 0.0f, jy = 0.0f;
     uint32_t sw = 0, sh = 0;

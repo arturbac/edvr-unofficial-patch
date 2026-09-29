@@ -305,16 +305,11 @@ python "tools\gen_exports.py" --source "%SystemRoot%\System32\d3d11.dll" ^
     --extra-export edvrAcquireNativeGraphics ^
     --extra-export edvr_selftest_graphics_bridge ^
     --extra-export edvrFssHealLeft ^
-    --extra-export edvrFssTheater ^
     --extra-export edvrTemporalAa ^
     --extra-export edvrEyeCaptureUntreated ^
-    --extra-export edvrEyeCaptureArm ^
     --extra-export edvrTemporalAaNoteHead ^
     --extra-export edvrSharpen ^
     --extra-export edvrDepthProbeSelftest ^
-    --extra-export edvrDlaaAvailable ^
-    --extra-export edvrDlaaCounts ^
-    --extra-export edvrMenuPanel ^
     --extra-export edvrAcquireNativeMenu ^
     --extra-export edvrAcquireNativeTemporal ^
     --extra-export edvrAcquireNativeSharpen ^
@@ -322,8 +317,6 @@ python "tools\gen_exports.py" --source "%SystemRoot%\System32\d3d11.dll" ^
     --extra-export edvrAcquireNativeFss ^
     --extra-export edvrAcquireNativeTiming ^
     --extra-export edvrReadNativePresentTrace ^
-    --extra-export edvrDoorGpuBegin ^
-    --extra-export edvrDoorGpuEnd ^
     --extra-export "edvrNativeStartupRouting DATA" ^
     --extra-export edvrQueryOculusRouting ^
     --extra-export edvrQueryNativeRenderSettings ^
@@ -507,12 +500,12 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\graphics_bridge.cpp" ^
     "src\d3d11\render_boundary.cpp" ^
     "src\d3d11\exposure_fix.cpp" "src\d3d11\vscreen.cpp" ^
-    "src\d3d11\glitch_frame.cpp" "src\d3d11\transition_flash_prevent.cpp" ^
+    "src\d3d11\glitch_frame.cpp" ^
     "src\d3d11\pose_reader_watch.cpp" "src\d3d11\transition_flash_eye_base.cpp" ^
     "src\d3d11\vscreen_res.cpp" "src\common\vscreen_auto_state.cpp" ^
     "src\d3d11\binding_shadow.cpp" "src\d3d11\head_offset_gate.cpp" ^
     "src\d3d11\vr_runtime.cpp" ^
-    "src\d3d11\camera_view.cpp" "src\d3d11\journal_watch.cpp" ^
+    "src\d3d11\journal_watch.cpp" ^
     "src\d3d11\elite_binds.cpp" "src\d3d11\draw_census.cpp" ^
     "src\d3d11\object_probe.cpp" ^
     "src\d3d11\pixel_probe.cpp" ^
@@ -522,19 +515,14 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\static_prop_gate.cpp" "src\d3d11\cull_gate_probe.cpp" ^
     "src\d3d11\lod_governor.cpp" ^
     "src\d3d11\engine_velocity.cpp" ^
-    "src\d3d11\fss_res.cpp" "src\d3d11\fss_scan.cpp" ^
-    "src\d3d11\fss_panel.cpp" "src\d3d11\fss_probe.cpp" ^
-    "src\d3d11\fss_reveal.cpp" "src\d3d11\fss_ring.cpp" ^
+    "src\d3d11\fss_res.cpp" ^
+    "src\d3d11\fss_panel.cpp" ^
+    "src\d3d11\fss_reveal.cpp" ^
     "src\d3d11\fss_dump.cpp" "src\d3d11\fss_heal.cpp" ^
-    "src\d3d11\eye_split.cpp" ^
-    "src\d3d11\resolve_probe.cpp" ^
-    "src\d3d11\stencil_probe.cpp" ^
     "src\d3d11\resolve_bind_fix.cpp" ^
-    "src\d3d11\fss_theater.cpp" ^
     "src\d3d11\xinput_watch.cpp" ^
     "src\d3d11\fss_panel_rect.cpp" ^
     "src\d3d11\panel_curve.cpp" "src\d3d11\screen_motion.cpp" "src\d3d11\weapon_motion.cpp" ^
-    "src\d3d11\shader_sig.cpp" ^
     "src\d3d11\remlok_fix.cpp" "src\d3d11\holo_fix.cpp" ^
     "src\d3d11\target_sharp.cpp" "src\d3d11\night_vision.cpp" ^
     "src\d3d11\hud_sprite.cpp" ^
@@ -542,7 +530,6 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\wake_pulse.cpp" ^
     "src\d3d11\hud_grain.cpp" ^
     "src\d3d11\ui_depth.cpp" ^
-    "src\d3d11\hud_layer_census.cpp" ^
     "src\d3d11\ui_layer.cpp" "src\d3d11\ui_surfaces.cpp" "src\d3d11\ui_panel_scale.cpp" ^
     "third_party\dxbc_hash\DxilHash.cpp" ^
     "src\d3d11\backdrop_fix.cpp" ^
@@ -558,8 +545,6 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\luma_probe.cpp" ^
     "src\d3d11\dlaa.cpp" ^
     "src\d3d11\fsr3_engine.cpp" ^
-    "src\d3d11\foveation.cpp" ^
-    "src\d3d11\eye_mask.cpp" ^
     "src\d3d11\sharpen_pass.cpp" ^
     "src\d3d11\loader_panel.cpp" ^
     "src\d3d11\splash_dim.cpp" ^
@@ -1147,7 +1132,7 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     "src\d3d11\head_offset_gate.cpp" "src\d3d11\vr_runtime.cpp" ^
     "src\common\config.cpp" ^
     "src\common\log.cpp" "src\common\frame_flag.cpp" ^
-    "src\d3d11\camera_view.cpp" "src\common\guard.cpp" ^
+    "src\common\guard.cpp" ^
     "src\common\proxy.cpp" "src\d3d11\journal_watch.cpp" ^
     /link /INCREMENTAL:NO kernel32.lib user32.lib version.lib
 if errorlevel 1 ( echo [edvr] ERROR: gate_test build failed & exit /b 1 )
@@ -2105,18 +2090,6 @@ REM match LedgerDraw in src\d3d11\object_probe.cpp byte for byte -- a field
 REM one off reads as a plausible table of draws. It fails HERE.
 python "%ROOT%\tools\eye_run_ledger.py" --self-test || (
     echo [edvr] ERROR: the eye-run ledger tool failed its own test
-    exit /b 1
-)
-
-echo [edvr] === eye-split diff self-test ===
-REM The tool that compares the two eyes of one frame. It registers the
-REM eyes before it compares them, because their projections are off-centre
-REM by different amounts and far content does not land on the same pixel in
-REM both. A sign flip in that step reads as plausible either way, and once
-REM cost a fix built on tiles that had landed on the Milky Way band. It
-REM fails HERE, not in the next report somebody trusts.
-python "tools\diff_eye_split.py" --self-test || (
-    echo [edvr] ERROR: the eye-split diff tool failed its own test
     exit /b 1
 )
 

@@ -50,8 +50,8 @@ void vScreenExecuteCommandListRaw(ID3D11DeviceContext*,ID3D11CommandList*,int re
 //
 // It lives HERE because the count is this module's -- it is incremented in
 // beginPanelOverride and handed out at the frame boundary -- and because the
-// alternative is a fourth copy of one measurement. camera_view kept its own
-// (kMenuEyeDraws) and its comment already said what that costs: "a third
+// alternative is a fourth copy of one measurement. camera_view (since removed)
+// kept its own (kMenuEyeDraws) and its comment already said what that costs: "a third
 // number for it would be a third thing to re-measure". glitch_frame's
 // minEyeDraws is deliberately still its own, being a per-fix tunable rather
 // than this fact.
@@ -77,7 +77,7 @@ constexpr uint32_t kSceneEyeDraws = 100;
 // times into one target in one frame.
 //
 // Integer arithmetic on purpose: this is asserted from a test that links
-// nothing, the same reason camera_view's grouping lives in a header.
+// nothing, the same reason camera_view's (since removed) grouping lived in a header.
 inline bool eyeShapedAtScale(uint32_t w, uint32_t h, uint32_t eyeW, uint32_t eyeH) {
     if (!w || !h || !eyeW || !eyeH) return false;
     // Aspect, cross-multiplied rather than divided: within about 1%, which
@@ -117,18 +117,15 @@ void vScreenSetRenderTargetsRaw(ID3D11DeviceContext* ctx, uint32_t n,
                                 ID3D11RenderTargetView* const* rtvs,
                                 ID3D11DepthStencilView* dsv);
 
-// The same bypass for Draw, the VS/PS stage, a VS constant buffer slot and
-// UpdateSubresource -- everything fix.eye_mask's ring needs past the hook,
-// so the draw census, the eye-draw gate, foveation and the temporal pass
-// never see it. Every one null-safe before the hooks are installed (no-op),
-// same as vScreenSetRenderTargetsRaw above.
+// The same bypass for Draw, the VS/PS stage and UpdateSubresource, so the
+// draw census, the eye-draw gate and the temporal pass never see them (the
+// UI-depth passes draw through these). Every one null-safe before the hooks
+// are installed (no-op), same as vScreenSetRenderTargetsRaw above.
 void vScreenDrawRaw(ID3D11DeviceContext* ctx, uint32_t vertexCount, uint32_t startVertex);
 void vScreenVSSetShaderRaw(ID3D11DeviceContext* ctx, ID3D11VertexShader* vs,
                            ID3D11ClassInstance* const* classInstances, uint32_t numClassInstances);
 void vScreenPSSetShaderRaw(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps,
                            ID3D11ClassInstance* const* classInstances, uint32_t numClassInstances);
-void vScreenVSSetConstantBuffersRaw(ID3D11DeviceContext* ctx, uint32_t startSlot,
-                                    uint32_t numBuffers, ID3D11Buffer* const* buffers);
 // The blend state, past the binding shadow's hook: engine-record velocity's
 // derived state for a substituted pool draw, and the game's put back.
 void vScreenOMSetBlendStateRaw(ID3D11DeviceContext* ctx, ID3D11BlendState* state,

@@ -6,6 +6,14 @@ static chain: see "Flight 184826".*
 
 ## Status
 
+- **State: the module retired 2026-09-29 (code removed, 68bddaaa).**
+  transition_flash_prevent.cpp and `advanced.transition_flash_prevent` (off,
+  watch, on, alternate) are deleted: flight 184826 refuted the engine chain
+  they hooked, and the key defaulted off. The entries below describe the module
+  as it was; the code is at `68bddaaa^`. `transition_flash_prevent_core.h`
+  stays because `transition_flash_eye_base_core.h` reuses its Mode, Treatment,
+  pose classifier and guard table.
+
 - **The view write was corrupting: column-major groups, and the finder was
   hitting prev-view (flight 160557).** The buffer's view groups store their
   translation in the w lanes (flat [3],[7],[11]); viewOriginMatch read

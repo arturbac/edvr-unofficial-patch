@@ -5,7 +5,6 @@
 #include "gpu_census.h"       // issue #38: the per-feature GPU cost census
 #include "../common/d3d11_gpu_command_slots.h"
 #include "head_offset_gate.h"
-#include "camera_view.h"
 #include "vr_runtime.h"
 
 #include <windows.h>
@@ -40,21 +39,12 @@
 #include "pixel_probe.h"      // advanced.pixel_probe: who drew this pixel, during an eye dump
 #include "lod_governor.h"     // fix.settlement_detail: the settlement LOD governor
 #include "fss_panel.h"
-#include "fss_probe.h"
 #include "fss_panel_rect.h"
 #include "fss_reveal.h"
 #include "fss_dump.h"
-#include "eye_split.h"
-#include "foveation.h"        // feature 2: the shading-rate image, bound at eye draws
-#include "resolve_probe.h"
 #include "resolve_bind_fix.h"
-#include "stencil_probe.h"
-#include "fss_ring.h"
 #include "fss_res.h"
-#include "fss_scan.h"
-#include "fss_theater.h"  // the warm-up; the theater itself runs at submit
-#include "depth_probe.h"       // Phase 0 item 3: which depth target the eye draws use, and how it reads
-#include "eye_mask.h"          // the lens-ring depth mask: draws past the hooks, once per eye per frame
+#include "depth_probe.h"      // Phase 0 item 3: which depth target the eye draws use, and how it reads
 #include "sharpen_pass.h"      // likewise: warm-up and totals; the sharpening runs at submit
 #include "menu.h"              // the settings menu's reload: its keys, then the row diff
 #include "perf_monitor.h"      // the draw hooks' sampled cost, and the reload as an event
@@ -62,7 +52,6 @@
 #include "boundary_tick.h"     // one fault budget per boundary tick
 #include "temporal_pass.h"     // and the temporal pass: warm-up, the camera capture, totals
 #include "glitch_frame.h"
-#include "transition_flash_prevent.h"
 #include "pose_reader_watch.h"
 #include "transition_flash_eye_base.h"
 #include "holo_fix.h"
@@ -75,7 +64,6 @@
 #include "ui_depth.h"
 #include "ui_layer.h"
 #include "ui_layer_math.h"
-#include "hud_layer_census.h"  // advanced.hud_census: the crisp-HUD Phase 0 census gates
 #include "ui_surfaces.h"  // uiAtlasNoteWrite: the glyph atlas instrument's write count
 #include "celestial_motion.h"
 #include "engine_velocity.h"
@@ -97,7 +85,6 @@
 #include "particle_fix.h"
 #include "sunglare_fix.h"
 #include "graphics_bridge.h"
-#include "game_query_probe.h"
 #include <intrin.h>
 
 namespace edvr {
@@ -233,7 +220,6 @@ constexpr size_t kSlotClearDepthStencilView = 53;
 constexpr size_t kSlotGenerateMips          = kGpuSlotGenerateMips;
 constexpr size_t kSlotBegin                 = 27;
 constexpr size_t kSlotEnd                   = 28;
-constexpr size_t kSlotGetData               = 29;
 constexpr size_t kSlotResolveSubresource    = 57;
 // The FSS resolution fix's half: a viewport of exactly the body layer's
 // requested (half) size, set while an inflated target is bound, is scaled
@@ -347,7 +333,6 @@ typedef void(STDMETHODCALLTYPE* PFN_ClearDsv)(ID3D11DeviceContext*,
                                               UINT, FLOAT, UINT8);
 typedef void(STDMETHODCALLTYPE* PFN_QueryMark)(ID3D11DeviceContext*,
                                                ID3D11Asynchronous*);
-typedef HRESULT(STDMETHODCALLTYPE* PFN_QueryData)(ID3D11DeviceContext*, ID3D11Asynchronous*, void*, UINT, UINT);
 typedef void(STDMETHODCALLTYPE* PFN_DrawIndirectArgs)(ID3D11DeviceContext*,
                                                       ID3D11Buffer*, UINT);
 typedef void(STDMETHODCALLTYPE* PFN_CopyStructureCount)(
@@ -448,8 +433,6 @@ struct State {
     PFN_ClearDsv             realClearDsv = nullptr;
     PFN_QueryMark            realBegin = nullptr;
     PFN_QueryMark            realEnd = nullptr;
-    PFN_QueryData            realGetData = nullptr;
-    GameQueryProbe           gameQueries;
     PFN_ExecuteCommandList   realExecuteCommandList = nullptr;
     // The bound target's underlying resource, cached per binding generation
     // for the FSS viewport paths -- resolved only while fssResActive(), so a
@@ -457,8 +440,8 @@ struct State {
     uint32_t rtv0ResGen = 0;
     void*    rtv0Res = nullptr;
     // Is the bound offscreen target the FSS body layer? Cached per binding
-    // generation for the scan-dissolve fix's gate and the panel fix's
-    // mode gate.
+    // generation for the panel fix's mode gate. (The "Scan" in the names is
+    // the scan-dissolve fix's, removed 2026-09-29; the cache outlived it.)
     uint32_t fssScanGen = 0;
     bool     fssScanBody = false;
     // The last frame a draw landed in the body layer -- the fact "the FSS
@@ -472,8 +455,7 @@ struct State {
     uint32_t fssChromeFrame = 0;
     int      fssHealOn = 0;
     int      censusFssJump = 0;
-    int      fssTheaterOn = 0;
-    uint32_t fssJumpFrame = 0;   // the zoom-start camera jump, for the
+    uint32_t fssJumpFrame = 0;  // the zoom-start camera jump, for the
                                  // reveal's arrival window
     bool     fssArrivalOpen = false;
     uint32_t fssArrivalRecogs = 0;
@@ -1473,11 +1455,6 @@ inline bool foreignContext(ID3D11DeviceContext* self) {
 // the file.
 void* currentRtv0Resource(State* s);
 bool viewportIs(const D3D11_VIEWPORT& v, uint32_t w, uint32_t h);
-// The HUD layer census's G-D colourless re-issue pair, defined beside
-// pureDrawReissue which it uses; the eye-draw branch calls it on the
-// census's say-so.
-void hudCensusGdPair(ID3D11DeviceContext* self, char kind, UINT count, UINT instances,
-                     const DrawArgs& args);
 
 // Record a draw we are about to decline. Cheap by construction: a linear scan
 // of at most eight entries, and GetType is asked ONCE per context rather than
@@ -1539,28 +1516,18 @@ enum class DrawVerdict {
     // (intro_panel.h): forwarded normally, restored after.
     kIntroPanel,
     kGlareClamp, kGlareSteady, kParticle,
-    // The FSS scan dissolve held uniform (fss_scan.h): a body-layer draw
-    // binding the 16x16 matrix, forwarded wrapped in fssScanBegin/End.
-    kFssScan,
     // The FSS panel composite pair (fss_panel.h): forwarded through the
     // replacement vertex shaders, wrapped in fssPanelBegin/End.
     kFssPanel,
-    // The body composite with one sampler slot held flat (fss_probe.h),
-    // wrapped in fssProbeBegin/End. A diagnostic, not a fix.
-    kFssProbe,
     // The body composite pair evaluated at one dissolve moment
     // (fss_reveal.h): eye B drawn with eye A's scene constants, wrapped
     // in fssRevealBegin/End.
     kFssReveal,
-    kFssRing,
     kFssDump,
-    // The deferred lighting resolve drawn through a replacement pixel
-    // shader (advanced.resolve_probe), wrapped in resolveProbeBegin/End.
-    kResolveProbe,
-    // One named draw re-issued with a different stencil REFERENCE and
-    // nothing else changed (advanced.stencil_probe), wrapped in
-    // stencilProbeBegin/End.
-    kStencilProbe,
+    // The deferred lighting resolve drawn with the scanner-body fix's
+    // input lend (fix.scanner_body, resolve_bind_fix.h), wrapped in
+    // resolveBindBegin/End.
+    kResolveBind,
     // A batched draw re-issued without some of its quads (advanced.
     // census_skip_quad). Swallows the game's draw and makes up to two of its
     // own, so it must not be combined with anything that also draws.
@@ -1697,16 +1664,15 @@ bool drawGateSubscribed(State* s) {
         headOffsetGateWantsPanel() || s->censusSkipCount != 0 ||
         s->censusSkipRangeCount != 0 || s->censusSkipOffCount != 0 ||
         s->quadSkipArmed ||
-        s->censusAutoW != 0 || fssResActive() || fssScanWantsDraws() ||
-        fssPanelWantsDraws() || fssProbeWants() || fssRevealWantsDraws() ||
-        fssRingWantsDraws() || fssDumpWantsDraws() ||
-        eyeSplitWantsDraws() || foveationWantsDraws() || resolveProbeWantsDraws() ||
-        stencilProbeWantsDraws() || resolveBindWants() ||
+        s->censusAutoW != 0 || fssResActive() ||
+        fssPanelWantsDraws() || fssRevealWantsDraws() ||
+        fssDumpWantsDraws() ||
+        resolveBindWants() ||
         remlokWantsDraws() || holoWantsDraws() || targetSharpWantsDraws() ||
         hudSpriteWantsDraws() || panelUpscaleWantsDraws() || hudGrainWantsDraws() ||
         uiDepthWantsDraws() ||
         sunglareWantsDraws() ||
-        drawCensusArmed() || hudLayerCensusArmed() ||  // review R6: the HUD layer census announces armed and emits windows; without this term it never saw a draw when every other subscriber was off
+        drawCensusArmed() ||
         objectProbeWantsDraws() ||
         panelCurveWants() || particleWantsDraws() || backdropWantsDraws() ||
         scrimWantsDraws() || quadProbeWants() || loaderPanelWants() ||
@@ -1834,7 +1800,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // free. The temporal pass asks too (temporalPassWantsFssChrome): the
     // scanner's interface takes the head's path while the screen is up,
     // and the stamp this tracker bumps is how the pass knows it is.
-    if ((s->fssHealOn || s->censusFssJump || s->fssTheaterOn ||
+    if ((s->fssHealOn || s->censusFssJump ||
          temporalPassWantsFssChrome()) &&
         kind == 'X' && count == 6) {
         bool chromeMatched = false;
@@ -1888,7 +1854,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         // scenery (the neon frame) and their ordinals land in a skip
         // mask. Until a derivation publishes, nothing is skipped and the
         // centred band crops -- both fail-safe.
-        if (chromeMatched && (s->fssTheaterOn || s->fssHealOn) &&
+        if (chromeMatched && s->fssHealOn &&
             deviceHookFssModeLatch()) {
             if (s->fssChromeSkipFrame != s->frameNo) {
                 s->fssChromeSkipFrame = s->frameNo;
@@ -2048,15 +2014,6 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         s->rtv0Cand = -1;
         s->rtv0Eye = targetIsEyeSized(bindingGet(BindSlot::Rtv0), &s->rtv0Cand);
         s->rtv0EyeGen = rtvGen;
-    }
-    // Foveated shading (foveation.h): the shading-rate image follows the
-    // census's verdict on slot 0 -- bound for an eye-sized target, cleared
-    // for anything else. One compare per draw once the answer is known, and
-    // it changes no binding of the game's, so everything below composes
-    // with it.
-    if (foveationWantsDraws()) {
-        foveationOnDraw(self, s->rtv0Eye, bindingGet(BindSlot::Rtv0), rtvGen,
-                         kind, count, instances);
     }
     // The intro probe, ABOVE the eye gate and deliberately. Its subject is the
     // startup sequence, and for the whole of the sequence's first phase there
@@ -2308,22 +2265,13 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
                 return DrawVerdict::kQuadSkip;
             }
         }
-        // The body-layer gate, shared by the scan-dissolve fix and the
-        // panel fix's mode stamp: is the bound target the BODY LAYER --
+        // The body-layer gate, for the panel fix's mode stamp: is the bound
+        // target the BODY LAYER --
         // eye/2-sized, or one of fss_res's inflated textures? Cached per
         // binding generation, so the resolve runs for a handful of scanner
         // draws and for nothing else in the game.
-        // The theater is in this list on its own feet: on 2026-08-26 it
-        // rode the gate implicitly and died silently the first flight all
-        // six neighbours were off.
-        if (s->fssTheaterOn || fssScanWantsDraws() || fssPanelWantsDraws() ||
-            fssProbeWants() || fssRevealWantsDraws() ||
-            fssRingWantsDraws() || fssDumpWantsDraws()) {
-            // Warmed here because this is the first draw-path site the
-            // theater owns: the compile lands on some menu frame at
-            // session start instead of stalling the submit thread 142 ms
-            // at the first zoom (measured 2026-08-26).
-            if (s->fssTheaterOn) fssTheaterWarm(self);
+        if (fssPanelWantsDraws() || fssRevealWantsDraws() ||
+            fssDumpWantsDraws()) {
             if (s->fssScanGen != rtvGen) {
                 s->fssScanGen = rtvGen;
                 s->fssScanBody = false;
@@ -2348,9 +2296,6 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
                 // land before the eye composites in the frame, so the
                 // stamp is fresh by the time the composites ask.
                 s->fssBodyFrame = s->frameNo;
-                if (fssScanWantsDraws() && fssScanOnBodyDraw()) {
-                    return DrawVerdict::kFssScan;
-                }
             }
         }
         return DrawVerdict::kNone;
@@ -2367,13 +2312,6 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         void* const eyeDsv = bindingGet(BindSlot::Dsv0);
         if (depthProbeEyeDrawNeedsNote(eyeDsv))
             depthProbeNoteEyeDraw(self, eyeDsv, s->eyeDrawsThisFrame);
-    }
-    // fix.eye_mask's own draw, past every hook below (eye_mask.h): at most
-    // once per eye per frame, so the cheap "already drawn" check runs before
-    // anything else even when the feature is off.
-    if (eyeMaskWantsDraws()) {
-        GpuCensusScope census(self, GpuCensusSection::FrameEyeMask);
-        eyeMaskOnEyeDraw(self, bindingGet(BindSlot::Dsv0));
     }
     // The interface's depth (ui_depth.h): a composite of a learned surface,
     // or a named family drawn straight into the eye, writes its depth. A
@@ -2427,18 +2365,6 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // one call and one bool.
     if (drawCensusArmed()) {
         drawCensusEyeDraw(self, kind, count, instances, s->eyeDrawsThisFrame, args);
-    }
-    // The HUD layer census (hud_layer_census.h): Phase 0 of the crisp-HUD
-    // design, observation only. One bool load while off (the default); when
-    // armed it watches for the three cockpit HUD families, the hologram
-    // families (Phase 3's family watch, one row) and the tonemap,
-    // and for a family draw it picked for its occlusion gate it re-issues
-    // this draw colourlessly (no colour target, writes masked, everything
-    // restored) around pureDrawReissue before the game's own draw runs.
-    if (hudLayerCensusArmed() && self == g_state->ownerCtx) {
-        if (hudLayerCensusEyeDraw(self, kind, count, instances, s->eyeDrawsThisFrame, args)) {
-            hudCensusGdPair(self, kind, count, instances, args);
-        }
     }
     // the crisp-HUD half of fix.ui_quality (ui_layer.h): admit the game's tonemap draw for its
     // re-issue, which tonemaps the HDR HUD layer into the eye's 8-bit layer
@@ -2612,18 +2538,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         return DrawVerdict::kFssPanel;
     }
 
-    // The composite-input probe (round 9a), behind the same body-frame
-    // gate for the same reason the panel fix wears it: 953C's hash names a
-    // shader, not the scanner, and an hour-old lesson says the difference
-    // is a loading screen's text quad.
-    if (fssProbeWants() && s->fssBodyFrame != 0 &&
-        s->frameNo - s->fssBodyFrame <= 2 &&
-        fssProbeOnEyeDraw(self, kind, count, instances)) {
-        return DrawVerdict::kFssProbe;
-    }
-
-    // The reveal sync, after the probe so a probing session sees the true
-    // draw. Same gate, same recognition shape.
+    // The reveal sync. Same gate, same recognition shape.
     // The reveal's gate covers the ARRIVAL as well as the void: the
     // 2026-08-27 lockstep flight engaged byte-identical and the squares
     // survived -- because the body gate opens at the arrival's END, and
@@ -2642,55 +2557,25 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         return DrawVerdict::kFssReveal;
     }
 
-    // The eye-image dump (round twenty), before the ring feed so a dump
-    // session records the natural state -- run one at a time.
+    // The eye-image dump (round twenty), so a dump session records the
+    // natural state -- run one at a time.
     if (fssDumpWantsDraws() && s->fssBodyFrame != 0 &&
         s->frameNo - s->fssBodyFrame <= 2 &&
         fssDumpOnEyeDraw(self, kind, count, instances)) {
         return DrawVerdict::kFssDump;
     }
 
-    // The eye split (the black planet, 2026-08-30): note which target this
-    // draw lands in, so the frame boundary knows what to copy. Passive by
-    // construction -- it returns no verdict and changes no binding, so it
-    // composes with every fix below it and records the frame as the game
-    // actually renders it. It is gated by nothing but its own arming: the
-    // whole point is that it needs no knowledge of which draw is the body,
-    // every previous guess at that having been wrong.
-    if (eyeSplitWantsDraws()) eyeSplitOnEyeDraw(self);
-
-    // The resolve probe (the black planet, 2026-08-30): recognised by its
-    // PIXEL shader hash, so it is asked LAST -- every fix above it that
-    // swaps a shader has already had its say, and this one replaces the
-    // whole pass rather than composing with anything.
+    // The scanner-body fix's resolve (the black planet, 2026-08-30):
+    // recognised by its PIXEL shader hash, so it is asked LAST -- every fix
+    // above it that swaps a shader has already had its say.
     // resolveBindShadowSaysNo (resolve_bind_fix.h) is the fix's own first
     // answer from the shadow, inline: a held shader whose hash is not the
     // resolve's is a false the call gives without touching anything.
-    if ((resolveProbeWantsDraws() && resolveProbeOnEyeDraw(self)) ||
-        (resolveBindWants() &&
-         !resolveBindShadowSaysNo(bindingGet(BindSlot::Ps) != nullptr,
-                                  bindingShaderHash(BindSlot::Ps)) &&
-         resolveBindOnEyeDraw(self))) {
-        return DrawVerdict::kResolveProbe;
-    }
-
-    // The stencil probe (the black planet, 2026-08-31), asked after the
-    // resolve probe because the two name different draws and the resolve is
-    // the more specific claim. This one changes no shader and swallows no
-    // draw -- it re-binds the game's own state with one number altered -- so
-    // it composes with everything and needs no place in the order beyond
-    // being past every fix that swaps a shader.
-    if (stencilProbeWantsDraws() && stencilProbeOnEyeDraw(self)) {
-        return DrawVerdict::kStencilProbe;
-    }
-
-    // The ring cross-feed (round eighteen), the same gate and shape: the
-    // ring draws' hashes name general pipelines, and only the scanner's
-    // body layer proves the scanner is on screen.
-    if (fssRingWantsDraws() && s->fssBodyFrame != 0 &&
-        s->frameNo - s->fssBodyFrame <= 2 &&
-        fssRingOnEyeDraw(self, kind, count, instances)) {
-        return DrawVerdict::kFssRing;
+    if (resolveBindWants() &&
+        !resolveBindShadowSaysNo(bindingGet(BindSlot::Ps) != nullptr,
+                                 bindingShaderHash(BindSlot::Ps)) &&
+        resolveBindOnEyeDraw(self)) {
+        return DrawVerdict::kResolveBind;
     }
 
     // The sun-glare element train: off skips it, first:K clamps it, and the
@@ -3241,7 +3126,6 @@ void STDMETHODCALLTYPE hookedClearState(ID3D11DeviceContext* self) {
         flatTemporalViewport(0, nullptr);
         flatTemporalClearBindings();
     }
-    foveationOnClearState();
     // ClearState changes bindings, not resource contents. Retain the
     // captured weapon vertices and attachment inputs across this call.
     s->realClearState(self);
@@ -3679,22 +3563,17 @@ __declspec(noinline) void forwardQuadSkip(ID3D11DeviceContext* self) {
 // Now the common draw pays one compare (v != kNone) and the rare one pays a
 // call into a switch. Exactly the same functions run for every verdict, in
 // the same order: each ladder rung was independent and v is a single value,
-// so at most one rung fired -- except kResolveProbe, which fired two in a
-// fixed order and fires the same two in the same order here. kBackdrop's End
+// so at most one rung fired. kBackdrop's End
 // is NOT here: it must precede the splash re-issue, which needs the draw
 // callable, so it stays inline in forwardWithVerdict. kNone, kPanel,
 // kIntroPanel and kGlareClamp had no rung and have no case.
 __declspec(noinline) void forwardVerdictBegin(ID3D11DeviceContext* self, DrawVerdict v) {
     switch (v) {
     case DrawVerdict::kRemlok:       remlokScissorBegin(self); break;
-    case DrawVerdict::kFssScan:      fssScanBegin(self); break;
     case DrawVerdict::kFssPanel:     fssPanelBegin(self); break;
-    case DrawVerdict::kFssProbe:     fssProbeBegin(self); break;
     case DrawVerdict::kFssReveal:    fssRevealBegin(self); break;
-    case DrawVerdict::kFssRing:      fssRingBegin(self); break;
     case DrawVerdict::kFssDump:      fssDumpBegin(self); break;
-    case DrawVerdict::kResolveProbe: resolveBindBegin(self); resolveProbeBegin(self); break;
-    case DrawVerdict::kStencilProbe: stencilProbeBegin(self); break;
+    case DrawVerdict::kResolveBind:  resolveBindBegin(self); break;
     case DrawVerdict::kHolo:         holoBegin(self); break;
     case DrawVerdict::kTargetSharp:  targetSharpBegin(self); break;
     case DrawVerdict::kNightVision:  nightVisionBegin(self); break;
@@ -3721,13 +3600,9 @@ __declspec(noinline) void forwardVerdictEnd(ID3D11DeviceContext* self, DrawVerdi
     case DrawVerdict::kNightVision:  nightVisionEnd(self); break;
     case DrawVerdict::kHolo:         holoEnd(self); break;
     case DrawVerdict::kFssReveal:    fssRevealEnd(self); break;
-    case DrawVerdict::kFssRing:      fssRingEnd(self); break;
-    case DrawVerdict::kStencilProbe: stencilProbeEnd(self); break;
-    case DrawVerdict::kResolveProbe: resolveProbeEnd(self); resolveBindEnd(self); break;
+    case DrawVerdict::kResolveBind:  resolveBindEnd(self); break;
     case DrawVerdict::kFssDump:      fssDumpEnd(self); break;
-    case DrawVerdict::kFssProbe:     fssProbeEnd(self); break;
     case DrawVerdict::kFssPanel:     fssPanelEnd(self); break;
-    case DrawVerdict::kFssScan:      fssScanEnd(self); break;
     case DrawVerdict::kRemlok:       remlokScissorEnd(self); break;
     default: break;   // kBackdrop: issued inline, before the splash re-issue
     }
@@ -3750,28 +3625,6 @@ __declspec(noinline) void pureDrawReissue(ID3D11DeviceContext* self, char kind, 
     case 'N':g_state->realDrawInstanced(self,count,instances,UINT(args.base),args.startInstance);break;
     case 'X':g_state->realDrawIndexedInstanced(self,count,instances,args.start,args.base,args.startInstance);break;
     }
-}
-
-// The HUD layer census's G-D pair (hud_layer_census.h): the game's own
-// draw, re-issued twice through pureDrawReissue with NO colour target --
-// once under a write-masked clone of the game's depth-stencil state (its
-// GEQUAL test exactly as submitted, nothing written), once with depth and
-// stencil off (every sample passes) -- each inside an occlusion query, so
-// the rejected share of the family's pixels is measured rather than
-// inferred. The module owns the queries, the cloned states, the OM save
-// and restore, and the answer; this helper is only the bracket the
-// re-issue needs because pureDrawReissue is file-local. NOINLINE for the
-// same reason pureDrawReissue is: it runs for a handful of family draws a
-// frame while armed, and the draw path must not pay its frame for the
-// rest.
-__declspec(noinline) void hudCensusGdPair(ID3D11DeviceContext* self, char kind, UINT count,
-                                          UINT instances, const DrawArgs& args) {
-    HudCensusGdSave save;
-    if (!hudLayerCensusGdBegin(self, save)) return;
-    pureDrawReissue(self, kind, count, instances, args);
-    hudLayerCensusGdSwapToDepthOff(self, save);
-    pureDrawReissue(self, kind, count, instances, args);
-    hudLayerCensusGdEnd(self, save);
 }
 
 // the crisp-HUD half of fix.ui_quality's tonemap re-issue (ui_layer.h): the game's admitted tonemap
@@ -4192,10 +4045,8 @@ void STDMETHODCALLTYPE hookedClearDsv(ID3D11DeviceContext* self,
                              foreignContext(self));
     }
     // The depth probe learns which value the game clears an eye-draw
-    // target to, which says which way its depth runs. eye_mask learns
-    // whether this is a re-clear of a target it already drew its ring
-    // into this frame -- which would wipe the ring -- for its summary.
-    if (!foreignContext(self)) {depthProbeNoteClear(dsv, depth);eyeMaskOnClear(dsv);if(uiLayerWatching())uiLayerNoteDepthClear(dsv, flags, depth, stencil);}
+    // target to, which says which way its depth runs.
+    if (!foreignContext(self)) {depthProbeNoteClear(dsv, depth);if(uiLayerWatching())uiLayerNoteDepthClear(dsv, flags, depth, stencil);}
     if (!foreignContext(self) && (flags & D3D11_CLEAR_DEPTH) && flatRuntimeActive()) { ResourceInfo info{}; if (bindingResolve(dsv, &info)) flatRuntimeWritten(static_cast<ID3D11Resource*>(info.resource)); }
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalClearDepth(dsv, flags, depth);
     g_state->realClearDsv(self, dsv, flags, depth, stencil);
@@ -4213,14 +4064,6 @@ void STDMETHODCALLTYPE hookedBegin(ID3D11DeviceContext* self,
     if (drawCensusArmed()) {
         drawCensusQuery('B', async, foreignContext(self));
     }
-    // The HUD layer census's G-D pair declines while any game query is open
-    // on the owner context (hud_layer_census.h says why). Tracked whether or
-    // not the census is armed, so a bracket begun before a live arm still
-    // blocks the pair until it closes (review R7); unarmed, the price is a
-    // pointer append on a <=16-entry set, no query type read.
-    if (!foreignContext(self)) {
-        hudLayerCensusNoteGameQuery(true, async);
-    }
     g_state->realBegin(self, async);
 }
 
@@ -4232,21 +4075,7 @@ void STDMETHODCALLTYPE hookedEnd(ID3D11DeviceContext* self,
     if (drawCensusArmed()) {
         drawCensusQuery('E', async, foreignContext(self));
     }
-    if (!foreignContext(self)) {
-        hudLayerCensusNoteGameQuery(false, async);  // the matching End; unarmed too (R7)
-    }
     g_state->realEnd(self, async);
-    if(!foreignContext(self))
-        g_state->gameQueries.noteEnd(async,_ReturnAddress());
-}
-
-HRESULT STDMETHODCALLTYPE hookedGetData(ID3D11DeviceContext* self,ID3D11Asynchronous* query,
-                                        void* data,UINT bytes,UINT flags) {
-    if (g_flatComputeInternal) return g_state->realGetData(self, query, data, bytes, flags);
-    // Forward exactly once with the original buffer and flags. The diagnostic
-    // observes completion; it never tries to make an unfinished query complete.
-    if(foreignContext(self))return g_state->realGetData(self,query,data,bytes,flags);
-    return g_state->gameQueries.read(g_state->realGetData,self,query,data,bytes,flags,_ReturnAddress());
 }
 
 // The argument buffer holds the counts, so the census records n=0 i=0
@@ -4677,7 +4506,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     // The rect deriver's capture runs INSIDE beginPanelOverride (the
     // chrome tracker's matched branch), so its draw-args stash must land
     // before the call.
-    if (g_state->fssTheaterOn || g_state->fssHealOn) {
+    if (g_state->fssHealOn) {
         fssPanelRectDrawArgs(baseVertex, startInstance);
     }
     // The sub-draw probe re-issues this draw from the verdict path, which
@@ -5250,12 +5079,6 @@ void vScreenPSSetShaderRaw(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps,
     g_state->realPSSetShader(ctx, ps, classInstances, numClassInstances);
 }
 
-void vScreenVSSetConstantBuffersRaw(ID3D11DeviceContext* ctx, uint32_t startSlot,
-                                    uint32_t numBuffers, ID3D11Buffer* const* buffers) {
-    if (!g_state || !g_state->realVSSetConstantBuffers || !ctx) return;
-    g_state->realVSSetConstantBuffers(ctx, startSlot, numBuffers, buffers);
-}
-
 void vScreenOMSetBlendStateRaw(ID3D11DeviceContext* ctx, ID3D11BlendState* state,
                                const float blendFactor[4], uint32_t sampleMask) {
     if (!g_state || !g_state->realOMSetBlendState || !ctx) return;
@@ -5360,25 +5183,12 @@ void vScreenRefreshConfig() {
     nightVisionConfigure(cfg);
     depthProbeConfigure(cfg);
     backdropConfigure(cfg);
-    fssScanConfigure(cfg);
     fssPanelConfigure(cfg);
-    fssProbeConfigure(cfg);
     fssRevealConfigure(cfg);
-    fssRingConfigure(cfg);
     fssDumpConfigure(cfg);
-    eyeSplitConfigure(cfg);
-    foveationConfigure(cfg);
-    eyeMaskConfigure(cfg);
-    resolveProbeConfigure(cfg);
     resolveBindConfigure(cfg);
-    stencilProbeConfigure(cfg);
-    // advanced.transition_flash_prevent: the engine-side fix (docs/design-
-    // transition-flash-engine-fix-2026-09-23.md). Off leaves this line as
-    // the only thing it does; a non-off value installs its four CodeHooks
-    // the first time this is reached (install or a later reload, whichever
-    // is first), then only moves the live mode.
-    transitionFlashPreventConfigure(cfg);
-    // advanced.eye_origin_readers: the same design doc's parts A2/B (who
+    // advanced.eye_origin_readers: the engine-side fix design doc's
+    // (docs/design-transition-flash-engine-fix-2026-09-23.md) parts A2/B (who
     // reads the pose, and the positioner swap). Off leaves this line as
     // the only thing it does; a non-off value installs its two CodeHooks
     // the first time this is reached, then only moves the live on/off bit
@@ -5398,7 +5208,6 @@ void vScreenRefreshConfig() {
     menuNoteConfigReloaded();
     {
         s->censusFssJump = cfg.getInt("advanced.census_fss_jump", 0) ? 1 : 0;
-        s->fssTheaterOn = cfg.getFloat("experimental.fss_theater", 0.0f) > 0.0f;
         // Defaulted to 1 because the key moved to [experimental] and now ships
         // commented out: this default is what everybody runs. Moving a setting out
         // of [fix] is a decision about where it is configured, not a decision to
@@ -5421,14 +5230,12 @@ void vScreenRefreshConfig() {
     objectProbeConfigure(cfg);
     pixelProbeConfigure(cfg);
     lodGovernorConfigure(cfg);
-    hudLayerCensusConfigure(cfg);
     // Every fix.head_offset_* key, on the reload path as well as the startup
     // one. A config reader on only one of the two is a specific repeatable bug
     // -- reload-only means the value stays its C++ initialiser for the whole
     // session -- and it cost a flight when fix.head_offset_gate did exactly
     // that.
     headOffsetGateConfigure();
-    cameraViewConfigure();
 
     if (wasVoid != s->blackVoid || wasScale != s->distanceScale) {
         Log::get().note("vScreen config reloaded: black void %s, panel distance x%.3f "
@@ -5561,7 +5368,6 @@ EDVR_BOUNDARY_TICK(tkPanelUpscale, "panel_upscale");
 EDVR_BOUNDARY_TICK(tkWakePulse, "wake_pulse");
 EDVR_BOUNDARY_TICK(tkUiDepth, "ui_depth");
 EDVR_BOUNDARY_TICK(tkUiLayer, "ui_layer");
-EDVR_BOUNDARY_TICK(tkHudCensus, "hud_census");
 EDVR_BOUNDARY_TICK(tkScreenMotion, "screen_motion");
 EDVR_BOUNDARY_TICK(tkCelestialMotion, "celestial_motion");
 EDVR_BOUNDARY_TICK(tkEngineVelocity, "engine_velocity");
@@ -5578,11 +5384,7 @@ EDVR_BOUNDARY_TICK(tkIntroProbe, "intro_probe");
 EDVR_BOUNDARY_TICK(tkLodGovernor, "lod_governor");
 EDVR_BOUNDARY_TICK(tkDrawCensusBoundary, "draw_census_boundary");
 EDVR_BOUNDARY_TICK(tkFssReveal, "fss_reveal");
-EDVR_BOUNDARY_TICK(tkFssRing, "fss_ring");
 EDVR_BOUNDARY_TICK(tkFssDump, "fss_dump");
-EDVR_BOUNDARY_TICK(tkEyeSplit, "eye_split");
-EDVR_BOUNDARY_TICK(tkFoveation, "foveation");
-EDVR_BOUNDARY_TICK(tkEyeMask, "eye_mask");
 EDVR_BOUNDARY_TICK(tkFssPacing, "fss_pacing");
 EDVR_BOUNDARY_TICK(tkRemlok, "remlok");
 }  // namespace
@@ -5607,10 +5409,6 @@ void vScreenFrameBoundary() {
         // cross-check and learning, the key's 30-second totals, and the end
         // of this frame's watch for draws after the UI.
         tkUiLayer.run([&] { uiLayerFrameBoundary(g_state->ownerCtx); });
-        // The HUD layer census's query polls, deferred readbacks and
-        // 30-second window report -- beside the layer's boundary, but gated
-        // only on advanced.hud_census, never on fix.ui_quality.
-        tkHudCensus.run([&] { hudLayerCensusFrameBoundary(g_state->ownerCtx); });
         tkScreenMotion.run([&] { screenMotionFrameBoundary(g_state->ownerCtx); });
         tkCelestialMotion.run([&] { celestialMotionFrameBoundary(g_state->ownerCtx); });
         tkEngineVelocity.run([&] { engineVelocityFrameBoundary(g_state->ownerCtx); });
@@ -5725,11 +5523,7 @@ void vScreenFrameBoundary() {
     // here, a running one advances, a spent one writes its tables.
     tkDrawCensusBoundary.run([&] { drawCensusFrameBoundary(s->frameNo); });
     tkFssReveal.run([&] { fssRevealFrameBoundary(); });
-    tkFssRing.run([&] { fssRingFrameBoundary(); });
     tkFssDump.run([&] { fssDumpFrameBoundary(s->ownerCtx); });
-    tkEyeSplit.run([&] { eyeSplitFrameBoundary(s->ownerCtx); });
-    tkFoveation.run([&] { foveationFrameBoundary(s->ownerCtx); });
-    tkEyeMask.run([&] { eyeMaskFrameBoundary(s->ownerCtx); });
 
     // FSS frame pacing (round 31): the left-only squares are now measured
     // to be runtime-side (both submitted images carry the flicker equally),
@@ -6117,9 +5911,9 @@ void vScreenFrameBoundary() {
     // WHY THE JOURNAL AND NOT THE COUNT decides that gameplay is happening:
     // every other gameplay signal in the DLL is downstream of this counter,
     // so asking one of them here would be asking the broken thing whether it
-    // is broken. camera_view's own latch is the case in point -- it ORs the
-    // journal with the draw count, and on both of those field sessions the
-    // journal had to carry it, which is itself in the logs.
+    // is broken. The since-removed camera_view's latch was the case in point:
+    // it ORed the journal with the draw count, and on both of those field
+    // sessions the journal had to carry it, which is itself in the logs.
     //
     // WHY A LOW PEAK AFTER LOADGAME IS DIAGNOSTIC AT ALL, given that the
     // count legitimately depends on what the player is doing: the load-in
@@ -6479,11 +6273,6 @@ void vScreenFrameBoundary() {
     // The flash detector needs the count for the frame that just ended, to tell
     // a rendered scene from a menu. It has to be told before the counter resets.
     glitchFrameBoundary(sceneDraws);
-    // Publishes the frame number the transition-flash-prevent hooks read
-    // from any thread (they can run on a scheduler job thread, off this
-    // one) and services one deferred ring dump if its due frame has
-    // arrived. Never called from inside a game hook.
-    transitionFlashPreventFrameBoundary(s->frameNo);
     // Publishes the frame number the consumer hook reads (also, possibly, a
     // scheduler job thread), runs the writer watch's own ship-pointer
     // stability gate / arms, re-arms or sweeps it, and services one
@@ -6503,20 +6292,6 @@ void vScreenFrameBoundary() {
     // The gate decides on the counts for the frame that just ended, so it is
     // told before they reset -- same rule as the flash detector above.
     headOffsetGateFrame(s->frameNo, s->panelCompositeDraws, sceneDraws);
-    // The first frame the flat panel is seen is the earliest moment the game is
-    // known to be loaded AND the player known to be on foot, which is what the
-    // scan needs. At startup the process holds a fraction of the memory it
-    // reaches in play, and a scan there finds nothing.
-    // Asked every frame the player is settled on foot; the scan itself guards
-    // against running twice. The old trigger was the FIRST panel sighting,
-    // which on a default install is the main menu four seconds after launch --
-    // 5 GB of an eventual 11 GB allocated, and the scan found nothing.
-    // The scan's tick sits beside its trigger, where the frame's counters are.
-    // It was in device_hook, which does not have them -- and the tick needs the
-    // eye-draw count to tell "the game is being played" from "the main menu is
-    // on screen", which is what stops a menu-dweller burning every attempt.
-    cameraViewTick(sceneDraws);
-    if (headOffsetGatePanelSettled()) cameraViewRequestScan();
     s->panelCompositeDraws = 0;
     s->eyeDrawsThisFrame = 0;
     s->sceneDrawsThisFrame = 0;
@@ -6616,24 +6391,10 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     nightVisionConfigure(cfg);
     depthProbeConfigure(cfg);
     backdropConfigure(cfg);
-    fssScanConfigure(cfg);
     fssPanelConfigure(cfg);
-    fssProbeConfigure(cfg);
     fssRevealConfigure(cfg);
-    fssRingConfigure(cfg);
     fssDumpConfigure(cfg);
-    eyeSplitConfigure(cfg);
-    foveationConfigure(cfg);
-    eyeMaskConfigure(cfg);
-    resolveProbeConfigure(cfg);
     resolveBindConfigure(cfg);
-    stencilProbeConfigure(cfg);
-    // advanced.transition_flash_prevent: the engine-side fix (docs/design-
-    // transition-flash-engine-fix-2026-09-23.md). Off leaves this line as
-    // the only thing it does; a non-off value installs its four CodeHooks
-    // the first time this is reached (install or a later reload, whichever
-    // is first), then only moves the live mode.
-    transitionFlashPreventConfigure(cfg);
     // advanced.eye_origin_readers: the same design doc's parts A2/B. See
     // the other call site's comment above.
     poseReaderWatchConfigure(cfg);
@@ -6643,8 +6404,6 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     {
         g_state->censusFssJump =
             cfg.getInt("advanced.census_fss_jump", 0) ? 1 : 0;
-        g_state->fssTheaterOn =
-            cfg.getFloat("experimental.fss_theater", 0.0f) > 0.0f;
         const int n = eyeSyncFromConfig(cfg).healMode;
         if (g_state->fssHealOn != n) {
             g_state->fssHealOn = n;
@@ -6663,7 +6422,6 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     objectProbeConfigure(cfg);
     pixelProbeConfigure(cfg);
     lodGovernorConfigure(cfg);
-    hudLayerCensusConfigure(cfg);
     // installGlitchFrameFix is called before this, deliberately, so this is its
     // settled answer rather than a guess about config it has not read yet.
     g_state->countForFlashFix = glitchFrameNeedsEyeDraws();
@@ -6768,9 +6526,6 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
                    reinterpret_cast<void**>(&s.realBegin));
     s.hook.replace(kSlotEnd, &hookedEnd,
                    reinterpret_cast<void**>(&s.realEnd));
-    const bool queryProbe=s.hook.replace(kSlotGetData,&hookedGetData,
-                   reinterpret_cast<void**>(&s.realGetData)) && s.realGetData;
-    Log::get().note("game query probe: %s; direct executable GetData on game context, 64 tracked intervals, 32 delayed-query details, 60 summaries; result buffers and flags unchanged.",queryProbe?"armed":"UNAVAILABLE");
     s.hook.replace(kSlotDrawIndexedInstancedIndirect,
                    &hookedDrawIndexedInstancedIndirect,
                    reinterpret_cast<void**>(&s.realDrawIndexedInstancedIndirect));
@@ -6978,7 +6733,6 @@ void shutdownVScreenFixes() {
     holoShutdown();
     uiDepthShutdown();
     uiLayerShutdown();
-    hudLayerCensusShutdown();
     screenMotionShutdown();
     nightVisionShutdown();
     celestialMotionShutdown();
@@ -6988,20 +6742,12 @@ void shutdownVScreenFixes() {
     loaderPanelShutdown();
     splashDimShutdown();
     backdropShutdown();
-    fssScanShutdown();
     fssPanelShutdown();
-    fssProbeShutdown();
     fssPanelRectShutdown();
     fssRevealShutdown();
-    fssRingShutdown();
     fssDumpShutdown();
-    eyeSplitShutdown();
-    foveationShutdown();
-    eyeMaskShutdown();
     gpuCensusShutdown();
-    resolveProbeShutdown();
     resolveBindShutdown();
-    stencilProbeShutdown();
     billboardShutdown();
     // Both halves of the intro. Neither was on this roll-call, so a session
     // that ended without a rendered scene ever arriving -- quitting from the

@@ -390,7 +390,6 @@ void testGate() {
     check(with([](UiLayerDrawFacts& g) { g.verdictForwards = false; }) == UiLayerDecision::kVerdict, "swallowed");
     check(with([](UiLayerDrawFacts& g) { g.eyeTarget = false; }) == UiLayerDecision::kNotEyeTarget, "not an eye");
     check(with([](UiLayerDrawFacts& g) { g.ldrView = false; }) == UiLayerDecision::kHdrTarget, "HDR target");
-    check(with([](UiLayerDrawFacts& g) { g.vrs = true; }) == UiLayerDecision::kVrs, "variable-rate shading");
     check(with([](UiLayerDrawFacts& g) { g.eye = -1; }) == UiLayerDecision::kNoEye, "no eye");
     check(with([](UiLayerDrawFacts& g) { g.targetMatchesEye = false; }) == UiLayerDecision::kTargetSize,
           "a target that is not the submitted eye's size");

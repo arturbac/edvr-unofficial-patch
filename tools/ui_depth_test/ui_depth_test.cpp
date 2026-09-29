@@ -77,8 +77,8 @@ void vScreenSetRenderTargetsRaw(ID3D11DeviceContext* ctx, UINT n,
     ctx->OMSetRenderTargets(n, rt, ds);
 }
 // Pass-through: this rig drives the coverage passes directly, so the hook
-// these bypass in production (the draw census, eye-draw gate, foveation,
-// probe) never needs to see them here either.
+// these bypass in production (the draw census, eye-draw gate, probe) never
+// needs to see them here either.
 void vScreenDrawRaw(ID3D11DeviceContext* ctx, UINT vertexCount, UINT startVertex) {
     ctx->Draw(vertexCount, startVertex);
 }

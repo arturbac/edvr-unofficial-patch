@@ -1789,13 +1789,3 @@ void menuPanelShutdown() {
 }
 
 }  // namespace edvr
-
-extern "C" __declspec(dllexport) void* edvrMenuPanel(void* srcTex, int eye, const float* bounds,
-                                                     const float* xf) {
-    if (edvr::graphicsRuntimeDisabled() || !srcTex || !xf || eye < 0 || eye > 1) return nullptr;
-    void* out = nullptr;
-    edvr::guardedBudget(edvr::g_budget, [&] {
-        out = edvr::compositeInner(srcTex, eye, bounds, xf);
-    });
-    return out;
-}

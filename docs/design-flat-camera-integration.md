@@ -2,6 +2,11 @@
 
 ## Status
 
+- **State: camera_view retired 2026-09-29 (code removed, 0fe90f09).**
+  `camera_view.cpp` and `camera_view.h`, cited below as the reader of
+  external-camera mode and as the camera settings probe, are deleted. They read
+  the game's camera-settings records for Explorer Cam's preset count, a read
+  that had been off since build 332753. The code is at `0fe90f09^`.
 - State: the C2 math and policy checks are established and green in the
   build pool (derive reducer, WARP raster/ray/lighting proofs, coexistence
   ownership lifecycle). Pinning the reprojection convention needs the

@@ -379,14 +379,13 @@ bool nearMs(double a, double b) { return std::fabs(a - b) < 1e-5; }
 
 void frameTicksChain() {
     // Hook 1: entered at 1000; the game's own time before that is not a tick. 10 us of work before the real
-    // Present (1000..1010), the real Present 1010..1060, then 10 + 20 + 10 us of work after it, then the
+    // Present (1000..1010), the real Present 1010..1060, then 30 + 10 us of work after it, then the
     // boundary: journal_watch 200 us (the slow one), fss_theater 10 us, and the frame edge at 1500 inside the
     // menu, which has run 190 us since the last mark.
     FrameTicks t;
     t.enter(1000);
     t.markAt("present_pre", 1010);
     t.external(1060);
-    t.markAt("game_exit_probe", 1070);
     t.markAt("gpu_frame_present", 1090);
     t.markAt("present_post", 1100);
     t.boundary(true);
@@ -394,11 +393,11 @@ void frameTicksChain() {
     t.markAt("fss_theater", 1310);
     FrameTickSummary a = t.cut("menu_tick", 1500, kUs);
     check(nearMs(a.hookMs, 0.45) && nearMs(a.boundaryMs, 0.40) && nearMs(a.realMs, 0.05) &&
-          a.marks == 7 && a.hooks == 1,
+          a.marks == 6 && a.hooks == 1,
           "frame ticks: the hook's ticks, the boundary's part of them and the real Present are kept apart");
     check(a.top[0].name && !std::strcmp(a.top[0].name, "journal_watch") && nearMs(a.top[0].ms, 0.20) &&
           a.top[1].name && !std::strcmp(a.top[1].name, "menu_tick") && nearMs(a.top[1].ms, 0.19) &&
-          a.top[2].name && !std::strcmp(a.top[2].name, "gpu_frame_present") && nearMs(a.top[2].ms, 0.02),
+          a.top[2].name && !std::strcmp(a.top[2].name, "gpu_frame_present") && nearMs(a.top[2].ms, 0.03),
           "frame ticks: the three slowest, slowest first, by name -- the real Present never among them");
 
     // The chain runs on past the cut: the rest of the menu (100 us), the rest of the boundary (100 us), then
@@ -409,19 +408,18 @@ void frameTicksChain() {
     t.markAt("render_callback", 1720);
     t.markAt("timing_note", 1730);
     // The game runs 1730..5000. Hook 2, entered at 5000: 5 us before the real Present (5005), the real Present
-    // (5005..5055), 5 + 20 + 20 us after it, 10 us of journal, and the frame edge at 5400 in the menu.
+    // (5005..5055), 25 + 20 us after it, 10 us of journal, and the frame edge at 5400 in the menu.
     t.enter(5000);
     t.markAt("present_pre", 5005);
     t.external(5055);
-    t.markAt("game_exit_probe", 5060);
     t.markAt("gpu_frame_present", 5080);
     t.markAt("present_post", 5100);
     t.boundary(true);
     t.markAt("journal_watch", 5110);
     FrameTickSummary b = t.cut("menu_tick", 5400, kUs);
-    // Ticks: hook 1's tail 100+100+20+10 = 230 us, hook 2's head 5+5+20+20+10+290 = 350 us; boundary: the
+    // Ticks: hook 1's tail 100+100+20+10 = 230 us, hook 2's head 5+25+20+10+290 = 350 us; boundary: the
     // tail's menu and boundary_rest (200), the head's journal_watch and menu_tick (300).
-    check(nearMs(b.hookMs, 0.58) && nearMs(b.boundaryMs, 0.50) && nearMs(b.realMs, 0.05) && b.hooks == 1 && b.marks == 10,
+    check(nearMs(b.hookMs, 0.58) && nearMs(b.boundaryMs, 0.50) && nearMs(b.realMs, 0.05) && b.hooks == 1 && b.marks == 9,
           "frame ticks: a frame holds the previous hook's tail and this hook's head, cut at the frame edge");
     // THE PARTITION: the frame is 1500..5400 = 3.90 ms and the game's own stretch between the two hooks
     // (1730..5000) is 3.27 ms, so the hook's ticks, the real Present and the game add up to the frame.
