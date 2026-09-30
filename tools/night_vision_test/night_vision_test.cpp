@@ -75,10 +75,11 @@ struct Rig {
         // (TEXCOORD4 then SV_Position -- see night_vision_shader.h's main),
         // so each semantic lands in the same register in both stages. The
         // old order wrote SV_Position to o0 while the pixel shader reads it
-        // from v1; Windows Server 2022's D3D11 debug layer reports that as a
-        // linkage error on the Draw, the newer Windows 11 layer does not. The
-        // pixel shader is production code, so the fixture's vertex shader
-        // is what adapts.
+        // from v1; the debug layer reports that as a linkage error on the
+        // Draw. It is the CI runner's layer that said so: a machine without
+        // the Graphics Tools feature has no layer, so this rig's clean-layer
+        // check never runs there. The pixel shader is production code, so the
+        // fixture's vertex shader is what adapts.
         auto vsCode=compile("struct O{float2 t:TEXCOORD4;float4 p:SV_Position;};O main(uint id:SV_VertexID){O o;o.p=float4(id==2?3:-1,id==1?3:-1,0,1);o.t=o.p.xy;return o;}","main","vs_5_0");
         ComPtr<ID3D11VertexShader> vs;hr(dev->CreateVertexShader(vsCode->GetBufferPointer(),vsCode->GetBufferSize(),nullptr,&vs));ctx->VSSetShader(vs.Get(),nullptr,0);
         const D3D_SHADER_MACRO macros[]={{"EDVR_NIGHT_STOCK","1"},{nullptr,nullptr}};auto code=compile(kNightVisionPs,"main","ps_5_0",macros);

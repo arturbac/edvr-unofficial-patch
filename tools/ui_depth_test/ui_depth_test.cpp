@@ -1276,23 +1276,14 @@ UN[id.xy]=uiEvidence(id.xy);Result[id.xy]=adaptiveUiReactive(id.xy,float2(id.xy)
         // (uiDepthReissueBegin binds edits ? 3 : holo ? 2 : mask ? 1 : 0).
         // The rig's single-target draws are the mask-only errand, so slot 2
         // is unbound here exactly as in play without an edit mask, and D3D11
-        // discards the write. Windows Server 2022's older D3D11 debug layer
-        // reports it; the newer layer on Windows 11 does not.
+        // discards the write. The debug layer reports it where one is
+        // installed (the CI runner's; a machine without the Graphics Tools
+        // feature has none, and this loop never runs there). Every other
+        // message id fails the rig, stage-linkage errors included: the
+        // fixture vertex shaders in this rig write their outputs in the order
+        // the pixel shader they draw with reads them, so each semantic lands
+        // in the same register on both sides (planet_coverage_test.h).
         if(m->ID==D3D11_MESSAGE_ID_DEVICE_DRAW_RENDERTARGETVIEW_NOT_SET) continue;
-        // "Vertex Shader - Pixel Shader linkage error: ... Semantic
-        // 'SV_Position' is defined for mismatched hardware registers between
-        // the output stage and input stage." -- production's kPlanetCoverageHlsl
-        // (planet_motion.h) names SV_Position alone and runs against the
-        // game's own planet and solar vertex shaders, which write it behind
-        // eight TEXCOORDs; the fixture's vertex shader mimics that layout.
-        // SV_Position is a system value the rasterizer supplies, and neither
-        // hardware nor WARP links it by register (the shader has flown, and
-        // this rig's pixel values pass), which is why the newer layer no
-        // longer reports it. Only the SV_Position case is ignored: a user
-        // semantic in the wrong register is real data corruption and still
-        // fails the rig. Every other message id fails it too.
-        if(m->ID==D3D11_MESSAGE_ID_DEVICE_SHADER_LINKAGE_REGISTERINDEX && m->pDescription &&
-           std::strstr(m->pDescription,"Semantic 'SV_Position' is defined for mismatched hardware registers")) continue;
         std::puts(m->pDescription); ++layerFaults;
     }
     check(layerFaults==0,"D3D debug-layer warning/error");

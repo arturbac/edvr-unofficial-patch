@@ -70,6 +70,18 @@ HANDLE g_release = nullptr;   // manual-reset: let it go
 // let the image go, which is exactly what a broken pin would do to it.
 std::atomic<bool> g_stopAfterHold{false};
 
+// "Entered" is signalled and the hold begun in ONE system call, here and in the
+// two thread bodies below: SignalObjectAndWait. A SetEvent followed by a
+// WaitForSingleObject leaves a gap, after the host has been told the thread is
+// held and before the thread has reached the wait, in which the thread is still
+// running this module's code. The host's next move in the unpinned controls is
+// FreeLibrary, so a thread preempted in that gap (any machine under load: the
+// build's rig pool, a CI runner) returns into an image that is gone, an access
+// violation that killed the rig with no line of output but its header.
+inline void enterAndHold(HANDLE entered, HANDLE release) {
+    SignalObjectAndWait(entered, release, INFINITE, FALSE);
+}
+
 // The worker's first file call is held until the host says. Never released in the
 // control, so the worker never returns into an image that is gone.
 void holdHook(const char*) {
@@ -78,8 +90,7 @@ void holdHook(const char*) {
     bool expected = false;
     if (!held.compare_exchange_strong(expected, true)) return;
     if (g_probe) g_probe->hookThread = static_cast<LONG>(GetCurrentThreadId());
-    SetEvent(g_entered);
-    WaitForSingleObject(g_release, INFINITE);
+    enterAndHold(g_entered, g_release);
     if (g_stopAfterHold.load()) journalWatchShutdown();
 }
 
@@ -103,15 +114,13 @@ Job g_raw = {};
 // The shape of ui_surfaces.cpp's hmdRefresh, held: a pool thread inside this
 // module's code that nobody waits for.
 VOID CALLBACK poolCallback(PTP_CALLBACK_INSTANCE, PVOID) {
-    SetEvent(g_pool.entered);
-    WaitForSingleObject(g_pool.release, INFINITE);
+    enterAndHold(g_pool.entered, g_pool.release);
     SetEvent(g_pool.done);
 }
 
 // A thread made with CreateThread: nothing takes a reference on its behalf.
 DWORD WINAPI rawProc(LPVOID) {
-    SetEvent(g_raw.entered);
-    WaitForSingleObject(g_raw.release, INFINITE);
+    enterAndHold(g_raw.entered, g_raw.release);
     SetEvent(g_raw.done);
     return 0;
 }

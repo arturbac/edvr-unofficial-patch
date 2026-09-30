@@ -451,6 +451,45 @@ int main() {
         ComPtr<ID3D11Resource> res; srv->GetResource(&res);
         return readDepth(dev.Get(), ctx.Get(), res.Get());
     };
+    // The resolve is a Submit-time pass: temporal_pass.cpp runs it once per
+    // eye, long after the game's hologram draw, so the game's output-merger
+    // stage holds whatever its LATER passes bound, not the HDR target the
+    // hologram blended into. This toy game never draws again, so its RTV0
+    // would still be that very target when the resolve's near-light compute
+    // pass sets the target's SRV (ui_depth.cpp, CSSetShaderResources slot 2;
+    // the OM is only cleared further down, before the resolve's own draw).
+    // D3D11 forces a view over a still-bound output to NULL -- the near-light
+    // pass would read a black target, or a black display where the test's
+    // display is the toy target itself -- and Windows Server 2022's debug
+    // layer reports it once per resolve ("Resource being set to CS shader
+    // resource slot 2 is still bound on output! Forcing to NULL."). A machine
+    // with no debug layer installed sees no message, but the runtime nulls
+    // the view there all the same, so the near-light pass ran blind in this
+    // rig even where it passed. So the resolve is called through here: an
+    // unrelated target is bound for the call, and the toy game's own binding
+    // is handed back after it.
+    ComPtr<ID3D11RenderTargetView> submitRtv;
+    {
+        D3D11_TEXTURE2D_DESC sbd = td;                 // the toy target's shape, in a format of its own
+        sbd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        ComPtr<ID3D11Texture2D> submitTex; hr(dev->CreateTexture2D(&sbd, nullptr, &submitTex));
+        hr(dev->CreateRenderTargetView(submitTex.Get(), nullptr, &submitRtv));
+    }
+    auto resolveAtSubmit = [&](int eye, ID3D11Texture2D* scene, uint32_t w, uint32_t h, ID3D11ShaderResourceView* display) {
+        ID3D11RenderTargetView* gameRtvs[8] = {}; ID3D11DepthStencilView* gameDsv = nullptr;
+        ctx->OMGetRenderTargets(8, gameRtvs, &gameDsv);
+        ctx->OMSetRenderTargets(1, submitRtv.GetAddressOf(), nullptr);
+        const bool ran = uiDepthHologramResolve(ctx.Get(), eye, scene, w, h, display);
+        ID3D11RenderTargetView* after[8] = {}; ID3D11DepthStencilView* afterDsv = nullptr;
+        ctx->OMGetRenderTargets(8, after, &afterDsv);
+        check(after[0] == submitRtv.Get() && afterDsv == nullptr, "resolve: the game's output-merger state is handed back as it was");
+        for (auto* v : after) if (v) v->Release();
+        if (afterDsv) afterDsv->Release();
+        ctx->OMSetRenderTargets(8, gameRtvs, gameDsv);   // the toy game's own binding, for what follows
+        for (auto* v : gameRtvs) if (v) v->Release();
+        if (gameDsv) gameDsv->Release();
+        return ran;
+    };
     constexpr float kNear5m = 0.005f;    // 0.025 / 5
     constexpr float kNear50m = 0.0005f;  // 0.025 / 50, beyond the 10 m radius
     // Not constexpr: reads g_cockpitMetres, set just above. The live call
@@ -476,7 +515,7 @@ int main() {
             {
                 CensusCommandSpy spy(ctx.Get());
                 listedReissue();
-                check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "census policy: production resolve runs");
+                check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "census policy: production resolve runs");
                 holoPollQueries(ctx.Get()); holoPollNearLightCounts(ctx.Get());
                 check(spy.draws == 3 && spy.dispatches == 1, "census policy: both reissues and near-light/resolve run");
                 if (pass == 0) {
@@ -522,7 +561,7 @@ int main() {
         {
             CensusCommandSpy spy(ctx.Get());
             listedReissue();
-            check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "census quota: production resolve runs");
+            check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "census quota: production resolve runs");
             check(spy.begins == 0 && spy.ends == 0 && spy.stagingCopies == 0, "census quota: no discarded query/copy work");
             check(spy.draws == 3 && spy.dispatches == 1, "census quota: output work retained");
         }
@@ -532,7 +571,7 @@ int main() {
         frame = (frame | 15u) + 1u; g_frame = frame;
         originalDraw(kNear5m, left, right, blendSrcAlphaOne.Get(), false, kBlack, false);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "census live toggle: queued resolve");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "census live toggle: queued resolve");
         bool pending = false;
         for (unsigned i = 0; i < kHoloQueryRing; ++i)
             pending = pending || g_holoScratch[0].occlusionPending[i] || g_holoScratch[0].nearLightStagePending[i];
@@ -549,7 +588,7 @@ int main() {
             originalDraw(kNear5m, left, right, blendSrcAlphaOne.Get(), false, kBlack, false);
             CensusCommandSpy spy(ctx.Get());
             listedReissue();
-            check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "census live off: resolve continues");
+            check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "census live off: resolve continues");
             holoPollQueries(ctx.Get()); holoPollNearLightCounts(ctx.Get());
             g_holoWindowStartMs = GetTickCount64() - 30001;
             holoDepthWindowTick(ctx.Get());
@@ -576,7 +615,7 @@ int main() {
         const float left[4] = {0.5f, 0.5f, 0.5f, 1.0f}, right[4] = {0.02f, 0.02f, 0.02f, 1.0f};
         originalDraw(kNear5m, left, right, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (T1/T2)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (T1/T2)");
         auto values = privateDepth();
         check(std::fabs(values[1] - kNear5m) < 1e-5f, "T1: bright half above the floor gets the element depth");
         check(std::fabs(values[6] - kFillerDepth) < 1e-5f, "T2: dark fringe near the bright half's light gets the filler depth");
@@ -602,7 +641,7 @@ int main() {
         ComPtr<ID3D11Resource> contribRes; contribSrv->GetResource(&contribRes);
         for (float v : readContribR(dev.Get(), ctx.Get(), contribRes.Get()))
             check(std::fabs(v - 0.01f) < 1e-3f, "alpha regression: contribution is alpha-weighted (0.01), not luma-only (1.0)");
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (alpha regression)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (alpha regression)");
         for (float v : privateDepth()) check(v == 0.0f, "alpha regression: dark with no light anywhere nearby is not covered");
     }
 
@@ -614,7 +653,7 @@ int main() {
         const float rgba[4] = {0.3f, 0.3f, 0.3f, 0.3f};
         originalDraw(kNear5m, rgba, rgba, blendPremultiplied.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (premultiplied)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (premultiplied)");
         for (float v : privateDepth()) check(std::fabs(v - kNear5m) < 1e-5f, "premultiplied: covered");
     }
 
@@ -627,7 +666,7 @@ int main() {
         ctx->ClearDepthStencilView(sceneDsv.Get(), D3D11_CLEAR_DEPTH, 0.3f, 0);
         check(g_uiDepth[0].acquire(ctx.Get(), sceneTex.Get()) != nullptr,
               "nothing listed: private copy seeded (simulating unrelated coverage)");
-        check(!uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "nothing listed: resolve declines");
+        check(!resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "nothing listed: resolve declines");
         for (float v : privateDepth()) check(std::fabs(v - 0.3f) < 1e-6f, "nothing listed: depth untouched");
     }
 
@@ -646,7 +685,7 @@ int main() {
         const float rgba[4] = {0.5f, 0.5f, 0.5f, 1.0f};
         originalDraw(kNear50m, rgba, rgba, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (beyond radius)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (beyond radius)");
         for (float v : privateDepth()) check(v == 0.0f, "beyond radius: leaves the sky's depth");
     }
 
@@ -666,7 +705,7 @@ int main() {
         originalDraw(kNear50m, rgba, rgba, blendSrcAlphaOne.Get(), false, kBlack, true);
         g_holoDrawVs = kHoloUnlistedMarker;
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (world marker)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (world marker)");
         for (float v : privateDepth())
             check(std::fabs(v - kNear50m) < 1e-5f, "world marker: beyond radius, covered with its own depth");
 
@@ -679,7 +718,7 @@ int main() {
         originalDraw(kNear50m, rgba, rgba, blendSrcAlphaOne.Get(), false, kBlack, true);
         g_holoDrawVs = kHoloIconCore;
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (same draw, cockpit family)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (same draw, cockpit family)");
         for (float v : privateDepth())
             check(v == 0.0f, "world marker: the same draw classified as cockpit is not covered");
     }
@@ -694,7 +733,7 @@ int main() {
         const float rgba[4] = {0.5f, 0.5f, 0.5f, 1.0f};
         originalDraw(kNear5m, rgba, rgba, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (behind nearer)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (behind nearer)");
         for (float v : privateDepth()) check(std::fabs(v - 0.5f) < 1e-6f, "behind nearer scene: untouched");
     }
 
@@ -715,20 +754,20 @@ int main() {
         g_uiDepth[0].frameBoundary(); g_uiDepth[1].frameBoundary();
         originalDraw(kNear5m, rgba, rgba, blendSrcAlphaOne.Get(), false, grey, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, toySrvUnorm.Get()), "resolve runs (share, over grey)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,toySrvUnorm.Get()), "resolve runs (share, over grey)");
         for (float v : privateDepth()) check(v == 0.0f, "share: +0.1 over 0.8 is not enough of the finished pixel");
 
         g_uiDepth[0].frameBoundary(); g_uiDepth[1].frameBoundary();
         originalDraw(kNear5m, rgba, rgba, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, toySrvUnorm.Get()), "resolve runs (share, over black)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,toySrvUnorm.Get()), "resolve runs (share, over black)");
         for (float v : privateDepth()) check(std::fabs(v - kNear5m) < 1e-5f, "share: +0.1 over black is covered");
 
         g_uiDepth[0].frameBoundary(); g_uiDepth[1].frameBoundary();
         originalDraw(kNear5m, rgba, rgba, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
         const uint32_t fallbackBefore = g_holoWindowFloorFallback;
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (share, no display)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (share, no display)");
         for (float v : privateDepth()) check(std::fabs(v - kNear5m) < 1e-5f, "share: null display still covers via the floor fallback");
         check(g_holoWindowFloorFallback == fallbackBefore + 1, "share: the floor-fallback counter moved exactly once");
     }
@@ -748,7 +787,7 @@ int main() {
         drawIntoRtv(hdrRtv.Get(), kNear5m, dim, dim, blendSrcAlphaOne.Get(), kBlack, true);
         listedReissue();
         auto display27 = makeDisplay(0.27f);
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, display27.Get()), "resolve runs (HDR, the flight's own case)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,display27.Get()), "resolve runs (HDR, the flight's own case)");
         for (float v : privateDepth()) check(std::fabs(v - kNear5m) < 1e-5f, "HDR: 0.078 HDR luma against 0.27 display luma is covered");
 
         // +0.1 over an HDR target pre-filled to 0.8 (finished 0.9), display
@@ -759,7 +798,7 @@ int main() {
         drawIntoRtv(hdrRtv.Get(), kNear5m, add, add, blendSrcAlphaOne.Get(), grey, true);
         listedReissue();
         auto display9 = makeDisplay(0.9f);
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, display9.Get()), "resolve runs (HDR, share)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,display9.Get()), "resolve runs (HDR, share)");
         for (float v : privateDepth()) check(v == 0.0f, "HDR: +0.1 over 0.8 is not enough of the finished HDR pixel");
 
         // Over black, display 0.02, floor 0.05: the floor reads the
@@ -773,7 +812,7 @@ int main() {
         drawIntoRtv(hdrRtv.Get(), kNear5m, bright, bright, blendSrcAlphaOne.Get(), kBlack, true);
         listedReissue();
         auto display02 = makeDisplay(0.02f);
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, display02.Get()), "resolve runs (HDR, floor on display)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,display02.Get()), "resolve runs (HDR, floor on display)");
         for (float v : privateDepth())
             check(v == 0.0f, "HDR: a uniformly dim display, nowhere near light, is not covered");
 
@@ -784,7 +823,7 @@ int main() {
         drawIntoRtv(hdrRtvNoSrv.Get(), kNear5m, bright, bright, blendSrcAlphaOne.Get(), kBlack, true);
         listedReissue();
         const uint32_t noTargetBefore = g_holoWindowNoTarget;
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, display27.Get()), "resolve runs (HDR, unviewable target)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,display27.Get()), "resolve runs (HDR, unviewable target)");
         for (float v : privateDepth()) check(std::fabs(v - kNear5m) < 1e-5f, "HDR: an unviewable target is covered on the floor alone");
         check(g_holoWindowNoTarget == noTargetBefore + 1, "HDR: the no-target counter moved exactly once");
 
@@ -794,7 +833,7 @@ int main() {
         drawIntoRtv(hdrRtv.Get(), kNear5m, bright, bright, blendSrcAlphaOne.Get(), kBlack, true);
         listedReissue();
         const uint32_t fallbackBefore2 = g_holoWindowFloorFallback;
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (HDR, null display)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (HDR, null display)");
         for (float v : privateDepth()) check(std::fabs(v - kNear5m) < 1e-5f, "HDR: null display falls back to the contribution floor");
         check(g_holoWindowFloorFallback == fallbackBefore2 + 1, "HDR: the floor-fallback counter moved exactly once more");
     }
@@ -822,7 +861,7 @@ int main() {
         const float dark[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         originalDraw(kNear5m, dark, dark, blendSrcAlphaOne.Get(), false, nullptr, false);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (sun corona)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (sun corona)");
         for (float v : privateDepth())
             check(v == 0.0f, "sun corona: the near quad's own dark pixel has no light of its own nearby, so stays uncovered");
     }
@@ -843,7 +882,7 @@ int main() {
         ctx->RSSetState(cullBack.Get());
         D3D11_VIEWPORT tiny{0, 0, 1, 1, 0, 1};
         ctx->RSSetViewports(1, &tiny);
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs under a hostile RS/viewport");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs under a hostile RS/viewport");
         for (float v : privateDepth()) check(std::fabs(v - kNear5m) < 1e-5f, "state: covered regardless of the externally bound RS/viewport");
         ComPtr<ID3D11RasterizerState> rsAfter; ctx->RSGetState(&rsAfter);
         check(rsAfter.Get() == cullBack.Get(), "state: RS restored to what was bound before the resolve");
@@ -871,13 +910,13 @@ int main() {
         ctx->ClearDepthStencilView(sceneDsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
         originalDraw(kNear5m, rgba, rgba, blendSrcAlphaOne.Get(), true /*sRGB view*/, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (sRGB view)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (sRGB view)");
         for (float v : privateDepth()) check(std::fabs(v - kNear5m) < 1e-5f, "sRGB: linear 0.02 through an sRGB view is covered");
 
         g_uiDepth[0].frameBoundary(); g_uiDepth[1].frameBoundary();
         originalDraw(kNear5m, rgba, rgba, blendSrcAlphaOne.Get(), false /*plain view*/, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (plain view)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (plain view)");
         for (float v : privateDepth())
             check(v == 0.0f, "sRGB: the same 0.02 through a plain view is dark with no light nearby, not covered");
         g_holoFloor = savedFloor;
@@ -895,7 +934,7 @@ int main() {
         const float glyph[4] = {0.6f, 0.6f, 0.6f, 1.0f}, gap[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         originalDraw(kNear5m, glyph, gap, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (glyph/gap, cockpit range)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (glyph/gap, cockpit range)");
         auto values = privateDepth();
         for (unsigned y = 0; y < 8; ++y) for (unsigned x = 0; x < 8; ++x) {
             const float expected = x < 4 ? kNear5m : kFillerDepth;
@@ -918,7 +957,7 @@ int main() {
         const float glyph[4] = {0.6f, 0.6f, 0.6f, 1.0f}, gap[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         originalDraw(kNear50m, glyph, gap, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (glyph/gap, beyond radius, cockpit family)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (glyph/gap, beyond radius, cockpit family)");
         for (float v : privateDepth()) check(v == 0.0f, "glyph/gap beyond radius: neither half is covered for a cockpit family");
 
         g_uiDepth[0].frameBoundary(); g_uiDepth[1].frameBoundary();
@@ -927,7 +966,7 @@ int main() {
         g_holoDrawVs = kHoloUnlistedMarker;   // toyVs has no TEXCOORD6/7 (round 8)
         originalDraw(kNear50m, glyph, gap, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr), "resolve runs (glyph/gap, beyond radius, world marker)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr), "resolve runs (glyph/gap, beyond radius, world marker)");
         auto values = privateDepth();
         check(std::fabs(values[1] - kNear50m) < 1e-5f, "glyph/gap beyond radius, world marker: the bright glyph half still covers");
         check(values[6] == 0.0f, "glyph/gap beyond radius, world marker: the gap half still does not");
@@ -982,7 +1021,7 @@ int main() {
         const D3D11_SUBRESOURCE_DATA sub{starDisplay.data(), 8 * 4, 0};
         ComPtr<ID3D11Texture2D> starTex; hr(dev->CreateTexture2D(&dd, &sub, &starTex));
         ComPtr<ID3D11ShaderResourceView> starSrv; hr(dev->CreateShaderResourceView(starTex.Get(), nullptr, &starSrv));
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, starSrv.Get()), "resolve runs (star)");
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,starSrv.Get()), "resolve runs (star)");
         auto values = privateDepth();
         for (unsigned y = 0; y < 8; ++y) for (unsigned x = 0; x < 8; ++x) {
             const bool starPixel = (x == 6 && y == 3);
@@ -1068,7 +1107,7 @@ int main() {
         // element depth at all.
         g_holoEye = 0; g_holoW = kWideW; g_holoH = kWideH;
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, wideScene.Get(), kWideW, kWideH, nullptr),
+        check(resolveAtSubmit(0, wideScene.Get(), kWideW, kWideH, nullptr),
               "resolve runs (near-light radius)");
         ID3D11ShaderResourceView* wideSrv = nullptr;
         check(uiDepthTemporalDepth(kWideW, kWideH, 0, wideScene.Get(), &wideSrv), "near-light radius: private depth published");
@@ -1111,7 +1150,7 @@ int main() {
         const float glyph[4] = {0.6f, 0.6f, 0.6f, 1.0f}, gap[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         originalDraw(kNear5m, glyph, gap, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr),
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr),
               "resolve runs (filler, nearer scene)");
         {
             auto values = privateDepth();
@@ -1133,7 +1172,7 @@ int main() {
         ctx->ClearDepthStencilView(sceneDsv.Get(), D3D11_CLEAR_DEPTH, 0.0f, 0);
         originalDraw(kNear5m, glyph, gap, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr),
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr),
               "resolve runs (filler, over sky)");
         {
             auto values = privateDepth();
@@ -1190,7 +1229,7 @@ int main() {
         ctx->ClearDepthStencilView(sceneDsv.Get(), D3D11_CLEAR_DEPTH, uiStamp, 0);
         originalDraw(elementDepth, bright, bright, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr),
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr),
               "resolve runs (UI-covered mask)");
         for (float v : privateDepth())
             check(std::fabs(v - uiStamp) < 1e-5f,
@@ -1204,7 +1243,7 @@ int main() {
         ctx->ClearDepthStencilView(sceneDsv.Get(), D3D11_CLEAR_DEPTH, uiStamp, 0);
         originalDraw(elementDepth, bright, bright, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr),
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr),
               "resolve runs (mask bit clear)");
         for (float v : privateDepth())
             check(std::fabs(v - elementDepth) < 1e-5f,
@@ -1221,7 +1260,7 @@ int main() {
         const float dark[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         originalDraw(kNear5m, bright, dark, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr),
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr),
               "resolve runs (UI-covered glyph, gap not covered)");
         {
             auto values = privateDepth();
@@ -1284,7 +1323,7 @@ int main() {
         g_holoDrawVs = kHoloUnlistedMarker;
         originalDraw(kNear50m, rgba, rgba, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr),
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr),
               "resolve runs (world marker, broken viewport)");
         for (float v : privateDepth())
             check(std::fabs(v - kNear50m) < 1e-5f,
@@ -1313,7 +1352,7 @@ int main() {
         g_holoDrawVs = kHoloUnlistedMarker;
         originalDraw(0.0f, rgba, rgba, blendSrcAlphaOne.Get(), false, kBlack, true);
         listedReissue();
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr),
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr),
               "resolve runs (world marker, VS z=0)");
         for (float v : privateDepth()) check(v == 0.0f, "world marker: a VS that writes z=0 itself is not stamped");
         for (int tries = 0; tries < 50 && g_holoMarkerSampleCount == 0; ++tries) {
@@ -1376,7 +1415,7 @@ int main() {
         ctx->VSSetConstantBuffers(0, 1, cbuf.GetAddressOf());
         ctx->PSSetConstantBuffers(0, 1, cbuf.GetAddressOf());
 
-        check(uiDepthHologramResolve(ctx.Get(), 0, sceneTex.Get(), 8, 8, nullptr),
+        check(resolveAtSubmit(0, sceneTex.Get(), 8, 8,nullptr),
               "resolve runs (world marker, true depth)");
         for (float v : privateDepth())
             check(std::fabs(v - kNear50m) < 1e-5f,
@@ -1435,13 +1474,20 @@ int main() {
         check(g_holoWindowStartMs != 0, "census: the window reset after printing");
     }
 
+    // Every offending message is printed before the rig fails (as
+    // tools\ui_depth_test does), so one run shows the whole queue rather
+    // than only its first entry. This rig used to stop at the first, which
+    // cost a CI round trip for every kind of message the runner's layer
+    // had to say.
+    unsigned layerFaults = 0;
     if (info) for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {
         SIZE_T size = 0; info->GetMessage(i, nullptr, &size); std::vector<unsigned char> storage(size);
         auto* m = reinterpret_cast<D3D11_MESSAGE*>(storage.data()); hr(info->GetMessage(i, m, &size));
         if (m->Severity <= D3D11_MESSAGE_SEVERITY_WARNING) {
-            std::puts(m->pDescription); check(false, "D3D debug-layer warning/error");
+            std::printf("%s [D3D11_MESSAGE_ID %d]\n", m->pDescription, static_cast<int>(m->ID)); ++layerFaults;
         }
     }
+    check(layerFaults == 0, "D3D debug-layer warning/error");
     ctx->ClearState(); uiDepthShutdown();
     check(gpuTimingShutdown(ctx.Get()), "explicit shared timer shutdown before WARP release");
     std::printf("PASS: %d checks; the generic hologram/icon depth pass mirrors the game's own blend "

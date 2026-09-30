@@ -20,11 +20,17 @@ Out main(float3 p:POSITION){Out o=(Out)0;float4 v=float4(p,1);o.a=o.b=o.c=o.d=o.
 o.p=float4(dot(m[4],v),dot(m[5],v),dot(m[6],v),dot(m[7],v));return o;}
 )HLSL","vs_5_0");
     auto psCode=compile("float4 main():SV_Target{return float4(.2,.4,.6,1);}","ps_5_0");
-    // The solar pixel shader declares the vertex shader's Out verbatim, unused
-    // fields included, so SV_Position sits in register 8 on both sides; naming
-    // only SV_Position put it in v0, which Windows Server 2022's D3D11 debug
-    // layer reports as a stage linkage error (the newer Windows 11 layer does not).
-    auto solarPsCode=compile("struct I{float3 a:TEXCOORD0;float3 b:TEXCOORD1;float3 c:TEXCOORD2;float3 d:TEXCOORD3;float3 e:TEXCOORD4;nointerpolation uint id:TEXCOORD5;float3 n:TEXCOORD6;float3 t:TEXCOORD7;float4 p:SV_Position;};float4 main(I i):SV_Target{if(i.p.x<4)discard;return float4(.2,.4,.6,.5);}","ps_5_0");
+    // The solar pixel shader declares the vertex shader's Out verbatim: same
+    // fields, same order, unused ones included. Windows Server 2022's D3D11
+    // debug layer checks on every Draw that each semantic the pixel shader
+    // reads sits in the register the vertex shader wrote it to, and reports a
+    // stage linkage error for any that does not. Out puts SV_Position first,
+    // so it is o0/v0 and TEXCOORD0-7 are registers 1-8 on both sides;
+    // production's coverage pixel shader (kPlanetCoverageHlsl) names only
+    // SV_Position, which also takes v0. Keep this struct in step with Out:
+    // reordering one without the other puts every TEXCOORD in the wrong
+    // register, one message per semantic, on that layer.
+    auto solarPsCode=compile("struct I{float4 p:SV_Position;float3 a:TEXCOORD0;float3 b:TEXCOORD1;float3 c:TEXCOORD2;float3 d:TEXCOORD3;float3 e:TEXCOORD4;nointerpolation uint id:TEXCOORD5;float3 n:TEXCOORD6;float3 t:TEXCOORD7;};float4 main(I i):SV_Target{if(i.p.x<4)discard;return float4(.2,.4,.6,.5);}","ps_5_0");
     ComPtr<ID3D11PixelShader> solarPs;hr(dev->CreatePixelShader(solarPsCode->GetBufferPointer(),solarPsCode->GetBufferSize(),nullptr,&solarPs));
     ComPtr<ID3D11VertexShader> vs;ComPtr<ID3D11PixelShader> ps;
     hr(dev->CreateVertexShader(vsCode->GetBufferPointer(),vsCode->GetBufferSize(),nullptr,&vs));

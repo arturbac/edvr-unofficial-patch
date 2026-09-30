@@ -151,9 +151,10 @@ int main(int argc,char** argv){
         // The input list repeats the vertex shader's output order (TEXCOORD0
         // then SV_Position) so both land in the same registers: a pixel shader
         // that names only SV_Position puts it in v0 while the vertex shader
-        // wrote it to o1, which the Windows Server 2022 debug layer reports as
-        // a stage linkage error and this rig's clean-layer check then fails.
-        // Newer Windows layers let it pass, which is how it went unnoticed.
+        // wrote it to o1, which the debug layer reports as a stage linkage
+        // error and this rig's clean-layer check then fails. Only the CI
+        // runner has a layer; a machine without the Graphics Tools feature
+        // never runs that check, which is how it went unnoticed.
         auto uc=compile("float4 main(float2 uv:__USER_VERTEX_M_TEXCOORD0,float4 p:SV_Position):SV_Target{if(p.x>48)discard;return float4(0,1,0,p.x<16?0:p.x<32?.25:1);}","ps_5_0");
         ComPtr<ID3D11PixelShader> up;hr(dev->CreatePixelShader(uc->GetBufferPointer(),uc->GetBufferSize(),nullptr,&up));
         D3D11_BLEND_DESC ub{};auto& r=ub.RenderTarget[0];r.BlendEnable=TRUE;r.SrcBlend=D3D11_BLEND_SRC_ALPHA;r.DestBlend=D3D11_BLEND_INV_SRC_ALPHA;r.BlendOp=D3D11_BLEND_OP_ADD;
