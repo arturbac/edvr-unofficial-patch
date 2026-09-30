@@ -49,7 +49,7 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-82):** users 1-2 refused every frame, 3 treated at 7-13
-  fps, 4 lost ~23 ms (ReShade). 80 flown, 81 flown, default auto, 82 chain seen
+  fps, 4 lost ~23 ms (ReShade). 80, 81 flown (auto). 82 (VR on foot): in build
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -5931,3 +5931,146 @@ flat HDR route has flown (decision 2).
   counter has the same blind spot for MRT slots 1-7).
 - ruled out: the q 8157 copy of H as the trigger, because it is a copy into
   another resource and the rule takes draws that read H.
+
+**Pre-build findings and the stop (2026-09-30, tree 0587d6f7).** The build of
+this section was ordered with stop conditions. Four readers went through the
+VR draw path and the world-screen gate, the door and the UI layer, the camera
+injector and the eye jitter, and the weapon map and the resolver's prep. One
+stop condition is met, so nothing was built: no key, no code, no flight. All
+of it is code reading (files cited), not flight evidence.
+
+The blocker: nothing keeps the world's jitter off the eyes.
+- `flatCameraAdmit` (flat_camera_phase.h) injects every kind-3 camera it sees
+  while its window is armed, Upstream owns the frame and the phase is
+  non-zero. It has no per-camera or per-group filter; a camera's identity is
+  its struct pointer, and "main group" is per-frame ownership state
+  (flat_camera_ownership.h), not an admission test. No camera-to-role join
+  exists (design-flat-camera-integration.md, lines 16, 51-52, 724).
+- The eye composite reads b1 rows 270..273 in the composer's layout, and an
+  Elite projection built from four tangents is the kind-3 encoding, so the
+  eye camera is probably kind 3 and probably passes the same refresh. The
+  injector has never run in the VR profile and no VR census exists.
+- An admitted eye camera takes the world's phase (bound pair += jx / 5040),
+  about half of it in eye pixels and never resolved, over 8 phases: the
+  screen plane would shimmer. The layer's jitter cancel reads only the eye
+  shift, so nothing cancels it.
+- The injector is flat-wired: the install is gated by runtimeFlatProfile()
+  (flat_camera_inject.cpp:578), Frame, Arm, Disarm and Close are driven from
+  flat_runtime.cpp, and phase, size and the phase-applied note are three
+  calls into the flat runtime. Disarm makes its caller the owner thread;
+  that the refresh runs on the VR render thread is unverified.
+- Ways to tell the eye cameras apart, none verified: (A) a field signature
+  at the refresh: aspect +0x260 against 5040/2835, near +0x254 (world 0.025,
+  weapon 0.0675), a bound pair near zero for the world against asymmetric
+  for an HMD eye, viewport +0x2A0/+0x2A4; (B) a learned pointer, joined by
+  content to the eye b1 rows the engine watch already holds
+  (engine_velocity.cpp:1188, :2543), which needs composeSceneCb ported from
+  c2_derive_model.h; (C) close the window at the trigger (the tone), valid
+  only if every world-view refresh precedes every eye-view one; (D) the
+  caller address, if the eye views use other callers; (E) the camera's
+  tangents against the eye frusta EDVR itself advertises. A leak detector
+  that already exists: flatCameraMeasureRowShift on the eye rows, which must
+  read zero once the eye shift is off.
+- Every option needs one VR on-foot census first. The injector's own census
+  runs with zero mutation (kind 3, armed window, zero phase is "warming")
+  and prints kinds, callers and pointers; the extra columns are per-camera
+  aspect, near, bounds and viewport, the call's place against the tone draw
+  and the refresh thread. Installing the detour in VR needs the flag at :578
+  in place of the profile test, a registered phase source for the three
+  flat calls, an owner-thread Disarm and a small per-frame driver.
+
+What the readers established for everything else (a build needs all of it).
+1. Hosting the resolver in the VR hooks. None of the seven draw thunks
+   (vscreen.cpp: Draw 4423, DrawAuto 4457, DrawIndexed 4469, DrawInstanced
+   4503, DrawIndexedInstanced 4550, the two Indirect at 4135 and 4162) and
+   neither dispatch thunk (exposure_fix.cpp 716 and 735) tests
+   g_flatComputeInternal, while every state hook does. The resolver's own
+   Draw(3,0), its dispatches and the NGX or FSR calls inside it would re-enter
+   the VR verdict path and the exposure fix, which and the dispatch probes key
+   off the shadow's last compute shader (the game's exposure pass), and would
+   count as late writes into H. The first edit of any build is a one-load
+   early return in all nine, and the detector belongs in DrawAuto and the two
+   Indirect thunks too, which skip beginPanelOverride.
+2. CPU. A draw with no colour target (16.8k shadows) dies at one Rtv0 load.
+   The ~5k coloured world draws need an Rtv0-generation memo of {resource,
+   size, format}: bindingResolve is four uncached COM calls, made today up to
+   three times per view per generation (the loader-panel gate, on by default
+   and unmeasured, ui_depth, the eye memo). The detector must not build a
+   FlatContractObservation per draw (~360 B, about 8 MB a frame at 21.8k
+   draws); it reads eight scalars.
+3. Late writes. Flat's observers for dispatch UAVs, copies, clears and maps
+   into H are flat-only and the shadow tracks Rtv0 only; the latch needs VR
+   equivalents in the shared hooks. Engine motion's state can still be bound
+   at the trigger (flat flushes it first, flat_runtime.cpp:2389).
+4. The gate. onFootGateTick returns at once unless the layer is live
+   (fix.ui_quality > 0, a temporal mode, jitter as shipped), so the route
+   requires the layer live. It enters after 2 frames, leaves after 90, and
+   the journal flag lags by about a second.
+5. Resolver inputs VR lacks: the world camera's CPU rows, now and previous
+   (screen_motion keeps GPU copies only; engine_velocity keeps the current
+   rows privately, no getter, no previous), a depth SRV accessor, and the
+   reset and plan bookkeeping. Engine families: VR keys fewer than flat
+   (familyForProfile), which is today's eye route too.
+6. Layer-only door: absent, but additive. treat() gets a branch before :337
+   that hands on an output-size black frame, calls uiLayerNoteTemporal, sets
+   treated and leaves continuity alone; it must never return null (:382 is a
+   permanent stand-down) and never S_FALSE with a shift (the host moves the
+   FOV by it). native_sharpen composites first and sharpens after for these
+   frames. About 400-700 lines over 6-8 files; S_OK with an output is the
+   path DLSS takes today, so the host needs no change (one reader read it as
+   touching the host; the door reader found no such change).
+7. The redirect. A take leaves the game's eye unwritten, and the game's own
+   post pass at q 8226-8227 reads each eye image into a 3840x2160: a mirror,
+   inferred. A refused take would also leave a black eye with no per-eye
+   fallback. So the layer re-issues the composite after the game's draw
+   (the crisp tonemap pattern, pureDrawReissue), with beginInner's mapped
+   viewport: +0.1 ms, the game's eye intact, the eye route always available.
+   kWorldScreen needs a route fact in UiLayerDrawFacts and a per-eye,
+   sequence-tagged "world taken" tag; a new UiLayerDecision value resizes
+   g_win.decided, and ui_quality_test covers kWorldScreen.
+8. Mips. None exists. The screen texture is R8G8B8A8_TYPELESS: GenerateMips
+   through an _SRGB SRV (linear-light, energy preserving: bright thin HUD
+   strokes are not dimmed), sampled through the UNORM view the game's shader
+   expects. The game's s0 may have MaxLOD 0, which would waste the mips, so
+   the re-issue binds a sampler copied from the game's with trilinear and
+   full LOD (no raw PSSetSamplers entry; an unhooked call once a frame).
+9. Screen motion must keep recognising. screenMotionRecognize runs only in
+   screenMotionDraw, which the layer's redirect skips (vscreen.cpp:4656), so
+   naming the source would stop after 2 frames and take the engine slot
+   source and the weapon map with it. Route frames call the recognition and
+   skip the per-eye re-issue (0.24 ms).
+10. The weapon fold-in fits. Prep takes two borrowed SRVs, the weapon map
+   (RGBA16F at the source size, previous minus current in source pixels,
+   w = 1 valid) and the stencil (bit 0x10), and constants.route[2]; attached
+   pixels take the map with screen_motion's tolerance, else reject, and
+   absent inputs keep today's arithmetic bit for bit. Without it, weapon
+   pixels would take the world's camera term at the wrong depth and FOV under
+   DLAA: a screen-fixed weapon ghosting in turns. The map's phase term is
+   open until the weapon camera's phase is observed. A WARP test belongs in
+   flat_mono_resolve_test.
+11. The GPU census rotation gives every section a turn, so new sections
+   lengthen it for the old ones even with the key off; the route's sections
+   must skip their turns while the route is off.
+
+Proposed staging, for Sean's decision. Stage 1 builds everything above with
+the world unjittered and the eye shift off while the route owns the frame:
+the injector is not installed in VR, so there is nothing to leak, and one
+flight reads the cost table (EDVR 4.8-5.2 ms against 2.6-3.6), the layer,
+mips, door and weapon paths and the gate. A zero-mutation VR camera census
+rides in the same build behind its own key, so that flight also answers the
+exclusion. Stage 2 adds the world phase once the census names the mechanism.
+The alternative is the census alone first.
+
+Questions for Sean. (1) Stage 1 with an unjittered world, or the census
+alone first? (2) Is the route allowed to require the layer live
+(fix.ui_quality > 0)? It is on by default. (3) Install the refresh detour
+in VR under a diagnostic key, for the census only?
+
+- ruled out: excluding the eye cameras by camera identity with today's
+  injector, because admission keys on kind 3 and nothing joins a camera
+  struct to a role (flat_camera_phase.h flatCameraAdmit).
+- ruled out: the layer taking the screen draw instead of re-issuing it, as
+  the first build, because it blanks the game's eye (the q 8226-8227 copy)
+  and leaves no per-eye fallback when the take is refused.
+- ruled out: g_flatComputeInternal as sufficient cover for the resolver in the
+  VR hooks, because nine thunks do not test it (see 1).
