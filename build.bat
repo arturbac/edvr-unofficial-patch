@@ -1713,6 +1713,23 @@ if errorlevel 1 ( echo [edvr] ERROR: GPU census test build failed & exit /b 1 )
 "%OBJ%\gpucensus\gpu_census_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_vr_world_mips_test
+REM The VR on-foot world route's mipped screen (design doc section 82, src\d3d11\vr_world_mips.cpp): a real D3D11 WARP
+REM device, the production module linked in as a source, away from build\d3d11.dll. The rig takes System32's device through
+REM src\common\system_d3d11.h, so it links without d3d11.lib, and its exe sits under obj\, not directly in build\.
+REM tools\vr_world_mips_test\mutants.py --self-test holds the rig's mutation list to the source as it is; the list itself
+REM (--run, on demand, about a minute) proves the rig fails when each rule of the module is flipped.
+if not exist "%OBJ%\vrworldmips" mkdir "%OBJ%\vrworldmips"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\vrworldmips\\" /Fe"%OBJ%\vrworldmips\vr_world_mips_test.exe" ^
+    "tools\vr_world_mips_test\vr_world_mips_test.cpp" "src\d3d11\vr_world_mips.cpp" ^
+    /link /INCREMENTAL:NO d3dcompiler.lib
+if errorlevel 1 ( echo [edvr] ERROR: vr_world_mips_test build failed & exit /b 1 )
+"%OBJ%\vrworldmips\vr_world_mips_test.exe" --dry-run || exit /b 1
+"%OBJ%\vrworldmips\vr_world_mips_test.exe" --self-test || exit /b 1
+python "tools\vr_world_mips_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
 :rig_openvr_abi_test
 if not exist "%OBJ%\openvr_abi" mkdir "%OBJ%\openvr_abi"
 cl.exe /nologo /W4 /O2 /EHsc /std:c++17 /MT ^
