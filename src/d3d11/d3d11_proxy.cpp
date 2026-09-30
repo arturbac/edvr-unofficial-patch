@@ -29,6 +29,7 @@
 #include "../common/proxy.h"
 #include "device_hook.h"
 #include "flat_wrapper_note.h"
+#include "format_support_log.h"
 #include "input_gate.h"
 #include "intro_probe.h"   // the device stamp the intro probe's clock reads
 #include "oculus_route.h"
@@ -99,6 +100,12 @@ void attachToDevice(ID3D11Device* device, IDXGISwapChain* swapChain,
     edvr::guardedBudget(g_createBudget, [&] {
         logDeviceCreation(device, driverType, flags, hr);
         if (!device) return;
+        // Which adapter this device is on, and what it says about the formats the
+        // world target is chosen from: read-only questions, asked before any hook goes
+        // on, on both profiles, every session (format_support_log.h). The "created"
+        // line above has no vendor in it; under CrossOver this is what says DXMT. It
+        // contains its own faults, so nothing it does can stop the install below.
+        edvr::formatSupportLogDevice(device);
         // Published before anything is hooked, and deliberately before the
         // config is consulted: the openvr half reads this as its test for a
         // d3d11 half being present (the cull guard), and it cannot ask for

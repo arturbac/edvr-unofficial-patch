@@ -509,6 +509,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_frame_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
     "src\d3d11\gpu_census.cpp" ^
     "src\d3d11\d3d11_proxy.cpp" "src\d3d11\device_hook.cpp" ^
+    "src\d3d11\format_support_log.cpp" ^
     "src\d3d11\graphics_bridge.cpp" ^
     "src\d3d11\render_boundary.cpp" ^
     "src\d3d11\exposure_fix.cpp" "src\d3d11\vscreen.cpp" ^
@@ -919,6 +920,26 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
 if errorlevel 1 ( echo [edvr] ERROR: dlaa_mode_test build failed & exit /b 1 )
 "%BUILD%\dlaa_mode_test.exe" --dry-run || exit /b 1
 "%BUILD%\dlaa_mode_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_format_support_test
+REM The device capability log (src\d3d11\format_support_log.h): its pure decode, line
+REM formats and lock-free ledger; the two vtable slots the device hook patches, held
+REM against the SDK's ID3D11DeviceVtbl; and, in an owned child process, the very hook
+REM bodies on a real WARP device with the real log, every answer with the hook compared
+REM with the answer without it. Built outside %BUILD%, where it can only ever load
+REM System32's d3d11.dll, never the proxy beside the game DLLs.
+if not exist "%OBJ%\formatsupport" mkdir "%OBJ%\formatsupport"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\formatsupport\\" ^
+    /Fe"%OBJ%\formatsupport\format_support_test.exe" ^
+    "tools\format_support_test\format_support_test.cpp" "tools\format_support_test\device_slots.cpp" ^
+    "src\d3d11\format_support_log.cpp" "src\common\vtable_hook.cpp" "src\common\guard.cpp" ^
+    "src\common\log.cpp" "src\common\config.cpp" "src\common\proxy.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: format_support_test build failed & exit /b 1 )
+"%OBJ%\formatsupport\format_support_test.exe" --dry-run || exit /b 1
+"%OBJ%\formatsupport\format_support_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_native_temporal_test

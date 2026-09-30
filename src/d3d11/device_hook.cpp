@@ -31,6 +31,8 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include <vector>
 
 #include "../common/config.h"
+#include "../common/d3d11_device_slots.h"   // kDevSlotCheckFormatSupport / kDevSlotCheckFeatureSupport
+#include "../common/format_query_log.h"     // formatHooksInstalledLine: the one line that says the hooks went on
 #include "../common/temporal_mode.h"
 #include "../common/runtime_profile.h"
 #include "../common/eye_sync.h"
@@ -63,6 +65,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "static_prop_gate.h"
 #include "temporal_pass.h"   // temporalPassArmEyeDump: the eye dump key's job
 #include "flat_runtime.h"
+#include "format_support_log.h"   // the device capability log: the two hooks' reports and its closing tick
 #include "flat_temporal.h"   // flat profile discovery at owned Present
 #include "flat_shader_capture.h"
 #include "perf_monitor.h"
@@ -132,6 +135,8 @@ typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateTexture2D)(
     ID3D11Texture2D**);
 typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateSamplerState)(
     ID3D11Device*, const D3D11_SAMPLER_DESC*, ID3D11SamplerState**);
+// (PFN_CheckFormatSupport and PFN_CheckFeatureSupport, the capability queries' own
+// signatures, are format_support_log.h's.)
 // All seven of the creates above share one register shape: this, a pointer,
 // a pointer, an out pointer. For a resource create the first is the desc and
 // the second the initial data; for a view create the first is the resource
@@ -174,6 +179,9 @@ struct State {
     PFN_CreateShader realCreatePS = nullptr;
     PFN_CreateTexture2D realCreateTexture2D = nullptr;
     PFN_CreateSamplerState realCreateSamplerState = nullptr;
+    // The format-support log's two pass-through hooks (hookedCheckFormatSupport).
+    PFN_CheckFormatSupport  realCheckFormatSupport = nullptr;
+    PFN_CheckFeatureSupport realCheckFeatureSupport = nullptr;
     // Indexed by vtable slot, so the template hook can find its own original
     // from its own slot number. Slots we do not hook stay null and are never
     // reached, because an unpatched entry never routes here.
@@ -1117,6 +1125,7 @@ EDVR_BOUNDARY_TICK(tkFrameFlagPeer, "frame_flag_peer");
 EDVR_BOUNDARY_TICK(tkHookReclaim, "hook_reclaim");
 EDVR_BOUNDARY_TICK(tkContextReclaim, "context_reclaim");
 EDVR_BOUNDARY_TICK(tkProbeCensus, "probe_census");
+EDVR_BOUNDARY_TICK(tkFormatSupport, "format_support");
 
 // The diagnostic keys (tkHotkeys). The exposure toggle is its own tick.
 void tickHotkeys() {
@@ -1678,6 +1687,10 @@ void presentFrameBoundary() {
         // table were therefore the sessions that reported nothing about it.
         // No-op unless a probe actually installed.
         tkProbeCensus.run([] { g_state->bareContextHook.censusTick("probe context"); });
+        // The device capability log's closing count, once the game's format-support
+        // queries have gone quiet (format_support_log.h). Its own tick, apart from the
+        // reclaim passes: a diagnostic's faults must not stand a repair down.
+        tkFormatSupport.run([] { formatSupportTick(); });
     }
 }
 
@@ -2452,6 +2465,41 @@ HRESULT STDMETHODCALLTYPE hookedCreateSamplerState(ID3D11Device* self,
     return s.realCreateSamplerState(self, &d, out);
 }
 
+// ---- WHAT THE GAME ASKS THE DEVICE ABOUT FORMATS, AND WHAT IT IS TOLD -------------
+//
+// CheckFormatSupport and CheckFeatureSupport, hooked to REPORT and for no other reason.
+// Under CrossOver d3d11.dll is DXMT and Elite builds its full-size world in format 23
+// where Windows gets 26; Elite picks from the device's answers to these two calls and
+// EDVR logged none of them (src\d3d11\format_support_log.h, docs\macos-dxmt-2026-09-30.md).
+//
+// PASS-THROUGH, by construction. These two bodies decide one thing -- is this the
+// game's own call -- and hand everything else to formatSupportCheckFormat/Feature,
+// which make the real call FIRST, unguarded, with the caller's own arguments, and
+// return its HRESULT on every path; the report is read from that result afterwards,
+// inside a fault budget of its own, so a report that faults costs the line and never
+// the answer. tools\format_support_test runs those very functions on a real device and
+// compares every answer with the hook and without it.
+//
+// "The game's own" is `self == g_state->device` (patching in place hooks the CLASS, so
+// another device sharing the table gets the same forward and no line) and a return
+// address outside this image: EDVR's other modules ask the device too (the temporal
+// pass, the UI layer, FSR), and they come from here, told from the game's exactly as
+// hookedCreateTexture2D tells EDVR's creates from the game's. _ReturnAddress is taken
+// in the hook itself, the one place it is the caller's.
+HRESULT STDMETHODCALLTYPE hookedCheckFormatSupport(ID3D11Device* self, DXGI_FORMAT format,
+                                                   UINT* support) {
+    const void* const caller = _ReturnAddress();
+    return formatSupportCheckFormat(g_state->realCheckFormatSupport, self, format, support,
+                                    self == g_state->device && !addressInEdvr(caller), caller);
+}
+
+HRESULT STDMETHODCALLTYPE hookedCheckFeatureSupport(ID3D11Device* self, D3D11_FEATURE feature,
+                                                    void* data, UINT size) {
+    const void* const caller = _ReturnAddress();
+    return formatSupportCheckFeature(g_state->realCheckFeatureSupport, self, feature, data, size,
+                                     self == g_state->device && !addressInEdvr(caller), caller);
+}
+
 bool deviceHookRecoveryDisabled() {
     return graphicsRuntimeDisabled();
 }
@@ -2655,6 +2703,15 @@ void hookDevice(ID3D11Device* device) {
     }
     s.deviceHook.replace(kDevCreateSamplerState, &hookedCreateSamplerState,
                          reinterpret_cast<void**>(&s.realCreateSamplerState));
+    // The two capability queries, hooked to REPORT and nothing else -- see
+    // hookedCheckFormatSupport. Slots 29 and 33 are past the prefix check above (which
+    // only demands more than CreateComputeShader, 18), so the prefix is what bounds
+    // them here: replace() refuses an index past it and leaves the forward null, which
+    // leaves that slot exactly as the runtime made it and stages nothing.
+    s.deviceHook.replace(kDevSlotCheckFormatSupport, &hookedCheckFormatSupport,
+                         reinterpret_cast<void**>(&s.realCheckFormatSupport));
+    s.deviceHook.replace(kDevSlotCheckFeatureSupport, &hookedCheckFeatureSupport,
+                         reinterpret_cast<void**>(&s.realCheckFeatureSupport));
     // Before the first create can arrive: the FSS resolution fix's flag is
     // read here for install and on vScreen's reload path for live flips.
     fssResConfigure(sentinelCfg);
@@ -2667,6 +2724,22 @@ void hookDevice(ID3D11Device* device) {
         return;
     }
     s.device = device;
+    // SAID, so the format-support log can be read without guessing (format_support_log.h).
+    // A session with no "format support (game #N)" lines is either a game that asked
+    // nothing or hooks that never went on, and only this line, present or absent, tells
+    // the two apart. Both forwards are set only if both replace() calls staged, which is
+    // what the commit above then wrote.
+    {
+        char note[448];
+        if (s.realCheckFormatSupport && s.realCheckFeatureSupport) {
+            formatHooksInstalledLine(device, kDevSlotCheckFormatSupport, kDevSlotCheckFeatureSupport,
+                                     note, sizeof(note));
+        } else {
+            formatHooksMissingLine(s.deviceHook.executablePrefix(), kDevSlotCheckFormatSupport,
+                                   kDevSlotCheckFeatureSupport, note, sizeof(note));
+        }
+        Log::get().note("%s", note);
+    }
 
     // The hook mechanism, decided ONCE from the immediate context and shared
     // by both context installers so they cannot split modes on the one object
