@@ -3,8 +3,10 @@
 How to build EDVR from source, check the build without the game or a headset,
 and what the optional DLSS mode and the release package need.
 
-Building needs Visual Studio 2022 with the C++ workload, and Python. First
-fetch the pinned official Khronos loader and its notice:
+Building needs Visual Studio 2022 with the C++ workload, and Python with the
+numpy and Pillow packages (`pip install numpy pillow`), which several of the
+tools the build runs import. First fetch the pinned official Khronos loader and
+its notice:
 
 ```
 python tools\fetch_openxr_loader.py
