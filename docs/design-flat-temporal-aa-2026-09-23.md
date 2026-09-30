@@ -5532,8 +5532,8 @@ R11G11B10F target, R1 the D32S8 depth; `R`n names a resource):
    copy, the HUD and the eyes follow the resolve. R = D = 5040x2835 by
    construction, so the gate binds at H's format only, and it is met.
 3. Does anything write the world after that point (the un-jitter question)?
-   H: nothing, on slot 0 (the runtime's `late-hdr-writes` counter watches
-   every slot). The screen texture R16, which both eyes read: yes, two things,
+   H: nothing, on slot 0 (the runtime's `late-hdr-writes` counter has the same
+   limit, below). The screen texture R16, which both eyes read: yes, two things,
    both the flat frame's post-tone writes: the game copy (8204) and six HUD
    draws (8205-8211). They sample GUI surfaces and, for C4B4B334/0146ABCC, the
    320x180 exposure output as its blurred-scene input; none reads H or R1. The
@@ -5562,8 +5562,10 @@ the b0 read in `recordDraw` and `drawCensusDrawDirect` (identity is enough), or
 a camera-hash trace on foot. (2) Render-target slots 1-7: only slot 0 is read,
 so writes through the G-buffer's other slots (R3, R4 and the R6 and R7
 surfaces are cleared, sampled, never seen written) are invisible; "no write to
-H after the trigger" rests on slot 0 here and on the binding shadow's eight
-slots in the runtime counter. (3) One frame: flapping at the world-screen
+H after the trigger" rests on slot 0 here, and the runtime's binding shadow
+keeps only render-target slot 0 too (`BindSlot::Rtv0`), so its counter sees
+draws into H through slot 0, dispatch UAVs and explicit writes, not MRT slots
+1-7. (3) One frame: flapping at the world-screen
 gate, boarding and disembark, and which draws are the first-person weapon
 (no stencil or pool column beyond `so=`) are not in it.
 
@@ -5573,7 +5575,7 @@ mid-frame copy of H is normal. Nothing is built for the VR path before the
 flat HDR route has flown (decision 2).
 
 - ruled out: a write to H after the tone trigger in the VR on-foot chain,
-  because the census shows none after q 8196 (slot 0; the runtime counter
-  covers the other slots).
+  because the census shows none after q 8196 (slot 0 only; the runtime
+  counter has the same blind spot for MRT slots 1-7).
 - ruled out: the q 8157 copy of H as the trigger, because it is a copy into
   another resource and the rule takes draws that read H.
