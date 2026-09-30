@@ -5031,3 +5031,26 @@ state that asks again is a finding: a setter path nothing hooks). Everything
 else unchanged: present p50, treated counts and streaks, the contract reasons,
 motion. With ReShade in the chain the panel shows the note and the log says
 `flat wrapper note: shown`; with EDHM alone, neither.
+
+**2026-09-30 note: flight 090706, the cuts flown (Epic, `c2a06a98` matched,
+on foot in a hangar, 60 s AA off then DLSS).** AA off presented 329-336 fps
+(about 3.0 ms); DLSS present p50 5.99 ms (p95 8.41), GPU frame p50 3.96 ms, so
+the frame is CPU-bound. The scene is heavier than flight 053745's (1,592
+substituted draws a frame against 1,130; contract reductions 8,574 against
+4,969), so compare per draw.
+
+- Draw wrapper: 2,082 D3D calls a frame over 1,592 substituted draws (about
+  1.3 a draw, was 12), 0.21 ms a clocked frame (was 0.89).
+- Camera rows: 0.085 ms over 1,049 fresh lookups a frame (was 0.44 over 5,065).
+- Query shortcuts: about 3,900 answers a frame from tracked state (depth
+  view 1,974, render targets 1,590, blend 149, MRT6 151, shader 4), checked
+  48-52 times each per window, 0 wrong; no state fell back to asking.
+- The census clocks the render thread 1 frame in 16. Its per-clocked-frame
+  total (3.74 ms) still carries that frame's clock overhead (about 73,000
+  scopes), so the render thread's own figures read high.
+- Frame cost of DLSS against AA off: about +3.0 ms (was +4.1 in 053745's
+  exclusive legs, with the unsampled census's 1.7 ms inside).
+- Largest remaining: hook entry ("other") 1.40 ms over 17,180 calls, contract
+  reduction 0.42, engine motion hooks 0.37, copy checks 0.34, trace ring
+  0.23, coverage 0.22, projection readiness 0.18; on job threads, the clear
+  and merge observers 1.9 and 1.06 thread-ms a clocked frame.
