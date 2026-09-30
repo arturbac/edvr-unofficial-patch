@@ -236,6 +236,19 @@ void uiLayerWorldReissueAbandon();
 // over `frame` (the black frame the door is about to hand on) for this eye and sequence? 0 when it would; else a
 // ui_layer_math.h UiWorldDoorGap as an int, and the door leaves the eye to the eye route in the same call.
 int uiLayerWorldDoorGap(uint64_t sequence, uint32_t eye, ID3D11Texture2D* frame);
+// The route's counters for the current 30 s window (the same numbers the gates and the route's lines print), so a
+// rig or the route's own census can read them: the 2D screen draws asked of the decision and what became of them
+// (screenDecided indexes ui_layer_math.h's UiLayerDecision; a draw the route's mode let through is NOT in
+// [kRedirect] -- it is `reissued` once the re-issue ran), the draws the game left in an eye image after its screen
+// was re-issued (lost while the route owns that eye), and the route's own refusals (refused indexes UiWorldRefuse).
+struct UiLayerWorldStats {
+    uint64_t screenAsked = 0;
+    uint64_t screenDecided[16] = {};
+    uint64_t reissued = 0;
+    uint64_t lostDraws = 0;
+    uint64_t refused[16] = {};
+};
+UiLayerWorldStats uiLayerWorldStats();
 
 // True between a successful uiLayerBegin and its End (owner context only):
 // the passes that ride the game's own draw -- the screen's motion and UI
