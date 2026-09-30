@@ -82,26 +82,27 @@ jobs:
       SIGN: "${{ vars.SIGNPATH_SIGNING == 'true' && (github.event_name != 'workflow_dispatch' || inputs.sign) }}"
       DLSS: "${{ github.event_name != 'workflow_dispatch' || inputs.dlss }}"
     steps:
-      # Two rigs that read EDVR's own source (flat_temporal_test and
-      # ui_quality_test) end a function by searching for "\n}\n". A Windows
-      # runner's default checkout writes CRLF, which can never match, and
-      # every machine this repo is built on checks out LF (core.eol=lf,
-      # autocrlf off). Match them before the checkout writes a file.
-      - name: Check out with LF line endings
-        run: |
-          git config --global core.autocrlf false
-          git config --global core.eol lf
-
       - name: Check out EDVR
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Print line-ending state
+      # Two rigs that read EDVR's own source (flat_temporal_test and
+      # ui_quality_test) end a function by searching for "\n}\n", which a CRLF
+      # checkout can never match, and a Windows runner's system git config has
+      # core.autocrlf=true (the first proving runs showed it). .gitattributes
+      # forces LF for .cpp, .h and .py (issue 37), so nothing here has to
+      # configure git; this step shows the state on every run and stops the job
+      # with a plain message, rather than twenty minutes later in an obscure
+      # rig, if the attribute ever stops working.
+      - name: Check the source checked out with LF line endings
         run: |
           git config --show-origin --get-all core.autocrlf
-          git config --show-origin --get-all core.eol
-          git ls-files --eol src/d3d11/ui_layer.cpp build.bat
+          $eol = git ls-files --eol src/d3d11/ui_layer.cpp build.bat
+          $eol | ForEach-Object { Write-Host $_ }
+          if (($eol | Select-String -Pattern 'w/lf\s+attr/text eol=lf\s+src/d3d11/ui_layer\.cpp' -Quiet) -ne $true) {
+            throw "src/d3d11/ui_layer.cpp was not checked out with LF: .gitattributes is not forcing LF for sources"
+          }
 
       # The runner image's default python is whatever the image was built
       # with; pin one so the tools see the same interpreter every release.
@@ -111,12 +112,12 @@ jobs:
           python-version: '3.12'
 
       # Everything else the tools import is the standard library, but the
-      # runner's interpreter has nothing beyond it: several gate tools import
-      # numpy and eye_draw_snapshot.py's self-test exports PNGs through Pillow.
+      # runner's interpreter has nothing beyond it: tools\requirements.txt
+      # names the numpy and Pillow that several gate tools import.
       - name: Install Python packages the rigs need
         run: |
-          python -m pip install --disable-pip-version-check --quiet numpy pillow
-          if ($LASTEXITCODE -ne 0) { throw "pip install numpy pillow failed" }
+          python -m pip install --disable-pip-version-check --quiet -r tools\requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install -r tools\requirements.txt failed" }
 
       - name: Compute release version
         run: |
