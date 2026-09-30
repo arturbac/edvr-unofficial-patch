@@ -657,6 +657,65 @@ inline bool uiLayerAfterWritePreserved(bool excluded, bool worldScreenHeld, bool
     return true;
 }
 
+// THE AFTER-UI IDENTITY (2026-09-30, docs/ui-layer-2026-09-23.md "2026-09-30:
+// the station menu's frosted base under the HUD").
+//
+// The after-UI rule needs to know which game target the layer's UI came from,
+// one resource identity per eye (Eye::target): a draw that WRITES it is taken
+// after the UI, a small draw that only READS it is a post pass and stays in
+// the frame. In a frame where the crisp-HUD tonemap re-issue opened the eye's
+// layer, that identity is the tonemap's output, A. Elite runs a post pass
+// between the tonemap and the interface (vs 20F383BBAC05C031, n=4: it reads A
+// and writes B), and every interface draw lands in B. Keyed to A the rule
+// never fired ("after the UI the game drew 0 times", eye check "could not be
+// told", flights 055723 and 060935), so the frosted base drawn under the
+// panels (vs C4B4B334B26E81A9) stayed in the game's frame, UNDER the layer
+// that now held the HUD the base covers in stock.
+//
+// The identity follows the eye through that pass instead: a reader of the
+// identity that draws into ANOTHER eye-sized 8-bit target carries the
+// identity there. Exactly once per eye-frame, and only while the layer holds
+// nothing but the re-issue's HUD (chainOpen: set by the re-issue, cleared by
+// the follow and by the first taken interface draw) -- after the UI has
+// started, a pass over the eye is a post pass of the UI and never moves the
+// identity, as before. The reader itself stays in the game's frame.
+//
+// Three pure pieces, so the rig (tools/ui_quality_test, the recorded station
+// tails) and uiLayerNoteOther call the same code. The order they are called
+// in is uiLayerNoteOther's; the rig scans it for exactly that order.
+
+// The write case: which eye's identity a draw's own render target is (-1:
+// neither). eyeTarget is uiLayerTargetKind() != 0; a null identity (nothing
+// taken from that eye this frame) matches nothing.
+inline int uiLayerAfterWriteEye(bool eyeTarget, const void* target, const void* taken0,
+                                const void* taken1) {
+    if (!eyeTarget || !target) return -1;
+    if (target == taken0) return 0;
+    if (target == taken1) return 1;
+    return -1;
+}
+
+// The read case: which eye's identity a resource a small draw samples at PS
+// SRV 0 or 1 is (-1: neither).
+inline int uiLayerAfterReadEye(const void* sampled, const void* taken0, const void* taken1) {
+    if (!sampled) return -1;
+    if (sampled == taken0) return 0;
+    if (sampled == taken1) return 1;
+    return -1;
+}
+
+// Whether the reader of an eye's identity carries it into its own target.
+// identity is that eye's, otherIdentity the other eye's (null when nothing is
+// taken from it); readerTargetIsEye8bit is uiLayerTargetKind() == 2 and
+// readerTarget its resource. A reader without an eye-sized 8-bit target, a
+// reader that draws into a taken target, and any reader once the chain is
+// closed never carry it.
+inline bool uiLayerFollowReader(bool chainOpen, const void* identity, const void* otherIdentity,
+                                bool readerTargetIsEye8bit, const void* readerTarget) {
+    if (!chainOpen || !identity || !readerTargetIsEye8bit || !readerTarget) return false;
+    return readerTarget != identity && readerTarget != otherIdentity;
+}
+
 // THE FAMILY RULE, pure: vscreen.cpp's uiLayerFamilyOf gathers these facts
 // for an owner draw into an eye target, in this order and only as far as the
 // rule reads them, and this decides. The shader hashes are the ones the

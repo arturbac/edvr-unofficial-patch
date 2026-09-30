@@ -208,6 +208,12 @@ inline bool uiLayerRedirecting() { return detail::g_uiLayerRedirecting; }
 // bracket it with uiLayerBegin/uiLayerEnd like any other decided draw. A
 // draw that only READS the target (a full-screen pass: count <= 6 vertices)
 // is left alone and never taken; it no longer sees the UI in what it reads.
+// One exception to "left alone": in a frame the crisp re-issue opened, the
+// eye's target is the tonemap's output, and Elite's post pass reads it and
+// draws into another eye-sized 8-bit target where every interface draw lands;
+// that read carries the eye's target there (uiLayerFollowReader, once an
+// eye-frame, before any UI draw is taken), so the interface draws are writes
+// into it. The pass itself is still left in the frame.
 // verdictForwards and substituted are the same facts uiLayerDecide takes for
 // a real UI family (vscreen.cpp's forwardWithVerdict already has them to
 // hand). Every case is counted and each shader pair named once.

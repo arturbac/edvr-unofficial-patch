@@ -35,6 +35,18 @@
 //     the UI, matching the game's own order; an overlay sampling an
 //     eye-sized input, or one the take path refuses (kMrt and kVerdict,
 //     the same rules as any family), is left under the UI instead.
+//   * the after-UI identity (ui_after_ui_test.h; 2026-09-30, the station menu's
+//     frosted base): the identity's pure pieces (a write into it, a read of it,
+//     the follow through the game's post pass) as a truth table; the RECORDED
+//     post-tonemap tails of two field censuses (station services, and the
+//     game's menu over it) routed through the real family rule, decide, gate
+//     and follow -- no interface draw left under the layer, and exactly the
+//     frosted bases left under it when routed as before the follow; the same
+//     draw structures composited stock against layered on the CPU blend model
+//     (equal with the follow, not without it); the known limit pinned (an
+//     HDR-phase draw the layer does not take, after a taken HUD draw, still
+//     sits under it); and a scan of ui_layer.cpp for the order the routing
+//     model assumes (the follow before the once-per-pair note).
 //   * the crisp-HUD parity model (docs/cockpit-hud-layer-design-2026-09-27.md,
 //     design point 5): stock T(F(1-a) + L) against the layer's T(F)(1-a) +
 //     T(L) on a synthetic frame through two stand-in tonemaps -- exact where
@@ -49,10 +61,16 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <initializer_list>
+#include <iterator>
+#include <string>
 #include <vector>
 
 #include "../../src/common/system_d3d11.h"
@@ -2387,6 +2405,7 @@ void testWriteBack(Gpu& g) {
 
 #include "ui_seed_census_test.h"
 #include "ui_seed_freshness_test.h"
+#include "ui_after_ui_test.h"
 
 }  // namespace
 
@@ -2415,6 +2434,10 @@ int main(int argc, char** argv) {
     testGate();
     testFamilyRule();
     testAfterUi();
+    afterui::testIdentity();
+    afterui::testRecordedTails();
+    afterui::testStationPixels();
+    afterui::testWiring();
     testHudParity();
     testChains();
     testPanelScale();

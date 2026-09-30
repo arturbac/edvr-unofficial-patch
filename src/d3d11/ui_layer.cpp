@@ -178,6 +178,11 @@ struct Eye {
     uint32_t draws = 0;          // redirected into it for that frame
     uint64_t compositedSeq = 0;  // the last frame the door composited (or tried)
     const void* target = nullptr;  // the game's target those draws left (identity)
+    // The identity is still a link of the pre-UI chain the crisp re-issue opened
+    // (the tonemap's output A, before the game's post pass carried it to B): a
+    // small pass reading it carries it on, once (uiLayerFollowReader,
+    // ui_layer_math.h). Cleared by that follow and by the first taken UI draw.
+    bool chainOpen = false;
 
     // The per-channel transmittance a multiply leaves (made at the first
     // multiply, cleared to 1 at the first multiply of each frame).
@@ -393,6 +398,11 @@ struct Window {
     // over it), left as a post pass (an eye-sized input), or refused at
     // issue (decide-time, via decided[kAfterUi][...], plus begin-time below).
     uint64_t afterTaken = 0, afterPostPass = 0, afterRefused = 0, afterDeclined = 0;
+    // The reads that carried an eye's identity through the game's post pass
+    // into the target the interface draws to (uiLayerFollowReader): about one
+    // per eye-frame the crisp re-issue ran. Zero beside a nonzero afterReads
+    // in a HUD frame says the follow never ran.
+    uint64_t afterFollowed = 0;
     uint64_t eyeMatched = 0, eyeSwapped = 0, eyeUntold = 0, seedStale = 0;
     uint64_t depthOnlySeedPreservedWriters = 0;
     uint64_t privateDepthPotentialBegins = 0;
@@ -726,6 +736,7 @@ bool ensureLayer(ID3D11Device* dev, Eye& e, uint32_t w, uint32_t h, int eye) {
     e.w = e.h = 0;
     e.seq = 0;
     e.draws = 0;
+    e.chainOpen = false;
     if (!dev || !w || !h ||
         !makeTarget(dev, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, &e.tex, &e.rtv, &e.srv))
         return false;
@@ -833,6 +844,7 @@ bool releaseLayers() {
         e.w = e.h = e.basisW = e.basisH = 0;
         e.seq = 0;
         e.draws = 0;
+        e.chainOpen = false;
         e.mTex.Reset();
         e.mRtv.Reset();
         e.mSrv.Reset();
@@ -1388,6 +1400,7 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
         e.seq = g_draw.seq;
         e.draws = 0;
         e.target = g_draw.targetRes;
+        e.chainOpen = false;  // the layer starts with a UI draw: no re-issue's HUD, no chain to follow
         ++g_win.clears;
     }
     if (which == 0 && g_draw.hdr && e.hdrSeq != g_draw.seq) {
@@ -1589,6 +1602,7 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
             ++g_win.hdrRedirected;
         } else {
             ++e.draws;
+            e.chainOpen = false;  // the UI has started: a pass over the eye no longer carries its identity
         }
         ++g_win.redirected;
         ++g_sessionRedirected;
@@ -2374,7 +2388,8 @@ void logTotals(double seconds) {
         "%llu times into an eye target the UI was taken from: %llu taken into the layer after "
         "the UI (kept over it), %llu left as post passes (eye-sized input), %llu declined by "
         "the layer's rules (the families line's 'after the UI' says which), %llu refused at "
-        "issue; %llu times read one (a post pass: the UI misses it); eye check against the "
+        "issue; %llu times read one (a post pass: the UI misses it), %llu of them carrying the "
+        "eye on into the target the interface draws to; eye check against the "
         "game's Submit: %llu matched, %llu SWAPPED, %llu could not be told; %llu redirected "
         "this session%s.",
         static_cast<unsigned long long>(late), static_cast<unsigned long long>(g_win.lostLayers),
@@ -2387,6 +2402,7 @@ void logTotals(double seconds) {
         static_cast<unsigned long long>(g_win.afterDeclined),
         static_cast<unsigned long long>(g_win.afterRefused),
         static_cast<unsigned long long>(g_win.afterReads),
+        static_cast<unsigned long long>(g_win.afterFollowed),
         static_cast<unsigned long long>(g_win.eyeMatched),
         static_cast<unsigned long long>(g_win.eyeSwapped),
         static_cast<unsigned long long>(g_win.eyeUntold),
@@ -3362,9 +3378,25 @@ void uiLayerCrispToneEnd(ID3D11DeviceContext* ctx) {
     // The 8-bit layer now holds this frame's tonemapped HUD: the door's
     // composite shows it, and the post-tonemap menus land on top in game
     // order (their draws see e.seq already current, so no clear).
+    //
+    // Two things this does not order, both about draws the layer did not take:
+    //  - after the UI: the identity below is the tonemap's OUTPUT, the FIRST
+    //    link of the eye's chain. Elite's post pass carries the eye on into
+    //    another target and every interface draw lands there, so the identity
+    //    follows it (uiLayerNoteOther's read case, uiLayerFollowReader): until
+    //    it has, and if it never does, the after-the-UI rule sees nothing
+    //    (flights 055723, 060935: the frosted base under the station panels
+    //    stayed in the frame, under the HUD this layer now holds).
+    //  - inside the HDR phase (KNOWN LIMIT, not fixed): a draw the layer does
+    //    not take, issued AFTER a taken HUD draw in the HDR target (the
+    //    frosted label quads vs 2CECEC30..., the canopy, other families), was
+    //    over that HUD draw in stock and is under it now -- the HUD layer is
+    //    composited over the whole frame. There is no HDR-phase counterpart of
+    //    the after-the-UI take; tools/ui_quality_test pins the inversion.
     e.seq = seq;
     e.draws = 1;
-    e.target = rtvRes;  // the RGBA8 eye the game's tonemap wrote: the eye check's identity
+    e.target = rtvRes;  // the RGBA8 eye the game's tonemap wrote: the FIRST link of the identity
+    e.chainOpen = true;
     e.hdrToneSeq = seq;
     e.hdrMissStreak = 0;  // a publication landed: the R1 deadline's streak resets
     g_lastRedirectSeq = seq;
@@ -3431,11 +3463,17 @@ bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForw
     // A write: the draw's target is one the UI left this frame -- a compare
     // on the target cache, every draw. A read: a pass over the eye samples it
     // at t0/t1 -- full-screen passes are a handful of vertices, so only those
-    // are resolved, and at most kWatchPerFrame a frame.
-    if (uiLayerTargetKind() != 0 &&
-        (g_tc.info.resource == taken[0] || g_tc.info.resource == taken[1])) {
+    // are resolved, and at most kWatchPerFrame a frame. The matching is
+    // ui_layer_math.h's (uiLayerAfterWriteEye / uiLayerAfterReadEye), which
+    // tools/ui_quality_test drives over the recorded station frames; keep the
+    // ORDER of this function's steps (write, read, follow, then the write
+    // path's exclusions and decide): the rig scans for it.
+    const int writeEye = uiLayerTargetKind() != 0
+                             ? uiLayerAfterWriteEye(true, g_tc.info.resource, taken[0], taken[1])
+                             : -1;
+    if (writeEye >= 0) {
         kind = 'W';
-        takenEye = g_tc.info.resource == taken[0] ? 0 : 1;
+        takenEye = writeEye;
         ++g_win.afterWrites;
     } else if (count <= 6 && g_watchBudget) {
         --g_watchBudget;
@@ -3443,9 +3481,11 @@ bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForw
         for (BindSlot slot : kSlots) {
             void* v = bindingGet(slot);
             ResourceInfo info;
-            if (v && bindingResolve(v, &info) && info.resource &&
-                (info.resource == taken[0] || info.resource == taken[1])) {
+            if (!v || !bindingResolve(v, &info)) continue;
+            const int readEye = uiLayerAfterReadEye(info.resource, taken[0], taken[1]);
+            if (readEye >= 0) {
                 kind = 'R';
+                takenEye = readEye;  // the eye whose identity this pass reads
                 ++g_win.afterReads;
                 break;
             }
@@ -3456,6 +3496,19 @@ bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForw
     // Exclusion 1 (today's behaviour, unchanged): a draw that READS the
     // target is never taken -- it only stops seeing the UI in what it reads.
     if (kind == 'R') {
+        // The follow (2026-09-30): the game's post pass sits between the
+        // tonemap and the interface, reading the tonemap's output A (the
+        // identity the crisp re-issue set) and writing B, where every
+        // interface draw lands. The identity goes with the eye, so those
+        // draws are writes into it. BEFORE the once-per-pair note below:
+        // that returns on every later frame, and a follow behind it would run
+        // once a session. The pass itself is left in the frame either way.
+        if (uiLayerFollowReader(g_eye[takenEye].chainOpen, taken[takenEye], taken[1 - takenEye],
+                                uiLayerTargetKind() == 2, g_tc.info.resource)) {
+            g_eye[takenEye].target = g_tc.info.resource;
+            g_eye[takenEye].chainOpen = false;
+            ++g_win.afterFollowed;
+        }
         for (uint32_t i = 0; i < g_afterSeenCount; ++i) {
             if (g_afterSeen[i].kind == 'R' && g_afterSeen[i].vs == vs && g_afterSeen[i].ps == ps) return false;
         }
@@ -3642,6 +3695,7 @@ ID3D11Texture2D* uiLayerComposite(uint64_t sequence, uint32_t eye, ID3D11Texture
         e.seq = sequence;
         e.draws = 0;
         e.target = nullptr;
+        e.chainOpen = false;
     } else {
         // The eye check: did the UI this layer holds leave the target the
         // game submitted (or copied into what it submitted) for THIS eye?
