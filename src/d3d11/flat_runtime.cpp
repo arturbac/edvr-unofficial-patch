@@ -1287,6 +1287,18 @@ bool depthView(ID3D11Texture2D* depth) {
     s.sceneDepth = depth; return true;
 }
 
+// The refusal state for the F8 panel's settings warning, published for any thread:
+// bit 0 a structural refusal is in force (stood down, or a run long enough to be more
+// than a loading blink), bit 1 the work is stood down, bits 8..15 the selector's reason.
+std::atomic<uint32_t> g_refusalPublished{0};
+void publishRefusal(const State& s, bool warn) {
+    uint32_t v = 0;
+    if (warn && s.standDown.warningActive(GetTickCount64()))
+        v = 1u | (s.standDown.standing ? 2u : 0u) |
+            (static_cast<uint32_t>(s.standDown.reason()) << 8);
+    g_refusalPublished.store(v, std::memory_order_release);
+}
+
 // --- Stand-down: what each mode does (flat_standdown.h) --------------------------
 // The one place the pieces are paused and resumed, called at every Present with the
 // mode of the frame that starts now (idempotent). Full is the runtime as it was
@@ -1340,6 +1352,7 @@ void endStandDown(State& s, uint64_t frame, const char* why) {
     s.frameReason = FlatMonoReason::NoOutputCopy;
     s.frameLive = false;
     applyWork(s, FlatWork::Full);
+    publishRefusal(s, false);
 }
 
 // The stand-down's frame boundary: what the frame that just ended showed about its
@@ -1366,7 +1379,16 @@ void standDownFrame(State& s, uint64_t frame) {
         Log::get().note("%s", text);
     }
     applyWork(s, s.standDown.nextFrame(now));
+    publishRefusal(s, true);
 }
+}
+
+bool flatRuntimeStructuralRefusal(const char** reasonName, bool* standingDown) {
+    const uint32_t v = g_refusalPublished.load(std::memory_order_acquire);
+    if (!(v & 1u)) return false;
+    if (reasonName) *reasonName = flatMonoReasonName(static_cast<FlatMonoReason>((v >> 8) & 0xFFu));
+    if (standingDown) *standingDown = (v & 2u) != 0;
+    return true;
 }
 
 void flatRuntimeResize() {

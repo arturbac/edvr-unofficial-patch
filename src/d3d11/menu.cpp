@@ -28,6 +28,7 @@
 #include "../common/temporal_mode.h"
 #include "device_hook.h"
 #include "elite_binds.h"
+#include "flat_elite_settings.h"
 #include "flat_runtime.h"
 #include "input_gate.h"
 #include "menu_flat_rows.h"
@@ -172,6 +173,15 @@ struct State {
     bool  flatEscapeDown = false;
     bool  flatKeysReadyShown = false;
     bool  flatNativeScaleShown = false;
+    // The flat panel's settings warning (flat_elite_settings.h): Elite's graphics files, read
+    // when the menu opens and when they change; whether the warning is up and the words it
+    // was built from (a change of either rebuilds the raster and is logged, at most
+    // kFlatWarnLogMax times a session).
+    FlatSettingsWatcher flatSettings;
+    bool        flatSettingsForce = false;
+    bool        flatWarnActive = false;
+    std::string flatWarnKey;
+    int         flatWarnLogged = 0;
     float alpha = 0.0f;
     uint64_t openedMs = 0;
     uint64_t lastInputMs = 0;
@@ -963,6 +973,72 @@ std::string displayValue(const MenuRowDef& d, const std::string& v) {
             if (v.empty()) return "(empty)";
             return v.size() > 28 ? v.substr(0, 27) + "~" : v;
     }
+}
+
+// ---------------------------------------------------------------------------
+// The flat panel's settings warning (flat_elite_settings.h). Shown only while a
+// temporal mode is selected and the runtime refuses frames for the shape of the
+// post chain (flatRuntimeStructuralRefusal): a treated session sees nothing.
+
+constexpr int kFlatWarnLogMax = 24;
+
+// The selected mode as the panel names it on its Anti-aliasing row.
+std::string flatModeLabel() {
+    const std::string value = Config::get().requestedTemporalMode();
+    for (int i = 0; i < kRowDefCount; ++i)
+        if (strcmp(kMenuRows[i].section, "fix") == 0 && strcmp(kMenuRows[i].key, "temporal_aa") == 0)
+            return displayValue(kMenuRows[i], value);
+    return value;
+}
+
+struct FlatWarnRuler { int emPx; };
+int flatWarnMeasure(const char* text, void* context) {
+    return menuPanelMeasureLine(text, static_cast<FlatWarnRuler*>(context)->emPx);
+}
+
+// One tick: read Elite's files when they are wanted, and notice a change in what the
+// warning would say. The files are read when the menu opens, when the warning becomes
+// wanted, and then at most every couple of seconds while it is wanted or the panel is up;
+// a treated session with the panel closed never touches them.
+void flatWarningTick(uint64_t now) {
+    State& s = g_s;
+    const char* reason = "";
+    bool standing = false;
+    // The runtime's atomic first: a treated session pays a load and nothing else.
+    const bool refusing = flatRuntimeStructuralRefusal(&reason, &standing) &&
+                          temporalModeEnabled(Config::get().requestedTemporalMode());
+    if (refusing || s.open || s.flatSettingsForce) {
+        const bool force = s.flatSettingsForce || (refusing && !s.flatWarnActive);
+        s.flatSettingsForce = false;
+        if (s.flatSettings.poll(now, force)) {
+            char line[512];
+            flatFormatEliteSettings(line, sizeof(line), s.flatSettings.settings());
+            Log::get().note("%s", line);
+        }
+    }
+    const std::string label = refusing ? flatModeLabel() : std::string();
+    const std::string key = refusing ? flatSettingsWarningKey(label.c_str(), s.flatSettings.settings())
+                                     : std::string();
+    if (refusing == s.flatWarnActive && key == s.flatWarnKey) return;
+    const bool was = s.flatWarnActive;
+    s.flatWarnActive = refusing;
+    s.flatWarnKey = key;
+    s.contentDirty = true;
+    if (s.flatWarnLogged >= kFlatWarnLogMax) return;
+    ++s.flatWarnLogged;
+    if (refusing) {
+        FlatSettingsWarning w;
+        flatComposeSettingsWarning(label.c_str(), s.flatSettings.settings(), 0, nullptr, nullptr, &w);
+        Log::get().note("flat settings warning: %s (mode=%s, frames refused for %s%s): %s%s%s",
+                        was ? "changed" : "shown", label.c_str(), reason,
+                        standing ? ", work stood down" : "", w.count > 0 ? w.line[0] : "",
+                        w.count > 1 ? " " : "", w.count > 1 ? w.line[1] : "");
+    } else {
+        Log::get().note("flat settings warning: hidden (frames are not refused for the shape of "
+                        "the post chain now, or the mode is off)");
+    }
+    if (s.flatWarnLogged == kFlatWarnLogMax)
+        Log::get().note("flat settings warning: further changes are not logged this session");
 }
 
 // ---------------------------------------------------------------------------
@@ -2028,6 +2104,21 @@ void buildContent(MenuContent& c) {
                 strncpy(c.popup, body.c_str(), sizeof(c.popup) - 1);
             }
         }
+        // The settings warning (flat only, and only while frames are refused for the shape
+        // of the post chain): a blank line, then the words wrapped to the note face's width.
+        if (runtimeFlatProfile() && s.flatWarnActive) {
+            FlatWarnRuler ruler{c.capPx * 8 / 7};   // the note face's em (menu_panel.cpp, Font::Hint)
+            const int width = c.cardPx - 2 * (c.capPx * 8 / 10);
+            FlatSettingsWarning warning;
+            flatComposeSettingsWarning(flatModeLabel().c_str(), s.flatSettings.settings(), width,
+                                       &flatWarnMeasure, &ruler, &warning);
+            if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;
+            for (int i = 0; i < warning.count && c.lineCount < kMenuMaxLines; ++i) {
+                MenuLine& l = c.lines[c.lineCount++];
+                strncpy(l.left, warning.line[i], sizeof(l.left) - 1);
+                l.style = kMenuNote;
+            }
+        }
         if (c.lineCount == 0) {
             MenuLine& l = c.lines[c.lineCount++];
             strncpy(l.left, "Nothing on this page yet.", sizeof(l.left) - 1);
@@ -3083,6 +3174,7 @@ void openMenu(uint64_t now) {
         s.lastDrawnMs = 0;
         s.flatEscapeDown = rawKeyDown(VK_ESCAPE);
         s.flatNativeScaleShown = flatRuntimeNativeScale();
+        s.flatSettingsForce = true;   // Elite's graphics files are looked at when the panel opens
         s.alpha = 1.0f;
         s.tooltipUp = false;
         s.contentDirty = true;
@@ -3208,6 +3300,7 @@ void menuConfigure(Config& cfg) {
         inputGateConfigure(cfg);
         if (!s.configured) {
             s.configured = true;
+            s.flatSettings.setFolder(flatEliteGraphicsFolder());
             initKeys();
             refreshRowValues();
             takeSnapshot();
@@ -3500,6 +3593,7 @@ void menuTick(ID3D11Device* dev) {
                 s.flatNativeScaleShown = nativeScale;
                 s.contentDirty = true;
             }
+            flatWarningTick(now);
             if (keysReady) handleKeys(now);
             if (s.open && dev && !menuPanelFlatRasterReady()) s.contentDirty = true;
             if (s.open && s.contentDirty) {

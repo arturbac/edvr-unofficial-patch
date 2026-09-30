@@ -22,6 +22,7 @@
 #include "flat_local_reject_tests.h"
 #include "flat_negotiated_eval_tests.h"
 #include "flat_standdown_tests.h"
+#include "flat_elite_settings_tests.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -2153,6 +2154,36 @@ void testStandDownAgainstModel() {
         check(sim.machine.entries == 0 && sim.work == FlatWork::Full && sim.machine.probes == 0,
               "frames the selector selects never stand the runtime down");
     }
+    // Supported, then an unsupported chain, then supported again -- the qualification lifecycle the
+    // motion-CPU review asks the stand-down to survive (reviews/flat-motion-cpu-review-2026-09-29.md,
+    // C2): nothing that pauses the work may wait for a treated frame to resume it, or warm-up
+    // deadlocks. Treated for 10 s; refused every frame until it stands down and has probed for
+    // 20 s; the chain becomes recognised again; after the resume the first frames are warm-up
+    // frames (the selector selects but the resolve refuses, or the prefix is transiently
+    // truncated), then treated frames: the runtime must never fall back into the stand-down.
+    {
+        Sim sim;
+        for (int i = 0; i < 60 * 10; ++i) sim.frame(verdictOf(ok), ok.reason);
+        check(sim.machine.entries == 0 && sim.work == FlatWork::Full, "supported: full, no stand-down");
+        FlatStandDownEvent event = FlatStandDownEvent::None;
+        while (event != FlatStandDownEvent::Entered) event = sim.frame(verdictOf(refused1), refused1.reason);
+        const uint64_t enteredAt = sim.now;
+        while (sim.now - enteredAt < 20000) sim.frame(verdictOf(refused1), refused1.reason);
+        check(sim.machine.standing && sim.work != FlatWork::Full, "unsupported: stood down and probing");
+        while (event != FlatStandDownEvent::Resumed) event = sim.frame(verdictOf(ok), ok.reason);
+        check(!sim.machine.standing && sim.work == FlatWork::Full && sim.machine.entries == 1 && sim.machine.resumes == 1,
+              "the chain becomes recognised again: the very next probe resumes, with no treated frame needed first");
+        bool fellBack = false;
+        for (int i = 0; i < 90; ++i) {   // warm-up: transient frames, then selected frames the resolve still refuses
+            const auto e = i < 45 ? sim.frame(FlatFrameSeen::Transient, FlatMonoReason::Truncated)
+                                  : sim.frame(verdictOf(ok), ok.reason);
+            if (e != FlatStandDownEvent::None || sim.work != FlatWork::Full) fellBack = true;
+        }
+        for (int i = 0; i < 60 * 30; ++i) {   // then treated frames
+            if (sim.frame(verdictOf(ok), ok.reason) != FlatStandDownEvent::None || sim.work != FlatWork::Full) fellBack = true;
+        }
+        check(!fellBack && sim.machine.entries == 1, "warm-up after the resume is never mistaken for a refusal: it stays full");
+    }
     // Each user's session: refused every frame stands the work down after 5 s; the user turns the
     // setting off in game (the chain becomes the stock one) at an arbitrary moment; the probe
     // that sees it ends the stand-down within two seconds.
@@ -2271,6 +2302,71 @@ void testStandDownWiring() {
         check(where != std::string::npos && probeReturn != std::string::npos && probeReturn < where,
               "coverage, source naming, substitution, jitter and the resolve all follow the Probe return");
     }
+    // NO DEADLOCK: nothing that pauses or resumes the work reads whether a frame was treated or
+    // accepted. The pause is decided by the chain verdict alone, so warm-up can always start.
+    const size_t first = at("void applyWork(State& s, FlatWork next) {");
+    const size_t last = at("bool flatRuntimeStructuralRefusal(");
+    check(first != std::string::npos && last != std::string::npos && first < last,
+          "the stand-down functions can be delimited in the runtime source");
+    if (first != std::string::npos && last != std::string::npos && first < last) {
+        const std::string body = runtimeCpp.substr(first, last - first);
+        check(body.find("s.treated") == std::string::npos && body.find("s.accepted") == std::string::npos &&
+              body.find("temporalAccepted") == std::string::npos && body.find("havePrevious") == std::string::npos &&
+              body.find("previousAcceptedValid") == std::string::npos,
+              "applyWork, endStandDown and standDownFrame never read whether a frame was treated: a pause cannot wait for one");
+        check(body.find("applyWork(") != std::string::npos && body.find("wake(") != std::string::npos,
+              "(control: the delimited text is the stand-down code)");
+    }
+}
+
+// The F8 panel's settings warning in the panel and the runtime: shown only while the runtime says
+// frames are refused for the shape of the post chain, Elite's files read when the panel opens, and
+// the installer's log bundler sharing the folder's spelling. A source scan, the way the stand-down
+// pins are, with the same removal controls.
+void testFlatWarningWiring() {
+    auto slurp = [](const char* path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string menuCpp = slurp("src/d3d11/menu.cpp");
+    const std::string runtimeCpp = slurp("src/d3d11/flat_runtime.cpp");
+    const std::string bundleCpp = slurp("src/installer/logbundle.cpp");
+    check(!menuCpp.empty() && !runtimeCpp.empty() && !bundleCpp.empty(),
+          "the menu, runtime and log bundler sources are readable from the repo root");
+    auto count = [](const std::string& text, const std::string& needle) {
+        unsigned n = 0;
+        for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
+        return n;
+    };
+    struct Pin { const std::string* text; const char* needle; unsigned times; const char* what; };
+    const Pin pins[] = {
+        {&menuCpp, "const bool refusing = flatRuntimeStructuralRefusal(&reason, &standing) &&", 1,
+         "the warning follows the runtime's structural-refusal state and nothing else"},
+        {&menuCpp, "temporalModeEnabled(Config::get().requestedTemporalMode());", 1,
+         "and only while a temporal mode is selected"},
+        {&menuCpp, "if (runtimeFlatProfile() && s.flatWarnActive) {", 1, "the panel draws the warning only while it is active"},
+        {&menuCpp, "if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;", 1,
+         "the warning is note lines below the rows"},
+        {&menuCpp, "FlatWarnRuler ruler{c.capPx * 8 / 7};", 1, "wrapped with the panel's own ruler at the note face's em"},
+        {&menuCpp, "flatWarningTick(now);", 1, "the flat tick runs the warning"},
+        {&menuCpp, "s.flatSettingsForce = true;", 1, "Elite's files are looked at when the panel opens"},
+        {&menuCpp, "s.flatSettings.setFolder(flatEliteGraphicsFolder());", 1, "from %LOCALAPPDATA%, resolved once"},
+        {&menuCpp, "if (s.flatWarnLogged >= kFlatWarnLogMax) return;", 1, "the state-change lines are bounded per session"},
+        {&runtimeCpp, "publishRefusal(s, true);", 1, "the Present publishes the refusal state after the stand-down's verdict"},
+        {&runtimeCpp, "publishRefusal(s, false);", 1, "and a wake clears it"},
+        {&runtimeCpp, "bool flatRuntimeStructuralRefusal(const char** reasonName, bool* standingDown) {", 1,
+         "the accessor the panel reads"},
+        {&bundleCpp, "return edvr::eliteGraphicsFolderUnder(base);", 1, "the log bundler composes the folder through the shared header"},
+    };
+    for (const Pin& pin : pins) {
+        check(count(*pin.text, pin.needle) == pin.times, pin.what);
+        std::string without = *pin.text;
+        for (size_t at = without.find(pin.needle); at != std::string::npos; at = without.find(pin.needle))
+            without.erase(at, std::strlen(pin.needle));
+        check(count(without, pin.needle) == 0, "warning wiring control: a source with the line removed no longer contains it");
+    }
+    check(count(bundleCpp, "Frontier Developments") == 1,
+          "the log bundler no longer spells the folder itself (its comment names it once)");
 }
 
 int main(int argc, char** argv) {
@@ -2324,6 +2420,8 @@ int main(int argc, char** argv) {
     failures += flatStandDownTests();
     testStandDownAgainstModel();
     testStandDownWiring();
+    failures += flatEliteSettingsTests();
+    testFlatWarningWiring();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;
