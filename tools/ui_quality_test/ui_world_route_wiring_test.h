@@ -185,9 +185,10 @@ void testWiringDoor() {
     if (only != std::string::npos && ordinary != std::string::npos && only < ordinary) {
         const std::string layerOnly = sharpen.substr(only, ordinary - only);
         const size_t composite = layerOnly.find("edvr::uiLayerComposite(seq,eye,source,region,layerUv)");
-        const size_t rcas = layerOnly.find("edvrSharpen(layered,int(eye),full,s->strength)");
-        check(composite != std::string::npos && rcas != std::string::npos && composite < rcas,
-              "sharpen: for a layer-only eye the UI layer is composited FIRST and RCAS runs over the composited eye");
+        const size_t rcas = layerOnly.find("edvrSharpen(");   // the FIRST RCAS call of the branch
+        check(composite != std::string::npos && rcas != std::string::npos && composite < rcas && countOf(layerOnly, "edvrSharpen(") == 1 &&
+                  has(layerOnly, "edvrSharpen(layered,int(eye),full,s->strength)"),
+              "sharpen: for a layer-only eye the UI layer is composited FIRST and RCAS runs once, over the composited eye");
         check(has(layerOnly, "++s->layerOnlyBlack;") && has(layerOnly, "returnS_FALSE;") && has(layerOnly, "s->layerOnlyBlack<=8"),
               "sharpen: a composite that does not run for a layer-only eye is counted, and the first eight named");
         const std::string rest = sharpen.substr(ordinary);

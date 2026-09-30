@@ -1167,6 +1167,45 @@ inline const char* uiWorldRefuseName(UiWorldRefuse r) {
     }
 }
 
+// The same reasons as short keys, for the 30 s line (the long texts above are the first-eight lines': Log's line
+// holds 1200 characters, and ten long reasons beside fourteen decisions would not fit).
+inline const char* uiWorldRefuseKey(UiWorldRefuse r) {
+    switch (r) {
+        case UiWorldRefuse::kCurved: return "curved-screen";
+        case UiWorldRefuse::kDepthState: return "depth-state";
+        case UiWorldRefuse::kNotOpaque: return "blending-draw";
+        case UiWorldRefuse::kNoSource: return "no-source-texture";
+        case UiWorldRefuse::kMipsNull: return "no-mipped-screen";
+        case UiWorldRefuse::kNoSampler: return "no-sampler";
+        case UiWorldRefuse::kSamplerNull: return "sampler-not-made";
+        case UiWorldRefuse::kStateChanged: return "bindings-changed";
+        case UiWorldRefuse::kBeginRefused: return "layer-refused-issue";
+        case UiWorldRefuse::kFault: return "fault";
+        default: return "?";
+    }
+}
+inline const char* uiLayerDecisionKey(UiLayerDecision d) {
+    switch (d) {
+        case UiLayerDecision::kRedirect: return "redirect";
+        case UiLayerDecision::kNotUi: return "not-ui";
+        case UiLayerDecision::kVerdict: return "verdict";
+        case UiLayerDecision::kWorldScreen: return "world-screen";
+        case UiLayerDecision::kNotEyeTarget: return "not-eye-target";
+        case UiLayerDecision::kHdrTarget: return "hdr-target";
+        case UiLayerDecision::kNoEye: return "no-eye";
+        case UiLayerDecision::kTargetSize: return "target-size";
+        case UiLayerDecision::kLate: return "late";
+        case UiLayerDecision::kToneLate: return "tone-late";
+        case UiLayerDecision::kNotArmed: return "not-armed";
+        case UiLayerDecision::kMrt: return "mrt";
+        case UiLayerDecision::kDepthStencilTest: return "depth-stencil-test";
+        case UiLayerDecision::kSubstitutedWrite: return "substituted-write";
+        case UiLayerDecision::kBlendRefused: return "blend-refused";
+        case UiLayerDecision::kLayerFailed: return "layer-failed";
+        default: return "?";
+    }
+}
+
 // One id space for the log's dedupe: the route's own reasons are their enum value, a refusal by the decision's
 // tests is kUiWorldDecisionBase + the decision.
 constexpr uint16_t kUiWorldDecisionBase = 32;

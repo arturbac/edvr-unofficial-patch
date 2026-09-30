@@ -83,7 +83,7 @@ struct Stubs {
     // the mips module (vr_world_mips.h)
     ID3D11ShaderResourceView* mipsAnswer = nullptr;
     ID3D11SamplerState* samplerAnswer = nullptr;
-    unsigned mipsCalls = 0, samplerCalls = 0;
+    unsigned mipsCalls = 0, samplerCalls = 0, mipsInternal = 0, samplerInternal = 0;   // ...and how many ran with the route's internal scope up
     uint64_t lastMipsFrame = 0;
     const void* lastMipsScreen = nullptr;
     // the draw-time jitter the native temporal channel reports
@@ -117,12 +117,14 @@ void vrWorldRouteNoteEyeTaken(uint32_t eye, uint64_t sequence) {
 }
 ID3D11ShaderResourceView* vrWorldMipsScreen(ID3D11DeviceContext*, ID3D11Texture2D* screen, uint64_t frame) {
     ++g_stubs.mipsCalls;
+    if (g_vrWorldInternal && g_flatComputeInternal) ++g_stubs.mipsInternal;
     g_stubs.lastMipsFrame = frame;
     g_stubs.lastMipsScreen = screen;
     return g_stubs.mipsAnswer;
 }
 ID3D11SamplerState* vrWorldMipsSampler(ID3D11Device*, const D3D11_SAMPLER_DESC&) {
     ++g_stubs.samplerCalls;
+    if (g_vrWorldInternal && g_flatComputeInternal) ++g_stubs.samplerInternal;
     return g_stubs.samplerAnswer;
 }
 bool nativeTemporalDrawJitter(uint32_t eye, uint64_t* sequence, float* jx, float* jy, uint32_t* w, uint32_t* h) {
@@ -329,6 +331,20 @@ bool region(const std::vector<uint32_t>& p, uint32_t w, uint32_t x0, uint32_t y0
     for (uint32_t y = y0; y < y1; ++y)
         for (uint32_t x = x0; x < x1; ++x)
             if (at(p, w, x, y) != want) return false;
+    return true;
+}
+
+// Every pixel of the rectangle is within `tol` of `want` on each channel (alpha exact).
+bool regionNear(const std::vector<uint32_t>& p, uint32_t w, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1, uint32_t want, int tol) {
+    for (uint32_t y = y0; y < y1; ++y)
+        for (uint32_t x = x0; x < x1; ++x) {
+            const uint32_t got = at(p, w, x, y);
+            for (int shift = 0; shift < 24; shift += 8) {
+                const int d = static_cast<int>((got >> shift) & 0xFF) - static_cast<int>((want >> shift) & 0xFF);
+                if (d > tol || d < -tol) return false;
+            }
+            if ((got >> 24) != (want >> 24)) return false;
+        }
     return true;
 }
 
@@ -620,7 +636,10 @@ void testReissue(Rig& r) {
     const Snap before = take(r.ctx.Get());
     const auto s0 = statsNow();
     const unsigned raw0 = g_stubs.rawCalls, internal0 = g_stubs.rawInternal, took0 = g_stubs.tookCalls, mips0 = g_stubs.mipsCalls;
+    const unsigned mipsInternal0 = g_stubs.mipsInternal, samplerInternal0 = g_stubs.samplerInternal, samplerCalls0 = g_stubs.samplerCalls;
     const Drawn d = drawScreen(r);
+    check(g_stubs.mipsInternal == mipsInternal0 + 1 && g_stubs.samplerInternal == samplerInternal0 + (g_stubs.samplerCalls - samplerCalls0) && g_stubs.samplerCalls > samplerCalls0,
+          "the mips module is asked, for the screen and the sampler, with the route's internal scope up (its copy and its mips step past vscreen's hooks)");
     check(!d.taken, "the route's mode is never a take: uiLayerDecide answers false for the game's draw");
     check(d.pendingAfterDecide, "...and holds the draw for the re-issue that follows the game's own");
     check(d.reissued, "the re-issue ran");
@@ -740,6 +759,8 @@ void refusal(Rig& r, const char* name, UiWorldRefuse reason, UiLayerDecision dec
                             s1.screenDecided[static_cast<size_t>(decision)] == s0.screenDecided[static_cast<size_t>(decision)] + 1;
     const bool counted = byRoute || byDecision;
     check(g_stubs.tookCalls == took0 && counted && s1.reissued == s0.reissued, msg);
+    std::snprintf(msg, sizeof(msg), "%s: the layer holds nothing of this frame, so the door cannot go layer-only for the eye", name);
+    check(uiLayerWorldDoorGap(g_stubs.seq, 0, r.frame[0].tex.Get()) == static_cast<int>(UiWorldDoorGap::kNoContent), msg);
     g_stubs.mipsAnswer = r.mipsSrv.Get();
     g_stubs.samplerAnswer = r.mipSampler.Get();
 }
@@ -888,6 +909,34 @@ void testLostDraws(Rig& r) {
     detail::g_bindingSlots[static_cast<size_t>(BindSlot::PsSrv0)].ptr = nullptr;
 }
 
+// fix.ui_quality 125: the layer is 1.25x the door's frame (120x90 for a 96x72 frame) and the composite box-filters it down. The
+// re-issue maps the eye onto that layer exactly as it maps onto the 1.0 one, so the screen lands where it does at 100.
+void test125(Rig& r) {
+    auto& cfg = Config::get();
+    cfg.set("fix.ui_quality", "125");
+    uiLayerConfigure(cfg);
+    g_stubs.mayTake = true;
+    const uint64_t seq = nextArmed(r);
+    bindGame(r, 0);
+    const Drawn d = drawScreen(r);
+    check(d.reissued, "fix.ui_quality 125: the screen is re-issued into the 1.25x layer");
+    const uint32_t whole[4] = {0, 0, kDoorW, kDoorH};
+    const float uv[4] = {0, 0, 1, 1};
+    ID3D11Texture2D* out = uiLayerComposite(seq, 0, r.frame[0].tex.Get(), whole, uv);
+    check(out != nullptr, "...and the composite box-filters the 120x90 layer down to the 96x72 frame");
+    if (out) {
+        const auto px = readPixels(r, out);
+        // The quad is 90x60 layer pixels for 144x96 texels: 1.6 texels a pixel, LOD log2(1.6) = 0.678 -- the trilinear blend of
+        // mip 0 (red) and mip 1 (green), (82, 173, 0): the map's scale selects the level, not the layer's size alone.
+        check(regionNear(px, kDoorW, 12, 12, 84, 60, 0xFF00AD52u, 3) && region(px, kDoorW, 0, 0, kDoorW, 12, kBlack) && region(px, kDoorW, 0, 60, kDoorW, kDoorH, kBlack) &&
+                  region(px, kDoorW, 0, 12, 12, 60, kBlack) && region(px, kDoorW, 84, 12, kDoorW, 60, kBlack),
+              "...the quad lands exactly where it does at 100 ([12,84) x [12,60)), sampled at the LOD its 1.25x layer pixels select (0.678: mip 0 and mip 1 blended)");
+        out->Release();
+    }
+    cfg.set("fix.ui_quality", "100");
+    uiLayerConfigure(cfg);
+}
+
 void testAccessors(Rig& r) {
     check(uiLayerLiveForWorldRoute() && uiLayerNotLiveReason() == nullptr, "the layer is live with fix.ui_quality on, a temporal mode on and the jitter as shipped");
     check(uiLayerWorldScreenHeld(), "the gate holds the screen (the journal says on foot)");
@@ -968,6 +1017,7 @@ int main(int argc, char** argv) {
     testBeginWithoutOuterScope(r);
     testLostDraws(r);
     testDoorGaps(r);
+    test125(r);
     testAccessors(r);
     uiLayerShutdown();
     std::printf("ui_layer_world_test: %u checks, %u failures\n", g_checks, g_fails);

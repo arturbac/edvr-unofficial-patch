@@ -254,7 +254,7 @@ int main(int argc,char** argv){
                 check(!screenMotionView(0,W,H)&&!screenMotionView(1,W,H),"a route frame draws no per-eye screen motion");
             }
             check(testSourceNotes==notes+8,"recognition alone keeps naming the world's source, frame after frame");
-            check(!(testVs=0x1ull,screenMotionRecognize()),"...and only the screen composite's pair is recognised");
+            check(!(testVs=0x1ull,testPs=0xCFE84157BC76E921ull,screenMotionRecognize())&&!(testVs=0x5C36AF051B98B9F1ull,testPs=0x1ull,screenMotionRecognize()),"...and only the screen composite's PAIR is recognised (either half alone is not)");
             // The control: no recognition at all -- the naming runs out two frames after the last screen.
             const unsigned before=testSourceNotes;
             for(int f=0;f<8;++f){screenMotionFrameBoundary(ctx.Get());sourceDraw();}

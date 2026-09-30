@@ -235,10 +235,33 @@ void testReasons() {
           "the route's reasons and the decision's share one id space without colliding, and each id names its own");
     check(uiWorldReasonId(UiLayerDecision::kLayerFailed) < 256, "...and an id fits the log's table");
 
+    // The 30 s line names reasons by short keys (Log's line holds 1200 characters): each has one, distinct, and all of them
+    // together leave room for the line's own text and their counts.
+    std::vector<std::string> keys;
+    size_t keyBytes = 0;
+    bool keysOk = true;
+    for (uint32_t r = 1; r < static_cast<uint32_t>(UiWorldRefuse::kCount); ++r) {
+        const std::string k = uiWorldRefuseKey(static_cast<UiWorldRefuse>(r));
+        keysOk = keysOk && !k.empty() && k != "?";
+        for (const auto& other : keys) keysOk = keysOk && other != k;
+        keys.push_back(k);
+        keyBytes += k.size() + 10;   // "=", a count of up to eight digits, ", "
+    }
+    for (uint32_t d = 0; d < static_cast<uint32_t>(UiLayerDecision::kCount); ++d) {
+        const std::string k = uiLayerDecisionKey(static_cast<UiLayerDecision>(d));
+        keysOk = keysOk && !k.empty() && k != "?";
+        for (const auto& other : keys) keysOk = keysOk && other != k;
+        keys.push_back(k);
+        keyBytes += k.size() + 10;
+    }
+    check(keysOk && uiWorldRefuseKey(UiWorldRefuse::kCount) == std::string("?") && keyBytes < 650,
+          "every route reason and every decision has its own short key, and the keys of the 30 s line fit beside its text (1200 characters)");
+
     // The first eight DISTINCT reasons, once each -- and no ninth, however often any repeats.
+    static_assert(kUiWorldReasonLines == 8, "the route logs the first EIGHT distinct reasons (the brief's number)");
     UiWorldReasonLog log;
     bool ok = true;
-    for (uint16_t id = 1; id <= kUiWorldReasonLines; ++id) ok = ok && log.first(id) && !log.first(id);
+    for (uint16_t id = 1; id <= 8; ++id) ok = ok && log.first(id) && !log.first(id);
     check(ok, "the first eight distinct reasons are logged, each once (a repeat is not logged again)");
     check(!log.first(9) && !log.first(40) && !log.first(1), "...and the ninth distinct reason is not logged, nor is a repeat of the first");
     UiWorldReasonLog mixed;

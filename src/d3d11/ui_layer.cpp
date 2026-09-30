@@ -2236,21 +2236,23 @@ void logWorldRoute(double seconds) {
     for (size_t r = 1; r < static_cast<size_t>(UiWorldRefuse::kCount); ++r) {
         const uint64_t n = g_win.worldRefused[r];
         if (!n) continue;
-        appendf(route, "%s%llu %s", route.empty() ? "" : "; ", static_cast<unsigned long long>(n),
-                uiWorldRefuseName(static_cast<UiWorldRefuse>(r)));
+        appendf(route, "%s%s=%llu", route.empty() ? "" : ", ", uiWorldRefuseKey(static_cast<UiWorldRefuse>(r)),
+                static_cast<unsigned long long>(n));
     }
     const size_t screen = static_cast<size_t>(UiLayerFamily::kScreen);
     for (size_t d = 1; d < static_cast<size_t>(UiLayerDecision::kCount); ++d) {
         if (d == static_cast<size_t>(UiLayerDecision::kWorldScreen)) continue;  // the eye route's frames
         const uint64_t n = g_win.decided[screen][d];
         if (!n) continue;
-        appendf(decision, "%s%llu %s", decision.empty() ? "" : "; ", static_cast<unsigned long long>(n),
-                uiLayerDecisionName(static_cast<UiLayerDecision>(d)));
+        appendf(decision, "%s%s=%llu", decision.empty() ? "" : ", ", uiLayerDecisionKey(static_cast<UiLayerDecision>(d)),
+                static_cast<unsigned long long>(n));
     }
     Log::get().note(
         "vr world route layer: %.0f s; %llu screen draws re-issued into the layer (%.2f a frame); refused by the "
-        "route's own checks: %s; refused by the decision's tests: %s; %llu draws into a re-issued eye left in the "
-        "game's frame (lost while the route owns that eye).",
+        "route's own checks: %s; refused by the decision's tests (every 2D screen draw this window, owned frames or "
+        "not): %s; %llu draws into a re-issued eye left in the game's frame (lost while the route owns that eye). "
+        "The first eight distinct reasons are named in full, once each, in the lines \"vr world route: layer did not "
+        "take the screen draw for eye N\".",
         seconds, static_cast<unsigned long long>(g_win.worldReissued),
         static_cast<double>(g_win.worldReissued) / (g_win.frames ? static_cast<double>(g_win.frames) : 1.0),
         route.empty() ? "none" : route.c_str(), decision.empty() ? "none" : decision.c_str(),

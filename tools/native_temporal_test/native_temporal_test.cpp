@@ -328,7 +328,8 @@ void run(){
       r.hr=t.treatEye(t.context,seq,eye,src,nullptr,&raw,r.box);r.tex.Attach(raw);return r;};
     const auto descOf=[](ID3D11Texture2D* tex){D3D11_TEXTURE2D_DESC dd{};tex->GetDesc(&dd);return dd;};
     const auto pixel=[&](ID3D11Texture2D* tex,unsigned x,unsigned y){
-      D3D11_TEXTURE2D_DESC dd=descOf(tex);dd.Usage=D3D11_USAGE_STAGING;dd.BindFlags=0;dd.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+      D3D11_TEXTURE2D_DESC dd=descOf(tex);if(x>=dd.Width||y>=dd.Height)return 0xDEADBEEFu;   // a pixel that is not there reads as a failure, not a fault
+      dd.Usage=D3D11_USAGE_STAGING;dd.BindFlags=0;dd.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
       ComPtr<ID3D11Texture2D> st;require(SUCCEEDED(d.device->CreateTexture2D(&dd,nullptr,&st)),"staging");
       d.context->CopyResource(st.Get(),tex);D3D11_MAPPED_SUBRESOURCE m{};require(SUCCEEDED(d.context->Map(st.Get(),0,D3D11_MAP_READ,0,&m)),"map");
       const auto* p=static_cast<const unsigned char*>(m.pData)+y*m.RowPitch+x*4;unsigned v=p[0]|(p[1]<<8)|(p[2]<<16)|(unsigned(p[3])<<24);
