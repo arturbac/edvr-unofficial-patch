@@ -107,6 +107,15 @@ struct FlatMonoResolveFrame {
     bool reset = true;
     FlatMonoResolveMode mode = FlatMonoResolveMode::Taa;
     uint32_t configuredDlssPreset = 0; // diagnostic attribution only
+    // The HDR route (docs/design-flat-temporal-aa-2026-09-23.md section 81; flat_hdr_route.h). `color` is then the
+    // game's HDR scene target H itself -- its shader view, R11G11B10_FLOAT at the render size -- not a tone-mapped
+    // copy, and `depth`, the camera rows and the engine views are the same as on the copy route. The resolver copies H
+    // into its private input, runs prep and the backend at E = R (the route refuses any other evaluation size) with
+    // the backend in HDR mode, and writes the result BACK INTO H through a pixel-shader draw into a render-target view
+    // it makes over H, so the game's own pass that reads H next sees the anti-aliased image. *output stays null: there
+    // is nothing for the caller to swap into a binding. False, the default, is the copy route and every byte of it
+    // unchanged.
+    bool hdr = false;
 };
 // Planned input metadata available before the game's next raster phase. This
 // intentionally carries no frame resources: preflight can allocate the
@@ -119,6 +128,9 @@ struct FlatMonoResolvePreflight {
     // F1), because the resolve's resource cache keys on E.
     uint32_t evalWidth = 0, evalHeight = 0;
     FlatMonoResolveMode mode = FlatMonoResolveMode::Taa;
+    // The HDR route's plan (FlatMonoResolveFrame::hdr): the colour view is H's R11G11B10_FLOAT one, the resources
+    // are the route's (fp16 output, an HDR input copy), and the fallback that must be ready is the pixel-shader one.
+    bool hdr = false;
     DXGI_FORMAT colorViewFormat = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT depthViewFormat = DXGI_FORMAT_UNKNOWN;
     bool colorViewIsTexture2D = true, depthViewIsTexture2D = true;
@@ -155,6 +167,8 @@ struct FlatMonoResolveStats {
     uint64_t invalidPreviousCameras = 0, formatChanges = 0, cameraCuts = 0;
     uint64_t backendFailures = 0;
     uint64_t currentContinueRun = 0, longestContinueRun = 0;
+    // The HDR route's resolves and its pixel-shader spatial recoveries (written into H, so no output view).
+    uint64_t hdrResolves = 0, hdrSpatial = 0;
     // The last resolve's EFFECTIVE reset (the requested one, or a lost history, a frame gap, an
     // invalid previous camera, a format change or a camera cut): what the pixel capture writes
     // as "reset" and what decides whether the frame is a live sample.
@@ -171,9 +185,10 @@ bool flatMonoResolveLastReset();
 FlatMonoResolvePreflightResult flatMonoResolvePreflight(
     ID3D11Device*, ID3D11DeviceContext*, const FlatMonoResolvePreflight&);
 // Owner immediate context only. Inputs borrowed for this call; successful output
-// is AddRef'd and output-sized. The caller suppresses hook observations throughout
-// this call. D3D11.1 context-state isolation is required and restored on every exit.
-// The caller supplies only jitter that was actually rendered into these inputs.
+// is AddRef'd and output-sized (null on the HDR route, FlatMonoResolveFrame::hdr, whose
+// result is written back into the input target). The caller suppresses hook observations
+// throughout this call. D3D11.1 context-state isolation is required and restored on every
+// exit. The caller supplies only jitter that was actually rendered into these inputs.
 bool flatMonoResolve(ID3D11Device*, ID3D11DeviceContext*, const FlatMonoResolveFrame&,
                      ID3D11ShaderResourceView** output, const char** reason);
 // The GPU census's timestamp pair (flat_cpu.h): begin is called just before the resolver's own
@@ -184,7 +199,8 @@ using FlatMonoResolveSpanFn = void (*)(ID3D11DeviceContext*) noexcept;
 void flatMonoResolveSetSpanHooks(FlatMonoResolveSpanFn begin, FlatMonoResolveSpanFn end);
 // Recover an already rendered jittered frame after backend refusal. This
 // spatial resolve uses no temporal history or SDK and borrows the same frame
-// inputs; successful output is AddRef'd. It leaves history invalid. A normal
+// inputs; successful output is AddRef'd (on the HDR route it is written into H by a
+// pixel-shader draw and *output stays null). It leaves history invalid. A normal
 // flatMonoResolve call allocates this output before it asks a backend to run,
 // so backend refusal reuses that allocation. Future nonzero-raster callers
 // must preflight allocation before drawing; this API cannot recover from a

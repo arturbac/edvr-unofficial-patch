@@ -1615,6 +1615,13 @@ int main(int argc, char** argv) {
     if (Config::get().getString("experimental.temporal_aa_jitter", "on") == "off")
         ok("flat jitter preserves explicit off");
     else fail("flat jitter override", "explicit off was not read");
+    // The HDR route's flight key (design doc section 81): the flat runtime reads it through getString with an "off"
+    // default. Unlisted in runtimeProfileAllowsKey it would read off here whatever the file says -- a flight that
+    // set auto would run the copy route with nothing in the log to say the key was refused.
+    Config::get().set("experimental.temporal_aa_before_post", "auto");
+    expectStr("experimental.temporal_aa_before_post", "auto", "flat scope permits the HDR route's flight key");
+    Config::get().set("experimental.temporal_aa_before_post", "off");
+    expectStr("experimental.temporal_aa_before_post", "off", "flat scope reads the HDR route's flight key off");
     Config::get().set("fix.temporal_aa", "dlss");
     Config::get().set("fix.black_void", "on");
     Config::get().set("fix.head_offset_forward", "12");
@@ -1626,6 +1633,21 @@ int main(int argc, char** argv) {
     expectBool("fix.black_void", false, "flat profile suppresses restored unrelated fix");
     expectBool("experimental.night_vision_realistic", false,
                "flat jitter exception leaves unrelated experimental settings suppressed");
+    // Night vision's pulse stability defaults ON, and nightVisionConfigure reads it through
+    // this getter: a refused key reading off is all that keeps nightVisionWantsDraws() false on
+    // flat, so the draw gate (vscreen.cpp drawGateSubscribed) is not held open there by a fix
+    // the flat profile does not run. expectBool asks with both defaults, so it is the default-on
+    // read that is pinned.
+    Config::get().set("fix.night_vision_stability", "on");
+    expectBool("fix.night_vision_stability", false,
+               "flat profile: night vision pulse stability (default on) reads off, so it cannot hold the draw gate open");
+    // The depth probe is armed by fix.temporal_aa (read off on flat, above) or by the eye depth capture,
+    // and depthProbeConfigure reads the capture through this getter: a refused key reading off is what
+    // keeps depthProbeWanted() false on flat, so the draw gate (vscreen.cpp drawGateSubscribed) is not
+    // held open there by a probe the flat profile does not run.
+    Config::get().set("advanced.eye_depth_capture", "on");
+    expectBool("advanced.eye_depth_capture", false,
+               "flat profile: eye depth capture reads off, so it cannot arm the depth probe or hold the draw gate open");
     expectInt("fix.head_offset_forward", 0, "flat profile suppresses numeric fix");
     expectFloat("fix.head_offset_forward", 0.0f, "flat profile suppresses float fix");
     if (Config::get().getIntInRange("fix.head_offset_forward", 12, 1, 100) != 0)
@@ -1664,6 +1686,8 @@ int main(int argc, char** argv) {
     if (Config::get().getString("experimental.temporal_aa_jitter", "on") == "off")
         ok("invalid profile suppresses flat jitter");
     else fail("invalid profile jitter", "flat key widened invalid scope");
+    Config::get().set("experimental.temporal_aa_before_post", "auto");
+    expectStr("experimental.temporal_aa_before_post", "off", "invalid profile cannot turn the HDR route on");
     g_runtimeProfile = RuntimeProfile::LegacyVr;
     expectBool("fix.black_void", true, "legacy profile retains original behavior");
     if (Config::get().getString("experimental.temporal_aa_jitter", "on") == "off")

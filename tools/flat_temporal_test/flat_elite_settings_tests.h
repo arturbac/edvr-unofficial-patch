@@ -210,6 +210,49 @@ inline int flatEliteSettingsTests() {
                "the warning key moves with the mode, the preset and the three fields");
     }
 
+    // ---- the HDR route is active (section 81): Bloom and Depth of field are not what a refusal is about -----------
+    // The route resolves before both, so their advice goes; the Anti-aliasing advice stays (the game's own AA after
+    // the tone double-filters, and a game TAA's jitter fights EDVR's). Every other word is unchanged, which the
+    // route-off rows above pin.
+    {
+        EliteGraphics user1, user2, all, preset;
+        for (EliteGraphics* g : {&user1, &user2, &all, &preset}) {
+            g->folderFound = g->presetKnown = g->custom = g->fileRead = true;
+            std::strcpy(g->preset, "Custom");
+            std::strcpy(g->file, "Custom.4.4.fxcfg");
+        }
+        user1.aaMode = 4; user1.bloomQuality = 0; user1.dofEnabled = 0;
+        user2.aaMode = 0; user2.bloomQuality = 3; user2.dofEnabled = 2;
+        all.aaMode = 4; all.bloomQuality = 1; all.dofEnabled = 1;
+        preset.aaMode = preset.bloomQuality = preset.dofEnabled = 0;
+        preset.custom = false; std::strcpy(preset.preset, "Ultra");
+        const int wide = 100000;
+        FlatSettingsWarning w;
+        auto hdrWords = [&](const char* mode, const EliteGraphics& g) {
+            flatComposeSettingsWarning(mode, g, wide, &elite_settings_test::ruler, nullptr, &w, true);
+        };
+        hdrWords("DLSS", user1);
+        expect(w.count == 2 && std::strcmp(w.line[1], "Turn off in Elite's graphics options: Anti-aliasing") == 0,
+               "HDR route active, user 1 (AA on): Anti-aliasing is still named");
+        hdrWords("DLAA", user2);
+        expect(w.count == 2 && std::strstr(w.line[1], "Bloom") == nullptr && std::strstr(w.line[1], "Depth of field") == nullptr &&
+               std::strstr(w.line[1], "Please send your logs") != nullptr,
+               "HDR route active, user 2 (only bloom and DoF on): neither is named, the logs are asked for");
+        hdrWords("TAA", all);
+        expect(w.count == 2 && std::strcmp(w.line[1], "Turn off in Elite's graphics options: Anti-aliasing") == 0,
+               "HDR route active, all three on: only Anti-aliasing is named");
+        hdrWords("DLSS", preset);
+        expect(w.count == 2 && std::strstr(w.line[1], "Ultra graphics preset may turn on Anti-aliasing.") != nullptr &&
+               std::strstr(w.line[1], "Bloom") == nullptr && std::strstr(w.line[1], "Depth of field") == nullptr,
+               "HDR route active, another preset: only Anti-aliasing is said to be turned on");
+        words("TAA", all, wide, &w);
+        expect(w.count == 2 && std::strcmp(w.line[1], "Turn off in Elite's graphics options: Anti-aliasing, Bloom, Depth of field") == 0,
+               "HDR route not active: the words are exactly what they were (all three named)");
+        expect(flatSettingsWarningKey("DLSS", user1, false) != flatSettingsWarningKey("DLSS", user1, true) &&
+               flatSettingsWarningKey("DLSS", user1) == flatSettingsWarningKey("DLSS", user1, false),
+               "the warning key moves with the route, so the panel rebuilds when it flips");
+    }
+
     // ---- real files ------------------------------------------------------------------------
     {
         Folder dir;

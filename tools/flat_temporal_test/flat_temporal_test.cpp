@@ -28,6 +28,7 @@
 #include "flat_camera_table_tests.h"
 #include "flat_query_cut_tests.h"
 #include "flat_wrapper_note_tests.h"
+#include "flat_hdr_route_tests.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -1747,15 +1748,17 @@ int flatTraceMigrate(const char* dirPath) {
             FlatTraceFrameHeader fh{};
             std::memcpy(&fh, bytes.data() + at, sizeof(fh));
             at += sizeof(fh);
+            // The corpus files are EDVRFTR3: the event layout stays the V3 one here, and the rewritten file stays FTR3.
             if (!fh.eventCount || fh.eventCount > kFlatTraceEventsPerFrame ||
-                bytes.size() - at < fh.eventCount * sizeof(FlatTraceEvent)) { ok = false; break; }
+                bytes.size() - at < fh.eventCount * sizeof(FlatTraceEventV3)) { ok = false; break; }
             FlatRuntimePrefix replay{};
             replay.frame = fh.frame; replay.output = fh.output;
             replay.width = fh.width; replay.height = fh.height; replay.format = fh.format;
             FlatFrameContract rc{};
             for (uint32_t i = 0; i < fh.eventCount; ++i) {
-                FlatTraceEvent e{};
-                std::memcpy(&e, bytes.data() + at, sizeof(e)); at += sizeof(e);
+                FlatTraceEventV3 v3{};
+                std::memcpy(&v3, bytes.data() + at, sizeof(v3)); at += sizeof(v3);
+                const FlatTraceEvent e = flatTraceEventFromV3(v3);
                 if (e.kind == kFlatTraceEventWriteResource) { flatRuntimeWritten(replay, e.key.color); continue; }
                 if (e.kind == kFlatTraceEventDispatchWritten) { flatRuntimeDispatchObserveWritten(replay, e.key.color); continue; }
                 if (e.kind == kFlatTraceEventMarkUncertain) { replay.uncertain = true; continue; }
@@ -2291,7 +2294,7 @@ void testStandDownWiring() {
     auto at = [&](const char* needle) { return runtimeCpp.find(needle); };
     const size_t menuVerify = at("d.menuHdrCopyVerified=verifyMenuHdrCopy(ctx,d);");
     const size_t observe = at("? flatRuntimeObserveContract(s.prefix, d, s.traceContract)");
-    const size_t record = at("flatTraceRecord(s.traceRing, d, foreignWork.load(std::memory_order_acquire));");
+    const size_t record = at("flatTraceRecord(s.traceRing, d, foreignWork.load(std::memory_order_acquire), hdrSrvKnown ? hdrSrv : nullptr);");
     const size_t verdict = at("const FlatFrameSeen seen = flatFrameSeenFor(");
     const size_t probeReturn = at("if (s.work == FlatWork::Probe) return;");
     check(menuVerify != std::string::npos && observe != std::string::npos && record != std::string::npos &&
@@ -2431,14 +2434,15 @@ void testFlatCpuWiring() {
         {&runtimeCpp, "flatcpu::kReduce", 1, "contract reduction times the reducer"},
         {&runtimeCpp, "flatcpu::kCopyChecks", 2, "the exact-shader verifications and the F10 captures are timed"},
         {&runtimeCpp, "flatcpu::kCameraRows", 2, "the camera lookup and hash, and capture()"},
-        {&runtimeCpp, "flatcpu::kTrace", 4, "every trace-ring copy is timed: capture, dispatch, write, record"},
+        {&runtimeCpp, "flatcpu::kTrace", 5, "every trace-ring copy is timed: capture, dispatch, write, record and the HDR route's resolve marker"},
         {&runtimeCpp, "flatcpu::kResource", 4, "Written, Map, Unmap and Update time their lookups"},
         {&runtimeCpp, "flatcpu::kCoverage", 1, "coverage classification"},
         {&runtimeCpp, "flatcpu::kProjection", 3, "qualifyProjection, the private binding and its restore"},
         {&runtimeCpp, "flatcpu::kShadows", 5, "the constant-buffer shadow observers"},
         {&runtimeCpp, "flatcpu::kWitness", 1, "the camera witness"},
         {&runtimeCpp, "flatcpu::kEngineDraw", 4, "engine motion's draw wrapper: naming, its begin (BeforeDraw), its end, and the flush of what it kept bound"},
-        {&runtimeCpp, "flatcpu::kResolve", 1, "the treatment at the copy draw"},
+        {&runtimeCpp, "flatcpu::kResolve", 2, "the treatment at the copy draw and at the HDR route's trigger"},
+        {&runtimeCpp, "flatcpu::kHdrRoute", 2, "the HDR route's trigger detector on every draw, and its selection at the trigger"},
         {&runtimeCpp, "flatcpu::kTrackers", 5, "the state trackers"},
         {&resolveCpp, "flatcpu::Scope backendScope(flatcpu::kBackend);", 1, "the backend evaluation inside the resolver"},
         {&injectCpp, "flatcpu::Scope timed(flatcpu::kInject);", 2, "the camera inject callback, both halves"},
@@ -2895,8 +2899,15 @@ int main(int argc, char** argv) {
         return flatTraceMigrate(argv[2]);
     if (argc == 3 && std::strcmp(argv[1], "--trace-rekey") == 0)
         return flatTraceRekey(argv[2]);
+    // The HDR route's own modes (flat_hdr_route_tests.h): what the trigger detector finds in a trace, frame by
+    // frame, and a trace cut down to the named frames.
+    if (argc == 3 && std::strcmp(argv[1], "--trace-chain") == 0)
+        return hdr_route_test::traceChain(argv[2]);
+    if (argc == 5 && std::strcmp(argv[1], "--trace-trim") == 0)
+        return hdr_route_test::traceTrim(argv[2], argv[3], argv[4]);
     if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) {
-        std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir> | --trace-check <file> | --trace-migrate <dir> | --trace-rekey <file|dir>");
+        std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir> | --trace-check <file> | --trace-migrate <dir> | "
+                  "--trace-rekey <file|dir> | --trace-chain <file> | --trace-trim <in> <out> <frame[,frame...]>");
         return 2;
     }
     failures += flatProjectionViewportTests();
@@ -2950,6 +2961,7 @@ int main(int argc, char** argv) {
     testFlatWrapperNoteWiring();
     failures += flatQueryCutTests();
     testFlatQueryCutWiring();
+    failures += flatHdrRouteTests();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

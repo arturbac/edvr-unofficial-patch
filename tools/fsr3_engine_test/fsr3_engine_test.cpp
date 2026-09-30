@@ -47,6 +47,10 @@
 //     reset=false carrying the old history forward.
 // (f) a size change (1711x1425 -> 3422x3394) recreates the context
 //     cleanly.
+// (l) the flat HDR route's flags (design section 81): an R11G11B10F input
+//     and an fp16 output dispatch FFX_OK under ENABLE_HIGH_DYNAMIC_RANGE |
+//     ENABLE_AUTO_EXPOSURE, a still field of 40 comes back as 40, and
+//     flipping the flag remakes the context each way.
 // (g) WARP's answer to IDXGIAdapter3::QueryVideoMemoryInfo, called
 //     directly against this rig's device and reported, not asserted. The
 //     engine's create line no longer uses that query (flights 1 to 3 of
@@ -59,6 +63,7 @@
 // (gpu_timing_test.cpp and native_frame_test.cpp's own convention; only
 // openxr_shared_texture_test.cpp uses the source-level form).
 #include "../../src/d3d11/fsr3_engine.h"
+#include "../../src/d3d11/hdr_backend_flags.h"
 #include "../../src/common/system_d3d11.h"
 #include "../../src/common/config.h"
 #include "../../src/common/temporal_math.h"
@@ -86,6 +91,7 @@ using Microsoft::WRL::ComPtr;
 namespace edvr {
 uint32_t fsr3TestMessageCount();
 void fsr3TestSkipBindCheck(bool on);
+uint32_t fsr3TestContextFlags(unsigned eye);   // the flags an eye's context was created with (hdr_backend_flags.h)
 }
 
 // perf_monitor.cpp is deliberately not linked here -- it pulls in
@@ -1045,6 +1051,129 @@ void testSizeChange(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     }
 }
 
+// (l) The flat HDR route's flags (docs\design-flat-temporal-aa-2026-09-23.md section 81; hdr_backend_flags.h). The
+// route hands AMD's port the game's R11G11B10F scene colour and takes an R16G16B16A16F output, with the context made
+// under ENABLE_HIGH_DYNAMIC_RANGE | ENABLE_AUTO_EXPOSURE (the exposure resource stays null, preExposure 1). Pinned:
+// that context is made and dispatches FFX_OK with an R11G11B10F input and an fp16 output; a scene with nothing moving
+// comes back as itself in radiance (40 stays 40, finite); and flipping the flag remakes the context each way without a
+// refusal and returns what it returned before. What the same still field does under the LDR flags is printed, not
+// asserted: on a constant field the two agree (measured on WARP: 39.97 and 40.00), so this case cannot show what the flag
+// does to a hot pixel, which only a flight can.
+uint32_t packSmallFloat(float v, int mantissaBits) {   // a positive normal number into an R11G11B10F channel
+    if (!(v > 0.0f)) return 0;
+    int e = 0;
+    const float m = frexpf(v, &e);                      // v = m * 2^e, m in [0.5, 1)
+    return (static_cast<uint32_t>(e - 1 + 15) << mantissaBits) |
+           static_cast<uint32_t>((2.0f * m - 1.0f) * static_cast<float>(1u << mantissaBits) + 0.5f);
+}
+// The mean of the central quarter of an R16G16B16A16_FLOAT texture, per channel; false when a texel there is not finite.
+bool readHalfCentre(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, UINT w, UINT h, float (&mean)[3]) {
+    D3D11_TEXTURE2D_DESC sd{};
+    sd.Width = w; sd.Height = h; sd.MipLevels = 1; sd.ArraySize = 1;
+    sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; sd.SampleDesc.Count = 1;
+    sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D* stage = nullptr;
+    if (FAILED(dev->CreateTexture2D(&sd, nullptr, &stage)) || !stage) return false;
+    ctx->CopyResource(stage, tex);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    bool finite = false;
+    if (SUCCEEDED(ctx->Map(stage, 0, D3D11_MAP_READ, 0, &m))) {
+        double sum[3] = {0, 0, 0};
+        unsigned n = 0;
+        finite = true;
+        for (UINT y = h / 4; y < h - h / 4; ++y) {
+            const auto* row = reinterpret_cast<const uint16_t*>(static_cast<const unsigned char*>(m.pData) +
+                                                                static_cast<size_t>(y) * m.RowPitch);
+            for (UINT x = w / 4; x < w - w / 4; ++x) {
+                for (int c = 0; c < 3; ++c) {
+                    const float v = halfToFloat(row[x * 4 + c]);
+                    if (!std::isfinite(v)) finite = false;
+                    sum[c] += v;
+                }
+                ++n;
+            }
+        }
+        for (int c = 0; c < 3; ++c) mean[c] = static_cast<float>(sum[c] / (n ? n : 1));
+        ctx->Unmap(stage, 0);
+    }
+    stage->Release();
+    return finite;
+}
+constexpr float kHdrFieldTolerance = 0.02f;   // the port returns 39.97 for a constant 40: 0.08% off
+void testHdrRoute(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
+    constexpr UINT w = 320, h = 192;
+    constexpr float kRadiance = 40.0f;
+    ID3D11Texture2D* colour = makeTexture(dev, w, h, DXGI_FORMAT_R11G11B10_FLOAT,     D3D11_BIND_SHADER_RESOURCE);
+    ID3D11Texture2D* depth  = makeTexture(dev, w, h, DXGI_FORMAT_R32_FLOAT,           D3D11_BIND_SHADER_RESOURCE);
+    ID3D11Texture2D* mv     = makeTexture(dev, w, h, DXGI_FORMAT_R16G16_FLOAT,        D3D11_BIND_SHADER_RESOURCE);
+    ID3D11Texture2D* out    = makeTexture(dev, w, h, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                          D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
+    const bool made = colour && depth && mv && out;
+    check(made, "(l) the HDR route's textures (an R11G11B10F colour, an R16G16B16A16F output) were created");
+    if (made) {
+        const uint32_t texel = packSmallFloat(kRadiance, 6) | (packSmallFloat(kRadiance, 6) << 11) |
+                               (packSmallFloat(kRadiance, 5) << 22);
+        const std::vector<uint32_t> field(static_cast<size_t>(w) * h, texel);
+        ctx->UpdateSubresource(colour, 0, nullptr, field.data(), w * 4, 0);
+        fillDepthConstant(ctx, depth, w, h, 0.3f);
+        fillZeroMotion(ctx, mv, w, h);
+        // Six still frames, zero jitter, the first a reset: what the route sends on a scene with nothing moving.
+        const auto run = [&](bool hdr, float (&mean)[3], bool* dispatched) {
+            bool ok = true;
+            for (int f = 0; f < 6; ++f) {
+                const char* why = nullptr;
+                const bool d = edvr::fsr3Evaluate(ctx, 0, colour, depth, mv, nullptr, out, w, h, w, h, 0.0f, 0.0f, f == 0,
+                                                  11.1f, 0.1f, 10000.0f, kFovY, &why, false, hdr);
+                if (!d) std::printf("info: (l) hdr=%d frame %d refused: %s\n", hdr ? 1 : 0, f, why ? why : "?");
+                ok = ok && d;
+            }
+            *dispatched = ok;
+            mean[0] = mean[1] = mean[2] = 0.0f;
+            return ok && readHalfCentre(dev, ctx, out, w, h, mean);
+        };
+        float hdrMean[3], ldrMean[3], againMean[3];
+        bool hdrDispatched = false, ldrDispatched = false, againDispatched = false;
+        // The flags the eye's context carries are what the route asked for, bit for bit: the LDR set the copy route has
+        // always made with, or that set plus the two HDR bits (this rig runs with AMD's debug checking on, which is
+        // the same bit in both). Read from the engine's own record of desc.flags, so a flag that never reached the
+        // port, or a flip that did not remake the context, shows here and nowhere a constant field could.
+        const bool diagnostics = edvr::Config::get().getBool("advanced.temporal_aa_diagnostics", false);
+        const uint32_t ldrFlags = edvr::flatFsrCreateFlags(false, diagnostics, false);
+        const uint32_t hdrFlags = edvr::flatFsrCreateFlags(false, diagnostics, true);
+        const uint32_t messagesBefore = edvr::fsr3TestMessageCount();
+        const bool hdrOk = run(true, hdrMean, &hdrDispatched);
+        check(hdrDispatched, "(l) six frames dispatched FFX_OK under ENABLE_HIGH_DYNAMIC_RANGE | ENABLE_AUTO_EXPOSURE");
+        check(edvr::fsr3TestContextFlags(0) == hdrFlags &&
+                  (hdrFlags & (edvr::kFsrFlagHighDynamicRange | edvr::kFsrFlagAutoExposure)) ==
+                      (edvr::kFsrFlagHighDynamicRange | edvr::kFsrFlagAutoExposure),
+              "(l) the context was created with the HDR and auto-exposure bits added to the LDR set");
+        std::printf("info: (l) HDR flags 0x%X; a constant %.1f field comes back (%.3f, %.3f, %.3f); AMD's messages %u -> %u\n",
+                    edvr::fsr3TestContextFlags(0), kRadiance, hdrMean[0], hdrMean[1], hdrMean[2], messagesBefore,
+                    edvr::fsr3TestMessageCount());
+        check(edvr::fsr3TestMessageCount() == messagesBefore,
+              "(l) AMD's own debug checking says nothing about the HDR route's input (an R11G11B10F colour, null exposure)");
+        check(hdrOk && std::fabs(hdrMean[0] / kRadiance - 1.0f) < kHdrFieldTolerance &&
+                  std::fabs(hdrMean[1] / kRadiance - 1.0f) < kHdrFieldTolerance &&
+                  std::fabs(hdrMean[2] / kRadiance - 1.0f) < kHdrFieldTolerance,
+              "(l) a still HDR field of 40 comes back as itself, finite, through the port's HDR and auto-exposure flags");
+        const bool ldrOk = run(false, ldrMean, &ldrDispatched);
+        check(ldrDispatched && edvr::fsr3TestContextFlags(0) == ldrFlags,
+              "(l) flipping the flag off remade the context with exactly the LDR set, and six frames dispatched again");
+        std::printf("info: (l) LDR flags 0x%X on the same field: (%.3f, %.3f, %.3f)%s\n", edvr::fsr3TestContextFlags(0),
+                    ldrMean[0], ldrMean[1], ldrMean[2], ldrOk ? "" : " (not finite)");
+        const bool againOk = run(true, againMean, &againDispatched);
+        check(againDispatched && againOk && edvr::fsr3TestContextFlags(0) == hdrFlags &&
+                  std::fabs(againMean[0] - hdrMean[0]) <= 0.01f * kRadiance &&
+                  std::fabs(againMean[1] - hdrMean[1]) <= 0.01f * kRadiance &&
+                  std::fabs(againMean[2] - hdrMean[2]) <= 0.01f * kRadiance,
+              "(l) flipping it back on remakes the context with the HDR set, and it returns what it returned before the flip");
+    }
+    if (colour) colour->Release();
+    if (depth) depth->Release();
+    if (mv) mv->Release();
+    if (out) out->Release();
+}
+
 // The upscale case (the review of 2026-09-16, F3). Until now EVERY
 // fsr3Evaluate in this rig passed outW = w: the whole point of fix.temporal_aa
 // = fsr -- native_temporal.cpp sets s.upscale for it -- had never run
@@ -1575,6 +1704,7 @@ int run() {
         testRegistrationTable(device.Get(), context.Get());
         testReset(device.Get(), context.Get());
         testSizeChange(device.Get(), context.Get());
+        testHdrRoute(device.Get(), context.Get());
         testUpscaleQuest3(device.Get(), context.Get());
         testUpscaleRegistration(device.Get(), context.Get());
         testWarmAndRelease(device.Get(), context.Get());
@@ -1605,7 +1735,7 @@ int main(int argc, char** argv) {
         std::puts(
             "Would test AMD's FSR3 engine on a WARP device: availability, context creation, "
             "DEBUG_CHECKING silence, the jitter/motion-vector sign registration table, reset, a "
-            "size change, the Quest 3's own upscale and the sign table at that ratio, the "
+            "size change, the flat HDR route's flags, the Quest 3's own upscale and the sign table at that ratio, the "
             "loading-screen warm-up and the release that frees it, a reactive mask, the "
             "bind-flag refusal and the caught throw behind it, and WARP's answer to the video "
             "memory query; no devices "

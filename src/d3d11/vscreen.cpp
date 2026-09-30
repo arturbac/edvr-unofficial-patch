@@ -1649,7 +1649,26 @@ __declspec(noinline) bool ensureOurCompositeCb(ID3D11DeviceContext* self, State*
 //
 // Kept as one expression, in the original order, so that a future subscriber
 // is added HERE and nowhere else -- which is the mistake the use site's
-// comment records three times over.
+// comment records three times over. The wake pulse, night vision, the
+// witchspace starfield switch and the depth probe repeated it: each acts below
+// the gate (wakePulseSkips in the offscreen branch, nightVisionMatches on the
+// eye draw, witchspaceStarsSkip ahead of the eye gate, the depth probe's two
+// notes) and none was listed, so with every other subscriber off the gate
+// closed and they never ran. They are the last four terms.
+//
+// The depth probe's two rungs share ONE term. depthProbeWanted() is the first
+// rung's own test; the second rung's pre-check, depthProbeEyeDrawNeedsNote(),
+// is that same flag AND a per-view test, so it cannot pass while the flag is
+// false. depthProbeConfigure arms it for any fix.temporal_aa value but off, or
+// for advanced.eye_depth_capture alone. objectProbeWantsDraws() below covers a
+// recognised temporal mode, which is why this went unnoticed; it does not cover
+// an unrecognised value or the capture on its own.
+//
+// Two rungs below the gate are deliberately NOT listed: screenMotionLive() and
+// uiLayerCrispOn(). Each implies temporalModeEnabled(fix.temporal_aa), the same
+// expression objectProbeConfigure sets g_objectProbeOn from, which is
+// objectProbeWantsDraws() below, so neither can be true while the gate is shut.
+// Narrow that probe's on-condition and both belong here.
 bool drawGateSubscribed(State* s) {
     return s->distanceEnabled || s->countForFlashFix ||
         headOffsetGateWantsPanel() || s->censusSkipCount != 0 ||
@@ -1666,7 +1685,9 @@ bool drawGateSubscribed(State* s) {
         objectProbeWantsDraws() ||
         panelCurveWants() || particleWantsDraws() || backdropWantsDraws() ||
         scrimWantsDraws() || quadProbeWants() || loaderPanelWants() ||
-        introProbeWants() || introPanelWants();
+        introProbeWants() || introPanelWants() ||
+        wakePulseWantsDraws() || nightVisionWantsDraws() ||
+        witchspaceStarsHidden() || depthProbeWanted();
 }
 
 // The bound target's resolve, for the wake pulse, memoised on Rtv0's binding

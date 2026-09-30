@@ -67,11 +67,16 @@ bool fsr3Warm(ID3D11DeviceContext* ctx, uint32_t w, uint32_t h, uint32_t outW,
 // catch stays as the backstop for a failure nobody foresaw.
 // infiniteDepth selects AMD's explicit infinite reversed-depth projection. nearZ
 // remains the measured finite near plane; farZ is ignored in that mode.
+// hdr (the flat HDR route, docs/design-flat-temporal-aa-2026-09-23.md section 81): the colour is HDR scene
+// radiance, the output fp16, and the context is created with ENABLE_HIGH_DYNAMIC_RANGE and ENABLE_AUTO_EXPOSURE
+// (hdr_backend_flags.h; the exposure resource stays null and preExposure 1). A context-creation flag, so part of
+// the context key: a flip remakes it. False is every other caller, unchanged.
 bool fsr3Evaluate(ID3D11DeviceContext* ctx, unsigned eye, ID3D11Texture2D* colour,
                   ID3D11Texture2D* depth, ID3D11Texture2D* mv, ID3D11Texture2D* reactive,
                   ID3D11Texture2D* out, uint32_t w, uint32_t h, uint32_t outW,
                   uint32_t outH, float jx, float jy, bool reset, float frameMs,
-                  float nearZ, float farZ, float fovY, const char** why, bool infiniteDepth = false);
+                  float nearZ, float farZ, float fovY, const char** why, bool infiniteDepth = false,
+                  bool hdr = false);
 
 // Releases FSR's per-eye contexts (g_ctx[2], design doc 3.2) without the
 // full port shutdown below -- for a size or engine change mid-session, the

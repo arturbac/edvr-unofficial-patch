@@ -1025,7 +1025,10 @@ void flatWarningTick(uint64_t now) {
         }
     }
     const std::string label = refusing ? flatModeLabel() : std::string();
-    const std::string key = refusing ? flatSettingsWarningKey(label.c_str(), s.flatSettings.settings())
+    // Whether the HDR route is what treats this session's frames (flat_hdr_route.h): its refusal is not about bloom or
+    // depth of field, so those are not named.
+    const bool hdrRoute = refusing && flatRuntimeHdrRouteActive();
+    const std::string key = refusing ? flatSettingsWarningKey(label.c_str(), s.flatSettings.settings(), hdrRoute)
                                      : std::string();
     if (refusing == s.flatWarnActive && key == s.flatWarnKey) return;
     const bool was = s.flatWarnActive;
@@ -1036,10 +1039,11 @@ void flatWarningTick(uint64_t now) {
     ++s.flatWarnLogged;
     if (refusing) {
         FlatSettingsWarning w;
-        flatComposeSettingsWarning(label.c_str(), s.flatSettings.settings(), 0, nullptr, nullptr, &w);
-        Log::get().note("flat settings warning: %s (mode=%s, frames refused for %s%s): %s%s%s",
+        flatComposeSettingsWarning(label.c_str(), s.flatSettings.settings(), 0, nullptr, nullptr, &w, hdrRoute);
+        Log::get().note("flat settings warning: %s (mode=%s, frames refused for %s%s%s): %s%s%s",
                         was ? "changed" : "shown", label.c_str(), reason,
-                        standing ? ", work stood down" : "", w.count > 0 ? w.line[0] : "",
+                        standing ? ", work stood down" : "", hdrRoute ? ", HDR route active" : "",
+                        w.count > 0 ? w.line[0] : "",
                         w.count > 1 ? " " : "", w.count > 1 ? w.line[1] : "");
     } else {
         Log::get().note("flat settings warning: hidden (the work is not stood down for the shape of "
@@ -2125,7 +2129,7 @@ void buildContent(MenuContent& c) {
             const int width = c.cardPx - 2 * (c.capPx * 8 / 10);
             FlatSettingsWarning warning;
             flatComposeSettingsWarning(flatModeLabel().c_str(), s.flatSettings.settings(), width,
-                                       &flatWarnMeasure, &ruler, &warning);
+                                       &flatWarnMeasure, &ruler, &warning, flatRuntimeHdrRouteActive());
             if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;
             for (int i = 0; i < warning.count && c.lineCount < kMenuMaxLines; ++i) {
                 MenuLine& l = c.lines[c.lineCount++];

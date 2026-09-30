@@ -1,5 +1,6 @@
 #include "dlaa.h"
 #include "dlss_floor.h"  // dlssModeRanges, defined below beside dlaaAvailable
+#include "hdr_backend_flags.h"  // the HDR route's creation flags, pure (section 81)
 
 #include <cmath>
 #include <cstdarg>
@@ -96,7 +97,21 @@ struct EyeFeature {
     uint32_t          w = 0, h = 0;
     uint32_t          outW = 0, outH = 0;
     uint64_t          presetGen = 0;   // the preset generation the feature was created under
+    // The flat HDR route's input is HDR with automatic exposure (section 81). The flags are creation-time, so
+    // the feature key carries the bit: a route flip remakes the feature and its history starts again.
+    bool              hdr = false;
 };
+
+// The flag set is hdr_backend_flags.h's, pure so a rig can pin it; every constant is checked against the SDK's own
+// enum here, so a drift in either fails this compile and not a flight.
+static_assert(kDlssFlagIsHdr == static_cast<uint32_t>(NVSDK_NGX_DLSS_Feature_Flags_IsHDR), "IsHDR bit");
+static_assert(kDlssFlagMvLowRes == static_cast<uint32_t>(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes), "MVLowRes bit");
+static_assert(kDlssFlagMvJittered == static_cast<uint32_t>(NVSDK_NGX_DLSS_Feature_Flags_MVJittered), "MVJittered bit");
+static_assert(kDlssFlagDepthInverted == static_cast<uint32_t>(NVSDK_NGX_DLSS_Feature_Flags_DepthInverted), "DepthInverted bit");
+static_assert(kDlssFlagAutoExposure == static_cast<uint32_t>(NVSDK_NGX_DLSS_Feature_Flags_AutoExposure), "AutoExposure bit");
+static_assert(flatDlssCreateFlags(false) == static_cast<uint32_t>(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
+                                                                   NVSDK_NGX_DLSS_Feature_Flags_DepthInverted),
+              "the LDR flag set is what it always was");
 
 // The render preset -- NVIDIA's model -- set by dlaaSetPreset from the
 // config and applied to the shared parameter block before each feature is
@@ -325,11 +340,12 @@ void logDlssModesOnce(uint32_t outW, uint32_t outH, const DlssModeRange modes[kD
 // mismatch, as it always did). createMs is the create's own duration,
 // zero when nothing was made.
 bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
-                   uint32_t outW, uint32_t outH, const char** reason, double* createMs) {
+                   uint32_t outW, uint32_t outH, const char** reason, double* createMs,
+                   bool hdr = false) {
     if (createMs) *createMs = 0.0;
     EyeFeature& f = g_feature[eye];
     if (!f.handle || f.w != w || f.h != h || f.outW != outW || f.outH != outH ||
-        f.presetGen != g_presetGen) {
+        f.presetGen != g_presetGen || f.hdr != hdr) {
         if (f.handle) {
             NVSDK_NGX_D3D11_ReleaseFeature(f.handle);
             f.handle = nullptr;
@@ -422,10 +438,10 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
         cp.Feature.InTargetWidth = outW;
         cp.Feature.InTargetHeight = outH;
         cp.Feature.InPerfQualityValue = quality;
-        // LDR colour; motion vectors at the render size, unjittered (the
-        // pass computes them on the unjittered grid); reversed-Z depth.
-        cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
-                                  NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+        // LDR colour (HDR with automatic exposure on the flat HDR route: hdr_backend_flags.h);
+        // motion vectors at the render size, unjittered (the pass computes them on the unjittered
+        // grid); reversed-Z depth.
+        cp.InFeatureCreateFlags = static_cast<int>(flatDlssCreateFlags(hdr));
         cp.InEnableOutputSubrects = false;
         applyPresetHints();
         // An event with a duration for the monitor's drop attribution: the
@@ -454,6 +470,11 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
         f.outW = outW;
         f.outH = outH;
         f.presetGen = g_presetGen;
+        f.hdr = hdr;
+        if (hdr)
+            Log::get().note("dlss: the feature for eye %d was created for the flat HDR route: HDR input and "
+                            "automatic exposure (IsHDR | AutoExposure with MVLowRes | DepthInverted); the "
+                            "history starts here.", eye);
         // Build point 5, 2026-09-23: a create success resets the shared
         // reason, so a caller that reads it later (dlaaAvailable's *reason,
         // which just echoes g_reason once NGX has initialised) is not shown
@@ -647,12 +668,12 @@ bool dlaaEvaluate(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour,
                   ID3D11Texture2D* output, ID3D11Texture2D* reactive,
                   uint32_t w, uint32_t h,
                   uint32_t outW, uint32_t outH, float jx, float jy, bool reset,
-                  float frameMs, const char** reason) {
+                  float frameMs, const char** reason, bool hdr) {
 #ifndef EDVR_HAVE_NGX
     (void)ctx; (void)eye; (void)colour; (void)depth; (void)motion; (void)output;
     (void)reactive;
     (void)w; (void)h; (void)outW; (void)outH; (void)jx; (void)jy; (void)reset;
-    (void)frameMs;
+    (void)frameMs; (void)hdr;
     if (reason) *reason = "this build has no DLSS SDK in it";
     return false;
 #else
@@ -668,7 +689,7 @@ bool dlaaEvaluate(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour,
     }
     // The feature: found made (by the warm-up or a previous frame) or made
     // here, through the one block the warm-up shares (ensureFeature).
-    if (!ensureFeature(ctx, eye, w, h, outW, outH, reason, nullptr)) return false;
+    if (!ensureFeature(ctx, eye, w, h, outW, outH, reason, nullptr, hdr)) return false;
     EyeFeature& f = g_feature[eye];
 
     NVSDK_NGX_D3D11_DLSS_Eval_Params ep{};

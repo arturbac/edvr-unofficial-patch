@@ -59,6 +59,10 @@ inline bool flatMonoReasonStructural(FlatMonoReason reason) {
     case FlatMonoReason::InvalidOutputCopy:
     case FlatMonoReason::BrokenLineage:
     case FlatMonoReason::WrongOrder:
+    // The HDR route's chain-shape refusal (section 81): an HDR target was drawn into and nothing
+    // the route recognises as its first consumer followed. Like the others it does not clear by
+    // itself inside a scene. HdrExtent (render smaller than output) is not: the copy route serves it.
+    case FlatMonoReason::NoHdrConsumer:
         return true;
     default:
         return false;

@@ -158,12 +158,17 @@ bool dlaaWarm(ID3D11DeviceContext* ctx, uint32_t w, uint32_t h, bool features,
 // not passing one. The runtime takes ONE such mask, so when the temporal
 // pass's mover mask (tier 1 of docs/per-object-motion.md) is on as well, the
 // pass folds the interface's into it before calling here and hands the union.
+//
+// `hdr` (the flat HDR route, docs/design-flat-temporal-aa-2026-09-23.md section 81): the colour is HDR scene
+// radiance (R11G11B10F or fp16), the output R16G16B16A16_FLOAT, and the feature is created with IsHDR and
+// AutoExposure beside the LDR flags (hdr_backend_flags.h). The flags are creation-time, so the feature key carries
+// the bit: a flip remakes the feature and its history starts again. False is every other caller, unchanged.
 bool dlaaEvaluate(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour,
                   ID3D11Texture2D* depth, ID3D11Texture2D* motion,
                   ID3D11Texture2D* output, ID3D11Texture2D* reactive,
                   uint32_t w, uint32_t h,
                   uint32_t outW, uint32_t outH, float jx, float jy, bool reset,
-                  float frameMs, const char** reason);
+                  float frameMs, const char** reason, bool hdr = false);
 
 // One eye, one frame, but NVIDIA runs on a CROP of the frame -- the fovea,
 // docs/performance.md feature 6. The colour, depth and motion are the same
