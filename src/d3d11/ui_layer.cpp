@@ -37,6 +37,8 @@
 #include "ui_panel_scale.h" // the engine-side panel sizing, configured and ticked with the key
 #include "ui_surfaces.h"   // the instruments: the target, the frame count, the atlas line
 #include "vscreen.h"       // the raw OM/RS entry points, vScreenIsEyeSized, vScreenPanelSize
+#include "vr_world_mips.h"  // the VR world route: the mipped screen and its sampler (the re-issue's inputs)
+#include "vr_world_route.h" // ...and what the route publishes: may the layer take, which eye was taken
 
 #include "../common/config.h"
 #include "../common/guard.h"
@@ -67,6 +69,7 @@ bool g_uiLayerRedirecting = false;
 bool g_uiLayerIssueBlocked = false;
 bool g_uiLayerCrispOn = false;      // the HDR HUD take/re-issue armed this frame (with the layer)
 bool g_uiLayerCrispPending = false; // a tonemap draw was admitted; its re-issue follows its draw
+bool g_uiLayerWorldReissue = false; // the VR world route: the screen composite just decided is re-issued after the game's draw
 }  // namespace detail
 
 namespace {
@@ -108,7 +111,9 @@ float layerTarget() {
 }
 
 void refreshLive() {
-    detail::g_uiLayerLive = g_target > 0.0f && g_temporal && g_jitterAsShipped && !g_stoodDown;
+    // ui_layer_math.h's uiLayerLiveFor: the one statement of "the layer is live", which the VR world route reads
+    // through uiLayerLiveForWorldRoute (tools/ui_quality_test pins it equal to the expression it replaced).
+    detail::g_uiLayerLive = uiLayerLiveFor(g_target, g_temporal, g_jitterAsShipped, g_stoodDown);
     detail::g_uiLayerCrispOn = detail::g_uiLayerLive && !g_crispStoodDown;
 }
 
@@ -178,6 +183,9 @@ struct Eye {
     uint32_t draws = 0;          // redirected into it for that frame
     uint64_t compositedSeq = 0;  // the last frame the door composited (or tried)
     const void* target = nullptr;  // the game's target those draws left (identity)
+    // The frame whose 2D screen draw the VR world route re-issued into this layer (End of the re-issue): the eye
+    // is the layer's alone that frame, and a draw the game left in its own eye image after it is lost (counted).
+    uint64_t worldSeq = 0;
     // The identity is still a link of the pre-UI chain the crisp re-issue opened
     // (the tonemap's output A, before the game's post pass carried it to B): a
     // small pass reading it carries it on, once (uiLayerFollowReader,
@@ -418,6 +426,11 @@ struct Window {
     uint64_t hdrDrawTimingEligible = 0, hdrDrawTimingDisabled = 0, hdrDrawTimingIssued = 0;
     uint64_t hdrDrawTimingAborted = 0;
     uint64_t hdrDeclined[static_cast<size_t>(CrispToneDecline::kCount)] = {};
+    // The VR world route (ui_layer.h): 2D screen draws re-issued into the layer, draws the game left in an eye
+    // image after its screen was re-issued (lost while the route owns that eye), and the route's own refusals by
+    // reason (the decision's refusals are in decided[kScreen][...] as for any family).
+    uint64_t worldReissued = 0, worldLeftDraws = 0;
+    uint64_t worldRefused[static_cast<size_t>(UiWorldRefuse::kCount)] = {};
     // The world-screen gate: frames read, 2D screen draws that asked, and the
     // frames each signal held the screen in the picture.
     uint64_t gateReads = 0, screenAsked = 0;
@@ -849,6 +862,7 @@ bool releaseLayers() {
         e.w = e.h = e.basisW = e.basisH = 0;
         e.seq = 0;
         e.draws = 0;
+        e.worldSeq = 0;
         e.chainOpen = false;
         e.mTex.Reset();
         e.mRtv.Reset();
@@ -2194,8 +2208,8 @@ void logWorldScreen() {
         "ui quality: world screen: the gate %s (the journal: %s; the screen's depth: %u draws a frame "
         "now, %u at most this window, %llu frames counted; over %u for %u frames holds it, under %u for "
         "%u frames lets go); held %llu of %llu frames -- %llu by the journal alone, %llu by the depth "
-        "alone, %llu by both; %llu 2D screen draws asked, %llu left in the picture; the screen's depth "
-        "at most, by GuiFocus: %s.",
+        "alone, %llu by both; %llu 2D screen draws asked, %llu left in the picture, %llu re-issued into the "
+        "layer by the VR world route; the screen's depth at most, by GuiFocus: %s.",
         g_screenHeld == 1 ? "holds" : g_screenHeld == 0 ? "is open" : "has never been read",
         journalReading(active, journalOnFootKnown(), journalOnFoot()), g_world.draws, g_win.depthMax,
         static_cast<unsigned long long>(g_win.depthCounted), kUiWorldEnterDraws, kUiWorldEnterFrames,
@@ -2209,7 +2223,40 @@ void logWorldScreen() {
         static_cast<unsigned long long>(
             g_win.decided[static_cast<size_t>(UiLayerFamily::kScreen)]
                          [static_cast<size_t>(UiLayerDecision::kWorldScreen)]),
+        static_cast<unsigned long long>(g_win.worldReissued),
         focus.empty() ? "nothing counted" : focus.c_str());
+}
+
+// The VR world route's own line: the screen draws the layer re-issued and, for the ones it did not, why -- the
+// route's refusals by reason and the decision's own refusals of the screen family (decided[kScreen][...], the
+// same numbers the families line carries). Printed while the key is auto, zeros included: an absent line is what
+// "the route never reached the layer" looks like.
+void logWorldRoute(double seconds) {
+    std::string route, decision;
+    for (size_t r = 1; r < static_cast<size_t>(UiWorldRefuse::kCount); ++r) {
+        const uint64_t n = g_win.worldRefused[r];
+        if (!n) continue;
+        appendf(route, "%s%s=%llu", route.empty() ? "" : ", ", uiWorldRefuseKey(static_cast<UiWorldRefuse>(r)),
+                static_cast<unsigned long long>(n));
+    }
+    const size_t screen = static_cast<size_t>(UiLayerFamily::kScreen);
+    for (size_t d = 1; d < static_cast<size_t>(UiLayerDecision::kCount); ++d) {
+        if (d == static_cast<size_t>(UiLayerDecision::kWorldScreen)) continue;  // the eye route's frames
+        const uint64_t n = g_win.decided[screen][d];
+        if (!n) continue;
+        appendf(decision, "%s%s=%llu", decision.empty() ? "" : ", ", uiLayerDecisionKey(static_cast<UiLayerDecision>(d)),
+                static_cast<unsigned long long>(n));
+    }
+    Log::get().note(
+        "vr world route layer: %.0f s; %llu screen draws re-issued into the layer (%.2f a frame); refused by the "
+        "route's own checks: %s; refused by the decision's tests (every 2D screen draw this window, owned frames or "
+        "not): %s; %llu draws into a re-issued eye left in the game's frame (lost while the route owns that eye). "
+        "The first eight distinct reasons are named in full, once each, in the lines \"vr world route: layer did not "
+        "take the screen draw for eye N\".",
+        seconds, static_cast<unsigned long long>(g_win.worldReissued),
+        static_cast<double>(g_win.worldReissued) / (g_win.frames ? static_cast<double>(g_win.frames) : 1.0),
+        route.empty() ? "none" : route.c_str(), decision.empty() ? "none" : decision.c_str(),
+        static_cast<unsigned long long>(g_win.worldLeftDraws));
 }
 
 // ------------------------------------------------------------ the totals
@@ -2464,6 +2511,9 @@ void logTotals(double seconds) {
         static_cast<unsigned long long>(g_sessionRedirected),
         g_stoodDown ? " -- the layer STOOD DOWN (the line above says why)" : "");
     logWorldScreen();
+    bool worldRefused = false;
+    for (const uint64_t n : g_win.worldRefused) worldRefused = worldRefused || n != 0;
+    if (vrWorldRouteEnabled() || g_win.worldReissued || g_win.worldLeftDraws || worldRefused) logWorldRoute(seconds);
 }
 
 }  // namespace
@@ -2609,6 +2659,143 @@ int uiLayerTargetKind() {
     return g_tc.kind;
 }
 
+// --------------------------------- the VR world route's re-issue (ui_layer.h)
+//
+// On a frame the route owns the world, the 2D screen's composite is decided here in the route's mode
+// (ui_layer_math.h uiLayerWorldRouteMode): the decision's tests run as for any opaque, no-depth eye draw, and the
+// draw that passes them is NOT taken -- uiLayerDecide returns false, the game's own draw lands in its eye image as
+// it always did (the game's post pass copies that image on, and a refused re-issue leaves the eye whole for the
+// eye route), and vscreen.cpp then issues it once more into the eye's layer (worldScreenReissue ->
+// uiLayerWorldReissueBegin / End) with the route's mipped copy of the resolved screen at PS slot 0 and a
+// trilinear sampler like the game's. Everything the re-issue changes goes back at End; any refusal leaves the
+// game's state untouched, is counted by reason and named (the first eight distinct reasons, once each), and the
+// eye route serves that eye.
+
+namespace {
+
+// The decided draw, held from its decision until the re-issue right after the game's own issue. One at a time,
+// render thread only; a stale one (its draw was swallowed) is overwritten by the next decision or dropped by
+// vscreen's scope and never fires.
+struct WorldReissue {
+    bool pending = false;  // decided: the game's draw runs as it always did, then is issued once more into the layer
+    bool active = false;   // Begin bound the layer and the mipped screen; End puts everything back
+    bool changed = false;  // Begin took PS slot 0 off the game's draw (the saved pair below is what to put back)
+    int eye = -1;
+    uint64_t seq = 0;
+    const void* targetRes = nullptr;  // the game's eye image the draw writes (identity only)
+    uint32_t targetW = 0, targetH = 0;
+    float jx = 0.0f, jy = 0.0f;       // this frame's jitter, in the target's pixels (0 while the eye shift is off)
+    UiBlendShape shape = UiBlendShape::kOpaque;
+    void* screenRes = nullptr;                    // the draw's PS slot 0 texture at the decision (identity only)
+    ID3D11ShaderResourceView* mipsSrv = nullptr;  // vrWorldMipsScreen's, valid for this frame (no reference held)
+    ID3D11SamplerState* sampler = nullptr;        // vrWorldMipsSampler's, cached by the mips module (none held)
+    // What Begin took off the game's PS slot 0 (references held), put back at End.
+    ID3D11ShaderResourceView* savedSrv = nullptr;
+    ID3D11SamplerState* savedSampler = nullptr;
+};
+WorldReissue g_reissue;
+FaultBudget g_worldBudget("uiLayer.worldReissue", 4);
+UiWorldReasonLog g_worldReasons;
+bool g_worldReissueNoted[2] = {};
+
+void worldReleaseSaved(WorldReissue& r) {
+    if (r.savedSrv) r.savedSrv->Release();
+    if (r.savedSampler) r.savedSampler->Release();
+    r.savedSrv = nullptr;
+    r.savedSampler = nullptr;
+}
+
+// Forget a pending or active re-issue: the frame boundary, shutdown.
+void worldReissueReset() {
+    worldReleaseSaved(g_reissue);
+    g_reissue = WorldReissue{};
+    detail::g_uiLayerWorldReissue = false;
+}
+
+// One refusal: counted by reason (the decision's own refusals are counted in decided[kScreen][...] as for any
+// family) and, the first kUiWorldReasonLines distinct ones, named once each.
+void worldRefuse(int eye, uint16_t id) {
+    if (id < static_cast<uint16_t>(UiWorldRefuse::kCount)) ++g_win.worldRefused[id];
+    if (!g_worldReasons.first(id)) return;
+    char line[320];
+    uiWorldFormatRefusal(line, sizeof(line), eye, id);
+    Log::get().note("%s", line);
+}
+
+// PS slot 0 of the decided draw -- the screen texture and the game's sampler -> the route's mipped copy of the
+// screen and the trilinear sampler like the game's, or why not. The mips module copies and mips the screen once a
+// frame (a second eye's call is a cache hit).
+UiWorldRefuse worldReissueSources(ID3D11DeviceContext* ctx, uint64_t seq, WorldReissue* plan) {
+    Ptr<ID3D11ShaderResourceView> srv;
+    ctx->PSGetShaderResources(0, 1, &srv);
+    Ptr<ID3D11Resource> res;
+    if (srv) srv->GetResource(&res);
+    Ptr<ID3D11Texture2D> tex;
+    if (res) res.As(&tex);
+    if (!tex) return UiWorldRefuse::kNoSource;
+    Ptr<ID3D11SamplerState> smp;
+    ctx->PSGetSamplers(0, 1, &smp);
+    if (!smp) return UiWorldRefuse::kNoSampler;
+    ID3D11ShaderResourceView* mips = vrWorldMipsScreen(ctx, tex.Get(), seq);
+    if (!mips) return UiWorldRefuse::kMipsNull;
+    Ptr<ID3D11Device> dev;
+    ctx->GetDevice(&dev);
+    D3D11_SAMPLER_DESC sd{};
+    smp->GetDesc(&sd);
+    ID3D11SamplerState* mip = dev ? vrWorldMipsSampler(dev.Get(), sd) : nullptr;
+    if (!mip) return UiWorldRefuse::kSamplerNull;
+    plan->screenRes = res.Get();  // identity only: the game holds the texture
+    plan->mipsSrv = mips;
+    plan->sampler = mip;
+    return UiWorldRefuse::kNone;
+}
+
+// The route's screen draw passed every test of the decision: check what the re-issue needs from the draw's own
+// bindings and, when it has them, hold the draw for the re-issue that follows the game's own issue. Never a take.
+void worldReissuePlan(ID3D11DeviceContext* ctx, const UiLayerDrawFacts& f, bool substituted, uint64_t seq,
+                      float jx, float jy) {
+    UiWorldRefuse why = UiWorldRefuse::kNone;
+    WorldReissue plan;
+    if (substituted) {
+        why = UiWorldRefuse::kCurved;
+    } else if (f.ds.tests() || f.ds.writes()) {
+        why = UiWorldRefuse::kDepthState;
+    } else if (f.blend != UiBlendShape::kOpaque) {
+        why = UiWorldRefuse::kNotOpaque;
+    } else {
+        // The mips' copy and every call below go through the hooked vtable: vscreen's hooks step aside for them.
+        // The scope is OUTSIDE the guard -- an SEH fault does not unwind a destructor inside it.
+        VrWorldInternalScope internal;
+        const bool ran = guardedBudget(g_worldBudget, [&] { why = worldReissueSources(ctx, seq, &plan); });
+        if (!ran) why = UiWorldRefuse::kFault;
+    }
+    if (why != UiWorldRefuse::kNone) {
+        worldRefuse(f.eye, uiWorldReasonId(why));
+        return;
+    }
+    plan.eye = f.eye;
+    plan.seq = seq;
+    plan.targetRes = g_tc.info.resource;
+    plan.targetW = g_tc.info.a;
+    plan.targetH = g_tc.info.b;
+    plan.jx = jx;
+    plan.jy = jy;
+    plan.shape = f.blend;
+    plan.pending = true;
+    g_reissue = plan;
+    detail::g_uiLayerWorldReissue = true;
+}
+
+// The game's PS slot 0, put back (raw: the binding shadow never saw the change).
+void worldRestoreSources(ID3D11DeviceContext* ctx, const WorldReissue& plan) {
+    ID3D11ShaderResourceView* srv = plan.savedSrv;
+    vScreenPSSetShaderResourcesRaw(ctx, 0, 1, &srv);
+    ID3D11SamplerState* smp = plan.savedSampler;
+    ctx->PSSetSamplers(0, 1, &smp);
+}
+
+}  // namespace
+
 bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards,
                    bool substituted, int knownEye) {
     g_draw.decided = false;
@@ -2619,6 +2806,12 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     g_draw.ds = UiDsEffect{};
     g_draw.stencilRead = 0;
     g_draw.shape = UiBlendShape::kRefused;
+    if (familyInt != static_cast<int>(UiLayerFamily::kAfterUi)) {
+        // A decision of a real family forgets a re-issue still pending from an earlier draw. The after-UI retry's
+        // decisions run between a draw's own decision and its re-issue, and leave it alone.
+        g_reissue.pending = false;
+        detail::g_uiLayerWorldReissue = false;
+    }
     if (!ctx || familyInt <= 0 || familyInt >= static_cast<int>(UiLayerFamily::kCount)) return false;
     const UiLayerFamily family = static_cast<UiLayerFamily>(familyInt);
     UiLayerDrawFacts f;
@@ -2627,6 +2820,9 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     f.substituted = substituted;
     // The world-screen gate, as this frame's boundary read it.
     f.worldScreen = g_screenHeld == 1;
+    // The VR world route owns this frame's world: the 2D screen composite is re-issued into the layer, not taken
+    // (asked for that family alone; false with experimental.temporal_aa_on_foot_world off, always).
+    f.worldRoute = family == UiLayerFamily::kScreen && vrWorldRouteLayerMayTake();
     if (family == UiLayerFamily::kScreen) ++g_win.screenAsked;
     const int kind = uiLayerTargetKind();
     f.eyeTarget = kind != 0;
@@ -2784,6 +2980,19 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
         for (auto* r : rtvs)
             if (r) r->Release();
         if (dsv) dsv->Release();
+    }
+    if (uiLayerWorldRouteMode(family, f.worldScreen, f.worldRoute)) {
+        // The route's mode: never a take. A draw that passed every test is held for the re-issue after the game's
+        // own issue (counted when it lands, as a re-issue -- not as "redirected": the layer took nothing from the
+        // game's frame); one the tests refused is counted and named as any refusal, and the eye route serves it.
+        if (uiLayerWorldCount(d, true) == UiWorldCount::kReissue) {
+            worldReissuePlan(ctx, f, substituted, seq, jx, jy);
+        } else {
+            ++g_win.decided[static_cast<size_t>(family)][static_cast<size_t>(d)];
+            noteFamily(family, d, detail);
+            worldRefuse(f.eye, uiWorldReasonId(d));
+        }
+        return false;
     }
     ++g_win.decided[static_cast<size_t>(family)][static_cast<size_t>(d)];
     noteFamily(family, d, detail);
@@ -3474,6 +3683,183 @@ void uiLayerCrispToneEnd(ID3D11DeviceContext* ctx) {
     }
 }
 
+// ------------------------------- the VR world route's re-issue: Begin, End, the door's preflight (ui_layer.h)
+
+UiLayerWorldStats uiLayerWorldStats() {
+    UiLayerWorldStats s;
+    s.screenAsked = g_win.screenAsked;
+    const size_t screen = static_cast<size_t>(UiLayerFamily::kScreen);
+    static_assert(static_cast<size_t>(UiLayerDecision::kCount) <= 16, "UiLayerWorldStats::screenDecided is 16 wide");
+    static_assert(static_cast<size_t>(UiWorldRefuse::kCount) <= 16, "UiLayerWorldStats::refused is 16 wide");
+    for (size_t d = 0; d < static_cast<size_t>(UiLayerDecision::kCount); ++d) s.screenDecided[d] = g_win.decided[screen][d];
+    s.reissued = g_win.worldReissued;
+    s.lostDraws = g_win.worldLeftDraws;
+    for (size_t r = 0; r < static_cast<size_t>(UiWorldRefuse::kCount); ++r) s.refused[r] = g_win.worldRefused[r];
+    return s;
+}
+
+bool uiLayerWorldScreenHeld() { return g_screenHeld == 1; }
+
+bool uiLayerLiveForWorldRoute() { return detail::g_uiLayerLive; }
+
+const char* uiLayerNotLiveReason() {
+    return uiLayerNotLiveReasonFor(g_target, g_temporal, g_jitterAsShipped, g_stoodDown);
+}
+
+void uiLayerWorldReissueAbandon() {
+    g_reissue.pending = false;
+    detail::g_uiLayerWorldReissue = false;
+}
+
+// Right after the game's own issue of the decided screen draw (vscreen.cpp, worldScreenReissue): the layer
+// bound for one more issue of it. The game's draw is never touched; false leaves the game's state exactly as it
+// was and the eye to the eye route.
+bool uiLayerWorldReissueBegin(ID3D11DeviceContext* ctx) {
+    detail::g_uiLayerWorldReissue = false;
+    if (!g_reissue.pending || !ctx) return false;
+    WorldReissue plan = g_reissue;
+    g_reissue = WorldReissue{};
+    if (plan.eye < 0 || plan.eye > 1) return false;
+    UiWorldRefuse why = UiWorldRefuse::kNone;
+    {
+        // Every call below goes through the hooked vtable or a raw entry: vscreen's hooks step aside. The scope is
+        // OUTSIDE every guard -- an SEH fault does not unwind a destructor inside one.
+        VrWorldInternalScope internal;
+        if (!detail::g_uiLayerLive || uiLayerIssueBlocked()) {
+            why = UiWorldRefuse::kBeginRefused;
+        } else if (uiLayerTargetKind() == 0 || g_tc.info.resource != plan.targetRes) {
+            // Nothing ran between the decision and here but the game's own draw and its verdict's state.
+            why = UiWorldRefuse::kStateChanged;
+        } else {
+            bool same = false;
+            const bool ran = guardedBudget(g_worldBudget, [&] {
+                Ptr<ID3D11ShaderResourceView> srv;
+                ctx->PSGetShaderResources(0, 1, &srv);
+                Ptr<ID3D11Resource> res;
+                if (srv) srv->GetResource(&res);
+                same = res.Get() == plan.screenRes;
+            });
+            if (!ran) why = UiWorldRefuse::kFault;
+            else if (!same) why = UiWorldRefuse::kStateChanged;
+        }
+        if (why == UiWorldRefuse::kNone) {
+            // The decided draw, as beginInner reads it: the eye's layer, the map and the jitter cancel, the opaque
+            // conversion of the game's own blend, no depth target. beginGuarded saves the game's targets,
+            // viewports, scissor and blend and puts them back itself on a refusal or a fault.
+            g_draw.decided = true;
+            g_draw.counted = false;
+            g_draw.hdr = false;
+            g_draw.holoPsHash = 0;
+            g_draw.holoOriginal = nullptr;
+            g_draw.holoPatched = nullptr;
+            g_draw.holoRestoreOk = true;
+            g_draw.ds = UiDsEffect{};
+            g_draw.stencilRead = 0;
+            g_draw.rawDepthWritePotential = false;
+            g_draw.eye = plan.eye;
+            g_draw.family = UiLayerFamily::kScreen;
+            g_draw.seq = plan.seq;
+            g_draw.targetRes = plan.targetRes;
+            g_draw.targetW = plan.targetW;
+            g_draw.targetH = plan.targetH;
+            g_draw.shape = plan.shape;
+            g_draw.jx = plan.jx;
+            g_draw.jy = plan.jy;
+            if (!beginGuarded(ctx, 0)) {
+                g_draw.decided = false;
+                why = UiWorldRefuse::kBeginRefused;
+            } else {
+                // Then the two bindings that make it the route's draw: the mipped screen and the trilinear
+                // sampler, both at PS slot 0. The game's own pair is held and put back at End.
+                const bool bound = guardedBudget(g_worldBudget, [&] {
+                    ctx->PSGetShaderResources(0, 1, &plan.savedSrv);
+                    ctx->PSGetSamplers(0, 1, &plan.savedSampler);
+                    plan.changed = true;
+                    ID3D11ShaderResourceView* mips = plan.mipsSrv;
+                    vScreenPSSetShaderResourcesRaw(ctx, 0, 1, &mips);
+                    ID3D11SamplerState* sampler = plan.sampler;
+                    ctx->PSSetSamplers(0, 1, &sampler);
+                });
+                if (!bound) {
+                    // Put back what was changed, the layer's own state included, and leave the eye alone.
+                    if (plan.changed) guarded("uiLayer.worldUnbind", [&] { worldRestoreSources(ctx, plan); });
+                    uiLayerEnd(ctx);
+                    g_draw.decided = false;
+                    why = UiWorldRefuse::kFault;
+                } else {
+                    plan.active = true;
+                }
+            }
+        }
+    }
+    if (why != UiWorldRefuse::kNone) {
+        worldReleaseSaved(plan);
+        worldRefuse(plan.eye, uiWorldReasonId(why));
+        return false;
+    }
+    plan.pending = false;  // decided -> active: a second Begin without a new decision finds nothing to do
+    g_reissue = plan;
+    return true;
+}
+
+// The game's draw has been issued once more: every binding Begin changed goes back, and the route is told which
+// eye the layer took. Safe without a Begin.
+void uiLayerWorldReissueEnd(ID3D11DeviceContext* ctx) {
+    if (!g_reissue.active || !ctx) return;
+    WorldReissue plan = g_reissue;
+    g_reissue = WorldReissue{};
+    const bool wasDown = g_stoodDown;
+    bool putBack = true;
+    {
+        VrWorldInternalScope internal;
+        putBack = guarded("uiLayer.worldEnd", [&] {
+            if (plan.changed) worldRestoreSources(ctx, plan);
+        });
+        uiLayerEnd(ctx);  // the layer's own: the game's targets, viewports, scissor and blend back, references released
+    }
+    worldReleaseSaved(plan);
+    g_draw.decided = false;
+    g_draw.counted = false;
+    if (!putBack) standDown("a fault while putting the game's texture and sampler back after the world route's re-issue");
+    if (!putBack || (g_stoodDown && !wasDown)) {
+        // The state could not be trusted back: the eye is not the layer's (the eye route serves it, or the layer
+        // stood down and the route lets go at the boundary).
+        worldRefuse(plan.eye, uiWorldReasonId(UiWorldRefuse::kFault));
+        return;
+    }
+    ++g_win.worldReissued;
+    g_eye[plan.eye].worldSeq = plan.seq;
+    vrWorldRouteNoteEyeTaken(static_cast<uint32_t>(plan.eye), plan.seq);
+    if (!g_worldReissueNoted[plan.eye]) {
+        g_worldReissueNoted[plan.eye] = true;
+        Log::get().note(
+            "vr world route: the layer re-issued the %s eye's 2D screen draw into its %ux%u layer from the mipped, "
+            "resolved screen (sequence %llu) -- the game's own draw still lands in its eye image, and the door runs "
+            "layer-only for this eye while the route owns the world.",
+            plan.eye == 0 ? "left" : "right", g_eye[plan.eye].w, g_eye[plan.eye].h,
+            static_cast<unsigned long long>(plan.seq));
+    }
+}
+
+// The door's preflight (native_temporal.cpp treat(), before it commits an eye to layer-only): would the composite
+// certainly run over `frame` for this eye? 0 when it would, else a UiWorldDoorGap.
+int uiLayerWorldDoorGap(uint64_t sequence, uint32_t eye, ID3D11Texture2D* frame) {
+    if (eye > 1 || !frame) return static_cast<int>(UiWorldDoorGap::kNoLayer);
+    const Eye& e = g_eye[eye];
+    UiWorldDoorFacts f;
+    f.live = detail::g_uiLayerLive;
+    f.layerMade = e.srv && e.rtv && e.w && e.h;
+    f.holdsContent = e.seq == sequence && e.draws != 0;
+    f.alreadyComposited = e.compositedSeq == sequence;
+    f.runtimeDisabled = graphicsRuntimeDisabled();
+    f.canComposite = f.live && doorCanComposite(frame);
+    D3D11_TEXTURE2D_DESC d{};
+    frame->GetDesc(&d);
+    const float whole[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    f.aspectMatches = uiLayerRegionMatches(d.Width, d.Height, whole, e.w, e.h);
+    return static_cast<int>(uiWorldDoorGap(f));
+}
+
 bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForwards, bool substituted,
                       bool excluded, bool panelSized, uint32_t instances, uint32_t verdict, char drawKind) {
     if (!ctx) return false;
@@ -3612,10 +3998,15 @@ bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForw
         // two exclusions before attempting the take -- the shader exclusion
         // and the held world-screen identity -- which the kAfterUi family
         // alone never saw.
-        if (!uiLayerAfterWritePreserved(excluded, g_screenHeld == 1, panelSized)) return false;
+        if (!uiLayerAfterWritePreserved(excluded, g_screenHeld == 1, panelSized)) {
+            // Left in the game's frame: lost while the VR world route owns this eye (the layer is the whole eye).
+            if (g_eye[takenEye].worldSeq == g_lastRedirectSeq) ++g_win.worldLeftDraws;
+            return false;
+        }
     }
     if (uiLayerAfterWriteDecide(eyeSizedInput) == UiAfterWriteDecision::kPostPass) {
         ++g_win.afterPostPass;
+        if (g_eye[takenEye].worldSeq == g_lastRedirectSeq) ++g_win.worldLeftDraws;
         for (uint32_t i = 0; i < g_afterSeenCount; ++i) {
             if (g_afterSeen[i].kind == 'P' && g_afterSeen[i].vs == vs && g_afterSeen[i].ps == ps) return false;
         }
@@ -3638,7 +4029,10 @@ bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForw
     // exactly as it did before the layer took after-UI draws.
     const bool took = uiLayerDecide(ctx, static_cast<int>(UiLayerFamily::kAfterUi), verdictForwards,
                                     substituted, takenEye);
-    if (!took) ++g_win.afterDeclined;
+    if (!took) {
+        ++g_win.afterDeclined;
+        if (g_eye[takenEye].worldSeq == g_lastRedirectSeq) ++g_win.worldLeftDraws;  // lost under the route, as above
+    }
     return took;
 }
 
@@ -3856,6 +4250,8 @@ void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     // survive the frame.
     g_crispPending = CrispTonePending{};
     detail::g_uiLayerCrispPending = false;
+    // ...nor does the VR world route's pending re-issue (a screen draw the game's frame never issued).
+    worldReissueReset();
     ++g_win.frames;
     // The route's timers read back (the door reads them too).
     routePoll(ctx);
@@ -3922,6 +4318,7 @@ void uiLayerShutdown() {
     g_crispPending = CrispTonePending{};
     g_crispSave = CrispToneSave{};
     detail::g_uiLayerCrispPending = false;
+    worldReissueReset();
     releaseLayers();
     for (RouteSlot& s : g_route) {
         s.timer.reset();

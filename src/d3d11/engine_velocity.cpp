@@ -2560,6 +2560,21 @@ bool engineVelocitySourceViews(ID3D11Texture2D* sourceDepth, EngineVelocityViews
                             g_draw.sourceRefusedUnwritten, g_draw.sourceRefusedPrevious});
 }
 
+bool engineVelocitySourceIsNamed(const ID3D11Texture2D* depth) {
+    if (!depth || !live.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    return g_sourceDepth.Get() == depth && g_sourceNoted == frameNow();
+}
+bool engineVelocitySourceCameraRows(float (&rows)[6][4]) {
+    static_assert(sizeof(rows) == kRowsBytes, "the resolver's camera rows are the watch's rows 270..275");
+    if (!live.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    const SourceCamera& c = g_sourceCamera;
+    if (c.frame != frameNow() || !c.scene || !c.rowsKnown) return false;
+    std::memcpy(rows, c.rows, sizeof(rows));
+    return true;
+}
+
 void engineVelocityNotePanelPixels(uint32_t joined, uint32_t masked, uint32_t camera, uint32_t stale, uint32_t corrupt,
                                    uint32_t stamped, uint32_t eyeDraws, uint32_t pixelStride) {
     if (!live.load(std::memory_order_acquire)) return;

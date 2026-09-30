@@ -10,6 +10,7 @@
     python tools/edvr_log.py --target frontier --tally periodic --expect-build HEAD
     python tools/edvr_log.py --target frontier --tally periodic --window-ms 250
     python tools/edvr_log.py --target frontier --tally periodic --infer-runs
+    python tools/edvr_log.py --target frontier --camera-census --expect-build HEAD
     python tools/edvr_log.py --list
 
 This is the sanctioned replacement for `Get-Content <some path> -Tail 200 |
@@ -71,8 +72,19 @@ journal re-glob: every 4 s, slow every time, a logged time for one run in
 three), marked est. A flight may cross midnight; a DST change inside one is
 not handled.
 
-Exit 0 when a log was read, 1 when none was found, 2 when --expect-build
-did not match (--tally periodic checks the runtime log against it too).
+--camera-census reads a VR flight flown with advanced.vr_camera_census = on
+(design doc section 82). It prints the census's 5 s lines, the camera table, each
+logged on-foot frame's call sequence reduced to runs of (kind, caller, tone),
+the eye composite draws' own constant-buffer rows, and then the OFFLINE JOIN: each
+eye draw's rows matched to the rows the composer produced for every logged call
+(equal within 1e-5). The cameras that match are the eye cameras; the report says
+which of the five candidate signals (A field signature, B content join, C place
+against the tone draw, D caller, E tangents against the advertised eye frusta)
+tells them from the world's camera. A log with no census lines exits 1.
+
+Exit 0 when a log was read, 1 when none was found (or --camera-census found no
+census line), 2 when --expect-build did not match (--tally periodic checks the
+runtime log against it too).
 """
 
 import argparse
@@ -421,6 +433,656 @@ def print_vh_tally(text, frame):
               "clears=%s unseen=%s"
               % (f, s["draws"], s["off"], s["copies"], s["disp"],
                  s["clears"], s["unseen"]))
+    return 0
+
+
+# --camera-census: the VR camera census (advanced.vr_camera_census), one flight
+# in the VR profile with the key on. The question it answers (design doc section
+# 82): which signal tells an eye view's camera from the world's at the game's
+# view-constant refresh, so the on-foot world route can jitter the world camera
+# and leave the eyes alone. The lines are written by src/d3d11/
+# vr_camera_census_core.h (every line's text lives there; tools\
+# vr_camera_census_test pins it and holds tools\camera_census_fixture.log, which
+# this script's --self-test reads, to exactly what those formatters write):
+#
+#   vr camera census 5s: frames=.. calls=.. off-thread=.. kinds=.. callers=.. ... tone-frames=..
+#       on-foot-frames=.. foot=yes|no|unknown|off ...
+#   vr camera census: camera=0xPTR kind=K caller=+0xRVA thread=owner aspect=..
+#       near=.. far=.. fov=.. bound=(..,..) offcentre=(..,..) viewport=(..,..)
+#       tan=(l,r,b,t) view=0xPTR vctx=0xPTR first-call=N draw=D tone=before|after|none frame=F
+#   vr camera census: changed: camera=0xPTR frame=F n=N <field>=<old>-><new> ...
+#   vr camera census: sequence frame=F index=I/3 foot=.. calls=N recorded=R truncated=T
+#   vr camera census: call frame=F n=N camera=0xPTR kind=K caller=+0xRVA draw=D
+#       tone=.. fl=0xPRE>0xPOST view=0xPTR rows=[16 floats]   (rows 270..273 the composer wrote)
+#   vr camera census: eye=E frame=F foot=.. draw=D b1=0xPTR first=N bytes=N rows=[16] meas=(..,..)
+#   vr camera census: eye-geometry eye=E frame=F seq=S frustum=[l,r,d,u] shift=(..,..)
+#       expect=(..,..) expect-shifted=(..,..) leak=(..,..)
+#   vr camera census: other-thread tid=T camera=0xPTR kind=K caller=+0xRVA calls=N
+#
+# THE JOIN (B) is offline: each eye draw's b1 rows are matched to the rows of every
+# logged call within CENSUS_JOIN_TOL; the cameras whose calls match ARE the eye
+# cameras, and their field signature, caller, view and place against the tone draw
+# are what a rule to exclude them can be built from. `foot=` is what Elite's journal
+# said: the census samples a frame (a call sequence, an eye readback) only when the
+# tone was drawn AND the journal, if it is read, says on foot (`off`: no journal,
+# the tone alone decided).
+
+CENSUS_LINE_RE = re.compile(
+    r"^(?P<ts>\[[\d:.]+\])?\s*vr camera census(?P<five> 5s)?: (?P<rest>.*?)\s*$")
+CENSUS_JOIN_TOL = 1e-5
+# Two shift-sign candidates whose residuals differ by less than this are a tie: rows are floats, so rounding alone moves a
+# measure by about 1e-7, and with a shift of nothing (the jitter off) every candidate is the same number.
+CENSUS_FIT_TIE = 2e-7
+CENSUS_WORLD_ASPECT = 5040.0 / 2835.0
+CENSUS_RUNS_SHOWN = 24    # a frame with more runs shows its first and last half of this, and says how many it left out
+CENSUS_FIXTURE = "camera_census_fixture.log"
+CENSUS_SIG_FIELDS = ("kind", "aspect", "near", "far", "fov", "bound",
+                     "offcentre", "viewport", "tan")
+
+
+def _cf(text):
+    """A number as the DLL prints it. `nan` (the DLL's spelling of any
+    non-finite value) and anything unreadable are NaN, so a comparison with one
+    is false and it never joins."""
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _chex(text):
+    try:
+        return int(text.lstrip("+"), 16)
+    except (AttributeError, ValueError):
+        return None
+
+
+def _ctuple(text):
+    """(a,b) or (a,b,c,d) -> floats; `-` or anything else -> None."""
+    if not text or not text.startswith("(") or not text.endswith(")"):
+        return None
+    return tuple(_cf(p) for p in text[1:-1].split(","))
+
+
+def _clist(text):
+    if not text or not text.startswith("[") or not text.endswith("]"):
+        return None
+    return [_cf(p) for p in text[1:-1].split(",")]
+
+
+def _ckv(rest):
+    kv = {}
+    for token in rest.split():
+        key, sep, value = token.partition("=")
+        if sep and re.match(r"^[a-z][a-z0-9-]*$", key):
+            kv[key] = value
+    return kv
+
+
+def parse_camera_census(text):
+    """A flight log's census lines, sorted into what each one is.
+
+    Returns a dict: lines (how many census lines), windows [(stamp, text)],
+    cameras {ptr: row} with order [ptr] in first-seen order, changes {ptr: [line]},
+    sequences [{frame, index, calls, recorded, truncated, rows}], eyes [dict],
+    geometry {(eye, frame): dict}, threads [dict], info [text]. A call row is
+    {n, camera, kind, caller, draw, tone, pre, post, rows}; a value the DLL
+    printed as `-` is None."""
+    c = {"lines": 0, "unparsed": 0, "windows": [], "cameras": {}, "order": [], "changes": {},
+         "sequences": [], "eyes": [], "geometry": {}, "threads": [], "info": []}
+    current = None
+    for raw in text.splitlines():
+        m = CENSUS_LINE_RE.match(raw)
+        if not m:
+            continue
+        c["lines"] += 1
+        rest = m.group("rest")
+        if m.group("five"):
+            c["windows"].append((m.group("ts") or "", rest))
+            continue
+        try:
+            kv = _ckv(rest)
+            if rest.startswith("camera="):
+                ptr = _chex(kv.get("camera"))
+                if ptr is None or ptr in c["cameras"]:
+                    continue
+                c["order"].append(ptr)
+                c["cameras"][ptr] = {
+                    "ptr": ptr, "kind": int(kv.get("kind", "-1")) if kv.get("kind", "-").isdigit() else None,
+                    "caller": _chex(kv.get("caller")), "thread": kv.get("thread"),
+                    "aspect": _cf(kv.get("aspect")), "near": _cf(kv.get("near")),
+                    "far": _cf(kv.get("far")), "fov": _cf(kv.get("fov")),
+                    "bound": _ctuple(kv.get("bound")), "offcentre": _ctuple(kv.get("offcentre")),
+                    "viewport": _ctuple(kv.get("viewport")), "tan": _ctuple(kv.get("tan")),
+                    "view": _chex(kv.get("view")), "vctx": _chex(kv.get("vctx")),
+                    "first_call": kv.get("first-call"), "draw": kv.get("draw"),
+                    "tone": kv.get("tone"), "frame": int(kv["frame"]) if kv.get("frame", "").isdigit() else None}
+            elif rest.startswith("changed:"):
+                ptr = _chex(kv.get("camera"))
+                fields = {k: v for k, v in kv.items()
+                          if k not in ("camera", "frame", "n") and "->" in v}
+                c["changes"].setdefault(ptr, []).append(
+                    {"frame": int(kv["frame"]) if kv.get("frame", "").isdigit() else None,
+                     "n": kv.get("n"), "fields": fields})
+            elif rest.startswith("sequence "):
+                current = {"frame": int(kv.get("frame", "-1")), "index": kv.get("index"), "foot": kv.get("foot"),
+                           "calls": int(kv.get("calls", "0")), "recorded": int(kv.get("recorded", "0")),
+                           "truncated": int(kv.get("truncated", "0")), "rows": []}
+                c["sequences"].append(current)
+            elif rest.startswith("call "):
+                frame = int(kv.get("frame", "-1"))
+                if _chex(kv.get("camera")) is None:   # nothing to join or digest, and no sequence to start for it
+                    c["unparsed"] += 1
+                    continue
+                if current is None or current["frame"] != frame:
+                    current = {"frame": frame, "index": "?", "foot": None, "calls": 0, "recorded": 0,
+                               "truncated": 0, "rows": []}
+                    c["sequences"].append(current)
+                pre, _, post = kv.get("fl", "").partition(">")
+                current["rows"].append({
+                    "n": int(kv.get("n", "0")), "camera": _chex(kv.get("camera")),
+                    "kind": int(kv["kind"]) if kv.get("kind", "-").isdigit() else None,
+                    "caller": _chex(kv.get("caller")),
+                    "draw": int(kv["draw"]) if kv.get("draw", "-").isdigit() else None,
+                    "tone": kv.get("tone"), "pre": _chex(pre) if pre else None,
+                    "post": _chex(post) if post and post != "-" else None,
+                    "view": _chex(kv.get("view")),
+                    "rows": _clist(kv.get("rows")), "frame": frame})
+            elif rest.startswith("eye-geometry"):
+                eye = int(kv.get("eye", "-1"))
+                frame = int(kv.get("frame", "-1"))
+                c["geometry"][(eye, frame)] = {
+                    "known": kv.get("geometry") != "unavailable",
+                    "seq": int(kv["seq"]) if kv.get("seq", "").isdigit() else None,
+                    "frustum": _clist(kv.get("frustum")), "shift": _ctuple(kv.get("shift")),
+                    "expect": _ctuple(kv.get("expect")),
+                    "expect_shifted": _ctuple(kv.get("expect-shifted")),
+                    "leak": _ctuple(kv.get("leak"))}
+            elif rest.startswith("eye="):
+                c["eyes"].append({
+                    "eye": int(kv.get("eye", "-1")), "frame": int(kv.get("frame", "-1")), "foot": kv.get("foot"),
+                    "draw": int(kv["draw"]) if kv.get("draw", "-").isdigit() else None,
+                    "b1": _chex(kv.get("b1")), "first": kv.get("first"), "bytes": kv.get("bytes"),
+                    "rows": _clist(kv.get("rows")), "meas": _ctuple(kv.get("meas")),
+                    "why": kv.get("why")})
+            elif rest.startswith("other-thread"):
+                c["threads"].append({"tid": kv.get("tid"), "camera": _chex(kv.get("camera")),
+                                     "kind": kv.get("kind"), "caller": _chex(kv.get("caller")),
+                                     "calls": kv.get("calls")})
+            else:
+                c["info"].append(rest)
+        except (ValueError, TypeError, KeyError, IndexError):
+            c["unparsed"] += 1   # a line cut short or garbled: counted, never fatal to the report
+    return c
+
+
+def census_join(c, tol=CENSUS_JOIN_TOL):
+    """(B): every eye draw's rows against every logged call's rows. Returns one
+    dict per eye draw: {eye, matches: [call rows], scope}, scope being `frame` (a
+    call of the same frame matched), `other-frame` (only a call of another frame
+    did: same camera, same pose, unusual), `none` (no call matched although the
+    frame's sequence was logged), `no-sequence` (that frame's calls were not
+    logged) or `no-rows` (the readback failed)."""
+    by_frame = {}
+    every = []
+    for seq in c["sequences"]:
+        for row in seq["rows"]:
+            by_frame.setdefault(seq["frame"], []).append(row)
+            every.append(row)
+
+    def matching(rows, eye_rows):
+        return [r for r in rows if r["rows"] and len(r["rows"]) == len(eye_rows) and
+                all(abs(a - b) <= tol for a, b in zip(r["rows"], eye_rows))]
+
+    out = []
+    for eye in c["eyes"]:
+        if not eye["rows"]:
+            out.append({"eye": eye, "matches": [], "scope": "no-rows"})
+            continue
+        same = matching(by_frame.get(eye["frame"], []), eye["rows"])
+        if same:
+            out.append({"eye": eye, "matches": same, "scope": "frame"})
+            continue
+        other = matching(every, eye["rows"])
+        if other:
+            out.append({"eye": eye, "matches": other, "scope": "other-frame"})
+        else:
+            out.append({"eye": eye, "matches": [],
+                        "scope": "none" if eye["frame"] in by_frame else "no-sequence"})
+    return out
+
+
+def census_runs(rows):
+    """A frame's calls as runs of consecutive calls that share (kind, caller,
+    tone): [(kind, caller, tone, count, first n, last n)]."""
+    runs = []
+    for r in rows:
+        key = (r["kind"], r["caller"], r["tone"])
+        if runs and runs[-1][:3] == key:
+            runs[-1] = key + (runs[-1][3] + 1, runs[-1][4], r["n"])
+        else:
+            runs.append(key + (1, r["n"], r["n"]))
+    return runs
+
+
+def _cequal(a, b):
+    """Two signature values the same, to the precision a log line holds."""
+    if a is None or b is None:
+        return a is b
+    if isinstance(a, tuple):
+        return isinstance(b, tuple) and len(a) == len(b) and \
+            all(_cequal(x, y) for x, y in zip(a, b))
+    if isinstance(a, int) and isinstance(b, int):
+        return a == b
+    if a != a or b != b:
+        return False
+    return abs(a - b) <= 1e-4 * max(1.0, abs(a), abs(b))
+
+
+def _cg(value):
+    """A value for the report: floats to six digits, tuples as (a, b)."""
+    if value is None:
+        return "-"
+    if isinstance(value, tuple):
+        return "(" + ", ".join(_cg(v) for v in value) + ")"
+    if isinstance(value, float):
+        return "%.6g" % value
+    if isinstance(value, int):
+        return "0x%X" % value if value > 0xFFFF else str(value)
+    return str(value)
+
+
+def census_roles(c, join):
+    """Who is who. The eye cameras are the ones an eye draw's rows joined to; the
+    world camera is the kind-3 camera at the screen's aspect with the most calls
+    in the logged sequences (else the busiest kind-3 camera that is not an eye's);
+    every other kind-3 camera is world-side (the weapon's, a pass's). Returns
+    {eye, world, world_side, other}: sets of camera pointers, `world` one pointer
+    or None."""
+    eye = set()
+    for j in join:
+        for m in j["matches"]:
+            eye.add(m["camera"])
+    calls = {}
+    for seq in c["sequences"]:
+        for row in seq["rows"]:
+            calls[row["camera"]] = calls.get(row["camera"], 0) + 1
+    kind3 = [p for p in c["order"] if c["cameras"][p]["kind"] == 3 and p not in eye]
+    screen = [p for p in kind3
+              if abs(c["cameras"][p]["aspect"] - CENSUS_WORLD_ASPECT) < 0.02]
+    pool = screen or kind3
+    world = None
+    if pool:
+        world = sorted(pool, key=lambda p: (-calls.get(p, 0),
+                                            c["cameras"][p]["near"], p))[0]
+    return {"eye": eye, "world": world, "world_side": set(kind3),
+            "other": {p for p in c["order"] if p not in eye and p not in kind3}}
+
+
+def census_separation(c, roles):
+    """(A): which fields of the first-sight signature tell the eye cameras from the
+    world camera, and which tell them from EVERY other kind-3 camera that is not
+    an eye's. A field separates when no eye camera has the value any of those
+    cameras has. Returns (vs_world, vs_all): lists of (field, eye values, other
+    values)."""
+    cams = c["cameras"]
+    eyes = [cams[p] for p in c["order"] if p in roles["eye"]]
+    world = cams.get(roles["world"])
+    others = [cams[p] for p in c["order"] if p in roles["world_side"]]
+    vs_world, vs_all = [], []
+    if not eyes or not world:
+        return vs_world, vs_all
+    for field in CENSUS_SIG_FIELDS:
+        if all(not _cequal(e[field], world[field]) for e in eyes):
+            vs_world.append((field, [e[field] for e in eyes], [world[field]]))
+        if others and all(not _cequal(e[field], o[field]) for e in eyes for o in others):
+            vs_all.append((field, [e[field] for e in eyes], [o[field] for o in others]))
+    return vs_world, vs_all
+
+
+def census_order(c, roles):
+    """(C): per logged sequence, whether every refresh of a world-side camera comes
+    before every refresh of an eye camera, by position, by the tone flag and by the
+    draw ordinal. Returns a list of dicts."""
+    out = []
+    for seq in c["sequences"]:
+        world = [r for r in seq["rows"] if r["camera"] in roles["world_side"]]
+        eye = [r for r in seq["rows"] if r["camera"] in roles["eye"]]
+        entry = {"frame": seq["frame"], "world": len(world), "eye": len(eye),
+                 "by_position": None, "world_tone": {}, "eye_tone": {},
+                 "world_last_draw": None, "eye_first_draw": None}
+        if world and eye:
+            entry["by_position"] = max(r["n"] for r in world) < min(r["n"] for r in eye)
+        for r in world:
+            entry["world_tone"][r["tone"]] = entry["world_tone"].get(r["tone"], 0) + 1
+        for r in eye:
+            entry["eye_tone"][r["tone"]] = entry["eye_tone"].get(r["tone"], 0) + 1
+        wd = [r["draw"] for r in world if r["draw"] is not None]
+        ed = [r["draw"] for r in eye if r["draw"] is not None]
+        entry["world_last_draw"] = max(wd) if wd else None
+        entry["eye_first_draw"] = min(ed) if ed else None
+        out.append(entry)
+    return out
+
+
+def _cfmt_tone(counts):
+    return ", ".join("%s x%d" % (k, counts[k]) for k in sorted(counts)) or "none"
+
+
+def census_expected_measure(frustum, dx, dy):
+    """What flatCameraMeasureRowShift reads off the rows of a projection built from
+    the window {left, right, down, up} moved by (dx, dy): (-(R+L)/(R-L), -(U+D)/(U-D)),
+    the model's off-centre terms p8 and p9. None when the window has no width."""
+    left, right, down, up = frustum[0] + dx, frustum[1] + dx, frustum[2] + dy, frustum[3] + dy
+    if right == left or up == down:
+        return None
+    return (-(right + left) / (right - left), -(up + down) / (up - down))
+
+
+def census_shift_fit(meas, frustum, shift):
+    """Which way the eye's rows carry the shift EDVR advertised. The DLL's `leak=`
+    column assumes the game builds its eye camera from the frustum moved by +shift;
+    that sign is not proven, so the reader tries every sign of each axis and the
+    unshifted frustum and names the best fit. Returns (label, residual, runner-up
+    label, its residual), residuals being the largest |measured - expected| of the
+    two axes, in NDC."""
+    fits = []
+    for name, sx, sy in (("the advertised frustum moved by (+shift.x, +shift.y)", 1, 1),
+                         ("the frustum moved by (+shift.x, -shift.y)", 1, -1),
+                         ("the frustum moved by (-shift.x, +shift.y)", -1, 1),
+                         ("the frustum moved by (-shift.x, -shift.y)", -1, -1),
+                         ("the unshifted frustum (the shift is not in the rows)", 0, 0)):
+        expected = census_expected_measure(frustum, sx * shift[0], sy * shift[1])
+        if expected is None or meas is None or len(meas) != 2:
+            continue
+        fits.append((max(abs(meas[0] - expected[0]), abs(meas[1] - expected[1])), name))
+    if not fits:
+        return None
+    fits.sort()
+    runner = fits[1] if len(fits) > 1 else (None, None)
+    return fits[0][1], fits[0][0], runner[1], runner[0]
+
+
+def print_camera_census(text):
+    """The --camera-census report. Returns the process exit code: 0 when the log
+    has census lines, 1 when it has none."""
+    c = parse_camera_census(text)
+    if not c["lines"]:
+        print("[edvr] camera census: no `vr camera census` line in this log. The key "
+              "advanced.vr_camera_census was off, this is not a VR-profile log, or the "
+              "build predates the census.")
+        return 1
+    print("[edvr] camera census: %d census line(s): %d 5 s line(s), %d camera(s), "
+          "%d call sequence(s), %d eye draw(s), %d other-thread entr%s"
+          % (c["lines"], len(c["windows"]), len(c["order"]), len(c["sequences"]),
+             len(c["eyes"]), len(c["threads"]), "y" if len(c["threads"]) == 1 else "ies"))
+    if c["unparsed"]:
+        print("[edvr]   %d census line(s) could not be parsed (cut short or garbled) and were skipped" % c["unparsed"])
+    for info in c["info"]:
+        print("[edvr]   note: %s" % info)
+
+    print("\n== 5 s lines ==")
+    if not c["windows"]:
+        print("none: the census never printed a window (a log that ends within five "
+              "seconds of the key going on, or a census that did not run)")
+    for stamp, line in c["windows"]:
+        print("%s vr camera census 5s: %s" % (stamp, line))
+    window_kv = [_ckv(line) for _, line in c["windows"]]
+    off_thread = sum(int(k.get("off-thread", "0")) for k in window_kv if k.get("off-thread", "0").isdigit())
+    if off_thread:
+        print("!! %d refresh call(s) ran on a thread other than the render thread "
+              "(off-thread): the owner-thread assumption failed; the other-thread "
+              "entries below name them" % off_thread)
+    elif window_kv:
+        print("off-thread calls: 0 in every window -- the refresh runs on the render thread")
+    if window_kv and not any(k.get("progress") == "yes" for k in window_kv):
+        print("!! progress=no in every window: the world route never reported its draw progress, so every "
+              "call prints draw=- tone=none and the place against the tone draw (C) cannot be read; frames "
+              "were sampled by the journal alone (foot=yes), so a call sequence and eye rows exist only if "
+              "the journal said on foot")
+    tone_frames = sum(int(k.get("tone-frames", "0")) for k in window_kv if k.get("tone-frames", "0").isdigit())
+    sampled_frames = sum(int(k.get("on-foot-frames", "0")) for k in window_kv if k.get("on-foot-frames", "0").isdigit())
+    if window_kv:
+        feet = sorted({k.get("foot", "?") for k in window_kv})
+        print("frames with the tone drawn: %d; sampled (tone while the journal says on foot, or no journal): %d; "
+              "the journal said: %s" % (tone_frames, sampled_frames, ", ".join(feet)))
+    if tone_frames and not sampled_frames:
+        print("!! the tone was drawn in %d frame(s) but no frame was sampled: the journal never said on foot "
+              "(foot=no is a ship, foot=unknown a menu). Nothing below can be joined; disembark and fly again."
+              % tone_frames)
+    for t in c["threads"]:
+        print("other-thread: tid %s camera %s kind %s caller %s calls %s"
+              % (t["tid"], _cg(t["camera"]), t["kind"], _cg(t["caller"]), t["calls"]))
+
+    join = census_join(c)
+    roles = census_roles(c, join)
+    print("\n== cameras (%d, in first-seen order) ==" % len(c["order"]))
+    if c["order"]:
+        print("%-14s %-4s %-9s %-10s %-8s %-7s %-7s %-24s %-14s %-14s %-6s %-5s %s"
+              % ("camera", "kind", "caller", "aspect", "near", "fov", "far", "bound",
+                 "viewport", "view", "tone", "frame", "role / changes"))
+    for ptr in c["order"]:
+        cam = c["cameras"][ptr]
+        role = "EYE" if ptr in roles["eye"] else "world" if ptr == roles["world"] \
+            else "world-side" if ptr in roles["world_side"] else "other kind"
+        changes = len(c["changes"].get(ptr, []))
+        print("0x%-12X %-4s %-9s %-10s %-8s %-7s %-7s %-24s %-14s %-14s %-6s %-5s %s%s"
+              % (ptr, cam["kind"], "+0x%X" % cam["caller"] if cam["caller"] is not None else "-",
+                 _cg(cam["aspect"]), _cg(cam["near"]), _cg(cam["fov"]), _cg(cam["far"]),
+                 _cg(cam["bound"]), _cg(cam["viewport"]),
+                 "0x%X" % cam["view"] if cam["view"] else "-", cam["tone"], cam["frame"], role,
+                 "; %d 'changed:' line(s)" % changes if changes else ""))
+    for ptr in c["order"]:
+        for ch in c["changes"].get(ptr, [])[:2]:
+            print("    0x%X frame %s moved: %s" % (ptr, ch["frame"], ", ".join(
+                "%s %s" % (k, v) for k, v in sorted(ch["fields"].items()))))
+
+    print("\n== call sequences (%d frame(s), calls reduced to runs of kind/caller/tone) ==" % len(c["sequences"]))
+    if not c["sequences"]:
+        print("none: no on-foot frame (the tone was never seen) while a sequence was still wanted")
+    for seq in c["sequences"]:
+        print("frame %d (sequence %s, journal foot=%s): %d call(s), %d recorded, %d truncated"
+              % (seq["frame"], seq["index"], seq["foot"] or "?", seq["calls"], seq["recorded"], seq["truncated"]))
+        # Per camera first: how many calls, from which callers, on which side of the tone, over which draws.
+        digest = {}
+        for r in seq["rows"]:
+            d = digest.setdefault(r["camera"], {"kind": r["kind"], "n": 0, "callers": {}, "tone": {}, "draws": [], "views": set()})
+            d["n"] += 1
+            d["views"].add(r["view"])
+            d["callers"][r["caller"]] = d["callers"].get(r["caller"], 0) + 1
+            d["tone"][r["tone"]] = d["tone"].get(r["tone"], 0) + 1
+            if r["draw"] is not None:
+                d["draws"].append(r["draw"])
+        for ptr, d in sorted(digest.items(), key=lambda kv: min(r["n"] for r in seq["rows"] if r["camera"] == kv[0])):
+            print("    camera 0x%X k%s: %d call(s), callers %s, view %s, tone %s, draws %s"
+                  % (ptr, "-" if d["kind"] is None else d["kind"], d["n"],
+                     ", ".join("+0x%X x%d" % (k, v) if k is not None else "- x%d" % v
+                               for k, v in sorted(d["callers"].items(), key=lambda kv: (kv[0] is None, kv[0] or 0))),
+                     ", ".join("0x%X" % v if v else "-" for v in sorted(d["views"], key=lambda v: v or 0)),
+                     _cfmt_tone(d["tone"]),
+                     "%d..%d" % (min(d["draws"]), max(d["draws"])) if d["draws"] else "-"))
+        runs = census_runs(seq["rows"])
+        half = CENSUS_RUNS_SHOWN // 2
+        for i, (kind, caller, tone, count, first, last) in enumerate(runs):
+            if len(runs) > CENSUS_RUNS_SHOWN and half <= i < len(runs) - half:
+                if i == half:
+                    print("    ... %d more run(s) ..." % (len(runs) - 2 * half))
+                continue
+            cams = sorted({r["camera"] for r in seq["rows"]
+                           if first <= r["n"] <= last and (r["kind"], r["caller"], r["tone"]) == (kind, caller, tone)})
+            print("    k%s %s %-6s x%-3d (calls %d..%d) camera %s"
+                  % ("-" if kind is None else kind, "+0x%X" % caller if caller is not None else "-",
+                     tone, count, first, last, ", ".join("0x%X" % p for p in cams)))
+
+    print("\n== eye draws (b1 rows 270..273 read back from the GPU) ==")
+    if not c["eyes"]:
+        print("none: no eye composite draw in an on-foot frame reached the readback")
+    for j in join:
+        e = j["eye"]
+        print("eye %d frame %d draw %s (journal foot=%s) b1 0x%X first=%s bytes=%s" %
+              (e["eye"], e["frame"], e["draw"] if e["draw"] is not None else "-", e["foot"] or "?", e["b1"] or 0,
+               e["first"], e["bytes"]))
+        if e["rows"]:
+            print("    rows   %s" % ", ".join("%.7g" % v for v in e["rows"]))
+            print("    meas   %s (flatCameraMeasureRowShift: the off-centre terms of the rows)" % _cg(e["meas"]))
+        else:
+            print("    rows   unavailable (%s)" % (e["why"] or "?"))
+        g = c["geometry"].get((e["eye"], e["frame"]))
+        if g and g["known"]:
+            print("    EDVR advertised seq %s frustum %s shift %s; expected measure %s, shifted %s; leak %s"
+                  % (g["seq"], _cg(tuple(g["frustum"]) if g["frustum"] else None), _cg(g["shift"]),
+                     _cg(g["expect"]), _cg(g["expect_shifted"]), _cg(g["leak"])))
+            fit = census_shift_fit(e["meas"], g["frustum"], g["shift"]) if g["frustum"] and g["shift"] else None
+            if fit and fit[3] is not None and fit[3] - fit[1] < CENSUS_FIT_TIE:
+                # No winner to name: sorting a tie would pick a label by its spelling.
+                print("    the rows cannot tell which way the shift is carried: every candidate leaves about %.2e NDC "
+                      "(the advertised shift, %s, is too small to separate them from rounding)"
+                      % (fit[1], _cg(g["shift"])))
+            elif fit:
+                print("    the rows measure as %s (residual %.2e NDC; next best: %s, %.2e)"
+                      % (fit[0], fit[1], fit[2], fit[3]))
+        else:
+            print("    EDVR advertised geometry: unavailable")
+    leaks = [max(abs(v) for v in g["leak"]) for g in c["geometry"].values()
+             if g["known"] and g["leak"] and all(v == v for v in g["leak"])]
+    if leaks:
+        print("leak measure over %d eye draw(s): largest |leak| = %.3e NDC (no world phase is injected in this census, "
+              "so this is the baseline a leak detector must clear; a world phase of half a pixel at 5040 wide is 2e-4; "
+              "`leak` assumes the game builds its eye camera from the frustum moved by +shift, which the fit "
+              "line above checks: `the rows measure as`, or `cannot tell` when the shift is too small)"
+              % (len(leaks), max(leaks)))
+
+    print("\n== the offline join (B): eye rows against the rows of every logged call, tolerance %g ==" % CENSUS_JOIN_TOL)
+    if not join:
+        print("nothing to join: no eye draw was read back")
+    for j in join:
+        e = j["eye"]
+        label = "eye %d frame %d draw %s" % (e["eye"], e["frame"], e["draw"] if e["draw"] is not None else "-")
+        if j["scope"] == "no-rows":
+            print("%s: no rows were read (%s)" % (label, e["why"] or "?"))
+        elif j["scope"] == "no-sequence":
+            print("%s: frame %d's call sequence was not logged (only the first %d on-foot frames are), so its rows "
+                  "cannot be joined" % (label, e["frame"], 3))
+        elif j["scope"] == "none":
+            print("%s: NO logged call of frame %d produced these rows. The eye's camera does not reach the refresh "
+                  "with them: either it is composed by another of the composer's callers, or by a path the detour "
+                  "does not see. (B) does not identify it." % (label, e["frame"]))
+        else:
+            cams = {}
+            for m in j["matches"]:
+                cams.setdefault(m["camera"], []).append(m)
+            for ptr, ms in sorted(cams.items()):
+                cam = c["cameras"].get(ptr)
+                print("%s: camera 0x%X (kind %s) caller %s, %d call(s) n=%s, draw %s, tone %s%s"
+                      % (label, ptr, ms[0]["kind"], ", ".join(sorted({"+0x%X" % m["caller"] for m in ms})),
+                         len(ms), "/".join(str(m["n"]) for m in ms),
+                         "/".join(str(m["draw"]) for m in ms if m["draw"] is not None) or "-",
+                         "/".join(sorted({m["tone"] for m in ms})),
+                         "" if j["scope"] == "frame" else " (another frame's call: the same pose)"))
+            if len(cams) > 1:
+                print("    %d different cameras composed identical rows for this draw" % len(cams))
+    # The field signature the eye rows belong to: each joined camera's first-sight line, once.
+    for ptr in [p for p in c["order"] if p in roles["eye"]]:
+        cam = c["cameras"][ptr]
+        print("eye camera 0x%X signature: kind %s, caller %s, aspect %s, near %s, far %s, fov %s, bound %s, offcentre %s, "
+              "viewport %s, tangents %s, view %s"
+              % (ptr, cam["kind"], "+0x%X" % cam["caller"] if cam["caller"] is not None else "-", _cg(cam["aspect"]),
+                 _cg(cam["near"]), _cg(cam["far"]), _cg(cam["fov"]), _cg(cam["bound"]), _cg(cam["offcentre"]),
+                 _cg(cam["viewport"]), _cg(cam["tan"]), "0x%X" % cam["view"] if cam["view"] else "-"))
+
+    print("\n== which signal separates the eye cameras (A)-(E) ==")
+    if not roles["eye"]:
+        print("no camera was joined to an eye draw, so no eye camera is known and nothing can be separated. "
+              "%s" % ("(The join found no matching call in a logged frame: see above.)" if join else "(No eye draw was read back.)"))
+        return 0
+    world = c["cameras"].get(roles["world"])
+    print("eye camera(s): %s; world camera: %s; other world-side kind-3 camera(s): %s"
+          % (", ".join("0x%X" % p for p in c["order"] if p in roles["eye"]),
+             "0x%X" % roles["world"] if roles["world"] else "none found",
+             ", ".join("0x%X" % p for p in c["order"] if p in roles["world_side"] and p != roles["world"]) or "none"))
+    vs_world, vs_all = census_separation(c, roles)
+    if vs_all:
+        print("(A) field signature: %s separate every eye camera from EVERY world-side kind-3 camera:"
+              % ", ".join(f for f, _, _ in vs_all))
+        for field, ev, ov in vs_all:
+            print("      %-9s eye %s  vs  world-side %s" % (field, ", ".join(_cg(v) for v in ev), ", ".join(_cg(v) for v in ov)))
+    elif vs_world:
+        print("(A) field signature: %s separate the eye cameras from the WORLD camera, but no field separates them "
+              "from every other kind-3 camera:" % ", ".join(f for f, _, _ in vs_world))
+        for field, ev, ov in vs_world:
+            print("      %-9s eye %s  vs  world %s" % (field, ", ".join(_cg(v) for v in ev), ", ".join(_cg(v) for v in ov)))
+    else:
+        print("(A) field signature: no single field separates the eye cameras from the world camera")
+    print("(B) content join: %d of %d eye draw(s) joined to a camera; eye camera(s) %s"
+          % (sum(1 for j in join if j["matches"]), len(join),
+             ", ".join("0x%X" % p for p in c["order"] if p in roles["eye"])))
+    order = census_order(c, roles)
+    decided = [o for o in order if o["by_position"] is not None]
+    ok = [o for o in decided if o["by_position"]]
+    if decided:
+        print("(C) place in the frame: every refresh of a world-side camera precedes every refresh of an eye camera "
+              "in %d of %d logged sequence(s)" % (len(ok), len(decided)))
+        for o in decided:
+            print("      frame %d: world-side %d call(s) [tone %s; last draw %s], eye %d call(s) [tone %s; first draw %s]%s"
+                  % (o["frame"], o["world"], _cfmt_tone(o["world_tone"]),
+                     o["world_last_draw"] if o["world_last_draw"] is not None else "-", o["eye"],
+                     _cfmt_tone(o["eye_tone"]), o["eye_first_draw"] if o["eye_first_draw"] is not None else "-",
+                     "" if o["by_position"] else "  <- INTERLEAVED"))
+        unknown = any("none" in o["world_tone"] or "none" in o["eye_tone"] for o in decided)
+        tone_clean = all(set(o["world_tone"]) <= {"before"} and set(o["eye_tone"]) <= {"after"} for o in decided)
+        print("      the tone flag %s" % (
+            "is unavailable (tone=none: the route reported no draw progress for these calls)" if unknown
+            else "separates the two sets" if tone_clean else "does NOT separate the two sets"))
+    else:
+        print("(C) place in the frame: no logged sequence holds both a world-side and an eye camera's call")
+    eye_callers, world_callers = set(), set()
+    for seq in c["sequences"]:
+        for r in seq["rows"]:
+            if r["camera"] in roles["eye"]:
+                eye_callers.add(r["caller"])
+            elif r["camera"] == roles["world"]:
+                world_callers.add(r["caller"])
+    fmt = lambda s: ", ".join("+0x%X" % x for x in sorted(v for v in s if v is not None)) or "none"
+    shared = eye_callers & world_callers
+    print("(D) caller: eye camera(s) call from %s; the world camera from %s; %s"
+          % (fmt(eye_callers), fmt(world_callers),
+             ("no caller is shared: the caller separates them" if eye_callers and world_callers and not shared
+              else "shared: %s -- the caller alone does not separate them" % fmt(shared) if shared
+              else "not enough calls logged to say")))
+    eye_views, world_views = set(), set()
+    for seq in c["sequences"]:
+        for r in seq["rows"]:
+            if r["camera"] in roles["eye"]:
+                eye_views.add(r["view"])
+            elif r["camera"] == roles["world"]:
+                world_views.add(r["view"])
+    vfmt = lambda s: ", ".join("0x%X" % v for v in sorted(x for x in s if x)) or "none"
+    shared_views = (eye_views & world_views) - {None, 0}
+    print("(F) view (the refresh's second argument, the pass object): eye camera(s) are refreshed with %s; the world "
+          "camera with %s; %s"
+          % (vfmt(eye_views), vfmt(world_views),
+             ("no view is shared: the view separates them" if eye_views - {None, 0} and world_views - {None, 0} and not shared_views
+              else "shared: %s -- the view alone does not separate them" % vfmt(shared_views) if shared_views
+              else "not enough calls logged to say")))
+    worst, compared = 0.0, 0
+    for j in join:
+        e = j["eye"]
+        g = c["geometry"].get((e["eye"], e["frame"]))
+        if not g or not g["known"] or not g["frustum"] or not j["matches"]:
+            continue
+        cam = c["cameras"].get(j["matches"][0]["camera"])
+        if not cam or not cam["tan"] or len(cam["tan"]) != 4 or cam["frame"] != e["frame"]:
+            continue
+        diff = max(abs(a - b) for a, b in zip(cam["tan"], g["frustum"]))
+        diff_flip = max(abs(a - b) for a, b in zip(cam["tan"], (g["frustum"][0], g["frustum"][1], -g["frustum"][3], -g["frustum"][2])))
+        worst = max(worst, min(diff, diff_flip))
+        compared += 1
+    if compared:
+        print("(E) tangents: the eye camera's tangents match the frustum EDVR advertised for its eye to within %.2e "
+              "(compared on %d draw(s) in the camera's first frame)" % (worst, compared))
+    else:
+        print("(E) tangents: no eye draw fell in the frame an eye camera's line was printed, so the camera's tangents "
+              "and the advertised frustum were not compared (their difference is the eye shift, about 1e-4, per frame)")
     return 0
 
 
@@ -1314,6 +1976,13 @@ def main(argv=None):
                     help="with --tally vh, restrict to this census frame "
                          "ordinal; frames past the census line cap have no "
                          "per-draw lines and are reported as summaries")
+    ap.add_argument("--camera-census", action="store_true",
+                    help="report a VR camera census flight (advanced.vr_camera_census "
+                         "= on): the 5 s lines, the cameras, each logged frame's "
+                         "call sequence reduced to runs, the eye draws' rows, and "
+                         "the offline join of those rows to the calls' -- which "
+                         "camera is an eye's, and which of its caller, signature, "
+                         "place in the frame and tangents tell it from the world's")
     ap.add_argument("--window-ms", type=float, default=100.0,
                     help="with --tally periodic, a long frame coincides with a "
                          "periodic event when the event's end time is inside "
@@ -1415,6 +2084,8 @@ def main(argv=None):
     if args.version:
         return 0
 
+    if args.camera_census:
+        return print_camera_census(text)
     if args.tally == "periodic":
         return print_periodic_report(path, text, ver, want, args, native_dirs)
     if args.tally:
@@ -1754,9 +2425,260 @@ def self_test():
 
     if not self_test_periodic():
         ok = False
+    if not self_test_camera_census():
+        ok = False
 
     print("self-test: %s" % ("ok" if ok else "FAILED"))
     return 0 if ok else 1
+
+
+def self_test_camera_census():
+    """--camera-census on the checked-in synthetic flight (tools\\camera_census_fixture.log,
+    which tools\\vr_camera_census_test holds to exactly what the DLL's formatters write),
+    then on logs altered to take away each thing the report depends on. Returns ok."""
+    import contextlib
+    import io
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("camera census: %s" % msg)
+        ok = False
+
+    def report(text):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = print_camera_census(text)
+        return rc, buf.getvalue()
+
+    def mutate(text, prefix, fn):
+        """The same log with every census line that starts (after its stamp and
+        the `vr camera census: ` words) with `prefix` replaced by fn(line)."""
+        out = []
+        for line in text.split("\n"):
+            body = line.split("] ", 1)[1] if line.startswith("[") and "] " in line else line
+            body = body[len("vr camera census: "):] if body.startswith("vr camera census: ") else ""
+            out.append(fn(line) if body.startswith(prefix) else line)
+        return "\n".join(out)
+
+    fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)), CENSUS_FIXTURE)
+    if not os.path.isfile(fixture):
+        fail("the fixture %s is missing beside this script" % CENSUS_FIXTURE)
+        return False
+    text = read_text(fixture)
+
+    # ---- the parser ----
+    c = parse_camera_census(text)
+    if (len(c["windows"]), len(c["order"]), len(c["sequences"]), len(c["eyes"]),
+            len(c["geometry"]), len(c["threads"])) != (2, 5, 3, 8, 8, 1):
+        fail("the fixture parsed as %r, not 2 windows, 5 cameras, 3 sequences, 8 eye draws, 8 geometry lines, 1 "
+             "other-thread entry" % ((len(c["windows"]), len(c["order"]), len(c["sequences"]), len(c["eyes"]),
+                                      len(c["geometry"]), len(c["threads"])),))
+    cam = c["cameras"].get(0x241DF6D0BB0)
+    if not cam or cam["kind"] != 3 or cam["caller"] != 0x594FE1 or cam["tone"] != "after" or \
+            abs(cam["near"] - 0.05) > 1e-9 or cam["tan"] is None or len(cam["tan"]) != 4 or \
+            cam["viewport"] != (2620.0, 2533.0) or cam["frame"] != 4 or cam["view"] != 0x241DD00E000 or \
+            cam["vctx"] != 0x241DD00E100:
+        fail("the eye camera's line parsed as %r" % (cam,))
+    seq = c["sequences"][0]
+    if seq["frame"] != 4 or seq["calls"] != 21 or len(seq["rows"]) != 21 or seq["rows"][0]["rows"] is None or \
+            len(seq["rows"][0]["rows"]) != 16 or seq["rows"][15]["kind"] != 1 or seq["rows"][15]["rows"] is not None or \
+            seq["rows"][15]["post"] != 0x4 or seq["rows"][0]["pre"] != 0x1C or seq["rows"][0]["post"] != 0x0 or \
+            seq["foot"] != "yes" or seq["rows"][0]["view"] != 0x241DD00A000 or seq["rows"][20]["view"] != 0x241DD00F000:
+        fail("a call sequence parsed wrong: %r" % (seq["rows"][15],))
+    if any(e["foot"] != "yes" for e in c["eyes"]):
+        fail("an eye draw parsed without the journal's word: %r" % (c["eyes"][0],))
+    if any(ch["fields"].keys() - {"bound"} for chs in c["changes"].values() for ch in chs):
+        fail("a 'changed:' line parsed with fields other than the moved bound: %r" % (c["changes"],))
+    # A line with no stamp, one with, and a value the DLL printed as nan.
+    n = parse_camera_census("vr camera census: call frame=9 n=1 camera=0x10 kind=3 caller=+0x594E13 draw=- tone=none "
+                            "fl=0x1C>- rows=[1,nan,0,0,0,0,0,0,0,0,0,0,0,0,0,0]\n"
+                            "[01:02:03.004] vr camera census: call frame=9 n=2 camera=0x10 kind=- caller=+0x1 draw=7 "
+                            "tone=after fl=0x0>0x0 rows=-\nsomething else entirely\n")
+    rows = n["sequences"][0]["rows"] if n["sequences"] else []
+    if len(rows) != 2 or rows[0]["draw"] is not None or rows[0]["post"] is not None or rows[1]["kind"] is not None or \
+            rows[1]["rows"] is not None or rows[0]["rows"][1] == rows[0]["rows"][1] or n["lines"] != 2:
+        fail("the stamp, a dash and a nan parsed wrong: %r lines=%r" % (rows, n["lines"]))
+
+    # A line cut short or garbled is counted and skipped, and a call with no camera has nothing to digest.
+    g = parse_camera_census("vr camera census: call frame=x n=1 camera=0x10 kind=3 caller=+0x1 draw=- tone=none fl=0x0>- rows=-\n"
+                            "vr camera census: call frame=5 n=1 kind=3 caller=+0x1 draw=- tone=none fl=0x0>- rows=-\n"
+                            "vr camera census: sequence frame=5 index=1/3 foot=yes calls=1 recorded=1 truncated=0\n"
+                            "vr camera census: call frame=5 n=1 camera=0x20 kind=3 caller=+0x1 draw=- tone=none fl=0x0>- view=0x99 rows=-\n")
+    if g["unparsed"] != 2 or len(g["sequences"]) != 1 or len(g["sequences"][0]["rows"]) != 1 or \
+            g["sequences"][0]["rows"][0]["view"] != 0x99:
+        fail("a garbled line and a call with no camera were not skipped: %r" % (g,))
+    rc, out = report("vr camera census: call frame=x n=1 camera=0x10 kind=3\n")
+    if rc != 0 or "1 census line(s) could not be parsed" not in out:
+        fail("a log of only garbled lines did not say so:\n%s" % out)
+
+    # ---- the report on the fixture ----
+    rc, out = report(text)
+    want = [
+        "95 census line(s): 2 5 s line(s), 5 camera(s), 3 call sequence(s), 8 eye draw(s), 1 other-thread entry",
+        "57 refresh call(s) ran on a thread other than the render thread",
+        "0x241DF6D0BB0  3    +0x594FE1 0.95",
+        "EYE; 2 'changed:' line(s)",
+        "frame 5 moved: bound (0.1316263,-0.04995501)->(0.1315684,-0.050025)",
+        "frame 4 (sequence 1/3, journal foot=yes): 21 call(s), 21 recorded, 0 truncated",
+        "camera 0x241DF6D0BB0 k3: 2 call(s), callers +0x594FE1 x2, view 0x241DD00E000, tone after x2, draws 8210..8212",
+        "frames with the tone drawn: 898; sampled (tone while the journal says on foot, or no journal): 450; the journal said: no, yes",
+        "k3 +0x594FE1 after  x4   (calls 18..21) camera 0x241DF6D0BB0, 0x241DF6D0FF0",
+        "eye 0 frame 4 draw 8213 (journal foot=yes) b1 0x1EB2E751E20 first=0 bytes=5376",
+        "eye 0 frame 4 draw 8213: camera 0x241DF6D0BB0 (kind 3) caller +0x594FE1, 2 call(s) n=18/20, draw 8210/8212, tone after",
+        "eye 1 frame 6 draw 8220: camera 0x241DF6D0FF0 (kind 3) caller +0x594FE1, 2 call(s) n=19/21",
+        "eye camera 0x241DF6D0BB0 signature: kind 3, caller +0x594FE1, aspect 0.95, near 0.05, far 50000, fov 1.5708, "
+        "bound (0.131626, -0.049955), offcentre (0.263253, -0.09991), viewport (2620, 2533), "
+        "tangents (-1.20009, 0.69991, -0.90009, 1.09991), view 0x241DD00E000",
+        "eye 1 frame 7 draw 8220: frame 7's call sequence was not logged (only the first 3 on-foot frames are)",
+        "eye camera(s): 0x241DF6D0BB0, 0x241DF6D0FF0; world camera: 0x241DC2E2960; other world-side kind-3 camera(s): 0x241DE100200",
+        "(A) field signature: aspect, near, fov, bound, offcentre, viewport, tan separate every eye camera from EVERY world-side kind-3 camera",
+        "(B) content join: 6 of 8 eye draw(s) joined to a camera; eye camera(s) 0x241DF6D0BB0, 0x241DF6D0FF0",
+        "(C) place in the frame: every refresh of a world-side camera precedes every refresh of an eye camera in 3 of 3 logged sequence(s)",
+        "frame 4: world-side 15 call(s) [tone before x15; last draw 5047], eye 4 call(s) [tone after x4; first draw 8210]",
+        "the tone flag separates the two sets",
+        "(D) caller: eye camera(s) call from +0x594FE1; the world camera from +0x594E13, +0x594EAB, +0x594FE1; shared: +0x594FE1 -- the caller alone does not separate them",
+        "(F) view (the refresh's second argument, the pass object): eye camera(s) are refreshed with 0x241DD00E000, 0x241DD00F000; "
+        "the world camera with 0x241DD00A000; no view is shared: the view separates them",
+        "(E) tangents: the eye camera's tangents match the frustum EDVR advertised for its eye to within 9.01e-05 (compared on 2 draw(s) in the camera's first frame)",
+        "leak measure over 8 eye draw(s): largest |leak| = 5.945e-08 NDC",
+        "the rows measure as the advertised frustum moved by (+shift.x, +shift.y) (residual 6.84e-08 NDC; next best: the",
+    ]
+    if rc != 0:
+        fail("the fixture reported exit %d" % rc)
+    for w in want:
+        if w not in out:
+            fail("the report on the fixture lacks %r:\n%s" % (w, out))
+            break
+
+    # ---- the join, a row at a time ----
+    # A float moved by 9e-6 still joins; one moved by 2e-5 does not, and that draw says so.
+    def nudge(delta):
+        def fn(line):
+            head, _, tail = line.partition("rows=[")
+            values, _, rest = tail.partition("]")
+            parts = values.split(",")
+            parts[0] = "%.9g" % (float(parts[0]) + delta)
+            return head + "rows=[" + ",".join(parts) + "]" + rest
+        return fn
+    near = mutate(text, "eye=0 frame=5 ", nudge(9e-6))
+    far = mutate(text, "eye=0 frame=5 ", nudge(2e-5))
+    _, out = report(near)
+    if "(B) content join: 6 of 8" not in out:
+        fail("rows 9e-6 apart did not join (the tolerance is 1e-5):\n%s" % out)
+    _, out = report(far)
+    if "(B) content join: 5 of 8" not in out or \
+            "eye 0 frame 5 draw 8213: NO logged call of frame 5 produced these rows" not in out:
+        fail("rows 2e-5 apart joined, or the unmatched draw was not named:\n%s" % out)
+    # No census lines at all: exit 1 and a sentence that says why.
+    rc, out = report("[00:00:01.000] version 0.18.0 (build ABCD)\n[00:00:02.000] something else\n")
+    if rc != 1 or "no `vr camera census` line in this log" not in out:
+        fail("a log with no census lines reported exit %d:\n%s" % (rc, out))
+    # The route never reported progress: a window with progress=no says so, and there is nothing to join.
+    only = "[00:00:05.000] vr camera census 5s: frames=450 calls=1000 posts=1000 off-thread=0 stale=0 kinds=3:1000 " \
+           "callers=+0x594E13:1000 cameras-seen=1 cameras-total=1 tone=0/0/1000 on-foot-frames=0 eye-draws=900/0 " \
+           "progress=no hook=installed windows=1 cam-overflow=0 thread-overflow=0\n"
+    rc, out = report(only)
+    if rc != 0 or "progress=no in every window" not in out or "No eye draw was read back" not in out or \
+            "off-thread calls: 0 in every window" not in out:
+        fail("a progress=no window was not called out:\n%s" % out)
+    # The tone was drawn all session but the journal never said on foot (a ship, a menu): named, and nothing is joined.
+    ship = "[00:00:05.000] vr camera census 5s: frames=450 calls=1000 posts=1000 off-thread=0 stale=0 kinds=3:1000 " \
+           "callers=+0x594E13:1000 cameras-seen=1 cameras-total=1 tone=500/500/0 tone-frames=450 on-foot-frames=0 foot=no " \
+           "eye-draws=900/0 progress=yes hook=installed windows=1 cam-overflow=0 thread-overflow=0\n"
+    rc, out = report(ship)
+    if rc != 0 or "the tone was drawn in 450 frame(s) but no frame was sampled" not in out or \
+            "the journal said: no" not in out or "No eye draw was read back" not in out:
+        fail("a tone with no on-foot frame was not called out:\n%s" % out)
+    # Eye draws whose rows match nothing at all: the eye's camera is not at the refresh.
+    every = mutate(text, "eye=", lambda line: line if "eye-geometry" in line else
+                   line.replace("rows=[", "rows=[9").replace("[99", "[9"))
+    _, out = report(every)
+    if "no camera was joined to an eye draw" not in out or "NO logged call of frame 4" not in out:
+        fail("eye rows that join to no call did not say so:\n%s" % out)
+    # Two cameras with the same rows are both named; a failed readback is named, not joined.
+    twice = text + "[12:00:09.000] vr camera census: call frame=4 n=22 camera=0x241DF6D0FF0 kind=3 caller=+0x594FE1 draw=8214 tone=after fl=0x1C>0x0 rows=-\n"
+    rc, out = report(twice)
+    if rc != 0:
+        fail("a log with an extra call line failed to report")
+    failed = mutate(text, "eye=1 frame=6 ", lambda line: line.split("rows=")[0] + "rows=- meas=- why=map")
+    _, out = report(failed)
+    if "eye 1 frame 6 draw 8220: no rows were read (map)" not in out or "(B) content join: 5 of 8" not in out:
+        fail("a failed readback was joined or not named:\n%s" % out)
+    # A shift of nothing (the jitter off): every sign candidate is the same number, so no sign is named. (Found on the
+    # glue rig's first real log: a tie was sorted by the candidates' spelling and named +shift.x, +shift.y.)
+    zero = mutate(text, "eye-geometry ", lambda line: re.sub(r" shift=\([^)]*\)", " shift=(0,0)", line))
+    _, out = report(zero)
+    if "the rows cannot tell which way the shift is carried" not in out or "\n    the rows measure as " in out:
+        fail("a zero shift named a sign, or did not say it could not:\n%s" % out)
+
+    # ---- the pieces ----
+    rows = [{"n": i + 1, "kind": k, "caller": cl, "tone": t} for i, (k, cl, t) in enumerate(
+        [(3, 1, "before")] * 5 + [(3, 2, "before")] * 2 + [(3, 1, "before"), (3, 1, "after"), (3, 1, "after")])]
+    runs = census_runs(rows)
+    if runs != [(3, 1, "before", 5, 1, 5), (3, 2, "before", 2, 6, 7), (3, 1, "before", 1, 8, 8), (3, 1, "after", 2, 9, 10)]:
+        fail("census_runs: %r" % (runs,))
+    if not _cequal(1.0, 1.00001) or _cequal(1.0, 1.001) or _cequal((0.0, 0.0), (0.0, 0.01)) or not _cequal((0.0, 1.0), (0.0, 1.0)) \
+            or _cequal(float("nan"), float("nan")) or not _cequal(3, 3) or _cequal(3, 4) or not _cequal(None, None):
+        fail("_cequal")
+    if _cf("nan") == _cf("nan") or _cf("-") == _cf("-") or _cf("1.5") != 1.5 or _chex("+0x594E13") != 0x594E13 or \
+            _chex("0x241dc2e2960") != 0x241DC2E2960 or _chex("-") is not None or _ctuple("(1,2)") != (1.0, 2.0) or \
+            _ctuple("-") is not None or _clist("[1,2,3]") != [1.0, 2.0, 3.0] or _clist("-") is not None:
+        fail("the value parsers")
+    # The sign of the shift in the rows: the fit names the convention the rows carry, whichever it is.
+    frustum = [-1.2, 0.7, -0.9, 1.1]
+    shift = (0.001, 0.0005)
+    for label, sx, sy in (("(+shift.x, +shift.y)", 1, 1), ("(+shift.x, -shift.y)", 1, -1),
+                          ("(-shift.x, +shift.y)", -1, 1), ("(-shift.x, -shift.y)", -1, -1)):
+        meas = census_expected_measure(frustum, sx * shift[0], sy * shift[1])
+        fit = census_shift_fit(meas, frustum, shift)
+        if not fit or label not in fit[0] or fit[1] > 1e-12 or not fit[3] > 1e-5:
+            fail("census_shift_fit did not find %s: %r" % (label, fit))
+    meas = census_expected_measure(frustum, 0.0, 0.0)
+    fit = census_shift_fit(meas, frustum, shift)
+    if not fit or "unshifted" not in fit[0]:
+        fail("census_shift_fit did not find the unshifted frustum: %r" % (fit,))
+    if census_expected_measure([1, 1, 0, 1], 0, 0) is not None or census_shift_fit(None, frustum, shift) is not None:
+        fail("a degenerate window or a missing measurement produced a fit")
+    # A frame with more runs than the report shows names how many it left out.
+    many = []
+    for i in range(40):
+        many.append("[00:00:00.%03d] vr camera census: call frame=8 n=%d camera=0x10 kind=3 caller=+0x%X draw=%d tone=before "
+                    "fl=0x1C>0x0 rows=-" % (i, i + 1, 0x594E13 + (i & 1), 100 + i))
+    many.insert(0, "[00:00:00.000] vr camera census: sequence frame=8 index=1/3 calls=40 recorded=40 truncated=0")
+    rc, out = report("\n".join(many) + "\n")
+    if "... 16 more run(s) ..." not in out or out.count("(calls ") != CENSUS_RUNS_SHOWN:
+        fail("a 40-run frame did not show %d runs and name the 16 it left out:\n%s" % (CENSUS_RUNS_SHOWN, out))
+    # No field separates, and the tone flag is unavailable: both are said, not guessed.
+    same = "\n".join([
+        "vr camera census: camera=0x100 kind=3 caller=+0x594E13 thread=owner aspect=1 near=0.025 far=50000 fov=1 bound=(0,0) "
+        "offcentre=(0,0) viewport=(100,100) tan=(-1,1,-1,1) first-call=1 draw=1 tone=none frame=1",
+        "vr camera census: camera=0x200 kind=3 caller=+0x594E13 thread=owner aspect=1 near=0.025 far=50000 fov=1 bound=(0,0) "
+        "offcentre=(0,0) viewport=(100,100) tan=(-1,1,-1,1) first-call=2 draw=2 tone=none frame=1",
+        "vr camera census: sequence frame=1 index=1/3 calls=2 recorded=2 truncated=0",
+        "vr camera census: call frame=1 n=1 camera=0x100 kind=3 caller=+0x594E13 draw=1 tone=none fl=0x1C>0x0 rows=[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0.1,0]",
+        "vr camera census: call frame=1 n=2 camera=0x200 kind=3 caller=+0x594E13 draw=2 tone=none fl=0x1C>0x0 rows=[2,0,0,0,0,1,0,0,0,0,1,0,0,0,0.1,0]",
+        "vr camera census: eye=0 frame=1 draw=2 b1=0x5 first=0 bytes=5376 rows=[2,0,0,0,0,1,0,0,0,0,1,0,0,0,0.1,0] meas=(0,0)",
+        ""])
+    rc, out = report(same)
+    if "(A) field signature: no single field separates" not in out:
+        fail("two cameras with one signature were separated by a field:\n%s" % out)
+    if "eye camera(s): 0x200; world camera: 0x100" not in out:
+        fail("the joined camera was not the eye and the other the world:\n%s" % out)
+    if "the tone flag is unavailable" not in out:
+        fail("calls with tone=none were judged by a tone flag they do not have:\n%s" % out)
+    if "(F) view" not in out or "not enough calls logged to say" not in out:
+        fail("calls with no view were judged by one:\n%s" % out)
+    if "(D) caller: eye camera(s) call from +0x594E13; the world camera from +0x594E13; shared: +0x594E13" not in out:
+        fail("two cameras calling from one site were separated by the caller:\n%s" % out)
+
+    # ---- the command line ----
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = main(["--file", fixture, "--camera-census"])
+    if rc != 0 or "== which signal separates the eye cameras (A)-(E) ==" not in buf.getvalue():
+        fail("--camera-census through main() returned %d:\n%s" % (rc, buf.getvalue()))
+    return ok
 
 
 def self_test_periodic():

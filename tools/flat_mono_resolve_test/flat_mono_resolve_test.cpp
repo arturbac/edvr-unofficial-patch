@@ -33,10 +33,17 @@ float observedMotion=0,observedMotionY=0,observedDepth=0;unsigned observedReject
 // output for the frame, so "bit-identical" can be asserted rather than sampled at one pixel.
 std::vector<float> observedMotionAll;std::vector<unsigned char> observedMaskAll;uint64_t observedMotionHash=0;uint32_t observedMotionW=0;
 std::vector<uint64_t> motionHashLog; // one entry per backend call, in call order: the key-off golden comparison reads it
+// The upscaler slot the resolver handed each backend call (FlatMonoResolveFrame::slot), in call order, and the first-person lines
+// the resolver logged ("flat resolve: first-person ..."): the world route's two new seams.
+std::vector<int> backendSlots;
+std::vector<std::string> firstPersonLines;
 uint32_t observedInW=0,observedInH=0,observedOutW=0,observedOutH=0;
 // What the stub backends were handed on the HDR route (section 81): the flag and the formats of the textures it names.
 bool observedHdr=false;DXGI_FORMAT observedColourFormat=DXGI_FORMAT_UNKNOWN,observedOutFormat=DXGI_FORMAT_UNKNOWN;
-void check(bool ok,const char* text){if(!ok){std::printf("FAIL: %s\n",text);++failures;}}
+// Mutation runs (flat_first_person_gpu_tests.h) count a failed check here instead of failing the rig: a scenario run against a
+// shader with one rule flipped is SUPPOSED to fail, and the rig fails only if it does not.
+int* mutationFailures=nullptr;std::string mutationFirst;
+void check(bool ok,const char* text){if(!ok){if(mutationFailures){if(!*mutationFailures)mutationFirst=text;++*mutationFailures;return;}std::printf("FAIL: %s\n",text);++failures;}}
 bool readPixel(ID3D11DeviceContext* context,ID3D11Texture2D* texture,void* out,size_t bytes,UINT x=8,UINT y=8) {
     ComPtr<ID3D11Device> device;context->GetDevice(device.GetAddressOf());
     D3D11_TEXTURE2D_DESC d{};texture->GetDesc(&d);d.Usage=D3D11_USAGE_STAGING;d.BindFlags=0;d.CPUAccessFlags=D3D11_CPU_ACCESS_READ;d.MiscFlags=0;
@@ -130,11 +137,12 @@ Config& Config::get() {
 }
 Log& Log::get() {static auto* log=new Log;return *log;}
 void Log::note(const char* fmt,...) {
-    constexpr char prefix[]="flat resolve reset event:";
-    if(std::strncmp(fmt,prefix,sizeof(prefix)-1)!=0)return;
+    constexpr char prefix[]="flat resolve reset event:",firstPersonPrefix[]="flat resolve: first-person";
+    const bool reset=std::strncmp(fmt,prefix,sizeof(prefix)-1)==0;
+    if(!reset && std::strncmp(fmt,firstPersonPrefix,sizeof(firstPersonPrefix)-1)!=0)return;
     char line[1024]{};
     va_list args;va_start(args,fmt);std::vsnprintf(line,sizeof(line),fmt,args);va_end(args);
-    resetEvents.emplace_back(line);
+    (reset?resetEvents:firstPersonLines).emplace_back(line);
 }
 // Stand-in for src\common\proxy.cpp's breadcrumb(): the route's crumbs land here so the rig can read the trail back.
 void breadcrumb(const char* stage) {if(stage)crumbLines.emplace_back(stage);}
@@ -142,16 +150,18 @@ bool ensureDirectory(const std::wstring& path) {return CreateDirectoryW(path.c_s
 thread_local bool g_flatComputeInternal = false;
 bool dlaaAvailable(ID3D11Device*,const char**){return true;}
 bool fsr3Available(ID3D11Device*,const char**){return true;}
-bool dlaaEvaluate(ID3D11DeviceContext* c,int,ID3D11Texture2D* colour,ID3D11Texture2D* depth,ID3D11Texture2D* mv,
+bool dlaaEvaluate(ID3D11DeviceContext* c,int slot,ID3D11Texture2D* colour,ID3D11Texture2D* depth,ID3D11Texture2D* mv,
     ID3D11Texture2D* out,ID3D11Texture2D* mask,uint32_t w,uint32_t h,uint32_t outW,uint32_t outH,float jx,float jy,bool reset,float,const char** why,bool hdr) {
+    backendSlots.push_back(slot);
     observedInW=w;observedInH=h;observedOutW=outW;observedOutH=outH;
     observedHdr=hdr;observedColourFormat=DXGI_FORMAT_UNKNOWN;observedOutFormat=DXGI_FORMAT_UNKNOWN;
     {D3D11_TEXTURE2D_DESC d{};colour->GetDesc(&d);observedColourFormat=d.Format;out->GetDesc(&d);observedOutFormat=d.Format;}
     return backend(c,depth,mv,mask,out,jx,jy,reset,why);
 }
-bool fsr3Evaluate(ID3D11DeviceContext* c,unsigned,ID3D11Texture2D* colour,ID3D11Texture2D* depth,ID3D11Texture2D* mv,
+bool fsr3Evaluate(ID3D11DeviceContext* c,unsigned slot,ID3D11Texture2D* colour,ID3D11Texture2D* depth,ID3D11Texture2D* mv,
     ID3D11Texture2D* mask,ID3D11Texture2D* out,uint32_t w,uint32_t h,uint32_t outW,uint32_t outH,float jx,float jy,bool reset,float,
     float nearZ,float,float fov,const char** why,bool infinite,bool hdr) {
+    backendSlots.push_back(static_cast<int>(slot));
     observedInW=w;observedInH=h;observedOutW=outW;observedOutH=outH;
     observedHdr=hdr;observedColourFormat=DXGI_FORMAT_UNKNOWN;observedOutFormat=DXGI_FORMAT_UNKNOWN;
     {D3D11_TEXTURE2D_DESC d{};colour->GetDesc(&d);observedColourFormat=d.Format;out->GetDesc(&d);observedOutFormat=d.Format;}
@@ -164,6 +174,9 @@ bool fsr3Evaluate(ID3D11DeviceContext* c,unsigned,ID3D11Texture2D* colour,ID3D11
 #include "flat_pixel_capture_gpu_tests.h"
 #include "flat_draw_capture_gpu_tests.h"
 #include "flat_hdr_route_gpu_tests.h"
+#include "flat_resolve_fixture.h"
+#include "flat_upscaler_slot_gpu_tests.h"
+#include "flat_first_person_gpu_tests.h"
 int main(int argc,char** argv) {
     const bool printGoldens=argc==2 && !std::strcmp(argv[1],"--print-goldens"); // --self-test plus the recorded key-off hashes, for re-recording
     if(argc!=2 || (std::strcmp(argv[1],"--self-test") && std::strcmp(argv[1],"--dry-run") && !printGoldens)){std::puts("usage: flat_mono_resolve_test --self-test|--dry-run|--print-goldens");return 2;}
@@ -749,6 +762,9 @@ int main(int argc,char** argv) {
     failures+=flatDrawCaptureGpuTests(device.Get(),context.Get());
     // The HDR route's resolver half (design section 81): before the D3D message check below, so its draws are held to it.
     hdrRouteGpuTests(device.Get(),context.Get());
+    // The VR world route's two seams (section 82): the third upscaler slot, and the first-person map and stencil in the prep.
+    upscalerSlotGpuTests(device.Get(),context.Get());
+    firstPersonGpuTests(device.Get(),context.Get());
     if(messages)for(UINT64 i=0;i<messages->GetNumStoredMessages();++i){SIZE_T n=0;messages->GetMessage(i,nullptr,&n);std::vector<unsigned char> bytes(n);
         auto* msg=reinterpret_cast<D3D11_MESSAGE*>(bytes.data());messages->GetMessage(i,msg,&n);
         if(msg->Severity<=D3D11_MESSAGE_SEVERITY_WARNING){std::printf("D3D: %s\n",msg->pDescription);check(false,"no D3D resource hazards/errors/warnings");}}

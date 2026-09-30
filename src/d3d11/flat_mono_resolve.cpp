@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <vector>
 #include "../common/log.h"
 #include "flat_cpu.h"
 #include "flat_hdr_crumbs.h"
@@ -82,10 +83,18 @@ FlatMonoResolveStats& stats=*new FlatMonoResolveStats;
 // visible even if ordinary requested resets use their budget first.
 uint32_t resetEventsLogged=0, cameraCutEventsLogged=0;
 constexpr uint32_t kResetEventLogCap=32;
+// The first-person inputs' two log lines (FlatMonoResolveFrame::firstPersonMotion): each said once a session, like the
+// budgets above. The refusal's reason is also kept in stats.firstPersonRefusal, so a later, different one is not lost.
+bool firstPersonBoundLogged=false, firstPersonRefusedLogged=false;
+// Test-only (flatMonoResolveTestPrepBytecode, at the foot of this file): empty, the only state outside tools\flat_mono_resolve_test.
+// Leaked on purpose, like the renderer state: nothing of ours runs from static destruction under the DLL loader lock.
+std::vector<unsigned char>& g_testPrepBytecode=*new std::vector<unsigned char>;
 // rowsJitter: the NDC shift the camera rows themselves carry (current xy, previous zw), the shader removes it; all zero
 // when the rows are unjittered, which is every path that does not go through the upstream camera injector.
 // route: x = the HDR route (the input is R11G11B10F radiance, the outputs fp16), y = with x, EDVR's TAA output is final
-// and the pixel-shader finish only copies it into H. All zero on the copy route, whose shader arithmetic is unchanged.
+// and the pixel-shader finish only copies it into H, z = the first-person map (t9) and stencil (t10) are bound and valid
+// (FlatMonoResolveFrame::firstPersonMotion), w = free. All zero on the copy route without them, whose shader arithmetic is
+// unchanged.
 struct Constants { float camera[6][4], previous[6][4]; uint32_t size[4], flags[4]; float jitter[4], rowsJitter[4]; uint32_t route[4]; };
 static_assert(sizeof(Constants)==272, "HLSL cbuffer layout");
 struct Isolate {
@@ -253,6 +262,10 @@ bool initialize(ID3D11Device* device,ID3D11DeviceContext* context,const char** r
             static_cast<unsigned>(hrShader[2]),static_cast<unsigned>(hrShader[3]));
     }
     if(shadersFailed)return fail(reason,"flat-resolve-shader-create-failed");
+    // Only a rig ever has bytes here (flatMonoResolveTestPrepBytecode): its mutated prep replaces the shipped one.
+    if(!g_testPrepBytecode.empty() &&
+       FAILED(device->CreateComputeShader(g_testPrepBytecode.data(),g_testPrepBytecode.size(),nullptr,g.prep.ReleaseAndGetAddressOf())))
+        return fail(reason,"flat-resolve-shader-create-failed");
     HRESULT hrBuffer=E_PENDING,hrSampler=E_PENDING;
     {
         HdrCrumbSpan span(g_crumbOn,"create-constants-sampler","cbuffer=%u bytes",static_cast<unsigned>(sizeof(Constants)));
@@ -336,6 +349,31 @@ bool inputTexture(ID3D11ShaderResourceView* view,uint32_t width,uint32_t height,
     if(color && hdr && (desc.Format!=DXGI_FORMAT_R11G11B10_FLOAT || !(desc.BindFlags&D3D11_BIND_RENDER_TARGET)))return false;
     return device.Get()==g.device.Get() && desc.Width==width && desc.Height==height && desc.MipLevels==1 &&
         desc.ArraySize==1 && desc.SampleDesc.Count==1 && (desc.BindFlags&D3D11_BIND_SHADER_RESOURCE)!=0;
+}
+// The first-person inputs (FlatMonoResolveFrame::firstPersonMotion and firstPersonStencil, section 82), checked the way
+// inputTexture checks the colour and depth views, and answered by name: null when the view is fit to bind, else a static
+// reason. The reason goes to stats.firstPersonRefusal and the log; a refusal never refuses the frame, it only drops the pair.
+const char* firstPersonViewRefusal(ID3D11ShaderResourceView* view,uint32_t width,uint32_t height,bool stencil) {
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv{};view->GetDesc(&srv);
+    if(srv.ViewDimension!=D3D11_SRV_DIMENSION_TEXTURE2D)
+        return stencil?"the stencil view is not a Texture2D view":"the map view is not a Texture2D view";
+    if(srv.Format!=(stencil?DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:DXGI_FORMAT_R16G16B16A16_FLOAT))
+        return stencil?"the stencil view format is not X32_TYPELESS_G8X24_UINT":"the map view format is not R16G16B16A16_FLOAT";
+    if(srv.Texture2D.MostDetailedMip!=0 || (srv.Texture2D.MipLevels!=1 && srv.Texture2D.MipLevels!=UINT(-1)))
+        return stencil?"the stencil view is not a one-mip view":"the map view is not a one-mip view";
+    ComPtr<ID3D11Resource> resource;view->GetResource(resource.GetAddressOf());
+    ComPtr<ID3D11Texture2D> texture;
+    if(FAILED(resource.As(&texture)))
+        return stencil?"the stencil resource is not a Texture2D":"the map resource is not a Texture2D";
+    D3D11_TEXTURE2D_DESC desc{};texture->GetDesc(&desc);
+    ComPtr<ID3D11Device> device;texture->GetDevice(device.GetAddressOf());
+    if(device.Get()!=g.device.Get() || desc.MipLevels!=1 || desc.ArraySize!=1 || desc.SampleDesc.Count!=1 ||
+       !(desc.BindFlags&D3D11_BIND_SHADER_RESOURCE))
+        return stencil?"the stencil texture is not a one-slice, one-sample shader resource on the resolver's device"
+                      :"the map texture is not a one-slice, one-sample shader resource on the resolver's device";
+    if(desc.Width!=width || desc.Height!=height)
+        return stencil?"the stencil texture is not the render size":"the map texture is not the render size";
+    return nullptr;
 }
 // The HDR route's pixel-shader half, created on first use so the copy route never pays for it.
 bool initializeHdr(ID3D11Device* device,const char** reason) {
@@ -538,6 +576,8 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         return fail(reason,"flat-resolve-invalid-rows-jitter");
     if(f.mode!=FlatMonoResolveMode::Taa && f.mode!=FlatMonoResolveMode::Dlaa && f.mode!=FlatMonoResolveMode::Dlss &&
        f.mode!=FlatMonoResolveMode::Fsr)return fail(reason,"flat-resolve-invalid-mode");
+    // The upscaler slot (FlatMonoResolveFrame::slot): a slot no engine has refuses the frame here, before anything is made or written.
+    if(f.slot>=kUpscalerSlots)return fail(reason,"flat-resolve-invalid-slot");
     // Gate 2 step 2 (design doc section 72): the route table owns the size
     // refusals. NVIDIA supersampling (R > D) evaluates DLAA at R and lets the
     // game's own copy downsample E = R to D; FSR refuses R > D until the
@@ -579,12 +619,34 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     Isolate isolated(g.context.Get(),g.isolated.Get());
     // DLAA and DLSS ask NGX, FSR asks AMD's port; EDVR's own TAA needs no SDK.
     if(f.mode!=FlatMonoResolveMode::Taa && !backendAvailable(f.mode,device,reason)) {++stats.backendFailures;g.history=false;stats.currentContinueRun=0;return false;}
+    // The first-person inputs (section 82): validated here, beside the colour and depth views, and bound for the prep kernel
+    // only when the pair is whole and fit. A missing half is an absent pair; an unfit one is named, counted and dropped.
+    ID3D11ShaderResourceView* firstPersonMap=nullptr,* firstPersonStencil=nullptr;
+    if(f.firstPersonMotion && f.firstPersonStencil) {
+        const char* refusal=firstPersonViewRefusal(f.firstPersonMotion,f.renderWidth,f.renderHeight,false);
+        if(!refusal)refusal=firstPersonViewRefusal(f.firstPersonStencil,f.renderWidth,f.renderHeight,true);
+        if(!refusal) {
+            firstPersonMap=f.firstPersonMotion;firstPersonStencil=f.firstPersonStencil;
+            ++stats.firstPersonFrames;
+            if(!firstPersonBoundLogged) {
+                firstPersonBoundLogged=true;
+                Log::get().note("flat resolve: first-person motion inputs bound (map %ux%u, stencil view)",f.renderWidth,f.renderHeight);
+            }
+        } else {
+            ++stats.firstPersonRefused;stats.firstPersonRefusal=refusal;
+            if(!firstPersonRefusedLogged) {
+                firstPersonRefusedLogged=true;
+                Log::get().note("flat resolve: first-person motion inputs refused: %s",refusal);
+            }
+        }
+    } else if(f.firstPersonMotion || f.firstPersonStencil) ++stats.firstPersonPartial;
     const uint32_t index=taa?g.current:0;
     Constants constants{};std::memcpy(constants.camera,f.camera,sizeof(f.camera));
     std::memcpy(constants.previous,reset?f.camera:f.previousCamera,sizeof(f.previousCamera));
     constants.size[0]=f.renderWidth;constants.size[1]=f.renderHeight;constants.size[2]=evalW;constants.size[3]=evalH;
     constants.flags[0]=reset;constants.flags[1]=engine;constants.flags[2]=taa;constants.flags[3]=f.staticScene?1u:0u;
     constants.route[0]=hdr?1u:0u;constants.route[1]=(hdr&&taa)?1u:0u;
+    constants.route[2]=firstPersonMap?1u:0u;
     constants.jitter[0]=f.jitterX;constants.jitter[1]=f.jitterY;
     constants.jitter[2]=f.previousJitterX;constants.jitter[3]=f.previousJitterY;
     // On a reset the previous rows ARE the current rows (above), so they carry the current phase.
@@ -601,14 +663,17 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     HdrCrumbSpan prepStep(g_crumbOn,"prep","groups=%ux%u",(f.renderWidth+7)/8,(f.renderHeight+7)/8);
     ID3D11Buffer* cb[]={g.constants.Get(),f.engine.sceneNow,f.engine.scenePrev};
     context->CSSetConstantBuffers(0,3,cb);
-    ID3D11ShaderResourceView* prepViews[]={g.color.srv.Get(),f.depth,f.engine.slots,f.engine.pool};
-    context->CSSetShaderResources(0,4,prepViews);
+    // t4..t8 are the later kernels' (motion, rejection, expected depth, history): null for prep. t9 and t10 are the
+    // first-person map and stencil, null unless the pair was accepted above.
+    ID3D11ShaderResourceView* prepViews[]={g.color.srv.Get(),f.depth,f.engine.slots,f.engine.pool,
+        nullptr,nullptr,nullptr,nullptr,nullptr,firstPersonMap,firstPersonStencil};
+    context->CSSetShaderResources(0,11,prepViews);
     ID3D11UnorderedAccessView* prepOutputs[]={g.depth[index].uav.Get(),g.motion.uav.Get(),g.rejection.uav.Get(),g.expected.uav.Get()};
     context->CSSetUnorderedAccessViews(0,4,prepOutputs,nullptr);
     context->CSSetShader(g.prep.Get(),nullptr,0);
     context->Dispatch((f.renderWidth+7)/8,(f.renderHeight+7)/8,1);
-    ID3D11UnorderedAccessView* nullUavs[5]={};ID3D11ShaderResourceView* nullViews[9]={};
-    context->CSSetUnorderedAccessViews(0,5,nullUavs,nullptr);context->CSSetShaderResources(0,9,nullViews);
+    ID3D11UnorderedAccessView* nullUavs[5]={};ID3D11ShaderResourceView* nullViews[11]={};
+    context->CSSetUnorderedAccessViews(0,5,nullUavs,nullptr);context->CSSetShaderResources(0,11,nullViews);
     if(hdr)++stats.hdrPrepped;
     prepStep.close();
     HdrCrumbSpan backendStep(g_crumbOn,"backend","mode=%s in=%ux%u out=%ux%u reset=%u",flatMonoResolveModeName(f.mode),
@@ -625,11 +690,11 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         context->CSSetShader(g.taa.Get(),nullptr,0);context->Dispatch((f.outputWidth+7)/8,(f.outputHeight+7)/8,1);
     } else if(f.mode==FlatMonoResolveMode::Fsr) {
         const float sy=std::sqrt(f.camera[0][1]*f.camera[0][1]+f.camera[1][1]*f.camera[1][1]+f.camera[2][1]*f.camera[2][1]);
-        ok=fsr3Evaluate(context,0,g.color.texture.Get(),g.depth[0].texture.Get(),g.motion.texture.Get(),g.rejection.texture.Get(),
+        ok=fsr3Evaluate(context,f.slot,g.color.texture.Get(),g.depth[0].texture.Get(),g.motion.texture.Get(),g.rejection.texture.Get(),
             g.output[0].texture.Get(),f.renderWidth,f.renderHeight,evalW,evalH,f.jitterX,f.jitterY,reset,f.deltaMs,
             f.camera[3][2],(std::numeric_limits<float>::max)(),2*std::atan(1/sy),reason,true,hdr);
     } else {
-        ok=dlaaEvaluate(context,0,g.color.texture.Get(),g.depth[0].texture.Get(),g.motion.texture.Get(),g.output[0].texture.Get(),
+        ok=dlaaEvaluate(context,static_cast<int>(f.slot),g.color.texture.Get(),g.depth[0].texture.Get(),g.motion.texture.Get(),g.output[0].texture.Get(),
             g.rejection.texture.Get(),f.renderWidth,f.renderHeight,evalW,evalH,f.jitterX,f.jitterY,reset,f.deltaMs,reason,hdr);
     }
     }
@@ -769,5 +834,15 @@ bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* co
     *output=(colorDesc.Format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB?g.output[1].srgb:g.output[1].srv).Get();
     (*output)->AddRef();
     return true;
+}
+
+// Test-only, NOT part of flat_mono_resolve.h's contract (the rig forward-declares it, as tools\fsr3_engine_test does for
+// fsr3_engine.cpp's own hooks): the prep kernel the NEXT initialisation makes is this bytecode instead of the shipped one, so
+// tools\flat_mono_resolve_test can run its first-person scenario against a prep with one rule flipped and prove the scenario's
+// assertions fail. The bytes are copied. Empty bytes (or a null pointer), the state in production and after a rig is done with
+// it, mean the shipped bytecode. It takes effect when the renderer is next initialised: call flatMonoResolveReset() after it.
+void flatMonoResolveTestPrepBytecode(const void* bytes,size_t size) {
+    g_testPrepBytecode.clear();
+    if(bytes && size)g_testPrepBytecode.assign(static_cast<const unsigned char*>(bytes),static_cast<const unsigned char*>(bytes)+size);
 }
 } // namespace edvr

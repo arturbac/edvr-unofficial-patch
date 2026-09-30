@@ -1194,6 +1194,72 @@ int main(int argc, char** argv) {
         }
     }
 
+    // The VR on-foot world route (design doc section 82, experimental.temporal_aa_on_foot_world) is OFF by default: it is
+    // unflown. The shipped file says off, and so must the code's fallback for an ini with no such line, which is every
+    // install that predates the key: the same pair of checks as above, because nothing else holds the two to one answer.
+    expectStr("experimental.temporal_aa_on_foot_world", "off", "the shipped edvr.ini ships the VR world route off");
+    {
+        const std::string shippedWorld = Config::get().getString("experimental.temporal_aa_on_foot_world", "<unset>");
+        const std::string worldSource = readRepoFile(dir, L"src\\d3d11\\vr_world_route.cpp");
+        if (worldSource.empty()) {
+            fail("vr_world_route.cpp is readable from the repo root", "could not read it");
+        } else {
+            const std::string fallback = codeFallbackOf(worldSource, "experimental.temporal_aa_on_foot_world");
+            if (fallback == shippedWorld) {
+                ok("the code's fallback for experimental.temporal_aa_on_foot_world is the shipped default");
+            } else {
+                fail("the code's fallback for experimental.temporal_aa_on_foot_world is the shipped default",
+                     "vr_world_route.cpp falls back to \"" + fallback + "\", the ini ships \"" + shippedWorld + "\"");
+            }
+            // CONTROL: the same source with the fallback turned to auto (a route that switched itself on for every install).
+            std::string flipped = worldSource;
+            const std::string from = "getString(\"experimental.temporal_aa_on_foot_world\", \"" + fallback + "\")";
+            const size_t at = flipped.find(from);
+            if (at != std::string::npos)
+                flipped.replace(at, from.size(), "getString(\"experimental.temporal_aa_on_foot_world\", \"auto\")");
+            if (at != std::string::npos && codeFallbackOf(flipped, "experimental.temporal_aa_on_foot_world") != shippedWorld) {
+                ok("control: the VR world route's fallback turned to auto is caught");
+            } else {
+                fail("control: the VR world route's fallback turned to auto is caught",
+                     at == std::string::npos ? "the call was not found to alter"
+                                             : "the flipped source still matched the ini");
+            }
+        }
+    }
+
+    // The VR camera census (design doc section 82, advanced.vr_camera_census) installs a game hook when it is on, so it
+    // is OFF by default in both places that can say so: the shipped file and the code's fallback for an ini that predates
+    // the key. The same pair of checks as the world route's, with the same control.
+    expectStr("advanced.vr_camera_census", "off", "the shipped edvr.ini ships the VR camera census off");
+    {
+        const std::string shippedCensus = Config::get().getString("advanced.vr_camera_census", "<unset>");
+        const std::string censusSource = readRepoFile(dir, L"src\\d3d11\\vr_camera_census.cpp");
+        if (censusSource.empty()) {
+            fail("vr_camera_census.cpp is readable from the repo root", "could not read it");
+        } else {
+            const std::string fallback = codeFallbackOf(censusSource, "advanced.vr_camera_census");
+            if (fallback == shippedCensus) {
+                ok("the code's fallback for advanced.vr_camera_census is the shipped default");
+            } else {
+                fail("the code's fallback for advanced.vr_camera_census is the shipped default",
+                     "vr_camera_census.cpp falls back to \"" + fallback + "\", the ini ships \"" + shippedCensus + "\"");
+            }
+            // CONTROL: the same source with the fallback turned to on (a census that installed its hook on every install).
+            std::string flipped = censusSource;
+            const std::string from = "getString(\"advanced.vr_camera_census\", \"" + fallback + "\")";
+            const size_t at = flipped.find(from);
+            if (at != std::string::npos)
+                flipped.replace(at, from.size(), "getString(\"advanced.vr_camera_census\", \"on\")");
+            if (at != std::string::npos && codeFallbackOf(flipped, "advanced.vr_camera_census") != shippedCensus) {
+                ok("control: the VR camera census's fallback turned to on is caught");
+            } else {
+                fail("control: the VR camera census's fallback turned to on is caught",
+                     at == std::string::npos ? "the call was not found to alter"
+                                             : "the flipped source still matched the ini");
+            }
+        }
+    }
+
     // The Explorer Cam block, under a SECOND [fix] and a second [hotkey].
     // This is the claim that a repeated section header is not a parse error
     // and does not silently discard everything after it.
@@ -1661,6 +1727,13 @@ int main(int argc, char** argv) {
     expectStr("experimental.temporal_aa_before_post", "auto", "flat scope permits the HDR route's key");
     Config::get().set("experimental.temporal_aa_before_post", "off");
     expectStr("experimental.temporal_aa_before_post", "off", "flat scope reads the HDR route's key off");
+    // The VR world route's key is a VR-profile key: unlisted in runtimeProfileAllowsKey, so a flat profile reads it off
+    // whatever the file says, and the flat runtime (which never asks) cannot be turned into it.
+    Config::get().set("experimental.temporal_aa_on_foot_world", "auto");
+    expectStr("experimental.temporal_aa_on_foot_world", "off", "flat scope refuses the VR world route's key");
+    // The VR camera census's key is a VR-profile key too: a flat profile must never install its hook.
+    Config::get().set("advanced.vr_camera_census", "on");
+    expectStr("advanced.vr_camera_census", "off", "flat scope refuses the VR camera census's key");
     Config::get().set("fix.temporal_aa", "dlss");
     Config::get().set("fix.black_void", "on");
     Config::get().set("fix.head_offset_forward", "12");
@@ -1727,6 +1800,8 @@ int main(int argc, char** argv) {
     else fail("invalid profile jitter", "flat key widened invalid scope");
     Config::get().set("experimental.temporal_aa_before_post", "auto");
     expectStr("experimental.temporal_aa_before_post", "off", "invalid profile cannot turn the HDR route on");
+    Config::get().set("advanced.vr_camera_census", "on");
+    expectStr("advanced.vr_camera_census", "off", "invalid profile cannot turn the VR camera census on");
     g_runtimeProfile = RuntimeProfile::LegacyVr;
     expectBool("fix.black_void", true, "legacy profile retains original behavior");
     if (Config::get().getString("experimental.temporal_aa_jitter", "on") == "off")
@@ -1737,6 +1812,13 @@ int main(int argc, char** argv) {
     if (Config::get().getString("experimental.temporal_aa_jitter", "off") == "on")
         ok("VR profile reads explicit jitter setting");
     else fail("VR profile jitter", "flat exception changed VR scope");
+    Config::get().set("experimental.temporal_aa_on_foot_world", "auto");
+    expectStr("experimental.temporal_aa_on_foot_world", "auto", "VR profile reads the VR world route's key");
+    Config::get().set("advanced.vr_camera_census", "on");
+    expectStr("advanced.vr_camera_census", "on", "VR profile reads the VR camera census's explicit on");
+    g_runtimeProfile = RuntimeProfile::LegacyVr;
+    expectStr("advanced.vr_camera_census", "on", "the legacy VR profile reads it too (runtimeVrProfile covers both)");
+    g_runtimeProfile = RuntimeProfile::Vr;
     expectFloat("fix.render_sharpness", 0.3f, "VR profile still reads the sharpening setting");
 
     // The flat panel writes the Sharpening row into edvr-flat.ini and asks for a

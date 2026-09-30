@@ -499,6 +499,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\native_temporal.cpp" "src\d3d11\flat_temporal.cpp" "src\d3d11\flat_compute_capture.cpp" "src\d3d11\flat_compute_readback.cpp" ^
     "src\d3d11\flat_runtime.cpp" "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
     "src\d3d11\flat_camera_producer_probe.cpp" "src\d3d11\flat_camera_inject.cpp" ^
+    "src\d3d11\vr_world_route.cpp" "src\d3d11\vr_world_mips.cpp" "src\d3d11\vr_camera_census.cpp" ^
     "src\d3d11\native_sharpen.cpp" ^
     "src\d3d11\native_frame.cpp" ^
     "src\d3d11\native_fss.cpp" ^
@@ -1107,6 +1108,38 @@ if errorlevel 1 ( echo [edvr] ERROR: flat temporal test build failed & exit /b 1
 "%BUILD%\flat_temporal_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_vr_world_route_test
+echo [edvr] === vr_world_route_test.exe ===
+REM The VR on-foot world route (design doc section 82): the pure half, the detector's glue on the census retake's chain, the
+REM key-off contract and the hook pins. Pure C++ and source scans: no D3D.
+if not exist "%OBJ%\vrworldroutetest" mkdir "%OBJ%\vrworldroutetest"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\vrworldroutetest"\ ^
+    /Fe"%BUILD%\vr_world_route_test.exe" "tools\vr_world_route_test\vr_world_route_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: vr world route test build failed & exit /b 1 )
+"%BUILD%\vr_world_route_test.exe" --self-test "%ROOT%" || exit /b 1
+exit /b 0
+
+:rig_vr_world_route_gpu_test
+echo [edvr] === vr_world_route_gpu_test.exe ===
+REM The VR world route's runtime (vr_world_route.cpp, linked as shipped) on WARP: the real binding shadow, the real Config and
+REM the real flat resolver with its backends stubbed, a synthetic copy of the census retake's chain drawn through the same
+REM per-draw entry the hooks call. Key off, the happy path, every refusal, the internal flags, the latch, scene resets,
+REM frame gaps and the key going off while owned.
+if not exist "%OBJ%\vrworldroutegpu" mkdir "%OBJ%\vrworldroutegpu"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /Fo"%OBJ%\vrworldroutegpu\\" ^
+    /Fe"%BUILD%\vr_world_route_gpu_test.exe" "tools\vr_world_route_gpu_test\vr_world_route_gpu_test.cpp" ^
+    "src\d3d11\vr_world_route.cpp" "src\d3d11\binding_shadow.cpp" "src\d3d11\flat_mono_resolve.cpp" ^
+    "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
+    "src\common\config.cpp" "src\common\proxy.cpp" "src\common\guard.cpp" ^
+    /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: vr world route GPU test build failed & exit /b 1 )
+"%BUILD%\vr_world_route_gpu_test.exe" --dry-run || exit /b 1
+"%BUILD%\vr_world_route_gpu_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_flat_mono_resolve_test
 echo [edvr] === flat_mono_resolve_test.exe ===
 if not exist "%OBJ%\flat_mono_resolve_test" mkdir "%OBJ%\flat_mono_resolve_test"
@@ -1163,6 +1196,39 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /link /INCREMENTAL:NO kernel32.lib
 if errorlevel 1 ( echo [edvr] ERROR: c2 coexist test build failed & exit /b 1 )
 "%BUILD%\c2_coexist_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_vr_camera_census_test
+echo [edvr] === vr_camera_census_test.exe ===
+REM The VR camera census (design doc section 82): the pure half the DLL compiles, run against the derive model, plus the
+REM source scans that hold "key off = nothing" and "the detour never writes a camera" (they read src\d3d11 from the repo
+REM root), plus tools\camera_census_fixture.log held to exactly what the formatters write -- the file that
+REM edvr_log.py --camera-census's own self-test reads.
+if not exist "%OBJ%\vrcamcensus" mkdir "%OBJ%\vrcamcensus"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\vrcamcensus\\" ^
+    /Fe"%BUILD%\vr_camera_census_test.exe" "tools\vr_camera_census_test\vr_camera_census_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: vr camera census test build failed & exit /b 1 )
+"%BUILD%\vr_camera_census_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_vr_camera_census_glue_test
+echo [edvr] === vr_camera_census_glue_test.exe ===
+REM The census's glue (src\d3d11\vr_camera_census.cpp) compiled for real with the real Config and Log, and stubs for what it
+REM calls (the injector, the world route's draw progress, the journal, EDVR's advertised eye geometry): the observer's two
+REM halves against cameras built by the game-camera derive model (no allocation, not one byte written), the boundary's
+REM order, the eye draw's staging readback on a WARP device, the key-off path, the bounded log -- and then
+REM tools\edvr_log.py --camera-census over the log the glue wrote, which must find the two eye cameras by the content
+REM join. Needs python on PATH; runs from the repo root; takes about six seconds (one 5 s window is waited out).
+if not exist "%OBJ%\vrcamcensusglue" mkdir "%OBJ%\vrcamcensusglue"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /Fo"%OBJ%\vrcamcensusglue\\" ^
+    /Fe"%BUILD%\vr_camera_census_glue_test.exe" "tools\vr_camera_census_glue_test\vr_camera_census_glue_test.cpp" ^
+    "src\d3d11\vr_camera_census.cpp" "src\common\config.cpp" "src\common\log.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: vr camera census glue test build failed & exit /b 1 )
+"%BUILD%\vr_camera_census_glue_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_config_test
@@ -1699,6 +1765,23 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
 if errorlevel 1 ( echo [edvr] ERROR: GPU census test build failed & exit /b 1 )
 "%OBJ%\gpucensus\gpu_census_test.exe" --dry-run || exit /b 1
 "%OBJ%\gpucensus\gpu_census_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_vr_world_mips_test
+REM The VR on-foot world route's mipped screen (design doc section 82, src\d3d11\vr_world_mips.cpp): a real D3D11 WARP
+REM device, the production module linked in as a source, away from build\d3d11.dll. The rig takes System32's device through
+REM src\common\system_d3d11.h, so it links without d3d11.lib, and its exe sits under obj\, not directly in build\.
+REM tools\vr_world_mips_test\mutants.py --self-test holds the rig's mutation list to the source as it is; the list itself
+REM (--run, on demand, about a minute) proves the rig fails when each rule of the module is flipped.
+if not exist "%OBJ%\vrworldmips" mkdir "%OBJ%\vrworldmips"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\vrworldmips\\" /Fe"%OBJ%\vrworldmips\vr_world_mips_test.exe" ^
+    "tools\vr_world_mips_test\vr_world_mips_test.cpp" "src\d3d11\vr_world_mips.cpp" ^
+    /link /INCREMENTAL:NO d3dcompiler.lib
+if errorlevel 1 ( echo [edvr] ERROR: vr_world_mips_test build failed & exit /b 1 )
+"%OBJ%\vrworldmips\vr_world_mips_test.exe" --dry-run || exit /b 1
+"%OBJ%\vrworldmips\vr_world_mips_test.exe" --self-test || exit /b 1
+python "tools\vr_world_mips_test\mutants.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_openvr_abi_test
@@ -2608,6 +2691,29 @@ cl.exe /I"%GEN%" /nologo /O2 /Gy /MT /std:c++17 /EHsc /W4 ^
     /link /INCREMENTAL:NO /OPT:REF d3d11.lib d3dcompiler.lib dxguid.lib
 if errorlevel 1 ( echo [edvr] ERROR: ui layer seed test build failed & exit /b 1 )
 "%OBJ%\uilayerseed\seed_test.exe" --self-test || exit /b 1
+exit /b 0
+
+:rig_ui_layer_world_test
+echo [edvr] === ui_layer_world_test.exe ===
+REM The VR on-foot world route's layer half (docs\design-flat-temporal-aa-2026-09-23.md, section 82) with
+REM src\d3d11\ui_layer.cpp linked WHOLE, on WARP: its neighbours (the binding shadow, the route, the mips module,
+REM the raw OM/RS entries, the journal) are stubs in the rig, the layer's own machinery is the production code. The
+REM route's mode is never a take; the re-issue draws the screen composite into the eye's layer from the mipped
+REM screen through the trilinear sampler (a mip chain of one flat colour a level shows which level the map's
+REM minification selects) and the composite of that layer over a frame is the eye; every changed state comes back
+REM after a landed re-issue and after every refusal; every refusal is counted by reason and tells the route
+REM nothing; the raw entries run with the route's internal scope up. Built outside build\ like the seed rig above.
+if not exist "%OBJ%\uilayerworld" mkdir "%OBJ%\uilayerworld"
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
+    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE ^
+    /Fo"%OBJ%\uilayerworld\\" /Fe"%OBJ%\uilayerworld\ui_layer_world_test.exe" ^
+    "tools\ui_layer_world_test\ui_layer_world_test.cpp" "src\d3d11\ui_layer.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" ^
+    "third_party\dxbc_hash\DxilHash.cpp" ^
+    /link /INCREMENTAL:NO d3dcompiler.lib user32.lib
+if errorlevel 1 ( echo [edvr] ERROR: ui layer world test build failed & exit /b 1 )
+"%OBJ%\uilayerworld\ui_layer_world_test.exe" --dry-run || exit /b 1
+"%OBJ%\uilayerworld\ui_layer_world_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_pixel_probe_test
