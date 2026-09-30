@@ -28,9 +28,10 @@ namespace edvr {
 
 class Config;
 
-// Reads fix.ui_depth (on | off), fix.temporal_aa (the gate),
-// advanced.ui_depth_families, advanced.ui_depth_exclude and
-// advanced.ui_depth_test. Install and reload; all live.
+// Reads fix.temporal_aa (the gate: the interface depth has no key of its own,
+// fix.ui_depth having been retired into it) and the nine advanced.ui_depth_*
+// keys (families, exclude, menus, variants, alpha, reactive, planes, eyes,
+// test). Install and reload; all live.
 void uiDepthConfigure(Config& cfg);
 
 // True while the key is on, the pass is on and nothing stood down: the

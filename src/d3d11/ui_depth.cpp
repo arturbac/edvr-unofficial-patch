@@ -155,7 +155,7 @@ constexpr uint32_t kTotalsFrames = 1800;   // about 20 s at 90 Hz
 
 FaultBudget g_budget("uiDepth", 5);
 
-bool     g_keyOn = false;      // fix.ui_depth = on
+bool     g_keyOn = false;      // the retired fix.ui_depth; always g_passOn now
 bool     g_passOn = false;     // fix.temporal_aa is not off
 bool     g_trained = false;    // ...and it is NVIDIA's history, which reads the mask
 

@@ -153,11 +153,11 @@ bool dlaaWarm(ID3D11DeviceContext* ctx, uint32_t w, uint32_t h, bool features,
 // history at that pixel -- NVIDIA's bias-current-colour input. It is for
 // content that changes without moving, which no motion vector can
 // describe: a HUD readout counting down registers perfectly and blends
-// with the digit before it (measured 2026-09-08, the flip side of
-// fix.ui_depth). Zero everywhere is the same as not passing one. The
-// runtime takes ONE such mask, so when the temporal pass's mover mask
-// (tier 1 of docs/per-object-motion.md) is on as well, the pass folds the
-// interface's into it before calling here and hands the union.
+// with the digit before it (measured 2026-09-08, the flip side of the
+// interface depth, then keyed fix.ui_depth). Zero everywhere is the same as
+// not passing one. The runtime takes ONE such mask, so when the temporal
+// pass's mover mask (tier 1 of docs/per-object-motion.md) is on as well, the
+// pass folds the interface's into it before calling here and hands the union.
 bool dlaaEvaluate(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour,
                   ID3D11Texture2D* depth, ID3D11Texture2D* motion,
                   ID3D11Texture2D* output, ID3D11Texture2D* reactive,
