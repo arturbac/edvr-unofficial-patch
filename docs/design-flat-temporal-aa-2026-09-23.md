@@ -37,10 +37,10 @@
 - **Ruled-out pointer:** the kinematic arc's Status records rejected motion
   estimates and the nonexistent engine velocity buffer. Reuse engine-record
   motion; do not revive estimation or the retired deferred UI replay.
-- **Next:** the HDR route flew (hangar, bright star) and is default auto
-  (section 81); legs still to fly: R < D, FSR, EDVR TAA, game FXAA, ReShade.
-  Then the open items above: section-75 confirming flight, section-76 matrix
-  cells, section-77 fixes, section-78 recipes (older lists: Status detail).
+- **Next:** the HDR route flew (hangar, bright star; R < D at 0.75) and is
+  default auto (section 81); legs still to fly: FSR, EDVR TAA, game FXAA,
+  ReShade. Then the open items above: section-75 confirming flight, section-76
+  matrix cells, section-77 fixes, section-78 recipes (older: Status detail).
   Existing evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
   PS91/BFE or stale-resize hypotheses. The menu hangar-floor P1 defect remains
@@ -5316,10 +5316,9 @@ game FXAA on, ReShade chained; then the default flips to auto.
 **Implementation note (2026-09-30).** Built on branch `claude/flat-hdr-route`
 from main 1de97469, decisions (a) to (e) all in. It was built with the key off,
 so the tree treated every frame as before until someone set it; it then flew
-the same day and the key is auto by default (the bullets Flight, R < D and F8
-supersampling line, near the end, say how). The bullets down to the flight
-plan describe the build as it stood before that flight: what the rigs pin,
-not what a headset showed.
+the same day and the key is auto by default (the bullets from Flight on, near
+the end, say how). The bullets down to the flight plan describe the build as
+it stood before that flight: what the rigs pin, not what a headset showed.
 
 - Pieces. `src\d3d11\flat_hdr_route.h` is the pure half (key, detector,
   selector, R >= D gate, late-write latch, census window, every log line).
@@ -5530,20 +5529,51 @@ not what a headset showed.
   treated 389 of 417, with `selection=` including
   `conflicting-hdr-target-or-camera`: seen once, not chased. Sean: "it looks
   good, let's make it default". Not in this record: the Bloom and DoF off
-  legs, FSR, EDVR TAA at R = D, game FXAA on, ReShade chained, and any frame
-  at R < D, which the rigs pin and no flight has shown.
+  legs, FSR, EDVR TAA at R = D, game FXAA on, ReShade chained. R < D is the
+  next bullet.
+- Flight at R < D (Epic, 2026-09-30). Log `edvr_gfx_20260930_133152.log`,
+  version v0.18.0-rc.4-65-geba67321 (`edvr_log.py --expect-build eba67321`
+  exits 0). Key auto from startup (`read at startup`); Sean set Elite's
+  supersampling to 0.75 with bloom on (Custom preset: AAMode 0, BloomQuality
+  3, DOFEnabled 2). At 13:32:30 the first trigger, a probe frame of the
+  hangar (VS 20F383BB PS FDB74215, 27 H draws, the pair pinned above), ended
+  a 30.9 s stand-down that had begun at startup for no-known-output-copy and
+  read no-known-tone-pass by its last probes. The window ending 13:32:43 has
+  `treated=60` of 78 triggers and `selection=selected:60,
+  hdr-route-needs-render-at-least-output:18` (`declined=0`: that counter is
+  for a selected frame the treatment declines) as the render went to
+  2880x1620 against a 3840x2160 output. After that every trigger read the
+  same verdict (288 in the next window, 151 in the one after), `treated`
+  stayed at 654, and the copy route refused the frames for
+  `no-known-tone-pass` (299 and 149; the frames with no scene read
+  `no-observed-hdr-writes`). At 13:32:49.848: `flat stand-down: entered at
+  frame=36663: every frame for 5.0 s (448 frames) was refused for
+  no-known-tone-pass, none treated`, and at the same instant `flat settings
+  warning: shown (mode=DLAA, frames refused for no-known-tone-pass, work stood
+  down, supersampling below 1.0 (render 2880x1620, output 3840x2160))` with
+  the Bloom and Depth of field advice and the supersampling paragraph. The
+  stand-down's probes kept reading the verdict (the window at 13:32:58 holds
+  3 watched frames, 2 of them triggers), which is what keeps the published
+  sizes fresh. Sean: it stands down and reports it in the menu. This is the
+  first R < D frame in the record and it confirms the masking fix below in
+  flight: the old merge would have read every one of those frames as
+  transient. Not in this record: the return to 1.0 (the warning hiding live;
+  the log ends at 13:33:00, still stood down, no resume line), the same at
+  0.75 with bloom and DoF off, and a flip of the key.
 - The default (2026-09-30). `experimental.temporal_aa_before_post` is auto
   when the file has no line: the `getString` fallback in `hdrReadKey`, and the
   shipped edvr.ini line and comment, say so, and `config_test` holds the two
   to one answer (it reads the shipped ini, takes the literal out of
   `flat_runtime.cpp` and proves a fallback put back to off is caught; the
   contract checker compares names, not values). A line that is present and
-  not `auto` still reads as off. The invalid-profile case is not a default
-  pin: `Config::getString` answers a fixed "off" for any key a profile
-  refuses, whatever fallback the caller passes, so an invalid descriptor
-  still cannot turn the route on (pinned). Existing installs: an ini with no
-  line gets auto; a live ini seeded by a build since 0794b3ed carries
-  `= off` and keeps it until edited.
+  not `auto` reads as off, and an absent line reads as auto: Sean's decision
+  (2026-09-30), keeping the tested behaviour over reading an unrecognised
+  value as the default, which would leave a mistyped `off` switched on. The
+  invalid-profile case is not a default pin: `Config::getString` answers a
+  fixed "off" for any key a profile refuses, whatever fallback the caller
+  passes, so an invalid descriptor still cannot turn the route on (pinned).
+  Existing installs: an ini with no line gets auto; a live ini seeded by a
+  build since 0794b3ed carries `= off` and keeps it until edited.
 - R < D under the default: a masking bug, found and fixed. The route merged
   its own verdict into a frame's stand-down verdict like any other answer.
   The order is None < Structural < Transient < Treatable and the trigger
@@ -5562,7 +5592,8 @@ not what a headset showed.
   a control that never does), and by a source pin that the route's refusal is
   no longer merged. A flip (off to auto, auto to off) runs `hdrReadKey` as
   in the flight build, changed only in its fallback and in clearing the
-  published sizes (below).
+  published sizes (below). Confirmed in flight at 0.75 (Flight at R < D,
+  above): the stand-down and the warning came up after 5 s.
 - F8 supersampling line (2026-09-30, Sean). A third paragraph of the flat
   warning: "Supersampling is below 1.0. At 1.0 or above, EDVR anti-aliases
   before bloom and depth of field, so they no longer block it. Raising it
@@ -5584,7 +5615,24 @@ not what a headset showed.
   little. Pinned in `flat_elite_settings_tests.h`: present for refused + R < D
   + key auto and nowhere else (the key off, R = D and above, the route
   treating, frames not refused), the words, the key, the wrap at the panel's
-  width and the log line; the wiring by source pins.
+  width and the log line; the wiring by source pins. Flown at 0.75 (Flight at
+  R < D, above): shown at the stand-down with the measured sizes.
+- Open, cosmetic, not fixed (seen in the R < D flight's log, as of
+  eba67321). (1) The log line joins the warning's paragraphs with one space
+  and no separator, and the list paragraph (Custom preset) has no final
+  period, so it runs into the next: "...Bloom, Depth of field Supersampling
+  is below 1.0. At 1.0...". The panel shows them as separate lines. The join
+  is `flatFormatSettingsWarningLog`'s `"%s%s", i ? " " : ""` at
+  `flat_elite_settings.h:451`; the missing period is `second = "Turn off in
+  Elite's graphics options: " + list;` at `flat_elite_settings.h:397`. The
+  next flat code change adds a separator (changing the on-screen words would
+  break their exact-text pins) and updates the log-line pin that encodes the
+  space, `flat_elite_settings_tests.h:359`. (2) The same line says
+  `mode=DLAA` at supersampling 0.75: the flat mode label is DLAA when the last
+  qualified frame was at R >= D (`nvidiaLabel`, `menu.cpp:888`, from
+  `flatRuntimeNativeScale`, which only a frame that reaches a treatment, or a
+  resize, updates), and every frame since was refused, so the warning says
+  "DLAA is not active" for a session that is upscaling.
 
 - ruled out: "under half an ulp" as the requantisation bound, because the
   rig's device truncates toward zero (0.969 ulp worst, 659 of 768 texel
