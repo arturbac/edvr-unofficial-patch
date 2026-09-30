@@ -386,6 +386,13 @@ bool vrWorldRouteDrawProgress(uint32_t* drawOrdinal, bool* toneSeen, uint64_t* f
     return true;
 }
 
+// SKELETON (stage 2): the route does not jitter yet.
+bool vrWorldRouteWorldPhase(float* x, float* y) {
+    if (x) *x = 0.0f;
+    if (y) *y = 0.0f;
+    return false;
+}
+
 // ---- writes after the trigger (the late-write latch's inputs) ---------------------------------------------------------------
 void vrWorldRouteNoteWrite(const void* resource) {
     if (!g_f.hdr.triggered) return;

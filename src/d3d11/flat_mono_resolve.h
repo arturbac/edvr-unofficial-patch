@@ -139,6 +139,19 @@ struct FlatMonoResolveFrame {
     // pixel never takes the engine or camera term. Every other pixel is treated exactly as without the inputs.
     ID3D11ShaderResourceView* firstPersonMotion = nullptr;
     ID3D11ShaderResourceView* firstPersonStencil = nullptr;
+    // The phase term of the map's vector (stage 2, when the world and the first-person camera are jittered; the prep kernel's
+    // "THE SEAM for a jittered world"). The map says previous minus current at the two frames' OWN raster phases, and the
+    // backend wants both phases out of it. Read only when firstPersonMotion and firstPersonStencil are both valid:
+    //   0 (the default) the map is used as it is given (the world is unjittered, or the map was built without a phase):
+    //     bit-for-bit what the prep did before this field existed;
+    //   1 the first-person camera carried the SAME phase as the world in both frames (the injector's role test, its
+    //     Scene and FirstPerson roles): the map's vector gets (jitter.xy - jitter.zw) added, in render pixels, so the vector
+    //     the backend sees excludes both phases, as the camera and engine terms do;
+    //   2 the first-person camera's phase is not known to equal the world's in both frames (it was not injected in one of
+    //     them): attached pixels REJECT their history this frame instead of taking a vector with an unknown term.
+    // Any other value is treated as 2. The sign of mode 1 is proven on WARP against a map built from explicit positions
+    // (tools\flat_mono_resolve_test).
+    uint32_t firstPersonPhaseMode = 0;
 };
 // Planned input metadata available before the game's next raster phase. This
 // intentionally carries no frame resources: preflight can allocate the

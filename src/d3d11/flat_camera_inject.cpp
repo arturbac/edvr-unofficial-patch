@@ -855,4 +855,12 @@ const char* flatCameraInjectObserveStatus() {
     return "pending";
 }
 
+// ---- the VR world route's injection mode (flat_camera_inject.h, stage 2) --------------------------------------------
+// SKELETON (2026-09-30): the interface compiles and does nothing yet; the detour below does not know the mode.
+bool flatCameraVrFrame(const FlatCameraVrFrame&) { return false; }
+void flatCameraVrCloseWindow() {}
+FlatCameraVrCounters flatCameraVrCounters() { return FlatCameraVrCounters{}; }
+size_t flatCameraVrExcluded(FlatCameraVrExcluded*, size_t) { return 0; }
+const char* flatCameraVrStatus() { return flatCameraInjectObserveStatus(); }
+
 } // namespace edvr
