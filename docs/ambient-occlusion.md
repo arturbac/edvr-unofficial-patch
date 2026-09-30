@@ -18,6 +18,8 @@ below and is not new evidence; update it whenever this doc changes.*
   `tools/diff_eye_split.py` (step 4 of the analysis) and the `eye_split.cpp`
   and `resolve_probe.h` line cites below refer to deleted code, which is at
   `d38272de^`. Any further dump needs that code restored or a new instrument.
+- **`hud_grain` (the noise-flatten template below) retired 2026-09-29 (code
+  removed, 0467e706):** its `hud_grain.h`/`.cpp` cites refer to `0467e706^`.
 - **State:** Issue #23, two captures in. The pass is named and measured:
   Elite's ambient occlusion is HBAO, three compute dispatches per eye per
   frame (`FB277B33F0865348`, `9347F8FC2DCE0248`, `D31E7812990B19A6`). Of
@@ -319,7 +321,8 @@ one rotation: the occlusion goes banded, visibly and unpleasantly, and the
 two eyes' patterns become identical in kind. If the reporter's
 inconsistency disappears under the banding, C is the mechanism and the
 noise is the lever. This is the one instrument this document proposes
-building before any fix, and it is `hud_grain.cpp` with a key.
+building before any fix, and it is `hud_grain.cpp` with a key (deleted in
+0467e706; the file is at `0467e706^`).
 
 **Fix, C1: the transcription.** A replacement shader for the pass
 (`shader_swap.h`: vertex, pixel or compute, compiled at runtime, standing

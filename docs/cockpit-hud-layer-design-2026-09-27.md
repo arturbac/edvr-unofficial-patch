@@ -661,8 +661,9 @@ NDC-derived and survives the remap; the sprite's measured state (depth
 test OFF -- uiLayerDsEffect requires depthEnable for depthWrite, so stock
 performs no depth write; stencil test 0x01 / write 0x05) is covered by the
 on-demand per-bit stencil seed and the existing colourless write-back, the
-path the holo 0x04 stencil write flew with. hud_grain and
-target_indicator brackets nest as before. Rig: 274 checks, 0 failures.
+path the holo 0x04 stencil write flew with. hud_grain (deleted 2026-09-29,
+0467e706) and target_indicator brackets nest as before. Rig: 274 checks, 0
+failures.
 
 Then origin/main merged into the branch (the Coriolis-blur arc and the
 rc-since-rc2 review round; two conflicts, both in the expected places:
