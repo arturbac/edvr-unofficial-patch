@@ -24,6 +24,7 @@
 #include "flat_standdown_tests.h"
 #include "flat_elite_settings_tests.h"
 #include "flat_cpu_tests.h"
+#include "flat_witness_bound_tests.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -2478,6 +2479,60 @@ void testFlatCpuWiring() {
           "the runtime touches the census in exactly its known places (the GPU notes, idle, and the Present block)");
 }
 
+// The camera-write witness's bound in the runtime (flat_witness_bound.h holds the policy itself): a
+// walk is asked for only while the bound wants one, the bound is told what each walk learned, an F10
+// audit re-arms it, and the camera data capture is a different function that never reads any of it.
+void testFlatWitnessWiring() {
+    auto slurp = [](const char* path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string runtimeCpp = slurp("src/d3d11/flat_runtime.cpp");
+    check(!runtimeCpp.empty(), "the runtime source is readable from the repo root");
+    auto count = [](const std::string& text, const std::string& needle) {
+        unsigned n = 0;
+        for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
+        return n;
+    };
+    struct Pin { const char* needle; unsigned times; const char* what; };
+    const Pin pins[] = {
+        {"#include \"flat_witness_bound.h\"", 1, "the runtime takes the bound from its header"},
+        {"FlatWitnessBound bound;", 1, "the witness carries the bound"},
+        {"if (w.sitesFull || !w.bound.wantsWalk()) { ++w.dedupHits; return; }", 1,
+         "a write is counted and returns before any stack walk when the witness is full or disarmed"},
+        {"const FlatWitnessStop stopped = w.bound.noteWalk(learned);", 1, "every walk tells the bound what it learned"},
+        {"witnessRearm();", 1, "an F10 audit re-arms the witness"},
+        {"CaptureStackBackTrace(", 1, "there is one stack walk in the runtime"},
+        {"witnessWalk(", 2, "and it is reached from one place: the bounded cameraWitness"},
+        {"bool learned = witnessWalk(buffer);", 1, "the walk's result is what the bound is told"},
+    };
+    for (const Pin& pin : pins) {
+        check(count(runtimeCpp, pin.needle) == pin.times, pin.what);
+        std::string without = runtimeCpp;
+        for (size_t at = without.find(pin.needle); at != std::string::npos; at = without.find(pin.needle))
+            without.erase(at, std::strlen(pin.needle));
+        check(count(without, pin.needle) == 0, "witness wiring control: a source with the line removed no longer contains it");
+    }
+    // The re-arm sits in the F10 audit's block, right after the stand-down ends.
+    const size_t audit = runtimeCpp.find("projectionAuditRequested.exchange(false");
+    const size_t rearm = runtimeCpp.find("witnessRearm();");
+    check(audit != std::string::npos && rearm != std::string::npos && audit < rearm && rearm - audit < 500,
+          "the re-arm is inside the F10 audit's block");
+    // The camera data capture is not the witness: nothing in the bounded region captures or invalidates a camera.
+    const size_t from = runtimeCpp.find("bool witnessWalk(const void* buffer) {");
+    const size_t to = runtimeCpp.find("bool depthView(ID3D11Texture2D* depth) {");
+    check(from != std::string::npos && to != std::string::npos && from < to, "the witness functions can be delimited");
+    if (from != std::string::npos && to != std::string::npos && from < to) {
+        const std::string region = runtimeCpp.substr(from, to - from);
+        check(region.find("capture(") == std::string::npos && region.find("flatCaptureCameraRows") == std::string::npos &&
+              region.find(".valid") == std::string::npos && region.find("->valid") == std::string::npos &&
+              region.find("cameras[") == std::string::npos && region.find("prefix.sequence") == std::string::npos,
+              "the witness never captures or touches a camera: the data motion correctness needs is capture(), apart from it");
+        check(region.find("cameraWitness(") != std::string::npos && region.find("witnessRearm(") != std::string::npos,
+              "(control: the delimited text is the witness code)");
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
         return flatShaderClassifierSweep(argv[2]);
@@ -2533,6 +2588,8 @@ int main(int argc, char** argv) {
     testFlatWarningWiring();
     failures += flatCpuTests();
     testFlatCpuWiring();
+    failures += flatWitnessBoundTests();
+    testFlatWitnessWiring();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

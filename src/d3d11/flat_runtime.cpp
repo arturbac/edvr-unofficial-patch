@@ -16,6 +16,7 @@
 #include "flat_negotiated_eval.h"
 #include "flat_camera_producer_probe.h"
 #include "flat_standdown.h"
+#include "flat_witness_bound.h"
 #include "flat_cpu.h"
 #include "gpu_timing.h"
 #include "flat_temporal.h"
@@ -1222,6 +1223,11 @@ struct CameraWitness {
     // the render thread, measured at microseconds per call over hundreds of
     // thousands of writes -- stops. Counts stay cheap and keep coming.
     bool sitesFull = false;
+    // The walks are bounded (flat_witness_bound.h; the 2026-09-29 motion-CPU review, C1): a game with
+    // fewer producers than slots never fills them, and the walk ran on every camera write of the
+    // session. It now stops after a run of walks that learned nothing, or a budget of walks in all,
+    // and an F10 audit re-arms it. The camera data itself (capture()) never depends on any of this.
+    FlatWitnessBound bound;
 };
 CameraWitness g_camWitness;
 // Brief module-plus-offset naming for witness stacks (vtable_hook.cpp's
@@ -1245,10 +1251,10 @@ const char* witnessModuleBrief(void* p, char* buf, size_t bufLen) {
                                                 reinterpret_cast<uintptr_t>(mbi.AllocationBase)));
     return buf;
 }
-void cameraWitness(const void* buffer) {
-    flatcpu::Scope timed(flatcpu::kWitness);
-    auto& w = g_camWitness; ++w.writes;
-    if (w.sitesFull) { ++w.dedupHits; return; }
+// One stack walk. True when it learned something: a producer site the witness did not know, or a new
+// buffer at a known one. The caller (cameraWitness) decides whether a walk is wanted at all.
+bool witnessWalk(const void* buffer) {
+    auto& w = g_camWitness;
     void* frames[10] = {};
     const USHORT n = CaptureStackBackTrace(0, 10, frames, nullptr);
     void* site = nullptr;
@@ -1259,7 +1265,7 @@ void cameraWitness(const void* buffer) {
         if (std::strncmp(brief, "EDVR's own ", 11) == 0) continue;
         site = frames[i]; break;
     }
-    if (!site) { ++w.dedupHits; return; }
+    if (!site) { ++w.dedupHits; return false; }
     for (auto& s : w.sites) if (s.address == site) {
         ++s.writes; ++w.dedupHits;
         bool known = false;
@@ -1269,8 +1275,9 @@ void cameraWitness(const void* buffer) {
             char briefBuf[96];
             const char* brief = witnessModuleBrief(site, briefBuf, sizeof(briefBuf));
             Log::get().note("flat camera witness: producer site %s also writes %p", brief, buffer);
+            return true;
         }
-        return;
+        return false;
     }
     for (auto& s : w.sites) if (!s.address) {
         s.address = site; s.writes = 1; s.buffers[0] = buffer; s.bufferCount = 1;
@@ -1288,13 +1295,41 @@ void cameraWitness(const void* buffer) {
             Log::get().note("flat camera witness: all 16 producer site slots are claimed; "
                             "stack collection stops here, write counts continue");
         }
-        return;
+        return true;
     }
     if (!w.budgetNoted) {
         w.budgetNoted = true;
         Log::get().note("flat camera witness: site budget reached; later writers counted without stacks");
     }
     ++w.budgetDropped;
+    return false;
+}
+// Every camera constant-buffer write that reaches the table. The count is cheap and never stops; the
+// stack walk behind it is bounded (flat_witness_bound.h) and re-armed by an F10 audit.
+void cameraWitness(const void* buffer) {
+    flatcpu::Scope timed(flatcpu::kWitness);
+    auto& w = g_camWitness; ++w.writes;
+    if (w.sitesFull || !w.bound.wantsWalk()) { ++w.dedupHits; return; }
+    const bool learned = witnessWalk(buffer);
+    const FlatWitnessStop stopped = w.bound.noteWalk(learned);
+    if (stopped != FlatWitnessStop::None && !w.sitesFull) {
+        uint64_t sites = 0; for (const auto& st : w.sites) sites += st.address != nullptr;
+        Log::get().note("flat camera witness: stack collection stopped after %u walks over %llu writes (%s); "
+                        "%llu producer sites known; write counts continue; an F10 audit re-arms it",
+            w.bound.walks, static_cast<unsigned long long>(w.writes), FlatWitnessBound::stopName(stopped),
+            static_cast<unsigned long long>(sites));
+    }
+}
+// An F10 audit asks for a fresh look: the sites are forgotten and the walks come back, up to the bound.
+// The write counts are cumulative and go on.
+void witnessRearm() {
+    auto& w = g_camWitness;
+    for (auto& site : w.sites) site = CameraWitnessSite{};
+    w.sitesFull = false; w.budgetNoted = false;
+    w.bound.rearm();
+    Log::get().note("flat camera witness: re-armed by an F10 audit; sites forgotten, up to %u stack walks, "
+                    "stopping after %u in a row that learn nothing",
+        kFlatWitnessWalkBudget, kFlatWitnessStableWalks);
 }
 bool depthView(ID3D11Texture2D* depth) {
     auto& s = state(); if (s.sceneDepth.Get() == depth && s.depthView) return true;
@@ -1717,6 +1752,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     if(projectionAuditRequested.exchange(false,std::memory_order_acq_rel)) {
         // A diagnostic asks for everything, refused frames included: the stand-down ends.
         endStandDown(s, frame, "an F10 audit asked for everything");
+        witnessRearm();   // the camera-write witness walks stacks again, bounded (flat_witness_bound.h)
         syncEngine();
         flatMonoResolveArmPixels(frame);
         s.drawCapture.arm(frame);
@@ -1923,9 +1959,11 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         for (const auto& entry : s.conflictWindow)
             Log::get().note("flat runtime conflict 5s: cause=%s count=%llu", entry.first.c_str(), static_cast<unsigned long long>(entry.second));
         uint64_t witnessSites = 0; for (const auto& st : g_camWitness.sites) witnessSites += st.address != nullptr;
-        Log::get().note("flat camera witness 5s: writes=%llu unique-sites=%llu dedup-hits=%llu stack-drops=%llu; every camera-table write is a producer witness candidate",
+        Log::get().note("flat camera witness 5s: writes=%llu unique-sites=%llu dedup-hits=%llu stack-drops=%llu stack-walks=%u (%s); every camera-table write is a producer witness candidate",
             static_cast<unsigned long long>(g_camWitness.writes), static_cast<unsigned long long>(witnessSites),
-            static_cast<unsigned long long>(g_camWitness.dedupHits), static_cast<unsigned long long>(g_camWitness.budgetDropped));
+            static_cast<unsigned long long>(g_camWitness.dedupHits), static_cast<unsigned long long>(g_camWitness.budgetDropped),
+            g_camWitness.bound.walks,
+            g_camWitness.sitesFull ? "all site slots claimed" : FlatWitnessBound::stopName(g_camWitness.bound.why));
         Log::get().note("flat runtime adapter reset 5s: no-previous=%llu frame-gap=%llu depth-change=%llu color-change=%llu extent-change=%llu present-not-ok=%llu",
             static_cast<unsigned long long>(s.resetMissingWindow), static_cast<unsigned long long>(s.resetGapWindow),
             static_cast<unsigned long long>(s.resetDepthWindow), static_cast<unsigned long long>(s.resetColorWindow),
