@@ -2558,7 +2558,14 @@ REM jittered quad through the redirected viewport lands on the unjittered
 REM pixels at all eight Halton phases; blended draws composited equal the same
 REM draws into the frame, a multiply included; a stencil-tested quad drawn
 REM against the layer's seeded copy of a stencil the game wrote matches the
-REM same quad drawn into the frame; the 1.25 box filter; the debug view.
+REM same quad drawn into the frame; the 1.25 box filter; the debug view. The
+REM after-UI identity (ui_after_ui_test.h, 2026-09-30): the follow through the
+REM game's post pass as a truth table; the recorded post-tonemap tails of two
+REM field censuses (station services, and the game's menu over it) routed
+REM through the real family rule, decide, gate and follow -- no interface draw
+REM left under the layer -- and composited stock against layered on the CPU
+REM blend model; the known limit pinned; and a scan of src\d3d11\ui_layer.cpp
+REM (the rig runs from the repo root) for the order the routing model assumes.
 if not exist "%OBJ%\uiqualitytest" mkdir "%OBJ%\uiqualitytest"
 cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS ^
