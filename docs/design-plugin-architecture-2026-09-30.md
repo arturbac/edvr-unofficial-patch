@@ -311,10 +311,10 @@ when ReShade was removed). The rules:
   rigs, and a census at the same spots showing EDVR's render-thread cost
   lower than today's (disabled features stop walking the ladder).
   The registry also owns the draw-gate subscriptions (wake pulse and night
-  vision are missing from `drawGateSubscribed` today, vscreen.cpp:1653; the
-  standalone fix is a separate task), and static props and the scheduler
-  stack probe stop hanging off `temporalPassConfigure` (temporal_pass.cpp
-  6149-6154), or deselecting temporal-aa orphans them.
+  vision were missing from `drawGateSubscribed` until d58e4cd0, 2026-09-30;
+  a subscriber the list forgets starves silently), and static props and the
+  scheduler stack probe stop hanging off `temporalPassConfigure`
+  (temporal_pass.cpp 6149-6154), or deselecting temporal-aa orphans them.
 - **Phase 2:** move the other groups one at a time, each with its rigs and
   one flight: cockpit-visuals, exposure, scanners, intro, on-foot-panel,
   comfort, performance, temporal-aa (with UI quality) last. Each move adds a
