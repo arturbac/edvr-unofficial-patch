@@ -1634,6 +1634,13 @@ int main(int argc, char** argv) {
     Config::get().set("fix.night_vision_stability", "on");
     expectBool("fix.night_vision_stability", false,
                "flat profile: night vision pulse stability (default on) reads off, so it cannot hold the draw gate open");
+    // The depth probe is armed by fix.temporal_aa (read off on flat, above) or by the eye depth capture,
+    // and depthProbeConfigure reads the capture through this getter: a refused key reading off is what
+    // keeps depthProbeWanted() false on flat, so the draw gate (vscreen.cpp drawGateSubscribed) is not
+    // held open there by a probe the flat profile does not run.
+    Config::get().set("advanced.eye_depth_capture", "on");
+    expectBool("advanced.eye_depth_capture", false,
+               "flat profile: eye depth capture reads off, so it cannot arm the depth probe or hold the draw gate open");
     expectInt("fix.head_offset_forward", 0, "flat profile suppresses numeric fix");
     expectFloat("fix.head_offset_forward", 0.0f, "flat profile suppresses float fix");
     if (Config::get().getIntInRange("fix.head_offset_forward", 12, 1, 100) != 0)
