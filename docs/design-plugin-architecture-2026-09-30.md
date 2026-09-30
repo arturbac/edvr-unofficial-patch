@@ -25,11 +25,14 @@
   so a split into DLLs stays mechanical (section 10 has the reasons).
   PR #46's C ABI stays the add-on tier, moved into the core so flat mode
   gets it too.
-- **Decisions still open:** Q2-Q6 in section 10 (the plugin list, default
-  sets, the add-on tier's timing, diagnostics, settings layout).
-- **Next:** Sean and Devin review sections 4 and 10; then Phase 1 (section 8):
-  the registry and dispatch tables in the core, and one small plugin moved
-  behind them with a byte-identical verdict replay as its gate.
+- **Decided, Q2-Q6 (Sean, 2026-09-30):** the nine plugins of section 4 with
+  temporal-aa as one; defaults that reproduce today's shipped behaviour; the
+  add-on tier after Phase 1 (PR #46's OM-unbind fix lands on its own now);
+  diagnostics probes out of the default install, census kept in the core;
+  today's keys and sections kept, each owned by a plugin. Section 10.
+- **Next:** Phase 1 (section 8), after v0.18.0: the registry and dispatch
+  tables in the core and night vision moved behind them, gated by a
+  byte-identical verdict replay and a lower render-thread census.
 - **Ruled out while designing:** loading every DLL found in a folder (DLL
   planting; the installer's receipts already know what it installed), a
   stable ABI for first-party plugins (they ship with the core; freezing
@@ -295,12 +298,23 @@ when ReShade was removed). The rules:
   binary, inlinable dispatch, simple installs and plugin toggles without a
   reinstall; the build enforces the boundaries. Revisit only if independent
   plugin updates or third-party draw-level plugins become real needs.
-- **Q2.** The plugin list and boundaries in section 4, especially
-  temporal-aa as one plugin.
-- **Q3.** Default sets per profile (the recommended preset).
-- **Q4.** The add-on tier: rework PR #46 now (manager into the core,
-  manifest, fault containment) or after Phase 1?
-- **Q5.** Diagnostics probes excluded from the default install, with the
-  census kept in the core?
-- **Q6.** Settings: keep today's keys and sections with an ownership map
-  (compatible), or per-plugin sections (cleaner, needs a migration)?
+- **Q2 (decided 2026-09-30): the nine plugins of section 4.** temporal-aa
+  stays one plugin: its parts share per-draw state, the camera and the
+  history, and splitting them would put that traffic on a plugin boundary,
+  against the north star.
+- **Q3 (decided): defaults reproduce today's shipped behaviour exactly.**
+  The recommended VR set is every plugin but diagnostics, with temporal-aa
+  and performance installed and their features at today's defaults; flat
+  is temporal-aa only.
+- **Q4 (decided): the add-on tier comes after Phase 1,** built on the
+  registry and manifests. Meanwhile PR #46's OM-unbind fix lands on its own,
+  and Devin gets section 2's defect list so his rework lines up.
+- **Q5 (decided): diagnostics probes, dumps and developer instruments form
+  the diagnostics plugin, not installed by default.** The per-frame census,
+  the LONG FRAME lines and the version and plugin lines stay in the core:
+  field reports are diagnosed from them.
+- **Q6 (decided): today's keys and sections stay,** each owned by one plugin
+  in the config contract (check_config_contract.py gains the owner). The
+  unread-key audit says "belongs to <plugin>, not installed" instead of
+  "not read"; a fresh install writes only the installed plugins' blocks;
+  existing ini files keep working untouched.
