@@ -35,9 +35,8 @@ issue (26 and 28 September). Read the Status block first.
   1. Stack overflow from hooks chaining into each other (an overlay, EDVR's
      live stubs, the keyboard gate's capture through the Steam overlay's
      table). Application log 1000, code 0xC00000FD.
-  2. Fast-fail: CFG or shadow-stack enforcement on the game, or a CRT abort.
-     Code 0xC0000409 or 0xC00001B2. The LiveCopy stub pages are not
-     registered as call targets; the PR 33 review flagged it, incidence low.
+  2. Fast-fail (CFG, shadow stack, CRT abort): code 0xC0000409 or 0xC00001B2.
+     The PR 33 review flagged the unregistered LiveCopy stub pages.
   3. A GPU hang once the hooks run (the #20/#21 class). System log Display
      4101 or LiveKernelEvent 141; EDVR's DEVICE_HUNG line could be lost in the
      250 ms flush gap. Not excluded: neither bundle shows a forced hook mode,
@@ -54,10 +53,11 @@ issue (26 and 28 September). Read the Status block first.
     d3d11_fixes.
   - Steam plus its overlay as a sufficient cause: Sean's Steam install has
     343 clean exits in 351 armed launches.
+  - A missing or wrong OpenXR install: the runtime, loader and config all
+    checked out in the logs and install records ("Install check").
 - **Next:**
   1. Ask the reporter for the Event Viewer entries of one A launch and the
-     whole edvr_logs folder (questions at the end). The answer picks the
-     candidate.
+     whole edvr_logs folder (questions at the end).
   2. Build the sentinel flight recorder (section "Proposed build") and fly it
      once on their rig. It dates the death to 100 ms and names the stage.
   3. Decide, Sean: should a tripped launch still start VR. The docs say it
@@ -162,6 +162,37 @@ does not; the game starts flat. Read, not flown. The troubleshooting page also
 offers `d3d11_fixes = 0` as the escape for a rig that dies every launch; on
 this rig it would give a stable flat game and nothing else.
 
+### Install check
+
+The reporter says he installed by hand from the zip. The files say the
+installer ran for both builds and that the OpenXR parts are in place.
+
+- edvr_install_state.ini is written only by the installer (state.cpp,
+  `serializeState`). Both bundles carry a fresh one: rc.2 recorded at 14:36:21
+  on 26 Sep (files written 14:36:32), rc.3 at 17:46:27 on 28 Sep (written
+  17:46:28, 37 s before the first rc.3 log). edvr.ini has the same stamp. Both
+  record all eight components: graphics, profile, ini, openvr, openxr-loader,
+  openxr-license, openxr-config, ngx-optional.
+- A hand copy of the release zip has d3d11.dll, edvr_profile.ini, edvr.ini,
+  openvr/openvr_api.dll, openvr/openxr_loader.dll, the loader notice and
+  edvr-installer.exe, and no edvr_openxr.ini (tools/package_native.py:421-423).
+  The logs say `module_configuration,source=local`, which needs a valid
+  edvr_openxr.ini, a readable openxr_loader.dll and a readable d3d11.dll at the
+  configured paths (native_module.cpp:359-369). A hand copy would log
+  `source=packaged-default`. So the zip was most likely unzipped and its
+  edvr-installer.exe run.
+- The game loaded the runtime. `module_init,version=` matches the graphics
+  DLL in every tripped launch (rc.2 twice, rc.3 once).
+- The `0x80004002` came back from a d3d11.dll found loaded at the configured
+  path with the paired exports (native_graphics_client.h:21-66). The pair is
+  matched, and only the owner is missing, as the trip explains.
+- Hashes: the recorded original openvr_api.dll, 243A818D..., equals the stock
+  openvr_api_orig.dll in both of Sean's installs, so the rename was done
+  right. The recorded loader, A231A209..., equals Sean's Frontier copy.
+- Not checkable from here: the files on his disk today, the loader notice,
+  nvngx_dlss.dll, and which OpenXR runtime Windows has active (the README says
+  to set it before launching).
+
 ### Not determinable from code or these logs
 
 - What ends an armed launch (the candidates above).
@@ -202,7 +233,9 @@ With the Event Viewer entry this names the cause without a further build.
    Services, Microsoft, Windows, Windows Defender, Operational (1116, 1117).
 4. Right after one crash launch, before starting the game again: zip the whole
    `edvr_logs` folder and `edvr_breadcrumbs.txt`, and list the folder contents
-   (a stale `d3d11_hooks.armed` or `vscreen_auto_eye_width.txt` matters).
+   (a stale `d3d11_hooks.armed` or `vscreen_auto_eye_width.txt` matters). Also
+   list `Openvr\win64` with file sizes; it should hold openvr_api.dll,
+   openvr_api_orig.dll, openxr_loader.dll and edvr_openxr.ini.
 5. Whether `context_hook_mode = shared` was saved under `[advanced]` before
    the launch; neither bundle shows it.
 6. Which overlays run: Steam, NVIDIA App, Afterburner or RTSS, Discord.
