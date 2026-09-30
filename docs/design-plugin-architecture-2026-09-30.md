@@ -25,8 +25,9 @@
   so a split into DLLs stays mechanical (section 10 has the reasons).
   PR #46's C ABI stays the add-on tier, moved into the core so flat mode
   gets it too.
-- **Decided, Q2-Q6 (Sean, 2026-09-30):** the nine plugins of section 4 with
-  temporal-aa as one; defaults that reproduce today's shipped behaviour; the
+- **Decided, Q2-Q6 (Sean, 2026-09-30):** the nine plugins of section 4
+  (regrouped: intro and on-foot-panel split out, UI quality inside
+  temporal-aa); defaults that reproduce today's shipped behaviour; the
   add-on tier after Phase 1 (PR #46's OM-unbind fix lands on its own now);
   diagnostics probes out of the default install, census kept in the core;
   today's keys and sections kept, each owned by a plugin. Section 10.
@@ -67,10 +68,11 @@ default first):
 |---|---|---|
 | Temporal | temporal AA (TAA/DLSS/FSR) with engine motion, camera jitter, screen/weapon/celestial/terrain motion; sharpening (RCAS); UI, smoke and hologram depth; the flat adapter | VF |
 | Interface | UI quality (layer, panel scale, hologram remaps) | V |
-| Cockpit visuals | sun glare, particle billboards and witchspace stars, RemLok lines, loading hologram, wake pulse, target indicator, night vision, black void | V |
+| Cockpit visuals | sun glare, particle billboards and witchspace stars, RemLok lines, loading hologram, wake pulse, target indicator, night vision | V |
 | Light | exposure share and damping | V |
 | Scanners | FSS eye sync (heal, reveal, panel, res), scanner body | V |
-| Screens | on-foot screen (resolution, distance, curvature), intro video, backdrop, loading dim, weapon stability | V |
+| Intro and loading | intro video, splash backdrop, loading dim | V |
+| On-foot panel | black void, screen resolution, panel distance, curvature, weapon stability | V |
 | Comfort | transition flash, Explorer Cam | V |
 | Performance | cull guard, FOV trim, OpenXR resolution, settlement detail, static props | V |
 | Always | F8 menu and FPS overlay, input gate, diagnostics (census, dumps, probes) | VF |
@@ -146,20 +148,20 @@ hotkeys and game bindings; the journal watch; the profile descriptor; frame
 ticks; the OpenXR runtime host on the VR side; the install manifest.
 
 Engine motion, camera jitter and the temporal backends serve only temporal
-AA, so they stay inside that plugin rather than becoming services. The UI
-layer's need for the temporal pass's frame state goes through a core-owned
-"frame treatment" record, never a direct call between plugins.
+AA, so they stay inside that plugin rather than becoming services. UI
+quality ships inside it too (Sean, 2026-09-30), so the UI layer's use of the
+temporal pass's frame state never crosses a plugin boundary.
 
 ## 4. The plugins
 
 | Plugin | Contents | Profiles | Needs | Default VR / flat |
 |---|---|---|---|---|
-| temporal-aa | TAA, DLSS, FSR, engine motion, camera jitter (VR frustum, flat camera path), screen, weapon, celestial and terrain motion, UI/smoke/hologram depth, sharpening, the flat adapter (stand-down, F8 warning) | VF | NGX DLL for DLSS | installed, mode off / installed |
-| interface-quality | UI layer, panel scale, hologram remaps | V | temporal-aa for the layer (panel scale runs without) | on / - |
-| cockpit-visuals | sun glare, particles and witchspace stars, RemLok, loading hologram, wake pulse, target indicator, night vision, black void | V | - | on / - |
+| temporal-aa | TAA, DLSS, FSR, engine motion, camera jitter (VR frustum, flat camera path), screen, weapon, celestial and terrain motion, UI/smoke/hologram depth, UI quality (the layer, panel scale, hologram remaps; VR), sharpening, the flat adapter (stand-down, F8 warning) | VF | NGX DLL for DLSS | installed, mode off, UI quality 100 / installed |
+| cockpit-visuals | sun glare, particles and witchspace stars, RemLok, loading hologram, wake pulse, target indicator, night vision | V | - | on / - |
 | exposure | exposure share and damping | V | - | on / - |
 | scanners | FSS eye sync family, scanner body | V | - | on / - |
-| screens | on-foot screen, intro video, backdrop, loading dim, weapon stability | V | temporal-aa for weapon stability's motion half (soft) | on / - |
+| intro | intro video, splash backdrop, loading dim | V | - | on / - |
+| on-foot-panel | black void, screen resolution, panel distance, curvature, weapon stability | V | temporal-aa for weapon stability's motion half (soft) | on / - |
 | comfort | transition flash, Explorer Cam | V | - | on / - |
 | performance | cull guard, FOV trim, OpenXR resolution, settlement detail, static props | V | - | installed, off / - |
 | diagnostics | probes, eye dumps, developer instruments | VF | - | off / off |
@@ -171,7 +173,10 @@ feature inside degrades and says so); the manifest records which.
 
 temporal-aa is one plugin on purpose: its parts share per-draw state, the
 camera and the history, and splitting them would put that state on a plugin
-boundary. It carries two adapters: the per-eye VR one, and the single-image
+boundary. UI quality ships only with it (Sean): the layer exists to keep the
+interface crisp under temporal AA and shares its frame state; its panel-size
+half keeps running with the AA mode off, as today. It carries two adapters:
+the per-eye VR one, and the single-image
 one that serves flat mode today and could serve the VR on-foot screen and the
 HDR route (docs\design-flat-temporal-aa-2026-09-23.md, section 81).
 
@@ -261,9 +266,9 @@ when ReShade was removed). The rules:
   rigs, and a census at the same spots showing EDVR's render-thread cost
   lower than today's (disabled features stop walking the ladder).
 - **Phase 2:** move the other groups one at a time, each with its rigs and
-  one flight: cockpit-visuals, exposure, scanners, screens, comfort,
-  performance, interface-quality, temporal-aa last. Each move adds a verdict
-  replay fixture for the features that have no rig today.
+  one flight: cockpit-visuals, exposure, scanners, intro, on-foot-panel,
+  comfort, performance, temporal-aa (with UI quality) last. Each move adds a
+  verdict replay fixture for the features that have no rig today.
 - **Phase 3:** installer component selection (profile-filtered, dependencies
   auto-selected, a recommended set), receipts that list plugins and
   versions, Modify without touching settings, F8 rows only for installed
@@ -279,7 +284,7 @@ when ReShade was removed). The rules:
 - **Coupled features split across plugins.** Kept together (temporal-aa);
   services where there is a real consumer.
 - **Combinations.** Per-plugin rigs plus a small supported matrix (temporal
-  on and off, interface-quality on and off, VR and flat) rather than every
+  on and off, UI quality off, 100 and 125, VR and flat) rather than every
   subset.
 - **The installer's modify and repair paths** grow; receipts already
   fingerprint every file.
@@ -301,7 +306,11 @@ when ReShade was removed). The rules:
 - **Q2 (decided 2026-09-30): the nine plugins of section 4.** temporal-aa
   stays one plugin: its parts share per-draw state, the camera and the
   history, and splitting them would put that traffic on a plugin boundary,
-  against the north star.
+  against the north star. Sean regrouped the same day: the intro fixes
+  (intro video, splash backdrop, loading dim) and the on-foot panel (black
+  void, screen resolution, panel distance, curvature, weapon stability)
+  become plugins of their own, replacing "screens", and UI quality ships
+  only with temporal AA, inside that plugin.
 - **Q3 (decided): defaults reproduce today's shipped behaviour exactly.**
   The recommended VR set is every plugin but diagnostics, with temporal-aa
   and performance installed and their features at today's defaults; flat
