@@ -26,6 +26,7 @@
 #include "flat_cpu_tests.h"
 #include "flat_witness_bound_tests.h"
 #include "flat_camera_table_tests.h"
+#include "flat_wrapper_note_tests.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -2349,9 +2350,9 @@ void testFlatWarningWiring() {
         {&menuCpp, "temporalModeEnabled(Config::get().requestedTemporalMode());", 1,
          "and only while a temporal mode is selected"},
         {&menuCpp, "if (runtimeFlatProfile() && s.flatWarnActive) {", 1, "the panel draws the warning only while it is active"},
-        {&menuCpp, "if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;", 1,
-         "the warning is note lines below the rows"},
-        {&menuCpp, "FlatWarnRuler ruler{c.capPx * 8 / 7};", 1, "wrapped with the panel's own ruler at the note face's em"},
+        {&menuCpp, "if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;", 2,
+         "the warning, and the wrapper note after it, are note lines below the rows"},
+        {&menuCpp, "FlatWarnRuler ruler{c.capPx * 8 / 7};", 2, "wrapped with the panel's own ruler at the note face's em (both)"},
         {&menuCpp, "flatWarningTick(now);", 1, "the flat tick runs the warning"},
         {&menuCpp, "s.flatSettingsForce = true;", 1, "Elite's files are looked at when the panel opens"},
         {&menuCpp, "s.flatSettings.setFolder(flatEliteGraphicsFolder());", 1, "from %LOCALAPPDATA%, resolved once"},
@@ -2758,6 +2759,63 @@ void testFlatSubstitutionWiring() {
     }
 }
 
+// The graphics-wrapper note's wiring (flat_wrapper_note.h holds the decision and the words, and the rig above them):
+// the hook-mode probe names the file and publishes it once, and the panel draws the note from that name only in the
+// flat profile, and logs the first time. A source scan with removal controls.
+void testFlatWrapperNoteWiring() {
+    auto slurp = [](const char* path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string proxyCpp = slurp("src/d3d11/d3d11_proxy.cpp");
+    const std::string menuCpp = slurp("src/d3d11/menu.cpp");
+    const std::string hookH = slurp("src/d3d11/device_hook.h");
+    check(!proxyCpp.empty() && !menuCpp.empty() && !hookH.empty(), "the proxy, panel and hook header sources are readable from the repo root");
+    auto count = [](const std::string& text, const std::string& needle) {
+        unsigned n = 0;
+        for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
+        return n;
+    };
+    struct Pin { const std::string* text; const char* needle; unsigned times; const char* what; };
+    const Pin pins[] = {
+        {&proxyCpp, "#include \"flat_wrapper_note.h\"", 1, "the probe takes the decision from its header"},
+        {&proxyCpp, "edvr::vtableDominantOtherModule(vt, kSample, g_systemModule, owner, sizeof(owner))", 1,
+         "the probe asks which module backs the methods, excluding Windows' d3d11.dll"},
+        {&proxyCpp, "flatWrapperFile(mode, probed, owner)", 1, "and lets the header decide from the mode it used and what it alone chose"},
+        {&proxyCpp, "g_wrapperFileSet.store(true, std::memory_order_release);", 1, "the name is published once, after it is written"},
+        {&proxyCpp, "const char* contextWrapperFile() {", 1, "and read back through one accessor"},
+        {&hookH, "const char* contextWrapperFile();", 1, "which the header declares"},
+        {&menuCpp, "#include \"flat_wrapper_note.h\"", 1, "the panel takes the words from the same header"},
+        {&menuCpp, "const char* wrapper = contextWrapperFile();", 1, "the panel reads the published name"},
+        {&menuCpp, "flatComposeWrapperNote(temporalModeEnabled(Config::get().requestedTemporalMode()), wrapper,", 1,
+         "and composes the note only for a selected temporal mode"},
+        {&menuCpp, "s.flatWrapperNoteLogged = true;", 1, "said once in the log"},
+        {&menuCpp, "flat wrapper note: shown in the panel", 1, "with its own line"},
+    };
+    for (const Pin& pin : pins) {
+        check(count(*pin.text, pin.needle) == pin.times, pin.what);
+        std::string without = *pin.text;
+        for (size_t at = without.find(pin.needle); at != std::string::npos; at = without.find(pin.needle))
+            without.erase(at, std::strlen(pin.needle));
+        check(count(without, pin.needle) == 0, "wrapper note wiring control: a source with the line removed no longer contains it");
+    }
+    // The probe publishes after it has decided and logged the mode, and the panel's block is flat-only.
+    const size_t decided = proxyCpp.find("hookModeName(mode), inSystem, kSample,");
+    const size_t named = proxyCpp.find("flatWrapperFile(mode, probed, owner)");
+    check(decided != std::string::npos && named != std::string::npos && decided < named,
+          "the probe names the wrapper after it has decided the mode");
+    // The name is written before the flag that says it is there: the panel reads it from another thread.
+    const size_t written = proxyCpp.find("std::memcpy(g_wrapperFile, file, std::strlen(file) + 1);");
+    const size_t flagged = proxyCpp.find("g_wrapperFileSet.store(true, std::memory_order_release);");
+    check(written != std::string::npos && flagged != std::string::npos && written < flagged,
+          "the probe writes the name before it publishes it");
+    const size_t block = menuCpp.find("The graphics-wrapper note (flat only");
+    const size_t flatOnly = block == std::string::npos ? std::string::npos : menuCpp.find("if (runtimeFlatProfile()) {", block);
+    const size_t reads = block == std::string::npos ? std::string::npos : menuCpp.find("contextWrapperFile()", block);
+    check(block != std::string::npos && flatOnly != std::string::npos && reads != std::string::npos && flatOnly < reads && reads - flatOnly < 200,
+          "the panel reads the wrapper's name only in the flat profile");
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
         return flatShaderClassifierSweep(argv[2]);
@@ -2818,6 +2876,8 @@ int main(int argc, char** argv) {
     failures += flatCameraTableTests();
     testFlatCameraTableWiring();
     testFlatSubstitutionWiring();
+    failures += flatWrapperNoteTests();
+    testFlatWrapperNoteWiring();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

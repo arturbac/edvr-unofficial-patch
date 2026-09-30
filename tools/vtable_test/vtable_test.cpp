@@ -379,11 +379,90 @@ static void observeFlipPublication(uint32_t index) {
 
 #include "shader_create_tests.h"
 
+// The flat F8 panel's graphics-wrapper note names the file that handles a context's methods (flat_wrapper_note.h): the
+// module, other than Windows' d3d11.dll and EDVR's own, that backs most of the table's entries. A table the way a
+// wrapper lays one -- most entries in its own module, a few elsewhere -- against real modules of this process.
+static void dominantOtherModuleCells() {
+    printf("the module that handles a context's methods\n");
+    const HMODULE user32 = LoadLibraryA("user32.dll");
+    const HMODULE kernelbase = GetModuleHandleA("kernelbase.dll");
+    void* const inUser = user32 ? reinterpret_cast<void*>(GetProcAddress(user32, "GetKeyState")) : nullptr;
+    void* const inBase = kernelbase ? reinterpret_cast<void*>(GetProcAddress(kernelbase, "GetCurrentProcessId")) : nullptr;
+    void* const inSelf = reinterpret_cast<void*>(&dominantOtherModuleCells);
+    check(inUser && inBase && inSelf, "the fixture: an entry in user32, one in kernelbase, one in this image",
+          "a module or an export was not there");
+    if (!inUser || !inBase || !inSelf) return;
+    // The expected names come from the addresses themselves (an export may be a forwarder into another image).
+    auto baseOf = [](void* p) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        VirtualQuery(p, &mbi, sizeof(mbi));
+        return static_cast<HMODULE>(mbi.AllocationBase);
+    };
+    auto leafOf = [](HMODULE m, char* out, size_t cap) {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(m, path, sizeof(path));
+        const char* leaf = path;
+        for (const char* c = path; *c; ++c) if (*c == '\\' || *c == '/') leaf = c + 1;
+        strncpy_s(out, cap, leaf, _TRUNCATE);
+    };
+    const HMODULE userImage = baseOf(inUser), baseImage = baseOf(inBase);
+    char userLeaf[64] = {}, baseLeaf[64] = {};
+    leafOf(userImage, userLeaf, sizeof(userLeaf));
+    leafOf(baseImage, baseLeaf, sizeof(baseLeaf));
+    check(userImage != baseImage && userLeaf[0] && baseLeaf[0], "the fixture's two entries are in two different images",
+          "user32 and kernelbase resolved into the same image");
+    if (userImage == baseImage) return;
+    void* table[96] = {};
+    auto fill = [&](size_t a, size_t b, size_t c) {   // a entries in user32, b in kernelbase, c in this image
+        size_t i = 0;
+        for (size_t k = 0; k < a && i < 96; ++k) table[i++] = inUser;
+        for (size_t k = 0; k < b && i < 96; ++k) table[i++] = inBase;
+        for (size_t k = 0; k < c && i < 96; ++k) table[i++] = inSelf;
+        while (i < 96) table[i++] = inSelf;
+    };
+    char name[64];
+    fill(60, 30, 6);
+    size_t hits = vtableDominantOtherModule(table, 96, nullptr, name, sizeof(name));
+    check(hits == 60 && _stricmp(name, userLeaf) == 0, "the module with the most entries is named, by file name alone",
+          "the dominant module was not user32.dll with 60 entries");
+    check(strchr(name, '\\') == nullptr && strchr(name, '/') == nullptr, "and the name carries no path",
+          "a path separator survived");
+    hits = vtableDominantOtherModule(table, 96, userImage, name, sizeof(name));
+    check(hits == 30 && _stricmp(name, baseLeaf) == 0, "an excluded module (Windows' d3d11.dll, in the shipped call) is not counted",
+          "excluding user32 did not leave kernelbase with its 30");
+    fill(0, 96, 0);
+    hits = vtableDominantOtherModule(table, 96, baseImage, name, sizeof(name));
+    check(hits == 0 && name[0] == '\0', "every entry in the excluded module: none, and an empty name",
+          "a name came back for a table wholly in the excluded module");
+    fill(0, 0, 96);
+    hits = vtableDominantOtherModule(table, 96, nullptr, name, sizeof(name));
+    check(hits == 0 && name[0] == '\0', "every entry in this image (EDVR's own hook): none",
+          "EDVR's own module was named as a wrapper");
+    void* generated = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (generated) {
+        fill(5, 0, 0);
+        for (size_t i = 5; i < 60; ++i) table[i] = static_cast<char*>(generated) + i;
+        hits = vtableDominantOtherModule(table, 96, nullptr, name, sizeof(name));
+        check(hits == 5 && _stricmp(name, userLeaf) == 0, "generated code is no module: 55 entries in a private page do not outvote 5 in user32",
+              "a private allocation was counted as a module");
+        VirtualFree(generated, 0, MEM_RELEASE);
+    }
+    strcpy_s(name, "unchanged");
+    check(vtableDominantOtherModule(nullptr, 96, nullptr, name, sizeof(name)) == 0 && name[0] == '\0' &&
+              vtableDominantOtherModule(table, 0, nullptr, name, sizeof(name)) == 0,
+          "no table, or no entries: none", "an empty question got an answer");
+    char tiny[4];
+    fill(96, 0, 0);
+    hits = vtableDominantOtherModule(table, 96, nullptr, tiny, sizeof(tiny));
+    check(hits == 96 && std::strlen(tiny) <= 3, "a name longer than the buffer is cut, not overrun", "the buffer was not respected");
+}
+
 int main() {
     shaderCreateFixture::run();
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     setvbuf(stdout, nullptr, _IONBF, 0);
     printf("edvr vtable / wrapper collision\n");
+    dominantOtherModuleCells();
 
     RealThing real;
     WrapThing wrapper(&real);

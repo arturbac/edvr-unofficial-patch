@@ -30,6 +30,7 @@
 #include "elite_binds.h"
 #include "flat_elite_settings.h"
 #include "flat_runtime.h"
+#include "flat_wrapper_note.h"
 #include "input_gate.h"
 #include "menu_flat_rows.h"
 #include "menu_keys.h"
@@ -182,6 +183,8 @@ struct State {
     bool        flatWarnActive = false;
     std::string flatWarnKey;
     int         flatWarnLogged = 0;
+    // The graphics-wrapper note (flat_wrapper_note.h): said once in the log when it is first drawn.
+    bool        flatWrapperNoteLogged = false;
     float alpha = 0.0f;
     uint64_t openedMs = 0;
     uint64_t lastInputMs = 0;
@@ -2128,6 +2131,29 @@ void buildContent(MenuContent& c) {
                 MenuLine& l = c.lines[c.lineCount++];
                 strncpy(l.left, warning.line[i], sizeof(l.left) - 1);
                 l.style = kMenuNote;
+            }
+        }
+        // The graphics-wrapper note (flat only, while a temporal mode is selected, and only when the hook-mode probe found
+        // a wrapper such as ReShade handling every graphics call): the words wrapped to the note face's width, after a
+        // blank line, and said once in the log the first time they are drawn.
+        if (runtimeFlatProfile()) {
+            const char* wrapper = contextWrapperFile();
+            FlatWarnRuler ruler{c.capPx * 8 / 7};
+            FlatSettingsWarning note;
+            flatComposeWrapperNote(temporalModeEnabled(Config::get().requestedTemporalMode()), wrapper,
+                                   c.cardPx - 2 * (c.capPx * 8 / 10), &flatWarnMeasure, &ruler, &note);
+            if (note.count > 0) {
+                if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;
+                for (int i = 0; i < note.count && c.lineCount < kMenuMaxLines; ++i) {
+                    MenuLine& l = c.lines[c.lineCount++];
+                    strncpy(l.left, note.line[i], sizeof(l.left) - 1);
+                    l.style = kMenuNote;
+                }
+                if (!s.flatWrapperNoteLogged) {
+                    s.flatWrapperNoteLogged = true;
+                    Log::get().note("flat wrapper note: shown in the panel (mode=%s): %s handles every graphics call, so every "
+                                    "call EDVR makes goes through it first.", flatModeLabel().c_str(), wrapper);
+                }
             }
         }
         if (c.lineCount == 0) {
