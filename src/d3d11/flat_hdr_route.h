@@ -22,6 +22,7 @@
 #pragma once
 #include "flat_runtime_model.h"
 #include "flat_mono_resolve.h"
+#include "flat_standdown.h"
 #include "hdr_backend_flags.h"
 #include <cstdio>
 #include <cstring>
@@ -29,9 +30,11 @@
 namespace edvr {
 
 // ---- the key --------------------------------------------------------------------------
-// experimental.temporal_aa_before_post: off (the copy route only; the trigger still runs, observing) or
-// auto (the HDR route where it applies). Sean's decision (a): off until it has flown, then the default
-// becomes auto. Anything that is not "auto" reads as off, so a typo never turns a flight key on.
+// experimental.temporal_aa_before_post: auto (the HDR route where it applies) or off (the copy route only; the
+// trigger still runs, observing). Sean's decision (a): off until it had flown, then the default becomes auto; it flew
+// on 2026-09-30 and the default is auto since (design section 81). A key that is absent reads as the default; a value
+// that is present and is not "auto" reads as off, so a typo leaves the copy route every frame had before the route
+// existed and never switches the route on by accident.
 enum class FlatHdrKey : uint8_t { Off, Auto };
 inline FlatHdrKey flatHdrKeyFromText(const char* text) {
     if (!text) return FlatHdrKey::Off;
@@ -242,10 +245,15 @@ inline FlatMonoFrame flatSelectHdrFrame(const FlatMonoFrameInput& in, const void
     if (!hdr) return refuse(FlatMonoReason::NoHdr);
     // The extent gate, before anything that could make the frame look broken for another reason: the route
     // resolves at E = R and needs R >= D (upscaling keeps the copy route and its whitelist, decision (c)).
-    // A target past twice the output or off the output's aspect is no scene extent either.
+    // A target past twice the output or off the output's aspect is no scene extent either. The refusal carries the
+    // measured sizes (H's and the output's): the F8 warning names supersampling below 1.0 from them, not from
+    // Elite's settings file.
     if (w < in.outputWidth || h < in.outputHeight || w > in.outputWidth * 2 || h > in.outputHeight * 2 ||
-        !flatUniformScale(w, h, in.outputWidth, in.outputHeight))
+        !flatUniformScale(w, h, in.outputWidth, in.outputHeight)) {
+        out.renderWidth = w; out.renderHeight = h;
+        out.outputWidth = in.outputWidth; out.outputHeight = in.outputHeight;
         return refuse(FlatMonoReason::HdrExtent);
+    }
     if (!hdrCameraDraws) return refuse(FlatMonoReason::NoHdrCamera);
     float camera[6][4];
     if (!cameraShape(hdrCamera->camera, camera)) return refuse(FlatMonoReason::InvalidCamera);
@@ -336,6 +344,49 @@ inline FlatMonoFrame flatSelectHdrRoute(FlatRuntimePrefix& p, const FlatHdrFrame
 inline bool flatHdrRouteEvaluatesAtRender(FlatMonoResolveMode mode, uint32_t rW, uint32_t rH, uint32_t dW, uint32_t dH) {
     const auto route = flatResolveRoute(mode, rW, rH, dW, dH);
     return !route.refused && route.evalWidth == rW && route.evalHeight == rH && rW >= dW && rH >= dH;
+}
+
+// What the route adds to a frame's stand-down verdict at its trigger (key auto; flat_standdown.h). That verdict is
+// about the SHAPE of the game's chain, so the route speaks only where it recognised the frame and will resolve it:
+// Treatable, whatever the copy stage makes of the bloom or tone variant. Every other answer adds nothing. A refusal
+// merged as itself would outrank the copy stage's structural one (the order is None < Structural < Transient <
+// Treatable), and the stand-down that stops an unrecognised chain from costing CPU, and the F8 warning that says why,
+// would never start: render below the output (R < D), where the copy route and its whitelist serve the frame and every
+// trigger says hdr-route-needs-render-at-least-output, and EDVR's TAA above D, which stays on the copy route, are
+// both that case. The key off merges nothing, so none of this reaches it.
+inline FlatFrameSeen flatHdrTriggerSeen(const FlatMonoFrame& selection, FlatMonoResolveMode mode) {
+    return selection.selected() && flatHdrRouteEvaluatesAtRender(mode, selection.renderWidth, selection.renderHeight,
+                                                                 selection.outputWidth, selection.outputHeight)
+        ? FlatFrameSeen::Treatable : FlatFrameSeen::None;
+}
+
+// ---- supersampling below 1.0 (the F8 warning's extra line) --------------------------------------------------
+// With the key auto, the route leaves a frame to the copy route for one reason a user can change: the game renders
+// below the output (R < D, Elite's supersampling under 1.0), and at 1.0 or above the route would resolve before
+// bloom and depth of field. Whether the warning says so: the key is auto, the route is not treating frames, and the
+// MEASURED render size (H's extent at the trigger) is below the output's (the swap chain's) on both axes. The sizes
+// are the route's own measurements, not Elite's settings file. The caller adds "frames are being refused".
+inline bool flatHdrSupersamplingAdvice(FlatHdrKey key, bool routeActive, uint32_t renderW, uint32_t renderH,
+                                       uint32_t outputW, uint32_t outputH) {
+    return key == FlatHdrKey::Auto && !routeActive && renderW && renderH && outputW && outputH &&
+           renderW < outputW && renderH < outputH;
+}
+// The four sizes in one 64-bit word, 16 bits each (a size past 65535 cannot be a screen), 0 meaning "not the case":
+// what the runtime publishes for the panel thread to read without a lock.
+inline uint64_t flatHdrPackSizes(uint32_t renderW, uint32_t renderH, uint32_t outputW, uint32_t outputH) {
+    if (!renderW || !renderH || !outputW || !outputH || renderW > 0xFFFFu || renderH > 0xFFFFu ||
+        outputW > 0xFFFFu || outputH > 0xFFFFu)
+        return 0;
+    return uint64_t(renderW) | uint64_t(renderH) << 16 | uint64_t(outputW) << 32 | uint64_t(outputH) << 48;
+}
+inline bool flatHdrUnpackSizes(uint64_t packed, uint32_t* renderW, uint32_t* renderH, uint32_t* outputW,
+                               uint32_t* outputH) {
+    if (!packed) return false;
+    if (renderW) *renderW = uint32_t(packed & 0xFFFFu);
+    if (renderH) *renderH = uint32_t(packed >> 16 & 0xFFFFu);
+    if (outputW) *outputW = uint32_t(packed >> 32 & 0xFFFFu);
+    if (outputH) *outputH = uint32_t(packed >> 48 & 0xFFFFu);
+    return true;
 }
 
 // ---- the latch -----------------------------------------------------------------------------------

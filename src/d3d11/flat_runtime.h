@@ -24,6 +24,13 @@ bool flatRuntimeStructuralRefusal(const char** reasonName, bool* standingDown);
 // published with the refusal state, so it is meaningful only while flatRuntimeStructuralRefusal is true. The F8
 // warning drops the Bloom and Depth of field advice while it holds.
 bool flatRuntimeHdrRouteActive();
+// Whether the route's key is auto and its last selection found the game rendering below the output on both axes
+// (Elite's supersampling under 1.0), so the route leaves the frames to the copy route: then true, with the measured
+// render and output sizes (the route's own, taken at its trigger, not Elite's settings file). False with the key off,
+// with a selection at R >= D and after a resize. Any thread. The F8 warning adds its supersampling line from it, and
+// only while frames are refused and the route is not treating them (flatWarningFlags).
+bool flatRuntimeHdrRouteBelowOutput(uint32_t* renderWidth, uint32_t* renderHeight, uint32_t* outputWidth,
+                                    uint32_t* outputHeight);
 // The upstream camera injector's read points into the phase machine: the
 // current phase in render pixels and the validated resolve plan's render
 // extent (w/h); applied is the machine's own applied count this frame.

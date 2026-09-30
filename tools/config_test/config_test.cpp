@@ -1160,6 +1160,39 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // The HDR route (design doc section 81, experimental.temporal_aa_before_post) is ON by default since it flew
+    // (2026-09-30): the shipped file says auto, and so must the code's fallback for an ini with no such line -- every
+    // install whose edvr.ini predates the key. The same pair of checks as ui_quality's above, because nothing else
+    // holds the two to one answer (check_config_contract.py compares names, not values).
+    expectStr("experimental.temporal_aa_before_post", "auto", "the shipped edvr.ini ships the HDR route on (auto)");
+    {
+        const std::string shippedRoute = Config::get().getString("experimental.temporal_aa_before_post", "<unset>");
+        const std::string runtimeSource = readRepoFile(dir, L"src\\d3d11\\flat_runtime.cpp");
+        if (runtimeSource.empty()) {
+            fail("flat_runtime.cpp is readable from the repo root", "could not read it");
+        } else {
+            const std::string fallback = codeFallbackOf(runtimeSource, "experimental.temporal_aa_before_post");
+            if (fallback == shippedRoute) {
+                ok("the code's fallback for experimental.temporal_aa_before_post is the shipped default");
+            } else {
+                fail("the code's fallback for experimental.temporal_aa_before_post is the shipped default",
+                     "flat_runtime.cpp falls back to \"" + fallback + "\", the ini ships \"" + shippedRoute + "\"");
+            }
+            // CONTROL: the same source with the fallback put back to off (what it was until the route flew).
+            std::string reverted = runtimeSource;
+            const std::string from = "getString(\"experimental.temporal_aa_before_post\", \"" + fallback + "\")";
+            const size_t at = reverted.find(from);
+            if (at != std::string::npos)
+                reverted.replace(at, from.size(), "getString(\"experimental.temporal_aa_before_post\", \"off\")");
+            if (at != std::string::npos && codeFallbackOf(reverted, "experimental.temporal_aa_before_post") != shippedRoute) {
+                ok("control: the HDR route's fallback put back to off is caught");
+            } else {
+                fail("control: the HDR route's fallback put back to off is caught",
+                     at == std::string::npos ? "the call was not found to alter"
+                                             : "the reverted source still matched the ini");
+            }
+        }
+    }
 
     // The Explorer Cam block, under a SECOND [fix] and a second [hotkey].
     // This is the claim that a repeated section header is not a parse error
@@ -1605,6 +1638,12 @@ int main(int argc, char** argv) {
             if (Config::get().getString("experimental.temporal_aa_jitter", "on") == "on")
                 ok("flat jitter uses on default when absent");
             else fail("flat jitter default", "missing key was not on");
+            // The HDR route's key is read the same way with an auto default. A flat profile that did not permit it
+            // would turn that default into off, and an ini with no line (every install that predates the key) would
+            // run the copy route with nothing to say the route was never asked.
+            if (Config::get().getString("experimental.temporal_aa_before_post", "auto") == "auto")
+                ok("flat HDR route uses the auto default when the key is absent");
+            else fail("flat HDR route default", "missing key was not auto");
         }
     }
     Config::get().set("experimental.temporal_aa_jitter", "on");
@@ -1615,13 +1654,13 @@ int main(int argc, char** argv) {
     if (Config::get().getString("experimental.temporal_aa_jitter", "on") == "off")
         ok("flat jitter preserves explicit off");
     else fail("flat jitter override", "explicit off was not read");
-    // The HDR route's flight key (design doc section 81): the flat runtime reads it through getString with an "off"
-    // default. Unlisted in runtimeProfileAllowsKey it would read off here whatever the file says -- a flight that
-    // set auto would run the copy route with nothing in the log to say the key was refused.
+    // The HDR route's key (design doc section 81): the flat runtime reads it through getString with an "auto" default.
+    // Unlisted in runtimeProfileAllowsKey it would read off here whatever the file says -- a user who set auto, or
+    // left the default, would run the copy route with nothing in the log to say the key was refused.
     Config::get().set("experimental.temporal_aa_before_post", "auto");
-    expectStr("experimental.temporal_aa_before_post", "auto", "flat scope permits the HDR route's flight key");
+    expectStr("experimental.temporal_aa_before_post", "auto", "flat scope permits the HDR route's key");
     Config::get().set("experimental.temporal_aa_before_post", "off");
-    expectStr("experimental.temporal_aa_before_post", "off", "flat scope reads the HDR route's flight key off");
+    expectStr("experimental.temporal_aa_before_post", "off", "flat scope reads the HDR route's key off");
     Config::get().set("fix.temporal_aa", "dlss");
     Config::get().set("fix.black_void", "on");
     Config::get().set("fix.head_offset_forward", "12");

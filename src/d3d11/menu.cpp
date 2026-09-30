@@ -182,6 +182,9 @@ struct State {
     bool        flatSettingsForce = false;
     bool        flatWarnActive = false;
     std::string flatWarnKey;
+    // The conditions the words were built from (route treating, supersampling below 1.0): set with the key, which
+    // carries both, so the panel and the log say what the key says.
+    FlatWarningFlags flatWarnFlags;
     int         flatWarnLogged = 0;
     // The graphics-wrapper note (flat_wrapper_note.h): said once in the log when it is first drawn.
     bool        flatWrapperNoteLogged = false;
@@ -990,6 +993,11 @@ std::string displayValue(const MenuRowDef& d, const std::string& v) {
 
 constexpr int kFlatWarnLogMax = 24;
 
+// The flat page is the rows of menu_flat_rows.h and nothing else; a blank line and a full warning make up the rest of
+// the card. (The wrapper note, when there is one, takes what is left.)
+static_assert(static_cast<int>(kFlatPageRowCount) + 1 + FlatSettingsWarning::kMaxLines <= kMenuMaxLines,
+              "the flat page's rows, a blank line and a full settings warning fit the card's lines");
+
 // The selected mode as the panel names it on its Anti-aliasing row.
 std::string flatModeLabel() {
     const std::string value = Config::get().requestedTemporalMode();
@@ -1025,26 +1033,32 @@ void flatWarningTick(uint64_t now) {
         }
     }
     const std::string label = refusing ? flatModeLabel() : std::string();
-    // Whether the HDR route is what treats this session's frames (flat_hdr_route.h): its refusal is not about bloom or
-    // depth of field, so those are not named.
-    const bool hdrRoute = refusing && flatRuntimeHdrRouteActive();
-    const std::string key = refusing ? flatSettingsWarningKey(label.c_str(), s.flatSettings.settings(), hdrRoute)
+    // Which of the warning's conditions hold (flat_elite_settings.h, flatWarningFlags). The HDR route treating this
+    // session's frames means the refusal is not about bloom or depth of field, so those are not named. The game
+    // rendering below the output with the route's key auto adds the supersampling paragraph; both come from the runtime's
+    // own measurements (the render and output sizes it saw at its trigger), never from Elite's settings file.
+    uint32_t renderW = 0, renderH = 0, outputW = 0, outputH = 0;
+    const bool belowOutput = refusing && flatRuntimeHdrRouteBelowOutput(&renderW, &renderH, &outputW, &outputH);
+    const FlatWarningFlags flags = flatWarningFlags(refusing, refusing && flatRuntimeHdrRouteActive(), belowOutput);
+    const std::string key = refusing ? flatSettingsWarningKey(label.c_str(), s.flatSettings.settings(), flags.hdrRoute,
+                                                              flags.supersamplingBelowOne)
                                      : std::string();
     if (refusing == s.flatWarnActive && key == s.flatWarnKey) return;
     const bool was = s.flatWarnActive;
     s.flatWarnActive = refusing;
     s.flatWarnKey = key;
+    s.flatWarnFlags = flags;
     s.contentDirty = true;
     if (s.flatWarnLogged >= kFlatWarnLogMax) return;
     ++s.flatWarnLogged;
     if (refusing) {
         FlatSettingsWarning w;
-        flatComposeSettingsWarning(label.c_str(), s.flatSettings.settings(), 0, nullptr, nullptr, &w, hdrRoute);
-        Log::get().note("flat settings warning: %s (mode=%s, frames refused for %s%s%s): %s%s%s",
-                        was ? "changed" : "shown", label.c_str(), reason,
-                        standing ? ", work stood down" : "", hdrRoute ? ", HDR route active" : "",
-                        w.count > 0 ? w.line[0] : "",
-                        w.count > 1 ? " " : "", w.count > 1 ? w.line[1] : "");
+        flatComposeSettingsWarning(label.c_str(), s.flatSettings.settings(), 0, nullptr, nullptr, &w, flags.hdrRoute,
+                                   flags.supersamplingBelowOne);
+        char line[900];
+        flatFormatSettingsWarningLog(line, sizeof(line), was, label.c_str(), reason, standing, flags, renderW, renderH,
+                                     outputW, outputH, w);
+        Log::get().note("%s", line);
     } else {
         Log::get().note("flat settings warning: hidden (the work is not stood down for the shape of "
                         "a post chain now, or the mode is off)");
@@ -2129,7 +2143,8 @@ void buildContent(MenuContent& c) {
             const int width = c.cardPx - 2 * (c.capPx * 8 / 10);
             FlatSettingsWarning warning;
             flatComposeSettingsWarning(flatModeLabel().c_str(), s.flatSettings.settings(), width,
-                                       &flatWarnMeasure, &ruler, &warning, flatRuntimeHdrRouteActive());
+                                       &flatWarnMeasure, &ruler, &warning, s.flatWarnFlags.hdrRoute,
+                                       s.flatWarnFlags.supersamplingBelowOne);
             if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;
             for (int i = 0; i < warning.count && c.lineCount < kMenuMaxLines; ++i) {
                 MenuLine& l = c.lines[c.lineCount++];
