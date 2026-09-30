@@ -259,22 +259,163 @@ inline int flatStandDownTests() {
                "the still-stood-down line is due every 30 s while stood down");
     }
 
-    // ---- the F8 warning gate: stood down, or a run longer than a loading blink -------
+    // ---- the F8 warning gate: tied to the stand-down, for a reason that found an output copy -----
+    // Flight 052916 (2026-09-30) showed two faults in the first version, which warned after a 2 s
+    // structural run or at any stand-down: the warning on a startup that had no final copy at all
+    // (no-known-output-copy: nothing to turn off in Elite), and a warning that came and went in half
+    // a second across a transition (shown 05:30:09.904, hidden 05:30:10.378). The gate is now the
+    // stand-down itself, so a run that never stands down shows nothing, and the reason must be one
+    // that found a recognised output copy.
     {
-        Sim sim;
-        expect(!sim.machine.warningActive(sim.now), "no warning before any refusal");
-        sim.frame(FlatFrameSeen::Structural);
-        const uint64_t runStart = sim.now;
-        while (sim.now - runStart < kFlatStandDownWarnMs - 40) sim.frame(FlatFrameSeen::Structural);
-        expect(!sim.machine.warningActive(sim.now), "a structural run under 2 s does not warn");
-        while (sim.now - runStart < kFlatStandDownWarnMs + 20) sim.frame(FlatFrameSeen::Structural);
-        expect(sim.machine.warningActive(sim.now) && !sim.machine.standing, "a run of 2 s warns before the stand-down");
-        sim.frame(FlatFrameSeen::Treatable, FlatMonoReason::Selected);
-        expect(!sim.machine.warningActive(sim.now), "a treatable frame ends the warning");
-        while (!sim.machine.standing) sim.frame(FlatFrameSeen::Structural);
-        expect(sim.machine.warningActive(sim.now), "stood down always warns");
-        while (sim.frame(FlatFrameSeen::Treatable, FlatMonoReason::Selected) != FlatStandDownEvent::Resumed) {}
-        expect(!sim.machine.warningActive(sim.now), "resumed: the warning ends");
+        const FlatMonoReason all[] = {
+            FlatMonoReason::Selected, FlatMonoReason::InvalidInput, FlatMonoReason::UnknownOutput,
+            FlatMonoReason::Truncated, FlatMonoReason::ForeignWork, FlatMonoReason::NoOutputCopy,
+            FlatMonoReason::AmbiguousOutputCopy, FlatMonoReason::InvalidOutputCopy,
+            FlatMonoReason::NoTonePass, FlatMonoReason::AmbiguousTonePass, FlatMonoReason::InvalidTonePass,
+            FlatMonoReason::BrokenLineage, FlatMonoReason::WrongOrder, FlatMonoReason::MissingCamera,
+            FlatMonoReason::InvalidCamera, FlatMonoReason::NoHdr, FlatMonoReason::ConflictingHdr,
+            FlatMonoReason::NoHdrCamera, FlatMonoReason::NoSupportedSource, FlatMonoReason::AmbiguousSource,
+            FlatMonoReason::InvalidSource};
+        bool table = true;
+        unsigned warns = 0;
+        for (FlatMonoReason r : all) {
+            const bool want = r == FlatMonoReason::AmbiguousOutputCopy || r == FlatMonoReason::InvalidOutputCopy ||
+                r == FlatMonoReason::NoTonePass || r == FlatMonoReason::AmbiguousTonePass ||
+                r == FlatMonoReason::InvalidTonePass || r == FlatMonoReason::BrokenLineage ||
+                r == FlatMonoReason::WrongOrder;
+            if (flatMonoReasonWarrantsWarning(r) != want) table = false;
+            warns += flatMonoReasonWarrantsWarning(r) ? 1u : 0u;
+        }
+        expect(table && warns == 7 && !flatMonoReasonWarrantsWarning(FlatMonoReason::NoOutputCopy) &&
+               flatMonoReasonStructural(FlatMonoReason::NoOutputCopy),
+               "seven reasons warn: every chain-shape refusal that found an output copy; no-known-output-copy is "
+               "structural (the work stands down for it) and never warns");
+
+        // A stand-down for no final copy at all never warns: not before it, not at it, not through its probes.
+        for (int variant = 0; variant < 2; ++variant) {
+            Sim sim;
+            bool warned = sim.machine.warningActive();
+            const auto show = [&] {
+                return variant == 0 ? sim.frame(FlatFrameSeen::None)
+                                    : sim.frame(FlatFrameSeen::Structural, FlatMonoReason::NoOutputCopy);
+            };
+            FlatStandDownEvent event = FlatStandDownEvent::None;
+            while (event != FlatStandDownEvent::Entered) { event = show(); warned = warned || sim.machine.warningActive(); }
+            expect(sim.machine.standing && sim.machine.reason() == FlatMonoReason::NoOutputCopy &&
+                   sim.machine.enteredReason == FlatMonoReason::NoOutputCopy,
+                   variant == 0 ? "frames that reached no final copy stand the work down, for no-known-output-copy"
+                                : "frames the selector calls no-known-output-copy stand the work down for it");
+            for (int i = 0; i < 700; ++i) { show(); warned = warned || sim.machine.warningActive(); }   // 11 s: seven probes
+            expect(!warned && sim.machine.standing && sim.machine.probes >= 6,
+                   "a stand-down for no final copy never warns: not before it, not at it, not through its probes");
+        }
+
+        // A stand-down for a chain that found its copy warns from the stand-down, and only from it.
+        {
+            Sim sim;
+            bool before = sim.machine.warningActive();
+            FlatStandDownEvent event = FlatStandDownEvent::None;
+            while (event != FlatStandDownEvent::Entered) {
+                event = sim.frame(FlatFrameSeen::Structural, FlatMonoReason::NoTonePass);
+                if (event != FlatStandDownEvent::Entered) before = before || sim.machine.warningActive();
+            }
+            expect(!before, "no warning before the stand-down: five seconds of refusal is what makes it news");
+            expect(sim.machine.standing && sim.machine.warningActive() &&
+                   sim.machine.reason() == FlatMonoReason::NoTonePass,
+                   "a stand-down for no-known-tone-pass warns at the moment it stands down");
+            bool always = true;
+            for (int i = 0; i < 700; ++i) {
+                sim.frame(FlatFrameSeen::Structural, FlatMonoReason::NoTonePass);
+                always = always && sim.machine.warningActive();
+            }
+            expect(always && sim.machine.probes >= 6, "and keeps warning through its paused frames and its refused probes");
+        }
+
+        // Every chain-shape reason: the stand-down warns exactly for the ones that found a copy.
+        {
+            bool agrees = true;
+            unsigned stoodDown = 0;
+            for (FlatMonoReason r : all) {
+                if (!flatMonoReasonStructural(r)) continue;
+                Sim sim;
+                while (sim.frame(FlatFrameSeen::Structural, r) != FlatStandDownEvent::Entered) {}
+                ++stoodDown;
+                agrees = agrees && sim.machine.warningActive() == flatMonoReasonWarrantsWarning(r);
+            }
+            expect(agrees && stoodDown == 8, "all eight structural reasons stand the work down; the warning follows the seven");
+        }
+
+        // A run that never stands down shows nothing, whatever its length under five seconds: the
+        // flicker of flight 052916 (a 2 s run, shown for half a second) cannot happen.
+        {
+            bool warned = false, entered = false;
+            for (const uint64_t runMs : {500u, 2100u, 3000u, 4900u}) {
+                Sim sim;
+                const uint64_t start = sim.now;
+                while (sim.now - start < runMs) {
+                    entered = entered || sim.frame(FlatFrameSeen::Structural, FlatMonoReason::NoTonePass) == FlatStandDownEvent::Entered;
+                    warned = warned || sim.machine.warningActive();
+                }
+                sim.frame(FlatFrameSeen::Treatable, FlatMonoReason::Selected);
+                warned = warned || sim.machine.warningActive();
+                entered = entered || sim.machine.standing;
+            }
+            expect(!warned && !entered, "a structural run of 0.5, 2.1, 3 or 4.9 s never stands down and never warns");
+            // ...and a session that keeps having such runs, forever, shows nothing either.
+            Sim sim;
+            bool anyWarn = false;
+            for (int cycle = 0; cycle < 12; ++cycle) {
+                const uint64_t start = sim.now;
+                while (sim.now - start < 3000) { sim.frame(FlatFrameSeen::Structural, FlatMonoReason::NoTonePass); anyWarn = anyWarn || sim.machine.warningActive(); }
+                sim.frame(FlatFrameSeen::Treatable, FlatMonoReason::Selected);
+                anyWarn = anyWarn || sim.machine.warningActive();
+            }
+            expect(!anyWarn && sim.machine.entries == 0, "repeated three-second refusals between treated frames never warn");
+        }
+
+        // It ends with the resume and with a wake.
+        {
+            Sim sim;
+            while (sim.frame(FlatFrameSeen::Structural, FlatMonoReason::NoTonePass) != FlatStandDownEvent::Entered) {}
+            expect(sim.machine.warningActive(), "(a stand-down for no-known-tone-pass warns)");
+            while (sim.frame(FlatFrameSeen::Treatable, FlatMonoReason::Selected) != FlatStandDownEvent::Resumed) {}
+            expect(!sim.machine.warningActive() && !sim.machine.standing, "the resume ends the warning");
+            while (sim.frame(FlatFrameSeen::Structural, FlatMonoReason::NoTonePass) != FlatStandDownEvent::Entered) {}
+            expect(sim.machine.warningActive(), "(and again on the next stand-down)");
+            expect(sim.machine.wake(sim.now) && !sim.machine.warningActive(), "a wake ends it too");
+        }
+
+        // It follows what the stand-down finds now. A startup stand-down for no final copy stays silent
+        // until the game reaches a scene whose copy is found and whose chain is refused; a loading screen
+        // after that takes it away again; a chain the selector now recognises (a transient refusal, not a
+        // shape) does too, and the stand-down itself stays until a probe is treatable.
+        {
+            Sim sim;
+            while (sim.frame(FlatFrameSeen::Structural, FlatMonoReason::NoOutputCopy) != FlatStandDownEvent::Entered) {}
+            expect(!sim.machine.warningActive(), "(startup: stood down for no final copy, silent)");
+            // Run frames of the given verdict until the warning changes; the time it took, or ~0 if it never did.
+            const auto untilWarnIs = [&](bool want, FlatMonoReason reason) {
+                const uint64_t from = sim.now;
+                while (sim.machine.warningActive() != want && sim.now - from < 4000)
+                    sim.frame(FlatFrameSeen::Structural, reason);
+                return sim.machine.warningActive() == want ? sim.now - from : ~uint64_t(0);
+            };
+            uint64_t took = untilWarnIs(true, FlatMonoReason::NoTonePass);
+            expect(took <= kFlatStandDownProbeMs + 48 && sim.machine.standing && sim.machine.reason() == FlatMonoReason::NoTonePass,
+                   "the scene arrives (copy found, chain refused): the warning shows at the next probe, within 1.5 s");
+            took = untilWarnIs(false, FlatMonoReason::NoOutputCopy);
+            expect(took <= kFlatStandDownProbeMs + 48 && sim.machine.standing && sim.machine.reason() == FlatMonoReason::NoOutputCopy,
+                   "a loading screen (no final copy again): the warning goes at the next probe, the stand-down stays");
+            took = untilWarnIs(true, FlatMonoReason::InvalidTonePass);
+            expect(took <= kFlatStandDownProbeMs + 48 && sim.machine.reason() == FlatMonoReason::InvalidTonePass,
+                   "and returns with the next scene, naming the reason the probe found");
+            // A probe that finds the chain recognised but not yet treatable (a transient reason).
+            const uint64_t from = sim.now;
+            while (sim.machine.warningActive() && sim.now - from < 4000)
+                sim.frame(FlatFrameSeen::Transient, FlatMonoReason::MissingCamera);
+            expect(!sim.machine.warningActive() && sim.machine.standing && sim.machine.reason() == FlatMonoReason::MissingCamera,
+                   "a probe that finds the chain recognised (transient refusal) takes the warning away; the stand-down stays");
+        }
     }
 
     // ---- the log lines ------------------------------------------------------------

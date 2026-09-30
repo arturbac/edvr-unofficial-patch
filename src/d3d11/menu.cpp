@@ -977,8 +977,10 @@ std::string displayValue(const MenuRowDef& d, const std::string& v) {
 
 // ---------------------------------------------------------------------------
 // The flat panel's settings warning (flat_elite_settings.h). Shown only while a
-// temporal mode is selected and the runtime refuses frames for the shape of the
-// post chain (flatRuntimeStructuralRefusal): a treated session sees nothing.
+// temporal mode is selected and the runtime has stood its work down for the shape
+// of a post chain whose output copy it found (flatRuntimeStructuralRefusal, which
+// follows the stand-down and nothing else): a treated session, a session that is
+// merely starting, and a loading screen see nothing.
 
 constexpr int kFlatWarnLogMax = 24;
 
@@ -1034,8 +1036,8 @@ void flatWarningTick(uint64_t now) {
                         standing ? ", work stood down" : "", w.count > 0 ? w.line[0] : "",
                         w.count > 1 ? " " : "", w.count > 1 ? w.line[1] : "");
     } else {
-        Log::get().note("flat settings warning: hidden (frames are not refused for the shape of "
-                        "the post chain now, or the mode is off)");
+        Log::get().note("flat settings warning: hidden (the work is not stood down for the shape of "
+                        "a post chain now, or the mode is off)");
     }
     if (s.flatWarnLogged == kFlatWarnLogMax)
         Log::get().note("flat settings warning: further changes are not logged this session");

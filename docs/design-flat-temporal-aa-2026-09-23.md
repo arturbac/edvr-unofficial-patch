@@ -49,7 +49,7 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-80):** two rc.4 users refused every frame (AA, bloom, DoF);
-  a third treated at 7-13 fps. 80 built, unflown: stand-down, F8 why, CPU census.
+  a third treated at 7-13 fps. 80 flown 09-30: stand-down, F8 why, CPU census.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -4744,9 +4744,10 @@ selector is not relaxed.
 ## 80. Refused frames stand down, F8 says why, a flat CPU census (2026-09-29)
 
 Branch `claude/flat-refusal-warning`, cut from main `0ab66bd9`. Built and
-rig-tested, NOT FLOWN. Five code commits: the stand-down `6a033956`, the F8
-warning `a3efa164`, the census `bc382f63`, engine motion's timing line
-`734264cd`, the bounded camera witness `2f87d15d`.
+rig-tested; flown once on Epic 2026-09-30 (readout in the note at the end).
+Five code commits: the stand-down `6a033956`, the F8 warning `a3efa164`, the
+census `bc382f63`, engine motion's timing line `734264cd`, the bounded camera
+witness `2f87d15d`.
 
 **Third field record (user 3).** rc.4, flat, 1920x1080 exclusive
 fullscreen, 60 fps cap, no chained mod, game AA, bloom and DoF all off.
@@ -4791,10 +4792,12 @@ selected; all work restarts` (or `ended ...: <cause>` for a wake), and a
 never stood down.
 
 **F8 warning** (`flat_elite_settings.h`, `menu.cpp`). Shown only while a
-temporal mode is selected AND the runtime reports a structural refusal
-(stood down, or an unbroken structural run of 2 s: a loading screen's blink
-says nothing); treated frames and transient refusals show nothing, so a
-settings-only rule cannot fire on a combination that works. The words, as
+temporal mode is selected AND the work is stood down for a chain-shape
+refusal that found an output copy (as first built it also warned after a 2 s
+structural run and for no-known-output-copy; both faults are fixed, see the
+2026-09-30 note); treated frames, transient refusals and any refusal shorter
+than the 5 s stand-down trigger show nothing, so a settings-only rule cannot
+fire on a combination that works. The words, as
 note lines under the rows, wrapped to the card: `<mode> is not active:
 Elite's post-processing is not recognised.` Then, from Elite's own files
 under `%LOCALAPPDATA%\Frontier Developments\Elite Dangerous\Options\
@@ -4876,3 +4879,18 @@ context; the census needs the owner thread's Present. Fixed sizes: 64
 thread slots for the census (later threads share one, approximate), 2048
 samples per window for the percentiles, four whole-frame and two resolver
 GPU timers, the witness's 16 site slots.
+
+**2026-09-30 note: flight 052916 (Epic, build `ce6d511a`, about 1,000 draws a
+frame).** Stand-down: startup entered for no-known-output-copy and resumed
+after 27.2 s (18 probes); Elite AA on (`AAMode=4`) entered for no-known-tone-
+pass with the right F8 text and resumed 13.5 s after AA went off. The witness
+stopped after 33 walks. DLSS treated: EDVR 0.89 ms a frame (the clocks cost
+0.40 ms, 0.19 ms of it in the total); largest part the draw wrapper, 0.21 ms,
+3,228 D3D calls a frame over 254 substituted draws. GPU frame p50 2.13 ms (the
+DLSS resolve 0.40 ms), present p50 2.15 ms: GPU-bound. Stood down: EDVR 0.009
+ms, present 1.21 ms. So on Sean's CPU the per-draw work is small, and user 3's
+~60 ms a frame is not this work on a slower CPU (he alone runs exclusive
+fullscreen at a 60 fps cap with RTSS). Two F8 faults, fixed on
+`claude/flat-warning-fix`, unflown: it warned for no-known-output-copy at startup
+(05:29:20) and flickered (shown 05:30:09.904, hidden 05:30:10.378, after a 2 s
+run); it now follows the stand-down and never warns for no-known-output-copy.

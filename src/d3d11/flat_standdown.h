@@ -42,7 +42,6 @@ namespace edvr {
 constexpr uint64_t kFlatStandDownTriggerMs = 5000;   // structural refusal, unbroken, before the work stands down
 constexpr uint64_t kFlatStandDownProbeMs = 1500;     // one whole frame watched this often while stood down
 constexpr uint64_t kFlatStandDownReportMs = 30000;   // the "still stood down" line
-constexpr uint64_t kFlatStandDownWarnMs = 2000;      // the F8 warning waits this long: a loading screen is not news
 
 // The chain-shape refusals: what the selector says when the frame's post chain is
 // not the one it recognises. These do not clear by themselves inside a scene: only
@@ -64,6 +63,16 @@ inline bool flatMonoReasonStructural(FlatMonoReason reason) {
     default:
         return false;
     }
+}
+
+// The chain-shape refusals that WARN (the F8 panel's settings warning): a recognised output copy
+// was found and what feeds it is not a chain the selector knows -- no, ambiguous or invalid tone
+// pass, broken lineage, wrong order, and a copy that was found but is not unique or not valid.
+// Not NoOutputCopy: a frame with no final copy at all is a startup or loading frame, there is
+// nothing in Elite's settings to turn off, and the flight of 2026-09-30 (flight 052916) showed
+// the warning on every such start. It is still structural: the work stands down for it, silently.
+inline bool flatMonoReasonWarrantsWarning(FlatMonoReason reason) {
+    return flatMonoReasonStructural(reason) && reason != FlatMonoReason::NoOutputCopy;
 }
 
 // What the runtime does in the frame that starts now.
@@ -116,6 +125,10 @@ struct FlatStandDown {
     FlatMonoReason enteredReason = FlatMonoReason::NoTonePass;
     FlatMonoReason probeReason = FlatMonoReason::NoTonePass;
     FlatFrameSeen probeSeen = FlatFrameSeen::None;
+    // What the stand-down currently finds: the reason that entered it, then each probe frame's
+    // own. The F8 warning follows it (a stand-down that began at startup for no final copy must
+    // still warn once the game reaches a scene whose copy is found and whose chain is refused).
+    FlatMonoReason standReason = FlatMonoReason::NoTonePass;
     // Session totals for the census line.
     uint64_t entries = 0, resumes = 0, totalStoodDownMs = 0;
     // What the last resume or wake reported (for its line).
@@ -146,6 +159,7 @@ struct FlatStandDown {
             ++probes;
             probeSeen = seen;
             probeReason = reason;
+            standReason = reason;
             if (seen == FlatFrameSeen::Treatable) return resume(nowMs);
             nextProbeMs = nowMs + kFlatStandDownProbeMs;
             return FlatStandDownEvent::None;
@@ -198,20 +212,18 @@ struct FlatStandDown {
         return true;
     }
 
-    // The reason the current refusal names: the run's while active, the one that
-    // started the stand-down while stood down.
-    FlatMonoReason reason() const { return standing ? enteredReason : runReason; }
+    // The reason the current refusal names: the run's while active, the stand-down's latest
+    // finding while stood down.
+    FlatMonoReason reason() const { return standing ? standReason : runReason; }
 
-    // The F8 warning's gate: a structural refusal in force -- stood down, or a run
-    // long enough to be more than a loading screen. The caller has already checked
-    // that a temporal mode is selected.
-    bool warningActive(uint64_t nowMs) const {
-        if (standing) return true;
-        return runSinceMs && nowMs > runSinceMs && nowMs - runSinceMs >= kFlatStandDownWarnMs;
-    }
-
-    // How long the current structural run has lasted, ms (0 when none).
-    uint64_t runMs(uint64_t nowMs) const { return runSinceMs && nowMs > runSinceMs ? nowMs - runSinceMs : 0; }
+    // The F8 warning's gate, tied to the stand-down and to nothing else: on while the work is stood
+    // down for a chain-shape reason that found an output copy (flatMonoReasonWarrantsWarning); off
+    // with the resume and the wake, and off while the latest probe finds no final copy at all (a
+    // loading screen) or a chain that is no longer refused for its shape. It has no timer of its
+    // own: the stand-down's five seconds of unbroken refusal are what keep a transition's blink from
+    // ever showing it, and a probe every 1.5 s is the most often it can change. The caller has
+    // already checked that a temporal mode is selected.
+    bool warningActive() const { return standing && flatMonoReasonWarrantsWarning(standReason); }
 
 private:
     FlatStandDownEvent enter(uint64_t nowMs) {
@@ -223,6 +235,7 @@ private:
         enteredAfterMs = nowMs - runSinceMs;
         enteredAfterFrames = runFrames;
         enteredReason = runReason;
+        standReason = runReason;
         probes = 0;
         pausedFrames = 0;
         probeSeen = FlatFrameSeen::None;

@@ -2322,9 +2322,9 @@ void testStandDownWiring() {
 }
 
 // The F8 panel's settings warning in the panel and the runtime: shown only while the runtime says
-// frames are refused for the shape of the post chain, Elite's files read when the panel opens, and
-// the installer's log bundler sharing the folder's spelling. A source scan, the way the stand-down
-// pins are, with the same removal controls.
+// the work is stood down for the shape of a post chain whose output copy it found, Elite's files
+// read when the panel opens, and the installer's log bundler sharing the folder's spelling. A
+// source scan, the way the stand-down pins are, with the same removal controls.
 void testFlatWarningWiring() {
     auto slurp = [](const char* path) {
         std::ifstream in(path, std::ios::binary);
@@ -2333,8 +2333,9 @@ void testFlatWarningWiring() {
     const std::string menuCpp = slurp("src/d3d11/menu.cpp");
     const std::string runtimeCpp = slurp("src/d3d11/flat_runtime.cpp");
     const std::string bundleCpp = slurp("src/installer/logbundle.cpp");
-    check(!menuCpp.empty() && !runtimeCpp.empty() && !bundleCpp.empty(),
-          "the menu, runtime and log bundler sources are readable from the repo root");
+    const std::string standdownH = slurp("src/d3d11/flat_standdown.h");
+    check(!menuCpp.empty() && !runtimeCpp.empty() && !bundleCpp.empty() && !standdownH.empty(),
+          "the menu, runtime, stand-down policy and log bundler sources are readable from the repo root");
     auto count = [](const std::string& text, const std::string& needle) {
         unsigned n = 0;
         for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
@@ -2358,7 +2359,16 @@ void testFlatWarningWiring() {
         {&runtimeCpp, "publishRefusal(s, false);", 1, "and a wake clears it"},
         {&runtimeCpp, "bool flatRuntimeStructuralRefusal(const char** reasonName, bool* standingDown) {", 1,
          "the accessor the panel reads"},
+        {&runtimeCpp, "if (warn && s.standDown.warningActive())", 1,
+         "the runtime publishes the warning from the stand-down's own gate"},
         {&bundleCpp, "return edvr::eliteGraphicsFolderUnder(base);", 1, "the log bundler composes the folder through the shared header"},
+        // The gate itself: the stand-down, for a reason that found an output copy, and no clock.
+        {&standdownH, "bool warningActive() const { return standing && flatMonoReasonWarrantsWarning(standReason); }", 1,
+         "the warning is on while stood down for a reason that found an output copy"},
+        {&standdownH, "return flatMonoReasonStructural(reason) && reason != FlatMonoReason::NoOutputCopy;", 1,
+         "and never for no-known-output-copy: a startup or loading frame has no final copy"},
+        {&standdownH, "standReason = runReason;", 1, "a stand-down starts with the reason that entered it"},
+        {&standdownH, "standReason = reason;", 1, "and follows each probe frame's own finding"},
     };
     for (const Pin& pin : pins) {
         check(count(*pin.text, pin.needle) == pin.times, pin.what);
@@ -2369,6 +2379,21 @@ void testFlatWarningWiring() {
     }
     check(count(bundleCpp, "Frontier Developments") == 1,
           "the log bundler no longer spells the folder itself (its comment names it once)");
+    // NO TIMER. The first version warned after a 2 s run of refusals and flickered across a
+    // transition; the gate is the stand-down now, so the constant is gone and the publisher reads no clock.
+    check(count(standdownH, "kFlatStandDownWarnMs") == 0 && count(runtimeCpp, "kFlatStandDownWarnMs") == 0 &&
+          count(menuCpp, "kFlatStandDownWarnMs") == 0,
+          "the warning has no timer of its own: its constant is gone from the policy, the runtime and the panel");
+    const size_t publishFrom = runtimeCpp.find("void publishRefusal(const State& s, bool warn) {");
+    const size_t publishTo = runtimeCpp.find("// --- Stand-down: what each mode does");
+    check(publishFrom != std::string::npos && publishTo != std::string::npos && publishFrom < publishTo,
+          "the publisher can be delimited in the runtime source");
+    if (publishFrom != std::string::npos && publishTo != std::string::npos && publishFrom < publishTo) {
+        const std::string publisher = runtimeCpp.substr(publishFrom, publishTo - publishFrom);
+        check(publisher.find("GetTickCount64") == std::string::npos && publisher.find("nowMs") == std::string::npos &&
+              publisher.find("warningActive()") != std::string::npos,
+              "the publisher reads the stand-down's gate and no clock (control: it names warningActive)");
+    }
 }
 
 // The CPU and GPU census's wiring (flat_cpu.h): which entry point carries which family's scope,

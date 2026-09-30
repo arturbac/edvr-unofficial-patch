@@ -1413,12 +1413,14 @@ void resolveSpanEnd(ID3D11DeviceContext* ctx) noexcept {
 }
 
 // The refusal state for the F8 panel's settings warning, published for any thread:
-// bit 0 a structural refusal is in force (stood down, or a run long enough to be more
-// than a loading blink), bit 1 the work is stood down, bits 8..15 the selector's reason.
+// bit 0 the warning is wanted -- the work is stood down for a chain-shape reason that
+// found an output copy, never for no-known-output-copy and never before the stand-down
+// (flat_standdown.h, warningActive) --, bit 1 the work is stood down (always with bit 0
+// now), bits 8..15 the stand-down's current reason.
 std::atomic<uint32_t> g_refusalPublished{0};
 void publishRefusal(const State& s, bool warn) {
     uint32_t v = 0;
-    if (warn && s.standDown.warningActive(GetTickCount64()))
+    if (warn && s.standDown.warningActive())
         v = 1u | (s.standDown.standing ? 2u : 0u) |
             (static_cast<uint32_t>(s.standDown.reason()) << 8);
     g_refusalPublished.store(v, std::memory_order_release);

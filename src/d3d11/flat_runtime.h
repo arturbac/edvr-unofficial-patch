@@ -10,11 +10,13 @@ extern std::atomic<bool> g_flatRuntimeLive;
 inline bool flatRuntimeActive() { return g_flatRuntimeLive.load(std::memory_order_relaxed) && !g_flatComputeInternal; }
 // Last qualified flat scene extent, published for the menu on any thread.
 bool flatRuntimeNativeScale();
-// The refusal state the F8 panel's settings warning follows (flat_standdown.h): true while a
-// temporal mode is selected and frames are refused for the shape of the post chain -- stood
-// down, or a structural run long enough to be more than a loading screen's blink. reasonName
-// is the selector's own name for the refusal, standingDown says the work is paused. Any thread;
-// false with a treated or transiently refused session, and with the mode off.
+// The refusal state the F8 panel's settings warning follows (flat_standdown.h): true while the
+// work is stood down for a chain-shape refusal that found an output copy (never for
+// no-known-output-copy: a startup or loading frame has no final copy at all, and nothing in
+// Elite's settings to turn off). It ends with the resume. reasonName is the selector's own name
+// for the stand-down's current reason, standingDown says the work is paused (always, with the
+// warning). Any thread; false with a treated, transiently refused or merely slow-to-start
+// session, and with the mode off. The caller checks that a temporal mode is selected.
 bool flatRuntimeStructuralRefusal(const char** reasonName, bool* standingDown);
 // The upstream camera injector's read points into the phase machine: the
 // current phase in render pixels and the validated resolve plan's render
