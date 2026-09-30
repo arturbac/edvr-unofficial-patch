@@ -509,8 +509,8 @@ void refreshPreVr(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera, u
     in.camera = camera;
     in.readable = readable;
     in.kind = kind;
-    in.gate = flatCameraVrEffectiveGate(gate, g_vr.stepAtMs(), GetTickCount64());
     in.mode = flatCameraVrModeOfBits(bits);
+    in.gate = flatCameraVrEffectiveGate(in.mode, gate, g_vr.stepAtMs(), GetTickCount64());
     in.callerRva = callerRva;
     // The role needs the camera's aspect and near plane: read only for a kind-3 call the frame could inject.
     FlatCameraVrFrustum frustum;

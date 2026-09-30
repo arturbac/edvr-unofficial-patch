@@ -368,11 +368,12 @@ inline bool flatCameraVrQuietFor(uint32_t bits, bool injectedSetEmpty) {
     return (bits & (kFlatCameraVrBitInject | kFlatCameraVrBitObserve)) == 0u && injectedSetEmpty;
 }
 
-// The route's frame step is the detour's Present edge: a window the step armed is honoured for the frame window's own expiry
-// (FlatCameraGate::kExpiryMs) from the STEP, even when something else (the census's per-frame re-arm) keeps the gate itself open,
-// so a route that stopped stepping cannot leave the last frame's phase injecting.
-inline FlatCameraGateVerdict flatCameraVrEffectiveGate(FlatCameraGateVerdict gate, uint64_t stepAtMs, uint64_t nowMs) {
-    if (gate != FlatCameraGateVerdict::Admit) return gate;
+// The route's frame step is the detour's Present edge: in an INJECTING frame a window the step armed is honoured for the frame
+// window's own expiry (FlatCameraGate::kExpiryMs) from the STEP, even when something else (the census's per-frame re-arm) keeps
+// the gate itself open, so a route that stopped stepping cannot leave the last frame's phase injecting. Every other mode keeps
+// the gate's own verdict: nothing is injected there, and the census's window field stays what it is for the census alone.
+inline FlatCameraGateVerdict flatCameraVrEffectiveGate(FlatCameraVrMode mode, FlatCameraGateVerdict gate, uint64_t stepAtMs, uint64_t nowMs) {
+    if (mode != FlatCameraVrMode::Inject || gate != FlatCameraGateVerdict::Admit) return gate;
     if (stepAtMs == 0 || (nowMs > stepAtMs && nowMs - stepAtMs > FlatCameraGate::kExpiryMs)) return FlatCameraGateVerdict::Expired;
     return gate;
 }

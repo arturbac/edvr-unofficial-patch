@@ -837,14 +837,23 @@ void testArithmetic() {
           !flatCameraVrPhaseNonzero(-0.0f, 0.0f, 5040, 2835) && !flatCameraVrPhaseNonzero(0.3f, 0.3f, 0, 2835) && !flatCameraVrPhaseNonzero(0.3f, 0.3f, 5040, 0) &&
           !flatCameraVrPhaseNonzero(kNaN, 0.3f, 5040, 2835) && !flatCameraVrPhaseNonzero(0.3f, kInf, 5040, 2835) && !flatCameraVrPhaseNonzero(0.0f, kNaN, 5040, 2835),
           "R9d", "a phase is non-zero when either axis is and both are finite and the render size is known: zero, a size of zero, NaN and infinity write nothing (warming)");
-    // The frame-window lapse.
-    check(flatCameraVrEffectiveGate(Gate::Admit, 1000, 1000) == Gate::Admit && flatCameraVrEffectiveGate(Gate::Admit, 1000, 1000 + FlatCameraGate::kExpiryMs) == Gate::Admit &&
-          flatCameraVrEffectiveGate(Gate::Admit, 1000, 1001 + FlatCameraGate::kExpiryMs) == Gate::Expired && flatCameraVrEffectiveGate(Gate::Admit, 0, 1000) == Gate::Expired &&
-          flatCameraVrEffectiveGate(Gate::Admit, 1000, 900) == Gate::Admit,
-          "R9e", "a window the route's step armed is honoured for the frame window's expiry from the STEP, then lapses, whatever keeps the gate itself open");
-    check(flatCameraVrEffectiveGate(Gate::Disarmed, 1000, 1000) == Gate::Disarmed && flatCameraVrEffectiveGate(Gate::Expired, 1000, 1000) == Gate::Expired &&
-          flatCameraVrEffectiveGate(Gate::OffThread, 1000, 9999) == Gate::OffThread,
+    // The frame-window lapse, in an injecting frame.
+    const Mode inj = Mode::Inject;
+    check(flatCameraVrEffectiveGate(inj, Gate::Admit, 1000, 1000) == Gate::Admit && flatCameraVrEffectiveGate(inj, Gate::Admit, 1000, 1000 + FlatCameraGate::kExpiryMs) == Gate::Admit &&
+          flatCameraVrEffectiveGate(inj, Gate::Admit, 1000, 1001 + FlatCameraGate::kExpiryMs) == Gate::Expired && flatCameraVrEffectiveGate(inj, Gate::Admit, 0, 1000) == Gate::Expired &&
+          flatCameraVrEffectiveGate(inj, Gate::Admit, 1000, 900) == Gate::Admit,
+          "R9e", "in an injecting frame a window the route's step armed is honoured for the frame window's expiry from the STEP, then lapses, whatever keeps the gate itself open");
+    check(flatCameraVrEffectiveGate(inj, Gate::Disarmed, 1000, 1000) == Gate::Disarmed && flatCameraVrEffectiveGate(inj, Gate::Expired, 1000, 1000) == Gate::Expired &&
+          flatCameraVrEffectiveGate(inj, Gate::OffThread, 1000, 9999) == Gate::OffThread,
           "R9f", "the lapse only ever closes an open window: the other verdicts pass through");
+    {
+        bool othersKeepTheGate = true;
+        for (Mode other : {Mode::PassThrough, Mode::Observe})
+            for (Gate g : kGates)
+                for (uint64_t now : {1000ull, 1500ull, 1501ull, 99999ull})
+                    if (flatCameraVrEffectiveGate(other, g, 0, now) != g || flatCameraVrEffectiveGate(other, g, 1000, now) != g) othersKeepTheGate = false;
+        check(othersKeepTheGate, "R9h", "outside an injecting frame the gate's own verdict stands whatever the step's age: the census's window field is what it is for the census alone");
+    }
     {   // the stand-down
         FlatCameraVrFailureWindow w;
         bool any = false;
@@ -1062,7 +1071,7 @@ void testSourcePins() {
     const std::string frustum = functionBody(cpp, "FlatCameraVrFrustum readFrustum(uintptr_t camera) noexcept {");
     {
         check(!vrpre.empty() &&
-              ordered(vrpre, {"if (gate == FlatCameraGateVerdict::OffThread) {", "sehReadU32(camera + kCamKind, &kind)", "flatCameraVrEffectiveGate(gate, g_vr.stepAtMs(), GetTickCount64())",
+              ordered(vrpre, {"if (gate == FlatCameraGateVerdict::OffThread) {", "sehReadU32(camera + kCamKind, &kind)", "flatCameraVrEffectiveGate(in.mode, gate, g_vr.stepAtMs(), GetTickCount64())",
                               "g_vr.wantsFrustum(in)", "readFrustum(camera)", "g_vr.plan(in, frustum, g_inject.injected)", "observer->pre(call)", "flushCamera(camera)",
                               "vrCommit(r0, ctx, camera, callNo, plan.inject, wantPost)", "g_vr.finish(plan, in, landed)"}),
               "R11j", "a VR call runs: off-thread exit, kind, the frame window as the route's step left it, the frustum (only when wanted), the plan, the census's report, the flush, the writes, the outcome -- in that order");
@@ -1090,6 +1099,7 @@ void testSourcePins() {
                               "if (g_inject.gameBase && sehReadU64(r0, &ret) && ret > g_inject.gameBase) callerRva = ret - g_inject.gameBase;",
                               "FlatCameraVrCallIn in;"})
             if (count(vrpre, s) != 1) told = false;
+        if (!ordered(vrpre, {"in.mode = flatCameraVrModeOfBits(bits);", "in.gate = flatCameraVrEffectiveGate(in.mode, gate, g_vr.stepAtMs(), GetTickCount64());"})) told = false;
         check(told, "R11ak", "the planner is told the call as it is: the camera, whether and what its kind read, the mode the word says, and the call site (each statement once)");
         bool reported = !vrpre.empty();
         for (const char* s : {"call.camera = camera;", "call.ctx = ctx;", "call.p2 = p2;", "call.callerRva = callerRva;", "call.callNo = callNo;", "call.kind = kind;",
