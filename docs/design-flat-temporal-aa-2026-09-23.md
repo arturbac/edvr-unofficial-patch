@@ -46,9 +46,10 @@
   PS91/BFE or stale-resize hypotheses. The separate menu hangar-floor P1
   defect remains open. VR still needs regression tests; the concourse NPC
   observation on `d9f86b09` belongs to the main/openxr-perf-gaps line.
-- **Test target (Sean):** use the Epic installation for all in-game tests.
-  Odyssey is under `C:\Program Files\Epic Games\EliteDangerous\Products`.
-  Preserve its existing INI; F10 is the flat default when dump_draws is absent.
+- **Test target (Sean):** all in-game tests on the Epic install under
+  `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
+- **Field reports (79):** two rc.4 users refused every frame: game AA or bloom
+  put passes between tone and copy; turning each off fixed it. Fix: open.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -4693,3 +4694,41 @@ architectural direction: exact recipes are the current mechanism, ship
 diversity is regression coverage, an upstream flat camera/projection
 hook is the proposed long-term investigation (unvalidated, not
 started), and the refusal is never to be bypassed.
+
+## 79. Two rc.4 users: every frame refused, passes between tone and copy (2026-09-30)
+
+Two flat-profile users on v0.18.0-rc.4 (game build 332841, the same as
+Sean's) reported DLSS "not activating". Their logs agree: `treated=0` in
+every window, each frame refused with `no-known-tone-pass`, the DLSS
+renderer never called (`calls=0`), the camera path `warming` throughout
+(`injected=0`). The discovery's chain dump names the post chain (menu
+frames only: its per-record detail fired on the first two dumps):
+
+| | tone pass | between tone and copy | settings |
+|---|---|---|---|
+| Sean (treated) | known VS and PS | nothing | game AA off |
+| user 1: 4K, `AAMode` 4, bloom/DoF/AO off, one unidentified chained proxy | known VS F9CFC798F21E9AEA, new PS 6E83D02E7422C5BA | 03D186CE0EC031E3/BAB75803059C271D, then 98E6F9986FDC9A53/4168985B52C5D7C4 (fmt 27) | game AA on |
+| user 2: EDHM chained, 3840x2160 scene to a 2560x1440 output, DoF 2, bloom 3, AO 3 | known VS, known DoF PS DE65BFFF2F12ECC6 | 20F383BBAC05C031/5AA08A96E3C14B10 (316 B), then 20F383BBAC05C031/2375CCCCBBFE7A4D (5 KB), one fmt-27 target | bloom 3 |
+
+The selector takes the tone pass only as the writer of the final copy's
+source and only from its hash list (`flat_mono_frame.h`, the tone search
+after the copy), so both refuse. Confirmed by the users, relayed by Sean:
+user 1 was fixed by turning the game's AA off, user 2 by turning bloom
+off (blur and DoF are fine).
+
+Also measured: with a temporal mode selected and every frame refused,
+user 1 presented 60-61 fps against 130-270 with AA off, while EDVR's GPU
+census read about 0.07 ms a frame, so the cost is EDVR's CPU-side work on
+frames it then refuses (no flat CPU instrument exists to name it). User 2
+stayed near a 120 fps cap. The warning anti-aliasing.md planned ("Elite's
+anti-aliasing appears to be on") was never built, so nothing told either
+user why.
+
+Both users' machines saved the unknown passes' bytecode (`flat producer
+shader ... existing=1`) and an F10 trace (`flat_trace_36244.bin`,
+`flat_trace_5481.bin`); the log bundler left both out (a separate task).
+
+Open, Sean to decide: treat the copy's source when every pass between the
+tone pass and the copy is a plain image pass (versus admitting these
+hashes one by one); say in F8 and the log when a frame is refused and why;
+stand the per-draw work down while every frame is refused.
