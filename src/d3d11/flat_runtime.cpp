@@ -19,6 +19,8 @@
 #include "flat_witness_bound.h"
 #include "flat_cpu.h"
 #include "flat_camera_table.h"
+#include "flat_query_cut.h"
+#include "flat_query_reads.h"
 #include "gpu_timing.h"
 #include "flat_temporal.h"
 #include "engine_velocity.h"
@@ -1552,6 +1554,8 @@ void flatRuntimeBeforePresent() {
     // The frame is ending: the game's state goes back where engine motion's is still bound, before the real Present
     // and every EDVR pass that follows it (the lazy form, engine_velocity.h).
     if (owner()) flatRuntimeSubstitution(state().context.Get(), FlatSubstEvent::kPresent);
+    // And what engine motion's bracket kept for the frame goes with it.
+    if (owner()) engineVelocityFlatFrameEnd();
     // The census's whole-frame GPU span ends here, just before the real Present.
     if (owner()) gpuFrameClose(state());
 }
@@ -1697,6 +1701,11 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         // be read as the first window's.
         const EngineVelocityWrapperCounts wrapper = engineVelocityTakeWrapperCounts();
         if (censusWasRunning) s.census.noteWrapper(wrapper.stateCalls, wrapper.substitutedDraws);
+        // The questions the runtime answered from what it already knew (flat_query_cut.h): drained with the wrapper's counts,
+        // and the frame that starts now says whether it is one of the checked ones (one in 64).
+        const FlatQueryCounts queries = flatQueryCut().take();
+        if (censusWasRunning) s.census.noteQueries(queries);
+        flatQueryCut().beginFrame(frame);
         gpuPoll(s);
         flatcpu::WindowReport window;
         if (s.census.take(censusNow, s.standDown.standing, window)) {
@@ -2156,6 +2165,18 @@ void flatRuntimeUpdate(ID3D11Resource* res, const void* bytes, const D3D11_BOX* 
     if (state().projection) { flatcpu::Scope shadows(flatcpu::kShadows); state().projection->observeUpdate(res,bytes,box); }
 }
 
+// The coverage classification's two questions to the context, asked of the binding shadow and of the context only on the
+// sampled frames or once a shadow has been found wrong (flat_query_reads.h holds them; flat_query_cut.h says why).
+static const void* coverageDepthResource(ID3D11DeviceContext* ctx, const FlatContractObservation& k, Ptr<ID3D11Resource>& hold) {
+    return flatQueryDepth(flatQueryCut(), ctx, k.depth, hold, [](const char* line) { Log::get().note("%s", line); });
+}
+static bool coverageShadersMatch(ID3D11DeviceContext* context, const FlatContractObservation& k) {
+    FlatComputeInternalScope guard;
+    return flatQueryShaders(flatQueryCut(), context, k.vs, k.ps, [](void* shader) { return lookupShaderHash(shader); },
+                            [&] { flatRuntimeSubstitution(context, FlatSubstEvent::kOtherDraw); },
+                            [](const char* line) { Log::get().note("%s", line); });
+}
+
 FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_t instances,
                                            char kind, uint32_t count, uint32_t start,
                                            int32_t base, uint32_t startInstance) {
@@ -2292,13 +2313,17 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         engineVelocityNoteSource(static_cast<ID3D11Texture2D*>(const_cast<void*>(k.depth)),static_cast<ID3D11Buffer*>(const_cast<void*>(k.b1)));
     }
     // A pool-family draw sees the game's state too, unless it can only continue a run of substituted producer draws (the
-    // one whose camera, depth and constants this frame's naming holds) AND nothing below reads the context for it: the
-    // coverage classification and the projection qualification ask the context what is bound (Get calls), and would read
-    // engine motion's shader and targets instead of the game's.
+    // one whose camera, depth and constants this frame's naming holds) AND nothing below reads the context for it. What
+    // the coverage classification asks the context in the ordinary (Upstream) route it answers from the binding shadow
+    // (coverageDepthResource, coverageShadersMatch: flat_query_cut.h), and asks the context only on a check, after
+    // flushing where the answer would be EDVR's. Two routes still read what is bound themselves, and so want the game's
+    // state first: an F10 audit's captures (s.projectionFrames), and the legacy route's qualification of the projection
+    // (qualifyProjection reads the shaders, the viewport and the constant buffers, and is skipped under Upstream).
     const bool continuesRun = sourceCandidate && s.namedDepth == k.depth && s.namedConstants == k.b1 &&
         std::memcmp(s.namedCamera, d.camera, sizeof(d.camera)) == 0;
     const bool coverageReads = s.projection && sceneExtent && k.color != s.prefix.output &&
-        (k.format==9 || k.format==23 || k.format==26 || k.format==60);
+        (k.format==9 || k.format==23 || k.format==26 || k.format==60) &&
+        (s.projectionFrames != 0 || !flatCameraInjectUpstreamOwns());
     if (d.supported && (!continuesRun || coverageReads)) flatRuntimeSubstitution(context, FlatSubstEvent::kOtherDraw);
     if(s.projection) {
         if(s.projectionFrames)++s.projectionDraws;
@@ -2313,21 +2338,17 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
             if(recipes.count) {
                 ++s.covExact;
                 FlatComputeInternalScope guard;
-                Ptr<ID3D11DepthStencilView> actualDepth;Ptr<ID3D11Resource> depthResource;
-                ctx->OMGetRenderTargets(0,nullptr,&actualDepth);
-                if(actualDepth)actualDepth->GetResource(&depthResource);
-                const bool owned=depthResource && (depthResource.Get()==s.namedDepth || depthResource.Get()==s.phaseDepth.Get());
+                Ptr<ID3D11Resource> depthHold;
+                const void* depthResource=coverageDepthResource(ctx,k,depthHold);
+                const bool owned=depthResource && (depthResource==s.namedDepth || depthResource==s.phaseDepth.Get());
                 if(!owned && k.color==s.phaseHdr.Get())failPhase(s,"scene-projection-depth-unassociated");
-                if(nonzeroPhase(s) && owned && s.phaseDepth && depthResource.Get()!=s.phaseDepth.Get())failPhase(s,"scene-depth-changed");
-                const bool sceneHdr=flatRuntimeProjectionHdr(k,s.prefix.output,owned?depthResource.Get():nullptr);
+                if(nonzeroPhase(s) && owned && s.phaseDepth && depthResource!=s.phaseDepth.Get())failPhase(s,"scene-depth-changed");
+                const bool sceneHdr=flatRuntimeProjectionHdr(k,s.prefix.output,owned?depthResource:nullptr);
                 projectionPlan=qualifyProjection(s,recipes,k.width,k.height,k.vs,k.ps,0,owned,sceneHdr);
             }
             else if(flatProjectionDrawUnchanged(k.vs,k.ps)) {
                 ++s.covUnchanged;
-                FlatComputeInternalScope guard;
-                Ptr<ID3D11VertexShader> actualVs;Ptr<ID3D11PixelShader> actualPs;
-                ctx->VSGetShader(&actualVs,nullptr,nullptr);ctx->PSGetShader(&actualPs,nullptr,nullptr);
-                if(lookupShaderHash(actualVs.Get())==k.vs && lookupShaderHash(actualPs.Get())==k.ps) {
+                if(coverageShadersMatch(ctx,k)) {
                     if(s.projectionFrames) {++s.projectionUnchanged;projectionDetail(s,k.vs,k.ps,0,103,"bytecode-unchanged");}
                 } else {if(s.projectionFrames) {++s.projectionUnknown;projectionDetail(s,k.vs,k.ps,0,100,"actual-shader-mismatch");}refuseDraw(s,"unchanged-shader-mismatch");}
             }
@@ -2346,21 +2367,17 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
                         generic.vsRow);
                     if(s.projectionFrames)projectionDetail(s,k.vs,k.ps,0,105,"generic-recipe");
                     FlatComputeInternalScope guard;
-                    Ptr<ID3D11DepthStencilView> actualDepth;Ptr<ID3D11Resource> depthResource;
-                    ctx->OMGetRenderTargets(0,nullptr,&actualDepth);
-                    if(actualDepth)actualDepth->GetResource(&depthResource);
-                    const bool owned=depthResource && (depthResource.Get()==s.namedDepth || depthResource.Get()==s.phaseDepth.Get());
+                    Ptr<ID3D11Resource> depthHold;
+                    const void* depthResource=coverageDepthResource(ctx,k,depthHold);
+                    const bool owned=depthResource && (depthResource==s.namedDepth || depthResource==s.phaseDepth.Get());
                     if(!owned && k.color==s.phaseHdr.Get())failPhase(s,"scene-projection-depth-unassociated");
-                    if(nonzeroPhase(s) && owned && s.phaseDepth && depthResource.Get()!=s.phaseDepth.Get())failPhase(s,"scene-depth-changed");
-                    const bool sceneHdr=flatRuntimeProjectionHdr(k,s.prefix.output,owned?depthResource.Get():nullptr);
+                    if(nonzeroPhase(s) && owned && s.phaseDepth && depthResource!=s.phaseDepth.Get())failPhase(s,"scene-depth-changed");
+                    const bool sceneHdr=flatRuntimeProjectionHdr(k,s.prefix.output,owned?depthResource:nullptr);
                     projectionPlan=qualifyProjection(s,genericRecipes,k.width,k.height,k.vs,k.ps,0,owned,sceneHdr);
                 }
                 else if(generic.vs==FlatVsProjectionClass::InertNoCB && generic.ps==FlatPsProjectionSafety::Clean) {
                     ++s.covInert;
-                    FlatComputeInternalScope guard;
-                    Ptr<ID3D11VertexShader> actualVs;Ptr<ID3D11PixelShader> actualPs;
-                    ctx->VSGetShader(&actualVs,nullptr,nullptr);ctx->PSGetShader(&actualPs,nullptr,nullptr);
-                    if(lookupShaderHash(actualVs.Get())==k.vs && lookupShaderHash(actualPs.Get())==k.ps) {
+                    if(coverageShadersMatch(ctx,k)) {
                         if(s.projectionFrames) {++s.projectionUnchanged;projectionDetail(s,k.vs,k.ps,0,106,"generic-inert");}
                     } else {if(s.projectionFrames) {++s.projectionUnknown;projectionDetail(s,k.vs,k.ps,0,100,"actual-shader-mismatch");}refuseDraw(s,"unchanged-shader-mismatch");}
                 }

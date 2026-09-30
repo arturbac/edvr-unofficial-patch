@@ -268,6 +268,9 @@ bool engineVelocityFlatBeginDraw(ID3D11DeviceContext* ctx, bool* gameHadTarget6)
 void engineVelocityFlatEndDraw(ID3D11DeviceContext* ctx);
 void engineVelocityFlatFlush(ID3D11DeviceContext* ctx, EngineVelocityFlushCause cause);
 void engineVelocityFlatAbandon() noexcept;
+// The frame ends, after the Present's flush: what the bracket kept for it (the game's render-target set, its blend state, the
+// accepted binding; flat_query_cut.h) is released. A no-op while EDVR's state is still bound: the flush is owed first.
+void engineVelocityFlatFrameEnd() noexcept;
 void engineVelocityFlatLazy(bool on) noexcept;
 // The flat CPU census (flat_cpu.h): what engine motion's draw wrapper asks of the D3D
 // immediate context. Every Get and Set on it, and the clears and copies an eye-frame's

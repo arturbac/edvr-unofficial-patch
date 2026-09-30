@@ -24,6 +24,19 @@
 //     resolve, a command list, the Present), is noticed by the same checks
 //   - the census line says how many draws, runs and flushes there were
 //
+// The KEPT ANSWERS (src\d3d11\flat_query_cut.h): a run of substituted draws no longer asks the context for the game's blend
+// state, the game's render targets or the runtime's acceptance of MRT6 each time, and the coverage classification no
+// longer asks it for the depth view or the shaders. What can go wrong is the game changing that state through a path
+// nothing hooks, which no shadow or kept answer can see, and the sampled check exists for exactly that:
+//   - a blend state and a render-target set changed by a REAL call with no shadow update, on a checking frame, are
+//     found (counted, one log line, the state asks the context from then on) and the context still ends up in the game's
+//     state; off a checking frame the stale answer is used, which is what one frame in 64 bounds
+//   - the depth view and the shaders the coverage classification asks about, through hooked setters (the shadow follows,
+//     ClearState included) and through an unhooked one (found on a checking frame)
+//   - the calls saved, counted on the context's own vtable: many short runs cost fewer with the answers kept than with
+//     every state asking the context
+//   - the frame's end lets go of what was kept: no view of the game's stays alive on our account
+//
 // The runtime's wiring -- that each hook calls the policy with the right event -- is a source scan in flat_temporal_test.
 
 #include <d3d11.h>
@@ -33,10 +46,13 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
 #include "../../src/d3d11/engine_velocity.h"
+#include "../../src/d3d11/flat_query_cut.h"
+#include "../../src/d3d11/flat_query_reads.h"
 #include "../../src/d3d11/flat_substitution.h"
 #include "lifecycle_tests.h"
 
@@ -264,6 +280,18 @@ public:
         for (unsigned i = 0; i < 8; ++i) exp.rtv[i] = i < count ? r[i] : nullptr;
         exp.dsv = g_.sourceDsv.Get();
     }
+    // The game changes state through a path nothing hooks: the real call and no shadow update, so no shortcut can see it.
+    void gameSetBlendUnhooked(ID3D11BlendState* b) {
+        const float f[4] = {};
+        ctx_->OMSetBlendState(b, f, ~0u);
+        exp.blend = b;
+    }
+    void gameBindTargetsUnhooked(unsigned count) {
+        ID3D11RenderTargetView* r[4] = {g_.sourceRtv[0].Get(), g_.sourceRtv[1].Get(), g_.sourceRtv[2].Get(), g_.sourceRtv[3].Get()};
+        ctx_->OMSetRenderTargets(count, r, g_.sourceDsv.Get());
+        for (unsigned i = 0; i < 8; ++i) exp.rtv[i] = i < count ? r[i] : nullptr;
+        exp.dsv = g_.sourceDsv.Get();
+    }
     // The binding shadow's generations move with nothing rebound (its once-a-frame bump, a set that kept the targets):
     // the wrapper reads the context's render targets again, and finds its own MRT6 among them.
     void bumpTargetGenerations() {
@@ -402,6 +430,7 @@ public:
     void commandList() { action(FlatSubstEvent::kExecuteCommandList, "a command list"); }
     void present() {
         action(FlatSubstEvent::kPresent, "the present");
+        edvr::engineVelocityFlatFrameEnd();   // the runtime's BeforePresent: the flush, then what the frame kept goes
         if (ok) g_.endFrame();
     }
     // The game's Get of state EDVR's substitution still holds: not a hooked call, so it reads what is bound.
@@ -459,6 +488,7 @@ struct SceneCleanup {
         edvr::engineVelocityShutdown();
         ctx->ClearState();
         edvr::engineVelocityFlatLazy(false);
+        edvr::flatQueryCut().reset();
     }
 };
 
@@ -548,6 +578,11 @@ bool mixedScene(const Harness& h, std::string* why) {
     e.otherDraw("and the next draw that is not a producer finds the game's set without MRT6");
     e.producer("a run again");
     e.bumpTargetGenerations();
+    e.gameSetPs(g.unkeyed.Get(), lifecycle_tests::kUnkeyedPs);
+    e.declinedProducer("the generations moved and the pixel shader is not one EDVR patches: declined, with MRT6 still on");
+    e.gameSetPs(g.ps.Get(), lifecycle_tests::kPsHash);
+    e.producer("a run again, with a shader it patches");
+    e.bumpTargetGenerations();
     e.gameSetBlend(logicBlend.Get());
     e.declinedProducer("the generations moved and the blend cannot be derived: declined with MRT6 still on");
     e.gameSetBlend(nullptr);
@@ -632,55 +667,68 @@ bool mixedScene(const Harness& h, std::string* why) {
     return true;
 }
 
-// Consecutive producer draws, in the restore-after-every-draw form (what the flat scope did) and in the lazy form:
-// the calls the context received. `gameSetsPs`: the game binds its own pixel shader before every draw, as it does
-// between materials, so the lazy form still patches each one.
-inline std::string g_lastRunDescription;   // what the last countRun's calls were, by method
-inline unsigned long long countRun(const Harness& h, bool lazy, unsigned draws, bool gameSetsPs) {
+// Producer draws in runs, in the restore-after-every-draw form (what the flat scope did before the lazy bracket) and in the
+// lazy form, with the kept answers (flat_query_cut.h) answering or every state asking the context: the calls the context
+// received. `runs` runs of `draws` consecutive draws, a draw that is not a producer between two runs. `gameSetsPs`: the
+// game binds its own pixel shader before every draw, as it does between materials, so the lazy form still patches each one.
+enum class Form { PerDraw, Lazy, LazyAsking };
+inline std::string g_lastRunDescription;   // what the last countRuns' calls were, by method
+inline unsigned long long countRuns(const Harness& h, Form form, unsigned runs, unsigned draws, bool gameSetsPs) {
     Game g(h);
     g.setup();
     SceneCleanup cleanup(g.ctx);
     for (auto& s : lifecycle_fake::g_slots) { s.ptr = nullptr; s.hash = 0; ++s.gen; }
     edvr::engineVelocityConfigure(true);
+    const bool lazy = form != Form::PerDraw;
     edvr::engineVelocityFlatLazy(lazy);
+    edvr::flatQueryCut().reset();
+    if (form == Form::LazyAsking) edvr::flatQueryCut().fallBackAll();
     g.makeSource(40, 24);
     Emu<> e(h, g);
     e.warmUp();
     e.startFrame();
-    e.producer("the frame's first draw, uncounted");   // the eye-frame's own preparation is the same in both forms
+    e.producer("the frame's first draw, uncounted");   // the eye-frame's own preparation is the same in every form
+    // The old form kept nothing between draws: what the bracket held after that first draw is not part of it.
+    if (form == Form::PerDraw) edvr::engineVelocityFlatAbandon();
     g_rec.reset();
-    for (unsigned i = 0; i < draws; ++i) {
-        if (gameSetsPs) e.gameSetPs(i % 2 ? g.ps2.Get() : g.ps.Get(), i % 2 ? lifecycle_tests::kPsHash2 : lifecycle_tests::kPsHash);
-        if (lazy) {
-            RecOn on;
-            bool had6 = false;
-            edvr::engineVelocityFlatBeginDraw(g.ctx, &had6);
-            {
-                RecOff off;
-                g.ctx->DrawInstanced(4, 1, 0, 0);
+    for (unsigned run = 0; run < runs; ++run) {
+        if (run) e.otherDraw("a draw between two runs");
+        for (unsigned i = 0; i < draws; ++i) {
+            if (gameSetsPs) e.gameSetPs(i % 2 ? g.ps2.Get() : g.ps.Get(), i % 2 ? lifecycle_tests::kPsHash2 : lifecycle_tests::kPsHash);
+            if (lazy) {
+                RecOn on;
+                bool had6 = false;
+                edvr::engineVelocityFlatBeginDraw(g.ctx, &had6);
+                {
+                    RecOff off;
+                    g.ctx->DrawInstanced(4, 1, 0, 0);
+                }
+                edvr::engineVelocityFlatEndDraw(g.ctx);
+            } else {
+                // What FlatRuntimeDrawScope did per producer draw: read the eight targets, BeforeDraw, the draw, the
+                // wrapper's restore, and the eight targets set back.
+                RecOn on;
+                ID3D11RenderTargetView* rt[8] = {};
+                ID3D11DepthStencilView* d = nullptr;
+                g.ctx->OMGetRenderTargets(8, rt, &d);
+                edvr::engineVelocityBeforeDraw(g.ctx, false);
+                {
+                    RecOff off;
+                    g.ctx->DrawInstanced(4, 1, 0, 0);
+                }
+                edvr::engineVelocityAfterFlatDraw(g.ctx);
+                g.ctx->OMSetRenderTargets(8, rt, d);
+                for (auto* v : rt) if (v) v->Release();
+                if (d) d->Release();
             }
-            edvr::engineVelocityFlatEndDraw(g.ctx);
-        } else {
-            // What FlatRuntimeDrawScope did per producer draw: read the eight targets, BeforeDraw, the draw, the
-            // wrapper's restore, and the eight targets set back.
-            RecOn on;
-            ID3D11RenderTargetView* rt[8] = {};
-            ID3D11DepthStencilView* d = nullptr;
-            g.ctx->OMGetRenderTargets(8, rt, &d);
-            edvr::engineVelocityBeforeDraw(g.ctx, false);
-            {
-                RecOff off;
-                g.ctx->DrawInstanced(4, 1, 0, 0);
-            }
-            edvr::engineVelocityAfterFlatDraw(g.ctx);
-            g.ctx->OMSetRenderTargets(8, rt, d);
-            for (auto* v : rt) if (v) v->Release();
-            if (d) d->Release();
         }
     }
-    e.present();   // the lazy form's one restore, at the frame's end (counted where the policy issues it)
+    e.present();   // the lazy form's restore, at the frame's end (counted where the policy issues it)
     g_lastRunDescription = g_rec.describe();
     return g_rec.total();
+}
+inline unsigned long long countRun(const Harness& h, bool lazy, unsigned draws, bool gameSetsPs) {
+    return countRuns(h, lazy ? Form::Lazy : Form::PerDraw, 1, draws, gameSetsPs);
 }
 
 // The overlay counters of the guard sequence, eager and lazy: the same, or the lazy form declined something.
@@ -752,6 +800,236 @@ inline OverlayCounts overlaySequence(const Harness& h, bool lazy) {
     if (!e.ok) std::printf("  flat lazy: the overlay sequence failed at: %s\n", e.why.c_str());
     h.check(e.ok, "flat lazy: the overlay sequence keeps the game's state");
     return c;
+}
+
+// --- The kept answers, and what samples them ---------------------------------------------------------------------------------
+struct CutOutcome {
+    bool held = false;   // the context was the game's after every game call and EDVR's after every producer begin
+    std::string why;
+    edvr::FlatQueryCounts counts;
+    std::string lines;   // what the log said, one per line
+};
+
+// One scene: a run of producer draws (the blend state, the render targets and the acceptance of MRT6 are read and
+// kept), a draw that is not one, then the game changes `what` through a path nothing hooks, and another run and another
+// draw follow. `checking`: the frame is one of the checked ones (one in 64).
+enum class Unhooked { Blend, Targets };
+inline CutOutcome unhookedScene(const Harness& h, Unhooked what, bool checking) {
+    CutOutcome out;
+    lifecycle_fake::g_hookLive = true;
+    edvr::g_clockForTest = &lifecycle_fake::fakeClock;
+    Game g(h);
+    g.setup();
+    SceneCleanup cleanup(g.ctx);
+    for (auto& s : lifecycle_fake::g_slots) { s.ptr = nullptr; s.hash = 0; ++s.gen; }
+    edvr::engineVelocityConfigure(true);
+    edvr::engineVelocityFlatLazy(true);
+    edvr::flatQueryCut().reset();
+    g.makeSource(40, 24);
+    Emu<> e(h, g);
+    e.additive = makeAdditive(h);
+    const size_t mark = lifecycle_fake::g_log.size();
+    e.warmUp();
+    e.startFrame();
+    e.producer("a run: what the bracket reads is read and kept");
+    e.producer("its second draw");
+    e.otherDraw("a draw that is not a producer: the game's state goes back, what was kept stays");
+    if (checking) edvr::flatQueryCut().beginFrame(0);
+    if (what == Unhooked::Blend) e.gameSetBlendUnhooked(e.additive.Get());
+    else e.gameBindTargetsUnhooked(2);
+    e.producer("the next run, under a change no setter hook saw");
+    e.otherDraw("and what comes back is the game's own");
+    if (what == Unhooked::Blend) e.gameSetBlendUnhooked(nullptr);
+    else e.gameBindTargetsUnhooked(4);
+    e.producer("another run, after whatever the check decided");
+    e.otherDraw("and again the game's own");
+    e.present();
+    out.held = e.ok;
+    out.why = e.why;
+    out.counts = edvr::flatQueryCut().take();
+    for (size_t i = mark; i < lifecycle_fake::g_log.size(); ++i)
+        if (lifecycle_fake::g_log[i].find("flat query shortcut") != std::string::npos) out.lines += lifecycle_fake::g_log[i] + "\n";
+    return out;
+}
+
+// The frame's end lets go of what the bracket kept: the game's render-target views and its blend state are not held past
+// the frame, and ClearState lets go at once. Counted on the COM reference counts of a view and a blend state the game
+// bound.
+inline bool releaseScene(const Harness& h, std::string* why) {
+    Game g(h);
+    g.setup();
+    SceneCleanup cleanup(g.ctx);
+    for (auto& s : lifecycle_fake::g_slots) { s.ptr = nullptr; s.hash = 0; ++s.gen; }
+    edvr::engineVelocityConfigure(true);
+    edvr::engineVelocityFlatLazy(true);
+    edvr::flatQueryCut().reset();
+    g.makeSource(40, 24);
+    Emu<> e(h, g);
+    e.additive = makeAdditive(h);
+    ID3D11RenderTargetView* view = g.sourceRtv[0].Get();
+    ID3D11BlendState* blend = e.additive.Get();
+    auto refs = [&] { view->AddRef(); return view->Release(); };         // the view's COM count as it stands
+    auto blendRefs = [&] { blend->AddRef(); return blend->Release(); };  // and the blend state's
+    e.warmUp();
+    e.startFrame();
+    e.gameSetBlend(blend);
+    e.producer("a first run: the derived blend state is made, and stays in its cache");
+    e.otherDraw("a draw that is not a producer");
+    e.present();
+    e.clearState();
+    const ULONG unbound = refs(), blendUnbound = blendRefs();   // nothing bound, nothing kept (the cache's own reference stays)
+    e.startFrame();
+    e.gameSetBlend(blend);
+    e.present();
+    const ULONG quiet = refs(), blendQuiet = blendRefs();       // a frame ended with nothing kept: what the game and the context hold
+    e.startFrame();
+    e.gameSetBlend(blend);
+    e.producer("a run");
+    e.otherDraw("a draw that is not a producer");
+    const ULONG during = refs(), blendDuring = blendRefs();
+    e.present();
+    const ULONG after = refs(), blendAfter = blendRefs();
+    e.startFrame();
+    e.gameSetBlend(blend);
+    e.producer("a run before ClearState");
+    const ULONG held = refs(), blendHeld = blendRefs();
+    e.clearState();
+    const ULONG cleared = refs(), blendCleared = blendRefs();    if (!e.ok) { *why = e.why; return false; }
+    if (during <= quiet || blendDuring <= blendQuiet) { *why = "the bracket held no reference to the game's view or blend state mid-frame (the scene proves nothing)"; return false; }
+    if (after != quiet) { *why = "the Present left the game's render-target view held"; return false; }
+    if (blendAfter != blendQuiet) { *why = "the Present left the game's blend state held"; return false; }
+    if (held <= unbound || cleared != unbound) { *why = "ClearState left the game's render-target view held"; return false; }
+    if (blendHeld <= blendUnbound || blendCleared != blendUnbound) { *why = "ClearState left the game's blend state held"; return false; }
+    return true;
+}
+// The coverage classification's two questions (flat_query_reads.h), through the same functions the runtime calls, against
+// the context itself: the binding shadow follows hooked setters (ClearState included) and does not follow a real call
+// nothing hooked, which one frame in 64 finds.
+struct CoverageOutcome {
+    bool ok = true;
+    std::string why;
+};
+inline CoverageOutcome coverageScene(const Harness& h) {
+    CoverageOutcome out;
+    auto fail = [&](const std::string& m) { if (out.ok) out.why = m; out.ok = false; };
+    Game g(h);
+    g.setup();
+    SceneCleanup cleanup(g.ctx);
+    for (auto& s : lifecycle_fake::g_slots) { s.ptr = nullptr; s.hash = 0; ++s.gen; }
+    g.makeSource(40, 24);
+    edvr::FlatQueryCut& cut = edvr::flatQueryCut();
+    cut.reset();
+    std::vector<std::string> said;
+    auto log = [&](const char* line) { said.push_back(line); };
+    ComPtr<ID3D11Resource> depthRes;
+    g.sourceDsv->GetResource(&depthRes);
+    const void* depthIdentity = depthRes.Get();
+    // A second depth view of the same shape, for the change nothing hooks.
+    ComPtr<ID3D11Texture2D> otherDepth;
+    ComPtr<ID3D11DepthStencilView> otherDsv;
+    {
+        D3D11_TEXTURE2D_DESC td{};
+        g.sourceDepth->GetDesc(&td);
+        h.check(SUCCEEDED(g.dev->CreateTexture2D(&td, nullptr, &otherDepth)) &&
+                    SUCCEEDED(g.dev->CreateDepthStencilView(otherDepth.Get(), nullptr, &otherDsv)),
+                "flat lazy: a second depth view");
+    }
+    ComPtr<ID3D11Resource> otherRes;
+    otherDsv->GetResource(&otherRes);
+    ID3D11RenderTargetView* r4[4] = {g.sourceRtv[0].Get(), g.sourceRtv[1].Get(), g.sourceRtv[2].Get(), g.sourceRtv[3].Get()};
+    auto bindHooked = [&](ID3D11DepthStencilView* dsv) {   // a hooked OMSetRenderTargets: the real call, then the shadow
+        g.ctx->OMSetRenderTargets(4, r4, dsv);
+        g.shadow(BindSlot::Rtv0, r4[0]);
+        g.shadow(BindSlot::Dsv0, dsv);
+    };
+    auto depthNow = [&](const void* shadow, unsigned long long* reads) {
+        ComPtr<ID3D11Resource> hold;
+        RecOn on;
+        g_rec.reset();
+        const void* got = edvr::flatQueryDepth(cut, g.ctx, shadow, hold, log);
+        if (reads) *reads = g_rec.calls[kOMGetRT];
+        return got;
+    };
+
+    // The depth view: answered from the shadow, with no read of the context.
+    bindHooked(g.sourceDsv.Get());
+    unsigned long long reads = 9;
+    cut.beginFrame(1);
+    if (depthNow(depthIdentity, &reads) != depthIdentity || reads != 0) fail("coverage depth: an ordinary frame answered from the shadow with a read of the context");
+    // On a checking frame the context is asked as well and agrees.
+    cut.beginFrame(0);
+    if (depthNow(depthIdentity, &reads) != depthIdentity || reads != 1) fail("coverage depth: a checking frame did not ask the context once");
+    if (!said.empty() || cut.fellBack(edvr::FlatQuery::CoverageDepth)) fail("coverage depth: an agreeing check was reported wrong");
+    // A hooked rebind: the shadow follows, and so the check still agrees.
+    bindHooked(otherDsv.Get());
+    cut.beginFrame(64);
+    if (depthNow(otherRes.Get(), &reads) != otherRes.Get() || !said.empty()) fail("coverage depth: a hooked rebind was reported wrong");
+    // ClearState, as the hook does it (the shadow forgets everything, then the real call): nothing is bound in either.
+    for (auto& s : lifecycle_fake::g_slots) { s.ptr = nullptr; s.hash = 0; ++s.gen; }
+    g.ctx->ClearState();
+    cut.beginFrame(128);
+    if (depthNow(nullptr, &reads) != nullptr || !said.empty()) fail("coverage depth: after ClearState the shadow and the context disagreed");
+    // A change nothing hooked: a real rebind with no shadow update. An ordinary frame cannot see it; a checking frame does.
+    bindHooked(g.sourceDsv.Get());
+    g.ctx->OMSetRenderTargets(4, r4, otherDsv.Get());
+    cut.beginFrame(129);
+    if (depthNow(depthIdentity, &reads) != depthIdentity) fail("coverage depth: an ordinary frame's shortcut was not the shadow's");
+    cut.beginFrame(192);
+    if (depthNow(depthIdentity, &reads) != otherRes.Get()) fail("coverage depth: a checking frame did not use the context's answer for a change nothing hooked");
+    if (said.size() != 1 || said[0].find("coverage depth view") == std::string::npos || !cut.fellBack(edvr::FlatQuery::CoverageDepth))
+        fail("coverage depth: the change nothing hooked was not reported once, by name, and fallen back on");
+    // Fallen back: every frame asks, the answer is the context's, and nothing more is said.
+    cut.beginFrame(193);
+    if (depthNow(depthIdentity, &reads) != otherRes.Get() || reads != 1 || said.size() != 1) fail("coverage depth: a fallen-back state did not just ask the context");
+    g.ctx->ClearState();
+    cut.reset();
+    said.clear();
+
+    // The shaders.
+    std::map<const void*, uint64_t> hashes = {{g.vs.Get(), lifecycle_tests::kVsHash}, {g.ps.Get(), lifecycle_tests::kPsHash},
+                                              {g.ps2.Get(), lifecycle_tests::kPsHash2}};
+    auto hashOf = [&](void* p) -> uint64_t { auto it = hashes.find(p); return it == hashes.end() ? 0 : it->second; };
+    unsigned flushes = 0;
+    auto flush = [&] { ++flushes; };
+    auto shadersNow = [&](uint64_t vs, uint64_t ps, unsigned long long* readsOut) {
+        RecOn on;
+        g_rec.reset();
+        const bool match = edvr::flatQueryShaders(cut, g.ctx, vs, ps, hashOf, flush, log);
+        if (readsOut) *readsOut = g_rec.calls[kVSGetShader] + g_rec.calls[kPSGetShader];
+        return match;
+    };
+    g.setVs();
+    g.setPs(g.ps.Get(), lifecycle_tests::kPsHash);
+    cut.beginFrame(1);
+    if (!shadersNow(lifecycle_tests::kVsHash, lifecycle_tests::kPsHash, &reads) || reads != 0 || flushes != 0)
+        fail("coverage shaders: an ordinary frame did not answer from the shadow with no read and no flush");
+    cut.beginFrame(0);
+    if (!shadersNow(lifecycle_tests::kVsHash, lifecycle_tests::kPsHash, &reads) || reads != 2 || flushes != 1)
+        fail("coverage shaders: a checking frame did not flush, ask the context for both shaders and agree");
+    if (!said.empty()) fail("coverage shaders: an agreeing check was reported wrong");
+    g.setPs(g.ps2.Get(), lifecycle_tests::kPsHash2);   // hooked: the shadow follows
+    cut.beginFrame(64);
+    if (!shadersNow(lifecycle_tests::kVsHash, lifecycle_tests::kPsHash2, &reads) || !said.empty()) fail("coverage shaders: a hooked rebind was reported wrong");
+    // ClearState: the shadow forgets the hashes and so does the context (no shader bound): nothing to match, on either side.
+    for (auto& s : lifecycle_fake::g_slots) { s.ptr = nullptr; s.hash = 0; ++s.gen; }
+    g.ctx->ClearState();
+    cut.beginFrame(128);
+    if (!shadersNow(0, 0, &reads) || !said.empty()) fail("coverage shaders: after ClearState the shadow and the context disagreed");
+    // A change nothing hooked: a real pixel-shader set with no shadow update.
+    g.setVs();
+    g.setPs(g.ps.Get(), lifecycle_tests::kPsHash);
+    g.ctx->PSSetShader(g.ps2.Get(), nullptr, 0);
+    cut.beginFrame(129);
+    if (!shadersNow(lifecycle_tests::kVsHash, lifecycle_tests::kPsHash, &reads)) fail("coverage shaders: an ordinary frame's shortcut was not the shadow's");
+    cut.beginFrame(192);
+    if (shadersNow(lifecycle_tests::kVsHash, lifecycle_tests::kPsHash, &reads)) fail("coverage shaders: a checking frame did not use the context's answer for a change nothing hooked");
+    if (said.size() != 1 || said[0].find("coverage shader identity") == std::string::npos || !cut.fellBack(edvr::FlatQuery::ShaderIdentity))
+        fail("coverage shaders: the change nothing hooked was not reported once, by name, and fallen back on");
+    // Fallen back: the shadow corrected by a hooked set, and every frame asks and matches.
+    g.setPs(g.ps2.Get(), lifecycle_tests::kPsHash2);
+    cut.beginFrame(193);
+    if (!shadersNow(lifecycle_tests::kVsHash, lifecycle_tests::kPsHash2, &reads) || reads != 2 || said.size() != 1) fail("coverage shaders: a fallen-back state did not just ask the context");
+    return out;
 }
 
 // --- The faults: the policy with one restore dropped ---------------------------------------------------------------
@@ -874,6 +1152,57 @@ inline void run(const Harness& h) {
         saved[variant] = oldCalls - lazyCalls;
     }
     h.check(saved[0] > 0 && saved[1] > 0, "flat lazy: and both runs saved calls");
+    h.check(countRun(h, false, 40, false) == 440,
+            "flat lazy: the restore-after-every-draw form is eleven context calls a draw: the figure the census measured (13,549 over 1,130)");
+
+    // The kept answers, on the case they are for: many short runs (a draw that is not a producer between two of them),
+    // where every run pays for reading the game's state again. Three forms: the old per-draw bracket, the lazy bracket with
+    // every state asking the context, and the lazy bracket answering from what it kept.
+    {
+        const unsigned long long perDraw = countRuns(h, Form::PerDraw, 40, 1, false);
+        const std::string perDrawWas = g_lastRunDescription;
+        const unsigned long long asking = countRuns(h, Form::LazyAsking, 40, 1, false);
+        const std::string askingWas = g_lastRunDescription;
+        const unsigned long long kept = countRuns(h, Form::Lazy, 40, 1, false);
+        std::printf("  flat lazy: 40 runs of one producer draw each: %llu context calls restoring after every draw, %llu lazy with every state "
+                    "asking the context, %llu lazy answering from what it kept (%.0f%% fewer than asking)\n"
+                    "    per draw: %s\n    lazy, asking: %s\n    lazy, kept: %s\n",
+                    perDraw, asking, kept, asking ? 100.0 * (1.0 - double(kept) / double(asking)) : 0.0, perDrawWas.c_str(),
+                    askingWas.c_str(), g_lastRunDescription.c_str());
+        h.check(kept > 0 && kept * 100 <= asking * 75,
+                "flat lazy: a run answering from what it kept costs at least 25% fewer calls than one asking the context for the same state");
+        h.check(kept < perDraw, "flat lazy: and short runs are still cheaper than restoring after every draw");
+    }
+
+    // A change nothing hooked, on a checking frame and off one, for the blend state and for the render targets.
+    for (int what = 0; what < 2; ++what) {
+        const Unhooked kind = what == 0 ? Unhooked::Blend : Unhooked::Targets;
+        const edvr::FlatQuery query = what == 0 ? edvr::FlatQuery::GameBlend : edvr::FlatQuery::GameTargets;
+        const char* name = what == 0 ? "blend state" : "render targets";
+        const CutOutcome checked = unhookedScene(h, kind, true);
+        if (!checked.held) std::printf("  flat lazy: the %s change on a checking frame failed at: %s\n", name, checked.why.c_str());
+        h.check(checked.held, (std::string("flat lazy: the context is the game's again after a ") + name + " change nothing hooked, on a checking frame").c_str());
+        h.check(checked.counts.mismatched[static_cast<unsigned>(query)] == 1 && (checked.counts.fellBack & (1u << static_cast<unsigned>(query))) != 0,
+                (std::string("flat lazy: the check counts that ") + name + " change once, and the state asks the context from then on").c_str());
+        h.check(checked.lines.find(edvr::flatQueryName(query)) != std::string::npos &&
+                    checked.lines.find('\n') == checked.lines.rfind('\n'),
+                (std::string("flat lazy: and says so once in the log, naming the ") + name).c_str());
+        const CutOutcome off = unhookedScene(h, kind, false);
+        h.check(!off.held && off.counts.mismatched[static_cast<unsigned>(query)] == 0,
+                (std::string("flat lazy: off a checking frame the ") + name + " change nothing hooked is NOT seen: the stale answer is used (what one frame in 64 bounds)").c_str());
+    }
+    {
+        std::string releaseWhy;
+        const bool released = releaseScene(h, &releaseWhy);
+        if (!released) std::printf("  flat lazy: the release scene failed: %s\n", releaseWhy.c_str());
+        h.check(released, "flat lazy: the Present and ClearState let go of the game's views the bracket kept");
+    }
+    {
+        const CoverageOutcome coverage = coverageScene(h);
+        if (!coverage.ok) std::printf("  flat lazy: the coverage questions failed at: %s\n", coverage.why.c_str());
+        h.check(coverage.ok, "flat lazy: the coverage classification's depth and shader questions answer from the shadow, follow hooked setters and "
+                             "ClearState, and a change nothing hooked is found on a checking frame");
+    }
 
     // The overlay guard: the counters agree with the eager form's.
     {

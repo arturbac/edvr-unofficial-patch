@@ -56,6 +56,7 @@
 #include <cstring>
 
 #include "engine_motion_cpu.h"
+#include "flat_query_cut.h"   // the counts of the questions answered from what the runtime tracks
 
 #ifndef EDVR_FLATCPU_NOW
 #define EDVR_FLATCPU_NOW() (::edvr::flatcpu::qpcNow())
@@ -416,6 +417,10 @@ struct WindowReport {
     // The engine-motion draw wrapper's D3D immediate-context calls in the window (state gets and
     // sets, clears and copies), and the draws it substituted, which they belong to.
     uint64_t stateCalls = 0, substitutedDraws = 0;
+    // The questions the flat path answered from what the runtime already tracks instead of asking the D3D
+    // context (flat_query_cut.h): how many, how many were also put to the context and compared, how many of
+    // those comparisons were wrong, and which states ask the context again.
+    FlatQueryCounts queries;
     // GPU spans, read back without waiting: the whole frame (first game draw to Present) and the
     // flat resolver's dispatches plus backend call. skipped: frames nothing could be timed for
     // (no free timer, or the frame was not watched); invalid: a sample the driver marked disjoint
@@ -504,6 +509,17 @@ public:
         stateCalls_ += stateCalls;
         substitutedDraws_ += substitutedDraws;
     }
+    // The query shortcuts' counts for the frame that just ended (flat_query_cut.h, take()), drained with
+    // the wrapper's.
+    void noteQueries(const FlatQueryCounts& c) noexcept {
+        for (unsigned i = 0; i < kFlatQueryCount; ++i) {
+            queries_.served[i] += c.served[i];
+            queries_.sampled[i] += c.sampled[i];
+            queries_.asked[i] += c.asked[i];
+            queries_.mismatched[i] += c.mismatched[i];
+        }
+        queries_.fellBack |= c.fellBack;
+    }
 
     // The census stops when no temporal mode is selected: both gates close (a scope then costs a
     // load and a compare) and the next frame primes afresh.
@@ -550,6 +566,7 @@ public:
         }
         out.stateCalls = stateCalls_;
         out.substitutedDraws = substitutedDraws_;
+        out.queries = queries_;
         percentiles(interval_, (std::min)(frames_, kMaxSamples), &out.presentP50Ms, &out.presentP95Ms);
         out.gpuFrameSamples = gpuFrame_;
         percentiles(gpuFrameMs_, gpuFrame_, &out.gpuFrameP50, &out.gpuFrameP95);
@@ -592,6 +609,7 @@ private:
         std::memset(emOtherTicks_, 0, sizeof(emOtherTicks_));
         std::memset(emOtherCalls_, 0, sizeof(emOtherCalls_));
         stateCalls_ = substitutedDraws_ = 0;
+        queries_ = FlatQueryCounts{};
         gpuFrame_ = gpuResolve_ = 0;
         gpuSkipped_ = gpuInvalid_ = 0;
     }
@@ -608,6 +626,7 @@ private:
     uint64_t emRenderTicks_[emcpu::kParts] = {}, emRenderCalls_[emcpu::kParts] = {};
     uint64_t emOtherTicks_[emcpu::kParts] = {}, emOtherCalls_[emcpu::kParts] = {};
     uint64_t stateCalls_ = 0, substitutedDraws_ = 0, gpuSkipped_ = 0, gpuInvalid_ = 0;
+    FlatQueryCounts queries_;
     float interval_[kMaxSamples];
     float gpuFrameMs_[kMaxSamples];
     float gpuResolveMs_[kMaxSamples];
@@ -767,6 +786,30 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
     tk.add("; ", "camera witness %.2f us/write (%llu writes clocked)", witnessUs, static_cast<unsigned long long>(r.renderCalls[kWitness]));
     tk.add("; ", "engine motion wrapper D3D calls %.0f/frame over %.1f substituted draws/frame",
            static_cast<double>(r.stateCalls) / frames, static_cast<double>(r.substitutedDraws) / frames);
+    // The questions answered from what the runtime tracks rather than put to the D3D context (flat_query_cut.h): per
+    // frame, and how many of them the one-frame-in-64 check also put to the context and found wrong. A state that was
+    // found wrong asks the context again, and is named.
+    tk.add("; ", "query shortcuts (answers a frame from what the runtime tracks; one frame in %u also asks the context and compares)",
+           FlatQueryCut::kFramePeriod);
+    for (unsigned i = 0; i < kFlatQueryCount; ++i) {
+        tk.add(i ? ", " : ": ", "%s %.1f (checked %llu, wrong %llu)", flatQueryName(static_cast<FlatQuery>(i)),
+               static_cast<double>(r.queries.served[i]) / frames, static_cast<unsigned long long>(r.queries.sampled[i]),
+               static_cast<unsigned long long>(r.queries.mismatched[i]));
+    }
+    if (!r.queries.fellBack) {
+        tk.add("; ", "no state asks the context again");
+    } else {
+        char names[200] = {};
+        size_t used = 0;
+        for (unsigned i = 0; i < kFlatQueryCount; ++i) {
+            if (!(r.queries.fellBack & (1u << i))) continue;
+            const int n = std::snprintf(names + used, sizeof(names) - used, "%s%s (%.1f a frame)", used ? ", " : "",
+                                        flatQueryName(static_cast<FlatQuery>(i)),
+                                        static_cast<double>(r.queries.asked[i]) / frames);
+            if (n > 0 && static_cast<size_t>(n) < sizeof(names) - used) used += static_cast<size_t>(n);
+        }
+        tk.add("; ", "ASKS THE CONTEXT AGAIN: %s", names);
+    }
     // The GPU spans, read back without waiting. No sample prints "-", never 0.00: a span that
     // was not timed is not a fast one.
     char frameText[64] = "-", resolveText[64] = "-";

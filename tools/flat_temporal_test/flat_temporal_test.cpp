@@ -26,6 +26,7 @@
 #include "flat_cpu_tests.h"
 #include "flat_witness_bound_tests.h"
 #include "flat_camera_table_tests.h"
+#include "flat_query_cut_tests.h"
 #include "flat_wrapper_note_tests.h"
 
 #include <cstdio>
@@ -2453,6 +2454,8 @@ void testFlatCpuWiring() {
         {&runtimeCpp, "s.census.idle();", 1, "and stops it when no temporal mode is selected"},
         {&runtimeCpp, "const EngineVelocityWrapperCounts wrapper = engineVelocityTakeWrapperCounts();", 1, "the draw wrapper's counts are drained every frame"},
         {&runtimeCpp, "if (censusWasRunning) s.census.noteWrapper(", 1, "and handed to the census only while it runs: no backlog"},
+        {&runtimeCpp, "const FlatQueryCounts queries = flatQueryCut().take();", 1, "the query shortcuts' counts are drained every frame too"},
+        {&runtimeCpp, "if (censusWasRunning) s.census.noteQueries(queries);", 1, "and handed over only while the census runs"},
         {&runtimeCpp, "Log::get().note(\"%s\", lines.line[i]);", 1, "the lines go to the log as they are"},
         // The census drives engine motion's clock in the flat profile; nothing else does.
         {&cpuH, "emcpu::g_gate.store(gate, std::memory_order_relaxed);", 1, "the census opens engine motion's gate with its own sampling decision"},
@@ -2499,10 +2502,10 @@ void testFlatCpuWiring() {
     if (first != std::string::npos && last != std::string::npos && first < last)
         check(runtimeCpp.substr(first, last - first).find("census") == std::string::npos,
               "the stand-down never reads the census: it measures, it does not decide");
-    // The same for the numbers: the runtime touches the census in ten places and no other -- the four
+    // The same for the numbers: the runtime touches the census in eleven places and no other -- the four
     // GPU notes and the skipped one, idle, and the block at the Present (running, onFrame, noteWrapper,
-    // take) -- and none of them reads a figure back into the runtime's state.
-    check(count(runtimeCpp, "s.census.") == 10,
+    // noteQueries, take) -- and none of them reads a figure back into the runtime's state.
+    check(count(runtimeCpp, "s.census.") == 11,
           "the runtime touches the census in exactly its known places (the GPU notes, idle, and the Present block)");
 }
 
@@ -2816,6 +2819,73 @@ void testFlatWrapperNoteWiring() {
           "the panel reads the wrapper's name only in the flat profile");
 }
 
+// The query shortcuts in the runtime and the engine motion wrapper (flat_query_cut.h holds the policy and the rig above
+// it, the engine rig the D3D side of each state): every question the flat path used to put to the context goes through the
+// policy, the census is told the counts, the frame's end lets go of what was kept, and the coverage classification no longer
+// reads the context itself. A source scan with removal controls.
+void testFlatQueryCutWiring() {
+    auto slurp = [](const char* path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string runtimeCpp = slurp("src/d3d11/flat_runtime.cpp");
+    const std::string engineCpp = slurp("src/d3d11/engine_velocity.cpp");
+    const std::string readsH = slurp("src/d3d11/flat_query_reads.h");
+    check(!runtimeCpp.empty() && !engineCpp.empty() && !readsH.empty(), "the runtime, engine motion and query sources are readable from the repo root");
+    auto count = [](const std::string& text, const std::string& needle) {
+        unsigned n = 0;
+        for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
+        return n;
+    };
+    struct Pin { const std::string* text; const char* needle; unsigned times; const char* what; };
+    const Pin pins[] = {
+        // The runtime.
+        {&runtimeCpp, "const void* depthResource=coverageDepthResource(ctx,k,depthHold);", 2, "both projection branches of the coverage classification ask for the depth view through the policy"},
+        {&runtimeCpp, "if(coverageShadersMatch(ctx,k)) {", 2, "and both unchanged-shader branches ask for the shaders through it"},
+        {&runtimeCpp, "flatQueryDepth(flatQueryCut(), ctx, k.depth, hold,", 1, "the depth question is the shared function's, with the draw key's depth as the shadow's answer"},
+        {&runtimeCpp, "flatQueryShaders(flatQueryCut(), context, k.vs, k.ps,", 1, "and the shader question, with the key's hashes"},
+        {&runtimeCpp, "flatQueryCut().beginFrame(frame);", 1, "the Present tells the policy which frame starts (one in 64 checks)"},
+        {&runtimeCpp, "(s.projectionFrames != 0 || !flatCameraInjectUpstreamOwns());", 1,
+         "the coverage reads that still ask the context (an F10 audit, the legacy route) put the game's state back first, and nothing else does"},
+        {&runtimeCpp, "if (owner()) engineVelocityFlatFrameEnd();", 1, "the frame's end lets go of what the bracket kept"},
+        // Engine motion's wrapper.
+        {&engineCpp, "flatQueryCut().plan(FlatQuery::GameTargets)", 1, "the game's render-target set is kept through the policy"},
+        {&engineCpp, "flatQueryCut().plan(FlatQuery::GameBlend)", 1, "and its blend state"},
+        {&engineCpp, "flatQueryCut().plan(FlatQuery::TargetsKept)", 1, "and the runtime's acceptance of MRT6"},
+        {&engineCpp, "flatQueryCut().compared(", 3, "each is compared with the context on a check"},
+        {&engineCpp, "void engineVelocityFlatFrameEnd() noexcept {", 1, "the bracket lets go of what it kept at the frame's end"},
+        // The shared reads.
+        {&readsH, "cut.plan(FlatQuery::CoverageDepth)", 1, "the depth question asks the policy"},
+        {&readsH, "cut.plan(FlatQuery::ShaderIdentity)", 1, "and the shader question"},
+        {&readsH, "cut.compared(", 2, "and each compares on a check"},
+    };
+    for (const Pin& pin : pins) {
+        check(count(*pin.text, pin.needle) == pin.times, pin.what);
+        std::string without = *pin.text;
+        for (size_t at = without.find(pin.needle); at != std::string::npos; at = without.find(pin.needle))
+            without.erase(at, std::strlen(pin.needle));
+        check(count(without, pin.needle) == 0, "query cut wiring control: a source with the line removed no longer contains it");
+    }
+    // The coverage classification no longer reads the context for what the shadow knows.
+    const size_t coverageFrom = runtimeCpp.find("flatcpu::Scope coverage(flatcpu::kCoverage);");
+    const size_t coverageTo = coverageFrom == std::string::npos ? std::string::npos : runtimeCpp.find("if (continuesRun) {", coverageFrom);
+    check(coverageFrom != std::string::npos && coverageTo != std::string::npos && coverageFrom < coverageTo,
+          "the coverage classification can be delimited");
+    if (coverageFrom != std::string::npos && coverageTo != std::string::npos && coverageFrom < coverageTo) {
+        const std::string region = runtimeCpp.substr(coverageFrom, coverageTo - coverageFrom);
+        check(count(region, "GetRenderTargets") == 0 && count(region, "GetShader") == 0,
+              "the coverage classification does not read the depth view or the shaders off the context itself");
+        check(count(region, "coverageDepthResource(") == 2 && count(region, "coverageShadersMatch(") == 2,
+              "(control: the delimited text is the classification, and asks through the policy)");
+    }
+    // The frame's end comes after the Present's flush, inside the same function.
+    const size_t before = runtimeCpp.find("void flatRuntimeBeforePresent() {");
+    const size_t flush = runtimeCpp.find("flatRuntimeSubstitution(state().context.Get(), FlatSubstEvent::kPresent);", before);
+    const size_t end = runtimeCpp.find("if (owner()) engineVelocityFlatFrameEnd();", before);
+    check(before != std::string::npos && flush != std::string::npos && end != std::string::npos && flush < end && end - flush < 400,
+          "the frame's end follows the Present's flush");
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
         return flatShaderClassifierSweep(argv[2]);
@@ -2878,6 +2948,8 @@ int main(int argc, char** argv) {
     testFlatSubstitutionWiring();
     failures += flatWrapperNoteTests();
     testFlatWrapperNoteWiring();
+    failures += flatQueryCutTests();
+    testFlatQueryCutWiring();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

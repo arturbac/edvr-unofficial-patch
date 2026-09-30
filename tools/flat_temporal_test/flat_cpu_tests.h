@@ -447,6 +447,55 @@ inline int flatCpuTests() {
                "a window is emptied when it is taken");
     }
 
+    // ---- 8b: the query shortcuts' counts (flat_query_cut.h) -------------------------------------------------
+    {
+        flatcpu::resetForTest();
+        fake(0);
+        Run run;
+        const unsigned depth = static_cast<unsigned>(edvr::FlatQuery::CoverageDepth), blend = static_cast<unsigned>(edvr::FlatQuery::GameBlend);
+        for (int i = 0; i < 300; ++i) {
+            run.frame(16667, false, {});
+            edvr::FlatQueryCounts c;
+            c.served[depth] = 1130;
+            c.served[blend] = 40;
+            if (i % 64 == 0) { c.sampled[depth] = 4; c.sampled[blend] = 2; }
+            run.census->noteQueries(c);
+        }
+        flatcpu::WindowReport r;
+        const bool got = run.census->take(run.now, false, r);
+        flatcpu::Lines lines;
+        flatcpu::formatWindow(r, &lines);
+        const std::string text = joined(lines);
+        expect(got && r.queries.served[depth] == 300ull * 1130 && r.queries.sampled[depth] == 20 && r.queries.sampled[blend] == 10,
+               "the window sums the frames' query counts");
+        expect(has(text, "query shortcuts (answers a frame from what the runtime tracks; one frame in 64 also asks the context and compares): "
+                         "coverage depth view 1130.0 (checked 20, wrong 0), coverage shader identity 0.0 (checked 0, wrong 0), "
+                         "game blend state 40.0 (checked 10, wrong 0)"),
+               "the line says how many questions a frame were answered from what the runtime tracks, per state, and how many were checked");
+        expect(has(text, "no state asks the context again"), "and says that no state fell back");
+        expect(!lines.truncated, "and the window still fits the lines");
+        // A state that fell back is named, with how often it asks now.
+        for (int i = 0; i < 300; ++i) {
+            run.frame(16667, false, {});
+            edvr::FlatQueryCounts c;
+            c.served[depth] = 1130;
+            c.asked[blend] = 40;
+            c.mismatched[blend] = i == 0 ? 1 : 0;
+            c.fellBack = 1u << blend;
+            run.census->noteQueries(c);
+        }
+        flatcpu::WindowReport fell;
+        const bool gotFell = run.census->take(run.now, false, fell);
+        flatcpu::Lines fellLines;
+        flatcpu::formatWindow(fell, &fellLines);
+        const std::string fellText = joined(fellLines);
+        expect(gotFell && fell.queries.served[blend] == 0 && fell.queries.mismatched[blend] == 1,
+               "the next window starts empty, and counts the disagreement that came");
+        expect(has(fellText, "game blend state 0.0 (checked 0, wrong 1)") && has(fellText, "ASKS THE CONTEXT AGAIN: game blend state (40.0 a frame)") &&
+                   !has(fellText, "no state asks the context again"),
+               "a state that fell back is named on the line, with how often it asks now");
+        expect(!fellLines.truncated, "and that window fits the lines too");
+    }
     // ---- 9: the census stops when asked, and starts afresh ------------------------------------------------
     {
         flatcpu::resetForTest();
