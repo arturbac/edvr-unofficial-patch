@@ -164,6 +164,8 @@ python tools\build_lock.py --self-test || exit /b 1
 python tools\flash_patch_residual.py --self-test || exit /b 1
 python tools\check_status_blocks.py --self-test || exit /b 1
 python tools\check_status_blocks.py || exit /b 1
+REM The physics the black-hole shader is held to (docs\black-holes.md).
+python tools\blackhole_optics.py --self-test || exit /b 1
 REM The guard tools\run_jobs.py holds every rig to (no window, no console, no
 REM move of the keyboard focus); its own self-test, run below with the rigs,
 REM starts it on real processes, so this one fails first and fast.
