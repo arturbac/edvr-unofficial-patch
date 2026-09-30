@@ -49,7 +49,7 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-82):** users 1-2 refused every frame, 3 treated at 7-13
-  fps, 4 lost ~23 ms (ReShade). 80-81 flown. 82 (VR on foot): built, unflown.
+  fps, 4 lost ~23 ms (ReShade). 80-81 flown. 82 (VR): flown once, analysed.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -6297,3 +6297,183 @@ treated-frame machine as flat (warm 8, grace 3, late-write latch 3).
   temporal door and the sharpen pass both ask it for the same eye and sequence
   and the 5 s line would read twice `eye-takes` on a healthy flight (found by
   the merged rigs, pinned).
+
+**Flight 1 of the route, analysed (2026-09-30).** Read and diagnosed; no code
+changed. Log `edvr_gfx_20260930_161545.log`, v0.18.0-rc.4-104-gbde47f81
+(`edvr_log.py --target frontier --expect-build bde47f81` exits 0). Sean turned
+the census (16:17:21) and the route (16:17:40) on live from the in-VR menu and
+had set `panel_curvature` 0 there (16:16:21). He stood on foot in a station
+from 16:20:05 (screen motion names the source by its "hangar" rule: the
+5040x2835 depth with the most pool-family draws last frame, 1,567), weapon not
+drawn, so the fold-in is unflown in substance (one line, `flat resolve:
+first-person motion inputs bound`). The in-VR menu was opened on foot twice
+(16:20:56, fps overlay on; 16:21:36) with the route owned. Environment as in
+the first-build note: native OpenXR, Crystal Super, HMD 0.65, DLSS preset K;
+the route resolves at DLAA 5040x2835 on slot 2.
+
+1. OWNERSHIP AND THE "FLAP". The route owned 14,220 of the 16,771 on-foot
+   frames (84.8%, frames 13787-30558) in three episodes: 13,044 frames
+   (16:20:06.1-16:22:41.9), 98 (16:23:00.1-16:23:01.3), 1,078 (16:23:12.1-
+   16:23:24.8). The 69 five-second lines sum to frames 29,129, treated 14,235,
+   declined 2,399 (2,396 depth-not-screen-motion-source, 3 engine-views-
+   unavailable), eye-takes 28,422 (= 2 x owned), door-layer-only 28,422,
+   late-hdr-writes 0, enters 3, releases 3. 31 whole windows were fully owned
+   (treated = frames, none declined, 372-450 frames: 74-90 fps, mean 83.7).
+   The 29 `observing treated=0 declined=0` windows (16:17:45-16:20:00) are the
+   cockpit and hangar: gate no, hdr-frames 0, journal "aboard", 0 draws into
+   the screen's depth. On-foot entry: 4 declines (naming not made yet) and 1
+   engine-views-unavailable, treated from frame 13792, OWNS at 13800.
+   THE RELEASES ARE SCENE CHANGES, not naming noise. No owned run declines
+   except the 3 frames of grace that end it, and the other 2,392 declines all
+   sit in two gaps: 16:22:41.9-16:22:59.96 (18.1 s) and 16:23:01.3-16:23:11.99
+   (10.7 s). (a) The tallies partition cleanly: 16:22:45 has 91 selected, 216
+   declined and 109 frames with no H at all; 16:22:50 and :55 have 450 of 450
+   declined; no window mixes them frame by frame. (b) Screen motion logs
+   "showed for 90 frames and nothing named its source" (16:22:43.1, 16:23:02.5)
+   and "named again after 1,597 / 929 screen frames"; engine motion freed and
+   re-made its 114.3 MB slot target at the same times. (c) The gate's depth
+   count fell from 4,917 draws a frame to 22. (d) THE WORLD WAS PAUSED: the
+   resolver's reset lines at each re-entry (delta-ms 18,125 and 10,750, the gap
+   lengths) print origin-delta (0,0,0) and max-matrix-delta 0, so the camera is
+   bit-identical to the last treated frame's, (-158.706497, 69.8441238,
+   -394.400391): the player did not move and no second world exists. (e) The
+   trigger keeps its shader pair but sits at seq 32-120 (about 1.9k in the
+   world): the same frame graph drawing a few objects. (f) The eye route
+   logs "auxiliary camera rows do not follow the head" within 4 ms of the
+   first release. So the game showed a full-screen non-world view. The 3D map
+   the plan asked for fits (the second gap is 10.7 s, the first 18.1 s a first
+   look, the 98-frame world between them the map closed and reopened), but the
+   log cannot tell map from menu: Sean's account is wanted. The named source
+   depth was 0x2636FFC0AA0, then 0x2636FFBD0E0 in the 98-frame episode, then
+   0x2636FFC0AA0 again. The third release (16:23:24.8) is the exit: 2016x1949
+   eye-sized depth targets and a loading composite into an eye appear in the
+   same ms, and the session closes 3 s later. Only 12 decline lines are logged
+   a session; they went to the entry (5) and the first 7 frames of the first
+   gap, and the tallies carry the rest. A world-to-world jump (camera moved
+   460 m at 16:20:44.240, LONG FRAME 153 ms, 469 MB created) did NOT release
+   the route: the resolver's camera-cut reset absorbed it.
+   NO FIX NEEDED. A frame with no naming draw has no world camera, and the
+   route must not resolve it; the refusal and the release are the design
+   working. One fact to carry: the trigger is not the census retake's tone. It
+   is a 2520x1417 R11G11B10F consumer of H (VS DFED8E1C9E191BEC, PS
+   143AAE0597E2F7BF) at seq 1661 after 132 draws into H (1518..1660), so the
+   resolve lands before bloom, with 0 late writes in 14,235 treated frames. A
+   write into H after that consumer would trip the 3-frame latch for the
+   session: watch it in a settlement.
+2. COST. No key-off on-foot baseline exists in this log (the frames before the
+   keys were cockpit and hangar). The earlier key-off on-foot 30 s windows the
+   same morning (c96b91f1, same rig) are the eye route: EDVR ~ 4.78, 5.15, 5.25
+   (mean 5.06; door 3.77-3.91, in-frame 0.88-1.48). The four whole owned
+   windows, ms a frame (EDVR ~, door, world resolve, mips, layer re-issue,
+   layer composite, sharpen, screen motion, weapon motion, application render
+   p50 with the game's share):
+     window    EDVR  door resolve mips re-iss compos sharp scrM wpnM  app (game)
+     16:20:46  2.858 .563 1.866  .068  .046   .284  .280 .125 .128  9.08 (6.22)
+     16:21:16  3.703 .697 1.848  .053  .051   .433  .242 .094 .873 11.62 (7.91)
+     16:21:46  3.791 .666 1.900  .053  .049   .392  .257 .094 .929 11.92 (8.13)
+     16:22:16  3.648 .657 1.918  .053  .048   .382  .260 .104 .770 11.54 (7.89)
+   EDVR ~ is 3.50 (2.86-3.79) against 5.06: -1.56 ms (-31%). The estimate was
+   2.6-3.6; three windows sit 0.05-0.19 above its top. The door fell to 0.56-
+   0.70 (upscaler, motion prep, UI resolve and hologram all "-"). Against the
+   table: world resolve 1.85-1.92 (estimate 1.4-1.8, 0.05-0.12 over), mips
+   0.05-0.07 (0.1-0.2, under), layer 0.33-0.48 counting the composite (0.2-0.5,
+   in). Sharpen 0.24-0.28 is unchanged; screen motion fell from 0.23-0.25 to
+   0.09-0.13 (the per-eye reissues are skipped). WEAPON MOTION is the largest
+   item the route does not own: 0.13-0.93 ms (55-300 calls a frame) with no
+   weapon drawn, 0.57-1.18 in the key-off baseline, so it is not new; it is
+   21-25% of EDVR in the three heavy windows. The GPU is the limit: frame gap
+   p50 0.09-0.10 ms and application render 11.5-11.9 ms in the heavy view
+   (74-86 fps). The eye route would add about 1.56 ms (about 13.1 ms, 76 fps;
+   an estimate, not measured). CPU: draw-hook CPU is 1.66-2.04 ms a frame
+   while owned (mean 1.94) against 0.73 and 1.47-1.78 in the key-off windows,
+   whose scenes were lighter (4.2k and 4.9k screen-depth draws against 4.8-
+   5.1k): a rise of 0.2-1.2 ms is possible and unproven. The route's own CPU
+   (detector, resolve issue, layer re-issue) needs its own clock. The
+   `submits` figure of `native timing CPU` is one frame's wall time with
+   waits (0.5-11 ms owned, 8-9 ms in the gaps, 0.3 ms in the cockpit): not a
+   CPU cost. FIRST TREAT: the world NGX feature took 126 ms to create (`dlaa:
+   ... for the VR world (upscaler slot 2) ... made in 126 ms`, 16:20:06.003).
+   There is no LONG FRAME line for it: the monitor logs one per 5 s and 60 a
+   session at most (perf_monitor.cpp kDropLogEveryMs, kDropLogMax); it had
+   printed one at 16:20:03.8, which is the game loading the scene (155 ms of
+   game work), and the 60th was at 16:22:30, so no hitch of the gaps is
+   logged. The baseline to fly: one spot, standing still, no menu, the same
+   scene in view, the route toggled LIVE from the in-VR menu (Experimental
+   page): 90 s auto, 90 s off, 90 s auto. Read the 30 s windows that fall
+   wholly inside a leg (they end at :15.8 and :45.8): EDVR ~, application
+   render p50 and frames a window.
+3. CAMERA CENSUS (`edvr_log.py --camera-census`): 470 lines, 4.63 million
+   refresh calls over 30,345 frames, all on the render thread (owner 13304),
+   hook installed from 16:17:21.665, no fault: the detour runs safely in VR.
+   THE EYE CAMERAS ARE KIND 5 AND THE ON-FOOT WORLD CAMERA IS KIND 3. On foot a
+   frame holds about 60-68 kind-3 calls, exactly 6.0 kind-5 calls (2 eyes x
+   the 3 call sites +0x594E13, +0x594EAB, +0x594FE1), 29.8 kind-0 and 15.2
+   kind-1 calls, and no kind 4. The eye b1 rows 270..273 read back at the eye
+   composite draw equal the eye camera's composed rows to 1e-5 in all 6
+   joinable draws (measured 0.178391, the advertised frusta's 0.178391): eye 0
+   is camera 0x25FED68B4D0, eye 1 is 0x25FF2358330, both kind 5, aspect
+   1.03441, fov 1.59971, near 0.025, far 50000, off-centre +0.1783 and -0.1785,
+   refreshed once a frame AFTER the tone at draws 6067-6069, immediately
+   before each eye's composite draw (6068, 6069). The world is ONE camera
+   object, 0x25FEFC53770, refreshed 54 times a frame as kind 3 (18 per call
+   site, 5 views), all BEFORE the tone (draws 4163-6049). Before the tone too:
+   kind 0 x8 (far 2-30 m) and kind 1 x6 (orthographic, near = -far), shadow-
+   like; a kind-0 camera (near 0.1, far 1000) follows it x6. Camera IDENTITY is
+   useless: 0x25FEFC53770 was the left eye camera in the cockpit (kind 5,
+   off-centre +0.1785, first seen 16:17:21) and is the world's kind-3 camera on
+   foot. The eye leak baseline with the shift off and no world phase is
+   |leak| <= 9.4e-9 NDC (half a pixel at 5040 wide is 2e-4). The reader labels
+   a camera by its first-seen kind, so it calls 0x25FEFC53770 "other kind",
+   finds no world camera and answers (C), (D) and (F) "not enough calls
+   logged"; the logged sequences answer them as above. The `changed:` budget
+   (24) went to the shadow cascades' drift in the first frames.
+   STAGE 2 IS DESIGNABLE, and the exclusion already exists: flatCameraAdmit
+   answers Unsupported for kinds 4 and 5 (never mutated) and Inject only for
+   kind 3. Design: install the injector in VR while the route is Warming or
+   Owned, the route as its Upstream owner and observeOnly off; keep the
+   admission table as it is (kind read on every call, never cached per
+   camera); close the window at the route's trigger, so the 54 world calls fall
+   inside it and any call after the tone is refused as stale; `worldPhase()`
+   returns the injector's phase for the world and for the rows (zero while
+   Warming); the eye shift stays off while owned. Verify in the same flight
+   with the census on: the eye draws' measured rows must not move (|leak| <
+   1e-6 with a world phase of 1e-4 to 2e-4) while the kind-3 calls' rows carry
+   it, kind-5 calls stay 6.0 a frame and injected calls run 54-68 a frame. STOP
+   on any |leak| > 1e-5, an injected kind other than 3, or off-thread or
+   unreadable calls. Open: the weapon map's phase term, and the ~6 other kind-3
+   calls a frame (two cameras in the table, a 90-degree square-aspect one from
+   caller +0x58DE73 and a 0.236 rad zoom-like one) which need a role before
+   they get a phase.
+4. STOP LIST. Late writes 0; no latch line. No `layer did not take` line; the
+   layer's refused and lost-draw counts are 0 in every 30 s line. native
+   temporal totals `layer_only=28422, layer_only_declined=0`; native sharpen
+   `layer_only=28422, layer_only_black=0`: no black eye, no `LAYER-ONLY ... got
+   NO composite` line. One mips line (16:20:06.088: 5040x2835, 13 levels, 76.2
+   MB), no refusal, not remade across the gaps. No route, layer, mips,
+   resolver or census fault line. The releases and the 98-frame episode are
+   item 1. The flight plan's `frames-not-treated` stop line was too broad:
+   read a release against the scene first.
+
+- ruled out: a hysteresis on the screen-motion naming to keep the route owned
+  through the gaps, because the gaps are 1,597 and 929 frames with the world
+  paused and no draw naming it; the route would resolve a non-world scene and
+  keep the layer re-issuing it.
+- ruled out: taking the route's depth identity from H's writers, because the
+  resolver's camera rows come from the naming draw's scene constants, and a
+  frame with no naming draw has none.
+- ruled out: telling the eye cameras from the world's by camera identity (the
+  stop note above stands), because one object was an eye camera in the cockpit
+  and the world camera on foot; by KIND it is exact: every eye call in 4.63
+  million was kind 5.
+- ruled out: the tone as the route's trigger in this scene: it is the first
+  half-size consumer of H (item 1).
+
+Next flight (none of it built): the same-spot A/B of item 2; a settlement with
+the weapon drawn and holstered (the fold-in, the terrain naming path, and the
+late-write latch on another chain); the map opened and closed again with Sean
+watching the first frames after each handover (the eye route serves 13 frames
+before the route owns again). Small instruments that are certain: the RELEASED
+line names its last decline reason and the decline log caps per episode, not
+per session; a route CPU clock; the fold-in's counters in the 30 s window; the
+first treat's duration as its own line; the census reader classifies a camera
+by each call's kind.
