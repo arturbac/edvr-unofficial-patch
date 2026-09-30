@@ -16,7 +16,7 @@ Read the Status block first.
   DXMT saying `SwapDeviceContextState is not implemented.`, then `raise (22)`
   (abort), then `LdrShutdownProcess`. The resolver isolates the game's pipeline
   state with that call, and DXMT aborts in it. Nothing after it had run.
-- **Fix, built and rig-tested, NOT FLOWN** (branch `claude/hdr-route-crumbs`): on
+- **Fix, built and rig-tested on WARP (no debug layer), NOT FLOWN** (branch `claude/hdr-route-crumbs`): on
   a DXMT device the resolver isolates by an explicit capture and restore of the
   whole context state (`flat_context_state.h`); every other device keeps the
   swap, unchanged. DXMT is recognised by its own markers, the adapter name only
@@ -356,8 +356,10 @@ are seconds of the same counter.
      range; the block captures; the context is at its defaults after
      `ClearState`; a stand-in backend dirties every stage and slot with other
      objects and runs a dispatch; `ClearState`; the block restores. All values and
-     every count are what they were, at both feature levels, with no debug-layer
-     warning.
+     every count are what they were, at both feature levels. The D3D debug layer
+     (Graphics Tools) is not installed on the build machine, so the calls were held
+     to the oracle and to WARP's results (a call the runtime refuses leaves its slot
+     unbound and the snapshot no longer matches), not to the layer's validation.
    - The oracle is held to its word: 54 single-slot changes, one in each stage and
      kind of slot, are each seen at their own label; a leaked reference is seen; a
      context cleared and not restored differs; a capture with ranges cut short

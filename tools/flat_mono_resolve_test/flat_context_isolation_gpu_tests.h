@@ -20,6 +20,11 @@
 //     must be what they were. Then the oracle is held to its word: 54 single changes, one in each stage and kind of slot, must
 //     each be seen at the right label, a leaked reference must be seen in the counts, a context cleared and never restored must
 //     differ, and a capture whose ranges stop short must leave exactly the far slots behind.
+//
+// THE DEBUG LAYER. Where the D3D debug layer is installed (the optional Graphics Tools feature) the calls are also held to its
+// validation, and the rig's final message check covers them. A machine without it runs on a plain device; the rig says so, and its
+// debug-layer checks are then skipped, not passed. The oracle is what holds the calls either way: a call the runtime refuses leaves
+// its slot unbound, and the snapshot no longer matches.
 //  3. The resolver, in both modes, on the copy route, the HDR route, a refused backend and the spatial recovery, with the rig's
 //     backend dirtying every stage after its own ClearState: the game's whole state and every reference count come back, the swap
 //     is what the default route uses (mode "swap", no explicit capture counted, the crumbs carry by=swap and none of the block's
@@ -1117,6 +1122,13 @@ inline void resolverTests(ID3D11Device* device, ID3D11DeviceContext* context, Fi
     edvr::flatMonoResolveReset();
 }
 
+// Is the D3D debug layer on this device? (It is the optional Graphics Tools feature; a machine without it runs the rigs on a plain
+// device, and the checks that ask the layer for its verdict say so instead of passing.)
+inline bool hasDebugLayer(ID3D11Device* device) {
+    ComPtr<ID3D11InfoQueue> queue;
+    device->QueryInterface(IID_PPV_ARGS(queue.GetAddressOf()));
+    return queue != nullptr;
+}
 // What a device's debug layer said since it was made or last cleared, at warning level or worse: counted, and the first printed.
 inline size_t debugWarnings(ID3D11Device* device, const char* what) {
     ComPtr<ID3D11InfoQueue> queue;
@@ -1137,10 +1149,9 @@ inline size_t debugWarnings(ID3D11Device* device, const char* what) {
 
 inline void contextIsolationGpuTests(ID3D11Device* device, ID3D11DeviceContext* context) {
     {
-        ComPtr<ID3D11InfoQueue> queue;
-        device->QueryInterface(IID_PPV_ARGS(queue.GetAddressOf()));
-        std::printf("flat context isolation: the D3D debug layer is %s on the rig's device (%s)\n", queue ? "on" : "not installed",
-                    queue ? "every call below is held to it" : "the calls are checked by their results only");
+        const bool layer = hasDebugLayer(device);
+        std::printf("flat context isolation: the D3D debug layer is %s on the rig's device (%s)\n", layer ? "on" : "not installed",
+                    layer ? "every call below is held to it, and to the rig's final message check" : "the calls are held to the oracle and to the runtime's results only");
     }
     decisionTests(device, context);
     // The block on a second WARP device at feature level 11_1 as well: the rig's own device is 11_0 (a null level list never offers
@@ -1158,9 +1169,11 @@ inline void contextIsolationGpuTests(ID3D11Device* device, ID3D11DeviceContext* 
             Fixture fx11(d11.Get(), c11.Get());
             check(fx11.ok && fx11.c1 && fx11.uavSlots == 64, "isolation rig: the 11_1 fixture is made");
             if (fx11.ok && fx11.c1) {
+                const bool layer = hasDebugLayer(d11.Get());
                 debugWarnings(d11.Get(), "11_1 fixture");
                 blockTests(fx11);
-                check(debugWarnings(d11.Get(), "11_1 block tests") == 0, "isolation: the explicit capture and restore draw no debug-layer error or warning at feature level 11_1");
+                if (layer) check(debugWarnings(d11.Get(), "11_1 block tests") == 0, "isolation: the explicit capture and restore draw no debug-layer error or warning at feature level 11_1");
+                else std::printf("flat context isolation: the 11_1 device has no debug layer, so the layer's validation of the capture's calls was not run there\n");
             }
             c11->ClearState();
         }
