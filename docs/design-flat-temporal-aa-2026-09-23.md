@@ -37,19 +37,19 @@
 - **Ruled-out pointer:** the kinematic arc's Status records rejected motion
   estimates and the nonexistent engine velocity buffer. Reuse engine-record
   motion; do not revive estimation or the retired deferred UI replay.
-- **Next:** the earlier flight list (sections 57, 68) is verbatim in Status
-  detail and was overtaken by sections 69-77; candidates now are the open
-  items in State above (section-75 confirming flight, section-76 matrix
-  cells, a flight of the section-77 fixes and section-78 recipes).
+- **Next:** flight the HDR route (section 81): key off, then auto in the same
+  session, at the hangar and a bright star, bloom and DoF on and off. Then the
+  open items above: the section-75 confirming flight, section-76 matrix cells,
+  the section-77 fixes and section-78 recipes (older lists: Status detail).
   Existing evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
-  PS91/BFE or stale-resize hypotheses. The separate menu hangar-floor P1
-  defect remains open. VR still needs regression tests; the concourse NPC
-  observation on `d9f86b09` belongs to the main/openxr-perf-gaps line.
+  PS91/BFE or stale-resize hypotheses. The menu hangar-floor P1 defect remains
+  open. VR still needs regression tests; the concourse NPC observation on
+  `d9f86b09` belongs to the main/openxr-perf-gaps line.
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-82):** users 1-2 refused every frame, 3 treated at 7-13
-  fps, 4 lost ~23 ms (ReShade). 80 flown, 81 key off, 82 chain seen, key later
+  fps, 4 lost ~23 ms (ReShade). 80 flown, 81 built, key off, 82 chain seen
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -5304,6 +5304,220 @@ game FXAA on, ReShade chained; then the default flips to auto.
 - ruled out: CopyResource for the copy-back, because the backend writes fp16.
 - ruled out: DoF as the cause of the star's refusals, because DoF 2 drew no
   DoF pass there; the bloom variant's tone pixel shader alone refused it.
+
+**Implementation note (2026-09-30).** Built on branch `claude/flat-hdr-route`
+from main 1de97469, decisions (a) to (e) all in. The key is off, so a build of
+this tree treats every frame as before until someone sets it. Not installed,
+not flown: everything below is what the rigs pin, not what a headset showed.
+
+- Pieces. `src\d3d11\flat_hdr_route.h` is the pure half (key, detector,
+  selector, R >= D gate, late-write latch, census window, every log line).
+  `hdr_backend_flags.h` holds the DLSS and FSR creation flags as pure
+  functions, static-asserted against both SDKs' headers. `flat_runtime.cpp`
+  wires them: the detector in the draw scope, `hdrSelectAtTrigger`,
+  `treatHdr`, `hdrReadKey`, `hdrFrameEnd`. `flat_mono_resolve.cpp` and three
+  new shader variants are the resolver's HDR path; `dlaa.cpp` and
+  `fsr3_engine.cpp` take `hdr` as part of the feature or context key;
+  `flat_trace.h` is EDVRFTR4.
+- The key. `experimental.temporal_aa_before_post = off|auto`, developer tier,
+  live (read at every Present). Anything that is not `auto` reads as off, so a
+  typo never turns a flight key on. A change wakes the stand-down, restarts
+  history and, going off, rearms the latch. It is in the ini, the config
+  contract, the settings schema and the flat allow-list; it has no panel row.
+- Key off. The detector still runs, observe-only, on every watched draw.
+  Rules (i), (ii) and (iv) compare what the draw scope already holds; the four
+  pixel-shader slots are the binding shadow's identities, resolved through the
+  cached `view()` the tone and copy draws already use (no context Get, no
+  driver call), and only for a draw that passes them; nothing acts on the
+  answer. The
+  trigger decision is a per-window token printed every 5 s with its zeros:
+  frames with a trigger, frames with none, late writes, and what the selector
+  said at each trigger (`selection=`). Its cost is its own family in `flat cpu
+  5s:`. The selector runs at the trigger too, so the key-off flight already
+  reads what the route would refuse, and why.
+- Key auto. At the trigger draw, before the game's pass runs: the selector
+  (no tone or copy requirement, R >= D, H R11G11B10F), then `treatHdr`. It
+  repeats the copy route's handoff checks, copies H into the resolver's
+  private `g.color` (H's own format), runs prep and the backend at E = R,
+  finishes into H through a pixel shader into a render-target view over H and
+  restores the game's state. The game's pass that reads H next sees the
+  resolved image with its own bindings untouched; the copy stage does not
+  resolve again. Verdict `treated-jittered-hdr` (`treated-zero-jitter-hdr` at
+  zero phase). A check that fails before anything is written declines, and the
+  frame is the copy route's exactly as with the key off. A backend refusal is
+  recovered by the spatial pixel shader into H (jitter resampled away, no
+  history) and counted as the refusal it is. RCAS stays at the copy, on the
+  game's own LDR image, only where the copy route's selector recognised that
+  copy.
+- Not the route's frames. R < D: `hdr-route-needs-render-at-least-output`
+  (transient, never a stand-down by itself), copy route and whitelist as
+  before. EDVR's TAA above D: selected, then declined at the treatment
+  (`route-does-not-evaluate-at-render-size`), and F8 does not claim the route.
+  No H (2D menu, loading): `no-hdr`. Two H candidates a consumer could read:
+  `conflicting-hdr` (transient).
+- Backends. DLSS flags: IsHDR | MVLowRes | DepthInverted | AutoExposure
+  (0x4B); the LDR set 0x0A is unchanged bit for bit; never MVJittered. FSR adds
+  ENABLE_HIGH_DYNAMIC_RANGE (1<<0) and ENABLE_AUTO_EXPOSURE (1<<5) to its LDR
+  set, exposure null, preExposure 1. The bit is in the DLSS feature key and
+  the FSR context key, so flipping the key mid-session remakes each once (a
+  hitch, logged) and history starts; with auto from startup the first feature
+  is already the HDR one. EDVR's TAA blends and clamps in c / (1 + max3(c))
+  space with fp16 history and inverts on output.
+- Stand-down and F8. `no-hdr-consumer` joins the structural set. It replaces
+  the copy stage's structural refusal of a frame that has an H and no consumer,
+  and nothing else: a frame the copy route treats keeps its verdict. A probe
+  frame runs trigger and selection without the resolve, and a probe the route
+  selects ends the stand-down. F8, while the
+  route is active (selected, and evaluating at R): no Bloom or DoF advice, the
+  Anti-aliasing advice kept (decision (d)); the log line says ", HDR route
+  active".
+- Latch. After the trigger, a draw into H, a dispatch whose UAV is H, an
+  explicit write to H, or a draw into a scene-shaped HDR target that did not
+  exist at the trigger counts as `late-hdr-writes`. A treated frame with any
+  counts toward the latch; the third in the session (not consecutive) turns
+  the route off, and the copy route treats from then on until the key goes off
+  and back to auto. The un-jitter contingency stays unbuilt.
+- Trace. EDVRFTR4 adds `hdrSrv[4]` to an event (flag 1<<6), read only for the
+  draws the detector asked about, and a Resolve marker (event kind 5: H, the
+  trigger's pair and place, the route's verdict). EDVRFTR3 still parses; the
+  corpus files are not rewritten.
+- Fixtures. The four captures, cut with `--trace-trim` from 12 frames (6.2 MB)
+  to 7 (3.7 MB), headers and events verbatim, so each replays to the hash it
+  was recorded with (`traces\manifest.txt` says which frames and why). Pinned
+  per frame: H's draw count and its first and last event, the trigger's event,
+  pair, target and format, no write after it, the route selects it. Event
+  indexes, "+n" = trigger minus H's last event: star with Bloom 3 and DoF 2,
+  85543 (63 H draws, +53) and 85814 (64, +2), DFED8E1C/143AAE05 at 1920x1080
+  fmt 26; hangar, same settings, 86970 (27, +2), 20F383BB/FDB74215 at
+  3840x2160 fmt 9, and 86701, a 2D menu frame with no H and no trigger; star
+  off, 45734 (53, +18) and 45735 (53, +17), the tone F9CFC798/FEE777E9;
+  hangar off, 39785 (28, +2), the game's copy of H, DEF19B03/DED87960. The
+  corpus is 17 files and 46 frames: 45 have an H and all 45 a trigger, none
+  has a write after it, each of the 42 frames the tone route selects has one,
+  and the cells below the output (R < D) are refused by name.
+- Rigs. `flat_temporal_test`, 112 new pins in `flat_hdr_route_tests.h`: key
+  parsing, the flag sets as pure functions, the detector on synthetic streams,
+  rule (iv) over nine extents, rules (i) to (iii) one at a time and each of
+  t0..t3, every selector refusal, the latch, the census lines and the
+  selection tally, the stand-down and F8 verdicts, the EDVRFTR4 round trip with
+  EDVRFTR3 still read, the corpus, and source pins for what needs an NVIDIA
+  GPU (DLSS flags, feature key, the resolver's calls). `--trace-chain <file>`
+  prints what the detector finds in each frame of a trace, `--trace-trim` cut
+  the fixtures. `flat_mono_resolve_test` on WARP, 37 checks in
+  `flat_hdr_route_gpu_tests.h`: the backend is told HDR and handed R11G11B10F
+  in and fp16 out, a reset frame is the jittered input resampled, a resolved
+  frame is the backend's output where history is trusted and the input where
+  not, TAA's bounded space (a 10000 firefly on 100 comes out near 111, a linear
+  blend would give 1090; no NaN, no overshoot, flat fields stay flat under a
+  jitter walk), a refusing backend leaves H bit for bit what it was, the
+  spatial recovery, refusals before any write, the preflight, the copy route
+  after an HDR frame. `fsr3_engine_test` (l), AMD's real port on WARP: the HDR
+  and auto-exposure bits reach `desc.flags`, a still 40 comes back as 40, AMD's
+  debug checking says nothing, a flip remakes the context each way.
+- Mutations caught, each a scratch run restored afterwards. Detector: rule
+  (iv) without its pixel of slack (1 failure), rule (iii) dropped (13), explicit
+  writes uncounted (2), ambiguity unmarked (4), the latch at four (2), the
+  extent band dropped (74), late draws uncounted (12), the selector without
+  R >= D (26). Resolver: TAA blending linearly (5), TAA's inverse missing (4),
+  DLSS not told HDR (6), the finish inverting its reject test (3), the spatial
+  recovery forgetting the jitter (1). Wiring: DLSS flags without hdr, the
+  feature key without the bit, ensureFeature and the FSR call not handed the
+  bit (1 each), FSR flags without the bits (2), FSR context key without the
+  bit (1). On the real star-off frame: a late H draw, a full-size impostor
+  between H writes, a second H, H changing identity after the trigger, an
+  explicit write and a dispatch into H, a copy of H.
+- Corrections to the design, found in the code. (1) "Requantisation under half
+  an ulp" holds only where a device rounds to nearest: the rig's device (WARP)
+  truncates float to R11G11B10F toward zero, worst miss 0.969 ulp, every miss
+  below the exact value, so the pin is one ulp. (2) fp16's 65504 is not H's
+  ceiling: R11G11B10F stops at 65024 (R, G) and 64512 (B), and a value above
+  stores an infinity that the game's bloom blur would spread; the finish clamps
+  per channel and TAA's inverse is bounded to it. (3) Rule (iv) needs a pixel of
+  slack: the half-size target of an odd extent is floor(w/2), so "at least
+  half" missed its own first bloom level. (4) Trace v4 is narrower than
+  written: slots only for the draws the detector asks about, in a field of
+  their own, no dispatch slots and no bind flags; a compute consumer of H
+  before the trigger stays invisible (none in the four captures). (5) "No
+  trigger by frame end: `no-hdr-consumer`" replaces only the copy stage's own
+  structural refusal; a frame the copy route treats keeps its verdict. (6) The
+  four captures are 6.2 MB untrimmed, not 7.1.
+- What the flight must show. Install on the Epic install (its ini kept) and
+  read the log's version line first (`edvr_log.py --expect-build HEAD`). SS
+  1.0 (R = D), DLSS, EDHM chained, game AA off; four legs of a minute or two:
+  the hangar and a bright star, each with Bloom 3 and DoF 2 on, then both 0.
+  (1) Key off, the default, all four legs, an F10 on each. Pass: a `flat hdr
+  route 5s:` line per window with `key=off state=observing`; on 3D windows
+  `trigger` equals `hdr-frames`, `none=0 ambiguous=0`, `late-hdr-writes=0 (in
+  0 frames)` and `selection=selected:N` alone; on 2D menu windows
+  `hdr-frames=0`; `last-trigger=` names each leg's pair from the list above;
+  the `hdr route` family in `flat cpu 5s:` small beside `state trackers`.
+  (2) In the same session set the key to auto in the ini (live), repeat the
+  four legs. Pass: the "changed" line, then the `flat route: ... (HDR route:`
+  line, `key=auto state=active`, `treated` equal to `trigger`, `declined=0`,
+  `late-hdr-writes=0`, `last=treated-jittered-hdr`, no `no-known-tone-pass`
+  refusal on the Bloom and DoF legs, no stand-down, F8 without Bloom or DoF
+  advice, `GPU resolve` within 0.3 ms of the copy route's on the off legs. Look
+  at: a sun or star disc and the hangar lights (AutoExposure pumping or
+  ghosting), bloom sparkle, DoF edges (halos from jittered depth against a
+  resolved colour), the UI, RCAS. Stop and read the log if: `late-hdr-writes`
+  above 0 in a treated frame (the pair is named once, the latch trips at
+  three), any `declined` (its reason is logged, a dozen a session),
+  `spatial-fallback` (`hdr-spatial=` in the renderer line), `ambiguous` above
+  0, `selection=` naming anything but `selected`, or `hdr-frames=0` in a 3D
+  window (H is not R11G11B10F, or the candidate rule does not match this
+  build). (3) Later: FSR, EDVR TAA at R = D, game FXAA on, ReShade chained;
+  then the default flips to auto.
+- The log, verbatim. Once a session each:
+  `flat hdr route: experimental.temporal_aa_before_post=<off|auto> (read at
+  startup|changed) at frame=N: <what the key does>`
+  `flat hdr route: first trigger at frame=N seq=Q (key=K): VS=<hash> PS=<hash>
+  target=WxH fmt=F reads the scene HDR WxH at tS; its D draw(s) ran seq a..b;
+  selection: <the route could resolve this frame | the refusal>`
+  `flat hdr route: frame=N wrote the scene HDR after the trigger (key=K): X
+  draw(s), Y dispatch(es), Z explicit write(s); the first is seq S VS=.. PS=..
+  target=WxH; a treated frame with such writes counts toward the latch (3
+  turns the route off)`
+  `flat hdr route: turned off at frame=N after 3 treated frame(s) wrote the
+  scene HDR after the resolve (the latest: ...); the copy route treats from
+  here until experimental.temporal_aa_before_post is set off and auto again`
+  Every 5 s while a temporal mode runs, zeros included:
+  `flat hdr route 5s: key=K state=observing|active|latched frames=N
+  hdr-frames=N trigger=N none=N ambiguous=N treated=N declined=N
+  late-hdr-writes=N (in N frames) last=<verdict> last-trigger=VS=.. PS=..
+  target=WxH hdr=WxH selection=<name:count,...|none>`
+  On a decline, a dozen a session: `flat hdr route: declined at frame=N seq=Q:
+  <reason> (the copy route serves this frame)`, the reason one of latched-off,
+  returned-to-observation, already-treated-this-frame,
+  producer-source-identity-mismatch, route-does-not-evaluate-at-render-size,
+  actual-hdr-binding-or-depth-view-refused, incomplete-jitter-frame,
+  engine-source-not-ready, or the resolver's own. Elsewhere: `flat route:
+  <route> R=.. E=.. D=.. (HDR route: H is resolved before the game's post
+  chain)`;
+  `flat runtime: ... last=treated-jittered-hdr|treated-zero-jitter-hdr|
+  spatial-fallback`; `flat runtime early fallback: ... output=spatial (HDR
+  route, into the scene target) ...`; `dlss: the feature for eye N was created
+  for the flat HDR route: HDR input and automatic exposure ...`; FSR's create
+  and remake lines naming the HDR input; `flat settings warning: ... , HDR
+  route active)`; `flat cpu 5s:` gains `hdr route X ms (calls N)`; the renderer
+  cumulative line gains `hdr-resolves=N hdr-spatial=N`; the stand-down reason
+  `no-hdr-consumer`.
+- Not built: the un-jitter contingency; the section-82 VR adapter, which
+  reuses this detector (its rule (iii) already skips a copy of H, pinned,
+  because the VR frame's exposure chain reads one); the default flip.
+
+- ruled out: "under half an ulp" as the requantisation bound, because the
+  rig's device truncates toward zero (0.969 ulp worst, 659 of 768 texel
+  channels below the exact value, none above).
+- ruled out: fp16's 65504 as H's ceiling, because R11G11B10F stops at 65024
+  (R, G) and 64512 (B) and stores an infinity above it.
+- ruled out: "at least half of H per axis" taken exactly, because an odd extent
+  halves down and the first bloom level would miss the rule.
+- ruled out: the contract observation's own srv slots as the detector's
+  source, because they are filled for tone and copy draws only, and filling
+  them for every draw changes which draws coalesce into a record.
+- ruled out: a constant field as a test of FSR's HDR flag, because the port
+  returns it alike under both sets (39.97 and 40.00 for 40), so the rig pins
+  the flags the context carries instead.
 
 ## 82. VR on foot: resolve the world once instead of two eye passes (analysis, 2026-09-30)
 
