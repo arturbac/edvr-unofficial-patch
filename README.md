@@ -266,9 +266,9 @@ anything.
 Building needs Visual Studio 2022 with the C++ workload, and Python.
 [docs/building.md](docs/building.md) has the steps.
 
-`build.bat --installer-only` rebuilds only the installer from the DLLs
-already in `build\`, which the release workflow uses after the DLLs come
-back from signing.
+`build.bat --installer-only` rebuilds only the two installers (VR and flat)
+from the DLLs already in `build\`, which the release workflow uses after the
+DLLs come back from signing.
 
 ## Antivirus
 
@@ -281,8 +281,8 @@ The source is here so you can read exactly what it does and build it yourself.
 Free code signing provided by [SignPath.io](https://signpath.io/), certificate
 by [SignPath Foundation](https://signpath.org/).
 
-**What is signed.** `edvr-installer.exe`, `d3d11.dll` and `openvr_api.dll` in
-every release from the first signed one on. They are built by the
+**What is signed.** `edvr-installer.exe`, `edvr-flat-installer.exe`,
+`d3d11.dll` and `openvr_api.dll` in every release from the first signed one on. They are built by the
 [release workflow](.github/workflows/release.yml) on GitHub-hosted runners
 from the tagged commit and signed by SignPath from that workflow's own
 artifacts; nothing built on a developer's machine is ever signed. NVIDIA's

@@ -1,10 +1,18 @@
 # EDVR release build and code-signing pipeline.
 #
-# Builds the two graphics/runtime DLLs and the installer that embeds them,
-# submits them to SignPath for Authenticode signing, rebuilds the installer
-# around the now-signed DLLs, signs that too, packages the release archive
-# and hashes it -- then stops. It never creates the GitHub release: a signed
-# zip still has to fly before anyone is told to install it.
+# Builds the two graphics/runtime DLLs and the installers that embed them (the
+# VR edition's and the flat edition's), submits the DLLs to SignPath for
+# Authenticode signing, rebuilds both installers around the now-signed DLLs,
+# signs those too, packages the release archives and hashes them -- then
+# stops. It never creates the GitHub release: a signed zip still has to fly
+# before anyone is told to install it.
+#
+# Packaging happens only on a run from a v* tag. tools\package_native.py
+# refuses binaries not stamped exactly v<version> or <version>, which is what
+# `git describe` prints on a clean checkout of that tag, so a branch run (or a
+# manual dispatch from a branch) proves the build, the signing and the
+# installer rebuild but stops before packaging. Dispatch from the tag itself to
+# repeat a release run.
 #
 # Reads, from repository configuration (Settings -> Secrets and variables):
 #   secret   SIGNPATH_API_TOKEN            SignPath API token
@@ -19,7 +27,9 @@
 #   variable SIGNPATH_ARTIFACT_DLLS        artifact-configuration slug for
 #                                           the d3d11.dll / openvr_api.dll pair
 #   variable SIGNPATH_ARTIFACT_INSTALLER   artifact-configuration slug for
-#                                           edvr-installer.exe
+#                                           the installer pair: its <pe-file>
+#                                           entries name edvr-installer.exe
+#                                           and edvr-flat-installer.exe
 name: Release build
 
 "on":
@@ -32,9 +42,10 @@ name: Release build
   workflow_dispatch:
     inputs:
       version:
-        description: "bare semver, e.g. 0.18.0"
+        description: "label for the artifact names on a run from a branch; a run from a v* tag takes its version from the tag"
         type: string
-        required: true
+        required: false
+        default: "0.0.0"
       sign:
         description: "submit to SignPath -- only takes effect when the SIGNPATH_SIGNING repository variable is 'true'"
         type: boolean
@@ -93,20 +104,24 @@ jobs:
 
       - name: Compute release version
         run: |
+          $package = 'false'
           if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            # Only here can package_native.py accept the binaries: build.bat
+            # stamps them from `git describe`, which on a clean checkout of
+            # this tag prints exactly v<version>.
             $version = $env:GITHUB_REF_NAME.TrimStart('v')
+            $package = 'true'
           } elseif ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            # A dispatch from a branch: the input only labels the artifacts.
             $version = '${{ inputs.version }}'
           } else {
-            # Push to the temporary proving branch below. git describe plus a
-            # -ci marker is not the bare semver package_native.py wants, so
-            # this run uses a fixed placeholder -- it only proves the
-            # pipeline runs end to end, it is never a real, installable
-            # version.
+            # Push to the temporary proving branch below: a placeholder label
+            # for the artifact names, never a real, installable version.
             $version = '0.0.0'
           }
-          Write-Host "VERSION=$version"
+          Write-Host "VERSION=$version PACKAGE=$package"
           Add-Content -Path $env:GITHUB_ENV -Value "VERSION=$version"
+          Add-Content -Path $env:GITHUB_ENV -Value "PACKAGE=$package"
 
       - name: Print toolchain versions
         run: |
@@ -144,7 +159,7 @@ jobs:
 
       - name: Check build outputs
         run: |
-          $files = 'build\d3d11.dll', 'build\openvr_api.dll', 'build\edvr-installer.exe'
+          $files = 'build\d3d11.dll', 'build\openvr_api.dll', 'build\edvr-installer.exe', 'build\edvr-flat-installer.exe'
           $missing = $false
           foreach ($f in $files) {
             if (Test-Path $f) {
@@ -193,19 +208,23 @@ jobs:
             Write-Host "$f signed by $($sig.SignerCertificate.Subject)"
           }
 
-      - name: Rebuild installer around signed DLLs
+      # Both editions' installers embed the graphics DLL, so both are rebuilt
+      # from the signed bytes and signed in one request.
+      - name: Rebuild installers around signed DLLs
         shell: cmd
         run: call "%GITHUB_WORKSPACE%\build.bat" --installer-only || exit /b 1
 
-      - name: Upload installer (round two)
-        id: installer
+      - name: Upload installers (round two)
+        id: installers
         uses: actions/upload-artifact@v4
         with:
-          name: edvr-installer-${{ env.VERSION }}
-          path: build/edvr-installer.exe
+          name: edvr-installers-${{ env.VERSION }}
+          path: |
+            build/edvr-installer.exe
+            build/edvr-flat-installer.exe
           if-no-files-found: error
 
-      - name: Submit installer to SignPath
+      - name: Submit installers to SignPath
         if: env.SIGN == 'true'
         uses: SignPath/github-action-submit-signing-request@v3
         with:
@@ -214,27 +233,41 @@ jobs:
           project-slug: "${{ vars.SIGNPATH_PROJECT_SLUG }}"
           signing-policy-slug: "${{ vars.SIGNPATH_POLICY_SLUG }}"
           artifact-configuration-slug: "${{ vars.SIGNPATH_ARTIFACT_INSTALLER }}"
-          github-artifact-id: "${{ steps.installer.outputs.artifact-id }}"
+          github-artifact-id: "${{ steps.installers.outputs.artifact-id }}"
           wait-for-completion: true
           wait-for-completion-timeout-in-seconds: 7200
-          output-artifact-directory: signed/installer
+          output-artifact-directory: signed/installers
 
-      - name: Install signed installer
+      - name: Install signed installers
         if: env.SIGN == 'true'
         run: |
-          Copy-Item signed\installer\edvr-installer.exe build\edvr-installer.exe -Force
-          $sig = Get-AuthenticodeSignature build\edvr-installer.exe
-          if ($sig.Status -ne 'Valid') { throw "build\edvr-installer.exe is not validly signed: $($sig.Status)" }
-          Write-Host "build\edvr-installer.exe signed by $($sig.SignerCertificate.Subject)"
+          foreach ($name in 'edvr-installer.exe', 'edvr-flat-installer.exe') {
+            Copy-Item "signed\installers\$name" "build\$name" -Force
+            $sig = Get-AuthenticodeSignature "build\$name"
+            if ($sig.Status -ne 'Valid') { throw "build\$name is not validly signed: $($sig.Status)" }
+            Write-Host "build\$name signed by $($sig.SignerCertificate.Subject)"
+          }
 
-      - name: Package release archive
+      - name: Not packaged (not a tag run)
+        if: env.PACKAGE != 'true'
+        run: |
+          Write-Host "This run is from $env:GITHUB_REF, not a v* tag, so it stops before packaging:"
+          Write-Host "tools\package_native.py accepts only binaries stamped with the release version."
+          Write-Host "What this run proves: the build, the signing, and the installer rebuild above."
+
+      # The two archives package.bat stages: the VR release, then the flat one.
+      - name: Package release archives
+        if: env.PACKAGE == 'true'
         run: |
           $packageArgs = @($env:VERSION)
           if ($env:DLSS -ne 'true') { $packageArgs += '--no-dlss' }
           python tools\package_native.py @packageArgs
-          if ($LASTEXITCODE -ne 0) { throw "package_native.py failed" }
+          if ($LASTEXITCODE -ne 0) { throw "package_native.py failed (VR edition)" }
+          python tools\package_native.py @packageArgs --profile flat
+          if ($LASTEXITCODE -ne 0) { throw "package_native.py failed (flat edition)" }
 
       - name: Hash release files
+        if: env.PACKAGE == 'true'
         run: |
           $lines = Get-ChildItem dist -File |
             Where-Object { $_.Extension -in '.zip', '.exe' } |
@@ -246,17 +279,21 @@ jobs:
           Get-Content dist\SHA256SUMS.txt
 
       - name: Upload release artifacts
+        if: env.PACKAGE == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: edvr-${{ env.VERSION }}
           path: |
             dist/edvr-${{ env.VERSION }}.zip
-            dist/edvr-installer-${{ env.VERSION }}.exe
+            dist/edvr-installer-${{ env.VERSION }}.zip
+            dist/edvr-flat-${{ env.VERSION }}.zip
+            dist/edvr-flat-installer-${{ env.VERSION }}.zip
             dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30
 
       - name: Next steps
+        if: env.PACKAGE == 'true'
         run: |
           Write-Host "================================================================"
           Write-Host "Built, not published."

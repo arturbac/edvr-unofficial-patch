@@ -248,11 +248,12 @@ goto installer_only_done
 REM ===========================================================================
 REM  --installer-only: SignPath signs build\d3d11.dll and build\openvr_api.dll,
 REM  the names that ship, after a normal build already produced them unsigned.
-REM  This rebuilds ONLY edvr-installer.exe from whatever is already sitting in
-REM  build\, so a second full compile can never overwrite the signed bytes
-REM  with fresh unsigned ones. This branch is taken before the shader
-REM  precompile, the d3d11 or openxr compiles, and the rig pool, and reaches
-REM  only the two installer rigs below.
+REM  This rebuilds ONLY the two installers (edvr-installer.exe and the flat
+REM  edition's edvr-flat-installer.exe, which embeds the same graphics DLL)
+REM  from whatever is already sitting in build\, so a second full compile can
+REM  never overwrite the signed bytes with fresh unsigned ones. This branch is
+REM  taken before the shader precompile, the d3d11 or openxr compiles, and the
+REM  rig pool, and reaches only the installer rigs below.
 REM ===========================================================================
 :installer_only
 for %%F in (d3d11.dll openvr_api.dll openxr_loader.dll OPENXR-LOADER-LICENSE.txt) do if not exist "%BUILD%\%%F" (
@@ -302,9 +303,15 @@ REM file, not assumed). tools\run_jobs.py's own module docstring hits the
 REM same trap with --jobs.
 call :rig_installer || exit /b 1
 call :rig_installer_test || exit /b 1
+REM The flat edition's installer embeds the same graphics DLL, so it is rebuilt
+REM from the signed bytes too. :rig_flat_installer is the same shape (single
+REM phase, every path ends in "exit /b") and runs --check-installer for its own
+REM profile, so the embedded-payload check covers both editions.
+call :rig_flat_installer || exit /b 1
 
 python tools\package_native.py --check-installer || exit /b 1
-echo [edvr] installer rebuilt from build\d3d11.dll + build\openvr_api.dll: %BUILD%\edvr-installer.exe
+echo [edvr] installers rebuilt from build\d3d11.dll + build\openvr_api.dll:
+echo        %BUILD%\edvr-installer.exe and %BUILD%\edvr-flat-installer.exe
 if exist "%BUILD%\nvngx_dlss.dll" (
     echo [edvr] DLSS runtime: CARRIED -- build\edvr-installer.exe places nvngx_dlss.dll
     echo        beside the game on machines with an NVIDIA card.
