@@ -68,10 +68,10 @@ default first):
 |---|---|---|
 | Temporal | temporal AA (TAA/DLSS/FSR) with engine motion, camera jitter, screen/weapon/celestial/terrain motion; sharpening (RCAS); UI, smoke and hologram depth; the flat adapter | VF |
 | Interface | UI quality (layer, panel scale, hologram remaps) | V |
-| Cockpit visuals | sun glare, particle billboards and witchspace stars, RemLok lines, loading hologram, wake pulse, target indicator, night vision | V |
+| Cockpit visuals | sun glare, particle billboards and witchspace stars, RemLok lines, wake pulse, target indicator, night vision | V |
 | Light | exposure share and damping | V |
 | Scanners | FSS eye sync (heal, reveal, panel, res), scanner body | V |
-| Intro and loading | intro video, splash backdrop, loading dim | V |
+| Intro and loading | intro video, splash backdrop, loading dim, loading hologram | V |
 | On-foot panel | black void, screen resolution, panel distance, curvature, weapon stability | V |
 | Comfort | transition flash, Explorer Cam | V |
 | Performance | cull guard, FOV trim, OpenXR resolution, settlement detail, static props | V |
@@ -157,10 +157,10 @@ temporal pass's frame state never crosses a plugin boundary.
 | Plugin | Contents | Profiles | Needs | Default VR / flat |
 |---|---|---|---|---|
 | temporal-aa | TAA, DLSS, FSR, engine motion, camera jitter (VR frustum, flat camera path), screen, weapon, celestial and terrain motion, UI/smoke/hologram depth, UI quality (the layer, panel scale, hologram remaps; VR), sharpening, the flat adapter (stand-down, F8 warning) | VF | NGX DLL for DLSS | installed, mode off, UI quality 100 / installed |
-| cockpit-visuals | sun glare, particles and witchspace stars, RemLok, loading hologram, wake pulse, target indicator, night vision | V | - | on / - |
+| cockpit-visuals | sun glare, particles and witchspace stars, RemLok, wake pulse, target indicator, night vision | V | - | on / - |
 | exposure | exposure share and damping | V | - | on / - |
 | scanners | FSS eye sync family, scanner body | V | - | on / - |
-| intro | intro video, splash backdrop, loading dim | V | - | on / - |
+| intro | intro video, splash backdrop, loading dim, loading hologram (`holo_pattern`) | V | - | on / - |
 | on-foot-panel | black void, screen resolution, panel distance, curvature, weapon stability | V | temporal-aa for weapon stability's motion half (soft) | on / - |
 | comfort | transition flash, Explorer Cam | V | - | on / - |
 | performance | cull guard, FOV trim, OpenXR resolution, settlement detail, static props | V | - | installed, off / - |
@@ -307,10 +307,10 @@ when ReShade was removed). The rules:
   stays one plugin: its parts share per-draw state, the camera and the
   history, and splitting them would put that traffic on a plugin boundary,
   against the north star. Sean regrouped the same day: the intro fixes
-  (intro video, splash backdrop, loading dim) and the on-foot panel (black
-  void, screen resolution, panel distance, curvature, weapon stability)
-  become plugins of their own, replacing "screens", and UI quality ships
-  only with temporal AA, inside that plugin.
+  (intro video, splash backdrop, loading dim, and the loading hologram) and
+  the on-foot panel (black void, screen resolution, panel distance,
+  curvature, weapon stability) become plugins of their own, replacing
+  "screens", and UI quality ships only with temporal AA, inside that plugin.
 - **Q3 (decided): defaults reproduce today's shipped behaviour exactly.**
   The recommended VR set is every plugin but diagnostics, with temporal-aa
   and performance installed and their features at today's defaults; flat
