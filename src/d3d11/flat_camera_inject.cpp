@@ -862,5 +862,6 @@ void flatCameraVrCloseWindow() {}
 FlatCameraVrCounters flatCameraVrCounters() { return FlatCameraVrCounters{}; }
 size_t flatCameraVrExcluded(FlatCameraVrExcluded*, size_t) { return 0; }
 const char* flatCameraVrStatus() { return flatCameraInjectObserveStatus(); }
+bool flatCameraVrQuiet() { return true; }
 
 } // namespace edvr

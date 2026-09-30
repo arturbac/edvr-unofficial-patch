@@ -11,12 +11,16 @@
 // a frame (four COM calls under the shadow's own guard and budget), never per draw. No allocation, no lock and no D3D call
 // per draw. FlatContractObservation is ~360 bytes: one static instance, eleven fields written.
 //
-// THE JITTER SEAM. This build resolves an UNJITTERED world (phase 0, rows phase 0): the flight judges cost and plumbing, not
-// image quality. flatPhase() is where the camera injector's phase plugs in later; nothing else here changes.
+// THE JITTER (stage 2). The route jitters the world's cameras through the camera injector while it is Warming or Owned and
+// experimental.temporal_aa_on_foot_world_jitter is on (the default); with that key off it resolves an unjittered world, which is
+// what flight 1 measured.
 #include "vr_world_route.h"
 #include "vr_world_route_math.h"
 #include "binding_shadow.h"
 #include "engine_velocity.h"
+#include "flat_camera_inject.h"    // stage 2: the camera injector's VR mode
+#include "flat_camera_phase.h"     // flatCameraCheckRowPair: the rows carry the phases they are claimed to
+#include "flat_live_phase.h"       // FlatLivePhase: the flat profile's phase machine, reused
 #include "dlaa.h"
 #include "flat_mono_resolve.h"
 #include "gpu_census.h"
@@ -60,13 +64,35 @@ bool g_sceneResetEvent = false;              // the transition detector reset th
 bool g_sceneResetPending = false;            // ... and the resolver's history resets at the next treat
 bool g_tookNoted = false;                    // the first layer take of this ownership episode was logged
 bool g_firstTriggerLogged = false, g_latchLogged = false, g_lateWriteLogged = false;
-uint32_t g_declineLines = 0;
 std::atomic<bool> g_ownsNext{false};
 uint64_t g_takenSequence[2] = {0, 0};
 uint64_t g_countedLayerOnly[2] = {0, 0};     // the sequence each eye's layer-only door was last counted for (it is asked twice an eye)
 bool g_startedOwned = false;                 // the frame now running started owned (the eye shift was off)
 bool g_resourcesLive = false;                // the resolver (and the mipped screen) made resources: release them when the key goes off
 bool g_gatePrev = false, g_gateSeen = false; // the on-foot gate at the last boundary, for the window's flip count
+
+// ---- stage 2: the world jitter (design doc section 82) ---------------------------------------------------------------------
+// The route puts the flat profile's phase into the game's own kind-3 world cameras through the camera injector, only while it
+// is Warming or Owned and experimental.temporal_aa_on_foot_world_jitter is on. The injector is driven from the frame boundary
+// (driveInjector) and told at the trigger that the window is over; the route reads what it did at the trigger and at the next
+// boundary. With the route key off from the start nothing below is ever called.
+FlatLivePhase g_phase;                          // picks the frame's phase after two warm zero-phase frames
+VrWorldJitterKey g_jitterKey = VrWorldJitterKey::On;
+VrWorldJitter g_jitter = VrWorldJitter::Idle;   // this frame's decision (the frame that is running)
+bool g_injectorEngaged = false;                 // flatCameraVrFrame was called with inject = true and the injector is not yet quiet again
+bool g_injectFault = false;                     // a STOP line switched the injector off for the session
+bool g_jitterLiveLogged = false;                // the JITTERED line was logged in this jitter period
+bool g_hookUnavailableLogged = false;
+float g_framePhaseX = 0.0f, g_framePhaseY = 0.0f; // the phase chosen for the running frame (what the injector was given)
+bool g_frameCoverageOk = true;                  // every scene injection of the running frame landed
+bool g_frameNamed = false;                      // the running frame's trigger named a source for the screen (the selector's depthNamed)
+bool g_namedLast = false;                       // the frame that ended named one: the only thing that opens the next frame's window
+VrWorldAppliedPhase g_frameWorldApplied;        // what the running frame's world rows carry (set at the trigger)
+uint32_t g_noSceneLines = 0, g_pairMismatchLines = 0, g_excludedLogged = 0, g_unnamedLines = 0;
+const char* g_declineWhy = nullptr;             // the selector's reason for the running frame's decline
+const char* g_missWhy = nullptr;                // the reason of the last untreated frame (a decline or "no-trigger")
+uint32_t g_missRun = 0;                         // consecutive untreated frames (for the RELEASED line)
+uint32_t g_declineRunLines = 0, g_declineLinesSession = 0;   // decline lines logged in this run of declines / this session
 
 // ---- the per-frame detector state ------------------------------------------------------------------------------------
 struct ViewEntry {
@@ -102,6 +128,8 @@ struct Previous {
     const void* depth = nullptr;
     const void* color = nullptr;
     uint32_t w = 0, h = 0;
+    VrWorldAppliedPhase worldApplied;   // the phase the stored rows carry (the injection landed), render pixels
+    VrWorldAppliedPhase fpApplied;      // the phase the first-person camera carried that frame (the fold-in's mode reads both)
 };
 Previous g_prev;
 uint64_t g_lastTreatMs = 0;
@@ -141,11 +169,27 @@ const ViewEntry* lookup(Frame& f, void* view) {
 void declineLine(const char* why) {
     g_win.hdr.lastVerdict = why;
     ++g_win.hdr.declined;
-    if (g_declineLines < 12) {
-        ++g_declineLines;
+    g_declineWhy = why;
+    // The log caps per RUN of declines, not per session (flight 1 spent its twelve lines on the entry and the first seconds of
+    // one gap): three lines for each run, 64 a session. The 5 s tallies carry the rest.
+    if (vrWorldDeclineLogAllowed(g_declineRunLines, g_declineLinesSession)) {
+        ++g_declineRunLines; ++g_declineLinesSession;
         Log::get().note("vr world route: declined at frame=%llu seq=%u: %s (the eye route serves this frame)",
                         static_cast<unsigned long long>(g_frameNo), g_f.hdr.trigger.sequence, why);
     }
+}
+
+// The injector's counters for the running frame, as the route reads them (a no-op copy of zeros when it is not engaged).
+VrWorldInjectFrame readInjectFrame() {
+    VrWorldInjectFrame f{};
+    if (!g_injectorEngaged) return f;
+    const FlatCameraVrCounters c = flatCameraVrCounters();
+    f.sceneInjected = c.sceneInjected; f.sceneRefused = c.sceneRefused;
+    f.firstPersonInjected = c.firstPersonInjected; f.firstPersonRefused = c.firstPersonRefused;
+    f.warming = c.warming; f.auxiliary = c.auxiliary; f.afterTrigger = c.afterTrigger; f.unsupported = c.unsupported;
+    f.otherKind = c.otherKind; f.unreadable = c.unreadable; f.writeFailures = c.writeFailures; f.offThread = c.offThread;
+    for (int i = 0; i < 8; ++i) f.injectedKind[i] = c.injectedKind[i];
+    return f;
 }
 
 bool makeDepthViews(ID3D11Device* device, ID3D11Texture2D* depth) {
@@ -201,15 +245,9 @@ WorldFirstPerson worldFirstPerson() {
     return fp;
 }
 
-// THE JITTER SEAM. The phase the world's camera is rendered with (x, y), and the phase the camera ROWS themselves carry
-// (rowsX, rowsY: nonzero only when the game derived b1[270..275] from a jittered frustum, which is what the camera injector
-// does; the resolver removes it from the camera, the previous camera and the engine's scene snapshots before any
-// reprojection, FlatMonoResolveFrame::rowsJitter*), in render pixels, positive right and down. Both are zero in this
-// build: the world is unjittered, the injector is not installed, and the flight judges cost and plumbing, not image
-// quality. When the injector plugs in, this function answers from its phase machine (flatCameraRowsPhase) and nothing else
-// in the route changes; the eye exclusion it needs is what the VR camera census (vr_camera_census.h) decides.
-struct WorldPhase { float x = 0.0f, y = 0.0f, rowsX = 0.0f, rowsY = 0.0f; };
-WorldPhase worldPhase() { return {}; }
+// THE JITTER (stage 2; the seam of the first build is gone). The phase is chosen at the frame boundary by the flat profile's own
+// phase machine (FlatLivePhase), handed to the camera injector (flat_camera_inject.h), and read back at the trigger: the world
+// resolves with the phase its scene camera call took. See driveInjector below and treatWorld.
 
 void treatWorld(ID3D11DeviceContext* ctx) {
     Frame& fr = g_f;
@@ -236,6 +274,7 @@ void treatWorld(ID3D11DeviceContext* ctx) {
     facts.extentOk = t.hdrWidth == screenW && t.hdrHeight == screenH && screenW && screenH;
     facts.depthKnown = depthRes != nullptr && !fr.depthMixed;
     facts.depthNamed = facts.depthKnown && engineVelocitySourceIsNamed(depthTex);
+    g_frameNamed = facts.depthNamed;   // the camera window's rule: it opens only after a frame that named its source
     float rows[6][4] = {};
     bool rowsOk = false;
     if (facts.depthNamed) {
@@ -290,18 +329,68 @@ void treatWorld(ID3D11DeviceContext* ctx) {
     const bool resetExtent = g_prev.valid && (g_prev.w != t.hdrWidth || g_prev.h != t.hdrHeight);
     const bool resetScene = g_sceneResetPending;
     f.reset = resetMissing || resetGap || resetDepth || resetColor || resetExtent || resetScene;
-    const WorldPhase phase = worldPhase();
-    f.jitterX = phase.x; f.jitterY = phase.y;
-    f.previousJitterX = phase.x; f.previousJitterY = phase.y;   // the seam: this frame's phase is the last frame's too (both zero)
-    f.rowsJitterX = phase.rowsX; f.rowsJitterY = phase.rowsY;
-    f.previousRowsJitterX = phase.rowsX; f.previousRowsJitterY = phase.rowsY;
+    // THE PHASE (stage 2). What the injector did to the world's cameras BEFORE the trigger is final: the route closed its window
+    // at the trigger. The phase the frame APPLIED is the one it was given when a scene camera call took it, zero otherwise (a
+    // frame the route meant to jitter and could not is resolved unjittered, and says so); the backend gets that phase as its
+    // jitter and the resolver gets it as the phase the rows carry, this frame and last. The first-person camera takes the same
+    // phase (the injector writes the same NDC shift into both), so the weapon fold-in adds the phase term to its map.
+    const WorldFirstPerson fp = worldFirstPerson();
+    const VrWorldInjectFrame inj = readInjectFrame();
+    VrWorldAppliedPhase worldApplied, fpApplied;
+    g_frameCoverageOk = true;
+    if (g_jitter == VrWorldJitter::On) {
+        const bool phaseNonzero = g_framePhaseX != 0.0f || g_framePhaseY != 0.0f;
+        if (phaseNonzero && inj.sceneInjected > 0) worldApplied = {g_framePhaseX, g_framePhaseY};
+        if (phaseNonzero && (inj.sceneRefused || inj.firstPersonRefused || inj.writeFailures)) {
+            // Some of the frame's world cameras took the phase and some did not: the frame is part jittered and cannot be
+            // resolved with one phase. The eye route serves it; the phase machine starts its warm-up again.
+            g_frameCoverageOk = false;
+            declineLine("camera-injection-incomplete");
+            return;
+        }
+        if (phaseNonzero && inj.sceneInjected == 0 && g_noSceneLines < 8) {
+            ++g_noSceneLines;
+            char line[512];
+            vrWorldFormatNoSceneInjection(line, sizeof(line), g_frameNo, inj);
+            Log::get().note("%s", line);
+        }
+        // A frame with no weapon drawn has no attached pixels: the world's phase stands in for the first-person camera's.
+        // A weapon drawn with no first-person call injected carried no phase at all.
+        fpApplied = !fp.motion ? worldApplied
+                               : ((inj.firstPersonInjected > 0 && inj.firstPersonRefused == 0) ? worldApplied : VrWorldAppliedPhase{});
+    }
+    const VrWorldAppliedPhase prevWorld = f.reset ? worldApplied : g_prev.worldApplied;
+    const VrWorldAppliedPhase prevFp = f.reset ? fpApplied : g_prev.fpApplied;
+    f.jitterX = worldApplied.x; f.jitterY = worldApplied.y;
+    f.previousJitterX = prevWorld.x; f.previousJitterY = prevWorld.y;
+    f.rowsJitterX = worldApplied.x; f.rowsJitterY = worldApplied.y;
+    f.previousRowsJitterX = prevWorld.x; f.previousRowsJitterY = prevWorld.y;
     std::memcpy(f.previousCamera, f.reset ? rows : g_prev.rows, sizeof(f.previousCamera));
     f.engine = ev;
     const uint64_t nowMs = GetTickCount64();
     f.deltaMs = g_lastTreatMs ? static_cast<float>(nowMs - g_lastTreatMs) : 11.111f;
-    const WorldFirstPerson fp = worldFirstPerson();
     f.firstPersonMotion = fp.motion;
     f.firstPersonStencil = fp.stencil;
+    f.firstPersonPhaseMode = (fp.motion && fp.stencil) ? vrWorldFirstPersonMode(worldApplied, prevWorld, fpApplied, prevFp) : 0u;
+    if (!f.reset) {
+        // The live proof that the rows carry the phases they are claimed to (the flat runtime's check): two consecutive
+        // frames' rows differ by exactly the difference of the two phases. Evidence, not a gate: the frame is still resolved.
+        const FlatCameraPairResult pair = flatCameraCheckRowPair(rows, worldApplied.x, worldApplied.y, g_prev.rows, prevWorld.x,
+                                                                prevWorld.y, t.hdrWidth, t.hdrHeight);
+        if (pair.verdict != FlatCameraPairVerdict::Skipped) {
+            ++g_win.inject.pairChecked;
+            if (pair.verdict == FlatCameraPairVerdict::Inconsistent) {
+                ++g_win.inject.pairBad;
+                if (g_pairMismatchLines < 8) {
+                    ++g_pairMismatchLines;
+                    char line[384];
+                    vrWorldFormatRowsMismatch(line, sizeof(line), g_frameNo, worldApplied.x, worldApplied.y, prevWorld.x,
+                                              prevWorld.y, pair.maxError);
+                    Log::get().note("%s", line);
+                }
+            }
+        }
+    }
 
     ComPtr<ID3D11ShaderResourceView> none;
     const char* why = nullptr;
@@ -333,12 +422,25 @@ void treatWorld(ID3D11DeviceContext* ctx) {
     g_prev.depth = depthRes;
     g_prev.color = t.hdr;
     g_prev.w = t.hdrWidth; g_prev.h = t.hdrHeight;
+    g_prev.worldApplied = worldApplied;
+    g_prev.fpApplied = fpApplied;
+    g_frameWorldApplied = worldApplied;
+    if (f.firstPersonMotion && f.firstPersonStencil) ++g_win.foldMode[f.firstPersonPhaseMode > 2 ? 2 : f.firstPersonPhaseMode];
+    if (!worldApplied.zero() && !g_jitterLiveLogged) {
+        g_jitterLiveLogged = true;
+        char line[512];
+        vrWorldFormatJitterLive(line, sizeof(line), g_frameNo, worldApplied.x, worldApplied.y, t.hdrWidth, t.hdrHeight, inj);
+        Log::get().note("%s", line);
+    }
 }
 
 void onTrigger(ID3D11DeviceContext* ctx) {
     Frame& fr = g_f;
     fr.triggered = true;
     g_vrWorldWatchWrites = true;
+    // The world's camera calls all precede the trigger: the injection window is over (a screen-view call after it is counted
+    // and never written). Only while the injector is engaged; with the route key off it never is.
+    if (g_injectorEngaged) flatCameraVrCloseWindow();
     if (!g_firstTriggerLogged) {
         g_firstTriggerLogged = true;
         char line[512];
@@ -386,11 +488,11 @@ bool vrWorldRouteDrawProgress(uint32_t* drawOrdinal, bool* toneSeen, uint64_t* f
     return true;
 }
 
-// SKELETON (stage 2): the route does not jitter yet.
 bool vrWorldRouteWorldPhase(float* x, float* y) {
-    if (x) *x = 0.0f;
-    if (y) *y = 0.0f;
-    return false;
+    const bool on = g_jitter == VrWorldJitter::On;
+    if (x) *x = on ? g_framePhaseX : 0.0f;
+    if (y) *y = on ? g_framePhaseY : 0.0f;
+    return on;
 }
 
 // ---- writes after the trigger (the late-write latch's inputs) ---------------------------------------------------------------
@@ -465,13 +567,97 @@ void vrWorldRouteDraw(ID3D11DeviceContext* ctx) {
     if (trigger) onTrigger(ctx);
 }
 
+// ---- stage 2: driving the camera injector -----------------------------------------------------------------------------------------
+namespace {
+// The kind-3 calls the role test excluded, once per distinct signature (the first eight the injector keeps): no I/O on the
+// game's call path, so the route says it here, at the boundary.
+void logNewExcluded(float screenAspect) {
+    FlatCameraVrExcluded ex[8];
+    const size_t n = flatCameraVrExcluded(ex, 8);
+    for (size_t i = g_excludedLogged; i < n; ++i) {
+        char line[384];
+        vrWorldFormatExcluded(line, sizeof(line), ex[i].aspect, ex[i].fov, ex[i].nearZ, ex[i].farZ,
+                              static_cast<unsigned long long>(ex[i].callerRva), screenAspect,
+                              static_cast<unsigned long long>(ex[i].calls));
+        Log::get().note("%s", line);
+    }
+    if (n > g_excludedLogged) g_excludedLogged = static_cast<uint32_t>(n);
+}
+
+// The frame boundary's injector step for a route that is on (key auto): decide the phase of the frame that starts, hand it to
+// the injector, or wind the injector down. wantsInjection: the route is Warming or Owned, the gate holds and the layer is live.
+void driveInjector(bool wantsInjection) {
+    g_jitterKey = vrWorldJitterKeyFromText(
+        Config::get().getString("experimental.temporal_aa_on_foot_world_jitter", "on").c_str());
+    const bool globalJitter = Config::get().getBool("experimental.temporal_aa_jitter", true);
+    uint32_t w = 0, h = 0;
+    vScreenPanelSize(&w, &h);
+    VrWorldJitter want = vrWorldJitterDecide(true, g_jitterKey, globalJitter, wantsInjection && w && h, g_namedLast, true, g_injectFault);
+    g_framePhaseX = g_framePhaseY = 0.0f;
+    g_frameCoverageOk = true;
+    g_frameWorldApplied = VrWorldAppliedPhase{};
+    if (want == VrWorldJitter::On) {
+        // The phase machine yields a zero phase for its first two frames (warm-up), then the flat profile's Halton sequence.
+        g_phase.beginFrame(true, g_prev.valid && g_f.treated, w, h);
+        g_framePhaseX = g_phase.currentX;
+        g_framePhaseY = g_phase.currentY;
+        FlatCameraVrFrame vf;
+        vf.inject = true;
+        vf.observe = g_census;
+        vf.phaseX = g_framePhaseX;
+        vf.phaseY = g_framePhaseY;
+        vf.renderW = w;
+        vf.renderH = h;
+        vf.screenAspect = static_cast<float>(w) / static_cast<float>(h);
+        const bool live = flatCameraVrFrame(vf);
+        g_injectorEngaged = true;
+        if (!live) {
+            want = VrWorldJitter::NoHook;
+            g_framePhaseX = g_framePhaseY = 0.0f;
+            g_phase.resetHistory();
+            if (!g_hookUnavailableLogged) {
+                g_hookUnavailableLogged = true;
+                Log::get().note("vr world route: the camera hook is not available (%s): the world stays unjittered; "
+                                "experimental.temporal_aa_on_foot_world_jitter has nothing to act on", flatCameraVrStatus());
+            }
+        }
+    } else {
+        g_phase.beginFrame(false, false, w, h);
+        if (g_injectorEngaged) {
+            // Not injecting this frame: the injector goes pass-through (the census, if it is on, re-asserts observation in its
+            // own boundary step right after this one) and, once no camera it wrote is waiting for its flush, is left alone.
+            FlatCameraVrFrame vf;
+            flatCameraVrFrame(vf);
+            if (flatCameraVrQuiet()) g_injectorEngaged = false;
+        }
+    }
+    if (want != VrWorldJitter::On) g_jitterLiveLogged = false;
+    g_jitter = want;
+}
+// The route's key is off (live): nothing is injected; an engaged injector is wound down once it has nothing left to flush.
+void windDownInjector() {
+    g_injectFault = false;           // flipping the key off is what clears a STOP
+    g_namedLast = g_frameNamed = false;
+    g_jitter = VrWorldJitter::Idle;
+    g_jitterLiveLogged = false;
+    g_framePhaseX = g_framePhaseY = 0.0f;
+    g_frameWorldApplied = VrWorldAppliedPhase{};
+    g_phase.resetHistory();
+    if (g_injectorEngaged) {
+        FlatCameraVrFrame vf;
+        flatCameraVrFrame(vf);
+        if (flatCameraVrQuiet()) g_injectorEngaged = false;
+    }
+}
+}  // namespace
+
 // ---- the frame boundary ------------------------------------------------------------------------------------------------------------
 void vrWorldRouteFrameBoundary() {
     // The key, live: read here, so the frame that starts now is the first to see a change. Off unless "auto".
     const VrWorldKey key = vrWorldKeyFromText(Config::get().getString("experimental.temporal_aa_on_foot_world", "off").c_str());
     g_key = key;
     g_census = vrCameraCensusWanted();
-    if (key == VrWorldKey::Off && g_machine.state == VrWorldState::Off && !g_census) {
+    if (key == VrWorldKey::Off && g_machine.state == VrWorldState::Off && !g_census && !g_injectorEngaged) {
         // Nothing to account and nothing to arm: the key-off path is this early return.
         g_vrWorldWants = false; g_vrWorldWatchWrites = false;
         g_ownsNext.store(false, std::memory_order_release);
@@ -496,6 +682,50 @@ void vrWorldRouteFrameBoundary() {
         if (g_gateSeen && gate != g_gatePrev) ++g_win.gateFlips;
         g_gatePrev = gate; g_gateSeen = true;
         if (g_startedOwned) { ++g_win.ownedFrames; ++g_ownedFramesEpisode; }
+        // Stage 2: what the injector did in the frame that ended (its counters, read before the next VrFrame resets them), the
+        // phase machine's end of frame, and the run of untreated frames the RELEASED line names.
+        if (g_injectorEngaged) {
+            const VrWorldInjectFrame inj = readInjectFrame();
+            vrWorldAddInjectFrame(g_win.inject, inj);
+            if (vrWorldInjectedWrongKind(inj) && !g_injectFault) {
+                g_injectFault = true;
+                char line[512];
+                vrWorldFormatStopWrongKind(line, sizeof(line), g_frameNo, inj);
+                Log::get().note("%s", line);
+            }
+            uint32_t pw = 0, ph = 0;
+            vScreenPanelSize(&pw, &ph);
+            logNewExcluded(ph ? static_cast<float>(pw) / static_cast<float>(ph) : 0.0f);
+            // The naming rule. A write on a frame the route had shut (a shut window is never written through) is a STOP. A frame
+            // whose window was open and that named nothing is the expected first frame of a map or menu: counted, said once per
+            // change (eight lines a session), the window shuts for the next frame by itself.
+            const bool injected = (inj.sceneInjected + inj.firstPersonInjected) > 0;
+            if (injected && g_jitter != VrWorldJitter::On) {
+                g_win.inject.shutInjected += inj.sceneInjected + inj.firstPersonInjected;
+                if (!g_injectFault) {
+                    g_injectFault = true;
+                    char line[640];
+                    vrWorldFormatStopShut(line, sizeof(line), g_frameNo, vrWorldJitterName(g_jitter), inj);
+                    Log::get().note("%s", line);
+                }
+            } else if (injected && !g_frameNamed) {
+                ++g_win.inject.unnamedFrames;
+                if (g_unnamedLines < 8) {
+                    ++g_unnamedLines;
+                    char line[512];
+                    vrWorldFormatUnnamedOpen(line, sizeof(line), g_frameNo, inj);
+                    Log::get().note("%s", line);
+                }
+            }
+        }
+        g_namedLast = g_frameNamed;
+        g_win.phaseX = g_framePhaseX; g_win.phaseY = g_framePhaseY;
+        g_win.rowsX = g_f.treated ? g_frameWorldApplied.x : 0.0f;
+        g_win.rowsY = g_f.treated ? g_frameWorldApplied.y : 0.0f;
+        if (g_jitter == VrWorldJitter::On) g_phase.finish(g_f.treated, g_frameCoverageOk);
+        if (g_f.treated) { g_missRun = 0; g_declineRunLines = 0; }
+        else { ++g_missRun; g_missWhy = g_f.triggered && g_declineWhy ? g_declineWhy : "no-trigger"; }
+        g_declineWhy = nullptr;
         VrWorldFrameEnd e;
         e.keyOn = true;
         e.layerLive = layerLive;
@@ -528,8 +758,10 @@ void vrWorldRouteFrameBoundary() {
         if (step.released != VrWorldRelease::None) {
             ++g_win.releases;
             g_win.lastRelease = vrWorldReleaseName(step.released);
-            char line[384];
-            vrWorldFormatReleased(line, sizeof(line), g_frameNo, step.released, g_ownedFramesEpisode);
+            char line[512];
+            const bool declined = step.released == VrWorldRelease::Declined;
+            vrWorldFormatReleased(line, sizeof(line), g_frameNo, step.released, g_ownedFramesEpisode,
+                                  declined ? g_missWhy : nullptr, declined ? g_missRun : 0u);
             Log::get().note("%s", line);
             g_ownedFramesEpisode = 0;
         }
@@ -558,9 +790,13 @@ void vrWorldRouteFrameBoundary() {
         // The 5 s window: zeros included while the key is auto.
         const uint64_t now = GetTickCount64();
         if (g_windowStartMs && now - g_windowStartMs >= 5000) {
-            char line[1024];
+            char line[1200];
+            g_win.jitter = vrWorldJitterName(g_jitter);
             vrWorldFormatWindow(line, sizeof(line), key, g_machine.state, layerLive, gate, g_win);
             Log::get().note("%s", line);
+            char injectLine[512];
+            vrWorldFormatInjectWindow(injectLine, sizeof(injectLine), g_win.inject);
+            Log::get().note("%s", injectLine);
             g_win.reset();
             g_windowStartMs = now;
         }
@@ -574,7 +810,9 @@ void vrWorldRouteFrameBoundary() {
             Log::get().note("%s", line);
         }
         g_ownedFramesEpisode = 0; g_tookNoted = false; g_win.reset(); g_windowStartMs = 0;
-        g_sceneResetPending = g_sceneResetEvent = false; g_prev.valid = false; g_declineLines = 0;
+        g_sceneResetPending = g_sceneResetEvent = false; g_prev.valid = false; g_declineRunLines = g_declineLinesSession = 0;
+        g_missRun = 0; g_missWhy = nullptr; g_declineWhy = nullptr;
+        windDownInjector();
         if (g_resourcesLive) {
             // The key went off after the route had made its resolver resources (about 300 MB at 5040x2835) and the mipped
             // screen: let them go once, on the render thread, inside the route's own scope.
@@ -591,6 +829,12 @@ void vrWorldRouteFrameBoundary() {
     g_startedOwned = g_machine.owned();
     g_vrWorldWants = g_census || (key == VrWorldKey::Auto && g_machine.wantsDraws() && gate && layerLive);
     g_vrWorldWatchWrites = false;
+    // Stage 2: the phase of the frame that starts. The route must be Warming or Owned (a frame the route may not resolve is not
+    // jittered at the source) and every condition that makes it watch draws must hold.
+    if (key == VrWorldKey::Auto) {
+        const bool routeWorks = g_machine.state == VrWorldState::Warming || g_machine.state == VrWorldState::Owned;
+        driveInjector(routeWorks && g_vrWorldWants && gate && layerLive);
+    }
 
     // Arm the detector for the frame that starts now.
     uint32_t outW = 0, outH = 0;
@@ -600,6 +844,7 @@ void vrWorldRouteFrameBoundary() {
     g_f.runRtv = g_f.runDsv = nullptr; g_f.runSkippable = false;
     std::memset(g_f.candDepth, 0, sizeof(g_f.candDepth));
     g_f.depthMixed = false; g_f.treated = false; g_f.triggered = false;
+    g_frameNamed = false;
     g_takenSequence[0] = g_takenSequence[1] = 0;
     g_countedLayerOnly[0] = g_countedLayerOnly[1] = 0;
 }

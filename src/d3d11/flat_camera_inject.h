@@ -183,5 +183,7 @@ FlatCameraVrCounters flatCameraVrCounters();
 size_t flatCameraVrExcluded(FlatCameraVrExcluded* out, size_t max);
 // The same words flatCameraInjectObserveStatus gives: "pending", "installed", "failed", "down".
 const char* flatCameraVrStatus();
+// True when the detour is quiet for the route's purposes: this frame asked for neither injection nor observation, and no camera this session injected is still waiting for its first un-injected call (its flush). The route stops calling flatCameraVrFrame once its key is off and this is true. False while there is no live hook only if a flush could still be pending; a hook that never installed is quiet.
+bool flatCameraVrQuiet();
 
 } // namespace edvr
