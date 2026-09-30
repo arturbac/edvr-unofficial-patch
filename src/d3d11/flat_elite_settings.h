@@ -310,11 +310,23 @@ private:
 };
 
 // ---- the words -------------------------------------------------------------------------
+// Twelve lines: the flat page has three rows, so a blank line and twelve of these are the card's sixteen (menu_panel.h's
+// kMenuMaxLines; menu.cpp static_asserts it). The two paragraphs of old took up to six at the panel's width (40
+// characters a line in the rig's ruler); the supersampling paragraph below takes four more, which is ten at worst, and
+// the two spare are for a ruler wider than the rig's rather than a cut-off sentence.
 struct FlatSettingsWarning {
-    static constexpr int kMaxLines = 6;
+    static constexpr int kMaxLines = 12;
     char line[kMaxLines][160] = {};
     int count = 0;
 };
+// The extra paragraph of the flat warning (design section 81): the frames are refused, the HDR route's key is auto,
+// and the route leaves them to the copy route only because the game renders below the output. Plain words, what the
+// user gets: at 1.0 or above the route resolves before bloom and depth of field, so they no longer block it.
+inline constexpr char kFlatSupersamplingWords[] =
+    "Supersampling is below 1.0. At 1.0 or above, EDVR anti-aliases before bloom and depth of field, so they no "
+    "longer block it. Raising it costs GPU time.";
+static_assert(sizeof(kFlatSupersamplingWords) <= sizeof(FlatSettingsWarning{}.line[0]),
+              "the supersampling paragraph fits one unwrapped log line");
 // The panel's ruler: the width in pixels of one line of note text (menuPanelMeasureLine at the
 // note face's em). A rig gives it a fixed pitch.
 using FlatMeasureFn = int (*)(const char* utf8, void* context);
@@ -352,10 +364,12 @@ inline void flatWrapWarning(const std::string& paragraph, int widthPx, FlatMeasu
 // DLAA, TAA, FSR3). `hdrRouteActive` (section 81): the HDR route is what treats this session's frames, so
 // bloom and depth of field are not what the refusal is about (the route resolves before both) and their
 // advice is dropped; the Anti-aliasing advice stays (the game's own AA after the tone still double-filters
-// and a game TAA's jitter fights EDVR's).
+// and a game TAA's jitter fights EDVR's). `supersamplingBelowOne`: the route's key is auto and it leaves these frames
+// to the copy route only because the game renders below the output; a third paragraph then says so, after the advice
+// above, which it does not replace. Never with the route active (nothing is left for it to say).
 inline void flatComposeSettingsWarning(const char* modeLabel, const EliteGraphics& g, int widthPx,
                                        FlatMeasureFn measure, void* context, FlatSettingsWarning* out,
-                                       bool hdrRouteActive = false) {
+                                       bool hdrRouteActive = false, bool supersamplingBelowOne = false) {
     *out = FlatSettingsWarning{};
     char first[160];
     std::snprintf(first, sizeof(first), "%s is not active: Elite's post-processing is not recognised.",
@@ -385,16 +399,59 @@ inline void flatComposeSettingsWarning(const char* modeLabel, const EliteGraphic
         second = "Please send your logs (F10 in the cockpit, then the installer's log bundle).";
     }
     flatWrapWarning(second, widthPx, measure, context, out);
+    if (supersamplingBelowOne && !hdrRouteActive)
+        flatWrapWarning(kFlatSupersamplingWords, widthPx, measure, context, out);
 }
 
 // A short key for the composed warning: it changes when the words would, so the panel
-// rebuilds (and the log speaks) exactly then.
-inline std::string flatSettingsWarningKey(const char* modeLabel, const EliteGraphics& g, bool hdrRouteActive = false) {
+// rebuilds (and the log speaks) exactly then. The supersampling paragraph is part of the words, so its flag is
+// part of the key: the text appears and goes when the user's supersampling crosses 1.0, live.
+inline std::string flatSettingsWarningKey(const char* modeLabel, const EliteGraphics& g, bool hdrRouteActive = false,
+                                          bool supersamplingBelowOne = false) {
     char key[200];
-    std::snprintf(key, sizeof(key), "%s|%d|%d|%s|%d|%d|%d|%d", modeLabel ? modeLabel : "",
+    std::snprintf(key, sizeof(key), "%s|%d|%d|%s|%d|%d|%d|%d|%d", modeLabel ? modeLabel : "",
                   g.presetKnown ? 1 : 0, g.custom ? 1 : 0, g.presetKnown ? g.preset : "",
-                  g.aaOn() ? 1 : 0, g.bloomOn() ? 1 : 0, g.dofOn() ? 1 : 0, hdrRouteActive ? 1 : 0);
+                  g.aaOn() ? 1 : 0, g.bloomOn() ? 1 : 0, g.dofOn() ? 1 : 0, hdrRouteActive ? 1 : 0,
+                  supersamplingBelowOne && !hdrRouteActive ? 1 : 0);
     return key;
+}
+
+// Which of the warning's conditions hold, from what the runtime publishes. The warning exists only while frames are
+// refused for the shape of the post chain (`refusing`); the route being active drops the Bloom and Depth of field
+// advice; the supersampling paragraph needs the refusal, the route NOT active and the runtime's "the game renders below
+// the output with the key auto" (flatRuntimeHdrRouteBelowOutput, which says true only for the key auto). One function,
+// so the panel, the log and the rig read the same truth table.
+struct FlatWarningFlags {
+    bool refusing = false;
+    bool hdrRoute = false;
+    bool supersamplingBelowOne = false;
+};
+inline FlatWarningFlags flatWarningFlags(bool refusing, bool routeActive, bool belowOutputWithKeyAuto) {
+    FlatWarningFlags f;
+    f.refusing = refusing;
+    f.hdrRoute = refusing && routeActive;
+    f.supersamplingBelowOne = refusing && !f.hdrRoute && belowOutputWithKeyAuto;
+    return f;
+}
+
+// The log line for a shown or changed warning: the conditions in the brackets, then the composed paragraphs as the
+// panel would say them (unwrapped, one per line), so the log carries every paragraph the panel does. The sizes are
+// the route's measured render and output sizes, named only with the supersampling paragraph.
+inline int flatFormatSettingsWarningLog(char* out, size_t size, bool changed, const char* modeLabel, const char* reason,
+                                        bool standing, const FlatWarningFlags& flags, uint32_t renderW, uint32_t renderH,
+                                        uint32_t outputW, uint32_t outputH, const FlatSettingsWarning& words) {
+    char below[96] = "";
+    if (flags.supersamplingBelowOne)
+        std::snprintf(below, sizeof(below), ", supersampling below 1.0 (render %ux%u, output %ux%u)", renderW, renderH,
+                      outputW, outputH);
+    int n = std::snprintf(out, size, "flat settings warning: %s (mode=%s, frames refused for %s%s%s%s): ",
+                          changed ? "changed" : "shown", modeLabel ? modeLabel : "", reason ? reason : "",
+                          standing ? ", work stood down" : "", flags.hdrRoute ? ", HDR route active" : "", below);
+    for (int i = 0; i < words.count && n >= 0 && static_cast<size_t>(n) < size; ++i) {
+        const int more = std::snprintf(out + n, size - static_cast<size_t>(n), "%s%s", i ? " " : "", words.line[i]);
+        if (more > 0) n += more;
+    }
+    return n;
 }
 
 // The log line for what was read.

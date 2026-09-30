@@ -1447,6 +1447,12 @@ void publishRefusal(const State& s, bool warn) {
             (static_cast<uint32_t>(s.standDown.reason()) << 8);
     g_refusalPublished.store(v, std::memory_order_release);
 }
+// The F8 warning's supersampling line (design section 81): with the route's key auto, the route's last selection found
+// the game rendering below the output on both axes (Elite's supersampling under 1.0), so it leaves the frames to the
+// copy route. The four measured sizes (render width and height, output width and height) in one word, 16 bits each
+// (flatHdrPackSizes); 0 when that is not the case, which is also what the key off, a selection at R >= D and a resize
+// publish. Written on the draw thread, read by the panel thread (flatRuntimeHdrRouteBelowOutput).
+std::atomic<uint64_t> g_hdrBelowOutput{0};
 
 // --- Stand-down: what each mode does (flat_standdown.h) --------------------------
 // The one place the pieces are paused and resumed, called at every Present with the
@@ -1542,6 +1548,11 @@ bool flatRuntimeStructuralRefusal(const char** reasonName, bool* standingDown) {
 bool flatRuntimeHdrRouteActive() {
     return (g_refusalPublished.load(std::memory_order_acquire) & 5u) == 5u;
 }
+bool flatRuntimeHdrRouteBelowOutput(uint32_t* renderWidth, uint32_t* renderHeight, uint32_t* outputWidth,
+                                    uint32_t* outputHeight) {
+    return flatHdrUnpackSizes(g_hdrBelowOutput.load(std::memory_order_acquire), renderWidth, renderHeight, outputWidth,
+                              outputHeight);
+}
 
 void flatRuntimeResize() {
     g_flatRuntimeLive.store(false, std::memory_order_release);
@@ -1573,6 +1584,7 @@ void flatRuntimeResize() {
     // The HDR route's per-frame detector state names resources of the old device; the key, the latch and the
     // census window are the session's and stay.
     flatHdrBeginFrame(s.hdr, 0, 0); s.hdrTreated = false; s.hdrEligible = false;
+    g_hdrBelowOutput.store(0, std::memory_order_release);
     s.prefix = FlatRuntimePrefix{}; s.context.Reset(); s.device.Reset(); s.thread = 0; s.viewportCount = 0;
 }
 void flatRuntimeBeforePresent() {
@@ -1645,14 +1657,18 @@ void flatTraceDumpToLogDir(State& s, uint64_t frame) {
         shortWrite || bytes != expected ? " SHORT WRITE -- capture unusable" : "");
 }
 // --- The HDR route's runtime half (flat_hdr_route.h holds the pure logic and the log lines) -----------------
-// experimental.temporal_aa_before_post, read at every Present. A change wakes the stand-down (a user who sets it to
-// auto to escape a refusal gets the route at once), rearms the latch when it goes off, and starts history afresh: the
-// backends' feature keys carry the route, so the next frame remakes what it needs.
+// experimental.temporal_aa_before_post, read at every Present; auto when the file has no line (the default since the
+// route flew, design section 81, and the shipped edvr.ini says the same: config_test holds the two to one answer).
+// A change wakes the stand-down (a user who sets it to auto to escape a refusal gets the route at once), rearms the
+// latch when it goes off, and starts history afresh: the backends' feature keys carry the route, so the next frame
+// remakes what it needs. The F8 supersampling line is the key's too: it goes with the key off and comes back from the
+// next selection with it auto.
 static void hdrReadKey(State& s, uint64_t frame) {
-    const FlatHdrKey key = flatHdrKeyFromText(Config::get().getString("experimental.temporal_aa_before_post", "off").c_str());
+    const FlatHdrKey key = flatHdrKeyFromText(Config::get().getString("experimental.temporal_aa_before_post", "auto").c_str());
     if (s.hdrKeyRead && key == s.hdrKey) return;
     const bool first = !s.hdrKeyRead;
     s.hdrKey = key; s.hdrKeyRead = true;
+    g_hdrBelowOutput.store(0, std::memory_order_release);
     if (key == FlatHdrKey::Off) { s.hdrLatch.reset(); s.hdrEligible = false; }
     Log::get().note("flat hdr route: experimental.temporal_aa_before_post=%s%s at frame=%llu: %s",
         flatHdrKeyName(key), first ? " (read at startup)" : " (changed)", static_cast<unsigned long long>(frame),
@@ -1716,13 +1732,26 @@ static void hdrSelectAtTrigger(State& s) {
         // Whether the route is what treats this session's frames (the F8 words follow it): a selected frame the mode's route
         // evaluates at the render size for, not one below the output (upscaling keeps the copy route and its whitelist,
         // decision (c)) and not EDVR's TAA above it. A transient refusal (no camera yet, say) leaves the last answer.
+        const FlatFrameSeen routeSeen = flatHdrTriggerSeen(sel, s.engine);
         if (sel.selected())
-            s.hdrEligible = flatHdrRouteEvaluatesAtRender(s.engine, sel.renderWidth, sel.renderHeight,
-                                                          sel.outputWidth, sel.outputHeight);
+            s.hdrEligible = routeSeen == FlatFrameSeen::Treatable;
         else if (sel.reason == FlatMonoReason::HdrExtent)
             s.hdrEligible = false;
-        const FlatFrameSeen hdrSeen = flatFrameSeenFor(sel.selected(), sel.reason);
-        if (hdrSeen >= s.frameSeen) { s.frameSeen = hdrSeen; s.frameReason = sel.reason; }
+        // The route speaks for the frame's stand-down verdict only where it will resolve the frame (flatHdrTriggerSeen).
+        // Its refusals add nothing: merged as themselves they outrank the copy stage's structural one, and at R < D every
+        // frame the copy route refuses would read as transient, so the stand-down and the F8 warning would never start.
+        if (routeSeen == FlatFrameSeen::Treatable) { s.frameSeen = FlatFrameSeen::Treatable; s.frameReason = sel.reason; }
+        // The F8 warning's supersampling line, from the route's own measurement at this trigger: the render (H's extent)
+        // and the output (the swap chain's) sizes of a selection that refused for R < D; cleared by a selection at R >= D
+        // and by a refusal for the extent that is not R < D (past twice the output, off its aspect).
+        if (sel.selected())
+            g_hdrBelowOutput.store(0, std::memory_order_release);
+        else if (sel.reason == FlatMonoReason::HdrExtent)
+            g_hdrBelowOutput.store(flatHdrSupersamplingAdvice(s.hdrKey, s.hdrEligible, sel.renderWidth, sel.renderHeight,
+                                                              sel.outputWidth, sel.outputHeight)
+                                       ? flatHdrPackSizes(sel.renderWidth, sel.renderHeight, sel.outputWidth, sel.outputHeight)
+                                       : 0,
+                                   std::memory_order_release);
     }
     {
         flatcpu::Scope trace(flatcpu::kTrace);

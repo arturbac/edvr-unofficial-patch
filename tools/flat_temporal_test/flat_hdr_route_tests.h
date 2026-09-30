@@ -332,7 +332,7 @@ inline int flatHdrRouteTests() {
            flatHdrKeyFromText(nullptr) == FlatHdrKey::Off && flatHdrKeyFromText("on") == FlatHdrKey::Off &&
            flatHdrKeyFromText("autos") == FlatHdrKey::Off && flatHdrKeyFromText("aut") == FlatHdrKey::Off &&
            flatHdrKeyFromText(" auto") == FlatHdrKey::Off,
-           "anything that is not auto reads as off, so a typo never turns a flight key on");
+           "a value that is not auto reads as off: a typo leaves the copy route, it never turns the route on by accident");
 
     // ---- the backend flags, as pure functions ---------------------------------------------------------
     // The values are the SDKs' own (dlaa.cpp and fsr3_engine.cpp static_assert them against the headers); what is pinned
@@ -591,6 +591,30 @@ inline int flatHdrRouteTests() {
         expect(!lowSel.selected() && lowSel.reason == FlatMonoReason::HdrExtent && !flatMonoReasonStructural(lowSel.reason) &&
                flatFrameSeenFor(false, lowSel.reason) == FlatFrameSeen::Transient,
                "R < D: hdr-route-needs-render-at-least-output, transient");
+        expect(lowSel.renderWidth == 2496 && lowSel.renderHeight == 1404 && lowSel.outputWidth == 3840 &&
+               lowSel.outputHeight == 2160,
+               "the extent refusal carries the measured render and output sizes (the F8 supersampling line reads them)");
+        // What the runtime publishes from it (flatHdrSupersamplingAdvice): the key, the route, the sizes.
+        {
+            const uint32_t rW = lowSel.renderWidth, rH = lowSel.renderHeight, dW = lowSel.outputWidth, dH = lowSel.outputHeight;
+            expect(flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, rW, rH, dW, dH) &&
+                       !flatHdrSupersamplingAdvice(FlatHdrKey::Off, false, rW, rH, dW, dH) &&
+                       !flatHdrSupersamplingAdvice(FlatHdrKey::Auto, true, rW, rH, dW, dH),
+                   "supersampling advice: the key auto and the route not treating, with the render below the output; never with the key off");
+            expect(!flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, dW, dH, dW, dH) &&
+                       !flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, dW + 960, dH + 540, dW, dH) &&
+                       !flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, rW, dH, dW, dH) &&
+                       !flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, dW, rH, dW, dH),
+                   "...not at R = D, above it, or with only one axis below (no uniform supersampling)");
+            expect(!flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, 0, 0, dW, dH) &&
+                       !flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, rW, rH, 0, 0),
+                   "...and not from sizes nobody measured");
+            uint32_t a = 0, b = 0, c = 0, d = 0;
+            expect(flatHdrUnpackSizes(flatHdrPackSizes(rW, rH, dW, dH), &a, &b, &c, &d) && a == rW && b == rH && c == dW && d == dH &&
+                       !flatHdrUnpackSizes(0, &a, &b, &c, &d) && flatHdrPackSizes(0, rH, dW, dH) == 0 &&
+                       flatHdrPackSizes(70000, rH, dW, dH) == 0,
+                   "the four sizes pack into one word and back; zero and oversized sizes publish nothing");
+        }
         Scene superSc; superSc.hW = 5760; superSc.hH = 3240;   // supersampling 1.5: R > D is the route's own ground
         Stream super(superSc); super.sceneDraws(2, 2); super.toneTrigger();
         expect(super.select().selected() && super.select().renderWidth == 5760 && super.select().outputWidth == 3840,
@@ -755,6 +779,95 @@ inline int flatHdrRouteTests() {
         Sim upscale;
         for (int i = 0; i < 60 * 30; ++i) upscale.frame(flatFrameSeenFor(false, FlatMonoReason::HdrExtent), FlatMonoReason::HdrExtent);
         expect(upscale.machine.entries == 0, "hdr-route-needs-render-at-least-output never stands the work down");
+
+        // ---- and what the route adds to a frame's verdict, merged as the runtime merges it --------------------------
+        // The route's trigger comes first in a frame, the copy stage's own verdict at the output copy after it, and the
+        // higher of the two stands (None < Structural < Transient < Treatable). The route speaks only where it will
+        // resolve the frame (flatHdrTriggerSeen): a refusal merged as itself would outrank the copy stage's structural
+        // one, and then a chain the copy route refuses would never stand down and never warn at R < D.
+        const auto merged = [&](const FlatMonoFrame& selection, FlatMonoResolveMode mode, bool routeSpeaks,
+                                FlatMonoReason copyReason, FlatMonoReason* reasonOut) {
+            FlatFrameSeen seen = FlatFrameSeen::None;
+            FlatMonoReason reason = FlatMonoReason::NoOutputCopy;
+            const FlatFrameSeen route = routeSpeaks ? flatHdrTriggerSeen(selection, mode)
+                                                    : flatFrameSeenFor(selection.selected(), selection.reason);   // the old merge
+            if (route != FlatFrameSeen::None && route >= seen) { seen = route; reason = selection.reason; }
+            const FlatFrameSeen copy = flatFrameSeenFor(false, copyReason);
+            if (copy >= seen) { seen = copy; reason = copyReason; }
+            *reasonOut = reason;
+            return seen;
+        };
+        const auto runs = [&](const FlatMonoFrame& selection, FlatMonoResolveMode mode, bool routeSpeaks, Sim* sim) {
+            for (int i = 0; i < 60 * 30; ++i) {
+                FlatMonoReason reason = FlatMonoReason::NoOutputCopy;
+                const FlatFrameSeen seen = merged(selection, mode, routeSpeaks, FlatMonoReason::NoTonePass, &reason);
+                sim->frame(seen, reason);
+            }
+        };
+        Scene lowSc; lowSc.hW = 2496; lowSc.hH = 1404;                       // 0.65 of 3840x2160: Elite's supersampling below 1.0
+        Stream low(lowSc); low.sceneDraws(2, 2); low.toneTrigger();
+        const FlatMonoFrame lowFrame = low.select();
+        expect(lowFrame.reason == FlatMonoReason::HdrExtent && flatHdrTriggerSeen(lowFrame, FlatMonoResolveMode::Dlss) == FlatFrameSeen::None,
+               "R < D: the route adds nothing to the frame's verdict");
+        Sim lowWith, lowOff;
+        runs(lowFrame, FlatMonoResolveMode::Dlss, true, &lowWith);
+        for (int i = 0; i < 60 * 30; ++i) lowOff.frame(flatFrameSeenFor(false, FlatMonoReason::NoTonePass), FlatMonoReason::NoTonePass);
+        expect(lowWith.machine.entries == 1 && lowWith.machine.enteredReason == FlatMonoReason::NoTonePass &&
+                   lowWith.machine.warningActive() && lowWith.machine.entries == lowOff.machine.entries &&
+                   lowWith.machine.enteredReason == lowOff.machine.enteredReason,
+               "R < D with the key auto: a chain the copy route refuses stands down and warns exactly as with the key off");
+        Sim lowMasked;
+        runs(lowFrame, FlatMonoResolveMode::Dlss, false, &lowMasked);
+        expect(lowMasked.machine.entries == 0 && !lowMasked.machine.warningActive(),
+               "control: the route's refusal merged as itself masks it (never stands down, never warns) -- the bug this pins");
+        // EDVR's TAA above D: selected (R >= D) but the mode evaluates on the display grid, so the copy route keeps the frame.
+        Scene superSc; superSc.hW = 5760; superSc.hH = 3240;
+        Stream super(superSc); super.sceneDraws(2, 2); super.toneTrigger();
+        const FlatMonoFrame superFrame = super.select();
+        expect(superFrame.selected() && flatHdrTriggerSeen(superFrame, FlatMonoResolveMode::Taa) == FlatFrameSeen::None &&
+                   flatHdrTriggerSeen(superFrame, FlatMonoResolveMode::Dlss) == FlatFrameSeen::Treatable &&
+                   flatHdrTriggerSeen(superFrame, FlatMonoResolveMode::Dlaa) == FlatFrameSeen::Treatable &&
+                   flatHdrTriggerSeen(superFrame, FlatMonoResolveMode::Fsr) == FlatFrameSeen::Treatable,
+               "a selected frame is treatable to the route for DLSS, DLAA and FSR above D, and not for EDVR's TAA there");
+        Sim taaAbove, dlssAbove;
+        runs(superFrame, FlatMonoResolveMode::Taa, true, &taaAbove);
+        runs(superFrame, FlatMonoResolveMode::Dlss, true, &dlssAbove);
+        expect(taaAbove.machine.entries == 1 && dlssAbove.machine.entries == 0,
+               "EDVR's TAA above D: a refused chain stands down as before; DLSS above D: the route treats it, nothing stands down");
+        // A refusal for any other reason adds nothing either (the copy stage decides).
+        Stream noPool; noPool.sceneDraws(0, 4); noPool.toneTrigger();
+        const FlatMonoFrame refused = noPool.select();
+        Sim refusedSim;
+        runs(refused, FlatMonoResolveMode::Dlss, true, &refusedSim);
+        expect(!refused.selected() && flatHdrTriggerSeen(refused, FlatMonoResolveMode::Dlss) == FlatFrameSeen::None &&
+                   refusedSim.machine.entries == 1,
+               "a selector refusal of the route's own adds nothing: the copy stage's structural verdict stands");
+        // At R = D the route treats what the copy route refuses, as before: nothing stands down.
+        Stream atD; atD.sceneDraws(2, 2); atD.toneTrigger();
+        const FlatMonoFrame okFrame = atD.select();
+        Sim treatedSim;
+        runs(okFrame, FlatMonoResolveMode::Dlss, true, &treatedSim);
+        expect(okFrame.selected() && treatedSim.machine.entries == 0 && treatedSim.work == FlatWork::Full,
+               "R = D with the key auto: the frames the route treats never stand the work down, whatever the copy stage said");
+        // A probe frame (stood down) that the route would resolve ends the stand-down; one at R < D does not.
+        Sim probeAbove = lowWith;   // stood down for no-known-tone-pass at R < D
+        FlatStandDownEvent lowEvent = FlatStandDownEvent::None;
+        for (int i = 0; i < 400; ++i) {
+            FlatMonoReason reason = FlatMonoReason::NoOutputCopy;
+            const FlatFrameSeen seen = merged(lowFrame, FlatMonoResolveMode::Dlss, true, FlatMonoReason::NoTonePass, &reason);
+            if (probeAbove.frame(seen, reason) == FlatStandDownEvent::Resumed) lowEvent = FlatStandDownEvent::Resumed;
+        }
+        expect(lowEvent == FlatStandDownEvent::None && probeAbove.machine.standing,
+               "probe frames at R < D keep the stand-down (the copy route still refuses them)");
+        Sim probeAtD = lowWith;
+        FlatStandDownEvent atDEvent = FlatStandDownEvent::None;
+        for (int i = 0; i < 400 && atDEvent != FlatStandDownEvent::Resumed; ++i) {
+            FlatMonoReason reason = FlatMonoReason::NoOutputCopy;
+            const FlatFrameSeen seen = merged(okFrame, FlatMonoResolveMode::Dlss, true, FlatMonoReason::NoTonePass, &reason);
+            atDEvent = probeAtD.frame(seen, reason);
+        }
+        expect(atDEvent == FlatStandDownEvent::Resumed && !probeAtD.machine.standing,
+               "a probe frame the route would resolve (R >= D) ends the stand-down");
     }
 
     // ---- the trace format: v4 carries the four slots and the resolve marker; v3 is still read -------------------------
@@ -1024,6 +1137,46 @@ inline int flatHdrRouteTests() {
         expect(count(resolve, "f.jitterX,f.jitterY,reset,f.deltaMs,reason,hdr);") == 1 &&
                    count(resolve, "2*std::atan(1/sy),reason,true,hdr);") == 1,
                "the resolver's backend calls pass the frame's hdr bit to the DLSS/DLAA evaluate and to the FSR evaluate");
+    }
+
+    // ---- the wiring no rig can run: the runtime's default, merge and publication, and the panel's use of them ---------
+    // The runtime and the panel need a game to run, so what the rigs above pin as functions is pinned here as calls: the
+    // route's key reads auto when the file has no line (config_test holds that to the shipped ini), the route adds to the
+    // stand-down verdict only through flatHdrTriggerSeen (the old merge of its own refusal, which masked a structural
+    // refusal at R < D, is gone), the measured sizes are published from the selection and cleared on a flip, a resize
+    // and a selection at R >= D, and the panel reads them only while frames are refused.
+    {
+        const auto slurpSource = [&](const char* path) {
+            std::vector<unsigned char> bytes;
+            std::string text;
+            if (readFile(fs::path(path), &bytes)) text.assign(bytes.begin(), bytes.end());
+            return text;
+        };
+        const auto count = [](const std::string& text, const char* needle) {
+            size_t n = 0, at = 0; const std::string s(needle);
+            while ((at = text.find(s, at)) != std::string::npos) { ++n; at += s.size(); }
+            return n;
+        };
+        const std::string runtime = slurpSource("src/d3d11/flat_runtime.cpp");
+        const std::string menu = slurpSource("src/d3d11/menu.cpp");
+        expect(!runtime.empty() && !menu.empty(), "the runtime and menu sources are readable from the repo root");
+        expect(count(runtime, "Config::get().getString(\"experimental.temporal_aa_before_post\", \"auto\")") == 1,
+               "the route's key falls back to auto when the file has no line");
+        expect(count(runtime, "flatHdrTriggerSeen(sel, s.engine)") == 1 && count(runtime, "flatFrameSeenFor(") == 1 &&
+                   count(runtime, "if (routeSeen == FlatFrameSeen::Treatable) { s.frameSeen = FlatFrameSeen::Treatable;") == 1,
+               "the route adds to a frame's stand-down verdict through flatHdrTriggerSeen only; the copy stage is the one other caller of flatFrameSeenFor");
+        expect(count(runtime, "g_hdrBelowOutput.store(") == 4 && count(runtime, "g_hdrBelowOutput.store(0, std::memory_order_release);") == 3 &&
+                   count(runtime, "flatHdrSupersamplingAdvice(s.hdrKey, s.hdrEligible, sel.renderWidth, sel.renderHeight,") == 1,
+               "the measured sizes are published from the selection and cleared by a key change, a resize and a selection at R >= D");
+        expect(count(menu, "const bool belowOutput = refusing && flatRuntimeHdrRouteBelowOutput(&renderW, &renderH, &outputW, &outputH);") == 1 &&
+                   count(menu, "const FlatWarningFlags flags = flatWarningFlags(refusing, refusing && flatRuntimeHdrRouteActive(), belowOutput);") == 1,
+               "the panel reads the published sizes only while frames are refused, through flatWarningFlags");
+        expect(count(menu, "flatSettingsWarningKey(label.c_str(), s.flatSettings.settings(), flags.hdrRoute,") == 1 &&
+                   count(menu, "flatFormatSettingsWarningLog(line, sizeof(line), was, label.c_str(), reason, standing, flags, renderW, renderH,") == 1 &&
+                   count(menu, "s.flatWarnFlags.hdrRoute,") == 1 && count(menu, "s.flatWarnFlags.supersamplingBelowOne);") == 1,
+               "the key, the log line and the panel's words all take the same two conditions");
+        expect(count(menu, "static_assert(static_cast<int>(kFlatPageRowCount) + 1 + FlatSettingsWarning::kMaxLines <= kMenuMaxLines,") == 1,
+               "the flat page's rows, a blank line and a full warning are held to the card's lines at compile time");
     }
 
     return failures;
