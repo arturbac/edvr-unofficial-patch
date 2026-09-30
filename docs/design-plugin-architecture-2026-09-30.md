@@ -5,6 +5,7 @@
 - **State:** design only, for the release after v0.18.0. Nothing is built.
   It extends draft PR #46 (Devin Nemec, "generic OpenXR addon and plugin
   architecture"), which this document reuses as its add-on tier (section 6).
+  The runtime-dependency check is done (section 4.1).
 - **Goal (Sean):** every fix and performance item belongs to one plugin,
   plugins group features logically, and the user picks which to install in
   the installer. A plugin that is not installed costs nothing.
@@ -31,9 +32,16 @@
   add-on tier after Phase 1 (PR #46's OM-unbind fix lands on its own now);
   diagnostics probes out of the default install, census kept in the core;
   today's keys and sections kept, each owned by a plugin. Section 10.
+- **Decided, Q7 (Sean, 2026-09-30): graphics-only VR is its own phase,
+  after Phase 1.** When no selected plugin needs the OpenXR runtime (section
+  4.1), the installer skips it and Elite stays on its stock VR path. Four
+  changes first (section 10); no F8, AA, flash fix or Explorer Cam without
+  the runtime; the first build needs a flight on a stock runtime.
 - **Next:** Phase 1 (section 8), after v0.18.0: the registry and dispatch
   tables in the core and night vision moved behind them, gated by a
-  byte-identical verdict replay and a lower render-thread census.
+  byte-identical verdict replay and a lower render-thread census. The
+  registry also owns the draw-gate subscriptions and takes static props and
+  the scheduler probe off temporalPassConfigure.
 - **Ruled out while designing:** loading every DLL found in a folder (DLL
   planting; the installer's receipts already know what it installed), a
   stable ABI for first-party plugins (they ship with the core; freezing
@@ -180,6 +188,43 @@ the per-eye VR one, and the single-image
 one that serves flat mode today and could serve the VR on-foot screen and the
 HDR route (docs\design-flat-temporal-aa-2026-09-23.md, section 81).
 
+### 4.1 What needs the OpenXR runtime
+
+D = works with only d3d11.dll installed, on a stock runtime; G = works
+without the runtime, degraded; R = needs it. A read-only check of main
+4a4f7fa2. The graphics half never calls openvr_api.dll, and every value the
+runtime publishes reads "no answer" when absent, so the rows are classes of
+behaviour, not crashes.
+
+| Plugin | Without the runtime | Evidence |
+|---|---|---|
+| temporal-aa | R: TAA, DLSS, FSR, jitter, sharpening and UI quality run at the runtime's Submit (treatEye, the door) | native_temporal.cpp:282, 380 |
+| cockpit-visuals | D particles, witchspace, wake pulse; G sun glare, night vision, target indicator, RemLok (eye-branch fixes need eye recognition) | vscreen.cpp:1976-2001, 2060 |
+| exposure | D | exposure_fix.cpp:735-940 |
+| scanners | G scanner body; R FSS eye sync (the heal is a runtime door, and the body-layer stamp reads the published eye size) | native_fss.cpp:120; vscreen.cpp:2275 |
+| intro | D skip, backdrop blit; G movie, loader panel, scrim; R splash dim, loading hologram | intro_skip.cpp; splash_dim.cpp:113-119; holo_fix.cpp:159 |
+| on-foot-panel | G black void, panel distance, curvature; D fixed resolution, R `auto`; R weapon stability | vscreen.cpp:2843; vscreen_res.cpp:358; native_frame.cpp:404-413 |
+| comfort | R: the flash withhold and Explorer Cam's offset happen in the runtime | native_frame.cpp:497-509; head_offset_gate.cpp:1046-1061 |
+| performance | R cull guard, FOV trim, OpenXR resolution; D static props, settlement detail `reduced`; G `auto` (holds at 1.0 without timing) | native_cull_guard.h; lod_governor.cpp:1273-1279 |
+| diagnostics | D census and probes; R eye dumps | temporal_pass.h:90-98 |
+| core: F8 menu | R: no door, and the anchor pose comes from the runtime | menu.cpp:3222-3232; native_menu.cpp:77 |
+
+Eye recognition is the hinge. The eye size reaches the graphics half only
+from the runtime (eye 0's treat, native_temporal.cpp:317). Without it
+`targetIsEyeSized` guesses 2048 or more on both axes (vscreen.cpp:1253), so a
+headset with a smaller eye axis gets no recognised eye draws and every
+eye-branch fix goes inert, silently. `advanced.eye_render_size` pins it by
+hand.
+
+Install components. Graphics (d3d11.dll) for every plugin. The runtime set
+(`Openvr\win64\openvr_api.dll` with the game's original renamed aside,
+`openxr_loader.dll`, its license, `edvr_openxr.ini`) for temporal-aa,
+comfort, scanners' FSS sync, and performance's cull guard, FOV trim and
+resolution; intro and on-foot-panel use it only for their R rows. The NGX DLL
+(`nvngx_dlss.dll`) for DLSS only. Profile and ini always. Flat already
+installs as graphics + profile + ini (+ NGX) with no runtime (plan.cpp:314,
+571; install_edvr.py:1186-1189).
+
 ## 5. The plugin contract
 
 - **Manifest** (compiled in, and exported as JSON for the installer): id,
@@ -265,6 +310,11 @@ when ReShade was removed). The rules:
   gate is byte-identical verdicts on replayed censuses plus the existing
   rigs, and a census at the same spots showing EDVR's render-thread cost
   lower than today's (disabled features stop walking the ladder).
+  The registry also owns the draw-gate subscriptions (wake pulse and night
+  vision are missing from `drawGateSubscribed` today, vscreen.cpp:1653; the
+  standalone fix is a separate task), and static props and the scheduler
+  stack probe stop hanging off `temporalPassConfigure` (temporal_pass.cpp
+  6149-6154), or deselecting temporal-aa orphans them.
 - **Phase 2:** move the other groups one at a time, each with its rigs and
   one flight: cockpit-visuals, exposure, scanners, intro, on-foot-panel,
   comfort, performance, temporal-aa (with UI quality) last. Each move adds a
@@ -276,6 +326,9 @@ when ReShade was removed). The rules:
   set (`edvr_log.py --expect-plugins`).
 - **Phase 4:** the add-on tier of section 6. (Separate first-party DLLs are
   not planned: Q1 chose monolithic.)
+- **Phase 5 (Q7):** graphics-only VR, after Phase 1 and Phase 3's component
+  selection: the four changes of Q7, then a flight on a stock runtime before
+  it ships.
 
 ## 9. Risks
 
@@ -327,3 +380,28 @@ when ReShade was removed). The rules:
   unread-key audit says "belongs to <plugin>, not installed" instead of
   "not read"; a fresh install writes only the installed plugins' blocks;
   existing ini files keep working untouched.
+- **Q7 (decided 2026-09-30): graphics-only VR is its own phase, after Phase
+  1 (section 8, Phase 5).** When no selected plugin needs the runtime
+  (section 4.1), the installer skips the runtime set and Elite stays on its
+  stock VR path (SteamVR's OpenVR, or LibOVR), with EDVR's d3d11 fixes on
+  top. Four changes first: (a) a graphics image that does not assume the
+  runtime: a second build (Oculus route inert, startup marker flags 0, the
+  shape 1a54e9e removed) or a load-time check; DllMain cannot read the ini
+  (oculus_route.h:22-25), so the decision is build-time or leaves DllMain;
+  (b) a hardened eye-size fallback: the "2048 on both axes" guess silently
+  disables every eye-branch fix on smaller headsets, so vScreenIsEyeSized and
+  splash_dim adopt the targetIsEyeSized rule; (c) dependency enforcement at
+  plugin registration, from the install record (the module list settles up
+  to a second late); (d) edition ini defaults generated the way
+  edvr-flat.ini is (`intro_video=head`, `fss_eye_sync=sync`,
+  `vscreen_res_width=2880`). The installer says plainly what the user gives
+  up: no F8 menu in VR (settings through the installer's settings window or
+  the ini; live reload works), no DLSS, FSR, TAA or UI quality, no flash
+  fix, no Explorer Cam. Not planned: any of those without the runtime; that
+  is rebuilding the OpenVR proxy deleted 2026-09-16 (1a54e9e). The first
+  build needs a flight on a stock runtime: the graphics half has not run on
+  one since then. Risks: LibOVR users move off LibOVR today (the route is
+  unconditional, d3d11_proxy.cpp:660); the native image refuses unknown game
+  revisions (DllMain returns FALSE); `temporal_aa` or FSS `on` without the
+  runtime costs with no output; the vr_runtime "Reinstall" advice
+  (vr_runtime.cpp:106-113) and the README's second-log guidance turn wrong.
