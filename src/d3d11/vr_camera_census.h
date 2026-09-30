@@ -8,11 +8,14 @@
 // What it records, bounded (vr_camera_census_core.h has the tables, the budget and the text of every line):
 //   - a 5 s line every window (zeros included): calls, calls on other threads, kinds, callers, distinct cameras, where in
 //     the frame the calls fell against the tone draw;
-//   - per distinct camera (the first 64): its kind, caller and field signature, and any later change of it;
+//   - per distinct camera (the first 64): its kind, caller, view and field signature, and any later change of it;
 //   - the FULL call sequence of the first three on-foot frames, one line a call, with the rows the composer produced;
 //   - at the eye composite draw of the first four on-foot frames (eight draws): the eye's b1 rows 270..273 read back
 //     from the GPU, what EDVR advertised for that eye, and the leak measure.
-// `python tools\edvr_log.py --camera-census` reads the log back and does the join offline.
+// An on-foot frame is one in which the world route's detector saw the tone AND Elite's journal, when it is read, says on
+// foot (vrCensusSamplesFrame in the core): the detector draws the same tone in a cockpit, a hangar and a menu, and those
+// frames must not spend the samples. When the route reports no draw progress at all (vrWorldRouteDrawProgress false) there
+// is no tone and the journal alone decides. `python tools\edvr_log.py --camera-census` reads the log back and does the join.
 #pragma once
 #include <cstdint>
 

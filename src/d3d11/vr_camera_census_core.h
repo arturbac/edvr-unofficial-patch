@@ -15,6 +15,7 @@
 // WHAT IS HERE. Everything the census decides and every line it prints, with no D3D, no log, no game and no allocation
 // (tools\vr_camera_census_test runs each function, and the DLL compiles the very same text):
 //   - the key and the decision to run (VR profile and the key on; anything else is nothing at all);
+//   - which frames are sampled (the tone seen, and the journal, when it is read, saying on foot);
 //   - the camera struct's field signature and the rows the composer writes for it, ported from
 //     tools\c2_derive_test\c2_derive_model.h (composeSceneCb), so a camera's rows are known without reading the game's
 //     own constant buffer and can be compared with an eye draw's;
@@ -213,9 +214,38 @@ inline const char* vrCensusToneName(VrCensusTone t) {
     return t == VrCensusTone::Before ? "before" : t == VrCensusTone::After ? "after" : "none";
 }
 
+// ---- which frames are sampled ------------------------------------------------------------------------------------
+// The brief's on-foot frame is "the tone was seen". The detector that reports the tone watches draws for the census in
+// every frame, and a cockpit, a hangar and a menu draw the same tone: without a second witness the first three call
+// sequences and the first four eye frames would be spent before the commander is on foot. The second witness is Elite's
+// own journal (Status.json Flags2 bit 0, journal_watch.h): while it is being read, a frame is sampled only when it says on
+// foot; with no journal the tone alone decides, as the brief has it. The journal lags the game by about a second.
+enum class VrCensusFoot : uint8_t {
+    Off,      // the journal is not being read (disabled, no folder, faults): no second witness
+    Unknown,  // read, but no Flags2 in the file: a menu, or shutdown
+    No,       // Flags2 says not on foot: a ship, a vehicle
+    Yes,      // Flags2 says on foot
+};
+inline const char* vrCensusFootName(VrCensusFoot f) {
+    return f == VrCensusFoot::Yes ? "yes" : f == VrCensusFoot::No ? "no" : f == VrCensusFoot::Unknown ? "unknown" : "off";
+}
+inline VrCensusFoot vrCensusFootFrom(bool journalActive, bool known, bool onFoot) {
+    return !journalActive ? VrCensusFoot::Off : !known ? VrCensusFoot::Unknown : onFoot ? VrCensusFoot::Yes : VrCensusFoot::No;
+}
+// A frame the census samples (a call sequence, an eye readback). With the world route's draw progress available it is the
+// brief's rule plus the journal's: the tone was seen, and the journal, if it is read, says on foot. With no progress (the
+// route does not report, or does not watch draws) there is no tone to see: the journal alone decides, and only a journal
+// that positively says on foot does (neither witness would sample the first frames of a session, menu frames, for nothing).
+constexpr bool vrCensusSamplesFrame(bool toneSeen, bool progressAvailable, VrCensusFoot foot) {
+    return progressAvailable ? (toneSeen && (foot == VrCensusFoot::Yes || foot == VrCensusFoot::Off)) : foot == VrCensusFoot::Yes;
+}
+// Whether a call is worth recording at all: a frame the journal says is not on foot is never sampled, so its calls are only counted.
+constexpr bool vrCensusMayRecord(VrCensusFoot foot) { return foot == VrCensusFoot::Yes || foot == VrCensusFoot::Off; }
+
 // ---- the bounded tables -----------------------------------------------------------------------------------------
 struct VrCensusCall {
     uintptr_t camera = 0;
+    uintptr_t view = 0;     // the refresh's second argument: the view (pass) object the camera belongs to
     uint32_t kind = 0;
     uint32_t callerRva = 0;
     uint32_t draw = 0;
@@ -232,8 +262,9 @@ struct VrCensusFrame {
     VrCensusCall call[kCapacity];
     uint32_t calls = 0;     // owner-thread calls this frame, recorded or not
     uint32_t recorded = 0;
-    bool toneSeen = false;  // the tone was seen at some call or eye draw: an on-foot frame
-    void reset() { calls = 0; recorded = 0; toneSeen = false; }
+    bool toneSeen = false;  // the tone was seen at some call or eye draw: an on-foot frame (see vrCensusSamplesFrame)
+    bool progress = false;  // the world route reported its draw progress at some call or eye draw this frame
+    void reset() { calls = 0; recorded = 0; toneSeen = false; progress = false; }
     // The next call's record (initialised), or null when the frame is full; the call is counted either way.
     VrCensusCall* add() {
         ++calls;
@@ -247,6 +278,7 @@ struct VrCensusFrame {
 
 struct VrCensusCamera {
     uintptr_t camera = 0;
+    uintptr_t firstView = 0, firstCtx = 0;   // the first call's second argument (the view) and first (the view-constant context)
     VrCensusSig firstSig, sig, changeFrom;
     float tan[4] = {};
     bool tanValid = false;
@@ -286,10 +318,18 @@ public:
         return true;
     }
     enum class Event : uint8_t { Known, New, Changed, Full };
+    // What the call that reported a camera knew: the frame in progress and where in it the call fell. A new row keeps
+    // these as its "first call"; a known row takes only the frame (when its signature moved).
+    struct Call {
+        uint64_t frame = 0;
+        uint32_t callerRva = 0, ordinal = 0, draw = 0;
+        bool drawKnown = false;
+        VrCensusTone tone = VrCensusTone::None;
+        uintptr_t view = 0, ctx = 0;
+    };
     // One post-half report for `camera`: a new row (its line pending), a known one whose signature moved (a pending
-    // change), or the same again. `first*` describe the call, used only when the row is new.
-    Event note(uintptr_t camera, const VrCensusSig& sig, const float tan[4], bool tanValid, uint64_t frame,
-               uint32_t callerRva, uint32_t ordinal, uint32_t draw, bool drawKnown, VrCensusTone tone) {
+    // change), or the same again.
+    Event note(uintptr_t camera, const VrCensusSig& sig, const float tan[4], bool tanValid, const Call& call) {
         size_t i = find(camera);
         if (i == kCapacity) {
             if (used_ >= kCapacity) { ++overflow_; return Event::Full; }
@@ -297,15 +337,17 @@ public:
             VrCensusCamera& e = entry_[i];
             e = VrCensusCamera{};
             e.camera = camera;
+            e.firstView = call.view;
+            e.firstCtx = call.ctx;
             e.firstSig = e.sig = sig;
             if (tanValid) std::memcpy(e.tan, tan, sizeof(e.tan));
             e.tanValid = tanValid;
-            e.callerRva = callerRva;
-            e.firstOrdinal = ordinal;
-            e.firstDraw = draw;
-            e.firstDrawKnown = drawKnown;
-            e.firstTone = tone;
-            e.firstFrame = frame;
+            e.callerRva = call.callerRva;
+            e.firstOrdinal = call.ordinal;
+            e.firstDraw = call.draw;
+            e.firstDrawKnown = call.drawKnown;
+            e.firstTone = call.tone;
+            e.firstFrame = call.frame;
             e.calls = 1;
             e.linePending = true;
             return Event::New;
@@ -314,7 +356,7 @@ public:
         ++e.calls;
         if (!vrCensusSigDiffers(e.sig, sig)) { e.sig.flags = sig.flags; return Event::Known; }
         ++e.changes;
-        if (!e.changePending) { e.changePending = true; e.changeFrom = e.sig; e.changeFrame = frame; }
+        if (!e.changePending) { e.changePending = true; e.changeFrom = e.sig; e.changeFrame = call.frame; }
         e.sig = sig;
         return Event::Changed;
     }
@@ -407,7 +449,9 @@ struct VrCensusWindow {
     uint32_t cameraCount = 0;
     uint64_t cameraOverflow = 0;
     uint64_t toneBefore = 0, toneAfter = 0, toneNone = 0;
-    uint64_t onFootFrames = 0, eyeDraws = 0, eyeOnFoot = 0;
+    uint64_t toneFrames = 0;                // frames in which the tone was seen, sampled or not
+    uint64_t onFootFrames = 0;              // ... of which the census samples (the journal, if it is read, says on foot)
+    uint64_t eyeDraws = 0, eyeOnFoot = 0;   // eye composite draws reported, and those of a sampled frame
     uint32_t windows = 0;                   // 5 s windows this line covers
     bool progressSeen = false;              // vrWorldRouteDrawProgress answered at least once
     void noteCall(bool kindReadable, uint32_t kind, uint32_t callerRva, uintptr_t camera, VrCensusTone tone, bool lapsed) {
@@ -478,10 +522,11 @@ constexpr uint32_t kVrCensusMaxSequences = 3;   // on-foot frames whose whole ca
 constexpr uint32_t kVrCensusMaxEyeFrames = 4;   // on-foot frames whose eye draws are read back
 constexpr uint32_t kVrCensusMaxEyeDraws = 8;    // and the eye draws in all: each is a staging readback that stalls once
 constexpr size_t kVrCensusLineBytes = 400;      // a line is at most this many characters
-// The frame that just ended prints its call sequence when it was an on-foot frame (the tone was seen) and fewer than
-// kVrCensusMaxSequences have printed. The recording of calls stops with the last sequence: a call is then only counted.
-constexpr bool vrCensusPrintsSequence(bool toneSeen, uint32_t sequencesLogged) {
-    return toneSeen && sequencesLogged < kVrCensusMaxSequences;
+// The frame that just ended prints its call sequence when the census samples it (vrCensusSamplesFrame: the tone was seen
+// and the journal, if it is read, says on foot) and fewer than kVrCensusMaxSequences have printed. The recording of calls
+// stops with the last sequence: a call is then only counted.
+constexpr bool vrCensusPrintsSequence(bool sampledFrame, uint32_t sequencesLogged) {
+    return sampledFrame && sequencesLogged < kVrCensusMaxSequences;
 }
 
 // Which eye draws are read back: the first kVrCensusMaxEyeDraws draws of the first kVrCensusMaxEyeFrames on-foot frames.
@@ -533,6 +578,7 @@ struct Out {
 
 struct VrCensusWindowText {
     const char* hook = "pending";
+    VrCensusFoot foot = VrCensusFoot::Off;   // what the journal said when the window closed
     uint64_t offThread = 0, offThreadOverflow = 0;
     uint32_t camerasTotal = 0;
     uint64_t cameraTableOverflow = 0;
@@ -565,11 +611,12 @@ inline int vrCensusFormatWindow(char* out, size_t size, const VrCensusWindow& w,
     if (!printed) o.put("-");
     const uint64_t unnamed = static_cast<uint64_t>(w.callerCount - printed) + w.callerOverflow;
     if (unnamed) o.put(",+more:%llu", (unsigned long long)unnamed);
-    o.put(" cameras-seen=%u cameras-total=%u tone=%llu/%llu/%llu on-foot-frames=%llu eye-draws=%llu/%llu progress=%s hook=%s "
-          "windows=%u cam-overflow=%llu thread-overflow=%llu",
+    o.put(" cameras-seen=%u cameras-total=%u tone=%llu/%llu/%llu tone-frames=%llu on-foot-frames=%llu foot=%s "
+          "eye-draws=%llu/%llu progress=%s hook=%s windows=%u cam-overflow=%llu thread-overflow=%llu",
           w.cameraCount, t.camerasTotal, (unsigned long long)w.toneBefore, (unsigned long long)w.toneAfter,
-          (unsigned long long)w.toneNone, (unsigned long long)w.onFootFrames, (unsigned long long)w.eyeDraws,
-          (unsigned long long)w.eyeOnFoot, w.progressSeen ? "yes" : "no", t.hook, w.windows,
+          (unsigned long long)w.toneNone, (unsigned long long)w.toneFrames, (unsigned long long)w.onFootFrames,
+          vrCensusFootName(t.foot), (unsigned long long)w.eyeDraws, (unsigned long long)w.eyeOnFoot,
+          w.progressSeen ? "yes" : "no", t.hook, w.windows,
           (unsigned long long)(w.cameraOverflow + t.cameraTableOverflow), (unsigned long long)t.offThreadOverflow);
     return static_cast<int>(o.n);
 }
@@ -586,6 +633,8 @@ inline int vrCensusFormatCamera(char* out, size_t size, const VrCensusCamera& c)
     o.put(" tan=");
     if (c.tanValid) { o.put("("); o.f(c.tan[0]); o.put(","); o.f(c.tan[1]); o.put(","); o.f(c.tan[2]); o.put(","); o.f(c.tan[3]); o.put(")"); }
     else o.put("-");
+    // The first call's second argument (the view, the pass the camera belongs to) and first (the view-constant context).
+    o.put(" view=0x%llx vctx=0x%llx", (unsigned long long)c.firstView, (unsigned long long)c.firstCtx);
     o.put(" first-call=%u draw=", c.firstOrdinal);
     o.draw(c.firstDrawKnown, c.firstDraw);
     o.put(" tone=%s frame=%llu", vrCensusToneName(c.firstTone), (unsigned long long)c.firstFrame);
@@ -617,9 +666,11 @@ inline int vrCensusFormatChanged(char* out, size_t size, const VrCensusCamera& c
     return static_cast<int>(o.n);
 }
 
-inline int vrCensusFormatSequence(char* out, size_t size, uint64_t frame, uint32_t index, uint32_t calls, uint32_t recorded) {
-    return std::snprintf(out, size, "vr camera census: sequence frame=%llu index=%u/%u calls=%u recorded=%u truncated=%u",
-                         (unsigned long long)frame, index, kVrCensusMaxSequences, calls, recorded, calls - recorded);
+inline int vrCensusFormatSequence(char* out, size_t size, uint64_t frame, uint32_t index, VrCensusFoot foot, uint32_t calls,
+                                  uint32_t recorded) {
+    return std::snprintf(out, size, "vr camera census: sequence frame=%llu index=%u/%u foot=%s calls=%u recorded=%u truncated=%u",
+                         (unsigned long long)frame, index, kVrCensusMaxSequences, vrCensusFootName(foot), calls, recorded,
+                         calls - recorded);
 }
 
 inline int vrCensusFormatCall(char* out, size_t size, uint64_t frame, uint32_t ordinal, const VrCensusCall& c) {
@@ -631,17 +682,17 @@ inline int vrCensusFormatCall(char* out, size_t size, uint64_t frame, uint32_t o
     o.draw(c.drawKnown, c.draw);
     o.put(" tone=%s fl=0x%X>", vrCensusToneName(c.tone), c.preFlags);
     if (c.postSeen) o.put("0x%X", c.postFlags); else o.put("-");
-    o.put(" rows=");
+    o.put(" view=0x%llx rows=", (unsigned long long)c.view);
     if (c.rowsValid) o.list(c.rows, 16); else o.put("-");
     return static_cast<int>(o.n);
 }
 
 // The eye draw's own rows and what they measure. why: null when the rows were read, else the reason they were not.
-inline int vrCensusFormatEye(char* out, size_t size, uint32_t eye, uint64_t frame, bool drawKnown, uint32_t draw,
-                             uint64_t b1, uint32_t firstConstant, uint32_t bytes, const float rows[16], bool measured,
-                             double measX, double measY, const char* why) {
+inline int vrCensusFormatEye(char* out, size_t size, uint32_t eye, uint64_t frame, VrCensusFoot foot, bool drawKnown,
+                             uint32_t draw, uint64_t b1, uint32_t firstConstant, uint32_t bytes, const float rows[16],
+                             bool measured, double measX, double measY, const char* why) {
     vrcensus_detail::Out o(out, size);
-    o.put("vr camera census: eye=%u frame=%llu draw=", eye, (unsigned long long)frame);
+    o.put("vr camera census: eye=%u frame=%llu foot=%s draw=", eye, (unsigned long long)frame, vrCensusFootName(foot));
     o.draw(drawKnown, draw);
     o.put(" b1=0x%llx first=%u bytes=%u rows=", (unsigned long long)b1, firstConstant, bytes);
     if (rows) o.list(rows, 16); else o.put("-");

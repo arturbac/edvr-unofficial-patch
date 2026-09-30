@@ -24,6 +24,7 @@
 #include "flat_camera_inject.h"
 #include "flat_camera_phase.h"
 #include "flat_compute_readback.h"
+#include "journal_watch.h"
 #include "vr_camera_census_core.h"
 #include "vr_world_route.h"
 
@@ -36,7 +37,7 @@ using Microsoft::WRL::ComPtr;
 struct Pending {
     bool valid = false;
     VrCensusCall* record = nullptr;   // null when the frame's buffer is full or no sequence is being recorded
-    uintptr_t camera = 0;
+    uintptr_t camera = 0, view = 0, ctx = 0;
     uint32_t ordinal = 0, callerRva = 0, draw = 0;
     bool drawKnown = false;
     VrCensusTone tone = VrCensusTone::None;
@@ -44,6 +45,7 @@ struct Pending {
 
 struct State {
     bool active = false;
+    VrCensusFoot foot = VrCensusFoot::Off;   // what Elite's journal said at the last boundary
     uint64_t frame = 0;               // the frame in progress, 1-based; 0 before the first boundary
     uint64_t lastWindowMs = 0;
     uint32_t tick = 0;                // 5 s windows since the census started
@@ -100,19 +102,22 @@ bool observePre(const FlatCameraObserveCall& call) noexcept {
     const VrCensusTone tone = !have ? VrCensusTone::None : toneSeen ? VrCensusTone::After : VrCensusTone::Before;
     if (have) {
         s->window.progressSeen = true;
+        s->current.progress = true;
         if (toneSeen) s->current.toneSeen = true;
     }
     const uint32_t callerRva = static_cast<uint32_t>(call.callerRva);
     s->window.noteCall(call.kindReadable, call.kind, callerRva, call.camera, tone, call.window != 0);
-    // A sequence is recorded only while one is still wanted (the last one is printed at the boundary that finds its
-    // frame on-foot); after that a call is counted and nothing else.
-    const bool recording = vrCensusPrintsSequence(true, s->sequencesLogged);
+    // A sequence is recorded only while one is still wanted and the journal does not rule the frame out (the last one is
+    // printed at the boundary that finds its frame sampled); otherwise a call is counted and nothing else.
+    const bool recording = vrCensusMayRecord(s->foot) && vrCensusPrintsSequence(true, s->sequencesLogged);
     VrCensusCall* record = nullptr;
     if (recording) record = s->current.add(); else ++s->current.calls;
     Pending& p = s->pending;
     p.valid = true;
     p.record = record;
     p.camera = call.camera;
+    p.view = call.p2;
+    p.ctx = call.ctx;
     p.ordinal = s->current.calls;
     p.callerRva = callerRva;
     p.draw = draw;
@@ -120,6 +125,7 @@ bool observePre(const FlatCameraObserveCall& call) noexcept {
     p.tone = tone;
     if (record) {
         record->camera = call.camera;
+        record->view = call.p2;
         record->kind = call.kind;
         record->kindReadable = call.kindReadable;
         record->callerRva = callerRva;
@@ -151,7 +157,16 @@ void observePost(uintptr_t camera, uintptr_t /*ctx*/) noexcept {
         p.record->postFlags = sig.flags;
         p.record->rowsValid = vrCensusComposeRows(snap, p.record->rows);
     }
-    s->cameras.note(camera, sig, tangents, tangentsValid, s->frame, p.callerRva, p.ordinal, p.draw, p.drawKnown, p.tone);
+    VrCensusCameraTable::Call first;
+    first.frame = s->frame;
+    first.callerRva = p.callerRva;
+    first.ordinal = p.ordinal;
+    first.draw = p.draw;
+    first.drawKnown = p.drawKnown;
+    first.tone = p.tone;
+    first.view = p.view;
+    first.ctx = p.ctx;
+    s->cameras.note(camera, sig, tangents, tangentsValid, first);
 }
 
 // Any thread but the owner's: counted into the lock-free table, nothing more.
@@ -163,6 +178,11 @@ void observeOffThread(uintptr_t camera, uint64_t callerRva, uint32_t kind, bool 
 
 const FlatCameraObserver g_observer = {&observePre, &observePost, &observeOffThread};
 
+// What Elite's own journal says about the commander, asked once a frame at the boundary (journal_watch.h: atomic peeks).
+VrCensusFoot currentFoot() {
+    return vrCensusFootFrom(journalWatchActive(), journalOnFootKnown(), journalOnFoot());
+}
+
 // ---- the key ---------------------------------------------------------------------------------------------------------
 bool readWanted() {
     if (!runtimeVrProfile()) return false;   // a flat profile reads the key off already (Config refuses it); asked twice
@@ -173,6 +193,7 @@ bool readWanted() {
 // ---- the boundary's work ------------------------------------------------------------------------------------------
 void activate(State* s) {
     s->active = true;
+    s->foot = currentFoot();
     s->frame = 0;
     s->current.reset();
     s->pending = Pending{};
@@ -184,10 +205,11 @@ void activate(State* s) {
         s->announced = true;
         Log::get().note("vr camera census: on (advanced.vr_camera_census); observe-only, nothing is written to any camera; "
                         "owner thread %lu; 5 s line per window for %u windows, then one per %u; cameras first %u, "
-                        "call sequences first %u on-foot frames, eye draws first %u on-foot frames; line budget %u",
+                        "call sequences first %u and eye draws first %u on-foot frames (the tone drawn while the journal, "
+                        "read=%s, says on foot); line budget %u",
                         static_cast<unsigned long>(GetCurrentThreadId()), kVrCensusEveryWindow, kVrCensusThinTo,
                         static_cast<unsigned>(VrCensusCameraTable::kCapacity), kVrCensusMaxSequences, kVrCensusMaxEyeFrames,
-                        VrCensusBudget::capTotal());
+                        journalWatchActive() ? "yes" : "no: the tone alone decides", VrCensusBudget::capTotal());
     }
 }
 
@@ -234,7 +256,7 @@ void printSequence(State* s) {
     char line[kVrCensusLineBytes + 16];
     const VrCensusFrame& f = s->current;
     ++s->sequencesLogged;
-    vrCensusFormatSequence(line, kVrCensusLineBytes + 1, s->frame, s->sequencesLogged, f.calls, f.recorded);
+    vrCensusFormatSequence(line, kVrCensusLineBytes + 1, s->frame, s->sequencesLogged, s->foot, f.calls, f.recorded);
     say(s, VrCensusLines::Call, line);
     for (uint32_t i = 0; i < f.recorded; ++i) {
         vrCensusFormatCall(line, kVrCensusLineBytes + 1, s->frame, i + 1, f.call[i]);
@@ -245,11 +267,13 @@ void printSequence(State* s) {
 // The frame that just ended is accounted and printed; the next one starts empty.
 void rollFrame(State* s) {
     if (s->frame) {
+        const bool sampled = vrCensusSamplesFrame(s->current.toneSeen, s->current.progress, s->foot);
         ++s->window.frames;
-        if (s->current.toneSeen) ++s->window.onFootFrames;
+        if (s->current.toneSeen) ++s->window.toneFrames;
+        if (sampled) ++s->window.onFootFrames;
         printCameraLines(s);      // a camera's line precedes the sequence that names it
         printOffThread(s);
-        if (vrCensusPrintsSequence(s->current.toneSeen, s->sequencesLogged)) printSequence(s);
+        if (vrCensusPrintsSequence(sampled, s->sequencesLogged)) printSequence(s);
     }
     s->current.reset();
     s->pending = Pending{};
@@ -265,6 +289,7 @@ void tickWindow(State* s) {
     if (!vrCensusWindowPrints(s->tick)) return;   // the counters keep adding; the line that prints covers every window
     VrCensusWindowText text;
     text.hook = flatCameraInjectObserveStatus();
+    text.foot = s->foot;
     const uint64_t total = s->offThread.total();
     text.offThread = total - s->offThreadReported;
     text.offThreadOverflow = s->offThread.overflow();
@@ -333,6 +358,7 @@ void vrCameraCensusFrameBoundary() {
     if (!s->active) activate(s);
     g_wanted = true;
     flatCameraInjectDisarm();          // the Present edge: the window closes and THIS thread is the owner
+    s->foot = currentFoot();           // the journal's word for the frame that ended, and for the one that starts
     rollFrame(s);
     flatCameraInjectObserveFrame();    // installs the hook once (observe-only), opens the window
     tickWindow(s);
@@ -347,9 +373,14 @@ void vrCameraCensusEyeDraw(ID3D11DeviceContext* ctx, uint32_t eye) {
     bool toneSeen = false;
     uint64_t routeFrame = 0;
     const bool have = vrWorldRouteDrawProgress(&draw, &toneSeen, &routeFrame);
-    if (have) s->window.progressSeen = true;
-    if (!have || !toneSeen) return;   // only an on-foot frame (the tone was drawn) is read back
-    s->current.toneSeen = true;
+    if (have) {
+        s->window.progressSeen = true;
+        s->current.progress = true;
+        if (toneSeen) s->current.toneSeen = true;
+    }
+    // Only a frame the census samples is read back: the tone drawn before this draw and the journal, when it is read, saying
+    // on foot; or, with no draw progress at all, the journal alone saying on foot.
+    if (!vrCensusSamplesFrame(toneSeen, have, s->foot)) return;
     ++s->window.eyeOnFoot;
     if (!s->eye.take(s->frame)) return;
 
@@ -370,8 +401,8 @@ void vrCameraCensusEyeDraw(ID3D11DeviceContext* ctx, uint32_t eye) {
         measured = flatCameraMeasureRowShift(six, measX, measY);
     }
     char line[kVrCensusLineBytes + 16];
-    vrCensusFormatEye(line, kVrCensusLineBytes + 1, eye, s->frame, true, draw, b1, first, bytes, read ? rows : nullptr,
-                      measured, measX, measY, read ? nullptr : why);
+    vrCensusFormatEye(line, kVrCensusLineBytes + 1, eye, s->frame, s->foot, true, draw, b1, first, bytes,
+                      read ? rows : nullptr, measured, measX, measY, read ? nullptr : why);
     say(s, VrCensusLines::Eye, line);
     uint64_t sequence = 0;
     float frustum[4] = {}, shift[2] = {};
