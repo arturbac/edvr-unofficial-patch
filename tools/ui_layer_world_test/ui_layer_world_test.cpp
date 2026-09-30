@@ -24,11 +24,12 @@
 //      draw's bindings changed before the re-issue, abandoned).
 //   5. THE HOOKS STEP ASIDE: every raw entry the re-issue calls runs with VrWorldInternalScope up, without an outer one.
 //   6. THE DOOR'S PREFLIGHT and the accessors, the lost-draw counter, the stats.
-// Exit codes: 0 pass, 1 a check failed, 2 usage. --dry-run touches nothing.
+// Exit codes: 0 pass, 1 a check failed, 2 usage. --dry-run touches nothing; --hardware runs the same checks on the default adapter.
 #include <windows.h>
 
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <dxgi.h>
 #include <wrl/client.h>
 
 #include <cmath>
@@ -269,7 +270,7 @@ struct Rig {
     ComPtr<ID3D11Buffer> rectCb;
     ComPtr<ID3D11SamplerState> gameSampler, otherSampler, mipSampler;
     ComPtr<ID3D11RasterizerState> raster;
-    ComPtr<ID3D11BlendState> blend, premul;
+    ComPtr<ID3D11BlendState> blend, premul, maxBlend;
     ComPtr<ID3D11DepthStencilState> dsOff, dsOn;
     ComPtr<ID3D11Texture2D> depth;
     ComPtr<ID3D11DepthStencilView> dsv;
@@ -397,10 +398,10 @@ bool makeMips(Rig& r) {
     return SUCCEEDED(r.dev->CreateShaderResourceView(r.mipsTex.Get(), &vd, &r.mipsSrv));
 }
 
-bool setup(Rig& r) {
+bool setup(Rig& r, bool hardware) {
     D3D_FEATURE_LEVEL fl{};
     const auto create = edvr::systemD3D11CreateDevice();
-    if (!create || FAILED(create(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &r.dev, &fl, &r.ctx))) return false;
+    if (!create || FAILED(create(nullptr, hardware ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &r.dev, &fl, &r.ctx))) return false;
     check(edvr::reportSystemD3D11Only("ui_layer_world_test"), "the rig runs on System32's d3d11.dll and on no other d3d11.dll");
     for (int e = 0; e < 2; ++e) {
         r.eye[e] = makeTex(r, kEyeW, kEyeH, DXGI_FORMAT_R8G8B8A8_TYPELESS, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
@@ -454,6 +455,13 @@ bool setup(Rig& r) {
     bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
     bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     if (FAILED(r.dev->CreateBlendState(&bl, &r.premul))) return false;
+    bl.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;   // a MAX blend: no form the layer can convert
+    bl.RenderTarget[0].DestBlend = D3D11_BLEND_ONE;
+    bl.RenderTarget[0].BlendOp = D3D11_BLEND_OP_MAX;
+    bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
+    bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_MAX;
+    if (FAILED(r.dev->CreateBlendState(&bl, &r.maxBlend))) return false;
     D3D11_DEPTH_STENCIL_DESC dso{};
     dso.DepthEnable = FALSE;
     dso.DepthFunc = D3D11_COMPARISON_ALWAYS;
@@ -681,7 +689,10 @@ void testReissue(Rig& r) {
 
     // Opaque means opaque: over a mid-grey frame the quad still replaces it.
     {
-        const float grey[4] = {0.5f, 0.5f, 0.5f, 1.0f};
+        // 128/255, not 0.5: half of 255 is 127.5, and the float-to-UNORM rounding of a tie is the adapter's (WARP gives 128, a
+        // hardware adapter 127), so the clear would differ between --self-test and --hardware. 128/255 converts to 128 on both.
+        const float level = 128.0f / 255.0f;
+        const float grey[4] = {level, level, level, 1.0f};
         r.ctx->ClearRenderTargetView(r.frame[1].rtv.Get(), grey);
         bindGame(r, 1);
         const Drawn d1 = drawScreen(r);
@@ -780,6 +791,24 @@ void testRefusals(Rig& r) {
     refusal(r, "a blending draw", UiWorldRefuse::kNotOpaque, UiLayerDecision::kRedirect, [&] {
         bindGame(r, 0, r.premul.Get());
     });
+    refusal(r, "a blend the layer cannot convert", UiWorldRefuse::kNone, UiLayerDecision::kBlendRefused, [&] {
+        bindGame(r, 0, r.maxBlend.Get());
+    });
+    // the door already ran for this eye this frame (gate G1): the layer's composite has been, nothing more can be taken
+    {
+        g_stubs.mayTake = true;
+        const uint64_t seq = nextArmed(r);
+        bindGame(r, 0);
+        uiLayerNoteSubmitted(seq, 0, r.eye[0].tex.Get());
+        uiLayerNoteTemporal(seq, 0, r.frame[0].tex.Get());
+        uiLayerDoorSeen(seq, 0, r.frame[0].tex.Get());
+        const Snap before = take(r.ctx.Get());
+        const auto s0 = statsNow();
+        const Drawn d = drawScreen(r);
+        check(!d.taken && !d.reissued && same(before, take(r.ctx.Get())) &&
+                  statsNow().screenDecided[static_cast<size_t>(UiLayerDecision::kLate)] == s0.screenDecided[static_cast<size_t>(UiLayerDecision::kLate)] + 1,
+              "late (the eye's door already ran this frame): counted as kLate, not re-issued, the game's state untouched");
+    }
     refusal(r, "a depth-tested draw", UiWorldRefuse::kDepthState, UiLayerDecision::kDepthStencilTest, [&] {
         bindGame(r, 0, nullptr, r.dsOn.Get());
     });
@@ -989,14 +1018,24 @@ int main(int argc, char** argv) {
         std::puts("ui_layer_world_test: dry-run (no device, no files)");
         return 0;
     }
-    if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) {
-        std::puts("usage: ui_layer_world_test --self-test | --dry-run");
+    // --hardware: the same checks on the default hardware adapter instead of WARP, by hand (the gate runs --self-test; a build
+    // machine may have no GPU).
+    const bool hardware = argc == 2 && std::strcmp(argv[1], "--hardware") == 0;
+    if (argc != 2 || (std::strcmp(argv[1], "--self-test") != 0 && !hardware)) {
+        std::puts("usage: ui_layer_world_test --self-test | --hardware | --dry-run");
         return 2;
     }
     Rig r;
-    if (!setup(r)) {
+    if (!setup(r, hardware)) {
         std::puts("FAIL: a device, the textures and the test shaders");
         return 1;
+    }
+    if (hardware) {   // name the adapter the hardware run used, so a pass is attributable
+        ComPtr<IDXGIDevice> dxgi;
+        ComPtr<IDXGIAdapter> adapter;
+        DXGI_ADAPTER_DESC desc{};
+        if (SUCCEEDED(r.dev.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc)))
+            std::printf("[ui_layer_world_test] hardware adapter: %ls\n", desc.Description);
     }
     auto& cfg = Config::get();
     cfg.set("fix.ui_quality", "100");
