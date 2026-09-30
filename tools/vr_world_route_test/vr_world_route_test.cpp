@@ -508,7 +508,7 @@ void stage2Cases() {
           "jitter key: the names are the ini's words");
 
     // The decision table: the reasons in order, each alone. Only On asks the injector to write a camera. `named`: the frame that
-    // just ended named the screen's source (the window's rule: the camera calls come before any draw, so the frame that starts
+    // just ended named the screen's source (the window's rule: the scene camera refreshes before the draws that name the source, so the frame that starts
     // cannot be asked, and a map frame refreshes about thirty kind-3 cameras that must never pick up the world's phase).
     using J = VrWorldJitter;
     const auto decide = [](bool auto_, bool keyOn, bool global, bool wants, bool named, bool hook, bool fault) {

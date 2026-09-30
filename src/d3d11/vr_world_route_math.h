@@ -380,7 +380,8 @@ enum class VrWorldJitter : uint8_t {
     Fault,      // the injector was switched off for the session after a STOP line (an injected kind other than 3)
 };
 // namedLast: the frame that just ended named the screen's source (the engine's pool-family draw into the screen-sized depth,
-// the selector's depthNamed fact). The camera calls of a frame come before any draw, so the frame that starts cannot be asked;
+// the selector's depthNamed fact). The frame's kind-3 refreshes come before the draws that name the source (the scene camera is
+// refreshed before the pass that draws with it), so the frame that starts cannot be asked;
 // a map frame refreshes about thirty kind-3 cameras and must never pick up the world's phase, so the window opens only after
 // a frame that named its source and stays shut after one that did not (design-world-camera-motion-2026-09-30.md section 5).
 inline VrWorldJitter vrWorldJitterDecide(bool routeKeyAuto, VrWorldJitterKey jitterKey, bool globalJitter,
@@ -517,7 +518,7 @@ inline int vrWorldFormatStopWrongKind(char* out, size_t size, uint64_t frame, co
         f.injectedKind[5], f.injectedKind[6], f.injectedKind[7]);
 }
 // A frame whose window was open named no source for the screen: the first frame of a map, a menu or a transition, which cannot
-// be told from a world frame before its cameras refresh (they come before any draw). Expected, once per change; the window is
+// be told from a world frame before its cameras refresh (the naming draw follows the first scene refresh). Expected, once per change; the window is
 // shut from the next frame on, until a frame names one again, and the map or menu is left as it was.
 inline int vrWorldFormatUnnamedOpen(char* out, size_t size, uint64_t frame, const VrWorldInjectFrame& f) {
     return std::snprintf(out, size,

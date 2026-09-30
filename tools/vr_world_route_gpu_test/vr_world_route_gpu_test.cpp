@@ -103,6 +103,8 @@ struct InjectorModel {
     std::vector<edvr::FlatCameraVrExcluded> excluded;
 };
 InjectorModel g_inj;
+// The counters of the frame that ended last (zeros when none did).
+edvr::FlatCameraVrCounters lastEnded() { return g_inj.ended.empty() ? edvr::FlatCameraVrCounters{} : g_inj.ended.back(); }
 // What the game does each frame: kind-3 scene calls and (with a weapon drawn) first-person calls before the tone, auxiliary
 // kind-3 calls, shadow cameras, and the kind-5 eye cameras after it.
 struct GameCameras { int scene = 48, firstPerson = 0, aux = 0, shadow = 10, eyes = 6; };
@@ -347,7 +349,7 @@ struct FrameOpts {
 // exposure reduction on a COPY of H, late draws, the 630x354-style tiny draws reading H, the tone, then what follows it.
 void frame(World& w, const FrameOpts& o = {}) {
     g_game.firstPerson = g_weaponMapSrv ? 6 : 0;   // a weapon drawn: its own first-person camera refreshes too
-    gameWorldRefreshes();   // the world's camera calls come before any draw of the frame, and all before the tone
+    gameWorldRefreshes();   // the world's camera calls come ahead of the draws they serve, and all before the tone
     for (int i = 0; i < o.gbufferDraws; ++i) draw(w, w.rg2.Get(), w.dsv.Get());
     for (int i = 0; i < 6; ++i) draw(w, w.rh.Get(), (o.secondDepth && i == 3) ? w.dsv2.Get() : w.dsv.Get());
     // q 8157, the copy of H, is not a draw: nothing reaches the route.
@@ -634,9 +636,12 @@ void scenarios(World& w) {
 
 
 // ---- STAGE 2: the world jitter against the injector model --------------------------------------------------------------------
-bool lastCallInject() { return !g_inj.frames.empty() && g_inj.frames.back().inject; }
+// The last step the route took of the injector (an empty frame when it took none, so a regression fails a check instead of
+// reading past the end of an empty vector).
+FlatCameraVrFrame lastStep() { return g_inj.frames.empty() ? FlatCameraVrFrame{} : g_inj.frames.back(); }
+bool lastCallInject() { return lastStep().inject; }
 float phaseOfLastCall() {
-    return g_inj.frames.empty() ? 0.0f : std::fabs(g_inj.frames.back().phaseX) + std::fabs(g_inj.frames.back().phaseY);
+    return std::fabs(lastStep().phaseX) + std::fabs(lastStep().phaseY);
 }
 void startRoute(World& w) {
     reset(w);
@@ -666,7 +671,7 @@ void stage2(World& w) {
     check(g_calls.size() == 1 && g_calls[0].jx == 0.0f && g_calls[0].jy == 0.0f,
           "jitter: the first resolve is unjittered (the route had not opened a window for it)");
     {
-        const FlatCameraVrFrame& f0 = g_inj.frames.back();
+        const FlatCameraVrFrame f0 = lastStep();
         check(f0.renderW == kW && f0.renderH == kH && std::fabs(f0.screenAspect - float(kW) / float(kH)) < 1e-6f && !f0.observe,
               "jitter: the window is told the render size of the screen's H and its aspect (the role test's anchor); no census is asked for");
     }
@@ -676,7 +681,7 @@ void stage2(World& w) {
     frame(w);   // frame 3
     check(g_inj.injectCalls == 3 && phaseOfLastCall() != 0.0f,
           "jitter: after two treated zero-phase frames the next window carries a non-zero phase");
-    const float px = g_inj.frames.back().phaseX, py = g_inj.frames.back().phaseY;
+    const float px = lastStep().phaseX, py = lastStep().phaseY;
     check(std::fabs(px) <= 0.5f && std::fabs(py) <= 0.5f, "jitter: the phase is a sub-pixel shift of the render grid (within half a pixel)");
     g_inj.order.clear();
     frame(w);   // frame 4: the first jittered frame
@@ -692,8 +697,8 @@ void stage2(World& w) {
     check(countLines("the world is JITTERED from frame=") == 1 && countLines("camera rows disagree with the phase") == 0,
           "jitter: the first jittered frame says so once, and the consecutive rows agree with the phases they carry");
     for (int i = 0; i < 6; ++i) frame(w);
-    check(vrWorldRouteState() == VrWorldState::Owned && g_inj.ended.back().unsupported == 6 && g_inj.ended.back().injectedKind[5] == 0 &&
-              g_inj.ended.back().injectedKind[3] > 0,
+    check(vrWorldRouteState() == VrWorldState::Owned && lastEnded().unsupported == 6 && lastEnded().injectedKind[5] == 0 &&
+              lastEnded().injectedKind[3] > 0,
           "kinds: the eye cameras (kind 5) refresh every frame and are counted Unsupported, never injected; only kind 3 is");
     check(countLines("STOP") == 0 && countLines("EXCLUDED") == 0, "jitter: nothing STOPs and nothing is excluded in a healthy run");
     {
@@ -705,7 +710,7 @@ void stage2(World& w) {
     check(vrWorldRouteOwnsNextFrame() && vrWorldRouteWorldPhase(nullptr, nullptr), "jitter: an owned route reports a live world phase and still owns the next frame");
     {
         float x = 9.0f, y = 9.0f;
-        check(vrWorldRouteWorldPhase(&x, &y) && x == g_inj.frames.back().phaseX && y == g_inj.frames.back().phaseY,
+        check(vrWorldRouteWorldPhase(&x, &y) && x == lastStep().phaseX && y == lastStep().phaseY,
               "jitter: worldPhase() answers with the phase the running frame was given");
     }
 
@@ -717,7 +722,7 @@ void stage2(World& w) {
     g_named = false;       // the map opens: nothing names the screen's source
     g_game.scene = 30;     // and about thirty kind-3 cameras refresh a frame
     frame(w);              // M1: its window was decided from the last world frame, so it is open; it names nothing
-    check(g_inj.ended.back().sceneInjected == 30 && g_inj.ended.back().injectedKind[3] == 30,
+    check(lastEnded().sceneInjected == 30 && lastEnded().injectedKind[3] == 30,
           "naming: M1's window WAS open: nothing can say a frame is a map before its cameras refresh, so its thirty kind-3 cameras took the phase, this once");
     check(countInjectedFrames() == injectedBefore + 0, "naming: (the window count does not move at M1's end: the next window is shut)");
     check(countLines("named no source for the screen but its camera window was open") == 1,
@@ -726,7 +731,7 @@ void stage2(World& w) {
     const size_t afterM1 = g_inj.injectCalls;
     frame(w);              // M2: shut; grace frame 2 of 3 (the route is still Owned)
     check(vrWorldRouteState() == VrWorldState::Owned && !lastCallInject() && g_inj.injectCalls == afterM1 &&
-              g_inj.ended.back().sceneInjected == 0 && g_inj.ended.back().warming == 0 && g_inj.ended.back().stale == 30,
+              lastEnded().sceneInjected == 0 && lastEnded().warming == 0 && lastEnded().stale == 30,
           "NAMING: a second unnamed frame through the route's grace: still Owned, the window shut, its thirty kind-3 refreshes injected nothing");
     check(countLines("STOP") == 0, "naming: a shut window that stays shut is no STOP");
     frame(w);              // M3: the third miss releases the world
@@ -734,7 +739,7 @@ void stage2(World& w) {
               countLines("last decline: depth-not-screen-motion-source x3") == 1,
           "naming: three unnamed frames release the route, the window stays shut, and the RELEASED line names the last decline and its run");
     for (int i = 0; i < 10; ++i) frame(w);
-    check(!lastCallInject() && g_inj.injectCalls == afterM1 && g_inj.ended.back().sceneInjected == 0,
+    check(!lastCallInject() && g_inj.injectCalls == afterM1 && lastEnded().sceneInjected == 0,
           "NAMING: ten more map frames with the route released: not one more window opened, nothing injected");
     check(countLines("declined at frame=") == 3, "decline log: a run of thirteen declines logs three lines (the cap is per run, not per session)");
     // The map closes: the world names its source again.
@@ -825,7 +830,7 @@ void stage2(World& w) {
     check(!lastCallInject() && vrWorldRouteState() == VrWorldState::Owned,
           "A/B: flipped off live, the boundary shuts the next frame's window at once, and the route still owns the world");
     frame(w);
-    check(g_calls.back().jx == 0.0f && g_calls.back().jy == 0.0f && g_inj.ended.back().sceneInjected == 0,
+    check(g_calls.back().jx == 0.0f && g_calls.back().jy == 0.0f && lastEnded().sceneInjected == 0,
           "A/B: and that frame is unjittered: the resolver's phase is zero again and nothing was injected");
     const int afterOff = g_inj.frameCalls;
     for (int i = 0; i < 5; ++i) frame(w);
@@ -889,7 +894,7 @@ void stage2(World& w) {
     e2.aspect = 1.0f; e2.fov = 1.5708f; e2.nearZ = 0.5f; e2.farZ = 9000.0f; e2.callerRva = 0x594EAB; e2.calls = 2;
     g_inj.excluded.push_back(e1);
     frame(w);
-    check(countLines("camera call EXCLUDED, not a screen view") == 1 && g_inj.ended.back().auxiliary == 7,
+    check(countLines("camera call EXCLUDED, not a screen view") == 1 && lastEnded().auxiliary == 7,
           "roles: an auxiliary kind-3 signature is named once, with its aspect and caller, and the calls are counted");
     g_inj.excluded.push_back(e2);
     for (int i = 0; i < 3; ++i) frame(w);
