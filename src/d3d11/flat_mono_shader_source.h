@@ -11,7 +11,9 @@ cbuffer Mono : register(b0) {
     float4 rowsJitter; // NDC shift the camera rows themselves carry: current xy, previous zw; all zero = unjittered rows
     uint4 route; // x: the HDR route (section 81): Color is R11G11B10F scene radiance and OutColor is fp16; y: with x, the
                  // TAA output is final and the pixel-shader finish only copies it into H. z: the first-person map (t9) and
-                 // stencil (t10) are bound and valid (section 82, prep only); w: free. All zero on the copy route without them.
+                 // stencil (t10) are bound and valid (section 82, prep only); w: with z, the first-person phase mode (0 the map's
+                 // vector as given, 1 the two phases' difference is added to it, any other value rejects attached pixels' history).
+                 // All zero on the copy route without them.
 };
 cbuffer EngineNow : register(b1) { float4 EN[277]; };   // EN[276].x: the frame stamp
 cbuffer EngineBefore : register(b2) { float4 EB[276]; };
@@ -119,11 +121,17 @@ void prep(uint3 id:SV_DispatchThreadID) {
         // occluded, new or ambiguous mesh (w != 1) must not borrow another surface's history, and a reset frame has none.
         bool valid=flags.x==0 && m.w==1 && all(isfinite(m)) && abs(m.z-depth)<=max(abs(depth)*.0005,3e-8) &&
                    all(prevPx>=0) && all(prevPx<=float2(size.xy));
-        // THE SEAM for a jittered world. The VR world is unjittered in this build, so the vector below is used as the map
-        // gives it. The map's vector is previous minus current at the two frames' own raster phases, and the backend wants
-        // both phases out of it: when the world gets a phase, a correction of (jitter.xy - jitter.zw) in render pixels
-        // belongs on m.xy here, its sign to be PROVEN on WARP against a map built with known phases (as the rows-jitter cases
-        // do for the camera term), not assumed.
+        // THE PHASE of a jittered world (route.w, FlatMonoResolveFrame::firstPersonPhaseMode). A surface at true (unjittered)
+        // positions P_cur now and P_prev a frame ago is RASTERISED at P_cur + c and P_prev + p, c the current phase (jitter.xy)
+        // and p the previous one (jitter.zw), so the map holds m.xy = (P_prev + p) - (P_cur + c) = (P_prev - P_cur) + (p - c).
+        // The backend wants the true motion, P_prev - P_cur, both phases out of it as the camera and engine terms have them
+        // out: m.xy + (c - p). Mode 0 leaves m.xy exactly as given (the world is unjittered, or the map was built without the
+        // phase) and its arithmetic is what it was before the mode existed. Mode 1 (the first-person camera carried the
+        // world's phase in both frames) adds the term. Any other value means that is not known, and history is refused as for
+        // an invalid texel. The validity test above runs on the UNcorrected m: prevPx is a position in the previous RASTER,
+        // and that is where the map says the surface was drawn. The sign is proven against a map built from explicit
+        // positions (tools\flat_mono_resolve_test, flat_first_person_phase_gpu_tests.h).
+        if(route.w==1)m.xy+=jitter.xy-jitter.zw; else if(route.w!=0)valid=false;
         motion=valid?m.xy:0; reject=valid?0:1; expected=valid?depth:0;
     } else if(flags.x==0 && isfinite(depth) && depth>=0 && depth<=1) {
         float4 before;

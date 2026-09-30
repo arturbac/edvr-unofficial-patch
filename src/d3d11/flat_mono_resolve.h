@@ -210,6 +210,10 @@ struct FlatMonoResolveStats {
     // and frames that passed only one of the two (treated as absent, and not a refusal). A frame with neither counts nowhere.
     uint64_t firstPersonFrames = 0, firstPersonRefused = 0, firstPersonPartial = 0;
     const char* firstPersonRefusal = nullptr;
+    // Of the frames counted in firstPersonFrames (their inputs bound), by FlatMonoResolveFrame::firstPersonPhaseMode: [0] mode 0
+    // (the map's vector as given), [1] mode 1 (the two phases' difference added to it), [2] any other value (attached pixels
+    // reject their history). The three sum to firstPersonFrames; a frame without bound inputs counts in none of them.
+    uint64_t firstPersonPhaseFrames[3] = {};
     // The last resolve's EFFECTIVE reset (the requested one, or a lost history, a frame gap, an
     // invalid previous camera, a format change or a camera cut): what the pixel capture writes
     // as "reset" and what decides whether the frame is a live sample.

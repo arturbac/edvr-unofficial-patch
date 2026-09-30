@@ -79,7 +79,7 @@ std::vector<unsigned char>& g_testPrepBytecode=*new std::vector<unsigned char>;
 // when the rows are unjittered, which is every path that does not go through the upstream camera injector.
 // route: x = the HDR route (the input is R11G11B10F radiance, the outputs fp16), y = with x, EDVR's TAA output is final
 // and the pixel-shader finish only copies it into H, z = the first-person map (t9) and stencil (t10) are bound and valid
-// (FlatMonoResolveFrame::firstPersonMotion), w = free. All zero on the copy route without them, whose shader arithmetic is
+// (FlatMonoResolveFrame::firstPersonMotion), w = the phase mode (firstPersonPhaseMode; 0 without z). All zero on the copy route without them, whose shader arithmetic is
 // unchanged.
 struct Constants { float camera[6][4], previous[6][4]; uint32_t size[4], flags[4]; float jitter[4], rowsJitter[4]; uint32_t route[4]; };
 static_assert(sizeof(Constants)==272, "HLSL cbuffer layout");
@@ -520,7 +520,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         if(!refusal)refusal=firstPersonViewRefusal(f.firstPersonStencil,f.renderWidth,f.renderHeight,true);
         if(!refusal) {
             firstPersonMap=f.firstPersonMotion;firstPersonStencil=f.firstPersonStencil;
-            ++stats.firstPersonFrames;
+            ++stats.firstPersonFrames;++stats.firstPersonPhaseFrames[f.firstPersonPhaseMode<2u?f.firstPersonPhaseMode:2u];
             if(!firstPersonBoundLogged) {
                 firstPersonBoundLogged=true;
                 Log::get().note("flat resolve: first-person motion inputs bound (map %ux%u, stencil view)",f.renderWidth,f.renderHeight);
@@ -539,7 +539,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     constants.size[0]=f.renderWidth;constants.size[1]=f.renderHeight;constants.size[2]=evalW;constants.size[3]=evalH;
     constants.flags[0]=reset;constants.flags[1]=engine;constants.flags[2]=taa;constants.flags[3]=f.staticScene?1u:0u;
     constants.route[0]=hdr?1u:0u;constants.route[1]=(hdr&&taa)?1u:0u;
-    constants.route[2]=firstPersonMap?1u:0u;
+    constants.route[2]=firstPersonMap?1u:0u;constants.route[3]=firstPersonMap?f.firstPersonPhaseMode:0u;
     constants.jitter[0]=f.jitterX;constants.jitter[1]=f.jitterY;
     constants.jitter[2]=f.previousJitterX;constants.jitter[3]=f.previousJitterY;
     // On a reset the previous rows ARE the current rows (above), so they carry the current phase.
