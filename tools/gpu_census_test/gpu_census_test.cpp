@@ -823,7 +823,7 @@ void alteredFixCases() {
     std::string allAbsent;
     for (int i = 0; i < kFixes; ++i) allAbsent += std::string(i ? ", " : "") + kAlteredFixNames[i] + " -";
     check(byFix && byFix->find(allAbsent + ";") != std::string::npos,
-          "fix line: a window with no wrapped draw prints all nineteen fixes with '-' in the enum's order");
+          "fix line: a window with no wrapped draw prints all sixteen fixes with '-' in the enum's order");
     check(classes && classes->find("other fix-wrapped draws -;") != std::string::npos,
           "fix line: and the classes' line's sum item is '-' too");
 
@@ -1131,7 +1131,7 @@ void lineLengths() {
     check(byFix && classes, "lines: both altered-draw lines were written at the worst case");
     if (byFix && classes) {
         std::printf("gpu_census_test: at their worst the classes' line is %zu characters and the fixes' line %zu\n", classes->size(), byFix->size());
-        check(byFix->size() < 1100 && byFix->size() > 700, "lines: the fixes' line names all nineteen at their widest and still fits");
+        check(byFix->size() < 1100 && byFix->size() > 700, "lines: the fixes' line names all sixteen at their widest and still fits");
     }
     const std::string* seedDetail = lineWith(kSeedDetailPrefix);
     check(seedDetail != nullptr, "lines: the seed's detail line was written at the worst case");

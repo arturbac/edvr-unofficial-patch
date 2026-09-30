@@ -55,14 +55,15 @@ namespace {
 constexpr uint64_t kGuiVector = 0x666EF0C4C616F67Eull;
 constexpr uint64_t kGuiText   = 0x1012E00B3CB44469ull;
 constexpr uint64_t kGuiIcons  = 0xA3E5D3FCBC1165F8ull;
-// The flight HUD's vector family, drawn straight into the eye (hud_grain.h).
+// The flight HUD's vector family, drawn straight into the eye (hud_grain.h,
+// removed 2026-09-29).
 constexpr uint64_t kFlightHud = 0xB7790CBFC6554097ull;
 // ...and its pixel shader, which is no vector rasteriser: it MARCHES a
 // noise-modulated capsule for each stroke (kHudDepthHlsl says what it does
 // before the march), and the empty corners of a stroke's bounding quad come
 // out at alpha nought without a discard.
 constexpr uint64_t kFlightHudPs = 0x8DEF46452FA459F5ull;
-// The cockpit's holo-panel family (panel_upscale.h).
+// The cockpit's holo-panel family (panel_upscale.h, removed 2026-09-29).
 constexpr uint64_t kHoloPanel = 0x81216C77F90DEDD6ull;
 // The generic hologram/icon depth pass's other built-in families (the radar's
 // star icon core, its two stalks, the corona family, the target hologram's
@@ -103,7 +104,7 @@ constexpr uint64_t kPanelPsCheap  = 0xF2F872B191F656D5ull;
 // as a scene family, like the holo panels, rather than through
 // advanced.ui_depth_families (which would also claim its draws that sample
 // no interface surface at all, and there are tens of thousands of those:
-// hud_sprite.h).
+// hud_sprite.h, removed 2026-09-29).
 //
 // Its alpha uses the screen shader's single t0/s0 sample, but its vertex
 // shader forces device Z to one. It needs dedicated depth reconstruction

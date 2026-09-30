@@ -25,7 +25,7 @@ namespace edvr {
 // subtracts that pair's own mean cost from the real one's, floored at zero.
 // How many fixes wrap Elite's draws and are named in the census (AlteredFix below: one for each
 // verdict that can reach the altered-draw site, and a last one for "unnamed").
-constexpr int kAlteredFixCount = 19;
+constexpr int kAlteredFixCount = 16;
 
 enum class GpuCensusSection : uint8_t {
     // Door: once or twice a frame, at Submit. K = 2 (both eyes) while active.
@@ -99,9 +99,6 @@ enum class AlteredFix : uint8_t {
     Holo,          // the loading hologram's pattern (kHolo)
     TargetSharp,   // the target indicator's reconstruction (kTargetSharp)
     NightVision,   // night vision (kNightVision)
-    HudSprite,     // a HUD sprite atlas, resampled (kHudSprite)
-    PanelUpscale,  // the cockpit holo panel, reconstructed (kPanelUpscale)
-    HudGrain,      // the flight HUD with its noise held flat (kHudGrain)
     IntroPanel,    // the intro movie's panel (kIntroPanel)
     GlareClamp,    // the sun glare train, its instance count clamped (kGlareClamp)
     GlareSteady,   // the sun glare train, world-locked (kGlareSteady)

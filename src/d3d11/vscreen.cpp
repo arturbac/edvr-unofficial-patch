@@ -56,10 +56,7 @@
 #include "transition_flash_eye_base.h"
 #include "holo_fix.h"
 #include "target_sharp.h"
-#include "hud_sprite.h"
-#include "panel_upscale.h"
 #include "wake_pulse.h"
-#include "hud_grain.h"
 #include "scheduler_stack_probe.h"  // schedulerStackProbeShutdown
 #include "ui_depth.h"
 #include "ui_layer.h"
@@ -1506,12 +1503,6 @@ enum class DrawVerdict {
     // (target_sharp.h): forwarded through a replacement pixel shader.
     kTargetSharp,
     kNightVision,
-    // A HUD sprite atlas, resampled once and substituted (hud_sprite.h).
-    kHudSprite,
-    // A cockpit holo panel, reconstructed once a frame (panel_upscale.h).
-    kPanelUpscale,
-    // The flight HUD with its noise table held flat (hud_grain.h).
-    kHudGrain,
     // The intro movie's panel drawn with our constants at VS b2
     // (intro_panel.h): forwarded normally, restored after.
     kIntroPanel,
@@ -1669,7 +1660,6 @@ bool drawGateSubscribed(State* s) {
         fssDumpWantsDraws() ||
         resolveBindWants() ||
         remlokWantsDraws() || holoWantsDraws() || targetSharpWantsDraws() ||
-        hudSpriteWantsDraws() || panelUpscaleWantsDraws() || hudGrainWantsDraws() ||
         uiDepthWantsDraws() ||
         sunglareWantsDraws() ||
         drawCensusArmed() ||
@@ -2482,27 +2472,6 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     if (targetSharpWantsDraws() &&
         targetSharpOnEyeDraw(self, kind, count, instances)) {
         return DrawVerdict::kTargetSharp;
-    }
-
-    // The HUD's sprite atlases, recognised the same way: shape, then what it
-    // samples, then its shader's hash.
-    if (hudSpriteWantsDraws() &&
-        hudSpriteOnEyeDraw(self, kind, count, instances)) {
-        return DrawVerdict::kHudSprite;
-    }
-
-    // The cockpit holo panel carrying the target indicator, recognised by
-    // what it reads at slot 2 and then by its shader.
-    if (panelUpscaleWantsDraws() &&
-        panelUpscaleOnEyeDraw(self, kind, count, instances)) {
-        return DrawVerdict::kPanelUpscale;
-    }
-
-    // The flight HUD's grain, recognised the same way: what it samples,
-    // then its shader.
-    if (hudGrainWantsDraws() &&
-        hudGrainOnEyeDraw(self, kind, count, instances)) {
-        return DrawVerdict::kHudGrain;
     }
 
     // The loader dialog's dimming wash, recognised by what it samples -- and
@@ -3577,9 +3546,6 @@ __declspec(noinline) void forwardVerdictBegin(ID3D11DeviceContext* self, DrawVer
     case DrawVerdict::kHolo:         holoBegin(self); break;
     case DrawVerdict::kTargetSharp:  targetSharpBegin(self); break;
     case DrawVerdict::kNightVision:  nightVisionBegin(self); break;
-    case DrawVerdict::kHudSprite:    hudSpriteBegin(self); break;
-    case DrawVerdict::kPanelUpscale: panelUpscaleBegin(self); break;
-    case DrawVerdict::kHudGrain:     hudGrainBegin(self); break;
     case DrawVerdict::kScrim:        scrimBegin(self); break;
     case DrawVerdict::kGlareSteady:  sunglareBegin(self); break;
     case DrawVerdict::kParticle:     particleBegin(self); break;
@@ -3593,9 +3559,6 @@ __declspec(noinline) void forwardVerdictEnd(ID3D11DeviceContext* self, DrawVerdi
     case DrawVerdict::kParticle:     particleEnd(self); break;
     case DrawVerdict::kGlareSteady:  sunglareEnd(self); break;
     case DrawVerdict::kScrim:        scrimEnd(self); break;
-    case DrawVerdict::kHudGrain:     hudGrainEnd(self); break;
-    case DrawVerdict::kPanelUpscale: panelUpscaleEnd(self); break;
-    case DrawVerdict::kHudSprite:    hudSpriteEnd(self); break;
     case DrawVerdict::kTargetSharp:  targetSharpEnd(self); break;
     case DrawVerdict::kNightVision:  nightVisionEnd(self); break;
     case DrawVerdict::kHolo:         holoEnd(self); break;
@@ -3623,9 +3586,6 @@ constexpr AlteredFix alteredFixOf(DrawVerdict v) noexcept {
     case DrawVerdict::kHolo:         return AlteredFix::Holo;
     case DrawVerdict::kTargetSharp:  return AlteredFix::TargetSharp;
     case DrawVerdict::kNightVision:  return AlteredFix::NightVision;
-    case DrawVerdict::kHudSprite:    return AlteredFix::HudSprite;
-    case DrawVerdict::kPanelUpscale: return AlteredFix::PanelUpscale;
-    case DrawVerdict::kHudGrain:     return AlteredFix::HudGrain;
     case DrawVerdict::kIntroPanel:   return AlteredFix::IntroPanel;
     case DrawVerdict::kGlareClamp:   return AlteredFix::GlareClamp;
     case DrawVerdict::kGlareSteady:  return AlteredFix::GlareSteady;
@@ -3646,8 +3606,7 @@ constexpr AlteredFix alteredFixOf(DrawVerdict v) noexcept {
 #pragma warning(pop)
 static_assert(alteredFixOf(DrawVerdict::kPanel) == AlteredFix::Panel && alteredFixOf(DrawVerdict::kRemlok) == AlteredFix::Remlok &&
                   alteredFixOf(DrawVerdict::kHolo) == AlteredFix::Holo && alteredFixOf(DrawVerdict::kTargetSharp) == AlteredFix::TargetSharp &&
-                  alteredFixOf(DrawVerdict::kNightVision) == AlteredFix::NightVision && alteredFixOf(DrawVerdict::kHudSprite) == AlteredFix::HudSprite &&
-                  alteredFixOf(DrawVerdict::kPanelUpscale) == AlteredFix::PanelUpscale && alteredFixOf(DrawVerdict::kHudGrain) == AlteredFix::HudGrain &&
+                  alteredFixOf(DrawVerdict::kNightVision) == AlteredFix::NightVision &&
                   alteredFixOf(DrawVerdict::kIntroPanel) == AlteredFix::IntroPanel && alteredFixOf(DrawVerdict::kGlareClamp) == AlteredFix::GlareClamp &&
                   alteredFixOf(DrawVerdict::kGlareSteady) == AlteredFix::GlareSteady && alteredFixOf(DrawVerdict::kParticle) == AlteredFix::Particle &&
                   alteredFixOf(DrawVerdict::kFssPanel) == AlteredFix::FssPanel && alteredFixOf(DrawVerdict::kFssReveal) == AlteredFix::FssReveal &&
@@ -3753,9 +3712,6 @@ bool uiLayerVerdictForwards(DrawVerdict v) {
         case DrawVerdict::kScrim:
         case DrawVerdict::kLoaderPanel:
         case DrawVerdict::kTargetSharp:
-        case DrawVerdict::kHudSprite:
-        case DrawVerdict::kPanelUpscale:
-        case DrawVerdict::kHudGrain:
             return true;
         default:
             return false;
@@ -5239,10 +5195,7 @@ void vScreenRefreshConfig() {
     remlokConfigure(cfg);
     holoConfigure(cfg);
     targetSharpConfigure(cfg);
-    hudSpriteConfigure(cfg);
-    panelUpscaleConfigure(cfg);
     wakePulseConfigure(cfg);
-    hudGrainConfigure(cfg);
     uiDepthConfigure(cfg);
     uiLayerConfigure(cfg);
     scrimConfigure(cfg);
@@ -5440,7 +5393,6 @@ EDVR_BOUNDARY_TICK(tkQuadProbe, "quad_probe");
 EDVR_BOUNDARY_TICK(tkDrawCensusTick, "draw_census_tick");
 EDVR_BOUNDARY_TICK(tkObjectProbe, "object_probe");
 EDVR_BOUNDARY_TICK(tkPixelProbe, "pixel_probe");
-EDVR_BOUNDARY_TICK(tkPanelUpscale, "panel_upscale");
 EDVR_BOUNDARY_TICK(tkWakePulse, "wake_pulse");
 EDVR_BOUNDARY_TICK(tkUiDepth, "ui_depth");
 EDVR_BOUNDARY_TICK(tkUiLayer, "ui_layer");
@@ -5478,7 +5430,6 @@ void vScreenFrameBoundary() {
         tkDrawCensusTick.run([&] { drawCensusTick(g_state->ownerCtx); });
         tkObjectProbe.run([&] { objectProbeFrameBoundary(g_state->ownerCtx); });
         tkPixelProbe.run([&] { pixelProbeFrameBoundary(g_state->ownerCtx); });
-        tkPanelUpscale.run([&] { panelUpscaleFrameEnd(); });
         tkWakePulse.run([&] { wakePulseReport(); });
         tkUiDepth.run([&] { uiDepthFrameBoundary(g_state->ownerCtx); });
         // fix.ui_quality: the layer's warm compile, the surfaces' five-second
@@ -6453,10 +6404,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     remlokConfigure(cfg);
     holoConfigure(cfg);
     targetSharpConfigure(cfg);
-    hudSpriteConfigure(cfg);
-    panelUpscaleConfigure(cfg);
     wakePulseConfigure(cfg);
-    hudGrainConfigure(cfg);
     uiDepthConfigure(cfg);
     uiLayerConfigure(cfg);
     scrimConfigure(cfg);
@@ -6847,16 +6795,12 @@ void shutdownVScreenFixes() {
     depthProbeShutdown();
     sharpenPassShutdown();
     g_state->hook.uninstall();
-    // After the hooks come off. These four are reached only through the draw
-    // thunks (their WantsDraws/OnEyeDraw and verdict Begin/End), the two
-    // configure paths and panel_upscale's frame-end counter; no other module
-    // and no shutdown above calls them. So past uninstall nothing can use
-    // them again. Each releases and nulls what it holds, so a second call
-    // finds nothing to release.
+    // After the hooks come off. This one is reached only through the draw
+    // thunks (its WantsDraws/OnEyeDraw and verdict Begin/End) and the two
+    // configure paths; no other module and no shutdown above calls it. So
+    // past uninstall nothing can use it again. It releases and nulls what it
+    // holds, so a second call finds nothing to release.
     targetSharpShutdown();
-    hudSpriteShutdown();
-    panelUpscaleShutdown();
-    hudGrainShutdown();
 }
 
 }  // namespace edvr

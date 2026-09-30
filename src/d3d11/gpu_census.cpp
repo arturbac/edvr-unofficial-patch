@@ -46,7 +46,7 @@ constexpr size_t kFrameSections = sizeof(kFrameBreakdownNames) / sizeof(kFrameBr
 // Elite's own draws that EDVR alters (gpu_census.h): the game's draws timed whole, so they are
 // reported on their own lines and never summed into EDVR's total. AlteredPoolFamily,
 // AlteredTerrain and AlteredUiLayer are one class each (indices 18..20); the draws another fix
-// wraps are one section per fix from AlteredFixFirst on (indices 21..39), reported as one item
+// wraps are one section per fix from AlteredFixFirst on (indices 21..36), reported as one item
 // on the classes' line (their sum) and one by one on the line after it.
 constexpr size_t kAlteredFirst = static_cast<size_t>(GpuCensusSection::AlteredPoolFamily);
 constexpr size_t kSeedSection = static_cast<size_t>(GpuCensusSection::FrameUiLayerHdrSeed);
@@ -59,9 +59,9 @@ constexpr const char* kAlteredNames[3] = {
 constexpr const char* kAlteredFixSumName = "other fix-wrapped draws";
 // The fix names, in AlteredFix's order: fixed strings, never built from a draw.
 constexpr const char* kAlteredFixNames[kAlteredFixCount] = {
-    "panel distance", "RemLok overlay", "loading hologram", "target indicator", "night vision", "HUD sprites",
-    "holo panel", "HUD grain", "intro panel", "sun glare clamp", "sun glare steady", "particles",
-    "FSS panel", "FSS reveal", "FSS dump", "scanner-body resolve", "loading scrim", "menu backdrop", "unnamed fix"
+    "panel distance", "RemLok overlay", "loading hologram", "target indicator", "night vision", "intro panel",
+    "sun glare clamp", "sun glare steady", "particles", "FSS panel", "FSS reveal", "FSS dump",
+    "scanner-body resolve", "loading scrim", "menu backdrop", "unnamed fix"
 };
 static_assert(kAlteredClassSections == 3, "one name for each altered-draw class");
 static_assert(kAlteredFirst == kDoorSections + kFrameSections, "one name for each in-frame section, and the altered sections follow them");
