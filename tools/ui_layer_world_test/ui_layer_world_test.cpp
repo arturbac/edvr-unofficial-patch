@@ -894,6 +894,12 @@ void testRefusals(Rig& r) {
         check(uiLayerWorldReissuePending(), "...and the after-UI retry's decision (kAfterUi) leaves it alone");
         uiLayerDecide(r.ctx.Get(), static_cast<int>(UiLayerFamily::kPanel), true, false);
         check(!uiLayerWorldReissuePending(), "...while a real family's decision forgets it");
+        {
+            // The flag is what vscreen reads; the plan behind it is forgotten as well. Nothing in the DLL calls Begin without
+            // the flag, so this is the only way to see that the plan itself went: a Begin here finds nothing to re-issue.
+            VrWorldInternalScope internal;
+            check(!uiLayerWorldReissueBegin(r.ctx.Get()), "...and the plan with it: a Begin after that decision finds nothing to re-issue");
+        }
         uiLayerWorldReissueAbandon();
     }
 }
