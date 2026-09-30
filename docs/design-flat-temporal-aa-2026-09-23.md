@@ -48,8 +48,8 @@
   observation on `d9f86b09` belongs to the main/openxr-perf-gaps line.
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
-- **Field reports (79):** two rc.4 users refused every frame: game AA or bloom
-  put passes between tone and copy; turning each off fixed it. Fix: open.
+- **Field reports (79-80):** two rc.4 users refused every frame (AA, bloom, DoF);
+  a third treated at 7-13 fps. 80 built, unflown: stand-down, F8 why, CPU census.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -4714,13 +4714,19 @@ The selector takes the tone pass only as the writer of the final copy's
 source and only from its hash list (`flat_mono_frame.h`, the tone search
 after the copy), so both refuse. Confirmed by the users, relayed by Sean:
 user 1 was fixed by turning the game's AA off, user 2 by turning bloom
-off (blur and DoF are fine).
+off. Blur is fine; depth of field was reported to break it too, so the
+fault depends on the combination of post-processing passes and not on one
+setting (Sean's all-maxed test, with DoF and bloom on, was treated).
 
 Also measured: with a temporal mode selected and every frame refused,
-user 1 presented 60-61 fps against 130-270 with AA off, while EDVR's GPU
-census read about 0.07 ms a frame, so the cost is EDVR's CPU-side work on
-frames it then refuses (no flat CPU instrument exists to name it). User 2
-stayed near a 120 fps cap. The warning anti-aliasing.md planned ("Elite's
+user 1 presented 60-61 fps against 130-270 with AA off. EDVR's GPU census
+read about 0.07 ms a frame, but that census cannot price the flat path: it
+times neither the flat resolver nor engine motion's overlay copy and
+substituted draws, so the reading proves nothing either way about where
+the loss is. User 3's Task Manager (i5-10400F, RTX 3050 at 31% while DLAA
+ran, about one busy thread; section 80) later pointed at the CPU and
+driver side, and the census section 80 built settles it. User 2 stayed
+near a 120 fps cap. The warning anti-aliasing.md planned ("Elite's
 anti-aliasing appears to be on") was never built, so nothing told either
 user why.
 
@@ -4731,4 +4737,142 @@ shader ... existing=1`) and an F10 trace (`flat_trace_36244.bin`,
 Open, Sean to decide: treat the copy's source when every pass between the
 tone pass and the copy is a plain image pass (versus admitting these
 hashes one by one); say in F8 and the log when a frame is refused and why;
-stand the per-draw work down while every frame is refused.
+stand the per-draw work down while every frame is refused. Section 80:
+the last two are built; the first is deferred by decision, and the
+selector is not relaxed.
+
+## 80. Refused frames stand down, F8 says why, a flat CPU census (2026-09-29)
+
+Branch `claude/flat-refusal-warning`, cut from main `0ab66bd9`. Built and
+rig-tested, NOT FLOWN. Five code commits: the stand-down `6a033956`, the F8
+warning `a3efa164`, the census `bc382f63`, engine motion's timing line
+`734264cd`, the bounded camera witness `2f87d15d`.
+
+**Third field record (user 3).** rc.4, flat, 1920x1080 exclusive
+fullscreen, 60 fps cap, no chained mod, game AA, bloom and DoF all off.
+His frames ARE treated (counts up to 373 in the logs, reason
+`treated-jittered`, camera injections 2.6-4k per 5 s window), yet 7-13
+treated fps against 52-56 presented with AA off. EDVR's own GPU census
+reads 0.1-0.15 ms a frame; his Task Manager (i5-10400F, RTX 3050 8 GB)
+showed the GPU at 31% while DLAA ran and about one busy thread. So this is
+not the refused-frames loss of users 1 and 2, and the GPU census that
+priced 0.1 ms cannot see either half of the flat path's cost. Hence the
+CPU and GPU census below.
+
+**Stand-down** (`flat_standdown.h`, pure, `applyWork` in the runtime). The
+runtime ran its whole per-draw and per-call pipeline for frames it then
+refused. Now a run of frames whose only verdict is a chain-shape refusal
+(no, ambiguous or invalid tone pass; no, ambiguous or invalid output copy;
+broken lineage; wrong order; a watched frame that reached no recognised
+copy counts as no-known-output-copy) lasting 5 s stands the work down. Any
+frame with a selecting copy draw is treatable whatever another copy said;
+a transient refusal (warming, reset, truncation, missing HDR) breaks the
+run; unwatched frames do not count. While stood down every frame is
+Paused except one whole Probe frame every 1.5 s that runs the contract
+observation only (the online prefix model and the selector, the same code
+and inputs). A probe the selector selects resumes the work at once with no
+treated frame needed first, so warm-up cannot deadlock (a rig case replays
+supported, unsupported, supported and asserts it). The AA mode changing, a
+swap-chain or device reset, and an F10 audit wake it. Paused: coverage
+classification and legacy projection readiness, the constant-buffer
+shadows on every Map/Unmap/Update, the camera-write witness, the camera
+refresh hook (its relay gate closes only when no camera holds an injected
+phase, and never reopens a hook that stood down for good), engine motion's
+hooks and substitution, the discovery observers, the draw-capture and
+audit probes. Kept: the O(1) trackers (viewport, constant-buffer binds,
+ClearState), so a resume starts from true state. The trace ring is not
+rotated on Paused frames. A session whose frames are selected never leaves
+Full and runs the code it always ran. Three lines, all prefixed
+`flat stand-down:`: `entered at frame=N: every frame for 5.0 s (M frames)
+was refused for <reason>, none treated; paused: ...`, `resumed at frame=N
+after S s stood down (P probes): a probe frame's chain was recognised and
+selected; all work restarts` (or `ended ...: <cause>` for a wake), and a
+`still stood down ...` reminder every 30 s. Absent from a log means it
+never stood down.
+
+**F8 warning** (`flat_elite_settings.h`, `menu.cpp`). Shown only while a
+temporal mode is selected AND the runtime reports a structural refusal
+(stood down, or an unbroken structural run of 2 s: a loading screen's blink
+says nothing); treated frames and transient refusals show nothing, so a
+settings-only rule cannot fire on a combination that works. The words, as
+note lines under the rows, wrapped to the card: `<mode> is not active:
+Elite's post-processing is not recognised.` Then, from Elite's own files
+under `%LOCALAPPDATA%\Frontier Developments\Elite Dangerous\Options\
+Graphics` (`Settings.xml` `<PresetName>`; for Custom, the highest
+`Custom.<major>.<minor>.fxcfg` present, which is what the game reads, with
+`<AAMode>`, `<BloomQuality>`, `<DOFEnabled>`, 0 for off): `Turn off in
+Elite's graphics options: Anti-aliasing, Bloom, Depth of field` (only the
+ones on); for Custom with none on, an unreadable file or unknown settings:
+`Please send your logs (F10 in the cockpit, then the installer's log
+bundle).`; for any other preset, named and not parsed: `Elite's <Preset>
+graphics preset may turn on Anti-aliasing, Bloom or Depth of field. Turn
+them off in Elite's graphics options.` The folder is read when the panel
+opens, when the warning becomes wanted, and at most every 2 s while either
+holds, the two files only when a write time, the chosen file or the file
+set changed; a treated session with the panel closed never touches the
+disk. Log: `flat settings: Elite graphics preset=... file=... AAMode=...
+BloomQuality=... DOFEnabled=...` once per read change, `flat settings
+warning: shown|changed (mode=DLSS, frames refused for no-known-tone-pass
+[, work stood down]): <the words>` and `... hidden ...` per change, at most
+24 a session. No new ini keys. The installer's log bundler now takes the
+folder from the same header (`src/common/elite_graphics_folder.h`). Left
+alone: `eliteHmdMultiplier` (`device_hook.cpp`) picks the newest `.fxcfg` of
+ANY preset by write time, which is not the file the warning reads; user 3
+had `Custom.4.0` to `4.4` side by side.
+
+**The census** (`flat_cpu.h`; modelled on `engine_motion_cpu.h`, which the
+flat menu tick never reaches). One `flat cpu 5s:` line every 5 s while a
+temporal mode is selected, zeros included, continuation lines
+(`flat cpu 5s (cont.):`, none over 1090 characters) when it does not fit:
+`frames=N (stood down M) present p50 X ms (p95 Y); EDVR per frame total a ms
+= other ... + contract reduction ... + copy checks + camera rows + trace
+ring + resource lookup + coverage + projection readiness + cb shadows +
+camera witness + engine motion draw wrapper + resolve + backend + discovery
++ state trackers + camera inject + engine motion hooks`, each `b ms (calls
+c)` per frame on the render thread, every call clocked, exclusive of
+nested families so they partition the time. Then `other threads (clocked
+on K of N frames, one in 32; thread-ms per clocked frame)`: camera inject
+and engine motion's emit, rigid emit, copier, merge, clear, jobs, builder,
+tees, the evaluator relays counted; `camera witness U us/write (W
+writes)`; `engine motion wrapper D3D calls C/frame over D substituted
+draws/frame`; `GPU frame p50 / p95 (first game draw to Present; n timed, s
+skipped, i invalid)` and `GPU resolve` (the resolver's dispatches plus
+backend, two hooks in `flat_mono_resolve`), read back without waiting,
+`-` when nothing was timed; the calibrated clock floor and what the clocks
+themselves cost the render thread. Engine motion's own instrument is driven
+by the census here (its draw side is inside the wrapper span, not counted
+twice). Two small fixes rode with it: engine motion's draw-side CPU and
+driver-call figures moved off the truncated `movers joined` line onto
+`engine motion: draw side over ...` (C5), and the camera-write witness's
+stack walk, which ran on every camera write for the whole session, stops
+after 32 walks in a row that learn nothing or 128 in all and is re-armed
+by F10 (C1).
+
+**What a flight should show.** Refused shape (a Custom preset with AA on,
+DLSS selected): `flat stand-down: entered` about 5 s into the scene; the
+census reporting `stood down` frames and a per-frame total near the
+trackers alone; present p50 back toward the AA-off cadence (user 1: 60 fps
+to 130+); the F8 note lines and `flat settings warning: shown`; turning AA
+off in game, `flat stand-down: resumed` within about 2 s, treated frames
+back, the warning `hidden`. Treated shape (user 3's, or Sean's rig with
+DLAA): read `EDVR per frame total` against the gap between the treated and
+the AA-off frame time. If the total is most of the gap, the family names
+the cost (the wrapper's D3D calls per frame say how many driver round
+trips it is; `camera witness` should fall away after the bounded walks);
+if `GPU frame` p50 is near the present p50, the frame is GPU-bound and
+`GPU resolve` says how much of it is ours; if neither, the loss is not in
+EDVR's own hooks and the census has ruled that half out. Not in any
+family: the shared hook layer's per-call shadow updates on every state
+setter. The census's clocks cost about 33 ns a scope on the build machine;
+the line prints the floor and the price.
+
+**Decided, not built.** Treating the copy's source when every pass
+between tone and copy is a plain image pass (section 79's first open
+item) is deferred, and the selector is not relaxed.
+
+**Environment.** Flat profile only; no VR runtime, headset or per-eye
+size is involved, and none of this touches the VR path. D3D11 immediate
+context; the census needs the owner thread's Present. Fixed sizes: 64
+thread slots for the census (later threads share one, approximate), 2048
+samples per window for the percentiles, four whole-frame and two resolver
+GPU timers, the witness's 16 site slots.
