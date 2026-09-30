@@ -1626,6 +1626,14 @@ int main(int argc, char** argv) {
     expectBool("fix.black_void", false, "flat profile suppresses restored unrelated fix");
     expectBool("experimental.night_vision_realistic", false,
                "flat jitter exception leaves unrelated experimental settings suppressed");
+    // Night vision's pulse stability defaults ON, and nightVisionConfigure reads it through
+    // this getter: a refused key reading off is all that keeps nightVisionWantsDraws() false on
+    // flat, so the draw gate (vscreen.cpp drawGateSubscribed) is not held open there by a fix
+    // the flat profile does not run. expectBool asks with both defaults, so it is the default-on
+    // read that is pinned.
+    Config::get().set("fix.night_vision_stability", "on");
+    expectBool("fix.night_vision_stability", false,
+               "flat profile: night vision pulse stability (default on) reads off, so it cannot hold the draw gate open");
     expectInt("fix.head_offset_forward", 0, "flat profile suppresses numeric fix");
     expectFloat("fix.head_offset_forward", 0.0f, "flat profile suppresses float fix");
     if (Config::get().getIntInRange("fix.head_offset_forward", 12, 1, 100) != 0)

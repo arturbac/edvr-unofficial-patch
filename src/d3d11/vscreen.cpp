@@ -1649,11 +1649,18 @@ __declspec(noinline) bool ensureOurCompositeCb(ID3D11DeviceContext* self, State*
 //
 // Kept as one expression, in the original order, so that a future subscriber
 // is added HERE and nowhere else -- which is the mistake the use site's
-// comment records three times over. The wake pulse and night vision repeated
-// it: both act below the gate (wakePulseSkips in the offscreen branch,
-// nightVisionMatches on the eye draw) and neither was listed, so with every
-// other subscriber off the gate closed and neither ever ran. They are the last
-// two terms.
+// comment records three times over. The wake pulse, night vision and the
+// witchspace starfield switch repeated it: each acts below the gate
+// (wakePulseSkips in the offscreen branch, nightVisionMatches on the eye draw,
+// witchspaceStarsSkip ahead of the eye gate) and none was listed, so with every
+// other subscriber off the gate closed and they never ran. They are the last
+// three terms.
+//
+// Two rungs below the gate are deliberately NOT listed: screenMotionLive() and
+// uiLayerCrispOn(). Each implies temporalModeEnabled(fix.temporal_aa), the same
+// expression objectProbeConfigure sets g_objectProbeOn from, which is
+// objectProbeWantsDraws() below, so neither can be true while the gate is shut.
+// Narrow that probe's on-condition and both belong here.
 bool drawGateSubscribed(State* s) {
     return s->distanceEnabled || s->countForFlashFix ||
         headOffsetGateWantsPanel() || s->censusSkipCount != 0 ||
@@ -1671,7 +1678,8 @@ bool drawGateSubscribed(State* s) {
         panelCurveWants() || particleWantsDraws() || backdropWantsDraws() ||
         scrimWantsDraws() || quadProbeWants() || loaderPanelWants() ||
         introProbeWants() || introPanelWants() ||
-        wakePulseWantsDraws() || nightVisionWantsDraws();
+        wakePulseWantsDraws() || nightVisionWantsDraws() ||
+        witchspaceStarsHidden();
 }
 
 // The bound target's resolve, for the wake pulse, memoised on Rtv0's binding
