@@ -585,6 +585,23 @@ static void testShippedIni(const std::wstring& root) {
         check(camMerged.find("# ui: Camera-path jitter") == std::string::npos,
               "the retired settings' menu rows are not resurrected");
 
+        // The note names the file the user's text came from. The flat edition merges its own
+        // edvr-flat.ini (2026-09-30: a flat install read edvr-flat.ini while every message said
+        // edvr.ini), so the caller says which, and the default stays the VR file's name.
+        const std::string flatMerged = mergeIni(shipped, flown, &previous, {}, nullptr, "edvr-flat.ini");
+        check(flatMerged.find("# carried over from your edvr-flat.ini; this version no longer uses it") !=
+                      std::string::npos &&
+                  flatMerged.find("carried over from your edvr.ini") == std::string::npos,
+              "a merge of edvr-flat.ini says the retired line was carried over from edvr-flat.ini");
+        const std::string flatBare = mergeIni(shipped, flown, nullptr, {}, nullptr, "edvr-flat.ini");
+        check(flatBare.find("# carried over from your edvr-flat.ini; not an EDVR setting this version knows") !=
+                  std::string::npos,
+              "...and so does the note for a key this version never shipped");
+        check(mergeIni(shipped, flown, nullptr, {}, nullptr, nullptr)
+                      .find("# carried over from your edvr.ini; not an EDVR setting this version knows") !=
+                  std::string::npos,
+              "no file named: the VR file's name, as before");
+
         // Hand-installed, no base copy: the same two lines are still carried and
         // still inert, only the note differs (the merge cannot know they once
         // shipped).
@@ -1414,6 +1431,33 @@ static void testFlatSettingsPlanner() {
         check(hasStep(plan, Action::Backup, L"edvr-flat.ini", L"edvr-flat.ini"),
               "the flat file is backed up before it is changed");
         check(!touchesLive(plan, dir, L"edvr.ini"), "and edvr.ini is not in the plan at all");
+    }
+
+    {   // A setting this version does not know is carried to the end of its section under a note
+        // that names the file it came from. The flat edition's own file is edvr-flat.ini, and a
+        // note saying "your edvr.ini" (the flight of 2026-09-30 read edvr-flat.ini while every
+        // message said edvr.ini) points at a file the flat edition never reads. Seeded from the
+        // shared file, naming edvr.ini is right: that is where the lines were.
+        Survey s = installedFlatSurvey(dir, flatOld);
+        s.iniPresent = true;
+        s.iniText = kSharedIni;
+        s.flatIniPresent = true;
+        s.flatIniText = std::string(kFlatOwnIni) + "stale_line = 1\r\n";
+        const std::string merged = plannedText(planInstall(s, options, flatNew), L"edvr-flat.ini");
+        check(merged.find("stale_line = 1") != std::string::npos &&
+                  merged.find("# carried over from your edvr-flat.ini; not an EDVR setting this version knows") !=
+                      std::string::npos,
+              "a flat update carries an unknown line under a note naming edvr-flat.ini");
+        check(merged.find("carried over from your edvr.ini") == std::string::npos,
+              "and never one naming edvr.ini, which it did not come from");
+
+        Survey seed = installedFlatSurvey(dir, flatOld);
+        seed.iniPresent = true;
+        seed.iniText = kSharedIni;
+        const std::string seeded = plannedText(planInstall(seed, options, flatNew), L"edvr-flat.ini");
+        check(seeded.find("# carried over from your edvr.ini; not an EDVR setting this version knows") !=
+                  std::string::npos,
+              "a seed from the shared file names edvr.ini for the lines it carries over");
     }
 
     {   // Asked for fresh defaults with two files: the flat one is replaced, after

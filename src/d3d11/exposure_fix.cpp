@@ -946,8 +946,9 @@ void STDMETHODCALLTYPE hookedDispatch(ID3D11DeviceContext* self, UINT x, UINT y,
                 // silently ignored, on the support path where it matters most.
                 Log::get().note("exposure fix: confirmed compute shader %016llX runs "
                                 "once per eye. Pin it with exposure_shader under "
-                                "[advanced] in edvr.ini if you want to skip detection.",
-                                static_cast<unsigned long long>(hashOf(bindingGet(BindSlot::Cs))));
+                                "[advanced] in %s if you want to skip detection.",
+                                static_cast<unsigned long long>(hashOf(bindingGet(BindSlot::Cs))),
+                                Config::get().iniName());
             }
             shareExposure(self, s->firstEye, second);
             if (s->dampK > 0.0f) exposureDamp(self, s->firstEye[1]);

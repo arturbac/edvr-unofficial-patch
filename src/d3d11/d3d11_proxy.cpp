@@ -518,10 +518,10 @@ HookMode contextHookModeFor(ID3D11DeviceContext* ctx) {
         // their evening. Config's own numeric and boolean readers say this for
         // their own bad values; a string one has to say it itself.
         Log::get().note(
-            "edvr.ini: advanced.context_hook_mode = \"%s\" is not one of auto, "
+            "%s: advanced.context_hook_mode = \"%s\" is not one of auto, "
             "shared, private or live, so it was IGNORED and the probe decided as "
             "usual. Check the spelling.",
-            want.c_str());
+            Config::get().iniName(), want.c_str());
     }
 
     Log::get().note(

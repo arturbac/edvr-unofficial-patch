@@ -38,13 +38,17 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "../../src/common/config.h"
+#include "../../src/common/ini_name.h"
 #include "../../src/common/runtime_profile.h"
 #include "../../src/common/temporal_mode.h"
 #include "../../src/common/log.h"
@@ -611,6 +615,288 @@ static void shareDeleteCase(const std::wstring& scratch) {
            reloads, refused, st.other.load());
 }
 
+// --- the settings file's name, in every message that carries it (2026-09-30) -------------
+//
+// Flight 052916, on an install that read edvr-flat.ini: the F8 panel said "written to
+// edvr.ini", the config audit said "edvr.ini: 1 line(s) name settings this build does not
+// read" about a line that was in edvr-flat.ini, and a chained mod stayed loaded because the
+// line that turned it off had been commented out in edvr.ini while edvr-flat.ini still had it
+// active. Config::iniName() says which file the process opened; ini_name.h says why nothing
+// else may spell the name. Held here three ways: the resolver against the four situations a
+// process can be in (real Config, real files, real log), the messages that come out of them,
+// and a scan of the sources for a message that spells a name.
+
+static void removeIniFile(const std::wstring& dir, const wchar_t* leaf) {
+    DeleteFileW((dir + L"\\" + leaf).c_str());
+}
+
+// A path as text for a failure line (ASCII paths; anything else prints as '?').
+static std::string narrow(const std::wstring& w) {
+    std::string out;
+    for (wchar_t c : w) out.push_back(c < 128 ? static_cast<char>(c) : '?');
+    return out;
+}
+
+static void iniNameCases(const std::wstring& scratch) {
+    const RuntimeProfile savedProfile = g_runtimeProfile;
+    Config& cfg = Config::get();
+
+    // The pure resolver, for a path a caller already holds.
+    static const struct { const wchar_t* path; const char* want; const char* what; } kPaths[] = {
+        {L"C:\\Games\\Elite\\edvr-flat.ini", "edvr-flat.ini", "a path to edvr-flat.ini names it"},
+        {L"C:\\Games\\Elite\\edvr.ini", "edvr.ini", "a path to edvr.ini names it"},
+        {L"C:/Games/Elite/EDVR-FLAT.INI", "edvr-flat.ini", "the name is compared without case, and either slash"},
+        {L"edvr-flat.ini", "edvr-flat.ini", "a bare file name is a path too"},
+        {L"C:\\Games\\edvr-flat.ini.bak", "edvr.ini", "a backup's name is not the file"},
+        {L"C:\\Games\\my-edvr-flat.ini", "edvr.ini", "nor is a longer name that ends the same way"},
+        {L"", "edvr.ini", "no path at all falls back to the VR file's name"},
+    };
+    for (const auto& p : kPaths) {
+        const char* got = iniNameOfPath(p.path);
+        if (std::strcmp(got, p.want) == 0) ok(p.what);
+        else fail(p.what, std::string("\"") + got + "\", wanted \"" + p.want + "\"");
+    }
+
+    // Four situations, each in a directory of its own with its own log. The file that is NOT read
+    // carries a different dead line and a different moved key, so a message about the wrong file
+    // shows in the text as well as in the name.
+    static const char* kKnown[] = {"advanced.d3d11_fixes", "experimental.new_name"};
+    static const char* kMoved[][3] = {{"fix.old_name_1", "experimental.new_name", ""},
+                                      {"fix.old_name_2", "experimental.new_name", ""},
+                                      {"fix.old_name_3", "experimental.new_name", ""}};
+    struct Fixture {
+        const wchar_t* suffix;
+        const wchar_t* tag;
+        const char* descriptor;
+        bool writeVr, writeFlat;
+        int index;                 // which dead and moved key this fixture's read file carries
+        const char* wantName;
+        const char* otherName;     // the name that must never appear as a message's file
+        const char* what;
+    };
+    static const Fixture kFixtures[] = {
+        {L"_ininame_vr", L"ininamevr", "[install]\r\nschema = 1\r\nprofile = vr\r\n", true, true, 1, "edvr.ini",
+         "edvr-flat.ini", "VR profile, with an edvr-flat.ini lying beside it"},
+        {L"_ininame_flat", L"ininameflat", "[install]\r\nschema = 1\r\nprofile = flat\r\n", true, true, 2,
+         "edvr-flat.ini", "edvr.ini", "flat profile, both files present (the flight's install)"},
+        {L"_ininame_fallback", L"ininamefall", "[install]\r\nschema = 1\r\nprofile = flat\r\n", true, false, 3,
+         "edvr.ini", "edvr-flat.ini", "flat profile, no edvr-flat.ini yet: it reads edvr.ini whole"},
+        {L"_ininame_none", L"ininamenone", "[install]\r\nschema = 1\r\nprofile = flat\r\n", false, false, 0,
+         "edvr-flat.ini", "edvr.ini", "flat profile, neither file: the one it would create"},
+    };
+
+    Log::get().close();
+    for (const Fixture& f : kFixtures) {
+        const std::wstring dir = scratch + f.suffix;
+        CreateDirectoryW(dir.c_str(), nullptr);
+        removeIniFile(dir, L"edvr.ini");
+        removeIniFile(dir, L"edvr-flat.ini");
+        deleteLogs(dir, f.tag);
+        // The read file carries: a dead line, a moved key still on its old name, a malformed
+        // yes/no. The other file carries a dead line and a moved key of its own (never reported).
+        const std::string mine = "[advanced]\r\nd3d11_fixes = maybe\r\n[fix]\r\nstale_line_" +
+                                 std::to_string(f.index) + " = on\r\nold_name_" + std::to_string(f.index) +
+                                 " = 3\r\n";
+        const std::string other = "[fix]\r\nnot_the_file_read = on\r\nold_name_9 = 4\r\n";
+        const bool flatRead = std::strcmp(f.wantName, "edvr-flat.ini") == 0;
+        bool wrote = writeIni(dir, f.descriptor, L"edvr_profile.ini");
+        if (f.writeVr) wrote = wrote && writeIni(dir, (flatRead ? other : mine).c_str(), L"edvr.ini");
+        if (f.writeFlat) wrote = wrote && writeIni(dir, (flatRead ? mine : other).c_str(), L"edvr-flat.ini");
+        if (!wrote) {
+            fail(f.what, "could not write the fixture");
+            continue;
+        }
+        cfg.setAuditTables(kKnown, 2, kMoved, 3);
+        cfg.init(dir);
+        const std::string got = cfg.iniName();
+        if (got == f.wantName) ok(f.what);
+        else fail(f.what, "iniName() said " + got + ", wanted " + f.wantName);
+        if (!f.writeVr && !f.writeFlat) {
+            // Nothing to read, nothing to say: the name is all this fixture asks.
+            cfg.setAuditTables(nullptr, 0, nullptr, 0);
+            continue;
+        }
+        if (!Log::get().open(dir, f.tag)) {
+            fail(f.what, "the log would not open");
+            cfg.setAuditTables(nullptr, 0, nullptr, 0);
+            continue;
+        }
+        (void)cfg.getBool("advanced.d3d11_fixes", true);   // says the malformed yes/no, flushes the audit's queue
+        Log::get().close();
+        cfg.setAuditTables(nullptr, 0, nullptr, 0);
+        const std::string body = readNewestLog(dir, f.tag);
+        const std::string idx = std::to_string(f.index);
+        const std::string mineName = f.wantName;
+        struct Need { std::string needle; const char* what; };
+        const Need needs[] = {
+            {mineName + ": 1 line(s) name settings this build does not read: fix.stale_line_" + idx,
+             "the config audit's dead-line note names the file it read"},
+            {mineName + ": fix.old_name_" + idx + " has moved to experimental.new_name",
+             "the moved-key note names it"},
+            {mineName + ": advanced.d3d11_fixes = \"maybe\" is not a yes/no value",
+             "a malformed yes/no names it"},
+        };
+        for (const Need& n : needs) {
+            if (body.find(n.needle) != std::string::npos) ok((std::string(f.what) + ": " + n.what).c_str());
+            else fail((std::string(f.what) + ": " + n.what).c_str(), "\"" + n.needle + "\" is not in the log");
+        }
+        // Never the other file: not at the front of a message, and nothing said about its own lines.
+        // A log line starts "[hh:mm:ss.mmm] " and then the message, so look for the other name right
+        // after that (edvr-flat.ini never matches "edvr.ini: ", the names differ before the dot).
+        const std::string otherPrefix = std::string(f.otherName) + ": ";
+        bool otherFirst = false;
+        for (size_t at = body.find(otherPrefix); at != std::string::npos; at = body.find(otherPrefix, at + 1)) {
+            if (at >= 2 && body[at - 1] == ' ' && body[at - 2] == ']') otherFirst = true;
+        }
+        if (!otherFirst) ok((std::string(f.what) + ": no message names the other file").c_str());
+        else fail((std::string(f.what) + ": a message names the other file").c_str(),
+                  std::string("\"") + otherPrefix + "\" starts a message");
+        if (body.find("not_the_file_read") == std::string::npos && body.find("old_name_9") == std::string::npos)
+            ok((std::string(f.what) + ": nothing is said about the file it did not read").c_str());
+        else fail((std::string(f.what) + ": it reported the file it did not read").c_str(), "a line of the other file is in the log");
+    }
+    g_runtimeProfile = savedProfile;
+}
+
+// A message that spells the settings file's name is the fault; tools\config_test knows it by scanning.
+// String literals only -- a comment may name a file -- lexed, not grepped, so a quote inside a char
+// literal, an apostrophe in a comment or a raw string cannot hide one or invent one.
+static std::vector<std::string> namedLiterals(const std::string& text) {
+    std::vector<std::string> hits;
+    const size_t n = text.size();
+    size_t line = 1;
+    auto lower = [](std::string s) { for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c))); return s; };
+    auto check = [&](const std::string& literal, size_t atLine) {
+        const std::string l = lower(literal);
+        if (l.find("edvr.ini") != std::string::npos || l.find("edvr-flat.ini") != std::string::npos)
+            hits.push_back("line " + std::to_string(atLine) + ": \"" + literal.substr(0, 70) + "\"");
+    };
+    for (size_t i = 0; i < n;) {
+        const char c = text[i];
+        if (c == '\n') { ++line; ++i; continue; }
+        if (c == '/' && i + 1 < n && text[i + 1] == '/') {          // line comment
+            while (i < n && text[i] != '\n') ++i;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && text[i + 1] == '*') {          // block comment
+            i += 2;
+            while (i + 1 < n && !(text[i] == '*' && text[i + 1] == '/')) { if (text[i] == '\n') ++line; ++i; }
+            i += 2;
+            continue;
+        }
+        if (c == '\'') {                                            // char literal (or a digit separator)
+            // A separator sits inside a number (0x1'0000): the token it is in starts with a digit.
+            // L'a' and u8'a' are char literals: their token starts with a letter.
+            size_t s = i;
+            while (s > 0 && (isalnum(static_cast<unsigned char>(text[s - 1])) || text[s - 1] == '_' ||
+                             text[s - 1] == '\'' || text[s - 1] == '.'))
+                --s;
+            const bool separator = s < i && isdigit(static_cast<unsigned char>(text[s])) && i + 1 < n &&
+                                   isalnum(static_cast<unsigned char>(text[i + 1]));
+            ++i;
+            if (separator) continue;
+            while (i < n && text[i] != '\'' && text[i] != '\n') { if (text[i] == '\\') ++i; ++i; }
+            ++i;
+            continue;
+        }
+        if (c == '"') {
+            const size_t atLine = line;
+            const bool raw = i > 0 && text[i - 1] == 'R';
+            std::string literal;
+            if (raw) {                                              // R"delim( ... )delim"
+                size_t d = i + 1;
+                std::string delim;
+                while (d < n && text[d] != '(' && text[d] != '\n' && delim.size() < 17) delim += text[d++];
+                const std::string close = ")" + delim + "\"";
+                const size_t end = text.find(close, d);
+                const size_t stop = end == std::string::npos ? n : end;
+                literal = text.substr(d + 1 < n ? d + 1 : n, stop > d ? stop - d - 1 : 0);
+                for (char ch : literal) if (ch == '\n') ++line;
+                i = end == std::string::npos ? n : end + close.size();
+            } else {
+                ++i;
+                while (i < n && text[i] != '"' && text[i] != '\n') {
+                    if (text[i] == '\\' && i + 1 < n) { literal += text[i + 1]; i += 2; continue; }
+                    literal += text[i++];
+                }
+                ++i;
+            }
+            check(literal, atLine);
+            continue;
+        }
+        ++i;
+    }
+    return hits;
+}
+
+// Every source under src\ but the installer's (which manages both files and says which it means).
+static void collectSources(const std::wstring& dir, const std::wstring& relative,
+                           std::vector<std::wstring>* out) {
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        const std::wstring name = fd.cFileName;
+        if (name == L"." || name == L"..") continue;
+        const std::wstring rel = relative.empty() ? name : relative + L"\\" + name;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (_wcsicmp(rel.c_str(), L"installer") == 0) continue;
+            collectSources(dir + L"\\" + name, rel, out);
+            continue;
+        }
+        const size_t dot = name.find_last_of(L'.');
+        const std::wstring ext = dot == std::wstring::npos ? L"" : name.substr(dot);
+        if (_wcsicmp(ext.c_str(), L".cpp") == 0 || _wcsicmp(ext.c_str(), L".h") == 0 ||
+            _wcsicmp(ext.c_str(), L".inc") == 0 || _wcsicmp(ext.c_str(), L".hpp") == 0)
+            out->push_back(rel);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void iniNameScan(const std::wstring& root) {
+    // The scanner itself first: it must find what it is for, and only that.
+    const std::string violating =
+        "void f() {\n"
+        "    Log::get().note(\"edvr.ini: advanced.x is bad\");\n"      // a message: the fault
+        "    // \"edvr.ini\" in a comment is fine\n"
+        "    /* and \"edvr-flat.ini\" in a block comment */\n"
+        "    const char q = '\"'; const char* s = \"a quote \\\" and edvr-flat.ini\";\n"   // the literal ends at its own quote
+        "    const wchar_t* w = L\"\\\\EDVR.INI\";\n"                   // wide, and without case
+        "    const char* r = R\"(raw edvr.ini text)\";\n"
+        "    const char* clean = \"edvr_profile.ini and edvr_openxr.ini are other files\";\n"
+        "}\n";
+    const std::vector<std::string> control = namedLiterals(violating);
+    if (control.size() == 4 && control[0].rfind("line 2:", 0) == 0 && control[1].rfind("line 5:", 0) == 0 &&
+        control[2].rfind("line 6:", 0) == 0 && control[3].rfind("line 7:", 0) == 0)
+        ok("the source scan finds a message, a wide literal and a raw string that spell the file, and skips comments, char literals and other ini files");
+    else fail("the source scan's own control", std::to_string(control.size()) + " hits, not the four literals at lines 2, 5, 6 and 7");
+
+    std::vector<std::wstring> files;
+    collectSources(root + L"\\src", L"", &files);
+    if (files.size() < 150) {
+        fail("source scan", "found only " + std::to_string(files.size()) + " sources under " +
+                                narrow(root) + "\\src; the scan would prove nothing");
+        return;
+    }
+    // The one place the names are spelled. The installer is not scanned: it manages both files.
+    int scanned = 0, bad = 0;
+    for (const std::wstring& rel : files) {
+        if (_wcsicmp(rel.c_str(), L"common\\ini_name.h") == 0) continue;
+        const std::string text = readRepoFile(root, (L"src\\" + rel).c_str());
+        ++scanned;
+        for (const std::string& hit : namedLiterals(text)) {
+            ++bad;
+            fail("a message spells the settings file's name; use Config::iniName()",
+                 narrow(rel) + " " + hit);
+        }
+    }
+    if (!bad) {
+        ok(("no string literal in " + std::to_string(scanned) +
+            " sources under src (the installer aside) spells edvr.ini or edvr-flat.ini; ini_name.h is the one place")
+               .c_str());
+    }
+}
+
 int main(int argc, char** argv) {
     // Unbuffered, so a crash does not take the output with it: the first run of
     // this test appeared to die before its first printf, which was only the
@@ -1140,10 +1426,12 @@ int main(int argc, char** argv) {
     //
     // Before the profile cases below: those switch g_runtimeProfile to flat and
     // invalid, under which these scratch keys would read as suppressed.
+    iniNameScan(dir);
     if (argc >= 3) {
         const std::wstring scratch = widen(argv[2]);
         floatCases(scratch);
         noteCases(scratch);
+        iniNameCases(scratch);
         raceCase(scratch);
         shareDeleteCase(scratch);
     }

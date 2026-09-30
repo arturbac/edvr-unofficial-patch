@@ -5870,9 +5870,10 @@ void vScreenFrameBoundary() {
                 "feeds the black void, Explorer Cam, the transition flash detector, the "
                 "RemLok lines and the loading hologram -- all of "
                 "them inert until this line. If something now lands on the wrong pass, "
-                "set advanced.eye_render_size = off under [advanced] in edvr.ini and "
+                "set advanced.eye_render_size = off under [advanced] in %s and "
                 "report this log.",
-                s->renderW, s->renderH, s->eyeW, s->eyeH, pct, best, s->eyeDrawsMax);
+                s->renderW, s->renderH, s->eyeW, s->eyeH, pct, best, s->eyeDrawsMax,
+                Config::get().iniName());
         } else if (best > kSceneEyeDraws) {
             // THE SAME EVIDENCE, WITHOUT THE CORROBORATION, so it buys less.
             //

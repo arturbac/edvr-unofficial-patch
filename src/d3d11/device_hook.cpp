@@ -2819,9 +2819,9 @@ void hookDevice(ID3D11Device* device) {
         } else {
             if (!probe.empty() && _stricmp(probe.c_str(), "off") != 0) {
                 Log::get().note(
-                    "edvr.ini: advanced.context_hook_probe = \"%s\" is not one of "
+                    "%s: advanced.context_hook_probe = \"%s\" is not one of "
                     "off, swap or live, so it was IGNORED. Check the spelling.",
-                    probe.c_str());
+                    Config::get().iniName(), probe.c_str());
             }
             installExposureFix(device, ctxMode);
             // Before the vScreen fixes, which ask it whether it needs the

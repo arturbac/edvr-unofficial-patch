@@ -729,9 +729,9 @@ std::string savedForText(const edvr::native_render::HeadsetEntry* entries, size_
         }
     }
     if (count > shown) {
-        char more[48];
-        snprintf(more, sizeof(more), " and %u more (see edvr.ini)",
-                 static_cast<unsigned>(count - shown));
+        char more[64];
+        snprintf(more, sizeof(more), " and %u more (see %s)",
+                 static_cast<unsigned>(count - shown), Config::get().iniName());
         body += more;
     }
     return body + ".";
@@ -837,7 +837,10 @@ bool parseTypedWidth(const std::string& text, uint32_t* out) {
     return true;
 }
 
-constexpr const char* kEightHeadsets = "Eight headsets saved; remove one in edvr.ini first.";
+// Names the settings file this process read (Config::iniName), never a literal one.
+std::string eightHeadsetsText() {
+    return std::string("Eight headsets saved; remove one in ") + Config::get().iniName() + " first.";
+}
 // A runtime whose name has no ASCII letter or digit yields an empty runtime
 // token, which the grammar cannot key an entry on (mergeHeadsetEntry refuses
 // it); said as such rather than as a full list.
@@ -1140,12 +1143,18 @@ bool g_mirrorFailNoted = false;
 
 bool menuIniWrite(const std::string& dotted, const std::string& value, std::string* err) {
     const std::wstring path = Config::get().path();
+    // The file this process reads and this write replaces: edvr-flat.ini under the
+    // flat profile, edvr.ini otherwise (Config::iniName names it for the messages).
+    // Its own name, both for the safety copies below and for what a failure says.
+    const std::string fileName = Config::get().iniName();
+    const size_t leafAt = path.find_last_of(L"\\/");
+    const std::wstring leaf = leafAt == std::wstring::npos ? path : path.substr(leafAt + 1);
     std::string source;
     // Re-read before every write, the settings window's 2026-08-28 lesson:
     // the file on disk is the source, never a copy cached when the panel
     // opened.
     if (!readWhole(path, &source) || source.empty()) {
-        *err = "edvr.ini could not be read";
+        *err = fileName + " could not be read";
         return false;
     }
     if (!g_backedUp) {
@@ -1154,7 +1163,9 @@ bool menuIniWrite(const std::string& dotted, const std::string& value, std::stri
         if (!dirExistsW(root)) CreateDirectoryW(root.c_str(), nullptr);
         const std::wstring dir = root + L"\\menu-" + stampName();
         if (CreateDirectoryW(dir.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS) {
-            CopyFileW(path.c_str(), (dir + L"\\edvr.ini").c_str(), FALSE);
+            // Named for the file copied: the flat profile's settings are not an edvr.ini,
+            // and a copy called that could be restored over the VR profile's.
+            CopyFileW(path.c_str(), (dir + L"\\" + leaf).c_str(), FALSE);
         }
     }
     MergeReport report;
@@ -1165,7 +1176,7 @@ bool menuIniWrite(const std::string& dotted, const std::string& value, std::stri
     // and a reload that lands between two writes cannot fail the second.
     std::wstring why;
     if (!writeFileAtomic(path, updated, &why)) {
-        *err = "edvr.ini: " + utf8Of(why);
+        *err = fileName + ": " + utf8Of(why);
         return false;
     }
     // The mirror of last resort, refreshed so an update that wipes the
@@ -1176,8 +1187,6 @@ bool menuIniWrite(const std::string& dotted, const std::string& value, std::stri
     // the mirror's edvr-flat.ini rather than over the VR profile's edvr.ini.
     const std::wstring mdir = mirrorDir();
     if (!mdir.empty()) {
-        const size_t slash = path.find_last_of(L"\\/");
-        const std::wstring leaf = slash == std::wstring::npos ? path : path.substr(slash + 1);
         std::wstring mirrorWhy;
         if (writeGenerations(mdir, leaf, updated, false, &mirrorWhy)) {
             if (!g_mirrorNoted) {
@@ -2293,7 +2302,7 @@ bool applyHeadsetChange(int defIndex, const HeadsetWrite& w, uint32_t value) {
     std::string list;
     if (value) {
         if (!mergeHeadsetEntry(before, w.rt, w.sys, value, &list, w.lo, w.hi)) {
-            s.lastWrite = kEightHeadsets;
+            s.lastWrite = eightHeadsetsText();
             s.contentDirty = true;
             return false;
         }
@@ -2362,17 +2371,17 @@ void drainWrites() {
                 // The per-headset row: the key and the values, then the
                 // list the file now holds.
                 s.lastWrite = w.job.headset + " = " + w.job.toValue;
-                Log::get().note("menu: %s %s %s -> %s (list now %s%s%s; written to edvr.ini; "
+                Log::get().note("menu: %s %s %s -> %s (list now %s%s%s; written to %s; "
                                 "%s).",
                                 w.job.dotted.c_str(), w.job.headset.c_str(), w.job.fromValue.c_str(),
                                 w.job.toValue.c_str(), w.job.value.empty() ? "empty" : w.job.value.c_str(),
                                 w.job.dropped.empty() ? "" : "; dropped malformed ",
-                                w.job.dropped.c_str(), when);
+                                w.job.dropped.c_str(), Config::get().iniName(), when);
             } else {
                 s.lastWrite = w.job.dotted + " = " + w.job.value;
-                Log::get().note("menu: %s %s -> %s (written to edvr.ini; %s).", w.job.dotted.c_str(),
+                Log::get().note("menu: %s %s -> %s (written to %s; %s).", w.job.dotted.c_str(),
                                 w.job.before.empty() ? "(default)" : w.job.before.c_str(),
-                                w.job.value.c_str(), when);
+                                w.job.value.c_str(), Config::get().iniName(), when);
             }
         } else {
             s.lastWrite = "FAILED: " + w.err;
@@ -3508,10 +3517,11 @@ void menuNoteConfigReloaded() {
             if (r.pending && !r.auditNoted) {
                 r.auditNoted = true;
                 const ResolutionView view = resolutionView(v);
-                Log::get().note("edvr.ini: %s now gives this headset (%s) %u wide on disk but is read "
+                Log::get().note("%s: %s now gives this headset (%s) %u wide on disk but is read "
                                 "when VR starts; the running value is %u wide (%s). Restart the game "
                                 "to apply it.",
-                                dotted.c_str(), view.key.c_str(), view.width, view.sizing.activeWidth[0],
+                                Config::get().iniName(), dotted.c_str(), view.key.c_str(), view.width,
+                                view.sizing.activeWidth[0],
                                 percentText(edvr::native_render::widthToScale(
                                     view.sizing.activeWidth[0], view.sizing.eyes[0].originalWidth)).c_str());
             }
@@ -3519,9 +3529,9 @@ void menuNoteConfigReloaded() {
             r.pending = rowPending(d, v, r.snapshot);
             if (r.pending && !r.auditNoted) {
                 r.auditNoted = true;
-                Log::get().note("edvr.ini: %s is now %s on disk but is read at launch; the running "
+                Log::get().note("%s: %s is now %s on disk but is read at launch; the running "
                                 "value is still %s. Restart the game to apply it.",
-                                dotted.c_str(), v.empty() ? "(default)" : v.c_str(),
+                                Config::get().iniName(), dotted.c_str(), v.empty() ? "(default)" : v.c_str(),
                                 r.snapshot.empty() ? "(default)" : r.snapshot.c_str());
             }
         }
