@@ -128,7 +128,7 @@ struct RefreshTls {
     uint32_t flags = 0;
     uint32_t haveFlags = 0;
     uint32_t armed = 0;
-    uint32_t pad = 0;
+    uint32_t observe = 0; // armed for the census: the post half reports, restores nothing (it wrote nothing)
 };
 __declspec(thread) RefreshTls g_refreshTls;
 static_assert(offsetof(RefreshTls, realRet) == 0, "stubB reads realRet at the struct base");
@@ -181,6 +181,10 @@ struct InjectState {
     std::atomic<uint64_t> closes{0};           // frames closed through flatCameraInjectClose
     std::atomic<uint64_t> cleanCloses{0};      // ... of which the phase machine called clean
     std::atomic<uint64_t> historyResets{0};    // owner switches that reset the runtime's history
+    // The observe-only mode (flatCameraInjectObserveFrame): set before the hook is installed and never cleared, so
+    // the detour that exists in a VR process can only ever observe. False for the flat profile's whole life.
+    std::atomic<bool> observeOnly{false};
+    std::atomic<uint64_t> observedCalls{0};    // owner-thread calls the observe-only detour reported
     uint64_t windowFrames = 0;                 // frames begun this window (census denominator)
     uint32_t ownerNotes = 0;                   // owner-transition notes written (capped)
     FlatCameraRoute lastRoute = FlatCameraRoute::Off;
@@ -199,6 +203,8 @@ struct InjectState {
     float lastRay[4] = {};
 };
 InjectState g_inject;
+// The census's observer (flatCameraInjectSetObserver). The struct it points to lives for the process.
+std::atomic<const FlatCameraObserver*> g_observer{nullptr};
 std::atomic<uintptr_t> g_gate{0};
 std::atomic<uintptr_t> g_refreshForward{0};
 // The incoming r11 of the most recent refresh call, captured by stubA's
@@ -350,6 +356,45 @@ void flushCamera(uintptr_t camera) noexcept {
     g_inject.writeFailures.fetch_add(1, std::memory_order_relaxed);
 }
 
+// The census's two reports (observe-only mode). Neither writes a camera: observeCall's ONLY store is the body's
+// return slot, so the post half runs and can read what the body derived -- the store every injected call makes too,
+// undone by stubB's jump to the real return address. tools\vr_camera_census_test pins that these two functions
+// contain no other write (the source scan walks this text).
+void observeCall(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera, uint64_t callNo, bool kindReadable,
+                 uint32_t kind, uint64_t callerRva, FlatCameraGateVerdict gate) noexcept {
+    g_inject.observedCalls.fetch_add(1, std::memory_order_relaxed);
+    const FlatCameraObserver* observer = g_observer.load(std::memory_order_acquire);
+    if (!observer || !observer->pre || !camera) return;
+    FlatCameraObserveCall call;
+    call.camera = camera;
+    call.ctx = ctx;
+    call.p2 = p2;
+    call.callerRva = callerRva;
+    call.callNo = callNo;
+    call.kind = kind;
+    call.kindReadable = kindReadable;
+    call.window = gate == FlatCameraGateVerdict::Admit ? 0 : gate == FlatCameraGateVerdict::Expired ? 2 : 1;
+    if (!observer->pre(call) || !observer->post) return;
+    uint64_t realRet = 0;
+    if (!sehReadU64(r0, &realRet) || !sehWriteU64(r0, static_cast<uint64_t>(g_stubB))) return; // not redirected: no post half
+    g_refreshTls.realRet = realRet;
+    g_refreshTls.ctx = ctx;
+    g_refreshTls.camera = camera;
+    g_refreshTls.callNo = callNo;
+    g_refreshTls.armed = 1u;
+    g_refreshTls.observe = 1u;
+}
+
+void observeOffThread(uintptr_t r0, uintptr_t camera) noexcept {
+    const FlatCameraObserver* observer = g_observer.load(std::memory_order_acquire);
+    if (!observer || !observer->offThread) return;
+    uint32_t kind = 0;
+    const bool readable = camera && sehReadU32(camera + kCamKind, &kind);
+    uint64_t ret = 0, rva = 0;
+    if (g_inject.gameBase && sehReadU64(r0, &ret) && ret > g_inject.gameBase) rva = ret - g_inject.gameBase;
+    observer->offThread(camera, rva, kind, readable, GetCurrentThreadId());
+}
+
 // The pre-forward half, called by stubA with R0 (the game's return-
 // address slot) and the live argument registers. Everything the old
 // detour did before forward() -- admission, the phase, the dirty bits --
@@ -359,6 +404,7 @@ void flushCamera(uintptr_t camera) noexcept {
 void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noexcept {
     flatcpu::Scope timed(flatcpu::kInject);   // the census (flat_cpu.h): this callback's own time, the game's body excluded
     g_refreshTls.armed = 0; // a previous body that unwound never disarmed
+    g_refreshTls.observe = 0;
     const uint64_t callNo = g_inject.refreshCalls.fetch_add(1, std::memory_order_relaxed) + 1;
     // The triage fields ride out on the 5s tick (the lastcall line); no I/O here.
     g_inject.lastCallNo.store(callNo, std::memory_order_relaxed);
@@ -370,8 +416,11 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     // set of injected cameras belong to the thread that runs Present; a call
     // on any other thread touches none of them (counted, passed through).
     const FlatCameraGateVerdict gate = g_inject.gate.check(GetCurrentThreadId(), GetTickCount64());
+    // The VR camera census's switch: a process that observes only never leaves it (flatCameraInjectObserveFrame).
+    const bool observe = g_inject.observeOnly.load(std::memory_order_acquire);
     if (gate == FlatCameraGateVerdict::OffThread) {
         g_inject.offThreadCalls.fetch_add(1, std::memory_order_relaxed);
+        if (observe) observeOffThread(r0, camera); // reads, counts, never writes; lock-free
         return;
     }
 
@@ -384,12 +433,13 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     const bool readable = camera && sehReadU32(camera + kCamKind, &kind);
     g_inject.lastKind.store(readable ? kind : 0xffffffffu, std::memory_order_relaxed);
     g_inject.census.noteKind(readable, kind);
+    // The call site, for the census: [R0] is the return address, and its
+    // offset from the module names which of the refresh's callers this is.
+    uint64_t callerRva = 0;
     {
-        // The call site, for the census: [R0] is the return address, and its
-        // offset from the module names which of the refresh's callers this is.
-        uint64_t ret = 0, rva = 0;
-        if (g_inject.gameBase && sehReadU64(r0, &ret) && ret > g_inject.gameBase) rva = ret - g_inject.gameBase;
-        g_inject.census.noteCaller(rva);
+        uint64_t ret = 0;
+        if (g_inject.gameBase && sehReadU64(r0, &ret) && ret > g_inject.gameBase) callerRva = ret - g_inject.gameBase;
+        g_inject.census.noteCaller(callerRva);
     }
     // The phase, in RENDER pixels from the validated resolve plan (R5).
     float jx = 0, jy = 0;
@@ -398,11 +448,14 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     admission.readable = readable;
     admission.kind = kind;
     admission.gate = gate;
+    admission.observeOnly = observe;
     if (readable && kind == 3) {
         g_inject.kind3Seen.store(true, std::memory_order_relaxed);
-        flatRuntimePhaseState(&jx, &jy, &rw, &rh, &applied);
-        admission.upstreamOwns = g_inject.core.valid() && g_inject.core.route() == FlatCameraRoute::Upstream;
-        admission.phaseNonzero = rw && rh && (jx != 0.0f || jy != 0.0f);
+        if (!observe) { // observe mode asks the flat runtime nothing: there is no phase to read
+            flatRuntimePhaseState(&jx, &jy, &rw, &rh, &applied);
+            admission.upstreamOwns = g_inject.core.valid() && g_inject.core.route() == FlatCameraRoute::Upstream;
+            admission.phaseNonzero = rw && rh && (jx != 0.0f || jy != 0.0f);
+        }
     }
     const FlatCameraAdmit admit = flatCameraAdmit(admission);
     switch (admit) {
@@ -417,7 +470,15 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
         case FlatCameraAdmit::NotUpstream: g_inject.notUpstreamCalls.fetch_add(1, std::memory_order_relaxed); break;
         case FlatCameraAdmit::GateClosed: g_inject.staleCalls.fetch_add(1, std::memory_order_relaxed); break;
         case FlatCameraAdmit::Inject:
+        case FlatCameraAdmit::Observed:
         case FlatCameraAdmit::OffThread: break;
+    }
+    // THE OBSERVE-ONLY RETURN. Whatever the admission said (it cannot say Inject here), the census's call ends at
+    // this block: no flush, no bound pair, no flag, no restore is reached below it. The pin in
+    // tools\vr_camera_census_test holds this block ahead of every write in this function.
+    if (observe) {
+        observeCall(r0, ctx, p2, camera, callNo, readable, kind, callerRva, gate);
+        return;
     }
     // A camera this session injected, now not: its derived blocks still hold
     // the last phase, and the game re-derives only what its dirty bits name.
@@ -487,6 +548,13 @@ void refreshPost() noexcept {
     if (!g_refreshTls.armed) return; // defensive: stubB only fires after a redirect
     g_refreshTls.armed = 0;
     const uintptr_t camera = g_refreshTls.camera;
+    if (g_refreshTls.observe) {
+        // The census's call: nothing was written to the camera, so there is nothing to restore and nothing applied.
+        g_refreshTls.observe = 0;
+        const FlatCameraObserver* observer = g_observer.load(std::memory_order_acquire);
+        if (observer && observer->post) observer->post(camera, g_refreshTls.ctx);
+        return;
+    }
     sehWriteF32(camera + kCamBoundX, g_refreshTls.entryX);
     sehWriteF32(camera + kCamBoundY, g_refreshTls.entryY);
     if (g_refreshTls.haveFlags) sehWriteU32(camera + kCamFlags, g_refreshTls.flags);
@@ -502,6 +570,92 @@ void standDown(const char* why) {
         Log::get().note("flat camera inject: %s; the refresh hook stays in place as an inert "
                         "pass-through for process lifetime", why);
     }
+}
+
+// The hook install, once (the flat path and the VR camera census share it; observe says which is asking, and only
+// the success note reads it). A failed install is final for the session except a missing module or relay page,
+// which the next frame retries -- exactly as it was inline. Render thread.
+void installRefreshHook(bool observe) {
+    const HMODULE game = GetModuleHandleW(L"EliteDangerous64.exe");
+    if (!game) {
+        if (!g_inject.failReason[0] || std::strcmp(g_inject.failReason, "not attempted") == 0) {
+            g_inject.failReason = "EliteDangerous64.exe is not loaded in this process";
+            Log::get().note("flat camera inject: wanted but %s; standing down", g_inject.failReason);
+        }
+        return;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(game);
+    g_inject.gameBase = base; // before the hook exists: the detour reads it
+    if (!sehCheck(base + kRefreshRva, kRefreshPrologue, sizeof(kRefreshPrologue))) {
+        g_inject.failReason = "refresh prologue mismatch at this build (not the Ghidra-verified shape)";
+        Log::get().note("flat camera inject: %s; standing down", g_inject.failReason);
+        g_inject.relay = reinterpret_cast<uint8_t*>(1); // do not retry
+        return;
+    }
+    g_inject.relay = allocateRelay(base + kRefreshRva);
+    if (!g_inject.relay) { g_inject.failReason = "relay allocation failed (no free memory within 2 GB)"; return; }
+    // TLS placement for stubB's walk: _tls_index is process-constant
+    // after CRT init, and the struct's offset from this thread's TLS
+    // base is the same on every thread.
+    const auto tlsArray = reinterpret_cast<const uintptr_t*>(__readgsqword(0x58));
+    const uintptr_t tlsBase = tlsArray ? tlsArray[_tls_index] : 0;
+    const uintptr_t tlsStruct = reinterpret_cast<uintptr_t>(&g_refreshTls);
+    if (!tlsBase || tlsStruct < tlsBase || tlsStruct - tlsBase > 0xFFFFFFFFull ||
+        _tls_index == 0) {
+        static char tlsDetail[160];
+        std::snprintf(tlsDetail, sizeof(tlsDetail),
+            "the thread-local the return stub needs is outside its reach "
+            "(tlsBase=%p tlsStruct=%p tlsIndex=%u)",
+            reinterpret_cast<void*>(tlsBase), reinterpret_cast<void*>(tlsStruct), _tls_index);
+        g_inject.failReason = tlsDetail;
+        Log::get().note("flat camera inject: %s; standing down", g_inject.failReason);
+        VirtualFree(g_inject.relay, 0, MEM_RELEASE);
+        g_inject.relay = reinterpret_cast<uint8_t*>(1);
+        return;
+    }
+    g_stubB = reinterpret_cast<uintptr_t>(g_inject.relay) + kStubBOffset;
+    buildRelay(g_inject.relay, &g_gate, g_inject.relay + kStubAOffset);
+    g_stubATrampOfs = buildStubA(g_inject.relay + kStubAOffset, &refreshPre,
+                                 &g_lastIncomingR11);
+    buildStubB(g_inject.relay + kStubBOffset, &refreshPost, _tls_index,
+               static_cast<uint32_t>(tlsStruct - tlsBase));
+    if (!g_inject.hook.install(reinterpret_cast<void*>(base + kRefreshRva), g_inject.relay, nullptr,
+                               "camera-inject-refresh", &prepareRelay, &g_inject)) {
+        VirtualFree(g_inject.relay, 0, MEM_RELEASE); g_inject.relay = reinterpret_cast<uint8_t*>(1);
+        g_inject.failReason = "CodeHook refused it (its own line above names why)";
+        Log::get().note("flat camera inject: %s; standing down", g_inject.failReason);
+        return;
+    }
+    g_inject.installed.store(true, std::memory_order_release);
+    g_gate.store(g_inject.paused.load(std::memory_order_acquire) ? 0 : 1, std::memory_order_release);
+    if (observe) {
+        Log::get().note("flat camera inject: refresh hook installed at EliteDangerous64.exe+0x%llX in OBSERVE-ONLY mode "
+                        "(the VR camera census): no camera is ever written",
+                        static_cast<unsigned long long>(kRefreshRva));
+    } else {
+        Log::get().note("flat camera inject: refresh hook installed at EliteDangerous64.exe+0x%llX; "
+                        "kind-3 cameras now get the temporal phase applied transiently at the source",
+                        static_cast<unsigned long long>(kRefreshRva));
+    }
+    // Readback verification: the relay stub, its callback literal, the
+    // trampoline's and stubA's first bytes, so a later crash can be
+    // compared against what was actually built.
+    uint8_t relayBytes[46] = {};
+    uint64_t callbackLiteral = 0, fwd = g_refreshForward.load(std::memory_order_relaxed);
+    uint8_t trampBytes[16] = {};
+    uint8_t stubABytes[16] = {};
+    __try {
+        std::memcpy(relayBytes, g_inject.relay, sizeof(relayBytes));
+        std::memcpy(&callbackLiteral, g_inject.relay + kCallbackLiteral, 8);
+        std::memcpy(trampBytes, reinterpret_cast<const void*>(fwd), sizeof(trampBytes));
+        std::memcpy(stubABytes, g_inject.relay + kStubAOffset, sizeof(stubABytes));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    char hex1[192]{}, hex2[96]{}, hex3[96]{};
+    for (int i = 0; i < 46; ++i) std::snprintf(hex1 + i * 3, sizeof(hex1) - i * 3, "%02X ", relayBytes[i]);
+    for (int i = 0; i < 16; ++i) std::snprintf(hex2 + i * 3, sizeof(hex2) - i * 3, "%02X ", trampBytes[i]);
+    for (int i = 0; i < 16; ++i) std::snprintf(hex3 + i * 3, sizeof(hex3) - i * 3, "%02X ", stubABytes[i]);
+    Log::get().note("flat camera inject: relay[0..45]=%s| stubA=%p trampoline=%p tramp[0..15]=%s stubA[0..15]=%s",
+                    hex1, reinterpret_cast<void*>(callbackLiteral), reinterpret_cast<void*>(fwd), hex2, hex3);
 }
 
 } // namespace
@@ -601,80 +755,8 @@ void flatCameraInjectFrame(uint64_t frame, bool temporalModeEnabled) {
     }
     if (!g_inject.installed.load(std::memory_order_acquire)) {
         if (g_inject.relay) return; // a failed install is final for the session
-        const HMODULE game = GetModuleHandleW(L"EliteDangerous64.exe");
-        if (!game) {
-            if (!g_inject.failReason[0] || std::strcmp(g_inject.failReason, "not attempted") == 0) {
-                g_inject.failReason = "EliteDangerous64.exe is not loaded in this process";
-                Log::get().note("flat camera inject: wanted but %s; standing down", g_inject.failReason);
-            }
-            return;
-        }
-        const uintptr_t base = reinterpret_cast<uintptr_t>(game);
-        g_inject.gameBase = base; // before the hook exists: the detour reads it
-        if (!sehCheck(base + kRefreshRva, kRefreshPrologue, sizeof(kRefreshPrologue))) {
-            g_inject.failReason = "refresh prologue mismatch at this build (not the Ghidra-verified shape)";
-            Log::get().note("flat camera inject: %s; standing down", g_inject.failReason);
-            g_inject.relay = reinterpret_cast<uint8_t*>(1); // do not retry
-            return;
-        }
-        g_inject.relay = allocateRelay(base + kRefreshRva);
-        if (!g_inject.relay) { g_inject.failReason = "relay allocation failed (no free memory within 2 GB)"; return; }
-        // TLS placement for stubB's walk: _tls_index is process-constant
-        // after CRT init, and the struct's offset from this thread's TLS
-        // base is the same on every thread.
-        const auto tlsArray = reinterpret_cast<const uintptr_t*>(__readgsqword(0x58));
-        const uintptr_t tlsBase = tlsArray ? tlsArray[_tls_index] : 0;
-        const uintptr_t tlsStruct = reinterpret_cast<uintptr_t>(&g_refreshTls);
-        if (!tlsBase || tlsStruct < tlsBase || tlsStruct - tlsBase > 0xFFFFFFFFull ||
-            _tls_index == 0) {
-            static char tlsDetail[160];
-            std::snprintf(tlsDetail, sizeof(tlsDetail),
-                "the thread-local the return stub needs is outside its reach "
-                "(tlsBase=%p tlsStruct=%p tlsIndex=%u)",
-                reinterpret_cast<void*>(tlsBase), reinterpret_cast<void*>(tlsStruct), _tls_index);
-            g_inject.failReason = tlsDetail;
-            Log::get().note("flat camera inject: %s; standing down", g_inject.failReason);
-            VirtualFree(g_inject.relay, 0, MEM_RELEASE);
-            g_inject.relay = reinterpret_cast<uint8_t*>(1);
-            return;
-        }
-        g_stubB = reinterpret_cast<uintptr_t>(g_inject.relay) + kStubBOffset;
-        buildRelay(g_inject.relay, &g_gate, g_inject.relay + kStubAOffset);
-        g_stubATrampOfs = buildStubA(g_inject.relay + kStubAOffset, &refreshPre,
-                                     &g_lastIncomingR11);
-        buildStubB(g_inject.relay + kStubBOffset, &refreshPost, _tls_index,
-                   static_cast<uint32_t>(tlsStruct - tlsBase));
-        if (!g_inject.hook.install(reinterpret_cast<void*>(base + kRefreshRva), g_inject.relay, nullptr,
-                                   "camera-inject-refresh", &prepareRelay, &g_inject)) {
-            VirtualFree(g_inject.relay, 0, MEM_RELEASE); g_inject.relay = reinterpret_cast<uint8_t*>(1);
-            g_inject.failReason = "CodeHook refused it (its own line above names why)";
-            Log::get().note("flat camera inject: %s; standing down", g_inject.failReason);
-            return;
-        }
-        g_inject.installed.store(true, std::memory_order_release);
-        g_gate.store(g_inject.paused.load(std::memory_order_acquire) ? 0 : 1, std::memory_order_release);
-        Log::get().note("flat camera inject: refresh hook installed at EliteDangerous64.exe+0x%llX; "
-                        "kind-3 cameras now get the temporal phase applied transiently at the source",
-                        static_cast<unsigned long long>(kRefreshRva));
-        // Readback verification: the relay stub, its callback literal, the
-        // trampoline's and stubA's first bytes, so a later crash can be
-        // compared against what was actually built.
-        uint8_t relayBytes[46] = {};
-        uint64_t callbackLiteral = 0, fwd = g_refreshForward.load(std::memory_order_relaxed);
-        uint8_t trampBytes[16] = {};
-        uint8_t stubABytes[16] = {};
-        __try {
-            std::memcpy(relayBytes, g_inject.relay, sizeof(relayBytes));
-            std::memcpy(&callbackLiteral, g_inject.relay + kCallbackLiteral, 8);
-            std::memcpy(trampBytes, reinterpret_cast<const void*>(fwd), sizeof(trampBytes));
-            std::memcpy(stubABytes, g_inject.relay + kStubAOffset, sizeof(stubABytes));
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
-        char hex1[192]{}, hex2[96]{}, hex3[96]{};
-        for (int i = 0; i < 46; ++i) std::snprintf(hex1 + i * 3, sizeof(hex1) - i * 3, "%02X ", relayBytes[i]);
-        for (int i = 0; i < 16; ++i) std::snprintf(hex2 + i * 3, sizeof(hex2) - i * 3, "%02X ", trampBytes[i]);
-        for (int i = 0; i < 16; ++i) std::snprintf(hex3 + i * 3, sizeof(hex3) - i * 3, "%02X ", stubABytes[i]);
-        Log::get().note("flat camera inject: relay[0..45]=%s| stubA=%p trampoline=%p tramp[0..15]=%s stubA[0..15]=%s",
-                        hex1, reinterpret_cast<void*>(callbackLiteral), reinterpret_cast<void*>(fwd), hex2, hex3);
+        installRefreshHook(false);
+        if (!g_inject.installed.load(std::memory_order_acquire)) return;
     }
     const uint64_t now = GetTickCount64();
     if (now - g_inject.lastLogMs >= 5000) {
@@ -745,6 +827,32 @@ void flatCameraInjectFrame(uint64_t frame, bool temporalModeEnabled) {
                 g_inject.lastRay[0], g_inject.lastRay[1], g_inject.lastRay[2], g_inject.lastRay[3]);
         }
     }
+}
+
+// ---- the observe-only mode (flat_camera_inject.h; the VR camera census drives it) ------------------------------
+void flatCameraInjectSetObserver(const FlatCameraObserver* observer) {
+    g_observer.store(observer, std::memory_order_release);
+}
+
+bool flatCameraInjectObserveFrame() {
+    // Before any install: the first call the new hook ever sees already observes, and the detour in a VR process can
+    // never leave the mode. The flat profile never reaches this function (its frame step is flatCameraInjectFrame).
+    g_inject.observeOnly.store(true, std::memory_order_release);
+    if (!g_inject.installed.load(std::memory_order_acquire)) {
+        if (g_inject.relay) return false; // a failed install is final for the session
+        installRefreshHook(true);
+        if (!g_inject.installed.load(std::memory_order_acquire)) return false;
+    }
+    if (g_inject.permanentlyDown.load(std::memory_order_acquire)) return false;
+    g_inject.gate.arm(GetTickCount64()); // the window: owner-thread calls inside it are "open", a lapsed one is counted stale
+    return true;
+}
+
+const char* flatCameraInjectObserveStatus() {
+    if (g_inject.permanentlyDown.load(std::memory_order_acquire)) return "down";
+    if (g_inject.installed.load(std::memory_order_acquire)) return "installed";
+    if (g_inject.relay) return "failed";
+    return "pending";
 }
 
 } // namespace edvr

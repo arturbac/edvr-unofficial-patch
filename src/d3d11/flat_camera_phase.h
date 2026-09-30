@@ -205,6 +205,14 @@ private:
 // an armed window on the owner thread under Upstream ownership with a phase to
 // apply is ever mutated; every other call passes through untouched and is
 // counted by the reason it was.
+//
+// THE OBSERVE-ONLY SWITCH (2026-09-30, the VR camera census,
+// src/d3d11/vr_camera_census.cpp): the same detour runs in the VR profile
+// with observeOnly set. A kind-3 camera then answers Observed -- seen, never
+// written -- whatever the window, the ownership and the phase say, so the
+// function CANNOT return Inject while the census drives it (c2_coexist_test
+// C16 walks every input). Observed is the last enumerator so every earlier
+// value keeps its number.
 // ---------------------------------------------------------------------------
 enum class FlatCameraAdmit : uint8_t {
     Inject,      // kind 3, gate open, Upstream owns, phase non-zero
@@ -215,6 +223,7 @@ enum class FlatCameraAdmit : uint8_t {
     Unsupported, // kinds 4 and 5, named and never mutated
     OtherKind,   // any other readable kind (0, 1, 2, ...): passes through
     Unreadable,  // the kind could not be read
+    Observed,    // kind 3 under the observe-only switch: seen by the census, never written
 };
 struct FlatCameraAdmitInput {
     bool readable = false;
@@ -222,12 +231,14 @@ struct FlatCameraAdmitInput {
     FlatCameraGateVerdict gate = FlatCameraGateVerdict::Disarmed;
     bool upstreamOwns = false;
     bool phaseNonzero = false;
+    bool observeOnly = false; // the VR camera census drives: nothing may be injected
 };
 inline FlatCameraAdmit flatCameraAdmit(const FlatCameraAdmitInput& in) {
     if (in.gate == FlatCameraGateVerdict::OffThread) return FlatCameraAdmit::OffThread;
     if (!in.readable) return FlatCameraAdmit::Unreadable;
     if (in.kind == 4 || in.kind == 5) return FlatCameraAdmit::Unsupported;
     if (in.kind != 3) return FlatCameraAdmit::OtherKind;
+    if (in.observeOnly) return FlatCameraAdmit::Observed;
     if (in.gate != FlatCameraGateVerdict::Admit) return FlatCameraAdmit::GateClosed;
     if (!in.upstreamOwns) return FlatCameraAdmit::NotUpstream;
     if (!in.phaseNonzero) return FlatCameraAdmit::Warming;
@@ -243,6 +254,7 @@ inline const char* flatCameraAdmitName(FlatCameraAdmit a) {
         case FlatCameraAdmit::Unsupported: return "unsupported";
         case FlatCameraAdmit::OtherKind: return "other-kind";
         case FlatCameraAdmit::Unreadable: return "unreadable";
+        case FlatCameraAdmit::Observed: return "observed";
     }
     return "?";
 }
@@ -304,7 +316,8 @@ private:
     uint64_t evicted_ = 0;
 };
 // Which calls may flush: kind 3 (so a memory address that now holds something
-// else is never written), on the owner thread, not injected this call.
+// else is never written), on the owner thread, not injected this call. Observed
+// is NOT eligible: the observe-only detour writes no dirty bit, ever.
 inline bool flatCameraFlushEligible(FlatCameraAdmit a) {
     return a == FlatCameraAdmit::Warming || a == FlatCameraAdmit::NotUpstream ||
            a == FlatCameraAdmit::GateClosed;
