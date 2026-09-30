@@ -48,8 +48,8 @@
   observation on `d9f86b09` belongs to the main/openxr-perf-gaps line.
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
-- **Field reports (79-80):** two rc.4 users refused every frame (AA, bloom, DoF);
-  a third treated at 7-13 fps. 80 flown: on foot EDVR ~3 ms/frame; cut it.
+- **Field reports (79-80):** users 1-2 refused every frame, 3 treated at 7-13
+  fps, 4 (AMD, ReShade CONFIRMED) lost ~23 ms. 80: cuts built, NOT flown.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -4916,3 +4916,118 @@ fullscreen: DLSS 7.0-7.3 ms, AA off about 3.0 ms (331-351 fps).
   the census must be sampled before a release. User 3's roughly 50 ms a
   frame is still unexplained by it (RTSS, or their system); next are user 3's
   RTSS-off test and a census build on their machine.
+
+**2026-09-30 note: the CPU cuts, and a fourth field record (branch
+`claude/flat-cpu-cuts`, cut from main `fef6d55a`; built and rig-tested, NOT
+flown).** Flight 053745's census priced the flat path's CPU work at about
+3 ms a frame on Sean's rig: the draw wrapper's 13,549 D3D calls a frame, the
+camera-row lookup's 0.44 ms over about 5,000 calls, and the clocks' own 1.7
+ms. Sean approved five pieces; each is its own commit.
+
+- **A, the census is sampled** (`b1ecc903`). The render thread is clocked on
+  one frame in 16, exactly one in each block of 16 at a random place, and
+  the other threads' one-in-32 sampled frames are always among them. The line
+  says "render thread clocked on K of N frames, one in 16" and its per-frame
+  figures divide by K; present p50 and p95 still come from every frame, the
+  GPU timestamps are unchanged, and the self-cost line prices the sampled
+  clocks. A rig compares a sampled window with a fully clocked one on the same
+  workload.
+- **B, the camera-row lookup is kept** (`513bb41a`, `flat_camera_table.h`).
+  The draw's answer (rows, hash, epoch, sequence) is kept until the b1
+  identity, its binding generation, the frame or the table changes, and every
+  table mutation (claim, invalidate, map, unmap, capture, invalidate-all,
+  frame, clear) bumps the table's generation. The record the draw fills is
+  byte-identical to the fresh lookup's (a rig replays random scripts of
+  writes, rebinds and captures against the old algorithm); the search is
+  timed only when it is made afresh.
+- **C, engine motion's substitution stays bound across producer draws**
+  (`13b1b8ee`, `flat_substitution.h`). The wrapper read the game's eight
+  targets, bound MRT6, the derived blend and the patched pixel shader, drew,
+  and restored all of it around EVERY producer draw: eleven context calls a
+  draw at least, and a cache reset that sent the next draw through the slow
+  half. Now the state stays bound, as VR's always has, and the game's is put
+  back once, before anything that could observe or depend on it: any hooked
+  draw that is not a substituted producer draw, dispatch, clear, copy,
+  resolve, command list, an OMSetRenderTargetsAndUnorderedAccessViews that
+  keeps the targets, and the Present flush; ClearState and a resize forget
+  without touching a context that may be gone. A game setter of the same
+  state needs no event (the shadow's generations say so). What it cannot see
+  is a game Get*: none is hooked, so a Get between two producer draws reads
+  EDVR's state, exactly as it can under VR; every other hooked call restores
+  first instead. A diagnostic capture, or the overlay guard's private t3,
+  restores after each draw as before. Rig, on WARP with the context's methods
+  counted on its own vtable: 40 consecutive draws cost 440 calls before and 3
+  now (99% fewer; 43 with the game changing its pixel shader before each);
+  every game call sees exactly the game's state and every producer draw
+  EDVR's; each dropped restore, and 16 mutations of the engine side, are
+  caught. VR is not touched.
+- **The query cut** (`515af954`, `flat_query_cut.h`). With the state kept,
+  the questions left were the coverage classification's (the depth view, and
+  the actual shaders of draws whose projection needs no patch) and the
+  wrapper's per run (the game's targets, blend state and the runtime's
+  acceptance of MRT6). Each is now answered from what the runtime already
+  tracks (the shadow's depth resource and shader hashes; the blend state and
+  the saved target set kept under the generations of the game's bindings; the
+  read-back once per binding), and one frame in 64 puts up to four questions
+  per state to the context as well and compares. A disagreement is counted,
+  that state asks the context for the rest of the session, and one log line
+  names it; the flat CPU line reports answers a frame, checks and wrong per
+  state. Not cut: qualifyProjection's shader, viewport and constant-buffer
+  reads run only for an F10 audit or the legacy route (it returns first under
+  Upstream ownership), and those two still put the game's state back first;
+  the eight-target read stays once per binding (a restore needs views it
+  owns; a shadow pointer can dangle after an unhooked unbind); the UAV check
+  stays a read per run. Rig: 40 runs of one draw cost 394 calls asking, 276
+  answering (7 a run, not 10); a blend state or target set changed by a real
+  call nothing hooked is found on a checking frame and is NOT seen between
+  checks, which is what one frame in 64 bounds. 27 engine, 15 policy/read/
+  census and 5 wiring mutations are caught.
+- **F8 note** (`a82fac56`, `flat_wrapper_note.h`). When the hook-mode probe
+  finds the context's methods outside Windows' d3d11.dll and the session
+  hooks in place, the panel says, while a temporal mode is selected, "<file>
+  handles every graphics call (likely ReShade): anti-aliasing costs more
+  frame time with it."; the file is the module backing most of the table
+  (`vtableDominantOtherModule`). Never for a live copy (EDHM and 3Dmigoto sit
+  at 96 of 96), never for a forced mode, no new key; one log line at the probe
+  and one when the note is first drawn.
+
+**Fourth field record (user 4).** rc.4, flat, Ryzen 7 9700X, Radeon RX 9070
+XT (AMD: NGX refuses, the chain ran FSR), 5120x1440 exclusive fullscreen at
+144 Hz, Elite's limiter on at 60, SSAA 0.85, DoF on. Frames refused for
+no-known-tone-pass held 55-60 fps; from 14:25:39, treated and jittered,
+20-30 fps, about 23 ms a frame more, on a CPU at least as fast as Sean's.
+
+- ruled out: AMD Fluid Motion Frames 2.1 as the cause, because turning it off
+  left the drop.
+- CONFIRMED: ReShade. The log has `context hook mode: InPlace -- 0 of 96
+  sampled vtable entries are inside Windows' d3d11.dll`, DrawIndexed at
+  `...\dxgi.dll+0xFF790`, and with ReShade disabled the treated frame rate
+  came back. A wrapper makes every one of EDVR's per-frame D3D calls dear and
+  the treated path makes thousands a frame, so for anyone behind a wrapper
+  the NUMBER of calls is the lever, not only their CPU time: C and the query
+  cut are the answer to it, and the F8 note says so on screen.
+- Shared with user 3, untested by Sean: exclusive fullscreen with Elite's
+  limiter at 60 (Sean flew exclusive uncapped, no collapse). Next test:
+  limiter on, exclusive, in the hangar. User 3's context is Windows' own
+  (LiveCopy, 96 of 96), so ReShade does not explain his ~50 ms; the RTSS-off
+  test and a census build on his machine stay next.
+- His EDHM stopped loading because `real_dll` in `edvr-flat.ini` was changed
+  to `d3d11.dll` between two launches by something outside EDVR; EDVR refuses
+  to chain to itself and forwarded to the system d3d11. Proposed, NOT built:
+  fall back to the installer's recorded `chain_target` when `real_dll` names
+  EDVR itself.
+
+**What the next hangar flight should show** (same spot as 053745, DLSS or
+DLAA; read the build line first): the flat CPU line says "clocked on K of N
+frames, one in 16" and prices the clocks near 0.1 ms a frame (was 1.7);
+`camera rows` near zero (fresh lookups only: the writes and rebinds, about a
+hundred a frame, not about 5,000); `engine motion wrapper D3D calls` a frame
+far below 13,549 (the new `engine motion: flat draw bracket` line says the
+runs, the draws that found the state still bound, why the game's state went
+back and calls per substituted draw); the `query shortcuts` token reads
+about a thousand answers a frame for the coverage depth view, a handful
+checked per 64 frames and 0 wrong, and no `flat query shortcut:` line (a
+state that asks again is a finding: a setter path nothing hooks). Everything
+else unchanged: present p50, treated counts and streaks, the contract reasons,
+motion. With ReShade in the chain the panel shows the note and the log says
+`flat wrapper note: shown`; with EDHM alone, neither.
