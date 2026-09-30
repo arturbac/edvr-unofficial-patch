@@ -470,6 +470,9 @@ def print_vh_tally(text, frame):
 CENSUS_LINE_RE = re.compile(
     r"^(?P<ts>\[[\d:.]+\])?\s*vr camera census(?P<five> 5s)?: (?P<rest>.*?)\s*$")
 CENSUS_JOIN_TOL = 1e-5
+# Two shift-sign candidates whose residuals differ by less than this are a tie: rows are floats, so rounding alone moves a
+# measure by about 1e-7, and with a shift of nothing (the jitter off) every candidate is the same number.
+CENSUS_FIT_TIE = 2e-7
 CENSUS_WORLD_ASPECT = 5040.0 / 2835.0
 CENSUS_RUNS_SHOWN = 24    # a frame with more runs shows its first and last half of this, and says how many it left out
 CENSUS_FIXTURE = "camera_census_fixture.log"
@@ -930,7 +933,12 @@ def print_camera_census(text):
                   % (g["seq"], _cg(tuple(g["frustum"]) if g["frustum"] else None), _cg(g["shift"]),
                      _cg(g["expect"]), _cg(g["expect_shifted"]), _cg(g["leak"])))
             fit = census_shift_fit(e["meas"], g["frustum"], g["shift"]) if g["frustum"] and g["shift"] else None
-            if fit:
+            if fit and fit[3] is not None and fit[3] - fit[1] < CENSUS_FIT_TIE:
+                # No winner to name: sorting a tie would pick a label by its spelling.
+                print("    the rows cannot tell which way the shift is carried: every candidate leaves about %.2e NDC "
+                      "(the advertised shift, %s, is too small to separate them from rounding)"
+                      % (fit[1], _cg(g["shift"])))
+            elif fit:
                 print("    the rows measure as %s (residual %.2e NDC; next best: %s, %.2e)"
                       % (fit[0], fit[1], fit[2], fit[3]))
         else:
@@ -940,8 +948,8 @@ def print_camera_census(text):
     if leaks:
         print("leak measure over %d eye draw(s): largest |leak| = %.3e NDC (no world phase is injected in this census, "
               "so this is the baseline a leak detector must clear; a world phase of half a pixel at 5040 wide is 2e-4; "
-              "`leak` assumes the game builds its eye camera from the frustum moved by +shift, which the "
-              "`the rows measure as` line above checks)"
+              "`leak` assumes the game builds its eye camera from the frustum moved by +shift, which the fit "
+              "line above checks: `the rows measure as`, or `cannot tell` when the shift is too small)"
               % (len(leaks), max(leaks)))
 
     print("\n== the offline join (B): eye rows against the rows of every logged call, tolerance %g ==" % CENSUS_JOIN_TOL)
@@ -2597,6 +2605,12 @@ def self_test_camera_census():
     _, out = report(failed)
     if "eye 1 frame 6 draw 8220: no rows were read (map)" not in out or "(B) content join: 5 of 8" not in out:
         fail("a failed readback was joined or not named:\n%s" % out)
+    # A shift of nothing (the jitter off): every sign candidate is the same number, so no sign is named. (Found on the
+    # glue rig's first real log: a tie was sorted by the candidates' spelling and named +shift.x, +shift.y.)
+    zero = mutate(text, "eye-geometry ", lambda line: re.sub(r" shift=\([^)]*\)", " shift=(0,0)", line))
+    _, out = report(zero)
+    if "the rows cannot tell which way the shift is carried" not in out or "\n    the rows measure as " in out:
+        fail("a zero shift named a sign, or did not say it could not:\n%s" % out)
 
     # ---- the pieces ----
     rows = [{"n": i + 1, "kind": k, "caller": cl, "tone": t} for i, (k, cl, t) in enumerate(
