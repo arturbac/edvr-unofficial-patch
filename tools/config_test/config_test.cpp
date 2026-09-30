@@ -1616,8 +1616,8 @@ int main(int argc, char** argv) {
         ok("flat jitter preserves explicit off");
     else fail("flat jitter override", "explicit off was not read");
     // The HDR route's flight key (design doc section 81): the flat runtime reads it through getString with an "off"
-    // default. Unlisted in runtimeProfileAllowsKey it would read empty here whatever the file says, and empty is
-    // off -- a flight that set auto would run the copy route with nothing in the log to say the key was refused.
+    // default. Unlisted in runtimeProfileAllowsKey it would read off here whatever the file says -- a flight that
+    // set auto would run the copy route with nothing in the log to say the key was refused.
     Config::get().set("experimental.temporal_aa_before_post", "auto");
     expectStr("experimental.temporal_aa_before_post", "auto", "flat scope permits the HDR route's flight key");
     Config::get().set("experimental.temporal_aa_before_post", "off");
@@ -1672,7 +1672,7 @@ int main(int argc, char** argv) {
         ok("invalid profile suppresses flat jitter");
     else fail("invalid profile jitter", "flat key widened invalid scope");
     Config::get().set("experimental.temporal_aa_before_post", "auto");
-    expectStr("experimental.temporal_aa_before_post", "", "invalid profile cannot turn the HDR route on");
+    expectStr("experimental.temporal_aa_before_post", "off", "invalid profile cannot turn the HDR route on");
     g_runtimeProfile = RuntimeProfile::LegacyVr;
     expectBool("fix.black_void", true, "legacy profile retains original behavior");
     if (Config::get().getString("experimental.temporal_aa_jitter", "on") == "off")
