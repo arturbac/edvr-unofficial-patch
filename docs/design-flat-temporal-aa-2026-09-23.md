@@ -48,8 +48,8 @@
   observation on `d9f86b09` belongs to the main/openxr-perf-gaps line.
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
-- **Field reports (79-81):** users 1-2 refused every frame, 3 treated at 7-13
-  fps, 4 lost ~23 ms (ReShade). 80 flown, +3.0 ms. 81: HDR route DESIGNED.
+- **Field reports (79-82):** users 1-2 refused every frame, 3 treated at 7-13
+  fps, 4 lost ~23 ms (ReShade). 80 flown, 81 HDR key off, 82 VR foot -1.8 ms
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -5165,12 +5165,12 @@ every treated frame (the jitter: b092, b775, 9ff2 star; 6b9c, fa3c, de8d
 hangar) and is shared by every H draw. The UI draws (1 in the star, 8-9 in the
 hangar) use one camera that never changes (hangar 05ec in BOTH sessions,
 jitter on and off): not jittered. The late draws use the jittered camera (CB1).
-By vertex signature: packed-vertex meshes (2CECEC30 x15; 81216C77 x11 with a
-16 KB lit pixel shader: cockpit glass and HUD panels, inferred), particle
-emitters (1B285CBC: atlas and align-blend inputs), a lighting-volume mesh
-(5559BD94) and, in the hangar, one instanced glow sprite (94D5C556). They lie
-inside the resolved image, so nothing drawn after the anchor needs an
-un-jittered camera.
+By vertex signature: packed-vertex meshes (2CECEC30 x15; 81216C77 x11, the
+cockpit holo family, `kHolo` in eye_draw_snapshot.h, with a 16 KB lit pixel
+shader), particle emitters (1B285CBC: atlas and align-blend inputs), a
+lighting-volume mesh (5559BD94) and, in the hangar, one instanced glow sprite
+(94D5C556). They lie inside the resolved image, so nothing drawn after the
+anchor needs an un-jittered camera.
 
 **5. Copy-back.** H is R11G11B10F at R = D, the same resource every frame. No
 game history pass is visible (the trace records no reads; v4 settles it);
@@ -5186,11 +5186,13 @@ requantises to the game's own precision; history stays fp16 in the backend.
 
 **Design.**
 
-- Gate: HDR route iff a temporal mode is selected, R >= D, the route's E = R
-  (every mode at R = D; DLSS, DLAA, FSR above; EDVR TAA evaluates at D above D
-  so it stays on the copy route) and H is R11G11B10F, as the selector requires
-  today (another format declines with a named reason). Else the copy route as
-  today; so does a frame with no H (2D menus, loading).
+- Gate: HDR route iff `experimental.temporal_aa_before_post` is auto (off
+  until flown, then the default), a temporal mode is selected, R >= D, the
+  route's E = R (every mode at R = D; DLSS, DLAA, FSR above; EDVR TAA
+  evaluates at D above D so it stays on the copy route) and H is R11G11B10F,
+  as the selector requires today (another format declines with a named
+  reason). Else the copy route as today; so does a frame with no H (2D
+  menus, loading).
 - Recognition: a sibling of `flatSelectMonoFrame` over the records so far (H,
   one depth, one camera hash, sources) WITHOUT the tone and copy requirements,
   run at the trigger. No trigger by frame end: chain-shape refusal
@@ -5244,10 +5246,11 @@ route (same prep, backend, finish); read `GPU resolve`. (5) R < D (upscaling;
 known chains (bloom stops sparkling, DoF and tone see the AA'd image).
 
 **Rigs and fixtures.**
-- Add the four traces to `tools\flat_temporal_test\traces` (7.1 MB; the set is
-  29 MB), pin per frame H, its first and last event, the trigger event and
-  pair (table above), 0 H writes after it, and run the rule over every
-  fixture: a trigger in each frame the tone route selects, none in 2D menus.
+- Add the four traces to `tools\flat_temporal_test\traces`, trimmed to the
+  frames the rigs pin (7.1 MB untrimmed; the set is 29 MB), pin per frame H,
+  its first and last event, the trigger event and pair (table above), 0 H
+  writes after it, and run the rule over every fixture: a trigger in each
+  frame the tone route selects, none in 2D menus.
 - A `--trace-chain <file>` mode for flat_temporal_test: the pass-level dump
   behind this section (a scratch program today), so the pins are re-derivable.
 - Mutations: a late H draw after the trigger (counter, latch); a half-size
@@ -5273,15 +5276,18 @@ one trigger per 3D frame, 0 late writes, the pairs above. (2) HDR route on,
 DLSS, the same legs against AA off and the copy route on the off legs. Pass:
 on legs treated with 0 no-known-tone-pass, cost within 0.3 ms of the copy
 route; judge sun and light edges, bloom sparkle, DoF edges. (3) FSR, EDVR TAA,
-game FXAA on, ReShade chained; then decide the default.
+game FXAA on, ReShade chained; then the default flips to auto.
 
-**Open questions for Sean.** (a) Default: HDR route whenever R >= D even where
-the copy route also treats (changes the look), with a flight-only key
-`experimental.temporal_aa_before_post = auto|off`, or no key? (b)
-AutoExposure first, the game's exposure later? (c) R < D: keep the copy route
-and its whitelist, or study an HDR-space upscale with SRV substitution? (d)
-Game AA on: treat (double AA) or decline with the F8 line? (e) 7.1 MB of new
-fixtures in the repo?
+**Decisions (Sean, 2026-09-30).**
+- (a) The HDR route ships behind a flight key,
+  `experimental.temporal_aa_before_post = off|auto`, default OFF until flown;
+  then the default becomes auto (on where R >= D and H is R11G11B10F).
+- (b) DLSS starts with AutoExposure; the game's own exposure is taken later
+  only if highlights look wrong.
+- (c) Upscaling (R < D) keeps the copy route and its whitelist for now.
+- (d) With the game's AA on, treat the frame anyway (softer) and keep the F8
+  advice to turn the game's AA off.
+- (e) The trace fixtures go in the repo, trimmed to the frames the rigs pin.
 
 - ruled out: user 2's 20F383BB/5AA08A96 and /2375CCCC as bloom's passes,
   because they are an alpha-1 copy and an FXAA-shaped filter, absent from
@@ -5298,3 +5304,167 @@ fixtures in the repo?
 - ruled out: CopyResource for the copy-back, because the backend writes fp16.
 - ruled out: DoF as the cause of the star's refusals, because DoF 2 drew no
   DoF pass there; the bloom variant's tone pixel shader alone refused it.
+
+## 82. VR on foot: resolve the world once instead of two eye passes (analysis, 2026-09-30)
+
+Sean asked whether the flat single-image route would be more performant than
+today's on-foot VR path. Analysis only: no code, no build, no flight. The
+proposal: resolve the world texture once, with the flat resolver, before the
+screen composite reads it; jitter the world camera through the flat camera
+path and stop jittering the eyes on foot; put the resolved screen into the UI
+layer as a crisp opaque quad with mips; switch at the world-screen gate.
+Evidence: `edvr_gfx_20260930_100723.log` (Frontier, build c96b91f1 matched,
+Pimax OpenXR, 90 Hz, game eye 2620x2533, output 4032x3898) and the code.
+
+**The census tail is cut.** Both NumLock censuses (10:12:16.744, 10:12:34.259;
+`census_offscreen` on, `census_frames` 2) hit the 16,384-line cap inside frame
+0: all 16,384 lines are frame 0's (16,325 draws, 43 clears, 2 copies, 14
+dispatches); frame 1 and the two eye draws are counted (`draws=4`), not logged.
+Frame 0 alone held 21,919 offscreen draws, 151 copies, 106 dispatches, 133
+clears. The logged 73% is 22 GUI-family draws (9307x8014, 8111x4871), 4,577
+depth-only draws into a 512x512 depth and 11,726 into a 6144x4096 R16 shadow
+atlas (six 2048x2048 tiles); it ends at q=16383 inside a tile. The world's own
+draws (4.9k a frame into the 5040x2835 depth), its post chain, the copy into
+the screen texture and the eye composite all follow and are absent. Question
+1 is unanswered by this capture; the rest rests on the log and the code.
+
+Retake, no code. The cap is per census and already at its ceiling
+(`kMaxLinesCeiling` 16384, draw_census.cpp), so `census_frames=1` alone does
+not help, and the `census_skip*` keys do not either (they swallow game draws
+after the census has recorded them). (a) Cut the shadow load first: Elite's
+Shadow Quality (fxcfg `DirectionalShadowQuality` and `SpotShadowQuality`, both
+4 now) to 0 or 1, or stand where little casts, then `census_offscreen=1`,
+`census_frames=1`. The tail is whole when the `DC end` line reads `lines=`
+under 16384 (draws + copies + dispatches + clears under that). (b) The cheap
+half: `census_offscreen=0`, `census_frames=3`, default lines: the two eye draws
+with bindings, 151 copies and 106 dispatches a frame, enough for the screen
+texture's size and format and any CopySubresource into it, not the tone or
+copy draws. A five-line census change (skip draws with no colour target when a
+key is set) is the fallback.
+
+**Established without it.**
+- The world is drawn once, flat, into the 2D screen's target and shown by one
+  composite draw an eye (ui_layer_math.h, flight 09-23; `draws=2` a frame).
+  Here it is 5040x2835: `fix.vscreen_res_width` auto is 125% of the 4032 eye
+  width, EDVR patching the game's own 1920x1080 in memory (6 sites). Depth
+  R32G8X24_TYPELESS at that size (520-4,911 draws a frame; a second one of the
+  same size takes 4, likely the HUD panel's), MRT6 slot target R32G32 (114 MB).
+- The composite: VS 5C36AF05 (position x SIZE, cb0 world, cb1[270..273] clip),
+  PS CFE84157 (bytecode, 360 B): one sample of t0, times cb1[90].y, alpha 1.
+  t0 is the 5040x2835 screen texture (vscreen tells the composite by SRV0's
+  panel size). Opaque, one texture, no depth.
+- On foot the gate holds (2529 of 2529 frames) and the layer takes nothing (0
+  redirected draws): the screen stays in the game's frame, and DLSS (quality,
+  preset K, 2620x2533 to 4032x3898) treats both eyes, whose frusta EDVR
+  shifts every frame (`native_temporal.cpp`; 26,735 jitter frames).
+
+**Answers.**
+1. Chain shape: not observed. Likely the flat renderer's (H f26 and depth f19,
+   then tone, copy, HUD panel with its own depth) ending in the screen texture
+   instead of the back buffer; unconfirmed: the tone pair, whether the copy is
+   a draw, the texture's format. The selector pins the copy to the swap
+   chain's back buffer, so the copy route cannot recognise it as written; the
+   HDR route (section 81) needs no output. The eye draw: above.
+2. Camera: the game's first-person flat camera, not head-tracked; each frame
+   named as b1 of the first non-weapon pool draw into the screen-sized depth
+   that took the most pool draws last frame (`screenMotionSource`; 2530 of
+   2530 namings by that depth). The weapon has its own (near 0.0675 against
+   0.025, section 57). EDVR does not jitter it: the only VR jitter is the eye
+   frustum shift above; the flat injector and the legacy projection patch are
+   flat-profile only (`flatCameraPathWanted(runtimeFlatProfile(), ...)`);
+   engine motion reads the world's rows unshifted. Eye jitter therefore only
+   resamples a finished texture: the world image never gains sub-pixel
+   information, and edges aliased in it stay so when static (expected; a
+   flight judges it). The C3 injector could jitter it: same producer (the
+   view-constant refresh FUN_1405921f0; its composer runs about 30 times a
+   frame). But it is flat-gated, its ownership machine knows one main group,
+   and the eye views presumably pass the same refresh, taking the world's
+   phase on top of EDVR's shift unless excluded by camera identity (open in
+   the camera doc). Engine motion's source rows would then carry the phase and
+   need it subtracted, as the flat path does (`rowsJitter`).
+3. HUD: into the world texture after the world (ui_layer_math.h: "the helmet
+   HUD, drawn into the same texture"; log: "screen UI: original late GUI
+   draws supply alpha coverage at 5040x2835"). The eyes get only the
+   composite. In flat mode the HUD follows the copy on the unjittered UI
+   camera; if it does here too, it stays crisp and unresolved under the HDR
+   route (the retake confirms).
+4. Weapon motion belongs to the world image. Per first-person draw of the
+   source pass it rebuilds motion from the original animated vertices into a
+   5040x2835 map, chosen by the first-person stencil; screen motion then maps
+   it to eye pixels. Fold-in: the map and stencil become two inputs of the
+   resolver's `prep`, replacing the eye mapping. Without it the flat weapon
+   fallback applies (weapon pixels fail depth ownership and take the current
+   colour: no smear, possible crawl), likely below today's weapon.
+
+**Cost** (ms a frame, EDVR GPU census; game 5.8-8.1 ms; GPU p50 10.6-13.3 ms
+against an 11.1 ms period, CPU p50 2.5-5 ms: GPU-bound).
+
+| item | 10:11:54 (84 fps) | 10:12:24 (74 fps) | single image |
+|---|---|---|---|
+| upscaler, two eyes | 2.93 | 2.87 | 0 |
+| motion prep, UI resolve | 0.28, 0.40 | 0.36, 0.40 | 0 |
+| screen motion (18-19 commands) | 0.24 | 0.25 | 0 |
+| sharpen | 0.25 | 0.24 | 0.25 at the layer |
+| weapon motion (118-290 commands) | 0.57 | 0.94 | 0.57-0.94 |
+| engine velocity | 0.07 | 0.07 | 0.07 |
+| world resolve, 14.3 MP (prep, DLAA, finish) | - | - | 1.4-1.8 |
+| screen into the layer, two eyes; mips | - | - | 0.35-0.55 |
+| EDVR total | 4.78 | 5.15 | 2.6-3.6 |
+
+Saving 1.5-2.1 ms (about 1.8), 11-18% of the frame; GPU p50 10.6 becomes about
+8.5-9.1 and 13.2 about 11.1-11.7. The pool-family draws' own 0.6-0.9 ms stays.
+The resolve line is a fit to two measurements: flat DLAA `GPU resolve` p50 is
+0.41 ms at 1920x1080 (flight 090706) and 0.98 ms at 3840x2160 (sessions
+091933 and 092433, RTX 5090, preset K), a line of 0.22 ms + 0.092 ms per MP:
+1.5 ms at 14.3 MP. The eye DLSS runs at 0.093 ms per output MP: about the
+same slope.
+The layer and mips lines are estimates from traffic (63 MB written and 57 MB
+read an eye, 76 MB of mips).
+
+**Sketch.**
+- Resolve: the HDR route (section 81; unbuilt, key off until flown). R = D
+  here by construction (the game draws the world into the screen-sized
+  target), so decision (c)'s R < D exclusion does not bind. Run it from the VR
+  draw path as a small world adapter around `flatMonoResolve`, which is
+  profile-agnostic, not the flat runtime: the draw hooks split at
+  `runtimeFlatProfile()` (vscreen.cpp), so the flat draw scope and VR's engine
+  velocity, weapon and layer paths exclude each other today. The inputs
+  exist: the source depth and camera (`screenMotionSource`),
+  `engineVelocitySourceViews` (the flat runtime's own call), H by its colour
+  target and the first full-scale consumer. Output target: H itself; the
+  game's chain then makes the screen texture.
+- Jitter: the injector on the source group only; the `native_temporal.cpp`
+  shift off while the route is active (the layer's jitter cancel follows to 0).
+- Layer: at `uiLayerDecide`'s `kWorldScreen`, redirect the screen draw once
+  the world route has treated N frames: the game's own shader, opaque,
+  4032x3898 an eye, t0 a mipped copy of the screen texture (`GenerateMips`,
+  about 0.1 ms) so a 5040-to-~3500 minification does not alias; RCAS at the
+  composite. The door has to run layer-only on foot (no DLSS, motion prep or
+  UI resolve); whether it has such a mode is unchecked.
+- Gate: leave to the eye route on a refusal streak (eye history reset); a 3D
+  map, or any frame without an H, stays on the eye route. A separate DLSS
+  feature slot for the world (a creation costs 30-45 ms once, per the log).
+- Lever beyond the saving: 5040 wide compensates for a world with no AA of its
+  own. With a resolve it can come down: 3840 wide is 8.3 MP, 0.98 ms to
+  resolve (measured) and up to 40% off the game's pixel-bound world render
+  (HUD text sharpness trades; unmeasured).
+
+**Risks and open questions.** (1) The VR path has never hosted this: CPU at
+21.8k draws a frame (16.8k are shadows) needs the adapter to skip draws by
+their depth target; flat measured about 2.5 ms of EDVR CPU at 1.6k substituted
+draws. (2) The injector's eye exclusion, and the weapon's second camera (same
+phase group, compatible offsets). (3) Weapon fold-in or the flat fallback for
+the first flight? (4) The retake decides the chain, the format (sRGB mips) and
+whether the copy is a draw. (5) Flapping at the gate, boarding and disembark
+resets, the transition-flash fix (jumps reset the resolve's history). (6)
+Sean: keep `vscreen_res_width` at 125% or study a lower width once the world
+has AA? (7) A separate flight key for the VR world route, off by default?
+
+- ruled out: `census_frames=1` as the retake, because the cap counts lines
+  per census and frame 0 alone has 22.3k events against 16,384.
+- ruled out: the copy route as the on-foot world's resolve point, because the
+  selector pins the copy to the swap chain's back buffer and this copy lands
+  in the screen texture; the HDR route has no such term.
+- ruled out: eye jitter as a way to anti-alias the world's own edges, because
+  the world texture is finished before the eyes exist: it can only recover
+  what the texture holds.
