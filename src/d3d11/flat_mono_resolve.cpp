@@ -9,6 +9,8 @@
 #include <limits>
 #include <vector>
 #include "../common/log.h"
+#include "flat_context_isolation.h"
+#include "flat_context_state.h"
 #include "flat_cpu.h"
 #include "flat_hdr_crumbs.h"
 #include "flat_pixel_capture.h"
@@ -53,7 +55,12 @@ struct Image {
 struct State {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext1> context;
+    // The game's state is isolated one of two ways (flat_context_isolation.h), chosen at initialisation: by swapping in this fresh
+    // state object (every device but DXMT's), or by the explicit capture (capture true, no state object made), whose slot ranges
+    // are this device's.
     ComPtr<ID3DDeviceContextState> isolated;
+    bool capture=false;
+    FlatContextRanges ranges;
     ComPtr<ID3D11ComputeShader> prep, taa, finish, spatial;
     ComPtr<ID3D11Buffer> constants;
     ComPtr<ID3D11SamplerState> sampler;
@@ -89,6 +96,15 @@ bool firstPersonBoundLogged=false, firstPersonRefusedLogged=false;
 // Test-only (flatMonoResolveTestPrepBytecode, at the foot of this file): empty, the only state outside tools\flat_mono_resolve_test.
 // Leaked on purpose, like the renderer state: nothing of ours runs from static destruction under the DLL loader lock.
 std::vector<unsigned char>& g_testPrepBytecode=*new std::vector<unsigned char>;
+// advanced.flat_context_isolation (flatMonoResolveSetIsolation): what the next initialisation is asked for; and the renderer's
+// initialisations that said which isolation they chose, in the log, at most kIsolationLogCap a session.
+FlatContextIsolation g_isolationRequest=FlatContextIsolation::Auto;
+uint32_t isolationLogged=0;
+constexpr uint32_t kIsolationLogCap=4;
+// The explicit capture's storage (flat_context_state.h): one block, filled and emptied inside one Isolate at a time. Leaked on
+// purpose, like the renderer state: a process that dies inside an isolation must not release the game's objects from static
+// destruction under the loader lock.
+FlatContextState& g_contextBlock=*new FlatContextState;
 // rowsJitter: the NDC shift the camera rows themselves carry (current xy, previous zw), the shader removes it; all zero
 // when the rows are unjittered, which is every path that does not go through the upstream camera injector.
 // route: x = the HDR route (the input is R11G11B10F radiance, the outputs fp16), y = with x, EDVR's TAA output is final
@@ -97,23 +113,38 @@ std::vector<unsigned char>& g_testPrepBytecode=*new std::vector<unsigned char>;
 // unchanged.
 struct Constants { float camera[6][4], previous[6][4]; uint32_t size[4], flags[4]; float jitter[4], rowsJitter[4]; uint32_t route[4]; };
 static_assert(sizeof(Constants)==272, "HLSL cbuffer layout");
+// The game's pipeline state out of the way for the resolver's own work and its backends', and back on every exit. Two ways
+// (flat_context_isolation.h says which a device gets): the context state swap, which every device but DXMT's has always had and
+// which is unchanged, or the explicit capture (flat_context_state.h) for DXMT, whose SwapDeviceContextState aborts the process.
+// Either way the context is ClearState()d after the game's state is out and before it goes back, so the work starts from the
+// defaults and leaves nothing bound for the game to inherit.
 struct Isolate {
     ID3D11DeviceContext1* context;
     ComPtr<ID3DDeviceContextState> previous;
-    Isolate(ID3D11DeviceContext1* c, ID3DDeviceContextState* state):context(c) {
-        HdrCrumbSpan capture(g_crumbOn,"capture-state");   // the game's pipeline state swapped out, ours cleared
-        context->SwapDeviceContextState(state, previous.GetAddressOf());
+    const bool byCapture;
+    Isolate(ID3D11DeviceContext1* c, ID3DDeviceContextState* state, bool explicitCapture):context(c),byCapture(explicitCapture) {
+        HdrCrumbSpan capture(g_crumbOn,"capture-state","by=%s",byCapture?"capture":"swap");   // the game's pipeline state taken out, ours cleared
+        if(byCapture) {
+            ++stats.isolationCaptures;
+            g_contextBlock.capture(context,g.ranges,hdrCrumbFirstCapture(g_crumbOn));
+        } else {
+            ++stats.isolationSwaps;
+            context->SwapDeviceContextState(state, previous.GetAddressOf());
+        }
         context->ClearState();
         if(g_hdrCall)++stats.hdrCaptured;
     }
     ~Isolate() {
-        HdrCrumbSpan restore(g_crumbOn,"restore-state");   // ours cleared, the game's swapped back
+        HdrCrumbSpan restore(g_crumbOn,"restore-state","by=%s",byCapture?"capture":"swap");   // ours cleared, the game's put back
         // Keep our reusable state free of resource bindings; restoring the game
         // cannot leave our UAVs aliased with its pending output-copy SRV.
         context->ClearState();
-        context->SwapDeviceContextState(previous.Get(), nullptr);
+        if(byCapture)g_contextBlock.restore(context,hdrCrumbFirstRestore(g_crumbOn));
+        else context->SwapDeviceContextState(previous.Get(), nullptr);
         if(g_hdrCall)++stats.hdrRestored;
     }
+    Isolate(const Isolate&)=delete;
+    Isolate& operator=(const Isolate&)=delete;
 };
 bool fail(const char** reason, const char* text) {
     g.history=false;
@@ -225,7 +256,8 @@ bool image(ID3D11Device* device,uint32_t width,uint32_t height,DXGI_FORMAT forma
     return done(true);
 }
 bool initialize(ID3D11Device* device,ID3D11DeviceContext* context,const char** reason) {
-    if(g.device.Get()==device && g.context.Get()==context && g.prep && g.taa && g.finish && g.spatial && g.constants && g.sampler && g.isolated)return true;
+    if(g.device.Get()==device && g.context.Get()==context && g.prep && g.taa && g.finish && g.spatial && g.constants && g.sampler &&
+       (g.capture || g.isolated))return true;
     if(g.device.Get()==device && g.context && g.context.Get()!=context)++stats.contextPointerMismatches;
     ++stats.initializations;
     g=State{};
@@ -234,21 +266,39 @@ bool initialize(ID3D11Device* device,ID3D11DeviceContext* context,const char** r
     ComPtr<ID3D11Device> contextDevice;context->GetDevice(contextDevice.GetAddressOf());
     if(contextDevice.Get()!=device)return fail(reason,"flat-resolve-context-device-mismatch");
     ComPtr<ID3D11Device1> d1;
-    if(FAILED(device->QueryInterface(IID_PPV_ARGS(d1.GetAddressOf()))) ||
-       FAILED(context->QueryInterface(IID_PPV_ARGS(g.context.GetAddressOf()))))
+    if(FAILED(context->QueryInterface(IID_PPV_ARGS(g.context.GetAddressOf()))))
+        return fail(reason,"flat-resolve-requires-context-state-isolation");
+    // Which isolation this device gets, said once in the log with the reason (flat_context_isolation.h): the key's if it forces
+    // one, else the device's, and a device that calls itself DXMT gets the explicit capture, whose swap aborts the process.
+    const FlatDxmtDetection dxmt=flatDetectDxmt(device,context);
+    const FlatContextIsolationChoice choice=flatChooseContextIsolation(g_isolationRequest,dxmt);
+    g.capture=choice.mode==FlatContextIsolation::Capture;
+    g.ranges=flatContextRanges(device->GetFeatureLevel(),dxmt.dxmt());
+    stats.isolation=g.capture?"capture":"swap";
+    if(isolationLogged<kIsolationLogCap) {
+        ++isolationLogged;
+        char line[448];flatFormatContextIsolationLine(choice,dxmt,line,sizeof(line));
+        Log::get().note("%s",line);
+    }
+    if(!g.capture && FAILED(device->QueryInterface(IID_PPV_ARGS(d1.GetAddressOf()))))
         return fail(reason,"flat-resolve-requires-context-state-isolation");
     D3D_FEATURE_LEVEL level=device->GetFeatureLevel(),selected{};
     UINT flags=(device->GetCreationFlags()&D3D11_CREATE_DEVICE_SINGLETHREADED)?D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED:0;
     // The HDR route's crumbs bracket each creation that has never run on a DXMT device (flat_hdr_crumbs.h). E_PENDING in a
     // result is a call that was not reached.
     HRESULT hrState=E_PENDING;
-    {
-        HdrCrumbSpan span(g_crumbOn,"create-context-state","level=0x%X flags=%u",static_cast<unsigned>(level),static_cast<unsigned>(flags));
-        if(level>=D3D_FEATURE_LEVEL_11_0)
-            hrState=d1->CreateDeviceContextState(flags,&level,1,D3D11_SDK_VERSION,__uuidof(ID3D11Device),&selected,g.isolated.GetAddressOf());
-        span.result("hr=0x%08X",static_cast<unsigned>(hrState));
+    if(g.capture) {
+        // The explicit capture makes no state object (DXMT's is a stub); the compute shaders need feature level 11_0 all the same.
+        if(level<D3D_FEATURE_LEVEL_11_0)return fail(reason,"flat-resolve-requires-feature-level-11-0");
+    } else {
+        {
+            HdrCrumbSpan span(g_crumbOn,"create-context-state","level=0x%X flags=%u",static_cast<unsigned>(level),static_cast<unsigned>(flags));
+            if(level>=D3D_FEATURE_LEVEL_11_0)
+                hrState=d1->CreateDeviceContextState(flags,&level,1,D3D11_SDK_VERSION,__uuidof(ID3D11Device),&selected,g.isolated.GetAddressOf());
+            span.result("hr=0x%08X",static_cast<unsigned>(hrState));
+        }
+        if(level<D3D_FEATURE_LEVEL_11_0 || FAILED(hrState))return fail(reason,"flat-resolve-context-state-create-failed");
     }
-    if(level<D3D_FEATURE_LEVEL_11_0 || FAILED(hrState))return fail(reason,"flat-resolve-context-state-create-failed");
     HRESULT hrShader[4]={E_PENDING,E_PENDING,E_PENDING,E_PENDING};
     bool shadersFailed;
     {
@@ -542,6 +592,7 @@ FlatMonoResolvePreflightResult flatMonoResolvePreflight(ID3D11Device* device,
     return result;
 }
 void flatMonoResolveReset() { pixels.cancel();++stats.fullResets;stats.currentContinueRun=0;g=State{}; }
+void flatMonoResolveSetIsolation(FlatContextIsolation request) { g_isolationRequest=request; }
 void flatMonoResolveArmPixels(uint64_t frame) {
     try { pixels.arm(frame); } catch(...) { pixels.cancel(); }
 }
@@ -616,7 +667,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     const bool engine=f.engine.slots && f.engine.pool && f.engine.sceneNow && f.engine.scenePrev;
     if(!reset && !engine)return fail(reason,"flat-resolve-engine-source-views-unavailable");
     // All external backend work is inside the same complete state isolation.
-    Isolate isolated(g.context.Get(),g.isolated.Get());
+    Isolate isolated(g.context.Get(),g.isolated.Get(),g.capture);
     // DLAA and DLSS ask NGX, FSR asks AMD's port; EDVR's own TAA needs no SDK.
     if(f.mode!=FlatMonoResolveMode::Taa && !backendAvailable(f.mode,device,reason)) {++stats.backendFailures;g.history=false;stats.currentContinueRun=0;return false;}
     // The first-person inputs (section 82): validated here, beside the colour and depth views, and bound for the prep kernel
@@ -794,7 +845,7 @@ bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* co
     if(!resources(f,reason))return false;
     if(hdr && !hdrTargetView(color.Get(),reason))return false;
     D3D11_SHADER_RESOURCE_VIEW_DESC colorDesc{};f.color->GetDesc(&colorDesc);
-    Isolate isolated(g.context.Get(),g.isolated.Get());
+    Isolate isolated(g.context.Get(),g.isolated.Get(),g.capture);
     {
         HdrCrumbSpan copyStep(g_crumbOn,"copy-h","fmt=%s(%u) size=%ux%u",hdrCrumbFormat(static_cast<uint32_t>(colorDesc.Format)),
             static_cast<unsigned>(colorDesc.Format),f.renderWidth,f.renderHeight);
@@ -845,4 +896,7 @@ void flatMonoResolveTestPrepBytecode(const void* bytes,size_t size) {
     g_testPrepBytecode.clear();
     if(bytes && size)g_testPrepBytecode.assign(static_cast<const unsigned char*>(bytes),static_cast<const unsigned char*>(bytes)+size);
 }
+// Test-only, likewise: the session's budget of isolation log lines (kIsolationLogCap) starts over, so a rig that has initialised the
+// renderer many times can still read the line an initialisation says.
+void flatMonoResolveTestResetIsolationLog() { isolationLogged=0; }
 } // namespace edvr

@@ -8,6 +8,9 @@ struct ID3D11DeviceContext;
 struct ID3D11ShaderResourceView;
 
 namespace edvr {
+// How the resolver isolates the game's pipeline state (flat_context_isolation.h has the definition): the context state swap, or
+// the explicit state capture a DXMT device gets.
+enum class FlatContextIsolation : uint8_t;
 enum class FlatMonoResolveMode { Taa, Dlaa, Dlss, Fsr };
 // The mode as the logs and the HDR route's breadcrumbs (flat_hdr_crumbs.h) spell it.
 inline const char* flatMonoResolveModeName(FlatMonoResolveMode mode) {
@@ -201,6 +204,11 @@ struct FlatMonoResolveStats {
     // (FlatHdrSteps, flat_hdr_route.h): the game's state swapped out, H copied into the private input, the prep dispatch,
     // the backend's success, the draw into H, the game's state put back. Counted whatever the breadcrumbs are doing.
     uint64_t hdrCaptured = 0, hdrCopied = 0, hdrPrepped = 0, hdrBackend = 0, hdrFinished = 0, hdrRestored = 0;
+    // Which isolation each call used (flat_context_isolation.h): the context state swap, which is every device but DXMT's, or the
+    // explicit state capture (DXMT, or advanced.flat_context_isolation=capture); and the name of the one the renderer was last
+    // initialised for ("swap" or "capture", static text; null before its first initialisation).
+    uint64_t isolationSwaps = 0, isolationCaptures = 0;
+    const char* isolation = nullptr;
     // The first-person inputs (FlatMonoResolveFrame::firstPersonMotion and firstPersonStencil): frames whose prep took them,
     // frames whose pair failed validation (firstPersonRefusal names the last reason, a static string, null until one has),
     // and frames that passed only one of the two (treated as absent, and not a refusal). A frame with neither counts nowhere.
@@ -224,8 +232,10 @@ FlatMonoResolvePreflightResult flatMonoResolvePreflight(
 // Owner immediate context only. Inputs borrowed for this call; successful output
 // is AddRef'd and output-sized (null on the HDR route, FlatMonoResolveFrame::hdr, whose
 // result is written back into the input target). The caller suppresses hook observations
-// throughout this call. D3D11.1 context-state isolation is required and restored on every
-// exit. The caller supplies only jitter that was actually rendered into these inputs.
+// throughout this call. The game's pipeline state is isolated from the call's own work and its
+// backends' and restored on every exit: by ID3D11DeviceContext1::SwapDeviceContextState (which
+// needs D3D11.1) on every device but DXMT's, by the explicit state capture on DXMT's
+// (flatMonoResolveSetIsolation). The caller supplies only jitter that was actually rendered into these inputs.
 bool flatMonoResolve(ID3D11Device*, ID3D11DeviceContext*, const FlatMonoResolveFrame&,
                      ID3D11ShaderResourceView** output, const char** reason);
 // The GPU census's timestamp pair (flat_cpu.h): begin is called just before the resolver's own
@@ -244,6 +254,11 @@ void flatMonoResolveSetSpanHooks(FlatMonoResolveSpanFn begin, FlatMonoResolveSpa
 // device or allocation failure by itself.
 bool flatMonoResolveSpatialFallback(ID3D11Device*, ID3D11DeviceContext*, const FlatMonoResolveFrame&,
                                     ID3D11ShaderResourceView** output, const char** reason);
+// advanced.flat_context_isolation (auto, swap or capture): what the renderer's next initialisation is asked for. Auto, the
+// default, takes the swap everywhere but on a device that calls itself DXMT, where SwapDeviceContextState aborts the process
+// and the explicit capture runs instead. Read once by the flat runtime before its first resolve; flatMonoResolveReset() makes
+// the next call initialise again, which a rig uses to change it.
+void flatMonoResolveSetIsolation(FlatContextIsolation request);
 // Owner thread: release renderer resources/history. Does not shut down shared SDKs.
 void flatMonoResolveReset();
 // Manual F10 diagnostic; owner-thread poll also runs when rendering is refused.

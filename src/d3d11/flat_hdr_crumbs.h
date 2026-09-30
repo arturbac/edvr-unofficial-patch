@@ -29,7 +29,7 @@
 // the third is numbered by reaching. "frame=" in the admitted and reached lines tells them apart. An "end" line
 // carries the result (hr=0x.., ok=..); E_PENDING (0x8000000A) in an hr field means that call was never reached.
 //
-// ONE LINE TELLS THE TRAIL FROM NO TRAIL. "gfx: hdr-treat armed key=auto frames=3 declined=3 cap=128" is written once when
+// ONE LINE TELLS THE TRAIL FROM NO TRAIL. "gfx: hdr-treat armed key=auto frames=3 declined=3 cap=192" is written once when
 // the route is switched on (the key read as auto, at startup or later; three a session at most, outside the budget). A
 // file with no such line came from a build without these crumbs. A file with it and no "admitted" after it is a session
 // that ended before the route took a frame. One with "admitted" and nothing after names the step the route was in.
@@ -45,7 +45,12 @@
 //    create-texture (one per image: role, format, size, hr srv uav), create-rtv]
 //                                              flat_mono_resolve.cpp initialize/initializeHdr/resources/hdrTargetView,
 //                                              the first time (and after a resize), at the preflight or at the resolve
-//   capture-state begin|end                    the game's pipeline state swapped out (Isolate's constructor)
+//   capture-state begin|end by=swap|capture    the game's pipeline state taken out (Isolate's constructor): swapped out, or on DXMT
+//                                              (whose swap aborts the process) read out by the explicit capture
+//     [capture-ia, capture-vs, capture-hs, capture-ds, capture-gs, capture-ps, capture-cs, capture-so, capture-om,
+//      capture-rs, capture-predication  begin|end]
+//                                              the explicit capture's eleven groups (flat_context_state.h), written for the
+//                                              session's first capture only; each end line says what the game had bound
 //   [backend-available begin|end]              the SDK's own initialisation, the first ask only
 //   copy-h begin|end                           the GPU span's timestamps, the constants upload, CopyResource H -> private copy
 //   prep begin|end                             the prep dispatch: bindings, Dispatch, unbind
@@ -56,7 +61,9 @@
 //     backend-evaluate begin|end                 the NGX evaluate call, or AMD's dispatch
 //   finish-bind begin|end                      ClearState, the bindings, and H bound as the render target
 //   finish-draw begin|end                      the pixel-shader draw into H
-//   restore-state begin|end                    the game's pipeline state put back (Isolate's destructor)
+//   restore-state begin|end by=swap|capture    the game's pipeline state put back (Isolate's destructor)
+//     [restore-ia, restore-vs, ... restore-rs, restore-predication  begin|end]
+//                                              the explicit capture's groups going back, the session's first restore only
 //   before-present begin|end                   engine motion's state back, the census span closed (flatRuntimeBeforePresent)
 //   present begin|end hr=.. removed=..         the real Present (hookedPresent); removed is GetDeviceRemovedReason
 //   frame-end begin hr=..  ...  frame-end end  everything flatRuntimePresent does for the frame just ended, the
@@ -68,8 +75,10 @@
 // WHAT IT COSTS IN CRUMBS. A frame that reaches the resolver writes 24 (admitted, reached, eleven pairs), the first of them 6
 // more (the target view, the feature or context, DLSS's size queries), a declined one 4, the preflight that makes the route's
 // objects (the first time, at the Present of the first admitted frame) about 30 and the depth view 2. Three reaching frames, two
-// declined ones and that preflight come to about 115 (FSR 4 more, for its three shared surfaces). That is why the cap is 128
-// and not the 60 the per-frame steps alone would make: the one-time creations are the steps a Metal layer is likeliest to refuse.
+// declined ones and that preflight come to about 115 (FSR 4 more, for its three shared surfaces). A device that isolates by the
+// explicit capture adds 44 once: eleven pairs at the session's first capture and eleven at its first restore, about 160 in all.
+// That is why the cap is 192 and not the 60 the per-frame steps alone would make: the one-time creations are the steps a Metal
+// layer is likeliest to refuse, and the capture's Get and Set calls are the first of those it has answered to.
 //
 // The state is one struct, and the gate a load. Nothing here allocates, locks or throws; every write is one
 // breadcrumb() call, and a crumb that cannot be written is simply not there.
@@ -91,9 +100,9 @@ constexpr uint32_t kHdrCrumbFrames = 3;
 // Admitted frames that never got there and still write (admitted, declined, frame end). Past this they are silent, and a
 // later frame that does reach the resolver writes again from there.
 constexpr uint32_t kHdrCrumbDeclined = 3;
-// Every crumb of the session, the one-time creations and the declined frames included (see WHAT IT COSTS above); the last of
-// these is the "budget spent" line.
-constexpr uint32_t kHdrCrumbCap = 128;
+// Every crumb of the session, the one-time creations, the declined frames and the explicit capture's groups included (see WHAT
+// IT COSTS above); the last of these is the "budget spent" line.
+constexpr uint32_t kHdrCrumbCap = 192;
 
 struct HdrCrumbState {
     std::atomic<bool> live{false};       // a frame that writes is in progress: from its admission or reach to its Present
@@ -104,6 +113,8 @@ struct HdrCrumbState {
     bool frameReached = false;           // the frame in progress has reached the resolver
     bool frameDeclined = false;          // ... has been counted as declined
     bool spent = false;                  // the budget ran out
+    bool captureCrumbed = false;         // the explicit capture's per-group crumbs have been written for a capture (once a session)
+    bool restoreCrumbed = false;         // ... and for a restore
 };
 // One per process. Inline so the resolver, the backends and the runtime share it, and the rigs that compile the resolver alone
 // get their own. Plain data with a trivial destructor, so static destruction under the loader lock touches nothing.
@@ -119,6 +130,7 @@ inline void hdrCrumbReset() noexcept {
     c.written.store(0, std::memory_order_relaxed);
     c.reached = c.declinedFrames = c.armedSaid = 0;
     c.frameReached = c.frameDeclined = c.spent = false;
+    c.captureCrumbed = c.restoreCrumbed = false;
 }
 
 // The K of "K/3": the frame's number among those that reach the resolver, or the number it will have if it does.
@@ -126,6 +138,22 @@ inline uint32_t hdrCrumbSlot() noexcept {
     const HdrCrumbState& c = g_hdrCrumbs;
     const uint32_t n = c.frameReached ? c.reached : c.reached + 1;
     return n > kHdrCrumbFrames ? kHdrCrumbFrames : (n ? n : 1);
+}
+
+// The explicit capture's per-group crumbs (flat_context_state.h) are for the session's first capture and first restore, which
+// are the first calls a Metal layer has answered to: true once each, for the first call made while a frame that writes is in
+// progress and the caller's own gate (`on`, the resolver's flag for a call that belongs to the route) is open.
+inline bool hdrCrumbFirstCapture(bool on) noexcept {
+    HdrCrumbState& c = g_hdrCrumbs;
+    if (!on || !hdrCrumbLive() || c.captureCrumbed) return false;
+    c.captureCrumbed = true;
+    return true;
+}
+inline bool hdrCrumbFirstRestore(bool on) noexcept {
+    HdrCrumbState& c = g_hdrCrumbs;
+    if (!on || !hdrCrumbLive() || c.restoreCrumbed) return false;
+    c.restoreCrumbed = true;
+    return true;
 }
 
 // The one writer. `edge` is "begin", "end" or null for a line that stands alone; `detail` may be null or empty. The

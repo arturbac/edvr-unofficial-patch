@@ -6,6 +6,8 @@
 #include "../../src/d3d11/fsr3_engine.h"
 #include "../../src/d3d11/engine_velocity_emit.h"
 #include "../../src/d3d11/flat_hdr_crumbs.h"
+#include "../../src/d3d11/flat_context_isolation.h"
+#include "../../src/d3d11/flat_context_state.h"
 #include "../hdr_crumb_trail.h"
 #include <d3d11_1.h>
 #include <d3d11sdklayers.h>
@@ -27,6 +29,10 @@ bool backendFail=false,backendReset=false,infiniteSeen=false;
 std::vector<std::string> resetEvents;
 // What the HDR route's breadcrumbs (flat_hdr_crumbs.h) were handed to breadcrumb(), in order: the lines edvr_breadcrumbs.txt would hold.
 std::vector<std::string> crumbLines;
+// The resolver's one log line per initialisation that says which isolation it chose (flat_context_isolation.h), in order.
+std::vector<std::string> isolationLines;
+// Set by flat_context_isolation_gpu_tests.h: what the stub backend leaves bound, after its own ClearState. Null dirties nothing.
+void (*backendDirtyHook)(ID3D11DeviceContext*)=nullptr;
 float expectedJx=0,expectedJy=0;
 float observedMotion=0,observedMotionY=0,observedDepth=0;unsigned observedReject=0;
 // The whole motion texture the SDK was handed, decoded, and a hash over its raw bits: the shader's complete
@@ -92,6 +98,7 @@ bool backend(ID3D11DeviceContext* c,ID3D11Texture2D* depth,ID3D11Texture2D* mv,I
      } else {observedMotionHash=0;observedMotionAll.clear();observedMaskAll.clear();}
      motionHashLog.push_back(observedMotionHash);}
     c->ClearState(); // Both successful and refused backends may clobber all stages.
+    if(backendDirtyHook)backendDirtyHook(c);   // ...and the isolation tests make it clobber every stage and slot
     if(backendFail){if(reason)*reason="injected-backend-refusal";return false;}
     ComPtr<ID3D11Device> d;c->GetDevice(d.GetAddressOf());ComPtr<ID3D11UnorderedAccessView> uav;
     if(FAILED(d->CreateUnorderedAccessView(out,nullptr,uav.GetAddressOf())))return false;
@@ -137,12 +144,13 @@ Config& Config::get() {
 }
 Log& Log::get() {static auto* log=new Log;return *log;}
 void Log::note(const char* fmt,...) {
-    constexpr char prefix[]="flat resolve reset event:",firstPersonPrefix[]="flat resolve: first-person";
-    const bool reset=std::strncmp(fmt,prefix,sizeof(prefix)-1)==0;
-    if(!reset && std::strncmp(fmt,firstPersonPrefix,sizeof(firstPersonPrefix)-1)!=0)return;
+    // Formatted first: the isolation line is logged through "%s", so its prefix is in the text, not the format.
+    constexpr char prefix[]="flat resolve reset event:",firstPersonPrefix[]="flat resolve: first-person",isolationPrefix[]="flat resolver: context isolation";
     char line[1024]{};
     va_list args;va_start(args,fmt);std::vsnprintf(line,sizeof(line),fmt,args);va_end(args);
-    (reset?resetEvents:firstPersonLines).emplace_back(line);
+    if(std::strncmp(line,prefix,sizeof(prefix)-1)==0)resetEvents.emplace_back(line);
+    else if(std::strncmp(line,firstPersonPrefix,sizeof(firstPersonPrefix)-1)==0)firstPersonLines.emplace_back(line);
+    else if(std::strncmp(line,isolationPrefix,sizeof(isolationPrefix)-1)==0)isolationLines.emplace_back(line);
 }
 // Stand-in for src\common\proxy.cpp's breadcrumb(): the route's crumbs land here so the rig can read the trail back.
 void breadcrumb(const char* stage) {if(stage)crumbLines.emplace_back(stage);}
@@ -177,6 +185,7 @@ bool fsr3Evaluate(ID3D11DeviceContext* c,unsigned slot,ID3D11Texture2D* colour,I
 #include "flat_resolve_fixture.h"
 #include "flat_upscaler_slot_gpu_tests.h"
 #include "flat_first_person_gpu_tests.h"
+#include "flat_context_isolation_gpu_tests.h"
 int main(int argc,char** argv) {
     const bool printGoldens=argc==2 && !std::strcmp(argv[1],"--print-goldens"); // --self-test plus the recorded key-off hashes, for re-recording
     if(argc!=2 || (std::strcmp(argv[1],"--self-test") && std::strcmp(argv[1],"--dry-run") && !printGoldens)){std::puts("usage: flat_mono_resolve_test --self-test|--dry-run|--print-goldens");return 2;}
@@ -765,6 +774,8 @@ int main(int argc,char** argv) {
     // The VR world route's two seams (section 82): the third upscaler slot, and the first-person map and stencil in the prep.
     upscalerSlotGpuTests(device.Get(),context.Get());
     firstPersonGpuTests(device.Get(),context.Get());
+    // The resolver's context isolation (the swap, and the explicit capture DXMT gets): also before the message check, so its calls are held to it.
+    contextIsolationGpuTests(device.Get(),context.Get());
     if(messages)for(UINT64 i=0;i<messages->GetNumStoredMessages();++i){SIZE_T n=0;messages->GetMessage(i,nullptr,&n);std::vector<unsigned char> bytes(n);
         auto* msg=reinterpret_cast<D3D11_MESSAGE*>(bytes.data());messages->GetMessage(i,msg,&n);
         if(msg->Severity<=D3D11_MESSAGE_SEVERITY_WARNING){std::printf("D3D: %s\n",msg->pDescription);check(false,"no D3D resource hazards/errors/warnings");}}

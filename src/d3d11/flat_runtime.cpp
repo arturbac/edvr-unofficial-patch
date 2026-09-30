@@ -2,6 +2,7 @@
 #include "flat_runtime_model.h"
 #include "flat_hdr_route.h"
 #include "flat_hdr_crumbs.h"
+#include "flat_context_isolation.h"
 #include "flat_mono_resolve.h"
 #include "flat_projection_recipes.h"
 #include "flat_shader_classifier.h"
@@ -269,6 +270,7 @@ struct State {
     int gpuFrameOpen = -1, gpuResolveOpen = -1;   // the timer holding this frame's open span
     bool gpuFrameTried = false;                   // this frame already tried to open its span
     bool censusHooked = false;                    // the resolver's span hooks are installed
+    bool isolationRead = false;                   // advanced.flat_context_isolation is handed to the resolver (once, before its first call)
 };
 // Driver objects retire on the owner Present; never release under loader lock.
 State& state() { static State* p = new State; return *p; }
@@ -1865,6 +1867,12 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // the GPU spans that finished are read (never waited for), and every 5 s the window is
     // printed, zeros included. Instrument only: nothing below reads any of it.
     if (!s.censusHooked) { flatMonoResolveSetSpanHooks(&resolveSpanBegin, &resolveSpanEnd); s.censusHooked = true; }
+    // advanced.flat_context_isolation (auto, swap, capture): how the resolver isolates the game's state from its own work. Read
+    // once, here, before anything of the resolver's has run: the device is known and no frame has reached it (flat_context_isolation.h).
+    if (!s.isolationRead) {
+        s.isolationRead = true;
+        flatMonoResolveSetIsolation(flatContextIsolationFromText(Config::get().getString("advanced.flat_context_isolation", "auto").c_str()));
+    }
     {
         static const int64_t censusFreq = flatcpu::qpcFrequency();
         const int64_t censusNow = EDVR_FLATCPU_NOW();

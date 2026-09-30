@@ -228,6 +228,27 @@ inline int flatHdrCrumbTests() {
     hdrCrumbAdmit(2, "dlss");
     expect(hdrCrumbSlot() == 2, "the next reads 2/3 from its admission");
     hdrCrumbReset();
+
+    // ---- the explicit capture's per-group crumbs: once a session each way, for the first call made while a frame writes ----
+    fresh();
+    expect(!hdrCrumbFirstCapture(true) && !hdrCrumbFirstRestore(true) && !g_hdrCrumbs.captureCrumbed && !g_hdrCrumbs.restoreCrumbed,
+           "with no frame writing, neither first-use gate opens, and neither is spent");
+    hdrCrumbAdmit(1, "dlss");
+    expect(!hdrCrumbFirstCapture(false) && !g_hdrCrumbs.captureCrumbed,
+           "a call that is not the route's (the resolver's own flag) never opens the gate, and does not spend it");
+    expect(hdrCrumbFirstCapture(true) && !hdrCrumbFirstCapture(true) && g_hdrCrumbs.captureCrumbed && !g_hdrCrumbs.restoreCrumbed,
+           "the capture's gate opens once while a frame writes, and the restore's is its own");
+    expect(hdrCrumbFirstRestore(true) && !hdrCrumbFirstRestore(true), "the restore's gate opens once as well");
+    { HdrCrumbFrameEnd end(0); }
+    hdrCrumbAdmit(2, "dlss");
+    expect(!hdrCrumbFirstCapture(true) && !hdrCrumbFirstRestore(true), "and stays shut for the rest of the session, a later frame included");
+    hdrCrumbReset();
+    hdrCrumbAdmit(3, "dlss");
+    expect(hdrCrumbFirstCapture(true) && hdrCrumbFirstRestore(true), "a new session opens both again");
+    hdrCrumbReset();
+    // The budget holds the worst session (DXMT's): three reaching frames, two declined ones, the preflight (about 115) and the
+    // explicit capture's 44 group crumbs, with room over.
+    expect(kHdrCrumbCap >= 115 + 44 + 16, "the crumb budget holds a session that also writes the explicit capture's eleven groups each way");
     return failures;
 }
 
@@ -341,10 +362,66 @@ inline int flatHdrCrumbWiringTests() {
                       "drawHdrTarget(context,g.spatialHdr.Get(),f.renderWidth,f.renderHeight,views,1);"},
             "the spatial recovery writes the same capture, copy and finish crumbs around the same calls");
     const std::string isolate = body(resolve, "struct Isolate {");
-    ordered(isolate, {"HdrCrumbSpan capture(g_crumbOn,\"capture-state\");", "context->SwapDeviceContextState(state, previous.GetAddressOf());",
-                      "context->ClearState();", "if(g_hdrCall)++stats.hdrCaptured;", "~Isolate() {", "HdrCrumbSpan restore(g_crumbOn,\"restore-state\");",
-                      "context->ClearState();", "context->SwapDeviceContextState(previous.Get(), nullptr);", "if(g_hdrCall)++stats.hdrRestored;"},
-            "the game's state is crumbed going out and coming back, the crumb before the calls, and counted for the 5 s line after them");
+    ordered(isolate, {"HdrCrumbSpan capture(g_crumbOn,\"capture-state\",\"by=%s\"", "if(byCapture) {", "g_contextBlock.capture(context,g.ranges,hdrCrumbFirstCapture(g_crumbOn));",
+                      "} else {", "context->SwapDeviceContextState(state, previous.GetAddressOf());", "context->ClearState();", "if(g_hdrCall)++stats.hdrCaptured;",
+                      "~Isolate() {", "HdrCrumbSpan restore(g_crumbOn,\"restore-state\",\"by=%s\"", "context->ClearState();",
+                      "if(byCapture)g_contextBlock.restore(context,hdrCrumbFirstRestore(g_crumbOn));", "else context->SwapDeviceContextState(previous.Get(), nullptr);",
+                      "if(g_hdrCall)++stats.hdrRestored;"},
+            "the game's state is crumbed going out and coming back, by the swap or the explicit capture, the crumb before the calls, ClearState between the two halves "
+            "either way, and counted for the 5 s line after them");
+    // The swap is what it was: one call out and one back in the whole resolver, in that order around ClearState, and one state object made for it.
+    expect(count(resolve, "SwapDeviceContextState(") == 2 && count(resolve, "CreateDeviceContextState(") == 1 && count(resolve, "Isolate isolated(g.context.Get(),g.isolated.Get(),g.capture);") == 2,
+           "the resolver's swap is two calls in Isolate and its state object one creation, and both entry points isolate through Isolate");
+    const std::string init = body(resolve, "bool initialize(ID3D11Device* device,ID3D11DeviceContext* context,const char** reason) {");
+    ordered(init, {"(g.capture || g.isolated))return true;", "context->QueryInterface(IID_PPV_ARGS(g.context.GetAddressOf()))", "flatDetectDxmt(device,context)",
+                   "flatChooseContextIsolation(g_isolationRequest,dxmt)", "g.capture=choice.mode==FlatContextIsolation::Capture;",
+                   "flatContextRanges(device->GetFeatureLevel(),dxmt.dxmt())", "flatFormatContextIsolationLine(choice,dxmt,line,sizeof(line));",
+                   "Log::get().note(\"%s\",line);", "if(!g.capture && FAILED(device->QueryInterface(IID_PPV_ARGS(d1.GetAddressOf()))))", "if(g.capture) {",
+                   "} else {", "\"create-context-state\"", "d1->CreateDeviceContextState(", "flat-resolve-context-state-create-failed"},
+            "the renderer decides its isolation, says so in one log line, and makes the swap's state object only when it is the swap");
+    // The key is handed to the resolver once, before anything of the resolver's runs.
+    ordered(runtime, {"flatMonoResolveSetSpanHooks(&resolveSpanBegin, &resolveSpanEnd);", "if (!s.isolationRead) {",
+                      "flatMonoResolveSetIsolation(flatContextIsolationFromText(Config::get().getString(\"advanced.flat_context_isolation\", \"auto\").c_str()));",
+                      "flatMonoResolvePreflight(s.device.Get(),s.context.Get(),s.plannedResolve)"},
+            "advanced.flat_context_isolation is read once, at the first frame-end with a mode on, before the first preflight or resolve");
+    // The explicit block: no swap in it, every stage's calls, in the order the groups are written.
+    const std::string blockSrc = slurp("src/d3d11/flat_context_state.h");
+    expect(!blockSrc.empty() && count(blockSrc, "->SwapDeviceContextState(") == 0 && count(blockSrc, "->CreateDeviceContextState(") == 0,
+           "the explicit block never calls SwapDeviceContextState or makes a context state (DXMT aborts in the first)");
+    {
+        static const char* const stages[] = {"VS", "HS", "DS", "GS", "PS", "CS"};
+        static const char* const tails[] = {"GetShader(", "GetShaderResources(", "GetConstantBuffers1(", "GetSamplers(", "SetShader(", "SetShaderResources(",
+                                            "SetConstantBuffers1(", "SetSamplers("};
+        bool all = true;
+        for (const char* s : stages)
+            for (const char* tail : tails) {
+                const std::string call = std::string("->") + s + tail;
+                if (count(blockSrc, call.c_str()) != 1) { std::printf("  (explicit block: %s appears %zu times, not once)\n", call.c_str(), count(blockSrc, call.c_str())); all = false; }
+            }
+        static const char* const others[] = {"->IAGetInputLayout(", "->IAGetPrimitiveTopology(", "->IAGetVertexBuffers(", "->IAGetIndexBuffer(", "->IASetInputLayout(",
+                                             "->IASetPrimitiveTopology(", "->IASetVertexBuffers(", "->IASetIndexBuffer(", "->CSGetUnorderedAccessViews(",
+                                             "->CSSetUnorderedAccessViews(", "->SOGetTargets(", "->SOSetTargets(", "->OMGetRenderTargetsAndUnorderedAccessViews(",
+                                             "->OMSetRenderTargetsAndUnorderedAccessViews(", "->OMSetRenderTargets(", "->OMGetBlendState(", "->OMSetBlendState(",
+                                             "->OMGetDepthStencilState(", "->OMSetDepthStencilState(", "->RSGetState(", "->RSSetState(", "->RSGetViewports(",
+                                             "->RSSetViewports(", "->RSGetScissorRects(", "->RSSetScissorRects(", "->GetPredication(", "->SetPredication("};
+        for (const char* call : others)
+            if (count(blockSrc, call) != 1) { std::printf("  (explicit block: %s appears %zu times, not once)\n", call, count(blockSrc, call)); all = false; }
+        expect(all, "the explicit block reads and sets every stage it documents, each call once (six stages at four Get and four Set calls, and the IA, UAV, SO, OM, RS and predication calls)");
+    }
+    {
+        const size_t cap = blockSrc.find("void capture(");
+        expect(cap != std::string::npos, "the explicit block has its capture");
+        ordered(cap == std::string::npos ? std::string() : blockSrc.substr(cap),
+                {"\"capture-ia\"", "->IAGetInputLayout(", "->IAGetIndexBuffer(", "kStep[kStageCount] = {\"capture-vs\", \"capture-hs\", \"capture-ds\", \"capture-gs\", \"capture-ps\", \"capture-cs\"}",
+                 "captureStage(c, s);", "->CSGetUnorderedAccessViews(", "\"capture-so\"", "->SOGetTargets(", "\"capture-om\"", "->OMGetRenderTargetsAndUnorderedAccessViews(",
+                 "->OMGetBlendState(", "->OMGetDepthStencilState(", "\"capture-rs\"", "->RSGetState(", "->RSGetViewports(", "->RSGetScissorRects(", "\"capture-predication\"",
+                 "->GetPredication(", "held_ = true;", "void restore(", "\"restore-ia\"", "->IASetInputLayout(", "->IASetIndexBuffer(",
+                 "kStep[kStageCount] = {\"restore-vs\", \"restore-hs\", \"restore-ds\", \"restore-gs\", \"restore-ps\", \"restore-cs\"}", "restoreStage(c, s);",
+                 "->CSSetUnorderedAccessViews(", "\"restore-so\"", "->SOSetTargets(", "\"restore-om\"", "->OMSetRenderTargetsAndUnorderedAccessViews(", "->OMSetRenderTargets(",
+                 "->OMSetBlendState(", "->OMSetDepthStencilState(", "\"restore-rs\"", "->RSSetState(", "->RSSetViewports(", "->RSSetScissorRects(", "\"restore-predication\"",
+                 "->SetPredication(", "release();"},
+                "the explicit block captures and restores its eleven groups in the order its crumbs name them, each crumb before its calls, and lets go of everything at the end");
+    }
     const std::string draw = body(resolve, "void drawHdrTarget(");
     ordered(draw, {"\"finish-bind\"", "context->ClearState();", "context->OMSetRenderTargets(1,&rtv,nullptr);", "\"finish-draw\"", "context->Draw(3,0);",
                    "++stats.hdrFinished;"},
