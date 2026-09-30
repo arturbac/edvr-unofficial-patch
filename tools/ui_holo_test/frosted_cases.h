@@ -158,7 +158,8 @@ inline std::vector<Scene> scenes() {
 // the cb13 declaration, the raised temp count and the one inserted mad.
 inline void structure(const std::vector<BYTE>& stock,const std::vector<BYTE>& hologram) {
     std::vector<BYTE> patched;std::string why;
-    check(edvr::ui_holo_remap::patch(stock.data(),stock.size(),kFrostedPs,patched,why),why.c_str());
+    const bool patchedOk=edvr::ui_holo_remap::patch(stock.data(),stock.size(),kFrostedPs,patched,why);
+    check(patchedOk,why.c_str());
     check(patched.size()==stock.size()+60,"the frosted program grows by exactly 15 tokens");
     const auto a=edvr::dxbc_container::parseContainer(stock.data(),stock.size(),0x50),b=edvr::dxbc_container::parseContainer(patched.data(),patched.size(),0x50);
     check(a.size()==3&&b.size()==a.size(),"three chunks before and after");
