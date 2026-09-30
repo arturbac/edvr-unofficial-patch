@@ -59,6 +59,7 @@ uint64_t g_stateCalls = 0;
 // The flat census drains the two counts once a frame (engineVelocityTakeWrapperCounts): what was
 // already handed over, and the draws the 30 s summary zeroed out of familyDraws before it could.
 uint64_t g_stateCallsTaken = 0, g_substitutedBase = 0, g_substitutedTaken = 0;
+uint64_t g_stateCallsAtWindow = 0;   // g_stateCalls when the 30 s summary last ran: its window's share is the difference
 std::atomic<const ID3D11Resource*> watch[kWatchSlots] = {};
 
 // --- The keyed pool families -------------------------------------------------
@@ -1565,9 +1566,7 @@ void summaryLocked(uint64_t now) {
                     "%llu; depth not single-sample %llu, slot target create failed %llu; blend: derived state bound %llu "
                     "times, refused %llu%s%s%s, shadow disagreed %llu; views asked %llu, given %llu, refused: stood down "
                     "%llu, other depth %llu, other frame %llu, invalidated %llu, unwritten %llu, no previous scene "
-                    "constants %llu; draw hook slow half %llu calls, %.2f us each, ~%.3f ms/frame on the caller thread "
-                    "(plus %llu lock-free looks); restores %llu; shader setters issued %llu, skipped %llu (ours still "
-                    "bound).",
+                    "constants %llu.",
                     double(g_emit.recordsMoving.load()) / frames,
                     u(g_draw.eyeFrames), u(g_draw.eyeFramesBound), u(g_draw.eyeFramesSeen), u(g_draw.eyeFramesSubstituted),
                     u(g_draw.eyeFrames > g_draw.eyeFramesSubstituted ? g_draw.eyeFrames - g_draw.eyeFramesSubstituted : 0),
@@ -1579,10 +1578,22 @@ void summaryLocked(uint64_t now) {
                     g_draw.blendRefusedWhy ? g_draw.blendRefusedWhy : "", g_draw.blendRefusedWhy ? ")" : "",
                     u(g_draw.blendShadowDisagreed), u(g_draw.viewsAsked), u(g_draw.viewsGiven), u(g_draw.refusedNoEmit),
                     u(g_draw.refusedDepth), u(g_draw.refusedFrame), u(g_draw.refusedInvalid), u(g_draw.refusedUnwritten),
-                    u(g_draw.refusedPrevious), u(g_draw.slowPaths),
+                    u(g_draw.refusedPrevious));
+    // The draw side's CPU and driver-call figures, on a line of their own (the 2026-09-29 motion-CPU
+    // review, C5). They were the tail of the line above, past the 1,160 characters the log keeps, and
+    // no log ever showed them. The D3D calls are every Get, Set, clear and copy the draw wrapper asked
+    // of the immediate context (engineVelocityNoteStateCalls), so a slow half that costs little of its
+    // own but issues eleven driver calls a draw shows here.
+    const uint64_t stateCallsWindow = g_stateCalls - g_stateCallsAtWindow;
+    Log::get().note("engine motion: draw side over %.0f s, %.0f frames: draw hook slow half %llu calls, %.2f us each, "
+                    "~%.3f ms/frame on the caller thread (plus %llu lock-free looks); restores %llu; shader setters "
+                    "issued %llu, skipped %llu (ours still bound); D3D context calls the draw wrapper made %llu, "
+                    "%.0f a frame.",
+                    seconds, double(g_draw.frames), u(g_draw.slowPaths),
                     g_draw.slowPaths ? double(g_draw.slowTicks) * 1e6 / freq / double(g_draw.slowPaths) : 0.0,
                     double(g_draw.slowTicks) * 1e3 / freq / frames, u(g_draw.quickPaths), u(g_draw.restores),
-                    u(g_draw.settersIssued), u(g_draw.settersSkipped));
+                    u(g_draw.settersIssued), u(g_draw.settersSkipped), u(stateCallsWindow),
+                    double(stateCallsWindow) / frames);
     // The snapshots' copy traffic (item 4, measured only): logical bytes
     // submitted, not GPU time -- a CopyResource's CPU submission prices
     // nothing on the GPU.
@@ -1718,6 +1729,7 @@ void summaryLocked(uint64_t now) {
     g_primaryEmit.clear(); g_primaryAttempts.store(0,std::memory_order_relaxed);
     g_lastGaps = 0;
     g_draw.clear();
+    g_stateCallsAtWindow = g_stateCalls;
     g_windowStartMs = now;
 }
 
