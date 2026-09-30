@@ -25,6 +25,7 @@
 #include "flat_elite_settings_tests.h"
 #include "flat_cpu_tests.h"
 #include "flat_witness_bound_tests.h"
+#include "flat_camera_table_tests.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -2558,6 +2559,59 @@ void testFlatWitnessWiring() {
     }
 }
 
+// The camera table in the runtime (flat_camera_table.h holds the table and its kept answer, and the rig above
+// holds THEM): every entry of the table is changed through the table's own operations, each of which
+// invalidates the draw path's kept answer, and the draw path asks the table for its answer. A source scan
+// with removal controls, so a line that goes back to assigning into an entry, or a draw that goes back
+// to searching for itself, fails here and not in a flight.
+void testFlatCameraTableWiring() {
+    auto slurp = [](const char* path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string runtimeCpp = slurp("src/d3d11/flat_runtime.cpp");
+    check(!runtimeCpp.empty(), "the runtime source is readable from the repo root");
+    auto count = [](const std::string& text, const std::string& needle) {
+        unsigned n = 0;
+        for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
+        return n;
+    };
+    struct Pin { const char* needle; unsigned times; const char* what; };
+    const Pin pins[] = {
+        {"#include \"flat_camera_table.h\"", 1, "the runtime takes the table from its header"},
+        {"using CameraTable = FlatCameraTable<Ptr<ID3D11Buffer>>;", 1, "the runtime's table is the header's, holding COM references"},
+        // The draw path asks the table, and times the search only when it is made afresh.
+        {"const uint32_t b1Binding = bindingGeneration(BindSlot::VsCb1);", 1, "the draw reads the b1 slot's binding generation"},
+        {"s.cameras.probe(k.b1, b1Binding, s.prefix.frame)", 1, "the draw asks for the kept answer"},
+        {"s.cameras.refresh(k.b1, b1Binding, s.prefix.frame)", 1, "and makes it afresh when there is none"},
+        // Every change of an entry, and where it comes from.
+        {"s.cameras.claim(std::move(buffer), d.ByteWidth, s.prefix.frame)", 1, "a buffer joins through the table"},
+        {"s.cameras.invalidate(*c)", 1, "a write into a buffer invalidates through the table"},
+        {"state().cameras.setMapped(*c, bytes)", 1, "a Map notes it through the table"},
+        {"state().cameras.setMapped(*c, nullptr)", 1, "and so does the Unmap"},
+        {"s.cameras.capture(c, bytes, s.prefix.frame, ++s.prefix.sequence)", 1, "a capture goes through the table, with the frame and the write sequence"},
+        {"s.cameras.invalidateAll();", 1, "the game's state going unknown"},
+        {"s.cameras.newFrame();", 1, "the frame boundary"},
+        {"s.cameras.clear();", 1, "the reset"},
+        {"s.cameras.find(resource)", 1, "a search for a buffer is the table's"},
+        {"const Camera* camera(ID3D11Resource* resource, bool add) {", 1, "the runtime's finder hands out entries for reading only"},
+    };
+    for (const Pin& pin : pins) {
+        check(count(runtimeCpp, pin.needle) == pin.times, pin.what);
+        std::string without = runtimeCpp;
+        for (size_t at = without.find(pin.needle); at != std::string::npos; at = without.find(pin.needle))
+            without.erase(at, std::strlen(pin.needle));
+        check(count(without, pin.needle) == 0, "camera table wiring control: a source with the line removed no longer contains it");
+    }
+    // Nothing assigns into an entry, or indexes the table, behind the table's back.
+    const char* const bypasses[] = {"->valid = false", ".valid = false", "->mapped =", ".mapped =", "Camera{}", "s.cameras[",
+                                    "cameraCount", "->frame =", "->sequence =", "->width ="};
+    for (const char* bypass : bypasses)
+        check(count(runtimeCpp, bypass) == 0, "the runtime does not change a camera entry except through the table (no such text in it)");
+    // (control: the scan does find what it looks for)
+    check(count("c->valid = false;", "->valid = false") == 1, "camera table wiring control: the bypass scan finds an assignment");
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
         return flatShaderClassifierSweep(argv[2]);
@@ -2615,6 +2669,8 @@ int main(int argc, char** argv) {
     testFlatCpuWiring();
     failures += flatWitnessBoundTests();
     testFlatWitnessWiring();
+    failures += flatCameraTableTests();
+    testFlatCameraTableWiring();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

@@ -18,6 +18,7 @@
 #include "flat_standdown.h"
 #include "flat_witness_bound.h"
 #include "flat_cpu.h"
+#include "flat_camera_table.h"
 #include "gpu_timing.h"
 #include "flat_temporal.h"
 #include "engine_velocity.h"
@@ -45,12 +46,11 @@ std::atomic<bool> nativeScale{false};
 std::atomic<bool> foreignWork{false};
 std::atomic<bool> projectionAuditRequested{false};
 template<class T> using Ptr = Microsoft::WRL::ComPtr<T>;
-struct Camera {
-    Ptr<ID3D11Buffer> buffer; uint32_t width = 0; uint64_t frame = 0;
-    uint32_t sequence = 0;
-    void* mapped = nullptr; bool valid = false;
-    unsigned char rows[kFlatCameraBytes]{};
-};
+// The camera table (flat_camera_table.h): the constant buffers bound to VS b1 that can carry the camera rows, and
+// the draw path's kept answer from them. An entry is read through a const pointer here and changed only through
+// the table's own operations, each of which invalidates that kept answer: nothing below assigns to one.
+using CameraTable = FlatCameraTable<Ptr<ID3D11Buffer>>;
+using Camera = CameraTable::Entry;
 struct View {
     void* identity = nullptr; uint32_t generation = 0; ResourceInfo info{};
     Ptr<IUnknown> held;
@@ -59,7 +59,7 @@ struct State {
     FlatDrawCapture drawCapture;
     DWORD thread = 0; Ptr<ID3D11Device> device; Ptr<ID3D11DeviceContext> context;
     Ptr<ID3D11Texture2D> output, sceneDepth; Ptr<ID3D11ShaderResourceView> depthView;
-    FlatRuntimePrefix prefix{}; Camera cameras[64]{}; uint32_t cameraCount = 0;
+    FlatRuntimePrefix prefix{}; CameraTable cameras;
     View views[4]{}; D3D11_VIEWPORT viewport{}; UINT viewportCount = 0;
     Ptr<ID3D11Resource> colors[128], depths[128], previousColor;
     Ptr<ID3D11Resource> uavs[8];
@@ -1187,24 +1187,24 @@ ResourceInfo view(BindSlot slot, uint32_t cache) {
     }
     return v.info;
 }
-Camera* camera(ID3D11Resource* resource, bool add) {
-    auto& s = state(); for (uint32_t i = 0; i < s.cameraCount; ++i) if (s.cameras[i].buffer.Get() == resource) return &s.cameras[i];
+// The table's entry for `resource`, or, with `add`, a new one when it is a constant buffer wide enough for the
+// camera rows. For reading: an entry is changed only through the table (state().cameras), never through this pointer.
+const Camera* camera(ID3D11Resource* resource, bool add) {
+    auto& s = state();
+    if (const Camera* known = s.cameras.find(resource)) return known;
     if (!add || !resource) return nullptr;
     Ptr<ID3D11Buffer> buffer; if (FAILED(resource->QueryInterface(IID_PPV_ARGS(&buffer)))) return nullptr;
     D3D11_BUFFER_DESC d{}; buffer->GetDesc(&d);
     if (!(d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) || d.ByteWidth < kFlatCameraOffset + kFlatCameraBytes) return nullptr;
-    uint32_t index = s.cameraCount;
-    if (index == 64) {
-        for (uint32_t i = 0; i < 64; ++i) if (s.cameras[i].frame != s.prefix.frame && !s.cameras[i].mapped) { index = i; break; }
-        if (index == 64) { s.prefix.uncertain = true; flatTraceMark(s.traceRing, kFlatTraceEventMarkUncertain, nullptr); return nullptr; }
-    } else ++s.cameraCount;
-    auto& c = s.cameras[index]; c = Camera{}; c.buffer = buffer; c.width = d.ByteWidth; return &c;
+    const Camera* claimed = s.cameras.claim(std::move(buffer), d.ByteWidth, s.prefix.frame);
+    if (!claimed) { s.prefix.uncertain = true; flatTraceMark(s.traceRing, kFlatTraceEventMarkUncertain, nullptr); return nullptr; }
+    return claimed;
 }
-void capture(Camera& c, const void* bytes) {
+void capture(const Camera& c, const void* bytes) {
     flatcpu::Scope timed(flatcpu::kCameraRows);   // the camera data motion correctness needs, apart from the witness
-    c.valid = flatCaptureCameraRows(c.rows, bytes, c.width); c.frame = state().prefix.frame;
-    { flatcpu::Scope trace(flatcpu::kTrace); flatTraceMark(state().traceRing, kFlatTraceEventCameraCapture, nullptr); }
-    c.sequence = ++state().prefix.sequence;
+    auto& s = state();
+    s.cameras.capture(c, bytes, s.prefix.frame, ++s.prefix.sequence);
+    { flatcpu::Scope trace(flatcpu::kTrace); flatTraceMark(s.traceRing, kFlatTraceEventCameraCapture, nullptr); }
 }
 // The camera producer witness (design-flat-camera-integration.md, C0/C1):
 // where the camera table already captures a camera CB write, capture the
@@ -1538,7 +1538,7 @@ void flatRuntimeResize() {
     for (auto& v : s.views) v = View{};
     for (auto& r : s.colors) r.Reset(); for (auto& r : s.depths) r.Reset();
     for (auto& r : s.uavs) r.Reset();
-    for (auto& c : s.cameras) c = Camera{}; s.cameraCount = 0;
+    s.cameras.clear();
     // Local refusal's observation ends with the contract: a resize or device
     // change requalifies nothing, but the state itself must not survive.
     s.observing = false; s.covFrameLocallyRefused = false;
@@ -1661,7 +1661,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     const bool enginePausedThen = s.enginePaused;
     engineVelocityConfigure(enabled && !enginePausedThen);
     // No temporal mode selected: the census stops (its gates close, a scope costs a load and a compare).
-    if (!enabled) { s.census.idle(); if (s.device || s.output || s.cameraCount) flatRuntimeResize(); return; }
+    if (!enabled) { s.census.idle(); if (s.device || s.output || s.cameras.count()) flatRuntimeResize(); return; }
     FlatComputeInternalScope guard;
     Ptr<ID3D11Device> actualDevice; swap->GetDevice(IID_PPV_ARGS(&actualDevice));
     if (s.device && actualDevice.Get() != s.device.Get()) { flatRuntimeResize(); s.thread = GetCurrentThreadId(); }
@@ -1881,7 +1881,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     s.drawCapture.begin(frame+1,s.phaseDepth.Get(),s.phaseWidth,s.phaseHeight);
     foreignWork.store(false, std::memory_order_release);
     // Retain bounded CB identities across frames: unchanged bindings are legal.
-    for (uint32_t i = 0; i < s.cameraCount; ++i) { s.cameras[i].valid = false; s.cameras[i].mapped = nullptr; }
+    s.cameras.newFrame();
     const auto now = GetTickCount64();
     if (now - s.lastReport >= 5000) {
         reportPhaseCensus(s,"5s");
@@ -2021,7 +2021,7 @@ void flatRuntimeUnknown() {
     s.viewportCount = 0; for (auto& u : s.uavs) u.Reset();
     if (s.work == FlatWork::Paused) return;
     flatTraceMark(s.traceRing, kFlatTraceEventMarkUncertain, nullptr); s.prefix.uncertain = true;
-    for (auto& c : s.cameras) c.valid = false;
+    s.cameras.invalidateAll();
     if(s.projection) {s.projection->invalidateAll();failPhase(s,"unknown-context-state");}
 }
 void flatRuntimeUavs(UINT start, UINT count, ID3D11UnorderedAccessView* const* views) {
@@ -2080,7 +2080,7 @@ FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
 static void resourceWritten(State& s, ID3D11Resource* res) {
     { flatcpu::Scope trace(flatcpu::kTrace); flatTraceMark(s.traceRing, kFlatTraceEventWriteResource, res); }
     flatRuntimeWritten(s.prefix, res);
-    if (auto* c = camera(res, false)) c->valid = false;
+    if (auto* c = camera(res, false)) s.cameras.invalidate(*c);
     if (s.projection) { flatcpu::Scope shadows(flatcpu::kShadows); s.projection->invalidate(res); }
 }
 void flatRuntimeWritten(ID3D11Resource* res) {
@@ -2091,7 +2091,7 @@ void flatRuntimeWritten(ID3D11Resource* res) {
 void flatRuntimeMap(ID3D11Resource* res, D3D11_MAP type, void* bytes) {
     if (!owner() || type == D3D11_MAP_READ || state().work == FlatWork::Paused) return;
     flatcpu::Scope lookup(flatcpu::kResource);
-    resourceWritten(state(), res); if (auto* c = camera(res, false)) c->mapped = bytes;
+    resourceWritten(state(), res); if (auto* c = camera(res, false)) state().cameras.setMapped(*c, bytes);
     if (state().projection) { flatcpu::Scope shadows(flatcpu::kShadows); state().projection->observeMap(res,type,bytes); }
 }
 void flatRuntimeUnmap(ID3D11Resource* res) {
@@ -2100,7 +2100,7 @@ void flatRuntimeUnmap(ID3D11Resource* res) {
     if (state().projection) { flatcpu::Scope shadows(flatcpu::kShadows); state().projection->observeUnmap(res); }
     if (auto* c = camera(res, false)) {
         if (c->mapped) { capture(*c, c->mapped); if (state().work == FlatWork::Full) cameraWitness(res); }
-        c->mapped = nullptr;
+        state().cameras.setMapped(*c, nullptr);
     }
 }
 void flatRuntimeUpdate(ID3D11Resource* res, const void* bytes, const D3D11_BOX* box) {
@@ -2138,10 +2138,18 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     k.b1 = bindingGet(BindSlot::VsCb1); k.viewportCount = s.viewportCount;
     static_assert(sizeof(k.viewport) == sizeof(D3D11_VIEWPORT), "viewport layout"); std::memcpy(k.viewport, &s.viewport, sizeof(k.viewport));
     {
-        flatcpu::Scope rows(flatcpu::kCameraRows);   // camera table lookup, rows copy and hash
-        if (auto* c = camera(static_cast<ID3D11Buffer*>(const_cast<void*>(k.b1)), false)) {
-            if (c->valid && c->frame == s.prefix.frame) { std::memcpy(d.camera, c->rows, sizeof(d.camera)); k.camera = d.camera; k.cameraHash = flatCameraHash(d.camera); k.writeEpoch = c->frame; k.writeSeq = c->sequence; }
+        // The camera rows the buffer bound at b1 holds for this frame. The table keeps its last answer and serves
+        // it to every draw until the binding, the frame or the table changes (flat_camera_table.h: on foot about
+        // 5,000 draws a frame ask, about a hundred writes and rebinds change the answer), so the lookup, the
+        // copy and the hash are timed as this family only when they are made afresh. The record it fills is the
+        // one the search always produced.
+        const uint32_t b1Binding = bindingGeneration(BindSlot::VsCb1);
+        const FlatCameraRows* kept = s.cameras.probe(k.b1, b1Binding, s.prefix.frame);
+        if (!kept) {
+            flatcpu::Scope rows(flatcpu::kCameraRows);   // camera table lookup, rows copy and hash: a fresh lookup
+            kept = &s.cameras.refresh(k.b1, b1Binding, s.prefix.frame);
         }
+        if (kept->have) { std::memcpy(d.camera, kept->rows, sizeof(d.camera)); k.camera = d.camera; k.cameraHash = kept->hash; k.writeEpoch = kept->epoch; k.writeSeq = kept->sequence; }
     }
     d.supported = engineVelocityPoolFamilyPair(k.vs, k.ps); d.instances = instances;
     k.kind = flatContractKind(d.supported, k.color, k.depth, k.width, k.height, k.format, s.prefix.width, s.prefix.height, k.color == s.prefix.output);
