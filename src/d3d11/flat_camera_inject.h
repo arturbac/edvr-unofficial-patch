@@ -162,6 +162,11 @@ struct FlatCameraVrCounters {
     uint32_t writeFailures = 0;         // mutation, flush or redirect writes that failed
     uint32_t offThread = 0;             // calls on a thread other than Present's (lock-free count, any thread)
     uint32_t injectedKind[8] = {};      // INJECTED calls by kind: 0..5, 6 = other, 7 = unreadable. Only index 3 may ever be non-zero
+    // Appended by the injector (2026-09-30), after the declared fields so nothing that names them moves:
+    uint32_t notActive = 0;             // the first-level outcome the list above lacks: kind-3 calls in a frame that is not injecting (observe-only or
+                                        // pass-through). With it, calls == the sum of the first-level outcomes in every mode (flat_camera_vr.h, flatCameraVrOutcomeSum)
+    uint32_t flushed = 0;               // cameras flushed: the one-time dirty-bit write on a camera injected earlier and now not (not an outcome: a
+                                        // flush accompanies whichever outcome the call had)
 };
 // One distinct excluded signature (the route logs the first eight, once each).
 struct FlatCameraVrExcluded {

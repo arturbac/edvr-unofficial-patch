@@ -1231,6 +1231,25 @@ if errorlevel 1 ( echo [edvr] ERROR: vr camera census glue test build failed & e
 "%BUILD%\vr_camera_census_glue_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_flat_camera_vr_test
+echo [edvr] === flat_camera_vr_test.exe ===
+REM The VR world route's camera injection mode (design doc section 82, stage 2): the pure half the detour runs
+REM (src\d3d11\flat_camera_vr.h: the role of a kind-3 camera, the admission, the flush, the counters, the mode word) run
+REM exhaustively and through scripted call sequences -- the camera-object reuse scenario among them -- plus the source pins
+REM that hold the detour to it (src\d3d11\flat_camera_inject.cpp: the flat profile's regions byte-for-byte, the order of a
+REM call's steps, no write reachable from a pass-through or observe-only call). The pins read src\d3d11 from the repo root
+REM (the rig takes the root as its argument). tools\flat_camera_vr_test\mutants.py --self-test holds the mutation list to
+REM the sources as they are; the list itself (--run, on demand, about a minute) proves the rig fails when each rule is flipped.
+if not exist "%OBJ%\flatcameravr" mkdir "%OBJ%\flatcameravr"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\flatcameravr\\" ^
+    /Fe"%BUILD%\flat_camera_vr_test.exe" "tools\flat_camera_vr_test\flat_camera_vr_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: flat camera vr test build failed & exit /b 1 )
+"%BUILD%\flat_camera_vr_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\flat_camera_vr_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
 :rig_config_test
 echo [edvr] === config_test.exe ===
 REM The real parser over the real shipped edvr.ini. The file's own layout
