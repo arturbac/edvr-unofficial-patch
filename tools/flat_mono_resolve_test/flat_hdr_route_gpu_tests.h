@@ -417,4 +417,254 @@ inline void hdrRouteGpuTests(ID3D11Device* device, ID3D11DeviceContext* context)
         check(good && out && restored() && !observedHdr && px == 0xff0000ff,
               "after the HDR route, the copy route resolves an LDR frame as before: output view, LDR backend flag, the input's pixels");
     }
+
+    // ---- 9. the crash-safe breadcrumbs around every step (src\d3d11\flat_hdr_crumbs.h) ---------------------------------------
+    // What the route writes to edvr_breadcrumbs.txt so that a session that ends inside the treatment names the step, read back
+    // from the rig's breadcrumb() while the real resolver runs on WARP. The runtime's own calls (the admission, the reach, the
+    // Present's end) are driven by hand, in the order the runtime makes them; what no rig can run (treatHdr, the real Present,
+    // the two SDKs) is pinned as source by flat_temporal_test. Pinned here: every begin has its end on a normal frame, the
+    // steps come in the order they run, each creation says what it makes, a refusal and a state restore are written, a call that is
+    // not the route's writes nothing, and after the third frame to reach the resolver the resolver writes nothing at all.
+    {
+        namespace ct = hdr_crumb_trail;
+        const auto inOrder = [&](const std::vector<ct::Crumb>& trail, std::initializer_list<std::pair<const char*, const char*>> steps) {
+            int at = -1;
+            for (const auto& step : steps) {
+                const int i = ct::find(trail, step.first, step.second, static_cast<size_t>(at + 1));
+                if (i < 0) { std::printf("  (crumb trail: no '%s %s' after index %d in: %s)\n", step.first, step.second, at, ct::outline(trail).c_str()); return false; }
+                at = i;
+            }
+            return true;
+        };
+        // One frame as the runtime drives it around a call into the resolver: admitted, reached, the call, the Present's end.
+        const auto routeFrame = [&](const char* backend, auto&& resolverCall) {
+            edvr::hdrCrumbAdmit(f.frame, backend);
+            edvr::hdrCrumbReach(f.frame, backend, "resolve");
+            resolverCall();
+            { edvr::HdrCrumbFrameEnd end(0); }
+        };
+        const auto restart = [&] { edvr::flatMonoResolveReset(); edvr::hdrCrumbReset(); crumbLines.clear(); };
+        f.mode = FlatMonoResolveMode::Dlss; f.hdr = true; f.jitterX = f.jitterY = f.previousJitterX = f.previousJitterY = 0; expectedJx = expectedJy = 0;
+        fill([&](UINT x, UINT y, double (&c)[3]) { c[0] = 64 + 8.0 * x; c[1] = 32 + y; c[2] = 16; });
+
+        // (a) the preflight at the Present of the frame the route admitted: on a renderer that has made nothing, it writes
+        // what it creates, the texture crumbs saying what each is, and ends; the backend's first ask is bracketed.
+        restart();
+        edvr::hdrCrumbAdmit(f.frame, "dlss");
+        {
+            edvr::FlatMonoResolvePreflight planned{};
+            planned.renderWidth = w; planned.renderHeight = h; planned.outputWidth = w; planned.outputHeight = h;
+            planned.mode = FlatMonoResolveMode::Dlss; planned.hdr = true;
+            planned.colorViewFormat = DXGI_FORMAT_R11G11B10_FLOAT; planned.depthViewFormat = DXGI_FORMAT_R32_FLOAT;
+            edvr::HdrCrumbFrameEnd end(0);
+            const auto ready = edvr::flatMonoResolvePreflight(device, context, planned);
+            check(ready.readyForRasterJitter(), "breadcrumbs: the HDR preflight the crumbs bracket is the one that was always ready");
+        }
+        {
+            const auto trail = ct::trail(crumbLines);
+            std::string gap;
+            check(ct::balanced(trail, &gap), "breadcrumbs: the preflight's crumbs balance");
+            check(inOrder(trail, {{"admitted", ""}, {"frame-end", "begin"}, {"preflight", "begin"}, {"create-context-state", "begin"},
+                                  {"create-context-state", "end"}, {"create-compute-shaders", "begin"}, {"create-compute-shaders", "end"},
+                                  {"create-constants-sampler", "begin"}, {"create-constants-sampler", "end"}, {"create-hdr-vs", "begin"},
+                                  {"create-hdr-vs", "end"}, {"create-hdr-ps-finish", "begin"}, {"create-hdr-ps-finish", "end"},
+                                  {"create-hdr-ps-spatial", "begin"}, {"create-hdr-ps-spatial", "end"}, {"create-texture", "begin"},
+                                  {"create-texture", "end"}, {"backend-available", "begin"}, {"backend-available", "end"},
+                                  {"preflight", "end"}, {"frame-end", "end"}}),
+                  "breadcrumbs: a cold preflight writes its creations in the order it makes them, the SDK's first ask after them, all inside its own pair");
+            check(ct::count(trail, "create-texture", "begin") == 5 && ct::count(trail, "create-texture", "end") == 5 &&
+                      ct::count(trail, "create-rtv", "begin") == 0,
+                  "breadcrumbs: the DLSS route's five private images are each crumbed, and the preflight makes no target view");
+            const int pre = ct::find(trail, "preflight", "begin");
+            check(pre >= 0 && trail[pre].detail == "plan=16x16->16x16 mode=dlss", "breadcrumbs: the preflight names its plan");
+            const int pe = ct::find(trail, "preflight", "end");
+            check(pe >= 0 && ct::has(trail[pe].detail, "status=0 ready=1 reason=ready-backend-feature-creation-deferred"),
+                  "breadcrumbs: the preflight's end carries its verdict");
+            // Each texture: role, format, size before; every result after.
+            struct Want { const char* role; const char* fmt; const char* uavResult; };
+            static const Want wants[5] = {{"color", "R11G11B10_FLOAT(26)", "0x8000000A"}, {"depth0", "R32_FLOAT(41)", "0x00000000"},
+                                          {"motion", "R16G16_FLOAT(34)", "0x00000000"}, {"rejection", "R8_UNORM(61)", "0x00000000"},
+                                          {"output0", "R16G16B16A16_FLOAT(10)", "0x00000000"}};
+            bool textures = true; int at = -1;
+            for (const auto& want : wants) {
+                const int b = ct::find(trail, "create-texture", "begin", static_cast<size_t>(at + 1));
+                const int e = ct::find(trail, "create-texture", "end", static_cast<size_t>(at + 1));
+                std::string begin = b >= 0 ? trail[b].detail : "", end = e >= 0 ? trail[e].detail : "";
+                textures = textures && b >= 0 && e == b + 1 && begin == std::string("role=") + want.role + " fmt=" + want.fmt + " size=16x16 uav=" + (std::strcmp(want.role, "color") ? "1" : "0") &&
+                           ct::has(end, "hr=0x00000000 srv=0x00000000") && ct::has(end, (std::string("uav=") + want.uavResult).c_str());
+                at = e;
+            }
+            check(textures, "breadcrumbs: each image says its role, format and size before it is made, and its three results after (E_PENDING where a call was not reached)");
+            check(ct::count(trail, "backend-available", "begin") == 1 && trail[ct::find(trail, "backend-available", "end")].detail == "ok=1 reason=none",
+                  "breadcrumbs: the SDK's first availability ask is bracketed, with its answer");
+            check(!edvr::hdrCrumbLive(), "breadcrumbs: the frame's end closes the gate");
+        }
+        const size_t coldPreflightCrumbs = crumbLines.size();
+
+        // (b) three frames that reach the resolver, then nothing: from a warm renderer (what the preflight left) the first frame
+        // makes only its target view, and the creations are not written again. The preflight's frame was not one of the three
+        // (it never reached the resolver), so the count starts here without a new renderer. The 5 s line's step counts do not
+        // stop with the crumbs: all five frames are counted, at every step of the resolver.
+        edvr::hdrCrumbReset();
+        crumbLines.clear();
+        size_t sizes[5] = {};
+        const auto steps0 = edvr::flatMonoResolveStats();
+        for (int n = 0; n < 5; ++n) {
+            f.reset = n == 0; ++f.frame;
+            routeFrame("dlss", [&] { run(true); });
+            sizes[n] = crumbLines.size();
+        }
+        {
+            const auto steps1 = edvr::flatMonoResolveStats();
+            check(steps1.hdrCaptured - steps0.hdrCaptured == 5 && steps1.hdrCopied - steps0.hdrCopied == 5 && steps1.hdrPrepped - steps0.hdrPrepped == 5 &&
+                      steps1.hdrBackend - steps0.hdrBackend == 5 && steps1.hdrFinished - steps0.hdrFinished == 5 &&
+                      steps1.hdrRestored - steps0.hdrRestored == 5,
+                  "breadcrumbs: the step counts of the 5 s line count every frame at every step, the two after the crumbs' third frame included");
+        }
+        {
+            const auto trail = ct::trail(crumbLines);
+            std::string gap;
+            check(ct::balanced(trail, &gap), "breadcrumbs: three frames through the real resolver leave every begin ended");
+            check(ct::count(trail, "reached", "") == 3 && sizes[3] == sizes[2] && sizes[4] == sizes[2] && !edvr::hdrCrumbLive(),
+                  "breadcrumbs: the third frame to reach the resolver is the last that writes; the fourth and fifth write nothing");
+            bool slotsOk = true;
+            for (const auto& c : trail) slotsOk = slotsOk && c.slot >= 1 && c.slot <= 3;
+            check(slotsOk, "breadcrumbs: no crumb is numbered past 3/3");
+            // The first frame on a warm renderer: the route's target view is made and the creations already made are not written again.
+            const int first = ct::find(trail, "admitted", "");
+            const int second = ct::find(trail, "admitted", "", static_cast<size_t>(first + 1));
+            const std::vector<ct::Crumb> one(trail.begin() + first, trail.begin() + second);
+            check(inOrder(one, {{"admitted", ""}, {"reached", ""}, {"create-rtv", "begin"}, {"create-rtv", "end"}, {"capture-state", "begin"},
+                                {"capture-state", "end"}, {"copy-h", "begin"}, {"copy-h", "end"}, {"prep", "begin"}, {"prep", "end"},
+                                {"backend", "begin"}, {"backend", "end"}, {"finish-bind", "begin"}, {"finish-bind", "end"},
+                                {"finish-draw", "begin"}, {"finish-draw", "end"}, {"restore-state", "begin"}, {"restore-state", "end"},
+                                {"frame-end", "begin"}, {"frame-end", "end"}}) &&
+                      ct::count(one, "create-texture", "begin") == 0 && ct::count(one, "create-compute-shaders", "begin") == 0,
+                  "breadcrumbs: a first frame writes capture, copy, prep, backend, finish-bind, finish-draw and restore, in that order, between its reach and its frame end");
+            const int rtv = ct::find(one, "create-rtv", "begin");
+            check(rtv >= 0 && one[rtv].detail == "over H fmt=R11G11B10_FLOAT(26) size=16x16" && one[rtv + 1].detail == "hr=0x00000000",
+                  "breadcrumbs: the target view over H says what it is over and its result");
+            const int copy = ct::find(one, "copy-h", "begin"), prep = ct::find(one, "prep", "begin"), backend = ct::find(one, "backend", "begin"),
+                      bind = ct::find(one, "finish-bind", "begin"), draw = ct::find(one, "finish-draw", "begin");
+            check(copy >= 0 && one[copy].detail == "fmt=R11G11B10_FLOAT(26) size=16x16" && one[prep].detail == "groups=2x2" &&
+                      one[backend].detail == "mode=dlss in=16x16 out=16x16 reset=1" && one[backend + 1].step == "backend" && one[backend + 1].detail == "ok=1 reason=none" &&
+                      one[bind].detail == "ps=finish target=16x16 views=8" && one[draw].detail == "ps=finish vertices=3",
+                  "breadcrumbs: each step names what it does before it does it, and the backend says how it ended");
+            bool one1 = true;
+            for (const auto& c : one) one1 = one1 && c.slot == 1;
+            check(one1, "breadcrumbs: every crumb of the first frame reads 1/3");
+            check(ct::find(trail, "capture-state", "end") < ct::find(trail, "restore-state", "begin") && ct::has(trail[ct::find(trail, "finish-draw", "begin")].detail, "ps=finish"),
+                  "breadcrumbs: the game's state is out before the draw and back after it");
+        }
+
+        // (c) a cold resolve with no preflight before it (the first HDR frame can be the first call): the creations are written inside it.
+        restart();
+        f.reset = true; ++f.frame;
+        routeFrame("dlss", [&] { run(true); });
+        {
+            const auto trail = ct::trail(crumbLines);
+            std::string gap;
+            check(ct::balanced(trail, &gap), "breadcrumbs: a cold resolve's crumbs balance");
+            check(inOrder(trail, {{"admitted", ""}, {"reached", ""}, {"create-context-state", "begin"}, {"create-compute-shaders", "begin"},
+                                  {"create-constants-sampler", "begin"}, {"create-hdr-vs", "begin"}, {"create-hdr-ps-spatial", "end"},
+                                  {"create-texture", "begin"}, {"create-rtv", "begin"}, {"capture-state", "begin"}, {"copy-h", "begin"},
+                                  {"prep", "begin"}, {"backend", "begin"}, {"finish-bind", "begin"}, {"finish-draw", "begin"},
+                                  {"restore-state", "end"}, {"frame-end", "end"}}),
+                  "breadcrumbs: with no preflight before it the resolve writes every creation, then capture, copy, prep, backend, finish and restore");
+            check(ct::count(trail, "create-texture", "begin") == 5, "breadcrumbs: the five images are made inside the cold resolve");
+        }
+        const size_t coldFrameCrumbs = crumbLines.size();
+
+        // (d) a backend that refuses: the refusal is written, and the game's state is still put back (restore-state after the backend's end).
+        // The step counts say where the frame stopped: the game's state out, H copied, prep run, the backend refused, nothing drawn, the state back.
+        restart();
+        f.reset = true; ++f.frame;
+        backendFail = true;
+        const auto refuse0 = edvr::flatMonoResolveStats();
+        routeFrame("dlss", [&] { run(false); });
+        const auto refuse1 = edvr::flatMonoResolveStats();
+        backendFail = false;
+        {
+            const auto trail = ct::trail(crumbLines);
+            std::string gap;
+            const int backend = ct::find(trail, "backend", "end");
+            check(ct::balanced(trail, &gap) && backend >= 0 && trail[backend].detail == "ok=0 reason=injected-backend-refusal" &&
+                      ct::find(trail, "restore-state", "end") > backend && ct::count(trail, "finish-draw", "begin") == 0,
+                  "breadcrumbs: a refused backend ends its step with the reason, draws nothing, and the state is restored");
+            check(refuse1.hdrCaptured - refuse0.hdrCaptured == 1 && refuse1.hdrCopied - refuse0.hdrCopied == 1 && refuse1.hdrPrepped - refuse0.hdrPrepped == 1 &&
+                      refuse1.hdrBackend - refuse0.hdrBackend == 0 && refuse1.hdrFinished - refuse0.hdrFinished == 0 &&
+                      refuse1.hdrRestored - refuse0.hdrRestored == 1,
+                  "breadcrumbs: a refused backend's frame is counted at capture, copy, prep and restore, and not at the backend or the draw");
+        }
+
+        // (e) the spatial recovery writes its own steps: capture, copy, the finish through the spatial shader, restore.
+        restart();
+        f.reset = true; ++f.frame;
+        edvr::hdrCrumbAdmit(f.frame, "dlss");
+        edvr::hdrCrumbReach(f.frame, "dlss", "spatial-recovery");
+        const auto spatial0 = edvr::flatMonoResolveStats();
+        {
+            bindOriginal();
+            ComPtr<ID3D11ShaderResourceView> noView; const char* recoverWhy = nullptr;
+            check(edvr::flatMonoResolveSpatialFallback(device, context, f, noView.GetAddressOf(), &recoverWhy) && restored(), "breadcrumbs: the recovery the crumbs bracket still recovers");
+        }
+        const auto spatial1 = edvr::flatMonoResolveStats();
+        { edvr::HdrCrumbFrameEnd end(0); }
+        check(spatial1.hdrCaptured - spatial0.hdrCaptured == 1 && spatial1.hdrCopied - spatial0.hdrCopied == 1 && spatial1.hdrPrepped - spatial0.hdrPrepped == 0 &&
+                  spatial1.hdrBackend - spatial0.hdrBackend == 0 && spatial1.hdrFinished - spatial0.hdrFinished == 1 &&
+                  spatial1.hdrRestored - spatial0.hdrRestored == 1,
+              "breadcrumbs: the spatial recovery is counted at capture, copy, draw and restore, and not at prep or the backend");
+        {
+            const auto trail = ct::trail(crumbLines);
+            std::string gap;
+            check(ct::balanced(trail, &gap) &&
+                      inOrder(trail, {{"reached", ""}, {"capture-state", "begin"}, {"capture-state", "end"}, {"copy-h", "begin"}, {"copy-h", "end"},
+                                      {"finish-bind", "begin"}, {"finish-bind", "end"}, {"finish-draw", "begin"}, {"finish-draw", "end"},
+                                      {"restore-state", "begin"}, {"restore-state", "end"}, {"frame-end", "end"}}) &&
+                      ct::count(trail, "prep", "begin") == 0 && ct::count(trail, "backend", "begin") == 0 &&
+                      ct::has(trail[ct::find(trail, "finish-bind", "begin")].detail, "ps=spatial"),
+                  "breadcrumbs: the spatial recovery writes capture, copy, finish-bind, finish-draw and restore, through the spatial pixel shader, and no prep or backend");
+        }
+
+        // (f) a call that is not the route's writes nothing, even inside a frame the route has admitted and reached: the copy route's
+        // resolve and its recovery (hdr false) in the same frame.
+        restart();
+        edvr::hdrCrumbAdmit(f.frame, "dlss");
+        edvr::hdrCrumbReach(f.frame, "dlss", "resolve");
+        const auto copyRoute0 = edvr::flatMonoResolveStats();
+        {
+            std::vector<uint32_t> red(w * h, 0xff0000ff);
+            auto color = texture(device, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_SHADER_RESOURCE, red.data(), w * 4);
+            auto colorView = view(device, color.Get());
+            FlatMonoResolveFrame ldr{};
+            ldr.color = colorView.Get(); ldr.depth = depthView.Get(); ldr.renderWidth = w; ldr.renderHeight = h;
+            ldr.outputWidth = w; ldr.outputHeight = h; ldr.deltaMs = 16; camera(ldr.camera); camera(ldr.previousCamera);
+            ldr.engine = {slotView.Get(), poolView.Get(), now.Get(), old.Get()};
+            ldr.mode = FlatMonoResolveMode::Dlss; ldr.frame = f.frame + 2000; ldr.reset = true;
+            expectedJx = expectedJy = 0;
+            bindOriginal(); ComPtr<ID3D11ShaderResourceView> out; const char* reason = nullptr;
+            const bool good = edvr::flatMonoResolve(device, context, ldr, out.GetAddressOf(), &reason);
+            ComPtr<ID3D11ShaderResourceView> noView; const char* recoverWhy = nullptr;
+            const bool recoveredLdr = edvr::flatMonoResolveSpatialFallback(device, context, ldr, noView.GetAddressOf(), &recoverWhy);
+            check(good && recoveredLdr, "breadcrumbs: the copy route's resolve and recovery still run while the route's frame is live");
+        }
+        {
+            const auto trail = ct::trail(crumbLines);
+            check(trail.size() == 2 && trail[0].step == "admitted" && trail[1].step == "reached",
+                  "breadcrumbs: the copy route's resolve and its recovery write nothing under the route's name, even in a frame the route admitted");
+            const auto copyRoute1 = edvr::flatMonoResolveStats();
+            check(copyRoute1.hdrCaptured == copyRoute0.hdrCaptured && copyRoute1.hdrCopied == copyRoute0.hdrCopied && copyRoute1.hdrPrepped == copyRoute0.hdrPrepped &&
+                      copyRoute1.hdrBackend == copyRoute0.hdrBackend && copyRoute1.hdrFinished == copyRoute0.hdrFinished &&
+                      copyRoute1.hdrRestored == copyRoute0.hdrRestored,
+                  "breadcrumbs: the copy route's resolve and its recovery are not counted as the HDR route's steps");
+        }
+        { edvr::HdrCrumbFrameEnd end(0); }
+        edvr::hdrCrumbReset();
+        // What it comes to, for the cap (flat_hdr_crumbs.h, WHAT IT COSTS): the real thing adds the depth view (2), the SDK's own
+        // create and evaluate (2 and 2), before-present (2) and the Present (2) that only the game's process can write.
+        std::printf("flat mono resolve: HDR breadcrumbs: a cold preflight writes %zu crumbs, a first frame on a warm renderer %zu, a steady frame %zu "
+                    "(resolver, admission and frame end; the game's process adds 6 more a frame), a cold resolve %zu; the budget is %u and a frame "
+                    "past the third writes none\n", coldPreflightCrumbs, sizes[0], sizes[2] - sizes[1], coldFrameCrumbs,
+                    static_cast<unsigned>(edvr::kHdrCrumbCap));
+    }
 }

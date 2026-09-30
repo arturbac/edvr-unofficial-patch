@@ -65,6 +65,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "static_prop_gate.h"
 #include "temporal_pass.h"   // temporalPassArmEyeDump: the eye dump key's job
 #include "flat_runtime.h"
+#include "flat_hdr_crumbs.h"   // the flat HDR route's crash-safe breadcrumbs: the real Present's pair
 #include "format_support_log.h"   // the device capability log: the two hooks' reports and its closing tick
 #include "flat_temporal.h"   // flat profile discovery at owned Present
 #include "flat_shader_capture.h"
@@ -1723,9 +1724,17 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         flatTemporalBeforePresent(self, g_state->frameCounter, flags);
     if (runtimeFlatProfile()) flatRuntimeBeforePresent();
     if (runtimeFlatProfile()) menuFlatBeforePresent(self, flags);
+    // The flat HDR route's crash-safe breadcrumbs (flat_hdr_crumbs.h): for the first frames that reach the resolver, the
+    // real Present is bracketed, its result and the device's removed reason written. Both crumbs fall outside the clock
+    // reads below, which time the call alone. The gate is one relaxed load.
+    const bool routeCrumbs = hdrCrumbPresentSide();
+    if (routeCrumbs) hdrCrumbWrite("present", "begin");
     const int64_t presentT0 = qpcNow();
     const HRESULT hr = g_state->realPresent(self, syncInterval, flags);
     const int64_t presentT1 = qpcNow();
+    if (routeCrumbs)
+        hdrCrumbWrite("present", "end", "hr=0x%08X removed=0x%08X", static_cast<unsigned>(hr),
+                      static_cast<unsigned>(g_state->device->GetDeviceRemovedReason()));
     // The hook's own work before the real call is a tick; the real call is not
     // EDVR's, so it is timed apart and kept out of the slowest three.
     g_frameTicks.markAt("present_pre", presentT0);

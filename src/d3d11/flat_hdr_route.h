@@ -406,6 +406,20 @@ struct FlatHdrLatch {
 };
 
 // ---- the census ----------------------------------------------------------------------------------
+// Where the route's frames got to in a window: how many reached each step of the treatment. The runtime counts the first
+// two, the resolver the rest (FlatMonoResolveStats::hdrCaptured and its neighbours, handed over by difference), so a window
+// whose counts stop at one step names the step that frames stop at in a session that goes on. The crash-safe trail of the
+// first frames, for a session that does not, is flat_hdr_crumbs.h; this is the census of every frame, with no budget.
+struct FlatHdrSteps {
+    uint64_t admitted = 0;   // the route took the frame: treatHdr ran
+    uint64_t reached = 0;    // ... and the frame got to the resolver (the resolve, or the spatial recovery)
+    uint64_t captured = 0;   // the game's pipeline state was swapped out
+    uint64_t copied = 0;     // H was copied into the private input
+    uint64_t prepped = 0;    // the prep dispatch ran (the resolve only)
+    uint64_t backend = 0;    // the backend returned success (the resolve only)
+    uint64_t finished = 0;   // the pixel-shader draw into H ran
+    uint64_t restored = 0;   // the game's pipeline state was put back
+};
 // One 5 s window, reset when it prints. The per-window token is the trigger decision: frames with an H and
 // a trigger against frames with an H and none.
 struct FlatHdrWindow {
@@ -415,6 +429,7 @@ struct FlatHdrWindow {
     uint64_t lateWriteFrames = 0, lateWrites = 0;
     uint64_t treated = 0;         // frames the route resolved
     uint64_t declined = 0;        // the selector chose the frame and the treatment declined it (each is logged, to a dozen)
+    FlatHdrSteps steps;           // how far the route's frames got, step by step
     const char* lastVerdict = "none";
     uint64_t lastTriggerVs = 0, lastTriggerPs = 0;
     uint32_t lastHdrWidth = 0, lastHdrHeight = 0, lastTargetWidth = 0, lastTargetHeight = 0;
@@ -459,6 +474,7 @@ inline int flatHdrFormatWindow(char* out, size_t size, FlatHdrKey key, FlatHdrSt
     int n = std::snprintf(out, size,
         "flat hdr route 5s: key=%s state=%s frames=%llu hdr-frames=%llu trigger=%llu none=%llu ambiguous=%llu "
         "treated=%llu declined=%llu late-hdr-writes=%llu (in %llu frames) last=%s "
+        "steps: admitted=%llu reached=%llu captured=%llu copied=%llu prepped=%llu backend=%llu finished=%llu restored=%llu "
         "last-trigger=VS=%016llX PS=%016llX target=%ux%u hdr=%ux%u selection=",
         flatHdrKeyName(key), flatHdrStateName(state),
         static_cast<unsigned long long>(w.frames), static_cast<unsigned long long>(w.hdrFrames),
@@ -466,6 +482,10 @@ inline int flatHdrFormatWindow(char* out, size_t size, FlatHdrKey key, FlatHdrSt
         static_cast<unsigned long long>(w.ambiguousFrames), static_cast<unsigned long long>(w.treated),
         static_cast<unsigned long long>(w.declined), static_cast<unsigned long long>(w.lateWrites),
         static_cast<unsigned long long>(w.lateWriteFrames), w.lastVerdict,
+        static_cast<unsigned long long>(w.steps.admitted), static_cast<unsigned long long>(w.steps.reached),
+        static_cast<unsigned long long>(w.steps.captured), static_cast<unsigned long long>(w.steps.copied),
+        static_cast<unsigned long long>(w.steps.prepped), static_cast<unsigned long long>(w.steps.backend),
+        static_cast<unsigned long long>(w.steps.finished), static_cast<unsigned long long>(w.steps.restored),
         static_cast<unsigned long long>(w.lastTriggerVs), static_cast<unsigned long long>(w.lastTriggerPs),
         w.lastTargetWidth, w.lastTargetHeight, w.lastHdrWidth, w.lastHdrHeight);
     // The selector's verdicts at this window's triggers, "name:count" each, or "none" when no frame triggered.

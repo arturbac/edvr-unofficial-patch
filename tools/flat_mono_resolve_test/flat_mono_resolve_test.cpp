@@ -5,6 +5,8 @@
 #include "../../src/d3d11/dlaa.h"
 #include "../../src/d3d11/fsr3_engine.h"
 #include "../../src/d3d11/engine_velocity_emit.h"
+#include "../../src/d3d11/flat_hdr_crumbs.h"
+#include "../hdr_crumb_trail.h"
 #include <d3d11_1.h>
 #include <d3d11sdklayers.h>
 #include <wrl/client.h>
@@ -23,6 +25,8 @@ namespace {
 int failures=0,backendCalls=0;
 bool backendFail=false,backendReset=false,infiniteSeen=false;
 std::vector<std::string> resetEvents;
+// What the HDR route's breadcrumbs (flat_hdr_crumbs.h) were handed to breadcrumb(), in order: the lines edvr_breadcrumbs.txt would hold.
+std::vector<std::string> crumbLines;
 float expectedJx=0,expectedJy=0;
 float observedMotion=0,observedMotionY=0,observedDepth=0;unsigned observedReject=0;
 // The whole motion texture the SDK was handed, decoded, and a hash over its raw bits: the shader's complete
@@ -132,6 +136,8 @@ void Log::note(const char* fmt,...) {
     va_list args;va_start(args,fmt);std::vsnprintf(line,sizeof(line),fmt,args);va_end(args);
     resetEvents.emplace_back(line);
 }
+// Stand-in for src\common\proxy.cpp's breadcrumb(): the route's crumbs land here so the rig can read the trail back.
+void breadcrumb(const char* stage) {if(stage)crumbLines.emplace_back(stage);}
 bool ensureDirectory(const std::wstring& path) {return CreateDirectoryW(path.c_str(),nullptr) || GetLastError()==ERROR_ALREADY_EXISTS;}
 thread_local bool g_flatComputeInternal = false;
 bool dlaaAvailable(ID3D11Device*,const char**){return true;}

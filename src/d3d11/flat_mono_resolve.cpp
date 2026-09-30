@@ -9,6 +9,7 @@
 #include <limits>
 #include "../common/log.h"
 #include "flat_cpu.h"
+#include "flat_hdr_crumbs.h"
 #include "flat_pixel_capture.h"
 #include "flat_projection_math.h"
 
@@ -25,6 +26,19 @@ struct SpanGuard {
         if (g_spanBegin && g_spanEnd) { g_spanBegin(context); open = true; }
     }
     ~SpanGuard() { if (open) g_spanEnd(context); }
+};
+// The HDR route's breadcrumbs (flat_hdr_crumbs.h): true while a resolver call that belongs to the route is running and the
+// session's crumbs are live. The three entry points set it (CrumbScope) and the helpers below read it, so none of them is
+// handed the route's bit; a copy-route call in the same frame never sets it, so its steps are never written under the
+// route's name. A plain bool: the resolver runs on the owner thread. g_hdrCall is the same scope without the crumbs' gate:
+// the call is the HDR route's, which is what its step counts (FlatMonoResolveStats::hdrCaptured and the rest) ask.
+bool g_crumbOn = false, g_hdrCall = false;
+struct CrumbScope {
+    const bool previous, previousCall;
+    explicit CrumbScope(bool hdr) : previous(g_crumbOn), previousCall(g_hdrCall) { g_hdrCall = hdr; g_crumbOn = hdr && hdrCrumbLive(); }
+    ~CrumbScope() { g_crumbOn = previous; g_hdrCall = previousCall; }
+    CrumbScope(const CrumbScope&) = delete;
+    CrumbScope& operator=(const CrumbScope&) = delete;
 };
 // Like renderer state, explicit owner-thread cleanup only: never release live
 // driver resources from static destruction under the DLL loader lock.
@@ -78,14 +92,18 @@ struct Isolate {
     ID3D11DeviceContext1* context;
     ComPtr<ID3DDeviceContextState> previous;
     Isolate(ID3D11DeviceContext1* c, ID3DDeviceContextState* state):context(c) {
+        HdrCrumbSpan capture(g_crumbOn,"capture-state");   // the game's pipeline state swapped out, ours cleared
         context->SwapDeviceContextState(state, previous.GetAddressOf());
         context->ClearState();
+        if(g_hdrCall)++stats.hdrCaptured;
     }
     ~Isolate() {
+        HdrCrumbSpan restore(g_crumbOn,"restore-state");   // ours cleared, the game's swapped back
         // Keep our reusable state free of resource bindings; restoring the game
         // cannot leave our UAVs aliased with its pending output-copy SRV.
         context->ClearState();
         context->SwapDeviceContextState(previous.Get(), nullptr);
+        if(g_hdrCall)++stats.hdrRestored;
     }
 };
 bool fail(const char** reason, const char* text) {
@@ -170,22 +188,32 @@ bool preflightMetadataValid(const FlatMonoResolvePreflight& f,const char** reaso
     }
     return true;
 }
-bool image(ID3D11Device* device,uint32_t width,uint32_t height,DXGI_FORMAT format,Image& out,bool writable=true) {
+// `role` names the image in the HDR route's crumbs, which say what each texture is (format, size) before it is made and
+// every HRESULT after; E_PENDING in one of them means that call was never reached.
+bool image(ID3D11Device* device,uint32_t width,uint32_t height,DXGI_FORMAT format,Image& out,bool writable=true,const char* role="image") {
+    HdrCrumbSpan span(g_crumbOn,"create-texture","role=%s fmt=%s(%u) size=%ux%u uav=%u",role,hdrCrumbFormat(static_cast<uint32_t>(format)),
+        static_cast<unsigned>(format),width,height,writable?1u:0u);
+    HRESULT hrTexture=E_PENDING,hrSrv=E_PENDING,hrUav=E_PENDING,hrSrgb=E_PENDING;
+    const auto done=[&](bool ok) {
+        span.result("hr=0x%08X srv=0x%08X uav=0x%08X srgb=0x%08X",static_cast<unsigned>(hrTexture),static_cast<unsigned>(hrSrv),
+            static_cast<unsigned>(hrUav),static_cast<unsigned>(hrSrgb));
+        return ok;
+    };
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width=width;desc.Height=height;desc.MipLevels=desc.ArraySize=1;desc.Format=format;
     desc.SampleDesc.Count=1;desc.Usage=D3D11_USAGE_DEFAULT;
     desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|(writable?D3D11_BIND_UNORDERED_ACCESS:0);
-    if(FAILED(device->CreateTexture2D(&desc,nullptr,out.texture.GetAddressOf())))return false;
+    if(FAILED(hrTexture=device->CreateTexture2D(&desc,nullptr,out.texture.GetAddressOf())))return done(false);
     D3D11_SHADER_RESOURCE_VIEW_DESC sd{};sd.Format=format==DXGI_FORMAT_R8G8B8A8_TYPELESS?DXGI_FORMAT_R8G8B8A8_UNORM:format;
     sd.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D;sd.Texture2D.MipLevels=1;
     D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};ud.Format=sd.Format;ud.ViewDimension=D3D11_UAV_DIMENSION_TEXTURE2D;
-    if(FAILED(device->CreateShaderResourceView(out.texture.Get(),&sd,out.srv.GetAddressOf())) ||
-       (writable && FAILED(device->CreateUnorderedAccessView(out.texture.Get(),&ud,out.uav.GetAddressOf()))))return false;
+    if(FAILED(hrSrv=device->CreateShaderResourceView(out.texture.Get(),&sd,out.srv.GetAddressOf())) ||
+       (writable && FAILED(hrUav=device->CreateUnorderedAccessView(out.texture.Get(),&ud,out.uav.GetAddressOf()))))return done(false);
     if(format==DXGI_FORMAT_R8G8B8A8_TYPELESS) {
         sd.Format=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        if(FAILED(device->CreateShaderResourceView(out.texture.Get(),&sd,out.srgb.GetAddressOf())))return false;
+        if(FAILED(hrSrgb=device->CreateShaderResourceView(out.texture.Get(),&sd,out.srgb.GetAddressOf())))return done(false);
     }
-    return true;
+    return done(true);
 }
 bool initialize(ID3D11Device* device,ID3D11DeviceContext* context,const char** reason) {
     if(g.device.Get()==device && g.context.Get()==context && g.prep && g.taa && g.finish && g.spatial && g.constants && g.sampler && g.isolated)return true;
@@ -202,18 +230,43 @@ bool initialize(ID3D11Device* device,ID3D11DeviceContext* context,const char** r
         return fail(reason,"flat-resolve-requires-context-state-isolation");
     D3D_FEATURE_LEVEL level=device->GetFeatureLevel(),selected{};
     UINT flags=(device->GetCreationFlags()&D3D11_CREATE_DEVICE_SINGLETHREADED)?D3D11_1_CREATE_DEVICE_CONTEXT_STATE_SINGLETHREADED:0;
-    if(level<D3D_FEATURE_LEVEL_11_0 || FAILED(d1->CreateDeviceContextState(flags,&level,1,D3D11_SDK_VERSION,
-        __uuidof(ID3D11Device),&selected,g.isolated.GetAddressOf())))return fail(reason,"flat-resolve-context-state-create-failed");
-    if(FAILED(device->CreateComputeShader(kFlatMonoPrepBytecode,sizeof(kFlatMonoPrepBytecode),nullptr,g.prep.GetAddressOf())) ||
-       FAILED(device->CreateComputeShader(kFlatMonoTaaBytecode,sizeof(kFlatMonoTaaBytecode),nullptr,g.taa.GetAddressOf())) ||
-       FAILED(device->CreateComputeShader(kFlatMonoFinishBytecode,sizeof(kFlatMonoFinishBytecode),nullptr,g.finish.GetAddressOf())) ||
-       FAILED(device->CreateComputeShader(kFlatMonoSpatialBytecode,sizeof(kFlatMonoSpatialBytecode),nullptr,g.spatial.GetAddressOf())))
-        return fail(reason,"flat-resolve-shader-create-failed");
-    D3D11_BUFFER_DESC cb{};cb.ByteWidth=sizeof(Constants);cb.Usage=D3D11_USAGE_DEFAULT;cb.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
-    if(FAILED(device->CreateBuffer(&cb,nullptr,g.constants.GetAddressOf())))return fail(reason,"flat-resolve-constants-create-failed");
-    D3D11_SAMPLER_DESC sm{};sm.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    sm.AddressU=sm.AddressV=sm.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sm.MaxLOD=D3D11_FLOAT32_MAX;
-    if(FAILED(device->CreateSamplerState(&sm,g.sampler.GetAddressOf())))return fail(reason,"flat-resolve-sampler-create-failed");
+    // The HDR route's crumbs bracket each creation that has never run on a DXMT device (flat_hdr_crumbs.h). E_PENDING in a
+    // result is a call that was not reached.
+    HRESULT hrState=E_PENDING;
+    {
+        HdrCrumbSpan span(g_crumbOn,"create-context-state","level=0x%X flags=%u",static_cast<unsigned>(level),static_cast<unsigned>(flags));
+        if(level>=D3D_FEATURE_LEVEL_11_0)
+            hrState=d1->CreateDeviceContextState(flags,&level,1,D3D11_SDK_VERSION,__uuidof(ID3D11Device),&selected,g.isolated.GetAddressOf());
+        span.result("hr=0x%08X",static_cast<unsigned>(hrState));
+    }
+    if(level<D3D_FEATURE_LEVEL_11_0 || FAILED(hrState))return fail(reason,"flat-resolve-context-state-create-failed");
+    HRESULT hrShader[4]={E_PENDING,E_PENDING,E_PENDING,E_PENDING};
+    bool shadersFailed;
+    {
+        HdrCrumbSpan span(g_crumbOn,"create-compute-shaders","prep,taa,finish,spatial");
+        shadersFailed=
+           FAILED(hrShader[0]=device->CreateComputeShader(kFlatMonoPrepBytecode,sizeof(kFlatMonoPrepBytecode),nullptr,g.prep.GetAddressOf())) ||
+           FAILED(hrShader[1]=device->CreateComputeShader(kFlatMonoTaaBytecode,sizeof(kFlatMonoTaaBytecode),nullptr,g.taa.GetAddressOf())) ||
+           FAILED(hrShader[2]=device->CreateComputeShader(kFlatMonoFinishBytecode,sizeof(kFlatMonoFinishBytecode),nullptr,g.finish.GetAddressOf())) ||
+           FAILED(hrShader[3]=device->CreateComputeShader(kFlatMonoSpatialBytecode,sizeof(kFlatMonoSpatialBytecode),nullptr,g.spatial.GetAddressOf()));
+        span.result("hr=0x%08X,0x%08X,0x%08X,0x%08X",static_cast<unsigned>(hrShader[0]),static_cast<unsigned>(hrShader[1]),
+            static_cast<unsigned>(hrShader[2]),static_cast<unsigned>(hrShader[3]));
+    }
+    if(shadersFailed)return fail(reason,"flat-resolve-shader-create-failed");
+    HRESULT hrBuffer=E_PENDING,hrSampler=E_PENDING;
+    {
+        HdrCrumbSpan span(g_crumbOn,"create-constants-sampler","cbuffer=%u bytes",static_cast<unsigned>(sizeof(Constants)));
+        D3D11_BUFFER_DESC cb{};cb.ByteWidth=sizeof(Constants);cb.Usage=D3D11_USAGE_DEFAULT;cb.BindFlags=D3D11_BIND_CONSTANT_BUFFER;
+        hrBuffer=device->CreateBuffer(&cb,nullptr,g.constants.GetAddressOf());
+        if(SUCCEEDED(hrBuffer)) {
+            D3D11_SAMPLER_DESC sm{};sm.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            sm.AddressU=sm.AddressV=sm.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;sm.MaxLOD=D3D11_FLOAT32_MAX;
+            hrSampler=device->CreateSamplerState(&sm,g.sampler.GetAddressOf());
+        }
+        span.result("cbuffer=0x%08X sampler=0x%08X",static_cast<unsigned>(hrBuffer),static_cast<unsigned>(hrSampler));
+    }
+    if(FAILED(hrBuffer))return fail(reason,"flat-resolve-constants-create-failed");
+    if(FAILED(hrSampler))return fail(reason,"flat-resolve-sampler-create-failed");
     g.device=device;
     return true;
 }
@@ -233,8 +286,13 @@ bool resources(const FlatMonoResolveFrame& f,const char** reason) {
     g.color={};g.depth[0]={};g.depth[1]={};g.motion={};g.rejection={};g.expected={};g.output[0]={};g.output[1]={};
     g.width=g.height=g.outWidth=g.outHeight=0;g.evalWidth=g.evalHeight=0;g.current=0;g.history=false;g.hdr=false;
     const bool taa=f.mode==FlatMonoResolveMode::Taa;
+    // The images' names for the HDR route's crumbs: which of the private textures each creation is.
+    const auto role=[&](const Image& i)->const char* {
+        return &i==&g.color?"color":&i==&g.depth[0]?"depth0":&i==&g.depth[1]?"depth1":&i==&g.motion?"motion":
+               &i==&g.rejection?"rejection":&i==&g.expected?"expected":&i==&g.output[0]?"output0":"output1";
+    };
     auto make=[&](Image& out,DXGI_FORMAT format,bool output=false,bool writable=true) {
-        return image(g.device.Get(),output?evalW:f.renderWidth,output?evalH:f.renderHeight,format,out,writable);
+        return image(g.device.Get(),output?evalW:f.renderWidth,output?evalH:f.renderHeight,format,out,writable,role(out));
     };
     bool made;
     if(f.hdr) {
@@ -282,9 +340,16 @@ bool inputTexture(ID3D11ShaderResourceView* view,uint32_t width,uint32_t height,
 // The HDR route's pixel-shader half, created on first use so the copy route never pays for it.
 bool initializeHdr(ID3D11Device* device,const char** reason) {
     if(g.hdrVs && g.finishHdr && g.spatialHdr && g.noCull)return true;
-    if(FAILED(device->CreateVertexShader(kFlatMonoHdrVsBytecode,sizeof(kFlatMonoHdrVsBytecode),nullptr,g.hdrVs.GetAddressOf())) ||
-       FAILED(device->CreatePixelShader(kFlatMonoFinishHdrBytecode,sizeof(kFlatMonoFinishHdrBytecode),nullptr,g.finishHdr.GetAddressOf())) ||
-       FAILED(device->CreatePixelShader(kFlatMonoSpatialHdrBytecode,sizeof(kFlatMonoSpatialHdrBytecode),nullptr,g.spatialHdr.GetAddressOf())))
+    // One crumb pair per shader: these three are the route's own, and the first D3D11 shaders of it any DXMT device sees.
+    const auto made=[&](const char* step,auto&& create) {
+        HdrCrumbSpan span(g_crumbOn,step);
+        const HRESULT hr=create();
+        span.result("hr=0x%08X",static_cast<unsigned>(hr));
+        return hr;
+    };
+    if(FAILED(made("create-hdr-vs",[&]{return device->CreateVertexShader(kFlatMonoHdrVsBytecode,sizeof(kFlatMonoHdrVsBytecode),nullptr,g.hdrVs.GetAddressOf());})) ||
+       FAILED(made("create-hdr-ps-finish",[&]{return device->CreatePixelShader(kFlatMonoFinishHdrBytecode,sizeof(kFlatMonoFinishHdrBytecode),nullptr,g.finishHdr.GetAddressOf());})) ||
+       FAILED(made("create-hdr-ps-spatial",[&]{return device->CreatePixelShader(kFlatMonoSpatialHdrBytecode,sizeof(kFlatMonoSpatialHdrBytecode),nullptr,g.spatialHdr.GetAddressOf());})))
         return fail(reason,"flat-resolve-hdr-shader-create-failed");
     D3D11_RASTERIZER_DESC rd{};rd.FillMode=D3D11_FILL_SOLID;rd.CullMode=D3D11_CULL_NONE;rd.DepthClipEnable=TRUE;
     if(FAILED(device->CreateRasterizerState(&rd,g.noCull.GetAddressOf())))return fail(reason,"flat-resolve-hdr-rasterizer-create-failed");
@@ -295,8 +360,16 @@ bool hdrTargetView(ID3D11Texture2D* texture,const char** reason) {
     if(g.hdrRtv && g.hdrRtvTexture==texture)return true;
     g.hdrRtv.Reset();g.hdrRtvTexture=nullptr;
     D3D11_RENDER_TARGET_VIEW_DESC rv{};rv.Format=DXGI_FORMAT_R11G11B10_FLOAT;rv.ViewDimension=D3D11_RTV_DIMENSION_TEXTURE2D;
-    if(FAILED(g.device->CreateRenderTargetView(texture,&rv,g.hdrRtv.GetAddressOf())))
-        return fail(reason,"flat-resolve-hdr-target-not-renderable");
+    HRESULT hr;
+    {
+        D3D11_TEXTURE2D_DESC td{};
+        if(g_crumbOn)texture->GetDesc(&td);   // only to say what the view is over
+        HdrCrumbSpan span(g_crumbOn,"create-rtv","over H fmt=%s(%u) size=%ux%u",hdrCrumbFormat(static_cast<uint32_t>(rv.Format)),
+            static_cast<unsigned>(rv.Format),td.Width,td.Height);
+        hr=g.device->CreateRenderTargetView(texture,&rv,g.hdrRtv.GetAddressOf());
+        span.result("hr=0x%08X",static_cast<unsigned>(hr));
+    }
+    if(FAILED(hr))return fail(reason,"flat-resolve-hdr-target-not-renderable");
     g.hdrRtvTexture=texture;
     return true;
 }
@@ -304,26 +377,49 @@ bool hdrTargetView(ID3D11Texture2D* texture,const char** reason) {
 // already isolated the context; this starts from its own clean state, as the compute finish does after an SDK.
 void drawHdrTarget(ID3D11DeviceContext* context,ID3D11PixelShader* ps,uint32_t width,uint32_t height,
                    ID3D11ShaderResourceView* const* views,uint32_t viewCount) {
-    context->ClearState();
-    ID3D11Buffer* cb0=g.constants.Get();context->PSSetConstantBuffers(0,1,&cb0);
-    context->PSSetShaderResources(0,viewCount,views);
-    ID3D11SamplerState* sampler=g.sampler.Get();context->PSSetSamplers(0,1,&sampler);
-    context->IASetInputLayout(nullptr);context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    context->VSSetShader(g.hdrVs.Get(),nullptr,0);context->PSSetShader(ps,nullptr,0);
-    context->RSSetState(g.noCull.Get());
-    const D3D11_VIEWPORT vp{0.0f,0.0f,static_cast<float>(width),static_cast<float>(height),0.0f,1.0f};
-    context->RSSetViewports(1,&vp);
-    ID3D11RenderTargetView* rtv=g.hdrRtv.Get();context->OMSetRenderTargets(1,&rtv,nullptr);
-    context->Draw(3,0);
+    const char* which=ps==g.spatialHdr.Get()?"spatial":"finish";   // for the crumbs: the route's two pixel shaders
+    {
+        // H bound as the render target, with everything the draw reads: the crumbs name this step apart from the draw.
+        HdrCrumbSpan bind(g_crumbOn,"finish-bind","ps=%s target=%ux%u views=%u",which,width,height,viewCount);
+        context->ClearState();
+        ID3D11Buffer* cb0=g.constants.Get();context->PSSetConstantBuffers(0,1,&cb0);
+        context->PSSetShaderResources(0,viewCount,views);
+        ID3D11SamplerState* sampler=g.sampler.Get();context->PSSetSamplers(0,1,&sampler);
+        context->IASetInputLayout(nullptr);context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        context->VSSetShader(g.hdrVs.Get(),nullptr,0);context->PSSetShader(ps,nullptr,0);
+        context->RSSetState(g.noCull.Get());
+        const D3D11_VIEWPORT vp{0.0f,0.0f,static_cast<float>(width),static_cast<float>(height),0.0f,1.0f};
+        context->RSSetViewports(1,&vp);
+        ID3D11RenderTargetView* rtv=g.hdrRtv.Get();context->OMSetRenderTargets(1,&rtv,nullptr);
+    }
+    {
+        HdrCrumbSpan draw(g_crumbOn,"finish-draw","ps=%s vertices=3",which);
+        context->Draw(3,0);
+        ++stats.hdrFinished;   // drawHdrTarget is the HDR route's alone: the resolve's finish and the spatial recovery's
+    }
     // Nothing of ours stays bound: the isolation guard's destructor clears the state once more before the game's returns.
     context->OMSetRenderTargets(0,nullptr,nullptr);
     ID3D11ShaderResourceView* none[8]={};context->PSSetShaderResources(0,viewCount,none);
+}
+// The backend's availability ask, where the asker is the HDR route: the first such ask of a session is the SDK's own
+// initialisation (NGX's, or AMD's), the first call into code that has never run on a DXMT device, so the crumbs bracket it.
+// Later asks are a flag test and are not written. DLAA and DLSS share NGX.
+bool backendAvailable(FlatMonoResolveMode mode,ID3D11Device* device,const char** reason) {
+    static bool crumbed[2]={false,false};
+    const unsigned which=mode==FlatMonoResolveMode::Fsr?1u:0u;
+    const bool first=g_crumbOn && !crumbed[which];
+    if(first)crumbed[which]=true;
+    HdrCrumbSpan span(first,"backend-available","backend=%s",which?"fsr":"ngx");
+    const bool ok=which?fsr3Available(device,reason):dlaaAvailable(device,reason);
+    span.result("ok=%u reason=%s",ok?1u:0u,(reason && *reason)?*reason:"none");
+    return ok;
 }
 } // namespace
 
 FlatMonoResolveStats flatMonoResolveStats() { return stats; }
 bool flatMonoResolveLastReset() { return stats.lastReset; }
-FlatMonoResolvePreflightResult flatMonoResolvePreflight(ID3D11Device* device,
+// The preflight proper; the public entry below puts the route's crumbs around it.
+static FlatMonoResolvePreflightResult preflightBody(ID3D11Device* device,
     ID3D11DeviceContext* context,const FlatMonoResolvePreflight& planned) {
     FlatMonoResolvePreflightResult result{};
     const char* why=nullptr;
@@ -381,10 +477,9 @@ FlatMonoResolvePreflightResult flatMonoResolvePreflight(ID3D11Device* device,
         return result;
     }
     result.backendFeatureCreationDeferred=planned.mode!=FlatMonoResolveMode::Taa;
-    if(planned.mode==FlatMonoResolveMode::Dlaa || planned.mode==FlatMonoResolveMode::Dlss)
-        result.backendAvailable=dlaaAvailable(device,&why);
-    else if(planned.mode==FlatMonoResolveMode::Fsr)
-        result.backendAvailable=fsr3Available(device,&why);
+    // DLAA and DLSS ask NGX, FSR asks AMD's port, EDVR's own TAA needs no SDK.
+    if(planned.mode!=FlatMonoResolveMode::Taa)
+        result.backendAvailable=backendAvailable(planned.mode,device,&why);
     else result.backendAvailable=true;
     if(!result.backendAvailable) {
         result.status=FlatMonoResolvePreflightStatus::BackendUnavailable;
@@ -394,6 +489,18 @@ FlatMonoResolvePreflightResult flatMonoResolvePreflight(ID3D11Device* device,
     result.status=FlatMonoResolvePreflightStatus::Ready;
     result.reason=result.backendFeatureCreationDeferred?
         "ready-backend-feature-creation-deferred":"ready";
+    return result;
+}
+FlatMonoResolvePreflightResult flatMonoResolvePreflight(ID3D11Device* device,
+    ID3D11DeviceContext* context,const FlatMonoResolvePreflight& planned) {
+    // The HDR route's plan, at the Present that ends the frame that made it: the route's crumbs bracket the whole preflight
+    // and, through g_crumbOn, every creation inside it (flat_hdr_crumbs.h). A copy-route plan writes nothing.
+    CrumbScope crumbs(planned.hdr);
+    HdrCrumbSpan span(g_crumbOn,"preflight","plan=%ux%u->%ux%u mode=%s",planned.renderWidth,planned.renderHeight,
+        planned.outputWidth,planned.outputHeight,flatMonoResolveModeName(planned.mode));
+    const FlatMonoResolvePreflightResult result=preflightBody(device,context,planned);
+    span.result("status=%u ready=%u reason=%s",static_cast<unsigned>(result.status),result.readyForRasterJitter()?1u:0u,
+        result.reason?result.reason:"none");
     return result;
 }
 void flatMonoResolveReset() { pixels.cancel();++stats.fullResets;stats.currentContinueRun=0;g=State{}; }
@@ -413,6 +520,7 @@ void flatMonoResolveSetSpanHooks(FlatMonoResolveSpanFn begin, FlatMonoResolveSpa
 
 bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const FlatMonoResolveFrame& f,
                      ID3D11ShaderResourceView** output,const char** reason) {
+    CrumbScope crumbs(f.hdr);   // the HDR route's breadcrumbs (flat_hdr_crumbs.h) for every step below
     ++stats.calls;
     if(output)*output=nullptr;
     if(reason)*reason=nullptr;
@@ -469,9 +577,8 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     if(!reset && !engine)return fail(reason,"flat-resolve-engine-source-views-unavailable");
     // All external backend work is inside the same complete state isolation.
     Isolate isolated(g.context.Get(),g.isolated.Get());
-    if(f.mode==FlatMonoResolveMode::Dlaa || f.mode==FlatMonoResolveMode::Dlss) {
-        if(!dlaaAvailable(device,reason)) {++stats.backendFailures;g.history=false;stats.currentContinueRun=0;return false;}
-    } else if(f.mode==FlatMonoResolveMode::Fsr && !fsr3Available(device,reason)) {++stats.backendFailures;g.history=false;stats.currentContinueRun=0;return false;}
+    // DLAA and DLSS ask NGX, FSR asks AMD's port; EDVR's own TAA needs no SDK.
+    if(f.mode!=FlatMonoResolveMode::Taa && !backendAvailable(f.mode,device,reason)) {++stats.backendFailures;g.history=false;stats.currentContinueRun=0;return false;}
     const uint32_t index=taa?g.current:0;
     Constants constants{};std::memcpy(constants.camera,f.camera,sizeof(f.camera));
     std::memcpy(constants.previous,reset?f.camera:f.previousCamera,sizeof(f.previousCamera));
@@ -483,9 +590,15 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     // On a reset the previous rows ARE the current rows (above), so they carry the current phase.
     constants.rowsJitter[0]=rowsNow.ndcX;constants.rowsJitter[1]=rowsNow.ndcY;
     constants.rowsJitter[2]=reset?rowsNow.ndcX:rowsBefore.ndcX;constants.rowsJitter[3]=reset?rowsNow.ndcY:rowsBefore.ndcY;
+    // The crumbs' copy step covers the census's timestamps, the constants upload and the copy of H into the private input.
+    HdrCrumbSpan copyStep(g_crumbOn,"copy-h","fmt=%s(%u) size=%ux%u",hdrCrumbFormat(static_cast<uint32_t>(colorDesc.Format)),
+        static_cast<unsigned>(colorDesc.Format),f.renderWidth,f.renderHeight);
     SpanGuard span(context);   // the GPU census's timestamp pair: this call's own dispatches and the backend
     context->UpdateSubresource(g.constants.Get(),0,nullptr,&constants,0,0);
     context->CopyResource(g.color.texture.Get(),color.Get());
+    if(hdr)++stats.hdrCopied;
+    copyStep.close();
+    HdrCrumbSpan prepStep(g_crumbOn,"prep","groups=%ux%u",(f.renderWidth+7)/8,(f.renderHeight+7)/8);
     ID3D11Buffer* cb[]={g.constants.Get(),f.engine.sceneNow,f.engine.scenePrev};
     context->CSSetConstantBuffers(0,3,cb);
     ID3D11ShaderResourceView* prepViews[]={g.color.srv.Get(),f.depth,f.engine.slots,f.engine.pool};
@@ -496,6 +609,10 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     context->Dispatch((f.renderWidth+7)/8,(f.renderHeight+7)/8,1);
     ID3D11UnorderedAccessView* nullUavs[5]={};ID3D11ShaderResourceView* nullViews[9]={};
     context->CSSetUnorderedAccessViews(0,5,nullUavs,nullptr);context->CSSetShaderResources(0,9,nullViews);
+    if(hdr)++stats.hdrPrepped;
+    prepStep.close();
+    HdrCrumbSpan backendStep(g_crumbOn,"backend","mode=%s in=%ux%u out=%ux%u reset=%u",flatMonoResolveModeName(f.mode),
+        f.renderWidth,f.renderHeight,evalW,evalH,reset?1u:0u);
     bool ok=true;
     {
         flatcpu::Scope backendScope(flatcpu::kBackend);   // the backend evaluation: NGX, FSR3, or the TAA dispatch
@@ -516,6 +633,9 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
             g.rejection.texture.Get(),f.renderWidth,f.renderHeight,evalW,evalH,f.jitterX,f.jitterY,reset,f.deltaMs,reason,hdr);
     }
     }
+    backendStep.result("ok=%u reason=%s",ok?1u:0u,(reason && *reason)?*reason:"none");
+    backendStep.close();
+    if(hdr && ok)++stats.hdrBackend;
     if(!ok) {++stats.backendFailures;g.history=false;stats.currentContinueRun=0;return false;}
     if(hdr) {
         // The result goes back into the game's HDR target through a pixel-shader draw: per pixel the backend's output,
@@ -588,6 +708,9 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
 
 bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* context,const FlatMonoResolveFrame& f,
                                     ID3D11ShaderResourceView** output,const char** reason) {
+    // The HDR route's spatial recovery writes the same crumbs as its resolve (flat_hdr_crumbs.h): capture-state, copy-h,
+    // finish-bind, finish-draw, restore-state. The copy route's recovery writes none.
+    CrumbScope crumbs(f.hdr);
     if(output)*output=nullptr;
     if(reason)*reason=nullptr;
     g.history=false;stats.currentContinueRun=0;
@@ -607,7 +730,12 @@ bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* co
     if(hdr && !hdrTargetView(color.Get(),reason))return false;
     D3D11_SHADER_RESOURCE_VIEW_DESC colorDesc{};f.color->GetDesc(&colorDesc);
     Isolate isolated(g.context.Get(),g.isolated.Get());
-    context->CopyResource(g.color.texture.Get(),color.Get());
+    {
+        HdrCrumbSpan copyStep(g_crumbOn,"copy-h","fmt=%s(%u) size=%ux%u",hdrCrumbFormat(static_cast<uint32_t>(colorDesc.Format)),
+            static_cast<unsigned>(colorDesc.Format),f.renderWidth,f.renderHeight);
+        context->CopyResource(g.color.texture.Get(),color.Get());
+        if(hdr)++stats.hdrCopied;
+    }
     if(hdr) {
         // The HDR route's recovery: the jittered H resampled on the unjittered grid and written back into H by a
         // pixel shader (the same draw the resolve ends with), no history and no SDK. *output stays null.

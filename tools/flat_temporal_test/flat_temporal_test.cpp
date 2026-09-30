@@ -29,6 +29,7 @@
 #include "flat_query_cut_tests.h"
 #include "flat_wrapper_note_tests.h"
 #include "flat_hdr_route_tests.h"
+#include "flat_hdr_crumbs_tests.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -2962,6 +2963,8 @@ int main(int argc, char** argv) {
     failures += flatQueryCutTests();
     testFlatQueryCutWiring();
     failures += flatHdrRouteTests();
+    failures += flatHdrCrumbTests();
+    failures += flatHdrCrumbWiringTests();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

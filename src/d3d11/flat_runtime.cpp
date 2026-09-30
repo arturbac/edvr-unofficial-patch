@@ -1,6 +1,7 @@
 #include "flat_runtime.h"
 #include "flat_runtime_model.h"
 #include "flat_hdr_route.h"
+#include "flat_hdr_crumbs.h"
 #include "flat_mono_resolve.h"
 #include "flat_projection_recipes.h"
 #include "flat_shader_classifier.h"
@@ -246,6 +247,7 @@ struct State {
     bool hdrKeyRead = false;
     FlatHdrFrame hdr{};              // this frame's detector state, reset at the Present that starts the frame
     FlatHdrWindow hdrWindow{};       // the 5 s window of the census token
+    FlatHdrSteps hdrStepsSeen{};     // the resolver's cumulative step counts at the last window (the window prints the difference)
     FlatHdrLatch hdrLatch{};         // three treated frames with late writes turn the route off until the key flips
     FlatMonoFrame hdrSelected{};     // the selection at this frame's trigger (kept here: the draw scope is built per draw)
     bool hdrTreated = false;         // this frame's treatment was the route's: the copy stage must not treat it again
@@ -1358,7 +1360,17 @@ bool depthView(ID3D11Texture2D* depth) {
     v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; v.Texture2D.MipLevels = 1;
     v.Format = static_cast<DXGI_FORMAT>(flatRuntimeDepthReadFormat(d.Format));
     if (v.Format == DXGI_FORMAT_UNKNOWN) return false;
-    if (d.SampleDesc.Count != 1 || !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE) || FAILED(s.device->CreateShaderResourceView(depth, &v, &s.depthView))) return false;
+    if (d.SampleDesc.Count != 1 || !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) return false;
+    // The flat HDR route's crumbs (flat_hdr_crumbs.h) name the one resource the runtime itself makes for the treatment,
+    // the first time: the shader view over the scene depth, with its format, size and result.
+    HRESULT hr;
+    {
+        HdrCrumbSpan span(hdrCrumbLive(), "create-depth-srv", "fmt=%s(%u) size=%ux%u", hdrCrumbFormat(static_cast<uint32_t>(v.Format)),
+                          static_cast<unsigned>(v.Format), d.Width, d.Height);
+        hr = s.device->CreateShaderResourceView(depth, &v, &s.depthView);
+        span.result("hr=0x%08X", static_cast<unsigned>(hr));
+    }
+    if (FAILED(hr)) return false;
     s.sceneDepth = depth; return true;
 }
 
@@ -1589,6 +1601,9 @@ void flatRuntimeResize() {
 }
 void flatRuntimeBeforePresent() {
     g_flatRuntimeLive.store(false, std::memory_order_release);
+    // The flat HDR route's crash-safe breadcrumbs (flat_hdr_crumbs.h): engine motion's state going back and the census span
+    // closing are the last work before the real Present, for a frame the resolver has had.
+    HdrCrumbSpan routeBeforePresent(hdrCrumbPresentSide(), "before-present");
     // The frame is ending: the game's state goes back where engine motion's is still bound, before the real Present
     // and every EDVR pass that follows it (the lazy form, engine_velocity.h).
     if (owner()) flatRuntimeSubstitution(state().context.Get(), FlatSubstEvent::kPresent);
@@ -1670,6 +1685,14 @@ static void hdrReadKey(State& s, uint64_t frame) {
     s.hdrKey = key; s.hdrKeyRead = true;
     g_hdrBelowOutput.store(0, std::memory_order_release);
     if (key == FlatHdrKey::Off) { s.hdrLatch.reset(); s.hdrEligible = false; }
+    // The crash-safe trail's first line (flat_hdr_crumbs.h): proof, in edvr_breadcrumbs.txt itself, that this build has the
+    // crumbs and that the route is on, so a trail without an "admitted" after it is a session that ended before the route
+    // took a frame, and a file without it came from a build that has none. The log says so too, for whoever reads it first.
+    if (key == FlatHdrKey::Auto && hdrCrumbArmed(flatHdrKeyName(key)))
+        Log::get().note("flat hdr route: crash-safe trail on: edvr_breadcrumbs.txt gets a line before and after every step of the first "
+                        "%u frames that reach the resolver, at most %u lines a session; if the process ends inside the treatment, the last "
+                        "'gfx: hdr-treat' line there names the step",
+            static_cast<unsigned>(kHdrCrumbFrames), static_cast<unsigned>(kHdrCrumbCap));
     Log::get().note("flat hdr route: experimental.temporal_aa_before_post=%s%s at frame=%llu: %s",
         flatHdrKeyName(key), first ? " (read at startup)" : " (changed)", static_cast<unsigned long long>(frame),
         key == FlatHdrKey::Auto
@@ -1763,6 +1786,10 @@ static void hdrSelectAtTrigger(State& s) {
 void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT flags) {
     if (!runtimeFlatProfile() || !swap || (flags & DXGI_PRESENT_TEST)) return;
     auto& s = state(); if (s.thread && !owner()) return;
+    // The flat HDR route's crash-safe breadcrumbs (flat_hdr_crumbs.h): "frame-end begin" now (the real Present has just
+    // returned `hr`), "frame-end end" on every path out of this function, and the gate closed until the route admits
+    // another frame. The next frame's preflight, with its resource creations, runs inside it.
+    HdrCrumbFrameEnd routeFrameEnd(hr);
     s.thread = GetCurrentThreadId();
     // The Present edge: the frame window the camera injector may inject in
     // closes here and reopens only once the next frame's phase is chosen, so a
@@ -2098,6 +2125,17 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         // "the detector never ran" looks like. With the key off it is the flight's observation; with it auto, the state.
         {
             char hdrText[1024];
+            // The resolver's step counts are cumulative; the window prints what they gained since the last one.
+            {
+                const FlatMonoResolveStats rs = flatMonoResolveStats();
+                FlatHdrSteps& seen = s.hdrStepsSeen; FlatHdrSteps& gained = s.hdrWindow.steps;
+                gained.captured = rs.hdrCaptured - seen.captured; seen.captured = rs.hdrCaptured;
+                gained.copied = rs.hdrCopied - seen.copied; seen.copied = rs.hdrCopied;
+                gained.prepped = rs.hdrPrepped - seen.prepped; seen.prepped = rs.hdrPrepped;
+                gained.backend = rs.hdrBackend - seen.backend; seen.backend = rs.hdrBackend;
+                gained.finished = rs.hdrFinished - seen.finished; seen.finished = rs.hdrFinished;
+                gained.restored = rs.hdrRestored - seen.restored; seen.restored = rs.hdrRestored;
+            }
             flatHdrFormatWindow(hdrText, sizeof(hdrText), s.hdrKey,
                 s.hdrKey == FlatHdrKey::Auto ? (s.hdrLatch.tripped ? FlatHdrState::Latched : FlatHdrState::Active)
                                              : FlatHdrState::Observing, s.hdrWindow);
@@ -2897,6 +2935,17 @@ bool FlatRuntimeDrawScope::recover(const char* temporalReason) {
 // its own, and counts as the refusal it is; if even that fails H is still the game's and the frame is declined.
 void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvSlot) {
     auto& s = state();
+    // Crash-safe breadcrumbs (flat_hdr_crumbs.h, edvr_breadcrumbs.txt): the route took this frame. The first frames that
+    // reach the resolver write a crumb before and after every step from here to the frame's Present, so a session that
+    // ends inside the treatment names the step; after the third, this is one compare. They change nothing the route does.
+    hdrCrumbAdmit(s.prefix.frame, flatMonoResolveModeName(s.engine));
+    ++s.hdrWindow.steps.admitted;
+    // The frame reaches the resolver at most once, whichever call takes it (the census counts it once, the crumbs number it).
+    bool reachedCounted = false;
+    const auto reach = [&](const char* step) {
+        if (!reachedCounted) { reachedCounted = true; ++s.hdrWindow.steps.reached; }
+        hdrCrumbReach(s.prefix.frame, flatMonoResolveModeName(s.engine), step);
+    };
     const auto decline = [&](const char* why) {
         s.hdrWindow.lastVerdict = why; ++s.hdrWindow.declined;
         if (s.hdrFlightLines < 12) {
@@ -2904,6 +2953,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
             Log::get().note("flat hdr route: declined at frame=%llu seq=%u: %s (the copy route serves this frame)",
                 (unsigned long long)s.prefix.frame, s.hdr.trigger.sequence, why);
         }
+        hdrCrumbDeclined(why);
     };
     if (s.hdrLatch.tripped) { decline("latched-off"); return; }
     if (s.observing) { decline("returned-to-observation"); return; }
@@ -2928,6 +2978,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
     s.reason = "hdr-route";
     // The spatial recovery, into H: the jitter resampled away, no history, no SDK. True when H now holds it.
     const auto recoverHdr = [&](const char* temporalReason, const FlatMonoResolveFrame& frame) {
+        reach("spatial-recovery");   // the frame is the resolver's from here
         failPhase(s, temporalReason);
         FlatMonoResolveFrame sf{}; sf.color = frame.color; sf.hdr = true; sf.mode = frame.mode;
         sf.renderWidth = frame.renderWidth; sf.renderHeight = frame.renderHeight;
@@ -3036,6 +3087,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
             }
         }
     }
+    reach("resolve");   // the frame is the resolver's from here
     if (!flatMonoResolve(s.device.Get(), ctx, f, &outputView, &s.reason)) {
         const char* temporalReason = s.reason;
         // The backend (or the route's own guard) refused before H was written. Recover the jitter into H, or decline.

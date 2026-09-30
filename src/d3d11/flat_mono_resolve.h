@@ -9,6 +9,11 @@ struct ID3D11ShaderResourceView;
 
 namespace edvr {
 enum class FlatMonoResolveMode { Taa, Dlaa, Dlss, Fsr };
+// The mode as the logs and the HDR route's breadcrumbs (flat_hdr_crumbs.h) spell it.
+inline const char* flatMonoResolveModeName(FlatMonoResolveMode mode) {
+    return mode == FlatMonoResolveMode::Fsr ? "fsr" : mode == FlatMonoResolveMode::Dlss ? "dlss"
+         : mode == FlatMonoResolveMode::Dlaa ? "dlaa" : "taa";
+}
 
 // The three sizes of the staged program's gate 2 (docs/design-flat-temporal-aa-2026-09-23.md
 // section 72): the game's render size R, the temporal evaluation size E and
@@ -169,6 +174,10 @@ struct FlatMonoResolveStats {
     uint64_t currentContinueRun = 0, longestContinueRun = 0;
     // The HDR route's resolves and its pixel-shader spatial recoveries (written into H, so no output view).
     uint64_t hdrResolves = 0, hdrSpatial = 0;
+    // The HDR route's calls (a resolve or a spatial recovery) that got through each step, for the route's 5 s census
+    // (FlatHdrSteps, flat_hdr_route.h): the game's state swapped out, H copied into the private input, the prep dispatch,
+    // the backend's success, the draw into H, the game's state put back. Counted whatever the breadcrumbs are doing.
+    uint64_t hdrCaptured = 0, hdrCopied = 0, hdrPrepped = 0, hdrBackend = 0, hdrFinished = 0, hdrRestored = 0;
     // The last resolve's EFFECTIVE reset (the requested one, or a lost history, a frame gap, an
     // invalid previous camera, a format change or a camera cut): what the pixel capture writes
     // as "reset" and what decides whether the frame is a live sample.

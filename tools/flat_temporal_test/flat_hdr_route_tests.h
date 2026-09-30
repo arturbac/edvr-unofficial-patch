@@ -714,6 +714,21 @@ inline int flatHdrRouteTests() {
         expect(tally.size() > overflow.size() && tally.compare(tally.size() - overflow.size(), overflow.size(), overflow) == 0 &&
                m < int(sizeof(text)),
                "a seventh distinct verdict is counted as other, never dropped and never a write past the buffer");
+        // Where the route's frames got to: the eight step counts in the order a frame meets them, between the verdict and
+        // the trigger, zeros included, and gone when the window resets.
+        {
+            FlatHdrWindow stepped;
+            stepped.steps.admitted = 7; stepped.steps.reached = 6; stepped.steps.captured = 5; stepped.steps.copied = 4;
+            stepped.steps.prepped = 3; stepped.steps.backend = 2; stepped.steps.finished = 1; stepped.steps.restored = 0;
+            flatHdrFormatWindow(text, sizeof(text), FlatHdrKey::Auto, FlatHdrState::Active, stepped);
+            expect(std::string(text).find(" last=none steps: admitted=7 reached=6 captured=5 copied=4 prepped=3 backend=2 finished=1 restored=0 "
+                                          "last-trigger=VS=") != std::string::npos,
+                   "the 5 s line carries how many frames reached each step of the treatment, between the verdict and the trigger");
+            stepped.reset();
+            flatHdrFormatWindow(text, sizeof(text), FlatHdrKey::Auto, FlatHdrState::Active, stepped);
+            expect(std::string(text).find(" steps: admitted=0 reached=0 captured=0 copied=0 prepped=0 backend=0 finished=0 restored=0 ") != std::string::npos,
+                   "a window that resets starts its step counts at zero, and still prints them");
+        }
         char tiny[40];
         expect(flatHdrFormatWindow(tiny, sizeof(tiny), FlatHdrKey::Off, FlatHdrState::Observing, w) >= 0 && tiny[sizeof(tiny) - 1] == 0,
                "a buffer too small for the line truncates it without a write past the end");
