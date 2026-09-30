@@ -14,12 +14,19 @@
   on foot; D3D call counts are what a wrapper such as ReShade multiplies),
   the landing-pad regression of 2026-09-29 (a claim order nobody had written
   down) and PR #46's diff.
-- **Recommendation in one line:** a core that owns every hook and service,
-  first-party plugins version-locked to it (modules inside one DLL first,
-  separate DLLs only if still wanted), and PR #46's C ABI kept for third-party
-  add-ons, moved into the core so flat mode gets it too.
-- **Decisions for Sean:** Q1-Q6 in section 10 (phase order, the plugin list,
-  default sets, the add-on tier's timing, diagnostics, settings layout).
+- **North star (Sean, 2026-09-30): performance.** The plugin layer never
+  makes EDVR slower, and its first phase makes it faster. Gates are relative:
+  each phase flies the same spots and must be no worse than the previous
+  phase, within noise (section 7).
+- **Decided, Q1 (Sean, 2026-09-30): monolithic.** First-party plugins are
+  modules inside the one DLL: each a static library behind the plugin
+  interface, a build gate against one plugin including another's internals,
+  and an unselected plugin never registers. The interface stays C-compatible
+  so a split into DLLs stays mechanical (section 10 has the reasons).
+  PR #46's C ABI stays the add-on tier, moved into the core so flat mode
+  gets it too.
+- **Decisions still open:** Q2-Q6 in section 10 (the plugin list, default
+  sets, the add-on tier's timing, diagnostics, settings layout).
 - **Next:** Sean and Devin review sections 4 and 10; then Phase 1 (section 8):
   the registry and dispatch tables in the core, and one small plugin moved
   behind them with a byte-identical verdict replay as its gate.
@@ -116,9 +123,11 @@ The OM-unbind fix in the same PR is unrelated and should land on its own.
 
 - **Core** (always installed, one per profile as today): every hook, the
   draw dispatch, and the services in 3.1. It has no fixes of its own.
-- **First-party plugins:** EDVR's fixes, grouped as in section 4, built from
-  the same tree and version-locked to the core (a plugin whose build stamp
-  differs is refused and named in the log).
+- **First-party plugins:** EDVR's fixes, grouped as in section 4, built into
+  the one DLL as modules (Q1): each a static library behind the plugin
+  interface, with a build gate that fails when one plugin includes another's
+  internals. A plugin the install did not select never runs its
+  registration.
 - **Add-ons:** third-party DLLs through a stable, versioned C ABI (section 6)
   with narrow extension points: overlays, panels, input, settings.
 
@@ -201,23 +210,43 @@ and `logNote`, `onRenderEye` for overlays, `onFilterInput`. Change:
    survive restarts and appear in the log bundle.
 7. Versioning policy: the host supports API N and N-1.
 
-## 7. Performance rules
+## 7. Performance: the north star
+
+Sean, 2026-09-30: EDVR already runs close to its budget, in VR above all,
+so performance decides every trade-off in this design. The plugin layer
+never makes EDVR slower, and its first phase makes it faster.
 
 Measured on 2026-09-30 (flight 090706, on foot): hook entry costs about
 1.4 ms over 17,180 calls a frame, and each D3D call EDVR makes is multiplied
 by a context wrapper such as ReShade (one user's frame rate came back only
-when ReShade was removed). So:
+when ReShade was removed). The rules:
 
 1. A plugin that is not installed, or installed but switched off, registers
-   nothing and costs nothing per draw. Today a disabled fix still walks the
-   ladder.
-2. The core evaluates interest once per draw (a shader-identity table plus
-   declared shape predicates) and calls only the interested plugins; no
-   per-draw fan-out.
-3. Plugins read state from the core's binding shadows, never with Get*
-   calls on a hot path. This extends the query cut to everything.
-4. The census reports cost per plugin, and a plugin's manifest states its
-   expected per-frame budget.
+   nothing: no hook compare, no dispatch entry, no census line. Today a
+   disabled fix still walks the ladder on every eye draw, so removing that
+   is Phase 1's first win.
+2. Draw-path interest is decided when a shader is bound, not per draw. The
+   binding shadows already see every shader set; the core looks the shader
+   up once in its interest table, caches the answer, and a draw only reads
+   that cached answer and calls the plugins it names.
+3. The plugin layer adds no D3D calls. Plugins read state from the binding
+   shadows, never with Get* calls on a hot path (the query cut, everywhere),
+   and the census counts D3D calls per plugin.
+4. No virtual fan-out, `std::function`, heap allocation or lock on the
+   render thread's draw path (engine motion took a recursive mutex twice a
+   draw until 2026-09-30). Dispatch tables are flat arrays, rebuilt only on
+   configure.
+5. The same rules on the runtime side: no plugin callback in the XR frame's
+   critical path unless the plugin subscribed to it.
+6. Budgets and gates, relative rather than absolute (Sean, 2026-09-30):
+   - each plugin's manifest states a per-frame budget (render-thread CPU,
+     D3D calls, GPU time), and the census reports every plugin against it;
+   - a build rig replays a recorded draw stream through the dispatch and
+     fails when the cost per draw exceeds the previous build's;
+   - every migration phase is flown at the same spots (the Epic hangar in
+     flat; the carrier and on foot in VR; anti-aliasing off and on) and
+     ships only if its census shows EDVR's CPU and GPU cost no worse than
+     the previous phase's, within noise.
 
 ## 8. Migration
 
@@ -226,7 +255,8 @@ when ReShade was removed). So:
   inside the one DLL; the ladder as data; per-plugin configure and census
   families. Move night vision first (small, and it already has a rig). The
   gate is byte-identical verdicts on replayed censuses plus the existing
-  rigs.
+  rigs, and a census at the same spots showing EDVR's render-thread cost
+  lower than today's (disabled features stop walking the ladder).
 - **Phase 2:** move the other groups one at a time, each with its rigs and
   one flight: cockpit-visuals, exposure, scanners, screens, comfort,
   performance, interface-quality, temporal-aa last. Each move adds a verdict
@@ -236,11 +266,8 @@ when ReShade was removed). So:
   versions, Modify without touching settings, F8 rows only for installed
   plugins, the contract gate per plugin, and a startup line naming the plugin
   set (`edvr_log.py --expect-plugins`).
-- **Phase 4 (optional):** first-party plugins as separate DLLs beside the
-  core. They are version-locked, with a C-style boundary: /MT gives every DLL
-  its own CRT heap, so nothing is allocated on one side and freed on the
-  other. They are signed like the core.
-- **Phase 5:** the add-on tier of section 6.
+- **Phase 4:** the add-on tier of section 6. (Separate first-party DLLs are
+  not planned: Q1 chose monolithic.)
 
 ## 9. Risks
 
@@ -253,14 +280,21 @@ when ReShade was removed). So:
   subset.
 - **The installer's modify and repair paths** grow; receipts already
   fingerprint every file.
-- **More signed binaries** in Phase 4 (the SignPath route).
 - **Runtime-side features** (cull guard, FOV, resolution, pacing, flash) need
   hook points in the OpenXR runtime as well; the contract spans both DLLs.
 
 ## 10. Decisions for Sean
 
-- **Q1.** Phase order: modules inside one DLL first (install means enabled),
-  then separate DLLs only if still wanted? Or separate DLLs from the start?
+- **Q1 (decided 2026-09-30): monolithic.** Separate plugin DLLs would add a
+  C-only boundary (/MT gives each DLL its own CRT heap, so nothing may be
+  allocated on one side and freed on the other), calls on per-draw paths
+  that cannot be inlined, a signed binary per plugin and more for antivirus
+  heuristics to flag (EDVR has a quarantine history), installer file sets
+  that vary with the selection, and hash-checked loading. Version-locking
+  means they would not buy independent updates either. Monolithic keeps one
+  binary, inlinable dispatch, simple installs and plugin toggles without a
+  reinstall; the build enforces the boundaries. Revisit only if independent
+  plugin updates or third-party draw-level plugins become real needs.
 - **Q2.** The plugin list and boundaries in section 4, especially
   temporal-aa as one plugin.
 - **Q3.** Default sets per profile (the recommended preset).
