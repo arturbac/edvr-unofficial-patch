@@ -8,7 +8,8 @@
 //   (B) a join by content between the rows the composer produced for a camera and the eye draws' b1 rows,
 //   (C) the call's place in the frame against the tone draw,
 //   (D) the caller address,
-//   (E) the camera's tangents against the eye frusta EDVR itself advertises.
+//   (E) the camera's tangents against the eye frusta EDVR itself advertises,
+//   (F) the view (the pass object the refresh is handed with the camera: its second argument).
 // One flight with advanced.vr_camera_census = on records enough to decide: this header is what it records and how each
 // record is written. `python tools\edvr_log.py --camera-census` reads it back and does the join offline.
 //

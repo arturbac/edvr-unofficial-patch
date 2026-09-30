@@ -525,7 +525,7 @@ def parse_camera_census(text):
     geometry {(eye, frame): dict}, threads [dict], info [text]. A call row is
     {n, camera, kind, caller, draw, tone, pre, post, rows}; a value the DLL
     printed as `-` is None."""
-    c = {"lines": 0, "windows": [], "cameras": {}, "order": [], "changes": {},
+    c = {"lines": 0, "unparsed": 0, "windows": [], "cameras": {}, "order": [], "changes": {},
          "sequences": [], "eyes": [], "geometry": {}, "threads": [], "info": []}
     current = None
     for raw in text.splitlines():
@@ -537,73 +537,79 @@ def parse_camera_census(text):
         if m.group("five"):
             c["windows"].append((m.group("ts") or "", rest))
             continue
-        kv = _ckv(rest)
-        if rest.startswith("camera="):
-            ptr = _chex(kv.get("camera"))
-            if ptr is None or ptr in c["cameras"]:
-                continue
-            c["order"].append(ptr)
-            c["cameras"][ptr] = {
-                "ptr": ptr, "kind": int(kv.get("kind", "-1")) if kv.get("kind", "-").isdigit() else None,
-                "caller": _chex(kv.get("caller")), "thread": kv.get("thread"),
-                "aspect": _cf(kv.get("aspect")), "near": _cf(kv.get("near")),
-                "far": _cf(kv.get("far")), "fov": _cf(kv.get("fov")),
-                "bound": _ctuple(kv.get("bound")), "offcentre": _ctuple(kv.get("offcentre")),
-                "viewport": _ctuple(kv.get("viewport")), "tan": _ctuple(kv.get("tan")),
-                "view": _chex(kv.get("view")), "vctx": _chex(kv.get("vctx")),
-                "first_call": kv.get("first-call"), "draw": kv.get("draw"),
-                "tone": kv.get("tone"), "frame": int(kv["frame"]) if kv.get("frame", "").isdigit() else None}
-        elif rest.startswith("changed:"):
-            ptr = _chex(kv.get("camera"))
-            fields = {k: v for k, v in kv.items()
-                      if k not in ("camera", "frame", "n") and "->" in v}
-            c["changes"].setdefault(ptr, []).append(
-                {"frame": int(kv["frame"]) if kv.get("frame", "").isdigit() else None,
-                 "n": kv.get("n"), "fields": fields})
-        elif rest.startswith("sequence "):
-            current = {"frame": int(kv.get("frame", "-1")), "index": kv.get("index"), "foot": kv.get("foot"),
-                       "calls": int(kv.get("calls", "0")), "recorded": int(kv.get("recorded", "0")),
-                       "truncated": int(kv.get("truncated", "0")), "rows": []}
-            c["sequences"].append(current)
-        elif rest.startswith("call "):
-            frame = int(kv.get("frame", "-1"))
-            if current is None or current["frame"] != frame:
-                current = {"frame": frame, "index": "?", "foot": None, "calls": 0, "recorded": 0,
-                           "truncated": 0, "rows": []}
+        try:
+            kv = _ckv(rest)
+            if rest.startswith("camera="):
+                ptr = _chex(kv.get("camera"))
+                if ptr is None or ptr in c["cameras"]:
+                    continue
+                c["order"].append(ptr)
+                c["cameras"][ptr] = {
+                    "ptr": ptr, "kind": int(kv.get("kind", "-1")) if kv.get("kind", "-").isdigit() else None,
+                    "caller": _chex(kv.get("caller")), "thread": kv.get("thread"),
+                    "aspect": _cf(kv.get("aspect")), "near": _cf(kv.get("near")),
+                    "far": _cf(kv.get("far")), "fov": _cf(kv.get("fov")),
+                    "bound": _ctuple(kv.get("bound")), "offcentre": _ctuple(kv.get("offcentre")),
+                    "viewport": _ctuple(kv.get("viewport")), "tan": _ctuple(kv.get("tan")),
+                    "view": _chex(kv.get("view")), "vctx": _chex(kv.get("vctx")),
+                    "first_call": kv.get("first-call"), "draw": kv.get("draw"),
+                    "tone": kv.get("tone"), "frame": int(kv["frame"]) if kv.get("frame", "").isdigit() else None}
+            elif rest.startswith("changed:"):
+                ptr = _chex(kv.get("camera"))
+                fields = {k: v for k, v in kv.items()
+                          if k not in ("camera", "frame", "n") and "->" in v}
+                c["changes"].setdefault(ptr, []).append(
+                    {"frame": int(kv["frame"]) if kv.get("frame", "").isdigit() else None,
+                     "n": kv.get("n"), "fields": fields})
+            elif rest.startswith("sequence "):
+                current = {"frame": int(kv.get("frame", "-1")), "index": kv.get("index"), "foot": kv.get("foot"),
+                           "calls": int(kv.get("calls", "0")), "recorded": int(kv.get("recorded", "0")),
+                           "truncated": int(kv.get("truncated", "0")), "rows": []}
                 c["sequences"].append(current)
-            pre, _, post = kv.get("fl", "").partition(">")
-            current["rows"].append({
-                "n": int(kv.get("n", "0")), "camera": _chex(kv.get("camera")),
-                "kind": int(kv["kind"]) if kv.get("kind", "-").isdigit() else None,
-                "caller": _chex(kv.get("caller")),
-                "draw": int(kv["draw"]) if kv.get("draw", "-").isdigit() else None,
-                "tone": kv.get("tone"), "pre": _chex(pre) if pre else None,
-                "post": _chex(post) if post and post != "-" else None,
-                "view": _chex(kv.get("view")),
-                "rows": _clist(kv.get("rows")), "frame": frame})
-        elif rest.startswith("eye-geometry"):
-            eye = int(kv.get("eye", "-1"))
-            frame = int(kv.get("frame", "-1"))
-            c["geometry"][(eye, frame)] = {
-                "known": kv.get("geometry") != "unavailable",
-                "seq": int(kv["seq"]) if kv.get("seq", "").isdigit() else None,
-                "frustum": _clist(kv.get("frustum")), "shift": _ctuple(kv.get("shift")),
-                "expect": _ctuple(kv.get("expect")),
-                "expect_shifted": _ctuple(kv.get("expect-shifted")),
-                "leak": _ctuple(kv.get("leak"))}
-        elif rest.startswith("eye="):
-            c["eyes"].append({
-                "eye": int(kv.get("eye", "-1")), "frame": int(kv.get("frame", "-1")), "foot": kv.get("foot"),
-                "draw": int(kv["draw"]) if kv.get("draw", "-").isdigit() else None,
-                "b1": _chex(kv.get("b1")), "first": kv.get("first"), "bytes": kv.get("bytes"),
-                "rows": _clist(kv.get("rows")), "meas": _ctuple(kv.get("meas")),
-                "why": kv.get("why")})
-        elif rest.startswith("other-thread"):
-            c["threads"].append({"tid": kv.get("tid"), "camera": _chex(kv.get("camera")),
-                                 "kind": kv.get("kind"), "caller": _chex(kv.get("caller")),
-                                 "calls": kv.get("calls")})
-        else:
-            c["info"].append(rest)
+            elif rest.startswith("call "):
+                frame = int(kv.get("frame", "-1"))
+                if _chex(kv.get("camera")) is None:   # nothing to join or digest, and no sequence to start for it
+                    c["unparsed"] += 1
+                    continue
+                if current is None or current["frame"] != frame:
+                    current = {"frame": frame, "index": "?", "foot": None, "calls": 0, "recorded": 0,
+                               "truncated": 0, "rows": []}
+                    c["sequences"].append(current)
+                pre, _, post = kv.get("fl", "").partition(">")
+                current["rows"].append({
+                    "n": int(kv.get("n", "0")), "camera": _chex(kv.get("camera")),
+                    "kind": int(kv["kind"]) if kv.get("kind", "-").isdigit() else None,
+                    "caller": _chex(kv.get("caller")),
+                    "draw": int(kv["draw"]) if kv.get("draw", "-").isdigit() else None,
+                    "tone": kv.get("tone"), "pre": _chex(pre) if pre else None,
+                    "post": _chex(post) if post and post != "-" else None,
+                    "view": _chex(kv.get("view")),
+                    "rows": _clist(kv.get("rows")), "frame": frame})
+            elif rest.startswith("eye-geometry"):
+                eye = int(kv.get("eye", "-1"))
+                frame = int(kv.get("frame", "-1"))
+                c["geometry"][(eye, frame)] = {
+                    "known": kv.get("geometry") != "unavailable",
+                    "seq": int(kv["seq"]) if kv.get("seq", "").isdigit() else None,
+                    "frustum": _clist(kv.get("frustum")), "shift": _ctuple(kv.get("shift")),
+                    "expect": _ctuple(kv.get("expect")),
+                    "expect_shifted": _ctuple(kv.get("expect-shifted")),
+                    "leak": _ctuple(kv.get("leak"))}
+            elif rest.startswith("eye="):
+                c["eyes"].append({
+                    "eye": int(kv.get("eye", "-1")), "frame": int(kv.get("frame", "-1")), "foot": kv.get("foot"),
+                    "draw": int(kv["draw"]) if kv.get("draw", "-").isdigit() else None,
+                    "b1": _chex(kv.get("b1")), "first": kv.get("first"), "bytes": kv.get("bytes"),
+                    "rows": _clist(kv.get("rows")), "meas": _ctuple(kv.get("meas")),
+                    "why": kv.get("why")})
+            elif rest.startswith("other-thread"):
+                c["threads"].append({"tid": kv.get("tid"), "camera": _chex(kv.get("camera")),
+                                     "kind": kv.get("kind"), "caller": _chex(kv.get("caller")),
+                                     "calls": kv.get("calls")})
+            else:
+                c["info"].append(rest)
+        except (ValueError, TypeError, KeyError, IndexError):
+            c["unparsed"] += 1   # a line cut short or garbled: counted, never fatal to the report
     return c
 
 
@@ -807,6 +813,8 @@ def print_camera_census(text):
           "%d call sequence(s), %d eye draw(s), %d other-thread entr%s"
           % (c["lines"], len(c["windows"]), len(c["order"]), len(c["sequences"]),
              len(c["eyes"]), len(c["threads"]), "y" if len(c["threads"]) == 1 else "ies"))
+    if c["unparsed"]:
+        print("[edvr]   %d census line(s) could not be parsed (cut short or garbled) and were skipped" % c["unparsed"])
     for info in c["info"]:
         print("[edvr]   note: %s" % info)
 
@@ -2483,6 +2491,18 @@ def self_test_camera_census():
     if len(rows) != 2 or rows[0]["draw"] is not None or rows[0]["post"] is not None or rows[1]["kind"] is not None or \
             rows[1]["rows"] is not None or rows[0]["rows"][1] == rows[0]["rows"][1] or n["lines"] != 2:
         fail("the stamp, a dash and a nan parsed wrong: %r lines=%r" % (rows, n["lines"]))
+
+    # A line cut short or garbled is counted and skipped, and a call with no camera has nothing to digest.
+    g = parse_camera_census("vr camera census: call frame=x n=1 camera=0x10 kind=3 caller=+0x1 draw=- tone=none fl=0x0>- rows=-\n"
+                            "vr camera census: call frame=5 n=1 kind=3 caller=+0x1 draw=- tone=none fl=0x0>- rows=-\n"
+                            "vr camera census: sequence frame=5 index=1/3 foot=yes calls=1 recorded=1 truncated=0\n"
+                            "vr camera census: call frame=5 n=1 camera=0x20 kind=3 caller=+0x1 draw=- tone=none fl=0x0>- view=0x99 rows=-\n")
+    if g["unparsed"] != 2 or len(g["sequences"]) != 1 or len(g["sequences"][0]["rows"]) != 1 or \
+            g["sequences"][0]["rows"][0]["view"] != 0x99:
+        fail("a garbled line and a call with no camera were not skipped: %r" % (g,))
+    rc, out = report("vr camera census: call frame=x n=1 camera=0x10 kind=3\n")
+    if rc != 0 or "1 census line(s) could not be parsed" not in out:
+        fail("a log of only garbled lines did not say so:\n%s" % out)
 
     # ---- the report on the fixture ----
     rc, out = report(text)

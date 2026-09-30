@@ -690,7 +690,7 @@ struct Sim {
             if (cameras.takeCameraLine(i)) { vrCensusFormatCamera(line, sizeof(line), cameras.at(i)); say(VrCensusLines::Camera, line); }
             if (cameras.takeChangeLine(i)) { vrCensusFormatChanged(line, sizeof(line), cameras.at(i)); say(VrCensusLines::Changed, line); }
         }
-        if (vrCensusPrintsSequence(sampled, sequencesLogged)) {
+        if (vrCensusPrintsSequence(sampled, sequencesLogged) && frame.recorded > 0) {
             ++sequencesLogged;
             vrCensusFormatSequence(line, sizeof(line), frameNo, sequencesLogged, foot, frame.calls, frame.recorded);
             say(VrCensusLines::Call, line);
@@ -749,6 +749,20 @@ void testSession() {
     // After three sequences the recording stops: a further frame's calls are counted and no record is written.
     for (int i = 0; i < 30; ++i) sim.call(0x1000, 3, 0x594E13, true, world);
     check(sim.frame.recorded == 0 && sim.frame.calls == 30, "once three sequences are out, a call is counted and nothing is recorded");
+    // The journal flips to on foot AT a boundary (the glue reads it before it rolls the frame that ended): that frame was
+    // recorded under the old word, so it has no calls; it is sampled by the rule but prints no empty sequence and spends
+    // none of the three. The next frame, recorded under the new word, prints.
+    Sim flip;
+    flip.foot = VrCensusFoot::No;
+    for (int i = 0; i < 4; ++i) flip.call(0x3000, 3, 0x594FE1, true, eye);
+    flip.foot = VrCensusFoot::Yes;
+    flip.boundary();
+    check(flip.sequencesLogged == 0 && flip.sampledFrames == 1 && flip.log.size() == 1,
+          "the frame the journal flips at is sampled by the rule but recorded nothing: no empty sequence header, none of the three spent");
+    for (int i = 0; i < 4; ++i) flip.call(0x3000, 3, 0x594FE1, true, eye);
+    flip.boundary();
+    check(flip.sequencesLogged == 1 && flip.log.back().find("call frame=2 n=4 ") != std::string::npos,
+          "the next frame, recorded under the new word, prints its whole sequence");
     // With the journal not read at all the tone alone decides, as the brief has it: the first tone frame prints a sequence.
     Sim bare;
     bare.foot = VrCensusFoot::Off;
@@ -855,8 +869,23 @@ void testSourcePins(const std::string& injectCpp) {
     check(startsWith(readWanted, readHead, "\n    if (!runtimeVrProfile()) return false;") &&
           readWanted.find("getString(\"advanced.vr_camera_census\", \"off\")") > readWanted.find("runtimeVrProfile()"),
           "KEY OFF outside VR: the flat profile returns before it asks for the key (and Config reads the key off there anyway)");
-    check(count(censusCpp, "new (std::nothrow) State") == 1 && count(censusCpp, "new ") == 1 && count(censusCpp, "malloc") == 0,
-          "the only allocation in the census is the one State, made at the first boundary with the key on");
+    std::string censusCode;   // the glue without its // comments, so prose that says "new" is not an allocation
+    {
+        size_t from = 0;
+        while (from < censusCpp.size()) {
+            size_t to = censusCpp.find('\n', from);
+            if (to == std::string::npos) to = censusCpp.size();
+            std::string ln = censusCpp.substr(from, to - from);
+            const size_t slashes = ln.find("//");
+            if (slashes != std::string::npos) ln.erase(slashes);
+            censusCode += ln;
+            censusCode += '\n';
+            from = to + 1;
+        }
+    }
+    check(count(censusCode, "new (std::nothrow) State") == 1 && count(censusCode, "new ") == 1 && count(censusCode, "malloc") == 0 &&
+          count(censusCode, "std::vector") == 0 && count(censusCode, "std::string ") == 1,
+          "the only allocation in the census's code is the one State, made at the first boundary with the key on (the key's one std::string is a three-character small string)");
     check(count(censusCpp, "journalOnFootKnown()") == 1 && count(censusCpp, "journalOnFoot()") == 1 &&
           boundary.find("s->foot = currentFoot();") != std::string::npos && boundary.find("s->foot = currentFoot();") < boundary.find("rollFrame(s);") &&
           eyeDraw.find("if (!vrCensusSamplesFrame(toneSeen, have, s->foot)) return;") != std::string::npos &&

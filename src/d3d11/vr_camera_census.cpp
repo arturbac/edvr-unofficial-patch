@@ -273,7 +273,9 @@ void rollFrame(State* s) {
         if (sampled) ++s->window.onFootFrames;
         printCameraLines(s);      // a camera's line precedes the sequence that names it
         printOffThread(s);
-        if (vrCensusPrintsSequence(sampled, s->sequencesLogged)) printSequence(s);
+        // The frame the journal flips at was recorded under the old word (nothing): it has no calls to print and must not
+        // spend one of the sequences as an empty header. The next frame is recorded under the new word.
+        if (vrCensusPrintsSequence(sampled, s->sequencesLogged) && s->current.recorded > 0) printSequence(s);
     }
     s->current.reset();
     s->pending = Pending{};
