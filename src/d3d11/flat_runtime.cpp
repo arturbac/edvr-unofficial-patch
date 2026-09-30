@@ -1521,6 +1521,9 @@ bool flatRuntimeStructuralRefusal(const char** reasonName, bool* standingDown) {
 void flatRuntimeResize() {
     g_flatRuntimeLive.store(false, std::memory_order_release);
     nativeScale.store(false, std::memory_order_release);
+    // The swap chain or the device went: engine motion's bound state (the game's render targets among it, held by
+    // reference) is forgotten without touching a context that may be gone.
+    flatRuntimeSubstitution(nullptr, FlatSubstEvent::kResize);
     auto& s = state(); FlatComputeInternalScope guard; s.drawCapture.cancel("resize-or-stop"); flatMonoResolveReset();
     // A reset (or the mode turned off) ends a stand-down: the new contract may well be
     // one the selector recognises, and every paused piece restarts with it.
@@ -1546,6 +1549,9 @@ void flatRuntimeResize() {
 }
 void flatRuntimeBeforePresent() {
     g_flatRuntimeLive.store(false, std::memory_order_release);
+    // The frame is ending: the game's state goes back where engine motion's is still bound, before the real Present
+    // and every EDVR pass that follows it (the lazy form, engine_velocity.h).
+    if (owner()) flatRuntimeSubstitution(state().context.Get(), FlatSubstEvent::kPresent);
     // The census's whole-frame GPU span ends here, just before the real Present.
     if (owner()) gpuFrameClose(state());
 }
@@ -1995,6 +2001,39 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     s.frameLive = s.work != FlatWork::Paused;
     g_flatRuntimeLive.store(true, std::memory_order_release);
 }
+// Why the game's state went back (engine_velocity.h counts it under this name).
+static EngineVelocityFlushCause flushCauseOf(FlatSubstEvent event) {
+    switch (event) {
+    case FlatSubstEvent::kDispatch: return EngineVelocityFlushCause::kDispatch;
+    case FlatSubstEvent::kClear: return EngineVelocityFlushCause::kClear;
+    case FlatSubstEvent::kCopy: return EngineVelocityFlushCause::kCopy;
+    case FlatSubstEvent::kResolve: return EngineVelocityFlushCause::kResolve;
+    case FlatSubstEvent::kKeepTargets: return EngineVelocityFlushCause::kKeepTargets;
+    case FlatSubstEvent::kExecuteCommandList: return EngineVelocityFlushCause::kCommandList;
+    case FlatSubstEvent::kPresent: return EngineVelocityFlushCause::kPresent;
+    default: return EngineVelocityFlushCause::kOtherDraw;
+    }
+}
+void flatRuntimeSubstitution(ID3D11DeviceContext* ctx, FlatSubstEvent event) {
+    // Nothing of engine motion's is bound over the game's: the common case, one load.
+    if (!engineVelocityFlatPending()) return;
+    if (!owner()) return;
+    switch (flatSubstAction(event)) {
+    case FlatSubstAction::kFlush:
+        // Only the owner's immediate context carries state of ours; a deferred context's calls are its own. The work is
+        // engine motion's draw wrapper's, and the census counts it there, not in whatever hook it came from.
+        if (ctx && ctx == state().context.Get()) {
+            flatcpu::Scope engine(flatcpu::kEngineDraw);
+            engineVelocityFlatFlush(ctx, flushCauseOf(event));
+        }
+        return;
+    case FlatSubstAction::kAbandon:
+        engineVelocityFlatAbandon();
+        return;
+    default:
+        return;
+    }
+}
 void flatRuntimeViewport(UINT n, const D3D11_VIEWPORT* vp) {
     if (!owner()) return;
     flatcpu::Scope tracker(flatcpu::kTrackers);
@@ -2010,6 +2049,8 @@ void flatRuntimeClearBindings() {
     if (owner()) {
         flatcpu::Scope tracker(flatcpu::kTrackers);
         state().viewportCount = 0; for (auto& u : state().uavs) u.Reset();
+        // ClearState took engine motion's bound state with the game's: nothing left to put back, and nothing safe to touch.
+        flatRuntimeSubstitution(nullptr, FlatSubstEvent::kClearState);
     }
 }
 void flatRuntimeUnknown() {
@@ -2036,6 +2077,8 @@ void flatRuntimeUavs(UINT start, UINT count, ID3D11UnorderedAccessView* const* v
 FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
     if(!flatRuntimeActive())return;
     auto& s = state(); if (!owner() || ctx != s.context.Get()) { foreignWork.store(true, std::memory_order_release); return; }
+    // A dispatch is not a substituted producer draw: it sees the game's state (engine_velocity.h, the lazy form).
+    flatRuntimeSubstitution(ctx, FlatSubstEvent::kDispatch);
     if (s.work == FlatWork::Paused) return;
     flatcpu::Scope shell(flatcpu::kOther);   // the dispatch scope's own time
     if(s.projection) {
@@ -2125,6 +2168,14 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     if (s.work == FlatWork::Paused) return;
     flatcpu::Scope shell(flatcpu::kOther);   // the scope's own time; the named families below are carved out of it
     ctx = context; FlatRuntimeDraw d{}; auto& k = d.key;
+    // Lazy substitution (engine_velocity.h): engine motion's state may still be bound from the producer draw before this
+    // one, and stays bound only while nothing that could see it runs. A diagnostic capture reads the context, so with
+    // one armed the game's state goes back at once and every producer draw restores after itself, as it always did.
+    {
+        const bool diagnostics = flatTemporalCapturing() || s.drawCapture.active();
+        engineVelocityFlatLazy(!diagnostics);
+        if (diagnostics) flatRuntimeSubstitution(context, FlatSubstEvent::kOtherDraw);
+    }
     const FlatProjectionBindingPlan* projectionPlan=nullptr;
     const auto rt = view(BindSlot::Rtv0, 0), ds = view(BindSlot::Dsv0, 1);
     k.color = rt.resource; k.rtv = bindingGet(BindSlot::Rtv0); k.width = rt.a; k.height = rt.b; k.format = rt.fmt;
@@ -2152,6 +2203,9 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         if (kept->have) { std::memcpy(d.camera, kept->rows, sizeof(d.camera)); k.camera = d.camera; k.cameraHash = kept->hash; k.writeEpoch = kept->epoch; k.writeSeq = kept->sequence; }
     }
     d.supported = engineVelocityPoolFamilyPair(k.vs, k.ps); d.instances = instances;
+    // A draw that is not a pool-family draw cannot be a substituted producer: it sees the game's state, and so does
+    // everything EDVR reads of the context for it below.
+    if (!d.supported) flatRuntimeSubstitution(context, FlatSubstEvent::kOtherDraw);
     k.kind = flatContractKind(d.supported, k.color, k.depth, k.width, k.height, k.format, s.prefix.width, s.prefix.height, k.color == s.prefix.output);
     const bool tone = flat_mono_detail::toneHdrSlot(k.vs, k.ps) != ~0u;
     const bool copy = k.vs == flat_mono_detail::kCopyVs && k.ps == flat_mono_detail::kCopyPs && k.color == s.prefix.output;
@@ -2237,6 +2291,15 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         s.namedDepth=k.depth;s.namedConstants=k.b1;std::memcpy(s.namedCamera,d.camera,sizeof(d.camera));
         engineVelocityNoteSource(static_cast<ID3D11Texture2D*>(const_cast<void*>(k.depth)),static_cast<ID3D11Buffer*>(const_cast<void*>(k.b1)));
     }
+    // A pool-family draw sees the game's state too, unless it can only continue a run of substituted producer draws (the
+    // one whose camera, depth and constants this frame's naming holds) AND nothing below reads the context for it: the
+    // coverage classification and the projection qualification ask the context what is bound (Get calls), and would read
+    // engine motion's shader and targets instead of the game's.
+    const bool continuesRun = sourceCandidate && s.namedDepth == k.depth && s.namedConstants == k.b1 &&
+        std::memcmp(s.namedCamera, d.camera, sizeof(d.camera)) == 0;
+    const bool coverageReads = s.projection && sceneExtent && k.color != s.prefix.output &&
+        (k.format==9 || k.format==23 || k.format==26 || k.format==60);
+    if (d.supported && (!continuesRun || coverageReads)) flatRuntimeSubstitution(context, FlatSubstEvent::kOtherDraw);
     if(s.projection) {
         if(s.projectionFrames)++s.projectionDraws;
         if(sceneExtent && k.color!=s.prefix.output && (k.format==9 || k.format==23 || k.format==26 || k.format==60)) {
@@ -2309,22 +2372,21 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
             }
         }
     }
-    if (sourceCandidate) {
+    if (continuesRun) {
         FlatComputeInternalScope guard;
-        if (s.namedDepth == k.depth && s.namedConstants == k.b1 && std::memcmp(s.namedCamera, d.camera, sizeof(d.camera)) == 0) {
-            // Engine motion's draw wrapper: the MRT save, then BeforeDraw (the target and blend
-            // state queries, the shader substitution). Its D3D state calls are counted.
-            flatcpu::Scope engine(flatcpu::kEngineDraw);
-            ctx->OMGetRenderTargets(8, targets, &depth); producer = true; engineVelocityNoteStateCalls(1);
-            engineVelocityBeforeDraw(ctx, false);
-        }
+        // Engine motion's draw wrapper, lazy form (engine_velocity.h): the game's render targets saved once per binding, then
+        // BeforeDraw (the shader substitution, MRT6, the blend state), and EDVR's state stays bound for the next producer
+        // draw. True only when the draw is substituted; a declined one has already put the game's state back. The
+        // wrapper's D3D state calls are counted where they are made.
+        flatcpu::Scope engine(flatcpu::kEngineDraw);
+        producer = engineVelocityFlatBeginDraw(ctx, &gameHadTarget6);
     }
     // The earlier capture preserves original game CBs and shader identities.
     // Motion is sampled only after the producer has attached its actual MRT6,
     // and the destructor takes the matching sample before restoring the draw.
     if(drawCaptureStarted) {
         FlatComputeInternalScope guard;
-        s.drawCapture.motionBefore(ctx,producer && !targets[6] && engineVelocityDrawSubstituted(),sourceCandidate);
+        s.drawCapture.motionBefore(ctx,producer && !gameHadTarget6,sourceCandidate);
     }
     // Engine motion observes unmodified game constants above. Under Upstream
     // ownership the camera was already jittered at the source by the
@@ -2623,12 +2685,13 @@ FlatRuntimeDrawScope::~FlatRuntimeDrawScope() {
         projection.reset();
     }
     if (producer) {
-        // Engine motion's draw wrapper, the other half: the game's shader, blend state and MRTs back.
+        // Engine motion's draw wrapper, the other half. Lazy: nothing goes back here; the game's shader, blend state and
+        // MRTs go back once, before anything that could see them (flatRuntimeSubstitution). Eager, with a capture armed
+        // or the overlay guard's private t3 bound: back now, as it always was.
         flatcpu::Scope engine(flatcpu::kEngineDraw);
-        engineVelocityAfterFlatDraw(ctx); ctx->OMSetRenderTargets(8, targets, depth); engineVelocityNoteStateCalls(1);
+        engineVelocityFlatEndDraw(ctx);
     }
     if (replaced) ctx->PSSetShaderResources(0, 1, &original);
-    for (auto* target : targets) if (target) target->Release();
-    if (depth) depth->Release(); if (original) original->Release();
+    if (original) original->Release();
 }
 } // namespace edvr

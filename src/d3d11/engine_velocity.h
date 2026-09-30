@@ -211,8 +211,64 @@ inline void engineVelocityResourceUnknown(const ID3D11Resource* resource) {
 void engineVelocityNotePresentFrame(uint32_t presentFrame) noexcept;
 // The owner thread's frame boundary (vscreen): rotation, the periodic lines.
 void engineVelocityFrameBoundary(ID3D11DeviceContext*);
-// Flat draw bracket: restore substituted shaders/blend; caller restores MRTs.
+// The flat runtime's per-draw restore before the lazy form below: substituted shaders/blend back, the draw cache reset,
+// and the caller put the game's render targets back. The runtime no longer calls it (engineVelocityFlatEndDraw and
+// engineVelocityFlatFlush do this, and the targets too); the lifecycle rig drives it as its model of a draw that restores
+// after itself.
 void engineVelocityAfterFlatDraw(ID3D11DeviceContext*);
+
+// ---- The flat draw bracket, lazy form (2026-09-30) ----------------------------------------------------------
+// The flat runtime put the game's state back after EVERY substituted producer draw, and bound EDVR's again for the
+// next: the game's eight render targets read, MRT6 added (read again, set, read to verify), the blend state read and
+// set, the patched pixel shader set, then the shader, the blend and the targets restored -- eleven immediate-context
+// calls a draw at least, 13,549 a frame over 1,130 draws on foot (flight 053745), each of them a driver round trip,
+// and, under a graphics wrapper (ReShade), each one dearer. It also reset the draw cache, so every next draw took the
+// slow half and its two mutex acquisitions.
+//
+// Now EDVR's state (MRT6, the derived blend, the patched shaders) stays bound across consecutive substituted producer
+// draws, as VR's always has, and the game's is put back ONCE, before anything that could observe or depend on it.
+// What that is, is flat_substitution.h's policy, called from the hooks: every hooked draw, dispatch, clear, copy,
+// resolve and command-list execution that is not a substituted producer draw, and the Present. A game setter of the
+// same state simply replaces EDVR's (the binding shadow's generations say so, as they always did: restore puts back
+// only what is still ours). A game Get* of that state is NOT seen by the hook layer -- no Get is hooked -- so it would
+// read EDVR's, exactly as it can under VR, where the state has always stayed bound between draws; that exposure is
+// the whole of what the lazy form adds, and it is why every hooked call above restores instead of guessing.
+//
+//   engineVelocityFlatBeginDraw: before a candidate producer draw. The game's render targets are saved once per
+//     binding (a read only when the game has rebound them), BeforeDraw runs, and a draw it declines puts the game's
+//     state fully back at once. True: EDVR's state is bound for this draw. *gameHadTarget6: the game's own slot 6
+//     was occupied.
+//   engineVelocityFlatEndDraw: after the draw. Lazy: nothing is restored. Eager (a diagnostic capture is armed, or the
+//     overlay guard's private t3 is bound): the game's state goes back now, as it always did.
+//   engineVelocityFlatFlush: the game's state back where EDVR's is still bound, and the bookkeeping reset. A no-op
+//     when nothing is bound.
+//   engineVelocityFlatAbandon: the context lost its state (ClearState, a resize): forget, without touching it.
+//   engineVelocityFlatLazy: the runtime's switch, owner thread, per draw.
+enum class EngineVelocityFlushCause : unsigned {
+    kDeclined = 0,   // a candidate producer draw the slow half declined
+    kOtherDraw,      // a draw that is not a substituted producer draw
+    kDispatch,
+    kClear,
+    kCopy,
+    kResolve,
+    kKeepTargets,    // the game keeps its render targets and sets UAVs beside them
+    kCommandList,
+    kPresent,
+    kOverlay,        // an overlay-guard draw's base snapshot needs the game's state bound
+    kEager,          // not lazy: a diagnostic capture is armed, or the overlay guard's t3 is bound
+    kCount
+};
+namespace engine_velocity_detail {
+extern std::atomic<bool> g_flatPending;   // EDVR's state may be bound over the game's
+}
+inline bool engineVelocityFlatPending() noexcept {
+    return engine_velocity_detail::g_flatPending.load(std::memory_order_relaxed);
+}
+bool engineVelocityFlatBeginDraw(ID3D11DeviceContext* ctx, bool* gameHadTarget6);
+void engineVelocityFlatEndDraw(ID3D11DeviceContext* ctx);
+void engineVelocityFlatFlush(ID3D11DeviceContext* ctx, EngineVelocityFlushCause cause);
+void engineVelocityFlatAbandon() noexcept;
+void engineVelocityFlatLazy(bool on) noexcept;
 // The flat CPU census (flat_cpu.h): what engine motion's draw wrapper asks of the D3D
 // immediate context. Every Get and Set on it, and the clears and copies an eye-frame's
 // preparation makes, are counted at their call sites, on the owner thread (the caller of

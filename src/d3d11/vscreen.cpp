@@ -2805,7 +2805,10 @@ void STDMETHODCALLTYPE hookedClearRtv(ID3D11DeviceContext* self,
         s->realClearRtv(self, rtv, c);
         return;
     }
-    if (flatRuntimeActive()) { ResourceInfo info{}; if (bindingResolve(rtv, &info)) flatRuntimeWritten(static_cast<ID3D11Resource*>(info.resource)); }
+    if (flatRuntimeActive()) {
+        flatRuntimeSubstitution(self, FlatSubstEvent::kClear);   // a clear is not a substituted producer draw: the game's state first
+        ResourceInfo info{}; if (bindingResolve(rtv, &info)) flatRuntimeWritten(static_cast<ID3D11Resource*>(info.resource));
+    }
     if (flatTemporalCapturing()) flatTemporalClearColor(rtv);
     // The census's record of this clear, before the probes and before
     // the void fix touches the colour: the line carries what the GAME
@@ -2854,6 +2857,7 @@ void STDMETHODCALLTYPE hookedClearUavUint(ID3D11DeviceContext* self,
                                           const UINT c[4]) {
     if (g_flatComputeInternal) { g_state->realClearUavUint(self, uav, c); return; }
     gpuFrameCommand(self);
+    if (!foreignContext(self) && flatRuntimeActive()) flatRuntimeSubstitution(self, FlatSubstEvent::kClear);
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalClearUav(uav);
     g_state->realClearUavUint(self, uav, c);
 }
@@ -2862,6 +2866,7 @@ void STDMETHODCALLTYPE hookedClearUavFloat(ID3D11DeviceContext* self,
                                            const FLOAT c[4]) {
     if (g_flatComputeInternal) { g_state->realClearUavFloat(self, uav, c); return; }
     gpuFrameCommand(self);
+    if (!foreignContext(self) && flatRuntimeActive()) flatRuntimeSubstitution(self, FlatSubstEvent::kClear);
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalClearUav(uav);
     g_state->realClearUavFloat(self, uav, c);
 }
@@ -2869,6 +2874,7 @@ void STDMETHODCALLTYPE hookedGenerateMips(ID3D11DeviceContext* self,
                                           ID3D11ShaderResourceView* srv) {
     if (g_flatComputeInternal) { g_state->realGenerateMips(self, srv); return; }
     gpuFrameCommand(self);
+    if (!foreignContext(self) && flatRuntimeActive()) flatRuntimeSubstitution(self, FlatSubstEvent::kCopy);
     g_state->realGenerateMips(self, srv);
 }
 
@@ -2928,6 +2934,10 @@ void STDMETHODCALLTYPE hookedOMSetRtvAndUav(ID3D11DeviceContext* self, UINT n,
         bindingSet(BindSlot::Rtv0, (n && rtvs) ? rtvs[0] : nullptr);
         bindingSet(BindSlot::Dsv0, dsv);
         if (flatTemporalCapturing()) flatTemporalBind((n && rtvs) ? rtvs[0] : nullptr, dsv);
+    } else if (flatRuntimeActive()) {
+        // The targets stay as they are and the UAVs go beside them: engine motion's MRT6, if it is still bound over the
+        // game's targets, is among the targets those UAV slots must follow. The game's own set first.
+        flatRuntimeSubstitution(self, FlatSubstEvent::kKeepTargets);
     }
     g_state->realOMSetRtvAndUav(self, n, rtvs, dsv, uavStart, uavCount, uavs, counts);
 }
@@ -3119,6 +3129,8 @@ void STDMETHODCALLTYPE hookedExecuteCommandList(ID3D11DeviceContext* self,
                         kSlotExecuteCommandList, restoreContextState ? 1 : 0);
     }
     const bool privateExecution = graphicsBridgeConsumePermit(self, list, restoreContextState);
+    // A recorded command list runs on the state the context holds: the game's, not engine motion's.
+    if (flatRuntimeActive()) flatRuntimeSubstitution(self, FlatSubstEvent::kExecuteCommandList);
     if (flatRuntimeActive() && !privateExecution) flatRuntimeUnknown();
     if (flatTemporalCapturing() && !privateExecution)
         flatTemporalExecuteList(false);
@@ -4038,7 +4050,7 @@ void STDMETHODCALLTYPE hookedCopyResource(ID3D11DeviceContext* self,
     uiAtlasNoteWrite(dst, 2);
     if(foreignContext(self))engineVelocityResourceUnknown(dst);
     if (!foreignContext(self)) {motionResourceWritten(dst);celestialMotionConstantsUnknownWrite(dst);glitchFrameInvalidatePool(dst);if(fssResActive())fssResNoteCopyMaybeMismatched(dst,src);if(uiLayerWatching())uiLayerNoteCopy(dst,src);}
-    if (!foreignContext(self) && flatRuntimeActive()) flatRuntimeWritten(dst);
+    if (!foreignContext(self) && flatRuntimeActive()) { flatRuntimeSubstitution(self, FlatSubstEvent::kCopy); flatRuntimeWritten(dst); }
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalTransfer(dst, src, 'R');
     if (drawCensusArmed()) {
         drawCensusCopy('R', dst, 0, 0, 0, src, 0, false, 0, 0, 0, 0,
@@ -4065,6 +4077,7 @@ void STDMETHODCALLTYPE hookedClearDsv(ID3D11DeviceContext* self,
     // The depth probe learns which value the game clears an eye-draw
     // target to, which says which way its depth runs.
     if (!foreignContext(self)) {depthProbeNoteClear(dsv, depth);if(uiLayerWatching())uiLayerNoteDepthClear(dsv, flags, depth, stencil);}
+    if (!foreignContext(self) && flatRuntimeActive()) flatRuntimeSubstitution(self, FlatSubstEvent::kClear);
     if (!foreignContext(self) && (flags & D3D11_CLEAR_DEPTH) && flatRuntimeActive()) { ResourceInfo info{}; if (bindingResolve(dsv, &info)) flatRuntimeWritten(static_cast<ID3D11Resource*>(info.resource)); }
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalClearDepth(dsv, flags, depth);
     g_state->realClearDsv(self, dsv, flags, depth, stencil);
@@ -4154,6 +4167,7 @@ void STDMETHODCALLTYPE hookedCopyStructureCount(ID3D11DeviceContext* self,
                                                 ID3D11Buffer* dst, UINT off,
                                                 ID3D11UnorderedAccessView* src) {
     gpuFrameCommand(self);
+    if (!foreignContext(self) && flatRuntimeActive()) flatRuntimeSubstitution(self, FlatSubstEvent::kCopy);
     if(!foreignContext(self)){motionResourceWritten(dst,off,uint64_t(off)+4);glitchFrameInvalidatePool(dst);}
     else engineVelocityResourceUnknown(dst);
     if (drawCensusArmed()) {
@@ -4183,7 +4197,7 @@ void STDMETHODCALLTYPE hookedCopySubresourceRegion(
         if (fssResActive()) fssResNoteCopyMaybeMismatched(dst, src);
         if (uiLayerWatching()) uiLayerNoteCopy(dst, src);
     }
-    if (!foreignContext(self) && flatRuntimeActive()) flatRuntimeWritten(dst);
+    if (!foreignContext(self) && flatRuntimeActive()) { flatRuntimeSubstitution(self, FlatSubstEvent::kCopy); flatRuntimeWritten(dst); }
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalTransfer(dst, src, 'C');
     if (drawCensusArmed()) {
         drawCensusCopy('S', dst, dstSub, dstX, dstY, src, srcSub, box != nullptr,
@@ -4232,7 +4246,7 @@ void STDMETHODCALLTYPE hookedUpdateSubresource(ID3D11DeviceContext* self,
     if (fssRevealWantsDraws() && !foreignContext(self)) {
         fssRevealNoteUpdate(dst, data);
     }
-    if (!foreignContext(self) && flatRuntimeActive()) flatRuntimeUpdate(dst, data, box);
+    if (!foreignContext(self) && flatRuntimeActive()) { flatRuntimeSubstitution(self, FlatSubstEvent::kCopy); flatRuntimeUpdate(dst, data, box); }
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalUpdate(dst, data, box);
     g_state->realUpdateSubresource(self, dst, dstSub, box, data, rowPitch,
                                    depthPitch);
@@ -4253,7 +4267,7 @@ void STDMETHODCALLTYPE hookedResolveSubresource(ID3D11DeviceContext* self,
     noteStaleForward(kSlotResolveSubresource, reinterpret_cast<const void*>(g_state->realResolveSubresource),
                      "ResolveSubresource");
     if(!foreignContext(self)){if(fssResActive())fssResNoteCopyMaybeMismatched(dst,src);}
-    if (!foreignContext(self) && flatRuntimeActive()) flatRuntimeWritten(dst);
+    if (!foreignContext(self) && flatRuntimeActive()) { flatRuntimeSubstitution(self, FlatSubstEvent::kResolve); flatRuntimeWritten(dst); }
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalTransfer(dst, src, 'V');
     if (drawCensusArmed()) {
         drawCensusResolve(dst, dstSub, src, srcSub, static_cast<uint32_t>(fmt));

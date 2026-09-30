@@ -4,6 +4,7 @@
 #include <dxgi.h>
 #include "flat_compute_readback.h"
 #include "flat_projection_scope.h"
+#include "flat_substitution.h"
 #include <optional>
 namespace edvr {
 extern std::atomic<bool> g_flatRuntimeLive;
@@ -46,11 +47,15 @@ void flatRuntimeUnknown();
 void flatRuntimeArmProjectionAudit();
 void flatRuntimeCreateBuffer(ID3D11Buffer*, const void* initialData);
 void flatRuntimeClearBindings();
+// A hooked call of the kind flat_substitution.h names has come, or the frame is ending: put the game's state back where
+// engine motion's substitution is still bound (a lazy run of substituted producer draws), or forget it (the context
+// lost its state). Every hook of that kind calls this before its real call; a load and a compare when nothing of EDVR's
+// is bound, which is nearly always.
+void flatRuntimeSubstitution(ID3D11DeviceContext* ctx, FlatSubstEvent event);
 struct FlatRuntimeDrawScope {
     ID3D11DeviceContext* ctx = nullptr;
-    ID3D11RenderTargetView* targets[8]{};
-    ID3D11DepthStencilView* depth = nullptr;
     ID3D11ShaderResourceView* original = nullptr;
+    bool gameHadTarget6 = false;   // the game's own slot 6 was occupied under a substituted draw
     bool producer = false, replaced = false;
     bool drawCaptureStarted = false;
     std::optional<FlatProjectionBindingScope> projection;

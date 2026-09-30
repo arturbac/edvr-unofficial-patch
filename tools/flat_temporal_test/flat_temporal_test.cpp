@@ -2298,7 +2298,7 @@ void testStandDownWiring() {
           "in the draw scope the menu copy verification, the model, the trace record and the verdict all precede the Probe return");
     const char* afterProbe[] = {
         "const bool sourceCandidate=", "engineVelocityNoteSource(", "++s.covSceneDraws;",
-        "qualifyProjection(s,recipes,", "engineVelocityBeforeDraw(ctx, false);",
+        "qualifyProjection(s,recipes,", "engineVelocityFlatBeginDraw(ctx, &gameHadTarget6);",
         "flatMonoResolve(s.device.Get(), ctx, f,", "projection.emplace(*projectionPlan);"};
     for (const char* needle : afterProbe) {
         const size_t where = at(needle);
@@ -2435,7 +2435,7 @@ void testFlatCpuWiring() {
         {&runtimeCpp, "flatcpu::kProjection", 3, "qualifyProjection, the private binding and its restore"},
         {&runtimeCpp, "flatcpu::kShadows", 5, "the constant-buffer shadow observers"},
         {&runtimeCpp, "flatcpu::kWitness", 1, "the camera witness"},
-        {&runtimeCpp, "flatcpu::kEngineDraw", 3, "engine motion's draw wrapper: naming, BeforeDraw and AfterFlatDraw"},
+        {&runtimeCpp, "flatcpu::kEngineDraw", 4, "engine motion's draw wrapper: naming, its begin (BeforeDraw), its end, and the flush of what it kept bound"},
         {&runtimeCpp, "flatcpu::kResolve", 1, "the treatment at the copy draw"},
         {&runtimeCpp, "flatcpu::kTrackers", 5, "the state trackers"},
         {&resolveCpp, "flatcpu::Scope backendScope(flatcpu::kBackend);", 1, "the backend evaluation inside the resolver"},
@@ -2612,6 +2612,152 @@ void testFlatCameraTableWiring() {
     check(count("c->valid = false;", "->valid = false") == 1, "camera table wiring control: the bypass scan finds an assignment");
 }
 
+// The lazy draw bracket in the runtime and the hooks (flat_substitution.h holds the policy, the engine rig's
+// flat_lazy_tests.h the engine's half of it and the policy's own mistakes): every hooked call that could observe or
+// depend on engine motion's state puts the game's back first, and EDVR's own reads of the context follow a flush. A
+// source scan with removal controls, so a hook that loses its line, a flush that moves behind the real call or behind
+// what reads the context, or an event nothing raises, fails here and not in a flight.
+void testFlatSubstitutionWiring() {
+    auto slurp = [](const char* path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string runtimeCpp = slurp("src/d3d11/flat_runtime.cpp");
+    const std::string vscreenCpp = slurp("src/d3d11/vscreen.cpp");
+    const std::string exposureCpp = slurp("src/d3d11/exposure_fix.cpp");
+    const std::string deviceCpp = slurp("src/d3d11/device_hook.cpp");
+    const std::string policyH = slurp("src/d3d11/flat_substitution.h");
+    check(!runtimeCpp.empty() && !vscreenCpp.empty() && !exposureCpp.empty() && !deviceCpp.empty() && !policyH.empty(),
+          "the runtime, hook and policy sources are readable from the repo root");
+    auto count = [](const std::string& text, const std::string& needle) {
+        unsigned n = 0;
+        for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
+        return n;
+    };
+    struct Pin { const std::string* text; const char* needle; unsigned times; const char* what; };
+    const Pin pins[] = {
+        // The runtime's own sites: what each says to the policy.
+        {&runtimeCpp, "engineVelocityFlatLazy(!diagnostics);", 1, "the draw scope turns the lazy form off while a diagnostic capture is armed"},
+        {&runtimeCpp, "if (diagnostics) flatRuntimeSubstitution(context, FlatSubstEvent::kOtherDraw);", 1, "and puts the game's state back at once"},
+        {&runtimeCpp, "if (!d.supported) flatRuntimeSubstitution(context, FlatSubstEvent::kOtherDraw);", 1,
+         "a draw that is not a pool-family draw puts the game's state back"},
+        {&runtimeCpp, "if (d.supported && (!continuesRun || coverageReads)) flatRuntimeSubstitution(context, FlatSubstEvent::kOtherDraw);", 1,
+         "so does a pool-family draw that is not a plain continuation of the run, or that EDVR reads the context for"},
+        {&runtimeCpp, "flatRuntimeSubstitution(ctx, FlatSubstEvent::kDispatch);", 1, "a dispatch puts the game's state back"},
+        {&runtimeCpp, "flatRuntimeSubstitution(state().context.Get(), FlatSubstEvent::kPresent);", 1, "the Present puts it back before the real Present"},
+        {&runtimeCpp, "flatRuntimeSubstitution(nullptr, FlatSubstEvent::kResize);", 1, "a resize forgets it, touching no context"},
+        {&runtimeCpp, "flatRuntimeSubstitution(nullptr, FlatSubstEvent::kClearState);", 1, "ClearState forgets it, touching no context"},
+        {&runtimeCpp, "if (!engineVelocityFlatPending()) return;", 1, "with nothing of engine motion's bound the policy costs one load"},
+        {&runtimeCpp, "switch (flatSubstAction(event)) {", 1, "the runtime asks the policy what to do"},
+        {&runtimeCpp, "engineVelocityFlatFlush(ctx, flushCauseOf(event));", 1, "a flush names its cause"},
+        {&runtimeCpp, "engineVelocityFlatAbandon();", 1, "an abandon"},
+        {&runtimeCpp, "producer = engineVelocityFlatBeginDraw(ctx, &gameHadTarget6);", 1, "the producer branch opens the lazy bracket"},
+        {&runtimeCpp, "engineVelocityFlatEndDraw(ctx);", 1, "and closes it"},
+        {&runtimeCpp, "case FlatSubstEvent::kDispatch: return EngineVelocityFlushCause::kDispatch;", 1, "a dispatch's cause"},
+        {&runtimeCpp, "case FlatSubstEvent::kClear: return EngineVelocityFlushCause::kClear;", 1, "a clear's cause"},
+        {&runtimeCpp, "case FlatSubstEvent::kCopy: return EngineVelocityFlushCause::kCopy;", 1, "a copy's cause"},
+        {&runtimeCpp, "case FlatSubstEvent::kResolve: return EngineVelocityFlushCause::kResolve;", 1, "a resolve's cause"},
+        {&runtimeCpp, "case FlatSubstEvent::kKeepTargets: return EngineVelocityFlushCause::kKeepTargets;", 1, "a targets-keeping set's cause"},
+        {&runtimeCpp, "case FlatSubstEvent::kExecuteCommandList: return EngineVelocityFlushCause::kCommandList;", 1, "a command list's cause"},
+        {&runtimeCpp, "case FlatSubstEvent::kPresent: return EngineVelocityFlushCause::kPresent;", 1, "the Present's cause"},
+        // Who reaches the runtime's scopes.
+        {&vscreenCpp, "FlatRuntimeDrawScope flatDraw(self,", 7, "every draw entry point (D, A, I, N, X, and the two indirect ones) opens the draw scope"},
+        {&exposureCpp, "FlatRuntimeDispatchScope flatDispatch(self);", 2, "Dispatch and DispatchIndirect open the dispatch scope"},
+        {&deviceCpp, "menuFlatResize(); flatRuntimeResize(); }", 2, "both ResizeBuffers hooks tell the runtime before the real call"},
+    };
+    for (const Pin& pin : pins) {
+        check(count(*pin.text, pin.needle) == pin.times, pin.what);
+        std::string without = *pin.text;
+        for (size_t at = without.find(pin.needle); at != std::string::npos; at = without.find(pin.needle))
+            without.erase(at, std::strlen(pin.needle));
+        check(count(without, pin.needle) == 0, "substitution wiring control: a source with the line removed no longer contains it");
+    }
+    // The hooks: one event each, ahead of the real call the hook forwards to (the last one in its body: the early returns
+    // for an internal or foreign call forward untouched, and the void fix in ClearRenderTargetView is another way out).
+    struct Hook { const char* name; const char* event; const char* real; };
+    const Hook hooks[] = {
+        {"hookedClearRtv", "kClear", "realClearRtv("},
+        {"hookedClearUavUint", "kClear", "realClearUavUint("},
+        {"hookedClearUavFloat", "kClear", "realClearUavFloat("},
+        {"hookedClearDsv", "kClear", "realClearDsv("},
+        {"hookedGenerateMips", "kCopy", "realGenerateMips("},
+        {"hookedCopyResource", "kCopy", "realCopyResource("},
+        {"hookedCopyStructureCount", "kCopy", "realCopyStructureCount("},
+        {"hookedCopySubresourceRegion", "kCopy", "realCopySubresourceRegion("},
+        {"hookedUpdateSubresource", "kCopy", "realUpdateSubresource("},
+        {"hookedResolveSubresource", "kResolve", "realResolveSubresource("},
+        {"hookedOMSetRtvAndUav", "kKeepTargets", "realOMSetRtvAndUav("},
+        {"hookedExecuteCommandList", "kExecuteCommandList", "realExecuteCommandList("},
+    };
+    for (const Hook& hook : hooks) {
+        const std::string head = std::string("void STDMETHODCALLTYPE ") + hook.name + "(";
+        const size_t from = vscreenCpp.find(head);
+        const size_t to = from == std::string::npos ? std::string::npos : vscreenCpp.find("\n}\n", from);
+        check(from != std::string::npos && to != std::string::npos, (std::string("the hook ") + hook.name + " can be delimited").c_str());
+        if (from == std::string::npos || to == std::string::npos) continue;
+        const std::string body = vscreenCpp.substr(from, to - from);
+        const std::string call = std::string("flatRuntimeSubstitution(self, FlatSubstEvent::") + hook.event + ");";
+        const size_t sub = body.find(call);
+        const size_t real = body.rfind(hook.real);
+        check(count(body, call) == 1, (std::string(hook.name) + " raises " + hook.event + " exactly once").c_str());
+        check(sub != std::string::npos && real != std::string::npos && sub < real,
+              (std::string(hook.name) + " raises it before the real call").c_str());
+        check(body.find("flatRuntimeActive()") != std::string::npos && body.find("flatRuntimeActive()") < sub,
+              (std::string(hook.name) + " raises it only while the flat runtime is active").c_str());
+    }
+    // The event the policy names all have a caller, and a caller for an event the policy does not name does not compile.
+    const char* const events[] = {"kOtherDraw", "kDispatch", "kClear", "kCopy", "kResolve", "kKeepTargets", "kExecuteCommandList", "kPresent",
+                                  "kClearState", "kResize"};
+    for (const char* event : events) {
+        const std::string enumerator = std::string("FlatSubstEvent::") + event;
+        check(count(policyH, std::string("    ") + event) >= 1 || count(policyH, std::string(event) + ",") >= 1,
+              (std::string("the policy names ") + event).c_str());
+        check(count(runtimeCpp, enumerator) + count(vscreenCpp, enumerator) >= 1, (std::string("something raises ") + event).c_str());
+    }
+    // Order inside the runtime's draw scope: the lazy switch and the flushes come before anything reads the context, and the
+    // bracket opens after the coverage classification and the qualification, which read it.
+    const size_t scope = runtimeCpp.find("FlatRuntimeDrawScope::FlatRuntimeDrawScope(");
+    const char* const order[] = {
+        "engineVelocityFlatLazy(!diagnostics);",
+        "if (diagnostics) flatRuntimeSubstitution(context, FlatSubstEvent::kOtherDraw);",
+        "d.supported = engineVelocityPoolFamilyPair(k.vs, k.ps);",
+        "if (!d.supported) flatRuntimeSubstitution(context, FlatSubstEvent::kOtherDraw);",
+        "d.hdrCopyVerified=verifyHdrCopy(ctx,d);",
+        "const bool continuesRun =",
+        "if (d.supported && (!continuesRun || coverageReads)) flatRuntimeSubstitution(context, FlatSubstEvent::kOtherDraw);",
+        "flatcpu::Scope coverage(flatcpu::kCoverage);",
+        "qualifyProjection(s,recipes,",
+        "producer = engineVelocityFlatBeginDraw(ctx, &gameHadTarget6);",
+        "flatMonoResolve(s.device.Get(), ctx, f,",
+    };
+    size_t previous = scope;
+    bool ordered = scope != std::string::npos;
+    for (const char* needle : order) {
+        const size_t where = scope == std::string::npos ? std::string::npos : runtimeCpp.find(needle, scope);
+        if (where == std::string::npos || where < previous) { ordered = false; std::printf("  out of order or missing: %s\n", needle); }
+        else previous = where;
+    }
+    check(ordered, "in the draw scope the lazy switch and the flushes precede every read of the context, and the bracket opens after the coverage reads");
+    // The frame's end: the flush comes before the census closes its span, and the menu and the real Present follow it.
+    const size_t before = runtimeCpp.find("void flatRuntimeBeforePresent() {");
+    const size_t flushAt = runtimeCpp.find("flatRuntimeSubstitution(state().context.Get(), FlatSubstEvent::kPresent);", before);
+    const size_t closeAt = runtimeCpp.find("gpuFrameClose(state());", before);
+    check(before != std::string::npos && flushAt != std::string::npos && closeAt != std::string::npos && flushAt < closeAt,
+          "the Present's flush comes before the census closes its span");
+    const size_t hookFrom = deviceCpp.find("HRESULT STDMETHODCALLTYPE hookedPresent(");
+    const size_t hookTo = hookFrom == std::string::npos ? std::string::npos : deviceCpp.find("\n}\n", hookFrom);
+    if (hookFrom != std::string::npos && hookTo != std::string::npos) {
+        const std::string body = deviceCpp.substr(hookFrom, hookTo - hookFrom);
+        const size_t flush = body.find("flatRuntimeBeforePresent();");
+        const size_t menu = body.find("menuFlatBeforePresent(self, flags);");
+        const size_t real = body.rfind("g_state->realPresent(self, syncInterval, flags);");   // (the first is the foreign swap chain's)
+        check(flush != std::string::npos && menu != std::string::npos && real != std::string::npos && flush < menu && menu < real,
+              "the Present hook flushes before the menu draws and before the real Present");
+    } else {
+        check(false, "the Present hook can be delimited");
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
         return flatShaderClassifierSweep(argv[2]);
@@ -2671,6 +2817,7 @@ int main(int argc, char** argv) {
     testFlatWitnessWiring();
     failures += flatCameraTableTests();
     testFlatCameraTableWiring();
+    testFlatSubstitutionWiring();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;
