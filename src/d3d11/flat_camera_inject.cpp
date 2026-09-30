@@ -14,6 +14,7 @@
 #include "../common/runtime_profile.h"
 #include "flat_camera_ownership.h"
 #include "flat_camera_stubs.h"
+#include "flat_cpu.h"
 #include "flat_runtime.h"
 
 extern "C" DWORD _tls_index; // CRT-provided once a __declspec(thread) exists
@@ -356,6 +357,7 @@ void flushCamera(uintptr_t camera) noexcept {
 // untouched, which is the whole of "forward unmodified" now: stubA joins
 // the trampoline regardless and the body returns straight to its caller.
 void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noexcept {
+    flatcpu::Scope timed(flatcpu::kInject);   // the census (flat_cpu.h): this callback's own time, the game's body excluded
     g_refreshTls.armed = 0; // a previous body that unwound never disarmed
     const uint64_t callNo = g_inject.refreshCalls.fetch_add(1, std::memory_order_relaxed) + 1;
     // The triage fields ride out on the 5s tick (the lastcall line); no I/O here.
@@ -481,6 +483,7 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
 // the derived blocks keep this call's jitter (the committed phase); the
 // sources return pristine for the next derivation.
 void refreshPost() noexcept {
+    flatcpu::Scope timed(flatcpu::kInject);   // the census: the restore after the game's body
     if (!g_refreshTls.armed) return; // defensive: stubB only fires after a redirect
     g_refreshTls.armed = 0;
     const uintptr_t camera = g_refreshTls.camera;

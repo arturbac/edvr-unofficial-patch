@@ -16,6 +16,8 @@
 #include "flat_negotiated_eval.h"
 #include "flat_camera_producer_probe.h"
 #include "flat_standdown.h"
+#include "flat_cpu.h"
+#include "gpu_timing.h"
 #include "flat_temporal.h"
 #include "engine_velocity.h"
 #include "binding_shadow.h"
@@ -229,6 +231,21 @@ struct State {
     FlatMonoReason frameReason = FlatMonoReason::NoOutputCopy;
     bool frameLive = false;      // the frame that just ended was watched (Full or Probe)
     bool enginePaused = false;   // engine motion is configured off for the stand-down
+
+    // --- CPU and GPU census (flat_cpu.h) ------------------------------------------
+    // What EDVR's own flat work costs, by family, printed every 5 s while a temporal
+    // mode is selected. The GPU spans are timestamp pairs read back without waiting:
+    // the whole frame, first game draw to Present, and the resolver's dispatches plus
+    // backend call. A timer is owned until its sample is read; with none free the
+    // frame is skipped and counted.
+    flatcpu::Census census;
+    static constexpr int kGpuFrameTimers = 4, kGpuResolveTimers = 2;
+    GpuTimer gpuFrameTimer[kGpuFrameTimers];
+    GpuTimer gpuResolveTimer[kGpuResolveTimers];
+    bool gpuFrameBusy[kGpuFrameTimers] = {}, gpuResolveBusy[kGpuResolveTimers] = {};
+    int gpuFrameOpen = -1, gpuResolveOpen = -1;   // the timer holding this frame's open span
+    bool gpuFrameTried = false;                   // this frame already tried to open its span
+    bool censusHooked = false;                    // the resolver's span hooks are installed
 };
 // Driver objects retire on the owner Present; never release under loader lock.
 State& state() { static State* p = new State; return *p; }
@@ -1030,6 +1047,7 @@ void refuseDraw(State& s, const char* reason) {
 const FlatProjectionBindingPlan* qualifyProjection(State& s, FlatProjectionRecipes recipes, uint32_t width, uint32_t height,
                        uint64_t vs, uint64_t ps, uint64_t cs, bool owned, bool sceneHdr = false) {
     if (!s.projection || !recipes.count) return nullptr;
+    flatcpu::Scope timed(flatcpu::kProjection);   // projection readiness: the checks, preflight and prepare
     const bool audit=s.projectionFrames!=0;
     if(audit) { ++s.projectionCandidates;if(!owned)++s.projectionUnowned; }
     // A previous qualified frame names early depth prepasses before this
@@ -1182,8 +1200,9 @@ Camera* camera(ID3D11Resource* resource, bool add) {
     auto& c = s.cameras[index]; c = Camera{}; c.buffer = buffer; c.width = d.ByteWidth; return &c;
 }
 void capture(Camera& c, const void* bytes) {
+    flatcpu::Scope timed(flatcpu::kCameraRows);   // the camera data motion correctness needs, apart from the witness
     c.valid = flatCaptureCameraRows(c.rows, bytes, c.width); c.frame = state().prefix.frame;
-    flatTraceMark(state().traceRing, kFlatTraceEventCameraCapture, nullptr);
+    { flatcpu::Scope trace(flatcpu::kTrace); flatTraceMark(state().traceRing, kFlatTraceEventCameraCapture, nullptr); }
     c.sequence = ++state().prefix.sequence;
 }
 // The camera producer witness (design-flat-camera-integration.md, C0/C1):
@@ -1227,6 +1246,7 @@ const char* witnessModuleBrief(void* p, char* buf, size_t bufLen) {
     return buf;
 }
 void cameraWitness(const void* buffer) {
+    flatcpu::Scope timed(flatcpu::kWitness);
     auto& w = g_camWitness; ++w.writes;
     if (w.sitesFull) { ++w.dedupHits; return; }
     void* frames[10] = {};
@@ -1285,6 +1305,76 @@ bool depthView(ID3D11Texture2D* depth) {
     if (v.Format == DXGI_FORMAT_UNKNOWN) return false;
     if (d.SampleDesc.Count != 1 || !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE) || FAILED(s.device->CreateShaderResourceView(depth, &v, &s.depthView))) return false;
     s.sceneDepth = depth; return true;
+}
+
+// --- GPU spans for the census (flat_cpu.h) ----------------------------------------------------
+// Timestamp pairs on the shared disjoint clock (gpu_timing.h), read back without ever waiting:
+// the whole frame, first game draw to Present, and the resolver's dispatches plus backend call.
+// A GpuTimer stays owned until its sample is read, a few frames on; with none free the frame
+// is skipped and counted. Nested spans borrow the frame's open disjoint scope, so a resolver
+// span costs one timestamp pair.
+void gpuFrameOpen(State& s, ID3D11DeviceContext* ctx) {
+    s.gpuFrameTried = true;
+    for (int i = 0; i < State::kGpuFrameTimers; ++i) {
+        if (s.gpuFrameBusy[i]) continue;
+        if (s.gpuFrameTimer[i].begin(s.device.Get(), ctx)) { s.gpuFrameBusy[i] = true; s.gpuFrameOpen = i; return; }
+        break;
+    }
+    s.census.noteGpuSkipped();
+}
+void gpuFrameClose(State& s) {
+    if (s.gpuFrameOpen < 0) return;
+    s.gpuFrameTimer[s.gpuFrameOpen].end(s.context.Get());
+    s.gpuFrameOpen = -1;
+}
+void gpuPoll(State& s) {
+    ID3D11DeviceContext* ctx = s.context.Get();
+    double ms = 0;
+    for (int i = 0; i < State::kGpuFrameTimers; ++i) {
+        if (!s.gpuFrameBusy[i] || i == s.gpuFrameOpen) continue;
+        switch (s.gpuFrameTimer[i].poll(ctx, ms)) {
+        case GpuTimerPoll::Ready: s.census.noteGpuFrame(ms); s.gpuFrameBusy[i] = false; break;
+        case GpuTimerPoll::Invalid: s.census.noteGpuInvalid(); s.gpuFrameBusy[i] = false; break;
+        case GpuTimerPoll::Pending: break;
+        }
+    }
+    for (int i = 0; i < State::kGpuResolveTimers; ++i) {
+        if (!s.gpuResolveBusy[i] || i == s.gpuResolveOpen) continue;
+        switch (s.gpuResolveTimer[i].poll(ctx, ms)) {
+        case GpuTimerPoll::Ready: s.census.noteGpuResolve(ms); s.gpuResolveBusy[i] = false; break;
+        case GpuTimerPoll::Invalid: s.census.noteGpuInvalid(); s.gpuResolveBusy[i] = false; break;
+        case GpuTimerPoll::Pending: break;
+        }
+    }
+}
+// A reset drops the spans: only on the verified owner thread, where a span still open can be
+// cancelled cleanly (a timer with an open span released from anywhere else would switch the
+// shared GPU clock off for the session).
+void gpuReset(State& s) {
+    ID3D11DeviceContext* ctx = s.context.Get();
+    if (!ctx || !gpuTimingOwns(ctx)) return;
+    for (auto& t : s.gpuFrameTimer) t.reset(ctx);
+    for (auto& t : s.gpuResolveTimer) t.reset(ctx);
+    for (auto& b : s.gpuFrameBusy) b = false;
+    for (auto& b : s.gpuResolveBusy) b = false;
+    s.gpuFrameOpen = s.gpuResolveOpen = -1;
+}
+// The resolver's hooks (flat_mono_resolve.h): a timestamp pair around its own dispatches and
+// backend call. Called on the thread that resolves, inside the treatment scope.
+void resolveSpanBegin(ID3D11DeviceContext* ctx) noexcept {
+    auto& s = state();
+    if (s.gpuResolveOpen >= 0) return;
+    for (int i = 0; i < State::kGpuResolveTimers; ++i) {
+        if (s.gpuResolveBusy[i]) continue;
+        if (s.gpuResolveTimer[i].begin(s.device.Get(), ctx)) { s.gpuResolveBusy[i] = true; s.gpuResolveOpen = i; }
+        return;
+    }
+}
+void resolveSpanEnd(ID3D11DeviceContext* ctx) noexcept {
+    auto& s = state();
+    if (s.gpuResolveOpen < 0) return;
+    s.gpuResolveTimer[s.gpuResolveOpen].end(ctx);
+    s.gpuResolveOpen = -1;
 }
 
 // The refusal state for the F8 panel's settings warning, published for any thread:
@@ -1398,6 +1488,7 @@ void flatRuntimeResize() {
     // A reset (or the mode turned off) ends a stand-down: the new contract may well be
     // one the selector recognises, and every paused piece restarts with it.
     endStandDown(s, s.prefix.frame, "the swap chain or device was reset, or the mode was turned off");
+    gpuReset(s);
     flatCameraInjectReset(); // history and the decision do not survive a resize; injected cameras stay known for the flush
     finishPhaseCensusFrame(s);
     if(s.phaseCensusFrames || s.phaseFailuresUsed || s.phaseOverflowCalls)
@@ -1416,7 +1507,11 @@ void flatRuntimeResize() {
     s.observing = false; s.covFrameLocallyRefused = false;
     s.prefix = FlatRuntimePrefix{}; s.context.Reset(); s.device.Reset(); s.thread = 0; s.viewportCount = 0;
 }
-void flatRuntimeBeforePresent() { g_flatRuntimeLive.store(false, std::memory_order_release); }
+void flatRuntimeBeforePresent() {
+    g_flatRuntimeLive.store(false, std::memory_order_release);
+    // The census's whole-frame GPU span ends here, just before the real Present.
+    if (owner()) gpuFrameClose(state());
+}
 bool flatRuntimeNativeScale() { return nativeScale.load(std::memory_order_acquire); }
 void flatRuntimePhaseState(float* x, float* y, uint32_t* w, uint32_t* h, uint32_t* applied) {
     auto& s = state();
@@ -1430,7 +1525,10 @@ void flatRuntimeNoteCameraApplied() { auto& s = state(); s.phase.noteApplied(); 
 bool flatRuntimeLegacyPlanExists() { return state().projection != nullptr; }
 void flatRuntimeArmProjectionAudit() { if(runtimeFlatProfile()) projectionAuditRequested.store(true,std::memory_order_release); }
 void flatRuntimeCreateBuffer(ID3D11Buffer* buffer, const void* initialData) {
-    if(owner() && state().projection) state().projection->observeCreateBuffer(buffer,initialData);
+    if(owner() && state().projection) {
+        flatcpu::Scope shadows(flatcpu::kShadows);
+        state().projection->observeCreateBuffer(buffer,initialData);
+    }
 }
 // Gate 1 trace dump: write the ring's complete frames to logDir\traces on the
 // F10 audit arm. CREATE_ALWAYS: each arm is a new capture of the newest slots.
@@ -1525,7 +1623,8 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // starts now is decided below, and a change of it is handed over there.
     const bool enginePausedThen = s.enginePaused;
     engineVelocityConfigure(enabled && !enginePausedThen);
-    if (!enabled) { if (s.device || s.output || s.cameraCount) flatRuntimeResize(); return; }
+    // No temporal mode selected: the census stops (its gates close, a scope costs a load and a compare).
+    if (!enabled) { s.census.idle(); if (s.device || s.output || s.cameraCount) flatRuntimeResize(); return; }
     FlatComputeInternalScope guard;
     Ptr<ID3D11Device> actualDevice; swap->GetDevice(IID_PPV_ARGS(&actualDevice));
     if (s.device && actualDevice.Get() != s.device.Get()) { flatRuntimeResize(); s.thread = GetCurrentThreadId(); }
@@ -1539,8 +1638,31 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         engineConfiguredPaused = s.enginePaused;
         engineVelocityConfigure(enabled && !s.enginePaused);
     };
+    const bool endedPaused = s.work == FlatWork::Paused;
     standDownFrame(s, frame);
     syncEngine();
+    // The CPU and GPU census (flat_cpu.h): the frame that just ended is cut into its families,
+    // the GPU spans that finished are read (never waited for), and every 5 s the window is
+    // printed, zeros included. Instrument only: nothing below reads any of it.
+    if (!s.censusHooked) { flatMonoResolveSetSpanHooks(&resolveSpanBegin, &resolveSpanEnd); s.censusHooked = true; }
+    {
+        static const int64_t censusFreq = flatcpu::qpcFrequency();
+        const int64_t censusNow = EDVR_FLATCPU_NOW();
+        const bool censusWasRunning = s.census.running();
+        s.census.onFrame(censusNow, censusFreq, endedPaused);
+        // Always drained, so the priming frame (or a census that was stopped) leaves no backlog to
+        // be read as the first window's.
+        const EngineVelocityWrapperCounts wrapper = engineVelocityTakeWrapperCounts();
+        if (censusWasRunning) s.census.noteWrapper(wrapper.stateCalls, wrapper.substitutedDraws);
+        gpuPoll(s);
+        flatcpu::WindowReport window;
+        if (s.census.take(censusNow, s.standDown.standing, window)) {
+            flatcpu::Lines lines;
+            flatcpu::formatWindow(window, &lines);
+            for (int i = 0; i < lines.count; ++i) Log::get().note("%s", lines.line[i]);
+        }
+        s.gpuFrameTried = false;
+    }
     // The completed frame is a draw-capture sample only if it was live: the resolver did not reset
     // it, and it ran at a nonzero phase unless the jitter is off on purpose. The two frames after an
     // F10 arm were neither, and their constants carry no phase (2026-09-29).
@@ -1833,13 +1955,26 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     s.frameLive = s.work != FlatWork::Paused;
     g_flatRuntimeLive.store(true, std::memory_order_release);
 }
-void flatRuntimeViewport(UINT n, const D3D11_VIEWPORT* vp) { if (!owner()) return; auto& s = state(); s.viewportCount = n; if (n == 1 && vp) s.viewport = *vp; }
-void flatRuntimeConstantBuffers(UINT start, UINT count, ID3D11Buffer* const* buffers) {
-    if (owner() && start <= 1 && 1-start < count && buffers && buffers[1-start]) camera(buffers[1-start], true);
+void flatRuntimeViewport(UINT n, const D3D11_VIEWPORT* vp) {
+    if (!owner()) return;
+    flatcpu::Scope tracker(flatcpu::kTrackers);
+    auto& s = state(); s.viewportCount = n; if (n == 1 && vp) s.viewport = *vp;
 }
-void flatRuntimeClearBindings() { if (owner()) { state().viewportCount = 0; for (auto& u : state().uavs) u.Reset(); } }
+void flatRuntimeConstantBuffers(UINT start, UINT count, ID3D11Buffer* const* buffers) {
+    if (owner() && start <= 1 && 1-start < count && buffers && buffers[1-start]) {
+        flatcpu::Scope tracker(flatcpu::kTrackers);
+        camera(buffers[1-start], true);
+    }
+}
+void flatRuntimeClearBindings() {
+    if (owner()) {
+        flatcpu::Scope tracker(flatcpu::kTrackers);
+        state().viewportCount = 0; for (auto& u : state().uavs) u.Reset();
+    }
+}
 void flatRuntimeUnknown() {
     if (!owner()) return;
+    flatcpu::Scope tracker(flatcpu::kTrackers);
     auto& s = state();
     // The trackers lose what they knew in every mode; a Paused frame watches nothing
     // else, so no trace mark and no prefix or shadow to invalidate.
@@ -1851,6 +1986,7 @@ void flatRuntimeUnknown() {
 }
 void flatRuntimeUavs(UINT start, UINT count, ID3D11UnorderedAccessView* const* views) {
     if (!owner() || state().work == FlatWork::Paused) return;
+    flatcpu::Scope tracker(flatcpu::kTrackers);
     for (UINT i = 0; i < count && start + i < 8; ++i) {
         ResourceInfo info{};
         if (views && views[i]) bindingResolve(views[i], &info);
@@ -1861,6 +1997,7 @@ FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
     if(!flatRuntimeActive())return;
     auto& s = state(); if (!owner() || ctx != s.context.Get()) { foreignWork.store(true, std::memory_order_release); return; }
     if (s.work == FlatWork::Paused) return;
+    flatcpu::Scope shell(flatcpu::kOther);   // the dispatch scope's own time
     if(s.projection) {
         if(s.projectionFrames)++s.projectionDispatches;
         // CSSetShader records only the pointer via bindingSet, unlike the
@@ -1890,7 +2027,7 @@ FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
         }
     }
     for (const auto& u : s.uavs) if (u) {
-        flatTraceMark(s.traceRing, kFlatTraceEventDispatchWritten, u.Get());
+        { flatcpu::Scope trace(flatcpu::kTrace); flatTraceMark(s.traceRing, kFlatTraceEventDispatchWritten, u.Get()); }
         flatRuntimeDispatchObserveWritten(s.prefix, u.Get());
     }
     if(s.prefix.uncertain && s.projection)failPhase(s,"compute-source-invalidated");
@@ -1898,21 +2035,29 @@ FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
 // The per-call tees below return at once in a Paused frame (flat_standdown.h). A Probe
 // frame runs them as a Full one does except for the camera witness, which is diagnostics
 // for a frame that could be treated, and the projection shadows, which do not exist then.
+// What a write to a resource does to the prefix model, the camera table and the shadows -- the
+// body flatRuntimeWritten, Map and Update share, timed by the caller's scope.
+static void resourceWritten(State& s, ID3D11Resource* res) {
+    { flatcpu::Scope trace(flatcpu::kTrace); flatTraceMark(s.traceRing, kFlatTraceEventWriteResource, res); }
+    flatRuntimeWritten(s.prefix, res);
+    if (auto* c = camera(res, false)) c->valid = false;
+    if (s.projection) { flatcpu::Scope shadows(flatcpu::kShadows); s.projection->invalidate(res); }
+}
 void flatRuntimeWritten(ID3D11Resource* res) {
     if (!owner() || state().work == FlatWork::Paused) return;
-    flatTraceMark(state().traceRing, kFlatTraceEventWriteResource, res);
-    flatRuntimeWritten(state().prefix, res);
-    if (auto* c = camera(res, false)) c->valid = false;
-    if(state().projection)state().projection->invalidate(res);
+    flatcpu::Scope lookup(flatcpu::kResource);   // prefix target and source lookup, camera lookup
+    resourceWritten(state(), res);
 }
 void flatRuntimeMap(ID3D11Resource* res, D3D11_MAP type, void* bytes) {
     if (!owner() || type == D3D11_MAP_READ || state().work == FlatWork::Paused) return;
-    flatRuntimeWritten(res); if (auto* c = camera(res, false)) c->mapped = bytes;
-    if(state().projection)state().projection->observeMap(res,type,bytes);
+    flatcpu::Scope lookup(flatcpu::kResource);
+    resourceWritten(state(), res); if (auto* c = camera(res, false)) c->mapped = bytes;
+    if (state().projection) { flatcpu::Scope shadows(flatcpu::kShadows); state().projection->observeMap(res,type,bytes); }
 }
 void flatRuntimeUnmap(ID3D11Resource* res) {
     if (!owner() || state().work == FlatWork::Paused) return;
-    if(state().projection)state().projection->observeUnmap(res);
+    flatcpu::Scope lookup(flatcpu::kResource);
+    if (state().projection) { flatcpu::Scope shadows(flatcpu::kShadows); state().projection->observeUnmap(res); }
     if (auto* c = camera(res, false)) {
         if (c->mapped) { capture(*c, c->mapped); if (state().work == FlatWork::Full) cameraWitness(res); }
         c->mapped = nullptr;
@@ -1920,11 +2065,12 @@ void flatRuntimeUnmap(ID3D11Resource* res) {
 }
 void flatRuntimeUpdate(ID3D11Resource* res, const void* bytes, const D3D11_BOX* box) {
     if (!owner() || state().work == FlatWork::Paused) return;
-    flatRuntimeWritten(res);
+    flatcpu::Scope lookup(flatcpu::kResource);
+    resourceWritten(state(), res);
     if (auto* c = camera(res, false)) {
         if (!box || (box->left == 0 && box->right == c->width)) { capture(*c, bytes); if (state().work == FlatWork::Full) cameraWitness(res); }
     }
-    if(state().projection)state().projection->observeUpdate(res,bytes,box);
+    if (state().projection) { flatcpu::Scope shadows(flatcpu::kShadows); state().projection->observeUpdate(res,bytes,box); }
 }
 
 FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_t instances,
@@ -1932,9 +2078,12 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
                                            int32_t base, uint32_t startInstance) {
     if (!flatRuntimeActive()) return;
     auto& s = state(); if (!owner() || context != s.context.Get()) { foreignWork.store(true, std::memory_order_release); return; }
+    // The census's whole-frame GPU span opens at the frame's first game draw, watched or not.
+    if (!s.gpuFrameTried) gpuFrameOpen(s, context);
     // A Paused frame (flat_standdown.h) watches nothing: the scope is a no-op, ctx stays
     // null and the destructor returns at its first line.
     if (s.work == FlatWork::Paused) return;
+    flatcpu::Scope shell(flatcpu::kOther);   // the scope's own time; the named families below are carved out of it
     ctx = context; FlatRuntimeDraw d{}; auto& k = d.key;
     const FlatProjectionBindingPlan* projectionPlan=nullptr;
     const auto rt = view(BindSlot::Rtv0, 0), ds = view(BindSlot::Dsv0, 1);
@@ -1948,8 +2097,11 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     s.drawVs = k.vs; s.drawPs = k.ps;
     k.b1 = bindingGet(BindSlot::VsCb1); k.viewportCount = s.viewportCount;
     static_assert(sizeof(k.viewport) == sizeof(D3D11_VIEWPORT), "viewport layout"); std::memcpy(k.viewport, &s.viewport, sizeof(k.viewport));
-    if (auto* c = camera(static_cast<ID3D11Buffer*>(const_cast<void*>(k.b1)), false)) {
-        if (c->valid && c->frame == s.prefix.frame) { std::memcpy(d.camera, c->rows, sizeof(d.camera)); k.camera = d.camera; k.cameraHash = flatCameraHash(d.camera); k.writeEpoch = c->frame; k.writeSeq = c->sequence; }
+    {
+        flatcpu::Scope rows(flatcpu::kCameraRows);   // camera table lookup, rows copy and hash
+        if (auto* c = camera(static_cast<ID3D11Buffer*>(const_cast<void*>(k.b1)), false)) {
+            if (c->valid && c->frame == s.prefix.frame) { std::memcpy(d.camera, c->rows, sizeof(d.camera)); k.camera = d.camera; k.cameraHash = flatCameraHash(d.camera); k.writeEpoch = c->frame; k.writeSeq = c->sequence; }
+        }
     }
     d.supported = engineVelocityPoolFamilyPair(k.vs, k.ps); d.instances = instances;
     k.kind = flatContractKind(d.supported, k.color, k.depth, k.width, k.height, k.format, s.prefix.width, s.prefix.height, k.color == s.prefix.output);
@@ -1965,21 +2117,35 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         k.srvView[slot] = bindingGet(bind); k.srvResource[slot] = view(bind, 2 + slot).resource;
     }
     if (foreignWork.load(std::memory_order_acquire)) s.prefix.uncertain = true;
-    d.hdrCopyVerified=verifyHdrCopy(ctx,d);
-    d.menuHdrCopyVerified=verifyMenuHdrCopy(ctx,d);
-    d.imageSourceCameraIndependentVerified=verifyCameraIndependentImageSource(ctx,d);
-    captureCopyProvenance(s,ctx,d);
+    {
+        // The exact-shader verifications: each returns at once unless this draw is the copy it
+        // names, and then reads the pipeline back from the context (shader, targets, view, viewport).
+        flatcpu::Scope checks(flatcpu::kCopyChecks);
+        d.hdrCopyVerified=verifyHdrCopy(ctx,d);
+        d.menuHdrCopyVerified=verifyMenuHdrCopy(ctx,d);
+        d.imageSourceCameraIndependentVerified=verifyCameraIndependentImageSource(ctx,d);
+        captureCopyProvenance(s,ctx,d);
+    }
     const auto oldTargets = s.prefix.targetsUsed;
     const uint32_t oldImageAccepted=s.prefix.imageCopiesAccepted,oldImageRefused=s.prefix.imageCopiesRefused;
     const uint32_t oldMenuAccepted=s.prefix.menuCopiesAccepted,oldMenuRefused=s.prefix.menuCopiesRefused;
-    const uint32_t cameraProbeAttempt=captureCameraConflict(s,d);
+    const uint32_t cameraProbeAttempt=[&] {
+        flatcpu::Scope checks(flatcpu::kCopyChecks);   // F10-only unless it is the camera-conflict draw
+        return captureCameraConflict(s,d);
+    }();
     // Gate 1 consolidation: the copy draw's selection is produced as the
     // frame contract (identical decision), and every draw is recorded into
     // the trace ring for the reducer replay.
-    const auto selected = copy
-        ? flatRuntimeObserveContract(s.prefix, d, s.traceContract)
-        : flatRuntimeObserve(s.prefix, d);
-    flatTraceRecord(s.traceRing, d, foreignWork.load(std::memory_order_acquire));
+    const FlatMonoFrame selected = [&]() -> FlatMonoFrame {
+        flatcpu::Scope reduce(flatcpu::kReduce);   // the reducer: the online prefix model and the selector
+        return copy
+            ? flatRuntimeObserveContract(s.prefix, d, s.traceContract)
+            : flatRuntimeObserve(s.prefix, d);
+    }();
+    {
+        flatcpu::Scope trace(flatcpu::kTrace);
+        flatTraceRecord(s.traceRing, d, foreignWork.load(std::memory_order_acquire));
+    }
     if(cameraProbeAttempt)for(uint32_t i=0;i<s.prefix.targetsUsed;++i)if(s.prefix.targets[i].resource==k.color){
         const auto& witness=s.prefix.targets[i].firstBad;
         Log::get().note("flat camera probe observer: attempt=%u frame=%llu draw-seq=%u first-bad=%s first-bad-seq=%u caused-first-camera-conflict=%u",
@@ -2019,12 +2185,14 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         (k.format==23 || k.format==26) && flat_mono_detail::fullViewport(k,k.width,k.height);
     if(sourceCandidate && !s.namedDepth) {
         FlatComputeInternalScope guard;
+        flatcpu::Scope engine(flatcpu::kEngineDraw);
         s.namedDepth=k.depth;s.namedConstants=k.b1;std::memcpy(s.namedCamera,d.camera,sizeof(d.camera));
         engineVelocityNoteSource(static_cast<ID3D11Texture2D*>(const_cast<void*>(k.depth)),static_cast<ID3D11Buffer*>(const_cast<void*>(k.b1)));
     }
     if(s.projection) {
         if(s.projectionFrames)++s.projectionDraws;
         if(sceneExtent && k.color!=s.prefix.output && (k.format==9 || k.format==23 || k.format==26 || k.format==60)) {
+            flatcpu::Scope coverage(flatcpu::kCoverage);   // the classification; qualifyProjection carves its own family out of it
             // Part B coverage census (always on, no F10 audit needed): which
             // recipe branch this candidate draw took. Orthogonal to whether
             // qualifyProjection then accepted or locally/globally refused it.
@@ -2096,7 +2264,11 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     if (sourceCandidate) {
         FlatComputeInternalScope guard;
         if (s.namedDepth == k.depth && s.namedConstants == k.b1 && std::memcmp(s.namedCamera, d.camera, sizeof(d.camera)) == 0) {
-            ctx->OMGetRenderTargets(8, targets, &depth); producer = true; engineVelocityBeforeDraw(ctx, false);
+            // Engine motion's draw wrapper: the MRT save, then BeforeDraw (the target and blend
+            // state queries, the shader substitution). Its D3D state calls are counted.
+            flatcpu::Scope engine(flatcpu::kEngineDraw);
+            ctx->OMGetRenderTargets(8, targets, &depth); producer = true; engineVelocityNoteStateCalls(1);
+            engineVelocityBeforeDraw(ctx, false);
         }
     }
     // The earlier capture preserves original game CBs and shader identities.
@@ -2112,6 +2284,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     // elsewhere, never silence); the injector's noteApplied covers the
     // phase machine's application accounting.
     if(projectionPlan && !flatCameraInjectUpstreamOwns()) {
+        flatcpu::Scope jitter(flatcpu::kProjection);   // the private constant-buffer binding for the draw
         projection.emplace(*projectionPlan);
         if(projection->active()) {s.phase.noteApplied();++s.jitterDraws;}
         else refuseDraw(s,"draw-binding-refused");
@@ -2158,6 +2331,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         refuse(s); return;
     }
     FlatComputeInternalScope guard;
+    flatcpu::Scope resolveScope(flatcpu::kResolve);   // the treatment: the handoff checks, the resolver, the sharpen pass
     // Verify the actual handoff once. Cached bindings only nominate this draw.
     Ptr<ID3D11RenderTargetView> actualRt; Ptr<ID3D11DepthStencilView> actualDs;
     ctx->OMGetRenderTargets(1, &actualRt, &actualDs); ctx->PSGetShaderResources(0, 1, &original);
@@ -2394,9 +2568,17 @@ bool FlatRuntimeDrawScope::recover(const char* temporalReason) {
 }
 FlatRuntimeDrawScope::~FlatRuntimeDrawScope() {
     if (!ctx) return; FlatComputeInternalScope guard;
+    flatcpu::Scope shell(flatcpu::kOther);
     if(drawCaptureStarted)state().drawCapture.after(ctx);
-    projection.reset();
-    if (producer) { engineVelocityAfterFlatDraw(ctx); ctx->OMSetRenderTargets(8, targets, depth); }
+    {
+        flatcpu::Scope jitter(flatcpu::kProjection);   // the binding scope's restore
+        projection.reset();
+    }
+    if (producer) {
+        // Engine motion's draw wrapper, the other half: the game's shader, blend state and MRTs back.
+        flatcpu::Scope engine(flatcpu::kEngineDraw);
+        engineVelocityAfterFlatDraw(ctx); ctx->OMSetRenderTargets(8, targets, depth); engineVelocityNoteStateCalls(1);
+    }
     if (replaced) ctx->PSSetShaderResources(0, 1, &original);
     for (auto* target : targets) if (target) target->Release();
     if (depth) depth->Release(); if (original) original->Release();

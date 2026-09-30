@@ -1,0 +1,572 @@
+#pragma once
+
+// The flat CPU census (src\d3d11\flat_cpu.h), driven on a fake clock so every figure is exact.
+//
+// What it holds to, each a way the first flight of this instrument could have lied:
+//   - exclusive time: a family's figure is its own work, a nested family is subtracted from its
+//     parent, and the families add up to the render thread's total with no tick in two of them
+//   - every family the runtime times reaches the line, under the name the rest of the flat log
+//     uses, with its calls; a window in which nothing ran still prints every family, as zeros
+//   - the render thread is clocked on every call of every frame; another thread only on the
+//     sampled frames, one in 32, exactly one in each block of 32, and its figure is per SAMPLED
+//     frame; a window with no sampled frame says "not clocked", it does not print zeros
+//   - engine motion's hook parts (engine_motion_cpu.h) are cut at the same edge and folded in,
+//     except its draw side, which the flat draw wrapper's own span already contains
+//   - the camera witness prints its cost per write; the draw wrapper prints its D3D calls and the
+//     draws they belong to; a GPU span nobody timed prints "-", never 0.00
+//   - the census stops when asked (both gates close, nothing more is clocked) and starts afresh
+//   - the clock floor is measured once, at the end of the first window
+//   - a window with more to say than a log line holds goes out as continuation lines, none over
+//     the limit, none dropped, at the worst values the counters can hold
+//
+// The runtime's wiring (which entry point carries which family's scope, and that the census
+// changes no decision) is a source scan in flat_temporal_test.cpp, testFlatCpuWiring.
+
+#include <windows.h>
+
+#include <cmath>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+
+namespace flat_cpu_rig {
+// A clock the rig moves by hand, per thread: a thread that has not switched it on reads the real one.
+inline thread_local bool t_fake = false;
+inline thread_local int64_t t_now = 0;
+inline thread_local int64_t t_step = 0;    // ticks each reading advances the clock by (0: only the rig moves it)
+inline thread_local int64_t t_reads = 0;   // readings taken since the clock was switched on
+inline int64_t now() {
+    if (t_fake) {
+        const int64_t v = t_now;
+        ++t_reads;
+        t_now += t_step;
+        return v;
+    }
+    LARGE_INTEGER t{};
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+}  // namespace flat_cpu_rig
+#define EDVR_FLATCPU_NOW() (::flat_cpu_rig::now())
+#define EDVR_EMCPU_NOW() (::flat_cpu_rig::now())
+#include "../../src/d3d11/flat_cpu.h"
+
+namespace flat_cpu_rig {
+
+inline void fake(int64_t at) {
+    t_fake = true;
+    t_now = at;
+    t_step = 0;
+    t_reads = 0;
+}
+
+// One worker thread that runs what it is told on its own fake clock, one job at a time.
+class Worker {
+public:
+    Worker() : thread_([this] { loop(); }) {}
+    ~Worker() {
+        {
+            std::lock_guard<std::mutex> l(m_);
+            quit_ = true;
+        }
+        cv_.notify_all();
+        thread_.join();
+    }
+    void run(std::function<void()> job) {
+        std::unique_lock<std::mutex> l(m_);
+        job_ = std::move(job);
+        busy_ = true;
+        cv_.notify_all();
+        cv_.wait(l, [this] { return !busy_; });
+    }
+
+private:
+    void loop() {
+        fake(0);
+        std::unique_lock<std::mutex> l(m_);
+        for (;;) {
+            cv_.wait(l, [this] { return busy_ || quit_; });
+            if (quit_) return;
+            job_();
+            busy_ = false;
+            cv_.notify_all();
+        }
+    }
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::function<void()> job_;
+    bool busy_ = false, quit_ = false;
+    std::thread thread_;
+};
+
+// The frame clock the Present hands the census: 1 tick a microsecond.
+constexpr int64_t kFreq = 1000000;
+
+// The lines, joined with a newline, for a search that does not care where a break fell.
+inline std::string joined(const edvr::flatcpu::Lines& lines) {
+    std::string s;
+    for (int i = 0; i < lines.count; ++i) {
+        if (i) s += '\n';
+        s += lines.line[i];
+    }
+    return s;
+}
+inline bool has(const std::string& text, const std::string& needle) { return text.find(needle) != std::string::npos; }
+
+// Runs `frames` frames of `interval` ticks, each doing `work` on the render thread (the caller's),
+// and `otherWork` on the worker thread when there is one; returns the window closed at the end.
+struct Run {
+    std::unique_ptr<edvr::flatcpu::Census> census{new edvr::flatcpu::Census};
+    int64_t now = 0;
+    bool primed = false;
+    void frame(int64_t interval, bool paused, const std::function<void()>& work, Worker* worker = nullptr,
+               const std::function<void()>& otherWork = {}) {
+        if (!primed) {
+            census->onFrame(now, kFreq, false);
+            primed = true;
+        }
+        if (work) work();
+        if (worker && otherWork) worker->run(otherWork);
+        now += interval;
+        census->onFrame(now, kFreq, paused);
+    }
+};
+
+}  // namespace flat_cpu_rig
+
+inline int flatCpuTests() {
+    using namespace edvr;
+    using namespace flat_cpu_rig;
+    int failures = 0;
+    auto expect = [&](bool ok, const char* name) {
+        if (!ok) { std::printf("FAIL: census %s\n", name); ++failures; }
+    };
+    auto nearly = [](double a, double b, double eps = 1e-6) { return std::fabs(a - b) <= eps; };
+
+    // ---- 1: exclusive nesting, in the scope itself -------------------------------------------
+    {
+        flatcpu::resetForTest();
+        fake(0);
+        {
+            flatcpu::Scope outer(flatcpu::kOther);
+            t_now = 10;
+            {
+                flatcpu::Scope inner(flatcpu::kReduce);
+                t_now = 30;
+                {
+                    flatcpu::Scope innermost(flatcpu::kTrace);
+                    t_now = 35;
+                }
+                t_now = 40;
+            }
+            t_now = 100;
+        }
+        const flatcpu::Slot* s = flatcpu::t_ctx.slot;
+        expect(s && s->cell[flatcpu::kTrace].ticks.load() == 5 && s->cell[flatcpu::kTrace].calls.load() == 1,
+               "the innermost scope is its own 5 ticks");
+        expect(s && s->cell[flatcpu::kReduce].ticks.load() == 25 && s->cell[flatcpu::kReduce].calls.load() == 1,
+               "the middle scope is its 30 ticks (10 to 40) less the innermost's 5, and none of the outer's");
+        expect(s && s->cell[flatcpu::kOther].ticks.load() == 70 && s->cell[flatcpu::kOther].calls.load() == 1,
+               "the outer scope is its 100 ticks less the middle's whole 30: 70; the three add up to 100");
+    }
+
+    // ---- 2: a frame's figures, in the census and in the words ---------------------------------
+    // 300 frames of 16,667 ticks: the shell 50 own ticks, contract reduction 40, the witness 30
+    // (three writes of 10), the trace ring 20, then 10 more of the shell's own.
+    {
+        flatcpu::resetForTest();
+        fake(0);
+        Run run;
+        for (int i = 0; i < 300; ++i) {
+            run.frame(16667, false, [] {
+                flatcpu::Scope shell(flatcpu::kOther);
+                t_now += 50;
+                { flatcpu::Scope r(flatcpu::kReduce); t_now += 40; }
+                for (int w = 0; w < 3; ++w) { flatcpu::Scope wt(flatcpu::kWitness); t_now += 10; }
+                { flatcpu::Scope t(flatcpu::kTrace); t_now += 20; }
+                t_now += 10;
+            });
+        }
+        flatcpu::WindowReport r;
+        const bool got = run.census->take(run.now, false, r);
+        expect(got && r.valid && r.frames == 300 && r.pausedFrames == 0, "the window closes after 5 s with 300 frames");
+        expect(nearly(r.renderMs[flatcpu::kOther] / 300.0, 0.060) && r.renderCalls[flatcpu::kOther] == 300,
+               "other: 60 ticks and one call a frame");
+        expect(nearly(r.renderMs[flatcpu::kReduce] / 300.0, 0.040) && r.renderCalls[flatcpu::kReduce] == 300,
+               "contract reduction: 40 ticks and one call a frame");
+        expect(nearly(r.renderMs[flatcpu::kWitness] / 300.0, 0.030) && r.renderCalls[flatcpu::kWitness] == 900,
+               "camera witness: 30 ticks and three calls a frame");
+        expect(nearly(r.presentP50Ms, 16.667) && nearly(r.presentP95Ms, 16.667), "present p50 and p95 are the frame interval");
+        flatcpu::Lines lines;
+        flatcpu::formatWindow(r, &lines);
+        const std::string text = joined(lines);
+        const std::string promised =
+            "flat cpu 5s: frames=300 (stood down 0) present p50 16.67 ms (p95 16.67); EDVR per frame total 0.150 ms = "
+            "other 0.060 ms (calls 1.0) + contract reduction 0.040 ms (calls 1.0) + copy checks 0.000 ms (calls 0.0) + "
+            "camera rows 0.000 ms (calls 0.0) + trace ring 0.020 ms (calls 1.0) + resource lookup 0.000 ms (calls 0.0) + "
+            "coverage 0.000 ms (calls 0.0) + projection readiness 0.000 ms (calls 0.0) + cb shadows 0.000 ms (calls 0.0) + "
+            "camera witness 0.030 ms (calls 3.0) + engine motion draw wrapper 0.000 ms (calls 0.0) + resolve 0.000 ms (calls 0.0) + "
+            "backend 0.000 ms (calls 0.0) + discovery 0.000 ms (calls 0.0) + state trackers 0.000 ms (calls 0.0) + "
+            "camera inject 0.000 ms (calls 0.0) + engine motion hooks 0.000 ms (calls 0.0)";
+        expect(std::string(lines.line[0]).compare(0, promised.size(), promised) == 0,
+               "the first line has the promised shape, in the promised order, with the figures the frames spent");
+        expect(has(text, "camera witness 10.00 us/write (900 writes)"), "the witness prints its cost per write");
+        expect(has(text, "engine motion hooks 0.000 ms (calls 0.0)"), "engine motion's hooks print as zero when they never ran");
+        expect(lines.count >= 1 && !lines.truncated, "a window fits the lines the log holds");
+        expect(std::strncmp(lines.line[0], "flat cpu 5s:", 12) == 0, "the first line is the flat cpu 5s line");
+        for (int i = 1; i < lines.count; ++i)
+            expect(std::strncmp(lines.line[i], "flat cpu 5s (cont.): ", 21) == 0, "a continuation line says it is one");
+        for (int i = 0; i < lines.count; ++i)
+            expect(std::strlen(lines.line[i]) <= flatcpu::kLineLimit, "no line is longer than the log keeps");
+    }
+
+    // ---- 3: every family reaches the line, under its name ---------------------------------------
+    {
+        for (unsigned fam = 0; fam < flatcpu::kFamilies; ++fam) {
+            flatcpu::resetForTest();
+            fake(0);
+            Run run;
+            for (int i = 0; i < 300; ++i) {
+                run.frame(16667, false, [fam] {
+                    flatcpu::Scope one(fam);
+                    t_now += 7;
+                });
+            }
+            flatcpu::WindowReport r;
+            const bool got = run.census->take(run.now, false, r);
+            flatcpu::Lines lines;
+            flatcpu::formatWindow(r, &lines);
+            const std::string text = joined(lines);
+            const std::string entry = std::string(flatcpu::kInfo[fam].name) + " 0.007 ms (calls 1.0)";
+            expect(got && nearly(r.renderMs[fam] / 300.0, 0.007) && r.renderCalls[fam] == 300,
+                   "each family accumulates the ticks and calls its scope was given");
+            // A game-thread family with render-thread time prints it in the total's chain like every other.
+            expect(has(text, entry), "each family's figure is on the line under the name the flat log uses");
+            for (unsigned other = 0; other < flatcpu::kFamilies; ++other) {
+                if (other == fam) continue;
+                expect(r.renderCalls[other] == 0, "a family nothing ran in stays at zero calls");
+            }
+        }
+    }
+
+    // ---- 4: a window in which nothing ran still prints everything ---------------------------------
+    {
+        flatcpu::resetForTest();
+        fake(0);
+        Run run;
+        for (int i = 0; i < 300; ++i) run.frame(16667, false, {});
+        flatcpu::WindowReport r;
+        const bool got = run.census->take(run.now, false, r);
+        flatcpu::Lines lines;
+        flatcpu::formatWindow(r, &lines);
+        const std::string text = joined(lines);
+        expect(got && lines.count >= 1, "an empty window still closes and prints");
+        bool all = true;
+        for (unsigned fam = 0; fam < flatcpu::kFamilies; ++fam)
+            all = all && has(text, std::string(flatcpu::kInfo[fam].name) + " 0.000 ms (calls 0.0)");
+        expect(all, "every family is on the line of an empty window, as zeros");
+        expect(has(text, "EDVR per frame total 0.000 ms"), "and the total is zero");
+        expect(has(text, "GPU frame - (") && has(text, "GPU resolve - ("), "a GPU span nobody timed prints a dash, not 0.00");
+        expect(!has(text, "GPU frame p50") && !has(text, "GPU resolve p50"), "and no percentile");
+        expect(has(text, "engine motion wrapper D3D calls 0/frame over 0.0 substituted draws/frame"),
+               "the draw wrapper's calls print as zero");
+    }
+
+    // ---- 5: another thread is clocked on one frame in 32, and its figure is per sampled frame ----
+    {
+        flatcpu::resetForTest();
+        fake(0);
+        Run run;
+        Worker worker;
+        // 320 frames of 15,625 ticks is exactly 5 s, and ten blocks of 32.
+        for (int i = 0; i < 320; ++i) {
+            run.frame(15625, false,
+                      [] { flatcpu::Scope one(flatcpu::kInject); t_now += 3; },   // the render thread: 3 ticks
+                      &worker,
+                      [] {
+                          // The game's thread: five camera inject calls of 20 ticks, every frame.
+                          for (int c = 0; c < 5; ++c) { flatcpu::Scope one(flatcpu::kInject); t_now += 20; }
+                      });
+        }
+        flatcpu::WindowReport r;
+        const bool got = run.census->take(run.now, false, r);
+        expect(got && r.frames == 320, "320 frames of 15.625 ms close a 5 s window");
+        expect(r.sampledFrames == 10, "exactly one frame in each block of 32 is sampled: ten in ten blocks");
+        expect(r.renderCalls[flatcpu::kInject] == 320, "the render thread is clocked on every call of every frame");
+        expect(r.otherCalls[flatcpu::kInject] == 50, "the other thread is clocked on the ten sampled frames only: 10 x 5 calls");
+        expect(nearly(r.otherMs[flatcpu::kInject], 50 * 20 * 0.001), "and its time is those calls' 20 ticks each");
+        flatcpu::Lines lines;
+        flatcpu::formatWindow(r, &lines);
+        const std::string text = joined(lines);
+        expect(has(text, "other threads (clocked on 10 of 320 frames, one in 32; thread-ms per clocked frame): camera inject 0.100 ms (calls 5.0)"),
+               "the other threads' line says how many frames it was clocked on and prints per clocked frame");
+        expect(has(text, "camera inject 0.003 ms (calls 1.0)"), "the render thread's own inject time is on the render chain");
+    }
+
+    // ---- 6: a window with no sampled frame says so ----------------------------------------------------
+    {
+        flatcpu::WindowReport r;
+        r.valid = true;
+        r.frames = 40;
+        r.sampledFrames = 0;
+        flatcpu::Lines lines;
+        flatcpu::formatWindow(r, &lines);
+        const std::string text = joined(lines);
+        expect(has(text, "other threads: not clocked in this window (one frame in 32 is, and none was)"),
+               "no sampled frame: the other threads' line says they were not clocked");
+        expect(!has(text, "camera inject 0.000 ms (calls 0.0) + engine emit"),
+               "and does not print their figures as zeros");
+    }
+
+    // ---- 7: engine motion's parts, driven and folded ----------------------------------------------------
+    {
+        flatcpu::resetForTest();
+        fake(0);
+        Run run;
+        Worker worker;
+        for (int i = 0; i < 320; ++i) {
+            run.frame(15625, false,
+                      [] {
+                          // The draw side is inside the flat draw wrapper's own span: not folded in twice.
+                          { emcpu::Scope draw(emcpu::kDraw); t_now += 50; }
+                          { emcpu::Scope apply(emcpu::kApply); t_now += 9; }
+                          { emcpu::Scope patch(emcpu::kPatch); t_now += 8; }
+                          { emcpu::Scope tee(emcpu::kTee); t_now += 20; }
+                      },
+                      &worker,
+                      [] {
+                          { emcpu::Scope emit(emcpu::kEmit); t_now += 30; }
+                          { emcpu::Scope copier(emcpu::kCopier); t_now += 10; }
+                          { emcpu::Scope merge(emcpu::kMerge); t_now += 6; }
+                          { emcpu::Scope clear(emcpu::kClear); t_now += 4; }
+                          for (int c = 0; c < 8; ++c) emcpu::count(emcpu::kEval);
+                      });
+        }
+        flatcpu::WindowReport r;
+        const bool got = run.census->take(run.now, false, r);
+        expect(got, "the window closes with engine motion driven by the census");
+        expect(nearly(r.emRenderMs[emcpu::kTee] / 320.0, 0.020) && r.emRenderCalls[emcpu::kTee] == 320,
+               "the render thread's tees are cut at the frame edge");
+        expect(r.emRenderCalls[emcpu::kDraw] == 320 && nearly(r.emRenderMs[emcpu::kDraw] / 320.0, 0.050),
+               "the draw side is cut too (it is in the report, and not in the fold)");
+        expect(r.emOtherCalls[emcpu::kEmit] == 10 && r.emOtherCalls[emcpu::kCopier] == 10 &&
+               r.emOtherCalls[emcpu::kMerge] == 10 && r.emOtherCalls[emcpu::kClear] == 10,
+               "the other thread's hooks are clocked on the ten sampled frames only");
+        expect(r.emRenderCalls[emcpu::kEval] + r.emOtherCalls[emcpu::kEval] == 80,
+               "the evaluator relays are counted, on the sampled frames only: 10 x 8");
+        flatcpu::Lines lines;
+        flatcpu::formatWindow(r, &lines);
+        const std::string text = joined(lines);
+        expect(has(text, "engine motion hooks 0.020 ms (calls 1.0)"),
+               "the render thread's engine motion hooks are the tees alone: the draw side, apply and patch are not counted twice");
+        expect(has(text, "EDVR per frame total 0.020 ms"), "and the total is the same 0.020 ms, no draw side in it");
+        expect(has(text, "engine emit 0.030 ms (calls 1.0)") && has(text, "engine copier 0.010 ms (calls 1.0)") &&
+               has(text, "engine merge 0.006 ms (calls 1.0)") && has(text, "engine clear 0.004 ms (calls 1.0)"),
+               "the emit, copier, merge and clear callbacks are on the other threads' line, per sampled frame");
+        expect(has(text, "engine jobs 0.000 ms (calls 0.0)") && has(text, "engine builder 0.000 ms (calls 0.0)") &&
+               has(text, "engine rigid emit 0.000 ms (calls 0.0)") && has(text, "engine tees 0.000 ms (calls 0.0)"),
+               "the parts that did not run print as zeros");
+        expect(has(text, "engine eval relays 8.0 calls (counted, not clocked)"), "the evaluator relays print as a count");
+    }
+
+    // ---- 8: the draw wrapper's D3D calls, the GPU spans, the paused frames -------------------------------
+    {
+        flatcpu::resetForTest();
+        fake(0);
+        Run run;
+        for (int i = 0; i < 300; ++i) {
+            run.frame(16667, i % 6 == 0, {});
+            run.census->noteWrapper(4700, 430);
+        }
+        for (double ms : {1.0, 2.0, 3.0, 4.0, 5.0}) run.census->noteGpuFrame(ms);
+        for (double ms : {0.5, 0.7, 0.9}) run.census->noteGpuResolve(ms);
+        run.census->noteGpuSkipped();
+        run.census->noteGpuSkipped();
+        run.census->noteGpuSkipped();
+        run.census->noteGpuInvalid();
+        flatcpu::WindowReport r;
+        const bool got = run.census->take(run.now, true, r);
+        flatcpu::Lines lines;
+        flatcpu::formatWindow(r, &lines);
+        const std::string text = joined(lines);
+        expect(got && r.pausedFrames == 50, "a paused frame is counted as one");
+        expect(has(text, "frames=300 (stood down 50, stood down now)"), "the window says how many frames were stood down, and that it is now");
+        expect(has(text, "engine motion wrapper D3D calls 4700/frame over 430.0 substituted draws/frame"),
+               "the draw wrapper's D3D calls and substituted draws print per frame");
+        expect(has(text, "GPU frame p50 3.00 / p95 5.00 ms (first game draw to Present; 5 timed, 3 skipped, 1 invalid)"),
+               "the whole-frame GPU span prints its median, p95 and what could not be timed");
+        expect(has(text, "GPU resolve p50 0.70 / p95 0.90 ms (3 timed)"), "the resolver's GPU span prints its median and p95");
+        // The next window starts empty.
+        for (int i = 0; i < 300; ++i) run.frame(16667, false, {});
+        flatcpu::WindowReport next;
+        const bool gotNext = run.census->take(run.now, false, next);
+        expect(gotNext && next.pausedFrames == 0 && next.gpuFrameSamples == 0 && next.stateCalls == 0 && next.gpuSkipped == 0,
+               "a window is emptied when it is taken");
+    }
+
+    // ---- 9: the census stops when asked, and starts afresh ------------------------------------------------
+    {
+        flatcpu::resetForTest();
+        fake(0);
+        Run run;
+        for (int i = 0; i < 10; ++i) run.frame(16667, false, [] { flatcpu::Scope one(flatcpu::kReduce); t_now += 5; });
+        expect(run.census->running(), "the census is running once it has had a frame");
+        run.census->idle();
+        expect(!run.census->running(), "idle stops it");
+        expect(flatcpu::g_gate.load() == 0 && emcpu::g_gate.load() == 0, "both gates are closed");
+        const flatcpu::Slot* s = flatcpu::t_ctx.slot;
+        const uint64_t callsBefore = s ? s->cell[flatcpu::kReduce].calls.load() : 0;
+        { flatcpu::Scope one(flatcpu::kReduce); t_now += 5; }
+        { emcpu::Scope one(emcpu::kTee); t_now += 5; }
+        expect(s && s->cell[flatcpu::kReduce].calls.load() == callsBefore, "a scope opened while the census is stopped is not clocked");
+        flatcpu::WindowReport stoppedReport;
+        expect(!run.census->take(run.now + 60000000, false, stoppedReport), "a stopped census takes no window");
+        // Afresh: the first frame primes, nothing from before is in the next window.
+        Run again;
+        again.census = std::move(run.census);
+        again.now = run.now;
+        for (int i = 0; i < 300; ++i) again.frame(16667, false, {});
+        flatcpu::WindowReport r;
+        const bool got = again.census->take(again.now, false, r);
+        expect(got && r.frames == 300 && r.renderCalls[flatcpu::kReduce] == 0,
+               "after a stop the next window holds only its own frames");
+    }
+
+    // ---- 10: the clock floor is measured once, at the end of the first window ----------------------------------
+    {
+        flatcpu::resetForTest();
+        fake(0);
+        t_step = 2;   // every reading advances the clock two ticks: a floor exists
+        Run run;
+        for (int i = 0; i < 300; ++i) run.frame(16667, false, {});
+        flatcpu::WindowReport first;
+        const int64_t readsBefore = t_reads;
+        const bool got = run.census->take(run.now, false, first);
+        const int64_t calibrationReads = t_reads - readsBefore;
+        expect(got && first.floor.measured && first.emFloor.measured, "the first window carries a measured floor, this instrument's and engine motion's");
+        expect(first.floor.costNs > 0 && first.emFloor.plainCostNs > 0, "the floor costs something on a clock that moves");
+        expect(calibrationReads > 1000, "the first take read the clock to measure it");
+        for (int i = 0; i < 300; ++i) run.frame(16667, false, {});
+        flatcpu::WindowReport second;
+        const int64_t readsBeforeSecond = t_reads;
+        const bool gotSecond = run.census->take(run.now, false, second);
+        expect(gotSecond && second.floor.measured && t_reads == readsBeforeSecond,
+               "the second take measures nothing again: the floor is measured once");
+        expect(nearly(first.floor.costNs, second.floor.costNs), "and reports the same floor");
+        flatcpu::Lines lines;
+        flatcpu::formatWindow(first, &lines);
+        expect(has(joined(lines), "clock floor ") && has(joined(lines), "engine hooks floor "), "the floor is on the line");
+    }
+
+    // ---- 11: the worst values still fit the lines, split not dropped --------------------------------------------
+    {
+        flatcpu::WindowReport r;
+        r.valid = true;
+        r.frames = 5000;
+        r.pausedFrames = 4999;
+        r.sampledFrames = 156;
+        r.standingDown = true;
+        r.presentP50Ms = 99999.99;
+        r.presentP95Ms = 99999.99;
+        for (unsigned f = 0; f < flatcpu::kFamilies; ++f) {
+            r.renderMs[f] = 9.9e9;
+            r.otherMs[f] = 9.9e9;
+            r.renderCalls[f] = 999999999999ull;
+            r.otherCalls[f] = 999999999999ull;
+        }
+        for (unsigned p = 0; p < emcpu::kParts; ++p) {
+            r.emRenderMs[p] = 9.9e9;
+            r.emOtherMs[p] = 9.9e9;
+            r.emRenderCalls[p] = 999999999999ull;
+            r.emOtherCalls[p] = 999999999999ull;
+        }
+        r.stateCalls = r.substitutedDraws = 99999999999999ull;
+        r.gpuFrameSamples = r.gpuResolveSamples = 2048;
+        r.gpuFrameP50 = r.gpuFrameP95 = r.gpuResolveP50 = r.gpuResolveP95 = 99999.99;
+        r.gpuSkipped = r.gpuInvalid = 999999999999ull;
+        r.floor.measured = r.emFloor.measured = true;
+        r.floor.costNs = r.floor.recordedNs = 99999;
+        r.emFloor.plainCostNs = r.emFloor.pausedCostNs = r.emFloor.plainRecordedNs = r.emFloor.pausedRecordedNs = 99999;
+        flatcpu::Lines lines;
+        flatcpu::formatWindow(r, &lines);
+        bool within = true;
+        for (int i = 0; i < lines.count; ++i) within = within && std::strlen(lines.line[i]) <= flatcpu::kLineLimit;
+        expect(lines.count >= 2 && lines.count <= flatcpu::kMaxLines && !lines.truncated && within,
+               "at the worst values the window is a few lines, none over the limit, nothing dropped");
+        const std::string text = joined(lines);
+        bool named = true;
+        for (unsigned f = 0; f < flatcpu::kFamilies; ++f) named = named && has(text, flatcpu::kInfo[f].name);
+        for (unsigned i = 0; i < flatcpu::kEmNameCount; ++i) named = named && has(text, flatcpu::kEmNames[i].name);
+        named = named && has(text, "engine motion hooks") && has(text, "GPU frame") && has(text, "GPU resolve") &&
+                has(text, "clock floor") && has(text, "camera witness") && has(text, "engine motion wrapper D3D calls");
+        expect(named, "and every family, engine part and figure is still on them");
+        for (int i = 1; i < lines.count; ++i)
+            expect(std::strncmp(lines.line[i], "flat cpu 5s (cont.): ", 21) == 0, "every line after the first says it continues");
+    }
+
+    // ---- 12: the clock-floor sampling schedule --------------------------------------------------------------------
+    {
+        flatcpu::SampleSchedule schedule;
+        bool exactlyOne = true;
+        for (int block = 0; block < 100; ++block) {
+            unsigned n = 0;
+            for (unsigned i = 0; i < flatcpu::kSamplePeriod; ++i) n += schedule.next() ? 1u : 0u;
+            if (n != 1) exactlyOne = false;
+        }
+        expect(exactlyOne, "the schedule samples exactly one frame in each block of 32");
+    }
+
+    // ---- 13: a slow present shows in the tail, not the median ---------------------------------------------------------
+    {
+        flatcpu::resetForTest();
+        fake(0);
+        Run run;
+        for (int i = 0; i < 300; ++i) run.frame(i % 10 == 0 ? 60000 : 16000, false, {});
+        flatcpu::WindowReport r;
+        // The window closes when 5 s have passed: this run is 30 x 60 ms + 270 x 16 ms = 6.1 s.
+        const bool got = run.census->take(run.now, false, r);
+        expect(got && nearly(r.presentP50Ms, 16.0) && nearly(r.presentP95Ms, 60.0),
+               "a tenth of the frames at 60 ms leave the median at 16 ms and the p95 at 60");
+    }
+
+    // ---- 14: the instrument's own price is on the line ------------------------------------------------------------------
+    {
+        flatcpu::WindowReport r;
+        r.valid = true;
+        r.frames = 100;
+        r.floor.measured = true;
+        r.floor.costNs = 50;
+        r.floor.recordedNs = 20;
+        r.emFloor.measured = true;
+        r.emFloor.plainCostNs = 60;
+        r.emFloor.pausedCostNs = 120;
+        r.emFloor.plainRecordedNs = 24;
+        r.emFloor.pausedRecordedNs = 44;
+        r.renderCalls[flatcpu::kReduce] = 100 * 4000;   // 4000 scopes a frame of this instrument's
+        r.emRenderCalls[emcpu::kEmit] = 100 * 1000;     // 1000 of a paused shape
+        r.emRenderCalls[emcpu::kTee] = 100 * 500;       // 500 plain
+        r.emRenderCalls[emcpu::kDraw] = 100 * 400;      // 400 of the draw side: clocked, though not folded into the total
+        r.emRenderCalls[emcpu::kEval] = 100 * 999;      // counted and never clocked: not a scope
+        flatcpu::Lines lines;
+        flatcpu::formatWindow(r, &lines);
+        const std::string text = joined(lines);
+        expect(has(text, "the clocks cost the render thread about 0.374 ms a frame (5900 scopes) and put about 0.146 ms of the total above into it"),
+               "the line prices its own clocks: scopes a frame times the calibrated floor, the draw side included, the counted relays not");
+        flatcpu::WindowReport unmeasured;
+        unmeasured.valid = true;
+        unmeasured.frames = 100;
+        unmeasured.renderCalls[flatcpu::kReduce] = 100 * 4000;
+        flatcpu::formatWindow(unmeasured, &lines);
+        expect(has(joined(lines), "about 0.000 ms a frame (0 scopes)"), "with no floor measured it claims no price");
+    }
+
+    fake(0);
+    t_fake = false;
+    return failures;
+}

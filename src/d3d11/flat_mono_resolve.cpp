@@ -8,12 +8,24 @@
 #include <cstring>
 #include <limits>
 #include "../common/log.h"
+#include "flat_cpu.h"
 #include "flat_pixel_capture.h"
 #include "flat_projection_math.h"
 
 namespace edvr {
 namespace {
 using Microsoft::WRL::ComPtr;
+// The GPU census's span hooks (flatMonoResolveSetSpanHooks): null unless the flat runtime installed them.
+FlatMonoResolveSpanFn g_spanBegin = nullptr, g_spanEnd = nullptr;
+// One timestamp pair around the resolver's own dispatches and backend call, closed by every exit.
+struct SpanGuard {
+    ID3D11DeviceContext* context;
+    bool open = false;
+    explicit SpanGuard(ID3D11DeviceContext* c) : context(c) {
+        if (g_spanBegin && g_spanEnd) { g_spanBegin(context); open = true; }
+    }
+    ~SpanGuard() { if (open) g_spanEnd(context); }
+};
 // Like renderer state, explicit owner-thread cleanup only: never release live
 // driver resources from static destruction under the DLL loader lock.
 FlatPixelCapture& pixels=*new FlatPixelCapture;
@@ -304,6 +316,11 @@ void flatMonoResolvePollPixels(ID3D11DeviceContext* context,uint64_t frame) {
     try { pixels.poll(context,frame); } catch(...) { pixels.cancel(); }
 }
 void flatMonoResolveInvalidateHistory() { ++stats.invalidations;stats.currentContinueRun=0;g.history=false; }
+void flatMonoResolveSetSpanHooks(FlatMonoResolveSpanFn begin, FlatMonoResolveSpanFn end) {
+    // Both or neither: a begin without its end would leave a span open.
+    g_spanBegin = begin && end ? begin : nullptr;
+    g_spanEnd = begin && end ? end : nullptr;
+}
 
 bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const FlatMonoResolveFrame& f,
                      ID3D11ShaderResourceView** output,const char** reason) {
@@ -367,6 +384,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     // On a reset the previous rows ARE the current rows (above), so they carry the current phase.
     constants.rowsJitter[0]=rowsNow.ndcX;constants.rowsJitter[1]=rowsNow.ndcY;
     constants.rowsJitter[2]=reset?rowsNow.ndcX:rowsBefore.ndcX;constants.rowsJitter[3]=reset?rowsNow.ndcY:rowsBefore.ndcY;
+    SpanGuard span(context);   // the GPU census's timestamp pair: this call's own dispatches and the backend
     context->UpdateSubresource(g.constants.Get(),0,nullptr,&constants,0,0);
     context->CopyResource(g.color.texture.Get(),color.Get());
     ID3D11Buffer* cb[]={g.constants.Get(),f.engine.sceneNow,f.engine.scenePrev};
@@ -380,6 +398,8 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     ID3D11UnorderedAccessView* nullUavs[5]={};ID3D11ShaderResourceView* nullViews[9]={};
     context->CSSetUnorderedAccessViews(0,5,nullUavs,nullptr);context->CSSetShaderResources(0,9,nullViews);
     bool ok=true;
+    {
+        flatcpu::Scope backendScope(flatcpu::kBackend);   // the backend evaluation: NGX, FSR3, or the TAA dispatch
     if(taa) {
         ID3D11ShaderResourceView* views[]={g.color.srv.Get(),nullptr,nullptr,nullptr,g.motion.srv.Get(),
             g.rejection.srv.Get(),g.expected.srv.Get(),g.output[index^1].srv.Get(),g.depth[index^1].srv.Get()};
@@ -395,6 +415,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     } else {
         ok=dlaaEvaluate(context,0,g.color.texture.Get(),g.depth[0].texture.Get(),g.motion.texture.Get(),g.output[0].texture.Get(),
             g.rejection.texture.Get(),f.renderWidth,f.renderHeight,evalW,evalH,f.jitterX,f.jitterY,reset,f.deltaMs,reason);
+    }
     }
     if(!ok) {++stats.backendFailures;g.history=false;stats.currentContinueRun=0;return false;}
     if(!taa) {

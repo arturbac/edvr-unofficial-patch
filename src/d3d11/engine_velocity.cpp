@@ -55,6 +55,10 @@ template <class... A> bool timedApply(A&&... a) {
 std::atomic<bool> live{false};
 DrawCache cache;
 uint64_t familyDraws[kMaxFamilies] = {};
+uint64_t g_stateCalls = 0;
+// The flat census drains the two counts once a frame (engineVelocityTakeWrapperCounts): what was
+// already handed over, and the draws the 30 s summary zeroed out of familyDraws before it could.
+uint64_t g_stateCallsTaken = 0, g_substitutedBase = 0, g_substitutedTaken = 0;
 std::atomic<const ID3D11Resource*> watch[kWatchSlots] = {};
 
 // --- The keyed pool families -------------------------------------------------
@@ -665,6 +669,7 @@ bool overlayDepthState(ID3D11DeviceContext* ctx) {
     Ptr<ID3D11DepthStencilState> state;
     UINT reference = 0;
     ctx->OMGetDepthStencilState(&state, &reference);
+    engineVelocityNoteStateCalls(1);
     if (!state) return false;
     D3D11_DEPTH_STENCIL_DESC d{};
     state->GetDesc(&d);
@@ -695,13 +700,16 @@ bool snapshotOverlayBase(ID3D11DeviceContext* ctx, Eye& e) {
     // live. A later bindTarget reattaches MRT6 for this draw.
     ID3D11RenderTargetView* rt[8] = {};
     ctx->OMGetRenderTargets(8, rt, nullptr);
+    engineVelocityNoteStateCalls(1);
     std::array<Ptr<ID3D11RenderTargetView>, 8> held;
     for (unsigned i = 0; i < 8; ++i) held[i].Attach(rt[i]);
     for (auto* view : rt) if (view == e.slotsRtv.Get()) return false;
     Ptr<ID3D11ShaderResourceView> boundSrv;
     ctx->PSGetShaderResources(kEngineVelocityOverlaySnapshotSlot, 1, &boundSrv);
+    engineVelocityNoteStateCalls(1);
     if (boundSrv.Get() == e.overlayBaseSrv.Get()) return false;
     ctx->CopyResource(e.overlayBase.Get(), e.slots.Get());
+    engineVelocityNoteStateCalls(1);
     ++g_draw.overlayCopies;
     g_draw.overlayBytes += uint64_t(e.width) * e.height * 8u;
     return true;
@@ -728,23 +736,28 @@ void restore(ID3D11DeviceContext* ctx) {
     if (g_bound.guardSrv3 && bindingGeneration(BindSlot::PsSrv3) == g_bound.srv3Gen) {
         Ptr<ID3D11ShaderResourceView> actual;
         ctx->PSGetShaderResources(kEngineVelocityOverlaySnapshotSlot, 1, &actual);
+        engineVelocityNoteStateCalls(1);
         if (actual.Get() == g_bound.guardSrv3.Get()) {
             ID3D11ShaderResourceView* game = g_bound.gameSrv3.Get();
             FlatComputeInternalScope internal;
             ctx->PSSetShaderResources(kEngineVelocityOverlaySnapshotSlot, 1, &game);
+            engineVelocityNoteStateCalls(1);
             ++g_draw.restores;
         }
     }
     if (g_bound.patchedPs && bindingGeneration(BindSlot::Ps) == g_bound.psGen) {
         vScreenPSSetShaderRaw(ctx, g_bound.originalPs, nullptr, 0);
+        engineVelocityNoteStateCalls(1);
         ++g_draw.restores;
     }
     if (g_bound.patchedVs && bindingGeneration(BindSlot::Vs) == g_bound.vsGen) {
         vScreenVSSetShaderRaw(ctx, g_bound.originalVs, nullptr, 0);
+        engineVelocityNoteStateCalls(1);
         ++g_draw.restores;
     }
     if (g_bound.derivedBlend && bindingGeneration(BindSlot::Blend) == g_bound.blendGen) {
         vScreenOMSetBlendStateRaw(ctx, g_bound.gameBlend.Get(), g_bound.blendFactor, g_bound.sampleMask);
+        engineVelocityNoteStateCalls(1);
         ++g_draw.restores;
     }
     g_bound = Bound{};
@@ -834,6 +847,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
     ctx->GetDevice(&dev);
     Ptr<ID3D11ShaderResourceView> poolView;
     ctx->VSGetShaderResources(kEngineVelocityPoolSlot, 1, &poolView);
+    engineVelocityNoteStateCalls(1);
     if (!poolView) { invalidate(e, kNoPool); return false; }
     // The slot the vertex shader indexes is relative to the view's first
     // element; the snapshot and the compose's view start at 0, so must this.
@@ -860,6 +874,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
                         "private-copy coverage warms up on its next observed map.",static_cast<void*>(poolBuf.Get()),frame);
     Ptr<ID3D11Buffer> scene;
     ctx->VSGetConstantBuffers(kEngineVelocitySceneSlot, 1, &scene);
+    engineVelocityNoteStateCalls(1);
     if (!scene) { invalidate(e, kNoScene); return false; }
     D3D11_BUFFER_DESC sd{};
     scene->GetDesc(&sd);
@@ -903,6 +918,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         // instead of paying two pairs' worth of overhead for it.
         GpuCensusScope census(ctx, GpuCensusSection::FrameEngineVelocity);
         ctx->CopyResource(e.pool.Get(), poolBuf.Get());
+        engineVelocityNoteStateCalls(1);
         if(timedApply(ctx,e.pool.Get(),poolBuf.Get(),frame,e.poolOutput))++g_primaryApplied;
         // The copy by region, not resource: our buffer can be a float4
         // larger than the game's (the stamp), which CopyResource would
@@ -914,6 +930,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         // stamp rides a 16-byte cell: a whole-subresource update, then a
         // boxed copy into the scene constants' shadow.
         ctx->CopySubresourceRegion(e.scene[slot].Get(), 0, 0, 0, 0, scene.Get(), 0, nullptr);
+        engineVelocityNoteStateCalls(1);
         if (!e.stampCell) {
             D3D11_BUFFER_DESC cd{};
             cd.ByteWidth = 16; cd.Usage = D3D11_USAGE_DEFAULT;
@@ -931,6 +948,7 @@ bool snapshot(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame) {
         ctx->UpdateSubresource(e.stampCell.Get(), 0, nullptr, stamp, 16, 0);
         const D3D11_BOX stampBox{0, 0, 0, 16, 1, 1};
         ctx->CopySubresourceRegion(e.scene[slot].Get(), 0, kStampFloat4 * 16u, 0, 0, e.stampCell.Get(), 0, &stampBox);
+        engineVelocityNoteStateCalls(2);
     }
     // What the snapshots copy (the performance review, item 4: measured
     // before any storage change): the whole pool buffer, whatever the view
@@ -973,6 +991,7 @@ void checkSources(ID3D11DeviceContext* ctx, Eye& e, int eye) {
     if (bindingGet(BindSlot::VsSrv33) != e.poolView.Get()) {
         Ptr<ID3D11ShaderResourceView> poolView;
         ctx->VSGetShaderResources(kEngineVelocityPoolSlot, 1, &poolView);
+        engineVelocityNoteStateCalls(1);
         if (poolView.Get() != e.poolView.Get()) {
             if (!poolView) { invalidate(e, kPoolRebound); return; }
             Ptr<ID3D11Resource> res;
@@ -987,6 +1006,7 @@ void checkSources(ID3D11DeviceContext* ctx, Eye& e, int eye) {
     if (bindingGet(BindSlot::VsCb1) != e.sceneBuffer.Get()) {
         Ptr<ID3D11Buffer> scene;
         ctx->VSGetConstantBuffers(kEngineVelocitySceneSlot, 1, &scene);
+        engineVelocityNoteStateCalls(1);
         if (scene.Get() != e.sceneBuffer.Get()) { invalidate(e, kSceneRebound); return; }
     }
     const WatchInfo& wp = g_watchInfo[static_cast<unsigned>(eye) * 2u];
@@ -1001,6 +1021,7 @@ void checkSources(ID3D11DeviceContext* ctx, Eye& e, int eye) {
             // snapshot()'s pair.
             GpuCensusScope census(ctx, GpuCensusSection::FrameEngineVelocity);
             ctx->CopyResource(e.pool.Get(), e.poolBuffer.Get());
+            engineVelocityNoteStateCalls(1);
             if(timedApply(ctx,e.pool.Get(),e.poolBuffer.Get(),e.frame,e.poolOutput))++g_primaryApplied;
         }
         endCapture(ctx, refreshTimer);
@@ -1037,6 +1058,7 @@ bool sourceCameraHolds(ID3D11DeviceContext* ctx, int f, uint32_t frame) {
         // The shadow first; a different pointer is asked of the context.
         Ptr<ID3D11Buffer> scene;
         ctx->VSGetConstantBuffers(kEngineVelocitySceneSlot, 1, &scene);
+        engineVelocityNoteStateCalls(1);
         if (scene.Get() != c.scene.Get()) why = kOtherScene;
     }
     if (why < 0) {
@@ -1073,6 +1095,7 @@ bool bindTarget(ID3D11DeviceContext* ctx, Eye& e, ID3D11DepthStencilView* dsv) {
     ID3D11RenderTargetView* rt[8] = {};
     ID3D11DepthStencilView* bound = nullptr;
     ctx->OMGetRenderTargets(8, rt, &bound);
+    engineVelocityNoteStateCalls(1);
     std::array<Ptr<ID3D11RenderTargetView>, 8> held;
     for (unsigned i = 0; i < 8; ++i) held[i].Attach(rt[i]);
     Ptr<ID3D11DepthStencilView> heldDsv;
@@ -1081,6 +1104,7 @@ bool bindTarget(ID3D11DeviceContext* ctx, Eye& e, ID3D11DepthStencilView* dsv) {
     if (rt[kEngineVelocityTarget] && rt[kEngineVelocityTarget] != e.slotsRtv.Get()) { ++g_draw.targetOccupied; return false; }
     ID3D11UnorderedAccessView* uav[8] = {};
     ctx->OMGetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 8, uav);
+    engineVelocityNoteStateCalls(1);
     bool anyUav = false;
     for (auto* u : uav) if (u) { anyUav = true; u->Release(); }
     if (anyUav) { ++g_draw.uavBound; return false; }
@@ -1094,6 +1118,7 @@ bool bindTarget(ID3D11DeviceContext* ctx, Eye& e, ID3D11DepthStencilView* dsv) {
     ID3D11RenderTargetView* now[8] = {};
     ID3D11DepthStencilView* nowDsv = nullptr;
     ctx->OMGetRenderTargets(8, now, &nowDsv);
+    engineVelocityNoteStateCalls(2);
     bool kept = nowDsv == dsv;
     for (unsigned i = 0; i < 8; ++i) {
         if (now[i] != rt[i]) kept = false;
@@ -1104,6 +1129,7 @@ bool bindTarget(ID3D11DeviceContext* ctx, Eye& e, ID3D11DepthStencilView* dsv) {
         ++g_draw.bindRejected;
         rt[kEngineVelocityTarget] = nullptr;
         vScreenSetRenderTargetsRaw(ctx, 8, rt, dsv);
+        engineVelocityNoteStateCalls(1);
         return false;
     }
     return true;
@@ -1124,6 +1150,7 @@ bool captureGameMark(ID3D11DeviceContext* ctx, Eye& e, int eye, uint32_t frame, 
     ID3D11RenderTargetView* rts[8] = {};
     Ptr<ID3D11DepthStencilView> dsvNow;
     ctx->OMGetRenderTargets(8, rts, &dsvNow);
+    engineVelocityNoteStateCalls(1);
     // OMGet returns owned references: adopt slot 6's, release the rest
     // (the 2026-09-27 review's F2 -- assigning the raw pointer into a smart
     // pointer that addrefs, then releasing around it, leaked one reference per
@@ -1296,6 +1323,7 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
             // a separate call site from the snapshot below, not merged with it.
             GpuCensusScope census(ctx, GpuCensusSection::FrameEngineVelocity);
             ctx->ClearRenderTargetView(e.slotsRtv.Get(), cleared);
+            engineVelocityNoteStateCalls(1);
         }
         endCapture(ctx, clearTimer);
         const int snapTimer = beginCapture(ctx, kCaptureSnapshot);
@@ -1351,6 +1379,7 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
         float factor[4] = {};
         UINT mask = 0;
         ctx->OMGetBlendState(&game, factor, &mask);
+        engineVelocityNoteStateCalls(1);
         if (game.Get() != bindingGet(BindSlot::Blend)) ++g_draw.blendShadowDisagreed;
         const char* refused = nullptr;
         ID3D11BlendState* derived = derivedBlendFor(ctx, game.Get(), &refused);
@@ -1361,6 +1390,7 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
             return;
         }
         vScreenOMSetBlendStateRaw(ctx, derived, factor, mask);
+        engineVelocityNoteStateCalls(1);
         g_bound.gameBlend = game;
         g_bound.derivedBlend = derived;
         std::memcpy(g_bound.blendFactor, factor, sizeof(factor));
@@ -1379,7 +1409,7 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
                              bindingGeneration(BindSlot::Vs) == g_bound.vsGen;
     if (useVs != vs) {
         if (vsInstalled) ++g_draw.settersSkipped;
-        else { vScreenVSSetShaderRaw(ctx, useVs, nullptr, 0); ++g_draw.settersIssued; }
+        else { vScreenVSSetShaderRaw(ctx, useVs, nullptr, 0); engineVelocityNoteStateCalls(1); ++g_draw.settersIssued; }
     }
     if (guardOverlay) {
         Ptr<ID3D11ShaderResourceView> gameSrv;
@@ -1391,6 +1421,7 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
         }
         Ptr<ID3D11ShaderResourceView> actual;
         ctx->PSGetShaderResources(kEngineVelocityOverlaySnapshotSlot, 1, &actual);
+        engineVelocityNoteStateCalls(3);
         if (actual.Get() != privateSrv) {
             e.overlayGroup = false;
             ++g_draw.overlayDeclinedCreate;
@@ -1398,6 +1429,7 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
             {
                 FlatComputeInternalScope internal;
                 ctx->PSSetShaderResources(kEngineVelocityOverlaySnapshotSlot, 1, &original);
+                engineVelocityNoteStateCalls(1);
             }
             usePs = patchedPsFor(ctx, f, ps);
             psInstalled = false;
@@ -1411,7 +1443,7 @@ void slowPath(ID3D11DeviceContext* ctx, bool rtv0Eye) {
         }
     }
     if (psInstalled) ++g_draw.settersSkipped;
-    else { vScreenPSSetShaderRaw(ctx, usePs, nullptr, 0); ++g_draw.settersIssued; }
+    else { vScreenPSSetShaderRaw(ctx, usePs, nullptr, 0); engineVelocityNoteStateCalls(1); ++g_draw.settersIssued; }
     g_bound.originalPs = ps; g_bound.patchedPs = usePs; g_bound.psGen = cache.ps;
     g_bound.originalVs = useVs != vs ? vs : nullptr; g_bound.patchedVs = useVs != vs ? useVs : nullptr; g_bound.vsGen = cache.vs;
     g_bound.family = f;
@@ -1679,6 +1711,7 @@ void summaryLocked(uint64_t now) {
         s.unkeyedPsDraws = 0;
         s.selfMarked = 0;
         s.selfMarkedLatched = 0;
+        g_substitutedBase += familyDraws[f];   // kept for the flat census's drain
         familyDraws[f] = 0;
     }
     g_emit.clear();
@@ -1846,6 +1879,20 @@ void engineVelocityAfterFlatDraw(ID3D11DeviceContext* ctx) {
     cache = DrawCache{};
 }
 
+// The flat census's once-a-frame drain, owner thread. The substituted draws are the sum of the
+// per-family counts plus what the 30 s summary zeroed out of them (g_substitutedBase), so a
+// summary between two drains loses none.
+EngineVelocityWrapperCounts engineVelocityTakeWrapperCounts() noexcept {
+    EngineVelocityWrapperCounts out;
+    out.stateCalls = g_stateCalls - g_stateCallsTaken;
+    g_stateCallsTaken = g_stateCalls;
+    uint64_t substituted = g_substitutedBase;
+    for (uint64_t n : familyDraws) substituted += n;
+    out.substitutedDraws = substituted - g_substitutedTaken;
+    g_substitutedTaken = substituted;
+    return out;
+}
+
 namespace engine_velocity_detail {
 void beforeDrawSlow(ID3D11DeviceContext* ctx, bool rtv0Eye) {
     if (!ctx) return;
@@ -2001,6 +2048,7 @@ void psShadowProbe(ID3D11DeviceContext* ctx) {
     ++g_draw.poolShadowProbes;
     ID3D11PixelShader* livePs = nullptr;
     ctx->PSGetShader(&livePs, nullptr, nullptr);
+    engineVelocityNoteStateCalls(1);
     if (!livePs) return;
     // EDVR's own installed substitution is not a bypass (rc-since-rc2 review
     // F7): the shadow correctly holds the game's original and g_bound owns
@@ -2041,26 +2089,32 @@ void engineVelocityFrameBoundary(ID3D11DeviceContext* ctx) {
         if (g_bound.guardSrv3) {
             Ptr<ID3D11ShaderResourceView> actual;
             ctx->PSGetShaderResources(kEngineVelocityOverlaySnapshotSlot, 1, &actual);
+            engineVelocityNoteStateCalls(1);
             if (actual.Get() == g_bound.guardSrv3.Get() &&
                 bindingGeneration(BindSlot::PsSrv3) == g_bound.srv3Gen) {
                 ID3D11ShaderResourceView* game = g_bound.gameSrv3.Get();
                 FlatComputeInternalScope internal;
                 ctx->PSSetShaderResources(kEngineVelocityOverlaySnapshotSlot, 1, &game);
+                engineVelocityNoteStateCalls(1);
                 ++g_draw.restores;
             }
         }
         Ptr<ID3D11PixelShader> ps;
         ctx->PSGetShader(&ps, nullptr, nullptr);
-        if (g_bound.patchedPs && ps.Get() == g_bound.patchedPs) { vScreenPSSetShaderRaw(ctx, g_bound.originalPs, nullptr, 0); ++g_draw.restores; }
+        engineVelocityNoteStateCalls(1);
+        if (g_bound.patchedPs && ps.Get() == g_bound.patchedPs) { vScreenPSSetShaderRaw(ctx, g_bound.originalPs, nullptr, 0); engineVelocityNoteStateCalls(1); ++g_draw.restores; }
         Ptr<ID3D11VertexShader> vs;
         ctx->VSGetShader(&vs, nullptr, nullptr);
-        if (g_bound.patchedVs && vs.Get() == g_bound.patchedVs) { vScreenVSSetShaderRaw(ctx, g_bound.originalVs, nullptr, 0); ++g_draw.restores; }
+        engineVelocityNoteStateCalls(1);
+        if (g_bound.patchedVs && vs.Get() == g_bound.patchedVs) { vScreenVSSetShaderRaw(ctx, g_bound.originalVs, nullptr, 0); engineVelocityNoteStateCalls(1); ++g_draw.restores; }
         Ptr<ID3D11BlendState> blend;
         float factor[4] = {};
         UINT mask = 0;
         ctx->OMGetBlendState(&blend, factor, &mask);
+        engineVelocityNoteStateCalls(1);
         if (g_bound.derivedBlend && blend.Get() == g_bound.derivedBlend.Get()) {
             vScreenOMSetBlendStateRaw(ctx, g_bound.gameBlend.Get(), g_bound.blendFactor, g_bound.sampleMask);
+            engineVelocityNoteStateCalls(1);
             ++g_draw.restores;
         }
     }

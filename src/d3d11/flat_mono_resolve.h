@@ -176,6 +176,12 @@ FlatMonoResolvePreflightResult flatMonoResolvePreflight(
 // The caller supplies only jitter that was actually rendered into these inputs.
 bool flatMonoResolve(ID3D11Device*, ID3D11DeviceContext*, const FlatMonoResolveFrame&,
                      ID3D11ShaderResourceView** output, const char** reason);
+// The GPU census's timestamp pair (flat_cpu.h): begin is called just before the resolver's own
+// dispatches and backend call, end when the call returns by any path. Owner thread. Null (the
+// default, and in every rig) times nothing; installing them changes no command the resolver
+// issues except the two queries.
+using FlatMonoResolveSpanFn = void (*)(ID3D11DeviceContext*) noexcept;
+void flatMonoResolveSetSpanHooks(FlatMonoResolveSpanFn begin, FlatMonoResolveSpanFn end);
 // Recover an already rendered jittered frame after backend refusal. This
 // spatial resolve uses no temporal history or SDK and borrows the same frame
 // inputs; successful output is AddRef'd. It leaves history invalid. A normal

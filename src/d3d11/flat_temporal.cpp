@@ -4,6 +4,7 @@
 #include "flat_standdown.h"
 #include "flat_compute_capture.h"
 #include "flat_compute_model.h"
+#include "flat_cpu.h"
 #include "flat_runtime.h"
 
 #include <algorithm>
@@ -888,6 +889,7 @@ void flatTemporalSetPaused(bool paused) {
 }
 
 void flatTemporalBeforePresent(IDXGISwapChain* swap, uint64_t frame, UINT flags) {
+    flatcpu::Scope timed(flatcpu::kDiscovery);   // the census (flat_cpu.h): every passive discovery observer below is this family
     if (flatComputeReadbackPending() && !flatComputeCandidate() && detail::g_flatTemporalOwnerThread.load(std::memory_order_acquire) == GetCurrentThreadId())
         flatComputePoll(frame);
     if (g_waitingForPresent.exchange(false, std::memory_order_acq_rel)) {
@@ -923,6 +925,7 @@ void flatTemporalBeforePresent(IDXGISwapChain* swap, uint64_t frame, UINT flags)
 
 void flatTemporalAfterPresent(uint64_t frame, HRESULT result, UINT flags) {
     if (!flatTemporalCapturing()) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     ++g.serial;
     g.forwardingPresent = false;
     ++g.presents;
@@ -961,6 +964,7 @@ void flatTemporalAfterPresent(uint64_t frame, HRESULT result, UINT flags) {
 
 void flatTemporalBind(ID3D11RenderTargetView* rtv, ID3D11DepthStencilView* dsv) {
     if (!flatTemporalCapturing()) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     ++g.serial;
     g.current = nullptr;
     g.sampledTarget = nullptr;
@@ -969,6 +973,7 @@ void flatTemporalBind(ID3D11RenderTargetView* rtv, ID3D11DepthStencilView* dsv) 
 
 void flatTemporalViewport(UINT count, const D3D11_VIEWPORT* vps) {
     if (!flatTemporalCapturing()) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     ++g.serial;
     if (count && vps) {
         g.viewportW = static_cast<uint32_t>(vps[0].Width);
@@ -985,6 +990,7 @@ void flatTemporalViewport(UINT count, const D3D11_VIEWPORT* vps) {
 
 void flatTemporalConstantBuffers(bool pixelStage, UINT start, UINT count, ID3D11Buffer* const* buffers) {
     if (!flatTemporalCapturing()) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     ++g.serial;
     ++g.projectionBindCalls[pixelStage ? 1 : 0];
     auto observe = [&](uint32_t index, uint32_t slot) {
@@ -998,6 +1004,7 @@ void flatTemporalConstantBuffers(bool pixelStage, UINT start, UINT count, ID3D11
 
 void flatTemporalClearBindings() {
     if (!flatTemporalCapturing()) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     for (auto& binding : g.projectionBindings) {
         binding.resource = nullptr; binding.observed = true;
     }
@@ -1005,6 +1012,7 @@ void flatTemporalClearBindings() {
 
 void flatTemporalDraw(ID3D11DeviceContext* ctx, uint32_t count, uint32_t instances) {
     if (!flatTemporalCapturing()) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     ++g.serial;
     if (!g.forwardingPresent && flatComputeCandidate()) flatComputeProbeDraw(ctx,g.epoch,g.serial);
     if (!g.forwardingPresent) captureMenuCopy(ctx);
@@ -1110,6 +1118,7 @@ void flatTemporalDraw(ID3D11DeviceContext* ctx, uint32_t count, uint32_t instanc
 
 void flatTemporalClearColor(ID3D11RenderTargetView* rtv) {
     if (!flatTemporalCapturing()) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     ++g.serial;
     if (!g.forwardingPresent && flatComputeCandidate()) flatComputeProbeClear(rtv,g.epoch,g.serial,"RTV-clear");
     bool matched = false;
@@ -1119,11 +1128,13 @@ void flatTemporalClearColor(ID3D11RenderTargetView* rtv) {
 }
 void flatTemporalClearUav(ID3D11UnorderedAccessView* uav) {
     if (!flatTemporalCapturing()) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     ++g.serial;
     if (!g.forwardingPresent && flatComputeCandidate()) flatComputeProbeClear(uav,g.epoch,g.serial,"UAV-clear");
 }
 void flatTemporalClearDepth(ID3D11DepthStencilView* dsv, UINT flags, float depth) {
     if (!flatTemporalCapturing()) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     ++g.serial;
     bool matched = false;
     for (uint32_t i = 0; i < g.targetCount; ++i)
@@ -1138,6 +1149,7 @@ void flatTemporalClearDepth(ID3D11DepthStencilView* dsv, UINT flags, float depth
 }
 void flatTemporalTransfer(ID3D11Resource* dst, ID3D11Resource* src, char kind) {
     if (!flatTemporalCapturing()) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     ++g.serial; ++g.totalCopies;
     if (!g.forwardingPresent && flatComputeCandidate()) flatComputeProbeTransfer(dst,src,g.epoch,g.serial,kind);
     if (g.forwardingPresent) ++g.forwardedCopies;
@@ -1146,11 +1158,13 @@ void flatTemporalTransfer(ID3D11Resource* dst, ID3D11Resource* src, char kind) {
 }
 void flatTemporalDispatch(ID3D11DeviceContext* ctx, UINT x, UINT y, UINT z, ID3D11Buffer* args, UINT offset) {
     if (!flatTemporalCapturing()) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     ++g.serial; ++g.totalDispatches;
     if (!g.forwardingPresent && flatComputeCandidate()) flatComputeDispatch(ctx, g.epoch, g.serial, x, y, z, args, offset);
 }
 void flatTemporalExecuteList(bool foreign) {
     if (!flatTemporalCapturing()) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     ++g.serial; ++g.unknownLists;
     if (flatComputeCandidate()) flatComputeProbeUnknown(g.epoch,g.serial);
     g.proof.unknownDeferredWork = true;
@@ -1169,6 +1183,7 @@ void flatTemporalExecuteList(bool foreign) {
 }
 void flatTemporalMap(ID3D11Resource* res, UINT sub, D3D11_MAP type, void* data) {
     if (!flatTemporalCapturing() || !res || !data || sub || type == D3D11_MAP_READ) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     const uint32_t width = bufferWidth(res);
     // A small b0/b1 write can precede the later bind. Keep bounded separate
     // large and small pools so unrelated small writes cannot evict scene-size
@@ -1184,6 +1199,7 @@ void flatTemporalMap(ID3D11Resource* res, UINT sub, D3D11_MAP type, void* data) 
 }
 void flatTemporalUnmap(ID3D11Resource* res) {
     if (!flatTemporalCapturing() || !res) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     if (Cb* found = findCb(res)) {
         Cb& cb = *found;
         if (!cb.mapped) return;
@@ -1200,6 +1216,7 @@ void flatTemporalUnmap(ID3D11Resource* res) {
 }
 void flatTemporalUpdate(ID3D11Resource* dst, const void* data, const D3D11_BOX* box) {
     if (!flatTemporalCapturing() || !dst) return;
+    flatcpu::Scope timed(flatcpu::kDiscovery);
     if (!g.forwardingPresent && flatComputeCandidate()) {
         ++g.serial;
         flatComputeProbeUpdate(dst,g.epoch,g.serial,data && !box);

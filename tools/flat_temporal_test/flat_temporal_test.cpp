@@ -23,6 +23,7 @@
 #include "flat_negotiated_eval_tests.h"
 #include "flat_standdown_tests.h"
 #include "flat_elite_settings_tests.h"
+#include "flat_cpu_tests.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -2369,6 +2370,114 @@ void testFlatWarningWiring() {
           "the log bundler no longer spells the folder itself (its comment names it once)");
 }
 
+// The CPU and GPU census's wiring (flat_cpu.h): which entry point carries which family's scope,
+// where the once-a-frame tick sits, that it stops with the mode, and that nothing it measures is
+// read by a decision. A source scan with removal controls, the way the stand-down pins are.
+void testFlatCpuWiring() {
+    auto slurp = [](const char* path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string runtimeCpp = slurp("src/d3d11/flat_runtime.cpp");
+    const std::string resolveCpp = slurp("src/d3d11/flat_mono_resolve.cpp");
+    const std::string resolveH = slurp("src/d3d11/flat_mono_resolve.h");
+    const std::string injectCpp = slurp("src/d3d11/flat_camera_inject.cpp");
+    const std::string temporalCpp = slurp("src/d3d11/flat_temporal.cpp");
+    const std::string engineCpp = slurp("src/d3d11/engine_velocity.cpp");
+    const std::string engineH = slurp("src/d3d11/engine_velocity.h");
+    const std::string cpuH = slurp("src/d3d11/flat_cpu.h");
+    const std::string menuCpp = slurp("src/d3d11/menu.cpp");
+    check(!runtimeCpp.empty() && !resolveCpp.empty() && !resolveH.empty() && !injectCpp.empty() && !temporalCpp.empty() &&
+          !engineCpp.empty() && !engineH.empty() && !cpuH.empty() && !menuCpp.empty(),
+          "the census's sources are readable from the repo root");
+    auto count = [](const std::string& text, const std::string& needle) {
+        unsigned n = 0;
+        for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
+        return n;
+    };
+    struct Pin { const std::string* text; const char* needle; unsigned times; const char* what; };
+    const Pin pins[] = {
+        // Every family the census names has its scope at the entry points that family stands for.
+        {&runtimeCpp, "flatcpu::Scope shell(flatcpu::kOther);", 3, "the draw scope (both halves) and the dispatch scope time their own shells"},
+        {&runtimeCpp, "flatcpu::kReduce", 1, "contract reduction times the reducer"},
+        {&runtimeCpp, "flatcpu::kCopyChecks", 2, "the exact-shader verifications and the F10 captures are timed"},
+        {&runtimeCpp, "flatcpu::kCameraRows", 2, "the camera lookup and hash, and capture()"},
+        {&runtimeCpp, "flatcpu::kTrace", 4, "every trace-ring copy is timed: capture, dispatch, write, record"},
+        {&runtimeCpp, "flatcpu::kResource", 4, "Written, Map, Unmap and Update time their lookups"},
+        {&runtimeCpp, "flatcpu::kCoverage", 1, "coverage classification"},
+        {&runtimeCpp, "flatcpu::kProjection", 3, "qualifyProjection, the private binding and its restore"},
+        {&runtimeCpp, "flatcpu::kShadows", 5, "the constant-buffer shadow observers"},
+        {&runtimeCpp, "flatcpu::kWitness", 1, "the camera witness"},
+        {&runtimeCpp, "flatcpu::kEngineDraw", 3, "engine motion's draw wrapper: naming, BeforeDraw and AfterFlatDraw"},
+        {&runtimeCpp, "flatcpu::kResolve", 1, "the treatment at the copy draw"},
+        {&runtimeCpp, "flatcpu::kTrackers", 5, "the state trackers"},
+        {&resolveCpp, "flatcpu::Scope backendScope(flatcpu::kBackend);", 1, "the backend evaluation inside the resolver"},
+        {&injectCpp, "flatcpu::Scope timed(flatcpu::kInject);", 2, "the camera inject callback, both halves"},
+        {&temporalCpp, "flatcpu::Scope timed(flatcpu::kDiscovery);", 16, "each discovery observer"},
+        // The resolver's GPU span: the hooks, the guard around its dispatches, and the install.
+        {&resolveH, "void flatMonoResolveSetSpanHooks(FlatMonoResolveSpanFn begin, FlatMonoResolveSpanFn end);", 1, "the resolver takes span hooks"},
+        {&resolveCpp, "SpanGuard span(context);", 1, "the resolver's dispatches and backend call are one GPU span"},
+        {&runtimeCpp, "flatMonoResolveSetSpanHooks(&resolveSpanBegin, &resolveSpanEnd);", 1, "the Present installs the span hooks"},
+        // The frame: its GPU span opens at the first game draw and closes before Present; the tick cuts it after.
+        {&runtimeCpp, "if (!s.gpuFrameTried) gpuFrameOpen(s, context);", 1, "the whole-frame GPU span opens at the frame's first game draw"},
+        {&runtimeCpp, "if (owner()) gpuFrameClose(state());", 1, "and closes just before the real Present"},
+        {&runtimeCpp, "s.census.onFrame(censusNow, censusFreq, endedPaused);", 1, "the Present cuts the census once a frame"},
+        {&runtimeCpp, "s.census.idle();", 1, "and stops it when no temporal mode is selected"},
+        {&runtimeCpp, "const EngineVelocityWrapperCounts wrapper = engineVelocityTakeWrapperCounts();", 1, "the draw wrapper's counts are drained every frame"},
+        {&runtimeCpp, "if (censusWasRunning) s.census.noteWrapper(", 1, "and handed to the census only while it runs: no backlog"},
+        {&runtimeCpp, "Log::get().note(\"%s\", lines.line[i]);", 1, "the lines go to the log as they are"},
+        // The census drives engine motion's clock in the flat profile; nothing else does.
+        {&cpuH, "emcpu::g_gate.store(gate, std::memory_order_relaxed);", 1, "the census opens engine motion's gate with its own sampling decision"},
+        {&cpuH, "emcpu::g_gate.store(0, std::memory_order_relaxed);", 1, "and closes it when it stops"},
+        {&menuCpp, "perfMonitorFrame(dev);", 1, "perfMonitorFrame, which cuts engine motion's own recorder, is called once"},
+        // The draw wrapper's D3D calls are counted where they are made.
+        {&engineH, "inline void engineVelocityNoteStateCalls(unsigned n) noexcept { engine_velocity_detail::g_stateCalls += n; }", 1, "the count is one owner-thread add"},
+        {&engineCpp, "EngineVelocityWrapperCounts engineVelocityTakeWrapperCounts() noexcept {", 1, "and drained by one function"},
+        {&engineCpp, "g_substitutedBase += familyDraws[f];", 1, "a summary between two drains loses none of the substituted draws"},
+    };
+    for (const Pin& pin : pins) {
+        check(count(*pin.text, pin.needle) == pin.times, pin.what);
+        std::string without = *pin.text;
+        for (size_t at = without.find(pin.needle); at != std::string::npos; at = without.find(pin.needle))
+            without.erase(at, std::strlen(pin.needle));
+        check(count(without, pin.needle) == 0, "census wiring control: a source with the line removed no longer contains it");
+    }
+    check(count(engineCpp, "engineVelocityNoteStateCalls(") >= 30,
+          "the draw wrapper counts its D3D calls at every call site (thirty and more)");
+    // ORDER. The census's whole-frame span opens before the Paused return (a stood-down frame is
+    // still a frame), the Present's census block sits after the stand-down's frame boundary and
+    // before anything that reads the frame's draw capture, and the flat branch of the menu tick
+    // returns before perfMonitorFrame -- so the census is the only driver of engine motion's clock.
+    auto at = [&](const std::string& text, const char* needle) { return text.find(needle); };
+    const size_t open = at(runtimeCpp, "if (!s.gpuFrameTried) gpuFrameOpen(s, context);");
+    const size_t lastPausedReturn = runtimeCpp.rfind("if (s.work == FlatWork::Paused) return;");
+    check(open != std::string::npos && lastPausedReturn != std::string::npos && open < lastPausedReturn && lastPausedReturn - open < 400,
+          "the frame's GPU span opens just before the draw scope's Paused return");
+    const size_t standDown = at(runtimeCpp, "standDownFrame(s, frame);");
+    const size_t tick = at(runtimeCpp, "s.census.onFrame(censusNow, censusFreq, endedPaused);");
+    const size_t capture = at(runtimeCpp, "s.drawCapture.present(s.context.Get()");
+    check(standDown != std::string::npos && tick != std::string::npos && capture != std::string::npos &&
+          standDown < tick && tick < capture,
+          "the census tick follows the stand-down's frame boundary and precedes the draw capture");
+    const size_t flatReturn = at(menuCpp, "if (!g_budget.shouldRun()) inputGateSetPrivate(false);");
+    const size_t perf = at(menuCpp, "perfMonitorFrame(dev);");
+    check(flatReturn != std::string::npos && perf != std::string::npos && flatReturn < perf,
+          "the flat branch of the menu tick ends before perfMonitorFrame: the census is the flat profile's only driver of engine motion's clock");
+    // INSTRUMENT ONLY. The stand-down functions never read the census, and no decision in the
+    // runtime reads a figure it produced.
+    const size_t first = at(runtimeCpp, "void applyWork(State& s, FlatWork next) {");
+    const size_t last = at(runtimeCpp, "bool flatRuntimeStructuralRefusal(");
+    check(first != std::string::npos && last != std::string::npos && first < last, "the stand-down functions can be delimited");
+    if (first != std::string::npos && last != std::string::npos && first < last)
+        check(runtimeCpp.substr(first, last - first).find("census") == std::string::npos,
+              "the stand-down never reads the census: it measures, it does not decide");
+    // The same for the numbers: the runtime touches the census in ten places and no other -- the four
+    // GPU notes and the skipped one, idle, and the block at the Present (running, onFrame, noteWrapper,
+    // take) -- and none of them reads a figure back into the runtime's state.
+    check(count(runtimeCpp, "s.census.") == 10,
+          "the runtime touches the census in exactly its known places (the GPU notes, idle, and the Present block)");
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
         return flatShaderClassifierSweep(argv[2]);
@@ -2422,6 +2531,8 @@ int main(int argc, char** argv) {
     testStandDownWiring();
     failures += flatEliteSettingsTests();
     testFlatWarningWiring();
+    failures += flatCpuTests();
+    testFlatCpuWiring();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

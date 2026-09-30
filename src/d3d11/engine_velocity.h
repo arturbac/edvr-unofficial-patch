@@ -113,6 +113,7 @@ constexpr int kMaxFamilies = 10;
 extern std::atomic<bool> live;
 extern DrawCache cache;                        // owner thread only
 extern uint64_t familyDraws[kMaxFamilies];     // owner thread only: draws that ran substituted
+extern uint64_t g_stateCalls;                  // owner thread only: the draw wrapper's D3D context calls (see below)
 // The resources an open eye-frame's snapshot came from (eye0 pool, eye0
 // scene, eye1 pool, eye1 scene, then the on-foot source's pool and scene).
 // Identities only, never dereferenced here.
@@ -212,6 +213,18 @@ void engineVelocityNotePresentFrame(uint32_t presentFrame) noexcept;
 void engineVelocityFrameBoundary(ID3D11DeviceContext*);
 // Flat draw bracket: restore substituted shaders/blend; caller restores MRTs.
 void engineVelocityAfterFlatDraw(ID3D11DeviceContext*);
+// The flat CPU census (flat_cpu.h): what engine motion's draw wrapper asks of the D3D
+// immediate context. Every Get and Set on it, and the clears and copies an eye-frame's
+// preparation makes, are counted at their call sites, on the owner thread (the caller of
+// the flat draw scope); the flat Present drains the count once a frame with the draws the
+// wrapper substituted. A count, not a clock: it prices nothing by itself, it says how many
+// driver round trips the wrapper is.
+inline void engineVelocityNoteStateCalls(unsigned n) noexcept { engine_velocity_detail::g_stateCalls += n; }
+struct EngineVelocityWrapperCounts {
+    uint64_t stateCalls = 0;
+    uint64_t substitutedDraws = 0;
+};
+EngineVelocityWrapperCounts engineVelocityTakeWrapperCounts() noexcept;
 // Owner-thread diagnostic, sampled after BeforeDraw and before restoring the
 // draw bracket. A source candidate alone does not prove substitution succeeded.
 inline bool engineVelocityDrawSubstituted() noexcept {
