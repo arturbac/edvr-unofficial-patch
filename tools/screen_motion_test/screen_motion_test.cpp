@@ -240,6 +240,26 @@ int main(int argc,char** argv){
         // motion is drawn for it and the eye has no map that frame.
         screenMotionFrameBoundary(ctx.Get());sourceDraw();detail::g_uiLayerRedirecting=true;screenDraw(0);detail::g_uiLayerRedirecting=false;
         check(!screenMotionView(0,W,H),"a composite the UI layer took draws no screen motion");
+        // The VR world route (ui_layer.h) re-issues the screen composite into the layer and the door runs layer-only for the
+        // eye, so the per-eye motion reissues are skipped (vscreen.cpp's tail: 0.24 ms, unused while the route owns the eye) --
+        // but the RECOGNITION still runs, because it is what keeps naming the world's source camera and depth for the next
+        // frames (screenMotionSource only names within two frames of the last recognised screen), and the engine slot source and
+        // the weapon map depend on the naming. screenMotionRecognize is that step alone.
+        {
+            const unsigned notes=testSourceNotes;
+            for(int f=0;f<8;++f){
+                screenMotionFrameBoundary(ctx.Get());sourceDraw();
+                testVs=0x5C36AF051B98B9F1ull;testPs=0xCFE84157BC76E921ull;testRtv=er[0].Get();
+                check(screenMotionRecognize(),"the screen composite's shader pair is recognised");
+                check(!screenMotionView(0,W,H)&&!screenMotionView(1,W,H),"a route frame draws no per-eye screen motion");
+            }
+            check(testSourceNotes==notes+8,"recognition alone keeps naming the world's source, frame after frame");
+            check(!(testVs=0x1ull,testPs=0xCFE84157BC76E921ull,screenMotionRecognize())&&!(testVs=0x5C36AF051B98B9F1ull,testPs=0x1ull,screenMotionRecognize()),"...and only the screen composite's PAIR is recognised (either half alone is not)");
+            // The control: no recognition at all -- the naming runs out two frames after the last screen.
+            const unsigned before=testSourceNotes;
+            for(int f=0;f<8;++f){screenMotionFrameBoundary(ctx.Get());sourceDraw();}
+            check(testSourceNotes==before+2,"without the recognition the source stops being named after two frames (the step is what the route keeps)");
+        }
     }
     // Optional recorded source/eye matrices and double-precision expected
     // projection. No proprietary assets are committed with the test.

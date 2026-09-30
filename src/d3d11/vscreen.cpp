@@ -61,6 +61,7 @@
 #include "ui_depth.h"
 #include "ui_layer.h"
 #include "ui_layer_math.h"
+#include "vr_world_route.h"  // VrWorldInternalScope: the world route's own D3D calls step past these hooks
 #include "ui_surfaces.h"  // uiAtlasNoteWrite: the glyph atlas instrument's write count
 #include "celestial_motion.h"
 #include "engine_velocity.h"
@@ -3686,6 +3687,24 @@ __declspec(noinline) void crispHudTonemapReissue(ID3D11DeviceContext* self, char
     }
 }
 
+// The VR world route's re-issue (ui_layer.h): the 2D screen's composite, decided in the route's mode -- the layer
+// did NOT take it -- issued once more into the eye's layer right after the game's own issue, with the route's
+// mipped copy of the resolved screen at PS slot 0 and a trilinear sampler like the game's; every other binding is
+// the game's, still bound from its draw. A Begin that declines leaves the game's state untouched (counted by
+// reason, named once) and the eye to the eye route. The route's own D3D calls step past these hooks
+// (VrWorldInternalScope). NOINLINE for the reason pureDrawReissue is: two draws a frame, and only while the route
+// owns the world.
+__declspec(noinline) void worldScreenReissue(ID3D11DeviceContext* self, char kind, UINT count,
+                                             UINT instances, const DrawArgs& args) {
+    if (uiLayerIssueBlocked()) return;
+    VrWorldInternalScope internal;
+    if (uiLayerWorldReissueBegin(self)) {
+        GpuCensusScope census(self, GpuCensusSection::FrameWorldLayer);
+        pureDrawReissue(self, kind, count, instances, args);
+        uiLayerWorldReissueEnd(self);
+    }
+}
+
 // fix.ui_quality (ui_layer.h): which piece of the interface an owner draw is.
 // Asked only while the layer is live. A draw into anything that is not an
 // eye target is none -- the GUI's own draws into its surfaces are the
@@ -3833,6 +3852,14 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
             if (on) uiLayerSeedDrawOutcome(original, substituted, redirected, known);
         }
     } seedOutcome{owner && uiLayerSeedDiagnostics()};
+    // The VR world route's pending re-issue of THIS draw (ui_layer.h): held for this call and no longer, so a draw
+    // that goes no further (swallowed, or never issued) cannot leave it for the next one.
+    struct WorldReissueScope {
+        bool on = false;
+        ~WorldReissueScope() {
+            if (on) uiLayerWorldReissueAbandon();
+        }
+    } worldReissue;
     // The game's own draw, and only it: the class says which kind of altered draw it is
     // (gpu_census.h), so the thunk's real-draw call can be timed as that section. Every
     // other issue through `draw` below passes None and is timed by its own section.
@@ -3847,6 +3874,9 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         if (uiFamily != UiLayerFamily::kNone) {
             uiLayer = uiLayerDecide(self, static_cast<int>(uiFamily), uiLayerVerdictForwards(v),
                                     g_state->curveThisDraw);
+            // The VR world route does not TAKE the 2D screen's composite: the game's draw is issued as it always
+            // was and re-issued into the layer right after it (worldScreenReissue below).
+            worldReissue.on = uiLayerWorldReissuePending();
         }
     } else if (owner && uiLayerLive() && v != DrawVerdict::kQuadSkip) {
         // The two composites into a target vScreen does not call an eye's:
@@ -3878,6 +3908,12 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         const bool afterPanelSized = srv0IsPanelSized(g_state, kind, count);
         uiLayer = uiLayerNoteOther(self, count, uiLayerVerdictForwards(v), g_state->curveThisDraw,
                                    afterExcluded, afterPanelSized, instances, static_cast<uint32_t>(v), kind);
+        // A draw the retry took is the layer's, not the route's to re-issue (the held screen's exclusion never
+        // lets it take a 2D screen composite; this keeps "taken AND re-issued" impossible by construction).
+        if (uiLayer && worldReissue.on) {
+            worldReissue.on = false;
+            uiLayerWorldReissueAbandon();
+        }
     }
     // The sub-draw probe, which also SWALLOWS the game's draw -- it re-issues
     // the surviving index ranges itself. Before the curve substitution
@@ -3967,6 +4003,12 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // one bool load for the ordinary draw.
     if (originalIssued && uiLayerCrispPending()) {
         crispHudTonemapReissue(self, kind, count, instances, args);
+    }
+    // The VR world route: the 2D screen composite the layer did not take, issued above exactly as the game
+    // always did, is issued once more into the eye's layer from the mipped, resolved screen (ui_layer.h). Before
+    // the verdict's state is undone below: the placement state the second issue needs is still bound.
+    if (worldReissue.on && originalIssued) {
+        worldScreenReissue(self, kind, count, instances, args);
     }
     // A draw the UI layer took is not in the eye's colour at all, so the
     // interface depth below does not re-issue it: its depth and its
@@ -4668,12 +4710,18 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
                 }
                 if(scene)scene->Release();
             }
+            // The VR world route re-issues this 2D screen composite into the eye's layer right after the game's
+            // own issue (ui_layer.h), and the door runs layer-only for the eye: the per-eye motion reissues below
+            // are unused while the route owns it (0.24 ms), so they are skipped -- but the RECOGNITION still runs.
+            // It is what keeps naming the world's source camera and depth for the next frames (the engine slot
+            // source and the weapon map depend on it), and it only ever ran inside screenMotionDraw.
+            if (screenMotionLive() && uiLayerWorldReissuePending()) screenMotionRecognize();
             // screenMotionLive() is the first term of both (screen_motion.h);
             // with fix.temporal_aa off these were two calls per draw that only
             // ever returned. Neither runs for a draw the UI layer took
             // (ui_layer.h): its pixels are not in the pass's input, and the
             // bound target and viewport are the layer's.
-            if (screenMotionLive() && !uiLayerRedirecting()) {
+            if (screenMotionLive() && !uiLayerRedirecting() && !uiLayerWorldReissuePending()) {
                 // The census (issue #38) times screen_motion.cpp's own GPU
                 // work now, not this call site: most calls into either
                 // function return above, at screenMotionLive()'s own flags

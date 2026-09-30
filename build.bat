@@ -2660,6 +2660,29 @@ if errorlevel 1 ( echo [edvr] ERROR: ui layer seed test build failed & exit /b 1
 "%OBJ%\uilayerseed\seed_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_ui_layer_world_test
+echo [edvr] === ui_layer_world_test.exe ===
+REM The VR on-foot world route's layer half (docs\design-flat-temporal-aa-2026-09-23.md, section 82) with
+REM src\d3d11\ui_layer.cpp linked WHOLE, on WARP: its neighbours (the binding shadow, the route, the mips module,
+REM the raw OM/RS entries, the journal) are stubs in the rig, the layer's own machinery is the production code. The
+REM route's mode is never a take; the re-issue draws the screen composite into the eye's layer from the mipped
+REM screen through the trilinear sampler (a mip chain of one flat colour a level shows which level the map's
+REM minification selects) and the composite of that layer over a frame is the eye; every changed state comes back
+REM after a landed re-issue and after every refusal; every refusal is counted by reason and tells the route
+REM nothing; the raw entries run with the route's internal scope up. Built outside build\ like the seed rig above.
+if not exist "%OBJ%\uilayerworld" mkdir "%OBJ%\uilayerworld"
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
+    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE ^
+    /Fo"%OBJ%\uilayerworld\\" /Fe"%OBJ%\uilayerworld\ui_layer_world_test.exe" ^
+    "tools\ui_layer_world_test\ui_layer_world_test.cpp" "src\d3d11\ui_layer.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" ^
+    "third_party\dxbc_hash\DxilHash.cpp" ^
+    /link /INCREMENTAL:NO d3dcompiler.lib user32.lib
+if errorlevel 1 ( echo [edvr] ERROR: ui layer world test build failed & exit /b 1 )
+"%OBJ%\uilayerworld\ui_layer_world_test.exe" --dry-run || exit /b 1
+"%OBJ%\uilayerworld\ui_layer_world_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_pixel_probe_test
 echo [edvr] === pixel_probe_test.exe ===
 REM Build gate for advanced.pixel_probe (src/d3d11/pixel_probe.*), the "who
