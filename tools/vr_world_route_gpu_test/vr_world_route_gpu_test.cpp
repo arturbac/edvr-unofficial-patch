@@ -25,6 +25,7 @@
 #include "../../src/d3d11/vr_camera_census.h"
 #include "../../src/d3d11/vr_world_mips.h"
 #include "../../src/d3d11/vscreen.h"
+#include "../../src/d3d11/weapon_motion.h"
 #include "../../src/common/config.h"
 #include "../../src/common/log.h"
 #include "../../src/common/runtime_profile.h"
@@ -50,6 +51,7 @@ void check(bool ok, const char* what) {
 constexpr uint32_t kW = 128, kH = 72;
 // The stub world the route's neighbours answer from.
 bool g_gate = true, g_layerLive = true, g_named = true, g_rowsKnown = true, g_viewsReady = true;
+bool g_realMismatch = false;   // the real context's t1 is not what the shadow says (the route verifies the actual binding)
 uint32_t g_panelW = kW, g_panelH = kH;
 const ID3D11Texture2D* g_namedDepth = nullptr;
 float g_rows[6][4];
@@ -59,7 +61,7 @@ std::vector<std::string> g_log;
 int g_backendCalls = 0;
 struct BackendCall { int slot; bool reset, hdr, internalFlags; uint32_t w, h, outW, outH; DXGI_FORMAT colour; };
 std::vector<BackendCall> g_calls;
-ComPtr<ID3D11ShaderResourceView> g_slotsSrv, g_poolSrv;
+ComPtr<ID3D11ShaderResourceView> g_slotsSrv, g_poolSrv, g_weaponMapSrv;   // the weapon map the stub weapon_motion answers with (null: no weapon drew)
 ComPtr<ID3D11Buffer> g_sceneNow, g_scenePrev;
 
 // Real rows (Epic frame 71751, b1[270..275]): the shape the game composes for a kind-3 camera (flat_mono_resolve_test).
@@ -107,6 +109,7 @@ bool engineVelocitySourceViews(ID3D11Texture2D* depth, EngineVelocityViews* out)
     out->slots->AddRef(); out->pool->AddRef(); out->sceneNow->AddRef(); out->scenePrev->AddRef();
     return true;
 }
+ID3D11ShaderResourceView* weaponMotionView() { return g_weaponMapSrv.Get(); }
 bool gpuCensusBegin(ID3D11DeviceContext*, GpuCensusSection) noexcept { return false; }
 void gpuCensusEnd(ID3D11DeviceContext*, GpuCensusSection) noexcept {}
 bool dlaaAvailable(ID3D11Device*, const char**) { return true; }
@@ -163,10 +166,10 @@ ComPtr<ID3D11ShaderResourceView> srvOf(ID3D11Device* d, ID3D11Resource* t) {
 struct World {
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext> ctx;
-    ComPtr<ID3D11Texture2D> h, depth, depth2, g2, tone, copy, tiny, other;
+    ComPtr<ID3D11Texture2D> h, depth, depth2, g2, tone, copy, tiny, other, weapon, weaponSmall;
     ComPtr<ID3D11RenderTargetView> rh, rg2, rtone, rsmall;
     ComPtr<ID3D11DepthStencilView> dsv, dsv2;
-    ComPtr<ID3D11ShaderResourceView> sh, scopy, sother;
+    ComPtr<ID3D11ShaderResourceView> sh, scopy, sother, sweapon, sweaponSmall;
     uint64_t seq = 0;
 };
 
@@ -193,6 +196,9 @@ bool build(World& w) {
               SUCCEEDED(d->CreateDepthStencilView(w.depth2.Get(), &dd, w.dsv2.GetAddressOf())), "fixture DSVs");
     w.rh = rtvOf(d, w.h.Get()); w.rg2 = rtvOf(d, w.g2.Get()); w.rtone = rtvOf(d, w.tone.Get()); w.rsmall = rtvOf(d, w.tiny.Get());
     w.sh = srvOf(d, w.h.Get()); w.scopy = srvOf(d, w.copy.Get()); w.sother = srvOf(d, w.other.Get());
+    w.weapon = makeTexture(d, kW, kH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE);
+    w.weaponSmall = makeTexture(d, kW / 2, kH / 2, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE);
+    w.sweapon = srvOf(d, w.weapon.Get()); w.sweaponSmall = srvOf(d, w.weaponSmall.Get());
     const float gray[4] = {0.25f, 0.25f, 0.25f, 1.0f};
     w.ctx->ClearRenderTargetView(w.rh.Get(), gray);
     // The engine's source data the resolver's prep reads: slots (R32G32), the pool (structured, stride 336), two scene buffers.
@@ -222,7 +228,9 @@ void draw(World& w, ID3D11RenderTargetView* rtv, ID3D11DepthStencilView* dsv, st
     for (uint32_t i = 0; i < 4; ++i) bindingSet(static_cast<BindSlot>(static_cast<uint32_t>(BindSlot::PsSrv0) + i), bound[i]);
     bindingSetShader(BindSlot::Vs, reinterpret_cast<void*>(uintptr_t(0x10)), vs);
     bindingSetShader(BindSlot::Ps, reinterpret_cast<void*>(uintptr_t(0x20)), ps);
-    w.ctx->PSSetShaderResources(0, 4, bound);   // the real context, for the route's own PSGetShaderResources verification
+    ID3D11ShaderResourceView* real[4] = {bound[0], bound[1], bound[2], bound[3]};
+    if (g_realMismatch && real[1]) real[1] = w.sother.Get();
+    w.ctx->PSSetShaderResources(0, 4, real);   // the real context, for the route's own PSGetShaderResources verification
     ID3D11RenderTargetView* r = rtv;
     w.ctx->OMSetRenderTargets(1, &r, dsv);
     ++w.seq;
@@ -233,18 +241,19 @@ struct FrameOpts {
     bool lateWrite = false;       // something writes H after the tone (a copy into it)
     bool secondDepth = false;     // H is drawn with two different depth targets
     bool noTone = false;          // the frame has H but no consumer
+    int gbufferDraws = 4;         // draws into one target pair before H: the run the route skips at two compares
 };
 // The retake chain at tiny scale (design doc section 82): the world into the G-buffer, H's draws (with the screen depth), the
 // exposure reduction on a COPY of H, late draws, the 630x354-style tiny draws reading H, the tone, then what follows it.
 void frame(World& w, const FrameOpts& o = {}) {
-    for (int i = 0; i < 4; ++i) draw(w, w.rg2.Get(), w.dsv.Get());
+    for (int i = 0; i < o.gbufferDraws; ++i) draw(w, w.rg2.Get(), w.dsv.Get());
     for (int i = 0; i < 6; ++i) draw(w, w.rh.Get(), (o.secondDepth && i == 3) ? w.dsv2.Get() : w.dsv.Get());
     // q 8157, the copy of H, is not a draw: nothing reaches the route.
     draw(w, w.rsmall.Get(), nullptr, {w.scopy.Get()});
     for (int i = 0; i < 12; ++i) draw(w, w.rh.Get(), w.dsv.Get(), {w.sother.Get(), w.scopy.Get()});
     for (int i = 0; i < 3; ++i) draw(w, w.rsmall.Get(), nullptr, {w.sh.Get()});   // reads H, but an eighth per axis: rule (iv)
     if (!o.noTone) draw(w, w.rtone.Get(), nullptr, {w.sother.Get(), w.sh.Get()}, 0xF9CFC798F21E9AEAull, 0xFEE777E92850B390ull);   // the tone
-    if (o.lateWrite) vrWorldRouteNoteWrite(w.h.Get());
+    if (o.lateWrite && g_vrWorldWatchWrites) vrWorldRouteNoteWrite(w.h.Get());   // the hooks' own guard
     draw(w, w.rtone.Get(), nullptr, {w.sother.Get()});   // the game copy, the HUD, the eye composites: writes elsewhere
     vrWorldRouteFrameBoundary();
     bindingFrameBoundary();
@@ -266,7 +275,7 @@ void reset(World& w) {
     vrWorldRouteFrameBoundary();
     g_log.clear(); g_calls.clear(); g_backendCalls = 0; g_mipsResets = 0;
     g_gate = g_layerLive = g_named = g_rowsKnown = g_viewsReady = true;
-    g_panelW = kW; g_panelH = kH;
+    g_panelW = kW; g_panelH = kH; g_realMismatch = false;
     g_namedDepth = w.depth.Get();
 }
 
@@ -328,6 +337,32 @@ void scenarios(World& w) {
     const auto stats = flatMonoResolveStats();
     check(stats.hdrResolves >= uint64_t(kVrWorldWarmFrames), "auto: the resolver counted its HDR resolves");
 
+    // A long run of draws into one uninteresting target pair (the shadow atlas, the G-buffer) must not hide what follows it.
+    {
+        const int before = g_backendCalls;
+        FrameOpts o;
+        o.gbufferDraws = 6000;
+        frame(w, o);
+        check(g_backendCalls == before + 1, "run skip: 6000 draws into one G-buffer target pair, then H and the tone: the tone still triggers the resolve");
+    }
+
+    // The weapon fold-in seam: a map and the depth's stencil view go to the resolver together or not at all.
+    {
+        const auto before = flatMonoResolveStats();
+        frame(w);
+        check(flatMonoResolveStats().firstPersonFrames == before.firstPersonFrames && flatMonoResolveStats().firstPersonRefused == before.firstPersonRefused,
+              "weapon: no weapon map this frame: the resolver gets no first-person inputs (the flat path's weapon handling)");
+        g_weaponMapSrv = w.sweapon;
+        frame(w);
+        check(flatMonoResolveStats().firstPersonFrames == before.firstPersonFrames + 1 && flatMonoResolveStats().firstPersonRefused == before.firstPersonRefused,
+              "weapon: a weapon map and the stencil view reach the resolver together and are taken");
+        g_weaponMapSrv = w.sweaponSmall;
+        const int calls = g_backendCalls;
+        frame(w);
+        check(g_backendCalls == calls + 1 && flatMonoResolveStats().firstPersonRefused == before.firstPersonRefused + 1,
+              "weapon: a map of the wrong size is refused and counted by the resolver, and the frame is still treated without it");
+        g_weaponMapSrv.Reset();
+    }
     // 3. LATE WRITES latch the route off.
     frame(w, {true});
     frame(w, {true});
@@ -362,6 +397,16 @@ void scenarios(World& w) {
         r.set(w, false);
         frame(w);
         check(g_backendCalls == 1, "refusal: and the next frame with the fact restored is treated");
+    }
+    {   // the shadow says H is bound at t1 but the real context disagrees: the route verifies the actual binding once
+        reset(w);
+        configure(true);
+        vrWorldRouteFrameBoundary();
+        g_realMismatch = true;
+        for (int i = 0; i < 3; ++i) frame(w);
+        check(g_backendCalls == 0 && countLines("actual-hdr-binding-or-depth-view-refused") >= 1,
+              "refusal: the shadow nominated a draw whose real t1 is not H: the route verifies the actual binding and does not resolve");
+        g_realMismatch = false;
     }
     {   // H drawn with two depth targets: the route cannot name its depth
         reset(w);

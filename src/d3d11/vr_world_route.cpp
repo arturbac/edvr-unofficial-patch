@@ -17,11 +17,13 @@
 #include "vr_world_route_math.h"
 #include "binding_shadow.h"
 #include "engine_velocity.h"
+#include "dlaa.h"
 #include "flat_mono_resolve.h"
 #include "gpu_census.h"
 #include "ui_layer.h"
 #include "vr_camera_census.h"
 #include "vr_world_mips.h"
+#include "weapon_motion.h"
 #include "vscreen.h"
 #include "../common/config.h"
 #include "../common/log.h"
@@ -33,6 +35,9 @@
 #include <string>
 
 namespace edvr {
+
+static_assert(kVrWorldFeatureSlot < kUpscalerSlots && kVrWorldFeatureSlot >= kUpscalerEyeSlots,
+              "the world's upscaler slot is one the backends have, and not one of the eyes' (dlaa.h)");
 
 bool g_vrWorldWants = false;
 bool g_vrWorldWatchWrites = false;
@@ -75,6 +80,11 @@ struct Frame {
     uint32_t seq = 0;                        // coloured draws seen (the detector's q)
     uint32_t draws = 0;                      // every draw seen (the census's ordinal)
     const void* candDepth[kFlatHdrCandidates] = {};
+    // The last coloured draw's target pair and whether it showed the route nothing to watch (vrWorldRouteDraw): the next draw
+    // into the same pair skips at two compares. 16k draws into one shadow atlas are one lookup and 16k compares.
+    const void* runRtv = nullptr;
+    const void* runDsv = nullptr;
+    bool runSkippable = false;
     bool depthMixed = false;
     bool treated = false;
     bool triggered = false;
@@ -98,6 +108,7 @@ uint64_t g_lastTreatMs = 0;
 struct DepthViews {
     ComPtr<ID3D11Texture2D> texture;
     ComPtr<ID3D11ShaderResourceView> depth;
+    ComPtr<ID3D11ShaderResourceView> stencil;   // the stencil plane (R32G8X24 only): the weapon fold-in's second input; null otherwise
 };
 DepthViews g_depthViews;
 
@@ -158,19 +169,35 @@ bool makeDepthViews(ID3D11Device* device, ID3D11Texture2D* depth) {
     if (FAILED(device->CreateShaderResourceView(depth, &sd, srv.GetAddressOf()))) return false;
     g_depthViews.texture = depth;
     g_depthViews.depth = srv;
+    if (d.Format == DXGI_FORMAT_R32G8X24_TYPELESS) {
+        // The same texture's stencil plane, for the first-person fold-in. Optional: without it the route runs without the
+        // weapon inputs (the flat path's weapon handling).
+        sd.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+        ComPtr<ID3D11ShaderResourceView> stencil;
+        if (SUCCEEDED(device->CreateShaderResourceView(depth, &sd, stencil.GetAddressOf()))) g_depthViews.stencil = stencil;
+    }
     return true;
 }
 
-// THE WEAPON SEAM (docs section 82, item 3). The first-person motion map and the first-person stencil are two optional inputs
-// of the resolver's prep: attached pixels (the stencil's bit 0x10) take the map's motion instead of the world's camera term.
-// Both or neither. Until the fold-in is wired this returns neither, which is the flat path's weapon handling (the weapon's
-// pixels fail depth ownership and take the current colour under EDVR's TAA; under DLAA, DLSS and FSR they would take the
-// world's camera term at the wrong depth and field of view: a screen-fixed weapon ghosting in a turn).
+// THE WEAPON SEAM (docs section 82, item 3: Sean, 2026-09-30, builds the fold-in). The first-person motion map (weapon_motion.cpp:
+// the weapon's own animated vertices, rebuilt into a source-sized map each frame a weapon draws) and the stencil plane of the
+// world's depth (bit 0x10, written by the game's first-person draws) are two optional inputs of the resolver's prep: attached
+// pixels take the map's motion, or reject their history, and never the world's camera term at the weapon's depth and field of
+// view. BOTH OR NEITHER. Neither (no weapon drew this frame, fix.weapon_stability off, the depth without a stencil plane, a
+// map the resolver refuses) is the flat path's weapon handling: today's arithmetic, bit for bit. What the fold-in needs at this
+// seam, for whoever changes it: a map of FlatMonoResolveFrame::firstPersonMotion's contract and the depth's stencil view.
 struct WorldFirstPerson {
     ID3D11ShaderResourceView* motion = nullptr;
     ID3D11ShaderResourceView* stencil = nullptr;
 };
-WorldFirstPerson worldFirstPerson(ID3D11Device*, ID3D11Texture2D*) { return {}; }
+WorldFirstPerson worldFirstPerson() {
+    WorldFirstPerson fp;
+    ID3D11ShaderResourceView* map = weaponMotionView();   // null unless a weapon draw made the map THIS frame (and it is not ambiguous)
+    if (!map || !g_depthViews.stencil) return fp;
+    fp.motion = map;
+    fp.stencil = g_depthViews.stencil.Get();
+    return fp;
+}
 
 // THE JITTER SEAM. The phase the world's camera is rendered with (x, y), and the phase the camera ROWS themselves carry
 // (rowsX, rowsY: nonzero only when the game derived b1[270..275] from a jittered frustum, which is what the camera injector
@@ -270,8 +297,9 @@ void treatWorld(ID3D11DeviceContext* ctx) {
     f.engine = ev;
     const uint64_t nowMs = GetTickCount64();
     f.deltaMs = g_lastTreatMs ? static_cast<float>(nowMs - g_lastTreatMs) : 11.111f;
-    const WorldFirstPerson fp = worldFirstPerson(device.Get(), depthTex);
-    (void)fp;   // the seam: neither input yet (the flat fallback)
+    const WorldFirstPerson fp = worldFirstPerson();
+    f.firstPersonMotion = fp.motion;
+    f.firstPersonStencil = fp.stencil;
 
     ComPtr<ID3D11ShaderResourceView> none;
     const char* why = nullptr;
@@ -381,13 +409,20 @@ void vrWorldRouteDraw(ID3D11DeviceContext* ctx) {
     ++f.draws;
     void* rtv = bindingGet(BindSlot::Rtv0);
     if (!rtv) return;                                   // depth-only: no colour target, so no candidate, consumer or H write
-    const ViewEntry* c = lookup(f, rtv);
+    const uint32_t q = ++f.seq;
     void* dsv = bindingGet(BindSlot::Dsv0);
+    // A run of draws into one target pair that the last of them showed to be nothing the route watches for (not a candidate,
+    // not a consumer, not a write into H) is the same answer again: the shadow atlas takes thousands in a row.
+    if (f.runSkippable && rtv == f.runRtv && dsv == f.runDsv) return;
+    f.runRtv = rtv; f.runDsv = dsv; f.runSkippable = false;
+    const ViewEntry* c = lookup(f, rtv);
     const ViewEntry* d = dsv ? lookup(f, dsv) : nullptr;
     FlatContractObservation& k = g_k;
     if (!c || !vrWorldFillObservation(k, &c->v, d ? &d->v : nullptr, rtv, dsv, bindingShaderHash(BindSlot::Vs),
-                                      bindingShaderHash(BindSlot::Ps)))
+                                      bindingShaderHash(BindSlot::Ps))) {
+        f.runSkippable = true;                          // a colour target the shadow cannot read is ignored, run or not
         return;
+    }
     if (!f.hdr.outputWidth) {   // before the first boundary armed the detector
         uint32_t outW = 0, outH = 0;
         vScreenPanelSize(&outW, &outH);
@@ -407,7 +442,7 @@ void vrWorldRouteDraw(ID3D11DeviceContext* ctx) {
         srvKnown = true;
     }
     const bool candidate = !f.hdr.triggered && flatHdrCandidateDraw(k, f.hdr.outputWidth, f.hdr.outputHeight);
-    const bool trigger = flatHdrObserveDraw(f.hdr, k, ++f.seq, srv, srvKnown);
+    const bool trigger = flatHdrObserveDraw(f.hdr, k, q, srv, srvKnown);
     if (candidate) {
         // One depth target for all of H's draws: the route resolves against it.
         if (const FlatHdrCandidate* hc = flatHdrFindCandidate(f.hdr, k.color)) {
@@ -416,6 +451,7 @@ void vrWorldRouteDraw(ID3D11DeviceContext* ctx) {
             else if (slot != k.depth) f.depthMixed = true;
         }
     }
+    f.runSkippable = !trigger && !candidate && !consumer && !(f.hdr.triggered && flatHdrFindCandidate(f.hdr, k.color));
     if (trigger) onTrigger(ctx);
 }
 
@@ -545,6 +581,7 @@ void vrWorldRouteFrameBoundary() {
     vScreenPanelSize(&outW, &outH);
     flatHdrBeginFrame(g_f.hdr, outW, outH);
     g_f.viewCount = 0; g_f.viewOverflow = 0; g_f.seq = 0; g_f.draws = 0;
+    g_f.runRtv = g_f.runDsv = nullptr; g_f.runSkippable = false;
     std::memset(g_f.candDepth, 0, sizeof(g_f.candDepth));
     g_f.depthMixed = false; g_f.treated = false; g_f.triggered = false;
     g_takenSequence[0] = g_takenSequence[1] = 0;
