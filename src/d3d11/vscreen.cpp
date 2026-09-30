@@ -3694,7 +3694,7 @@ __declspec(noinline) void crispHudTonemapReissue(ID3D11DeviceContext* self, char
 // reason, named once) and the eye to the eye route. The route's own D3D calls step past these hooks
 // (VrWorldInternalScope). NOINLINE for the reason pureDrawReissue is: two draws a frame, and only while the route
 // owns the world.
-// The VR camera census (vr_camera_census.h, advanced.vr_camera_census): at the 2D screen's composite draw, which is one
+// The VR camera census (vr_camera_census.h; the key is read only there): at the 2D screen's composite draw, which is one
 // an eye, tell the census the eye, so it can read that eye's view constants (b1 rows 270..273) back and log what EDVR
 // advertised for it. Observes only: the census copies and maps under the flat compute scope and never writes a binding.
 // NOINLINE and reached only with the census key on (the caller tests the flag); two draws a frame, and only the first
