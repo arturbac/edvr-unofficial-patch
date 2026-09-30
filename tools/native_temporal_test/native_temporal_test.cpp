@@ -64,8 +64,11 @@ extern "C" void edvrEyeCaptureUntreated(void*,int,const float*){++dumps;}
 // frame. Recorded here, asserted below.
 unsigned uiLayerNotes=0;uint64_t uiLayerNoteSeq=0;uint32_t uiLayerNoteEye=9;const void* uiLayerNoteOut=nullptr;
 unsigned uiLayerSubmits=0;const void* uiLayerSubmitted[2]{};
+// The VR world route's scene reset (src/d3d11/vr_world_route.cpp, docs section 82): skipEye tells it a withheld frame.
+unsigned worldRouteSceneResets=0;
 namespace edvr{void uiLayerNoteTemporal(uint64_t seq,uint32_t eye,const void* out){++uiLayerNotes;uiLayerNoteSeq=seq;uiLayerNoteEye=eye;uiLayerNoteOut=out;}
-void uiLayerNoteSubmitted(uint64_t,uint32_t eye,const void* submitted){++uiLayerSubmits;if(eye<2)uiLayerSubmitted[eye]=submitted;}}
+void uiLayerNoteSubmitted(uint64_t,uint32_t eye,const void* submitted){++uiLayerSubmits;if(eye<2)uiLayerSubmitted[eye]=submitted;}
+void vrWorldRouteNoteSceneReset(){++worldRouteSceneResets;}}
 // The served floor's NGX query (dlaa.cpp), shaped the way the flights'
 // modes lines read (edvr_gfx_20260923_153446.log line 435): quality,
 // balanced and performance take half the output up to the output, ultra
@@ -210,8 +213,11 @@ void run(){
   auto omitted=acquire(d,17);f=frame(17,1);begin(omitted,f);
   check(treat(omitted,1,0,source.Get())==S_OK,"omission baseline");
   f=frame(17,2);begin(omitted,f);const auto count=calls.size();
+  const unsigned resetsBefore=worldRouteSceneResets;
   check(omitted.skipEye(omitted.context,2,0,1,edvr::jumpVerdictPacked())==S_OK&&calls.size()==count,"withheld pixels never enter history");
+  check(worldRouteSceneResets==resetsBefore+1,"a withheld eye tells the VR world route once (a scene reset: boarding, disembarking, a jump, a glitch frame)");
   check(omitted.skipEye(omitted.context,2,0,1,0)==E_INVALIDARG&&treat(omitted,2,0,source.Get())==E_INVALIDARG,"omitted eye cannot be consumed twice");
+  check(worldRouteSceneResets==resetsBefore+1,"a refused skipEye is not a scene reset");
   edvr::noteJumpVerdict(2);f=frame(17,3);f.head[3]=.2f;begin(omitted,f);
   check(treat(omitted,3,0,source.Get())==S_OK&&!(calls.back().flags&1)&&closeFloat(calls.back().translation[0],.2f),"stayed verdict preserves real previous pose across omitted frame");
   f=frame(17,4);begin(omitted,f);omitted.skipEye(omitted.context,4,0,1,edvr::jumpVerdictPacked());

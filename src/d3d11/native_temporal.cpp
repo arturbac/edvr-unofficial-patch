@@ -4,6 +4,7 @@
 #include "dlss_floor.h"
 #include "ui_layer.h"
 #include "ui_surfaces.h"
+#include "vr_world_route.h"
 #include "../common/config.h"
 #include "../common/frame_flag.h"
 #include "../common/temporal_math.h"
@@ -398,6 +399,9 @@ HRESULT WINAPI invalidate(void* p){std::lock_guard<std::mutex> lock(mutex);State
 HRESULT WINAPI skipEye(void* p,uint64_t seq,uint32_t eye,uint32_t jumpOnly,uint32_t verdict) {
   std::lock_guard<std::mutex> lock(mutex);State* s=identify(p);
   if(!s||!s->active||s!=current||!s->begun||seq!=s->sequence||eye>1||s->treated[eye]||jumpOnly>1)return E_INVALIDARG;
+  // The transition detector withheld this eye's frame (a glitch frame, a jump, a hold): the VR world route (docs section 82)
+  // lets go of the world and resets its resolver's history with the eyes'. A no-op with the key off.
+  edvr::vrWorldRouteNoteSceneReset();
   if(!jumpOnly||s->continuity[eye]+1!=seq) {
     s->history[eye]={};s->verdictPending[eye]=false;
   } else if(!s->verdictPending[eye]) {

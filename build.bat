@@ -1087,6 +1087,38 @@ if errorlevel 1 ( echo [edvr] ERROR: flat temporal test build failed & exit /b 1
 "%BUILD%\flat_temporal_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_vr_world_route_test
+echo [edvr] === vr_world_route_test.exe ===
+REM The VR on-foot world route (design doc section 82): the pure half, the detector's glue on the census retake's chain, the
+REM key-off contract and the hook pins. Pure C++ and source scans: no D3D.
+if not exist "%OBJ%\vrworldroutetest" mkdir "%OBJ%\vrworldroutetest"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\vrworldroutetest"\ ^
+    /Fe"%BUILD%\vr_world_route_test.exe" "tools\vr_world_route_test\vr_world_route_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: vr world route test build failed & exit /b 1 )
+"%BUILD%\vr_world_route_test.exe" --self-test "%ROOT%" || exit /b 1
+exit /b 0
+
+:rig_vr_world_route_gpu_test
+echo [edvr] === vr_world_route_gpu_test.exe ===
+REM The VR world route's runtime (vr_world_route.cpp, linked as shipped) on WARP: the real binding shadow, the real Config and
+REM the real flat resolver with its backends stubbed, a synthetic copy of the census retake's chain drawn through the same
+REM per-draw entry the hooks call. Key off, the happy path, every refusal, the internal flags, the latch, scene resets,
+REM frame gaps and the key going off while owned.
+if not exist "%OBJ%\vrworldroutegpu" mkdir "%OBJ%\vrworldroutegpu"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /Fo"%OBJ%\vrworldroutegpu\\" ^
+    /Fe"%BUILD%\vr_world_route_gpu_test.exe" "tools\vr_world_route_gpu_test\vr_world_route_gpu_test.cpp" ^
+    "src\d3d11\vr_world_route.cpp" "src\d3d11\binding_shadow.cpp" "src\d3d11\flat_mono_resolve.cpp" ^
+    "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
+    "src\common\config.cpp" "src\common\proxy.cpp" "src\common\guard.cpp" ^
+    /link /INCREMENTAL:NO dxgi.lib d3dcompiler.lib user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: vr world route GPU test build failed & exit /b 1 )
+"%BUILD%\vr_world_route_gpu_test.exe" --dry-run || exit /b 1
+"%BUILD%\vr_world_route_gpu_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_flat_mono_resolve_test
 echo [edvr] === flat_mono_resolve_test.exe ===
 if not exist "%OBJ%\flat_mono_resolve_test" mkdir "%OBJ%\flat_mono_resolve_test"

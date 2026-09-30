@@ -205,11 +205,44 @@ inline const char* vrWorldSelectName(VrWorldSelect s) {
     return "?";
 }
 
+// ---- the detector's glue ------------------------------------------------------------------------------------------
+// A view as the draw hook resolved it from the binding shadow, once a frame per distinct view pointer: what the detector
+// needs of a render target or a depth target and nothing else.
+struct VrWorldView {
+    const void* resource = nullptr;   // the resource behind the view: an identity, compared and never dereferenced
+    uint32_t width = 0, height = 0, format = 0;
+    bool known = false;               // the shadow could resolve the view
+    bool texture2d = false;
+};
+// One coloured draw's observation for flatHdrObserveDraw, from the two views the draw hook read. The caller has tested the
+// render target slot for null (a draw with no colour target is neither a candidate, a consumer nor a write into H), so
+// `color` is the slot's view. A draw whose colour target cannot be read is ignored (false). A DEPTH target that cannot be
+// read still counts as a bound depth target (dsv set, depth resource null): rule (i) of the trigger is "no depth bound",
+// and an unreadable one is not "none". Only the fields the detector reads are written; the rest of the observation keeps
+// whatever it held, because nothing in the route reads them (the observation is one static instance, not ~360 bytes of
+// zeroing per draw).
+inline bool vrWorldFillObservation(FlatContractObservation& k, const VrWorldView* color, const VrWorldView* depth,
+                                   const void* rtv, const void* dsv, uint64_t vs, uint64_t ps) {
+    if (!color || !color->known || !color->texture2d || !color->resource) return false;
+    k.color = color->resource; k.rtv = rtv;
+    k.width = color->width; k.height = color->height; k.format = color->format;
+    if (depth && depth->known && depth->texture2d && depth->resource) {
+        k.depth = depth->resource; k.dsv = dsv;
+        k.depthWidth = depth->width; k.depthHeight = depth->height;
+    } else {
+        k.depth = nullptr; k.dsv = dsv;
+        k.depthWidth = k.depthHeight = 0;
+    }
+    k.vs = vs; k.ps = ps;
+    return true;
+}
+
 // ---- the census -----------------------------------------------------------------------------------------------
 // One 5 s window, reset when it prints. The HDR route's window is the detector's half; the rest is the route's.
 struct VrWorldWindow {
     FlatHdrWindow hdr;            // frames, hdr-frames, trigger, none, ambiguous, treated, declined, late writes, selection tally
     uint64_t gateFrames = 0;      // frames the route watched with the gate held
+    uint64_t gateFlips = 0;       // times the on-foot gate changed between two boundaries (either way)
     uint64_t ownedFrames = 0;     // frames that started owned (eye shift off)
     uint64_t takes = 0;           // eye screen draws the layer took (two a frame)
     uint64_t layerOnly = 0;       // eyes whose door ran layer-only
@@ -222,12 +255,13 @@ struct VrWorldWindow {
 inline int vrWorldFormatWindow(char* out, size_t size, VrWorldKey key, VrWorldState state, bool layerLive, bool gate,
                                const VrWorldWindow& w) {
     int n = std::snprintf(out, size,
-        "vr world route 5s: key=%s state=%s layer=%s gate=%s frames=%llu gate-frames=%llu hdr-frames=%llu trigger=%llu "
+        "vr world route 5s: key=%s state=%s layer=%s gate=%s frames=%llu gate-frames=%llu gate-flips=%llu hdr-frames=%llu trigger=%llu "
         "none=%llu ambiguous=%llu treated=%llu declined=%llu owned-frames=%llu eye-takes=%llu door-layer-only=%llu "
         "enters=%llu releases=%llu (last=%s) scene-resets=%llu late-hdr-writes=%llu (in %llu frames) last=%s "
         "last-trigger=VS=%016llX PS=%016llX target=%ux%u hdr=%ux%u selection=",
         vrWorldKeyName(key), vrWorldStateName(state), layerLive ? "live" : "not-live", gate ? "held" : "no",
         static_cast<unsigned long long>(w.hdr.frames), static_cast<unsigned long long>(w.gateFrames),
+        static_cast<unsigned long long>(w.gateFlips),
         static_cast<unsigned long long>(w.hdr.hdrFrames), static_cast<unsigned long long>(w.hdr.triggerFrames),
         static_cast<unsigned long long>(w.hdr.noTriggerFrames), static_cast<unsigned long long>(w.hdr.ambiguousFrames),
         static_cast<unsigned long long>(w.hdr.treated), static_cast<unsigned long long>(w.hdr.declined),

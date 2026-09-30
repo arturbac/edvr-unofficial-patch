@@ -64,6 +64,8 @@
 #include "ui_surfaces.h"  // uiAtlasNoteWrite: the glyph atlas instrument's write count
 #include "celestial_motion.h"
 #include "engine_velocity.h"
+#include "vr_world_route.h"
+#include "vr_camera_census.h"
 #include "map_wait.h"         // the game's time inside Map, for the native timing line
 #include "flat_runtime.h"
 #include "flat_temporal.h"   // bounded, flat-profile-only scene discovery
@@ -2830,6 +2832,7 @@ void STDMETHODCALLTYPE hookedClearRtv(ID3D11DeviceContext* self,
         flatRuntimeSubstitution(self, FlatSubstEvent::kClear);   // a clear is not a substituted producer draw: the game's state first
         ResourceInfo info{}; if (bindingResolve(rtv, &info)) flatRuntimeWritten(static_cast<ID3D11Resource*>(info.resource));
     }
+    if (g_vrWorldWatchWrites) vrWorldRouteNoteRtvClear(rtv);
     if (flatTemporalCapturing()) flatTemporalClearColor(rtv);
     // The census's record of this clear, before the probes and before
     // the void fix touches the colour: the line carries what the GAME
@@ -4069,6 +4072,7 @@ void STDMETHODCALLTYPE hookedCopyResource(ID3D11DeviceContext* self,
     noteStaleForward(kSlotCopyResource, reinterpret_cast<const void*>(g_state->realCopyResource),
                      "CopyResource");
     uiAtlasNoteWrite(dst, 2);
+    if (g_vrWorldWatchWrites && !foreignContext(self)) vrWorldRouteNoteWrite(dst);   // a write into H after the resolve is the latch's
     if(foreignContext(self))engineVelocityResourceUnknown(dst);
     if (!foreignContext(self)) {motionResourceWritten(dst);celestialMotionConstantsUnknownWrite(dst);glitchFrameInvalidatePool(dst);if(fssResActive())fssResNoteCopyMaybeMismatched(dst,src);if(uiLayerWatching())uiLayerNoteCopy(dst,src);}
     if (!foreignContext(self) && flatRuntimeActive()) { flatRuntimeSubstitution(self, FlatSubstEvent::kCopy); flatRuntimeWritten(dst); }
@@ -4140,6 +4144,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
         g_state->realDrawIndexedInstancedIndirect(self, args, off);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDrawIndexedInstancedIndirect(self, args, off); return; }
     if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawIndexedIndirect, self, static_cast<int>(self->GetType()));
@@ -4152,6 +4157,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
         depthProbeNoteIndirectDraw(self, bindingGet(BindSlot::Dsv0));
         engineVelocityBeforeDraw(self, g_state->rtv0Eye);
         pixelProbeBefore(g_state, self);
+        if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     }
     g_state->realDrawIndexedInstancedIndirect(self, args, off);
     // Indirect: the GPU-side argument buffer means count/instances are not
@@ -4167,6 +4173,7 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
         g_state->realDrawInstancedIndirect(self, args, off);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDrawInstancedIndirect(self, args, off); return; }
     if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawIndirect, self, static_cast<int>(self->GetType()));
@@ -4179,6 +4186,7 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
         depthProbeNoteIndirectDraw(self, bindingGet(BindSlot::Dsv0));
         engineVelocityBeforeDraw(self, g_state->rtv0Eye);
         pixelProbeBefore(g_state, self);
+        if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     }
     g_state->realDrawInstancedIndirect(self, args, off);
     if (!foreignContext(self)) pixelProbeAfterEye(g_state, self, 0, 0, true);
@@ -4206,6 +4214,7 @@ void STDMETHODCALLTYPE hookedCopySubresourceRegion(
     noteStaleForward(kSlotCopySubresourceRegion, reinterpret_cast<const void*>(g_state->realCopySubresourceRegion),
                      "CopySubresourceRegion");
     uiAtlasNoteWrite(dst, 2);
+    if (g_vrWorldWatchWrites && !foreignContext(self)) vrWorldRouteNoteWrite(dst);
     if(foreignContext(self))engineVelocityResourceUnknown(dst);
     if (!foreignContext(self)) {
         // Buffer boxes are byte ranges. Keep the destination offset: a
@@ -4244,6 +4253,7 @@ void STDMETHODCALLTYPE hookedUpdateSubresource(ID3D11DeviceContext* self,
     noteStaleForward(kSlotUpdateSubresource, reinterpret_cast<const void*>(g_state->realUpdateSubresource),
                      "UpdateSubresource");
     uiAtlasNoteWrite(dst, 0);
+    if (g_vrWorldWatchWrites && !foreignContext(self)) vrWorldRouteNoteWrite(dst);
     if(foreignContext(self))engineVelocityResourceUnknown(dst);
     if (!foreignContext(self)) {
         if(box && box->right>=box->left)motionResourceWritten(dst,box->left,box->right);
@@ -4430,6 +4440,7 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
         g_state->realDraw(self, count, start);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDraw(self, count, start); return; }   // the world route's own draw (vr_world_route.h)
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::Draw, self, static_cast<int>(self->GetType()));
     DrawClock clock;
@@ -4442,6 +4453,7 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
     const DrawVerdict v = beginPanelOverride(self, 'D', count, 1, args);
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
+    if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);   // the VR world route's detector; at the tone, its resolve
     forwardWithVerdict(self, v, 'D', count, 1, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
@@ -4461,9 +4473,11 @@ void STDMETHODCALLTYPE hookedDrawAuto(ID3D11DeviceContext* self) {
         g_state->realDrawAuto(self);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDrawAuto(self); return; }
     if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
     gpuFrameCommand(self);
     if(self==g_state->ownerCtx)engineVelocityBeforeDraw(self,g_state->rtv0Eye);
+    if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     g_state->realDrawAuto(self);
 }
 void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
@@ -4475,6 +4489,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         g_state->realDrawIndexed(self, count, startIndex, baseVertex);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDrawIndexed(self, count, startIndex, baseVertex); return; }
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawIndexed, self, static_cast<int>(self->GetType()));
     DrawClock clock;
@@ -4488,6 +4503,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
     const DrawVerdict v = beginPanelOverride(self, 'I', count, 1, args);
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
+    if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     forwardWithVerdict(self, v, 'I', count, 1, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
@@ -4511,6 +4527,7 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
         g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance); return; }
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawInstanced, self, static_cast<int>(self->GetType()));
     noteStaleForward(kSlotDrawInstanced, reinterpret_cast<const void*>(g_state->realDrawInstanced),
@@ -4524,6 +4541,7 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
     const DrawVerdict v = beginPanelOverride(self, 'N', perInstance, instances, args);
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
+    if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);   // the tone is a DrawInstanced triangle: the route's trigger
     // The draw's instance window, for the glare telemetry: the trains
     // share one record buffer at different offsets, and which train a
     // draw carries is only knowable from (start, count).
@@ -4560,6 +4578,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
                                           baseVertex, startInstance);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex, baseVertex, startInstance); return; }
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawIndexedInstanced, self, static_cast<int>(self->GetType()));
     noteStaleForward(kSlotDrawIndexedInstanced, reinterpret_cast<const void*>(g_state->realDrawIndexedInstanced),
@@ -4591,6 +4610,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     // verdict, which refreshes rtv0Eye; a draw a verdict claims is left alone.
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
+    if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     forwardWithVerdict(self, v, 'X', perInstance, instances, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
@@ -5431,6 +5451,8 @@ EDVR_BOUNDARY_TICK(tkPixelProbe, "pixel_probe");
 EDVR_BOUNDARY_TICK(tkWakePulse, "wake_pulse");
 EDVR_BOUNDARY_TICK(tkUiDepth, "ui_depth");
 EDVR_BOUNDARY_TICK(tkUiLayer, "ui_layer");
+EDVR_BOUNDARY_TICK(tkVrWorldRoute, "vr_world_route");
+EDVR_BOUNDARY_TICK(tkVrCameraCensus, "vr_camera_census");
 EDVR_BOUNDARY_TICK(tkScreenMotion, "screen_motion");
 EDVR_BOUNDARY_TICK(tkCelestialMotion, "celestial_motion");
 EDVR_BOUNDARY_TICK(tkEngineVelocity, "engine_velocity");
@@ -5471,6 +5493,11 @@ void vScreenFrameBoundary() {
         // cross-check and learning, the key's 30-second totals, and the end
         // of this frame's watch for draws after the UI.
         tkUiLayer.run([&] { uiLayerFrameBoundary(g_state->ownerCtx); });
+        // The VR world route (docs section 82) reads the world-screen gate the layer's boundary just computed, accounts the
+        // frame that ended, steps its ownership machine and arms its detector; the camera census runs after it. With
+        // experimental.temporal_aa_on_foot_world off and the census off each returns at its first test.
+        tkVrWorldRoute.run([&] { vrWorldRouteFrameBoundary(); });
+        tkVrCameraCensus.run([&] { vrCameraCensusFrameBoundary(); });
         tkScreenMotion.run([&] { screenMotionFrameBoundary(g_state->ownerCtx); });
         tkCelestialMotion.run([&] { celestialMotionFrameBoundary(g_state->ownerCtx); });
         tkEngineVelocity.run([&] { engineVelocityFrameBoundary(g_state->ownerCtx); });

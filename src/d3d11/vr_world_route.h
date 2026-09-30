@@ -16,7 +16,6 @@
 // KEY OFF. g_vrWorldWants stays false, the hooks do nothing, the state is Off, the eye shift is never suppressed, the layer
 // is never told the world is the route's and the door never runs layer-only. tools\vr_world_route_test pins each.
 #pragma once
-#include "vr_world_route_math.h"
 #include "flat_compute_readback.h"
 #include <atomic>
 #include <cstdint>
@@ -26,6 +25,10 @@ struct ID3D11ShaderResourceView;
 struct ID3D11Texture2D;
 
 namespace edvr {
+
+// Defined in vr_world_route_math.h (the pure half), declared opaque here so that the modules that only ask the route a
+// question (native_temporal, the layer, the hooks) do not pull the detector's headers in.
+enum class VrWorldState : uint8_t;
 
 // The upscaler feature slot of the world. The eyes own 0 and 1 (dlaa.cpp, fsr3_engine.cpp); the flat runtime uses 0.
 constexpr uint32_t kVrWorldFeatureSlot = 2;
@@ -38,6 +41,13 @@ inline bool vrWorldRouteWantsDraws() { return g_vrWorldWants; }
 // One call per game draw on the owner context while wanted, before the game's draw is issued: the detector, the trigger,
 // and, at the tone, the resolve. Never throws; every failure is a counted decline and the eye route serves the frame.
 void vrWorldRouteDraw(ID3D11DeviceContext* ctx);
+
+// True from the trigger to the frame's end while the route watches (a treated or refused frame alike): the copy, update,
+// clear and dispatch hooks then tell the route what they write, so a write into H after the resolve is counted (the latch).
+extern bool g_vrWorldWatchWrites;
+void vrWorldRouteNoteWrite(const void* resource);   // a copy or update wrote `resource`
+void vrWorldRouteNoteRtvClear(void* rtv);           // ClearRenderTargetView on `rtv`
+void vrWorldRouteNoteDispatch();                    // a dispatch ran: its UAVs (the shadow's CsUav0..3) are writes
 
 // The route's own D3D calls (the resolver's dispatches and draw, the upscaler SDK's, the mip copy) go through the hooked
 // vtable. Every state hook steps aside for g_flatComputeInternal; the draw and dispatch thunks step aside for this flag
