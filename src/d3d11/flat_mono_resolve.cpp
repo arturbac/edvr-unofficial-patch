@@ -42,10 +42,20 @@ struct State {
     ComPtr<ID3D11ComputeShader> prep, taa, finish, spatial;
     ComPtr<ID3D11Buffer> constants;
     ComPtr<ID3D11SamplerState> sampler;
+    // The HDR route's pixel-shader half (section 81), made on first use (initializeHdr): one triangle vertex shader,
+    // the finish and the spatial recovery as pixel shaders, and a rasterizer state that culls nothing. The render-target
+    // view over the game's H is cached by the texture it was made for and holds a reference to it, so the address
+    // cannot be reused by another texture while it stands; flatMonoResolveReset lets go.
+    ComPtr<ID3D11VertexShader> hdrVs;
+    ComPtr<ID3D11PixelShader> finishHdr, spatialHdr;
+    ComPtr<ID3D11RasterizerState> noCull;
+    ComPtr<ID3D11RenderTargetView> hdrRtv;
+    ID3D11Texture2D* hdrRtvTexture=nullptr;
     Image color, depth[2], motion, rejection, expected, output[2];
     uint32_t width=0, height=0, outWidth=0, outHeight=0, evalWidth=0, evalHeight=0, current=0;
     uint64_t lastFrame=0;
     FlatMonoResolveMode mode=FlatMonoResolveMode::Taa;
+    bool hdr=false;   // the resources below are the HDR route's (an HDR input copy, fp16 outputs)
     bool history=false;
     DXGI_FORMAT inputFormat=DXGI_FORMAT_UNKNOWN;
 };
@@ -60,8 +70,10 @@ uint32_t resetEventsLogged=0, cameraCutEventsLogged=0;
 constexpr uint32_t kResetEventLogCap=32;
 // rowsJitter: the NDC shift the camera rows themselves carry (current xy, previous zw), the shader removes it; all zero
 // when the rows are unjittered, which is every path that does not go through the upstream camera injector.
-struct Constants { float camera[6][4], previous[6][4]; uint32_t size[4], flags[4]; float jitter[4], rowsJitter[4]; };
-static_assert(sizeof(Constants)==256, "HLSL cbuffer layout");
+// route: x = the HDR route (the input is R11G11B10F radiance, the outputs fp16), y = with x, EDVR's TAA output is final
+// and the pixel-shader finish only copies it into H. All zero on the copy route, whose shader arithmetic is unchanged.
+struct Constants { float camera[6][4], previous[6][4]; uint32_t size[4], flags[4]; float jitter[4], rowsJitter[4]; uint32_t route[4]; };
+static_assert(sizeof(Constants)==272, "HLSL cbuffer layout");
 struct Isolate {
     ID3D11DeviceContext1* context;
     ComPtr<ID3DDeviceContextState> previous;
@@ -127,8 +139,17 @@ bool preflightMetadataValid(const FlatMonoResolvePreflight& f,const char** reaso
             "flat-preflight-dlaa-requires-native-render-size" : "flat-preflight-trained-resolve-cannot-downsample";
         return false;
     }
-    const bool colorFormat=f.colorViewFormat==DXGI_FORMAT_R8G8B8A8_UNORM ||
-        f.colorViewFormat==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    // The HDR route resolves at E = R and writes into H: a render below the output, or a route that evaluates on
+    // another grid (EDVR's TAA above D), stays on the copy route (section 81, decision (c)).
+    const uint32_t plannedEvalW=(f.evalWidth&&f.evalHeight)?f.evalWidth:route.evalWidth;
+    const uint32_t plannedEvalH=(f.evalWidth&&f.evalHeight)?f.evalHeight:route.evalHeight;
+    if(f.hdr && (plannedEvalW!=f.renderWidth || plannedEvalH!=f.renderHeight ||
+                 f.renderWidth<f.outputWidth || f.renderHeight<f.outputHeight)) {
+        if(reason)*reason="flat-preflight-hdr-requires-render-size-evaluation";
+        return false;
+    }
+    const bool colorFormat=f.hdr ? f.colorViewFormat==DXGI_FORMAT_R11G11B10_FLOAT
+        : (f.colorViewFormat==DXGI_FORMAT_R8G8B8A8_UNORM || f.colorViewFormat==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
     const bool depthFormat=f.depthViewFormat==DXGI_FORMAT_R32_FLOAT ||
         f.depthViewFormat==DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ||
         f.depthViewFormat==DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
@@ -206,39 +227,97 @@ bool resources(const FlatMonoResolveFrame& f,const char** reason) {
     // cache keyed only on mode/R/D would hand a D-sized cache to a cut E, and
     // the finish pass would fill only the E rectangle of it.
     if(g.width==f.renderWidth && g.height==f.renderHeight && g.outWidth==f.outputWidth &&
-       g.outHeight==f.outputHeight && g.mode==f.mode &&
+       g.outHeight==f.outputHeight && g.mode==f.mode && g.hdr==f.hdr &&
        g.evalWidth==evalW && g.evalHeight==evalH)return true;
     ++stats.allocations;
     g.color={};g.depth[0]={};g.depth[1]={};g.motion={};g.rejection={};g.expected={};g.output[0]={};g.output[1]={};
-    g.width=g.height=g.outWidth=g.outHeight=0;g.evalWidth=g.evalHeight=0;g.current=0;g.history=false;
+    g.width=g.height=g.outWidth=g.outHeight=0;g.evalWidth=g.evalHeight=0;g.current=0;g.history=false;g.hdr=false;
     const bool taa=f.mode==FlatMonoResolveMode::Taa;
     auto make=[&](Image& out,DXGI_FORMAT format,bool output=false,bool writable=true) {
         return image(g.device.Get(),output?evalW:f.renderWidth,output?evalH:f.renderHeight,format,out,writable);
     };
-    if(!make(g.color,DXGI_FORMAT_R8G8B8A8_UNORM,false,false) || !make(g.depth[0],DXGI_FORMAT_R32_FLOAT) ||
-       !make(g.motion,DXGI_FORMAT_R16G16_FLOAT) || !make(g.rejection,DXGI_FORMAT_R8_UNORM) ||
-       !make(g.output[0],taa?DXGI_FORMAT_R8G8B8A8_TYPELESS:DXGI_FORMAT_R8G8B8A8_UNORM,true) ||
-       !make(g.output[1],DXGI_FORMAT_R8G8B8A8_TYPELESS,true) ||
-       (taa && (!make(g.depth[1],DXGI_FORMAT_R32_FLOAT) || !make(g.expected,DXGI_FORMAT_R32_FLOAT))))
-        return fail(reason,"flat-resolve-texture-create-failed");
+    bool made;
+    if(f.hdr) {
+        // The HDR route (section 81): the input copy is H's own format, the backend's output and TAA's ping-pong
+        // history are fp16 (R11G11B10F holds no more than the game's own tone pass would see, and the history must
+        // not be requantised every frame). The finish goes into H through a pixel shader, so output[1] is only TAA's
+        // second history and is otherwise not made.
+        made=make(g.color,DXGI_FORMAT_R11G11B10_FLOAT,false,false) && make(g.depth[0],DXGI_FORMAT_R32_FLOAT) &&
+            make(g.motion,DXGI_FORMAT_R16G16_FLOAT) && make(g.rejection,DXGI_FORMAT_R8_UNORM) &&
+            make(g.output[0],DXGI_FORMAT_R16G16B16A16_FLOAT,true) &&
+            (!taa || (make(g.output[1],DXGI_FORMAT_R16G16B16A16_FLOAT,true) && make(g.depth[1],DXGI_FORMAT_R32_FLOAT) &&
+                      make(g.expected,DXGI_FORMAT_R32_FLOAT)));
+    } else {
+        made=make(g.color,DXGI_FORMAT_R8G8B8A8_UNORM,false,false) && make(g.depth[0],DXGI_FORMAT_R32_FLOAT) &&
+            make(g.motion,DXGI_FORMAT_R16G16_FLOAT) && make(g.rejection,DXGI_FORMAT_R8_UNORM) &&
+            make(g.output[0],taa?DXGI_FORMAT_R8G8B8A8_TYPELESS:DXGI_FORMAT_R8G8B8A8_UNORM,true) &&
+            make(g.output[1],DXGI_FORMAT_R8G8B8A8_TYPELESS,true) &&
+            (!taa || (make(g.depth[1],DXGI_FORMAT_R32_FLOAT) && make(g.expected,DXGI_FORMAT_R32_FLOAT)));
+    }
+    if(!made)return fail(reason,"flat-resolve-texture-create-failed");
     g.width=f.renderWidth;g.height=f.renderHeight;g.outWidth=f.outputWidth;g.outHeight=f.outputHeight;g.mode=f.mode;
-    g.evalWidth=evalW;g.evalHeight=evalH;
+    g.evalWidth=evalW;g.evalHeight=evalH;g.hdr=f.hdr;
     return true;
 }
-bool inputTexture(ID3D11ShaderResourceView* view,uint32_t width,uint32_t height,bool color,ComPtr<ID3D11Texture2D>& out) {
+// `hdr`: the colour is the game's HDR scene target H itself (FlatMonoResolveFrame::hdr): an R11G11B10_FLOAT shader
+// view over an R11G11B10_FLOAT texture the game also renders into, because the result goes back through a render-target
+// view the resolver makes over it.
+bool inputTexture(ID3D11ShaderResourceView* view,uint32_t width,uint32_t height,bool color,ComPtr<ID3D11Texture2D>& out,bool hdr=false) {
     if(!view)return false;
     D3D11_SHADER_RESOURCE_VIEW_DESC srv{};view->GetDesc(&srv);
     if(srv.ViewDimension!=D3D11_SRV_DIMENSION_TEXTURE2D || srv.Texture2D.MostDetailedMip!=0 ||
        (srv.Texture2D.MipLevels!=1 && srv.Texture2D.MipLevels!=UINT(-1)))return false;
-    if(color && srv.Format!=DXGI_FORMAT_R8G8B8A8_UNORM && srv.Format!=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)return false;
+    if(color && !hdr && srv.Format!=DXGI_FORMAT_R8G8B8A8_UNORM && srv.Format!=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)return false;
+    if(color && hdr && srv.Format!=DXGI_FORMAT_R11G11B10_FLOAT)return false;
     if(!color && srv.Format!=DXGI_FORMAT_R32_FLOAT && srv.Format!=DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS &&
        srv.Format!=DXGI_FORMAT_R24_UNORM_X8_TYPELESS && srv.Format!=DXGI_FORMAT_R16_UNORM)return false;
     ComPtr<ID3D11Resource> resource;view->GetResource(resource.GetAddressOf());
     if(FAILED(resource.As(&out)))return false;
     D3D11_TEXTURE2D_DESC desc{};out->GetDesc(&desc);
     ComPtr<ID3D11Device> device;out->GetDevice(device.GetAddressOf());
+    if(color && hdr && (desc.Format!=DXGI_FORMAT_R11G11B10_FLOAT || !(desc.BindFlags&D3D11_BIND_RENDER_TARGET)))return false;
     return device.Get()==g.device.Get() && desc.Width==width && desc.Height==height && desc.MipLevels==1 &&
         desc.ArraySize==1 && desc.SampleDesc.Count==1 && (desc.BindFlags&D3D11_BIND_SHADER_RESOURCE)!=0;
+}
+// The HDR route's pixel-shader half, created on first use so the copy route never pays for it.
+bool initializeHdr(ID3D11Device* device,const char** reason) {
+    if(g.hdrVs && g.finishHdr && g.spatialHdr && g.noCull)return true;
+    if(FAILED(device->CreateVertexShader(kFlatMonoHdrVsBytecode,sizeof(kFlatMonoHdrVsBytecode),nullptr,g.hdrVs.GetAddressOf())) ||
+       FAILED(device->CreatePixelShader(kFlatMonoFinishHdrBytecode,sizeof(kFlatMonoFinishHdrBytecode),nullptr,g.finishHdr.GetAddressOf())) ||
+       FAILED(device->CreatePixelShader(kFlatMonoSpatialHdrBytecode,sizeof(kFlatMonoSpatialHdrBytecode),nullptr,g.spatialHdr.GetAddressOf())))
+        return fail(reason,"flat-resolve-hdr-shader-create-failed");
+    D3D11_RASTERIZER_DESC rd{};rd.FillMode=D3D11_FILL_SOLID;rd.CullMode=D3D11_CULL_NONE;rd.DepthClipEnable=TRUE;
+    if(FAILED(device->CreateRasterizerState(&rd,g.noCull.GetAddressOf())))return fail(reason,"flat-resolve-hdr-rasterizer-create-failed");
+    return true;
+}
+// A render-target view over the game's H, made before anything is written and kept while H is the same texture.
+bool hdrTargetView(ID3D11Texture2D* texture,const char** reason) {
+    if(g.hdrRtv && g.hdrRtvTexture==texture)return true;
+    g.hdrRtv.Reset();g.hdrRtvTexture=nullptr;
+    D3D11_RENDER_TARGET_VIEW_DESC rv{};rv.Format=DXGI_FORMAT_R11G11B10_FLOAT;rv.ViewDimension=D3D11_RTV_DIMENSION_TEXTURE2D;
+    if(FAILED(g.device->CreateRenderTargetView(texture,&rv,g.hdrRtv.GetAddressOf())))
+        return fail(reason,"flat-resolve-hdr-target-not-renderable");
+    g.hdrRtvTexture=texture;
+    return true;
+}
+// One triangle over the render-size target: the pixel shader `ps` (finish or spatial recovery) into H. The caller has
+// already isolated the context; this starts from its own clean state, as the compute finish does after an SDK.
+void drawHdrTarget(ID3D11DeviceContext* context,ID3D11PixelShader* ps,uint32_t width,uint32_t height,
+                   ID3D11ShaderResourceView* const* views,uint32_t viewCount) {
+    context->ClearState();
+    ID3D11Buffer* cb0=g.constants.Get();context->PSSetConstantBuffers(0,1,&cb0);
+    context->PSSetShaderResources(0,viewCount,views);
+    ID3D11SamplerState* sampler=g.sampler.Get();context->PSSetSamplers(0,1,&sampler);
+    context->IASetInputLayout(nullptr);context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->VSSetShader(g.hdrVs.Get(),nullptr,0);context->PSSetShader(ps,nullptr,0);
+    context->RSSetState(g.noCull.Get());
+    const D3D11_VIEWPORT vp{0.0f,0.0f,static_cast<float>(width),static_cast<float>(height),0.0f,1.0f};
+    context->RSSetViewports(1,&vp);
+    ID3D11RenderTargetView* rtv=g.hdrRtv.Get();context->OMSetRenderTargets(1,&rtv,nullptr);
+    context->Draw(3,0);
+    // Nothing of ours stays bound: the isolation guard's destructor clears the state once more before the game's returns.
+    context->OMSetRenderTargets(0,nullptr,nullptr);
+    ID3D11ShaderResourceView* none[8]={};context->PSSetShaderResources(0,viewCount,none);
 }
 } // namespace
 
@@ -268,7 +347,14 @@ FlatMonoResolvePreflightResult flatMonoResolvePreflight(ID3D11Device* device,
     frame.renderWidth=planned.renderWidth;frame.renderHeight=planned.renderHeight;
     frame.outputWidth=planned.outputWidth;frame.outputHeight=planned.outputHeight;
     frame.mode=planned.mode;
+    frame.hdr=planned.hdr;
     frame.evalWidth=planned.evalWidth;frame.evalHeight=planned.evalHeight;
+    // The HDR route's pixel-shader half is part of what must be ready before a frame may be jittered for it.
+    if(planned.hdr && !initializeHdr(device,&why)) {
+        result.status=FlatMonoResolvePreflightStatus::FallbackUnavailable;
+        result.reason=why?why:"flat-preflight-hdr-shaders-unavailable";
+        return result;
+    }
     if(!resources(frame,&why)) {
         result.status=FlatMonoResolvePreflightStatus::FallbackUnavailable;
         result.reason=why?why:"flat-preflight-resource-allocation-failed";
@@ -280,12 +366,15 @@ FlatMonoResolvePreflightResult flatMonoResolvePreflight(ID3D11Device* device,
         (planned.evalWidth&&planned.evalHeight)?planned.evalWidth:plannedRoute.evalWidth;
     const uint32_t plannedEvalH=plannedRoute.refused?planned.outputHeight:
         (planned.evalWidth&&planned.evalHeight)?planned.evalHeight:plannedRoute.evalHeight;
-    result.spatialFallbackReady=g.spatial && g.constants && g.sampler &&
-        g.output[1].texture && g.output[1].srv && g.output[1].uav &&
+    // The copy route's fallback is the compute spatial pass into output[1]; the HDR route's is the pixel shader into H.
+    const bool fallbackResources=planned.hdr
+        ? (g.hdrVs && g.spatialHdr && g.finishHdr && g.noCull && g.color.texture && g.output[0].texture && g.output[0].srv)
+        : (g.output[1].texture && g.output[1].srv && g.output[1].uav);
+    result.spatialFallbackReady=g.spatial && g.constants && g.sampler && fallbackResources &&
         g.width==planned.renderWidth && g.height==planned.renderHeight &&
         g.outWidth==planned.outputWidth && g.outHeight==planned.outputHeight &&
         g.evalWidth==plannedEvalW && g.evalHeight==plannedEvalH &&
-        g.mode==planned.mode;
+        g.mode==planned.mode && g.hdr==planned.hdr;
     if(!result.spatialFallbackReady) {
         result.status=FlatMonoResolvePreflightStatus::FallbackUnavailable;
         result.reason="flat-preflight-spatial-output-not-ready";
@@ -352,11 +441,20 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     // drives allocation, dispatch and telemetry (gate-2 review G2-2).
     const uint32_t evalW = (!route.refused && f.evalWidth && f.evalHeight) ? f.evalWidth : route.evalWidth;
     const uint32_t evalH = (!route.refused && f.evalWidth && f.evalHeight) ? f.evalHeight : route.evalHeight;
+    // The HDR route resolves at E = R into H itself (section 81): a render below the output, or a mode that evaluates
+    // on another grid, is the copy route's.
+    const bool hdr=f.hdr;
+    if(hdr && (evalW!=f.renderWidth || evalH!=f.renderHeight || f.renderWidth<f.outputWidth || f.renderHeight<f.outputHeight))
+        return fail(reason,"flat-resolve-hdr-requires-render-size-evaluation");
     if(!initialize(device,context,reason))return false;
+    if(hdr && !initializeHdr(device,reason))return false;
     ComPtr<ID3D11Texture2D> color,depth;
-    if(!inputTexture(f.color,f.renderWidth,f.renderHeight,true,color) ||
+    if(!inputTexture(f.color,f.renderWidth,f.renderHeight,true,color,hdr) ||
        !inputTexture(f.depth,f.renderWidth,f.renderHeight,false,depth))return fail(reason,"flat-resolve-input-view-mismatch");
     if(!resources(f,reason))return false;
+    // The render-target view over H exists before anything is written: a game texture the resolver cannot render into
+    // refuses the frame while H is still the game's own.
+    if(hdr && !hdrTargetView(color.Get(),reason))return false;
     const bool taa=f.mode==FlatMonoResolveMode::Taa;
     D3D11_SHADER_RESOURCE_VIEW_DESC colorDesc{};f.color->GetDesc(&colorDesc);
     const bool requestedReset=f.reset, lostHistory=!g.history, frameGap=f.frame!=g.lastFrame+1;
@@ -379,6 +477,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     std::memcpy(constants.previous,reset?f.camera:f.previousCamera,sizeof(f.previousCamera));
     constants.size[0]=f.renderWidth;constants.size[1]=f.renderHeight;constants.size[2]=evalW;constants.size[3]=evalH;
     constants.flags[0]=reset;constants.flags[1]=engine;constants.flags[2]=taa;constants.flags[3]=f.staticScene?1u:0u;
+    constants.route[0]=hdr?1u:0u;constants.route[1]=(hdr&&taa)?1u:0u;
     constants.jitter[0]=f.jitterX;constants.jitter[1]=f.jitterY;
     constants.jitter[2]=f.previousJitterX;constants.jitter[3]=f.previousJitterY;
     // On a reset the previous rows ARE the current rows (above), so they carry the current phase.
@@ -411,14 +510,21 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         const float sy=std::sqrt(f.camera[0][1]*f.camera[0][1]+f.camera[1][1]*f.camera[1][1]+f.camera[2][1]*f.camera[2][1]);
         ok=fsr3Evaluate(context,0,g.color.texture.Get(),g.depth[0].texture.Get(),g.motion.texture.Get(),g.rejection.texture.Get(),
             g.output[0].texture.Get(),f.renderWidth,f.renderHeight,evalW,evalH,f.jitterX,f.jitterY,reset,f.deltaMs,
-            f.camera[3][2],(std::numeric_limits<float>::max)(),2*std::atan(1/sy),reason,true);
+            f.camera[3][2],(std::numeric_limits<float>::max)(),2*std::atan(1/sy),reason,true,hdr);
     } else {
         ok=dlaaEvaluate(context,0,g.color.texture.Get(),g.depth[0].texture.Get(),g.motion.texture.Get(),g.output[0].texture.Get(),
-            g.rejection.texture.Get(),f.renderWidth,f.renderHeight,evalW,evalH,f.jitterX,f.jitterY,reset,f.deltaMs,reason);
+            g.rejection.texture.Get(),f.renderWidth,f.renderHeight,evalW,evalH,f.jitterX,f.jitterY,reset,f.deltaMs,reason,hdr);
     }
     }
     if(!ok) {++stats.backendFailures;g.history=false;stats.currentContinueRun=0;return false;}
-    if(!taa) {
+    if(hdr) {
+        // The result goes back into the game's HDR target through a pixel-shader draw: per pixel the backend's output,
+        // or the raw input where the rejection mask says the history is not to be trusted; for EDVR's TAA (route y) its
+        // output, which has already made that choice. The state is our own, cleared at the top of the draw.
+        ID3D11ShaderResourceView* views[8]={g.color.srv.Get(),nullptr,nullptr,nullptr,nullptr,
+            g.rejection.srv.Get(),nullptr,g.output[taa?index:0].srv.Get()};
+        drawHdrTarget(context,g.finishHdr.Get(),f.renderWidth,f.renderHeight,views,8);
+    } else if(!taa) {
         // SDKs may alter every stage. Start our final composite from the isolated
         // empty state; the outer guard still owns the untouched game's state.
         context->ClearState();
@@ -430,7 +536,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         ID3D11UnorderedAccessView* out=g.output[1].uav.Get();context->CSSetUnorderedAccessViews(4,1,&out,nullptr);
         context->CSSetShader(g.finish.Get(),nullptr,0);context->Dispatch((evalW+7)/8,(evalH+7)/8,1);
     }
-    if(pixels.active() && (f.mode==FlatMonoResolveMode::Dlss || f.mode==FlatMonoResolveMode::Dlaa)) {
+    if(!hdr && pixels.active() && (f.mode==FlatMonoResolveMode::Dlss || f.mode==FlatMonoResolveMode::Dlaa)) {
         ID3D11Texture2D* textures[]={g.color.texture.Get(),g.depth[0].texture.Get(),g.motion.texture.Get(),
             g.rejection.texture.Get(),g.output[0].texture.Get(),g.output[1].texture.Get()};
         try { pixels.capture(device,context,f,reset,textures); } catch(...) { pixels.cancel(); }
@@ -473,6 +579,8 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         ++stats.acceptedContinues;
         if(++stats.currentContinueRun>stats.longestContinueRun)stats.longestContinueRun=stats.currentContinueRun;
     }
+    // The HDR route's result is already in H: nothing for the caller to bind, *output stays null.
+    if(hdr) {++stats.hdrResolves;return true;}
     *output=(colorDesc.Format==DXGI_FORMAT_R8G8B8A8_UNORM_SRGB?g.output[taa?index:1].srgb:g.output[taa?index:1].srv).Get();
     (*output)->AddRef();
     return true;
@@ -489,13 +597,29 @@ bool flatMonoResolveSpatialFallback(ID3D11Device* device,ID3D11DeviceContext* co
        !jitterValid(f) || (f.mode!=FlatMonoResolveMode::Taa && f.mode!=FlatMonoResolveMode::Dlaa &&
        f.mode!=FlatMonoResolveMode::Dlss && f.mode!=FlatMonoResolveMode::Fsr))
         return fail(reason,"flat-spatial-invalid-frame");
+    const bool hdr=f.hdr;
+    if(hdr && (f.renderWidth<f.outputWidth || f.renderHeight<f.outputHeight))return fail(reason,"flat-spatial-hdr-requires-render-at-least-output");
     if(!initialize(device,context,reason))return false;
+    if(hdr && !initializeHdr(device,reason))return false;
     ComPtr<ID3D11Texture2D> color;
-    if(!inputTexture(f.color,f.renderWidth,f.renderHeight,true,color))return fail(reason,"flat-spatial-input-view-mismatch");
+    if(!inputTexture(f.color,f.renderWidth,f.renderHeight,true,color,hdr))return fail(reason,"flat-spatial-input-view-mismatch");
     if(!resources(f,reason))return false;
+    if(hdr && !hdrTargetView(color.Get(),reason))return false;
     D3D11_SHADER_RESOURCE_VIEW_DESC colorDesc{};f.color->GetDesc(&colorDesc);
     Isolate isolated(g.context.Get(),g.isolated.Get());
     context->CopyResource(g.color.texture.Get(),color.Get());
+    if(hdr) {
+        // The HDR route's recovery: the jittered H resampled on the unjittered grid and written back into H by a
+        // pixel shader (the same draw the resolve ends with), no history and no SDK. *output stays null.
+        Constants hc{};
+        hc.size[0]=f.renderWidth;hc.size[1]=f.renderHeight;hc.size[2]=f.renderWidth;hc.size[3]=f.renderHeight;
+        hc.jitter[0]=f.jitterX;hc.jitter[1]=f.jitterY;hc.route[0]=1;
+        context->UpdateSubresource(g.constants.Get(),0,nullptr,&hc,0,0);
+        ID3D11ShaderResourceView* views[1]={g.color.srv.Get()};
+        drawHdrTarget(context,g.spatialHdr.Get(),f.renderWidth,f.renderHeight,views,1);
+        ++stats.hdrSpatial;
+        return true;
+    }
     // The spatial recovery runs on the route's evaluation grid, exactly as
     // the resolve it substitutes for (section 72's supersample routes).
     const auto route = flatResolveRoute(f.mode, f.renderWidth, f.renderHeight, f.outputWidth, f.outputHeight);

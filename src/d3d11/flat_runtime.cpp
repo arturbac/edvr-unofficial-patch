@@ -1,5 +1,6 @@
 #include "flat_runtime.h"
 #include "flat_runtime_model.h"
+#include "flat_hdr_route.h"
 #include "flat_mono_resolve.h"
 #include "flat_projection_recipes.h"
 #include "flat_shader_classifier.h"
@@ -62,7 +63,8 @@ struct State {
     DWORD thread = 0; Ptr<ID3D11Device> device; Ptr<ID3D11DeviceContext> context;
     Ptr<ID3D11Texture2D> output, sceneDepth; Ptr<ID3D11ShaderResourceView> depthView;
     FlatRuntimePrefix prefix{}; CameraTable cameras;
-    View views[4]{}; D3D11_VIEWPORT viewport{}; UINT viewportCount = 0;
+    // 0 Rtv0, 1 Dsv0, then pixel-shader t0..t3: the tone and copy draws read t0 and t1, the HDR route's trigger detector all four.
+    View views[6]{}; D3D11_VIEWPORT viewport{}; UINT viewportCount = 0;
     Ptr<ID3D11Resource> colors[128], depths[128], previousColor;
     Ptr<ID3D11Resource> uavs[8];
     const void* namedDepth = nullptr, *namedConstants = nullptr;
@@ -235,6 +237,22 @@ struct State {
     bool frameLive = false;      // the frame that just ended was watched (Full or Probe)
     bool enginePaused = false;   // engine motion is configured off for the stand-down
 
+    // --- The HDR route (flat_hdr_route.h, design section 81) ------------------------------------
+    // experimental.temporal_aa_before_post, read at every Present. The trigger detector runs on every watched frame
+    // whatever the key says: with it off the route only OBSERVES (the window census, a first-trigger line, late-write
+    // accounting) and the copy route treats exactly as before; with it auto the route treats at its trigger and the
+    // copy stage leaves the frame to it. Nothing here touches a D3D object.
+    FlatHdrKey hdrKey = FlatHdrKey::Off;
+    bool hdrKeyRead = false;
+    FlatHdrFrame hdr{};              // this frame's detector state, reset at the Present that starts the frame
+    FlatHdrWindow hdrWindow{};       // the 5 s window of the census token
+    FlatHdrLatch hdrLatch{};         // three treated frames with late writes turn the route off until the key flips
+    FlatMonoFrame hdrSelected{};     // the selection at this frame's trigger (kept here: the draw scope is built per draw)
+    bool hdrTreated = false;         // this frame's treatment was the route's: the copy stage must not treat it again
+    bool hdrEligible = false;        // the route applies to this session's frames (published with the refusal, for F8)
+    bool hdrFirstTriggerLogged = false, hdrLateLogged = false;
+    uint32_t hdrFlightLines = 0;     // bounded per-session log lines about the route's own decisions
+
     // --- CPU and GPU census (flat_cpu.h) ------------------------------------------
     // What EDVR's own flat work costs, by family, printed every 5 s while a temporal
     // mode is selected. The GPU spans are timestamp pairs read back without waiting:
@@ -347,7 +365,7 @@ void reportPhaseCensus(State& s,const char* event) {
 bool sameResolvePlan(const FlatMonoResolvePreflight& a,const FlatMonoResolvePreflight& b) {
     return a.renderWidth==b.renderWidth && a.renderHeight==b.renderHeight && a.outputWidth==b.outputWidth &&
         a.outputHeight==b.outputHeight && a.evalWidth==b.evalWidth && a.evalHeight==b.evalHeight &&
-        a.mode==b.mode && a.colorViewFormat==b.colorViewFormat &&
+        a.mode==b.mode && a.hdr==b.hdr && a.colorViewFormat==b.colorViewFormat &&
         a.depthViewFormat==b.depthViewFormat && a.colorViewIsTexture2D==b.colorViewIsTexture2D &&
         a.depthViewIsTexture2D==b.depthViewIsTexture2D && a.colorMostDetailedMip==b.colorMostDetailedMip &&
         a.depthMostDetailedMip==b.depthMostDetailedMip && a.colorViewMipLevels==b.colorViewMipLevels &&
@@ -1422,8 +1440,10 @@ void resolveSpanEnd(ID3D11DeviceContext* ctx) noexcept {
 std::atomic<uint32_t> g_refusalPublished{0};
 void publishRefusal(const State& s, bool warn) {
     uint32_t v = 0;
+    // Bit 2 (value 4): the HDR route is what treats this session's frames, so the F8 words drop the Bloom and Depth
+    // of field advice (flatRuntimeHdrRouteActive).
     if (warn && s.standDown.warningActive())
-        v = 1u | (s.standDown.standing ? 2u : 0u) |
+        v = 1u | (s.standDown.standing ? 2u : 0u) | (s.hdrEligible ? 4u : 0u) |
             (static_cast<uint32_t>(s.standDown.reason()) << 8);
     g_refusalPublished.store(v, std::memory_order_release);
 }
@@ -1519,6 +1539,9 @@ bool flatRuntimeStructuralRefusal(const char** reasonName, bool* standingDown) {
     if (standingDown) *standingDown = (v & 2u) != 0;
     return true;
 }
+bool flatRuntimeHdrRouteActive() {
+    return (g_refusalPublished.load(std::memory_order_acquire) & 5u) == 5u;
+}
 
 void flatRuntimeResize() {
     g_flatRuntimeLive.store(false, std::memory_order_release);
@@ -1547,6 +1570,9 @@ void flatRuntimeResize() {
     // Local refusal's observation ends with the contract: a resize or device
     // change requalifies nothing, but the state itself must not survive.
     s.observing = false; s.covFrameLocallyRefused = false;
+    // The HDR route's per-frame detector state names resources of the old device; the key, the latch and the
+    // census window are the session's and stay.
+    flatHdrBeginFrame(s.hdr, 0, 0); s.hdrTreated = false; s.hdrEligible = false;
     s.prefix = FlatRuntimePrefix{}; s.context.Reset(); s.device.Reset(); s.thread = 0; s.viewportCount = 0;
 }
 void flatRuntimeBeforePresent() {
@@ -1618,6 +1644,93 @@ void flatTraceDumpToLogDir(State& s, uint64_t frame) {
         path, emittedFrames, emittedEvents, bytes, skipped,
         shortWrite || bytes != expected ? " SHORT WRITE -- capture unusable" : "");
 }
+// --- The HDR route's runtime half (flat_hdr_route.h holds the pure logic and the log lines) -----------------
+// experimental.temporal_aa_before_post, read at every Present. A change wakes the stand-down (a user who sets it to
+// auto to escape a refusal gets the route at once), rearms the latch when it goes off, and starts history afresh: the
+// backends' feature keys carry the route, so the next frame remakes what it needs.
+static void hdrReadKey(State& s, uint64_t frame) {
+    const FlatHdrKey key = flatHdrKeyFromText(Config::get().getString("experimental.temporal_aa_before_post", "off").c_str());
+    if (s.hdrKeyRead && key == s.hdrKey) return;
+    const bool first = !s.hdrKeyRead;
+    s.hdrKey = key; s.hdrKeyRead = true;
+    if (key == FlatHdrKey::Off) { s.hdrLatch.reset(); s.hdrEligible = false; }
+    Log::get().note("flat hdr route: experimental.temporal_aa_before_post=%s%s at frame=%llu: %s",
+        flatHdrKeyName(key), first ? " (read at startup)" : " (changed)", static_cast<unsigned long long>(frame),
+        key == FlatHdrKey::Auto
+            ? "the route resolves the game's HDR scene target before its bloom, depth of field and tone where the "
+              "render size is at least the output's and the target is R11G11B10F; every other frame keeps the copy route"
+            : "the trigger detector only observes (a census line every 5 s); the copy route treats every frame as before");
+    if (!first) {
+        endStandDown(s, frame, "experimental.temporal_aa_before_post changed");
+        s.phase.resetHistory(); reset();
+    }
+}
+// The frame that just ended, as the route saw it: the census token (every watched frame, the key off included), the
+// late-write accounting with its latch, and, only with the key auto, the chain verdict of a frame that had an HDR
+// target and no consumer. Runs once per Present, before the stand-down reads s.frameSeen.
+static void hdrFrameEnd(State& s, uint64_t frame) {
+    if (!s.frameLive) return;   // a Paused frame watched nothing
+    const FlatHdrFrameVerdict verdict = flatHdrFrameVerdict(s.hdr);
+    s.hdrWindow.noteFrame(s.hdr);
+    char text[700];
+    if (verdict == FlatHdrFrameVerdict::Trigger) {
+        if (flatHdrLateWrites(s.hdr)) {
+            if (!s.hdrLateLogged) {
+                s.hdrLateLogged = true;
+                flatHdrFormatLateWrite(text, sizeof(text), frame, s.hdrKey, s.hdr);
+                Log::get().note("%s", text);
+            }
+            if (s.hdrTreated && s.hdrLatch.treatedFrame(true)) {
+                flatHdrFormatLatched(text, sizeof(text), frame, s.hdr, s.hdrLatch.frames);
+                Log::get().note("%s", text);
+                s.hdrEligible = false;
+            }
+        } else if (s.hdrTreated) {
+            s.hdrLatch.treatedFrame(false);
+        }
+    } else if (verdict == FlatHdrFrameVerdict::NoTrigger) {
+        s.hdrWindow.lastVerdict = flatMonoReasonName(FlatMonoReason::NoHdrConsumer);
+        // A frame that reached the game's output copy, had an HDR target and gave the route no consumer is refused for
+        // the shape of its chain. A frame that never reached a copy stays "no final copy" (a loading screen).
+        if (s.hdrKey == FlatHdrKey::Auto && !s.hdrLatch.tripped && s.frameSeen != FlatFrameSeen::None &&
+            s.frameSeen <= FlatFrameSeen::Structural) {
+            s.frameSeen = FlatFrameSeen::Structural; s.frameReason = FlatMonoReason::NoHdrConsumer;
+        }
+    }
+}
+// At the trigger draw, in the draw scope: the route's selection over the prefix so far, its verdict into the stand-down
+// (key auto only: with it off the route decides nothing), the window token, the once-a-session trigger line and the
+// trace's resolve marker. The treatment itself follows in FlatRuntimeDrawScope::treatHdr.
+static void hdrSelectAtTrigger(State& s) {
+    const FlatMonoFrame sel = s.hdrSelected = flatSelectHdrRoute(s.prefix, s.hdr, [](uint64_t, uint64_t) { return true; });
+    const bool autoKey = s.hdrKey == FlatHdrKey::Auto;
+    s.hdrWindow.lastVerdict = sel.selected() ? "selected" : flatMonoReasonName(sel.reason);
+    s.hdrWindow.noteSelection(s.hdrWindow.lastVerdict);   // the key off's answer: what the selector says at each trigger
+    if (!s.hdrFirstTriggerLogged) {
+        s.hdrFirstTriggerLogged = true;
+        char text[700];
+        flatHdrFormatFirstTrigger(text, sizeof(text), s.prefix.frame, s.hdrKey, s.hdr);
+        Log::get().note("%s; selection: %s", text, sel.selected() ? "the route could resolve this frame" : flatMonoReasonName(sel.reason));
+    }
+    if (autoKey && !s.hdrLatch.tripped) {
+        // Whether the route is what treats this session's frames (the F8 words follow it): a selected frame the mode's route
+        // evaluates at the render size for, not one below the output (upscaling keeps the copy route and its whitelist,
+        // decision (c)) and not EDVR's TAA above it. A transient refusal (no camera yet, say) leaves the last answer.
+        if (sel.selected())
+            s.hdrEligible = flatHdrRouteEvaluatesAtRender(s.engine, sel.renderWidth, sel.renderHeight,
+                                                          sel.outputWidth, sel.outputHeight);
+        else if (sel.reason == FlatMonoReason::HdrExtent)
+            s.hdrEligible = false;
+        const FlatFrameSeen hdrSeen = flatFrameSeenFor(sel.selected(), sel.reason);
+        if (hdrSeen >= s.frameSeen) { s.frameSeen = hdrSeen; s.frameReason = sel.reason; }
+    }
+    {
+        flatcpu::Scope trace(flatcpu::kTrace);
+        flatTraceResolve(s.traceRing, s.hdr.trigger.hdr, s.hdr.trigger.vs, s.hdr.trigger.ps, s.hdr.trigger.sequence,
+                         static_cast<uint32_t>(sel.reason));
+    }
+}
+
 void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT flags) {
     if (!runtimeFlatProfile() || !swap || (flags & DXGI_PRESENT_TEST)) return;
     auto& s = state(); if (s.thread && !owner()) return;
@@ -1685,6 +1798,10 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         engineConfiguredPaused = s.enginePaused;
         engineVelocityConfigure(enabled && !s.enginePaused);
     };
+    // The HDR route (flat_hdr_route.h): the frame that just ended is accounted, then the key is read for the frame that
+    // starts now. Before the stand-down reads the frame's verdict, which the route may have added to.
+    hdrFrameEnd(s, frame);
+    hdrReadKey(s, frame);
     const bool endedPaused = s.work == FlatWork::Paused;
     standDownFrame(s, frame);
     syncEngine();
@@ -1892,6 +2009,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     s.phaseCensusFailed=false;
     s.prefix.output = output.Get(); s.prefix.width = d.Width; s.prefix.height = d.Height; s.prefix.format = d.Format;
     s.namedDepth = s.namedConstants = nullptr; s.treated = false;
+    flatHdrBeginFrame(s.hdr, d.Width, d.Height); s.hdrTreated = false;
     s.observingQualifiedHandoff = false;
     s.drawCapture.begin(frame+1,s.phaseDepth.Get(),s.phaseWidth,s.phaseHeight);
     foreignWork.store(false, std::memory_order_release);
@@ -1947,6 +2065,16 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             static_cast<unsigned long long>(s.streak), static_cast<unsigned long long>(s.longestStreak));
         for (const auto& entry : s.refusedWindow)
             Log::get().note("flat runtime refusal 5s: reason=%s count=%llu", entry.first.c_str(), static_cast<unsigned long long>(entry.second));
+        // The HDR route's census token, every window while a temporal mode runs, zeros included: an absent line is what
+        // "the detector never ran" looks like. With the key off it is the flight's observation; with it auto, the state.
+        {
+            char hdrText[1024];
+            flatHdrFormatWindow(hdrText, sizeof(hdrText), s.hdrKey,
+                s.hdrKey == FlatHdrKey::Auto ? (s.hdrLatch.tripped ? FlatHdrState::Latched : FlatHdrState::Active)
+                                             : FlatHdrState::Observing, s.hdrWindow);
+            Log::get().note("%s", hdrText);
+            s.hdrWindow.reset();
+        }
         // Part B coverage census: always printed, even when every field is
         // zero -- that is how "code never ran" (line absent) differs from
         // "ran, nothing refused" (local-refused=0 on a line that is present).
@@ -1986,7 +2114,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             static_cast<unsigned long long>(s.resetDepthWindow), static_cast<unsigned long long>(s.resetColorWindow),
             static_cast<unsigned long long>(s.resetExtentWindow), static_cast<unsigned long long>(s.presentNotOkWindow));
         const auto renderer = flatMonoResolveStats();
-        Log::get().note("flat runtime renderer cumulative: calls=%llu init=%llu context-change=%llu allocations=%llu full-reset=%llu invalidations=%llu accepted-reset=%llu accepted-continue=%llu requested-reset=%llu lost-history=%llu frame-gap=%llu invalid-prev-camera=%llu format-change=%llu camera-cut=%llu backend-failure=%llu continue-run=%llu longest-continue-run=%llu",
+        Log::get().note("flat runtime renderer cumulative: calls=%llu init=%llu context-change=%llu allocations=%llu full-reset=%llu invalidations=%llu accepted-reset=%llu accepted-continue=%llu requested-reset=%llu lost-history=%llu frame-gap=%llu invalid-prev-camera=%llu format-change=%llu camera-cut=%llu backend-failure=%llu continue-run=%llu longest-continue-run=%llu hdr-resolves=%llu hdr-spatial=%llu",
             static_cast<unsigned long long>(renderer.calls), static_cast<unsigned long long>(renderer.initializations),
             static_cast<unsigned long long>(renderer.contextPointerMismatches), static_cast<unsigned long long>(renderer.allocations),
             static_cast<unsigned long long>(renderer.fullResets), static_cast<unsigned long long>(renderer.invalidations),
@@ -1995,7 +2123,8 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             static_cast<unsigned long long>(renderer.frameGaps), static_cast<unsigned long long>(renderer.invalidPreviousCameras),
             static_cast<unsigned long long>(renderer.formatChanges), static_cast<unsigned long long>(renderer.cameraCuts),
             static_cast<unsigned long long>(renderer.backendFailures), static_cast<unsigned long long>(renderer.currentContinueRun),
-            static_cast<unsigned long long>(renderer.longestContinueRun));
+            static_cast<unsigned long long>(renderer.longestContinueRun), static_cast<unsigned long long>(renderer.hdrResolves),
+            static_cast<unsigned long long>(renderer.hdrSpatial));
         s.refusedWindow.clear(); s.acceptedResetWindow = s.acceptedHistoryWindow = 0;
         s.resetMissingWindow = s.resetGapWindow = s.resetDepthWindow = s.resetColorWindow = s.resetExtentWindow = 0;
         s.presentNotOkWindow = 0;
@@ -2121,6 +2250,7 @@ FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
     for (const auto& u : s.uavs) if (u) {
         { flatcpu::Scope trace(flatcpu::kTrace); flatTraceMark(s.traceRing, kFlatTraceEventDispatchWritten, u.Get()); }
         flatRuntimeDispatchObserveWritten(s.prefix, u.Get());
+        flatHdrObserveDispatchWrite(s.hdr, u.Get());   // a dispatch into the HDR target after the trigger is counted
     }
     if(s.prefix.uncertain && s.projection)failPhase(s,"compute-source-invalidated");
 }
@@ -2132,6 +2262,7 @@ FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
 static void resourceWritten(State& s, ID3D11Resource* res) {
     { flatcpu::Scope trace(flatcpu::kTrace); flatTraceMark(s.traceRing, kFlatTraceEventWriteResource, res); }
     flatRuntimeWritten(s.prefix, res);
+    flatHdrObserveExplicitWrite(s.hdr, res);   // a write into the HDR target after the route's trigger is counted
     if (auto* c = camera(res, false)) s.cameras.invalidate(*c);
     if (s.projection) { flatcpu::Scope shadows(flatcpu::kShadows); s.projection->invalidate(res); }
 }
@@ -2265,9 +2396,24 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
             ? flatRuntimeObserveContract(s.prefix, d, s.traceContract)
             : flatRuntimeObserve(s.prefix, d);
     }();
+    // The HDR route's trigger detector (flat_hdr_route.h, section 81), on every watched draw whatever the key says: rules
+    // (i), (ii) and (iv) are comparisons on what this scope already holds, the four pixel-shader slots are read from the
+    // binding shadow (no D3D call) only for the few draws that pass them, and with the key off nothing below acts on the
+    // answer. The resolved slots ride into the trace, which has no other way to carry them.
+    const void* hdrSrv[4] = {};
+    bool hdrSrvKnown = false, hdrTrigger = false;
+    {
+        flatcpu::Scope hdrScope(flatcpu::kHdrRoute);
+        if (flatHdrCouldConsume(s.hdr, k)) {
+            for (uint32_t slot = 0; slot < 4; ++slot)
+                hdrSrv[slot] = view(static_cast<BindSlot>(static_cast<uint32_t>(BindSlot::PsSrv0) + slot), 2 + slot).resource;
+            hdrSrvKnown = true;
+        }
+        hdrTrigger = flatHdrObserveDraw(s.hdr, k, s.prefix.sequence, hdrSrvKnown ? hdrSrv : nullptr, hdrSrvKnown);
+    }
     {
         flatcpu::Scope trace(flatcpu::kTrace);
-        flatTraceRecord(s.traceRing, d, foreignWork.load(std::memory_order_acquire));
+        flatTraceRecord(s.traceRing, d, foreignWork.load(std::memory_order_acquire), hdrSrvKnown ? hdrSrv : nullptr);
     }
     if(cameraProbeAttempt)for(uint32_t i=0;i<s.prefix.targetsUsed;++i)if(s.prefix.targets[i].resource==k.color){
         const auto& witness=s.prefix.targets[i].firstBad;
@@ -2296,6 +2442,9 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         const FlatFrameSeen seen = flatFrameSeenFor(selected.selected(), selected.reason);
         if (seen >= s.frameSeen) { s.frameSeen = seen; s.frameReason = selected.reason; }
     }
+    // The HDR route's selection at its trigger (and, with the key auto, its verdict into the stand-down): a Probe frame
+    // runs it too, so a probe that finds the route's consumer ends the stand-down, as a probe that selects a copy does.
+    if (hdrTrigger) { flatcpu::Scope hdrScope(flatcpu::kHdrRoute); hdrSelectAtTrigger(s); }
     // A Probe frame is the contract observation above and nothing else: the prefix model
     // and the selector, on the same inputs an active frame gives them. No coverage, no
     // projection readiness, no source naming or substitution, no resolve. A copy draw the
@@ -2418,7 +2567,25 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     }
     // Tripwire, structurally unreachable: a legacy application under Upstream.
     if(projection && projection->active() && flatCameraInjectUpstreamOwns())++s.rows.legacyAppliedUnderUpstream;
+    // The HDR route treats at its trigger (key auto, the selection selected): the game's pass that reads H next sees the
+    // anti-aliased image with its own bindings untouched, and the copy stage below leaves the frame to the route.
+    if (hdrTrigger && s.hdrKey == FlatHdrKey::Auto && s.hdrSelected.selected()) treatHdr(s.hdrSelected, s.hdr.trigger.srvSlot);
     if (!copy) return;
+    if (s.hdrTreated) {
+        // The frame was treated before the post chain, so nothing here resolves again (the contract observation above
+        // still ran for the trace). fix.render_sharpness stays at the copy, on the game's own LDR image, and only where
+        // the copy route's selector recognised that copy: then t0 is known to be the tone output and RCAS may take it.
+        if (selected.selected()) {
+            FlatComputeInternalScope guard;
+            ctx->PSGetShaderResources(0, 1, &original);
+            Ptr<ID3D11Resource> actualColor; if (original) original->GetResource(&actualColor);
+            if (actualColor.Get() == selected.color) {
+                ID3D11ShaderResourceView* sharpened = flatSharpenView(ctx, original);
+                if (sharpened && sharpened != original) { ctx->PSSetShaderResources(0, 1, &sharpened); replaced = true; }
+            }
+        }
+        return;
+    }
     // Local refusal's observation: no resolve until a qualified, completely
     // covered frame requalifies the contract; the contract observation above
     // (flatRuntimeObserve) is what requalifies, so it keeps running, and the
@@ -2692,6 +2859,171 @@ bool FlatRuntimeDrawScope::recover(const char* temporalReason) {
     if(s.spatialFallbackFailures<=8)Log::get().note("flat runtime early fallback refused: frame=%llu temporal=%s spatial=%s; next frame returns to zero phase",
         (unsigned long long)s.prefix.frame,temporalReason,reason?reason:"unknown");
     return false;
+}
+// The HDR route's treatment (flat_hdr_route.h, design section 81). The same checks as the copy route's, for the same
+// reasons, then the resolve of H itself: `hdr` frames write the result back into H, so nothing is bound for the caller
+// and the game's pass that reads H next sees the anti-aliased image with its own bindings untouched. A check that fails
+// before anything is written DECLINES: the frame is the copy route's, exactly as if the key were off. A resolve the
+// backend refuses is recovered by the spatial pixel shader into H (the jitter resampled away), as the copy route recovers
+// its own, and counts as the refusal it is; if even that fails H is still the game's and the frame is declined.
+void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvSlot) {
+    auto& s = state();
+    const auto decline = [&](const char* why) {
+        s.hdrWindow.lastVerdict = why; ++s.hdrWindow.declined;
+        if (s.hdrFlightLines < 12) {
+            ++s.hdrFlightLines;
+            Log::get().note("flat hdr route: declined at frame=%llu seq=%u: %s (the copy route serves this frame)",
+                (unsigned long long)s.prefix.frame, s.hdr.trigger.sequence, why);
+        }
+    };
+    if (s.hdrLatch.tripped) { decline("latched-off"); return; }
+    if (s.observing) { decline("returned-to-observation"); return; }
+    if (s.treated) { decline("already-treated-this-frame"); return; }
+    if (selected.depth != s.namedDepth || selected.sceneConstants != s.namedConstants) {
+        decline("producer-source-identity-mismatch"); return;
+    }
+    if (!flatHdrRouteEvaluatesAtRender(s.engine, selected.renderWidth, selected.renderHeight,
+                                       selected.outputWidth, selected.outputHeight)) {
+        decline("route-does-not-evaluate-at-render-size"); return;
+    }
+    FlatComputeInternalScope guard;
+    flatcpu::Scope resolveScope(flatcpu::kResolve);   // the treatment: the handoff checks, the resolver
+    // Verify the actual binding once: the shadow only nominated this draw.
+    Ptr<ID3D11ShaderResourceView> hdrView; ctx->PSGetShaderResources(srvSlot, 1, &hdrView);
+    Ptr<ID3D11Resource> hdrResource; if (hdrView) hdrView->GetResource(&hdrResource);
+    if (!hdrView || hdrResource.Get() != selected.hdr ||
+        !depthView(static_cast<ID3D11Texture2D*>(const_cast<void*>(selected.depth)))) {
+        decline("actual-hdr-binding-or-depth-view-refused"); return;
+    }
+    if (nonzeroPhase(s) && !s.phase.applied) failPhase(s, "no-raster-application");
+    s.reason = "hdr-route";
+    // The spatial recovery, into H: the jitter resampled away, no history, no SDK. True when H now holds it.
+    const auto recoverHdr = [&](const char* temporalReason, const FlatMonoResolveFrame& frame) {
+        failPhase(s, temporalReason);
+        FlatMonoResolveFrame sf{}; sf.color = frame.color; sf.hdr = true; sf.mode = frame.mode;
+        sf.renderWidth = frame.renderWidth; sf.renderHeight = frame.renderHeight;
+        sf.outputWidth = frame.outputWidth; sf.outputHeight = frame.outputHeight;
+        sf.jitterX = s.phase.currentX; sf.jitterY = s.phase.currentY;
+        Ptr<ID3D11ShaderResourceView> none; const char* why = nullptr;
+        if (flatMonoResolveSpatialFallback(s.device.Get(), ctx, sf, &none, &why)) {
+            ++s.spatialFallbacks; s.treated = s.hdrTreated = true;
+            s.hdrWindow.lastVerdict = "spatial-fallback";
+            if (s.spatialFallbacks <= 8)
+                Log::get().note("flat runtime early fallback: frame=%llu temporal=%s output=spatial (HDR route, into the scene target) phase=(%.5g,%.5g) history=invalid",
+                    (unsigned long long)s.prefix.frame, temporalReason, sf.jitterX, sf.jitterY);
+            return true;
+        }
+        ++s.spatialFallbackFailures;
+        if (s.spatialFallbackFailures <= 8)
+            Log::get().note("flat runtime early fallback refused: frame=%llu temporal=%s spatial=%s (HDR route); the copy route serves the frame",
+                (unsigned long long)s.prefix.frame, temporalReason, why ? why : "unknown");
+        return false;
+    };
+    FlatMonoResolveFrame f{}; f.color = hdrView.Get(); f.depth = s.depthView.Get(); f.hdr = true;
+    f.renderWidth = selected.renderWidth; f.renderHeight = selected.renderHeight;
+    f.outputWidth = selected.outputWidth; f.outputHeight = selected.outputHeight;
+    f.frame = s.prefix.frame; f.mode = s.engine;
+    nativeScale.store(true, std::memory_order_release);   // the route's gate is R >= D
+    f.configuredDlssPreset = s.preset;
+    f.staticScene = flatFrameThroughMenuCopy(s.prefix, selected.hdr);
+    if (f.staticScene) ++s.staticSceneFrames;
+    // The plan, frozen from the qualified trigger for the next frame's preflight, as the copy route freezes its own.
+    Ptr<ID3D11Texture2D> colorTexture;
+    if (s.projection && SUCCEEDED(hdrResource.As(&colorTexture))) {
+        D3D11_TEXTURE2D_DESC colorDesc{}, depthDesc{}; D3D11_SHADER_RESOURCE_VIEW_DESC colorViewDesc{}, depthViewDesc{};
+        colorTexture->GetDesc(&colorDesc); s.sceneDepth->GetDesc(&depthDesc);
+        hdrView->GetDesc(&colorViewDesc); s.depthView->GetDesc(&depthViewDesc);
+        FlatMonoResolvePreflight plan{};
+        plan.renderWidth = f.renderWidth; plan.renderHeight = f.renderHeight;
+        plan.outputWidth = f.outputWidth; plan.outputHeight = f.outputHeight;
+        plan.mode = f.mode; plan.hdr = true;
+        plan.colorViewFormat = colorViewDesc.Format; plan.depthViewFormat = depthViewDesc.Format;
+        plan.colorViewIsTexture2D = colorViewDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D;
+        plan.depthViewIsTexture2D = depthViewDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D;
+        if (plan.colorViewIsTexture2D) {
+            plan.colorMostDetailedMip = colorViewDesc.Texture2D.MostDetailedMip; plan.colorViewMipLevels = colorViewDesc.Texture2D.MipLevels;
+        }
+        if (plan.depthViewIsTexture2D) {
+            plan.depthMostDetailedMip = depthViewDesc.Texture2D.MostDetailedMip; plan.depthViewMipLevels = depthViewDesc.Texture2D.MipLevels;
+        }
+        plan.colorResourceMipLevels = colorDesc.MipLevels; plan.colorArraySize = colorDesc.ArraySize; plan.colorSampleCount = colorDesc.SampleDesc.Count;
+        plan.depthResourceMipLevels = depthDesc.MipLevels; plan.depthArraySize = depthDesc.ArraySize; plan.depthSampleCount = depthDesc.SampleDesc.Count;
+        if (!s.haveResolvePlan || !sameResolvePlan(plan, s.plannedResolve)) {
+            s.resolvePreflight = {}; s.resolvePreflightRetryMs = 0;
+            const auto route = flatResolveRoute(plan.mode, plan.renderWidth, plan.renderHeight, plan.outputWidth, plan.outputHeight);
+            Log::get().note("flat route: %s R=%ux%u E=%ux%u D=%ux%u (HDR route: H is resolved before the game's post chain)", route.name,
+                plan.renderWidth, plan.renderHeight, route.evalWidth, route.evalHeight, plan.outputWidth, plan.outputHeight);
+            // No standing negotiation applies to a route that evaluates at the render size (R >= D).
+            s.negotiatedEvalW = s.negotiatedEvalH = 0; s.negotiatedRenderW = s.negotiatedRenderH = 0;
+            s.negotiatedOutputW = s.negotiatedOutputH = 0;
+        }
+        s.plannedResolve = plan; s.haveResolvePlan = true;
+    }
+    std::memcpy(f.camera, selected.camera, sizeof(f.camera));
+    const bool resetMissing = !s.havePrevious;
+    const bool resetGap = s.havePrevious && s.previous.frame + 1 != selected.frame;
+    const bool resetDepth = s.havePrevious && s.previous.depth != selected.depth;
+    const bool resetColor = s.havePrevious && s.previous.color != selected.color;
+    const bool resetExtent = s.havePrevious &&
+        (s.previous.outputWidth != selected.outputWidth || s.previous.outputHeight != selected.outputHeight ||
+         s.previous.renderWidth != selected.renderWidth || s.previous.renderHeight != selected.renderHeight);
+    f.reset = resetMissing || resetGap || resetDepth || resetColor || resetExtent ||
+        (s.jitterWanted && (s.phase.failed || !s.phase.previousAcceptedValid));
+    f.jitterX = s.phase.currentX; f.jitterY = s.phase.currentY;
+    f.previousJitterX = f.reset ? f.jitterX : s.phase.previousX;
+    f.previousJitterY = f.reset ? f.jitterY : s.phase.previousY;
+    std::memcpy(f.previousCamera, f.reset ? selected.camera : s.previous.camera, sizeof(f.previousCamera));
+    const FlatCameraRoute cameraRoute = flatCameraInjectRoute();
+    const FlatCameraRowsPhase rowsNow = flatCameraRowsPhase(cameraRoute, s.phase.applied, s.phase.currentX, s.phase.currentY);
+    f.rowsJitterX = rowsNow.x; f.rowsJitterY = rowsNow.y;
+    f.previousRowsJitterX = f.reset ? rowsNow.x : s.previousRowsX;
+    f.previousRowsJitterY = f.reset ? rowsNow.y : s.previousRowsY;
+    const auto now = GetTickCount64(); f.deltaMs = s.lastMs ? static_cast<float>(now - s.lastMs) : 16.667f;
+    if (s.phase.needsSpatialFallback()) {
+        s.reason = "incomplete-jitter-frame";
+        if (recoverHdr(s.reason, f)) { refuse(s); } else decline("incomplete-jitter-frame");
+        return;
+    }
+    if (!engineVelocitySourceViews(static_cast<ID3D11Texture2D*>(const_cast<void*>(selected.depth)), &f.engine)) {
+        s.reason = "engine-source-not-ready";
+        if (s.phase.applied && recoverHdr(s.reason, f)) refuse(s); else decline("engine-source-not-ready");
+        return;
+    }
+    Ptr<ID3D11ShaderResourceView> engineSlots, enginePool, outputView; Ptr<ID3D11Buffer> nowCb, prevCb;
+    engineSlots.Attach(f.engine.slots); enginePool.Attach(f.engine.pool); nowCb.Attach(f.engine.sceneNow); prevCb.Attach(f.engine.scenePrev);
+    if (cameraRoute != FlatCameraRoute::Off) {
+        ++s.rows.frames;
+        if (rowsNow.x != 0.0f || rowsNow.y != 0.0f) ++s.rows.unjittered; else ++s.rows.zeroPhase;
+        if (!f.reset) {
+            const FlatCameraPairResult pair = flatCameraCheckRowPair(f.camera, f.rowsJitterX, f.rowsJitterY,
+                f.previousCamera, f.previousRowsJitterX, f.previousRowsJitterY, f.renderWidth, f.renderHeight);
+            s.rows.pairs.note(pair);
+            if (pair.verdict == FlatCameraPairVerdict::Inconsistent && s.rowsMismatchLogged < 8) {
+                ++s.rowsMismatchLogged;
+                char text[320];
+                flatCameraFormatRowsMismatch(text, sizeof(text), s.prefix.frame, f.rowsJitterX, f.rowsJitterY,
+                    f.previousRowsJitterX, f.previousRowsJitterY, pair.maxError);
+                Log::get().note("%s", text);
+            }
+        }
+    }
+    if (!flatMonoResolve(s.device.Get(), ctx, f, &outputView, &s.reason)) {
+        const char* temporalReason = s.reason;
+        // The backend (or the route's own guard) refused before H was written. Recover the jitter into H, or decline.
+        if (recoverHdr(temporalReason, f)) { refuse(s); s.reason = "spatial-fallback"; }
+        else { reset(); decline(temporalReason ? temporalReason : "resolve-refused"); }
+        return;
+    }
+    s.reason = nonzeroPhase(s) ? "treated-jittered-hdr" : "treated-zero-jitter-hdr";
+    s.previous = selected; s.previousColor = hdrResource; s.havePrevious = s.treated = s.hdrTreated = s.temporalAccepted = true;
+    s.lastMs = now; ++s.accepted; ++s.hdrWindow.treated; s.hdrWindow.lastVerdict = s.reason;
+    s.previousRowsX = f.rowsJitterX; s.previousRowsY = f.rowsJitterY;
+    s.drawCapture.qualify(s.prefix.frame, selected.depth, selected.hdr, selected.renderWidth, selected.renderHeight);
+    s.resetMissingWindow += resetMissing; s.resetGapWindow += resetGap; s.resetDepthWindow += resetDepth;
+    s.resetColorWindow += resetColor; s.resetExtentWindow += resetExtent;
+    if (f.reset) { ++s.acceptedResetWindow; s.streak = 1; }
+    else { ++s.acceptedHistoryWindow; ++s.streak; }
+    if (s.streak > s.longestStreak) s.longestStreak = s.streak;
 }
 FlatRuntimeDrawScope::~FlatRuntimeDrawScope() {
     if (!ctx) return; FlatComputeInternalScope guard;

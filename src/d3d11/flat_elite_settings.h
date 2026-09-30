@@ -349,9 +349,13 @@ inline void flatWrapWarning(const std::string& paragraph, int widthPx, FlatMeasu
 
 // The warning, as wrapped note lines. Called only while the runtime is refusing frames for
 // the shape of the post chain. `modeLabel` is the selected mode as the panel names it (DLSS,
-// DLAA, TAA, FSR3).
+// DLAA, TAA, FSR3). `hdrRouteActive` (section 81): the HDR route is what treats this session's frames, so
+// bloom and depth of field are not what the refusal is about (the route resolves before both) and their
+// advice is dropped; the Anti-aliasing advice stays (the game's own AA after the tone still double-filters
+// and a game TAA's jitter fights EDVR's).
 inline void flatComposeSettingsWarning(const char* modeLabel, const EliteGraphics& g, int widthPx,
-                                       FlatMeasureFn measure, void* context, FlatSettingsWarning* out) {
+                                       FlatMeasureFn measure, void* context, FlatSettingsWarning* out,
+                                       bool hdrRouteActive = false) {
     *out = FlatSettingsWarning{};
     char first[160];
     std::snprintf(first, sizeof(first), "%s is not active: Elite's post-processing is not recognised.",
@@ -359,9 +363,12 @@ inline void flatComposeSettingsWarning(const char* modeLabel, const EliteGraphic
     flatWrapWarning(first, widthPx, measure, context, out);
     std::string second;
     if (g.presetKnown && !g.custom) {
-        second = std::string("Elite's ") + g.preset + " graphics preset may turn on Anti-aliasing, Bloom or "
-                 "Depth of field. Turn them off in Elite's graphics options.";
-    } else if (g.custom && g.anyOn()) {
+        second = hdrRouteActive
+            ? std::string("Elite's ") + g.preset + " graphics preset may turn on Anti-aliasing. Turn it off in "
+              "Elite's graphics options."
+            : std::string("Elite's ") + g.preset + " graphics preset may turn on Anti-aliasing, Bloom or "
+              "Depth of field. Turn them off in Elite's graphics options.";
+    } else if (g.custom && (hdrRouteActive ? g.aaOn() : g.anyOn())) {
         std::string list;
         auto add = [&](bool on, const char* name) {
             if (!on) return;
@@ -369,8 +376,10 @@ inline void flatComposeSettingsWarning(const char* modeLabel, const EliteGraphic
             list += name;
         };
         add(g.aaOn(), "Anti-aliasing");
-        add(g.bloomOn(), "Bloom");
-        add(g.dofOn(), "Depth of field");
+        if (!hdrRouteActive) {
+            add(g.bloomOn(), "Bloom");
+            add(g.dofOn(), "Depth of field");
+        }
         second = "Turn off in Elite's graphics options: " + list;
     } else {
         second = "Please send your logs (F10 in the cockpit, then the installer's log bundle).";
@@ -380,11 +389,11 @@ inline void flatComposeSettingsWarning(const char* modeLabel, const EliteGraphic
 
 // A short key for the composed warning: it changes when the words would, so the panel
 // rebuilds (and the log speaks) exactly then.
-inline std::string flatSettingsWarningKey(const char* modeLabel, const EliteGraphics& g) {
+inline std::string flatSettingsWarningKey(const char* modeLabel, const EliteGraphics& g, bool hdrRouteActive = false) {
     char key[200];
-    std::snprintf(key, sizeof(key), "%s|%d|%d|%s|%d|%d|%d", modeLabel ? modeLabel : "",
+    std::snprintf(key, sizeof(key), "%s|%d|%d|%s|%d|%d|%d|%d", modeLabel ? modeLabel : "",
                   g.presetKnown ? 1 : 0, g.custom ? 1 : 0, g.presetKnown ? g.preset : "",
-                  g.aaOn() ? 1 : 0, g.bloomOn() ? 1 : 0, g.dofOn() ? 1 : 0);
+                  g.aaOn() ? 1 : 0, g.bloomOn() ? 1 : 0, g.dofOn() ? 1 : 0, hdrRouteActive ? 1 : 0);
     return key;
 }
 

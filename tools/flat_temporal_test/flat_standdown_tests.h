@@ -56,19 +56,24 @@ inline int flatStandDownTests() {
             FlatMonoReason::BrokenLineage, FlatMonoReason::WrongOrder, FlatMonoReason::MissingCamera,
             FlatMonoReason::InvalidCamera, FlatMonoReason::NoHdr, FlatMonoReason::ConflictingHdr,
             FlatMonoReason::NoHdrCamera, FlatMonoReason::NoSupportedSource, FlatMonoReason::AmbiguousSource,
-            FlatMonoReason::InvalidSource};
+            FlatMonoReason::InvalidSource, FlatMonoReason::NoHdrConsumer, FlatMonoReason::HdrExtent};
         bool table = true;
         unsigned structural = 0;
         for (FlatMonoReason r : all) {
             const bool want = r == FlatMonoReason::NoTonePass || r == FlatMonoReason::AmbiguousTonePass ||
                 r == FlatMonoReason::InvalidTonePass || r == FlatMonoReason::NoOutputCopy ||
                 r == FlatMonoReason::AmbiguousOutputCopy || r == FlatMonoReason::InvalidOutputCopy ||
-                r == FlatMonoReason::BrokenLineage || r == FlatMonoReason::WrongOrder;
+                r == FlatMonoReason::BrokenLineage || r == FlatMonoReason::WrongOrder ||
+                r == FlatMonoReason::NoHdrConsumer;
             if (flatMonoReasonStructural(r) != want) table = false;
             structural += flatMonoReasonStructural(r) ? 1u : 0u;
         }
-        expect(table && structural == 8 && sizeof(all) / sizeof(all[0]) == 21,
-               "the structural reasons are exactly the eight chain-shape ones, of all 21");
+        expect(table && structural == 9 && sizeof(all) / sizeof(all[0]) == 23,
+               "the structural reasons are exactly the nine chain-shape ones (the eight and no-hdr-consumer), of all 23");
+        expect(!flatMonoReasonStructural(FlatMonoReason::HdrExtent) &&
+               flatFrameSeenFor(false, FlatMonoReason::HdrExtent) == FlatFrameSeen::Transient &&
+               flatFrameSeenFor(false, FlatMonoReason::NoHdrConsumer) == FlatFrameSeen::Structural,
+               "the HDR route's extent refusal is transient (the copy route serves upscaling), its missing consumer is structural");
         expect(flatFrameSeenFor(true, FlatMonoReason::Selected) == FlatFrameSeen::Treatable &&
                flatFrameSeenFor(false, FlatMonoReason::NoTonePass) == FlatFrameSeen::Structural &&
                flatFrameSeenFor(false, FlatMonoReason::Truncated) == FlatFrameSeen::Transient &&
@@ -275,21 +280,21 @@ inline int flatStandDownTests() {
             FlatMonoReason::BrokenLineage, FlatMonoReason::WrongOrder, FlatMonoReason::MissingCamera,
             FlatMonoReason::InvalidCamera, FlatMonoReason::NoHdr, FlatMonoReason::ConflictingHdr,
             FlatMonoReason::NoHdrCamera, FlatMonoReason::NoSupportedSource, FlatMonoReason::AmbiguousSource,
-            FlatMonoReason::InvalidSource};
+            FlatMonoReason::InvalidSource, FlatMonoReason::NoHdrConsumer, FlatMonoReason::HdrExtent};
         bool table = true;
         unsigned warns = 0;
         for (FlatMonoReason r : all) {
             const bool want = r == FlatMonoReason::AmbiguousOutputCopy || r == FlatMonoReason::InvalidOutputCopy ||
                 r == FlatMonoReason::NoTonePass || r == FlatMonoReason::AmbiguousTonePass ||
                 r == FlatMonoReason::InvalidTonePass || r == FlatMonoReason::BrokenLineage ||
-                r == FlatMonoReason::WrongOrder;
+                r == FlatMonoReason::WrongOrder || r == FlatMonoReason::NoHdrConsumer;
             if (flatMonoReasonWarrantsWarning(r) != want) table = false;
             warns += flatMonoReasonWarrantsWarning(r) ? 1u : 0u;
         }
-        expect(table && warns == 7 && !flatMonoReasonWarrantsWarning(FlatMonoReason::NoOutputCopy) &&
+        expect(table && warns == 8 && !flatMonoReasonWarrantsWarning(FlatMonoReason::NoOutputCopy) &&
                flatMonoReasonStructural(FlatMonoReason::NoOutputCopy),
-               "seven reasons warn: every chain-shape refusal that found an output copy; no-known-output-copy is "
-               "structural (the work stands down for it) and never warns");
+               "eight reasons warn: every chain-shape refusal that found an output copy, and the HDR route's "
+               "no-hdr-consumer; no-known-output-copy is structural (the work stands down for it) and never warns");
 
         // A stand-down for no final copy at all never warns: not before it, not at it, not through its probes.
         for (int variant = 0; variant < 2; ++variant) {
@@ -342,7 +347,8 @@ inline int flatStandDownTests() {
                 ++stoodDown;
                 agrees = agrees && sim.machine.warningActive() == flatMonoReasonWarrantsWarning(r);
             }
-            expect(agrees && stoodDown == 8, "all eight structural reasons stand the work down; the warning follows the seven");
+            expect(agrees && stoodDown == 9,
+                   "all nine structural reasons stand the work down (the HDR route's no-hdr-consumer among them); the warning follows the eight");
         }
 
         // A run that never stands down shows nothing, whatever its length under five seconds: the

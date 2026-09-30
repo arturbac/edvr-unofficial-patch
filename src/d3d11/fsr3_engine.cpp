@@ -13,6 +13,7 @@
 #include "perf_monitor.h"   // the context's creation is an event with a duration
 #include "gpu_timing.h"
 #include "gpu_adapter_name.h"  // adapterName -- shared with dlaa.cpp
+#include "hdr_backend_flags.h"  // the HDR route's creation flags, pure (section 81)
 
 // Bare `/D EDVR_HAVE_FSR3` (no value, matching how a future build.bat block
 // might be typed beside NGX's `/DEDVR_HAVE_NGX=1`, build.bat:300) would make
@@ -30,6 +31,16 @@
 // alone (it pulls in ffx_interface.h/ffx_types.h/ffx_error.h itself), not
 // the combined ffxFsr3Context wrapper.
 #include <FidelityFX/host/ffx_fsr3upscaler.h>
+
+// hdr_backend_flags.h mirrors the SDK's creation flags so a rig can pin the flag set without the SDK; every
+// constant is checked against the real enum here, so a drift in either fails this compile and not a flight.
+namespace edvr {
+static_assert(kFsrFlagHighDynamicRange == static_cast<uint32_t>(FFX_FSR3UPSCALER_ENABLE_HIGH_DYNAMIC_RANGE), "HDR bit");
+static_assert(kFsrFlagDepthInverted == static_cast<uint32_t>(FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED), "inverted depth bit");
+static_assert(kFsrFlagDepthInfinite == static_cast<uint32_t>(FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE), "infinite depth bit");
+static_assert(kFsrFlagAutoExposure == static_cast<uint32_t>(FFX_FSR3UPSCALER_ENABLE_AUTO_EXPOSURE), "auto exposure bit");
+static_assert(kFsrFlagDebugChecking == static_cast<uint32_t>(FFX_FSR3UPSCALER_ENABLE_DEBUG_CHECKING), "debug checking bit");
+}  // namespace edvr
 
 // backends\dx11\ffx_dx11.h is deliberately NOT included. Its declaration of
 // ffxGetResourceDX11_Fsr31 is extern "C" with a `const ID3D11Resource*`
@@ -158,6 +169,10 @@ struct EyeCtx {
     // work is to flip exactly this key mid-session.
     bool diagnostics = false;
     bool infiniteDepth = false;
+    // The flat HDR route's input is HDR with automatic exposure (section 81, hdr_backend_flags.h). The flags are
+    // baked in at creation, so the bit is part of the key: a route flip remakes the context.
+    bool hdr = false;
+    uint32_t createFlags = 0;   // desc.flags as the context was made (fsr3TestContextFlags reads it, rigs only)
     // The create-failure latch (the same review, F5). A create that fails --
     // or, worse, one that throws out of AMD's port halfway -- used to be
     // retried on EVERY treated frame: ~90 half-creates a second, each one
@@ -171,6 +186,7 @@ struct EyeCtx {
     uint32_t failW = 0, failH = 0, failOutW = 0, failOutH = 0;
     bool     failDiagnostics = false;
     bool     failInfiniteDepth = false;
+    bool     failHdr = false;
     char     failWhy[256] = {};
 };
 // One per eye, keyed on (w, h, outW, outH) exactly as dlaa.cpp's
@@ -369,12 +385,13 @@ void releaseEyeSurfaces(EyeCtx& e) {
 // in the log even when the seam's own once-per-session refusal line has
 // already been spent on something else.
 void latchCreateFailure(EyeCtx& e, unsigned eye, uint32_t w, uint32_t h, uint32_t outW,
-                        uint32_t outH, bool diagnostics, bool infiniteDepth, const char* reason) {
+                        uint32_t outH, bool diagnostics, bool infiniteDepth, bool hdr, const char* reason) {
     e = EyeCtx{};
     e.failed = true;
     e.failW = w; e.failH = h; e.failOutW = outW; e.failOutH = outH;
     e.failDiagnostics = diagnostics;
     e.failInfiniteDepth = infiniteDepth;
+    e.failHdr = hdr;
     snprintf(e.failWhy, sizeof(e.failWhy), "%s", reason ? reason : "no reason given");
     Log::get().note("fsr3: eye %u is stood down at %ux%u -> %ux%u for the rest of this session (a "
                     "different size, or a switch away and back, tries again): %s",
@@ -421,7 +438,7 @@ bool g_fovFallbackNoted = false;
 // what the warm-up makes on the loading screen is exactly what the first
 // evaluation would have made (mirrors dlaa.cpp's ensureFeature).
 bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t outH,
-                   const char** why, double* createMs, bool infiniteDepth) {
+                   const char** why, double* createMs, bool infiniteDepth, bool hdr = false) {
     if (createMs) *createMs = 0.0;
     if (eye > 1) {
         if (why) *why = "eye must be 0 or 1";
@@ -440,13 +457,13 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
 
     EyeCtx& e = g_ctx[eye];
     if (e.valid && e.w == w && e.h == h && e.outW == outW && e.outH == outH &&
-        e.diagnostics == diagnostics && e.infiniteDepth == infiniteDepth) {
+        e.diagnostics == diagnostics && e.infiniteDepth == infiniteDepth && e.hdr == hdr) {
         return true;
     }
     // This key already failed: refuse with the stored reason, silently and
     // without touching AMD's port again (F5). Another key re-arms it.
     if (e.failed && e.failW == w && e.failH == h && e.failOutW == outW && e.failOutH == outH &&
-        e.failDiagnostics == diagnostics && e.failInfiniteDepth == infiniteDepth) {
+        e.failDiagnostics == diagnostics && e.failInfiniteDepth == infiniteDepth && e.failHdr == hdr) {
         if (why) *why = e.failWhy;
         return false;
     }
@@ -464,6 +481,7 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
             (e.w != w || e.h != h || e.outW != outW || e.outH != outH)
                 ? "the sizes moved"
                 : e.infiniteDepth != infiniteDepth ? "the depth projection changed"
+                : e.hdr != hdr ? "the flat HDR route flipped (its input is HDR with automatic exposure)"
                 : "advanced.temporal_aa_diagnostics was flipped",
             e.w, e.h, e.outW, e.outH, e.diagnostics ? "on" : "off", w, h, outW, outH,
             diagnostics ? "on" : "off");
@@ -475,9 +493,9 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
     e = EyeCtx{};
 
     FfxFsr3UpscalerContextDescription desc{};
-    desc.flags = FFX_FSR3UPSCALER_ENABLE_DEPTH_INVERTED;
-    if (infiniteDepth) desc.flags |= FFX_FSR3UPSCALER_ENABLE_DEPTH_INFINITE;
-    if (diagnostics) desc.flags |= FFX_FSR3UPSCALER_ENABLE_DEBUG_CHECKING;
+    // hdr_backend_flags.h: reversed-Z always, infinite depth and AMD's debug checking as before, and on the flat HDR
+    // route the HDR bit and automatic exposure (the exposure resource stays null and preExposure 1 at dispatch).
+    desc.flags = flatFsrCreateFlags(infiniteDepth, diagnostics, hdr);
     desc.maxRenderSize = FfxDimensions2D{w, h};
     desc.maxUpscaleSize = FfxDimensions2D{outW, outH};
     desc.fpMessage = &FsrMessage;
@@ -524,7 +542,7 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
         // fsr3Available). Bounded because the failure is latched below and
         // never retried at this key; released only by fsr3Shutdown, which
         // drops the whole backend and its scratch.
-        latchCreateFailure(e, eye, w, h, outW, outH, diagnostics, infiniteDepth, g_reason);
+        latchCreateFailure(e, eye, w, h, outW, outH, diagnostics, infiniteDepth, hdr, g_reason);
         if (why) *why = e.failWhy;
         return false;
     }
@@ -536,7 +554,7 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
         // A clean FfxErrorCode: the port unwound its own create, so there is
         // nothing here to destroy. Latched all the same -- a create costs
         // tens of milliseconds and this one runs on every treated frame.
-        latchCreateFailure(e, eye, w, h, outW, outH, diagnostics, infiniteDepth, g_reason);
+        latchCreateFailure(e, eye, w, h, outW, outH, diagnostics, infiniteDepth, hdr, g_reason);
         if (why) *why = e.failWhy;
         return false;
     }
@@ -558,7 +576,7 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
                  sr != FFX_OK ? "the port would not describe them" : "this device would not "
                                                                      "create one of them");
         g_reason = g_reasonBuf;
-        latchCreateFailure(e, eye, w, h, outW, outH, diagnostics, infiniteDepth, g_reason);
+        latchCreateFailure(e, eye, w, h, outW, outH, diagnostics, infiniteDepth, hdr, g_reason);
         if (why) *why = e.failWhy;
         return false;
     }
@@ -583,7 +601,7 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
                      "port needs to register it",
                      s.name, eye, missing);
             g_reason = g_reasonBuf;
-            latchCreateFailure(e, eye, w, h, outW, outH, diagnostics, infiniteDepth, g_reason);
+            latchCreateFailure(e, eye, w, h, outW, outH, diagnostics, infiniteDepth, hdr, g_reason);
             if (why) *why = e.failWhy;
             return false;
         }
@@ -593,6 +611,8 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
     e.w = w; e.h = h; e.outW = outW; e.outH = outH;
     e.diagnostics = diagnostics;
     e.infiniteDepth = infiniteDepth;
+    e.hdr = hdr;
+    e.createFlags = desc.flags;
 
     // The figure is the three surfaces' own bytes (textureBytes), computed,
     // never a measured delta: see bytesPerPixel's comment for the flights
@@ -606,7 +626,10 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
         "fsr3: the context is created for eye %u at %ux%u -> %ux%u%s; its three working "
         "surfaces take %.1f MB%s (the port's own history targets are not counted); the "
         "history starts here (made in %.0f ms).",
-        eye, w, h, outW, outH, diagnostics ? ", AMD's own debug checking on" : "",
+        eye, w, h, outW, outH,
+        hdr ? (diagnostics ? ", HDR input with automatic exposure (the flat HDR route), AMD's own debug checking on"
+                           : ", HDR input with automatic exposure (the flat HDR route)")
+            : (diagnostics ? ", AMD's own debug checking on" : ""),
         static_cast<double>(surfaceBytes) / (1024.0 * 1024.0),
         uncounted ? " plus surfaces of a format this build does not size" : "", ms);
     return true;
@@ -753,11 +776,11 @@ bool fsr3Evaluate(ID3D11DeviceContext* ctx, unsigned eye, ID3D11Texture2D* colou
                   ID3D11Texture2D* depth, ID3D11Texture2D* mv, ID3D11Texture2D* reactive,
                   ID3D11Texture2D* out, uint32_t w, uint32_t h, uint32_t outW,
                   uint32_t outH, float jx, float jy, bool reset, float frameMs,
-                  float nearZ, float farZ, float fovY, const char** why, bool infiniteDepth) {
+                  float nearZ, float farZ, float fovY, const char** why, bool infiniteDepth, bool hdr) {
 #if !EDVR_HAVE_FSR3
     (void)ctx; (void)eye; (void)colour; (void)depth; (void)mv; (void)reactive; (void)out;
     (void)w; (void)h; (void)outW; (void)outH; (void)jx; (void)jy; (void)reset; (void)frameMs;
-    (void)nearZ; (void)farZ; (void)fovY; (void)infiniteDepth;
+    (void)nearZ; (void)farZ; (void)fovY; (void)infiniteDepth; (void)hdr;
     if (why) *why = "this build was made without AMD's upscaler (EDVR_HAVE_FSR3)";
     return false;
 #else
@@ -800,7 +823,7 @@ bool fsr3Evaluate(ID3D11DeviceContext* ctx, unsigned eye, ID3D11Texture2D* colou
     }
     // The context: found made (by the warm-up or a previous frame) or made
     // here, through the one block the warm-up shares (ensureContext).
-    if (!ensureContext(eye, w, h, outW, outH, why, nullptr, infiniteDepth)) return false;
+    if (!ensureContext(eye, w, h, outW, outH, why, nullptr, infiniteDepth, hdr)) return false;
     EyeCtx& e = g_ctx[eye];
 
     // FSR's cameraNear/cameraFar, under DEPTH_INVERTED: the port's own
@@ -1035,6 +1058,11 @@ uint32_t fsr3TestMessageCount() { return g_msgCount; }
 // extern "C" function never throws, and the catch is not required to run).
 // The shipped path never calls this; the flag is false unless a rig sets it.
 void fsr3TestSkipBindCheck(bool on) { g_testSkipBindCheck = on; }
+
+// Test-only, NOT part of fsr3_engine.h's contract: the flags (FfxFsr3UpscalerContextDescription::flags) this eye's
+// context was created with, 0 when it has none. tools\fsr3_engine_test reads it to prove the flat HDR route's bits
+// (hdr_backend_flags.h) reach the port, and that flipping the route remakes the context with the other set.
+uint32_t fsr3TestContextFlags(unsigned eye) { return eye < 2 && g_ctx[eye].valid ? g_ctx[eye].createFlags : 0u; }
 #endif
 
 }  // namespace edvr

@@ -7,6 +7,7 @@
 #include "flat_substitution.h"
 #include <optional>
 namespace edvr {
+struct FlatMonoFrame;   // flat_mono_frame.h: the selector's result, passed by reference to the HDR route's treatment
 extern std::atomic<bool> g_flatRuntimeLive;
 inline bool flatRuntimeActive() { return g_flatRuntimeLive.load(std::memory_order_relaxed) && !g_flatComputeInternal; }
 // Last qualified flat scene extent, published for the menu on any thread.
@@ -19,6 +20,10 @@ bool flatRuntimeNativeScale();
 // warning). Any thread; false with a treated, transiently refused or merely slow-to-start
 // session, and with the mode off. The caller checks that a temporal mode is selected.
 bool flatRuntimeStructuralRefusal(const char** reasonName, bool* standingDown);
+// Whether the HDR route (experimental.temporal_aa_before_post = auto, flat_hdr_route.h) is what treats frames now:
+// published with the refusal state, so it is meaningful only while flatRuntimeStructuralRefusal is true. The F8
+// warning drops the Bloom and Depth of field advice while it holds.
+bool flatRuntimeHdrRouteActive();
 // The upstream camera injector's read points into the phase machine: the
 // current phase in render pixels and the validated resolve plan's render
 // extent (w/h); applied is the machine's own applied count this frame.
@@ -64,5 +69,9 @@ struct FlatRuntimeDrawScope {
                          int32_t base=0, uint32_t startInstance=0);
     ~FlatRuntimeDrawScope();
     bool recover(const char* reason);
+    // The HDR route's treatment at its trigger draw (flat_hdr_route.h, design section 81): the resolve of the game's HDR
+    // scene target H, written back into H, before the game's pass that reads it. `srvSlot` is the pixel-shader slot that
+    // binds H for this draw. Declines quietly (the copy route then serves the frame) and never leaves H half-written.
+    void treatHdr(const FlatMonoFrame& selected, uint32_t srvSlot);
 };
 } // namespace edvr

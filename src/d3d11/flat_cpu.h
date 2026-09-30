@@ -105,6 +105,7 @@ enum Family : unsigned {
     kBackend,       // the backend evaluation inside the resolve (NGX, FSR3, or the TAA dispatch)
     kDiscovery,     // the passive discovery observers (flatTemporal*)
     kTrackers,      // the O(1) state trackers: constant-buffer binds, viewport, ClearState, UAV binds
+    kHdrRoute,      // the HDR route's trigger detector (flat_hdr_route.h) on every draw, observe-only with the key off
     kInject,        // the camera inject callback (refreshPre / refreshPost): game threads
     kFamilies
 };
@@ -128,6 +129,7 @@ inline constexpr FamilyInfo kInfo[kFamilies] = {
     {"backend", false},
     {"discovery", false},
     {"state trackers", false},
+    {"hdr route", false},
     {"camera inject", true},
 };
 constexpr unsigned kCal = kFamilies;   // the calibration cell, never reported

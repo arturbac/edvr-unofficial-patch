@@ -111,6 +111,8 @@ inline bool runtimeProfileAllowsKey(const char* key) {
         std::strcmp(key, "hotkey.dump_draws") == 0 ||
         std::strcmp(key, "fix.render_sharpness") == 0 ||
         std::strcmp(key, "experimental.temporal_aa_jitter") == 0 ||
-        std::strcmp(key, "experimental.temporal_aa_partial") == 0);
+        std::strcmp(key, "experimental.temporal_aa_partial") == 0 ||
+        // The HDR route's flight key (flat_hdr_route.h, design doc section 81); developer tier, no flat panel row.
+        std::strcmp(key, "experimental.temporal_aa_before_post") == 0);
 }
 } // namespace edvr

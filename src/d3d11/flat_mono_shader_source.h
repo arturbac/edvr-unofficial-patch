@@ -9,6 +9,8 @@ cbuffer Mono : register(b0) {
     uint4 flags; // reset, complete engine views, TAA, static scene (w: only ever nonzero in the 3D main menu)
     float4 jitter; // current xy, previous zw; actual raster phase in render pixels
     float4 rowsJitter; // NDC shift the camera rows themselves carry: current xy, previous zw; all zero = unjittered rows
+    uint4 route; // x: the HDR route (section 81): Color is R11G11B10F scene radiance and OutColor is fp16; y: with x, the
+                 // TAA output is final and the pixel-shader finish only copies it into H. All zero on the copy route.
 };
 cbuffer EngineNow : register(b1) { float4 EN[277]; };   // EN[276].x: the frame stamp
 cbuffer EngineBefore : register(b2) { float4 EB[276]; };
@@ -122,6 +124,11 @@ void prep(uint3 id:SV_DispatchThreadID) {
     OutMotion[q]=motion; OutRejection[q]=reject;
     if(flags.z!=0)OutExpected[q]=expected;
 }
+// The HDR route accumulates in a bounded space, c / (1 + max3(c)), and inverts it on output: a sun disc or a hot
+// particle in a linear 3x3 clamp would set the box and the blend alone and ring around every highlight. The history
+// stays linear fp16, so a route flip needs no conversion and the tone pass sees linear radiance again.
+float3 hdrCompress(float3 c) { c=max(c,0); return c/(1+max(c.r,max(c.g,c.b))); }
+float3 hdrExpand(float3 c) { float m=max(c.r,max(c.g,c.b)); return min(c/max(1-m,1.0/65504.0),65504); }
 [numthreads(8,8,1)]
 void taa(uint3 id:SV_DispatchThreadID) {
     if(any(id.xy>=size.zw))return;
@@ -137,13 +144,18 @@ void taa(uint3 id:SV_DispatchThreadID) {
         if(abs(was-predicted)<=max(1e-6,predicted*.01))weight=.9;
     }
     if(weight==0) {OutColor[id.xy]=current;return;}
-    float3 lo=current.rgb,hi=current.rgb;
+    bool hdr=route.x!=0;
+    float3 cur=hdr?hdrCompress(current.rgb):current.rgb;
+    float3 lo=cur,hi=cur;
     [unroll]for(int y=-1;y<=1;++y)[unroll]for(int x=-1;x<=1;++x) {
         float3 value=Color.Load(int3(clamp(q+int2(x,y),0,int2(size.xy)-1),0)).rgb;
+        if(hdr)value=hdrCompress(value);
         lo=min(lo,value);hi=max(hi,value);
     }
     float3 history=History.SampleLevel(LinearClamp,previous,0).rgb;
-    OutColor[id.xy]=float4(lerp(current.rgb,clamp(history,lo,hi),weight),current.a);
+    if(hdr)history=hdrCompress(history);
+    float3 mixed=lerp(cur,clamp(history,lo,hi),weight);
+    OutColor[id.xy]=float4(hdr?hdrExpand(mixed):mixed,current.a);
 }
 // Modern DLSS presets ignore NGX's bias-current-colour mask. Explicitly rejected
 // pixels must display current colour even when the backend declines that hint.
@@ -165,6 +177,34 @@ void spatial(uint3 id:SV_DispatchThreadID) {
     if(any(id.xy>=size.zw))return;
     float2 uv=(float2(id.xy)+.5)/float2(size.zw);
     OutColor[id.xy]=Color.SampleLevel(LinearClamp,uv+jitter.xy/float2(size.xy),0);
+}
+// The HDR route's pixel-shader half (section 81). The result goes back into H, a render target that need not have an
+// unordered-access view, so the compute finish cannot carry it: one triangle over the render-size target, the
+// finish or the spatial recovery as a pixel shader. R11G11B10_FLOAT holds no NaN, no negative, at most 65024 in red
+// and green (6-bit mantissas) and 64512 in blue (5 bits); the game's own tone pass sees a value the format can
+// represent, which is what requantisation to its precision means here.
+float hdrSafe(float v,float top) { return isnan(v)?0:clamp(v,0,top); }
+float3 hdrRepresentable(float3 c) { return float3(hdrSafe(c.x,65024),hdrSafe(c.y,65024),hdrSafe(c.z,64512)); }
+float4 hdrVs(uint id:SV_VertexID):SV_Position {
+    float2 p=float2((id<<1)&2,id&2);
+    return float4(p*float2(2,-2)+float2(-1,1),0,1);
+}
+float4 finishHdr(float4 pos:SV_Position):SV_Target {
+    int2 p=int2(pos.xy);
+    // EDVR's TAA output is final (its own rejection ran inside it): a plain copy.
+    if(route.y!=0)return float4(hdrRepresentable(History.Load(int3(p,0)).rgb),1);
+    float2 uv=pos.xy/float2(size.zw);
+    float2 rasterUv=uv+jitter.xy/float2(size.xy);
+    int2 q=int2(floor(rasterUv*float2(size.xy)-.5));
+    float reject=0;
+    [unroll]for(int y=0;y<2;++y)[unroll]for(int x=0;x<2;++x)
+        reject=max(reject,Rejection.Load(int3(clamp(q+int2(x,y),0,int2(size.xy)-1),0)));
+    float3 c=reject>0?Color.SampleLevel(LinearClamp,rasterUv,0).rgb:History.Load(int3(p,0)).rgb;
+    return float4(hdrRepresentable(c),1);
+}
+float4 spatialHdr(float4 pos:SV_Position):SV_Target {
+    float2 uv=pos.xy/float2(size.zw);
+    return float4(hdrRepresentable(Color.SampleLevel(LinearClamp,uv+jitter.xy/float2(size.xy),0).rgb),1);
 }
 )HLSL";
 } // namespace edvr
