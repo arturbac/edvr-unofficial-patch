@@ -14,6 +14,7 @@
 #include "../common/runtime_profile.h"
 #include "flat_camera_ownership.h"
 #include "flat_camera_stubs.h"
+#include "flat_camera_vr.h"
 #include "flat_cpu.h"
 #include "flat_runtime.h"
 
@@ -115,6 +116,8 @@ constexpr uint32_t kCamBoundX = 0x28C;
 constexpr uint32_t kCamBoundY = 0x290;
 constexpr uint32_t kCamFlags = 0x250;
 constexpr uint32_t kFlagProj = 4, kFlagVP = 8;
+// The four fields the VR world route's role test reads (vr_camera_census_core.h's table: aspect, near, far, vertical fov).
+constexpr uint32_t kCamNear = 0x254, kCamFar = 0x258, kCamAspect = 0x260, kCamFov = 0x280;
 
 // Per-thread forward state. While the body runs with its return address
 // redirected to stubB, everything the post-half needs travels here --
@@ -129,6 +132,11 @@ struct RefreshTls {
     uint32_t haveFlags = 0;
     uint32_t armed = 0;
     uint32_t observe = 0; // armed for the census: the post half reports, restores nothing (it wrote nothing)
+    // The VR world route's calls (flatCameraVrFrame): the post half is refreshPostVr's. Appended after the fields the flat
+    // path reads; a flat call never sets any of them.
+    uint32_t vr = 0;        // this call was classified by the VR path
+    uint32_t vrReport = 0;  // the census asked for its post half: it hears the derived projection BEFORE the restore
+    uint32_t vrRestore = 0; // the phase landed: the post half restores the bound pair and the flag word
 };
 __declspec(thread) RefreshTls g_refreshTls;
 static_assert(offsetof(RefreshTls, realRet) == 0, "stubB reads realRet at the struct base");
@@ -205,6 +213,14 @@ struct InjectState {
 InjectState g_inject;
 // The census's observer (flatCameraInjectSetObserver). The struct it points to lives for the process.
 std::atomic<const FlatCameraObserver*> g_observer{nullptr};
+// THE VR WORLD ROUTE'S PER-FRAME MODE (flat_camera_vr.h: kFlatCameraVrBit*). Written on the thread that runs Present by
+// flatCameraVrFrame and flatCameraInjectObserveFrame, read on every call. Zero for the flat profile's whole life and for a VR
+// process the route never drives: the detour then runs the flat/observe-only code below it, unchanged.
+std::atomic<uint32_t> g_vrBits{0};
+// The route's frame state, the planner, the counters, the excluded signatures. Owner thread, except what FlatCameraVrTally and
+// FlatCameraVrExcludedTable say is lock-free.
+FlatCameraVrCore g_vr;
+FlatCameraVrFailureWindow g_vrFailures;   // the frame step's stand-down accounting (the Present thread only)
 std::atomic<uintptr_t> g_gate{0};
 std::atomic<uintptr_t> g_refreshForward{0};
 // The incoming r11 of the most recent refresh call, captured by stubA's
@@ -345,15 +361,17 @@ void observeRayCb(uintptr_t ctx) {
 // re-derives it from the pristine bound pair the restore left behind. One
 // SEH-guarded write of the flag word the injection itself writes; the body
 // clears the bits as it consumes them, so nothing is restored afterwards.
-// Counted either way, and a failed write counts toward the stand-down.
-void flushCamera(uintptr_t camera) noexcept {
+// Counted either way, and a failed write counts toward the stand-down. True when the write landed (the flat caller ignores it;
+// the VR world route's path counts a failure in its own frame counters).
+bool flushCamera(uintptr_t camera) noexcept {
     uint32_t flags = 0;
     if (sehReadU32(camera + kCamFlags, &flags) && sehWriteU32(camera + kCamFlags, flags | kFlagProj | kFlagVP)) {
         g_inject.flushed.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return true;
     }
     g_inject.flushFailed.fetch_add(1, std::memory_order_relaxed);
     g_inject.writeFailures.fetch_add(1, std::memory_order_relaxed);
+    return false;
 }
 
 // The census's two reports (observe-only mode). Neither writes a camera: observeCall's ONLY store is the body's
@@ -395,6 +413,154 @@ void observeOffThread(uintptr_t r0, uintptr_t camera) noexcept {
     observer->offThread(camera, rva, kind, readable, GetCurrentThreadId());
 }
 
+// ---- THE VR WORLD ROUTE'S CALL (flat_camera_inject.h, "THE VR WORLD ROUTE'S INJECTION MODE") -------------------------------
+// refreshPre hands a call here when the route's frame step has set the mode word (g_vrBits != 0). flat_camera_vr.h decides
+// (kind, role, admission, the flush, the counters); what is here is the memory: the reads the decision needs, the census's
+// report, the flush, the phase and the return redirect -- in that order, with nothing on the path that does I/O, allocates or
+// asks the flat runtime anything (the 2026-09-28 crash lesson: no call-path I/O, ever). A pass-through or observe-only call
+// reaches no write but the one-time flush of a camera this session injected (the injected set is filled only by an injection).
+
+// The four fields the role test needs, one SEH-guarded read each. The whole frustum stays NaN ("not read") when any of them
+// faults: an unreadable camera has no role and is excluded, never guessed.
+FlatCameraVrFrustum readFrustum(uintptr_t camera) noexcept {
+    FlatCameraVrFrustum out;
+    float aspect = 0, fov = 0, nearZ = 0, farZ = 0;
+    if (sehReadF32(camera + kCamAspect, &aspect) && sehReadF32(camera + kCamFov, &fov) &&
+        sehReadF32(camera + kCamNear, &nearZ) && sehReadF32(camera + kCamFar, &farZ)) {
+        out.aspect = aspect; out.fov = fov; out.nearZ = nearZ; out.farZ = farZ;
+    }
+    return out;
+}
+
+// The writes of one VR call. `inject`: write the frame's phase (the same writes the flat injector makes: the bound pair, then
+// the flag word with bits 4 and 8, rolled back if any fails). The return is redirected to stubB when the phase landed or the
+// census asked for its post half; that store is the LAST step, so a failure undoes the mutation and the body returns to its
+// caller. True when the phase landed. A call with nothing to write ends at the first line: no write is reachable below it.
+bool vrCommit(uintptr_t r0, uintptr_t ctx, uintptr_t camera, uint64_t callNo, bool inject, bool wantPost) noexcept {
+    if (!inject && !wantPost) return false;
+    float entryX = 0, entryY = 0;
+    uint32_t flags = 0;
+    bool haveFlags = false;
+    if (inject) {
+        if (!sehReadF32(camera + kCamBoundX, &entryX) || !sehReadF32(camera + kCamBoundY, &entryY)) {
+            g_vr.tally().noteWriteFailure();
+            inject = false;
+        } else {
+            float jitX = 0, jitY = 0;
+            g_vr.bound(entryX, entryY, &jitX, &jitY);
+            haveFlags = sehReadU32(camera + kCamFlags, &flags);
+            const bool wroteX = sehWriteF32(camera + kCamBoundX, jitX);
+            const bool wroteY = wroteX && sehWriteF32(camera + kCamBoundY, jitY);
+            const bool wroteAll = wroteY && (!haveFlags || sehWriteU32(camera + kCamFlags, flags | kFlagProj | kFlagVP));
+            if (!wroteAll) { // roll back whatever landed; the body runs pristine
+                if (wroteX) sehWriteF32(camera + kCamBoundX, entryX);
+                if (wroteY) sehWriteF32(camera + kCamBoundY, entryY);
+                g_vr.tally().noteWriteFailure();
+                inject = false;
+            }
+        }
+    }
+    if (!inject && !wantPost) return false;
+    uint64_t realRet = 0;
+    if (!sehReadU64(r0, &realRet) || !sehWriteU64(r0, static_cast<uint64_t>(g_stubB))) {
+        if (inject) {
+            sehWriteF32(camera + kCamBoundX, entryX);
+            sehWriteF32(camera + kCamBoundY, entryY);
+            if (haveFlags) sehWriteU32(camera + kCamFlags, flags);
+        }
+        g_vr.tally().noteWriteFailure();
+        return false;
+    }
+    g_refreshTls.realRet = realRet;
+    g_refreshTls.ctx = ctx;
+    g_refreshTls.camera = camera;
+    g_refreshTls.callNo = callNo;
+    g_refreshTls.entryX = entryX;
+    g_refreshTls.entryY = entryY;
+    g_refreshTls.flags = flags;
+    g_refreshTls.haveFlags = haveFlags ? 1u : 0u;
+    g_refreshTls.armed = 1u;
+    g_refreshTls.vr = 1u;
+    g_refreshTls.vrReport = wantPost ? 1u : 0u;
+    g_refreshTls.vrRestore = inject ? 1u : 0u;
+    // Committed: this camera now carries a phase the game will keep after the bound pair is restored, so it is a flush
+    // candidate from here on.
+    if (inject) g_inject.injected.noteInjected(camera);
+    return inject;
+}
+
+void refreshPreVr(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera, uint64_t callNo,
+                  FlatCameraGateVerdict gate, uint32_t bits) noexcept {
+    const bool report = flatCameraVrObserves(bits);
+    if (gate == FlatCameraGateVerdict::OffThread) {
+        g_vr.tally().noteOffThread();
+        if (report) observeOffThread(r0, camera); // reads, counts, never writes; lock-free
+        return;
+    }
+    // What the call is: the kind, the call site, and the frame window as the route's own step left it.
+    uint32_t kind = 0;
+    const bool readable = camera && sehReadU32(camera + kCamKind, &kind);
+    uint64_t callerRva = 0;
+    {
+        uint64_t ret = 0;
+        if (g_inject.gameBase && sehReadU64(r0, &ret) && ret > g_inject.gameBase) callerRva = ret - g_inject.gameBase;
+    }
+    FlatCameraVrCallIn in;
+    in.camera = camera;
+    in.readable = readable;
+    in.kind = kind;
+    in.gate = flatCameraVrEffectiveGate(gate, g_vr.stepAtMs(), GetTickCount64());
+    in.mode = flatCameraVrModeOfBits(bits);
+    in.callerRva = callerRva;
+    // The role needs the camera's aspect and near plane: read only for a kind-3 call the frame could inject.
+    FlatCameraVrFrustum frustum;
+    if (g_vr.wantsFrustum(in)) frustum = readFrustum(camera);
+    const FlatCameraVrPlan plan = g_vr.plan(in, frustum, g_inject.injected);
+    // The census hears the call BEFORE any write (what it reads of the camera is the game's own state), told whether the call
+    // will be injected and in what role; it may ask for the post half, which reads what the body derived.
+    bool wantPost = false;
+    if (report && camera) {
+        const FlatCameraObserver* observer = g_observer.load(std::memory_order_acquire);
+        if (observer && observer->pre) {
+            FlatCameraObserveCall call;
+            call.camera = camera;
+            call.ctx = ctx;
+            call.p2 = p2;
+            call.callerRva = callerRva;
+            call.callNo = callNo;
+            call.kind = kind;
+            call.kindReadable = readable;
+            call.window = in.gate == FlatCameraGateVerdict::Admit ? 0 : in.gate == FlatCameraGateVerdict::Expired ? 2 : 1;
+            call.willInject = plan.inject;
+            call.role = plan.roleKnown ? static_cast<uint8_t>(plan.role) : 255;
+            wantPost = observer->pre(call) && observer->post != nullptr;
+        }
+    }
+    // A camera this session injected, now not: its derived blocks still hold the last phase. One write, once per such edge.
+    if (plan.flush) {
+        if (flushCamera(camera)) g_vr.tally().noteFlushed(); else g_vr.tally().noteWriteFailure();
+    }
+    const bool landed = vrCommit(r0, ctx, camera, callNo, plan.inject, wantPost);
+    g_vr.finish(plan, in, landed);   // the call's ONE outcome
+}
+
+// The post half of a VR call: the census first, while the camera still carries the injected phase in its derived blocks, then the
+// restore (restore-after-call: the entry values are the authoritative originals; the sources return pristine).
+void refreshPostVr(uintptr_t camera) noexcept {
+    if (g_refreshTls.vrReport) {
+        g_refreshTls.vrReport = 0;
+        const FlatCameraObserver* observer = g_observer.load(std::memory_order_acquire);
+        if (observer && observer->post) observer->post(camera, g_refreshTls.ctx);
+    }
+    if (g_refreshTls.vrRestore) {
+        g_refreshTls.vrRestore = 0;
+        const bool restoredX = sehWriteF32(camera + kCamBoundX, g_refreshTls.entryX);
+        const bool restoredY = sehWriteF32(camera + kCamBoundY, g_refreshTls.entryY);
+        const bool restoredFlags = !g_refreshTls.haveFlags || sehWriteU32(camera + kCamFlags, g_refreshTls.flags);
+        if (!(restoredX && restoredY && restoredFlags)) g_vr.tally().noteWriteFailure();
+    }
+}
+
 // The pre-forward half, called by stubA with R0 (the game's return-
 // address slot) and the live argument registers. Everything the old
 // detour did before forward() -- admission, the phase, the dirty bits --
@@ -405,6 +571,7 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     flatcpu::Scope timed(flatcpu::kInject);   // the census (flat_cpu.h): this callback's own time, the game's body excluded
     g_refreshTls.armed = 0; // a previous body that unwound never disarmed
     g_refreshTls.observe = 0;
+    g_refreshTls.vr = 0;
     const uint64_t callNo = g_inject.refreshCalls.fetch_add(1, std::memory_order_relaxed) + 1;
     // The triage fields ride out on the 5s tick (the lastcall line); no I/O here.
     g_inject.lastCallNo.store(callNo, std::memory_order_relaxed);
@@ -416,6 +583,14 @@ void refreshPre(uintptr_t r0, uintptr_t ctx, uintptr_t p2, uintptr_t camera) noe
     // set of injected cameras belong to the thread that runs Present; a call
     // on any other thread touches none of them (counted, passed through).
     const FlatCameraGateVerdict gate = g_inject.gate.check(GetCurrentThreadId(), GetTickCount64());
+    // THE VR WORLD ROUTE (flatCameraVrFrame): once it has stepped a frame, its per-frame mode classifies the call and everything
+    // below is skipped. The word is zero for the flat profile's whole life and for a VR process the route never drives, and
+    // those keep the code below exactly as it was.
+    const uint32_t vrBits = g_vrBits.load(std::memory_order_acquire);
+    if (vrBits != 0) {
+        refreshPreVr(r0, ctx, p2, camera, callNo, gate, vrBits);
+        return;
+    }
     // The VR camera census's switch: a process that observes only never leaves it (flatCameraInjectObserveFrame).
     const bool observe = g_inject.observeOnly.load(std::memory_order_acquire);
     if (gate == FlatCameraGateVerdict::OffThread) {
@@ -548,6 +723,11 @@ void refreshPost() noexcept {
     if (!g_refreshTls.armed) return; // defensive: stubB only fires after a redirect
     g_refreshTls.armed = 0;
     const uintptr_t camera = g_refreshTls.camera;
+    if (g_refreshTls.vr) { // the VR world route's call: its own post half (the census, then the restore)
+        g_refreshTls.vr = 0;
+        refreshPostVr(camera);
+        return;
+    }
     if (g_refreshTls.observe) {
         // The census's call: nothing was written to the camera, so there is nothing to restore and nothing applied.
         g_refreshTls.observe = 0;
@@ -572,10 +752,11 @@ void standDown(const char* why) {
     }
 }
 
-// The hook install, once (the flat path and the VR camera census share it; observe says which is asking, and only
-// the success note reads it). A failed install is final for the session except a missing module or relay page,
-// which the next frame retries -- exactly as it was inline. Render thread.
-void installRefreshHook(bool observe) {
+// The hook install, once (the flat path, the VR camera census and the VR world route share it; observe and vrAsked say
+// which is asking, and only the success note reads them: vrAsked names what the route's frame asked for). A failed install
+// is final for the session except a missing module or relay page, which the next frame retries -- exactly as it was inline.
+// Render thread.
+void installRefreshHook(bool observe, const char* vrAsked = nullptr) {
     const HMODULE game = GetModuleHandleW(L"EliteDangerous64.exe");
     if (!game) {
         if (!g_inject.failReason[0] || std::strcmp(g_inject.failReason, "not attempted") == 0) {
@@ -628,7 +809,12 @@ void installRefreshHook(bool observe) {
     }
     g_inject.installed.store(true, std::memory_order_release);
     g_gate.store(g_inject.paused.load(std::memory_order_acquire) ? 0 : 1, std::memory_order_release);
-    if (observe) {
+    if (vrAsked) {
+        Log::get().note("flat camera inject: refresh hook installed at EliteDangerous64.exe+0x%llX for the VR world route "
+                        "(asked for by %s): kind-3 screen-view cameras get the world's sub-pixel phase applied transiently at "
+                        "the source while the route injects; kinds 4 and 5 (the eyes) are never injected",
+                        static_cast<unsigned long long>(kRefreshRva), vrAsked);
+    } else if (observe) {
         Log::get().note("flat camera inject: refresh hook installed at EliteDangerous64.exe+0x%llX in OBSERVE-ONLY mode "
                         "(the VR camera census): no camera is ever written",
                         static_cast<unsigned long long>(kRefreshRva));
@@ -838,6 +1024,10 @@ bool flatCameraInjectObserveFrame() {
     // Before any install: the first call the new hook ever sees already observes, and the detour in a VR process can
     // never leave the mode. The flat profile never reaches this function (its frame step is flatCameraInjectFrame).
     g_inject.observeOnly.store(true, std::memory_order_release);
+    // A detour the VR world route drives (flatCameraVrFrame ran first this frame): its injection frame keeps its mode -- the
+    // census never switches an injection frame to observe-only -- and any other frame of it is the census's. The word is zero
+    // for a detour the route never stepped, and the store above is then the whole story (flat_camera_vr.h).
+    g_vrBits.store(flatCameraVrBitsAfterCensusFrame(g_vrBits.load(std::memory_order_acquire)), std::memory_order_release);
     if (!g_inject.installed.load(std::memory_order_acquire)) {
         if (g_inject.relay) return false; // a failed install is final for the session
         installRefreshHook(true);
@@ -856,11 +1046,54 @@ const char* flatCameraInjectObserveStatus() {
 }
 
 // ---- the VR world route's injection mode (flat_camera_inject.h, stage 2) --------------------------------------------
-// SKELETON (2026-09-30): the interface compiles and does nothing yet; the detour below does not know the mode.
-bool flatCameraVrFrame(const FlatCameraVrFrame&) { return false; }
-void flatCameraVrCloseWindow() {}
-FlatCameraVrCounters flatCameraVrCounters() { return FlatCameraVrCounters{}; }
-size_t flatCameraVrExcluded(FlatCameraVrExcluded*, size_t) { return 0; }
+// The route's frame step, on the thread that runs Present (vrWorldRouteFrameBoundary, which runs ahead of the census's
+// boundary). flat_camera_vr.h holds every decision; refreshPreVr, vrCommit and refreshPostVr above are the detour's half.
+bool flatCameraVrFrame(const FlatCameraVrFrame& frame) {
+    const uint64_t now = GetTickCount64();
+    // The frame that ended: its failed writes feed the flat path's stand-down rule (kFlatCameraWriteFailureLimit in one 5 s
+    // window). Named here, on the frame step -- never on the call path.
+    if (g_vrFailures.note(now, g_vr.tally().snapshot().writeFailures)) {
+        char why[112];
+        std::snprintf(why, sizeof(why), "%llu or more camera writes failed in one 5s window (the VR world route)",
+                      static_cast<unsigned long long>(kFlatCameraWriteFailureLimit));
+        standDown(why);
+    }
+    // This step is the detour's Present edge: the frame window closes and this thread is the owner; then the frame's phase, the
+    // role anchor, the reset counters and the open injection window, and only then the mode word the detour reads.
+    g_inject.gate.disarm(GetCurrentThreadId());
+    g_vr.beginFrame(frame, now);
+    // The census drives the same detour while its observer is registered (flatCameraInjectSetObserver), and that counts as
+    // observing whatever the frame says: a route that did not say so must not close the relay gate on a census that is running.
+    const bool observe = frame.observe || g_observer.load(std::memory_order_acquire) != nullptr;
+    const bool wanted = frame.inject || observe;
+    // Published BEFORE any install, so the first call a new hook ever sees already runs under this frame's mode.
+    g_vrBits.store(flatCameraVrBitsForFrame(frame.inject, observe, true), std::memory_order_release);
+    if (wanted && !g_inject.installed.load(std::memory_order_acquire)) {
+        if (g_inject.relay) { // a failed install is final for the session
+            g_vrBits.store(flatCameraVrBitsForFrame(frame.inject, observe, false), std::memory_order_release);
+            return false;
+        }
+        installRefreshHook(observe, frame.inject ? (observe ? "injection, observed by the census" : "injection") : "observation");
+    }
+    // A hook that is not live (never installed, failed, stood down) honours neither mode: inject is not honoured.
+    const bool live = g_inject.installed.load(std::memory_order_acquire) && !g_inject.permanentlyDown.load(std::memory_order_acquire);
+    g_vrBits.store(flatCameraVrBitsForFrame(frame.inject, observe, live), std::memory_order_release);
+    if (!live) return false;
+    g_inject.gate.arm(GetTickCount64());
+    // The relay gate: open while the frame injects or observes or a camera this session injected still waits for its flush;
+    // closed only once the detour is quiet (flatCameraInjectPause's own rule, which holds it open until the set is empty).
+    flatCameraInjectPause(flatCameraVrQuiet());
+    return true;
+}
+
+void flatCameraVrCloseWindow() { g_vr.closeWindow(); }
+
+FlatCameraVrCounters flatCameraVrCounters() { return g_vr.tally().snapshot(); }
+
+size_t flatCameraVrExcluded(FlatCameraVrExcluded* out, size_t max) { return g_vr.excluded().copy(out, max); }
+
 const char* flatCameraVrStatus() { return flatCameraInjectObserveStatus(); }
+
+bool flatCameraVrQuiet() { return flatCameraVrQuietFor(g_vrBits.load(std::memory_order_acquire), g_inject.injected.empty()); }
 
 } // namespace edvr
