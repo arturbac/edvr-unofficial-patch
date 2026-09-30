@@ -56,7 +56,15 @@ void remlokConfigure(Config& cfg);
 
 // Does the fix need the per-draw path at all? False in stock mode, which is
 // what keeps this module free when it is off.
-bool remlokWantsDraws();
+//
+// Inline: asked per eye draw, and the build has no /GL to fold a cross-TU
+// getter for one scalar load. The enum lives here too, so this can name
+// its kStock value.
+namespace detail {
+enum class RemlokMode : uint32_t { kStock, kOuter, kHide };
+extern RemlokMode g_remlokMode;
+}  // namespace detail
+inline bool remlokWantsDraws() { return detail::g_remlokMode != detail::RemlokMode::kStock; }
 
 // One draw that reached an eye texture, with its bindings still current.
 // Matches the overlay by shape (kind, count, instances, no depth bound,
@@ -64,6 +72,15 @@ bool remlokWantsDraws();
 // per-frame arrival order -- the game draws the left eye's final block
 // first (EVIDENCE 6y.10), and advanced.remlok_swap_eyes exists for a rig
 // that proves otherwise.
+//
+// remlokOverlayShape is the shape half of that match, inline so the draw
+// path asks it before the call: remlokOnEyeDraw answers kNone, having
+// touched nothing, for any other shape. remlok_fix.cpp matches through this
+// same function.
+inline bool remlokOverlayShape(char kind, uint32_t count, uint32_t instances) {
+    // A fullscreen triangle, one instance, DrawInstanced ('N').
+    return kind == 'N' && count == 3 && instances == 1;
+}
 RemlokAction remlokOnEyeDraw(char kind, uint32_t count, uint32_t instances);
 
 // Around the real draw, for kScissor: set a scissor-enabled rasterizer

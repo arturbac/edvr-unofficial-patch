@@ -31,7 +31,16 @@ struct DisjointBackend {
 // clock. All lifetime changes are explicit on the verified owner thread.
 class DisjointClock final {
 public:
-    static constexpr unsigned kRecords = 8, kLeases = 32;
+    // kLeases is the per-record concurrency budget for EVERY timestamp
+    // consumer inside one disjoint scope: the GPU-census sections, the
+    // GpuTimer route intervals (a seed and a write-back per HUD draw-group
+    // once the crisp take exists -- tens a frame), the hologram passes.
+    // 32 covered the pre-crisp census; the crisp route's interval rate
+    // exhausted it mid-frame ("no free timer", eye-frame timings dropped --
+    // the phase-3 review saw 60,895), so the 30 s price lines could not
+    // report the feature's cost. Leases are five-word states; 128 x 8
+    // records is still trivial memory.
+    static constexpr unsigned kRecords = 8, kLeases = 128;
     static constexpr uint64_t kMaxAgeMs = 2000;
     struct Lease {
         uint64_t clock = 0, generation = 0, serial = 0;
@@ -167,6 +176,22 @@ public:
         if (active_ >= 0) return allocate(static_cast<unsigned>(active_), Kind::Borrowed);
         collect(now);
         return open(Kind::Standalone);
+    }
+    // A diagnostic nested in the application-frame clock must never create a
+    // second disjoint scope. It may borrow only a live Frame record; an active
+    // standalone producer is deliberately rejected.
+    Lease acquireBorrowedFrame() noexcept {
+        if (!ownerOk() || stopped_ || shut_ || active_ < 0) return {};
+        const unsigned i = static_cast<unsigned>(active_);
+        const auto& r = records_[i];
+        bool frame = false;
+        for (const auto& l : r.leases) {
+            if (l.occupied && l.kind == Kind::Frame && !l.ended && !l.invalid) {
+                frame = true;
+                break;
+            }
+        }
+        return frame ? allocate(i, Kind::Borrowed) : Lease{};
     }
     bool endInterval(Lease t, uint64_t now) noexcept {
         if (!ownerOk() || shut_ || !valid(t)) return false;

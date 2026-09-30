@@ -5,13 +5,39 @@
 // History keys name the surface/mesh, never the reordered pool slot.
 #include <d3d11.h>
 #include <wrl/client.h>
+#include <atomic>
 #include <cstdint>
 #include <unordered_map>
 #include <algorithm>
 #include "shader_swap.h"
+#include "fixed_shader_source.h"
+#include "temporal_shader_bytecode.h"
 #include "eye_draw_snapshot.h"
 
 namespace edvr {
+// "Some HoloMotion may hold geometry", for ui_depth.h's inline write guard.
+//
+// resourceWritten below is a no-op for a non-null resource unless that
+// resource is a key of `geometry`, and every Unmap, Copy and Update the game
+// makes reaches it twice (both eyes' g_holoMotion) through
+// uiDepthMotionResourceWritten -- an unordered_map find each, about 1100
+// times a frame over terrain: 98 innermost samples of the 1355-frame window
+// of 2026-09-22 (parked-5), the largest EDVR-owned item on the Unmap path.
+// The maps are empty unless a smoke corona was accepted in the last few
+// frames.
+//
+// Set TRUE at the one insertion site (prepare, corona path), before anything
+// that can re-enter the write hooks; recomputed from g_holoMotion's own maps
+// at uiDepthFrameBoundary, after their frameBoundary() pruning. Nothing else
+// inserts, and erasures (pruning, clear, reassignment) can only empty a map,
+// so FALSE always means g_holoMotion's maps are empty -- the only instances
+// the guarded call reaches. Relaxed: every writer and reader is on the
+// owner context's thread, the same thread that already touches the maps
+// unlocked.
+namespace detail {
+inline std::atomic<bool> g_holoGeometryTracked{false};
+}  // namespace detail
+
 struct HoloDraw {
     char kind=0;
     uint32_t count=0, instances=0, start=0;
@@ -19,140 +45,7 @@ struct HoloDraw {
     uint32_t startInstance=0;
 };
 
-constexpr char kHoloMotionBuild[] = R"HLSL(
-struct Record { uint4 key[8]; float4 clip[3]; float4 map[3]; float4 meta; };
-cbuffer Model : register(b0) { float4 model[8]; }
-cbuffer Scene : register(b1) { float4 scene[276]; }
-cbuffer Material : register(b2) { float4 material[4]; }
-cbuffer Draw : register(b3) { uint4 info; uint4 mesh[4]; float4 limits; }
-StructuredBuffer<Record> Previous : register(t0);
-struct PoolRecord { uint4 data[21]; };
-StructuredBuffer<PoolRecord> Pool : register(t1);
-ByteAddressBuffer Instance : register(t2);
-RWStructuredBuffer<Record> Current : register(u0);
-// Preserve the game's non-normalized UNORM16 quaternion operation exactly.
-float3 turn(float4 q, float3 v) {
-    return (2*q.w*q.w-1)*v + 2*dot(q.xyz,v)*q.xyz + 2*q.w*cross(q.xyz,v);
-}
-[numthreads(1,1,1)] void main(uint3 id : SV_DispatchThreadID) {
-    Record n=(Record)0;
-    // b2 animates the material's glow coordinates every frame; it does
-    // not move vertices or the primary surface UVs and is not identity.
-    [unroll] for(uint k=0;k<4;++k) n.key[k]=mesh[k];
-    bool valid=true;
-    if(info.z==1 || info.z==4 || info.z==5) {
-        [unroll] for(uint r=0;r<3;++r) n.clip[r]=model[r==2?7:4+r];
-        // Planet material constants shade the sphere; they are not geometry
-        // identity. The captured surface's mesh and texture identify it.
-        if(info.z==1) [unroll] for(uint k=0;k<4;++k) n.key[4+k]=asuint(material[k]);
-        if(info.z==5) {
-            n.key[4]=asuint(material[0].w);
-            n.key[5]=asuint(material[1].x);
-            n.key[6]=asuint(material[1].y);
-            valid=all(isfinite(material[0].w)) && all(isfinite(material[1].xy)) &&
-                  material[0].w>0 && material[1].x>0 && material[1].y>0;
-        }
-        valid=valid && all(abs(model[6].xyz)<1e-10) && model[6].w>0;
-    } else {
-        float3 scale,pos; float4 q;
-        if(info.z==2) {
-            uint at=id.x*60;
-            pos=asfloat(Instance.Load3(at))-scene[275].xyz;
-            q=asfloat(Instance.Load4(at+16)); scale=asfloat(Instance.Load3(at+32));
-            n.key[4]=Instance.Load4(at+16); n.key[5]=uint4(Instance.Load3(at+32),Instance.Load(at+12));
-            // Geometry lies at local Z=0. A comparable unused Z axis avoids
-            // an ill-conditioned inverse for billion-metre orbital ellipses.
-            scale.z=max(abs(scale.x),abs(scale.y));
-            // The RGBA float4 at byte offset 44 is the instance
-            // colour/alpha. It is useful only for disambiguating the
-            // fallback below: intensity and alpha can animate, while
-            // chromaticity identifies the stroke.
-            n.key[6]=Instance.Load4(at+44);
-        } else {
-            uint index=Instance.Load(0), count,stride; Pool.GetDimensions(count,stride);
-            if(index>=count) { Current[info.x]=n; return; }
-            PoolRecord p=Pool[index]; valid=p.data[0].x==0;
-            scale=asfloat(p.data[0].y);
-            uint2 packed=p.data[0].zw;
-            q=float4(packed.x&65535,packed.x>>16,packed.y&65535,packed.y>>16)*(2.0/65535.0)-1;
-            pos=asfloat(p.data[1].xyz)-scene[275].xyz;
-        }
-        float3 x=turn(q,float3(scale.x,0,0)),y=turn(q,float3(0,scale.y,0)),z=turn(q,float3(0,0,scale.z));
-        [unroll] for(uint r=0;r<3;++r) {
-            uint row=r==2?3:r;
-            float4 c=info.z==2 ? float4(scene[270][row],scene[271][row],scene[272][row],scene[273][row]) : model[r==2?7:4+r];
-            n.clip[r]=float4(dot(c.xyz,x),dot(c.xyz,y),dot(c.xyz,z),dot(c,float4(pos,1)));
-        }
-        valid=valid && all(isfinite(scale)) && all(abs(scale)>1e-8) && all(isfinite(pos)) && abs(dot(q,q)-1)<.002;
-        if(info.z==0) valid=valid && all(abs(model[6].xyz)<1e-10) && model[6].w>0 && n.clip[2].w<limits.x;
-        // Sprite VS uses the same pool transform and clip X/Y/W, but forces
-        // clip Z=W and may billboard at planetary distances. UV tiles name
-        // distinct atlas quads; changing brightness does not move geometry.
-        if(info.z==3) n.key[4]=asuint(material[1]);
-    }
-    valid=valid && n.clip[2].w>.025 && all(isfinite(n.clip[0])) && all(isfinite(n.clip[1])) && all(isfinite(n.clip[2]));
-    float3 a=cross(n.clip[1].xyz,n.clip[2].xyz),b=cross(n.clip[2].xyz,n.clip[0].xyz),c=cross(n.clip[0].xyz,n.clip[1].xyz);
-    float det=dot(n.clip[0].xyz,a);
-    valid=valid && isfinite(det) && abs(det)>1e-12;
-    n.meta=float4(valid?1:0,limits.yz,0);
-    uint matches=0,match=0;
-    [loop] for(uint i=0;i<info.y;++i) {
-        Record old=Previous[i]; bool same=old.meta.x==1;
-        [unroll] for(uint j=0;j<8;++j) {
-            // Mode 2 keeps key[6] as diagnostic identity data, but colour
-            // intensity/alpha changes must not make an otherwise exact
-            // orbital record miss the existing strict path.
-            if(info.z!=2 || j!=6) same=same && all(n.key[j]==old.key[j]);
-        }
-        // Identical meshes can occur on multiple panels. Require one nearby
-        // projected origin; an ambiguous match or a newly opened panel declines.
-        float2 here=float2(n.clip[0].w,n.clip[1].w)/n.clip[2].w;
-        float2 there=float2(old.clip[0].w,old.clip[1].w)/old.clip[2].w;
-        same=same && all(abs(here-there)<.2) && old.clip[2].w>n.clip[2].w*.5 && old.clip[2].w<n.clip[2].w*2;
-        if(same) {
-            // Identical ring passes may repeat the same geometry/material.
-            // They are interchangeable only when their complete transforms
-            // are identical. Cockpit ambiguity remains a hard rejection.
-            bool duplicate=(info.z==1 || info.z==4) && matches==1;
-            [unroll] for(uint row=0;row<3;++row) duplicate=duplicate && all(old.clip[row]==Previous[match].clip[row]);
-            if(!duplicate) { ++matches; match=i; }
-        }
-    }
-    // A changing orbital instance can alter its quaternion/scale while
-    // retaining the same draw/mesh, width and colour family. Only use this
-    // relaxed identity when the original exact search found no candidate;
-    // every candidate must be unique and retain the same continuity checks.
-    if(valid && info.z==2 && matches==0) {
-        uint fallbackMatches=0,fallbackMatch=0;
-        float3 newRgb=asfloat(n.key[6].xyz); float newMax=max(newRgb.x,max(newRgb.y,newRgb.z));
-        bool newRgbValid=all(isfinite(newRgb)) && isfinite(newMax) && newMax>0;
-        [loop] for(uint i=0;i<info.y;++i) {
-            Record old=Previous[i]; bool candidate=old.meta.x==1;
-            [unroll] for(uint j=0;j<4;++j) candidate=candidate && all(n.key[j]==old.key[j]);
-            candidate=candidate && n.key[5].w==old.key[5].w;
-            float3 oldRgb=asfloat(old.key[6].xyz); float oldMax=max(oldRgb.x,max(oldRgb.y,oldRgb.z));
-            bool oldRgbValid=all(isfinite(oldRgb)) && isfinite(oldMax) && oldMax>0;
-            bool sameChroma=false;
-            if(newRgbValid && oldRgbValid) sameChroma=all(abs(newRgb/newMax-oldRgb/oldMax)<=1e-6);
-            candidate=candidate && sameChroma;
-            float2 here=float2(n.clip[0].w,n.clip[1].w)/n.clip[2].w;
-            float2 there=float2(old.clip[0].w,old.clip[1].w)/old.clip[2].w;
-            candidate=candidate && all(abs(here-there)<.2) && old.clip[2].w>n.clip[2].w*.5 && old.clip[2].w<n.clip[2].w*2;
-            if(candidate) { ++fallbackMatches; fallbackMatch=i; }
-        }
-        if(fallbackMatches==1) { matches=1; match=fallbackMatch; }
-    }
-    if(valid && matches==1) {
-        Record old=Previous[match]; float3 t=float3(n.clip[0].w,n.clip[1].w,n.clip[2].w);
-        [unroll] for(uint row=0;row<3;++row) {
-            float3 v=float3(dot(old.clip[row].xyz,a),dot(old.clip[row].xyz,b),dot(old.clip[row].xyz,c))/det;
-            n.map[row]=float4(v,old.clip[row].w-dot(v,t));
-        }
-        n.meta.w=all(isfinite(n.map[0])) && all(isfinite(n.map[1])) && all(isfinite(n.map[2])) ? 1:0;
-    }
-    Current[info.x+id.x]=n;
-}
-)HLSL";
+
 
 class HoloMotion {
     template<class T> using Ptr=Microsoft::WRL::ComPtr<T>;
@@ -172,16 +65,9 @@ class HoloMotion {
     std::unordered_map<ID3D11Resource*,GeometryStamp> geometry;
     unsigned geometryEpoch=1,unknownEpoch=0,frame=0;
     Ptr<ID3D11Texture2D> scene,coverage;
-    // Optional world-only coverage twin.  It is deliberately separate from
-    // the live HC surface: callers may omit a mode-3 sprite from the clean
-    // colour path while retaining the normal UI motion inputs.
-    Ptr<ID3D11Texture2D> separatedCoverage;
-    ID3D11Texture2D* separatedScene=nullptr;
-    bool separatedReady=false;
     Ptr<ID3D11RenderTargetView> rtv;
     Ptr<ID3D11BlendState> motionBlendState;
-    Ptr<ID3D11ShaderResourceView> coverageSrv,instanceSrv,separatedCoverageSrv;
-    Ptr<ID3D11RenderTargetView> separatedRtv;
+    Ptr<ID3D11ShaderResourceView> coverageSrv,instanceSrv;
     Ptr<ID3D11Buffer> draw,instance;
     Ptr<ID3D11ComputeShader> shader;
     bool create(ID3D11DeviceContext* ctx,ID3D11Device* dev,ID3D11Texture2D* source) {
@@ -214,43 +100,10 @@ class HoloMotion {
         D3D11_SHADER_RESOURCE_VIEW_DESC sd{}; sd.Format=DXGI_FORMAT_R32_TYPELESS; sd.ViewDimension=D3D11_SRV_DIMENSION_BUFFEREX;
         sd.BufferEx.NumElements=1024; sd.BufferEx.Flags=D3D11_BUFFEREX_SRV_FLAG_RAW;
         if(FAILED(dev->CreateShaderResourceView(instance.Get(),&sd,&instanceSrv))) return false;
-        shader.Attach(shaderSwapCompileCs(ctx,kHoloMotionBuild,sizeof(kHoloMotionBuild)-1,"main","holo motion",nullptr,"holo motion"));
+        shader.Attach(shaderSwapCreateCs(ctx,kHoloMotionBytecode,sizeof(kHoloMotionBytecode),"holo motion","holo motion"));
         return shader!=nullptr;
     }
 public:
-    // Allocate the optional clean-world HC twin at the same size/format as
-    // the live coverage.  No allocation occurs unless a caller explicitly
-    // opts into separated coverage for the frame.
-    bool ensureSeparated(ID3D11DeviceContext* ctx, ID3D11Texture2D* source) {
-        if (!ctx || !source || scene.Get()!=source) return false;
-        if (separatedCoverage && separatedRtv && separatedCoverageSrv && separatedScene==source) return true;
-        Ptr<ID3D11Device> dev; ctx->GetDevice(&dev); if (!dev) return false;
-        D3D11_TEXTURE2D_DESC td{}; source->GetDesc(&td);
-        td.MipLevels=1; td.ArraySize=1;
-        td.Format=DXGI_FORMAT_R32G32_FLOAT; td.SampleDesc.Count=1; td.SampleDesc.Quality=0;
-        td.Usage=D3D11_USAGE_DEFAULT; td.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
-        td.CPUAccessFlags=0; td.MiscFlags=0;
-        separatedCoverage.Reset(); separatedRtv.Reset(); separatedCoverageSrv.Reset();
-        separatedScene=source; separatedReady=false;
-        if (FAILED(dev->CreateTexture2D(&td,nullptr,&separatedCoverage)) ||
-            FAILED(dev->CreateRenderTargetView(separatedCoverage.Get(),nullptr,&separatedRtv)) ||
-            FAILED(dev->CreateShaderResourceView(separatedCoverage.Get(),nullptr,&separatedCoverageSrv))) {
-            separatedCoverage.Reset(); separatedRtv.Reset(); separatedCoverageSrv.Reset(); separatedScene=nullptr; separatedReady=false; return false;
-        }
-        return true;
-    }
-    // Seed the clean twin from the live HC before the first separated draw.
-    // This is a GPU copy; no readback and no change to the live surface.
-    bool snapshotSeparated(ID3D11DeviceContext* ctx) {
-        if (!ctx || !coverage || !separatedCoverage) return false;
-        ctx->CopyResource(separatedCoverage.Get(), coverage.Get()); separatedReady=true; return true;
-    }
-    void invalidateSeparated() { separatedReady=false; }
-    ID3D11RenderTargetView* separatedTarget() const { return separatedRtv.Get(); }
-    ID3D11ShaderResourceView* separatedView() const { return separatedCoverageSrv.Get(); }
-    bool separatedValid(ID3D11Texture2D* source) const {
-        return separatedReady && separatedScene==source && separatedCoverageSrv && separatedRtv;
-    }
     // Called only for the recognized holo VS/PS, one unskinned instance,
     // and the normal full-eye viewport. Does not replace the original draw.
     // mode 0: cockpit pool, 1: ring local-to-clip, 2: orbital instance stream,
@@ -320,7 +173,7 @@ public:
         bool enough=true; const UINT minimum[3]={mode==2?0u:128u,276*16,(mode==2 || mode==4)?0u:corona?32u:mode==3?32u:64u};
         for(int i=0;i<3;++i) { D3D11_BUFFER_DESC bd{}; if(cb[i]) cb[i]->GetDesc(&bd); enough=enough && bd.ByteWidth>=minimum[i]; }
         if(!enough) { for(auto* p:cb) if(p) p->Release(); return false; }
-        if(corona) { geometry[vb[0].Get()].seen=frame; geometry[ib.Get()].seen=frame; }
+        if(corona) { geometry[vb[0].Get()].seen=frame; geometry[ib.Get()].seen=frame; detail::g_holoGeometryTracked.store(true,std::memory_order_relaxed); }
         struct Data { UINT info[4],key[16]; float limits[4]; } data{};
         data.info[0]=now.count; data.info[1]=prev.count; data.info[2]=mode; data.info[3]=count;
         IUnknown* objects[3]={surface.Get(),vb[pooled?1:0].Get(),mode==2?nullptr:ib.Get()};
@@ -360,10 +213,15 @@ public:
             if(++geometryEpoch==0) { geometryEpoch=1; unknownEpoch=0; geometry.clear(); for(auto& hist:history){for(unsigned i=0;i<hist.count;++i)for(auto& p:hist.sources[i])p.Reset();hist.count=0;} cleared=false; }
             unknownEpoch=geometryEpoch; return true;
         }
+        // Empty is the common state (no corona accepted lately): a find on an
+        // empty map hashes the key and misses, so this answers the same.
+        if(geometry.empty()) return false;
         auto it=geometry.find(resource); if(it==geometry.end()) return false;
         if(++geometryEpoch==0) { geometryEpoch=1; unknownEpoch=0; geometry.clear(); for(auto& hist:history){for(unsigned i=0;i<hist.count;++i)for(auto& p:hist.sources[i])p.Reset();hist.count=0;} cleared=false; return true; }
         it->second.epoch=geometryEpoch; return true;
     }
+    // For detail::g_holoGeometryTracked's recompute (ui_depth.cpp).
+    bool tracksGeometry() const { return !geometry.empty(); }
     void noteFrame() {
         ++frame;
         for(auto it=geometry.begin();it!=geometry.end();) {
@@ -377,7 +235,6 @@ public:
         if(!failed && cleared && scene.Get()==source) { out[0]=coverageSrv.Get(); out[1]=history[write].srv.Get(); }
     }
     void frameBoundary() {
-        separatedReady=false;
         write=1-write; auto& next=history[write];
         for(unsigned i=0;i<next.count;++i) for(auto& p:next.sources[i]) p.Reset();
         next.count=0; cleared=false; noteFrame();

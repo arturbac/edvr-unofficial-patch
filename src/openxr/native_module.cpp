@@ -5,6 +5,7 @@
 #include "native_module.h"
 #include "native_bootstrap.h"
 #include "native_local_config.h"
+#include "native_cpu_trace.h"
 #include "init_error.h"
 #include <new>
 #include <stdexcept>
@@ -38,6 +39,7 @@ class ModuleBackend final : public RuntimeBackend {
     if (cancelled.load(std::memory_order_acquire)) return vr::VRInitError_Init_ShuttingDown;
     const HRESULT acquired=generation->binding.acquire(options_.graphicsProxy,[generation] {
       if (!generation->loadingAdmitted.load(std::memory_order_acquire)) return;
+      if (generation->host->consumeOverlappedPresent()) return;
       if (!generation->route.invoke([generation] { generation->host->loadingBoundary(); }))
         throw std::runtime_error("native loading boundary unavailable");
     });
@@ -52,6 +54,10 @@ class ModuleBackend final : public RuntimeBackend {
     if (cancelled.load(std::memory_order_acquire)) return vr::VRInitError_Init_ShuttingDown;
     generation->route.present=&generation->binding.work();
     if (!generation->route.bind()) return vr::VRInitError_Init_Internal;
+    // Read-only: Elite's own thread, never adjusted. For comparison against
+    // native_thread_priority,thread=owner|pacer, which EDVR does raise.
+    nativeTracePrintf("native_thread_priority,thread=render,tid=%lu,priority=%d\n",
+        (unsigned long)GetCurrentThreadId(),GetThreadPriority(GetCurrentThread()));
     if (!generation->owner.start([generation] {
       if (generation->host) generation->host->pumpEvents();
     })) return vr::VRInitError_Init_Internal;
@@ -211,6 +217,21 @@ struct Module {
 std::atomic<Module*> module{nullptr};
 std::mutex configureMutex;
 
+uint32_t initModule(Module& owner,vr::EVRInitError* error,vr::EVRApplicationType application) noexcept {
+  const uint32_t token=owner.lifecycle.init(error,application);
+  if(token) {
+    auto& trace=NativeCpuTrace::get();const bool registered=trace.start();const auto counters=trace.counters();
+    static std::atomic<unsigned> notes{0};
+    if(notes.fetch_add(1,std::memory_order_relaxed)<16)
+      nativeTracePrintf("native_cpu_trace,provider={D3885FA1-0B70-44F1-AF88-63B2012B111E},schema=1,build=%s,registered=%u,externally_enabled=%u,error=%lu\n",
+        EDVR_VERSION_STRING,unsigned(registered),unsigned(trace.enabled()),(unsigned long)counters.lastError);
+    // Shutdown can race the short interval between lifecycle publication and
+    // provider registration. Do not leave an idle registration after it wins.
+    if(!owner.lifecycle.running())trace.stop();
+  }
+  return token;
+}
+
 bool copyPath(const wchar_t* input,std::wstring& output) {
   if (!input) return false;
   size_t length=0; while(length<32768&&input[length])++length;
@@ -320,7 +341,7 @@ extern "C" uint32_t __cdecl edvr_module_VR_InitInternal(vr::EVRInitError* error,
       nativeTracePrintf("module_init,version=%s,durable_log=%u\n",EDVR_VERSION_STRING,unsigned(logging));
       nativeTracePuts("native_call_probes,frequency_property=2002,early=4,interval_ms=20000,max_samples=16,shutdown_return_marker=1,frequency_policy=runtime_or_90hz");
     }
-    if (auto* owner=module.load(std::memory_order_acquire)) return owner->lifecycle.init(error,application);
+    if (auto* owner=module.load(std::memory_order_acquire)) return initModule(*owner,error,application);
     // The staged DLL can also be initialized by an unmodified application:
     // Explicit configuration wins, then a complete process environment,
     // then the adjacent validated config. No fallback to another VR backend.
@@ -342,10 +363,11 @@ extern "C" uint32_t __cdecl edvr_module_VR_InitInternal(vr::EVRInitError* error,
          readableRegularFile(local.graphics)&&(localConfigUsesSystemRuntime(local.runtime)||readableRegularFile(local.runtime))) {
         RuntimeOptions options;options.loader=std::move(local.loader);options.graphicsProxy=std::move(local.graphics);
         options.separateDevice=local.separateDevice;localManifest=std::move(local.runtime);
+        options.frameThreadPriorityHigh=local.frameThreadPriorityHigh;options.frameEndOverlap=local.frameEndOverlap;
         const auto configured=configureModule(std::move(options),5000,localManifest);
         if(configured!=S_OK&&configured!=E_PENDING){if(error)*error=vr::VRInitError_Init_InstallationCorrupt;return 0;}
         if(configured==S_OK){nativeTracePuts("module_configuration,source=local");std::fflush(stdout);}
-        if(auto* owner=module.load(std::memory_order_acquire))return owner->lifecycle.init(error,application);
+        if(auto* owner=module.load(std::memory_order_acquire))return initModule(*owner,error,application);
       }
       if(localResult==LocalConfigResult::Absent) {
         if(packagedDefaultPaths(paths)) {
@@ -354,7 +376,7 @@ extern "C" uint32_t __cdecl edvr_module_VR_InitInternal(vr::EVRInitError* error,
           const auto configured=configureModule(std::move(options),5000,localManifest);
           if(configured==S_OK||configured==E_PENDING) {
             nativeTracePuts("module_configuration,source=packaged-default");std::fflush(stdout);
-            if(auto* owner=module.load(std::memory_order_acquire))return owner->lifecycle.init(error,application);
+            if(auto* owner=module.load(std::memory_order_acquire))return initModule(*owner,error,application);
           }
         }
         nativeTracePuts("module_configuration,source=packaged-default,invalid=1");
@@ -379,7 +401,7 @@ extern "C" uint32_t __cdecl edvr_module_VR_InitInternal(vr::EVRInitError* error,
     if (configured==S_OK) {
       nativeTracePuts("module_configuration,source=environment");std::fflush(stdout);
     }
-    if (auto* owner=module.load(std::memory_order_acquire))return owner->lifecycle.init(error,application);
+    if (auto* owner=module.load(std::memory_order_acquire))return initModule(*owner,error,application);
     if(error)*error=vr::VRInitError_Init_Internal;
   } catch (...) { if(error)*error=vr::VRInitError_Init_Internal; }
   return 0;
@@ -394,8 +416,9 @@ extern "C" void __cdecl edvr_module_VR_ShutdownInternal() noexcept {
       nativeTracePrintf("module_shutdown_caller,stack_frames=%u,game_frames=%u,game_rvas=%s\n",stack.captured,stack.gameFrames,stack.rvas);
     }
     if(auto* owner=module.load(std::memory_order_acquire))owner->lifecycle.shutdown();
+    NativeCpuTrace::get().stop();
     if(trace)nativeTracePuts("module_shutdown_return,exception=0");
-  } catch (...) { if(trace)nativeTracePuts("module_shutdown_return,exception=1"); }
+  } catch (...) { NativeCpuTrace::get().stop();if(trace)nativeTracePuts("module_shutdown_return,exception=1"); }
 }
 extern "C" void* __cdecl edvr_module_VR_GetGenericInterface(const char* version,vr::EVRInitError* error) noexcept {
   try { if(auto* owner=module.load(std::memory_order_acquire))return owner->lifecycle.getInterface(version,error); }

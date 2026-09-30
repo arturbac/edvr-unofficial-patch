@@ -1,4 +1,5 @@
 #include "openvr_system.h"
+#include "native_cpu_trace.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -193,7 +194,9 @@ void OpenVRSystem::GetProjectionRaw(EVREye e,float* l,float* r,float* t,float* b
   const unsigned eye=unsigned(e);
   const bool liveGeometry=geometryValid(s);
   if(opticsAvailable(s)&&eyeValid(e)) {
-    const RawFov base=liveGeometry?s.geometry.raw[eye]:s.optics.raw[eye];
+    // The cull guard's channel probe (advanced.cull_guard_channel) may hand
+    // this channel a different frustum from the one the game renders.
+    const RawFov base=liveGeometry?(s.geometry.queryRawValid?s.geometry.queryRaw[eye]:s.geometry.raw[eye]):s.optics.raw[eye];
     if(liveGeometry) shiftedRawFov(base,s.tangentShift[eye][0],
                                    s.tangentShift[eye][1],out);
     else out=base;
@@ -207,19 +210,22 @@ HmdMatrix34_t OpenVRSystem::GetEyeToHeadTransform(EVREye e) {
   return opticsAvailable(s)&&eyeValid(e)?(liveGeometry?s.geometry.eyeToHead[unsigned(e)]:s.optics.eyeToHead[unsigned(e)]):HmdMatrix34_t{};
 }
 bool OpenVRSystem::GetTimeSinceLastVsync(float* seconds,uint64_t* frame) {
-  if(seconds)*seconds=0;if(frame)*frame=0;unavailable(5);return false;
+  NativeCpuTraceSpan trace(EdvrCpuGetTimeSinceLastVsync);
+  if(seconds)*seconds=0;if(frame)*frame=0;unavailable(5);return trace.finish(false);
 }
 int32_t OpenVRSystem::GetD3D9AdapterIndex() { unavailable(6);return -1; }
 void OpenVRSystem::GetDXGIOutputInfo(int32_t* index) {const auto s=source_.read();if(index)*index=live(s)?s.adapterIndex:-1;}
 bool OpenVRSystem::IsDisplayOnDesktop() { return false; }
 bool OpenVRSystem::SetDisplayVisibility(bool) { unavailable(9);return false; }
 void OpenVRSystem::GetDeviceToAbsoluteTrackingPose(ETrackingUniverseOrigin origin,float prediction,TrackedDevicePose_t* poses,uint32_t count) {
-  if(!poses||!count)return;
+  NativeCpuTraceSpan trace(EdvrCpuGetDeviceToAbsoluteTrackingPose);
+  if(!poses||!count){trace.finishVoid(0);return;}
   const auto s=source_.read();for(uint32_t i=0;i<count;++i)poses[i]=invalidPose();
-  if(!live(s))return;poses[0]=invalidPose(true);
-  if(!originValid(origin)||!std::isfinite(prediction))return;
+  if(!live(s)){trace.finishVoid(0);return;}poses[0]=invalidPose(true);
+  if(!originValid(origin)||!std::isfinite(prediction)){trace.finishVoid(0);return;}
   TrackedDevicePose_t p=invalidPose(true);
-  if(source_.locateHead(s.generation,origin,prediction,p))poses[0]=p;
+  const bool located=source_.locateHead(s.generation,origin,prediction,p);if(located)poses[0]=p;
+  trace.finishVoid(located?1:0);
 }
 void OpenVRSystem::ResetSeatedZeroPose() { const auto s=source_.read();if(!live(s)||!source_.resetSeated(s.generation))unavailable(11); }
 HmdMatrix34_t OpenVRSystem::GetSeatedZeroPoseToStandingAbsoluteTrackingPose() {

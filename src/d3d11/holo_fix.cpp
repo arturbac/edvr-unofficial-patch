@@ -11,6 +11,13 @@
 #include "vscreen.h"  // vScreenIsEyeSized
 
 namespace edvr {
+
+// holoWantsDraws reads this from the header with no call: asked per draw,
+// and the build has no /GL to fold a cross-TU getter.
+namespace detail {
+bool g_holoSteady = false;
+}  // namespace detail
+
 namespace {
 
 // The hologram composite's shape, as the loading-screen census measured it
@@ -23,8 +30,11 @@ constexpr uint32_t kInstances = 1;
 constexpr uint32_t kPatternW = 256;
 constexpr uint32_t kPatternH = 256;
 constexpr uint32_t kPatternFmt = 70;   // BC1-class, as the census resolves it
+// The shape test itself is holoPatternShape (holo_fix.h), inline so the draw
+// path can ask it first; it must say what the three constants above say.
+static_assert(kKind == 'X' && kIndices == 6 && kInstances == 1,
+              "holoPatternShape (holo_fix.h) must match the composite's measured shape");
 
-bool    g_steady = false;
 uint32_t g_level = 255;      // the uniform's channel value, live-tuned
 
 // The substitute: a 1x1 immutable texture at g_level, rebuilt when the level
@@ -95,39 +105,37 @@ ID3D11ShaderResourceView* uniformSrv(ID3D11DeviceContext* ctx) {
 }  // namespace
 
 void holoConfigure(Config& cfg) {
-    const bool was = g_steady;
+    const bool was = detail::g_holoSteady;
     // steady by default since the field verification (2026-08-19): shimmer
     // gone, ship normal, level 255 correct first try -- which also proved
     // the shader multiplies the term, so identity is white.
     const std::string m = cfg.getString("fix.holo_pattern", "steady");
     if (m == "stock") {
-        g_steady = false;
+        detail::g_holoSteady = false;
     } else if (m == "steady") {
-        g_steady = true;
+        detail::g_holoSteady = true;
     } else {
-        g_steady = false;
+        detail::g_holoSteady = false;
         Log::get().note("holo_pattern \"%s\" is not stock or steady; running "
                         "stock.", m.c_str());
     }
     int level = cfg.getIntInRange("advanced.holo_pattern_level", 255, 0, 255);
     g_level = static_cast<uint32_t>(level);
 
-    if (was != g_steady) {
+    if (was != detail::g_holoSteady) {
         Log::get().note("holo pattern: %s. The loading hologram's screen-space "
                         "pattern (the head-locked shimmer inside the ship's "
                         "silhouette) is %s; level %u.",
-                        g_steady ? "steady" : "stock",
-                        g_steady ? "replaced with a uniform for that one draw"
+                        detail::g_holoSteady ? "steady" : "stock",
+                        detail::g_holoSteady ? "replaced with a uniform for that one draw"
                                  : "the game's own",
                         g_level);
     }
 }
 
-bool holoWantsDraws() { return g_steady; }
-
 bool holoOnEyeDraw(char kind, uint32_t count, uint32_t instances) {
-    if (!g_steady) return false;
-    if (kind != kKind || count != kIndices || instances != kInstances) {
+    if (!detail::g_holoSteady) return false;
+    if (!holoPatternShape(kind, count, instances)) {
         return false;
     }
     // Slot 1 first: the 256x256 pattern is the cheaper resolve and the rarer

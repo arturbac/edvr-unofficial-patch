@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "../common/config.h"
+#include "../common/runtime_profile.h"
 #include "../common/frame_flag.h"
 #include "../common/guard.h"
 #include "../common/hotkey.h"
@@ -27,7 +28,11 @@
 #include "../common/temporal_mode.h"
 #include "device_hook.h"
 #include "elite_binds.h"
+#include "flat_elite_settings.h"
+#include "flat_runtime.h"
+#include "flat_wrapper_note.h"
 #include "input_gate.h"
+#include "menu_flat_rows.h"
 #include "menu_keys.h"
 #include "menu_panel.h"
 #include "native_menu.h"
@@ -37,6 +42,7 @@
 #include "perf_monitor.h"
 #include "sharpen_pass.h"
 #include "temporal_pass.h"
+#include "vscreen_res.h"
 // fsr3_engine.h is deliberately NOT included: the Temporal AA status line
 // reaches AMD's price and its name through temporal_pass.h's
 // temporalPassTrainedTotals, which answers for the engine in force (F6).
@@ -165,6 +171,20 @@ struct State {
     uint64_t tickMs = 0;
 
     bool  open = false;
+    bool  flatEscapeDown = false;
+    bool  flatKeysReadyShown = false;
+    bool  flatNativeScaleShown = false;
+    // The flat panel's settings warning (flat_elite_settings.h): Elite's graphics files, read
+    // when the menu opens and when they change; whether the warning is up and the words it
+    // was built from (a change of either rebuilds the raster and is logged, at most
+    // kFlatWarnLogMax times a session).
+    FlatSettingsWatcher flatSettings;
+    bool        flatSettingsForce = false;
+    bool        flatWarnActive = false;
+    std::string flatWarnKey;
+    int         flatWarnLogged = 0;
+    // The graphics-wrapper note (flat_wrapper_note.h): said once in the log when it is first drawn.
+    bool        flatWrapperNoteLogged = false;
     float alpha = 0.0f;
     uint64_t openedMs = 0;
     uint64_t lastInputMs = 0;
@@ -235,6 +255,7 @@ struct State {
     // down: re-anchored to the head every frame, re-rasterised twice a
     // second.
     bool     overlay = false;
+    bool     overlayLock = false;
     float    overlayYaw = 0.0f;
     float    overlayPitch = -16.0f;
     bool     overlayUp = false;
@@ -242,6 +263,12 @@ struct State {
     uint64_t overlayTextMs = 0;
     std::string overlayText;
     float    overlayTextDeg = 0.0f;
+    // The menu-embedded copy's own refresh clock (menu.fps_overlay_lock).
+    // Kept apart from overlayTextMs: the floating readout's own block runs
+    // first each tick and, on its own cadence, resets that field to "now"
+    // before this one's check ever sees it due -- a shared field starved
+    // the embedded copy's refresh outright (found 2026-09-25).
+    uint64_t menuOverlayTextMs = 0;
 
     // Restart bookkeeping.
     bool snapshotTaken = false;
@@ -270,7 +297,19 @@ std::string dottedOf(const MenuRowDef& d) {
 }
 
 std::string rowValue(const MenuRowDef& d) {
+    if (runtimeFlatProfile() && strcmp(d.section, "fix") == 0 &&
+        strcmp(d.key, "temporal_aa") == 0)
+        return Config::get().requestedTemporalMode();
     return Config::get().getString(dottedOf(d).c_str(), d.shipped);
+}
+
+bool flatDlssSelected() {
+    for (int i = 0; i < kRowDefCount; ++i)
+        if (strcmp(kMenuRows[i].section, "fix") == 0 &&
+            strcmp(kMenuRows[i].key, "temporal_aa") == 0)
+            return _stricmp(g_rows[i].value.c_str(), "dlss") == 0 ||
+                   _stricmp(g_rows[i].value.c_str(), "dlaa") == 0;
+    return false;
 }
 
 bool boolOf(const std::string& v, bool def) {
@@ -312,14 +351,64 @@ bool isOpenxrRenderScaleRow(const MenuRowDef& d) {
            strcmp(d.key, "openxr_resolution") == 0;
 }
 
-// The generic per-headset list row (`# ui: ... | headset`): one integer per
-// headset in a `runtime/system:value` list, of which the row shows and edits
-// only the worn headset's entry. The three field-of-view trims are these; the
-// resolution row is a per-headset list too, but it keeps its own width
-// semantics (percentages, megapixels, the runtime's cap) and is handled by
-// everything above rather than by the generic integer row below.
-bool isHeadsetRow(const MenuRowDef& d) {
-    return d.headset && !isOpenxrRenderScaleRow(d);
+// fix.temporal_aa_model (the DLSS preset row): NVIDIA's reconstruction
+// model, which only DLSS and DLAA read (temporal_mode.h). It stays on the
+// Performance page under every mode -- rather than dropping out of the list
+// on a mode change, which read as the setting vanishing -- and dims and
+// stops responding to input instead.
+bool isDlssPresetRow(const MenuRowDef& d) {
+    return strcmp(d.section, "fix") == 0 && strcmp(d.key, "temporal_aa_model") == 0;
+}
+
+bool dlssPresetDisabled() {
+    if (runtimeFlatProfile()) return !flatDlssSelected();
+    return temporalEngineFor(Config::get().getString("fix.temporal_aa", "off")) !=
+           TemporalEngine::Nvidia;
+}
+
+// fix.render_sharpness (the Sharpening row). VR sharpens whatever it submits,
+// so there its row never dims. The flat profile sharpens the temporal pass's
+// output (flat_sharpen.h), so with anti-aliasing off there is nothing for it
+// to act on: the row stays on the panel, dimmed, and stops responding, the way
+// the DLSS preset row does under a mode that does not read it.
+bool isSharpenRow(const MenuRowDef& d) {
+    return strcmp(d.section, "fix") == 0 && strcmp(d.key, "render_sharpness") == 0;
+}
+
+bool sharpenRowDisabled() {
+    return flatSharpenRowDim(runtimeFlatProfile(),
+                             temporalModeEnabled(Config::get().requestedTemporalMode()));
+}
+
+// The on-foot panel's width: "auto", or a width in pixels -- never a list, so
+// this is not a headset row despite living beside one in the ini. The height
+// is not a setting any more; it is derived from whichever width applies.
+bool isVscreenResolutionRow(const MenuRowDef& d) {
+    return strcmp(d.section, "fix") == 0 && strcmp(d.key, "vscreen_res_width") == 0;
+}
+
+constexpr uint32_t kVscreenWidthLo = 640, kVscreenWidthHi = 8192;
+
+// "auto" (any case), or digits within the panel patch's own sane range --
+// vscreen_res.cpp refuses outside it anyway, so a value this rejects would
+// only be refused later with a less specific message.
+bool parseVscreenWidth(const std::string& text, uint32_t* out) {
+    std::string v = text;
+    while (!v.empty() && v.front() == ' ') v.erase(v.begin());
+    while (!v.empty() && v.back() == ' ') v.pop_back();
+    if (_stricmp(v.c_str(), "auto") == 0) {
+        if (out) *out = 0;
+        return true;
+    }
+    if (v.empty() || v.size() > 5) return false;
+    uint32_t value = 0;
+    for (char c : v) {
+        if (c < '0' || c > '9') return false;
+        value = value * 10 + static_cast<uint32_t>(c - '0');
+    }
+    if (value < kVscreenWidthLo || value > kVscreenWidthHi) return false;
+    if (out) *out = value;
+    return true;
 }
 
 bool coherentNativeRenderSizing(const EdvrNativeRenderSizing& sizing) {
@@ -505,8 +594,9 @@ bool renderScaleRowPending(const std::string& value) {
 // runtime/system entry, or -- when the system token is empty, so the worn
 // key is the runtime alone -- the runtime-only entry the menu itself wrote
 // for this headset (matched 2 with no system). A runtime-only fallback under
-// a non-empty system token is another key's entry and is left alone. One rule
-// for every per-headset list, so R cannot mean two things on two rows.
+// a non-empty system token is another key's entry and is left alone. (One rule,
+// kept as its own function: the resolution row is the only per-headset row now,
+// but the field-of-view trims had a row that asked the same question.)
 bool wornEntryRemovable(bool headset, uint32_t matched, const std::string& sys) {
     return headset && (matched == 1 || (matched == 2 && sys.empty()));
 }
@@ -610,7 +700,7 @@ const char* openxrResolutionFacts() {
            "Shipped 100% (no entry).  Applies after a game restart.";
 }
 
-// "Saved for: " and the list, for any per-headset row's tooltip: at most four
+// "Saved for: " and the list, for a per-headset row's tooltip: at most four
 // entries, so the ini prose after them is not pushed out of the 1024-byte
 // popup (the log line carries the whole list). The entry in effect for the
 // worn headset -- the exact key, or the runtime-only fallback -- is marked,
@@ -642,9 +732,9 @@ std::string savedForText(const edvr::native_render::HeadsetEntry* entries, size_
         }
     }
     if (count > shown) {
-        char more[48];
-        snprintf(more, sizeof(more), " and %u more (see edvr.ini)",
-                 static_cast<unsigned>(count - shown));
+        char more[64];
+        snprintf(more, sizeof(more), " and %u more (see %s)",
+                 static_cast<unsigned>(count - shown), Config::get().iniName());
         body += more;
     }
     return body + ".";
@@ -750,153 +840,21 @@ bool parseTypedWidth(const std::string& text, uint32_t* out) {
     return true;
 }
 
-constexpr const char* kEightHeadsets = "Eight headsets saved; remove one in edvr.ini first.";
+// Names the settings file this process read (Config::iniName), never a literal one.
+std::string eightHeadsetsText() {
+    return std::string("Eight headsets saved; remove one in ") + Config::get().iniName() + " first.";
+}
 // A runtime whose name has no ASCII letter or digit yields an empty runtime
 // token, which the grammar cannot key an entry on (mergeHeadsetEntry refuses
 // it); said as such rather than as a full list.
 constexpr const char* kNoRuntimeToken = "not written: the runtime's name yields no key";
 
-// ---------------------------------------------------------------------------
-// The generic per-headset row: fix.fov_trim_vertical, _outer and _nasal. One
-// integer per headset, in the same list grammar the resolution uses, of which
-// the row shows and edits only the worn headset's entry. A trim tuned on a
-// Pimax is wrong on a Quest 3, which is what these lists exist for.
-//
-// 0 is "no entry": the value column reads 0, and the list never carries
-// `key:0`, so a row put back to 0 leaves the file as if it had never been set.
-struct HeadsetRowView {
-    bool        headset = false;   // sizing coherent and labels valid
-    std::string rt, sys, key;      // the worn tokens and rt/sys
-    NativeRenderLabels labels{};
-    edvr::native_render::HeadsetEntry entries[edvr::native_render::kHeadsetEntryMax];
-    size_t      entryCount = 0;
-    uint32_t    matched = 0;       // 0 none, 1 runtime/system, 2 runtime-only
-    uint32_t    value = 0;         // the worn headset's entry, 0 when none
-    uint32_t    lo = 0, hi = 0;    // what ONE entry may hold
-};
-
-// The bounds the ui: line declared. `headset` beside `range` is what says the
-// range bounds one entry's value rather than the string, so this is where the
-// generated lo/hi mean degrees.
-uint32_t headsetRowLow(const MenuRowDef& d) {
-    const int lo = d.lo[0] ? atoi(d.lo) : 0;
-    return lo > 0 ? static_cast<uint32_t>(lo) : 0u;
-}
-
-uint32_t headsetRowHigh(const MenuRowDef& d) {
-    const int hi = d.hi[0] ? atoi(d.hi) : 0;
-    return hi > 0 ? static_cast<uint32_t>(hi) : edvr::native_render::kTrimDegreesMax;
-}
-
-HeadsetRowView headsetRowView(const MenuRowDef& d, const std::string& value) {
-    using namespace edvr::native_render;
-    HeadsetRowView v;
-    v.lo = headsetRowLow(d);
-    v.hi = headsetRowHigh(d);
-    v.headset = currentHeadset(&v.rt, &v.sys, nullptr, nullptr, nullptr, &v.labels);
-    v.entryCount = parseHeadsetEntries(value.c_str(), v.entries, nullptr, v.lo, v.hi);
-    if (!v.headset) return v;
-    v.key = headsetKey(v.rt, v.sys);
-    v.value = resolveHeadsetValue(v.entries, v.entryCount, v.rt, v.sys, &v.matched);
-    return v;
-}
-
-// The value column: the worn headset's entry, or `unknown` when no headset is
-// published -- which no number could mean, and which the resolution row says
-// the same way.
-std::string headsetRowValue(const HeadsetRowView& v) {
-    if (!v.headset) return "unknown";
-    char text[16];
-    snprintf(text, sizeof(text), "%u", v.value);
-    return text;
-}
-
-// The always-visible hint under the rows: which key this row is keyed on, and
-// what 0 does, so nobody looks for a "remove" the row does not have.
-std::string headsetRowHint(const HeadsetRowView& v) {
-    if (!v.headset) {
-        return nativeMenuActive() ? "No headset is known yet; try again in a moment."
-                                  : "Native OpenXR only; this runtime ignores it.";
-    }
-    return "This headset: " + v.key + ". " +
-           (v.value ? "0 removes its entry." : "Not set for this headset; Left/Right sets it.");
-}
-
-// The tooltip's facts line, in place of the Text default (no range at all).
-std::string headsetRowFacts(const MenuRowDef& d, const HeadsetRowView& v) {
-    char text[160];
-    snprintf(text, sizeof(text), "Range: %u to %u, for the headset you are wearing.  "
-             "Shipped (no entry).  %s", v.lo, v.hi,
-             d.applies == 1   ? "Applies at once."
-             : d.applies == 2 ? "Takes effect at the next launch."
-                              : "When it applies is not documented.");
-    return text;
-}
-
-// The tooltip's body: the headset this row is keyed on, what it is set to,
-// and every headset the list holds.
-std::string headsetRowTooltip(const MenuRowDef& d, const HeadsetRowView& v) {
-    std::string body;
-    if (!v.headset) {
-        body = nativeMenuActive()
-            ? "This headset: unknown (nothing has published a headset yet)."
-            : "This headset: not read (native OpenXR only; this runtime ignores the key).";
-    } else {
-        body = "This headset: " + v.key + " (" + v.labels.runtimeName + ", ";
-        body += v.sys.empty() ? std::string("runtime reported no system name)")
-                              : std::string(v.labels.systemName) + ")";
-        char digits[16];
-        snprintf(digits, sizeof(digits), "%u", v.value);
-        if (!v.value) {
-            body += std::string(". No entry for it, so ") + d.label + " does nothing here.";
-        } else {
-            body += std::string(". Set to ") + digits;
-            if (v.matched == 2) body += " (runtime-only entry " + v.rt + ":" + digits + ")";
-            body += ".";
-        }
-        body += "\n0 removes this headset's entry and leaves every other headset's alone.";
-    }
-    body += savedForText(v.entries, v.entryCount, v.headset, v.rt, v.sys, v.matched, v.value);
-    return body;
-}
-
-// One Left/Right step: 1, or `mult` with Shift, held inside the row's own
-// bounds. A press never moves against its own direction.
-uint32_t steppedHeadsetValue(const HeadsetRowView& v, int dir, int mult) {
-    const int64_t count = mult > 0 ? mult : 1;
-    int64_t next = static_cast<int64_t>(v.value) + (dir > 0 ? count : -count);
-    if (next < static_cast<int64_t>(v.lo)) next = static_cast<int64_t>(v.lo);
-    if (next > static_cast<int64_t>(v.hi)) next = static_cast<int64_t>(v.hi);
-    return static_cast<uint32_t>(next);
-}
-
-// A typed value for this row: digits only, within the row's bounds. Never the
-// list -- the buffer holds one headset's number.
-bool parseTypedHeadsetValue(const MenuRowDef& d, const std::string& text, uint32_t* out) {
-    std::string digits = text;
-    while (!digits.empty() && digits.front() == ' ') digits.erase(digits.begin());
-    while (!digits.empty() && digits.back() == ' ') digits.pop_back();
-    if (digits.empty() || digits.size() > 5) return false;
-    uint32_t value = 0;
-    for (char c : digits) {
-        if (c < '0' || c > '9') return false;
-        value = value * 10 + static_cast<uint32_t>(c - '0');
-    }
-    if (value < headsetRowLow(d) || value > headsetRowHigh(d)) return false;
-    if (out) *out = value;
-    return true;
-}
-
 // Whether a row that needs a restart has an on-disk value the running game
-// does not have. A per-headset list is compared on the WORN headset's value,
+// does not have. The resolution row is compared on the WORN headset's width,
 // never as text: a hand edit to another headset's entry, or a canonicalising
 // rewrite of the list, changes nothing here and must badge nothing.
 bool rowPending(const MenuRowDef& d, const std::string& value, const std::string& snapshot) {
     if (isOpenxrRenderScaleRow(d)) return renderScaleRowPending(value);
-    if (isHeadsetRow(d)) {
-        const HeadsetRowView now = headsetRowView(d, value);
-        return now.headset && now.value != headsetRowView(d, snapshot).value;
-    }
     return value != snapshot;
 }
 
@@ -924,6 +882,7 @@ struct ChoiceItem {
 };
 
 const char* nvidiaLabel() {
+    if (runtimeFlatProfile()) return flatRuntimeNativeScale() ? "DLAA" : "DLSS";
     float quality = 0.0f;
     deviceHookHmdQuality(&quality);
     return temporalNvidiaLabel(quality);
@@ -949,6 +908,13 @@ std::vector<ChoiceItem> choicesOf(const MenuRowDef& d) {
             }
             if (strcmp(d.section, "fix") == 0 && strcmp(d.key, "temporal_aa") == 0 && c.value == "dlss") {
                 c.label = nvidiaLabel();
+            }
+            if (runtimeFlatProfile() && strcmp(d.section, "fix") == 0 &&
+                strcmp(d.key, "temporal_aa") == 0) {
+                if (c.value == "off") c.label = "Off";
+                else if (c.value == "on") c.label = "TAA";
+                else if (c.value == "dlss") c.label = nvidiaLabel();
+                else if (c.value == "fsr") c.label = "FSR3";
             }
             out.push_back(c);
         }
@@ -1016,6 +982,74 @@ std::string displayValue(const MenuRowDef& d, const std::string& v) {
 }
 
 // ---------------------------------------------------------------------------
+// The flat panel's settings warning (flat_elite_settings.h). Shown only while a
+// temporal mode is selected and the runtime has stood its work down for the shape
+// of a post chain whose output copy it found (flatRuntimeStructuralRefusal, which
+// follows the stand-down and nothing else): a treated session, a session that is
+// merely starting, and a loading screen see nothing.
+
+constexpr int kFlatWarnLogMax = 24;
+
+// The selected mode as the panel names it on its Anti-aliasing row.
+std::string flatModeLabel() {
+    const std::string value = Config::get().requestedTemporalMode();
+    for (int i = 0; i < kRowDefCount; ++i)
+        if (strcmp(kMenuRows[i].section, "fix") == 0 && strcmp(kMenuRows[i].key, "temporal_aa") == 0)
+            return displayValue(kMenuRows[i], value);
+    return value;
+}
+
+struct FlatWarnRuler { int emPx; };
+int flatWarnMeasure(const char* text, void* context) {
+    return menuPanelMeasureLine(text, static_cast<FlatWarnRuler*>(context)->emPx);
+}
+
+// One tick: read Elite's files when they are wanted, and notice a change in what the
+// warning would say. The files are read when the menu opens, when the warning becomes
+// wanted, and then at most every couple of seconds while it is wanted or the panel is up;
+// a treated session with the panel closed never touches them.
+void flatWarningTick(uint64_t now) {
+    State& s = g_s;
+    const char* reason = "";
+    bool standing = false;
+    // The runtime's atomic first: a treated session pays a load and nothing else.
+    const bool refusing = flatRuntimeStructuralRefusal(&reason, &standing) &&
+                          temporalModeEnabled(Config::get().requestedTemporalMode());
+    if (refusing || s.open || s.flatSettingsForce) {
+        const bool force = s.flatSettingsForce || (refusing && !s.flatWarnActive);
+        s.flatSettingsForce = false;
+        if (s.flatSettings.poll(now, force)) {
+            char line[512];
+            flatFormatEliteSettings(line, sizeof(line), s.flatSettings.settings());
+            Log::get().note("%s", line);
+        }
+    }
+    const std::string label = refusing ? flatModeLabel() : std::string();
+    const std::string key = refusing ? flatSettingsWarningKey(label.c_str(), s.flatSettings.settings())
+                                     : std::string();
+    if (refusing == s.flatWarnActive && key == s.flatWarnKey) return;
+    const bool was = s.flatWarnActive;
+    s.flatWarnActive = refusing;
+    s.flatWarnKey = key;
+    s.contentDirty = true;
+    if (s.flatWarnLogged >= kFlatWarnLogMax) return;
+    ++s.flatWarnLogged;
+    if (refusing) {
+        FlatSettingsWarning w;
+        flatComposeSettingsWarning(label.c_str(), s.flatSettings.settings(), 0, nullptr, nullptr, &w);
+        Log::get().note("flat settings warning: %s (mode=%s, frames refused for %s%s): %s%s%s",
+                        was ? "changed" : "shown", label.c_str(), reason,
+                        standing ? ", work stood down" : "", w.count > 0 ? w.line[0] : "",
+                        w.count > 1 ? " " : "", w.count > 1 ? w.line[1] : "");
+    } else {
+        Log::get().note("flat settings warning: hidden (the work is not stood down for the shape of "
+                        "a post chain now, or the mode is off)");
+    }
+    if (s.flatWarnLogged == kFlatWarnLogMax)
+        Log::get().note("flat settings warning: further changes are not logged this session");
+}
+
+// ---------------------------------------------------------------------------
 // The ini write (docs/settings-menu.md, "Persistence")
 
 bool readWhole(const std::wstring& path, std::string* out) {
@@ -1034,15 +1068,15 @@ bool readWhole(const std::wstring& path, std::string* out) {
     return ok && got == size;
 }
 
-bool writeWhole(const std::wstring& path, const std::string& text) {
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return false;
-    DWORD wrote = 0;
-    const BOOL ok = text.empty() ||
-                    WriteFile(f, text.data(), static_cast<DWORD>(text.size()), &wrote, nullptr);
-    CloseHandle(f);
-    return ok && wrote == text.size();
+std::string utf8Of(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    const int need = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                         nullptr, 0, nullptr, nullptr);
+    if (need <= 0) return std::string();
+    std::string out(static_cast<size_t>(need), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), &out[0], need,
+                        nullptr, nullptr);
+    return out;
 }
 
 std::wstring stampName() {
@@ -1108,15 +1142,22 @@ std::wstring mirrorDir() {
 
 bool g_backedUp = false;
 bool g_mirrorNoted = false;
+bool g_mirrorFailNoted = false;
 
 bool menuIniWrite(const std::string& dotted, const std::string& value, std::string* err) {
     const std::wstring path = Config::get().path();
+    // The file this process reads and this write replaces: edvr-flat.ini under the
+    // flat profile, edvr.ini otherwise (Config::iniName names it for the messages).
+    // Its own name, both for the safety copies below and for what a failure says.
+    const std::string fileName = Config::get().iniName();
+    const size_t leafAt = path.find_last_of(L"\\/");
+    const std::wstring leaf = leafAt == std::wstring::npos ? path : path.substr(leafAt + 1);
     std::string source;
     // Re-read before every write, the settings window's 2026-08-28 lesson:
     // the file on disk is the source, never a copy cached when the panel
     // opened.
     if (!readWhole(path, &source) || source.empty()) {
-        *err = "edvr.ini could not be read";
+        *err = fileName + " could not be read";
         return false;
     }
     if (!g_backedUp) {
@@ -1125,36 +1166,44 @@ bool menuIniWrite(const std::string& dotted, const std::string& value, std::stri
         if (!dirExistsW(root)) CreateDirectoryW(root.c_str(), nullptr);
         const std::wstring dir = root + L"\\menu-" + stampName();
         if (CreateDirectoryW(dir.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS) {
-            CopyFileW(path.c_str(), (dir + L"\\edvr.ini").c_str(), FALSE);
+            // Named for the file copied: the flat profile's settings are not an edvr.ini,
+            // and a copy called that could be restored over the VR profile's.
+            CopyFileW(path.c_str(), (dir + L"\\" + leaf).c_str(), FALSE);
         }
     }
     MergeReport report;
     const std::string updated = mergeIni(source, source, &source, {{dotted, value}}, &report);
-    // Atomic: the whole new file beside the old one, then one replace, so
-    // config.cpp's size check never meets half a save.
-    const std::wstring tmp = path + L".menu-tmp";
-    if (!writeWhole(tmp, updated)) {
-        *err = "the temporary file could not be written beside edvr.ini";
-        return false;
-    }
-    if (!MoveFileExW(tmp.c_str(), path.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(tmp.c_str());
-        *err = "edvr.ini could not be replaced (read-only, or held by an editor?)";
+    // Atomic, through the one writer iniedit owns (the whole new file beside the
+    // old one, flushed, then one replace that is tried again while a reader has
+    // the file for a moment), so config.cpp's size check never meets half a save
+    // and a reload that lands between two writes cannot fail the second.
+    std::wstring why;
+    if (!writeFileAtomic(path, updated, &why)) {
+        *err = fileName + ": " + utf8Of(why);
         return false;
     }
     // The mirror of last resort, refreshed so an update that wipes the
-    // folder cannot lose an evening's tuning.
+    // folder cannot lose an evening's tuning. A change made just now, not a
+    // checkpoint: it replaces the newest copy in place and leaves the older
+    // generations the installer keeps (edvr.ini.1, edvr.ini.2) alone. Named for
+    // the file actually written, so the flat profile's edvr-flat.ini lands in
+    // the mirror's edvr-flat.ini rather than over the VR profile's edvr.ini.
     const std::wstring mdir = mirrorDir();
     if (!mdir.empty()) {
-        CopyFileW(path.c_str(), (mdir + L"\\edvr.ini").c_str(), FALSE);
-        if (!g_mirrorNoted) {
-            g_mirrorNoted = true;
-            char utf8[MAX_PATH * 3] = {};
-            WideCharToMultiByte(CP_UTF8, 0, mdir.c_str(), -1, utf8, sizeof(utf8), nullptr, nullptr);
-            Log::get().note("menu: each write is mirrored to %s, the installer's copy outside "
-                            "the game folder.",
-                            utf8);
+        std::wstring mirrorWhy;
+        if (writeGenerations(mdir, leaf, updated, false, &mirrorWhy)) {
+            if (!g_mirrorNoted) {
+                g_mirrorNoted = true;
+                Log::get().note("menu: each write is mirrored to %s, the installer's copy outside "
+                                "the game folder.",
+                                utf8Of(mdir).c_str());
+            }
+        } else if (!g_mirrorFailNoted) {
+            // Once: a mirror that cannot be written fails every write the same
+            // way, and the menu never fails a settings change over its safety net.
+            g_mirrorFailNoted = true;
+            Log::get().note("menu: the mirror copy in %s could not be written: %s.",
+                            utf8Of(mdir).c_str(), utf8Of(mirrorWhy).c_str());
         }
     }
     return true;
@@ -1264,16 +1313,6 @@ void addSettingRows(Page& p, MenuTier tier, const char* page, bool grouped) {
         const MenuRowDef& d = kMenuRows[i];
         if (d.tier != tier) continue;
         if (page && _stricmp(d.page, page) != 0) continue;
-        // fix.temporal_aa_model is NVIDIA's preset row; fsr ignores it
-        // (design doc 3.1), so it stays off the list while fsr is selected.
-        // The row reappears the next time the pages rebuild (developer
-        // switch toggle, or the menu reopening) after a mode change, the
-        // same timing the developer-tier pages themselves already use.
-        if (strcmp(d.section, "fix") == 0 && strcmp(d.key, "temporal_aa_model") == 0 &&
-            temporalEngineFor(Config::get().getString("fix.temporal_aa", "off")) ==
-                TemporalEngine::Amd) {
-            continue;
-        }
         if (grouped && d.group[0] && (!lastGroup || strcmp(lastGroup, d.group) != 0)) {
             Entry h;
             h.kind = EntryKind::Heading;
@@ -1310,6 +1349,27 @@ void buildPages() {
     const int keepScroll = s.pages.empty() ? 0 : s.pages[s.page].scroll;
     const size_t keepCount = s.pages.empty() ? 0 : s.pages[s.page].entries.size();
     s.pages.clear();
+    if (runtimeFlatProfile()) {
+        Page p;
+        p.name = "Flat graphics";
+        for (int i = 0; i < kRowDefCount; ++i) {
+            const MenuRowDef& d = kMenuRows[i];
+            // The rows are the table in menu_flat_rows.h, which a rig checks
+            // against the flat profile's key gate: a row listed there whose key
+            // is refused fails the build instead of reading a silent 0.
+            if (!flatPageHasRow(d.section, d.key)) continue;
+            Entry e;
+            e.kind = EntryKind::Setting;
+            e.def = i;
+            p.entries.push_back(e);
+        }
+        firstSelectable(p);
+        s.pages.push_back(p);
+        s.page = 0;
+        s.developerBuilt = s.developer;
+        s.contentDirty = true;
+        return;
+    }
     {
         Page p;
         p.name = "Performance";
@@ -1683,10 +1743,10 @@ void buildMonitor(MenuContent& c) {
         mg.zeroIsValid = nativeGraphs;
         if (nativeGraphs && mg.budgetMs > 0.0f)
             snprintf(mg.label, sizeof(mg.label), "%s, %d samples; predicted period %.1f ms",
-                     g == 0 ? "Producer GPU" : "Submit wall", mg.count, double(mg.budgetMs));
+                     g == 0 ? "Producer GPU" : "Application wall", mg.count, double(mg.budgetMs));
         else if (nativeGraphs)
             snprintf(mg.label, sizeof(mg.label), "%s, %d samples; no runtime reference",
-                     g == 0 ? "Producer GPU" : "Submit wall", mg.count);
+                     g == 0 ? "Producer GPU" : "Application wall", mg.count);
         else snprintf(mg.label, sizeof(mg.label), "%s, last %d frames; the line is the %.1f ms budget",
                  names[g], mg.count, static_cast<double>(mg.budgetMs));
         ++c.graphCount;
@@ -1735,6 +1795,11 @@ float panelShift(float halfW, bool withTip) {
 // panel: the panel is specified in degrees, so it reads the same size in
 // any headset and composites near 1:1. `withTip` adds the strip.
 void sizeContent(MenuContent& c, float widthDeg, float textDeg, bool withTip = false) {
+    if (runtimeFlatProfile()) {
+        c.cardPx = c.widthPx = 860;
+        c.capPx = 34;
+        return;
+    }
     float ppd = 45.0f;
     uint32_t ew = 0, eh = 0;
     float outer = 0.0f, inner = 0.0f;
@@ -1768,6 +1833,15 @@ void buildContent(MenuContent& c) {
     memset(&c, 0, sizeof(c));
     c.popupLine = -1;
     sizeContent(c, s.widthDeg, s.textDeg, tooltipsOn());
+
+    // If the FPS overlay is locked to the menu, show the same readout at the
+    // top of the menu panel so both are visible for A/B testing.
+    if (s.overlay && s.overlayLock) {
+        char line[120];
+        perfMonitorOverlayLine(line, sizeof(line));
+        strncpy(c.overlayLine, line, sizeof(c.overlayLine) - 1);
+        c.overlayLine[sizeof(c.overlayLine) - 1] = 0;
+    }
 
     // The tab strip: a window of pages that fits the panel, always
     // including the current one, with an arrow at whichever end has more.
@@ -1858,6 +1932,7 @@ void buildContent(MenuContent& c) {
             const Entry& e = p.entries[i];
             MenuLine& l = c.lines[c.lineCount++];
             l.badge = kBadgeNone;
+            l.dim = false;
             if (e.kind == EntryKind::Heading) {
                 strncpy(l.left, e.text, sizeof(l.left) - 1);
                 l.style = kMenuHeading;
@@ -1875,24 +1950,30 @@ void buildContent(MenuContent& c) {
             const MenuRowDef& d = kMenuRows[e.def];
             const RowState& r = g_rows[e.def];
             const bool editingThis = (s.editEntry == i);
+            const bool dlssRow = isDlssPresetRow(d);
+            const bool sharpenRow = isSharpenRow(d);
+            const bool dim = (dlssRow && dlssPresetDisabled()) ||
+                             (sharpenRow && sharpenRowDisabled());
+            l.dim = dim;
             strncpy(l.left, d.label, sizeof(l.left) - 1);
-            if (strcmp(d.section, "fix") == 0 && strcmp(d.key, "temporal_aa_model") == 0) {
-                const std::string mode = Config::get().getString("fix.temporal_aa", "off");
+            if (dlssRow) {
+                const std::string mode = runtimeFlatProfile() ? Config::get().requestedTemporalMode()
+                                                              : Config::get().getString("fix.temporal_aa", "off");
                 snprintf(l.left, sizeof(l.left), "%s preset", _stricmp(mode.c_str(), "dlaa") == 0 ? "DLAA" : nvidiaLabel());
             }
+            if (runtimeFlatProfile() && strcmp(d.section, "fix") == 0 &&
+                strcmp(d.key, "temporal_aa") == 0) {
+                strncpy(l.left, "Anti-aliasing", sizeof(l.left) - 1);
+            }
             const bool openxrScaleRow = isOpenxrRenderScaleRow(d);
-            const bool headsetRow = isHeadsetRow(d);
             // The worn headset's entry, resolved once for every site of this
             // row below (label, value, hint, tooltip, reset prompt).
             const ResolutionView res = openxrScaleRow ? resolutionView(r.value) : ResolutionView{};
-            const HeadsetRowView headsetValue =
-                headsetRow ? headsetRowView(d, r.value) : HeadsetRowView{};
             if (openxrScaleRow) {
                 snprintf(l.left, sizeof(l.left), "%s", openxrResolutionLabel(res).c_str());
             }
-            std::string v = openxrScaleRow  ? openxrResolutionValue(res)
-                            : headsetRow    ? headsetRowValue(headsetValue)
-                                            : displayValue(d, r.value);
+            std::string v = openxrScaleRow ? openxrResolutionValue(res)
+                                           : displayValue(d, r.value);
             if (editingThis) {
                 // What has been typed, with a caret. The raster shows a
                 // typed row in the value colour whatever its kind.
@@ -1902,7 +1983,7 @@ void buildContent(MenuContent& c) {
                 // after-restart value.  The pending badge supplies the same
                 // timing cue as every other restart row, while keeping the
                 // per-eye dimensions readable.
-                if (!openxrScaleRow && !headsetRow) v = displayValue(d, r.snapshot) + " -> " + v;
+                if (!openxrScaleRow) v = displayValue(d, r.snapshot) + " -> " + v;
                 l.badge = kBadgePending;
             } else if (d.applies == 2) {
                 l.badge = kBadgeRestart;
@@ -1929,12 +2010,30 @@ void buildContent(MenuContent& c) {
                     l.right[sizeof(l.right) - 1] = 0;
                 }
             }
-            l.style = editingThis ? kMenuRowEdit : (hi ? kMenuRowHi : kMenuRow);
+            l.style = editingThis ? kMenuRowEdit
+                      : hi        ? kMenuRowHi
+                      : dim       ? kMenuDim
+                                  : kMenuRow;
+            if (hi && dim && runtimeFlatProfile())
+                snprintf(c.hint, sizeof(c.hint), "%s",
+                         sharpenRow ? "Turn anti-aliasing on to sharpen."
+                                    : "Choose DLSS to change its model preset.");
             if (hi && openxrScaleRow) {
                 snprintf(c.hint, sizeof(c.hint), "%s", openxrResolutionHint(res).c_str());
             }
-            if (hi && headsetRow) {
-                snprintf(c.hint, sizeof(c.hint), "%s", headsetRowHint(headsetValue).c_str());
+            if (hi && isVscreenResolutionRow(d)) {
+                // announce=false: this runs every frame the row is highlighted,
+                // not once at startup, so the resolver must stay silent here.
+                uint32_t vw = 0, vh = 0;
+                resolveVScreenTargetResolution(Config::get(), &vw, &vh, /*announce=*/false);
+                if (vw && vh) {
+                    snprintf(c.hint, sizeof(c.hint), "Currently resolves to %ux%u.", vw, vh);
+                } else {
+                    snprintf(c.hint, sizeof(c.hint),
+                             "No runtime width on record yet; the panel stays at the "
+                             "game's own 1920x1080 until a session with VR running has "
+                             "completed once.");
+                }
             }
             if (hi && showTip) {
                 // The tooltip beside the row: what the ini says about this
@@ -1953,8 +2052,9 @@ void buildContent(MenuContent& c) {
                 std::string body;
                 if (openxrScaleRow) {
                     body += openxrResolutionFacts();
-                } else if (headsetRow) {
-                    body += headsetRowFacts(d, headsetValue);
+                } else if (isVscreenResolutionRow(d) && d.lo[0] && d.hi[0]) {
+                    body += std::string("\"auto\", or a width in pixels from ") + d.lo +
+                            " to " + d.hi + ". The height always follows it at 16:9.  ";
                 } else if (d.kind == MenuKind::Number && d.lo[0] && d.hi[0]) {
                     body += std::string("Range ") + d.lo + " to " + d.hi + ".  ";
                 } else if (d.kind == MenuKind::Choice) {
@@ -1965,14 +2065,13 @@ void buildContent(MenuContent& c) {
                     }
                     if (!list.empty()) body += "Choices: " + list + ".  ";
                 }
-                if (!openxrScaleRow && !headsetRow) {
+                if (!openxrScaleRow) {
                     body += std::string("Shipped ") + displayValue(d, d.shipped) + ".  " +
                             (d.applies == 1   ? "Applies at once."
                              : d.applies == 2 ? "Takes effect at the next launch."
                                               : "When it applies is not documented.");
                 }
                 if (openxrScaleRow) body += "\n" + openxrResolutionTooltip(res);
-                if (headsetRow) body += "\n" + headsetRowTooltip(d, headsetValue);
                 if (editingThis) {
                     body += s.editBad ? "\nThat is not a value this key accepts."
                                       : "\nEnter writes it, Escape leaves it alone.";
@@ -1999,26 +2098,8 @@ void buildContent(MenuContent& c) {
                         }
                         body += "\nPress R again to remove this headset's entry (back to " + fallback + ").";
                     }
-                } else if (s.resetArmedEntry == i && headsetRow) {
-                    // R clears only the worn headset's entry here too, never
-                    // d.shipped (the empty list, every headset's entry).
-                    if (!headsetValue.headset) {
-                        body += std::string("\nR would remove this headset's entry, but ") +
-                                (nativeMenuActive() ? "no headset is known yet."
-                                                    : "this runtime ignores it (native OpenXR only).");
-                    } else if (!wornEntryRemovable(headsetValue.headset, headsetValue.matched,
-                                                   headsetValue.sys)) {
-                        body += "\nNo entry for this headset; R removes nothing.";
-                    } else {
-                        const HeadsetRowView after = headsetRowView(
-                            d, edvr::native_render::removeHeadsetEntry(
-                                   r.value, headsetValue.rt, headsetValue.sys,
-                                   headsetValue.lo, headsetValue.hi));
-                        char back[32];
-                        snprintf(back, sizeof(back), "%u", after.value);
-                        body += std::string("\nPress R again to remove this headset's entry (back to ") +
-                                back + ").";
-                    }
+                } else if (dim) {
+                    body += "\nInactive: only DLSS and DLAA read this preset.";
                 } else if (s.resetArmedEntry == i) {
                     body += "\nPress R again to reset it to the shipped value.";
                 } else if (aliasesLive) {
@@ -2035,6 +2116,44 @@ void buildContent(MenuContent& c) {
                 }
                 body += std::string("\n\n") + (d.detail[0] ? d.detail : d.hint);
                 strncpy(c.popup, body.c_str(), sizeof(c.popup) - 1);
+            }
+        }
+        // The settings warning (flat only, and only while frames are refused for the shape
+        // of the post chain): a blank line, then the words wrapped to the note face's width.
+        if (runtimeFlatProfile() && s.flatWarnActive) {
+            FlatWarnRuler ruler{c.capPx * 8 / 7};   // the note face's em (menu_panel.cpp, Font::Hint)
+            const int width = c.cardPx - 2 * (c.capPx * 8 / 10);
+            FlatSettingsWarning warning;
+            flatComposeSettingsWarning(flatModeLabel().c_str(), s.flatSettings.settings(), width,
+                                       &flatWarnMeasure, &ruler, &warning);
+            if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;
+            for (int i = 0; i < warning.count && c.lineCount < kMenuMaxLines; ++i) {
+                MenuLine& l = c.lines[c.lineCount++];
+                strncpy(l.left, warning.line[i], sizeof(l.left) - 1);
+                l.style = kMenuNote;
+            }
+        }
+        // The graphics-wrapper note (flat only, while a temporal mode is selected, and only when the hook-mode probe found
+        // a wrapper such as ReShade handling every graphics call): the words wrapped to the note face's width, after a
+        // blank line, and said once in the log the first time they are drawn.
+        if (runtimeFlatProfile()) {
+            const char* wrapper = contextWrapperFile();
+            FlatWarnRuler ruler{c.capPx * 8 / 7};
+            FlatSettingsWarning note;
+            flatComposeWrapperNote(temporalModeEnabled(Config::get().requestedTemporalMode()), wrapper,
+                                   c.cardPx - 2 * (c.capPx * 8 / 10), &flatWarnMeasure, &ruler, &note);
+            if (note.count > 0) {
+                if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;
+                for (int i = 0; i < note.count && c.lineCount < kMenuMaxLines; ++i) {
+                    MenuLine& l = c.lines[c.lineCount++];
+                    strncpy(l.left, note.line[i], sizeof(l.left) - 1);
+                    l.style = kMenuNote;
+                }
+                if (!s.flatWrapperNoteLogged) {
+                    s.flatWrapperNoteLogged = true;
+                    Log::get().note("flat wrapper note: shown in the panel (mode=%s): %s handles every graphics call, so every "
+                                    "call EDVR makes goes through it first.", flatModeLabel().c_str(), wrapper);
+                }
             }
         }
         if (c.lineCount == 0) {
@@ -2059,6 +2178,16 @@ void buildContent(MenuContent& c) {
     // THE GAME had never been visible -- the likeliest root of "how do I
     // change tabs". The width is the card less the raster's pad either
     // side (menu_panel.cpp: pad = cap * 8 / 10).
+    if (runtimeFlatProfile()) {
+        const char* status = "";
+        if (!s.flatKeysReadyShown) status = " | keyboard gate unavailable";
+        else if (s.lastWrite.compare(0, 8, "writing ") == 0) status = " | saving";
+        else if (s.lastWrite.compare(0, 7, "FAILED:") == 0) status = " | write failed";
+        else if (!s.lastWrite.empty()) status = " | saved";
+        snprintf(c.footer, sizeof(c.footer), "Up/Down row  Left/Right change\n%s/Esc close%s",
+                 s.summonName.c_str(), status);
+        return;
+    }
     {
         MenuFooterInput in = {};
         in.editing = s.editEntry >= 0;
@@ -2152,8 +2281,8 @@ void applyChange(int defIndex, const std::string& fileValue) {
 
 // What one per-headset write needs to know about the row it is changing: the
 // worn key, what that key resolves to now, and what ONE entry may hold. The
-// resolution row fills it from its ResolutionView, a trim row from its
-// HeadsetRowView, and the write below is the same for both.
+// resolution row fills it from its ResolutionView. (The field-of-view trims
+// filled it from a row of their own until 2026-09-29; they are ini-only now.)
 struct HeadsetWrite {
     bool        headset = false;
     std::string rt, sys, key;
@@ -2175,20 +2304,7 @@ HeadsetWrite headsetWriteOf(const ResolutionView& v) {
     return w;
 }
 
-HeadsetWrite headsetWriteOf(const HeadsetRowView& v) {
-    HeadsetWrite w;
-    w.headset = v.headset;
-    w.rt = v.rt;
-    w.sys = v.sys;
-    w.key = v.key;
-    w.matched = v.matched;
-    w.entryValue = v.value;
-    w.lo = v.lo;
-    w.hi = v.hi;
-    return w;
-}
-
-// The write for a per-headset list (fix.openxr_resolution and the trims): the
+// The write for a per-headset list (fix.openxr_resolution): the
 // worn headset's entry merged into the list (every other headset's entry kept
 // -- re-serialised in the canonical `rt/sys:V` spacing and case, never resized
 // or re-keyed -- malformed tokens dropped and named), the whole list written
@@ -2212,7 +2328,7 @@ bool applyHeadsetChange(int defIndex, const HeadsetWrite& w, uint32_t value) {
     std::string list;
     if (value) {
         if (!mergeHeadsetEntry(before, w.rt, w.sys, value, &list, w.lo, w.hi)) {
-            s.lastWrite = kEightHeadsets;
+            s.lastWrite = eightHeadsetsText();
             s.contentDirty = true;
             return false;
         }
@@ -2281,17 +2397,17 @@ void drainWrites() {
                 // The per-headset row: the key and the values, then the
                 // list the file now holds.
                 s.lastWrite = w.job.headset + " = " + w.job.toValue;
-                Log::get().note("menu: %s %s %s -> %s (list now %s%s%s; written to edvr.ini; "
+                Log::get().note("menu: %s %s %s -> %s (list now %s%s%s; written to %s; "
                                 "%s).",
                                 w.job.dotted.c_str(), w.job.headset.c_str(), w.job.fromValue.c_str(),
                                 w.job.toValue.c_str(), w.job.value.empty() ? "empty" : w.job.value.c_str(),
                                 w.job.dropped.empty() ? "" : "; dropped malformed ",
-                                w.job.dropped.c_str(), when);
+                                w.job.dropped.c_str(), Config::get().iniName(), when);
             } else {
                 s.lastWrite = w.job.dotted + " = " + w.job.value;
-                Log::get().note("menu: %s %s -> %s (written to edvr.ini; %s).", w.job.dotted.c_str(),
+                Log::get().note("menu: %s %s -> %s (written to %s; %s).", w.job.dotted.c_str(),
                                 w.job.before.empty() ? "(default)" : w.job.before.c_str(),
-                                w.job.value.c_str(), when);
+                                w.job.value.c_str(), Config::get().iniName(), when);
             }
         } else {
             s.lastWrite = "FAILED: " + w.err;
@@ -2310,6 +2426,16 @@ void drainWrites() {
 void stepRow(int defIndex, int dir, int mult) {
     const MenuRowDef& d = kMenuRows[defIndex];
     const std::string& cur = g_rows[defIndex].value;
+    if (isDlssPresetRow(d) && dlssPresetDisabled()) {
+        g_s.lastWrite = "DLSS preset is inactive: select DLSS or DLAA above first.";
+        g_s.contentDirty = true;
+        return;
+    }
+    if (isSharpenRow(d) && sharpenRowDisabled()) {
+        g_s.lastWrite = "Sharpening is inactive: turn anti-aliasing on above first.";
+        g_s.contentDirty = true;
+        return;
+    }
     if (isOpenxrRenderScaleRow(d)) {
         // A width for the worn headset, stepped by 100 px on the grid of
         // round hundreds (steppedResolution); the generated row is Text,
@@ -2322,20 +2448,6 @@ void stepRow(int defIndex, int dir, int mult) {
         }
         const uint32_t next = steppedResolution(v, dir, mult);
         if (next != v.width) applyResolutionChange(defIndex, v, next);
-        return;
-    }
-    if (isHeadsetRow(d)) {
-        // One number for the worn headset, stepped by 1 within the row's
-        // bounds; the generated row is Text, for which stepping would
-        // otherwise be a no-op.
-        const HeadsetRowView v = headsetRowView(d, cur);
-        if (!v.headset) {
-            g_s.lastWrite = noHeadsetWriteText();
-            g_s.contentDirty = true;
-            return;
-        }
-        const uint32_t next = steppedHeadsetValue(v, dir, mult);
-        if (next != v.value) applyHeadsetChange(defIndex, headsetWriteOf(v), next);
         return;
     }
     switch (d.kind) {
@@ -2640,10 +2752,10 @@ bool editBufferBad() {
     const State& s = g_s;
     if (s.editDef < 0) return false;
     const MenuRowDef& d = kMenuRows[s.editDef];
-    // The per-headset rows take one headset's number -- a width in pixels,
-    // 1..16384, or the row's own range -- never the list.
+    // The per-headset row takes one headset's number -- a width in pixels,
+    // 1..16384 -- never the list.
     if (isOpenxrRenderScaleRow(d)) return !parseTypedWidth(s.editBuf, nullptr);
-    if (isHeadsetRow(d)) return !parseTypedHeadsetValue(d, s.editBuf, nullptr);
+    if (isVscreenResolutionRow(d)) return !parseVscreenWidth(s.editBuf, nullptr);
     if (d.kind != MenuKind::Number) return false;
     if (s.editBuf.empty()) return true;
     char* end = nullptr;
@@ -2657,6 +2769,13 @@ bool editBufferBad() {
 void beginEdit(int entryIndex, int defIndex) {
     State& s = g_s;
     std::string seed = g_rows[defIndex].value;
+    // A typed value is a change like a step is: the dimmed Sharpening row takes
+    // neither (stepRow says why).
+    if (isSharpenRow(kMenuRows[defIndex]) && sharpenRowDisabled()) {
+        s.lastWrite = "Sharpening is inactive: turn anti-aliasing on above first.";
+        s.contentDirty = true;
+        return;
+    }
     if (isOpenxrRenderScaleRow(kMenuRows[defIndex])) {
         // The buffer holds the worn headset's width as digits, never the
         // list (so kEditMax cannot cut it); with no headset to key on the
@@ -2669,19 +2788,6 @@ void beginEdit(int entryIndex, int defIndex) {
         }
         char digits[16];
         snprintf(digits, sizeof(digits), "%u", width);
-        seed = digits;
-    } else if (isHeadsetRow(kMenuRows[defIndex])) {
-        // The buffer holds the worn headset's number as digits, never the
-        // list; with no headset to key on the edit is refused and the Status
-        // page says why.
-        const HeadsetRowView v = headsetRowView(kMenuRows[defIndex], seed);
-        if (!v.headset) {
-            s.lastWrite = noHeadsetWriteText();
-            s.contentDirty = true;
-            return;
-        }
-        char digits[16];
-        snprintf(digits, sizeof(digits), "%u", v.value);
         seed = digits;
     }
     s.editEntry = entryIndex;
@@ -2731,14 +2837,8 @@ void commitEdit() {
         // title).
         if (isOpenxrRenderScaleRow(d)) {
             s.lastWrite = "not written: needs a width in pixels, 1 to 16384";
-        } else if (isHeadsetRow(d)) {
-            // As above, the dotted key is dropped: the row is highlighted and
-            // the key is the tooltip's title, and the line has to fit the
-            // Status page's 63-byte field.
-            char text[64];
-            snprintf(text, sizeof(text), "not written: needs a number from %u to %u",
-                     headsetRowLow(d), headsetRowHigh(d));
-            s.lastWrite = text;
+        } else if (isVscreenResolutionRow(d)) {
+            s.lastWrite = "not written: needs \"auto\" or a width in pixels, 640 to 8192";
         } else {
             s.lastWrite = std::string("not written: ") + dottedOf(d) + " needs a number" +
                           (d.lo[0] && d.hi[0] ? std::string(" from ") + d.lo + " to " + d.hi : "");
@@ -2753,17 +2853,6 @@ void commitEdit() {
         const ResolutionView view = resolutionView(g_rows[def].value);
         if (parseTypedWidth(v, &width) && (width != view.width || !view.entryWidth)) {
             applyResolutionChange(def, view, width);
-        }
-        return;
-    }
-    if (isHeadsetRow(d)) {
-        // The typed number is the worn headset's entry; the file gets the
-        // merged list, the other headsets' entries untouched. A typed 0
-        // removes the entry, and is a change whenever there is one to remove.
-        uint32_t value = 0;
-        const HeadsetRowView view = headsetRowView(d, g_rows[def].value);
-        if (parseTypedHeadsetValue(d, v, &value) && value != view.value) {
-            applyHeadsetChange(def, headsetWriteOf(view), value);
         }
         return;
     }
@@ -2854,19 +2943,6 @@ void dispatchNav(MenuNav nav, uint64_t now) {
                             s.contentDirty = true;
                         } else {
                             applyResolutionChange(def, v, 0);
-                        }
-                    } else if (isHeadsetRow(d)) {
-                        // The same rule on a trim: only the worn headset's
-                        // entry goes, never the whole list.
-                        const HeadsetRowView v = headsetRowView(d, g_rows[def].value);
-                        if (!v.headset) {
-                            s.lastWrite = noHeadsetWriteText();
-                            s.contentDirty = true;
-                        } else if (!wornEntryRemovable(v.headset, v.matched, v.sys)) {
-                            s.lastWrite = "no entry to remove for this headset";
-                            s.contentDirty = true;
-                        } else {
-                            applyHeadsetChange(def, headsetWriteOf(v), 0);
                         }
                     } else {
                         applyChange(def, d.shipped);
@@ -3123,6 +3199,26 @@ void latchAnchor(float yawDeg, float pitchDeg) {
 
 void openMenu(uint64_t now) {
     State& s = g_s;
+    if (runtimeFlatProfile()) {
+        inputGateInstall();
+        for (KeyRepeat& k : s.keys) keyRepeatPrime(k, rawKeyDown(k.vk));
+        for (KeyRepeat& k : s.editKeys) keyRepeatPrime(k, rawKeyDown(k.vk));
+        buildPages();
+        refreshRowValues();
+        s.open = true;
+        s.openedMs = s.lastInputMs = s.highlightSinceMs = now;
+        s.lastDrawn = menuDrawnValue();
+        s.lastDrawnMs = 0;
+        s.flatEscapeDown = rawKeyDown(VK_ESCAPE);
+        s.flatNativeScaleShown = flatRuntimeNativeScale();
+        s.flatSettingsForce = true;   // Elite's graphics files are looked at when the panel opens
+        s.alpha = 1.0f;
+        s.tooltipUp = false;
+        s.contentDirty = true;
+        Log::get().note("menu: flat graphics panel open; keyboard %s.",
+                        s.privateWanted ? "private" : "shared");
+        return;
+    }
     if (!glitchConsumerPresent() && !nativeMenuAvailable()) {
         if (!s.noConsumerNoted) {
             s.noConsumerNoted = true;
@@ -3227,6 +3323,34 @@ void menuAdoptGameBindings(bool enabled, const char* why) {
 
 void menuConfigure(Config& cfg) {
     State& s = g_s;
+    if (runtimeFlatProfile()) {
+        const std::string key = cfg.getString("hotkey.menu", "F8");
+        if (!s.configured || key != s.summonName) {
+            s.summonName = key;
+            s.summon.setBinding(key.c_str());
+        }
+        s.privateWanted = true;
+        s.aimMode = 1;
+        s.tooltipDelayS = 0.0f;
+        s.toasts = false;
+        s.overlay = false;
+        inputGateConfigure(cfg);
+        if (!s.configured) {
+            s.configured = true;
+            s.flatSettings.setFolder(flatEliteGraphicsFolder());
+            initKeys();
+            refreshRowValues();
+            takeSnapshot();
+            buildPages();
+            Log::get().note("menu: flat graphics panel configured; summon with %s.", key.c_str());
+        }
+        return;
+    }
+    if (!runtimeVrProfile()) {
+        s.configured = false;
+        s.summon.setBinding("");
+        return;
+    }
     const std::string key = cfg.getString("hotkey.menu", "F8");
     const bool summonChanged = key != s.summonName || !s.configured;
     if (summonChanged) {
@@ -3322,14 +3446,22 @@ void menuConfigure(Config& cfg) {
     s.toasts = cfg.getBool("menu.toasts", true);
     {
         const bool ov = cfg.getBool("menu.fps_overlay", false);
+        const bool ovLock = cfg.getBool("menu.fps_overlay_lock", false);
         float yaw = cfg.getFloat("menu.fps_overlay_yaw", 0.0f);
         float pitch = cfg.getFloat("menu.fps_overlay_pitch", 20.0f);
         if (!(yaw >= -60.0f) || yaw > 60.0f) yaw = 0.0f;
         if (!(pitch >= -45.0f) || pitch > 45.0f) pitch = 20.0f;
         if (s.configured && ov != s.overlay) {
             Log::get().note("menu: the frame-rate overlay is %s.", ov ? "on" : "off");
+            if (s.open && (ovLock || s.overlayLock)) s.contentDirty = true;
+        }
+        if (s.configured && ovLock != s.overlayLock) {
+            Log::get().note("menu: the frame-rate overlay is %s while the menu is open.",
+                            ovLock ? "locked on" : "no longer locked");
+            if (s.open && ov) s.contentDirty = true;
         }
         s.overlay = ov;
+        s.overlayLock = ovLock;
         s.overlayYaw = yaw;
         s.overlayPitch = pitch;
     }
@@ -3369,8 +3501,6 @@ bool menuTakeConfigPollRequest() {
     return r;
 }
 
-bool menuOpen() { return g_s.open || g_s.alpha > 0.0f; }
-
 void menuNoteConfigReloaded() {
     State& s = g_s;
     if (!s.configured) return;
@@ -3382,25 +3512,10 @@ void menuNoteConfigReloaded() {
         const std::string dotted = dottedOf(d);
         const bool byMenu = (s.menuWroteDotted == dotted);
         const bool openxrScaleRow = isOpenxrRenderScaleRow(d);
-        const bool headsetRow = isHeadsetRow(d);
         if (v != r.value) {
             const std::string was = r.value;
             r.value = v;
-            if (!byMenu && headsetRow) {
-                // The list would toast truncated, and an edit to another
-                // headset's entry means nothing here: toast the worn
-                // headset's own value, or say the list moved without it.
-                const HeadsetRowView now = headsetRowView(d, v);
-                char text[96];
-                if (!now.headset) {
-                    snprintf(text, sizeof(text), "%s: list changed (no headset known)", d.label);
-                } else if (now.value == headsetRowView(d, was).value) {
-                    snprintf(text, sizeof(text), "%s: list changed (not this headset)", d.label);
-                } else {
-                    snprintf(text, sizeof(text), "%s: %u for this headset", d.label, now.value);
-                }
-                changed.push_back(text);
-            } else if (!byMenu && openxrScaleRow) {
+            if (!byMenu && openxrScaleRow) {
                 // The list would toast truncated; say what it means here.
                 // A hand edit that touched only another headset's entry
                 // changes nothing for the worn one, and says so rather
@@ -3428,10 +3543,11 @@ void menuNoteConfigReloaded() {
             if (r.pending && !r.auditNoted) {
                 r.auditNoted = true;
                 const ResolutionView view = resolutionView(v);
-                Log::get().note("edvr.ini: %s now gives this headset (%s) %u wide on disk but is read "
+                Log::get().note("%s: %s now gives this headset (%s) %u wide on disk but is read "
                                 "when VR starts; the running value is %u wide (%s). Restart the game "
                                 "to apply it.",
-                                dotted.c_str(), view.key.c_str(), view.width, view.sizing.activeWidth[0],
+                                Config::get().iniName(), dotted.c_str(), view.key.c_str(), view.width,
+                                view.sizing.activeWidth[0],
                                 percentText(edvr::native_render::widthToScale(
                                     view.sizing.activeWidth[0], view.sizing.eyes[0].originalWidth)).c_str());
             }
@@ -3439,9 +3555,9 @@ void menuNoteConfigReloaded() {
             r.pending = rowPending(d, v, r.snapshot);
             if (r.pending && !r.auditNoted) {
                 r.auditNoted = true;
-                Log::get().note("edvr.ini: %s is now %s on disk but is read at launch; the running "
+                Log::get().note("%s: %s is now %s on disk but is read at launch; the running "
                                 "value is still %s. Restart the game to apply it.",
-                                dotted.c_str(), v.empty() ? "(default)" : v.c_str(),
+                                Config::get().iniName(), dotted.c_str(), v.empty() ? "(default)" : v.c_str(),
                                 r.snapshot.empty() ? "(default)" : r.snapshot.c_str());
             }
         }
@@ -3453,9 +3569,89 @@ void menuNoteConfigReloaded() {
     }
 }
 
+void menuFlatBeforePresent(IDXGISwapChain* swap, unsigned flags) {
+    if (!runtimeFlatProfile() || !g_s.configured || !g_s.open ||
+        (flags & DXGI_PRESENT_TEST)) return;
+    menuPanelCompositeFlat(swap);
+}
+
+void menuFlatResize() {
+    if (!runtimeFlatProfile()) return;
+    menuPanelFlatResize();
+    g_s.lastDrawn = menuDrawnValue();
+    g_s.lastDrawnMs = 0;
+    g_s.contentDirty = true;
+    inputGateSetPrivate(false);
+}
+
 void menuTick(ID3D11Device* dev) {
     State& s = g_s;
     if (!s.configured) return;
+    if (runtimeFlatProfile()) {
+        guardedBudget(g_budget, [&] {
+            const uint64_t now = nowMs();
+            s.tickMs = now;
+            drainWrites();
+            if (s.summon.pressed()) {
+                if (s.open) closeMenu("the menu key");
+                else openMenu(now);
+            }
+            if (s.summon.takeMissedWhileUnfocused())
+                Log::get().note("menu: %s was pressed while Elite was unfocused.",
+                                s.summonName.c_str());
+            if (s.open && !gameHasFocus()) closeMenu("Elite lost focus");
+            if (s.open) {
+                const bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+                if (esc && !s.flatEscapeDown) {
+                    if (s.editEntry >= 0) cancelEdit();
+                    else closeMenu("Escape");
+                }
+                s.flatEscapeDown = esc;
+            }
+            const uint32_t drawn = menuDrawnValue();
+            if (drawn != s.lastDrawn) {
+                s.lastDrawn = drawn;
+                s.lastDrawnMs = now;
+            }
+            if (s.open && now - s.openedMs > kNotDrawnCloseMs &&
+                now - s.lastDrawnMs > kNotDrawnCloseMs) {
+                Log::get().note("menu: flat panel was not drawn; closing and releasing keyboard.");
+                closeMenu("not drawn");
+            }
+            const bool drawnFresh = s.open && s.lastDrawnMs != 0 &&
+                                    now - s.lastDrawnMs <= kDrawnFreshMs;
+            inputGateSetPrivate(drawnFresh);
+            const bool keysReady = drawnFresh && inputGateHoldsGameKeyboard();
+            if (keysReady != s.flatKeysReadyShown) {
+                s.flatKeysReadyShown = keysReady;
+                s.contentDirty = true;
+            }
+            const bool nativeScale = flatRuntimeNativeScale();
+            if (nativeScale != s.flatNativeScaleShown) {
+                s.flatNativeScaleShown = nativeScale;
+                s.contentDirty = true;
+            }
+            flatWarningTick(now);
+            if (keysReady) handleKeys(now);
+            if (s.open && dev && !menuPanelFlatRasterReady()) s.contentDirty = true;
+            if (s.open && s.contentDirty) {
+                s.contentDirty = false;
+                MenuContent c;
+                buildContent(c);
+                menuPanelSubmit(c);
+            }
+            MenuGeometry g;
+            g.dist = 1.0f;
+            g.curve = 0.0f;
+            g.halfW = 0.62f;
+            g.alpha = s.open ? 1.0f : 0.0f;
+            menuPanelSetGeometry(g);
+            inputGateTick();
+            if (dev) menuPanelTick(dev);
+        });
+        if (!g_budget.shouldRun()) inputGateSetPrivate(false);
+        return;
+    }
     guardedBudget(g_budget, [&] {
         static uint64_t lastNativeRevision = 0;
         const uint64_t nativeRevision = nativeMenuRevision();
@@ -3516,8 +3712,7 @@ void menuTick(ID3D11Device* dev) {
                 if (s.snapshotTaken) {
                     for (int i = 0; i < kRowDefCount; ++i) {
                         const MenuRowDef& row = kMenuRows[i];
-                        if (row.applies == 2 &&
-                            (isOpenxrRenderScaleRow(row) || isHeadsetRow(row))) {
+                        if (row.applies == 2 && isOpenxrRenderScaleRow(row)) {
                             g_rows[i].pending = rowPending(row, g_rows[i].value,
                                                            g_rows[i].snapshot);
                         }
@@ -3674,6 +3869,12 @@ void menuTick(ID3D11Device* dev) {
             Page& p = s.pages[s.page];
             if (p.status && dueMs(s.statusRefreshMs, p.monitor ? kMonitorRefreshMs : kStatusRefreshMs)) {
                 s.statusRefreshMs = stampMs();
+                s.contentDirty = true;
+            }
+            // The locked FPS readout refreshes at the same cadence as the
+            // head-locked overlay: twice a second, cheaply.
+            if (s.open && s.overlay && s.overlayLock && dueMs(s.menuOverlayTextMs, 500)) {
+                s.menuOverlayTextMs = stampMs();
                 s.contentDirty = true;
             }
             if (s.contentDirty) {

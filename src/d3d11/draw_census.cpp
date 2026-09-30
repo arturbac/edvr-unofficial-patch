@@ -13,9 +13,22 @@
 #include "../common/log.h"
 #include "../common/timing.h"  // the startup schedule's clock
 #include "binding_shadow.h"
+#include "draw_gate.h"      // drawGateArm: a census armed mid-frame must not
+                            // lose the frame it counts from
 #include "exposure_fix.h"   // lookupShaderHash: the shader hash registry
 
 namespace edvr {
+
+// drawCensusArmed and drawCensusWantsOffscreen read these from the header
+// with no call: drawCensusArmed is asked from beginPanelOverride on every
+// draw regardless of census state, and the build has no /GL to fold a
+// cross-TU getter.
+namespace detail {
+bool     g_drawCensusPending = false;
+uint32_t g_drawCensusFramesLeft = 0;
+bool     g_drawCensusOffscreen = false;
+}  // namespace detail
+
 namespace {
 
 // Three frames: enough that "present in every frame of one census and no
@@ -108,19 +121,16 @@ struct Interned {
 };
 
 bool resolveByKind(void* ptr, Kind kind, ResourceInfo* out) {
-    if (kind == Kind::kView) return bindingResolve(ptr, out);
-    if (kind == Kind::kResource) return bindingResolveResource(ptr, out);
+    if (kind == Kind::kView) return bindingResolveProbe(ptr, out);
+    if (kind == Kind::kResource) return bindingResolveResourceProbe(ptr, out);
     return false;
 }
 
-bool     g_pending = false;      // key pressed, waiting for a frame edge
 bool     g_forceOffscreen = false; // the auto arm's rider: this census records
                                  // offscreen draws whatever the ini says,
                                  // because it exists to watch an offscreen build
-uint32_t g_framesLeft = 0;       // frames still to record; >0 means capturing
 uint32_t g_framesWanted = kCensusFrames;  // this census's length, from config
 uint32_t g_maxLines = kMaxLines; // this census's line cap, from config
-bool     g_offscreen = false;    // record non-eye draws too, latched at start
 uint32_t g_offThisFrame = 0;     // offscreen draws this frame, for the line index
 uint32_t g_offDraws = 0;         // offscreen draws this census, for the end line
 uint32_t g_copiesThisFrame = 0;  // copies this frame, for the line index
@@ -483,7 +493,7 @@ void cbWatchRegister(uint32_t slot, void* buf) {
     w.bytes = 0;
     ResourceInfo info;
     uint32_t full = 0;
-    if (buf && bindingResolveResource(buf, &info) && info.isBuffer) {
+    if (buf && bindingResolveResourceProbe(buf, &info) && info.isBuffer) {
         full = info.a;
         w.bytes = info.a < kCbShadowBytes ? info.a : kCbShadowBytes;
     }
@@ -702,7 +712,11 @@ void finish() {
 
 }  // namespace
 
-bool drawCensusArmed() { return g_pending || g_framesLeft > 0; }
+// The numeric form of bindingToken's "@N", for the eye-run ledger's binary
+// rows: the same table entry a census line would name this view by, so a
+// ledger row joins a census line's r= token exactly. -1 for null (no RTV
+// bound), -2 when the table is full.
+int drawCensusIntern(void* view) { return internOf(view, Kind::kView); }
 
 void drawCensusRequest() {
     if (drawCensusArmed()) {
@@ -710,7 +724,11 @@ void drawCensusRequest() {
                         "already running; ignored. One at a time.");
         return;
     }
-    g_pending = true;
+    detail::g_drawCensusPending = true;
+    // The hotkey lands inside a frame, after that frame's gate sample. The
+    // census counts frames from here, so a gate that stayed false until the
+    // next boundary would hand it an empty frame 1 (draw_gate.h).
+    drawGateArm();
     Log::get().note("DC: census armed -- the next whole frames of eye-texture "
                     "draws will be logged. Diff two of these with "
                     "tools/diff_draw_census.py.");
@@ -721,8 +739,9 @@ void drawCensusAutoRequest() {
     // case -- the build keeps drawing while its own census runs -- must not
     // write a line per draw.
     if (drawCensusArmed()) return;
-    g_pending = true;
+    detail::g_drawCensusPending = true;
     g_forceOffscreen = true;
+    drawGateArm();   // the trigger is a draw, so this is mid-frame (draw_gate.h)
     // The caller logs WHY (the size that tripped it); this side owns only the
     // census mechanics, which the begin line below reports as it always has.
 }
@@ -1075,14 +1094,14 @@ static void recordDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
 void drawCensusEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                        uint32_t instances, uint32_t eyeDrawIndex,
                        const DrawArgs& args) {
-    if (g_framesLeft == 0) return;   // pending counts draws only once started
+    if (detail::g_drawCensusFramesLeft == 0) return;   // pending counts draws only once started
     ++g_draws;
     ++g_drawsThisFrame;
     recordDraw(ctx, kind, count, instances, "DC", eyeDrawIndex, args);
 }
 
 void drawCensusNoteUnseen(char why) {
-    if (g_framesLeft == 0) return;   // pending is not recording
+    if (detail::g_drawCensusFramesLeft == 0) return;   // pending is not recording
     ++g_unseenThisFrame;
     ++g_unseen;
     const int k = why == 'p' ? 0 : why == 'w' ? 1 : 2;
@@ -1091,16 +1110,14 @@ void drawCensusNoteUnseen(char why) {
 
 void drawCensusEarlyDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                          uint32_t instances, bool eye, const DrawArgs& args) {
-    if (g_framesLeft == 0 || !ctx) return;
+    if (detail::g_drawCensusFramesLeft == 0 || !ctx) return;
     if (eye) drawCensusEyeDraw(ctx, kind, count, instances, g_drawsThisFrame, args);
     else drawCensusOffDraw(ctx, kind, count, instances, args);
 }
 
-bool drawCensusWantsOffscreen() { return g_offscreen; }
-
 void drawCensusOffDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                        uint32_t instances, const DrawArgs& args) {
-    if (g_framesLeft == 0 || !g_offscreen) return;
+    if (detail::g_drawCensusFramesLeft == 0 || !detail::g_drawCensusOffscreen) return;
     ++g_offDraws;
     recordDraw(ctx, kind, count, instances, "DCO", g_offThisFrame++, args);
 }
@@ -1117,7 +1134,7 @@ void drawCensusDrawDirect(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                           uint32_t instances, bool foreignCtx,
                           void* indirectArgs, uint32_t indirectOff,
                           const DrawArgs& args) {
-    if (g_framesLeft == 0 || !ctx) return;
+    if (detail::g_drawCensusFramesLeft == 0 || !ctx) return;
     ++g_draws;
     ++g_drawsThisFrame;
     const uint32_t q = g_seq++;
@@ -1192,7 +1209,7 @@ void drawCensusDrawDirect(ID3D11DeviceContext* ctx, char kind, uint32_t count,
 
 void drawCensusStructCount(void* dst, uint32_t dstOff, void* srcView,
                            bool foreignCtx) {
-    if (g_framesLeft == 0) return;
+    if (detail::g_drawCensusFramesLeft == 0) return;
     ++g_copies;
     ++g_copiesThisFrame;
     const uint32_t q = g_seq++;
@@ -1215,7 +1232,7 @@ void drawCensusCopy(char kind, void* dst, uint32_t dstSub, uint32_t dstX,
                     uint32_t dstY, void* src, uint32_t srcSub, bool hasBox,
                     uint32_t left, uint32_t top, uint32_t right, uint32_t bottom,
                     bool foreignCtx) {
-    if (g_framesLeft == 0) return;
+    if (detail::g_drawCensusFramesLeft == 0) return;
     ++g_copies;
     ++g_copiesThisFrame;
     const uint32_t q = g_seq++;
@@ -1242,7 +1259,7 @@ void drawCensusCopy(char kind, void* dst, uint32_t dstSub, uint32_t dstX,
 
 void drawCensusResolve(void* dst, uint32_t dstSub, void* src, uint32_t srcSub,
                        uint32_t fmt) {
-    if (g_framesLeft == 0) return;
+    if (detail::g_drawCensusFramesLeft == 0) return;
     ++g_copies;
     ++g_copiesThisFrame;
     const uint32_t q = g_seq++;
@@ -1264,7 +1281,7 @@ void drawCensusResolve(void* dst, uint32_t dstSub, void* src, uint32_t srcSub,
 // so the tokens JOIN, and "which eye's depth was cleared, and when" is
 // readable straight off the listing.
 void drawCensusClearColor(void* rtv, const float c[4], bool foreignCtx) {
-    if (g_framesLeft == 0) return;
+    if (detail::g_drawCensusFramesLeft == 0) return;
     ++g_clears;
     ++g_clearsThisFrame;
     const uint32_t q = g_seq++;
@@ -1279,7 +1296,7 @@ void drawCensusClearColor(void* rtv, const float c[4], bool foreignCtx) {
 
 void drawCensusClearDepth(void* dsv, uint32_t flags, float depth,
                           uint32_t stencil, bool foreignCtx) {
-    if (g_framesLeft == 0) return;
+    if (detail::g_drawCensusFramesLeft == 0) return;
     ++g_clears;
     ++g_clearsThisFrame;
     const uint32_t q = g_seq++;
@@ -1298,7 +1315,7 @@ void drawCensusClearDepth(void* dsv, uint32_t flags, float depth,
 // counter) reports t=- and is recorded anyway; the bracket's POSITION is
 // the finding even when its type is exotic.
 void drawCensusQuery(char kind, void* async, bool foreignCtx) {
-    if (g_framesLeft == 0) return;
+    if (detail::g_drawCensusFramesLeft == 0) return;
     ++g_clears;
     ++g_clearsThisFrame;
     const uint32_t q = g_seq++;
@@ -1365,7 +1382,7 @@ void drawCensusCbNoteUpdate(void* resource, const void* data, uint32_t bytes) {
 void drawCensusDispatch(ID3D11DeviceContext* ctx, uint32_t x, uint32_t y,
                         uint32_t z, bool foreignCtx, void* indirectArgs,
                         uint32_t indirectOff) {
-    if (g_framesLeft == 0) return;
+    if (detail::g_drawCensusFramesLeft == 0) return;
     ++g_dispatches;
     ++g_dispThisFrame;
     const uint32_t q = g_seq++;
@@ -1508,8 +1525,9 @@ static void runCensusSchedule(uint32_t frameNo) {
         if (g_scheduleFired & (1u << i)) continue;
         if (elapsed < g_scheduleMs[i]) continue;
         g_scheduleFired |= (1u << i);
-        g_pending = true;
+        detail::g_drawCensusPending = true;
         g_forceOffscreen = true;
+        drawGateArm();   // draw_gate.h: this tick is not the gate's sample
         Log::get().note(
             "DC: census armed by advanced.census_at_ms entry %u of %u -- it "
             "asked for %llu ms and landed at %llu ms, frame %u.",
@@ -1573,7 +1591,7 @@ void drawCensusTick(ID3D11DeviceContext* ctx) {
 void drawCensusFrameBoundary(uint32_t frameNo) {
     g_lastFrameNo = frameNo;
     runCensusSchedule(frameNo);
-    if (g_framesLeft > 0) {
+    if (detail::g_drawCensusFramesLeft > 0) {
         Log::get().note("DC frame %u draws=%u off=%u copies=%u disp=%u clears=%u unseen=%u",
                         g_frameOrdinal, g_drawsThisFrame, g_offThisFrame,
                         g_copiesThisFrame, g_dispThisFrame, g_clearsThisFrame,
@@ -1586,10 +1604,10 @@ void drawCensusFrameBoundary(uint32_t frameNo) {
         g_unseenThisFrame = 0;
         g_seq = 0;
         ++g_frameOrdinal;
-        if (--g_framesLeft == 0) finish();
+        if (--detail::g_drawCensusFramesLeft == 0) finish();
     }
-    if (g_pending) {
-        g_pending = false;
+    if (detail::g_drawCensusPending) {
+        detail::g_drawCensusPending = false;
         ++g_censusNo;
         // Latched here, not read per draw: a census must record one
         // configuration throughout, and the draw path is the last place that
@@ -1600,7 +1618,7 @@ void drawCensusFrameBoundary(uint32_t frameNo) {
         g_maxLines = static_cast<uint32_t>(Config::get().getIntInRange(
             "advanced.census_lines", static_cast<int>(kMaxLines), 256,
             static_cast<int>(kMaxLinesCeiling)));
-        g_framesLeft = g_framesWanted;
+        detail::g_drawCensusFramesLeft = g_framesWanted;
         g_frameOrdinal = 0;
         g_draws = 0;
         g_drawsThisFrame = 0;
@@ -1622,7 +1640,7 @@ void drawCensusFrameBoundary(uint32_t frameNo) {
         // The auto arm's rider wins over the ini: a census fired at an
         // offscreen build that recorded no offscreen draws is the exact
         // capture this module already wasted a day on once.
-        g_offscreen = Config::get().getBool("advanced.census_offscreen", false) ||
+        detail::g_drawCensusOffscreen = Config::get().getBool("advanced.census_offscreen", false) ||
                       g_forceOffscreen;
         g_forceOffscreen = false;
         // The CB watch's shader, and a fresh dump budget. The watch SLOTS
@@ -1645,7 +1663,7 @@ void drawCensusFrameBoundary(uint32_t frameNo) {
         for (Interned& e : g_tab) e = Interned();
         Log::get().note("DC begin census=%u frames=%u frame=%u offscreen=%s",
                         g_censusNo, g_framesWanted, frameNo,
-                        g_offscreen ? "yes" : "no");
+                        detail::g_drawCensusOffscreen ? "yes" : "no");
         if (g_cbWatchHash) {
             Log::get().note("DCW watching vs=%016llX -- every recorded draw "
                             "running that shader dumps its b%u constants "

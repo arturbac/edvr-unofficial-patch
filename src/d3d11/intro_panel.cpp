@@ -85,8 +85,8 @@ constexpr float kScreenDistDefault = 3.35f;
 // matters.
 constexpr float kHalfIpd = 0.0315f;
 
-// World lock (part of fix.intro_video = screen). The counter-move is witchstar_fix's,
-// which already holds a head-locked sprite on a world direction by shifting
+// World lock (part of fix.intro_video = screen). The counter-move is the
+// retired witchstar fix's (removed 2026-09-23), which held a head-locked sprite on a world direction by shifting
 // the VIEWPORT for one draw -- no matrix, no new channel, and field-proven on
 // a different draw. It counter-moves against the game's world forward, and
 // that is exactly the anchor wanted here -- the field's own words, "the
@@ -209,7 +209,7 @@ bool isFiniteF(float v) { return v == v && v <= 3.4e38f && v >= -3.4e38f; }
 // the pose this transform was built from -- menu.cpp's reading (minus the
 // pose's third column), for the one "holding" line, so it says what the
 // game's forward was being held against.
-bool buildWorldCb(bool leftEye, float dist, float vpW, float vpH,
+bool buildWorldCb(bool leftEye, float dist,
                   float* out, const char** why, float* yawDeg = nullptr) {
     float pose[12];
     if (!headPose(pose)) { *why = "no head pose has been published"; return false; }
@@ -501,8 +501,8 @@ bool introPanelOnComposite(ID3D11DeviceContext* ctx, char kind, uint32_t count,
 
     // The world lock is not a nudge to the game's geometry -- it is a
     // REPLACEMENT transform, built here and written into cb2 exactly as the
-    // splash's own is. A viewport shift (the first attempt, witchstar_fix's
-    // pattern) can only translate: it gives no stereo, so the picture always
+    // splash's own is. A viewport shift (the first attempt, the retired
+    // witchstar fix's pattern) can only translate: it gives no stereo, so the picture always
     // reads as being at infinity, and the splash's screen is not at
     // infinity. That is why it could never have worked, whatever its sign.
     //
@@ -576,8 +576,7 @@ bool introPanelOnComposite(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                 float yawDeg = 0.0f;
                 const char* why = "the viewport is degenerate";
                 if (nvp == 0 || vp.Width <= 0.0f || vp.Height <= 0.0f ||
-                    !buildWorldCb(s->leftEye, g_screenDist, vp.Width,
-                                  vp.Height, world, &why,
+                    !buildWorldCb(s->leftEye, g_screenDist, world, &why,
                                   g_anchored ? nullptr : &yawDeg)) {
                     // No pose, no tangents, no viewport: stock rather than a
                     // panel placed on guesses.

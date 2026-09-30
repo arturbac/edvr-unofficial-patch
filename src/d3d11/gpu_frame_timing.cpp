@@ -3,23 +3,32 @@
 #include "../common/gpu_frame_protocol.h"
 #include "../common/log.h"
 #include "../common/guard.h"
+#include "../openxr/native_cpu_trace.h"
 #include <atomic>
 #include <algorithm>
 #include <limits>
 #include <new>
 
 namespace edvr {
+
+// gpuFrameCommandMightAct()'s backing state (gpu_frame_timing.h). Out here
+// rather than in the anonymous namespace below purely so the header can see
+// them.
+namespace detail {
+thread_local bool g_gpuFrameInternal = false;
+std::atomic<bool> g_gpuFrameCommandLive{false};
+}  // namespace detail
+
 namespace {
 // Low bit means a successful pose wait has armed this sequence. A wait-start
 // publishes a disarmed sequence immediately, on any thread, without touching
 // the context. The graphics DLL allocates IDs across compositor reinitialization.
 std::atomic<uint64_t> g_token{0}, g_nextSequence{0}, g_poisoned{0};
 std::atomic<uint64_t> g_applicationSequence{0};
-thread_local bool g_internal = false;
 struct Internal {
-    bool previous = g_internal;
-    Internal() noexcept { g_internal = true; }
-    ~Internal() { g_internal = previous; }
+    bool previous = detail::g_gpuFrameInternal;
+    Internal() noexcept { detail::g_gpuFrameInternal = true; }
+    ~Internal() { detail::g_gpuFrameInternal = previous; }
 };
 SRWLOCK g_snapshotLock = SRWLOCK_INIT;
 GpuFrameSnapshot g_snapshot;
@@ -32,6 +41,30 @@ uint64_t g_completionFloor = 1;
 GpuSpanOwner bindOwner(GpuTimingFrameDriver& driver, ID3D11Device* d,
                        ID3D11DeviceContext* c) noexcept {
     return driver.bind(d, c) ? driver.currentOwner() : GpuSpanOwner{};
+}
+// GetCurrentThreadId() is an imported call, which cannot inline even in a
+// build with /GL, let alone this one without it. A thread's id never
+// changes, so read it once per thread rather than once per owns() call --
+// after the first call on a given thread this is a TLS read, no call at
+// all. Provably identical to GetCurrentThreadId() by construction (it IS
+// that call, cached), so no separate self-check is needed the way an
+// offset-based read of the TEB would want.
+//
+// A ZERO-INITIALISED thread_local, filled on first use, rather than a
+// function-local `static thread_local const DWORD id = GetCurrentThreadId()`:
+// that form is a dynamic TLS initialisation, so every call tested and set a
+// per-thread init guard beside the read (the flown owns() did exactly that,
+// once per hooked command). Zero is a safe "not yet": no running thread has
+// id 0 (it names the idle process), so the cached value is GetCurrentThreadId()
+// on every call either way.
+thread_local DWORD t_currentThreadId = 0;
+__forceinline DWORD currentThreadIdCached() noexcept {
+    DWORD id = t_currentThreadId;
+    if (!id) {
+        id = GetCurrentThreadId();
+        t_currentThreadId = id;
+    }
+    return id;
 }
 struct Controller {
     GpuTimingFrameDriver driver;
@@ -50,8 +83,12 @@ struct Controller {
     ID3D11DeviceContext* context() const noexcept {
         return reinterpret_cast<ID3D11DeviceContext*>(owner.context);
     }
-    bool owns(ID3D11DeviceContext* c) const noexcept {
-        return owner.immediate && owner.thread == GetCurrentThreadId() &&
+    // Forced inline: gpuFrameCommand asks it once per hooked command, and
+    // as a call (the flown build did not inline it) it was a second prologue
+    // and a second walk to this module's TLS block, which gpuFrameCommand
+    // has just made for g_gpuFrameInternal. Same four tests, same order.
+    __forceinline bool owns(ID3D11DeviceContext* c) const noexcept {
+        return owner.immediate && owner.thread == currentThreadIdCached() &&
                owner.context && c == context();
     }
     void publish(GpuSpanResult result, uint64_t now) noexcept {
@@ -62,9 +99,31 @@ struct Controller {
             result.sequence <= g_poisoned.load(std::memory_order_acquire)) {
             result.reason = GpuSpanReason::Incomplete;
             result.outerMs = result.leftMs = result.rightMs = 0;
+            result.firstTick = result.lastTick = result.frequency = 0;   // a poisoned frame's clock is no clock
         }
         if (result.reason == GpuSpanReason::Valid) ++validCount;
         else ++invalidCount;
+        // One enabled load outside WPR; no timestamp or ETW work while off.
+        auto& trace = openxr::NativeCpuTrace::get();
+        if (trace.enabled()) {
+            static_assert(unsigned(GpuSpanSource::ApplicationRender) == 1 &&
+                          unsigned(GpuSpanReason::CreateFailed) == 13,
+                          "native GPU trace enum contract");
+            LARGE_INTEGER qpc{};
+            QueryPerformanceCounter(&qpc);
+            EdvrNativeGpuCompletionPayload payload{};
+            payload.publicationQpc = uint64_t(qpc.QuadPart);
+            payload.timestampUs = edvrNativeTraceUs(qpc.QuadPart);
+            payload.sequence = result.sequence;
+            payload.sourceFrame = result.sourceFrame;
+            payload.ageMs = result.ageMs;
+            payload.outerMs = result.outerMs;
+            payload.source = uint16_t(result.source);
+            payload.reason = uint16_t(result.reason);
+            payload.version = 1;
+            payload.size = sizeof(payload);
+            trace.emitGpu(payload);
+        }
         AcquireSRWLockExclusive(&g_snapshotLock);
         // Older slots may settle after newer ones. Keep their logged identity,
         // but never let a late result replace a newer frame in the readout.
@@ -150,7 +209,7 @@ const char* gpuFrameReason(GpuSpanReason reason) noexcept {
     default: return "query failure";
     }
 }
-bool gpuFrameInternal() noexcept { return g_internal; }
+bool gpuFrameInternal() noexcept { return detail::g_gpuFrameInternal; }
 bool gpuFrameBind(ID3D11Device* d, ID3D11DeviceContext* c, bool enabled) noexcept {
     auto* current = g_controller.load(std::memory_order_acquire);
     if (current) return current->owns(c) && current->owner.device == reinterpret_cast<uintptr_t>(d);
@@ -168,6 +227,7 @@ bool gpuFrameBind(ID3D11Device* d, ID3D11DeviceContext* c, bool enabled) noexcep
         return false;
     }
     gpuFrameConfigure(enabled);
+    openxr::NativeCpuTrace::get().start();
     if (!enabled) Log::get().note("Render-to-submit GPU: disabled (advanced.app_gpu_timing).");
     Log::get().note("Application-render GPU: owner bound; non-overlapping producer segments "
         "cover game rendering and native treatment, while transfer/runtime waits are excluded.");
@@ -177,6 +237,12 @@ void gpuFrameConfigure(bool enabled) noexcept {
     auto* c = g_controller.load(std::memory_order_acquire);
     if (!c || !c->owns(c->context())) return;
     const bool previous = c->enabled.exchange(enabled, std::memory_order_acq_rel);
+    // gpuFrameCommandMightAct()'s refresh (gpu_frame_timing.h): c is known
+    // non-null and owned here, so the combined "live controller" condition
+    // is exactly this call's own `enabled` argument. Before the early return
+    // below, so a re-configure to the same value still leaves the mirror
+    // correct (it already is, but this does not depend on that).
+    detail::g_gpuFrameCommandLive.store(enabled, std::memory_order_relaxed);
     if (previous == enabled) return;
     Internal internal;
     const uint64_t now = GetTickCount64();
@@ -198,7 +264,7 @@ void gpuFrameConfigure(bool enabled) noexcept {
                     enabled ? "enabled" : "disabled");
 }
 void gpuFrameCommand(ID3D11DeviceContext* ctx) noexcept {
-    if (g_internal) return;
+    if (detail::g_gpuFrameInternal) return;
     auto* c = g_controller.load(std::memory_order_acquire);
     if (!c || !c->enabled.load(std::memory_order_relaxed) || ctx != c->context()) return;
     const uint64_t token = g_token.load(std::memory_order_acquire);
@@ -268,6 +334,7 @@ GpuFrameSnapshot gpuFrameSnapshot() noexcept {
         result.result.sequence <= g_poisoned.load(std::memory_order_acquire)) {
         result.result.reason = GpuSpanReason::Incomplete;
         result.result.outerMs = result.result.leftMs = result.result.rightMs = 0;
+        result.result.firstTick = result.result.lastTick = result.result.frequency = 0;
     }
     return result;
 }
@@ -296,6 +363,7 @@ unsigned gpuFrameReadCompletions(uint64_t& cursor, GpuFrameSnapshot* out,
             out[i].result.sequence <= g_poisoned.load(std::memory_order_acquire)) {
             out[i].result.reason = GpuSpanReason::Incomplete;
             out[i].result.outerMs = out[i].result.leftMs = out[i].result.rightMs = 0;
+            out[i].result.firstTick = out[i].result.lastTick = out[i].result.frequency = 0;
         }
         cursor = item.ordinal;
     }
@@ -303,7 +371,11 @@ unsigned gpuFrameReadCompletions(uint64_t& cursor, GpuFrameSnapshot* out,
     return count;
 }
 void gpuFrameAbandon() noexcept {
+    openxr::NativeCpuTrace::get().stop();
     auto* c = g_controller.exchange(nullptr, std::memory_order_acq_rel);
+    // No controller at all now, so gpuFrameCommandMightAct()'s combined
+    // condition is false regardless of the old controller's enabled state.
+    detail::g_gpuFrameCommandLive.store(false, std::memory_order_relaxed);
     if (c) { c->driver.reset(); delete c; }
     AcquireSRWLockExclusive(&g_snapshotLock);
     g_snapshot = {};

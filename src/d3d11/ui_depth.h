@@ -28,14 +28,51 @@ namespace edvr {
 
 class Config;
 
-// Reads fix.ui_depth (on | off), fix.temporal_aa (the gate),
-// advanced.ui_depth_families, advanced.ui_depth_exclude and
-// advanced.ui_depth_test. Install and reload; all live.
+// Reads fix.temporal_aa (the gate: the interface depth has no key of its own,
+// fix.ui_depth having been retired into it) and the nine advanced.ui_depth_*
+// keys (families, exclude, menus, variants, alpha, reactive, planes, eyes,
+// test). Install and reload; all live.
 void uiDepthConfigure(Config& cfg);
 
 // True while the key is on, the pass is on and nothing stood down: the
 // draw path's one bool.
-bool uiDepthWantsDraws();
+//
+// Inline, with the state it reads, because "the draw path's one bool" was a
+// cross-TU call in a build with no /GL -- and it is asked from the subscriber
+// gate and again inside beginPanelOverride, every draw.
+//
+// uiDepthPlanetPending() is published for the same reason and is the FIRST
+// test of the function it guards, so a call declined out here is a call that
+// would have declined inside: uiDepthPlanetBegin clears both pending flags
+// and then returns false unless one of them was set; clearing flags that are
+// already false is what the guard skips, and nothing else.
+// The MODE ITSELF moves here rather than a bool mirroring it. ui_depth.cpp
+// writes g_uiDepthMode in seven places, and a mirror maintained at seven call
+// sites is a desync waiting to happen -- the failure this codebase has paid
+// for more than once. One variable, read inline, written where it always was.
+namespace detail {
+enum class UiDepthMode : unsigned char { kNone, kReissue, kReissueScene };
+extern UiDepthMode g_uiDepthMode;
+extern bool g_uiDepthOn;
+extern bool g_uiDepthStoodDown;
+extern bool g_uiDepthPlanetPending;
+extern bool g_uiDepthPlanetSolarPending;
+// advanced.temporal_aa_hologram_depth: the generic contribution-based
+// coverage below, independent of g_uiDepthOn's own per-family shaders.
+extern bool g_holoDepthOn;
+}  // namespace detail
+inline bool uiDepthWantsDraws() {
+    return detail::g_uiDepthOn && !detail::g_uiDepthStoodDown;
+}
+inline bool uiDepthPlanetPending() {
+    return detail::g_uiDepthPlanetPending || detail::g_uiDepthPlanetSolarPending;
+}
+// The hologram/icon depth pass's own draw-path bool, read inline for the
+// same reason uiDepthWantsDraws() is (ui_depth.h's header comment): a
+// cross-TU call at every eye draw versus one already-loaded flag.
+inline bool uiDepthHologramWantsDraws() {
+    return detail::g_holoDepthOn && uiDepthWantsDraws();
+}
 
 // Every draw that did NOT land in an eye texture: learn the target as a UI
 // surface when the bound vertex shader is one of the GUI renderer's
@@ -43,11 +80,83 @@ bool uiDepthWantsDraws();
 // checked to exhaustion is not asked again for a while.
 void uiDepthNoteOffscreenDraw(ID3D11DeviceContext* ctx);
 
+// fix.ui_quality's classifier (ui_layer.h) asks two questions this pass's
+// own classifier already answers, without touching its per-draw state:
+//   - which pixel-stage slot 0..3 of the bound draw holds a learned
+//     interface surface (the same memoised test uiDepthOnEyeDraw makes), or
+//     -1 for none -- always -1 while this pass is off or stood down, since
+//     it learns nothing then;
+//   - which eye a colour target is: eyeIndexFor's per-frame table, first
+//     target of a shape = left, advanced.ui_depth_eyes = swapped applied --
+//     SHARED, so the layer and this pass can never disagree about an eye.
+//     -1 for a third target of one shape, or a full table.
+int uiDepthSampledSurfaceSlot();
+int uiDepthEyeOfTarget(const void* res, uint32_t w, uint32_t h, uint32_t fmt);
+// The read-only form, for observers (the HUD layer census): a query that
+// REGISTERS changes the table the deciding paths then read. On 2026-09-27
+// the crisp-HUD tonemap admission's per-frame lookup of the tonemap's LDR
+// output took the table's two same-shape slots ahead of the main menu's
+// own composite target, and the menus read "no eye" ever after (the ui
+// quality menu regression). A target the table has not seen gets -1 here;
+// the layer's decide keeps the registering form, exactly as the pass's own
+// classifier would register at the same draw.
+int uiDepthEyeOfTargetReadOnly(const void* res);
+// ...and a third: is this vertex shader on the interface pass's exclude list
+// (the null-output mesh B018D143700AB803 that samples a stale surface
+// binding, plus advanced.ui_depth_exclude)? A draw this pass will never treat
+// as interface is not the layer's either.
+bool uiDepthIsExcluded(uint64_t vsHash);
+
 // Every eye draw: a UI composite (samples a learned surface in a
 // pixel-stage slot 0..3) or a named direct family, with a depth target
 // bound that is the scene pair's. True means the draw should write its
 // coverage depth; the caller reissues it after the original draw.
 bool uiDepthOnEyeDraw(ID3D11DeviceContext* ctx, const HoloDraw& draw = {});
+
+// The generic, contribution-based hologram/icon depth pass: a family-
+// agnostic alternative to uiDepthOnEyeDraw's per-family coverage shaders,
+// for the holo panel/ship hologram and the radar's icon families (none of
+// which has one), plus a separate WORLD MARKER list (the target reticle's
+// triangles) for draws that track something possibly far outside the
+// cockpit and so are never radius-clipped. Classifies beside
+// uiDepthOnEyeDraw at the same call site; true means the two reissues
+// below apply after the game's own draw.
+bool uiDepthHologramOnEyeDraw(ID3D11DeviceContext* ctx);
+// Pass (a): the game's own draw again, RTV0 rebound to a per-eye scratch
+// target whose blend mirrors the game's own RT0 blend (so RGB accumulates
+// what the game's blend equation actually adds), VS/PS/inputs unchanged.
+// A cockpit family depth-tests (never writes) against a per-eye/frame
+// cockpit-radius scratch -- never the game's own depth, so a draw with
+// depth off or no depth view bound is still covered. A world marker
+// depth-tests against nothing (DepthEnable FALSE): every fragment
+// contributes, regardless of range. Same Begin/draw/End contract as
+// uiDepthReissueBegin below.
+bool uiDepthHologramContributionBegin(ID3D11DeviceContext* ctx);
+void uiDepthHologramContributionEnd(ID3D11DeviceContext* ctx);
+// Pass (b): the same draw once more, null pixel shader, into a scratch
+// depth target of its own (cleared to 0, reversed-Z far, GREATER, write
+// on) -- the element's nearest raster depth over its whole geometry,
+// independent of the coverage floor. Shared by both lists: a cockpit
+// family's radius gating happens in the contribution pass above, not here.
+bool uiDepthHologramElementDepthBegin(ID3D11DeviceContext* ctx);
+void uiDepthHologramElementDepthEnd(ID3D11DeviceContext* ctx);
+// Once per eye per frame, before the temporal pass reads the private
+// scene-depth copy (uiDepthTemporalDepth): stamps each scratch pair's
+// nearest depth into that copy wherever the pixel is visibly lit -- on
+// display (display, the eye's own finished, tonemapped image, or null),
+// falling back to the accumulated light's own space if display is null or
+// the wrong size -- and, when the game's own render target turned out to
+// be viewable (tracked by uiDepthHologramContributionBegin, never display:
+// a different resource at a different dynamic range), is a real share of
+// it. False (and counted, by reason, for the periodic census) when
+// nothing was listed this eye/frame, the private copy is unavailable, or
+// the resolve's own shaders/state never built.
+bool uiDepthHologramResolve(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* scene,
+                            uint32_t w, uint32_t h, ID3D11ShaderResourceView* display);
+// Borrowed view of this eye's raw contribution target (RGBA16F), for the
+// eye dump (temporal_pass.cpp's HoloContribution input). Null off, before
+// this frame's first listed draw for this eye, or after a size change.
+bool uiDepthHologramContribution(uint32_t w, uint32_t h, int eye, ID3D11ShaderResourceView** srv);
 
 // At the scanner's screen composite, which the chrome tracker
 // (vscreen.cpp, beginPanelOverride) recognises before uiDepthOnEyeDraw
@@ -59,19 +168,6 @@ bool uiDepthOnEyeDraw(ID3D11DeviceContext* ctx, const HoloDraw& draw = {});
 // composite's vertex shader, for the note. True when the surface was new.
 bool uiDepthLearnScannerChrome(ID3D11DeviceContext* ctx, uint64_t vs,
                                ID3D11ShaderResourceView* view, ID3D11Resource* chrome);
-
-// Colour separation hook: the owner sets this after routing a recognized
-// target-sprite draw out of the clean colour stream and before the matching
-// coverage reissue.  The flag is per-draw and is cleared by uiDepthEnd().
-void uiDepthSetTargetSeparated(bool separated);
-int uiDepthTargetSpriteEye();
-int uiDepthDeferredEye();
-// After the original private coverage draw, bind the same reissue shader to
-// clean sidecars and a private clean depth copy for one pure replay.
-bool uiDepthSeparatedReissueBegin(ID3D11DeviceContext* ctx);
-void uiDepthSeparatedReissueEnd(ID3D11DeviceContext* ctx);
-// A later coverage owner without the pure-replay hook must fail closed.
-void uiDepthSeparatedInvalidate(int eye = -1);
 
 // Clear per-draw classification, including when another fix skipped the
 // draw. The original draw's depth state is never changed by this module.
@@ -130,20 +226,30 @@ bool uiDepthTemporalDepth(uint32_t w, uint32_t h, int eye, ID3D11Texture2D* scen
                           ID3D11ShaderResourceView** srv);
 // Exact draw-transform history for nearby holograms; borrowed coverage/record views.
 void uiDepthHoloMotion(int eye, ID3D11Texture2D* scene, ID3D11ShaderResourceView** views);
-
-// Borrowed clean-world coverage twins.  These are valid only after a
-// separated mode-3 draw has seeded them for the current frame/eye.
-bool uiDepthSeparatedCoverage(uint32_t w, uint32_t h, int eye,
-                              ID3D11Texture2D* scene,
-                              ID3D11Texture2D** mask,
-                              ID3D11ShaderResourceView** holo,
-                              ID3D11ShaderResourceView** edits,
-                              ID3D11ShaderResourceView** depth);
 void uiDepthHoloStageDump(ID3D11DeviceContext* ctx, ID3D11Texture2D* scene);
 void uiDepthHoloWriteDump(ID3D11DeviceContext* ctx, const wchar_t* directory, const wchar_t* stamp);
 // Geometry writes invalidate only accepted corona generations; nullptr is an
 // unknown write and invalidates all such generations.
-void uiDepthMotionResourceWritten(ID3D11Resource*,uint64_t first=0,uint64_t end=~uint64_t(0));
+//
+// uiDepthMotionResourceWrittenImpl is the real body (ui_depth.cpp), whose own
+// first line is `if(!resource && !detail::g_uiDepthOn) return;`. That test
+// moves here, inline, as the wrapper every caller actually links against --
+// including the one inside motionResourceWritten (vscreen.cpp), which cannot
+// itself change to add a guard (see AGENTS.md's scope note on that file).
+//
+// And for a NON-null resource the body's only effect is inside
+// HoloMotion::resourceWritten, which does nothing unless the resource is in
+// g_holoMotion's geometry maps -- empty unless a smoke corona was accepted in
+// the last few frames. detail::g_holoGeometryTracked (holo_motion.h) is false
+// only while those maps are empty, so the call is skipped exactly when it
+// could not act. This was an unordered_map find per eye on every Unmap, Copy
+// and Update: 98 innermost samples of the 1355-frame parked-5 window.
+void uiDepthMotionResourceWrittenImpl(ID3D11Resource*,uint64_t first,uint64_t end);
+inline void uiDepthMotionResourceWritten(ID3D11Resource* resource,uint64_t first=0,uint64_t end=~uint64_t(0)) {
+    if (resource ? detail::g_holoGeometryTracked.load(std::memory_order_relaxed)
+                 : detail::g_uiDepthOn)
+        uiDepthMotionResourceWrittenImpl(resource, first, end);
+}
 
 // The strength the interface proper is marked at (advanced.ui_depth_reactive;
 // 0 = no fixed NVIDIA bias; motion classification and adaptive history remain).

@@ -15,6 +15,7 @@
 using Microsoft::WRL::ComPtr;
 using namespace edvr::openxr;
 #pragma comment(linker, "/EXPORT:edvrAcquireNativeTiming")
+#pragma comment(linker, "/EXPORT:edvrReadNativePresentTrace")
 namespace {
 std::atomic<unsigned> checks{0};
 void require(bool value, const char* why) {
@@ -63,6 +64,15 @@ void run() {
                 "module-owned production capability on producer");
         }), "acquire producer callback");
     }), "acquire owner route");
+    require(client.presentTraceAvailable(), "optional Present trace export resolved from provider module");
+    EdvrNativePresentSpan present{100,110,120,130,140,GetCurrentThreadId(),1,7,S_OK};
+    const auto presentToken=edvr::nativeTimingPresentBegin(device.Get(),present.beginUs,present.thread);
+    edvr::nativeTimingNotePresent(device.Get(),presentToken,present);
+    EdvrNativePresentTrace presentTrace{};
+    require(client.readPresentTrace(120,130,presentTrace) && presentTrace.generation==41 &&
+        presentTrace.totalObserved==1 && presentTrace.count==1 && !presentTrace.overflow &&
+        presentTrace.spans[0].thread==present.thread && presentTrace.spans[0].flags==7,
+        "client reads owned provider Present trace end to end");
     auto source=texture(device.Get(),0xff4488dd), copy=texture(device.Get(),0xff000000);
     ComPtr<ID3D11RenderTargetView> target;
     require(SUCCEEDED(device->CreateRenderTargetView(source.Get(),nullptr,&target)), "render target");
@@ -93,7 +103,7 @@ void run() {
         edvr::gpuFrameCommand(context.Get()); // Same pre-command seam used by the game hooks.
         const float color[4]={.1f,.3f,.6f,1};
         context->ClearRenderTargetView(target.Get(),color);
-        EdvrNativeTimingFrame cpu{sizeof(cpu),EDVR_NATIVE_TIMING_VERSION_3,sequence};
+        EdvrNativeTimingFrame cpu{sizeof(cpu),EDVR_NATIVE_TIMING_VERSION_5,sequence};   // no cycle instrument here: caller work absent
         for (unsigned order=0; order<2; ++order) {
             const unsigned eye=order^(frame&1);
             require(client.applicationSegment(sequence,false), "CPU segment closes at submit route entry");

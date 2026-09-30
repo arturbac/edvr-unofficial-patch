@@ -79,7 +79,13 @@ class Config;
 void scrimConfigure(Config& cfg);
 
 // False in stock mode, which keeps the per-draw path free when off.
-bool scrimWantsDraws();
+//
+// Inline: asked per draw, and the build has no /GL to fold a cross-TU
+// getter for one bool load.
+namespace detail {
+extern bool g_scrimOn;
+}  // namespace detail
+inline bool scrimWantsDraws() { return detail::g_scrimOn; }
 
 // Is this eye draw the loader's UI composite carrying the wash? Matched by
 // what it SAMPLES, not by shader hash: A888D51024D9798E is the engine's
@@ -87,6 +93,15 @@ bool scrimWantsDraws();
 // and the loading screen's text quad both learned that the hard way). The
 // discriminator is the pair -- a 16x16 BC1 in slot 0, which nothing else
 // stretches across a mesh, and a large interface surface in slot 1.
+//
+// scrimWashShape is the draw-shape half (an indexed, single-instance mesh of
+// at least 100 indices -- scrim_fix.cpp says why a floor), inline so the
+// draw path asks it before the call: scrimOnEyeDraw answers false, having
+// resolved nothing, for any other shape. scrim_fix.cpp matches through this
+// same function.
+inline bool scrimWashShape(char kind, uint32_t count, uint32_t instances) {
+    return kind == 'X' && instances == 1 && count >= 100;
+}
 bool scrimOnEyeDraw(char kind, uint32_t count, uint32_t instances);
 
 // Around the real draw: bind the uniform into PS slot 0, restore the game's
@@ -95,5 +110,12 @@ void scrimBegin(ID3D11DeviceContext* ctx);
 void scrimEnd(ID3D11DeviceContext* ctx);
 
 void scrimShutdown();
+
+#ifdef EDVR_SCRIM_METADATA_TEST
+// Counts non-null calls through the production metadata resolver. The focused
+// WARP fixture uses this to prove cache hits avoid the real D3D query path.
+uint64_t scrimMetadataResolveCallsForTest();
+void scrimMetadataResetResolveCallsForTest();
+#endif
 
 }  // namespace edvr

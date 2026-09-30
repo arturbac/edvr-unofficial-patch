@@ -1,0 +1,359 @@
+#pragma once
+// The eye run's completed depth, per eye per frame (advanced.eye_depth_capture).
+// Nothing on screen captures depth today: the eye dumps are colour-only. This
+// instrument pairs with an armed eye run and, for each of the two eye passes,
+// copies the pass's depth-stencil texture the moment the pass ends -- the
+// first eye draw whose DSV differs from the pass's is, by command-stream
+// order, after every draw of the ended pass and before anything new touches
+// its texture, so the staged copy holds the depth every submitted draw left
+// behind. The readback and the disk write happen at the ledger's own late
+// sync point (writeLedger), with the same no-wait Map and explicit failure
+// counts the draw snapshot uses.
+//
+// Eye A/B is the CALLER's verdict (object_probe passes depthProbeSceneEyeOf's
+// answer): the depth probe's scene pair, ordered by first bind in the frame.
+// The first flight of this instrument (2026-09-21) interned the frame's two
+// first-SEEN DSVs instead, and the engine's offscreen stages -- which run
+// before the eye passes and reach the armed ledger with their own depth
+// targets -- took both slots: 190 declines, zero files. Only verdict-eye
+// draws allocate state; every other draw is counted in nonEyeSkips, reported
+// separately from declines so the two can never blur together again.
+//
+// The constants block is VS b1 float4 REGISTERS [256, 336) -- bytes
+// [4096, 5376), the end clamped to the buffer -- from the pass's FIRST
+// pool-carrying draw (the ledger's own t33==g_pool test). The game's pool
+// VS reads the view-projection from registers cb1[270..273] (the clip
+// matrix's columns: clip = x*c270 + y*c271 + z*c272 + c273 for the record
+// position minus register 275, the eye origin in the record frame;
+// vs_EB5234DB6ADB491D); the 80-register window keeps them with room for a
+// small layout shift. A buffer that stops short of register 275, or a pass
+// with no pool draw, keeps an explicit zero-float constants block.
+//
+// File version 2 (2026-09-22). Version 1 counted the window in FLOATS,
+// not registers, and copied cb1 bytes [1024, 2368) -- registers 64..147 --
+// which never hold the view-projection or the origin, whichever draw keyed
+// the copy (design-occlusion-culling-2026-09-22.md §9). Version 2 adds the
+// block's first cb1 float index to the header (1024 = register 256), so a
+// reader tells the two apart; tools/eye_depth_dump.py reads both.
+#include <d3d11.h>
+#include <wrl/client.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include "depth_probe.h"   // depthReadFormat: the probe's own depth-channel table
+
+namespace edvr {
+class EyeDepthCapture {
+    using Texture = Microsoft::WRL::ComPtr<ID3D11Texture2D>;
+    using Buffer = Microsoft::WRL::ComPtr<ID3D11Buffer>;
+    struct PendingConst {   // captured at the first pool draw, joined at pass end
+        Buffer stage;
+        uint32_t frame = 0, eye = 0, bytes = 0, whole = 0;
+        bool live = false;
+    };
+    struct Record {
+        Texture stage;   // the pass-end copy; the source texture is not held past enqueue
+        Buffer constStage;
+        uint32_t frame = 0, eye = 0, width = 0, height = 0, format = 0;
+        uint32_t bytes = 0, constBytes = 0, constWhole = 0;
+        uint32_t storedTexel = 4;   // staged bytes per texel: 4 plain, 8 for R32G8X24
+    };
+    std::vector<Record> records_;
+    PendingConst pending_[2];   // per verdict eye, this frame
+    bool on_ = false;
+    uint32_t frame_ = 0;
+    ID3D11DepthStencilView* lastDsv_ = nullptr;   // the open pass
+    uint32_t lastFrame_ = 0;
+    int lastEye_ = -1;            // the open pass's verdict eye
+    bool openEnqueued_ = false;   // the open pass's record is staged
+
+    void newFrame(uint32_t frame) {
+        frame_ = frame;
+        // A pending constants block belongs to one frame; its pass either
+        // joined a record at enqueue or never ended, so a new frame starts
+        // clean rather than letting a stale block block this one. The join
+        // happens in noteEyeDraw BEFORE this runs: the pass that ended on
+        // this draw may belong to the frame that is closing.
+        pending_[0] = PendingConst{};
+        pending_[1] = PendingConst{};
+    }
+    void resetSlots() {
+        newFrame(0);
+        lastDsv_ = nullptr;
+        lastFrame_ = 0;
+        lastEye_ = -1;
+        openEnqueued_ = false;
+    }
+    // The mapped-row copy runs under SEH: a faulting staging pointer must
+    // count, not crash the late write. POD locals only -- /EHs units cannot
+    // unwind C++ objects through __try (kinematic_eval_hook.cpp's rule).
+    // srcTexel 8 (R32G8X24 staged in its own family) converts each texel to
+    // its first four bytes, the depth float; the payload is always 4-byte.
+    static bool guardedRows(FILE* f, const uint8_t* p, int64_t pitch, uint32_t rowBytes,
+                            uint32_t rows, uint32_t srcTexel, uint32_t* faults) {
+        bool ok = true;
+        uint8_t* conv = nullptr;
+        if (srcTexel != 4) {
+            conv = static_cast<uint8_t*>(std::malloc(rowBytes));
+            if (!conv) { ++*faults; return false; }
+        }
+        __try {
+            for (uint32_t y = 0; y < rows; ++y) {
+                const uint8_t* src = p + static_cast<size_t>(y) * pitch;
+                if (srcTexel == 4) {
+                    ok = fwrite(src, 1, rowBytes, f) == rowBytes && ok;
+                } else {
+                    const uint32_t n = rowBytes / 4;
+                    for (uint32_t x = 0; x < n; ++x)
+                        std::memcpy(conv + size_t(x) * 4, src + size_t(x) * srcTexel, 4);
+                    ok = fwrite(conv, 1, rowBytes, f) == rowBytes && ok;
+                }
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { ++*faults; ok = false; }
+        std::free(conv);
+        return ok;
+    }
+    static bool guardedBytes(FILE* f, const void* p, uint32_t bytes, uint32_t* faults) {
+        bool ok = true;
+        __try { ok = fwrite(p, 1, bytes, f) == bytes; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { ++*faults; ok = false; }
+        return ok;
+    }
+    void enqueue(ID3D11DeviceContext* ctx, ID3D11DepthStencilView* dsv, uint32_t frame, int eye) {
+        openEnqueued_ = true;
+        bool keptFrame = false;
+        uint32_t keptFrames = 0;
+        for (size_t i = 0; i < records_.size(); ++i) {
+            const Record& r = records_[i];
+            if (r.frame == frame) { keptFrame = true; continue; }
+            bool counted = false;
+            for (size_t k = 0; k < i; ++k) counted = counted || records_[k].frame == r.frame;
+            if (!counted) ++keptFrames;
+        }
+        // Declines carry a reason, never a bare count: the 2026-09-21 flight
+        // logged 151 unexplained declines that were all one format gate.
+        if (!keptFrame && keptFrames >= kMaxFrames) { ++declinedFrameCap; return; }
+        Microsoft::WRL::ComPtr<ID3D11Resource> res;
+        dsv->GetResource(&res);
+        Texture tex;
+        if (!res || FAILED(res.As(&tex))) { ++failures; return; }
+        D3D11_TEXTURE2D_DESC td{};
+        tex->GetDesc(&td);
+        // The payload is always plain R32_FLOAT depth (file format field
+        // DXGI_FORMAT_R32_FLOAT). Two read paths, both borrowed from the
+        // depth probe (depthReadFormat, depth_probe.h): the 4-byte family
+        // stages as-is; the R32G8X24 family (the flight rig's eye texture:
+        // resource R32G8X24_TYPELESS -- the census line's "D32" is the DSV's
+        // VIEW format, D32_FLOAT_S8X24_UINT) stages in its own typeless
+        // family and the depth float is picked out of each 8-byte texel at
+        // the write. Anything the probe's table does not read, MSAA, or a
+        // non-single-slice texture declines as format, never half-copies.
+        const bool plain = td.Format == DXGI_FORMAT_R32_TYPELESS || td.Format == DXGI_FORMAT_D32_FLOAT;
+        DXGI_FORMAT readFmt = DXGI_FORMAT_UNKNOWN, copyFmt = DXGI_FORMAT_UNKNOWN;
+        uint32_t storedTexel = 4;
+        if (!plain) {
+            readFmt = depthReadFormat(td.Format, &copyFmt);
+            if (readFmt == DXGI_FORMAT_UNKNOWN || copyFmt != DXGI_FORMAT_R32G8X24_TYPELESS) {
+                ++declinedFormat;
+                return;
+            }
+            storedTexel = 8;
+        }
+        if (td.SampleDesc.Count != 1 || td.ArraySize != 1 || !td.Width || !td.Height) {
+            ++declinedFormat;
+            return;
+        }
+        const uint64_t bytes = static_cast<uint64_t>(td.Width) * td.Height * 4;
+        if (!bytes || bytes > kMaxTextureBytes || bytes > kMaxTotalBytes - bytes_) {
+            ++declinedBytes;
+            return;
+        }
+        Microsoft::WRL::ComPtr<ID3D11Device> dev;
+        ctx->GetDevice(&dev);
+        if (!dev) { ++failures; return; }
+        Record r;
+        r.frame = frame;
+        r.eye = static_cast<uint32_t>(eye);
+        r.width = td.Width;
+        r.height = td.Height;
+        r.format = static_cast<uint32_t>(DXGI_FORMAT_R32_FLOAT);   // the payload, not the source
+        r.storedTexel = storedTexel;
+        r.bytes = static_cast<uint32_t>(bytes);
+        td.MipLevels = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.BindFlags = td.MiscFlags = 0;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (!plain) td.Format = copyFmt;   // same typeless family: a bit-exact stage
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &r.stage))) { ++failures; return; }
+        ctx->CopySubresourceRegion(r.stage.Get(), 0, 0, 0, 0, tex.Get(), 0, nullptr);
+        bytes_ += bytes;
+        if (pending_[eye].live && pending_[eye].frame == frame) {
+            r.constStage = pending_[eye].stage;
+            r.constBytes = pending_[eye].bytes;
+            r.constWhole = pending_[eye].whole;
+        }
+        records_.push_back(std::move(r));
+    }
+public:
+    static constexpr uint32_t kFileVersion = 2;        // 2: register window + const_first_float
+    static constexpr uint32_t kConstFirstRegister = 256;   // VS b1 float4 registers from here...
+    static constexpr uint32_t kConstEndRegister = 336;     // ...to here, clamped to the buffer...
+    static constexpr uint32_t kConstNeedRegister = 276;    // ...which must reach register 275
+    static constexpr uint32_t kConstFirstByte = kConstFirstRegister * 16;
+    static constexpr uint32_t kConstFirstFloat = kConstFirstByte / 4;   // the header's const_first_float
+    static constexpr uint32_t kConstMaxBytes = (kConstEndRegister - kConstFirstRegister) * 16;
+    // The window [first, end) of a VS b1 buffer ByteWidth bytes long, in
+    // bytes; 0 when the buffer stops short of register 275.
+    static uint32_t constWindowEnd(uint32_t byteWidth) {
+        uint32_t end = byteWidth & ~15u;
+        if (end > kConstEndRegister * 16) end = kConstEndRegister * 16;
+        return end >= kConstNeedRegister * 16 ? end : 0;
+    }
+    // Two frames, not four: a converted R32G8X24 slice is w*h*4 (~28 MB at
+    // the flight rig's 2665x2632), 2 frames x 2 eyes ~112 MB under the 192 MB
+    // total -- and the parked-settlement analysis this serves needs one, at
+    // most two frames, never four.
+    static constexpr uint32_t kMaxFrames = 2;
+    static constexpr uint64_t kMaxTotalBytes = 192ull * 1024 * 1024;
+    static constexpr uint64_t kMaxTextureBytes = 64ull * 1024 * 1024;
+    uint32_t declinedFormat = 0, declinedBytes = 0, declinedFrameCap = 0;
+    uint32_t failures = 0, faults = 0, nonEyeSkips = 0;
+    uint32_t declined() const { return declinedFormat + declinedBytes + declinedFrameCap; }
+    bool enabled() const { return on_; }
+    void configure(bool on) {
+        on_ = on;
+        if (!on_) reset();
+    }
+    void reset() {
+        records_.clear();
+        pending_[0] = PendingConst{};
+        pending_[1] = PendingConst{};
+        resetSlots();
+        declinedFormat = 0;
+        declinedBytes = 0;
+        declinedFrameCap = 0;
+        failures = 0;
+        faults = 0;
+        nonEyeSkips = 0;
+        bytes_ = 0;
+    }
+    uint32_t count() const { return static_cast<uint32_t>(records_.size()); }
+    uint64_t bytes() const { return bytes_; }
+    // One armed-frame draw. `dsv` is the draw's depth-stencil view (the
+    // caller's single OMGetRenderTargets, which the ledger already runs for
+    // the RTV); `poolDraw` is the ledger's own t33==g_pool verdict; `eye` is
+    // the caller's eye verdict, 0/1 for a draw into the depth probe's scene
+    // pair (depthProbeSceneEyeOf), -1 for anything else. Non-eye draws return
+    // before any state is touched and are counted in nonEyeSkips -- the
+    // offscreen stages run BEFORE the eye passes in a frame and must not
+    // spend the two slots (the 2026-09-21 flight: they did, 190 declines, no
+    // files). One bool while off; a pointer compare per draw while on.
+    void noteEyeDraw(ID3D11DeviceContext* ctx, uint32_t frame, ID3D11DepthStencilView* dsv, bool poolDraw, int eye) {
+        if (!on_ || !ctx || !dsv) return;
+        if (eye < 0 || eye > 1) { ++nonEyeSkips; return; }
+        // The open pass ended: its DSV just changed and nothing new for its
+        // texture is enqueued before this point in the stream. This runs
+        // BEFORE the frame rolls below, while the ended pass's pending
+        // constants still belong to the closing frame.
+        if (dsv != lastDsv_ && lastDsv_ && !openEnqueued_ && lastEye_ >= 0)
+            enqueue(ctx, lastDsv_, lastFrame_, lastEye_);
+        if (frame != frame_) newFrame(frame);
+        if (dsv != lastDsv_) {
+            lastDsv_ = dsv;
+            lastEye_ = eye;
+            openEnqueued_ = false;
+        }
+        lastFrame_ = frame;
+        if (!poolDraw || pending_[eye].live) return;
+        // First pool-carrying draw of this pass: keep VS b1's frame block,
+        // float4 registers [256, 336) clamped to the buffer -- the
+        // view-projection (270..273) and the eye origin (275) with room for
+        // a small layout shift. Offsets are REGISTERS x 16 bytes: version 1
+        // counted floats and copied registers 64..147 instead.
+        ID3D11Buffer* b1 = nullptr;
+        ctx->VSGetConstantBuffers(1, 1, &b1);
+        if (!b1) return;
+        D3D11_BUFFER_DESC bd{};
+        b1->GetDesc(&bd);
+        const uint32_t off = kConstFirstByte;
+        const uint32_t end = constWindowEnd(bd.ByteWidth);
+        if (end > off) {
+            Microsoft::WRL::ComPtr<ID3D11Device> dev;
+            ctx->GetDevice(&dev);
+            if (dev) {
+                Buffer stage;
+                D3D11_BUFFER_DESC sd = bd;
+                sd.ByteWidth = end - off;
+                sd.Usage = D3D11_USAGE_STAGING;
+                sd.BindFlags = sd.MiscFlags = sd.StructureByteStride = 0;
+                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                if (SUCCEEDED(dev->CreateBuffer(&sd, nullptr, &stage))) {
+                    D3D11_BOX box{off, 0, 0, end, 1, 1};
+                    ctx->CopySubresourceRegion(stage.Get(), 0, 0, 0, 0, b1, 0, &box);
+                    pending_[eye].stage = stage;
+                    pending_[eye].frame = frame;
+                    pending_[eye].bytes = end - off;
+                    pending_[eye].whole = bd.ByteWidth;
+                    pending_[eye].live = true;
+                } else ++failures;
+            }
+        }
+        b1->Release();
+    }
+    // The ledger's late sync point: no waits, unavailable copies write an
+    // explicit zero-byte payload and count a failure. One file per eye per
+    // kept frame: depth_<stamp>_f<frame>_<A|B>.bin.
+    uint32_t write(ID3D11DeviceContext* ctx, const wchar_t* dir, const wchar_t* stamp) {
+        if (!ctx || !dir || !stamp) return 0;
+        uint32_t written = 0;
+        wchar_t path[MAX_PATH];
+        for (Record& r : records_) {
+            _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\depth_%s_f%u_%c.bin", dir, stamp,
+                         r.frame, r.eye ? 'B' : 'A');
+            FILE* f = nullptr;
+            if (_wfopen_s(&f, path, L"wb") || !f) { ++failures; continue; }
+            bool ok = fwrite("EDVRDEPT", 1, 8, f) == 8;
+            auto u32 = [&](uint32_t v) { ok = fwrite(&v, 4, 1, f) == 1 && ok; };
+            u32(kFileVersion);            // version 2
+            u32(r.frame);
+            u32(r.eye);
+            u32(r.width);
+            u32(r.height);
+            u32(r.format);
+            u32(kConstFirstFloat);        // const_first_float: 1024 = register 256 (v2)
+            const uint32_t fileFaults = faults;
+            D3D11_MAPPED_SUBRESOURCE mc{};
+            const bool constOk = r.constBytes && r.constStage &&
+                                 SUCCEEDED(ctx->Map(r.constStage.Get(), 0, D3D11_MAP_READ,
+                                                    D3D11_MAP_FLAG_DO_NOT_WAIT, &mc)) && mc.pData;
+            u32(constOk ? r.constBytes / 4 : 0);
+            if (constOk) {
+                ok = guardedBytes(f, mc.pData, r.constBytes, &faults) && ok;
+                ctx->Unmap(r.constStage.Get(), 0);
+            } else if (r.constBytes) ++failures;
+            D3D11_MAPPED_SUBRESOURCE m{};
+            const bool mapped = r.stage &&
+                                SUCCEEDED(ctx->Map(r.stage.Get(), 0, D3D11_MAP_READ,
+                                                   D3D11_MAP_FLAG_DO_NOT_WAIT, &m)) &&
+                                m.pData && m.RowPitch >= static_cast<int>(r.width * r.storedTexel);
+            u32(mapped ? r.bytes : 0);
+            if (mapped) {
+                ok = guardedRows(f, static_cast<const uint8_t*>(m.pData), m.RowPitch, r.width * 4,
+                                 r.height, r.storedTexel, &faults) && ok;
+                ctx->Unmap(r.stage.Get(), 0);
+            } else ++failures;
+            u32(faults - fileFaults);
+            ok = !ferror(f) && ok;
+            if (fclose(f) != 0 || !ok) ++failures;
+            else ++written;
+        }
+        return written;
+    }
+private:
+    uint64_t bytes_ = 0;
+};
+} // namespace edvr

@@ -30,7 +30,22 @@ class Config;
 void fssDumpConfigure(Config& cfg);
 
 // One bool for the draw path's early-out set and the body-frame gate.
-bool fssDumpWantsDraws();
+//
+// Inline: asked per eye draw behind the body-frame gate, and the build
+// has no /GL to fold a cross-TU getter for four scalar loads.
+namespace detail {
+extern uint32_t g_fssDumpFrame;
+extern bool     g_fssDumpDone;
+extern uint32_t g_fssDumpSeriesWant;
+extern bool     g_fssDumpSeriesDone;
+}  // namespace detail
+// __forceinline, not inline: beginPanelOverride is large enough that MSVC's
+// inliner declined this one and called an out-of-line copy per eye draw
+// (checked on the built DLL, 2026-09-22 round three).
+__forceinline bool fssDumpWantsDraws() {
+    return (detail::g_fssDumpFrame != 0 && !detail::g_fssDumpDone) ||
+           (detail::g_fssDumpSeriesWant != 0 && !detail::g_fssDumpSeriesDone);
+}
 
 // Called for eye draws behind the body-frame gate; matches the ring quad
 // and the composite by vertex hash. True wraps the draw in Begin/End so

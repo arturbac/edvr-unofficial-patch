@@ -31,7 +31,10 @@ struct ID3D11PixelShader;
 struct ID3D11ClassInstance;
 struct ID3D11Buffer;
 struct ID3D11Resource;
+struct ID3D11BlendState;
+struct ID3D11ShaderResourceView;
 struct D3D11_BOX;
+struct D3D11_VIEWPORT;
 
 namespace edvr {
 void vScreenExecuteCommandListRaw(ID3D11DeviceContext*,ID3D11CommandList*,int restore);
@@ -47,8 +50,8 @@ void vScreenExecuteCommandListRaw(ID3D11DeviceContext*,ID3D11CommandList*,int re
 //
 // It lives HERE because the count is this module's -- it is incremented in
 // beginPanelOverride and handed out at the frame boundary -- and because the
-// alternative is a fourth copy of one measurement. camera_view kept its own
-// (kMenuEyeDraws) and its comment already said what that costs: "a third
+// alternative is a fourth copy of one measurement. camera_view (since removed)
+// kept its own (kMenuEyeDraws) and its comment already said what that costs: "a third
 // number for it would be a third thing to re-measure". glitch_frame's
 // minEyeDraws is deliberately still its own, being a per-fix tunable rather
 // than this fact.
@@ -74,7 +77,7 @@ constexpr uint32_t kSceneEyeDraws = 100;
 // times into one target in one frame.
 //
 // Integer arithmetic on purpose: this is asserted from a test that links
-// nothing, the same reason camera_view's grouping lives in a header.
+// nothing, the same reason camera_view's (since removed) grouping lived in a header.
 inline bool eyeShapedAtScale(uint32_t w, uint32_t h, uint32_t eyeW, uint32_t eyeH) {
     if (!w || !h || !eyeW || !eyeH) return false;
     // Aspect, cross-multiplied rather than divided: within about 1%, which
@@ -97,11 +100,11 @@ inline bool eyeShapedAtScale(uint32_t w, uint32_t h, uint32_t eyeW, uint32_t eye
 // runtime published, or the size this rig turned out to render an eye at?
 //
 // The second half is why this exists as a shared answer instead of three
-// copies of `== eyeW && == eyeH`. holo_fix and witchstar_fix identify their
-// draw by an eye-sized DEPTH buffer, and on a rig with a render scale that
-// buffer is the scaled size, so both fixes silently matched nothing.
+// copies of `== eyeW && == eyeH`. holo_fix identifies its draw by an
+// eye-sized DEPTH buffer, and on a rig with a render scale that buffer is the
+// scaled size, so the fix silently matched nothing.
 // Answers false when nothing has been published and nothing measured, which
-// is the same "disable yourself" answer those two already acted on.
+// is the same "disable yourself" answer it already acted on.
 bool vScreenIsEyeSized(uint32_t w, uint32_t h);
 
 // The context's OMSetRenderTargets through the ORIGINAL entry, past the
@@ -114,21 +117,40 @@ void vScreenSetRenderTargetsRaw(ID3D11DeviceContext* ctx, uint32_t n,
                                 ID3D11RenderTargetView* const* rtvs,
                                 ID3D11DepthStencilView* dsv);
 
-// The same bypass for Draw, the VS/PS stage, a VS constant buffer slot and
-// UpdateSubresource -- everything fix.eye_mask's ring needs past the hook,
-// so the draw census, the eye-draw gate, foveation and the temporal pass
-// never see it. Every one null-safe before the hooks are installed (no-op),
-// same as vScreenSetRenderTargetsRaw above.
+// The same bypass for Draw, the VS/PS stage and UpdateSubresource, so the
+// draw census, the eye-draw gate and the temporal pass never see them (the
+// UI-depth passes draw through these). Every one null-safe before the hooks
+// are installed (no-op), same as vScreenSetRenderTargetsRaw above.
 void vScreenDrawRaw(ID3D11DeviceContext* ctx, uint32_t vertexCount, uint32_t startVertex);
 void vScreenVSSetShaderRaw(ID3D11DeviceContext* ctx, ID3D11VertexShader* vs,
                            ID3D11ClassInstance* const* classInstances, uint32_t numClassInstances);
 void vScreenPSSetShaderRaw(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps,
                            ID3D11ClassInstance* const* classInstances, uint32_t numClassInstances);
-void vScreenVSSetConstantBuffersRaw(ID3D11DeviceContext* ctx, uint32_t startSlot,
-                                    uint32_t numBuffers, ID3D11Buffer* const* buffers);
+// The blend state, past the binding shadow's hook: engine-record velocity's
+// derived state for a substituted pool draw, and the game's put back.
+void vScreenOMSetBlendStateRaw(ID3D11DeviceContext* ctx, ID3D11BlendState* state,
+                               const float blendFactor[4], uint32_t sampleMask);
 void vScreenUpdateSubresourceRaw(ID3D11DeviceContext* ctx, ID3D11Resource* dstResource,
                                  uint32_t dstSubresource, const D3D11_BOX* dstBox,
                                  const void* srcData, uint32_t srcRowPitch, uint32_t srcDepthPitch);
+// And the two fix.ui_quality's layer needs (ui_layer.cpp): its viewports
+// set around a redirected draw -- the RSSetViewports hook would scale them
+// again for a tracked surface and count them -- and its per-frame clear,
+// which the ClearRenderTargetView hook would otherwise report to the
+// separation as a write to a target it tracks.
+void vScreenRSSetViewportsRaw(ID3D11DeviceContext* ctx, uint32_t n, const D3D11_VIEWPORT* vps);
+void vScreenClearRenderTargetViewRaw(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* rtv,
+                                     const float colour[4]);
+// The PS shader-resource slots, past the binding shadow's hook: the crisp-HUD half's of fix.ui_quality
+// tonemap re-issue swaps the admitted draw's HDR source slot for the HDR HUD
+// layer's SRV and puts the game's own back after (ui_layer.cpp), and the
+// shadow must keep describing the game's bindings throughout.
+void vScreenPSSetShaderResourcesRaw(ID3D11DeviceContext* ctx, uint32_t startSlot, uint32_t n,
+                                    ID3D11ShaderResourceView* const* srvs);
+// The layer's copy of the game's depth-stencil target, which it seeds its
+// own from (a depth- or stencil-tested UI draw): past the copy hook, which
+// would report the write to the motion paths.
+void vScreenCopyResourceRaw(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src);
 
 // Installs the context hooks using the mechanism the caller decided for this
 // device -- shared with the exposure hooks so the two never split modes on
@@ -148,6 +170,13 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode);
 // that REFUSED left it claiming 4K while the panel really rendered 1920x1080.
 // Both end with the fix quietly doing nothing.
 void vScreenSetPanelSize(uint32_t width, uint32_t height);
+
+// ...and the size the panel recogniser uses: the one set above, or the
+// stock 1920x1080 until it is. False when vScreen is not installed (then
+// no 2D screen composite is recognised either). For fix.ui_quality's
+// world-screen gate, which asks the depth probe how busy a depth target of
+// exactly this size was.
+bool vScreenPanelSize(uint32_t* width, uint32_t* height);
 
 // Re-read the settings that are documented as changeable while the game runs.
 //

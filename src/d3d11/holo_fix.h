@@ -38,13 +38,26 @@ class Config;
 void holoConfigure(Config& cfg);
 
 // False in stock mode, which keeps the per-draw path free when off.
-bool holoWantsDraws();
+//
+// Inline: asked per draw, and the build has no /GL to fold a cross-TU
+// getter for one bool load.
+namespace detail {
+extern bool g_holoSteady;
+}  // namespace detail
+inline bool holoWantsDraws() { return detail::g_holoSteady; }
 
 // Is this eye draw the hologram composite? Matched by shape: a 6-index
 // instanced quad, no depth via... the quad BINDS depth for masking, so the
 // discriminator is what it samples: slot 0 resolves to the eye-sized depth
 // texture and slot 1 to the 256x256 pattern. True means the thunk should
 // wrap the draw in holoBegin/holoEnd.
+//
+// holoPatternShape is the shape half, inline so the draw path asks it before
+// the call: holoOnEyeDraw answers false, having resolved nothing, for any
+// other shape. holo_fix.cpp matches through this same function.
+inline bool holoPatternShape(char kind, uint32_t count, uint32_t instances) {
+    return kind == 'X' && count == 6 && instances == 1;   // a 6-index quad, one instance
+}
 bool holoOnEyeDraw(char kind, uint32_t count, uint32_t instances);
 
 // Around the real draw: bind the uniform texture into PS slot 1, restore

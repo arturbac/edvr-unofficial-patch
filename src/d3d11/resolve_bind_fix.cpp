@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <cstdint>
 #include <string>
 
 #include <d3d11.h>
@@ -9,21 +10,30 @@
 #include "../common/config.h"
 #include "../common/guard.h"
 #include "../common/log.h"
+#include "binding_shadow.h"
 #include "exposure_fix.h"   // lookupShaderHash: the shared shader registry
 
 namespace edvr {
+
+// resolveBindWants reads this from the header with no call: asked per
+// eye draw, and the build has no /GL to fold a cross-TU getter.
+namespace detail {
+bool g_resolveBindOn = false;
+}  // namespace detail
+
 namespace {
 
-// The deferred resolve's PIXEL shader -- the same content hash
-// resolve_probe.cpp matches on, measured 2026-08-30 from a field shader
-// dump and confirmed by disassembly. Duplicated rather than shared because
-// the two modules stand alone: one is a probe somebody arms for an
-// evening, this is a fix that ships on.
-constexpr uint64_t kResolvePs = 0x7CECABDE34FFBE9EULL;
+// The deferred resolve's PIXEL shader and the shadow's three-way answer now
+// live in resolve_bind_fix.h (detail::kResolveBindPs, resolveBindShadowMatch)
+// so the draw path can ask the "No" inline before calling in; these are the
+// names this file has always used for them.
+constexpr uint64_t kResolvePs = detail::kResolveBindPs;
+using ShadowMatch = detail::ResolveBindShadow;
+constexpr ShadowMatch shadowMatch(bool hasShader, uint64_t hash) {
+    return detail::resolveBindShadowMatch(hasShader, hash);
+}
 
 FaultBudget g_budget("resolveBind", 8);
-
-bool g_on = false;
 
 // The remembered quad. A reference is held: the game reuses one buffer for
 // both eyes and every frame (the healthy captures show the same token all
@@ -60,8 +70,8 @@ void resolveBindConfigure(Config& cfg) {
     // the ini in the zip. One line at first sight, whatever the state, so
     // every bundle names it.
     static bool announced = false;
-    if (want == g_on) {
-        if (!announced && !g_on) {
+    if (want == detail::g_resolveBindOn) {
+        if (!announced && !detail::g_resolveBindOn) {
             announced = true;
             Log::get().note("scanner body fix off: resolve draws are left "
                             "as the game issues them.");
@@ -70,8 +80,8 @@ void resolveBindConfigure(Config& cfg) {
         return;
     }
     announced = true;
-    g_on = want;
-    if (g_on) {
+    detail::g_resolveBindOn = want;
+    if (detail::g_resolveBindOn) {
         Log::get().note(
             "scanner body fix ON: a lighting-resolve draw that arrives with "
             "no vertex buffer is drawn with the buffer the other eye's "
@@ -84,16 +94,33 @@ void resolveBindConfigure(Config& cfg) {
     }
 }
 
-bool resolveBindWants() { return g_on; }
-
 bool resolveBindOnEyeDraw(ID3D11DeviceContext* ctx) {
-    if (!g_on || !ctx) return false;
+    if (!detail::g_resolveBindOn || !ctx) return false;
+
+    // beginPanelOverride calls this only after rejecting foreign contexts, so
+    // these are the owner immediate context's bindings. The PS setter records
+    // the pointer and hash together. A nonzero hash with a live pointer is a
+    // complete answer and avoids PSGetShader's device lock and AddRef/Release
+    // on every eye draw.
+    //
+    // Null and hash zero remain UNKNOWN, not "not the resolve". ClearState and
+    // ExecuteCommandList without restore deliberately forget the shadow, and a
+    // shader may be bound before its registry entry exists. Both cases must use
+    // the real getter. A successful fallback lookup repairs this one slot so a
+    // command-list invalidation costs one getter rather than every later draw.
+    const ShadowMatch shadow =
+        shadowMatch(bindingGet(BindSlot::Ps) != nullptr,
+                    bindingShaderHash(BindSlot::Ps));
+    if (shadow != ShadowMatch::Unknown) return shadow == ShadowMatch::Yes;
+
     bool match = false;
     guardedBudget(g_budget, [&] {
         ID3D11PixelShader* ps = nullptr;
         ctx->PSGetShader(&ps, nullptr, nullptr);
         if (ps) {
-            match = lookupShaderHash(ps) == kResolvePs;
+            const uint64_t hash = lookupShaderHash(ps);
+            if (hash) bindingSetShader(BindSlot::Ps, ps, hash);
+            match = hash == kResolvePs;
             ps->Release();
         }
     });
@@ -101,7 +128,7 @@ bool resolveBindOnEyeDraw(ID3D11DeviceContext* ctx) {
 }
 
 void resolveBindBegin(ID3D11DeviceContext* ctx) {
-    if (!g_on || !ctx) return;
+    if (!detail::g_resolveBindOn || !ctx) return;
     guardedBudget(g_budget, [&] {
         ID3D11Buffer* vb = nullptr;
         UINT stride = 0, offset = 0;

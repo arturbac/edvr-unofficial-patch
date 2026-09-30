@@ -57,8 +57,6 @@ enum NativeBenchmarkAbortReason : uint32_t {
 struct NativeBenchmarkReport {
     uint64_t window = 0;
     uint64_t scope = 0;
-    uint64_t warmupMs = 0;
-    uint64_t sampleMs = 0;
     uint64_t drainMs = 0;
     uint64_t startedAtMs = 0;
     uint64_t sampleEndedAtMs = 0;
@@ -93,6 +91,9 @@ public:
     void reset() noexcept;
     uint64_t window() const noexcept { return window_; }
     bool warming() const noexcept { return phase_ == Phase::Warmup; }
+    // Sampling only: Drain still accepts delayed completions for the finished
+    // interval, but must not be presented as an active comparison sample.
+    bool collecting() const noexcept { return phase_ == Phase::Sampling; }
     bool sampling() const noexcept { return phase_ == Phase::Sampling || phase_ == Phase::Drain; }
 
 private:

@@ -1,9 +1,13 @@
+#include "temporal_shader_bytecode.h"
 #include "menu_panel.h"
+#include "flat_compute_readback.h"
 #include "graphics_runtime.h"
+#include "../common/runtime_profile.h"
 
 #include <windows.h>
 
 #include <d3d11.h>
+#include <d3d11_1.h>
 
 #include <atomic>
 #include <algorithm>
@@ -25,6 +29,7 @@
 #include "perf_monitor.h"   // the upload is an event for the drop attribution
 #include "shader_swap.h"
 #include "gpu_timing.h"
+#include "gpu_census.h"   // issue #38: the per-feature GPU cost census
 
 namespace edvr {
 namespace {
@@ -293,8 +298,11 @@ void layout(const MenuContent& c, std::vector<Op>& ops, std::vector<LineRect>& l
     const int tileGap = cap / 4;
     const int tilesH = tileRows > 0 ? tileRows * (tileH + tileGap) + cap / 2 : 0;
     const int hintHUsed = c.hint[0] ? hintH : 0;
-    const int H = pad + tabH + tilesH + rows * rowPitch + (c.toast ? cap * 2 / 10 : 0) + graphH +
-                  hintHUsed + footH + pad;
+    // A locked FPS readout sits above the tabs so it stays visible while
+    // the menu is scrolled or a tooltip is up.
+    const int overlayH = (c.toast || !c.overlayLine[0]) ? 0 : cap * 16 / 10;
+    const int H = pad + overlayH + tabH + tilesH + rows * rowPitch + (c.toast ? cap * 2 / 10 : 0) +
+                  graphH + hintHUsed + footH + pad;
     *outH = H;
 
     // Background.
@@ -306,6 +314,17 @@ void layout(const MenuContent& c, std::vector<Op>& ops, std::vector<LineRect>& l
         ops.push_back(o);
     }
     int y = pad;
+    if (overlayH > 0) {
+        Op o;
+        o.text = true;
+        o.str = widen(c.overlayLine);
+        o.rect = {pad, y, cardW - pad, y + overlayH};
+        o.align = DT_LEFT | DT_VCENTER;
+        o.font = Font::Hint;
+        o.rgb = kToastText;
+        ops.push_back(o);
+        y += overlayH;
+    }
     if (!c.toast) {
         // The tab bar: the window of names the model chose, with an arrow
         // at whichever end has pages beyond it, so the strip never ends
@@ -431,11 +450,11 @@ void layout(const MenuContent& c, std::vector<Op>& ops, std::vector<LineRect>& l
         left.rect = {pad, y, split, y + rowPitch};
         left.align = DT_LEFT;
         left.font = l.style == kMenuHeading ? Font::Small : l.style == kMenuNote ? Font::Hint : Font::Row;
-        left.rgb = l.style == kMenuHeading ? kHeading
-                   : l.style == kMenuDim   ? kDimText
-                   : l.style == kMenuNote  ? kHint
-                   : c.toast               ? kToastText
-                                           : kLabel;
+        left.rgb = l.style == kMenuHeading        ? kHeading
+                   : l.style == kMenuDim || l.dim ? kDimText
+                   : l.style == kMenuNote         ? kHint
+                   : c.toast                      ? kToastText
+                                                   : kLabel;
         if (l.style == kMenuHeading) left.rect.left = pad / 2;
         if (c.toast) left.rect.right = cardW - pad;
         ops.push_back(left);
@@ -488,10 +507,10 @@ void layout(const MenuContent& c, std::vector<Op>& ops, std::vector<LineRect>& l
             right.rect = {split, y, cardW - pad, y + rowPitch};
             right.align = l.style == kMenuInfo ? DT_LEFT : DT_RIGHT;
             right.font = Font::Row;
-            right.rgb = l.style == kMenuInfo ? kLabel
-                        : l.style == kMenuDim ? kDimText
-                        : l.badge == kBadgePending ? kBadge
-                                                   : kValue;
+            right.rgb = l.style == kMenuInfo               ? kLabel
+                        : l.style == kMenuDim || l.dim      ? kDimText
+                        : l.badge == kBadgePending          ? kBadge
+                                                             : kValue;
             if (l.style == kMenuRowEdit) right.rect.right -= cap / 3;
             if (l.toggle) right.rect.right -= switchW + cap / 2;
             ops.push_back(right);
@@ -882,80 +901,7 @@ void workerMain() {
 // ---------------------------------------------------------------------------
 // The GPU side
 
-constexpr char kCompositeCs[] = R"HLSL(
-Texture2D<float4> S : register(t0);
-Texture2D<float4> P : register(t1);
-SamplerState L : register(s0);
-RWTexture2D<float4> O : register(u0);
-cbuffer C : register(b0) {
-    int4   region;     // the pixels of S this eye owns (x1, y1 exclusive)
-    int2   outSize;
-    int    flipV;      // the submit's rows run bottom-up
-    int    linearOut;  // the frame is linear light: linearise the panel
-    int4   box;        // the output pixels this dispatch covers (x1, y1 exclusive)
-    float4 tans;       // left, right, top, bottom tangent magnitudes
-    float4 m0;         // current-head -> anchor rotation rows; .w = origin
-    float4 m1;
-    float4 m2;
-    float4 geom;       // dist, curve, halfW, halfH
-    float4 misc;       // alpha
-};
-float3 toLinear(float3 c) {
-    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
-}
-[numthreads(8, 8, 1)]
-void main(uint3 tid : SV_DispatchThreadID) {
-    uint2 id = uint2(box.x + tid.x, box.y + tid.y);
-    if (id.x >= (uint)box.z || id.y >= (uint)box.w) return;
-    float4 src = S.Load(int3(region.x + id.x, region.y + id.y, 0));
-    float u = (id.x + 0.5) / outSize.x;
-    float v = (id.y + 0.5) / outSize.y;
-    if (misc.z > 0.5) u = 1.0 - u;
-    if (flipV) v = 1.0 - v;
-    float tx = lerp(-tans.x, tans.y, u);
-    float ty = lerp(tans.z, -tans.w, v);
-    float3 dv = float3(tx, ty, -1.0);
-    float3 df = float3(dot(m0.xyz, dv), dot(m1.xyz, dv), dot(m2.xyz, dv));
-    float3 org = float3(m0.w, m1.w, m2.w);
-    float dist = geom.x, curve = geom.y, halfW = geom.z, halfH = geom.w;
-    float su = -1.0, sv = -1.0;
-    if (curve > 0.005) {
-        float R = dist / curve;
-        float zc = R - dist;
-        float a = df.x * df.x + df.z * df.z;
-        float b = 2.0 * (org.x * df.x + (org.z - zc) * df.z);
-        float c = org.x * org.x + (org.z - zc) * (org.z - zc) - R * R;
-        float disc = b * b - 4.0 * a * c;
-        if (disc > 0 && a > 1e-8) {
-            float t = (-b + sqrt(disc)) / (2.0 * a);
-            if (t > 0) {
-                float3 hit = org + t * df;
-                float th = atan2(hit.x, zc - hit.z);
-                su = (th * R - misc.y + halfW) / (2.0 * halfW);
-                sv = (hit.y + halfH) / (2.0 * halfH);
-            }
-        }
-    } else if (df.z < -1e-4) {
-        float t = (-dist - org.z) / df.z;
-        if (t > 0) {
-            float3 hit = org + t * df;
-            su = (hit.x - misc.y + halfW) / (2.0 * halfW);
-            sv = (hit.y + halfH) / (2.0 * halfH);
-        }
-    }
-    float4 outc = src;
-    if (su >= 0 && su <= 1 && sv >= 0 && sv <= 1) {
-        float4 p = P.SampleLevel(L, float2(su, 1.0 - sv), 0);
-        if (linearOut) {
-            float pa = max(p.a, 1e-4);
-            p.rgb = toLinear(p.rgb / pa) * pa;
-        }
-        float a = p.a * misc.x;
-        outc = float4(src.rgb * (1.0 - a) + p.rgb * misc.x, src.a);
-    }
-    O[id.xy] = outc;
-}
-)HLSL";
+
 
 struct Params {
     int32_t region[4];
@@ -987,6 +933,7 @@ EyeState g_eye[2];
 
 ID3D11Texture2D*          g_panelTex = nullptr;
 ID3D11ShaderResourceView* g_panelSrv = nullptr;
+ID3D11Device*             g_panelDevice = nullptr; // borrowed while g_panelTex holds its device
 int                       g_panelW = 0, g_panelH = 0;
 std::atomic<float>        g_panelAspect{0.0f};
 std::atomic<float>        g_panelWidthDeg{0.0f};
@@ -1186,7 +1133,8 @@ bool makeTex(ID3D11Device* dev, uint32_t w, uint32_t h, DXGI_FORMAT texFmt, DXGI
     return true;
 }
 
-void* compositeInner(void* srcTex, int eye, const float* bounds, const float* xf) {
+void* compositeInner(void* srcTex, int eye, const float* bounds, const float* xf,
+                     bool flat = false) {
     MenuGeometry g;
     {
         std::lock_guard<std::mutex> lock(g_geomMutex);
@@ -1243,8 +1191,7 @@ void* compositeInner(void* srcTex, int eye, const float* bounds, const float* xf
     }
     if (ok && !g_cs && !g_csTried) {
         g_csTried = true;
-        g_cs = shaderSwapCompileCs(ctx, kCompositeCs, sizeof(kCompositeCs) - 1, "main",
-                                   "menu_panel_cs", nullptr, "menu panel");
+        g_cs = shaderSwapCreateCs(ctx, kMenuCompositeBytecode, sizeof(kMenuCompositeBytecode), "menu_panel_cs", "menu panel");
     }
     ok = ok && g_cs != nullptr;
     if (ok && !g_cb) {
@@ -1271,7 +1218,7 @@ void* compositeInner(void* srcTex, int eye, const float* bounds, const float* xf
     ID3D11ShaderResourceView* inSrv = nullptr;
     bool viaCopy = false;
     if (ok) {
-        if (sd.BindFlags & D3D11_BIND_SHADER_RESOURCE) {
+        if (!flat && (sd.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
             if (e.srcRes != static_cast<void*>(src) || !e.srcSrv) {
                 if (e.srcSrv) { e.srcSrv->Release(); e.srcSrv = nullptr; }
                 D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
@@ -1329,7 +1276,13 @@ void* compositeInner(void* srcTex, int eye, const float* bounds, const float* xf
         // left eye, right edge of the right); the vertical pair as measured,
         // or derived symmetric from the region's shape when unpublished.
         Params p{};
-        menuPanelFrustum(eye, regionW, regionH, p.tans);
+        if (flat) {
+            p.tans[0] = p.tans[1] = 1.0f;
+            p.tans[2] = p.tans[3] = static_cast<float>(regionH) /
+                                         static_cast<float>(regionW ? regionW : 1);
+        } else {
+            menuPanelFrustum(eye, regionW, regionH, p.tans);
+        }
         // Where the panel lands in this eye. Outside it entirely: forward
         // the frame untouched, nothing copied, nothing dispatched. Behind
         // the eye (a look away from a world-anchored panel): the whole
@@ -1338,6 +1291,21 @@ void* compositeInner(void* srcTex, int eye, const float* bounds, const float* xf
         // Read the aspect ONCE: a raster landing between two reads would
         // give the culling box and the shader different panels for a frame.
         const float aspect = g_panelAspect.load();
+        float flatPose[12]{};
+        if (flat && aspect > 0.0f) {
+            const float fitHeight = 0.85f * static_cast<float>(regionH) /
+                                    static_cast<float>(regionW ? regionW : 1) / aspect;
+            // The old desktop card was centred and could occupy 85% of the
+            // screen height. Halve both of its screen dimensions, then pin
+            // its upper-left edge two percent in from the output edges.
+            // This is evaluated against the swapchain, not Elite's SS size.
+            g.halfW = 0.5f * (std::min)(g.halfW, fitHeight);
+            constexpr float margin = 0.02f;
+            g.shift = g.dist * (-1.0f + 2.0f * margin) + g.halfW;
+            flatPose[0] = flatPose[4] = flatPose[8] = 1.0f;
+            flatPose[10] = g.halfW * aspect - g.dist * (1.0f - 2.0f * margin) * p.tans[2];
+            xf = flatPose;
+        }
         const float halfH = g.halfW * aspect;
         if (panelBox(xf, p.tans, g.dist, g.curve, g.halfW, halfH, g.shift, regionW, regionH, flipV, g_nativeFrustum && flipU,
                      box) &&
@@ -1416,8 +1384,10 @@ void* compositeInner(void* srcTex, int eye, const float* bounds, const float* xf
             ctx->CSSetSamplers(0, 1, &g_samp);
             ctx->CSSetShaderResources(0, 2, setSrv);
             ctx->CSSetUnorderedAccessViews(0, 1, &e.outUav, nullptr);
+            gpuCensusBegin(ctx, GpuCensusSection::DoorMenu);
             ctx->Dispatch((static_cast<UINT>(box[2] - box[0]) + 7) / 8,
                           (static_cast<UINT>(box[3] - box[1]) + 7) / 8, 1);
+            gpuCensusEnd(ctx, GpuCensusSection::DoorMenu);
             if (qs >= 0) g_qring[qs].timer.end(ctx); // Poll consumes failed End samples too.
 
             ctx->CSSetShaderResources(0, 2, nullSrv);
@@ -1435,7 +1405,7 @@ void* compositeInner(void* srcTex, int eye, const float* bounds, const float* xf
 
             result = e.outTex;
             ++g_draws;
-            bumpMenuDrawn();
+            if (!flat) bumpMenuDrawn();
             if (!g_firstNoted) {
                 g_firstNoted = true;
                 Log::get().note(
@@ -1493,6 +1463,83 @@ void* menuPanelCompositeNative(ID3D11Texture2D* src, int eye, const float* bound
     return out;
 }
 
+bool menuPanelCompositeFlat(IDXGISwapChain* swap) {
+    if (!swap || graphicsRuntimeDisabled()) return false;
+    MenuGeometry g;
+    { std::lock_guard<std::mutex> lock(g_geomMutex); g = g_geom; }
+    if (!(g.alpha > 0.0f) || !g_panelSrv) return false;
+    ID3D11Texture2D* back = nullptr;
+    if (FAILED(swap->GetBuffer(0, __uuidof(ID3D11Texture2D),
+                               reinterpret_cast<void**>(&back))) || !back) return false;
+    bool copied = false;
+    guardedBudget(g_budget, [&] { copied = menuPanelCompositeFlatTexture(back); });
+    back->Release();
+    return copied;
+}
+
+bool menuPanelCompositeFlatTexture(ID3D11Texture2D* back) {
+    if (!back || graphicsRuntimeDisabled()) return false;
+    MenuGeometry g;
+    { std::lock_guard<std::mutex> lock(g_geomMutex); g = g_geom; }
+    if (!(g.alpha > 0.0f) || !g_panelSrv) return false;
+    FlatComputeInternalScope internal;
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    back->GetDevice(&dev);
+    if (g_panelDevice && g_panelDevice != dev) {
+        menuPanelFlatResize();
+        if (dev) dev->Release();
+        return false;
+    }
+    if (dev) dev->GetImmediateContext(&context);
+    if (!dev || !context) {
+        if (context) context->Release();
+        if (dev) dev->Release();
+        return false;
+    }
+    // compositeInner already saves and restores every compute-stage slot it
+    // touches (CSGetShader/CSGetShaderResources/CSGetUnorderedAccessViews/
+    // CSGetConstantBuffers/CSGetSamplers, mirrored going back out) -- the same
+    // protection menuPanelCompositeNative's VR path already relies on by
+    // calling compositeInner directly on the live context. A
+    // CreateDeviceContextState/SwapDeviceContextState detour around that was
+    // redundant on top of protection already proven elsewhere in this file,
+    // and depends on a D3D11.1 feature real games essentially never exercise
+    // -- exactly the kind of corner a translation layer has every reason to
+    // under-test.
+    bool copied = false;
+    {
+        // compositeInner expects a packed 3x3 rotation followed by XYZ origin.
+        const float identity[12] = {1,0,0, 0,1,0, 0,0,1, 0,0,0};
+        ID3D11Texture2D* out = static_cast<ID3D11Texture2D*>(
+            compositeInner(back, 0, nullptr, identity, true));
+        if (out) {
+            context->CopyResource(back, out);
+            copied = true;
+        }
+    }
+    if (copied) bumpMenuDrawn();
+    context->Release();
+    dev->Release();
+    return copied;
+}
+
+void menuPanelFlatResize() {
+    releaseEye(g_eye[0]);
+    if (g_panelSrv) { g_panelSrv->Release(); g_panelSrv = nullptr; }
+    if (g_panelTex) { g_panelTex->Release(); g_panelTex = nullptr; }
+    g_panelDevice = nullptr;
+    g_panelW = g_panelH = 0;
+    g_panelAspect.store(0.0f);
+    if (g_cs) { g_cs->Release(); g_cs = nullptr; }
+    g_csTried = false;
+    if (g_cb) { g_cb->Release(); g_cb = nullptr; }
+    if (g_samp) { g_samp->Release(); g_samp = nullptr; }
+    releaseQueries();
+}
+
+bool menuPanelFlatRasterReady() { return g_panelSrv != nullptr; }
+
 bool menuPanelHit(const float org[3], const float dir[3], float dist, float curve, float halfW,
                   float halfH, float shift, float* su, float* sv) {
     float u = -1.0f, v = -1.0f;
@@ -1549,6 +1596,8 @@ bool menuPanelWorkerReadyForTest() {
 
 void menuPanelTick(ID3D11Device* dev) {
     if (!dev) return;
+    if (runtimeFlatProfile() && g_panelDevice && g_panelDevice != dev)
+        menuPanelFlatResize();
     Raster r;
     bool have = false;
     {
@@ -1574,6 +1623,7 @@ void menuPanelTick(ID3D11Device* dev) {
             }
             g_panelW = r.w;
             g_panelH = r.h;
+            g_panelDevice = dev;
         }
         ID3D11DeviceContext* ctx = nullptr;
         dev->GetImmediateContext(&ctx);
@@ -1716,28 +1766,6 @@ bool menuPanelBuildOverlayContent(MenuContent& c, const char* line, float textDe
     return true;
 }
 
-int menuPanelLayoutHeightForTest(const MenuContent& c, int* footTop, int* footBottom,
-                                 float* rowEdges, int maxRows, int* footLines) {
-    std::vector<Op> ops;
-    std::vector<LineRect> lines;
-    int H = 0;
-    int scrollMax = 0;
-    RECT foot = {-1, -1, -1, -1};
-    int footN = 0;
-    layout(c, ops, lines, &H, 0, &scrollMax, &foot, &footN);
-    if (footTop) *footTop = foot.top;
-    if (footBottom) *footBottom = foot.bottom;
-    if (footLines) *footLines = footN;
-    if (rowEdges && maxRows > 0) {
-        for (int i = 0; i < maxRows; ++i) {
-            const bool have = i < static_cast<int>(lines.size());
-            rowEdges[i * 2] = have ? lines[static_cast<size_t>(i)].y0 : -1.0f;
-            rowEdges[i * 2 + 1] = have ? lines[static_cast<size_t>(i)].y1 : -1.0f;
-        }
-    }
-    return H;
-}
-
 void menuPanelShutdown() {
     {
         std::lock_guard<std::mutex> lock(g_w.m);
@@ -1750,6 +1778,7 @@ void menuPanelShutdown() {
     releaseQueries();
     if (g_panelSrv) { g_panelSrv->Release(); g_panelSrv = nullptr; }
     if (g_panelTex) { g_panelTex->Release(); g_panelTex = nullptr; }
+    g_panelDevice = nullptr;
     if (g_samp) { g_samp->Release(); g_samp = nullptr; }
     if (g_cb) { g_cb->Release(); g_cb = nullptr; }
     if (g_cs) { g_cs->Release(); g_cs = nullptr; }
@@ -1760,13 +1789,3 @@ void menuPanelShutdown() {
 }
 
 }  // namespace edvr
-
-extern "C" __declspec(dllexport) void* edvrMenuPanel(void* srcTex, int eye, const float* bounds,
-                                                     const float* xf) {
-    if (edvr::graphicsRuntimeDisabled() || !srcTex || !xf || eye < 0 || eye > 1) return nullptr;
-    void* out = nullptr;
-    edvr::guardedBudget(edvr::g_budget, [&] {
-        out = edvr::compositeInner(srcTex, eye, bounds, xf);
-    });
-    return out;
-}

@@ -25,7 +25,6 @@ using PayloadProvider = std::function<bool(const std::string& item, const void**
 
 struct ApplyResult {
     bool ok = false;
-    bool needsElevation = false;  // a write was refused; the same run as admin would work
     bool rolledBack = false;
     // A file was replaced before the failure. The transaction attempts to
     // restore its pre-write snapshot, while ordinary backups remain available.
@@ -35,6 +34,14 @@ struct ApplyResult {
 };
 
 ApplyResult applyPlan(const Plan& plan, const PayloadProvider& payload);
+
+// The rig's seam; nothing in the product calls it. How long a replace waits out a
+// file that something else has open, before the run fails and is rolled back:
+// `retries` further tries, `backoffMs` apart. The product waits about two seconds,
+// which a scripted case that is refused every time cannot afford; a negative
+// `retries` puts the product's numbers back. The renames themselves are iniedit's
+// (replaceHooksForTest is how a case scripts what they answer).
+void replacePatienceForTest(int retries, unsigned backoffMs);
 
 // Can this process create a file in that folder? Asked before anything is
 // touched, so that "you need to run this as administrator" is offered up front

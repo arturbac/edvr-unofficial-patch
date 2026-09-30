@@ -267,176 +267,6 @@ inline void temporalViewDelta(const float prev12[12], const float now12[12],
     }
 }
 
-// Tier 2 of docs/per-object-motion.md (2026-09-08): a rigid body's own
-// path. The body moved in the world by [Rd | td] -- a point at w now was
-// at Rd w + td last frame, the instance pool's own delta for its largest
-// cluster (object_probe.cpp), in the frame the camera rows share -- and
-// the rows are read as worldFromRows reads them, [R | c] with a
-// view-space point v at R v + c in the world. So a body point at
-// view-space P now was, last frame, at
-//   R_p^T (Rd (R_n P + c_n) + td - c_p) = W P + tv,
-//   W = R_p^T Rd R_n,   tv = R_p^T (Rd c_n + td - c_p),
-// with the same z-flip conjugation the camera path takes into the eye's
-// frame. With Rd = I and td = 0 it IS the camera path, which the test
-// pins; a station's turn is what it adds.
-inline void temporalBodyPath(const float prev34[12], const float now34[12],
-                             const float Rd[9], const float td[3], float W[9],
-                             float tv[3]) {
-    float Rp[9], Rn[9], RpT[9], tmp[9];
-    temporalRot3Of34(prev34, Rp);
-    temporalRot3Of34(now34, Rn);
-    temporalTranspose3(Rp, RpT);
-    temporalMul3(Rd, Rn, tmp);
-    temporalMul3(RpT, tmp, W);
-    const float cN[3] = {now34[3], now34[7], now34[11]};
-    const float cP[3] = {prev34[3], prev34[7], prev34[11]};
-    float rc[3];
-    temporalApply3(Rd, cN, rc);
-    const float dc[3] = {rc[0] + td[0] - cP[0], rc[1] + td[1] - cP[1], rc[2] + td[2] - cP[2]};
-    temporalApply3(RpT, dc, tv);
-    W[2] = -W[2];
-    W[5] = -W[5];
-    W[6] = -W[6];
-    W[7] = -W[7];
-    tv[2] = -tv[2];
-}
-
-// The same path on a frame whose rows are not the view's own -- another
-// camera's, a stale latch, a jump's -- composed with the camera delta the
-// pass carries for that frame (Wc, tvc: the eye-frame delta worldFromRows
-// gives, last frame's when this frame's was dropped) rather than with the
-// rows. R_p^T Rd R_n = (R_p^T Rd R_p)(R_p^T R_n): the body's turn taken
-// into last frame's view by its rows, then the camera's own delta; and
-// tv = B tvc + F R_p^T ((Rd - I) c_p + td), B = F R_p^T Rd R_p F.
-// The previous camera position must share td's coordinate origin. On an
-// origin jump, originStep moves c_p into that origin without adding the
-// jump to the physical camera delta. Rebasing td alone leaves an error of
-// (I - Rd) originStep: about nine metres for a 13 km shift at a station's
-// normal turn per frame. Apply B to tvc as well so ship translation and
-// head rotation compose exactly, including on carried frames.
-// Before this the body stood down on such frames, and a head turn dropped
-// the station to the camera's path for a frame at a time (2026-09-09).
-inline void temporalBodyPathCarried(const float prev34[12], const float Rd[9], const float td[3],
-                                    const float Wc[9], const float tvc[3], float W[9], float tv[3],
-                                    const float* originStep = nullptr) {
-    float Rp[9], RpT[9], tmp[9], conj[9];
-    temporalRot3Of34(prev34, Rp);
-    temporalTranspose3(Rp, RpT);
-    temporalMul3(Rd, Rp, tmp);
-    temporalMul3(RpT, tmp, conj);
-    conj[2] = -conj[2];
-    conj[5] = -conj[5];
-    conj[6] = -conj[6];
-    conj[7] = -conj[7];
-    temporalMul3(conj, Wc, W);
-    float cP[3] = {prev34[3], prev34[7], prev34[11]};
-    if (originStep) for (int i = 0; i < 3; ++i) cP[i] += originStep[i];
-    float rc[3];
-    temporalApply3(Rd, cP, rc);
-    const float dc[3] = {rc[0] - cP[0] + td[0], rc[1] - cP[1] + td[1], rc[2] - cP[2] + td[2]};
-    float t[3];
-    temporalApply3(RpT, dc, t);
-    t[2] = -t[2];
-    float bodyCameraTv[3];
-    temporalApply3(conj, tvc, bodyCameraTv);
-    for (int i = 0; i < 3; ++i) tv[i] = t[i] + bodyCameraTv[i];
-}
-
-// The rotation of an axis-angle vector (Rodrigues): w's direction the axis,
-// its length the angle in radians; row-major, R v rotates v.
-inline void temporalRodrigues(const float w[3], float R[9]) {
-    const float th = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
-    if (th < 1e-9f) {
-        const float I[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-        memcpy(R, I, sizeof(I));
-        return;
-    }
-    const float a[3] = {w[0] / th, w[1] / th, w[2] / th};
-    const float s = sinf(th), c = cosf(th), k = 1.0f - c;
-    R[0] = c + a[0] * a[0] * k;        R[1] = a[0] * a[1] * k - a[2] * s; R[2] = a[0] * a[2] * k + a[1] * s;
-    R[3] = a[1] * a[0] * k + a[2] * s; R[4] = c + a[1] * a[1] * k;        R[5] = a[1] * a[2] * k - a[0] * s;
-    R[6] = a[2] * a[0] * k - a[1] * s; R[7] = a[2] * a[1] * k + a[0] * s; R[8] = c + a[2] * a[2] * k;
-}
-
-// The rigid motion that best carries n points now to where they were: the
-// least-squares (w, t) of p_prev - p_now = w x p_now + t, the small-angle
-// form (exact to the angle squared times the distance, millimetres for a
-// station's turn ten kilometres off), about the points' centroid for the
-// conditioning. The instance pool gives every part of a station as a
-// (now, prev) pair; one part's quantised delta is noisy by a quarter of
-// the turn, and the fit over hundreds is not (tier 2's second flight,
-// 2026-09-08). Returns false with fewer than three points or a singular
-// system; rms is the fit's residual in metres.
-inline bool temporalRigidFit(const float* pNow, const float* pPrev, int n, float w[3],
-                             float t[3], float* rms) {
-    if (n < 3) return false;
-    double c0[3] = {0, 0, 0};
-    for (int i = 0; i < n; ++i) {
-        for (int k = 0; k < 3; ++k) c0[k] += pNow[i * 3 + k];
-    }
-    for (double& c : c0) c /= n;
-    double A[6][6] = {};
-    double b[6] = {};
-    for (int i = 0; i < n; ++i) {
-        const double p[3] = {pNow[i * 3] - c0[0], pNow[i * 3 + 1] - c0[1], pNow[i * 3 + 2] - c0[2]};
-        const double d[3] = {pPrev[i * 3] - pNow[i * 3], pPrev[i * 3 + 1] - pNow[i * 3 + 1],
-                             pPrev[i * 3 + 2] - pNow[i * 3 + 2]};
-        // Row r of [-[p]x | I]: w x p = -[p]x w.
-        double M[3][6] = {{0, p[2], -p[1], 1, 0, 0},
-                          {-p[2], 0, p[0], 0, 1, 0},
-                          {p[1], -p[0], 0, 0, 0, 1}};
-        for (int r = 0; r < 3; ++r) {
-            for (int j = 0; j < 6; ++j) {
-                b[j] += M[r][j] * d[r];
-                for (int k = 0; k < 6; ++k) A[j][k] += M[r][j] * M[r][k];
-            }
-        }
-    }
-    // Gaussian elimination with partial pivoting on the 6x6.
-    double x[6] = {};
-    for (int col = 0; col < 6; ++col) {
-        int piv = col;
-        for (int r = col + 1; r < 6; ++r) {
-            if (fabs(A[r][col]) > fabs(A[piv][col])) piv = r;
-        }
-        if (fabs(A[piv][col]) < 1e-12) return false;
-        if (piv != col) {
-            for (int k = 0; k < 6; ++k) { const double tmp = A[col][k]; A[col][k] = A[piv][k]; A[piv][k] = tmp; }
-            const double tb = b[col]; b[col] = b[piv]; b[piv] = tb;
-        }
-        for (int r = col + 1; r < 6; ++r) {
-            const double f = A[r][col] / A[col][col];
-            for (int k = col; k < 6; ++k) A[r][k] -= f * A[col][k];
-            b[r] -= f * b[col];
-        }
-    }
-    for (int r = 5; r >= 0; --r) {
-        double s = b[r];
-        for (int k = r + 1; k < 6; ++k) s -= A[r][k] * x[k];
-        x[r] = s / A[r][r];
-    }
-    // Back from the centroid: t = t' - w x c0.
-    for (int k = 0; k < 3; ++k) w[k] = static_cast<float>(x[k]);
-    const double wc[3] = {x[1] * c0[2] - x[2] * c0[1], x[2] * c0[0] - x[0] * c0[2],
-                          x[0] * c0[1] - x[1] * c0[0]};
-    for (int k = 0; k < 3; ++k) t[k] = static_cast<float>(x[3 + k] - wc[k]);
-    if (rms) {
-        float R[9];
-        temporalRodrigues(w, R);
-        double sum = 0.0;
-        for (int i = 0; i < n; ++i) {
-            float q[3];
-            temporalApply3(R, pNow + i * 3, q);
-            for (int k = 0; k < 3; ++k) {
-                const double e = q[k] + t[k] - pPrev[i * 3 + k];
-                sum += e * e;
-            }
-        }
-        *rms = static_cast<float>(sqrt(sum / n));
-    }
-    return true;
-}
-
 // Are these three rows a rotation? Near-unit, near-orthogonal -- the
 // sun-glare fix's own validation of the game's view rows, shared.
 inline bool temporalRowsAreRotation(const float m34[12]) {
@@ -451,6 +281,166 @@ inline bool temporalRowsAreRotation(const float m34[12]) {
     const float d02 = r[0] * r[6] + r[1] * r[7] + r[2] * r[8];
     const float d12 = r[3] * r[6] + r[4] * r[7] + r[5] * r[8];
     return fabsf(d01) < 0.05f && fabsf(d02) < 0.05f && fabsf(d12) < 0.05f;
+}
+
+// The world path's delta from two frames of the game's view rows, which
+// are the FULL view -- the headset's pose is in them -- stored view->world.
+// For rows [R | c] (c the eye's place in the world) a point P now was, last
+// frame, at W P + tv, W = R_p^T R_n, tv = R_p^T (c_n - c_p); camMove is
+// c_n - c_p, the eye's move in the world. The game's view space runs z
+// forward (DirectX), the runtime's eye space z back. A rotation read in
+// the one and applied in the other has its pitch and yaw reversed and its
+// roll kept, which is exactly what the regression measured: over a dozen
+// intervals in space the rows turned -1 times the head about x and y and
+// +1 about z (k = -2, -2, 0; 2026-09-04), and the far plane, on this delta
+// alone, moved the wrong way by the head's whole turn -- the sky's smear,
+// and the station's under a head turn, both gone with the world path off.
+// Conjugating by the z flip carries the delta into the eye's frame; the
+// translation term takes the same flip (a reflection, not a half turn: the
+// still-ship regression on the third line says which).
+inline void temporalWorldFromRows(const float prev[12], const float now[12],
+                                  float W[9], float tv[3], float camMove[3]) {
+    float rp[9], rn[9], rpT[9];
+    temporalRot3Of34(prev, rp);
+    temporalRot3Of34(now, rn);
+    temporalTranspose3(rp, rpT);
+    temporalMul3(rpT, rn, W);
+    const float dc[3] = {now[3] - prev[3], now[7] - prev[7], now[11] - prev[11]};
+    temporalApply3(rpT, dc, tv);
+    for (int i = 0; i < 3; ++i) camMove[i] = dc[i];
+    W[2] = -W[2];
+    W[5] = -W[5];
+    W[6] = -W[6];
+    W[7] = -W[7];
+    tv[2] = -tv[2];
+}
+
+// The world path's gate on that delta, per frame (the plausibility test of
+// src/d3d11/temporal_pass.cpp, here so tools/temporal_test can walk it).
+// The rows' delta is the head's plus the ship's turn, and no ship turns 270
+// degrees a second: a delta beyond 3 degrees from the head's is another
+// camera's rows or a stale latch, and the last accepted delta is carried in
+// its place (a far better guess than the head alone, which smeared the
+// world on every dropped frame). A jump over 50 m is the floating origin
+// moving: only the translation is dropped, and dropped BEFORE the last-good
+// store, so a jump never becomes the translation a later drop carries --
+// stored first, a jump of hundreds of metres to tens of kilometres was
+// carried into the next dropped frame and moved every pixel with a depth on
+// the world path by it for one frame (the review of 2026-09-04, F3). A
+// carried figure over 50 m is reported so the invariant has a witness on
+// the line.
+//
+// A drop leaves the frame's rows of unknown origin -- another camera's, or
+// the view's own after a real jump -- and the next frame's delta is
+// measured FROM them. Eye run 050423 (2026-09-25, build c9cab91e, the ship
+// rolling about a degree and a half a frame): the chooser resynchronised
+// onto an auxiliary pass parked 148 degrees from the view (dropped, carried),
+// took that pass's identical write again the next frame as the continuous
+// one, and the delta -- zero, which under a still head sits within 3
+// degrees of the head's -- was ACCEPTED as the view's and stored as the last
+// good; the frame after, back on the view and 148 degrees from the parked
+// rows, carried the zero. Two frames of the world standing still under a
+// roll, wherever the transition-flash tracker saw a parked camera
+// (docs/camera-rows-carry-2026-09-25.md). So the standing of the rows a
+// frame measures from is kept: rows a drop left behind are not the view's
+// own, and a delta from them that does not turn AT ALL -- the same
+// orientation to the last bit, which the view does not hold from one frame
+// to the next while the headset is tracked -- is a parked or world-fixed
+// camera's: refused, the last good carried, the rows still suspect. A
+// delta that turns and passes the 3 degrees restores them (the view resuming
+// after a hitch or a resync), so a recovery costs no frame. Measuring from
+// the last ACCEPTED rows instead was weighed and declined: after a real
+// jump every later frame measures across it from a stale anchor, and none
+// is accepted again.
+struct TemporalCameraGate {
+    float lastGoodC[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};   // the last accepted delta
+    float lastGoodTv[3] = {};                            // ...and its translation term
+    bool  lastGoodValid = false;
+    bool  refOwn = false;     // the rows this frame measures from (last frame's) are the view's own
+    bool  measured = false;   // this frame's delta was measured, by either eye...
+    bool  refused = false;    // ...and refused by one...
+    bool  parked = false;     // ...as a parked camera's
+    // Consecutive frames refused as a parked camera's, to the last boundary:
+    // a stay carries one delta for its whole length, and nothing else ends
+    // a stay on a pass that writes the bound block (the head-follow score
+    // trusts that block), so its length is reported.
+    uint32_t parkedRun = 0;
+};
+
+enum class TemporalCameraVerdict : uint8_t {
+    Own,       // the view's own delta: used, and kept as the last good
+    Another,   // over 3 degrees from the head's: another camera's rows, or a stale latch
+    Parked,    // measured from rows a drop left behind, and not turned at all
+};
+
+struct TemporalCameraStep {
+    TemporalCameraVerdict verdict = TemporalCameraVerdict::Own;
+    bool jump = false;          // the floating origin moved: the translation was dropped
+    bool carried = false;       // the last accepted delta stands in for this one
+    bool carriedJump = false;   // ...with a translation over 50 m: zero by construction
+    bool valid = true;          // a delta is in hand, the view's own or carried
+};
+
+// Rows with the same orientation to the last bit: a camera that did not turn.
+inline bool temporalRowsSameTurn(const float a[12], const float b[12]) {
+    for (int r = 0; r < 3; ++r) {
+        if (memcmp(a + r * 4, b + r * 4, sizeof(float) * 3) != 0) return false;
+    }
+    return true;
+}
+
+// One eye's verdict on this frame's delta: W and tv from
+// temporalWorldFromRows(prev, now), move the length of its camMove, diffDeg
+// the delta's angle from the eye's head delta (0 without one). W and tv come
+// back as the delta to use: the rows' own, or the last good carried. Both
+// eyes judge a frame against the same standing; it moves on once a frame, in
+// temporalCameraGateAdvance.
+inline TemporalCameraStep temporalCameraGateStep(TemporalCameraGate& g, const float prev[12],
+                                                 const float now[12], double move,
+                                                 float diffDeg, float W[9], float tv[3]) {
+    TemporalCameraStep s;
+    s.jump = move >= 50.0;
+    if (s.jump) {
+        for (int i = 0; i < 3; ++i) tv[i] = 0.0f;
+    }
+    if (diffDeg > 3.0f) {
+        s.verdict = TemporalCameraVerdict::Another;
+    } else if (!g.refOwn && temporalRowsSameTurn(prev, now)) {
+        s.verdict = TemporalCameraVerdict::Parked;
+        g.parked = true;
+    }
+    g.measured = true;
+    if (s.verdict != TemporalCameraVerdict::Own) {
+        g.refused = true;
+        if (g.lastGoodValid) {
+            memcpy(W, g.lastGoodC, sizeof(g.lastGoodC));
+            memcpy(tv, g.lastGoodTv, sizeof(g.lastGoodTv));
+            s.carried = true;
+            const double carried = std::sqrt(static_cast<double>(tv[0]) * tv[0] +
+                                             static_cast<double>(tv[1]) * tv[1] +
+                                             static_cast<double>(tv[2]) * tv[2]);
+            s.carriedJump = carried >= 50.0;
+        } else {
+            s.valid = false;
+        }
+    } else {
+        memcpy(g.lastGoodC, W, sizeof(g.lastGoodC));
+        if (!s.jump) memcpy(g.lastGoodTv, tv, sizeof(g.lastGoodTv));
+        g.lastGoodValid = true;
+    }
+    return s;
+}
+
+// The frame boundary: the rows just chosen become the next frame's
+// reference (rowsKept), the view's own when a delta to them was measured
+// and no eye refused it. Rows no delta reached -- the first after a frame
+// with no write -- are not known to be the view's.
+inline void temporalCameraGateAdvance(TemporalCameraGate& g, bool rowsKept) {
+    g.refOwn = rowsKept && g.measured && !g.refused;
+    g.parkedRun = g.parked ? g.parkedRun + 1 : 0;
+    g.measured = false;
+    g.refused = false;
+    g.parked = false;
 }
 
 // The whole reprojection for one pixel, as the shader does it: the pixel's

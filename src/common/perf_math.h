@@ -18,7 +18,6 @@ struct PerfStats {
     float avgMs = 0.0f;
     float maxMs = 0.0f;
     float p99Ms = 0.0f;   // the 1% low, as a frame time: the slowest 1% averaged
-    float p50Ms = 0.0f;   // the median
     int   count = 0;
 };
 
@@ -41,12 +40,6 @@ inline PerfStats perfStatsOf(const float* ms, int n, float capMs = 500.0f) {
     if (v.empty()) return s;
     s.count = static_cast<int>(v.size());
     s.avgMs = static_cast<float>(sum / static_cast<double>(v.size()));
-    // The median: the middle element by selection.
-    {
-        const size_t k = v.size() / 2;
-        std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
-        s.p50Ms = v[k];
-    }
     // The 1% low: the slowest ceil(n / 100) frames, averaged. With fewer
     // than a hundred frames that is the single worst one.
     {
@@ -64,21 +57,18 @@ inline PerfStats perfStatsOf(const float* ms, int n, float capMs = 500.0f) {
 // Frames per second for a frame time, 0 for nothing.
 inline float perfFpsOf(float ms) { return ms > 0.0f ? 1000.0f / ms : 0.0f; }
 
-// Both monitor surfaces use this same recent window and source selection.
-// App time is the compositor's poses-to-submit measurement; thread time
-// also includes work outside that interval and must be labelled separately.
+// Both monitor surfaces use this same recent window. Outside the native
+// path the only figure left is the render thread's, from EDVR's own clock:
+// the period less the time blocked in Present. (The compositor's GPU and
+// app times crossed from the legacy openvr half, and retired with it.)
 struct PerfRecentTimes {
-    double gpuSum = 0, appSum = 0, threadSum = 0;
-    int gpuCount = 0, appCount = 0, threadCount = 0;
-    void add(float period, float presentWait, float posesWait, bool settled, float gpu, float app) {
-        if (settled && gpu > 0 && gpu < 500) { gpuSum += gpu; ++gpuCount; }
-        if (settled && app > 0 && app < 500) { appSum += app; ++appCount; }
-        const float thread = period - presentWait - posesWait;
+    double threadSum = 0;
+    int threadCount = 0;
+    void add(float period, float presentWait) {
+        const float thread = period - presentWait;
         if (thread > 0 && thread < 500) { threadSum += thread; ++threadCount; }
     }
-    float gpuMs() const { return gpuCount ? float(gpuSum / gpuCount) : 0; }
     float threadMs() const { return threadCount ? float(threadSum / threadCount) : 0; }
-    float cpuMs() const { return appCount ? float(appSum / appCount) : threadMs(); }
 };
 
 }  // namespace edvr

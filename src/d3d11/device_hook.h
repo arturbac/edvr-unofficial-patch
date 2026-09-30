@@ -9,6 +9,7 @@
 
 #include <d3d11.h>
 #include <dxgi.h>
+#include <cstdint>
 
 #include "../common/vtable_hook.h"  // HookMode
 
@@ -34,6 +35,12 @@ namespace edvr {
 // SAME context -- one swapping the vptr while the other patches the table it
 // just orphaned. Sharing one answer removes the straddle entirely.
 HookMode contextHookModeFor(ID3D11DeviceContext* ctx);
+
+// The file name of the graphics wrapper (ReShade and its kind) that handles the immediate context's methods, when the
+// probe above found them outside Windows' d3d11.dll and the session hooks in place; null otherwise (nothing found, a
+// live copy, a forced mode). For the flat F8 panel's note (flat_wrapper_note.h). Written once by the probe, before
+// any frame.
+const char* contextWrapperFile();
 
 // Windows' own d3d11.dll, as a module base -- NOT this DLL, which the game
 // also has loaded under the name d3d11.dll.
@@ -63,6 +70,13 @@ void* systemD3D11Module();
 void logContextTableVariants(void** table, size_t span, const char* who);
 
 void hookDevice(ID3D11Device* device);
+// Manually armed flat producer probe only. Saves exact creation bytes by hash;
+// false is explicitly missing evidence, never permission to infer a shader.
+bool captureFlatProbeShader(char stage, uint64_t hash);
+// In-memory view of the same creation-byte cache for the generic projection
+// classifier. The map is node-based and entries are never mutated or erased
+// after insert, so the returned pointer stays valid after the lock releases.
+bool flatProbeShaderLookup(char stage, uint64_t hash, const uint8_t** data, size_t* bytes);
 // Sticky for the process, including later devices and submit-side passes.
 // True for either sentinel recovery or advanced.d3d11_fixes=0.
 bool deviceHookRecoveryDisabled();
@@ -89,10 +103,10 @@ bool deviceHookAutoBiasSource(float* multiplier, float* bias);
 // means unknown; callers should show a neutral DLSS/DLAA label.
 bool deviceHookHmdQuality(float* multiplier);
 
-// The FSS theater's mode latch: true while the player is (believed to
-// be) in the Full System Scanner -- keyed by their own FSS bindings for
-// frame-exact edges, reconciled against the game's GuiFocus. vscreen's
-// frame boundary turns this into the theater's stamp.
+// The FSS mode latch: true while the player is (believed to be) in the Full
+// System Scanner -- keyed by their own FSS bindings for frame-exact edges,
+// reconciled against the game's GuiFocus. Read by the panel rect's chrome
+// skip, the reveal's jump window and the exposure pair sync.
 bool deviceHookFssModeLatch();
 
 // A zoom press was seen since the last take (stepped or held, keyboard

@@ -12,7 +12,17 @@
 #include "binding_shadow.h"
 
 namespace edvr {
+
+// remlokWantsDraws reads this from the header with no call: asked per
+// eye draw, and the build has no /GL to fold a cross-TU getter.
+// RemlokMode itself is declared in the header, so the inline function
+// there can name its kStock value.
+namespace detail {
+RemlokMode g_remlokMode = RemlokMode::kStock;
+}  // namespace detail
+
 namespace {
+using Mode = detail::RemlokMode;
 
 // The overlay's shape, exactly as the census measured and the field
 // suppression verified it (2026-08-19): a fullscreen triangle, one instance,
@@ -24,10 +34,11 @@ constexpr uint32_t kVertices = 3;
 constexpr uint32_t kInstances = 1;
 constexpr uint32_t kSrvW = 1024;
 constexpr uint32_t kSrvH = 512;
+// The shape test itself is remlokOverlayShape (remlok_fix.h), inline so the
+// draw path can ask it first; it must say what the three constants say.
+static_assert(kKind == 'N' && kVertices == 3 && kInstances == 1,
+              "remlokOverlayShape (remlok_fix.h) must match the overlay's measured shape");
 
-enum class Mode : uint32_t { kStock, kOuter, kHide };
-
-Mode  g_mode = Mode::kStock;
 float g_keep = 0.55f;
 bool  g_swap = false;
 // Scale of the substituted viewport for the overlay draw, centred. Below 1
@@ -120,16 +131,16 @@ ID3D11RasterizerState* cloneWithScissor(ID3D11DeviceContext* ctx,
 }  // namespace
 
 void remlokConfigure(Config& cfg) {
-    const Mode was = g_mode;
+    const Mode was = detail::g_remlokMode;
     const std::string m = cfg.getString("fix.remlok_lines", "stock");
     if (m == "stock") {
-        g_mode = Mode::kStock;
+        detail::g_remlokMode = Mode::kStock;
     } else if (m == "outer") {
-        g_mode = Mode::kOuter;
+        detail::g_remlokMode = Mode::kOuter;
     } else if (m == "hide") {
-        g_mode = Mode::kHide;
+        detail::g_remlokMode = Mode::kHide;
     } else {
-        g_mode = Mode::kStock;
+        detail::g_remlokMode = Mode::kStock;
         Log::get().note("remlok_lines \"%s\" is not stock, outer or hide; "
                         "running stock.", m.c_str());
     }
@@ -163,17 +174,15 @@ void remlokConfigure(Config& cfg) {
     if (ang != g_angleDeg) g_derivedNoted = false;   // re-announce the derivation
     g_angleDeg = ang;
 
-    if (was != g_mode) {
+    if (was != detail::g_remlokMode) {
         const char* names[] = {"stock", "outer", "hide"};
         Log::get().note("remlok lines: %s. The overlay is recognised by shape "
                         "(3 vertices, 1 instance, no depth, 1024x512 in PS "
                         "slot 0); outer keeps %.0f%% of each eye's width from "
                         "its own temple.",
-                        names[static_cast<uint32_t>(g_mode)], g_keep * 100.0f);
+                        names[static_cast<uint32_t>(detail::g_remlokMode)], g_keep * 100.0f);
     }
 }
-
-bool remlokWantsDraws() { return g_mode != Mode::kStock; }
 
 namespace {
 
@@ -224,8 +233,8 @@ float effectiveScale() {
 }  // namespace
 
 RemlokAction remlokOnEyeDraw(char kind, uint32_t count, uint32_t instances) {
-    if (g_mode == Mode::kStock) return RemlokAction::kNone;
-    if (kind != kKind || count != kVertices || instances != kInstances) {
+    if (detail::g_remlokMode == Mode::kStock) return RemlokAction::kNone;
+    if (!remlokOverlayShape(kind, count, instances)) {
         return RemlokAction::kNone;
     }
     // The overlay binds no depth; scene and HUD draws do. Checked before the
@@ -239,7 +248,7 @@ RemlokAction remlokOnEyeDraw(char kind, uint32_t count, uint32_t instances) {
     }
 
     const uint32_t match = g_matchesThisFrame++;
-    if (g_mode == Mode::kHide) {
+    if (detail::g_remlokMode == Mode::kHide) {
         if (++g_hidden == 1) {
             Log::get().note("remlok lines: hidden (first overlay draw "
                             "suppressed this session).");

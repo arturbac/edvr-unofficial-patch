@@ -14,12 +14,10 @@
 
 namespace edvr {
 namespace {
-uint32_t g_argStartIndex2 = 0, g_argStartInstance2 = 0;
+uint32_t g_argStartInstance2 = 0;
 int32_t g_argBaseVertex2 = 0;
 }  // namespace
-void fssPanelRectDrawArgs(uint32_t startIndex, int32_t baseVertex,
-                          uint32_t startInstance) {
-    g_argStartIndex2 = startIndex;
+void fssPanelRectDrawArgs(int32_t baseVertex, uint32_t startInstance) {
     g_argBaseVertex2 = baseVertex;
     g_argStartInstance2 = startInstance;
 }
@@ -58,7 +56,6 @@ uint32_t g_vb0Bytes = 0;
 int  g_countdown = -1;    // frames until readback (counted at ordinal 0)
 bool g_capturing = false; // this frame's draws are being windowed
 bool g_published = false;
-LONG g_lastRedo = 0;      // the servo's request counter, consumed
 uint32_t g_retry = 0;     // capture frames rejected for missing quads
 bool g_failNoted = false;
 uint32_t g_derives = 0;
@@ -218,16 +215,7 @@ void fssPanelRectOnComposite(ID3D11DeviceContext* ctx, uint32_t ordinal,
         releaseAll();
         return;
     }
-    if (g_published) {
-        // The servo asked for a fresh derivation against its nudged pose.
-        const LONG redo = fssPanelRectRedoValue();
-        if (redo != g_lastRedo) {
-            g_lastRedo = redo;
-            g_published = false;
-        } else {
-            return;
-        }
-    }
+    if (g_published) return;
 
     guardedBudget(g_budget, [&] {
         ID3D11Device* dev = nullptr;
@@ -638,7 +626,7 @@ void fssPanelRectOnComposite(ID3D11DeviceContext* ctx, uint32_t ordinal,
             g_failNoted = true;
             Log::get().note(
                 "fss panel rect: the capture frame did not decode to a "
-                "plausible screen family; the theater keeps its centred "
+                "plausible screen family; the screen keeps its centred "
                 "band and no draw is skipped. Said once.");
         }
     });

@@ -23,6 +23,13 @@ std::wstring backupRootPath(const std::wstring& gameDir) {
     return joinPath(gameDir, L"edvr_backup");
 }
 
+const wchar_t* settingsLeafFor(const std::string& profile) {
+    return profile == "flat" ? L"edvr-flat.ini" : L"edvr.ini";
+}
+std::wstring settingsPathFor(const std::wstring& gameDir, const std::string& profile) {
+    return joinPath(gameDir, settingsLeafFor(profile));
+}
+
 std::string utcNow() {
     SYSTEMTIME st{};
     GetSystemTime(&st);
@@ -53,6 +60,10 @@ InstallState parseState(const std::string& text) {
 
     s.edvrVersion = get("edvr", "version");
     s.installedUtc = get("edvr", "installed_utc");
+    s.profile = get("edvr", "profile");
+    if (s.profile.empty()) s.profile = "vr";
+    s.descriptorSha = get("edvr", "descriptor_sha256");
+    s.components = get("edvr", "components");
     s.openvrDir = fromUtf8(get("edvr", "openvr_dir"));
 
     s.d3d11Sha = get("d3d11", "sha256");
@@ -76,7 +87,7 @@ InstallState parseState(const std::string& text) {
     s.nativeConfigSha = get("native", "config_sha256");
     s.nativeOriginalName = fromUtf8(get("native", "original_name"));
     s.nativeOriginalSha = get("native", "original_sha256");
-    s.nativeInstalled = !s.nativeRuntimeSha.empty() || !s.nativeGraphicsSha.empty();
+    s.nativeInstalled = !s.nativeRuntimeSha.empty();
 
     // A record with no version is not a record; it is a file that happens to
     // parse. Everything downstream keys off `present`, so it has to mean
@@ -99,6 +110,9 @@ std::string serializeState(const InstallState& state) {
     out += "\r\n[edvr]\r\n";
     out += "version = " + state.edvrVersion + "\r\n";
     out += "installed_utc = " + state.installedUtc + "\r\n";
+    out += "profile = " + state.profile + "\r\n";
+    out += "descriptor_sha256 = " + state.descriptorSha + "\r\n";
+    out += "components = " + state.components + "\r\n";
     out += "openvr_dir = " + toUtf8(state.openvrDir) + "\r\n";
 
     out += "\r\n[d3d11]\r\n";

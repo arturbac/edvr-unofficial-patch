@@ -44,6 +44,22 @@ void NativePerfHistory::clear() noexcept {
     cpu_.reset(); applicationCpu_.reset(); producer_.reset(); applicationGpu_.reset(); device_.reset();
     cpu_.floor=applicationCpu_.floor=producer_.floor=applicationGpu_.floor=device_.floor=0;
     generation_=firstSequence_=periodAt_=0;period_=0;
+    baseHz_=0;baseHzAt_=0;firstPeriodMs_=0;
+    cpuSource_=NativeCpuSource::None;
+}
+NativeCpuFigure NativePerfHistory::cpuFigure(const NativeTimingSnapshot& t) noexcept {
+    NativeCpuFigure f{};
+    if(!t.haveCpu)return f;
+    if(t.cpu.version>=EDVR_NATIVE_TIMING_VERSION_5) {
+        f.source=NativeCpuSource::CallerWork;
+        f.valid=t.cpu.callerWorkValid==1&&duration(t.cpu.callerWorkMs);
+        f.ms=f.valid?t.cpu.callerWorkMs:0;
+    } else {
+        f.source=NativeCpuSource::PreSubmit;
+        f.valid=t.applicationValid&&duration(t.applicationMs);
+        f.ms=f.valid?t.applicationMs:0;
+    }
+    return f;
 }
 void NativePerfHistory::observe(bool native,const NativeTimingSnapshot& t,const GpuFrameSnapshot& g,uint64_t now) noexcept {
     if(!native||!t.active||!t.generation||!t.firstSequence){clear();return;}
@@ -56,7 +72,7 @@ void NativePerfHistory::observe(bool native,const NativeTimingSnapshot& t,const 
         producer_.reset(g.haveResult?g.result.sequence:0);
         applicationGpu_.reset(g.haveResult?g.result.sequence:0);
         device_.reset(t.haveDeviceGpu?t.deviceGpu.sequence:0);
-        period_=0;periodAt_=0;return;
+        period_=0;periodAt_=0;baseHz_=0;baseHzAt_=0;return;
     }
     const auto& c=t.cpu;
     bool cpuOk=t.haveCpu&&c.sequence>=firstSequence_&&c.sequence==t.sequence&&age(now,t.capturedAtMs,2000)&&duration(t.waitMs)&&duration(c.composeMs);
@@ -64,19 +80,34 @@ void NativePerfHistory::observe(bool native,const NativeTimingSnapshot& t,const 
     const double submitMs=c.submitMs[0]+c.submitMs[1];
     cpuOk=cpuOk&&duration(submitMs);
     if(!cpuOk) {
-        cpu_.reset(t.haveCpu?c.sequence:0);period_=0;periodAt_=0;
+        cpu_.reset(t.haveCpu?c.sequence:0);period_=0;periodAt_=0;baseHz_=0;baseHzAt_=0;
     } else if(c.sequence>cpu_.floor) {
         cpu_.add(c.sequence,t.capturedAtMs,submitMs,t.waitMs);
         period_=std::isfinite(t.predictedPeriodMs)&&t.predictedPeriodMs>0&&t.predictedPeriodMs<=10000?t.predictedPeriodMs:0;
         periodAt_=period_?t.capturedAtMs:0;
+        // The base for the throttle flag: the panel rate the ABI publishes
+        // (display_frequency) while fresh; when a version 3 host never sends
+        // one, the session's first predicted period stands in for it.
+        baseHz_=c.version>=EDVR_NATIVE_TIMING_VERSION_4&&std::isfinite(c.baseDisplayHz)&&c.baseDisplayHz>0&&c.baseDisplayHz<=1000?double(c.baseDisplayHz):0;
+        baseHzAt_=baseHz_?t.capturedAtMs:0;
+        if(!firstPeriodMs_&&period_)firstPeriodMs_=period_;
     }
-    const bool applicationCpuOk = t.haveCpu && t.applicationValid &&
+    // The CPU figure (cpuFigure): the caller work per cycle, or an older
+    // runtime's pre-submit application time. A frame without one clears the
+    // stream as an invalid application time always did; a change of figure
+    // starts it over, so one average is never of both.
+    const NativeCpuFigure figure = cpuFigure(t);
+    const bool applicationCpuOk = figure.valid &&
         c.sequence >= firstSequence_ && c.sequence == t.sequence &&
-        age(now, t.capturedAtMs, 2000) && duration(t.applicationMs);
+        age(now, t.capturedAtMs, 2000);
     if (!applicationCpuOk) {
         applicationCpu_.reset(t.haveCpu ? c.sequence : 0);
     } else if (c.sequence > applicationCpu_.floor) {
-        applicationCpu_.add(c.sequence, t.capturedAtMs, t.applicationMs);
+        if (figure.source != cpuSource_) {
+            applicationCpu_.reset();
+            cpuSource_ = figure.source;
+        }
+        applicationCpu_.add(c.sequence, t.capturedAtMs, figure.ms);
     }
     // Include the age accumulated before publication; subtraction guards keep
     // old or malformed timestamps from becoming fresh through integer wrap.
@@ -112,5 +143,12 @@ NativePerfAverage NativePerfHistory::producer(uint64_t n,uint64_t w)const noexce
 NativePerfAverage NativePerfHistory::transfer(uint64_t n,uint64_t w)const noexcept{return device_.average(0,n,w);}
 NativePerfAverage NativePerfHistory::compose(uint64_t n,uint64_t w)const noexcept{return device_.average(1,n,w);}
 double NativePerfHistory::predictedPeriod(uint64_t n)const noexcept{return age(n,periodAt_,2000)?period_:0;}
+double NativePerfHistory::basePeriodMs(uint64_t n)const noexcept{
+    if(age(n,baseHzAt_,2000)&&baseHz_>0)return 1000.0/baseHz_;
+    return firstPeriodMs_;
+}
+bool NativePerfHistory::displayThrottled(double predicted,double base)noexcept{
+    return predicted>0&&base>0&&predicted>1.5*base;
+}
 int NativePerfHistory::graph(bool p,float* o,int m,uint64_t n)const noexcept{return (p?applicationGpu_:applicationCpu_).graph(o,m,n);}
 }

@@ -2,76 +2,81 @@
 
 ## Status
 
-*Written 2026-09-15 from the entries dated 2026-09-10, 2026-09-08,
-2026-09-06 and 2026-09-02 through 09-04. Restates the journal below;
-not new evidence — update it whenever this doc changes.
-Updated 2026-09-16 for Feature A's retirement.*
+*Restates the journal below; not new evidence -- update it whenever
+this doc changes. Last updated 2026-09-29 for flat sharpening.*
 
-- **State:** Per "Current defaults" (2026-09-10): TAA/DLSS includes
-  UI/smoke depth and station motion automatically. Feature A (the
-  supersample resolve) is RETIRED 2026-09-16: built and field-verified on
-  both rigs on the legacy OpenVR proxy (`auto` shipped 2026-09-03,
-  `off` from 6d22901 in v0.15.0), never called on the native OpenXR
-  runtime after the 2026-09-14 port, removed with its key rather
-  than ported; the eye-region rule it introduced stays in
-  `supersample_math.h`. Feature B (temporal AA,
-  DLAA/DLSS) is built, flown almost daily 2026-09-02 to 09-08, but
-  "is on its branch" per "Guidance for players now"; a 2026-09-06
-  pass cut its cost 2.80 -> 2.02 ms/eye. C and D remain unbuilt
-  sketches. The rest lock shipped 09-03, retired 09-04.
-  2026-09-16: TAA's own resolve was shipping with the registration
-  instrument compiled in; a lean variant is BUILT, NOT FLOWN (see the
-  2026-09-16 entry at the end).
+- **State:** TAA/DLSS carries UI/smoke depth and station motion by
+  default ("Current defaults", 2026-09-10). Feature A (the supersample
+  resolve) is RETIRED 2026-09-16: field-verified on the legacy OpenVR
+  proxy, never called on the native runtime, removed with its key; its
+  eye-region rule stays in `supersample_math.h`. Feature B (temporal
+  AA, DLAA/DLSS) is built and flown near-daily since 2026-09-02 (2.80
+  -> 2.02 ms/eye on 09-06); the own resolve's lean variant is BUILT,
+  NOT FLOWN (2026-09-16). C and D remain sketches; the rest lock shipped
+  09-03, retired 09-04. 2026-09-23: the DLSS ladder walk survives a
+  failed query, and the door's output follows an input under a mode's
+  floor (twice the input; the runtime upsamples the rest) -- BUILT, NOT
+  FLOWN ("The served floor", at the end).
 - **Open:**
-  - Features C and D: still unbuilt design sketches.
-  - DLSS/FSR 2 as default engines behind the door (Phasing step 6): not
-    phased in; the every-vendor engine's design is
+  - Flat sharpening (`fix.render_sharpness`, ahead of the game's output
+    copy; the UI never is): BUILT 2026-09-29, NOT FLOWN. See its section.
+  - The world path's rows after a drop: a parked camera's zero was
+    accepted as the view's delta and carried (eye run 050423). The gate
+    now refuses it. BUILT 2026-09-25, NOT FLOWN; its own doc is
+    camera-rows-carry-2026-09-25.md.
+  - The served floor: 0.5 FLOWN 16:27 (f05c84bf), not exercised (exactly
+    on the floor: 2037x1969 -> 4074x3938 at 50%, standard scaling); 0.45
+    still owed; signature in "The served floor".
+  - Features C and D: unbuilt. DLSS/FSR 2 as default engines (Phasing
+    step 6): not phased in; the every-vendor design is
     fsr-upscaler-design-2026-09-16.md (AMD has no D3D11 backend).
-  - Whether the 2026-09-04 far-warp/darkness review's four fixes and
-    that evening's five-lever cleanup hold up in flight — "Unflown as
-    of the commit."
-  - Phase 0 items 1, 7, 8, 9, 11 unaddressed (AA-option census, HUD
-    legibility under jitter, crop-edge behaviour, feature D's passes,
-    foveation reach) — see "Phase 0".
-  - Whether `shimmer_rest_still`/`_moving` can be raised past the Quest
-    3's tracker-noise floor was left as "the next flight's question" at
-    retirement; not answered later here.
-  - The lean own shader's price: one flight, toggle
-    `advanced.temporal_aa_diagnostics` live.
-- **Ruled out:**
-  - MSAA from outside a deferred renderer: structurally unreachable
-    (views, shading and every downstream pass would need rewriting).
-  - Conservative rasterisation for the menu-ship seam: built, flown
-    2026-09-03, reverted the same day — no effect, new artifacts.
-  - The rest lock (`shimmer_rest`): shipped 2026-09-03, retired
-    2026-09-04 — TAA integrates the wander instead, and it could not
-    engage on the Quest 3's noisier tracker.
-  - Five TAA levers named dead in "The cleanup of the same evening"
-    (2026-09-04): the rest snap, HUD depth layers, the assumed HUD
-    distance, the `camera` motion source, the transposed-reading A/B.
-  - Full per-object motion-vector matrices: declined — the neighbourhood
-    clamp already handles unmatched motion (unbuilt; per-object-motion.md).
-  - Feature A on the native runtime: retired 2026-09-16, not ported — the
-    native submit blit minifies an oversize eye with one bilinear tap
-    (`src/openxr/d3d11_stereo.cpp`), and the resolve had no caller there.
-- **Environment:** Native SteamVR is measured; under OpenComposite the
-  game-side half "works regardless" but reaching the OpenXR layer is
-  unverified. Two rigs disagree sharply: Pimax Crystal Super (~42
-  px/deg, tracking floors at 0.53 arcmin/frame) vs. Quest 3 (~20-40.6
-  px/deg, never under 1.9 arcmin/frame) — why the rest lock shipped on
-  one and not the other. Eye texture `R8G8B8A8_TYPELESS`, linear light;
-  depth reversed-Z, two plane pairs seen (0.025..50000 for the scene,
-  0.1..1000 elsewhere). DLSS/DLAA need an NVIDIA RTX GPU (Turing+) and
-  the NGX runtime; the field rig is an RTX 5090.
-- **Detail:** "What EDVR already owns" has the shared hooks. "Feature
-  A" and "Feature B" carry each feature's mechanism, settings and full
-  flight log (dates inline). "Considered and declined" and "The tracker
-  never rests: the rest lock" hold the retired ideas. "Phase 0" lists
-  what's unmeasured; "Phasing" is the build order. Linked:
-  performance.md (render_scale, HMD Quality), per-object-motion.md
-  (per-mover vectors), rest-lock-handoff.md, and the two 2026-09-04
-  adversarial reviews (review-motion-vectors and
-  review-temporal-far-warp-darkness).
+  - The 2026-09-04 far-warp/darkness review's four fixes and that
+    evening's five-lever cleanup: "Unflown as of the commit."
+  - Phase 0 items 1, 7, 8, 9, 11 (AA-option census, HUD legibility under
+    jitter, crop edges, feature D's passes, foveation reach).
+  - `shimmer_rest_still`/`_moving` past the Quest 3's tracker floor:
+    left as "the next flight's question" at retirement. The lean own
+    shader's price: one flight, `advanced.temporal_aa_diagnostics` live.
+- **Ruled out** (each with its reason, verbatim, in `## Status detail`
+  below): MSAA from outside a deferred renderer; conservative
+  rasterisation for the menu-ship seam (flown 2026-09-03, reverted); the
+  rest lock (retired 2026-09-04) and the five TAA levers of the
+  2026-09-04 cleanup; full per-object motion matrices (declined);
+  Feature A on the native runtime (not ported); a failed mid-ladder
+  query hiding the mode that serves a 40% input (2026-09-23 hardening).
+- **Environment:** Native SteamVR is measured; OpenComposite's OpenXR
+  leg is unverified. Pimax Crystal Super (~42 px/deg, tracking floor
+  0.53 arcmin/frame) vs. Quest 3 (~20-40.6 px/deg, never under 1.9).
+  Eye texture `R8G8B8A8_TYPELESS`, linear; depth reversed-Z (0.025..
+  50000 scene, 0.1..1000 elsewhere). DLSS/DLAA need an RTX GPU and the
+  NGX runtime (field rig: RTX 5090); per output, NGX serves half to full
+  size in three modes and a single point at a third in the fourth.
+- **Detail:** "What EDVR already owns" has the shared hooks; "Feature
+  A"/"Feature B" each feature's mechanism, settings and flight log;
+  "Considered and declined" and the rest lock the retired ideas;
+  "Phase 0" the unmeasured; "Phasing" the build order. Linked:
+  performance.md, per-object-motion.md, rest-lock-handoff.md, and the
+  two 2026-09-04 reviews (motion vectors; far-warp darkness).
+
+## Status detail (moved out of Status 2026-09-29)
+
+Ruled out, moved verbatim from Status:
+
+- MSAA from outside a deferred renderer: structurally unreachable.
+- Conservative rasterisation for the menu-ship seam: flown 2026-09-03,
+  reverted the same day (no effect, new artifacts).
+- The rest lock (`shimmer_rest`): retired 2026-09-04 (TAA integrates
+  the wander; it never engaged on the Quest 3's tracker). Five TAA
+  levers (2026-09-04 cleanup): the rest snap, HUD depth layers, the
+  assumed HUD distance, `camera` motion, the transposed-reading A/B.
+- Full per-object motion matrices: declined (per-object-motion.md).
+- Feature A on the native runtime: not ported (the submit blit
+  minifies an oversize eye with one bilinear tap, d3d11_stereo.cpp).
+- A failed mid-ladder query hiding the mode that serves a 40% input
+  (the 2026-09-23 hardening's cause): the 15:34 modes line answered
+  all four, and no mode serves between a third and a half.
+
+## The ask
 
 *A design document, written before the code, as a companion to
 [performance.md](performance.md). Claims about EDVR cite the source; claims
@@ -83,8 +88,6 @@ on 2026-09-02, field-verified on both rigs by 2026-09-03 on the legacy OpenVR
 proxy, shipped `auto` then `off`, and was retired on 2026-09-16 — its
 section is the record of what was built and measured; everything
 else here is design.*
-
-## The ask
 
 Two questions, asked together. The anti-aliasing Elite offers is widely
 held to be bad, worst of all in a headset — could EDVR supply its own MSAA
@@ -2037,3 +2040,327 @@ line, then flip advanced.temporal_aa_diagnostics to 1 live and read the
 1.2-1.6. If so, the next candidates -- only after this measurement -- are
 the 27-load three-source depth dilation, the 9-tap Catmull-Rom history,
 and the UI history read/write.
+
+## DLSS mode selection hardened (2026-09-23)
+
+A supporter's flight (edvr_gfx_20260923_092848.log) line 658, 09:29:10.213:
+"dlaa was asked for, but a 1229x1412 frame sits outside every DLSS mode's
+render range for a 3070x3032 output. The pass's own history runs instead."
+-- a 40% input against an output whose ultra performance mode (one third)
+should have held it. 54 ms later (line 668) the output changed to
+2458x2824 and the SAME input created fine, at exactly 50%, performance
+mode, range 1229x1412..2458x2824 (min = the mode's own optimal size, max
+= the output). Sean separately reported HMD Quality 0.5 "disengaging
+DLSS," not reproduced that day: a 1535x1516 -> 3070x3032 feature created
+at exactly 50%, range 1535x1516..3070x3032 -- the input exactly at the
+range's minimum.
+
+Cause, on the evidence available (the old code printed only the chosen
+mode's own range, never the other three, so this could not be settled
+outright): `ensureFeature`'s ladder walk (dlaa.cpp, then ~296-347) queried
+NGX_DLSS_GET_OPTIMAL_SETTINGS for quality, balanced, performance and
+ultra performance in order and `break`s on the first query that fails.
+Quality's query answering but not holding a 40% input, followed by
+balanced's query failing, would break the walk before performance or
+ultra performance -- which the evidence says should have held it -- were
+ever tried. `evaluateCrop`'s separate ratio selection (~675-681) used a
+different threshold (no epsilon, 0.66 vs. 0.667) from ensureFeature's own
+ratio fallback, so the same ratio could pick different modes depending
+which call site saw it.
+
+Fix (dlaa.h/dlaa.cpp):
+- The query loop never breaks: all four modes are always queried, each
+  recorded ok/failed, and logged ONCE per output size --
+  `dlss: modes for WxH: quality W2xH2 (minW2xH2..maxW2xH2), balanced ...,
+  performance ..., ultra performance ...` (a failed query prints its NGX
+  code instead of a range) -- so a refusal is always explained without a
+  second flight for better logging. If this code never ran on a given
+  output size, no such line appears for it; the old single-range refusal
+  text is the only sign that would remain.
+- Selection (dlaa.h, `dlssChooseMode`): among modes whose [min,max] holds
+  the input (>=/<= both ends, so exactly-at-minimum stays put), the
+  nearest optimal wins, as before. If none holds it but a query failed,
+  the ladder is incomplete, not a real "no": the nearest mode by ratio is
+  picked and NGX's create call decides (its own failure path already
+  logs the NGX result). Only when all four queries succeeded and truly
+  none holds the input does this refuse -- and now the message carries
+  all four ranges, not just the one that was checked last.
+- One ratio helper (`dlssModeByRatio`) replaces the two that had drifted
+  apart; both ensureFeature's range-unknown fallback and evaluateCrop's
+  per-frame ratio call it, epsilon and all (the 2026-09-05 review, F1: an
+  exact half stays on performance, not ultra performance).
+- A create success (ensureFeature and evaluateCrop) now resets the shared
+  `g_reason` to "available". It had no reset on success at all: a
+  ladder-walk refusal at one output size could outlive its own cause and
+  still be the string a later `dlaaAvailable(dev, &reason)` call hands
+  back (temporal_pass.cpp:5529, 5977) even after a later size change
+  fixed it. The read side already re-reads g_reason fresh on every call
+  (confirmed by inspection); this was purely a stale-write bug.
+
+Rig: `tools\dlaa_mode_test` (registered in build.bat, no NGX SDK or device
+needed -- DlssModeRange/dlssModeByRatio/dlssChooseMode are SDK-free, in
+dlaa.h). Fixture ladders for both outputs above, built from the field's
+own rule (min = a mode's optimal, max = the output); asserts the
+exact-minimum and one-pixel-short cases on both outputs at all six sizes
+(1535x1516, 1534x1516, 1229x1412, 1228x1411, 1023x1010, 1022x1010), a
+mid-ladder query hole that must not hide a lower mode, the all-failed and
+partial-failure ratio fallbacks with no fabricated range, nearest-optimal
+selection when every mode holds the input, and that a genuine floor
+(1022x1010 against 3070x3032, one pixel below even ultra performance's
+minimum with every query answering) still refuses.
+
+Not flown: the fix addresses what the log evidence and the code both
+support (the break, the two ratio rules, the stale reason), but no flight
+yet carries the "modes for WxH" line. Next flight: read it at the
+09:29:10 output size and confirm which query, if any, was the one that
+failed that day.
+
+## The served floor: the output follows the input (2026-09-23)
+
+Sean: "setting HMD Quality 0.5 causes DLSS to disengage." The first flight
+to carry the modes line (edvr_gfx_20260923_153446.log, v0.17.0-451, Pimax
+Crystal Super at `openxr_resolution` 4074 = 4074x4076, RTX 5090, preset K)
+names the floor exactly, line 435:
+`dlss: modes for 4074x4076: quality 2716x2717 (2037x2038..4074x4076),
+balanced 2363x2364 (2037x2038..4074x4076), performance 2037x2038
+(2037x2038..4074x4076), ultra performance 1358x1359 (1358x1359..1358x1359)`.
+The three upper modes share one floor at half the output; ultra
+performance's range is a single point at a third. Every input between a
+third and a half of the output, and every input under a third, is served
+by no mode. HMD Quality 0.5 sits exactly on the floor (2037x2038 in,
+created fine, line 436); a pixel under it, a 0.45 setting, or the trim's
+two-step adoption (092848, 09:29:10: 1229x1412 against a still-untrimmed
+3070x3032, 40%) falls into the hole, and the pass runs its own history.
+
+ruled out: a failed mid-ladder query hid the mode that would have served
+the 40% input (the hardening's cause above), because the 15:34 line has
+all four queries answering and no range between a third and a half.
+
+The selection refuses correctly there; the fix is the OUTPUT the pass is
+asked for. The door's output is chosen in native_temporal.cpp's treat():
+the host's recommendation (`recW x recH`, the runtime's treatedGeometry)
+whenever dlss upscales. Now, for NVIDIA only, `floorOutput` asks NGX for
+that output's four ranges (`dlssModeRanges`, dlaa.cpp: ensureFeature's
+query, its walk and selection untouched), and where no mode serves the
+input, cuts the output to the largest one, at or under the door's, that a
+mode's floor lets the input reach -- per axis input x door / floor, made
+even (dlss_floor.h, SDK-free): twice the input on the flights' ranges.
+NGX's own answer at the cut has the last word: while the input still
+misses the floor there, that axis steps down two pixels (eight steps at
+most). Decided when the door's output or the input changes, never per
+frame; undone when the input rises back; NGX silent or no served cut:
+the door's output stands, as before. FSR is untouched.
+
+What keys on the door's output follows it by itself: the runtime's submit
+blit samples whatever the door hands into the full swapchain, or the
+trim's placement viewport, with the same field of view
+(src/openxr/d3d11_stereo.cpp: the rest of the way is a bilinear
+upsample); the UI layer re-sizes from the door's texture
+(ui_layer.cpp, "the door hands on"); the sharpen and EDVR's menu run on
+the texture they are handed; the eye capture copies any size; the price
+lines print the pass's output. One reader did not: the mip-bias check
+(temporal_pass.cpp) divided the input by the output, so a cut at 0.45
+would have printed "they DISAGREE ... only a restart can fix it"; it now
+divides by the recommendation Elite was told.
+
+Rigs: `dlaa_mode_test` 61 checks (28 before): the logged line as the
+fixture, number for number, and the rule at 4074x4076 for 2037, 2036,
+1833, 1358 (point and off it), 1300; at 3070x3032 for 1535, 1534, 1229
+(the transient, cut to 2458x2824, the very door the promotion hands
+next); odd doors cut even. `native_temporal_test` 345 (230 before): the
+same sizes through treat(), NGX asked once per change, a stingier floor
+stepped down (3656x3658 for 1831x1832), NGX silent at the cut, FSR.
+
+Log signature (not flown). The rule firing at HMD Quality 0.45:
+`dlss floor: the game's 1833x1834 is under the 2037x2038 floor NVIDIA
+names for a 4074x4076 output, where no mode serves it; the pass outputs
+3666x3668 (2.00x the input, ...)`, then `dlss: modes for 3666x3668`,
+`dlss: the feature is created for eye 0, 1833x1834 in and 3666x3668 out
+(50% per axis), the performance mode`, `the left eye's door hands on
+3666x3668`, and `floor_cuts=` above 0 in the totals; back at 0.5, `...
+reaches the floor of the 4074x4076 output again`. If the rule never
+fired: `temporal aa: dlaa was asked for, but a 1833x1834 frame sits
+outside every DLSS mode's render range for a 4074x4076 output (...). The
+pass's own history runs instead.` and the door handing on 1833x1834.
+
+## Flat sharpening (2026-09-29)
+
+`fix.render_sharpness`, the setting VR already had (AMD's RCAS, 0 to 1),
+now works in the flat profile. BUILT, NOT FLOWN. Nothing in flat
+sharpened before: no upscaler does (FSR3 is created with sharpening off,
+`fsr3_engine.cpp`; DLSS with `InSharpness` 0, `dlaa.cpp`; the flat TAA
+shader has none), so a flat player who found TAA or DLSS soft had no
+dial. The shipped default is still 0.0.
+
+**Where.** Between the flat temporal resolve and the game's own output
+copy (`flat_runtime.cpp`, `FlatRuntimeDrawScope`: after the resolve
+hands back its view, before that view replaces the copy's first
+pixel-shader input). What the game draws after that copy, its interface
+layer, is never sharpened; what is in the world is part of the picture
+and is. VR has the same order (RCAS, then the UI layer,
+`native_sharpen.cpp`). The pass is `sharpen_pass.cpp`'s, reached through
+the same export (`edvrSharpen`), with the same shader and the same
+setting; `flat_sharpen.cpp` only decides which view goes in and which
+comes back.
+
+**Never.**
+- In place. The resolve reads its previous output back as history, so a
+  sharpened copy fed back would compound every frame. The pass writes a
+  texture of its own, in the source's format, and the view handed to the
+  copy has the format the resolve's own view had (sRGB or plain), so the
+  copy decodes it exactly as before.
+- At strength 0: the resolve's own view comes straight back, the pass is
+  not called, nothing is allocated.
+- On a frame the resolve did not produce. The plain spatial fallback
+  (what the flat runtime does when the temporal pass cannot resolve)
+  goes to the copy as it was: unsharpened this round, and the ini text
+  says so.
+- After a refusal. One refusal (the pass, or a view over its result)
+  stands the sharpening down for the session, with a line saying so; a
+  new device starts it afresh.
+
+**Environment.** Flat profile only. The own TAA, DLSS/DLAA and FSR all
+end in the same resolve output, so all reach it. With AA off the flat
+runtime returns before the resolve: nothing to sharpen, and the panel
+row dims like the DLSS preset row (it stays on the page and stops
+taking steps and typing). VR is unchanged; only the wording of the
+pass's log lines follows the profile. Cost is unmeasured in flat. VR's
+records are 0.04 ms an eye (the second build's flight, in "Feature B")
+and RCAS 0.23 ms an eye at 5792x5356 (`crisp-ui-handoff.md`); by pixel
+count that is a few hundredths of a millisecond at 1080p to 1440p, an
+estimate the "measured" line will replace.
+
+**Warm-up and ticks in flat, traced.** The pass's session hooks are in
+`vscreen.cpp` and all run in flat. `installVScreenFixes` (called from
+the device install in `device_hook.cpp`) calls `sharpenPassConfigure`;
+the Present path's `tkVscreenRest` runs `vScreenFrameBoundary` every
+owned Present in both profiles (unless the graphics runtime is disabled
+outright, when none of EDVR's graphics runs), and that runs
+`sharpenPassTick` (the shader warm-up; the 30 s never-ran note) and
+`sharpenPassNoteTotals`; `vScreenRefreshConfig` re-reads the setting;
+`shutdownVScreenFixes` ends in `sharpenPassShutdown`. Nothing needed
+calling from the flat Present branch.
+
+**The log, worded for flat (frames, not eyes).** In order: `render
+sharpening: shader warmed at session start -- the first sharpened frame
+pays no compile.`; `render sharpening: first sharpened frame -- AMD's
+RCAS at strength 0.30 (1.40 stops) over a WxH ... frame, read and
+written through ... views, on the temporal resolve's output, before the
+game's own output copy -- the interface is drawn after it and is not
+sharpened.`; after 120 timed passes `render sharpening: measured X ms
+per frame on average (max Y) at WxH -- one dispatch of AMD's RCAS ...`;
+`render sharpening totals: N frames sharpened this session ...`; and
+`flat sharpen:` lines for off, off-then-on again and any stand-down. If
+the wrapper is never reached, the tick says so after 30 s and names the
+cause: `no frame has been sharpened after 30 s: anti-aliasing is off
+(fix.temporal_aa) ...`, or with AA on, `The flat runtime has handed the
+sharpening no resolved frame -- read its 'flat runtime:' lines ...`. A
+session that does sharpen never says it. VR's version of that note
+(compositor hook, `openvr_api.dll`) no longer prints in flat, where it
+was wrong.
+
+**The panel, and the allowlist trap.** The flat panel page has a
+Sharpening row. `Config` answers 0.0 (`getFloat`) or "off" (`getString`)
+for any key the flat profile's allowlist (`runtime_profile.h`,
+`runtimeProfileAllowsKey`) does not list, without a word, so a panel row
+could ship that does nothing. `menu_flat_rows.h` is now the table the
+page is built from, and `flat_sharpen_test` fails the build if a key on
+it is refused by the allowlist, if `menu.cpp` builds the page from
+anything else, or if a row has no row in the generated schema.
+`fix.render_sharpness` is on the allowlist.
+
+**The seeding leak, accepted.** A flat install seeds `edvr-flat.ini`
+from `edvr.ini`, so a VR player's `render_sharpness = 0.3` arrives in
+flat. The setting means the same in both profiles (contrast handed back
+after the temporal pass), so it is not wrong, only not asked for; the
+ini text says so.
+
+**What it is for.** A taste control for the softness of TAA, DLSS and
+FSR, not a fix: it adds contrast at edges, not detail, does nothing with
+AA off, rings when it is too strong, and makes fine-line shimmer worse,
+not better. Do not reach for it to mask a jitter, motion-vector or
+timing fault.
+
+**Rigs** (all gated by `build.bat`). `flat_sharpen_test`, 77 checks: the
+wrapper against a stubbed pass on WARP (off, on, live and clamped, the
+two resolve textures' slots, the cached view, stand-down, a deferred
+context, a non-2D view, the log lines read back from a real file); the
+panel table against the flat gate, with negative controls; three source
+scans (`menu.cpp` builds the page from the table and dims the row in its
+three places; `flat_runtime.cpp` binds the copy to what the wrapper
+returns). `flat_sharpen_pass_test`, 37 + 5: the shipped pass on WARP
+against a CPU port of AMD's RCAS (bytes within one level, alpha exact),
+the source never written, five broken twins that must fail, the log; and
+a second run, `--self-test-working`, because the pass latches its
+never-ran note per process. `config_test`: the flat allowlist and the
+flat file's live reload. A mutation run over 44 one-line breaks of the
+shipped code kills all 44. Two survived the first pass (a view remade
+every frame; the rig compared addresses, now a tag on the object), and
+one fell only to the second run above (flat saying the never-ran note
+over a working pass).
+
+**Next flight (flat, AA on, DLSS or TAA).** Set `fix.render_sharpness`
+to 0.3 (`edvr-flat.ini` or the panel). In the log: the lines above, the
+"measured" line within a minute, and no `no frame has been sharpened`.
+In the picture: world edges crisper than at 0, and a menu or HUD edge
+unchanged between 0 and 0.3 (a halo there would mean the interface was
+sharpened, which the order rules out). Then 0.6, for the ringing. Ruled
+out: nothing yet.
+
+**The device changes (RC4 review, F5, 2026-09-29).** The pass kept its shader,
+parameter buffer, both eyes' textures and views, its price ring and its
+format-support answers on one D3D11 device until shutdown, whatever device the
+next frame came from. When the game recreates its device, the next frame got
+device A's result texture back, the wrapper's view over it on device B failed
+(0x887A0005) and the flat sharpening stood down for the session. VR's native
+provider acquires again on a new device and calls the same pass, so VR had the
+same defect. The reviewer's two-device WARP probe reproduced it line for line
+(device B: PASS_THROUGH, refusals 1, stood down); against the fix it gives a
+sharpened view made on B, refusals 0.
+
+The fix is in the pass (`sharpen_pass.cpp`, `adoptDevice`). It holds the device
+it works on, with a reference so the address cannot be recycled, and a frame
+whose source lives on another device releases everything the pass made -- the
+shader and its tried-latch, the parameter buffer, both eyes' result textures,
+cached source views and copy-through textures, the price ring, the
+format-support answers and the reason for a stand-down -- and makes it again on
+the new device, saying so (four notes at most, so two devices trading frames
+cannot fill a log). The session's counters, timing sums and once-per-session
+notes stay. Shutdown releases the reference too. The frame-boundary tick's warm
+compile follows the rule: it warms on the device the pass has, or adopts its
+context's when the pass has none, and never moves the pass.
+
+Rig (`flat_sharpen_pass_test`, the real pass: the wrapper-only two-device case
+stubs it out and could not see this): two WARP devices in one process. A, B, A
+through the pass, each correct against the CPU RCAS reference, each result made
+on the frame's device, and every kind of thing the pass holds (shader, buffer,
+both eyes' results, eye 0's view, eye 1's copy-through texture, the price ring,
+the format asks) made on the new device or gone, none left on the old. A test
+seam, `sharpenPassHeldForTest`, reports each one's device, because WARP
+tolerates a shader or buffer from another device and a stale one shows nowhere
+else. The wrapper is carried across the same changes the way the flat runtime
+carries it (sharpened on each, no stand-down); four changes are four lines and
+six alternating frames end the notes at the fourth; a tick on A then a frame
+from B is a change. CONTROL: `sharpenPassDeviceResetOffForTest` turns the reset
+off, which is the pass as it was: the pass hands B a texture made on A, the
+wrapper stands the sharpening down (sharpened 1, refusals 1), and the rig checks
+that this happens, so the checks with the reset on mean something. 96 checks (37
+before), stable over fifteen runs of both modes.
+
+Mutation run over the shipped pass, fifteen one-line breaks: thirteen killed
+(the reset never done; the shader, the buffer, the eyes, the ring, the shader
+latch and the format answers each not released; the notes uncapped and capped at
+five; the tick not adopting; shutdown keeping its reference; the seam not
+dropping state; the change never said). Two survive: the tick warming on any
+device (unreachable in one thread: a pass with an owner and no shader exists only
+between two lines of one call) and the stand-down reason not forgotten (needs a
+device whose parameter buffer or texture creation fails, which WARP does not
+offer). The rig's first version read a wrapper-owned view after the wrapper's next
+call (good only until then) and crashed one run in six; each view is read where
+it is returned now.
+
+Not flown: a device recreation in a game session has not been seen, only two WARP
+devices in one process. What to look for in a log after one: `render sharpening:
+the D3D device changed (change 1)`, a second `precompiled compute shader
+render_sharpen_cs created`, and no `flat sharpen: a view over the sharpened ...
+could not be made`.

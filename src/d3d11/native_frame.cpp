@@ -39,6 +39,7 @@ struct State {
     uint32_t lastTransitionEnabled = 0;
     uint32_t lastResubmitEnabled = 0;
     uint32_t lastCullMode = 0;
+    uint32_t lastCullChannel = 0;
     uint32_t lastDeferredPacing = 0;
     bool pacingNoted = false;
     bool weaponStabilityNoted = false;
@@ -119,6 +120,12 @@ uint32_t cullMode(const std::string& value) {
     return 0;
 }
 
+uint32_t cullChannel(const std::string& value) {
+    if (_stricmp(value.c_str(), "raw") == 0) return 1;
+    if (_stricmp(value.c_str(), "matrix") == 0) return 2;
+    return 0;
+}
+
 bool parseSignature(const std::string& token, uint32_t* width,
                     uint32_t* height) {
     if (!width || !height) return false;
@@ -178,19 +185,25 @@ float clampFraction(float value) {
 // ---------------------------------------------------------------------------
 // The field-of-view trim, per headset.
 //
-// fix.fov_trim_vertical / _outer / _nasal are per-headset lists keyed exactly
-// like fix.openxr_resolution -- `runtime[/system]:degrees`, degrees 0..30, at
-// most eight entries -- resolved against the worn headset's tokens as the last
-// v2 render-settings query saw them (nativeRenderLabels). A trim tuned on one
-// headset is wrong on another, so a headset with no entry of its own gets no
-// trim rather than somebody else's.
+// experimental.fov_trim_vertical / _outer / _nasal are per-headset lists keyed
+// exactly like fix.openxr_resolution -- `runtime[/system]:degrees`, degrees
+// 0..30, at most eight entries -- resolved against the worn headset's tokens as
+// the last v2 render-settings query saw them (nativeRenderLabels). A trim tuned
+// on one headset is wrong on another, so a headset with no entry of its own gets
+// no trim rather than somebody else's.
+//
+// They lived under [fix] until 2026-09-29, with rows on the F8 menu; edvr.ini
+// says where they went (`# moved-from: fix.fov_trim_*`) and Config reads an
+// old-layout line as the new name until the installer migrates the file. The
+// keys are set in the file only now.
 //
 // beginFrame runs on every frame, and three lists a frame is waste: the lists
 // are parsed only when a key's text or the worn headset changes, the resolved
 // triple is cached, and the log line goes out once per change of it.
 constexpr size_t kTrimCount = 3;
 const char* const kTrimKeys[kTrimCount] = {
-    "fix.fov_trim_vertical", "fix.fov_trim_outer", "fix.fov_trim_nasal"};
+    "experimental.fov_trim_vertical", "experimental.fov_trim_outer",
+    "experimental.fov_trim_nasal"};
 const char* const kTrimNames[kTrimCount] = {"vertical", "outer", "nasal"};
 // Enough distinct malformed tokens to name a hand-edited file's worth and
 // stop; past that the log would repeat itself on every edit.
@@ -223,9 +236,9 @@ void resolveTrim(uint32_t out[kTrimCount]) {
     // Read literally, one call per key: the config contract and the settings
     // schema both find a key by the string in the call that reads it.
     const std::string values[kTrimCount] = {
-        edvr::Config::get().getString("fix.fov_trim_vertical", ""),
-        edvr::Config::get().getString("fix.fov_trim_outer", ""),
-        edvr::Config::get().getString("fix.fov_trim_nasal", "")};
+        edvr::Config::get().getString("experimental.fov_trim_vertical", ""),
+        edvr::Config::get().getString("experimental.fov_trim_outer", ""),
+        edvr::Config::get().getString("experimental.fov_trim_nasal", "")};
     if (g_trim.resolved && g_trim.headset == haveHeadset && g_trim.rt == rt &&
         g_trim.sys == sys && g_trim.values[0] == values[0] &&
         g_trim.values[1] == values[1] && g_trim.values[2] == values[2]) {
@@ -307,31 +320,36 @@ HRESULT WINAPI beginFrame(void* context, const EdvrNativeFrameInput* input,
                           EdvrNativeFrameOutput* output) {
     std::lock_guard<std::mutex> lock(g_mutex);
     State* state = identify(context);
-    // A version 1 or 2 caller is an openvr_api.dll from before turbo pacing
-    // (or, for version 1, the field-of-view trim) existed. Each gets exactly
-    // the fields it knows about, and whatever it cannot carry stays out of
-    // its struct entirely.
-    const bool wantsPacing = output &&
-        output->version == EDVR_NATIVE_FRAME_VERSION_3 &&
+    // A version 1, 2 or 3 caller is an openvr_api.dll from before the
+    // channel probe (or, earlier, turbo pacing or the field-of-view trim)
+    // existed. Each gets exactly the fields it knows about, and whatever it
+    // cannot carry stays out of its struct entirely.
+    const bool wantsChannel = output &&
+        output->version == EDVR_NATIVE_FRAME_VERSION_4 &&
         output->size == sizeof(*output);
-    const bool wantsTrim = output && !wantsPacing &&
+    const bool wantsPacing = output && !wantsChannel &&
+        output->version == EDVR_NATIVE_FRAME_VERSION_3 &&
+        output->size == EDVR_NATIVE_FRAME_OUTPUT_SIZE_3;
+    const bool wantsTrim = output && !wantsChannel && !wantsPacing &&
         output->version == EDVR_NATIVE_FRAME_VERSION_2 &&
         output->size == EDVR_NATIVE_FRAME_OUTPUT_SIZE_2;
-    const bool legacy = output && !wantsPacing && !wantsTrim &&
+    const bool legacy = output && !wantsChannel && !wantsPacing && !wantsTrim &&
         output->version == EDVR_NATIVE_FRAME_VERSION_1 &&
         output->size == EDVR_NATIVE_FRAME_OUTPUT_SIZE_1;
     if (!state || state != g_current || !state->active || !input || !output ||
         input->size != sizeof(*input) || input->version != EDVR_NATIVE_FRAME_VERSION_1 ||
-        (!wantsPacing && !wantsTrim && !legacy) ||
+        (!wantsChannel && !wantsPacing && !wantsTrim && !legacy) ||
         input->generation != state->generation || input->referenceGeneration == 0 ||
         input->sequence == 0 || input->sequence <= state->sequenceFloor ||
         input->valid > 1 || (input->valid && !rigidPose(input->physicalHead))) return E_INVALIDARG;
 
     EdvrNativeFrameOutput result{};
-    result.size = wantsPacing ? sizeof(result)
+    result.size = wantsChannel ? sizeof(result)
+                 : wantsPacing ? EDVR_NATIVE_FRAME_OUTPUT_SIZE_3
                  : wantsTrim  ? EDVR_NATIVE_FRAME_OUTPUT_SIZE_2
                               : EDVR_NATIVE_FRAME_OUTPUT_SIZE_1;
-    result.version = wantsPacing ? EDVR_NATIVE_FRAME_VERSION_3
+    result.version = wantsChannel ? EDVR_NATIVE_FRAME_VERSION_4
+                    : wantsPacing ? EDVR_NATIVE_FRAME_VERSION_3
                     : wantsTrim  ? EDVR_NATIVE_FRAME_VERSION_2
                                  : EDVR_NATIVE_FRAME_VERSION_1;
     result.headOffset[0] = boundedOffset(edvr::Config::get().getFloat(
@@ -367,6 +385,8 @@ HRESULT WINAPI beginFrame(void* context, const EdvrNativeFrameInput* input,
     result.cullVerticalFraction = clampFraction(edvr::Config::get().getFloat(
         "fix.cull_guard_fraction_v", 1.0f));
     readSignatures(edvr::Config::get().getString("fix.cull_guard_headsets", ""), &result);
+    result.cullChannel = cullChannel(edvr::Config::get().getString(
+        "advanced.cull_guard_channel", "both"));
     // The worn headset's entry in each of the three lists, resolved from the
     // last render-settings query's labels and cached between changes.
     uint32_t trim[kTrimCount] = {0, 0, 0};
@@ -429,13 +449,15 @@ HRESULT WINAPI beginFrame(void* context, const EdvrNativeFrameInput* input,
         state->lastTransitionEnabled != result.transitionEnabled ||
         state->lastResubmitEnabled != result.resubmitEnabled ||
         state->lastCullMode != result.cullMode ||
+        state->lastCullChannel != result.cullChannel ||
         state->lastDeferredPacing != result.deferredPacing) {
         edvr::Log::get().note(
             "native frame: begin #%u seq=%llu offsets=%s (%+.3f,%+.3f,%+.3f), "
-            "cull=%u, transition=%s, resubmit=%s, pacing=%s.", state->beginCount,
+            "cull=%u, channel=%u, transition=%s, resubmit=%s, pacing=%s.", state->beginCount,
             static_cast<unsigned long long>(input->sequence),
             result.offsetEnabled ? "on" : "off", result.headOffset[0],
             result.headOffset[1], result.headOffset[2], result.cullMode,
+            result.cullChannel,
             result.transitionEnabled ? "on" : "off",
             result.resubmitEnabled ? "on" : "off",
             result.deferredPacing ? "turbo" : "runtime");
@@ -444,6 +466,7 @@ HRESULT WINAPI beginFrame(void* context, const EdvrNativeFrameInput* input,
         state->lastTransitionEnabled = result.transitionEnabled;
         state->lastResubmitEnabled = result.resubmitEnabled;
         state->lastCullMode = result.cullMode;
+        state->lastCullChannel = result.cullChannel;
         state->lastDeferredPacing = result.deferredPacing;
     }
     // Only as many bytes as the caller's own struct holds.

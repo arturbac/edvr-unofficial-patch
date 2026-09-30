@@ -1,8 +1,12 @@
 #include "../../src/openxr/native_trace.h"
+#include "../../src/openxr/native_cpu_trace.h"
 #include <cstdio>
+#include <cstdint>
 #include <string>
 
 using edvr::openxr::NativeTrace;
+using edvr::openxr::NativeCpuTrace;
+using edvr::openxr::NativeCpuTraceSpan;
 
 struct Checks {
   unsigned count=0, failures=0;
@@ -12,13 +16,82 @@ struct Checks {
   }
 };
 
+int cpuTraceSmoke() {
+  constexpr unsigned phaseCycles=30,cycleMs=100,totalCycles=phaseCycles*2;
+  auto& trace=NativeCpuTrace::get();
+  if(!trace.start()) {
+    const auto c=trace.counters();
+    std::printf("openxr_trace_test: cpu trace registration failed error=%lu\n",(unsigned long)c.lastError);return 3;
+  }
+  for(unsigned i=0;i<100&&!trace.enabled();++i)Sleep(10);
+  if(!trace.enabled()) {
+    std::printf("openxr_trace_test: CPU provider not externally enabled pid=%lu guid={D3885FA1-0B70-44F1-AF88-63B2012B111E}\n",
+      (unsigned long)GetCurrentProcessId());trace.stop();return 4;
+  }
+  const auto before=trace.counters();bool wrote=true;volatile uint64_t checksum=0;
+  std::printf("openxr_trace_test: cpu trace smoke pid=%lu busy_ms=%u sleep_ms=%u cycles=%u gpu=synthetic\n",
+    (unsigned long)GetCurrentProcessId(),phaseCycles*cycleMs,phaseCycles*cycleMs,totalCycles);
+  for(unsigned i=0;i<totalCycles;++i) {
+    const uint64_t frameBegin=edvrNativeTraceNowUs();
+    {
+      NativeCpuTraceSpan cycle(EdvrCpuFixtureCycle);
+      if(i<phaseCycles) {
+        NativeCpuTraceSpan phase(EdvrCpuFixtureBusy);const uint64_t until=frameBegin+uint64_t(cycleMs)*1000;
+        do {checksum=checksum*uint64_t(6364136223846793005ull)+uint64_t(i+1);} while(edvrNativeTraceNowUs()<until);
+        phase.finishVoid(int64_t(checksum&0x7fffffffffffffffull));
+      } else {
+        NativeCpuTraceSpan phase(EdvrCpuFixtureWait);Sleep(cycleMs);phase.finishVoid(cycleMs);
+      }
+      const uint64_t frameEnd=edvrNativeTraceNowUs();EdvrNativeCpuCompletedFramePayloadV2 payload{};auto& event=payload.frame;
+      const uint64_t fakeGpuToken=100001+uint64_t(i);payload.gpuSequence=fakeGpuToken;
+      event.timestampUs=frameEnd;event.sequence=i+1;event.generation=1;event.featureEpoch=1;
+      event.waitReturnUs=frameBegin;event.secondSubmitReturnUs=frameBegin;
+      event.nextWaitEntryUs=frameEnd;event.nextWaitReturnUs=frameEnd;
+      // Synthetic zero-duration Present keeps the fixture inside the same
+      // postValid+singlePresent admission the production analyzer requires.
+      event.presentBeginUs=frameBegin;event.presentEndUs=frameBegin;
+      event.callerThread=GetCurrentThreadId();event.nextWaitThread=event.callerThread;
+      event.status=EdvrCpuPostAvailable;event.flags=EdvrNativeCpuPostValid|EdvrNativeCpuSinglePresent;event.sceneReady=1;
+      wrote=trace.emitFrame(payload)&&wrote;
+      // Synthetic duration validates the actual manifest-free GPU event decoder;
+      // this fixture never issues GPU queries or claims real GPU execution.
+      LARGE_INTEGER publication{};QueryPerformanceCounter(&publication);
+      EdvrNativeGpuCompletionPayload gpu{};
+      gpu.timestampUs=edvrNativeTraceUs(publication.QuadPart);
+      gpu.publicationQpc=uint64_t(publication.QuadPart);gpu.sequence=fakeGpuToken;
+      gpu.sourceFrame=i+1;gpu.outerMs=9.0+double(i%3)*0.1;
+      gpu.source=1;gpu.reason=0;gpu.version=1;gpu.size=sizeof(gpu);
+      wrote=trace.emitGpu(gpu)&&wrote;cycle.finishVoid(i+1);
+    }
+  }
+  trace.stop();const auto after=trace.counters();const uint64_t expected=uint64_t(totalCycles)*4;
+  const uint64_t emitted=after.emitted-before.emitted;
+  const bool success=wrote&&after.failures==before.failures&&emitted>=expected;
+  std::printf("openxr_trace_test: cpu trace smoke emitted=%llu expected_data=%llu failures=%llu last_error=%lu checksum=%llu result=%s\n",
+    (unsigned long long)emitted,(unsigned long long)expected,(unsigned long long)(after.failures-before.failures),
+    (unsigned long)after.lastError,(unsigned long long)checksum,success?"ok":"failed");
+  return success?0:5;
+}
+
 int wmain(int argc, wchar_t** argv) {
   SetErrorMode(3);
   if (argc == 2 && !wcscmp(argv[1], L"--dry-run")) {
     std::puts("openxr_trace_test: dry-run (no files)"); return 0;
   }
+  if (argc == 2 && !wcscmp(argv[1], L"--cpu-trace-smoke")) return cpuTraceSmoke();
   if (argc != 2 || wcscmp(argv[1], L"--self-test")) return 2;
   Checks c;
+  {
+    auto& cpu=NativeCpuTrace::get();cpu.stop();const auto before=cpu.counters();
+    {NativeCpuTraceSpan disabled(EdvrCpuFixtureCycle);disabled.finishVoid(1);}
+    EdvrNativeCpuCompletedFramePayload event{};event.timestampUs=1;
+    c.check(!cpu.emitFrame(event)&&cpu.counters().emitted==before.emitted,"disabled CPU provider emits nothing");
+    EdvrNativeCpuCompletedFramePayloadV2 linked{};linked.gpuSequence=100001;
+    c.check(!cpu.emitFrame(linked)&&cpu.counters().emitted==before.emitted,"disabled linked CPU provider emits nothing");
+    EdvrNativeGpuCompletionPayload gpu{};gpu.sequence=1;
+    c.check(!cpu.emitGpu(gpu)&&cpu.counters().emitted==before.emitted,"disabled GPU completion emits nothing");
+    c.check(cpu.start(),"CPU provider registration succeeds");cpu.stop();
+  }
   SYSTEMTIME t{}; t.wYear=2026; t.wMonth=9; t.wDay=14;
   t.wHour=4; t.wMinute=23; t.wSecond=13; t.wMilliseconds=7;
   std::wstring path;

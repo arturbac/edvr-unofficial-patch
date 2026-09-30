@@ -1,3 +1,4 @@
+#include "temporal_shader_bytecode.h"
 #include "depth_probe.h"
 
 #include <cmath>
@@ -12,27 +13,27 @@
 #include "../common/guard.h"
 #include "../common/log.h"
 #include "../common/timing.h"
+#include "binding_shadow.h"
 #include "shader_swap.h"
 #include "temporal_pass.h"
 
 namespace edvr {
+
+// The probe's arming, out here only so depth_probe.h can read it inline --
+// and, since 2026-09-22 round three, the two fields depthProbeNoteEyeDraw's
+// one-compare common case reads, for depthProbeEyeDrawNeedsNote there.
+namespace detail {
+bool g_depthProbeWanted = false;
+void* g_depthProbeLastDsv = nullptr;
+bool g_depthProbeEyeDrawThisFrame = false;
+}  // namespace detail
+
 namespace {
 
 // The sampler: 256 depth values on a 16x16 grid across the target, read
 // through a view typed to the depth channel. Load, not Sample -- a depth
 // view has no filterable format, and the grid wants exact texels.
-constexpr char kSampleCsHlsl[] = R"HLSL(
-Texture2D<float> D : register(t0);
-RWStructuredBuffer<float> O : register(u0);
-cbuffer P : register(b0) { uint2 size; uint2 pad0; };
-[numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= 16 || id.y >= 16) return;
-    uint2 p = uint2((id.x * 2 + 1) * size.x / 32, (id.y * 2 + 1) * size.y / 32);
-    p = min(p, size - 1);
-    O[id.y * 16 + id.x] = D.Load(int3(int2(p), 0));
-}
-)HLSL";
+
 
 constexpr int      kMaxTargets = 32;   // the cockpit binds shadow maps by the handful
 constexpr uint64_t kSampleIntervalMs = 10000;
@@ -50,6 +51,12 @@ struct Target {
     void*       dsv = nullptr;          // identity only; dereferenced only inside the game's own call
     ID3D11Texture2D* tex = nullptr;     // the texture behind it, a reference HELD, so the
                                         // frame-boundary read cannot touch a freed object
+    // The view itself, a reference HELD too (flight 6): targets are matched by
+    // this pointer on every draw, and a view the game released could be
+    // reallocated at the same address for another texture -- its draws then
+    // counted under this entry's size. Held, the address cannot come back
+    // while the entry lives; released with the texture when it is evicted.
+    ID3D11DepthStencilView* viewHeld = nullptr;
     uint32_t    lastSeenFrame = 0;
     uint32_t    w = 0, h = 0;
     DXGI_FORMAT texFmt = DXGI_FORMAT_UNKNOWN;
@@ -81,14 +88,18 @@ struct Target {
 };
 Target   g_targets[kMaxTargets];
 int      g_targetCount = 0;
-void*    g_lastDsv = nullptr;
+// Bound to the published field depthProbeEyeDrawNeedsNote reads
+// (depth_probe.h), the g_wanted pattern below.
+void*&   g_lastDsv = detail::g_depthProbeLastDsv;
 void*    g_lastDrawDsv = nullptr;   // the per-draw fast path's cache
 int      g_lastDrawIdx = -1;
-bool     g_wanted = false;
+// Bound to the published flag depthProbeWanted() reads (depth_probe.h), so
+// the name this file and its rig have always used reads and writes it.
+bool&    g_wanted = detail::g_depthProbeWanted;
 uint32_t g_distinctThisFrame = 0;
 uint32_t g_maxDistinct = 0;
 uint32_t g_eyeFrames = 0;   // frames that had at least one eye draw
-bool     g_eyeDrawThisFrame = false;
+bool&    g_eyeDrawThisFrame = detail::g_depthProbeEyeDrawThisFrame;   // likewise
 bool     g_summaryNoted = false;
 // The census of all draws, per frame.
 uint32_t g_drawsThisFrame = 0, g_drawsLastFrame = 0;
@@ -103,6 +114,164 @@ bool     g_stagingAtBoundary = false;
 uint32_t g_frameNo = 0;
 constexpr uint32_t kReleaseAfterFrames = 120;
 
+// THE LAYOUT CENSUS (2026-09-23, the on-foot walk of flight 093817: the
+// scene's depth "went away" for the whole walk while target #23, 3840x2160,
+// took 5505 draws a frame with no eye-sized colour target beside it). When
+// the frame's busiest depth target is like that -- more than a thousand
+// draws, none of them beside an eye-sized colour target -- its draws'
+// viewports and scissors are sampled (the first draw of the frame and every
+// 1024th), with the colour target bound beside it, and the eye-sized
+// targets' draws meanwhile are counted by shader. The line says whether that
+// target is one view or several packed ones, and what paints the eyes: a
+// packed per-eye layout would show two viewports; one full viewport and a
+// single full-screen draw per eye is a flat picture shown on a panel. No
+// line at all means the census never saw such a target.
+constexpr uint32_t kLayoutMinDraws = 1000;
+constexpr int kLayoutKeep = 4;
+struct LayoutRect { int32_t x = 0, y = 0; int32_t w = 0, h = 0; uint32_t count = 0; };
+struct LayoutShader { uint64_t vs = 0, ps = 0; uint32_t count = 0; };
+// Each sampled target keeps its OWN record (flight 6, 153446, the hangar):
+// the busiest target alternated frame to frame between a 2048x1024 shadow
+// atlas and the 5088x2862 on-foot screen, the samples were pooled, and the
+// line named only the current one -- "now #0 2048x1024" beside a 5088x2862
+// viewport. A sample whose viewport lies outside its target's own size is
+// counted as such (`outside`): a draw whose depth was not the target it was
+// counted under, which a pooled record could never show.
+constexpr int kLayoutRecords = 3;
+struct LayoutRecord {
+    int          target = -1;              // g_targets index, -1 free
+    uint32_t     w = 0, h = 0;             // its size when the record began
+    uint32_t     frames = 0, samples = 0, outside = 0;
+    LayoutRect   viewports[kLayoutKeep];
+    LayoutRect   scissors[kLayoutKeep];
+    uint32_t     viewportOther = 0, scissorOther = 0;
+    uint32_t     colourW = 0, colourH = 0;
+    DXGI_FORMAT  colourFmt = DXGI_FORMAT_UNKNOWN;
+    bool         colourSeen = false, colourNone = false;
+};
+int          g_layoutTarget = -1;          // the target sampled this frame, -1 none
+int          g_layoutRecord = -1;          // its record, -1 none
+LayoutRecord g_layoutRecords[kLayoutRecords];
+uint32_t     g_layoutRecordsFull = 0;      // frames whose target found no record free
+LayoutShader g_layoutEyeShaders[kLayoutKeep];
+uint32_t     g_layoutEyeShaderOther = 0, g_layoutEyeDraws = 0, g_layoutFrames = 0;
+
+void layoutKeepRect(LayoutRect* rects, uint32_t& other, int32_t x, int32_t y, int32_t w, int32_t h) {
+    for (int i = 0; i < kLayoutKeep; ++i) {
+        LayoutRect& r = rects[i];
+        if (r.count && r.x == x && r.y == y && r.w == w && r.h == h) { ++r.count; return; }
+        if (!r.count) { r = LayoutRect{x, y, w, h, 1}; return; }
+    }
+    ++other;
+}
+
+void layoutSample(ID3D11DeviceContext* ctx, bool firstOfFrame) {
+    if (g_layoutRecord < 0) return;
+    LayoutRecord& r = g_layoutRecords[g_layoutRecord];
+    ++r.samples;
+    D3D11_VIEWPORT vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    UINT n = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    ctx->RSGetViewports(&n, vp);
+    bool outside = false;
+    for (UINT i = 0; i < n; ++i) {
+        layoutKeepRect(r.viewports, r.viewportOther, static_cast<int32_t>(vp[i].TopLeftX),
+                       static_cast<int32_t>(vp[i].TopLeftY), static_cast<int32_t>(vp[i].Width),
+                       static_cast<int32_t>(vp[i].Height));
+        outside = outside || vp[i].TopLeftX + vp[i].Width > static_cast<float>(r.w) + 0.5f ||
+                  vp[i].TopLeftY + vp[i].Height > static_cast<float>(r.h) + 0.5f;
+    }
+    if (outside) ++r.outside;
+    D3D11_RECT sc[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    UINT m = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    ctx->RSGetScissorRects(&m, sc);
+    for (UINT i = 0; i < m; ++i)
+        layoutKeepRect(r.scissors, r.scissorOther, sc[i].left, sc[i].top, sc[i].right - sc[i].left,
+                       sc[i].bottom - sc[i].top);
+    if (!firstOfFrame) return;
+    ID3D11RenderTargetView* rtv = nullptr;
+    ctx->OMGetRenderTargets(1, &rtv, nullptr);
+    if (!rtv) { r.colourNone = true; return; }
+    ID3D11Resource* res = nullptr;
+    rtv->GetResource(&res);
+    rtv->Release();
+    if (!res) return;
+    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    res->GetType(&dim);
+    if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+        D3D11_TEXTURE2D_DESC d{};
+        static_cast<ID3D11Texture2D*>(res)->GetDesc(&d);
+        r.colourW = d.Width;
+        r.colourH = d.Height;
+        r.colourFmt = d.Format;
+        r.colourSeen = true;
+    }
+    res->Release();
+}
+
+// The record for this frame's layout target: its own, or a free one.
+void layoutPickRecord() {
+    g_layoutRecord = -1;
+    if (g_layoutTarget < 0) return;
+    const Target& t = g_targets[g_layoutTarget];
+    int free = -1;
+    for (int i = 0; i < kLayoutRecords; ++i) {
+        const LayoutRecord& r = g_layoutRecords[i];
+        if (r.target == g_layoutTarget && r.w == t.w && r.h == t.h) { g_layoutRecord = i; break; }
+        if (r.target < 0 && free < 0) free = i;
+    }
+    if (g_layoutRecord < 0 && free >= 0) {
+        g_layoutRecords[free] = LayoutRecord{};
+        g_layoutRecords[free].target = g_layoutTarget;
+        g_layoutRecords[free].w = t.w;
+        g_layoutRecords[free].h = t.h;
+        g_layoutRecord = free;
+    }
+    if (g_layoutRecord >= 0) ++g_layoutRecords[g_layoutRecord].frames;
+    else ++g_layoutRecordsFull;
+}
+
+void layoutNoteEyeDraw() {
+    ++g_layoutEyeDraws;
+    const uint64_t vs = bindingShaderHash(BindSlot::Vs), ps = bindingShaderHash(BindSlot::Ps);
+    for (int i = 0; i < kLayoutKeep; ++i) {
+        LayoutShader& s = g_layoutEyeShaders[i];
+        if (s.count && s.vs == vs && s.ps == ps) { ++s.count; return; }
+        if (!s.count) { s = LayoutShader{vs, ps, 1}; return; }
+    }
+    ++g_layoutEyeShaderOther;
+}
+
+void layoutReset() {
+    for (auto& r : g_layoutRecords) r = LayoutRecord{};
+    g_layoutRecordsFull = 0;
+    for (auto& s : g_layoutEyeShaders) s = LayoutShader{};
+    g_layoutEyeShaderOther = g_layoutEyeDraws = 0;
+    // The frame now beginning was already counted: it goes on, into a fresh
+    // record, counted once.
+    g_layoutFrames = g_layoutTarget >= 0 ? 1u : 0u;
+    layoutPickRecord();
+}
+
+struct ScenePickCache {
+    uint32_t w = 0, h = 0;
+    bool result = false;
+    bool valid = false;
+};
+// There is deliberately one entry, not one per size: refreshing another size
+// may replace the one global hysteresis pair. Returning to the earlier size
+// must scan again and restore that pair rather than replaying a stale answer.
+ScenePickCache g_scenePickCache;
+#ifdef EDVR_DEPTH_SCENE_PICK_TEST
+uint32_t g_scenePickScans = 0;
+uint32_t g_scenePickRefreshCalls = 0;
+uint32_t g_scenePickOrderCalls = 0;
+uint32_t g_scenePickFormatVisits = 0;
+#endif
+
+void invalidateScenePickCache() {
+    g_scenePickCache.valid = false;
+}
+
 // The GPU side: the shader, its parameter buffer, the 1 KB result, TWO
 // staging twins (one per read path), and an owned copy of the target.
 ID3D11ComputeShader*       g_cs = nullptr;
@@ -114,7 +283,6 @@ ID3D11Buffer*              g_staging[2] = {};   // 0 the direct view, 1 the copy
 bool                       g_stagingInFlight = false;
 bool                       g_stagingHas[2] = {};
 int                        g_stagingTarget = -1;
-uint32_t                   g_stagingCycle = 0, g_stagingCycles = 0;
 HRESULT                    g_stagingDirectHr = S_OK;
 ID3D11Texture2D*           g_copyTex = nullptr;
 uint32_t                   g_copyW = 0, g_copyH = 0;
@@ -137,34 +305,6 @@ const char* fmtName(DXGI_FORMAT f) {
         case DXGI_FORMAT_D16_UNORM:                 return "D16_UNORM";
         case DXGI_FORMAT_R16_UNORM:                 return "R16_UNORM";
         default:                                    return "?";
-    }
-}
-
-// The view format that reads the depth channel of a texture of this
-// format, and the typeless format an owned copy of it must have. UNKNOWN
-// when this build knows no such view.
-DXGI_FORMAT depthReadFormat(DXGI_FORMAT tex, DXGI_FORMAT* copyFmt) {
-    switch (tex) {
-        case DXGI_FORMAT_R24G8_TYPELESS:
-        case DXGI_FORMAT_D24_UNORM_S8_UINT:
-            *copyFmt = DXGI_FORMAT_R24G8_TYPELESS;
-            return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-        case DXGI_FORMAT_R32_TYPELESS:
-        case DXGI_FORMAT_D32_FLOAT:
-        case DXGI_FORMAT_R32_FLOAT:
-            *copyFmt = DXGI_FORMAT_R32_TYPELESS;
-            return DXGI_FORMAT_R32_FLOAT;
-        case DXGI_FORMAT_R32G8X24_TYPELESS:
-        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
-            *copyFmt = DXGI_FORMAT_R32G8X24_TYPELESS;
-            return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
-        case DXGI_FORMAT_R16_TYPELESS:
-        case DXGI_FORMAT_D16_UNORM:
-            *copyFmt = DXGI_FORMAT_R16_TYPELESS;
-            return DXGI_FORMAT_R16_UNORM;
-        default:
-            *copyFmt = DXGI_FORMAT_UNKNOWN;
-            return DXGI_FORMAT_UNKNOWN;
     }
 }
 
@@ -193,9 +333,7 @@ void releaseGpu() {
 bool ensureGpu(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     if (!g_cs && !g_csTried) {
         g_csTried = true;
-        g_cs = shaderSwapCompileCs(ctx, kSampleCsHlsl, sizeof(kSampleCsHlsl) - 1,
-                                   "main", "depth_probe_cs", nullptr,
-                                   "depth probe");
+        g_cs = shaderSwapCreateCs(ctx, kDepthProbeBytecode, sizeof(kDepthProbeBytecode), "depth_probe_cs", "depth probe");
     }
     if (!g_cs) return false;
     if (!g_out) {
@@ -323,17 +461,16 @@ double metresOf(float v) {
 
 struct GridStats {
     float mn = 1e30f, mx = -1e30f, centre = 0.0f;
-    int atClear = 0, bandFar = 0, bandKm = 0, bandHm = 0, bandM = 0, bandNear = 0;
+    int bandFar = 0, bandKm = 0, bandHm = 0, bandM = 0, bandNear = 0;
     float block[16] = {};   // the 4x4 map: each block's NEAREST sample (reversed-Z max)
 };
 
-GridStats gridStats(const float* v, float clear) {
+GridStats gridStats(const float* v) {
     GridStats g;
     for (int i = 0; i < 256; ++i) {
         const float d = v[i];
         if (d < g.mn) g.mn = d;
         if (d > g.mx) g.mx = d;
-        if (clear >= 0.0f && fabsf(d - clear) < 1e-7f) ++g.atClear;
         // Bands, for the reversed-Z reading: value = near / z.
         if (d <= 0.0f) ++g.bandFar;
         else if (d < 2.5e-6f) ++g.bandKm;     // beyond 10 km
@@ -378,13 +515,12 @@ void mapText(const GridStats& g, char* out, size_t n) {
 
 void depthProbeConfigure(Config& cfg) {
     const std::string mode = cfg.getString("fix.temporal_aa", "off");
-    const std::string eyeMask = cfg.getString("fix.eye_mask", "off");
-    // fix.eye_mask needs the same clear-value census this probe already
-    // keeps for the temporal pass (depthProbeClearValueFor): the near value
-    // it writes must come from a recorded clear, never a guess, so the probe
-    // must be watching even on a rig with the temporal pass off.
+    // advanced.eye_depth_capture needs the scene pair too, and the flight
+    // rig runs fix.temporal_aa off -- the capture lights the probe itself
+    // rather than inherit the temporal pass's switch.
+    invalidateScenePickCache();
     g_wanted = (_stricmp(mode.c_str(), "off") != 0 && !mode.empty()) ||
-               (_stricmp(eyeMask.c_str(), "off") != 0 && !eyeMask.empty());
+               cfg.getBool("advanced.eye_depth_capture", false);
 }
 
 namespace {
@@ -423,6 +559,8 @@ int discoverTarget(void* dsv) {
                     t.dsvFlags = vd.Flags;
                     ok = true;
                     t.tex = tex;   // the reference stays with the entry
+                    v->AddRef();
+                    t.viewHeld = v;   // so is this one: the pointer stays this view's
                 }
                 res->Release();
             }
@@ -435,6 +573,7 @@ int discoverTarget(void* dsv) {
     }
     if (idx < 0) idx = g_targetCount++;
     g_targets[idx] = t;
+    invalidateScenePickCache();
     return idx;
 }
 
@@ -448,7 +587,12 @@ void depthProbeNoteDraw(ID3D11DeviceContext* ctx, void* dsv, bool rtvEyeSized,
     (void)ctx;
     if (!g_wanted) return;
     ++g_drawsThisFrame;
-    if (rtvEyeSized) ++g_eyeRtvDrawsThisFrame;
+    if (rtvEyeSized) {
+        ++g_eyeRtvDrawsThisFrame;
+        // The layout census: what paints the eyes while a non-eye target is
+        // the busiest (g_layoutTarget, chosen at the frame boundary).
+        if (g_layoutTarget >= 0) layoutNoteEyeDraw();
+    }
     if (!dsv) return;
     ++g_drawsWithDsvThisFrame;
     int idx;
@@ -463,6 +607,8 @@ void depthProbeNoteDraw(ID3D11DeviceContext* ctx, void* dsv, bool rtvEyeSized,
     if (idx < 0) return;
     Target& t = g_targets[idx];
     ++t.drawsThisFrame;
+    if (idx == g_layoutTarget && ctx && (t.drawsThisFrame == 1 || (t.drawsThisFrame & 1023u) == 0))
+        layoutSample(ctx, t.drawsThisFrame == 1);
     // The temporal pass's camera latch: the frame's FIRST draw into the
     // scene pair's depth is drawn with the scene camera by construction,
     // whichever eye it is (the first bound is the first rendered). The
@@ -493,13 +639,25 @@ void depthProbeNoteDraw(ID3D11DeviceContext* ctx, void* dsv, bool rtvEyeSized,
 // depthProbeSceneDepth and depthProbeSceneEyeOf so the two can never
 // disagree about which target is which eye. Only meaningful once both
 // g_scenePick entries are valid; callers check that first.
-static void sceneOrderFirstSecond(int* outFirst, int* outSecond) {
+template <bool CountTestWork>
+static void sceneOrderFirstSecondImpl(int* outFirst, int* outSecond) {
+#ifdef EDVR_DEPTH_SCENE_PICK_TEST
+    if constexpr (CountTestWork) ++g_scenePickOrderCalls;
+#endif
     int first = g_scenePick[0], second = g_scenePick[1];
     if (g_targets[second].firstBindLastFrame < g_targets[first].firstBindLastFrame) {
         const int tmp = first; first = second; second = tmp;
     }
     *outFirst = first;
     *outSecond = second;
+}
+
+static void sceneOrderFirstSecond(int* outFirst, int* outSecond) {
+#ifdef EDVR_DEPTH_SCENE_PICK_TEST
+    sceneOrderFirstSecondImpl<true>(outFirst, outSecond);
+#else
+    sceneOrderFirstSecondImpl<false>(outFirst, outSecond);
+#endif
 }
 
 // The scene's targets for this size: the two BUSIEST of this size last
@@ -510,12 +668,22 @@ static void sceneOrderFirstSecond(int* outFirst, int* outSecond) {
 // it. The pair in use is kept while it stays within half of the busiest,
 // so two pairs the game alternates between do not flap. One evaluation
 // shared by depthProbeSceneDepth (the temporal pass and the interface
-// depth ask by the eye's size) and depthProbeSceneEyeOf (fix.eye_mask
+// depth ask by the eye's size) and depthProbeSceneEyeOf (the object probe
 // asks by the bound depth view's own size), so the pick forms on a rig
 // where every other asker is off. True when a pick of this size is in
 // place afterwards; a stale pick is left alone when nothing of this size
 // was drawn last frame.
-static bool refreshScenePick(uint32_t w, uint32_t h) {
+template <bool CountTestWork>
+static bool refreshScenePickImpl(uint32_t w, uint32_t h) {
+#ifdef EDVR_DEPTH_SCENE_PICK_TEST
+    if constexpr (CountTestWork) ++g_scenePickRefreshCalls;
+#endif
+    if (g_scenePickCache.valid && g_scenePickCache.w == w && g_scenePickCache.h == h) {
+        return g_scenePickCache.result;
+    }
+#ifdef EDVR_DEPTH_SCENE_PICK_TEST
+    ++g_scenePickScans;
+#endif
     int best[2] = {-1, -1};
     for (int i = 0; i < g_targetCount; ++i) {
         const Target& t = g_targets[i];
@@ -528,7 +696,10 @@ static bool refreshScenePick(uint32_t w, uint32_t h) {
             best[1] = i;
         }
     }
-    if (best[0] < 0 || best[1] < 0) return false;
+    if (best[0] < 0 || best[1] < 0) {
+        g_scenePickCache = ScenePickCache{w, h, false, true};
+        return false;
+    }
     // Hysteresis: the pair in use stays while both are still of this size
     // and drawn into at least half as much as the busiest.
     bool keep = g_scenePick[0] >= 0 && g_scenePick[1] >= 0;
@@ -544,7 +715,33 @@ static bool refreshScenePick(uint32_t w, uint32_t h) {
         g_scenePick[0] = best[0];
         g_scenePick[1] = best[1];
     }
+    g_scenePickCache = ScenePickCache{w, h, true, true};
     return true;
+}
+
+
+static bool refreshScenePick(uint32_t w, uint32_t h) {
+#ifdef EDVR_DEPTH_SCENE_PICK_TEST
+    return refreshScenePickImpl<true>(w, h);
+#else
+    return refreshScenePickImpl<false>(w, h);
+#endif
+}
+
+template <bool CountTestWork>
+static bool sceneTextureHasFormat(const void* resource) {
+    for (int i = 0; i < g_targetCount; ++i) {
+        if (g_targets[i].tex == resource) {
+#ifdef EDVR_DEPTH_SCENE_PICK_TEST
+            if constexpr (CountTestWork) g_scenePickFormatVisits += static_cast<uint32_t>(i + 1);
+#endif
+            return g_targets[i].dsvFmt != DXGI_FORMAT_UNKNOWN;
+        }
+    }
+#ifdef EDVR_DEPTH_SCENE_PICK_TEST
+    if constexpr (CountTestWork) g_scenePickFormatVisits += static_cast<uint32_t>(g_targetCount);
+#endif
+    return false;
 }
 
 bool depthProbeSceneDepth(uint32_t w, uint32_t h, int eye, ID3D11Texture2D** tex) {
@@ -565,11 +762,16 @@ bool depthProbeSceneDepthFormat(uint32_t w, uint32_t h, int eye,
     *dsvFormat = 0;
     if (!depthProbeSceneDepth(w, h, eye, tex) || !*tex) return false;
     for (int i = 0; i < g_targetCount; ++i) {
-        if (g_targets[i].tex == *tex) {
-            *dsvFormat = static_cast<uint32_t>(g_targets[i].dsvFmt);
-            return *dsvFormat != 0;
-        }
+        if (g_targets[i].tex != *tex) continue;
+#ifdef EDVR_DEPTH_SCENE_PICK_TEST
+        g_scenePickFormatVisits += static_cast<uint32_t>(i + 1);
+#endif
+        *dsvFormat = static_cast<uint32_t>(g_targets[i].dsvFmt);
+        return *dsvFormat != 0;
     }
+#ifdef EDVR_DEPTH_SCENE_PICK_TEST
+    g_scenePickFormatVisits += static_cast<uint32_t>(g_targetCount);
+#endif
     return false;
 }
 
@@ -583,7 +785,36 @@ bool depthProbeIsSceneDepth(const void* resource) {
     return false;
 }
 
-// For fix.eye_mask: which eye (if either) THIS EXACT depth-stencil view
+template <bool CountTestWork>
+static bool sceneTextureEyeImpl(uint32_t w, uint32_t h, const void* resource,
+                                int* outEye) {
+    if (!outEye) return false;
+    *outEye = -1;
+    // Preserve the old mesh path's current-pair membership guard ahead of the
+    // size-based refresh.
+    if (!depthProbeIsSceneDepth(resource)) return false;
+    if (!refreshScenePickImpl<CountTestWork>(w, h)) return false;
+    int first, second;
+    sceneOrderFirstSecondImpl<CountTestWork>(&first, &second);
+    int eye = -1;
+    if (g_targets[first].tex == resource) eye = 0;
+    else if (g_targets[second].tex == resource) eye = 1;
+    else return false;  // The refresh displaced the formerly selected texture.
+    if (!sceneTextureHasFormat<CountTestWork>(resource)) return false;
+    *outEye = eye;
+    return true;
+}
+
+bool depthProbeSceneTextureEye(uint32_t w, uint32_t h, const void* resource,
+                               int* outEye) {
+#ifdef EDVR_DEPTH_SCENE_PICK_TEST
+    return sceneTextureEyeImpl<true>(w, h, resource, outEye);
+#else
+    return sceneTextureEyeImpl<false>(w, h, resource, outEye);
+#endif
+}
+
+// Which eye (if either) THIS EXACT depth-stencil view
 // is, using the identical scene-pair identity and first-bind ordering
 // depthProbeSceneDepth uses (sceneOrderFirstSecond, above), so the two can
 // never disagree about which target is which eye. *outTargetIndex is set
@@ -620,17 +851,23 @@ bool depthProbeSceneEyeOf(ID3D11DepthStencilView* dsv, int* outEye, int* outTarg
     return true;
 }
 
-// Whether target index (depthProbeSceneEyeOf's outTargetIndex) shares the
-// scene pick's own width/height -- a double-buffered twin the game
-// alternates with the chosen pair, or an unrelated stale target, for the
-// eye mask summary's "not the scene's pick" tally. False with no scene
-// pick yet or an out-of-range index.
-bool depthProbeTargetIsSceneSized(int targetIndex) {
-    if (targetIndex < 0 || targetIndex >= g_targetCount) return false;
-    if (g_scenePick[0] < 0 || g_scenePick[0] >= g_targetCount) return false;
-    const Target& t = g_targets[targetIndex];
-    const Target& ref = g_targets[g_scenePick[0]];
-    return t.dsv && t.w == ref.w && t.h == ref.h;
+bool depthProbeCurrentSceneEyeOf(ID3D11DepthStencilView* dsv, int* outEye,
+                                 int* outTargetIndex) {
+    if (outEye) *outEye = -1;
+    if (outTargetIndex) *outTargetIndex = -1;
+    if (!g_wanted || !dsv) return false;
+    const int firstPick = g_scenePick[0], secondPick = g_scenePick[1];
+    if (firstPick < 0 || firstPick >= g_targetCount ||
+        secondPick < 0 || secondPick >= g_targetCount) return false;
+    int idx = -1;
+    if (g_targets[firstPick].dsv == dsv) idx = firstPick;
+    else if (g_targets[secondPick].dsv == dsv) idx = secondPick;
+    if (idx < 0) return false;
+    if (outTargetIndex) *outTargetIndex = idx;
+    int first, second;
+    sceneOrderFirstSecond(&first, &second);
+    if (outEye) *outEye = idx == first ? 0 : 1;
+    return true;
 }
 
 uint32_t depthProbeSceneDraws() {
@@ -766,8 +1003,6 @@ void depthProbeSample(ID3D11DeviceContext* ctx, void* dsvPtr) {
             if (g_stagingHas[0] || g_stagingHas[1]) {
                 g_stagingInFlight = true;
                 g_stagingTarget = idx;
-                g_stagingCycle = t.unbindsThisFrame;
-                g_stagingCycles = t.unbindsLastFrame;
             }
         }
         if (tex) tex->Release();
@@ -783,19 +1018,24 @@ void depthProbeNoteClear(ID3D11DepthStencilView* dsv, float depth) {
     g_targets[idx].clearValue = depth;
 }
 
-bool depthProbeClearValueFor(ID3D11DepthStencilView* dsv, float* outClearValue, bool* outReversed) {
-    if (!g_wanted || !dsv) return false;
-    const int idx = findTarget(dsv);
-    if (idx < 0) return false;
-    const float c = g_targets[idx].clearValue;
-    if (c < 0.0f) return false;   // -1 sentinel: never seen (Target's own rule)
-    if (outClearValue) *outClearValue = c;
-    if (outReversed) *outReversed = c < 0.5f;
+bool depthProbeDrawsAtSize(uint32_t w, uint32_t h, uint32_t* draws) {
+    if (!g_wanted) return false;
+    uint32_t most = 0;
+    for (int i = 0; i < g_targetCount; ++i) {
+        const Target& t = g_targets[i];
+        if (!t.dsv || t.w != w || t.h != h) continue;
+        const uint32_t d = t.drawsThisFrame > t.drawsLastFrame ? t.drawsThisFrame : t.drawsLastFrame;
+        if (d > most) most = d;
+    }
+    if (draws) *draws = most;
     return true;
 }
 
 void depthProbeFrameBoundary(ID3D11DeviceContext* ctx) {
     if (!g_wanted) return;
+    // drawsLastFrame, firstBindLastFrame and live target identities all roll
+    // below. One invalidation covers count changes and any evicted slot.
+    invalidateScenePickCache();
     ++g_frameNo;
     if (g_eyeDrawThisFrame) ++g_eyeFrames;
     g_eyeDrawThisFrame = false;
@@ -818,6 +1058,7 @@ void depthProbeFrameBoundary(ID3D11DeviceContext* ctx) {
         Target& t = g_targets[i];
         if (t.dsv && g_frameNo - t.lastSeenFrame > kReleaseAfterFrames) {
             if (t.tex) { t.tex->Release(); t.tex = nullptr; }
+            if (t.viewHeld) { t.viewHeld->Release(); t.viewHeld = nullptr; }
             t.dsv = nullptr;
             t.drawsLastFrame = t.drawsThisFrame = 0;
             t.unbindsLastFrame = t.unbindsThisFrame = 0;
@@ -857,6 +1098,21 @@ void depthProbeFrameBoundary(ID3D11DeviceContext* ctx) {
                 ? "A shader view can be made over it directly."
                 : "No shader-resource bind: v2 would copy it out once per "
                   "eye (CopyResource, same typeless family) before reading.");
+    }
+    // The layout census's target for the frame beginning now: the busiest
+    // depth target, when none of its draws had an eye-sized colour target
+    // beside them (THE LAYOUT CENSUS above).
+    {
+        int busiest = -1;
+        for (int i = 0; i < g_targetCount; ++i) {
+            const Target& t = g_targets[i];
+            if (t.dsv && (busiest < 0 || t.drawsLastFrame > g_targets[busiest].drawsLastFrame)) busiest = i;
+        }
+        const bool layout = busiest >= 0 && g_targets[busiest].drawsLastFrame > kLayoutMinDraws &&
+                            g_targets[busiest].eyeRtvDrawsLastFrame == 0;
+        g_layoutTarget = layout ? busiest : -1;
+        if (layout) ++g_layoutFrames;
+        layoutPickRecord();
     }
     // The census, again every 20 s: the second depth flight showed the
     // scene's draws moving between pairs of targets and dropping to a
@@ -911,6 +1167,70 @@ void depthProbeFrameBoundary(ID3D11DeviceContext* ctx) {
                 }
             }
             Log::get().note("depth probe: the eye-sized targets: %s.", eyes);
+        }
+        uint32_t layoutSamples = 0;
+        for (const auto& r : g_layoutRecords) if (r.target >= 0) layoutSamples += r.samples;
+        if (g_layoutFrames > 0 && layoutSamples > 0) {
+            auto rects = [](const LayoutRect* r, uint32_t other, char* out, size_t cap) {
+                size_t u = 0;
+                out[0] = '\0';
+                for (int i = 0; i < kLayoutKeep && r[i].count && u < cap; ++i) {
+                    const int k = snprintf(out + u, cap - u, "%s(%d,%d) %dx%d x%u", i ? ", " : "", r[i].x, r[i].y,
+                                           r[i].w, r[i].h, r[i].count);
+                    if (k > 0) u += static_cast<size_t>(k);
+                }
+                if (other && u < cap) snprintf(out + u, cap - u, "%s+%u more", u ? ", " : "", other);
+                if (!out[0]) snprintf(out, cap, "none");
+            };
+            // Each sampled target's own record: its frames and samples, its
+            // viewports and scissors, the colour target beside it, and the
+            // samples whose viewport lies outside it.
+            char records[1600] = "", shaders[400];
+            size_t ur = 0;
+            for (const auto& r : g_layoutRecords) {
+                if (r.target < 0 || !r.samples || ur >= sizeof(records)) continue;
+                char vps[200], scs[200], colour[96];
+                rects(r.viewports, r.viewportOther, vps, sizeof(vps));
+                rects(r.scissors, r.scissorOther, scs, sizeof(scs));
+                if (r.colourSeen)
+                    snprintf(colour, sizeof(colour), "%ux%u %s", r.colourW, r.colourH, fmtName(r.colourFmt));
+                else
+                    snprintf(colour, sizeof(colour), "%s", r.colourNone ? "none (depth only)" : "not read");
+                const int k = snprintf(records + ur, sizeof(records) - ur,
+                                       "%s#%d %ux%u on %u frames, %u samples: viewports [%s], scissors [%s], "
+                                       "the colour target beside it %s, %u samples with a viewport outside it%s",
+                                       ur ? "; " : "", r.target, r.w, r.h, r.frames, r.samples, vps, scs, colour,
+                                       r.outside, r.outside ? " (drawn with another depth than the one counted)" : "");
+                if (k > 0) ur += static_cast<size_t>(k);
+            }
+            if (g_layoutRecordsFull && ur < sizeof(records))
+                snprintf(records + ur, sizeof(records) - ur, "%s%u frames of further targets not recorded",
+                         ur ? "; " : "", g_layoutRecordsFull);
+            size_t u = 0;
+            shaders[0] = '\0';
+            for (int i = 0; i < kLayoutKeep && g_layoutEyeShaders[i].count && u < sizeof(shaders); ++i) {
+                const int k = snprintf(shaders + u, sizeof(shaders) - u, "%svs %016llX ps %016llX x%u", i ? ", " : "",
+                                       static_cast<unsigned long long>(g_layoutEyeShaders[i].vs),
+                                       static_cast<unsigned long long>(g_layoutEyeShaders[i].ps),
+                                       g_layoutEyeShaders[i].count);
+                if (k > 0) u += static_cast<size_t>(k);
+            }
+            if (g_layoutEyeShaderOther && u < sizeof(shaders))
+                snprintf(shaders + u, sizeof(shaders) - u, "%s+%u more", u ? ", " : "", g_layoutEyeShaderOther);
+            if (!shaders[0]) snprintf(shaders, sizeof(shaders), "no draw");
+            char now[96] = "";
+            if (g_layoutTarget >= 0)
+                snprintf(now, sizeof(now), " (now #%d %ux%u, %u draws last frame)", g_layoutTarget,
+                         g_targets[g_layoutTarget].w, g_targets[g_layoutTarget].h,
+                         g_targets[g_layoutTarget].drawsLastFrame);
+            Log::get().note(
+                "depth probe layout: on %u frames the busiest depth target%s had no eye-sized colour target beside "
+                "any of its draws; by target, each its own samples: %s; meanwhile the eye-sized targets took %.1f "
+                "draws a frame, drawn by [%s]. Two viewports would be a packed per-eye layout; one full viewport with "
+                "a full-screen draw per eye is a flat picture the eyes show on a panel.",
+                g_layoutFrames, now, records,
+                static_cast<double>(g_layoutEyeDraws) / static_cast<double>(g_layoutFrames), shaders);
+            layoutReset();
         }
     }
     if (!g_summaryNoted && g_eyeFrames >= 120) {
@@ -986,8 +1306,6 @@ void depthProbeFrameBoundary(ID3D11DeviceContext* ctx) {
                     if (g_stagingHas[1]) {
                         g_stagingInFlight = true;
                         g_stagingTarget = idx;
-                        g_stagingCycle = 0;
-                        g_stagingCycles = t.unbindsLastFrame;
                         g_stagingAtBoundary = true;
                         g_stagingDirectHr = S_OK;
                     }
@@ -1040,7 +1358,7 @@ void depthProbeFrameBoundary(ID3D11DeviceContext* ctx) {
                              s == 0 ? "direct view" : "copy");
                     continue;
                 }
-                const GridStats g = gridStats(vals[s], clear);
+                const GridStats g = gridStats(vals[s]);
                 if (s == 1 || !g_stagingHas[1]) {
                     t.sampleFar = g.bandFar;
                     t.sampleNear = g.bandM + g.bandNear;
@@ -1076,15 +1394,19 @@ void depthProbeFrameBoundary(ID3D11DeviceContext* ctx) {
 }
 
 void depthProbeShutdown() {
+    invalidateScenePickCache();
     if (g_targetCount > 0) {
         Log::get().note("depth probe: %d depth target(s) seen at the eye draws "
                         "this session.", g_targetCount);
     }
     for (int i = 0; i < g_targetCount; ++i) {
         if (g_targets[i].tex) { g_targets[i].tex->Release(); g_targets[i].tex = nullptr; }
+        if (g_targets[i].viewHeld) { g_targets[i].viewHeld->Release(); g_targets[i].viewHeld = nullptr; }
     }
     releaseGpu();
     g_targetCount = 0;
+    g_layoutTarget = g_layoutRecord = -1;
+    for (auto& r : g_layoutRecords) r = LayoutRecord{};
     g_lastDsv = nullptr;
     g_lastDrawDsv = nullptr;
     g_lastDrawIdx = -1;

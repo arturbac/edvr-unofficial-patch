@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>EdvrCpuProfile</AssemblyName>
+    <OutputPath>$(MSBuildProjectDirectory)\..\..\build\cpu_profile\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <TraceEventDirectory Condition="'$(TraceEventDirectory)' == ''">C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\PrivateAssemblies</TraceEventDirectory>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="Microsoft.Diagnostics.Tracing.TraceEvent">
+      <HintPath>$(TraceEventDirectory)\Microsoft.Diagnostics.Tracing.TraceEvent.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Microsoft.Diagnostics.FastSerialization">
+      <HintPath>$(TraceEventDirectory)\Microsoft.Diagnostics.FastSerialization.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+  <!-- Symbolizing EDVR's own PDBs goes through TraceEvent's DIA wrapper, which
+       loads msdia140.dll from beside its own assembly. The CLSID is not
+       registered on a machine with only the VS build tools, so the local copy
+       from the same Visual Studio install is placed next to the analyzer. It is
+       copied, never downloaded, and its absence only disables symbolization. -->
+  <ItemGroup>
+    <None Include="$(TraceEventDirectory)\..\msdia140.dll"
+          Condition="Exists('$(TraceEventDirectory)\..\msdia140.dll')">
+      <Link>msdia140.dll</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+  <Target Name="RequireTraceEvent" BeforeTargets="ResolveAssemblyReferences">
+    <Error Condition="!Exists('$(TraceEventDirectory)\Microsoft.Diagnostics.Tracing.TraceEvent.dll')"
+           Text="TraceEvent was not found under $(TraceEventDirectory). Pass -p:TraceEventDirectory=&lt;directory containing Microsoft.Diagnostics.Tracing.TraceEvent.dll&gt;." />
+  </Target>
+</Project>

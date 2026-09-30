@@ -15,6 +15,24 @@ inline bool temporalModeEnabled(const std::string& mode) {
            _stricmp(mode.c_str(), "fsr") == 0;
 }
 
+struct TemporalPresetSelection {
+    unsigned full = 11, fovea = 11;
+    bool known = true;
+};
+// Shared model names; feature creation still applies the backend's DLAA guard.
+inline TemporalPresetSelection temporalPresetFor(const std::string& model) {
+    if (_stricmp(model.c_str(), "k") == 0 || _stricmp(model.c_str(), "quality") == 0)
+        return {11, 11, true};
+    if (_stricmp(model.c_str(), "steady") == 0) return {11, 12, true};
+    if (_stricmp(model.c_str(), "auto") == 0 || _stricmp(model.c_str(), "default") == 0)
+        return {0, 0, true};
+    if (_stricmp(model.c_str(), "j") == 0 || _stricmp(model.c_str(), "responsive") == 0)
+        return {10, 10, true};
+    if (_stricmp(model.c_str(), "l") == 0) return {12, 12, true};
+    if (_stricmp(model.c_str(), "m") == 0) return {13, 13, true};
+    return {11, 11, model.empty()};
+}
+
 inline constexpr float kTemporalShipMetres = 10.0f;
 
 // Which history the temporal pass hands the frame to. Own is the pass's own
@@ -35,8 +53,8 @@ inline TemporalEngine temporalEngineFor(const std::string& mode) {
 
 // True for every mode that hands the frame to an external, trained engine
 // (NVIDIA's or AMD's) rather than the pass's own history -- the test every
-// "a trained engine wants X" reader in src\ shares, so fsr reaches UI depth,
-// UI separation, deferred UI and the rest the same way dlss and dlaa do.
+// "a trained engine wants X" reader in src\ shares, so fsr reaches UI depth
+// and the rest the same way dlss and dlaa do.
 inline bool temporalExternalEngine(const std::string& mode) {
     return temporalEngineFor(mode) != TemporalEngine::Own;
 }
@@ -45,16 +63,6 @@ inline bool temporalExternalEngine(const std::string& mode) {
 inline const char* temporalNvidiaLabel(float hmdQuality) {
     if (!std::isfinite(hmdQuality) || hmdQuality <= 0.0f) return "DLSS / DLAA";
     return hmdQuality >= 1.0f ? "DLAA" : "DLSS";
-}
-
-// The engine's own display name: "TAA" for the pass's own history, NVIDIA's
-// label (DLSS/DLAA, by hmdQuality) for dlss/dlaa, "FSR" for fsr.
-inline const char* temporalEngineLabel(const std::string& mode, float hmdQuality) {
-    switch (temporalEngineFor(mode)) {
-        case TemporalEngine::Nvidia: return temporalNvidiaLabel(hmdQuality);
-        case TemporalEngine::Amd:    return "FSR";
-        default:                     return "TAA";
-    }
 }
 
 }  // namespace edvr

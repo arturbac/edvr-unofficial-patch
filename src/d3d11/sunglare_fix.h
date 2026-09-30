@@ -20,24 +20,34 @@ class Config;
 // restarts at zero per draw call, so a prefix is the only subset that
 // keeps every element's identity; the mapping run walks K to name each
 // instance, and the kept set is whatever prefix survives the walk.
-// kMatch: a train draw with nothing to skip or clamp -- the steady path
+// kMatch: a train draw with nothing to skip or clamp -- the world shader
 // still needs to know it happened.
 enum class SunglareAction { kStock, kSkip, kClamp, kMatch };
 
 void sunglareConfigure(Config& cfg);
+// Not inlined: calls exposureDampingActive() across module boundaries, so
+// there is no single scalar load here for the header to fold.
 bool sunglareWantsDraws();
-bool sunglareSteady();
-bool sunglareWorldActive();
+
+// sunglareWorldActive and sunglareProbeActive read these from the header
+// with no call: sunglareWorldActive is asked per draw, and the build has no
+// /GL to fold a cross-TU getter.
+namespace detail {
+extern bool g_sunglareProbe;
+extern int  g_sunglareWorld;
+}  // namespace detail
+inline bool sunglareWorldActive() { return detail::g_sunglareWorld != 0; }
 // advanced.sun_glare_probe: the debug instruments run in EVERY mode,
 // stock included, so a stock-vs-mode record diff is one hot swap apart.
-bool sunglareProbeActive();
+inline bool sunglareProbeActive() { return detail::g_sunglareProbe; }
 SunglareAction sunglareOnEyeDraw(char kind, uint32_t count,
                                  uint32_t instances);
 uint32_t sunglareKeep();
 
-// The steady wrap around a matched train draw: rotate the shared corner
-// stream by the head's roll (measured, never written, from the camera
-// rows), bind the rotated copy for this one draw, restore after.
+// The wrap around a matched train draw: the world shader (fix.sun_glare
+// realistic or vivid) swapped in for this one draw, and the probe's
+// instruments; restored after. (The corner-rotation steady path that also
+// lived here was retired with its keys and removed on 2026-09-23.)
 void sunglareBegin(ID3D11DeviceContext* ctx);
 void sunglareEnd(ID3D11DeviceContext* ctx);
 
@@ -62,9 +72,19 @@ void* sunglareSceneCbTarget();
 void  sunglareSceneRows(const void* data, uint32_t bytes);
 void  sunglareSceneDump(const void* data, uint32_t bytes);
 
-// The train's identity test, exported for the constant-buffer peek: the
-// steer needs to read the 208-byte CB of exactly these draws, and two
-// matchers for one family is how the witchstar era learned wrong things.
+// The train's identity test. One matcher for the family: two matchers for
+// one family is how the witchstar era learned wrong things.
+//
+// sunglareTrainShape is its first, shape-only half (DrawInstanced, six
+// vertices, more than one instance), inline: sunglareOnEyeDraw answers
+// kStock without touching anything when it fails, and sunglareWantsDraws is
+// a pure read, so the draw path asks the shape before both calls -- which it
+// made for every eye draw (35 innermost samples of the 1355-frame parked-5
+// window). sunglareIsGlareTrain asks this same function, so they cannot
+// drift.
+inline bool sunglareTrainShape(char kind, uint32_t count, uint32_t instances) {
+    return kind == 'N' && count == 6 && instances >= 2;
+}
 bool sunglareIsGlareTrain(char kind, uint32_t count, uint32_t instances);
 
 // When the train last drew, in nowMs() time; 0 = never this session.

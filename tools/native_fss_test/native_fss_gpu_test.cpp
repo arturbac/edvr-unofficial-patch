@@ -12,10 +12,21 @@
 #include "../../src/common/frame_flag.h"
 #include "../../src/d3d11/fss_heal.h"
 #include "../../src/d3d11/shader_swap.h"
+#include "../../src/d3d11/gpu_census.h"
 #include "../../src/common/system_d3d11.h"
 using Microsoft::WRL::ComPtr;
 namespace edvr {
+ID3D11ComputeShader* shaderSwapCreateCs(ID3D11DeviceContext* ctx,const void* bytes,size_t size,const char*,const char*) {
+    ComPtr<ID3D11Device> dev;ctx->GetDevice(&dev);ID3D11ComputeShader* shader=nullptr;
+    if(FAILED(dev->CreateComputeShader(bytes,size,nullptr,&shader)))return nullptr;return shader;
+}
+
 void breadcrumb(const char*) {}
+// The GPU census (issue #38) is cross-cutting; this rig is about fss_heal's
+// own effect, not the census's rotation, so it is stubbed like the other
+// modules fss_heal.cpp reaches but this rig does not link.
+bool gpuCensusBegin(ID3D11DeviceContext*, GpuCensusSection) noexcept { return false; }
+void gpuCensusEnd(ID3D11DeviceContext*, GpuCensusSection) noexcept {}
 // Compile the production HLSL on WARP without installing game hooks.
 ID3D11ComputeShader* shaderSwapCompileCs(ID3D11DeviceContext* context,const char* hlsl,size_t size,
     const char* entry,const char* name,const SwapMacro*,const char*) {

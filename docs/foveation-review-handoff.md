@@ -1,5 +1,22 @@
 # Pre-ship review of the foveation branch: what was found, what was fixed, what is left
 
+## Status
+
+- **State: retired 2026-09-29 (code removed, 184eee7f).**
+  `experimental.foveation` and the seven `advanced.foveation_*` keys,
+  foveation.cpp and foveation.h and the eight probe shaders are deleted:
+  default off, zero fps gain when flown, and it could not arm under the OpenXR
+  port. This review is the record of what it was; the code is at `184eee7f^`.
+- **2026-09-24:** `experimental.foveation_centre` is retired. The
+  eye-tracked centre it switched went on 2026-09-23 (frame_flag v34:
+  nothing has published a gaze since the legacy openvr half was deleted),
+  so the rings sit on each eye's straight ahead, and
+  `advanced.foveation_distance` defaults to 0 unconditionally -- the value
+  the key's shipped default (`eyes`) chose. The gaze findings below are
+  history.
+- **State:** a closed record of the 2026-09-06 review. The shading-rate
+  feature ships off ([performance.md](performance.md), "Feature 2").
+
 An adversarial review of `claude/foveation-gaze-probe-2ff1267` against `main`,
 2026-09-06, before any of it ships. The branch is 45 commits and about 9,000
 lines: the DLSS fovea crop (feature 6), the gaze probe and its eye-tracking

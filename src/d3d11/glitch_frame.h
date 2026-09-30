@@ -20,17 +20,28 @@
 
 #include "glitch_scene.h"
 
-namespace edvr {
-// Registered by vscreen at install: the arrival-mono frame count (0 = off)
-// and whether the scanner's chrome drew recently. Unregistered = off.
-void glitchFrameSetFssMonoProviders(int (*frames)(), bool (*chrome)());
-}  // namespace edvr
-
 #include <cstdint>
 
 namespace edvr {
 
 void installGlitchFrameFix();
+
+// glitchFrameInvalidatePool's own and only test (glitch_frame.cpp): the fix
+// is installed at all. Necessary and sufficient -- unlike the functions
+// below, it does not also ask State::observing.
+//
+// glitchFrameWantsPool's own necessary first test: installed AND
+// State::observing. Both mirror g_state/State::observing, kept in sync by
+// syncGlitchFrameDetail() at every site that changes either (glitch_frame.cpp).
+namespace detail {
+extern bool g_glitchFrameInstalled;
+extern bool g_glitchFrameObserving;
+}  // namespace detail
+inline bool glitchFrameInstalled() { return detail::g_glitchFrameInstalled; }
+inline bool glitchFrameObserving() { return detail::g_glitchFrameObserving; }
+// The camera validation behind "transition flash fix ACTIVE" has passed: the
+// scene camera moved through its first rendered frames (flight, not the menu).
+bool glitchFrameCameraValidated();
 
 // Called from the Map/Unmap hooks. The detector picks out the buffers it cares
 // about by size, so passing it everything is intended.
@@ -44,6 +55,16 @@ void glitchFrameObserve(const void* data, uint32_t bytes, const void* resource);
 // Read-only cross-check of the camera buffer bound to a recognised opaque
 // eye draw. A fresh same-frame write is required. Saved beside the legacy
 // furthest-camera history and paired with the bound pool below.
+//
+// glitchFrameIsSceneDraw is a pure classifier of five rigid-scene vertex
+// shader hashes, defined here inline: the draw lambda asks it for every eye
+// geometry draw, and as a cross-TU call (/O2, no /GL) that was a call per
+// draw for five compares.
+inline bool glitchFrameIsSceneDraw(uint64_t vertexShaderHash) {
+    return vertexShaderHash==0xEB5234DB6ADB491Dull || vertexShaderHash==0xDE545DC8EE4FBB87ull ||
+        vertexShaderHash==0x61AE8EB05FDC18DDull || vertexShaderHash==0x66DE2CADB1F4AE6Bull ||
+        vertexShaderHash==0xAACFDCF2FB9AD809ull;
+}
 bool glitchFrameWantsSceneDraw(uint64_t vertexShaderHash);
 bool glitchFrameNoteSceneDraw(const void* resource, float* sampledPosition = nullptr);
 
@@ -57,6 +78,23 @@ uint32_t glitchFrameWantsPool(const void* resource);
 void glitchFrameObservePool(const void* resource, const void* data, uint32_t bytes);
 void glitchFrameInvalidatePool(const void* resource);
 GlitchSceneGeometry glitchFrameSceneGeometry();
+
+// advanced.transition_flash_eye_base's per-bad-frame latch asks, at a
+// head-only fill, whether the pool's OWN upload for this counter frame is
+// already in the store, and if so gets the detector's own comparison run on
+// a COPY of that upload with its camera lane set to `camera` (the fill's row
+// 275 -- the same value s->sceneDrawPos will get at the draw). READ-ONLY
+// with respect to the store: never advances p.prev/p.older (only
+// glitchFrameNoteScenePool owns that) and never touches p.write. Returns
+// false when no pool slot holds this frame's upload -- the caller reads
+// that as "no evidence yet". `snapshot`, when non-null, receives the
+// triple the comparison used -- [0] the (camera-replaced) frame upload,
+// [1] p.prev, [2] p.older, all COPIES -- so the caller can re-evaluate
+// later fills against the LATCH-TIME history instead of the live store
+// (which NoteScenePool advances; comparing against it measures the upload
+// against itself, the 151942 wouldDiffer artifact).
+bool glitchFrameScenePoolEvidence(uint32_t frame, const float camera[3], GlitchSceneGeometry* out,
+                                  glitch_scene_detail::Sample snapshot[3]);
 
 // Called once per frame, after Present. eyeDraws is the number of draws that
 // reached the eye textures in the frame just finished -- used to tell a rendered

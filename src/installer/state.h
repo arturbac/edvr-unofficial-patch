@@ -23,6 +23,9 @@ struct InstallState {
 
     std::string  edvrVersion;   // the EDVR build installed
     std::string  installedUtc;  // when, ISO-8601 Z
+    std::string  profile = "vr"; // absent in legacy records means VR
+    std::string  descriptorSha;
+    std::string  components; // installed component inventory, comma separated
 
     // Which Openvr folder was used, RELATIVE to the game folder (Openvr\win64
     // or Openvr). Relative because the reader trims a value at whitespace
@@ -60,6 +63,15 @@ std::wstring stateDirPath(const std::wstring& gameDir);
 std::wstring statePath(const std::wstring& gameDir);
 std::wstring baseIniPath(const std::wstring& gameDir);
 std::wstring backupRootPath(const std::wstring& gameDir);
+
+// The settings file an edition owns: edvr.ini for "vr", edvr-flat.ini for "flat".
+// The flat runtime reads edvr-flat.ini first and falls back to edvr.ini only
+// while there is none (config.cpp), so a flat operation that touched edvr.ini
+// would land on the VR profile's tuning, and one that touched only edvr.ini
+// would change nothing the flat runtime reads. Anything else is the VR file: a
+// record from before the profiles existed says nothing and means VR.
+const wchar_t* settingsLeafFor(const std::string& profile);
+std::wstring   settingsPathFor(const std::wstring& gameDir, const std::string& profile);
 
 InstallState readState(const std::wstring& gameDir);
 InstallState parseState(const std::string& text);

@@ -1,6 +1,6 @@
 #include "luma_probe.h"
-#include "ui_deferred.h"
 #include "../common/log.h"
+#include "../common/periodic_work.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -17,9 +17,9 @@ namespace {
 
 template<class T> using Ptr = Microsoft::WRL::ComPtr<T>;
 
-constexpr int kStages = 5;
+constexpr int kStages = 3;
 constexpr int kGrid = 16;
-constexpr const char* kStageNames[kStages] = {"game", "clean_hdr", "dlss_in", "dlss_out", "final"};
+constexpr const char* kStageNames[kStages] = {"game", "dlss_out", "final"};
 
 // A 5-bit-exponent, N-bit-mantissa unsigned mini-float, bias 15 -- the
 // shape shared by half floats (10-bit mantissa, plus a sign this helper
@@ -138,7 +138,7 @@ void decodePixel(const uint8_t* p, FormatKind kind, float& r, float& g, float& b
     }
 }
 
-enum class SlotStatus : uint8_t { Empty, Pending, Read, Absent, Unsupported };
+enum class SlotStatus : uint8_t { Empty, Pending, Read, Absent, Unsupported, TimedOut };
 
 struct StageSlot {
     Ptr<ID3D11Texture2D> staging;
@@ -155,27 +155,53 @@ struct EyeState {
     StageSlot stages[kStages];
     LARGE_INTEGER lastReportQpc{};
     bool haveLastReport = false;
-    // Sentinel distinct from every real outcome (-1 = "none", 0..4 = a
+    // Sentinel distinct from every real outcome (-1 = "none", 0..2 = a
     // stage index), so the confirming line fires on the very first
     // report even when that report's answer is "none".
     int firstBlackStagePrev = -2;
     // Passes ended since the round was armed. A round is armed at the end
-    // of a pass, so the next frame's draws (where clean_hdr is sampled)
-    // and the next pass (the other four stages) both belong to it.
+    // of a pass, so the next pass's stages belong to it.
     int endsSinceArm = 0;
 };
 
 EyeState g_eyes[2];
 bool g_armedLogged = false;
 
+// Stages copied into staging and not yet read: the round's stages in flight.
+uint64_t pendingStages(const EyeState& es) {
+    uint64_t n = 0;
+    for (const auto& s : es.stages) {
+        if (s.status == SlotStatus::Pending) ++n;
+    }
+    return n;
+}
+
+// Phase-0 timing (src/common/periodic_work.h): what the probe costs the render
+// thread. One run per call that does work -- a stage's staging copies (and its
+// staging texture when one is made), or a readback poll with its decode and
+// report line -- so a frame's share can be laid against a LONG FRAME line.
+// Calls that do nothing (not armed, throttled, stage already sampled) are not
+// runs. The context is the stages in flight: 1 to 3 on a copy call, the
+// number polled on a readback call.
+PeriodicWork g_workRound{"luma_round", "stages"};
+
 void noteArmedOnce() {
     if (g_armedLogged) return;
     g_armedLogged = true;
     Log::get().note(
-        "luma probe: armed -- five stages sampled on a 16x16 grid every 2 s per eye: "
-        "game (the texture the game submits), clean_hdr (the deferred UI's world "
-        "snapshot), dlss_in (what DLSS receives), dlss_out (DLSS output before the UI "
-        "replay), final (the texture handed to the VR half).");
+        "luma probe: armed -- three stages sampled on a 16x16 grid every 2 s per eye: "
+        "game (the texture the game submits), dlss_out (the upscaler's output as the "
+        "pass hands it on, the UI resolve applied), final (the texture handed to the VR "
+        "half).");
+}
+
+// Keep the historical float arithmetic: dimensions not divisible by 16,
+// and dimensions smaller than the grid, must sample the same texels.
+int gridCoordinate(int index, UINT extent) {
+    int p = static_cast<int>((static_cast<float>(index) + 0.5f) /
+                            static_cast<float>(kGrid) * static_cast<float>(extent));
+    if (p < 0) p = 0; else if (p >= static_cast<int>(extent)) p = static_cast<int>(extent) - 1;
+    return p;
 }
 
 void decodeSlot(StageSlot& slot, const D3D11_MAPPED_SUBRESOURCE& mapped) {
@@ -186,18 +212,13 @@ void decodeSlot(StageSlot& slot, const D3D11_MAPPED_SUBRESOURCE& mapped) {
     }
     const uint8_t* base = static_cast<const uint8_t*>(mapped.pData);
     const size_t bpp = bytesPerPixel(kind);
-    const int w = static_cast<int>(slot.width);
-    const int h = static_cast<int>(slot.height);
     double sum = 0.0;
     float maxLuma = 0.0f;
     int blackCount = 0;
     for (int j = 0; j < kGrid; ++j) {
-        int py = static_cast<int>((static_cast<float>(j) + 0.5f) / static_cast<float>(kGrid) * static_cast<float>(h));
-        if (py < 0) py = 0; else if (py >= h) py = h - 1;
         for (int i = 0; i < kGrid; ++i) {
-            int px = static_cast<int>((static_cast<float>(i) + 0.5f) / static_cast<float>(kGrid) * static_cast<float>(w));
-            if (px < 0) px = 0; else if (px >= w) px = w - 1;
-            const uint8_t* p = base + static_cast<size_t>(py) * mapped.RowPitch + static_cast<size_t>(px) * bpp;
+            const int px = gridCoordinate(i, slot.width);
+            const uint8_t* p = base + static_cast<size_t>(j) * mapped.RowPitch + static_cast<size_t>(px) * bpp;
             float r = 0.0f, g = 0.0f, b = 0.0f;
             decodePixel(p, kind, r, g, b);
             const float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
@@ -220,21 +241,19 @@ void formatStage(const StageSlot& slot, char* out, size_t outSize) {
         case SlotStatus::Unsupported:
             snprintf(out, outSize, "fmt=%u?", slot.formatForLog);
             break;
+        case SlotStatus::TimedOut:
+            snprintf(out, outSize, "unavailable(timeout)");
+            break;
         default:
             snprintf(out, outSize, "-");
             break;
     }
 }
 
-void reportRound(int eye, EyeState& es, const LumaProbeState& state) {
+void reportRound(int eye, EyeState& es) {
     char bufs[kStages][32];
     for (int s = 0; s < kStages; ++s) formatStage(es.stages[s], bufs[s], sizeof(bufs[s]));
-    Log::get().note(
-        "luma probe: eye=%d game=%s clean_hdr=%s dlss_in=%s dlss_out=%s final=%s | "
-        "deferred=%u sampled=%u aliases=%u draws=%u apply=%u",
-        eye, bufs[0], bufs[1], bufs[2], bufs[3], bufs[4],
-        state.deferredEnabled ? 1u : 0u, state.sampled ? 1u : 0u, state.aliases, state.draws,
-        state.applied ? 1u : 0u);
+    Log::get().note("luma probe: eye=%d game=%s dlss_out=%s final=%s", eye, bufs[0], bufs[1], bufs[2]);
 
     int firstBlack = -1;
     for (int s = 0; s < kStages; ++s) {
@@ -253,10 +272,9 @@ void reportRound(int eye, EyeState& es, const LumaProbeState& state) {
             else
                 snprintf(meanBufs[s], sizeof(meanBufs[s]), "-");
         }
-        Log::get().note(
-            "luma probe: eye=%d first black stage is %s (game %s clean_hdr %s dlss_in %s dlss_out %s final %s).",
-            eye, firstBlack < 0 ? "none" : kStageNames[firstBlack],
-            meanBufs[0], meanBufs[1], meanBufs[2], meanBufs[3], meanBufs[4]);
+        Log::get().note("luma probe: eye=%d first black stage is %s (game %s dlss_out %s final %s).", eye,
+                        firstBlack < 0 ? "none" : kStageNames[firstBlack], meanBufs[0], meanBufs[1],
+                        meanBufs[2]);
     }
 }
 
@@ -292,8 +310,7 @@ void armIfDue(EyeState& es) {
 void lumaProbeBegin(int eye) {
     noteArmedOnce();
     // Arming happens in lumaProbeEnd after the previous round is complete.
-    // This call only marks the probe live in the log; clean_hdr is sampled
-    // in deferred preparation after the world draw sequence has finished.
+    // This call only marks the probe live in the log.
     (void)eye;
 }
 
@@ -319,6 +336,9 @@ void lumaProbeSample(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, int eye, in
         slot.status = SlotStatus::Unsupported;
         return;
     }
+    // From here the call does the work: the device lookup, a staging texture
+    // when the size changed, sixteen row copies. Timed however it is left.
+    PeriodicWorkScope timing(g_workRound);
     if (!slot.staging || slot.width != td.Width || slot.height != td.Height || slot.format != td.Format) {
         Ptr<ID3D11Device> dev;
         ctx->GetDevice(&dev);
@@ -328,7 +348,7 @@ void lumaProbeSample(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, int eye, in
         }
         D3D11_TEXTURE2D_DESC sd{};
         sd.Width = td.Width;
-        sd.Height = td.Height;
+        sd.Height = kGrid;
         sd.MipLevels = 1;
         sd.ArraySize = 1;
         sd.Format = td.Format;
@@ -347,35 +367,50 @@ void lumaProbeSample(ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, int eye, in
         slot.height = td.Height;
         slot.format = td.Format;
     }
-    // Subresource 0 only: CopyResource would need the staging texture to
-    // match the source's mip and array counts as well, and a refused copy
-    // would leave stale bytes to be read as a false black.
-    ctx->CopySubresourceRegion(slot.staging.Get(), 0, 0, 0, 0, tex, 0, nullptr);
+    // Exact source rows, unchanged bytes and format (including sRGB and
+    // typeless): no SRV, shader conversion or context bindings required.
+    // Sixteen row copies replace a whole-eye transfer; retain full row
+    // width to avoid 256 one-pixel commands for this diagnostic grid.
+    // Source subresource 0 only, independent of mip and array counts.
+    for (int j = 0; j < kGrid; ++j) {
+        const UINT y = static_cast<UINT>(gridCoordinate(j, td.Height));
+        const D3D11_BOX row{0, y, 0, td.Width, y + 1, 1};
+        ctx->CopySubresourceRegion(slot.staging.Get(), 0, 0, static_cast<UINT>(j), 0, tex, 0, &row);
+    }
     slot.status = SlotStatus::Pending;
     slot.waitFrames = 0;
+    timing.setContext(pendingStages(es));
 }
 
-void lumaProbeEnd(ID3D11DeviceContext* ctx, int eye, const LumaProbeState& state) {
+void lumaProbeEnd(ID3D11DeviceContext* ctx, int eye) {
     noteArmedOnce();
     if (eye < 0 || eye > 1) return;
     EyeState& es = g_eyes[eye];
     if (!ctx) return;   // try again once a frame hands us a context
     if (es.armed) {
+        // One run: the nonblocking polls, the decode and the report line.
+        PeriodicWorkScope timing(g_workRound, pendingStages(es));
         ++es.endsSinceArm;
         bool allResolved = true;
         for (auto& slot : es.stages) {
             if (slot.status != SlotStatus::Pending) continue;
             ++slot.waitFrames;
-            const bool forceBlock = slot.waitFrames > 30;
             D3D11_MAPPED_SUBRESOURCE mapped{};
             const HRESULT hr = ctx->Map(slot.staging.Get(), 0, D3D11_MAP_READ,
-                                         forceBlock ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+                                         D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
             if (SUCCEEDED(hr) && mapped.pData) {
                 decodeSlot(slot, mapped);
                 ctx->Unmap(slot.staging.Get(), 0);
                 if (slot.status == SlotStatus::Pending) slot.status = SlotStatus::Read;
             } else if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
-                allResolved = false;
+                if (slot.waitFrames > 30) {
+                    // A diagnostic must not wait for the device to rescue
+                    // a late sample. Mark it honestly unavailable and drop
+                    // our reference; queued copies retain their resource.
+                    // The next throttled round gets a fresh staging target.
+                    slot.status = SlotStatus::TimedOut;
+                    slot.staging.Reset();
+                } else allResolved = false;
             } else {
                 // An unexpected Map failure must not hang the round forever.
                 slot.status = SlotStatus::Absent;
@@ -388,7 +423,7 @@ void lumaProbeEnd(ID3D11DeviceContext* ctx, int eye, const LumaProbeState& state
         for (auto& slot : es.stages) {
             if (slot.status == SlotStatus::Empty) slot.status = SlotStatus::Absent;
         }
-        reportRound(eye, es, state);
+        reportRound(eye, es);
         es.armed = false;
         QueryPerformanceCounter(&es.lastReportQpc);
         es.haveLastReport = true;

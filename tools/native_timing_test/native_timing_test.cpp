@@ -29,9 +29,10 @@ extern "C" uint64_t WINAPI edvrGpuFrameEvent(unsigned protocol, unsigned event,
 }
 struct Checks { unsigned count=0, failures=0; void check(bool ok,const char* s){++count;if(!ok){++failures;std::printf("FAIL: %s\n",s);}} };
 static EdvrNativeTimingFrame frame(uint64_t seq) {
-    EdvrNativeTimingFrame f{sizeof(f),EDVR_NATIVE_TIMING_VERSION_3,seq};
+    EdvrNativeTimingFrame f{sizeof(f),EDVR_NATIVE_TIMING_VERSION_5,seq};
     f.submitMs[0]=.2;f.submitMs[1]=.3;f.temporalMs[0]=.1;f.temporalMs[1]=.1;
-    f.menuMs[0]=.05;f.menuMs[1]=.06;f.transferMs[0]=.4;f.transferMs[1]=.5;f.composeMs=.7;return f;
+    f.menuMs[0]=.05;f.menuMs[1]=.06;f.transferMs[0]=.4;f.transferMs[1]=.5;f.composeMs=.7;
+    f.baseDisplayHz=90;f.callerWorkMs=14.4;f.callerWorkValid=1;return f;
 }
 static uint64_t waitValid(EdvrNativeTimingTable& t,Checks& c,int64_t period=11111111) {
     uint64_t seq=0;HRESULT result=E_FAIL;std::thread cpu([&]{seq=t.waitBegin(t.context);result=t.waitEnd(t.context,seq,1,period);});cpu.join();
@@ -71,6 +72,22 @@ int wmain(int argc,wchar_t** argv){
     auto badWait=t.waitBegin(t.context);c.check(t.waitEnd(t.context,badWait,0,11111111)==E_INVALIDARG,"invalid wait flag");
     auto badValidity=t.waitBegin(t.context);c.check(t.waitEnd(t.context,badValidity,2,11111111)==E_INVALIDARG,"invalid validity value");
     auto s4=waitValid(t,c);auto badFrame=frame(s4);badFrame.size--;c.check(t.publishCpu(t.context,&badFrame)==E_INVALIDARG,"wrong frame size");badFrame=frame(s4);badFrame.version++;c.check(t.publishCpu(t.context,&badFrame)==E_INVALIDARG,"wrong frame version");
+    // Older hosts: the fixture's memory past each old size still holds a base
+    // rate and caller work, and none of it may cross -- publishCpu copies only
+    // the size the version names, so what an older frame lacks reads absent.
+    auto sV3=waitValid(t,c);auto oldFrame=frame(sV3);oldFrame.version=EDVR_NATIVE_TIMING_VERSION_3;oldFrame.size=EDVR_NATIVE_TIMING_FRAME_SIZE_3;
+    c.check(t.publishCpu(t.context,&oldFrame)==S_OK&&!edvr::nativeTimingSnapshot().cpu.baseDisplayHz,"version three frame still accepted without a base rate");
+    c.check(edvr::nativeTimingSnapshot().cpu.version==EDVR_NATIVE_TIMING_VERSION_3&&!edvr::nativeTimingSnapshot().cpu.callerWorkValid&&edvr::nativeTimingSnapshot().cpu.callerWorkMs==0,"version three frame carries no caller work");
+    auto sV4=waitValid(t,c);auto v4Frame=frame(sV4);v4Frame.version=EDVR_NATIVE_TIMING_VERSION_4;v4Frame.size=EDVR_NATIVE_TIMING_FRAME_SIZE_4;
+    c.check(t.publishCpu(t.context,&v4Frame)==S_OK&&edvr::nativeTimingSnapshot().cpu.baseDisplayHz==90,"version four frame still accepted with its base rate");
+    c.check(edvr::nativeTimingSnapshot().cpu.version==EDVR_NATIVE_TIMING_VERSION_4&&!edvr::nativeTimingSnapshot().cpu.callerWorkValid&&edvr::nativeTimingSnapshot().cpu.callerWorkMs==0,"version four frame carries no caller work (the consumer falls back)");
+    auto sMix=waitValid(t,c);auto mixFrame=frame(sMix);mixFrame.version=EDVR_NATIVE_TIMING_VERSION_4;c.check(t.publishCpu(t.context,&mixFrame)==E_INVALIDARG,"version four with the version five size rejected");
+    mixFrame=frame(sMix);mixFrame.size=EDVR_NATIVE_TIMING_FRAME_SIZE_4;c.check(t.publishCpu(t.context,&mixFrame)==E_INVALIDARG,"version five with the version four size rejected");
+    mixFrame=frame(sMix);c.check(t.publishCpu(t.context,&mixFrame)==S_OK,"a refused shape consumes nothing: the same frame publishes whole");
+    auto sB=waitValid(t,c);auto baseFrame=frame(sB);c.check(t.publishCpu(t.context,&baseFrame)==S_OK&&edvr::nativeTimingSnapshot().cpu.baseDisplayHz==90,"version five base display rate travels with the frame");
+    const auto v5=edvr::nativeTimingSnapshot();c.check(v5.cpu.version==EDVR_NATIVE_TIMING_VERSION_5&&v5.cpu.callerWorkValid==1&&v5.cpu.callerWorkMs==14.4,"version five caller work travels with the frame");
+    auto sNoWork=waitValid(t,c);auto noWork=frame(sNoWork);noWork.callerWorkValid=0;noWork.callerWorkMs=0;
+    c.check(t.publishCpu(t.context,&noWork)==S_OK&&edvr::nativeTimingSnapshot().haveCpu&&!edvr::nativeTimingSnapshot().cpu.callerWorkValid,"version five frame without caller work still publishes, marked absent");
     auto badPeriod=t.waitBegin(t.context);c.check(t.waitEnd(t.context,badPeriod,1,-1)==E_INVALIDARG,"invalid period");
     D3D11_TEXTURE2D_DESC desc{};desc.Width=desc.Height=4;desc.MipLevels=desc.ArraySize=1;desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;desc.SampleDesc.Count=1;desc.Usage=D3D11_USAGE_DEFAULT;ComPtr<ID3D11Texture2D>tex;c.check(SUCCEEDED(d->CreateTexture2D(&desc,nullptr,&tex)),"texture");
     auto s5=waitValid(t,c);c.check(t.gpuEye(t.context,s5,0,1,0,tex.Get())==1,"GPU begin");c.check(!t.gpuEye(t.context,s5,0,1,0,tex.Get()),"duplicate eye begin rejected");c.check(!t.gpuEye(t.context,s5,1,0,1,tex.Get()),"overlap eye end rejected");c.check(t.gpuEye(t.context,s5,0,0,0,tex.Get())==0,"abandoned pair rejected");c.check(!edvr::nativeTimingSnapshot().haveCpu,"abandoned pair clears CPU after wait end");
@@ -88,7 +105,44 @@ int wmain(int argc,wchar_t** argv){
     auto f6=frame(s6);c.check(t.publishCpu(t.context,&f6)==S_OK&&edvr::nativeTimingSnapshot().haveCpu,"CPU survives disabled GPU");c.check(cancelCalls.load()==cancels,"disabled GPU no cancel");gpuEnabled=true;
     edvr::Config::get().set("advanced.app_gpu_timing","false");c.check(t.gpuEnabled(t.context)==0&&edvr::nativeTimingSnapshot().deviceGpu.status==EdvrNativeGpuDisabled,"config disables GPU timing");edvr::Config::get().set("advanced.app_gpu_timing","true");c.check(t.gpuEnabled(t.context)!=0,"config re-enables GPU timing");
     independent.completedAtMs=GetTickCount64();c.check(t.publishDeviceGpu(t.context,&independent)==E_INVALIDARG,"pre-disable GPU sample cannot resurrect");
-    c.check(t.invalidate(t.context)==S_OK&&!edvr::nativeTimingSnapshot().haveCpu&&!edvr::nativeTimingSnapshot().haveDeviceGpu,"invalidate clears snapshots");c.check(t.publishDeviceGpu(t.context,&g2)==E_INVALIDARG,"old device GPU rejected after invalidation");c.check(t.close(t.context)==S_OK&&t.close(t.context)==S_FALSE,"repeated close");auto stale=t;auto t2=acquire(d.Get(),8,c);c.check(stale.invalidate(stale.context)==E_INVALIDARG,"old context cannot clear new");c.check(stale.close(stale.context)==S_FALSE,"old context close remains retired");c.check(t2.close(t2.context)==S_OK,"new close");
+    c.check(t.invalidate(t.context)==S_OK&&!edvr::nativeTimingSnapshot().haveCpu&&!edvr::nativeTimingSnapshot().haveDeviceGpu,"invalidate clears snapshots");c.check(t.publishDeviceGpu(t.context,&g2)==E_INVALIDARG,"old device GPU rejected after invalidation");c.check(t.close(t.context)==S_OK&&t.close(t.context)==S_FALSE,"repeated close");auto stale=t;auto t2=acquire(d.Get(),8,c);c.check(stale.invalidate(stale.context)==E_INVALIDARG,"old context cannot clear new");c.check(stale.close(stale.context)==S_FALSE,"old context close remains retired");
+    EdvrNativePresentTrace trace{sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1,0,0,8};
+    c.check(edvrReadNativePresentTrace(t2.context,100,200,&trace)==S_OK&&!trace.count&&!trace.totalObserved&&!trace.overflow,"fresh lease has empty Present trace");
+    const auto notePresent=[&](ID3D11Device* device,const EdvrNativePresentSpan& span){const auto token=edvr::nativeTimingPresentBegin(device,span.beginUs,span.thread);edvr::nativeTimingNotePresent(device,token,span);return token;};
+    EdvrNativePresentSpan owned{100,110,120,130,140,GetCurrentThreadId(),1,2,S_OK};
+    notePresent(foreign.Get(),owned);
+    trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1,0,0,8};
+    c.check(edvrReadNativePresentTrace(t2.context,100,140,&trace)==S_OK&&!trace.count&&!trace.totalObserved,"foreign-device Present ignored");
+    const auto inFlight=edvr::nativeTimingPresentBegin(d.Get(),owned.beginUs,owned.thread);
+    trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1};c.check(inFlight&&edvrReadNativePresentTrace(t2.context,110,120,&trace)==S_OK&&!trace.count&&trace.overflow,"in-flight owned Present makes overlapping read incomplete");
+    edvr::nativeTimingNotePresent(d.Get(),inFlight,owned);
+    EdvrNativePresentSpan partial{140,145,150,155,160,99,0,7,E_FAIL};
+    notePresent(d.Get(),partial);
+    EdvrNativePresentSpan malformed{170,190,180,195,200,77,2,9,E_PENDING};
+    notePresent(d.Get(),malformed);
+    trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1,0,0,8};
+    c.check(edvrReadNativePresentTrace(t2.context,140,170,&trace)==S_OK&&trace.count==3&&trace.totalObserved==3&&!trace.overflow,"inclusive overlap retains boundary partial and malformed spans");
+    c.check(trace.spans[0].thread==owned.thread&&trace.spans[1].thread==99&&trace.spans[1].flags==7&&trace.spans[1].result==E_FAIL&&trace.spans[2].realEndUs==180,"Present trace preserves insertion order threads flags results and malformed stamps");
+    for(unsigned i=0;i<20;++i){EdvrNativePresentSpan span{300+i,301+i,302+i,303+i,304+i,i+1,1,i,HRESULT(i)};notePresent(d.Get(),span);}
+    trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1,0,0,8};
+    c.check(edvrReadNativePresentTrace(t2.context,300,400,&trace)==S_OK&&trace.count==EDVR_NATIVE_PRESENT_TRACE_CAPACITY&&trace.overflow&&trace.totalObserved==23,"more than sixteen overlaps report bounded output overflow");
+    for(unsigned i=0;i<70;++i){const uint64_t base=1000+uint64_t(i)*10;EdvrNativePresentSpan span{base,base+1,base+2,base+3,base+4,i+1,0,0,S_OK};notePresent(d.Get(),span);}
+    trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1,0,0,8};
+    c.check(edvrReadNativePresentTrace(t2.context,100,200,&trace)==S_OK&&!trace.count&&trace.overflow&&trace.totalObserved==93,"overwritten range reports loss using overwritten end stamps");
+    trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1,0,0,8};
+    c.check(edvrReadNativePresentTrace(t2.context,5000,6000,&trace)==S_OK&&!trace.count&&trace.overflow,"overwritten malformed stamp fails safe for every requested range");
+    trace={sizeof(trace)-1,EDVR_NATIVE_PRESENT_TRACE_VERSION_1,0,0,8};c.check(edvrReadNativePresentTrace(t2.context,1,2,&trace)==E_INVALIDARG,"Present trace rejects invalid header");
+    trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1};c.check(edvrReadNativePresentTrace(t2.context,1,2,&trace)==S_OK&&trace.generation==8,"Present trace returns active lease generation");
+    trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1,0,0,8};c.check(edvrReadNativePresentTrace(t2.context,2,1,&trace)==E_INVALIDARG,"Present trace rejects reversed request");
+    const auto stalePresent=edvr::nativeTimingPresentBegin(d.Get(),7000,123);
+    uint64_t activeTokens[16]{};for(unsigned i=0;i<16;++i)activeTokens[i]=edvr::nativeTimingPresentBegin(d.Get(),8000+i,200+i);
+    trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1};c.check(stalePresent&&activeTokens[14]&&!activeTokens[15]&&edvrReadNativePresentTrace(t2.context,8000,9000,&trace)==S_OK&&trace.overflow,"bounded active Present saturation is explicit loss");
+    c.check(t2.close(t2.context)==S_OK,"new close");trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1,0,0,8};c.check(edvrReadNativePresentTrace(t2.context,1,2,&trace)==E_INVALIDARG,"Present trace rejects closed context");
+    auto presentLease=acquire(d.Get(),81,c);EdvrNativePresentSpan staleSpan{7000,7001,7002,7003,7004,123,0,0,S_OK};edvr::nativeTimingNotePresent(d.Get(),stalePresent,staleSpan);trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1};c.check(edvrReadNativePresentTrace(presentLease.context,7000,7010,&trace)==S_OK&&!trace.totalObserved&&!trace.count&&!trace.overflow,"stale completion cannot enter reacquired lease");
+    for(unsigned i=0;i<70;++i){const uint64_t base=1000+uint64_t(i)*10;EdvrNativePresentSpan span{base,base+1,base+2,base+3,base+4,i+1,0,0,S_OK};notePresent(d.Get(),span);}
+    trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1,0,0,81};c.check(edvrReadNativePresentTrace(presentLease.context,100,1050,&trace)==S_OK&&trace.overflow,"valid overwritten maximum marks intersecting old range lost");
+    trace={sizeof(trace),EDVR_NATIVE_PRESENT_TRACE_VERSION_1,0,0,81};c.check(edvrReadNativePresentTrace(presentLease.context,5000,6000,&trace)==S_OK&&!trace.count&&!trace.overflow,"valid overwritten maximum does not taint later disjoint range");
+    c.check(presentLease.close(presentLease.context)==S_OK,"Present maximum lease closes");
     uint64_t cursor=0,dropped=0;edvr::NativeTimingSnapshot completed[256]{};
     const unsigned count=edvr::nativeTimingReadCompletions(cursor,completed,256,dropped);
     bool ordered=true,negativeSeen=false,nanSeen=false,allIdentified=true;

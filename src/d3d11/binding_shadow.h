@@ -39,6 +39,7 @@
 // GetType wrote a 44-byte texture description into a 20-byte buffer struct.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 struct ID3D11DeviceContext;
@@ -69,6 +70,13 @@ enum class BindSlot : uint32_t {
     CsUav3,
     Vs,            // the bound vertex shader, with its content hash (bindingShaderHash)
     Ps,            // the bound pixel shader, likewise
+    // Engine-record velocity's snapshot sources and the blend its slot target
+    // must not inherit (engine_velocity.h; the 2026-09-23 review, items 3/4):
+    // a rebind of either source, or any blend-state set, sends the next pool
+    // draw through the slow half's checks.
+    VsSrv33,       // vertex shader resource slot 33, the pool
+    VsCb1,         // vertex shader constant buffer slot 1, the scene constants
+    Blend,         // the output merger's blend state
     Count
 };
 
@@ -91,12 +99,47 @@ struct ResourceInfo {
     void*    resource = nullptr;
 };
 
+// The shadow itself, in the header for ONE reason: the three readers below are
+// each a single load, and the draw path performs them about four times a draw
+// (vscreen's verdict block alone asks for the VS hash four times). The build
+// compiles with /O2 and NO /GL, so a one-line getter in a .cpp cannot be
+// inlined across the translation unit -- it is a real call, a real stack frame
+// and a real return for one field read. Measured 2026-09-22 on the caller
+// thread, parked at a settlement: bindingGet 78 samples and bindingShaderHash
+// 67 of a 1349-frame window, which is 0.11 ms a frame spent entirely on call
+// overhead for three loads.
+//
+// Writers stay in the .cpp. They run once per bind, not once per draw, and the
+// generation policy in the comment above is worth keeping in one place.
+// EDVR_BINDING_SHADOW_EXTERNAL: a standalone test rig that supplies its own
+// three readers defines this before including, and gets declarations instead.
+// Several rigs drive a fake shadow, and a rig may assert how many hash reads
+// the code under test performs -- a contract an inline field read cannot
+// keep, and worth keeping.
+#ifndef EDVR_BINDING_SHADOW_EXTERNAL
+namespace detail {
+struct BindingSlot {
+    void*    ptr = nullptr;
+    uint32_t gen = 1;   // starts at 1 so a caller's zero-initialised cache is stale
+    uint64_t hash = 0;  // a shader slot's content hash (bindingSetShader)
+};
+extern BindingSlot g_bindingSlots[static_cast<size_t>(BindSlot::Count)];
+}  // namespace detail
+
 // The pointer last seen bound to a slot, or nullptr.
-void* bindingGet(BindSlot slot);
+inline void* bindingGet(BindSlot slot) {
+    return detail::g_bindingSlots[static_cast<size_t>(slot)].ptr;
+}
 
 // How many times that slot's binding could have changed. A cached answer is
 // stale when this differs from the value it was computed at.
+inline uint32_t bindingGeneration(BindSlot slot) {
+    return detail::g_bindingSlots[static_cast<size_t>(slot)].gen;
+}
+#else
+void* bindingGet(BindSlot slot);
 uint32_t bindingGeneration(BindSlot slot);
+#endif
 
 // Record a new binding. Bumps that slot's generation even when the pointer is
 // unchanged: an identical address after a rebind is not evidence of an identical
@@ -111,7 +154,13 @@ void bindingSet(BindSlot slot, void* ptr);
 // hash is 0 for a slot never set; a caller that finds the pointer null falls
 // back to the Get, since the shadow follows the owner context only.
 void bindingSetShader(BindSlot slot, void* ptr, uint64_t hash);
+#ifndef EDVR_BINDING_SHADOW_EXTERNAL
+inline uint64_t bindingShaderHash(BindSlot slot) {
+    return detail::g_bindingSlots[static_cast<size_t>(slot)].hash;
+}
+#else
 uint64_t bindingShaderHash(BindSlot slot);
+#endif
 
 // Everything is unbound -- ClearState, or ExecuteCommandList without restore.
 // The only place forgetting a pointer is the truth rather than a guess.
@@ -149,5 +198,27 @@ bool bindingResolve(void* view, ResourceInfo* out);
 // views resolving, because a view that stops resolving is the panel distance
 // fix silently standing down.
 bool bindingResolveResource(void* resource, ResourceInfo* out);
+
+// THE SAME TWO RESOLVERS FOR AN INSTRUMENT, on budgets of their own.
+//
+// bindingResolve and bindingResolveResource are the FIXES' resolvers: the panel
+// distance, the interface layers, the scanner and the rest read them every draw,
+// and each has one budget of five faults. Every census, ledger and probe that
+// resolved a binding used to share those budgets, so five faults in a diagnostic --
+// a probe that resolves a stale pointer is exactly what it is for -- stopped the
+// resolver for every fix, and the notes said only "bindingShadow.resolve". An
+// instrument calls these instead: identical in every respect but which budget a
+// fault is charged to, so it can run its own out without taking anything with it.
+//
+// Which callers are instruments: the modules that exist to be looked at (the draw
+// census, the object probe, the FSS probe, the HUD layer census) and the probe
+// blocks inside vscreen.cpp's draw path. A fix that also serves a probe keeps the
+// fixes' resolver: a wrong guess costs it the old shared budget, which is where it
+// was, and never the reverse.
+//
+// Rigs that supply their own bindingResolve (EDVR_BINDING_SHADOW_EXTERNAL) never
+// call these; the modules that do are compiled only into the DLL.
+bool bindingResolveProbe(void* view, ResourceInfo* out);
+bool bindingResolveResourceProbe(void* resource, ResourceInfo* out);
 
 }  // namespace edvr

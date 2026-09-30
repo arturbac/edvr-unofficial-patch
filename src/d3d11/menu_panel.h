@@ -31,6 +31,7 @@
 struct ID3D11Device;
 struct ID3D11DeviceContext;
 struct ID3D11Texture2D;
+struct IDXGISwapChain;
 
 namespace edvr {
 
@@ -65,6 +66,11 @@ struct MenuLine {
     uint8_t style;
     uint8_t badge;
     uint8_t toggle;   // 0 none; 1 off, 2 on: a switch is drawn in place of `right`
+    // Dims the label and value even on the highlighted row, where kMenuDim
+    // alone would not (its style has no highlight box). A row currently
+    // irrelevant to the mode in force -- the DLSS preset outside DLSS/DLAA
+    // -- rather than one hidden and reappearing on a mode change.
+    bool    dim = false;
 };
 
 // THE TOOLTIP'S STRIP, as fractions of the menu card's width: the gap
@@ -104,6 +110,9 @@ constexpr int kMenuMaxGraphs = 2;
 // Everything the panel shows, as text. The model builds one of these on
 // every change; the raster lays it out.
 struct MenuContent {
+    // A one-line FPS readout drawn at the top of the menu card when the user
+    // has locked the overlay to the menu, so both are visible for A/B testing.
+    char     overlayLine[120];
     // The tabs the strip shows: a window of the pages that fits the panel,
     // `activeTab` indexing THIS array. An arrow at either end says there
     // are pages that way.
@@ -197,6 +206,13 @@ bool menuPanelWorkerReadyForTest();
 // Once per frame: upload a finished raster, create the texture as needed.
 void menuPanelTick(ID3D11Device* dev);
 
+// Desktop profile: blend the live raster onto the owned backbuffer. Does
+// nothing when hidden; no backbuffer reference survives the call.
+bool menuPanelCompositeFlat(IDXGISwapChain* swap);
+bool menuPanelCompositeFlatTexture(ID3D11Texture2D* back);
+bool menuPanelFlatRasterReady();
+void menuPanelFlatResize();
+
 void menuPanelSetGeometry(const MenuGeometry& g);
 
 // The last built raster's height over its width (0 until one exists).
@@ -233,29 +249,6 @@ bool menuPanelStats(int* w, int* h, double* lastMs, float* gpuMs);
 // device, callable from a test.
 int menuPanelMeasureLine(const char* utf8, int emPx);
 
-// For the test: lay `c` out without rasterising. Returns the bitmap's
-// height; `footTop`/`footBottom` receive the footer box's edges in pixels
-// (-1 when no footer op was made); `rowEdges` receives up to `maxRows`
-// row rectangles as y0,y1 pairs, fractions of the height as menuPanelLineAt
-// reads them (-1 past the rows present); `footLines` receives the number
-// of single-line ops the footer was split into (one per '\n'-separated
-// line, so a second line is drawn as its own line and not appended to the
-// first).
-int menuPanelLayoutHeightForTest(const MenuContent& c, int* footTop, int* footBottom,
-                                 float* rowEdges, int maxRows, int* footLines = nullptr);
-
 void menuPanelShutdown();
 
 }  // namespace edvr
-
-extern "C" {
-// The door's call (the sharpen export's contract): srcTex is an
-// ID3D11Texture2D* the openvr half is about to forward, eye 0 or 1, bounds
-// the Submit's uMin, vMin, uMax, vMax or null, xf the 12 floats the theater
-// uses (a row-major 3x3 taking current-head vectors into anchor space, then
-// this eye's ray origin in anchor space). Returns the composited texture
-// (EDVR-owned, region-sized, full-span content) or null: nothing to draw,
-// or a refusal said once in the log; the caller forwards what it had.
-__declspec(dllexport) void* edvrMenuPanel(void* srcTex, int eye, const float* bounds,
-                                          const float* xf);
-}

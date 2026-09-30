@@ -14,17 +14,21 @@
 #include <d3d11.h>
 #include <dxgi.h>
 
+#include <atomic>
 #include <cstring>  // _stricmp, for the hook-mode override's spellings
 #include <string>
 
 #include "../common/config.h"
+#include "../common/runtime_profile.h"
 #include "../common/d3d11_device_identity.h"
 #include "../common/frame_flag.h"
 #include "../common/guard.h"
 #include "../common/log.h"
+#include "../common/module_pin.h"
 #include "../common/native_startup.h"
 #include "../common/proxy.h"
 #include "device_hook.h"
+#include "flat_wrapper_note.h"
 #include "input_gate.h"
 #include "intro_probe.h"   // the device stamp the intro probe's clock reads
 #include "oculus_route.h"
@@ -49,6 +53,10 @@ HMODULE g_realModule = nullptr;    // what exports currently forward to
 HMODULE g_systemModule = nullptr;  // Windows' own, always resolved, never null
 HMODULE g_selfModule = nullptr;
 std::wstring* g_moduleDir = nullptr;
+// The file name of the graphics wrapper that handles the immediate context, written once before the flag (see
+// contextHookModeFor and flat_wrapper_note.h).
+char g_wrapperFile[64] = {};
+std::atomic<bool> g_wrapperFileSet{false};
 
 typedef HRESULT(WINAPI* PFN_D3D11CreateDevice)(IDXGIAdapter*, D3D_DRIVER_TYPE, HMODULE,
                                                UINT, const D3D_FEATURE_LEVEL*, UINT, UINT,
@@ -276,6 +284,21 @@ BOOL CALLBACK initOnceCallback(PINIT_ONCE, PVOID, PVOID*) {
     edvr::Log::get().open(cfg.logDir(), L"gfx");
     edvr::Log::get().note("edvr d3d11 proxy attached; module dir %S",
                           g_moduleDir->c_str());
+    // THIS DLL IS PINNED HERE, once, before anything can start that outlives a
+    // call: the journal worker starts at the first Present tick and fix.ui_quality's
+    // HMD Quality refresh (a thread-pool callback) at the first frame boundary,
+    // and both run this DLL's code on a thread nobody waits for. A FreeLibrary
+    // unload would unmap the image under a pool callback (RC4 review F1; the
+    // worker is held by the CRT's own thread start, but the pin does not lean on
+    // that). Not in DllMain, and after the log opens so the line it writes can be
+    // read: see src/common/module_pin.h. Every path to a device, so to a Present
+    // tick and a frame boundary, comes through the two creation exports that call
+    // this.
+    edvr::pinGraphicsModuleOnce(reinterpret_cast<const void*>(&initOnceCallback));
+    edvr::Log::get().note("installation profile: %s; %s", edvr::runtimeProfileName(),
+        edvr::runtimeFlatProfile() ? "experimental mono temporal adapter; qualified projection jitter; stereo and unrelated fixes suppressed" :
+        edvr::runtimeFeaturesAllowed() ? "VR configuration retained" :
+        "invalid edvr_profile.ini; fixes disabled, proxy chaining retained; repair the installation");
     edvr::oculusRouteReport();
 
     const std::string build = edvr::gameBuildVersion();
@@ -501,10 +524,10 @@ HookMode contextHookModeFor(ID3D11DeviceContext* ctx) {
         // their evening. Config's own numeric and boolean readers say this for
         // their own bad values; a string one has to say it itself.
         Log::get().note(
-            "edvr.ini: advanced.context_hook_mode = \"%s\" is not one of auto, "
+            "%s: advanced.context_hook_mode = \"%s\" is not one of auto, "
             "shared, private or live, so it was IGNORED and the probe decided as "
             "usual. Check the spelling.",
-            want.c_str());
+            Config::get().iniName(), want.c_str());
     }
 
     Log::get().note(
@@ -530,7 +553,31 @@ HookMode contextHookModeFor(ID3D11DeviceContext* ctx) {
             "to go back to the probe.",
             forced, want.c_str(), hookModeName(probed));
     }
+    // WHOSE CODE IT IS, when it is not Windows' -- for the flat F8 panel's note (flat_wrapper_note.h). The probe above says
+    // THAT a wrapper owns the methods; this names the file, because "ReShade is why it costs frame time" is the sentence a
+    // person can act on and "0 of 96" is not. The decision (only an in-place session on a probe that found no runtime
+    // code; never a live copy, never a forced mode) is the header's, so the rig can drive it.
+    {
+        char owner[sizeof(g_wrapperFile)] = {};
+        const size_t owned = edvr::vtableDominantOtherModule(vt, kSample, g_systemModule, owner, sizeof(owner));
+        if (const char* file = flatWrapperFile(mode, probed, owner)) {
+            if (!g_wrapperFileSet.load(std::memory_order_acquire)) {
+                std::memcpy(g_wrapperFile, file, std::strlen(file) + 1);
+                g_wrapperFileSet.store(true, std::memory_order_release);
+            }
+            Log::get().note(
+                "context hook mode: %s backs %zu of the %zu sampled methods of the immediate context in place of "
+                "Windows' d3d11.dll. That is a graphics wrapper (ReShade and its kind): every call EDVR makes on the "
+                "context goes through it first, and a temporal mode makes thousands of calls a frame. The F8 panel says "
+                "so while a temporal mode is selected.",
+                file, owned, kSample);
+        }
+    }
     return mode;
+}
+
+const char* contextWrapperFile() {
+    return g_wrapperFileSet.load(std::memory_order_acquire) ? g_wrapperFile : nullptr;
 }
 
 }  // namespace edvr
@@ -630,6 +677,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
                 edvr::deviceHookNoteCleanExit();
                 edvr::Log::get().detachDuringProcessExit();
             } else {
+                // A FreeLibrary unload. In the game this branch cannot be
+                // reached: Elite's exe imports d3d11.dll statically, so the
+                // load count never gets to zero, and the first device creation
+                // pins this module besides (initOnceCallback, module_pin.h). It
+                // stays for a host that loads the DLL and lets go of it before
+                // that -- a tool, a rig -- where nothing detached is running yet
+                // and this is the right teardown.
                 edvr::breadcrumb("gfx: FreeLibrary unload");
                 shutdown();
             }

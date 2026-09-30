@@ -15,7 +15,20 @@
 #include "screen_motion.h"
 
 namespace edvr {
+
+// panelCurveWants reads these from the header with no call: asked per
+// draw, and the build has no /GL to fold a cross-TU getter.
+// kDefaultSegments lives here too, so the inline function can compare
+// against it; the alias below keeps every unqualified use in this file
+// compiling unchanged.
+namespace detail {
+bool  g_panelCurveStoodDown = false;
+float g_panelCurveCurvature = 0.0f;
+int   g_panelCurveSegments = kDefaultSegments;
+}  // namespace detail
+
 namespace {
+using detail::kDefaultSegments;
 
 // The measured vertex format. Twenty bytes, position then UV, and the
 // static_assert is not decoration: the game's own input layout reads this
@@ -32,7 +45,6 @@ static_assert(sizeof(Vertex) == 20, "the composite's stride is 20 bytes");
 // against but the first stage of the staged proof.
 constexpr int kMinSegments = 1;
 constexpr int kMaxSegments = 256;
-constexpr int kDefaultSegments = 64;
 
 // OpenVR's convention, adopted outright: the fraction of a full circle the
 // bent screen occupies. 0 is flat and off; 1 would wrap it into a closed
@@ -48,28 +60,13 @@ constexpr float kPi = 3.14159265358979323846f;
 constexpr uint64_t kReadbackLagMs = 50;
 constexpr uint32_t kMaxBytes = 4096;
 
-float    g_curvature = 0.0f;
-int      g_segments = kDefaultSegments;
 int      g_sign = 1;              // +1 or -1: which way z goes. See below.
 
-// A flat displacement added to every vertex's z. The probe for one question
-// and nothing else: DOES the vertex z reach the output at all?
-//
-// The first 64-column flight bent nothing. The strip was real -- 130
-// vertices, 384 indices, the bend in their positions -- and the screen came
-// back flat and narrowed by exactly the arc-length factor the x displacement
-// predicts, with no depth whatever. That is the design's unknown 2 failing,
-// and it has two very different causes: the transform could be dropping z, or
-// the shader could never have been reading it. The captured quad cannot tell
-// them apart, because a third float that is 0.0 in all four vertices is what
-// an unused field looks like as much as a flat one.
-//
-// So: set this to a constant, leave curvature at 0, and watch. If the panel
-// moves in depth, z reaches the output and the bend's failure is about
-// magnitude or sign. If NOTHING changes, the shader is not reading z and no
-// geometry substitution can ever curve this screen -- which is worth knowing
-// before another line is written toward it.
-float    g_zTest = 0.0f;
+// The first 64-column flight bent nothing: the strip was real, and the
+// screen came back flat and narrowed by exactly the arc-length factor the x
+// displacement predicts, with no depth whatever. A flat z probe (a constant
+// added to every vertex's z; retired 2026-09-23 once it had answered) showed
+// z does reach the output, so the failure was magnitude, not the shader.
 
 // THE GAIN, and why the bend needs one at all.
 //
@@ -95,10 +92,7 @@ float    g_zTest = 0.0f;
 // multiplying z by size.x. That is read from the game's own SIZE buffer
 // rather than guessed, and overridable when the reading is not available.
 float    g_zGainCfg = 0.0f;      // advanced key; 0 means "use what was read"
-float    g_sizeX = 0.0f;         // read from the game's SIZE buffer
 bool     g_sizeLearned = false;
-void*    g_sizeSrc = nullptr;    // which buffer it was read from, so a panel
-                                 // of a different size relearns
 ID3D11Buffer* g_sizeStaging = nullptr;
 uint32_t g_sizeStagingBytes = 0;
 bool     g_sizePending = false;
@@ -152,7 +146,6 @@ float activeGain() {
     if (!(g_sizeLearned && g_sizeY > 0.0f)) return 0.0f;
     return g_sizeY * kPanelAspect * (g_basisLearned ? g_basisRatio : 1.0f);
 }
-bool     g_stoodDown = false;     // a fault took the feature out for good
 
 ID3D11Buffer* g_vb = nullptr;
 ID3D11Buffer* g_ib = nullptr;
@@ -162,7 +155,6 @@ uint32_t      g_indexCount = 0;
 float         g_builtCurvature = -1.0f;
 int           g_builtSegments = -1;
 int           g_builtSign = 0;
-float         g_builtZTest = 0.0f;
 float         g_builtGain = -1.0f;
 
 uint64_t g_substitutions = 0;
@@ -299,7 +291,6 @@ bool learnSize(ID3D11DeviceContext* ctx) {
             memcpy(sz, m.pData, sizeof(sz));
             ctx->Unmap(g_sizeStaging, 0);
             if (sz[0] > 0.0f && sz[1] > 0.0f) {
-                g_sizeX = sz[0];
                 g_sizeY = sz[1];
                 g_sizeLearned = true;
                 Log::get().note(
@@ -317,7 +308,7 @@ bool learnSize(ID3D11DeviceContext* ctx) {
                     "and there is none to be had, so it stands down. Set "
                     "advanced.panel_curvature_z_gain to supply one by hand.",
                     sz[0], sz[1]);
-                g_stoodDown = true;
+                detail::g_panelCurveStoodDown = true;
             }
         }
         g_sizePending = false;
@@ -347,7 +338,7 @@ bool learnSize(ID3D11DeviceContext* ctx) {
                 "panel's SIZE cannot be read and the bend has no gain to put it in "
                 "model units. Standing down. advanced.panel_curvature_z_gain "
                 "supplies one by hand if this build binds it elsewhere.");
-            g_stoodDown = true;
+            detail::g_panelCurveStoodDown = true;
         }
         return false;
     }
@@ -379,7 +370,6 @@ bool learnSize(ID3D11DeviceContext* ctx) {
             // first record, and a SIZE buffer that needed an offset would be a
             // pooled one, which the size cap above has already refused.
             ctx->CopyResource(g_sizeStaging, vbs[pick]);
-            g_sizeSrc = vbs[pick];
             g_sizeCopyMs = nowMs();
             g_sizePending = true;
             if (!g_sizeNoted) {
@@ -445,7 +435,7 @@ bool learnSize(ID3D11DeviceContext* ctx) {
 // geometry there is to have. N columns is 2(N+1) vertices and 6N indices --
 // 130 and 384 at the default.
 bool build(ID3D11DeviceContext* ctx) {
-    const int n = g_segments;
+    const int n = detail::g_panelCurveSegments;
     const uint32_t verts = static_cast<uint32_t>(2 * (n + 1));
     const uint32_t idxs = static_cast<uint32_t>(6 * n);
 
@@ -457,18 +447,15 @@ bool build(ID3D11DeviceContext* ctx) {
         // the bend moves where a column is, never which texel it shows.
         const float x = -1.0f + 2.0f * static_cast<float>(i) / static_cast<float>(n);
         float bx = 0.0f, bz = 0.0f;
-        bend(x, g_curvature, g_sign, activeGain(), &bx, &bz);
+        bend(x, detail::g_panelCurveCurvature, g_sign, activeGain(), &bx, &bz);
         const float u = (x + 1.0f) * 0.5f;
 
         // Bottom row first, then the top -- the game's own ordering, which is
         // what makes segments = 1 come out byte-identical to its quad. The
         // capture measured v = 1 at y = -1 and v = 0 at y = +1, so V falls as
         // Y rises; the other convention renders the screen upside down.
-        // The probe rides along, flat across every vertex, so it displaces
-        // the whole screen rather than shaping it.
-        const float z = bz + g_zTest;
-        vb[i] = Vertex{bx, -1.0f, z, u, 1.0f};
-        vb[(n + 1) + i] = Vertex{bx, 1.0f, z, u, 0.0f};
+        vb[i] = Vertex{bx, -1.0f, bz, u, 1.0f};
+        vb[(n + 1) + i] = Vertex{bx, 1.0f, bz, u, 0.0f};
     }
 
     // The game's own index pattern, per quad, so the winding is right by
@@ -518,26 +505,24 @@ bool build(ID3D11DeviceContext* ctx) {
     }
 
     g_indexCount = idxs;
-    g_builtCurvature = g_curvature;
-    g_builtSegments = g_segments;
+    g_builtCurvature = detail::g_panelCurveCurvature;
+    g_builtSegments = detail::g_panelCurveSegments;
     g_builtSign = g_sign;
-    g_builtZTest = g_zTest;
     g_builtGain = activeGain();
     Log::get().note(
         "panel curvature: built a %d-column strip -- %u vertices, %u indices -- at "
-        "curvature %.3f, depth sign %+d, z probe %+.3f. At curvature 0, 1 column "
-        "and no probe this is the game's own quad to the byte, which is what makes "
-        "a difference on screen there a fault in the substitution rather than in "
-        "the geometry.",
-        g_segments, verts, idxs, g_curvature, g_sign, g_zTest);
+        "curvature %.3f, depth sign %+d. At curvature 0 and 1 column this is the "
+        "game's own quad to the byte, which is what makes a difference on screen "
+        "there a fault in the substitution rather than in the geometry.",
+        detail::g_panelCurveSegments, verts, idxs, detail::g_panelCurveCurvature, g_sign);
     return true;
 }
 
 }  // namespace
 
 void panelCurveConfigure(Config& cfg) {
-    const float wasCurve = g_curvature;
-    const int wasSeg = g_segments;
+    const float wasCurve = detail::g_panelCurveCurvature;
+    const int wasSeg = detail::g_panelCurveSegments;
     const int wasSign = g_sign;
 
     float c = cfg.getFloat("fix.panel_curvature", 0.0f);
@@ -549,8 +534,8 @@ void panelCurveConfigure(Config& cfg) {
             c, kMaxCurvature);
         c = 0.0f;
     }
-    g_curvature = c;
-    g_segments = cfg.getIntInRange("advanced.panel_curvature_segments",
+    detail::g_panelCurveCurvature = c;
+    detail::g_panelCurveSegments = cfg.getIntInRange("advanced.panel_curvature_segments",
                                    kDefaultSegments, kMinSegments, kMaxSegments);
     // Which way the bend goes. 1 is toward the viewer and is correct on the
     // build this was measured against; -1 is the escape hatch if a game
@@ -559,20 +544,6 @@ void panelCurveConfigure(Config& cfg) {
     g_sign = cfg.getIntInRange("advanced.panel_curvature_sign", 1, -1, 1) < 0 ? -1 : 1;
     g_zGainCfg = cfg.getFloat("advanced.panel_curvature_z_gain", 0.0f);
     if (g_zGainCfg < 0.0f || g_zGainCfg > 10000.0f) g_zGainCfg = 0.0f;
-    const float wasZ = g_zTest;
-    g_zTest = 0.0f;   // retired probe: z reaches the screen, measured and documented
-    if (g_zTest < -2.0f || g_zTest > 2.0f) g_zTest = 0.0f;
-    if (g_zTest != wasZ && g_zTest != 0.0f) {
-        Log::get().note(
-            "panel curvature: Z PROBE at %+.3f -- every vertex of the strip is "
-            "displaced flat by that much in the panel's local z, which shapes "
-            "nothing and only moves it. If the screen moves in depth, the vertex z "
-            "reaches the output and the bend's problem is magnitude or sign. If "
-            "nothing changes at all, the shader is not reading z and no geometry "
-            "substitution can curve this screen. Leave curvature at 0 while "
-            "reading this.",
-            g_zTest);
-    }
 
     // A strip of N columns has N-1 INTERIOR vertex columns, and the whole
     // bend lives in those: the two edges receive the SAME z whatever the
@@ -581,7 +552,7 @@ void panelCurveConfigure(Config& cfg) {
     // which looks exactly like the screen receding and reads as the bend
     // going the wrong way. That cost the first flight, and the log said
     // nothing because nothing was wrong.
-    if (g_curvature > 0.0f && g_segments < 8) {
+    if (detail::g_panelCurveCurvature > 0.0f && detail::g_panelCurveSegments < 8) {
         Log::get().note(
             "panel curvature: %d column%s is too few to bend anything. The curve "
             "lives in the INTERIOR vertex columns and %d columns has %d of them; "
@@ -589,47 +560,38 @@ void panelCurveConfigure(Config& cfg) {
             "screen will stay FLAT and merely move away and narrow, which looks "
             "like it receding rather than curving. Raise "
             "advanced.panel_curvature_segments to 64 to see the bend.",
-            g_segments, g_segments == 1 ? "" : "s", g_segments, g_segments - 1);
+            detail::g_panelCurveSegments, detail::g_panelCurveSegments == 1 ? "" : "s", detail::g_panelCurveSegments, detail::g_panelCurveSegments - 1);
     }
 
-    if (g_curvature != wasCurve || g_segments != wasSeg || g_sign != wasSign) {
-        if (g_curvature > 0.0f) {
+    if (detail::g_panelCurveCurvature != wasCurve || detail::g_panelCurveSegments != wasSeg || g_sign != wasSign) {
+        if (detail::g_panelCurveCurvature > 0.0f) {
             Log::get().note(
                 "panel curvature: %.3f of a circle over %d columns, depth sign %+d. "
                 "The screen bends toward you and keeps its width, so the edges come "
                 "nearer rather than the middle going further.",
-                g_curvature, g_segments, g_sign);
-        } else if (g_segments != kDefaultSegments) {
+                detail::g_panelCurveCurvature, detail::g_panelCurveSegments, g_sign);
+        } else if (detail::g_panelCurveSegments != kDefaultSegments) {
             Log::get().note(
                 "panel curvature: off (0), but the segment count is %d rather than "
                 "the default, so the FLAT strip is substituted anyway. That is the "
                 "identity test: the screen must look exactly as it does without "
                 "EDVR. Set the segment count back to %d to stop substituting.",
-                g_segments, kDefaultSegments);
+                detail::g_panelCurveSegments, kDefaultSegments);
         } else {
             Log::get().note("panel curvature: off; the game's own quad is drawn.");
         }
     }
 }
 
-bool panelCurveWants() {
-    if (g_stoodDown) return false;
-    // Curvature 0 at the default segment count is the shipped state and does
-    // nothing at all. A non-default segment count at curvature 0 is the
-    // deliberate identity test, which has to substitute in order to prove
-    // anything -- so it counts as wanting.
-    return g_curvature > 0.0f || g_segments != kDefaultSegments || g_zTest != 0.0f;
-}
-
 bool panelCurveSubstitute(ID3D11DeviceContext* ctx, PanelCurveDrawFn draw) {
-    if (!ctx || !draw || g_stoodDown) return false;
+    if (!ctx || !draw || detail::g_panelCurveStoodDown) return false;
 
     bool substituted = false;
     const bool ok = guardedBudget(g_budget, [&] {
         if (!learnSize(ctx)) return;
-        if (!g_vb || !g_ib || g_builtCurvature != g_curvature ||
-            g_builtSegments != g_segments || g_builtSign != g_sign ||
-            g_builtZTest != g_zTest || g_builtGain != activeGain()) {
+        if (!g_vb || !g_ib || g_builtCurvature != detail::g_panelCurveCurvature ||
+            g_builtSegments != detail::g_panelCurveSegments || g_builtSign != g_sign ||
+            g_builtGain != activeGain()) {
             if (!build(ctx)) return;
         }
 
@@ -654,7 +616,7 @@ bool panelCurveSubstitute(ID3D11DeviceContext* ctx, PanelCurveDrawFn draw) {
         // again and substitute again, without end.
         draw(ctx, g_indexCount, 1, 0, 0, 0);
         const float shape[4]={kPi*g_builtCurvature,float(g_builtSegments),
-            kTowardViewer*float(g_builtSign)*g_builtGain,g_builtZTest};
+            kTowardViewer*float(g_builtSign)*g_builtGain,0.0f};
         screenMotionDraw(ctx,draw,g_indexCount,1,0,0,0,shape);
 
         restoreSaved(ctx);
@@ -668,7 +630,7 @@ bool panelCurveSubstitute(ID3D11DeviceContext* ctx, PanelCurveDrawFn draw) {
                 "is being cancelled by the transform; if it bows AWAY from you, "
                 "this build's handedness differs from the one this was measured "
                 "on and advanced.panel_curvature_sign = -1 is the fix.",
-                g_segments, g_curvature);
+                detail::g_panelCurveSegments, detail::g_panelCurveCurvature);
         }
     });
 
@@ -678,7 +640,7 @@ bool panelCurveSubstitute(ID3D11DeviceContext* ctx, PanelCurveDrawFn draw) {
         // observers, where retrying costs a log line; this one has the
         // player's view riding on it, and a substitution that faulted once has
         // no business being attempted again mid-flight.
-        g_stoodDown = true;
+        detail::g_panelCurveStoodDown = true;
         // And put the game's state back, which is the whole reason the saved
         // state is not a set of locals. Under its own guard: if the context is
         // far enough gone that restoring faults too, there is nothing further

@@ -1,15 +1,16 @@
+#include "temporal_shader_bytecode.h"
 #include "particle_fix.h"
 
 #include <windows.h>
 
 #include <d3d11.h>
-#include <d3d11_1.h>   // VSGetConstantBuffers1: the per-draw bind offset
 
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 
 #include "../common/config.h"
+#include "../common/runtime_profile.h"
 #include "../common/guard.h"
 #include "../common/log.h"
 #include <string>
@@ -17,12 +18,26 @@
 #include "../common/timing.h"
 #include "binding_shadow.h"   // bindingShaderHash: the bound vertex shader's hash, set with the shader
 #include "exposure_fix.h"   // lookupShaderHash
-#include "flare_vs.h"
-#include "particle_vs.h"
+// flare_vs.h is compiled by the build shader generator.
+// particle_vs.h is compiled by the build shader generator.
 #include "shader_swap.h"
 
 namespace edvr {
+
+// particleSteady reads this from the header with no call: asked per
+// draw, and the build has no /GL to fold a cross-TU getter. ParticleMode
+// itself is declared in the header, so the inline function there can
+// name its kSteady value.
+namespace detail {
+ParticleMode g_particleMode = ParticleMode::kStock;
+// Published for the draw path's inline first tests (particle_fix.h); the
+// file-local names below are references to these.
+bool g_particleHideStars = false;
+bool g_particleProbe = false;
+}  // namespace detail
+
 namespace {
+using Mode = detail::ParticleMode;
 
 // The particle billboard vertex shader, by content hash. Found 2026-08-23
 // by skipping shaders one at a time at a geyser field (census_skip's
@@ -82,21 +97,28 @@ constexpr uint64_t kFlareVs = 0x6041FD2D3D0164E1ull;
 // general background starfield. That is evidence it is specific to the
 // jump tunnel, not proof it draws nowhere else.
 constexpr uint64_t kWitchspaceStarsVs = 0x9AEC596A2B036EA6ull;
-bool g_hideWitchspaceStars = false;
+// Bound to the published flag witchspaceStarsHidden() reads (particle_fix.h).
+bool& g_hideWitchspaceStars = detail::g_particleHideStars;
 struct BillboardVariant {
     uint64_t    hash;
-    const char* hlsl;
-    size_t      hlslLen;
+    const void* bytecode;
+    size_t      bytecodeLen;
     const char* name;      // names the compile in the log
 };
 
 constexpr int kVariantCount = 2;
 const BillboardVariant kVariants[kVariantCount] = {
-    {kPlumeVs, kParticleWorldVS, sizeof(kParticleWorldVS) - 1,
+    {kPlumeVs, kParticleWorldBytecode, sizeof(kParticleWorldBytecode),
      "particle_vs"},
-    {kFlareVs, kFlareWorldVS, sizeof(kFlareWorldVS) - 1,
+    {kFlareVs, kFlareWorldBytecode, sizeof(kFlareWorldBytecode),
      "flare_vs"},
 };
+// The draw path's inline prefilter (particleOnDrawMayMatch, particle_fix.h)
+// compares against its own copy of these hashes; a variant added here and
+// not there would be silently never offered, so the two lists must agree.
+static_assert(kVariantCount == 2 && detail::kParticleVariantVs[0] == kPlumeVs &&
+                  detail::kParticleVariantVs[1] == kFlareVs,
+              "particle_fix.h's kParticleVariantVs must list kVariants' hashes in order");
 
 const char* variantLabel(int v) {
     return (v == 1) ? "solar flare" : "smoke plume";
@@ -131,9 +153,7 @@ constexpr uint64_t kSampleMs = 1000;
 // basis -- position arrives separately through cb0[9..11] -- and cb1[277]
 // holds a camera right the shader never even reads. [278] is the whole of
 // the change.
-enum class Mode { kStock, kSteady };
-Mode     g_mode = Mode::kStock;
-bool     g_probe = false;
+bool&    g_probe = detail::g_particleProbe;   // particleProbeOn() (particle_fix.h)
 bool     g_pending = false;
 uint64_t g_copyMs = 0;
 uint64_t g_lastMs = 0;
@@ -144,38 +164,6 @@ ID3D11Buffer* g_staging = nullptr;
 uint32_t      g_stagingBytes = 0;
 
 FaultBudget g_budget("particle.probe", 5);
-
-// The offset-aware view of a constant-buffer bind. D3D11.1 lets a game
-// bind ONE buffer to many draws, each reading a different slice via a
-// first-constant offset, and the plain VSGetConstantBuffers cannot see
-// that offset -- it returns the buffer and nothing else. Reading the
-// wrong slice is the leading suspect for the field result where aiming
-// each draw at its emitter made the smoke disappear: every draw would
-// have been aimed with whichever emitter happened to sit at offset zero.
-ID3D11DeviceContext1* g_ctx1 = nullptr;
-bool                  g_ctx1Tried = false;
-
-ID3D11DeviceContext1* context1(ID3D11DeviceContext* ctx) {
-    if (!g_ctx1Tried) {
-        g_ctx1Tried = true;
-        ctx->QueryInterface(__uuidof(ID3D11DeviceContext1),
-                            reinterpret_cast<void**>(&g_ctx1));
-    }
-    return g_ctx1;
-}
-
-// The first constant (in 16-byte registers) this draw reads slot `slot`
-// from. Zero when the runtime has no offset to report, which is also the
-// right answer for a plainly bound buffer.
-uint32_t bindOffsetRegs(ID3D11DeviceContext* ctx, UINT slot) {
-    ID3D11DeviceContext1* c1 = context1(ctx);
-    if (!c1) return 0;
-    ID3D11Buffer* b = nullptr;
-    UINT first = 0, num = 0;
-    c1->VSGetConstantBuffers1(slot, 1, &b, &first, &num);
-    if (b) b->Release();
-    return static_cast<uint32_t>(first);
-}
 
 // Which billboard variant is this draw, or -1 for none? By shader hash and
 // nothing else: the geyser hunt established that kind, count, stride and
@@ -372,7 +360,7 @@ uint64_t g_appliedAtNote = 0;
 uint64_t g_noteMs = 0;
 bool     g_learnNoted = false;
 
-// The emitter's constants, shadowed per draw. Elite renders in
+// Why the quads do not face their own emitter. Elite renders in
 // CAMERA-RELATIVE world space -- the shader's own near-fade takes
 // dot(forward, position) with no camera term, which is only a depth if
 // positions are already relative to the eye -- so cb0[9..11]'s
@@ -394,16 +382,9 @@ bool     g_learnNoted = false;
 // per-draw facing to be had from them. Exact facing is per-PARTICLE and
 // lives in the vertex stream, which only a replacement shader can read
 // -- the same ceiling the glare's constant substitution hit before it
-// became a shader swap. Kept behind the key so the measurement can be
-// repeated, never as something to switch on.
-bool     g_faceEmitter = false;
-void*    g_target0 = nullptr;
-// Sized for a RING buffer, not one object's constants: if the
-// emitter's matrix is reached by per-draw offset, the whole ring
-// has to be in hand to index into it.
-uint8_t  g_shadow0[65536];
-uint32_t g_shadow0Bytes = 0;
-bool     g_shadow0Valid = false;
+// became a shader swap. The key that repeated the measurement
+// (advanced.particle_face_emitter) and the emitter-buffer shadow it needed
+// retired 2026-09-23.
 uint64_t g_facingUsed = 0;
 float    g_lastFacing[3] = {};
 
@@ -489,8 +470,6 @@ bool shapeOk(const float* f, uint32_t floats) {
 
 }  // namespace
 
-bool particleSteady() { return g_mode == Mode::kSteady; }
-
 uint64_t g_starsSkipped = 0;
 uint64_t g_starsNoteMs = 0;
 
@@ -515,27 +494,12 @@ bool witchspaceStarsSkip(ID3D11DeviceContext* ctx, char kind, uint32_t count,
     return true;
 }
 
-void* particleTargetCb0() {
-    return g_mode == Mode::kSteady ? g_target0 : nullptr;
-}
-
-void particleCaptureCb0(const void* data, uint32_t bytes) {
-    if (g_mode != Mode::kSteady || !data || bytes < 12 * 16 ||
-        bytes > sizeof(g_shadow0)) {
-        g_shadow0Valid = false;
-        return;
-    }
-    memcpy(g_shadow0, data, bytes);
-    g_shadow0Bytes = bytes;
-    g_shadow0Valid = true;
-}
-
 void* particleTarget() {
-    return g_mode == Mode::kSteady ? g_target : nullptr;
+    return detail::g_particleMode == Mode::kSteady ? g_target : nullptr;
 }
 
 void particleCapture(const void* data, uint32_t bytes) {
-    if (g_mode != Mode::kSteady || !data || bytes < 64 || bytes > kMaxShadow) {
+    if (detail::g_particleMode != Mode::kSteady || !data || bytes < 64 || bytes > kMaxShadow) {
         g_shadowValid = false;
         return;
     }
@@ -546,7 +510,7 @@ void particleCapture(const void* data, uint32_t bytes) {
 
 bool particleOnDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                     uint32_t instances) {
-    if (g_mode != Mode::kSteady || !ctx) return false;
+    if (detail::g_particleMode != Mode::kSteady || !ctx) return false;
     if (kind != 'X' && kind != 'N') return false;
     if (instances == 0 || count < 6) return false;
     const int variant = billboardVariantFor(ctx);
@@ -575,28 +539,6 @@ bool particleOnDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
     }
     cb->Release();
 
-    // The emitter buffer, learned the same way. Its absence is not a
-    // refusal: without it the substitution still removes the roll, which
-    // is most of the artifact -- it only loses the per-emitter facing.
-    ID3D11Buffer* cb0 = nullptr;
-    ctx->VSGetConstantBuffers(0, 1, &cb0);
-    if (cb0) {
-        if (cb0 != g_target0) {
-            g_target0 = cb0;
-            g_shadow0Valid = false;
-            D3D11_BUFFER_DESC bd{};
-            cb0->GetDesc(&bd);
-            Log::get().note(
-                "particle billboard: the emitter's constants live in a %u-byte "
-                "buffer, and this draw reads it from register %u. A large "
-                "buffer with a moving offset is a ring the draws share -- "
-                "which is why aiming from its start pointed every plume with "
-                "one emitter's direction.",
-                bd.ByteWidth, bindOffsetRegs(ctx, 0));
-        }
-        cb0->Release();
-    }
-
     if (!g_shadowValid) return false;
     return shapeOk(reinterpret_cast<const float*>(g_shadow), g_shadowBytes / 4);
 }
@@ -610,8 +552,8 @@ void particleBegin(ID3D11DeviceContext* ctx) {
         if (!g_vsTried[variant]) {
             g_vsTried[variant] = true;
             const BillboardVariant& d = kVariants[variant];
-            g_ourVs[variant] = shaderSwapCompileVs(
-                ctx, d.hlsl, d.hlslLen, "main", d.name, nullptr,
+            g_ourVs[variant] = shaderSwapCreateVs(
+                ctx, d.bytecode, d.bytecodeLen, d.name,
                 "particle billboard");
             if (g_ourVs[variant]) {
                 Log::get().note(
@@ -711,7 +653,8 @@ void particleConfigure(Config& cfg) {
     // The witchspace starfield switch. "on" is the game's own behaviour and
     // the default; "off" empties the jump tunnel, which a player asked for
     // after 0.12.3 did it by accident.
-    const std::string ws = cfg.getString("fix.witchspace_stars", "on");
+    const std::string ws = runtimeVrProfile() ?
+        cfg.getString("fix.witchspace_stars", "on") : "on";
     const bool wasHidden = g_hideWitchspaceStars;
     if (ws == "off") {
         g_hideWitchspaceStars = true;
@@ -734,19 +677,20 @@ void particleConfigure(Config& cfg) {
                   "starfield, which is the game's own behaviour.");
     }
 
-    const Mode wasMode = g_mode;
-    const std::string m = cfg.getString("fix.particle_billboard", "steady");
+    const Mode wasMode = detail::g_particleMode;
+    const std::string m = runtimeVrProfile() ?
+        cfg.getString("fix.particle_billboard", "steady") : "stock";
     if (m == "steady") {
-        g_mode = Mode::kSteady;
+        detail::g_particleMode = Mode::kSteady;
     } else {
         if (m != "stock") {
             Log::get().note("particle billboard: that is not stock or "
                             "steady; running stock.");
         }
-        g_mode = Mode::kStock;
+        detail::g_particleMode = Mode::kStock;
     }
-    if (g_mode != wasMode) {
-        if (g_mode == Mode::kSteady) {
+    if (detail::g_particleMode != wasMode) {
+        if (detail::g_particleMode == Mode::kSteady) {
             g_learnNoted = false;
             Log::get().note(
                 "particle billboard: STEADY -- smoke and steam quads are "
@@ -757,12 +701,9 @@ void particleConfigure(Config& cfg) {
         } else {
             g_target = nullptr;
             g_shadowValid = false;
-            g_target0 = nullptr;
-            g_shadow0Valid = false;
             Log::get().note("particle billboard: stock.");
         }
     }
-    g_faceEmitter = cfg.getBool("advanced.particle_face_emitter", false);
     const bool was = g_probe;
     g_probe = cfg.getBool("advanced.particle_probe", false);
     if (g_probe != was) {
@@ -780,7 +721,7 @@ void particleConfigure(Config& cfg) {
 }
 
 bool particleWantsDraws() {
-    return g_probe || g_mode == Mode::kSteady;
+    return g_probe || detail::g_particleMode == Mode::kSteady;
 }
 
 void particleOnEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
@@ -836,8 +777,6 @@ void particleShutdown() {
     g_engaged = false;
     g_target = nullptr;
     g_shadowValid = false;
-    g_target0 = nullptr;
-    g_shadow0Valid = false;
     if (g_staging) {
         g_staging->Release();
         g_staging = nullptr;

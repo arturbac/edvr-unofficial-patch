@@ -1,3 +1,4 @@
+#include "temporal_shader_bytecode.h"
 #include "backdrop_fix.h"
 
 #include <windows.h>
@@ -13,69 +14,20 @@
 #include "shader_swap.h"
 
 namespace edvr {
+
+// backdropWantsDraws reads this from the header with no call: asked per
+// draw, and the build has no /GL to fold a cross-TU getter.
+namespace detail {
+bool g_backdropOn = false;
+}  // namespace detail
+
 namespace {
 
 // One deband pass. The kernel is run several times at growing radius, each
 // reading the previous pass's output, because that is what the offline
 // simulation this was validated against did -- widening the search for a
 // flat neighbourhood without ever widening the blur applied inside one.
-constexpr char kBackdropCsHlsl[] = R"HLSL(
-Texture2D<float4>   S : register(t0);
-RWTexture2D<float4> O : register(u0);
-cbuffer P : register(b0) {
-    float4 p;   // x = radius in texels, y = flatness threshold, z = dither
-};
 
-float mx3(float3 v) { return max(max(v.x, v.y), v.z); }
-
-// Interleaved gradient noise: a pure function of position. The bake is
-// therefore deterministic, and since ONE texture feeds both eyes the dither
-// cannot differ between them -- the failure mode the FSS arc spent forty
-// rounds on, absent here by construction rather than by care.
-float ign(float2 q) {
-    return frac(52.9829189 * frac(dot(q, float2(0.06711056, 0.00583715))));
-}
-
-[numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    uint w, h;
-    O.GetDimensions(w, h);
-    if (id.x >= w || id.y >= h) return;
-
-    int2 c0 = int2(id.xy);
-    int  r  = int(p.x);
-    int2 lo = int2(0, 0);
-    int2 hi = int2(int(w) - 1, int(h) - 1);
-
-    float4 c  = S[c0];
-    float3 n0 = S[clamp(c0 + int2( r,  0), lo, hi)].rgb;
-    float3 n1 = S[clamp(c0 + int2(-r,  0), lo, hi)].rgb;
-    float3 n2 = S[clamp(c0 + int2( 0,  r), lo, hi)].rgb;
-    float3 n3 = S[clamp(c0 + int2( 0, -r), lo, hi)].rgb;
-
-    // The threshold is the whole difference between a deband and a blur. A
-    // star, a hull edge, any real structure exceeds it and passes through
-    // untouched; only a neighbourhood already flat to within a quantization
-    // step or two is averaged -- which is exactly where the step between two
-    // block endpoints shows as a contour.
-    float d = max(max(mx3(abs(n0 - c.rgb)), mx3(abs(n1 - c.rgb))),
-                  max(mx3(abs(n2 - c.rgb)), mx3(abs(n3 - c.rgb))));
-    // A SOFT weight, not a hard switch. "d < threshold ? average : centre"
-    // makes adjacent pixels land on opposite sides of a cliff, and five
-    // chained passes bake each cliff in and re-average it -- which the first
-    // field run saw as blotches that are not in the source. Fading the
-    // average out as the neighbourhood stops being flat has no boundary to
-    // see, and at d = 0 it is still the full average.
-    float flat = saturate(1.0 - d / max(p.y, 1e-6));
-    float3 o = lerp(c.rgb, (n0 + n1 + n2 + n3) * 0.25, flat);
-
-    // Dither on the final pass only: about one LSB, enough to break the last
-    // residual contour and far below what reads as noise.
-    if (p.z > 0.0) o += (ign(float2(c0)) - 0.5) * p.z;
-
-    O[id.xy] = float4(saturate(o), c.a);
-}
-)HLSL";
 
 // Radius and threshold multiplier per pass, in order. Five passes reaching
 // sixteen texels: at the magnification this still is shown at, a contour is
@@ -135,7 +87,6 @@ constexpr int kMaxSlots = 4;
 
 FaultBudget g_budget("backdrop", 8);
 
-bool g_on = false;
 // "splash": serve the BEST still we hold for every matched draw, rather than
 // each draw's own.
 //
@@ -372,10 +323,7 @@ bool build(ID3D11DeviceContext* ctx, const Source& src, Slot& slot) {
         if (!ok) failOnce("the parameter buffer could not be created");
     }
     if (ok && !g_cs) {
-        g_cs = shaderSwapCompileCs(ctx, kBackdropCsHlsl,
-                                   sizeof(kBackdropCsHlsl) - 1, "main",
-                                   "backdrop deband", nullptr,
-                                   "menu backdrop");
+        g_cs = shaderSwapCreateCs(ctx, kBackdropBytecode, sizeof(kBackdropBytecode), "backdrop deband", "menu backdrop");
         if (!g_cs) failOnce("the deband kernel would not compile");
         ok = g_cs != nullptr;
     }
@@ -522,25 +470,25 @@ void backdropConfigure(Config& cfg) {
     }
     g_threshold = t;
     g_dither = d;
-    g_on = on;
+    detail::g_backdropOn = on;
     if (g_splash != splash) g_notedSplash = false;
     g_splash = splash;
 }
 
-bool backdropWantsDraws() { return g_on; }
-
 bool backdropOnDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                     uint32_t instances) {
-    if (!g_on || g_failed || !ctx) return false;
+    if (!detail::g_backdropOn || g_failed || !ctx) return false;
+    // The cheap half of the signature first, so a frame full of other draws
+    // costs two comparisons each -- and ahead of the journal below, which is
+    // a cross-TU call for one bool (/O2, no /GL). Both are pure reads, so
+    // only the order changed; backdropOnComposite made the same swap.
+    if (!backdropBlitShape(kind, count, instances)) return false;
     // This is the MENU's backdrop. The first field run had no such gate, kept
     // matching after LoadGame, and spent its rebuild budget on in-game
     // textures -- eye-draw count 22 (menu) to 724 (flying) in the same
     // session, the fix still hunting throughout. Once gameplay has started
     // there is no backdrop to fix and nothing here should run again.
     if (journalGameplay()) return false;
-    // The cheap half of the signature first, so a frame full of other draws
-    // costs two comparisons each.
-    if (kind != 'N' || count != 4 || instances != 1) return false;
 
     ID3D11ShaderResourceView* srv = static_cast<ID3D11ShaderResourceView*>(
         bindingGet(BindSlot::PsSrv0));
@@ -628,9 +576,15 @@ bool backdropOnDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
 // nothing else can answer yes.
 bool backdropOnComposite(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                          uint32_t instances) {
-    if (!g_on || g_failed || !ctx || g_slotsUsed == 0) return false;
+    if (!detail::g_backdropOn || g_failed || !ctx || g_slotsUsed == 0) return false;
+    // The draw's SHAPE before the journal, which is a cross-TU call for one
+    // bool that this build cannot inline (/O2, no /GL). Both are pure reads
+    // and the answer is unchanged; the difference is that the call is now
+    // made for six-index quads rather than for every draw in the frame. 59
+    // innermost samples of the 1349-frame window of 2026-09-22 were spent in
+    // journalGameplay, reached from here.
+    if (!backdropCompositeShape(kind, count, instances)) return false;
     if (journalGameplay()) return false;
-    if (kind != 'X' || count != 6 || instances != 1) return false;
 
     void* srv = bindingGet(BindSlot::PsSrv0);
     if (!srv) return false;
@@ -660,7 +614,7 @@ bool backdropOnComposite(ID3D11DeviceContext* ctx, char kind, uint32_t count,
 void backdropBegin(ID3D11DeviceContext* ctx) {
     g_bound = false;
     g_saved = nullptr;
-    if (!g_on || !ctx) return;
+    if (!detail::g_backdropOn || !ctx) return;
     if (g_hit < 0 || g_hit >= g_slotsUsed) return;
     const int use = chooseSlot(g_hit);
     ID3D11ShaderResourceView* mine = g_slots[use].gameSrv;

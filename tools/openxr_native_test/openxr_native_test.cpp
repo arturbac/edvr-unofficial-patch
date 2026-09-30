@@ -9,6 +9,8 @@
 #include "../../src/openxr/native_render_binding.h"
 #include "launch_centre_cases.h"
 #include "treatment_cases.h"
+#include "frame_end_overlap_cases.h"
+#include "frame_cycle_cases.h"
 #include "frequency_cases.h"
 #include "visibility_cases.h"
 #include "steam_identity_cases.h"
@@ -355,6 +357,28 @@ int run(const Options& options,PresentHost* present=nullptr) {
     std::vector<uint32_t> black(256*256,0xff000000u);
     for(auto& source:skySources){context->UpdateSubresource(source.Get(),0,nullptr,black.data(),256*4,0);source.Reset();}
   });})||!overwritten)return 3;
+  // The harness's own eye images, now that the runtime renders no scene of its
+  // own: one gradient per eye (different, so a swapped Submit shows), made on
+  // the graphics device and Submit as they are each frame.
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> eyeSources[2];
+  bool eyesCreated=true;
+  if(!backend.route.invoke([&]{eyesCreated=host.graphicsCalls.invoke([&]{
+    constexpr unsigned side=512;
+    std::vector<uint32_t> pixels(side*side);
+    for(unsigned eye=0;eye<2;++eye) {
+      for(unsigned y=0;y<side;++y)for(unsigned x=0;x<side;++x) {
+        const unsigned along=eye?side-1-x:x;
+        const bool line=x%64<2||y%64<2;
+        const unsigned rgb[3]={line?230u:along*255/(side-1),y*255/(side-1),eye?200u:60u};
+        pixels[y*side+x]=0xff000000u|rgb[0]|(rgb[1]<<8)|(rgb[2]<<16);
+      }
+      D3D11_TEXTURE2D_DESC desc{};desc.Width=desc.Height=side;desc.MipLevels=desc.ArraySize=1;
+      desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;desc.SampleDesc.Count=1;
+      desc.Usage=D3D11_USAGE_DEFAULT;desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+      const D3D11_SUBRESOURCE_DATA data{pixels.data(),side*4,0};
+      if(FAILED(host.graphics.device()->CreateTexture2D(&desc,&data,&eyeSources[eye]))){eyesCreated=false;break;}
+    }
+  })&&eyesCreated;})||!eyesCreated)return 3;
   compositor->ClearLastSubmittedFrame();
   const auto cacheBeforeLoading=host.compositorRead();
   bool outsideRejected=false,outsideRan=false;
@@ -454,10 +478,7 @@ int run(const Options& options,PresentHost* present=nullptr) {
         // the other eye, then compose the private pair at the second Submit.
         for(unsigned n=0;n<2;++n) {
           const unsigned eye=n ^ unsigned(frames&1);
-          ID3D11Texture2D* source=nullptr;
-          r=host.drawDiagnosticEye(eye,source);
-          if(r!=XR_SUCCESS){result("draw_eye",r);failed=true;break;}
-          const vr::Texture_t texture{source,vr::API_DirectX,vr::ColorSpace_Gamma};
+          const vr::Texture_t texture{eyeSources[eye].Get(),vr::API_DirectX,vr::ColorSpace_Gamma};
           const auto submitted=compositor->Submit(vr::EVREye(eye),&texture);
           if(submitted!=vr::VRCompositorError_None) {
             std::printf("error,submit_eye,%u,%d,xr=%d\n",eye,int(submitted),int(host.boundary.lastResult()));failed=true;break;
@@ -634,7 +655,28 @@ int selfTest() {
   edvr::openxr::test::runFeatureHostCases(check);
   edvr::openxr::test::runTreatmentCases(check);
   edvr::openxr::test::runDeferredTreatmentCases(check);
+  edvr::openxr::test::runFrameEndOverlapCases(check);
   edvr::openxr::test::runSubmissionStatsCases(check);
+  edvr::openxr::test::runFrameCycleCases(check);
+  {
+    OwnerService cycleOwner;RenderThreadDispatcher cycleDispatcher(cycleOwner);RenderRoute cycleRoute{cycleDispatcher};
+    auto cycleHost=std::make_unique<NativeRuntimeHost>(cycleOwner,cycleDispatcher,cycleRoute);
+    FrameCycleStats::Shape shape{};shape.width[0]=shape.width[1]=1;shape.height[0]=shape.height[1]=1;
+    shape.outputWidth[0]=shape.outputWidth[1]=1;shape.outputHeight[0]=shape.outputHeight[1]=1;shape.generation=1;
+    auto frame=[&](uint64_t seq,uint64_t base,uint64_t ms){auto w=cycleHost->frameCycles.waitCallerBegin(base,7);cycleHost->frameCycles.waitOwnerBegin(w,base+1);cycleHost->frameCycles.waitOwnerEnd(w,base+2);cycleHost->frameCycles.waitCallerEnd(w,seq,base+3,ms,7,shape,true);
+      for(unsigned eye=0;eye<2;++eye){auto s=cycleHost->frameCycles.submitCallerBegin(eye,base+10+eye*10,7);cycleHost->frameCycles.submitOwnerBegin(s,base+11+eye*10);cycleHost->frameCycles.submitOwnerEnd(s,base+12+eye*10);cycleHost->frameCycles.submitCallerEnd(s,eye,seq,base+13+eye*10,7,0.001,true);}};
+    frame(1,1000,1);frame(2,2000,2);
+    EdvrNativePresentTrace present{sizeof(present),EDVR_NATIVE_PRESENT_TRACE_VERSION_1,1,0,1,1};
+    present.spans[0]={2100,2200,2400,2500,2600,7,0,0,0};
+    auto w=cycleHost->frameCycles.waitCallerBegin(3000,7,&present);cycleHost->frameCycles.waitOwnerBegin(w,3001);cycleHost->frameCycles.waitOwnerEnd(w,3002);cycleHost->frameCycles.waitCallerEnd(w,3,3003,31002,7,shape,true);
+    cycleHost->reportFrameCycles(500);
+    check(cycleHost->frameCycleReportWork.runs()==1&&cycleHost->frameCycleReportWork.maxTicks()>=500,
+      "phase-0 timing: a finished frame-cycle report is one frame_cycle_report run, its build time included");
+    cycleHost->reportFrameCycles(500);
+    check(cycleHost->frameCycleReportWork.runs()==1,"phase-0 timing: no report ready is not a run");
+    check(cycleHost->frameCycleFirstNoted.load(),"production frame-cycle report path reachable");
+    check(cycleHost->postSubmitFirstNoted.load(),"production post-submit report path reachable with accepted Present sample");
+  }
   edvr::openxr::test::runFrequencyCases(check);
   edvr::openxr::test::runVisibilityCases(check);
   edvr::openxr::test::runSteamIdentityCases(check);

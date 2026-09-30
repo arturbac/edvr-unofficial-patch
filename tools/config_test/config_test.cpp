@@ -19,16 +19,41 @@
 // were real bugs, and the BOM case files every setting in the file under the
 // wrong section while the file still looks fine.
 //
+// Four more (2026-09-29) are about threads, the log and the file's sharing, and
+// read the real log file back rather than counting calls:
+//
+//   - a reader thread hammering the getters while the main thread rewrites the
+//     ini and reloads it, so a lock that is missing, or held only around the
+//     lookup and not the copy, shows as a wrong value or a crash;
+//   - a malformed value is said once per key per successful parse, however
+//     often it is read -- it was said on every read, 90 to 180 lines a second
+//     for a key read each frame;
+//   - getFloat takes the whole value and only a finite one;
+//   - a reload leaves edvr.ini open to being replaced, renamed or deleted (the
+//     read shares DELETE): the menu saves by renaming a temp file over it with
+//     POSIX semantics, and a read that did not share DELETE held that off while
+//     the reload had the file open.
+//
 // Usage: config_test.exe <dir containing edvr.ini> [scratch dir]
+//        config_test.exe --ininame-cases <scratch dir>   (its own child; see iniNameFixturesIsolated)
 #include <windows.h>
 
+#include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "../../src/common/config.h"
+#include "../../src/common/ini_name.h"
+#include "../../src/common/runtime_profile.h"
+#include "../../src/common/temporal_mode.h"
 #include "../../src/common/log.h"
+#include "config_contract_gen.h"   // build\gen: the tables the DLLs register, from the real edvr.ini
 
 using namespace edvr;
 
@@ -86,9 +111,10 @@ static std::wstring widen(const char* p) {
 
 // A scratch ini written from a literal, for the cases the real file cannot
 // contain without being wrong.
-static bool writeIni(const std::wstring& dir, const char* body) {
+static bool writeIni(const std::wstring& dir, const char* body,
+                     const wchar_t* leaf = L"edvr.ini") {
     CreateDirectoryW(dir.c_str(), nullptr);
-    const std::wstring path = dir + L"\\edvr.ini";
+    const std::wstring path = dir + L"\\" + leaf;
     HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
@@ -98,11 +124,928 @@ static bool writeIni(const std::wstring& dir, const char* body) {
     return true;
 }
 
+// The text of a file under the repo root, or empty: for the checks that hold
+// the shipped ini and the code that reads it to one answer.
+static std::string readRepoFile(const std::wstring& root, const wchar_t* relative) {
+    std::string out;
+    HANDLE f = CreateFileW((root + L"\\" + relative).c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return out;
+    char buf[8192];
+    DWORD got = 0;
+    while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got > 0) out.append(buf, got);
+    CloseHandle(f);
+    return out;
+}
+
+// The literal a getString call falls back to for `key`: its second argument.
+// "<no such read>" when the call is not in the source, so a rename fails loudly.
+static std::string codeFallbackOf(const std::string& source, const char* key) {
+    const std::string needle = std::string("getString(\"") + key + "\", \"";
+    const size_t at = source.find(needle);
+    if (at == std::string::npos) return "<no such read>";
+    const size_t begin = at + needle.size();
+    const size_t end = source.find('"', begin);
+    return end == std::string::npos ? "<unterminated>" : source.substr(begin, end - begin);
+}
+
+// writeIni, then a last-write time no earlier write has carried.
+//
+// reloadIfChanged() decides by comparing last-write times, and two writes inside
+// one clock tick -- 15 ms unless something has raised the timer rate -- carry the
+// same one. A loop that rewrites the file and reloads would then skip most of
+// its reloads without saying so, and a test of what a reload does to a reader
+// would be testing almost nothing. Each call stamps a time one second on from
+// the last, so every reload that follows is a parse.
+static bool rewriteIni(const std::wstring& dir, const std::string& body,
+                       const wchar_t* leaf = L"edvr.ini") {
+    if (!writeIni(dir, body.c_str(), leaf)) return false;
+    static ULONGLONG stamp = 0;
+    if (!stamp) {
+        FILETIME now;
+        GetSystemTimeAsFileTime(&now);
+        stamp = (static_cast<ULONGLONG>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    }
+    stamp += 10000000ull;  // 100 ns ticks: one second
+    FILETIME ft;
+    ft.dwLowDateTime = static_cast<DWORD>(stamp & 0xFFFFFFFFull);
+    ft.dwHighDateTime = static_cast<DWORD>(stamp >> 32);
+    HANDLE f = CreateFileW((dir + L"\\" + leaf).c_str(), FILE_WRITE_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    const BOOL stamped = SetFileTime(f, nullptr, nullptr, &ft);
+    CloseHandle(f);
+    return stamped != FALSE;
+}
+
+// Every edvr_<tag>_*.log in `dir`, gone: so "the newest" below is provably THIS
+// run's, and the scratch directory does not grow with every build.
+static void deleteLogs(const std::wstring& dir, const wchar_t* tag) {
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"\\edvr_" + tag + L"_*.log").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        DeleteFileW((dir + L"\\" + fd.cFileName).c_str());
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+// The newest edvr_<tag>_*.log in `dir`, whole; empty if there is none. Close the
+// log first: it is written by a flusher thread and only close() drains it.
+static std::string readNewestLog(const std::wstring& dir, const wchar_t* tag) {
+    std::string body;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"\\edvr_" + tag + L"_*.log").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return body;
+    std::wstring newest = fd.cFileName;
+    while (FindNextFileW(h, &fd)) newest = fd.cFileName;
+    FindClose(h);
+    HANDLE f = CreateFileW((dir + L"\\" + newest).c_str(), GENERIC_READ, FILE_SHARE_READ,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return body;
+    char chunk[65536];
+    DWORD got = 0;
+    while (ReadFile(f, chunk, sizeof(chunk), &got, nullptr) && got) body.append(chunk, got);
+    CloseHandle(f);
+    return body;
+}
+
+static int countOf(const std::string& haystack, const char* needle) {
+    int n = 0;
+    for (size_t at = haystack.find(needle); at != std::string::npos;
+         at = haystack.find(needle, at + 1)) {
+        ++n;
+    }
+    return n;
+}
+
+// --- getFloat: the whole value, and a finite one (2026-09-29) --------------
+//
+// strtof stops at the first character it cannot use and accepts "nan" and
+// "inf". getFloat asked only that SOMETHING parsed, so "1.5x" read as 1.5 and
+// "2,75" as 2 -- the truncation getInt was cured of -- and a NaN walked past
+// every range test a caller wrote, because it compares false against all of
+// them. A refused value is the caller's default, which is what expectFloat's
+// -999999 sentinel stands for.
+static void floatCases(const std::wstring& scratch) {
+    static const char kIni[] =
+        "[flt]\r\n"
+        "nan = nan\r\n"
+        "inf = inf\r\n"
+        "neginf = -inf\r\n"
+        "overflow = 1e999\r\n"      // strtof answers infinity, not an error
+        "junk = 1.5x\r\n"
+        "comma = 2,75\r\n"          // the comma locale the comment on getFloat names
+        "good = 1.5\r\n"
+        "neg = -0.25\r\n"
+        "whole = 2\r\n"
+        "exponent = 1e-3\r\n";
+    if (!writeIni(scratch, kIni)) {
+        fail("float scratch ini", "could not write it");
+        return;
+    }
+    Config::get().init(scratch);
+    expectFloat("flt.nan", -999999.0f, "getFloat refuses nan");
+    expectFloat("flt.inf", -999999.0f, "...and inf");
+    expectFloat("flt.neginf", -999999.0f, "...and -inf");
+    expectFloat("flt.overflow", -999999.0f, "...and a value too big for a float");
+    expectFloat("flt.junk", -999999.0f, "...and a number with a letter after it");
+    expectFloat("flt.comma", -999999.0f, "...and a decimal written with a comma");
+    expectFloat("flt.good", 1.5f, "getFloat still reads a plain decimal");
+    expectFloat("flt.neg", -0.25f, "...a negative one");
+    expectFloat("flt.whole", 2.0f, "...a whole number");
+    expectFloat("flt.exponent", 0.001f, "...and an exponent");
+}
+
+// --- a malformed value is said once per parse, however often it is read -----
+//
+// The getters noted it on EVERY read. A key read each frame wrote the same line
+// 90 to 180 times a second until log.max_mb, and then the flight logged
+// nothing. The property is read off the real log file, because a counter would
+// only prove that a counter was incremented.
+//
+// The same session covers the config audit's queue, whose flush now takes an
+// atomic flag and a lock instead of reading a vector: findings raised before
+// the log opens are written when it does, exactly once, and a reload that
+// finds the same lines does not write them again.
+//
+// Three parses, one log:
+//   1. malformed values, log CLOSED for the first hundred reads, then open.
+//      Nothing can be written while it is closed, and that must not use up the
+//      key's one note -- most keys are first read before Log::open.
+//   2. the same values again, rewritten: a new parse, so one more note.
+//   3. valid values: nothing to say.
+// So each malformed key appears twice in the file, not 0, 1 or 200.
+static void noteCases(const std::wstring& scratch) {
+    static const char* kKnown[] = {"experimental.zeta", "once.flag", "once.count",
+                                   "once.scale", "once.range", "once.rangebad"};
+    static const char* kMoved[][3] = {{"fix.zeta", "experimental.zeta", ""}};
+    const std::string first =
+        "[once]\r\n"
+        "flag = maybe\r\n"          // getBool
+        "count = 4w\r\n"            // getInt
+        "scale = 1,5\r\n"           // getFloat
+        "range = 999\r\n"           // getIntInRange, past the top
+        "rangebad = twelve\r\n"     // getIntInRange, not a number
+        "[fix]\r\n"
+        "zeta = 7\r\n"              // a moved key: the audit says so
+        "mystery2 = 9\r\n";         // a key nothing reads: the audit says so
+    const std::string second = first + "# written again, same values\r\n";
+    const std::string valid =
+        "[once]\r\n"
+        "flag = yes\r\n"
+        "count = 4\r\n"
+        "scale = 1.5\r\n"
+        "range = 7\r\n"
+        "rangebad = 8\r\n";
+
+    Config& cfg = Config::get();
+    // Reads every key 100 times and counts the answers that are not the ones a
+    // caller must get: the default for a malformed value, the clamp for an
+    // out-of-range one. Saying less must not change what is returned.
+    auto readRound = [&cfg](bool valid_) {
+        int wrong = 0;
+        for (int i = 0; i < 100; ++i) {
+            // A default that is NOT the answer, so a value read as absent shows.
+            if (cfg.getBool("once.flag", !valid_) != true) ++wrong;
+            if (cfg.getInt("once.count", 5) != (valid_ ? 4 : 5)) ++wrong;
+            if (cfg.getFloat("once.scale", 0.5f) != (valid_ ? 1.5f : 0.5f)) ++wrong;
+            if (cfg.getIntInRange("once.range", 5, 1, 10) != (valid_ ? 7 : 10)) ++wrong;
+            if (cfg.getIntInRange("once.rangebad", 5, 1, 10) != (valid_ ? 8 : 5)) ++wrong;
+        }
+        return wrong;
+    };
+
+    Log::get().close();                 // whatever an earlier case left open
+    deleteLogs(scratch, L"noteonce");
+    cfg.setAuditTables(kKnown, 6, kMoved, 1);
+    auto finish = [&]() {
+        Log::get().close();
+        cfg.setAuditTables(nullptr, 0, nullptr, 0);
+    };
+
+    if (!rewriteIni(scratch, first)) {
+        fail("note cases", "could not write the scratch ini");
+        finish();
+        return;
+    }
+    cfg.init(scratch);                  // parse 1: the audit's findings queue
+    int wrong = readRound(false);       // log closed: nothing to write, nothing spent
+    if (!Log::get().open(scratch, L"noteonce")) {
+        fail("note cases", "the log would not open in the scratch dir");
+        finish();
+        return;
+    }
+    wrong += readRound(false);          // parse 1, log open
+    if (!rewriteIni(scratch, second) || !cfg.reloadIfChanged()) {
+        fail("note cases", "the second write did not reload");
+        finish();
+        return;
+    }
+    wrong += readRound(false);          // parse 2
+    if (!rewriteIni(scratch, valid) || !cfg.reloadIfChanged()) {
+        fail("note cases", "the third write did not reload");
+        finish();
+        return;
+    }
+    wrong += readRound(true);           // parse 3: valid, so silent
+    finish();
+
+    if (wrong) {
+        fail("note cases", std::to_string(wrong) + " reads returned something other than "
+                           "the default, the clamp or the value");
+    } else {
+        ok("saying a malformed value once changes nothing a getter returns");
+    }
+
+    const std::string body = readNewestLog(scratch, L"noteonce");
+    if (body.empty()) {
+        fail("note cases", "could not read the log back");
+        return;
+    }
+    static const struct { const char* needle; int want; const char* what; } kNeeds[] = {
+        {"once.flag = \"maybe\"", 2,
+         "a malformed yes/no is noted once per parse, not once per read"},
+        {"once.count = \"4w\"", 2, "...a malformed integer"},
+        {"once.scale = \"1,5\"", 2, "...a malformed float"},
+        {"once.range = 999 is outside", 2, "...an out-of-range bounded integer"},
+        {"once.rangebad = \"twelve\"", 2, "...a malformed bounded integer"},
+        {"fix.zeta has moved to experimental.zeta", 1,
+         "an audit finding raised before the log opened is written once, and not "
+         "again by a reload"},
+        {"does not read: fix.mystery2", 1, "...and so is the audit's dead-line note"},
+    };
+    for (const auto& n : kNeeds) {
+        const int got = countOf(body, n.needle);
+        if (got == n.want) ok(n.what);
+        else fail(n.what, std::string("\"") + n.needle + "\" appears " +
+                              std::to_string(got) + " times in the log, wanted " +
+                              std::to_string(n.want));
+    }
+}
+
+// --- reads that race a reload (2026-09-29) ----------------------------------
+//
+// parse() swaps a freshly parsed map in and frees the old one. The render
+// thread does that whenever the ini's write time moves -- an in-VR menu write
+// does it -- while the OpenXR owner thread's deferred frame end reads
+// advanced.app_gpu_timing on its own. With no lock a read that straddled the
+// swap walked nodes that were being freed. And getString called the audit's
+// flush, which mutated a shared vector from whichever thread happened to read.
+//
+// The reader hammers four keys and a fifth that is never present; the main
+// thread alternates the file between two contents and reloads each time. Every
+// key has one of two legal values (the bool has one: both contents spell it
+// false, and the reader's default is true, so an absent key reads as true).
+// Anything else -- a default where a value should be, a torn string, an access
+// violation -- is the failure. The outcome for a correct build is
+// deterministic: the reader either only ever sees a whole map, or it does not.
+struct RaceReader {
+    std::atomic<bool> stop{false};
+    std::atomic<long> reads{0};
+    // Written by the reader thread alone; the main thread reads them after join().
+    long        bad = 0;
+    std::string firstBad;
+};
+
+static void raceReaderMain(RaceReader* r) {
+    Config& c = Config::get();
+    long n = 0;
+    auto flag = [r](const std::string& what) {
+        if (++r->bad == 1) r->firstBad = what;
+    };
+    while (!r->stop.load(std::memory_order_relaxed)) {
+        if (c.getBool("race.flag", true)) flag("race.flag read true: the key vanished");
+        const int count = c.getInt("race.count", -1);
+        if (count != 7 && count != 9) flag("race.count = " + std::to_string(count));
+        const float scale = c.getFloat("race.scale", -1.0f);
+        if (scale != 1.5f && scale != 2.5f) flag("race.scale = " + std::to_string(scale));
+        const std::string name = c.getString("race.name", "<none>");
+        if (name != "alpha" && name != "bravo") flag("race.name = \"" + name + "\"");
+        if (c.getInt("race.absent", -1) != -1) flag("race.absent found a value");
+        r->reads.store(++n, std::memory_order_relaxed);
+    }
+}
+
+static void raceCase(const std::wstring& scratch) {
+    const auto content = [](const char* flag, int count, const char* scale, const char* name) {
+        std::string s = "[race]\r\n";
+        s += std::string("flag = ") + flag + "\r\n";
+        s += "count = " + std::to_string(count) + "\r\n";
+        s += std::string("scale = ") + scale + "\r\n";
+        s += std::string("name = ") + name + "\r\n";
+        // A deeper tree takes longer to walk and to free, which is what widens
+        // the window that the lock has to close.
+        for (int i = 0; i < 64; ++i) s += "pad" + std::to_string(i) + " = " + name + "\r\n";
+        return s;
+    };
+    const std::string a = content("off", 7, "1.5", "alpha");
+    const std::string b = content("no", 9, "2.5", "bravo");
+
+    if (!rewriteIni(scratch, a)) {
+        fail("config race", "could not write the scratch ini");
+        return;
+    }
+    Config::get().init(scratch);
+
+    RaceReader reader;
+    std::thread thread(raceReaderMain, &reader);
+
+    // Do not start reloading until the reader is demonstrably running: a thread
+    // that has not been scheduled yet would make the loop below a test of nothing.
+    const ULONGLONG t0 = GetTickCount64();
+    while (reader.reads.load() < 1000 && GetTickCount64() - t0 < 5000) Sleep(1);
+    const bool started = reader.reads.load() >= 1000;
+
+    int  reloads = 0;
+    int  unparsed = 0;
+    bool writeFailed = false;
+    if (started) {
+        const ULONGLONG t1 = GetTickCount64();
+        while (reloads < 300 && GetTickCount64() - t1 < 1500) {
+            if (!rewriteIni(scratch, (reloads & 1) ? a : b)) {
+                writeFailed = true;
+                break;
+            }
+            if (!Config::get().reloadIfChanged()) ++unparsed;
+            ++reloads;
+        }
+    }
+    reader.stop.store(true);
+    thread.join();
+
+    if (!started) {
+        fail("config race", "the reader thread did not get going within 5 s");
+    } else if (writeFailed) {
+        fail("config race", "could not rewrite the scratch ini");
+    } else if (reloads < 20) {
+        fail("config race", "only " + std::to_string(reloads) + " reloads ran in 1.5 s; "
+                            "too few to say anything about a race");
+    } else if (unparsed) {
+        fail("config race", std::to_string(unparsed) + " of " + std::to_string(reloads) +
+                            " reloads found the file unchanged, so they never parsed");
+    } else if (reader.bad) {
+        fail("config race", std::to_string(reader.bad) + " bad reads; the first: " +
+                            reader.firstBad);
+    } else {
+        ok("reads racing reloads only ever see one whole map or the other");
+    }
+    printf("  info  %ld reads raced %d reloads\n", reader.reads.load(), reloads);
+}
+
+// --- a reload leaves the file open to being replaced (2026-09-29) --------------
+//
+// Config's read of edvr.ini opened it with FILE_SHARE_READ | FILE_SHARE_WRITE --
+// no FILE_SHARE_DELETE -- so for as long as a reload held the file (tens of
+// microseconds) nothing could delete it, rename it or replace it with POSIX
+// rename semantics, and the in-headset menu, which saves by renaming a temp file
+// over edvr.ini and asks for a reload straight after, could meet that hold on its
+// very next save.
+//
+// What this proves is the share mode; the replace itself is installer_test's
+// (its atomic-write cases replace a file under a reader that opens it this way).
+// iniedit's replace is a POSIX-semantics rename, which goes through under a
+// handle that shares DELETE and is refused under one that does not; the classic
+// MoveFileExW it falls back to is refused while ANY handle to the target is open.
+// The share mode is the half of that which lives here.
+//
+// The read cannot be paused from outside, so a second thread does to it what a
+// rename would: it opens the file for DELETE, with every share mode, over and
+// over, and counts the refusals that happen wholly inside a reload. It runs only
+// inside a reload, because a probe that ran while the test itself rewrote the
+// file would collide with the test: `busy` is the handshake that makes that so,
+// since a probe thread can be descheduled between opening the file and closing
+// it, and the test must not rewrite the file until that probe is finished.
+// A correct parse() is never refused. One without FILE_SHARE_DELETE is refused
+// whenever a probe lands while it holds the handle, which is hundreds of probes
+// over the run; the threshold below is for a scanner that happens to hold the
+// freshly written file for a moment, not for the bug.
+struct ProbeState {
+    std::atomic<bool> stop{false};
+    std::atomic<bool> inReload{false};
+    std::atomic<bool> busy{false};  // a probe is between its open and its close
+    std::atomic<long> inside{0};    // probes that ran wholly inside a reload
+    std::atomic<long> refused{0};   // ...and were refused with a sharing violation
+    std::atomic<long> other{0};     // ...and failed some other way
+};
+
+static void probeMain(const std::wstring* path, ProbeState* st) {
+    while (!st->stop.load()) {
+        // busy first, then the flag: either this probe sees the reload over and
+        // does nothing, or the test, after ending the reload, sees busy and waits.
+        st->busy.store(true);
+        if (!st->inReload.load()) {
+            st->busy.store(false);
+            SwitchToThread();
+            continue;
+        }
+        HANDLE h = CreateFileW(path->c_str(), DELETE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const DWORD code = h == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        const bool wholly = st->inReload.load();  // false: the reload ended mid-probe
+        st->busy.store(false);
+        if (!wholly) continue;
+        st->inside.fetch_add(1);
+        if (code == ERROR_SHARING_VIOLATION) st->refused.fetch_add(1);
+        else if (code != ERROR_SUCCESS) st->other.fetch_add(1);
+    }
+}
+
+static void shareDeleteCase(const std::wstring& scratch) {
+    const std::string one = "[share]\r\nk = 1\r\n";
+    const std::string two = "[share]\r\nk = 2\r\n";
+    if (!rewriteIni(scratch, one)) {
+        fail("config share delete", "could not write the scratch ini");
+        return;
+    }
+    Config::get().init(scratch);
+    const std::wstring path = scratch + L"\\edvr.ini";
+
+    ProbeState st;
+    std::thread probe(probeMain, &path, &st);
+
+    // At least 300 reloads, and on until the probe has landed 300 times inside
+    // them: a probe thread that is starved by a busy machine (the rigs run in a
+    // pool) gets the time it needs rather than failing the run for want of it.
+    // The cap is what ends a probe that never runs.
+    int  reloads = 0;
+    int  unparsed = 0;
+    bool writeFailed = false;
+    const ULONGLONG t0 = GetTickCount64();
+    for (int i = 0; i < 20000; ++i) {
+        if (i >= 300 && st.inside.load() >= 300) break;
+        if (i >= 300 && GetTickCount64() - t0 > 8000) break;
+        if (!rewriteIni(scratch, (i & 1) ? one : two)) {
+            writeFailed = true;
+            break;
+        }
+        st.inReload.store(true);
+        const bool parsed = Config::get().reloadIfChanged();
+        st.inReload.store(false);
+        while (st.busy.load()) SwitchToThread();  // a probe in flight finishes before the file is rewritten
+        if (!parsed) ++unparsed;
+        ++reloads;
+    }
+    st.stop.store(true);
+    probe.join();
+
+    const long inside = st.inside.load();
+    const long refused = st.refused.load();
+    if (writeFailed) {
+        fail("config share delete", "could not rewrite the scratch ini");
+    } else if (unparsed) {
+        fail("config share delete", std::to_string(unparsed) + " of " + std::to_string(reloads) +
+                                        " reloads found the file unchanged, so they never read it");
+    } else if (inside < 100) {
+        fail("config share delete", "the probe made only " + std::to_string(inside) +
+                                        " attempts inside " + std::to_string(reloads) +
+                                        " reloads; too few to say anything");
+    } else if (refused > 10) {
+        fail("config share delete",
+             std::to_string(refused) + " of " + std::to_string(inside) +
+                 " attempts to open the ini for delete were refused while a reload had it open: "
+                 "Config's read does not share DELETE");
+    } else {
+        ok("a reload leaves edvr.ini open to being replaced (FILE_SHARE_DELETE)");
+    }
+    printf("  info  %ld probes inside %d reloads, %ld refused, %ld failed another way\n", inside,
+           reloads, refused, st.other.load());
+}
+
+// --- the settings file's name, in every message that carries it (2026-09-30) -------------
+//
+// Flight 052916, on an install that read edvr-flat.ini: the F8 panel said "written to
+// edvr.ini", the config audit said "edvr.ini: 1 line(s) name settings this build does not
+// read" about a line that was in edvr-flat.ini, and a chained mod stayed loaded because the
+// line that turned it off had been commented out in edvr.ini while edvr-flat.ini still had it
+// active. Config::iniName() says which file the process opened; ini_name.h says why nothing
+// else may spell the name. Held here three ways: the resolver against the four situations a
+// process can be in (real Config, real files, real log), the messages that come out of them,
+// and a scan of the sources for a message that spells a name.
+
+static void removeIniFile(const std::wstring& dir, const wchar_t* leaf) {
+    DeleteFileW((dir + L"\\" + leaf).c_str());
+}
+
+// A path as text for a failure line (ASCII paths; anything else prints as '?').
+static std::string narrow(const std::wstring& w) {
+    std::string out;
+    for (wchar_t c : w) out.push_back(c < 128 ? static_cast<char>(c) : '?');
+    return out;
+}
+
+// The pure resolver, for a path a caller already holds.
+static void iniNamePathCases() {
+    static const struct { const wchar_t* path; const char* want; const char* what; } kPaths[] = {
+        {L"C:\\Games\\Elite\\edvr-flat.ini", "edvr-flat.ini", "a path to edvr-flat.ini names it"},
+        {L"C:\\Games\\Elite\\edvr.ini", "edvr.ini", "a path to edvr.ini names it"},
+        {L"C:/Games/Elite/EDVR-FLAT.INI", "edvr-flat.ini", "the name is compared without case, and either slash"},
+        {L"edvr-flat.ini", "edvr-flat.ini", "a bare file name is a path too"},
+        {L"C:\\Games\\edvr-flat.ini.bak", "edvr.ini", "a backup's name is not the file"},
+        {L"C:\\Games\\my-edvr-flat.ini", "edvr.ini", "nor is a longer name that ends the same way"},
+        {L"", "edvr.ini", "no path at all falls back to the VR file's name"},
+    };
+    for (const auto& p : kPaths) {
+        const char* got = iniNameOfPath(p.path);
+        if (std::strcmp(got, p.want) == 0) ok(p.what);
+        else fail(p.what, std::string("\"") + got + "\", wanted \"" + p.want + "\"");
+    }
+}
+
+// The directory this process's exe is in: the other place Config::init looks for a settings file.
+static std::wstring exeDirectory() {
+    wchar_t buf[MAX_PATH * 2]{};
+    const DWORD n = GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(sizeof(buf) / sizeof(buf[0])));
+    const std::wstring path(buf, n);
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
+}
+
+// Four situations, each in a directory of its own with its own log. The file that is NOT read
+// carries a different dead line and a different moved key, so a message about the wrong file
+// shows in the text as well as in the name.
+//
+// Run only by iniNameFixturesIsolated(), in a process whose exe directory holds no ini: Config::init
+// looks in the exe's directory too (a flat process reads <exe dir>\edvr-flat.ini when its module
+// directory has none), and in the build that is build\, where the flat edition's staged
+// edvr-flat.ini sits. The first version of these fixtures ran in this process, asked for "flat,
+// no edvr-flat.ini yet" and was handed build\'s file: the flat-fallback fixture failed in the
+// build and passed from a scratch directory, which is how it got past the author.
+static void iniNameFixtures(const std::wstring& scratch) {
+    const RuntimeProfile savedProfile = g_runtimeProfile;
+    Config& cfg = Config::get();
+
+    // The premise, asserted rather than assumed: nothing beside this exe for the loader to find.
+    {
+        const std::wstring exeDir = exeDirectory();
+        static const wchar_t* kBeside[] = {L"edvr.ini", L"edvr-flat.ini", L"edvr_profile.ini"};
+        std::string found;
+        for (const wchar_t* leaf : kBeside) {
+            if (GetFileAttributesW((exeDir + L"\\" + leaf).c_str()) != INVALID_FILE_ATTRIBUTES)
+                found += std::string(found.empty() ? "" : ", ") + narrow(leaf);
+        }
+        if (exeDir.empty() || !found.empty()) {
+            fail("the fixtures run beside no ini of their own",
+                 "the exe's directory " + narrow(exeDir) + " holds " + (found.empty() ? "no exe path" : found));
+            return;
+        }
+        ok("the fixtures run in a directory with no ini beside the exe");
+    }
+
+    static const char* kKnown[] = {"advanced.d3d11_fixes", "experimental.new_name"};
+    static const char* kMoved[][3] = {{"fix.old_name_1", "experimental.new_name", ""},
+                                      {"fix.old_name_2", "experimental.new_name", ""},
+                                      {"fix.old_name_3", "experimental.new_name", ""}};
+    struct Fixture {
+        const wchar_t* suffix;
+        const wchar_t* tag;
+        const char* descriptor;
+        bool writeVr, writeFlat;
+        int index;                 // which dead and moved key this fixture's read file carries
+        const char* wantName;
+        const char* otherName;     // the name that must never appear as a message's file
+        const char* what;
+    };
+    static const Fixture kFixtures[] = {
+        {L"_ininame_vr", L"ininamevr", "[install]\r\nschema = 1\r\nprofile = vr\r\n", true, true, 1, "edvr.ini",
+         "edvr-flat.ini", "VR profile, with an edvr-flat.ini lying beside it"},
+        {L"_ininame_flat", L"ininameflat", "[install]\r\nschema = 1\r\nprofile = flat\r\n", true, true, 2,
+         "edvr-flat.ini", "edvr.ini", "flat profile, both files present (the flight's install)"},
+        {L"_ininame_fallback", L"ininamefall", "[install]\r\nschema = 1\r\nprofile = flat\r\n", true, false, 3,
+         "edvr.ini", "edvr-flat.ini", "flat profile, no edvr-flat.ini yet: it reads edvr.ini whole"},
+        {L"_ininame_none", L"ininamenone", "[install]\r\nschema = 1\r\nprofile = flat\r\n", false, false, 0,
+         "edvr-flat.ini", "edvr.ini", "flat profile, neither file: the one it would create"},
+    };
+
+    Log::get().close();
+    for (const Fixture& f : kFixtures) {
+        const std::wstring dir = scratch + f.suffix;
+        CreateDirectoryW(dir.c_str(), nullptr);
+        removeIniFile(dir, L"edvr.ini");
+        removeIniFile(dir, L"edvr-flat.ini");
+        deleteLogs(dir, f.tag);
+        // The read file carries: a dead line, a moved key still on its old name, a malformed
+        // yes/no. The other file carries a dead line and a moved key of its own (never reported).
+        const std::string mine = "[advanced]\r\nd3d11_fixes = maybe\r\n[fix]\r\nstale_line_" +
+                                 std::to_string(f.index) + " = on\r\nold_name_" + std::to_string(f.index) +
+                                 " = 3\r\n";
+        const std::string other = "[fix]\r\nnot_the_file_read = on\r\nold_name_9 = 4\r\n";
+        const bool flatRead = std::strcmp(f.wantName, "edvr-flat.ini") == 0;
+        bool wrote = writeIni(dir, f.descriptor, L"edvr_profile.ini");
+        if (f.writeVr) wrote = wrote && writeIni(dir, (flatRead ? other : mine).c_str(), L"edvr.ini");
+        if (f.writeFlat) wrote = wrote && writeIni(dir, (flatRead ? mine : other).c_str(), L"edvr-flat.ini");
+        if (!wrote) {
+            fail(f.what, "could not write the fixture");
+            continue;
+        }
+        cfg.setAuditTables(kKnown, 2, kMoved, 3);
+        cfg.init(dir);
+        const std::string got = cfg.iniName();
+        if (got == f.wantName) ok(f.what);
+        else fail(f.what, "iniName() said " + got + ", wanted " + f.wantName);
+        if (!f.writeVr && !f.writeFlat) {
+            // Nothing to read, nothing to say: the name is all this fixture asks.
+            cfg.setAuditTables(nullptr, 0, nullptr, 0);
+            continue;
+        }
+        if (!Log::get().open(dir, f.tag)) {
+            fail(f.what, "the log would not open");
+            cfg.setAuditTables(nullptr, 0, nullptr, 0);
+            continue;
+        }
+        (void)cfg.getBool("advanced.d3d11_fixes", true);   // says the malformed yes/no, flushes the audit's queue
+        Log::get().close();
+        cfg.setAuditTables(nullptr, 0, nullptr, 0);
+        const std::string body = readNewestLog(dir, f.tag);
+        const std::string idx = std::to_string(f.index);
+        const std::string mineName = f.wantName;
+        struct Need { std::string needle; const char* what; };
+        const Need needs[] = {
+            {mineName + ": 1 line(s) name settings this build does not read: fix.stale_line_" + idx,
+             "the config audit's dead-line note names the file it read"},
+            {mineName + ": fix.old_name_" + idx + " has moved to experimental.new_name",
+             "the moved-key note names it"},
+            {mineName + ": advanced.d3d11_fixes = \"maybe\" is not a yes/no value",
+             "a malformed yes/no names it"},
+        };
+        for (const Need& n : needs) {
+            if (body.find(n.needle) != std::string::npos) ok((std::string(f.what) + ": " + n.what).c_str());
+            else fail((std::string(f.what) + ": " + n.what).c_str(), "\"" + n.needle + "\" is not in the log");
+        }
+        // Never the other file: not at the front of a message, and nothing said about its own lines.
+        // A log line starts "[hh:mm:ss.mmm] " and then the message, so look for the other name right
+        // after that (edvr-flat.ini never matches "edvr.ini: ", the names differ before the dot).
+        const std::string otherPrefix = std::string(f.otherName) + ": ";
+        bool otherFirst = false;
+        for (size_t at = body.find(otherPrefix); at != std::string::npos; at = body.find(otherPrefix, at + 1)) {
+            if (at >= 2 && body[at - 1] == ' ' && body[at - 2] == ']') otherFirst = true;
+        }
+        if (!otherFirst) ok((std::string(f.what) + ": no message names the other file").c_str());
+        else fail((std::string(f.what) + ": a message names the other file").c_str(),
+                  std::string("\"") + otherPrefix + "\" starts a message");
+        if (body.find("not_the_file_read") == std::string::npos && body.find("old_name_9") == std::string::npos)
+            ok((std::string(f.what) + ": nothing is said about the file it did not read").c_str());
+        else fail((std::string(f.what) + ": it reported the file it did not read").c_str(), "a line of the other file is in the log");
+    }
+    g_runtimeProfile = savedProfile;
+    // The last line the parent looks for: a process that died part-way says nothing after its
+    // failures, and "no failure lines" must not read as "all four ran".
+    ok("the four situations ran to the end");
+}
+
+// Runs iniNameFixtures() in a copy of this exe kept in a directory that holds nothing else, and
+// takes its lines as this process's own. The copy is a child whose stdout goes to a file: a few
+// dozen lines, read back whole once it has exited.
+static void iniNameFixturesIsolated(const std::wstring& scratchArg) {
+    const char* const what = "the settings file's name in a process of its own";
+    wchar_t self[MAX_PATH * 2]{};
+    const DWORD selfLen = GetModuleFileNameW(nullptr, self, static_cast<DWORD>(sizeof(self) / sizeof(self[0])));
+    if (selfLen == 0 || selfLen >= sizeof(self) / sizeof(self[0])) {
+        fail(what, "could not find this exe's own path");
+        return;
+    }
+    // The child starts in a directory of its own, so it is given the scratch directory in full.
+    wchar_t full[MAX_PATH * 2]{};
+    const DWORD fullLen = GetFullPathNameW(scratchArg.c_str(), static_cast<DWORD>(sizeof(full) / sizeof(full[0])),
+                                           full, nullptr);
+    if (fullLen == 0 || fullLen >= sizeof(full) / sizeof(full[0])) {
+        fail(what, "could not make " + narrow(scratchArg) + " a full path");
+        return;
+    }
+    const std::wstring scratch(full, fullLen);
+    const std::wstring home = scratch + L"_ininame_exe";
+    const std::wstring exe = home + L"\\config_test.exe";
+    const std::wstring outPath = home + L"\\output.txt";
+    CreateDirectoryW(home.c_str(), nullptr);
+    if (!CopyFileW(self, exe.c_str(), FALSE)) {
+        fail(what, "could not copy the exe to " + narrow(home) + " (error " + std::to_string(GetLastError()) + ")");
+        return;
+    }
+
+    SECURITY_ATTRIBUTES inherit{};
+    inherit.nLength = sizeof(inherit);
+    inherit.bInheritHandle = TRUE;
+    HANDLE out = CreateFileW(outPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &inherit, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE) {
+        fail(what, "could not open " + narrow(outPath) + " (error " + std::to_string(GetLastError()) + ")");
+        return;
+    }
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = out;
+    si.hStdError = out;
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = L"\"" + exe + L"\" --ininame-cases \"" + scratch + L"\"";
+    const BOOL started = CreateProcessW(exe.c_str(), &cmd[0], nullptr, nullptr, TRUE, 0, nullptr,
+                                        home.c_str(), &si, &pi);
+    const DWORD startError = GetLastError();
+    CloseHandle(out);
+    if (!started) {
+        fail(what, "could not start " + narrow(exe) + " (error " + std::to_string(startError) + ")");
+        return;
+    }
+    DWORD code = 1;
+    if (WaitForSingleObject(pi.hProcess, 120000) != WAIT_OBJECT_0) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 5000);
+        fail(what, "the process did not finish in two minutes");
+    } else {
+        GetExitCodeProcess(pi.hProcess, &code);
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    std::string text;
+    if (FILE* f = _wfopen(outPath.c_str(), L"rb")) {
+        char chunk[4096];
+        size_t got;
+        while ((got = fread(chunk, 1, sizeof(chunk), f)) > 0) text.append(chunk, got);
+        fclose(f);
+    }
+    // Its lines are this run's lines; its failures are this run's failures.
+    bool sawLast = false;
+    bool sawFailure = false;
+    for (size_t at = 0; at < text.size();) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(at, end - at);
+        at = end + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.empty()) continue;
+        printf("%s\n", line.c_str());
+        if (line.compare(0, 6, "  FAIL") == 0) {
+            ++g_fails;
+            sawFailure = true;
+        } else if (line == "  ok    the four situations ran to the end") {
+            sawLast = true;
+        }
+    }
+    if (!sawLast && !sawFailure) fail(what, "the process printed no result (exit code " + std::to_string(code) + ")");
+    else if (code != 0 && !sawFailure) fail(what, "the process exited with code " + std::to_string(code));
+}
+
+static void iniNameCases(const std::wstring& scratch) {
+    iniNamePathCases();
+    iniNameFixturesIsolated(scratch);
+}
+
+// A message that spells the settings file's name is the fault; tools\config_test knows it by scanning.
+// String literals only -- a comment may name a file -- lexed, not grepped, so a quote inside a char
+// literal, an apostrophe in a comment or a raw string cannot hide one or invent one.
+static std::vector<std::string> namedLiterals(const std::string& text) {
+    std::vector<std::string> hits;
+    const size_t n = text.size();
+    size_t line = 1;
+    auto lower = [](std::string s) { for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c))); return s; };
+    auto check = [&](const std::string& literal, size_t atLine) {
+        const std::string l = lower(literal);
+        if (l.find("edvr.ini") != std::string::npos || l.find("edvr-flat.ini") != std::string::npos)
+            hits.push_back("line " + std::to_string(atLine) + ": \"" + literal.substr(0, 70) + "\"");
+    };
+    for (size_t i = 0; i < n;) {
+        const char c = text[i];
+        if (c == '\n') { ++line; ++i; continue; }
+        if (c == '/' && i + 1 < n && text[i + 1] == '/') {          // line comment
+            while (i < n && text[i] != '\n') ++i;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && text[i + 1] == '*') {          // block comment
+            i += 2;
+            while (i + 1 < n && !(text[i] == '*' && text[i + 1] == '/')) { if (text[i] == '\n') ++line; ++i; }
+            i += 2;
+            continue;
+        }
+        if (c == '\'') {                                            // char literal (or a digit separator)
+            // A separator sits inside a number (0x1'0000): the token it is in starts with a digit.
+            // L'a' and u8'a' are char literals: their token starts with a letter.
+            size_t s = i;
+            while (s > 0 && (isalnum(static_cast<unsigned char>(text[s - 1])) || text[s - 1] == '_' ||
+                             text[s - 1] == '\'' || text[s - 1] == '.'))
+                --s;
+            const bool separator = s < i && isdigit(static_cast<unsigned char>(text[s])) && i + 1 < n &&
+                                   isalnum(static_cast<unsigned char>(text[i + 1]));
+            ++i;
+            if (separator) continue;
+            while (i < n && text[i] != '\'' && text[i] != '\n') { if (text[i] == '\\') ++i; ++i; }
+            ++i;
+            continue;
+        }
+        if (c == '"') {
+            const size_t atLine = line;
+            const bool raw = i > 0 && text[i - 1] == 'R';
+            std::string literal;
+            if (raw) {                                              // R"delim( ... )delim"
+                size_t d = i + 1;
+                std::string delim;
+                while (d < n && text[d] != '(' && text[d] != '\n' && delim.size() < 17) delim += text[d++];
+                const std::string close = ")" + delim + "\"";
+                const size_t end = text.find(close, d);
+                const size_t stop = end == std::string::npos ? n : end;
+                literal = text.substr(d + 1 < n ? d + 1 : n, stop > d ? stop - d - 1 : 0);
+                for (char ch : literal) if (ch == '\n') ++line;
+                i = end == std::string::npos ? n : end + close.size();
+            } else {
+                ++i;
+                while (i < n && text[i] != '"' && text[i] != '\n') {
+                    if (text[i] == '\\' && i + 1 < n) { literal += text[i + 1]; i += 2; continue; }
+                    literal += text[i++];
+                }
+                ++i;
+            }
+            check(literal, atLine);
+            continue;
+        }
+        ++i;
+    }
+    return hits;
+}
+
+// Every source under src\ but the installer's (which manages both files and says which it means).
+static void collectSources(const std::wstring& dir, const std::wstring& relative,
+                           std::vector<std::wstring>* out) {
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        const std::wstring name = fd.cFileName;
+        if (name == L"." || name == L"..") continue;
+        const std::wstring rel = relative.empty() ? name : relative + L"\\" + name;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (_wcsicmp(rel.c_str(), L"installer") == 0) continue;
+            collectSources(dir + L"\\" + name, rel, out);
+            continue;
+        }
+        const size_t dot = name.find_last_of(L'.');
+        const std::wstring ext = dot == std::wstring::npos ? L"" : name.substr(dot);
+        if (_wcsicmp(ext.c_str(), L".cpp") == 0 || _wcsicmp(ext.c_str(), L".h") == 0 ||
+            _wcsicmp(ext.c_str(), L".inc") == 0 || _wcsicmp(ext.c_str(), L".hpp") == 0)
+            out->push_back(rel);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static void iniNameScan(const std::wstring& root) {
+    // The scanner itself first: it must find what it is for, and only that.
+    const std::string violating =
+        "void f() {\n"
+        "    Log::get().note(\"edvr.ini: advanced.x is bad\");\n"      // a message: the fault
+        "    // \"edvr.ini\" in a comment is fine\n"
+        "    /* and \"edvr-flat.ini\" in a block comment */\n"
+        "    const char q = '\"'; const char* s = \"a quote \\\" and edvr-flat.ini\";\n"   // the literal ends at its own quote
+        "    const wchar_t* w = L\"\\\\EDVR.INI\";\n"                   // wide, and without case
+        "    const char* r = R\"(raw edvr.ini text)\";\n"
+        "    const char* clean = \"edvr_profile.ini and edvr_openxr.ini are other files\";\n"
+        "}\n";
+    const std::vector<std::string> control = namedLiterals(violating);
+    if (control.size() == 4 && control[0].rfind("line 2:", 0) == 0 && control[1].rfind("line 5:", 0) == 0 &&
+        control[2].rfind("line 6:", 0) == 0 && control[3].rfind("line 7:", 0) == 0)
+        ok("the source scan finds a message, a wide literal and a raw string that spell the file, and skips comments, char literals and other ini files");
+    else fail("the source scan's own control", std::to_string(control.size()) + " hits, not the four literals at lines 2, 5, 6 and 7");
+
+    std::vector<std::wstring> files;
+    collectSources(root + L"\\src", L"", &files);
+    if (files.size() < 150) {
+        fail("source scan", "found only " + std::to_string(files.size()) + " sources under " +
+                                narrow(root) + "\\src; the scan would prove nothing");
+        return;
+    }
+    // The one place the names are spelled. The installer is not scanned: it manages both files.
+    int scanned = 0, bad = 0;
+    for (const std::wstring& rel : files) {
+        if (_wcsicmp(rel.c_str(), L"common\\ini_name.h") == 0) continue;
+        const std::string text = readRepoFile(root, (L"src\\" + rel).c_str());
+        ++scanned;
+        for (const std::string& hit : namedLiterals(text)) {
+            ++bad;
+            fail("a message spells the settings file's name; use Config::iniName()",
+                 narrow(rel) + " " + hit);
+        }
+    }
+    if (!bad) {
+        ok(("no string literal in " + std::to_string(scanned) +
+            " sources under src (the installer aside) spells edvr.ini or edvr-flat.ini; ini_name.h is the one place")
+               .c_str());
+    }
+}
+
 int main(int argc, char** argv) {
     // Unbuffered, so a crash does not take the output with it: the first run of
     // this test appeared to die before its first printf, which was only the
     // buffer being discarded.
     setvbuf(stdout, nullptr, _IONBF, 0);
+
+    // The child iniNameFixturesIsolated() starts from a directory of its own: only the resolver's
+    // four real-file situations, no shipped ini read, and an exit code that says whether all held.
+    if (argc == 3 && std::strcmp(argv[1], "--ininame-cases") == 0) {
+        iniNameFixtures(widen(argv[2]));
+        return g_fails == 0 ? 0 : 1;
+    }
 
     if (argc < 2) {
         printf("usage: config_test.exe <dir containing edvr.ini> [scratch dir]\n");
@@ -131,6 +1074,19 @@ int main(int argc, char** argv) {
     expectStr("fix.ui_depth", "<unset>", "UI depth is bundled with temporal AA");
     expectStr("fix.temporal_aa_objects", "<unset>", "station motion is bundled with temporal AA");
     expectStr("fix.temporal_aa_smoke", "<unset>", "smoke depth is bundled with temporal AA");
+    expectStr("fix.engine_motion", "<unset>", "engine motion is bundled with temporal AA: its own key is retired");
+    // The estimation paths the engine records superseded (2026-09-23): their
+    // keys are retired, not merely off.
+    expectStr("advanced.temporal_aa_estimated_objects", "<unset>", "the retired estimated station/ship paths' key is absent");
+    expectStr("advanced.mesh_motion", "<unset>", "the retired mesh record pairing's key is absent");
+    expectStr("advanced.temporal_aa_objects_reach", "<unset>", "the retired station path's reach is absent");
+    expectStr("advanced.temporal_aa_objects_ships_metres", "<unset>", "the retired ship path's range is absent");
+    // The particle facing measurement (dead since 2026-08-23) retired 2026-09-23.
+    expectStr("advanced.particle_face_emitter", "<unset>", "the retired particle facing key is absent");
+    // The foveation's eye-tracked centre went with its gaze source (2026-09-23)
+    // and its key retired 2026-09-24; the whole shading-rate feature, keys
+    // and all, was removed 2026-09-29.
+    expectStr("experimental.foveation_centre", "<unset>", "the retired foveation centre key is absent");
     expectBool("fix.share_exposure", true, "a key in the first [fix] reads");
     expectBool("fix.transition_flash", true, "...and another beside it");
     expectStr("hotkey.toggle_exposure", "SCROLLLOCK",
@@ -141,6 +1097,69 @@ int main(int argc, char** argv) {
                 "the flash threshold reads from [advanced]");
     expectFloat("advanced.transition_flash_speed_factor", 8.0f,
                 "...and its speed factor");
+    // The eye-run depth instrument ships as a commented template like the
+    // other developer instruments: the compiled default is what a user gets.
+    if (Config::get().getBool("advanced.eye_depth_capture", false) == false &&
+        Config::get().getBool("advanced.eye_depth_capture", true) == true)
+        ok("eye depth capture is documented but not live under [advanced]");
+    else
+        fail("eye depth capture is documented but not live under [advanced]",
+             "the shipped file defines it live");
+    // The settlement LOD governor is a shipped fix: fix.settlement_detail is
+    // live under the first [fix] and reads game (off), the compiled default too.
+    // Its two [advanced] tuning keys ship as commented templates, so the
+    // compiled defaults -- a ceiling of 6.0 (held to 1..8) and observe 0 --
+    // are what every user runs until they choose otherwise.
+    expectStr("fix.settlement_detail", "game",
+              "settlement detail ships live in [fix] and reads game (off)");
+    expectStr("advanced.settlement_detail_max", "<unset>",
+              "...its ceiling ships commented out: the compiled 6.0 is in force");
+    expectStr("advanced.settlement_detail_observe", "<unset>",
+              "...and so does its observe-only switch");
+    // ui_quality (docs/ui-layer-2026-09-23.md) is one key for both halves:
+    // the interface panels made at the target's size, and the game's
+    // post-tonemap UI drawn into a per-eye layer after the upscale. Values
+    // off | 100 | 125 (percent of HMD Quality 1.0; ui_layer_math.h parses
+    // them, and the first spellings 1.0 / 1.25, for one release). Ships live
+    // in [fix]; the default is 100 since 2026-09-29 (the interface as at HMD
+    // Quality 1.0), off before that.
+    // fix.hud_quality, the surfaces' own key for one day, is gone: absorbed.
+    expectStr("fix.ui_quality", "100",
+              "ui quality ships live in [fix] and defaults to 100");
+    expectStr("fix.hud_quality", "<unset>",
+              "...and the separate HUD key it absorbed is gone");
+    // A file with no such line -- a hand-copied DLL over an old ini, a deleted
+    // line -- gets the code's fallback, and that has to be the shipped default or
+    // those installs run something the file never said. The read is in
+    // ui_layer.cpp; the rig takes the literal from the call itself.
+    {
+        const std::string shippedUiQuality = Config::get().getString("fix.ui_quality", "<unset>");
+        const std::string uiLayerSource = readRepoFile(dir, L"src\\d3d11\\ui_layer.cpp");
+        if (uiLayerSource.empty()) {
+            fail("ui_layer.cpp is readable from the repo root", "could not read it");
+        } else {
+            const std::string fallback = codeFallbackOf(uiLayerSource, "fix.ui_quality");
+            if (fallback == shippedUiQuality) {
+                ok("the code's fallback for fix.ui_quality is the shipped default");
+            } else {
+                fail("the code's fallback for fix.ui_quality is the shipped default",
+                     "ui_layer.cpp falls back to \"" + fallback + "\", the ini ships \"" +
+                         shippedUiQuality + "\"");
+            }
+            // CONTROL: the same source with the fallback put back to off.
+            std::string reverted = uiLayerSource;
+            const std::string from = "getString(\"fix.ui_quality\", \"" + fallback + "\")";
+            const size_t at = reverted.find(from);
+            if (at != std::string::npos) reverted.replace(at, from.size(), "getString(\"fix.ui_quality\", \"off\")");
+            if (at != std::string::npos && codeFallbackOf(reverted, "fix.ui_quality") != shippedUiQuality) {
+                ok("control: a fallback put back to off is caught");
+            } else {
+                fail("control: a fallback put back to off is caught",
+                     at == std::string::npos ? "the call was not found to alter"
+                                             : "the reverted source still matched the ini");
+            }
+        }
+    }
 
     // The Explorer Cam block, under a SECOND [fix] and a second [hotkey].
     // This is the claim that a repeated section header is not a parse error
@@ -268,6 +1287,134 @@ int main(int argc, char** argv) {
                       "a real old-line choice still follows the move");
         }
         Config::get().setAuditTables(nullptr, 0, nullptr, 0);
+
+        // --- the demoted field-of-view trims, over the SHIPPED tables --------
+        //
+        // 2026-09-29: fix.fov_trim_vertical / _outer / _nasal moved to
+        // [experimental] (edvr.ini: `# moved-from: fix.fov_trim_*`). Somebody who
+        // set them has them under [fix] in an old-layout edvr.ini, and the DLLs
+        // meet that file whenever they are copied in by hand. The fixture tables
+        // above prove the mechanics; these are the tables the DLLs register --
+        // config_contract_gen.h, generated from the real edvr.ini -- so what is
+        // proven is that the keys which actually moved read through, and that it
+        // is the shipped annotation that carries them.
+        {
+            using contractgen::kKnownKeys;
+            using contractgen::kMovedKeys;
+            constexpr size_t kKnownCount = sizeof(kKnownKeys) / sizeof(kKnownKeys[0]);
+            constexpr size_t kMovedCount = sizeof(kMovedKeys) / sizeof(kMovedKeys[0]);
+            constexpr const char* kTrimList = "pimax-openxr/pimax-crystal-super:10, "
+                                              "virtualdesktopxr/meta-quest-3:5";
+            static const char kOldTrims[] =
+                "[fix]\r\n"
+                "fov_trim_vertical = pimax-openxr/pimax-crystal-super:10, "
+                "virtualdesktopxr/meta-quest-3:5\r\n"
+                "fov_trim_outer = oculus/meta-quest-3:7\r\n"
+                "fov_trim_nasal = pimax-openxr/pimax-crystal-super:5\r\n";
+
+            // The tables carry the three moves, each old [fix] name to its new
+            // [experimental] one, and nothing is left documented under the old.
+            int trimMoves = 0;
+            static const char* filtered[kMovedCount][3];
+            size_t filteredCount = 0;
+            for (size_t i = 0; i < kMovedCount; ++i) {
+                const std::string oldKey = kMovedKeys[i][0], newKey = kMovedKeys[i][1];
+                const bool trim = newKey.rfind("experimental.fov_trim_", 0) == 0;
+                if (trim && oldKey == "fix.fov_trim_" + newKey.substr(strlen("experimental.fov_trim_"))) {
+                    ++trimMoves;
+                } else {
+                    for (int c = 0; c < 3; ++c) filtered[filteredCount][c] = kMovedKeys[i][c];
+                    ++filteredCount;
+                }
+            }
+            if (trimMoves == 3) ok("the shipped moved-from map carries fix.fov_trim_* to experimental.fov_trim_*");
+            else fail("the shipped moved-from map carries the three trims",
+                      std::to_string(trimMoves) + " of 3 moves found in edvr.ini's annotations");
+            int retiredStillKnown = 0;
+            for (size_t i = 0; i < kKnownCount; ++i) {
+                if (strncmp(kKnownKeys[i], "fix.fov_trim_", 13) == 0) ++retiredStillKnown;
+            }
+            if (retiredStillKnown == 0) ok("no fix.fov_trim_* key is still read or documented");
+            else fail("no fix.fov_trim_* key is still read or documented",
+                      std::to_string(retiredStillKnown) + " of them are");
+
+            Config::get().setAuditTables(kKnownKeys, kKnownCount, kMovedKeys, kMovedCount);
+            if (!writeIni(scratch, kOldTrims)) {
+                fail("old-layout fov trim ini", "could not write it");
+            } else {
+                Config::get().init(scratch);
+                expectStr("experimental.fov_trim_vertical", kTrimList,
+                          "an old-layout fov_trim_vertical is read as experimental.fov_trim_vertical");
+                expectStr("experimental.fov_trim_outer", "oculus/meta-quest-3:7",
+                          "an old-layout fov_trim_outer is read as experimental.fov_trim_outer");
+                expectStr("experimental.fov_trim_nasal", "pimax-openxr/pimax-crystal-super:5",
+                          "an old-layout fov_trim_nasal is read as experimental.fov_trim_nasal");
+
+                // Live: an edit to the OLD line under a running game reaches
+                // the new name on the next reload, because the read-through is
+                // resolved at every parse.
+                if (!rewriteIni(scratch, "[fix]\r\nfov_trim_outer = oculus/meta-quest-3:9\r\n") ||
+                    !Config::get().reloadIfChanged()) {
+                    fail("old-layout fov trim reload", "the edit did not reload");
+                } else {
+                    expectStr("experimental.fov_trim_outer", "oculus/meta-quest-3:9",
+                              "an edit to the old line is live: the next reload reads it");
+                    expectStr("experimental.fov_trim_vertical", "<unset>",
+                              "...and a trim no longer in the file is gone, not remembered");
+                }
+                // The shipped default, empty, in an old-layout file: no trim.
+                if (!rewriteIni(scratch, "[fix]\r\nfov_trim_vertical =\r\n") ||
+                    !Config::get().reloadIfChanged()) {
+                    fail("old-layout empty fov trim reload", "the edit did not reload");
+                } else {
+                    expectStr("experimental.fov_trim_vertical", "",
+                              "an old-layout line left empty reads as no trim");
+                }
+                // Both spellings in one file: the new name wins.
+                if (!rewriteIni(scratch,
+                                "[fix]\r\nfov_trim_outer = oculus/meta-quest-3:9\r\n"
+                                "[experimental]\r\nfov_trim_outer = oculus/meta-quest-3:2\r\n") ||
+                    !Config::get().reloadIfChanged()) {
+                    fail("both-layout fov trim reload", "the edit did not reload");
+                } else {
+                    expectStr("experimental.fov_trim_outer", "oculus/meta-quest-3:2",
+                              "when both spellings are set, experimental.fov_trim_outer wins");
+                }
+                // A new-layout file: read directly, and nothing under the old name.
+                if (!rewriteIni(scratch, "[experimental]\r\nfov_trim_vertical = oculus:3\r\n") ||
+                    !Config::get().reloadIfChanged()) {
+                    fail("new-layout fov trim reload", "the edit did not reload");
+                } else {
+                    expectStr("experimental.fov_trim_vertical", "oculus:3",
+                              "a new-layout fov_trim_vertical is read as it stands");
+                    expectStr("fix.fov_trim_vertical", "<unset>",
+                              "...and the retired name reads nothing");
+                }
+            }
+
+            // CONTROL: the same old-layout file, over the same tables minus the
+            // three moves (what edvr.ini without its annotations would generate).
+            // The values are stranded under [fix] and the new names read nothing,
+            // which is exactly what the assertions above would report if the
+            // annotations were lost.
+            Config::get().setAuditTables(kKnownKeys, kKnownCount,
+                                         reinterpret_cast<const char* const(*)[3]>(filtered),
+                                         filteredCount);
+            if (!writeIni(scratch, kOldTrims)) {
+                fail("control fov trim ini", "could not write it");
+            } else {
+                Config::get().init(scratch);
+                expectStr("experimental.fov_trim_vertical", "<unset>",
+                          "control: without the annotation an old-layout fov_trim_vertical is NOT read as the new name");
+                expectStr("experimental.fov_trim_outer", "<unset>",
+                          "control: ...nor fov_trim_outer");
+                expectStr("experimental.fov_trim_nasal", "<unset>",
+                          "control: ...nor fov_trim_nasal");
+                expectStr("fix.fov_trim_outer", "oculus/meta-quest-3:7",
+                          "control: the value sits under the old name, where nothing reads it");
+            }
+            Config::get().setAuditTables(nullptr, 0, nullptr, 0);
+        }
 
         // --- the log directory, and the environment's say over it ----------
         //
@@ -418,6 +1565,147 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+    // --- floats, notes and threads (2026-09-29) ----------------------------
+    //
+    // Before the profile cases below: those switch g_runtimeProfile to flat and
+    // invalid, under which these scratch keys would read as suppressed.
+    iniNameScan(dir);
+    if (argc >= 3) {
+        const std::wstring scratch = widen(argv[2]);
+        floatCases(scratch);
+        noteCases(scratch);
+        iniNameCases(scratch);
+        raceCase(scratch);
+        shareDeleteCase(scratch);
+    }
+
+    // An old/full INI cannot widen a flat installation, even through numeric
+    // getters whose ordinary fallback or lower bound would turn a fix on.
+    const RuntimeProfile savedProfile = g_runtimeProfile;
+    const char* descriptor = "[install]\r\nschema = 1\r\nprofile = flat\r\n";
+    if (parseRuntimeProfile(descriptor) != RuntimeProfile::Flat ||
+        parseRuntimeProfile("[install]\nschema=1\nprofile=vr\n") != RuntimeProfile::Vr ||
+        parseRuntimeProfile("[install]\nschema=2\nprofile=flat\n") != RuntimeProfile::Invalid ||
+        parseRuntimeProfile("[install]\nschema=1\nprofile=flat\nprofile=vr\n") != RuntimeProfile::Invalid ||
+        parseRuntimeProfile("[install]\nprofile=flat\n") != RuntimeProfile::Invalid ||
+        parseRuntimeProfile(std::string(4097, 'x')) != RuntimeProfile::Invalid)
+        fail("profile descriptor", "invalid schema/duplicate/oversize admitted");
+    else ok("profile descriptor refuses ambiguous or unsupported scope");
+    g_runtimeProfile = RuntimeProfile::Flat;
+    // The flat adapter reads this through getString with an on default. A
+    // refused key turns that default into off, so exercise the actual getter.
+    if (argc >= 3) {
+        const std::wstring scratch = widen(argv[2]);
+        if (!writeIni(scratch, "[fix]\r\nblack_void = on\r\n"))
+            fail("flat jitter scratch ini", "could not write it");
+        else {
+            Config::get().init(scratch);
+            g_runtimeProfile = RuntimeProfile::Flat;
+            if (Config::get().getString("experimental.temporal_aa_jitter", "on") == "on")
+                ok("flat jitter uses on default when absent");
+            else fail("flat jitter default", "missing key was not on");
+        }
+    }
+    Config::get().set("experimental.temporal_aa_jitter", "on");
+    if (Config::get().getString("experimental.temporal_aa_jitter", "off") == "on")
+        ok("flat jitter reads explicit on");
+    else fail("flat jitter enabled", "explicit on was suppressed");
+    Config::get().set("experimental.temporal_aa_jitter", "off");
+    if (Config::get().getString("experimental.temporal_aa_jitter", "on") == "off")
+        ok("flat jitter preserves explicit off");
+    else fail("flat jitter override", "explicit off was not read");
+    Config::get().set("fix.temporal_aa", "dlss");
+    Config::get().set("fix.black_void", "on");
+    Config::get().set("fix.head_offset_forward", "12");
+    Config::get().set("experimental.night_vision_realistic", "on");
+    Config::get().set("advanced.real_dll", "d3d11_edhm.dll");
+    expectStr("fix.temporal_aa", "off", "flat discovery cannot activate stereo temporal AA");
+    if (Config::get().requestedTemporalMode() != "dlss") fail("flat request", "intent lost");
+    else ok("flat diagnostic retains requested temporal mode");
+    expectBool("fix.black_void", false, "flat profile suppresses restored unrelated fix");
+    expectBool("experimental.night_vision_realistic", false,
+               "flat jitter exception leaves unrelated experimental settings suppressed");
+    expectInt("fix.head_offset_forward", 0, "flat profile suppresses numeric fix");
+    expectFloat("fix.head_offset_forward", 0.0f, "flat profile suppresses float fix");
+    if (Config::get().getIntInRange("fix.head_offset_forward", 12, 1, 100) != 0)
+        fail("flat bounded getter", "minimum reactivated disabled feature");
+    else ok("flat scope precedes bounded numeric defaults");
+    expectStr("advanced.real_dll", "d3d11_edhm.dll", "flat scope preserves mod chaining");
+    Config::get().set("hotkey.menu", "F8");
+    expectStr("hotkey.menu", "F8", "flat scope permits the temporal menu hotkey");
+    Config::get().set("fix.temporal_aa_model", "m");
+    expectStr("fix.temporal_aa_model", "m", "flat scope permits the DLSS model");
+    // The flat panel's Sharpening row and the flat sharpening both read this key
+    // through the generic getter. Unlisted, it would read 0 here whatever the file
+    // says: no error, no log line, a row that does nothing.
+    Config::get().set("fix.render_sharpness", "0.3");
+    expectFloat("fix.render_sharpness", 0.3f, "flat scope permits the sharpening setting");
+    expectStr("hotkey.toggle_exposure", "", "flat menu exception leaves unrelated hotkeys suppressed");
+    const struct { const char* name; unsigned full, fovea; bool known; } presets[] = {
+        {"auto",0,0,true},{"default",0,0,true},{"j",10,10,true},
+        {"K",11,11,true},{"l",12,12,true},{"m",13,13,true},
+        {"quality",11,11,true},{"steady",11,12,true},{"responsive",10,10,true},
+        {"removed-preset",11,11,false}
+    };
+    for (const auto& p : presets) {
+        const auto actual=temporalPresetFor(p.name);
+        if (actual.full!=p.full || actual.fovea!=p.fovea || actual.known!=p.known)
+            fail("shared temporal preset mapping",p.name);
+    }
+    Config::get().set("fix.black_void", "on");
+    expectBool("fix.black_void", false, "live setting change cannot widen scope");
+    g_runtimeProfile = RuntimeProfile::Invalid;
+    expectBool("advanced.d3d11_fixes", false, "bad descriptor disables graphics hooks");
+    expectStr("hotkey.menu", "", "invalid profile cannot open temporal menu");
+    expectStr("fix.temporal_aa_model", "off", "invalid profile cannot select a DLSS model");
+    expectFloat("fix.render_sharpness", 0.0f, "invalid profile cannot sharpen");
+    expectStr("advanced.real_dll", "d3d11_edhm.dll", "bad descriptor preserves mod chaining");
+    if (Config::get().getString("experimental.temporal_aa_jitter", "on") == "off")
+        ok("invalid profile suppresses flat jitter");
+    else fail("invalid profile jitter", "flat key widened invalid scope");
+    g_runtimeProfile = RuntimeProfile::LegacyVr;
+    expectBool("fix.black_void", true, "legacy profile retains original behavior");
+    if (Config::get().getString("experimental.temporal_aa_jitter", "on") == "off")
+        ok("legacy profile retains explicit jitter setting");
+    else fail("legacy profile jitter", "flat exception changed VR read");
+    g_runtimeProfile = RuntimeProfile::Vr;
+    Config::get().set("experimental.temporal_aa_jitter", "on");
+    if (Config::get().getString("experimental.temporal_aa_jitter", "off") == "on")
+        ok("VR profile reads explicit jitter setting");
+    else fail("VR profile jitter", "flat exception changed VR scope");
+    expectFloat("fix.render_sharpness", 0.3f, "VR profile still reads the sharpening setting");
+
+    // The flat panel writes the Sharpening row into edvr-flat.ini and asks for a
+    // reload; the flat sharpening reads the key every frame. Live means that file,
+    // read first (config.cpp), moves the value on the next reload -- not the
+    // edvr.ini beside it, which a flat install falls back to and a VR one owns.
+    if (argc >= 3) {
+        const std::wstring flatDir = widen(argv[2]) + L"_flatsharp";
+        g_runtimeProfile = RuntimeProfile::Flat;
+        const wchar_t* flatLeaf = L"edvr-flat.ini";
+        // The descriptor beside the inis is what makes init() pick the flat file:
+        // without it the profile reads as the legacy VR one and edvr.ini wins.
+        if (!writeIni(flatDir, descriptor, L"edvr_profile.ini") ||
+            !rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0.9\r\n") ||
+            !rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0.4\r\n", flatLeaf)) {
+            fail("flat sharpening reload", "could not write the scratch inis");
+        } else {
+            Config::get().init(flatDir);
+            if (!runtimeFlatProfile()) fail("flat sharpening reload", "the descriptor did not select flat");
+            expectFloat("fix.render_sharpness", 0.4f,
+                        "the flat file is read first: its 0.4, not edvr.ini's 0.9");
+            if (!rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0\r\n", flatLeaf) ||
+                !Config::get().reloadIfChanged())
+                fail("flat sharpening reload", "a panel write of 0 did not reload");
+            else expectFloat("fix.render_sharpness", 0.0f, "a panel write of 0 is live");
+            if (!rewriteIni(flatDir, "[fix]\r\nrender_sharpness = 0.65\r\n", flatLeaf) ||
+                !Config::get().reloadIfChanged())
+                fail("flat sharpening reload", "a panel write of 0.65 did not reload");
+            else expectFloat("fix.render_sharpness", 0.65f, "a panel write of 0.65 is live");
+        }
+    }
+    g_runtimeProfile = savedProfile;
 
     if (g_fails) {
         printf("CONFIG TEST FAILED (%d)\n", g_fails);

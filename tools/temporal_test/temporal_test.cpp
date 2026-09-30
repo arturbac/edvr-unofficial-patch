@@ -7,9 +7,11 @@
 // sign un-jitters the wrong way and wobbles the image by a pixel every
 // frame); the pixel-to-direction mapping and its inverse, on a real
 // headset's lopsided frustum; the rotation deltas from the runtime's pose
-// and from the game's view rows; and the whole reprojection walked by hand
-// against a known head turn. The shader in src/d3d11/temporal_shader_source.h
-// transcribes the same functions.
+// and from the game's view rows; the whole reprojection walked by hand
+// against a known head turn; and the world path's gate on the rows' delta,
+// replayed over a dumped event (eye run 050423: a parked camera's zero
+// taken as the view's and carried). The shader in
+// src/d3d11/temporal_shader_source.h transcribes the same functions.
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -50,6 +52,32 @@ void yaw34(float theta, float m34[12]) {
     m34[5] = 1.0f;
     m34[8] = -s; m34[10] = c;
 }
+
+// View rows turned `deg` about +Y and standing at (x, y, z).
+void rows34(float deg, float x, float y, float z, float m34[12]) {
+    yaw34(deg * 0.0174532925f, m34);
+    m34[3] = x; m34[7] = y; m34[11] = z;
+}
+
+// One eye's pass through the world path's gate, as temporal_pass.cpp runs
+// it: the rows' delta, its angle from the head's delta, then the verdict.
+// W and tv come back as the delta the pass would use.
+edvr::TemporalCameraStep gateEye(edvr::TemporalCameraGate& g, const float prev[12],
+                                 const float now[12], const float head[9],
+                                 float W[9], float tv[3], float* diffDeg = nullptr) {
+    float mv[3], hT[9], diff[9];
+    edvr::temporalWorldFromRows(prev, now, W, tv, mv);
+    edvr::temporalTranspose3(head, hT);
+    edvr::temporalMul3(W, hT, diff);
+    const float d = edvr::temporalRotationAngleDeg(diff);
+    if (diffDeg) *diffDeg = d;
+    const double move = sqrt(static_cast<double>(mv[0]) * mv[0] +
+                             static_cast<double>(mv[1]) * mv[1] +
+                             static_cast<double>(mv[2]) * mv[2]);
+    return edvr::temporalCameraGateStep(g, prev, now, move, d, W, tv);
+}
+
+bool same9(const float a[9], const float b[9]) { return memcmp(a, b, sizeof(float) * 9) == 0; }
 
 }  // namespace
 
@@ -343,194 +371,6 @@ int main() {
     }
 
     {
-        // Tier 2's body path (temporalBodyPath): with no body motion it is
-        // the camera path exactly -- W = R_p^T R_n and tv = R_p^T (c_n -
-        // c_p), z-flipped -- and with a fixed camera it is the body's own
-        // delta, z-flipped. Two camera poses a yaw apart and a step along
-        // x, then a body turning 1 degree about y.
-        float prev[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
-        float now[12];
-        yaw34(2.0f * 3.14159265f / 180.0f, now);
-        now[3] = 5.0f;   // the camera stepped 5 m along x
-        const float ident[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-        const float none3[3] = {0, 0, 0};
-        float W[9], tv[3];
-        edvr::temporalBodyPath(prev, now, ident, none3, W, tv);
-        // The camera path by hand, the way worldFromRows builds it.
-        float Rp[9], Rn[9], RpT[9], Wc[9], tvc[3];
-        edvr::temporalRot3Of34(prev, Rp);
-        edvr::temporalRot3Of34(now, Rn);
-        edvr::temporalTranspose3(Rp, RpT);
-        edvr::temporalMul3(RpT, Rn, Wc);
-        const float dc[3] = {now[3] - prev[3], now[7] - prev[7], now[11] - prev[11]};
-        edvr::temporalApply3(RpT, dc, tvc);
-        Wc[2] = -Wc[2]; Wc[5] = -Wc[5]; Wc[6] = -Wc[6]; Wc[7] = -Wc[7];
-        tvc[2] = -tvc[2];
-        bool same = true;
-        for (int i = 0; i < 9; ++i) same = same && fabsf(W[i] - Wc[i]) < 1e-6f;
-        for (int i = 0; i < 3; ++i) same = same && fabsf(tv[i] - tvc[i]) < 1e-6f;
-        check(same, "body path: with no body motion it is the camera path");
-        // The carried form: the same path composed with the camera delta
-        // handed in rather than the rows. With the camera turned but not
-        // moved (c_n = c_p, the one approximation exact) and a body turn of
-        // one degree about y, it must equal temporalBodyPath to the float.
-        {
-            float nowTurn[12];
-            yaw34(2.0f * 3.14159265f / 180.0f, nowTurn);
-            const float cb = cosf(1.0f * 3.14159265f / 180.0f);
-            const float sb = sinf(1.0f * 3.14159265f / 180.0f);
-            const float RdY[9] = {cb, 0, sb, 0, 1, 0, -sb, 0, cb};
-            const float tdY[3] = {0.3f, -0.2f, 0.1f};
-            float Wd[9], tvd[3];
-            edvr::temporalBodyPath(prev, nowTurn, RdY, tdY, Wd, tvd);
-            float Rn2[9], Wc2[9], tvc2[3];
-            edvr::temporalRot3Of34(nowTurn, Rn2);
-            edvr::temporalMul3(RpT, Rn2, Wc2);
-            const float dc2[3] = {nowTurn[3] - prev[3], nowTurn[7] - prev[7], nowTurn[11] - prev[11]};
-            edvr::temporalApply3(RpT, dc2, tvc2);
-            Wc2[2] = -Wc2[2]; Wc2[5] = -Wc2[5]; Wc2[6] = -Wc2[6]; Wc2[7] = -Wc2[7];
-            tvc2[2] = -tvc2[2];
-            float Wk[9], tvk[3];
-            edvr::temporalBodyPathCarried(prev, RdY, tdY, Wc2, tvc2, Wk, tvk);
-            bool sameK = true;
-            for (int i = 0; i < 9; ++i) sameK = sameK && fabsf(Wk[i] - Wd[i]) < 1e-5f;
-            for (int i = 0; i < 3; ++i) sameK = sameK && fabsf(tvk[i] - tvd[i]) < 1e-5f;
-            check(sameK, "body path: the carried form composes to the rows' form when the camera only turns");
-        }
-        // A fixed camera at the origin: the path is the body's delta itself
-        // (its rotation about y keeps the xz entries, which the flip negates).
-        const float c = cosf(1.0f * 3.14159265f / 180.0f);
-        const float s = sinf(1.0f * 3.14159265f / 180.0f);
-        const float Rd[9] = {c, 0, s, 0, 1, 0, -s, 0, c};
-        const float td[3] = {0.5f, 0.0f, -0.25f};
-        edvr::temporalBodyPath(prev, prev, Rd, td, W, tv);
-        checkNear(W[0], c, 1e-6f, "body path: a fixed camera keeps the body's rotation (xx)");
-        checkNear(W[2], -s, 1e-6f, "body path: ...and flips its xz entry into the eye's frame");
-        checkNear(W[6], s, 1e-6f, "body path: ...and its zx entry");
-        checkNear(tv[0], 0.5f, 1e-6f, "body path: the body's translation passes (x)");
-        checkNear(tv[2], 0.25f, 1e-6f, "body path: ...z-flipped");
-        // A station part that turned with the body: its world position now,
-        // carried back by [Rd | td], must be what the path predicts through
-        // the camera -- the algebra's whole claim, checked at one point.
-        const float pw[3] = {100.0f, 20.0f, -300.0f};
-        float pv[3];   // view-space now: v = R_n^T (w - c_n)
-        float RnT[9];
-        edvr::temporalTranspose3(Rn, RnT);
-        const float wc[3] = {pw[0] - now[3], pw[1] - now[7], pw[2] - now[11]};
-        edvr::temporalApply3(RnT, wc, pv);
-        edvr::temporalBodyPath(prev, now, Rd, td, W, tv);
-        // The path is conjugated into the eye's frame (z back), so it takes
-        // an eye-space point and returns one: flip in, flip out, and the
-        // compare is in the game's own view space.
-        const float pvEye[3] = {pv[0], pv[1], -pv[2]};
-        float got[3];
-        edvr::temporalApply3(W, pvEye, got);
-        for (int i = 0; i < 3; ++i) got[i] += tv[i];
-        got[2] = -got[2];
-        float wprev[3], want[3];
-        edvr::temporalApply3(Rd, pw, wprev);
-        for (int i = 0; i < 3; ++i) wprev[i] += td[i];
-        const float wp[3] = {wprev[0] - prev[3], wprev[1] - prev[7], wprev[2] - prev[11]};
-        edvr::temporalApply3(RpT, wp, want);
-        checkNear(got[0], want[0], 1e-3f, "body path: a turned part lands where the world says (x)");
-        checkNear(got[1], want[1], 1e-3f, "body path: ...(y)");
-        checkNear(got[2], want[2], 1e-3f, "body path: ...(z)");
-    }
-
-    {
-        // A station's carried motion must be independent of the world's
-        // origin, also with simultaneous camera translation and head turn.
-        // Compare against direct world-point composition, then shift the
-        // entire scene by 13 km while keeping the same physical camera delta.
-        const float I[9] = {1,0,0, 0,1,0, 0,0,1};
-        const float zero[3] = {};
-        float worst = 0.0f, oldError = 0.0f;
-        for (int axis = 0; axis < 3; ++axis) {
-            for (int sign = -1; sign <= 1; sign += 2) {
-                for (int moving = 0; moving < 2; ++moving) {
-                    float prev[12], now[12];
-                    yaw34(0.4f, prev);
-                    yaw34(0.417f, now);
-                    for (int k = 0; k < 3; ++k) {
-                        prev[k * 4 + 3] = 100.0f * (k + 1);
-                        now[k * 4 + 3] = prev[k * 4 + 3] + moving * (k - 1.5f) * 4.0f;
-                    }
-                    float w[3] = {}, R[9];
-                    w[axis] = sign * 0.0006981317f; // 0.04 degrees per frame
-                    edvr::temporalRodrigues(w, R);
-                    const float t[3] = {0.3f, -0.2f, 0.1f};
-                    float cameraW[9], cameraTv[3], wantW[9], wantTv[3];
-                    edvr::temporalBodyPath(prev, now, I, zero, cameraW, cameraTv);
-                    edvr::temporalBodyPath(prev, now, R, t, wantW, wantTv);
-                    for (int shifted = 0; shifted < 2; ++shifted) {
-                        float shift[3] = {}, rs[3], ts[3];
-                        shift[(axis + 1) % 3] = shifted * sign * 13000.0f;
-                        edvr::temporalApply3(R, shift, rs);
-                        for (int k = 0; k < 3; ++k) ts[k] = t[k] + shift[k] - rs[k];
-                        for (int eye = 0; eye < 2; ++eye) {
-                            float gotW[9], gotTv[3];
-                            edvr::temporalBodyPathCarried(prev, R, ts, cameraW, cameraTv, gotW, gotTv, shift);
-                            for (int k = 0; k < 9; ++k) worst = fmaxf(worst, fabsf(gotW[k] - wantW[k]));
-                            for (int k = 0; k < 3; ++k) worst = fmaxf(worst, fabsf(gotTv[k] - wantTv[k]));
-                            // Positive control: the old call site rebased the
-                            // body translation but left the camera in the old
-                            // origin. It must expose metres of error here.
-                            if (shifted && !moving) {
-                                edvr::temporalBodyPathCarried(prev, R, ts, cameraW, cameraTv, gotW, gotTv);
-                                for (int k = 0; k < 3; ++k) oldError = fmaxf(oldError, fabsf(gotTv[k] - wantTv[k]));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        printf("  carried origin regression: corrected max %.6f m, old-origin control %.3f m\n", worst, oldError);
-        check(worst < 0.004f, "carried body: origin shift preserves motion under combined head and ship movement");
-        check(oldError > 8.0f, "carried body: old camera origin reproduces whole-body displacement");
-    }
-
-    {
-        // The rigid fit (temporalRigidFit) and Rodrigues: twenty points of a
-        // body ten kilometres off, turned 0.05 deg about a tilted axis
-        // through a point away from the origin and moved 0.2 m, recovered
-        // from their (now, prev) pairs to the metre-per-thousand.
-        const float axis[3] = {0.6f, 0.8f, 0.0f};
-        const float ang = 0.05f * 3.14159265f / 180.0f;
-        const float wTrue[3] = {axis[0] * ang, axis[1] * ang, axis[2] * ang};
-        float Rt[9];
-        edvr::temporalRodrigues(wTrue, Rt);
-        checkNear(edvr::temporalRotationAngleDeg(Rt), 0.05f, 1e-4f, "rodrigues: the angle round-trips");
-        const float centre[3] = {8000.0f, -2000.0f, 5000.0f};
-        const float shift[3] = {0.2f, 0.0f, -0.1f};
-        float pNow[60], pPrev[60];
-        for (int i = 0; i < 20; ++i) {
-            const float p[3] = {centre[0] + 700.0f * sinf(i * 1.7f), centre[1] + 500.0f * cosf(i * 2.3f),
-                                centre[2] + 900.0f * sinf(i * 0.9f + 1.0f)};
-            // prev = R (p - centre) + centre + shift: a turn about the centre, then a step
-            const float rel[3] = {p[0] - centre[0], p[1] - centre[1], p[2] - centre[2]};
-            float rr[3];
-            edvr::temporalApply3(Rt, rel, rr);
-            for (int k = 0; k < 3; ++k) {
-                pNow[i * 3 + k] = p[k];
-                pPrev[i * 3 + k] = rr[k] + centre[k] + shift[k];
-            }
-        }
-        float w[3], t[3], rms = 0.0f;
-        check(edvr::temporalRigidFit(pNow, pPrev, 20, w, t, &rms), "rigid fit: solves");
-        // Float positions at eight kilometres carry half a millimetre; over
-        // lever arms of a kilometre that is a few millionths of a radian.
-        checkNear(w[0], wTrue[0], 5e-6f, "rigid fit: the axis-angle (x)");
-        checkNear(w[1], wTrue[1], 5e-6f, "rigid fit: ...(y)");
-        checkNear(w[2], wTrue[2], 5e-6f, "rigid fit: ...(z)");
-        // t = centre - R centre + shift
-        float rc[3];
-        edvr::temporalApply3(Rt, centre, rc);
-        checkNear(t[0], centre[0] - rc[0] + shift[0], 0.01f, "rigid fit: the translation (x)");
-        checkNear(t[2], centre[2] - rc[2] + shift[2], 0.01f, "rigid fit: ...(z)");
-        check(rms < 0.01f, "rigid fit: the residual is millimetres");
-    }
-
-    {
         float a=0, b=0;
         check(!edvr::temporalSceneProjection(0,0,.025f,&a,&b), "missing scene row uses the scene fallback");
         const float distances[] = {30.0f,3000.0f,15000.0f,25000.0f};
@@ -552,15 +392,223 @@ int main() {
         edvr::TemporalHistoryEntry entry{};
         for(uint32_t frame=1;frame<=5;++frame) {
             entry.frame=frame;entry.flags=frame==4?33u:2u;entry.output=frame==5?0u:2u;
+            entry.selectedSeq=100u+frame;entry.drawSeq=200u+frame;
+            entry.cameraChoiceFlags=frame;entry.cameraDrawFlags=frame<<4;
+            entry.selectedRows[3]=float(frame)+0.25f;entry.drawRows[11]=-float(frame);
             entry.events=frame==4?17u:8u;history.record(entry);
         }
         check(history.size()==3 && history.oldest(0).frame==3 && history.oldest(2).frame==5,
               "bounded temporal history retains chronological entries after wrap");
         check(history.oldest(1).flags==33 && history.oldest(1).events==17 && history.oldest(2).output==0,
               "reset requests and failed output survive alongside successful calls");
+        check(history.oldest(0).selectedSeq==103 && history.oldest(2).drawSeq==205 &&
+              history.oldest(1).cameraChoiceFlags==4 && history.oldest(1).cameraDrawFlags==64 &&
+              history.oldest(0).selectedRows[3]==3.25f && history.oldest(2).drawRows[11]==-5.0f,
+              "camera provenance and full selected/draw rows survive history wrap");
         history.clear();check(history.size()==0,"cleared temporal history cannot report stale success");
         entry.frame=9;history.record(entry);
         check(history.size()==1 && history.oldest(0).frame==9,"history restarts at its first new entry");
+    }
+
+    // ---- The world path's gate over a parked camera (eye run 050423). -----
+    // Eye 0's rows and head deltas from eye_050423_motion.csv (build
+    // c9cab91e, 2026-09-25 05:04, the ship rolling): frames 19994..19999 are
+    // real, real, an auxiliary pass parked 148 deg from the view, the same
+    // pass's identical write again, real, real. The gate before 2026-09-25
+    // accepted 19997's zero as the view's (a still head, well inside the 3
+    // degrees) and 19998 carried it: two frames of the world standing still
+    // under the roll. docs/camera-rows-carry-2026-09-25.md.
+    {
+        using edvr::TemporalCameraVerdict;
+        using edvr::temporalRotationAngleDeg;
+        const float r93[12] = {0.780769169f, 0.194406167f, -0.593806207f, -198.458389f,
+                               0.423516452f, 0.534070432f, 0.731712043f, 1471.88684f,
+                               0.459383726f, -0.822784841f, 0.33465144f, 767.823914f};
+        const float r94[12] = {0.778171837f, 0.206665993f, -0.593074799f, -198.482376f,
+                               0.418339074f, 0.53377068f, 0.734902203f, 1472.50903f,
+                               0.468445241f, -0.819986522f, 0.32890889f, 768.194946f};
+        const float r95[12] = {0.773163915f, 0.220272169f, -0.594724894f, -198.508804f,
+                               0.41296041f, 0.536850452f, 0.735700428f, 1473.16528f,
+                               0.48133266f, -0.814414859f, 0.324109703f, 768.586121f};
+        const float aux[12] = {-0.950436831f, 0.297400296f, 0.0906804204f, -199.47821f,
+                               0.0727622211f, 0.496309847f, -0.865090966f, 1491.63611f,
+                               -0.302283823f, -0.815616131f, -0.493350685f, 779.845398f};
+        const float r98[12] = {0.598011613f, 0.622053683f, -0.505402088f, -199.778397f,
+                               0.234719515f, 0.467010468f, 0.852530301f, 1498.0531f,
+                               0.766347706f, -0.628450692f, 0.133269534f, 783.657043f};
+        const float r99[12] = {0.582894862f, 0.642890394f, -0.496915996f, -199.863831f,
+                               0.225240201f, 0.459744751f, 0.859011889f, 1499.52124f,
+                               0.780705154f, -0.61263907f, 0.12317808f, 784.564819f};
+        const float h94[9] = {0.999999762f, 0.000184280798f, 0.00026550889f,
+                              -0.000184312463f, 0.99999994f, 4.96953726e-05f,
+                              -0.000265479088f, -4.97214496e-05f, 0.999999881f};
+        const float h95[9] = {0.999989986f, 0.00352385081f, 0.00276330113f,
+                              -0.00353198126f, 0.99998939f, 0.00295353308f,
+                              -0.00275287032f, -0.00296327844f, 0.999991775f};
+        const float h96[9] = {0.999999285f, 0.000695446506f, 0.000980585814f,
+                              -0.000695226714f, 0.999999762f, -0.000203188509f,
+                              -0.000980764627f, 0.00020249933f, 0.999999523f};
+        const float h97[9] = {0.999999881f, 9.8310411e-05f, 0.00028476119f,
+                              -9.83420759e-05f, 1.0f, 1.80006027e-05f,
+                              -0.000284701586f, -1.80006027e-05f, 0.999999881f};
+        const float h98[9] = {0.999999762f, -0.000324182212f, 0.00046429038f,
+                              0.000324141234f, 0.99999994f, -5.66542149e-05f,
+                              -0.000464260578f, 5.68702817e-05f, 0.999999762f};
+        const float h99[9] = {0.999999881f, -0.00010949932f, 0.000200748444f,
+                              0.000109475106f, 0.99999994f, -3.79234552e-05f,
+                              -0.000200778246f, 3.79942358e-05f, 1.0f};
+        // What the DLL wrote for 19995 and 19999 (cameraR, cameraTv): the
+        // header's arithmetic must be the pass's to the dump's precision.
+        const float cam95[9] = {0.99988991f, 0.0144863427f, 0.00319825113f,
+                                -0.0144734383f, 0.99988699f, -0.00402030349f,
+                                -0.00325605273f, 0.00397354364f, 0.999986768f};
+        const float tv95[3] = {0.437213093f, 0.0240675509f, -0.626614213f};
+        const float cam99[9] = {0.99973774f, 0.0228724182f, 0.00113745779f,
+                                -0.0228532553f, 0.999631405f, -0.0146477595f,
+                                -0.00147202611f, 0.0146179274f, 0.999891937f};
+        struct Frame { const float* prev; const float* now; const float* head; };
+        const Frame run[6] = {{r93, r94, h94}, {r94, r95, h95}, {r95, aux, h96},
+                              {aux, aux, h97}, {aux, r98, h98}, {r98, r99, h99}};
+        edvr::TemporalCameraGate gate;
+        float ownW[6][9], ownTv[6][3], usedW[6][2][9], usedTv[6][2][3], diffDeg[6];
+        edvr::TemporalCameraStep step[6][2];
+        uint32_t stay[6];
+        for (int f = 0; f < 6; ++f) {
+            float mv[3];
+            edvr::temporalWorldFromRows(run[f].prev, run[f].now, ownW[f], ownTv[f], mv);
+            for (int eye = 0; eye < 2; ++eye) {
+                step[f][eye] = gateEye(gate, run[f].prev, run[f].now, run[f].head,
+                                       usedW[f][eye], usedTv[f][eye], &diffDeg[f]);
+            }
+            edvr::temporalCameraGateAdvance(gate, true);
+            stay[f] = gate.parkedRun;
+        }
+        float worst = 0.0f;
+        for (int i = 0; i < 9; ++i) {
+            worst = fmaxf(worst, fabsf(ownW[1][i] - cam95[i]));
+            worst = fmaxf(worst, fabsf(ownW[5][i] - cam99[i]));
+        }
+        for (int i = 0; i < 3; ++i) worst = fmaxf(worst, fabsf(ownTv[1][i] - tv95[i]));
+        checkNear(worst, 0.0f, 1e-5f, "050423: the rows' delta is the pass's own (19995 and 19999 as dumped)");
+        check(step[1][0].verdict == TemporalCameraVerdict::Own &&
+              step[1][1].verdict == TemporalCameraVerdict::Own,
+              "050423 19995: the view's delta is accepted");
+        check(step[2][0].verdict == TemporalCameraVerdict::Another &&
+              step[2][0].carried && same9(usedW[2][0], ownW[1]),
+              "050423 19996: the parked pass, 148 deg away, is dropped and 19995's delta carried");
+        check(temporalRotationAngleDeg(ownW[3]) < 0.001f && diffDeg[3] <= 3.0f,
+              "050423 19997: the parked pass's own delta is a zero the 3-degree test alone passes");
+        check(step[3][0].verdict == TemporalCameraVerdict::Parked &&
+              step[3][1].verdict == TemporalCameraVerdict::Parked,
+              "050423 19997: a zero from rows a drop left behind is refused, by both eyes");
+        check(step[3][0].carried && same9(usedW[3][0], ownW[1]) && same9(usedW[3][1], ownW[1]) &&
+              memcmp(usedTv[3][0], ownTv[1], sizeof(float) * 3) == 0,
+              "050423 19997: the world delta is the carried real one, not zero");
+        check(step[4][0].verdict == TemporalCameraVerdict::Another && step[4][0].carried &&
+              same9(usedW[4][0], ownW[1]) && temporalRotationAngleDeg(usedW[4][0]) > 0.5f,
+              "050423 19998: back on the view, the carried delta is 19995's roll, not the zero");
+        check(step[5][0].verdict == TemporalCameraVerdict::Own && !step[5][0].carried &&
+              same9(usedW[5][0], ownW[5]) && same9(gate.lastGoodC, ownW[5]),
+              "050423 19999: the view's turning delta is accepted at once, as before");
+        check(gate.refOwn, "050423: the rows are the view's own again after 19999");
+        check(stay[2] == 0 && stay[3] == 1 && stay[4] == 0,
+              "050423: the stay is one parked frame, counted once for both eyes");
+    }
+    // ---- The same gate on the cases the fix must not disturb. -------------
+    {
+        using edvr::TemporalCameraVerdict;
+        using edvr::temporalRotationAngleDeg;
+        const float still[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+        float a0[12], a1[12], a2[12], a3[12], p[12], pMoved[12], b5[12], b6[12];
+        rows34(0.0f, 0, 0, 0, a0);
+        rows34(1.0f, 0, 0, 1, a1);
+        rows34(15.0f, 0, 0, 10, a2);     // a hitch: a real jump of 14 degrees
+        rows34(16.5f, 0, 0, 11, a3);
+        rows34(150.0f, 5, 0, 5, p);      // a parked pass
+        rows34(150.0f, 5, 0, 6, pMoved); // ...re-parked a metre on, the same turn
+        rows34(4.0f, 0, 0, 3, b5);
+        rows34(5.5f, 0, 0, 4, b6);
+        float W[9], tv[3], d1[9], d1tv[3];
+        // A hitch: the view jumps 14 degrees (dropped), then turns on; the
+        // turning frame is accepted at once -- recovery costs no frame.
+        edvr::TemporalCameraGate g;
+        gateEye(g, a0, a1, still, d1, d1tv); edvr::temporalCameraGateAdvance(g, true);
+        const auto hitch = gateEye(g, a1, a2, still, W, tv); edvr::temporalCameraGateAdvance(g, true);
+        const auto after = gateEye(g, a2, a3, still, W, tv); edvr::temporalCameraGateAdvance(g, true);
+        check(hitch.verdict == TemporalCameraVerdict::Another && hitch.carried,
+              "a real 14-degree hitch is dropped and the last delta carried");
+        check(after.verdict == TemporalCameraVerdict::Own && !after.carried &&
+              fabsf(temporalRotationAngleDeg(W) - 1.5f) < 0.01f,
+              "the frame after a hitch is accepted on its own turning delta");
+        // The view that truly stood still (the chooser's twin fallback) is
+        // still the view's own when the rows before it were.
+        edvr::TemporalCameraGate s;
+        gateEye(s, a0, a1, still, W, tv); edvr::temporalCameraGateAdvance(s, true);
+        const auto twin = gateEye(s, a1, a1, still, W, tv);
+        check(twin.verdict == TemporalCameraVerdict::Own && temporalRotationAngleDeg(W) < 0.001f,
+              "a still twin after the view's own rows is accepted as the identity");
+        // A longer stay: every frame on the parked pass, and the exit, carry
+        // the view's last delta; a re-parked pass (moved, not turned) too.
+        edvr::TemporalCameraGate c;
+        gateEye(c, a0, a1, still, d1, d1tv); edvr::temporalCameraGateAdvance(c, true);
+        bool allCarried = true;
+        uint32_t longest = 0;
+        const float* chain[6][2] = {{a1, p}, {p, p}, {p, p}, {p, pMoved}, {pMoved, pMoved}, {pMoved, b5}};
+        for (auto& link : chain) {
+            const auto r = gateEye(c, link[0], link[1], still, W, tv);
+            allCarried = allCarried && r.verdict != TemporalCameraVerdict::Own && r.carried &&
+                         same9(W, d1) && memcmp(tv, d1tv, sizeof(tv)) == 0;
+            edvr::temporalCameraGateAdvance(c, true);
+            if (c.parkedRun > longest) longest = c.parkedRun;
+        }
+        check(allCarried, "a parked stay of five frames, re-parked once, carries the view's delta throughout");
+        check(longest == 4 && c.parkedRun == 0,
+              "the stay's length is counted (four parked frames) and ends with it");
+        const auto back = gateEye(c, b5, b6, still, W, tv);
+        check(back.verdict == TemporalCameraVerdict::Own && same9(c.lastGoodC, W),
+              "the view's first turning delta after the stay is accepted");
+        // The standing moves on once a frame and needs both eyes: within a
+        // frame the second eye judges against the same standing as the
+        // first, one eye's drop leaves the rows suspect for the next frame,
+        // and rows no delta reached (a frame with no write before them) are
+        // not the view's.
+        edvr::TemporalCameraGate e;
+        float mvs[3];
+        gateEye(e, a0, a1, still, W, tv); edvr::temporalCameraGateAdvance(e, true);
+        edvr::temporalWorldFromRows(a1, a1, W, tv, mvs);
+        const auto eye0 = edvr::temporalCameraGateStep(e, a1, a1, 0.0, 3.5f, W, tv);
+        edvr::temporalWorldFromRows(a1, a1, W, tv, mvs);
+        const auto eye1 = edvr::temporalCameraGateStep(e, a1, a1, 0.0, 2.5f, W, tv);
+        check(eye0.verdict == TemporalCameraVerdict::Another &&
+              eye1.verdict == TemporalCameraVerdict::Own,
+              "the second eye judges a frame against the same standing as the first");
+        edvr::temporalCameraGateAdvance(e, true);
+        edvr::temporalWorldFromRows(a1, a1, W, tv, mvs);
+        const auto next = edvr::temporalCameraGateStep(e, a1, a1, 0.0, 0.0f, W, tv);
+        check(!e.refOwn && next.verdict == TemporalCameraVerdict::Parked,
+              "one eye's drop leaves the rows suspect for the next frame");
+        edvr::TemporalCameraGate n;
+        n.refOwn = true;
+        edvr::temporalCameraGateAdvance(n, true);
+        check(!n.refOwn, "rows no delta was measured to are not known to be the view's");
+        n.refOwn = true;
+        n.measured = true;
+        edvr::temporalCameraGateAdvance(n, false);
+        check(!n.refOwn, "a frame with no rows leaves no reference");
+        // The floating origin: a jump's translation is dropped before the
+        // last-good store, so a later drop never carries it.
+        edvr::TemporalCameraGate j;
+        float far1[12];
+        rows34(2.0f, 0, 0, 5001, far1);
+        gateEye(j, a0, a1, still, d1, d1tv); edvr::temporalCameraGateAdvance(j, true);
+        const auto jump = gateEye(j, a1, far1, still, W, tv); edvr::temporalCameraGateAdvance(j, true);
+        check(jump.jump && jump.verdict == TemporalCameraVerdict::Own &&
+              tv[0] == 0.0f && tv[1] == 0.0f && tv[2] == 0.0f &&
+              memcmp(j.lastGoodTv, d1tv, sizeof(d1tv)) == 0 && same9(j.lastGoodC, W),
+              "a jump keeps its turn as the last good and the translation before it");
+        const auto dropped = gateEye(j, far1, p, still, W, tv);
+        check(dropped.carried && !dropped.carriedJump && memcmp(tv, d1tv, sizeof(tv)) == 0,
+              "a drop after a jump carries the translation before it (a jump carried: zero)");
     }
     if (g_fails) {
         printf("\nTEMPORAL TEST FAILED (%d)\n", g_fails);

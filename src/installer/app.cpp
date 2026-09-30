@@ -36,25 +36,33 @@ std::string bullets(const char* title, const std::vector<std::string>& items) {
 }  // namespace
 
 std::string usageText() {
-    return "EDVR installer\r\n"
+    const bool flat = payloadInfo().profile == "flat";
+    const char* exe = flat ? "edvr-flat-installer.exe" : "edvr-installer.exe";
+    // The settings file of this edition: the flat one keeps its own, so its
+    // options and its mirror are about edvr-flat.ini, never the VR profile's edvr.ini.
+    const std::string ini = toUtf8(settingsLeafFor(payloadInfo().profile));
+    std::string out = flat ? "EDVR flat capture qualification installer\r\n" : "EDVR VR installer\r\n";
+    out +=
            "\r\n"
-           "  edvr-installer.exe                        open the window\r\n"
-           "  edvr-installer.exe --install [--dir D]    install or update\r\n"
-           "  edvr-installer.exe --repair  [--dir D]    put a clobbered install back together\r\n"
-           "  edvr-installer.exe --uninstall [--dir D]  remove EDVR, restoring what it replaced\r\n"
-           "  edvr-installer.exe --collect-logs         zip the latest logs onto the Desktop\r\n"
+           "  " + std::string(exe) + "                        open the window\r\n"
+           "  " + std::string(exe) + " --install [--dir D]    install or update\r\n"
+           "  " + std::string(exe) + " --repair  [--dir D]    repair this edition\r\n"
+           "  " + std::string(exe) + " --uninstall [--dir D]  remove EDVR, restoring what it replaced\r\n"
+           "  " + std::string(exe) + " --collect-logs         zip the latest logs onto the Desktop\r\n"
            "\r\n"
            "  --dir <path>         the folder holding EliteDangerous64.exe. Without it, the\r\n"
            "                       installer finds your installs itself and uses the only one.\r\n"
            "  --dry-run            say what would happen; touch nothing.\r\n"
-           "  --replace-settings   overwrite edvr.ini instead of keeping your values.\r\n"
-           "  --remove-settings    with --uninstall, delete edvr.ini too.\r\n"
+           "  --convert-profile    explicitly convert the installed VR/flat edition.\r\n"
+           "  --replace-settings   overwrite " + ini + " instead of keeping your values.\r\n"
+           "  --remove-settings    with --uninstall, delete the installed edition's settings file too.\r\n"
            "  --help               this.\r\n"
            "\r\n"
-           "  A copy of edvr.ini (and the install record) is kept outside the game folder, in\r\n"
+           "  A copy of " + ini + " (and the install record) is kept outside the game folder, in\r\n"
            "  %LOCALAPPDATA%\\EDVR, so a game update that wipes the folder cannot take it too.\r\n"
-           "  --install restores from it automatically when the folder has no edvr.ini of its\r\n"
+           "  --install restores from it automatically when the folder has no " + ini + " of its\r\n"
            "  own, unless --replace-settings says you want fresh defaults instead.\r\n";
+    return out;
 }
 
 AppArgs parseArgs(int argc, wchar_t** argv) {
@@ -84,6 +92,8 @@ AppArgs parseArgs(int argc, wchar_t** argv) {
             a.dir = arg.substr(6);
         else if (arg == L"--dry-run")
             a.dryRun = true;
+        else if (arg == L"--convert-profile")
+            a.convertProfile = true;
         else if (arg == L"--replace-settings")
             a.keepSettings = false;
         else if (arg == L"--remove-settings")
@@ -105,6 +115,7 @@ Options optionsFor(const AppArgs& args, bool repair) {
     o.keepSettings = args.keepSettings;
     o.removeSettings = args.removeSettings;
     o.repair = repair;
+    o.convertProfile = args.convertProfile;
     o.backupStamp = timestampName();
     o.nowUtc = utcNow();
     return o;
@@ -116,6 +127,9 @@ std::string statusReport(const Survey& s, const PayloadInfo& payload) {
     out += "Found by: " + toUtf8(s.game.source);
     if (!s.game.product.empty()) out += "   (" + toUtf8(s.game.product) + ")";
     out += "\r\n\r\n";
+    const std::string detected = installedProfile(s);
+    out += "Installed edition: " + (detected.empty() ? std::string("none") : detected) +
+           "   Installer edition: " + payload.profile + "\r\n";
 
     out += "d3d11.dll         " + toUtf8(describeDll(s.d3d11)) + "\r\n";
     if (s.haveOpenvrDir) {
@@ -134,6 +148,11 @@ std::string statusReport(const Survey& s, const PayloadInfo& payload) {
         out += "openvr_api.dll    the game's own copy was not found under this folder\r\n";
     }
     out += std::string("edvr.ini          ") + (s.iniPresent ? "present" : "not present") + "\r\n";
+    // The flat profile's own settings file, for the edition that uses it (and
+    // whenever one is there): "not present" beside a present edvr.ini means the
+    // flat edition has yet to start its own from it.
+    if (payload.profile == "flat" || s.flatIniPresent)
+        out += std::string("edvr-flat.ini     ") + (s.flatIniPresent ? "present" : "not present") + "\r\n";
     out += std::string("nvngx_dlss.dll    ") +
            (s.ngx.kind == DllKind::Absent ? std::string("not present (NVIDIA's DLSS runtime)")
                                           : toUtf8(describeDll(s.ngx))) +
@@ -154,6 +173,7 @@ std::string statusReport(const Survey& s, const PayloadInfo& payload) {
         }
     }
     if (!payload.version.empty()) out += "\r\nThis installer carries EDVR " + payload.version + ".\r\n";
+    if (payload.profile == "flat") out += "Experimental flat temporal build: zero-jitter testing. Game supersampling controls render scale. Press F10 for a bounded diagnostic capture.\r\n";
     if (s.gameRunningHere) {
         out += "\r\n!  Elite Dangerous is running. Close it before installing anything.\r\n";
     } else if (s.gameRunningElsewhere) {
@@ -161,13 +181,22 @@ std::string statusReport(const Survey& s, const PayloadInfo& payload) {
         // reads a status that ignores the game they can see running.
         out += "\r\n-  Elite Dangerous is running, but from a different folder. This install is "
                "not the one in use.\r\n";
+    } else if (s.gameRunStateUnknown) {
+        // A check that failed says so. Reading it as "not running" is how the
+        // installer used to walk into a folder the game had open.
+        out += "\r\n!  Could not tell whether Elite Dangerous is running (Windows would not list "
+               "the running programs). Nothing will be installed until that is settled.\r\n";
     }
     return out;
 }
 
 std::string planReport(const Plan& plan) {
     std::string out = planSummary(plan);
-    out += bullets("\r\n  Settings kept from your edvr.ini:", plan.merge.kept);
+    // Named for the file the plan works on: the flat edition's is edvr-flat.ini,
+    // and a report about "your edvr.ini" would send somebody to the wrong one.
+    const std::string kept = "\r\n  Settings kept from your " +
+                             (plan.settingsFile.empty() ? std::string("edvr.ini") : plan.settingsFile) + ":";
+    out += bullets(kept.c_str(), plan.merge.kept);
     out += bullets("  New defaults adopted (you had not changed these):", plan.merge.adopted);
     out += bullets("  Set by the installer:", plan.merge.forced);
     out += bullets("  Followed a setting that moved, and still applies:", plan.merge.followed);
@@ -211,6 +240,7 @@ bool relaunchElevated(const AppArgs& args) {
     if (!args.keepSettings) cmd += L"--replace-settings ";
     if (args.removeSettings) cmd += L"--remove-settings ";
     if (args.dryRun) cmd += L"--dry-run ";
+    if (args.convertProfile) cmd += L"--convert-profile ";
     cmd += L"--autorun";
 
     SHELLEXECUTEINFOW info{};
@@ -276,29 +306,38 @@ int runConsole(const AppArgs& args) {
     const std::wstring mirrorDir = mirrorDirFor(survey.game);
     const bool canMirror = args.action != AppArgs::Act::Uninstall;
 
-    // A folder with no edvr.ini at all but a mirror outside it is exactly the
-    // folder a game update just wiped. Restored by DEFAULT here -- there is no
+    // A folder with no settings file at all but a mirror outside it is exactly
+    // the folder a game update just wiped. Restored by DEFAULT here -- there is no
     // prompt to answer on a command line -- unless --replace-settings said the
     // opposite: somebody who asked for fresh defaults should not have last
     // week's settings appear anyway. --dry-run promises to touch nothing, and
     // a restore is a write, so it is only ever described there, never done.
-    if (canMirror && !survey.iniPresent && args.keepSettings) {
+    //
+    // "A settings file" and "a mirror of one" are asked in the edition's terms:
+    // the flat edition's is edvr-flat.ini (or the shared edvr.ini it falls back
+    // to), and a mirror holding only edvr-flat.ini is one worth offering.
+    if (canMirror && args.keepSettings) {
         const MirrorInfo mirror = readMirror(mirrorDir);
-        if (mirror.hasIni) {
-            writeOut("This folder has no edvr.ini, but one from an earlier install of it was "
-                     "found outside the game folder (" + toUtf8(mirror.dir) + "), last saved " +
+        if (offerRestore(hasSettingsFor(survey, payload.profile), mirror, payload.profile)) {
+            const std::string wanted = payload.profile == "flat" ? "edvr-flat.ini or edvr.ini" : "edvr.ini";
+            writeOut("This folder has no " + wanted + ", but settings from an earlier install of it "
+                     "were found outside the game folder (" + toUtf8(mirror.dir) + "), last saved " +
                      mirror.savedUtc + ".\r\n");
             if (args.dryRun) {
-                writeOut("  Would restore it before installing -- skipped, this is a dry run. "
-                         "The plan below is for this folder as it is now, with no edvr.ini.\r\n\r\n");
+                writeOut("  Would restore them before installing -- skipped, this is a dry run. "
+                         "The plan below is for this folder as it is now, with no " + wanted +
+                         ".\r\n\r\n");
             } else {
                 std::vector<std::string> notes;
-                if (restoreFromMirror(survey.game.dir, mirror, &notes)) {
-                    for (const std::string& n : notes) writeOut("  " + n + "\r\n");
-                    survey = surveyTarget(game);
-                } else {
-                    writeOut("  Could not restore it -- continuing as a fresh install.\r\n");
+                const bool restored = restoreFromMirror(survey.game.dir, mirror, &notes);
+                for (const std::string& n : notes) writeOut("  " + n + "\r\n");
+                if (!restored) {
+                    writeOut("  Could not restore all of it -- carrying on with what is in the "
+                             "folder now.\r\n");
                 }
+                // Whatever did come back is what the plan is for, whether or not
+                // all of it did.
+                survey = surveyTarget(game);
                 writeOut("\r\n");
             }
         }
@@ -330,7 +369,7 @@ int runConsole(const AppArgs& args) {
     if (!result.ok) {
         writeOut("\r\n" + result.error + "\r\n");
         if (result.rolledBack) {
-            writeOut("Everything this run had changed was put back.\r\n");
+            writeOut("Installed files and metadata were restored; recovery backups were kept.\r\n");
         }
         return 1;
     }

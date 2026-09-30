@@ -3,24 +3,38 @@
 #include <windows.h>
 
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <cwchar>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "log.h"
+#include "runtime_profile.h"
 
 namespace edvr {
 
+// std::less<> makes the map transparent, so find(const char*) compares in
+// place. With the default comparator every getter built a temporary
+// std::string just to look its key up, and most keys are longer than the 15
+// characters a std::string stores inline, so that was a heap allocation per
+// read.
+using ValueMap = std::map<std::string, std::string, std::less<>>;
+
 struct Config::Impl {
-    std::map<std::string, std::string> values;
+    ValueMap values;
     // The config audit's session memory: findings queued until the log can
     // take them (the first parse runs before Log::open), and a set of what
     // has already been said so a reload does not repeat it.
     std::vector<std::string> auditPending;
     std::set<std::string>    auditNoted;
+    // Keys whose malformed-value note has been written since the last
+    // successful parse. A parse clears it, so an edit that leaves a value
+    // malformed says so again -- once. See firstNoteFor().
+    std::set<std::string, std::less<>> noteNoted;
 };
 
 namespace {
@@ -37,6 +51,29 @@ std::string lowered(const std::string& s) {
     }
     return out;
 }
+
+// Config's lock, scoped. Shared for a lookup; exclusive for anything that
+// writes what m_impl points at. See the comment on Config::m_lock for what
+// may and may not happen while one of these is alive.
+class ReadGuard {
+public:
+    explicit ReadGuard(SRWLOCK& lock) : m_lock(lock) { AcquireSRWLockShared(&m_lock); }
+    ~ReadGuard() { ReleaseSRWLockShared(&m_lock); }
+    ReadGuard(const ReadGuard&) = delete;
+    ReadGuard& operator=(const ReadGuard&) = delete;
+private:
+    SRWLOCK& m_lock;
+};
+
+class WriteGuard {
+public:
+    explicit WriteGuard(SRWLOCK& lock) : m_lock(lock) { AcquireSRWLockExclusive(&m_lock); }
+    ~WriteGuard() { ReleaseSRWLockExclusive(&m_lock); }
+    WriteGuard(const WriteGuard&) = delete;
+    WriteGuard& operator=(const WriteGuard&) = delete;
+private:
+    SRWLOCK& m_lock;
+};
 }  // namespace
 
 void Config::setAuditTables(const char* const* knownLower, size_t knownCount,
@@ -94,16 +131,34 @@ std::wstring defaultLogDirectory() {
 }  // namespace
 
 void Config::init(const std::wstring& moduleDir) {
-    if (!m_impl) m_impl = new Impl();
+    runtimeProfileInitialize(moduleDir, executableDirectory());
+    {
+        // Under the lock, because a getter on another thread reads the pointer
+        // itself: it is null until here, and "no Impl yet" means "the default".
+        WriteGuard g(m_lock);
+        if (!m_impl) m_impl = new Impl();
+    }
 
-    const std::wstring candidates[] = {
-        moduleDir + L"\\edvr.ini",
-        executableDirectory() + L"\\edvr.ini",
-    };
+    // The flat profile keeps its settings in a file of its own, so a flat
+    // install over a VR one (or back) never clobbers the other profile's
+    // tuning. A flat install without edvr-flat.ini yet falls back to
+    // edvr.ini, which is how existing flat installs keep their settings
+    // until the installer seeds the separate file.
+    //
+    // One file is read, whole: m_path is the first candidate that exists, and iniName()
+    // (config.h) names it for every message that has to say which file it means.
+    std::wstring candidates[4];
+    size_t count = 0;
+    if (runtimeFlatProfile()) {
+        candidates[count++] = moduleDir + L"\\" + kIniNameFlatW;
+        candidates[count++] = executableDirectory() + L"\\" + kIniNameFlatW;
+    }
+    candidates[count++] = moduleDir + L"\\" + kIniNameVrW;
+    candidates[count++] = executableDirectory() + L"\\" + kIniNameVrW;
     m_path = candidates[0];
-    for (const std::wstring& c : candidates) {
-        if (GetFileAttributesW(c.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            m_path = c;
+    for (size_t i = 0; i < count; ++i) {
+        if (GetFileAttributesW(candidates[i].c_str()) != INVALID_FILE_ATTRIBUTES) {
+            m_path = candidates[i];
             break;
         }
     }
@@ -132,14 +187,38 @@ void Config::parse() {
     // and the reload poll runs about once a second with a text editor open,
     // which is exactly when somebody is editing. reloadIfChanged() would report
     // success too. Nothing survives being read at the wrong instant now.
-    std::map<std::string, std::string> parsed;
+    //
+    // Nor is the lock held while the file is read and parsed. That is the slow
+    // part -- a 148 KB ini -- and it touches nothing another thread can see.
+    // The lock is taken once, below, to swap the result in.
+    ValueMap parsed;
 
-    HANDLE f = CreateFileW(m_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    // FILE_SHARE_DELETE, so that reading the ini does not stop it being replaced,
+    // renamed or deleted. The in-headset menu and the installer's settings window
+    // both save through iniedit's writeFileAtomic, which renames a temp file over
+    // edvr.ini, and the menu asks for a reload straight after -- so the next save
+    // can land while this read has the file open.
+    //
+    // That rename is done with POSIX semantics (FileRenameInfoEx, Windows 10 1607+,
+    // NTFS), which goes through under a handle that shares DELETE: the target's
+    // name moves to the new file at once and this read carries on with the old
+    // one. Without the share it would be refused for as long as this read lasts.
+    // (The classic MoveFileExW replace, which writeFileAtomic falls back to where
+    // POSIX renames are unsupported, is refused while ANY handle to the target is
+    // open, this share included -- measured on Windows 11 build 26200 -- and there
+    // it is the writer's retry that waits this read out. See iniedit.h.)
+    HANDLE f = CreateFileW(m_path.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
         // An ini that is genuinely absent means "all defaults", which is only
         // true on the FIRST parse; later it means the file went away mid-session
         // and the values we already have are better than nothing.
+        //
+        // `parsed` is still empty here, so this can only leave an empty map
+        // empty. It is a write to shared state all the same, and is locked as
+        // one.
+        WriteGuard g(m_lock);
         if (m_impl->values.empty()) m_impl->values.swap(parsed);
         return;
     }
@@ -242,16 +321,27 @@ void Config::parse() {
         // right.
         parsed[lowered(section.empty() ? key : section + "." + key)] = val;
     }
-    auditResolve(&parsed);
-    m_impl->values.swap(parsed);
-    // Stamped only now, on the success path.
-    //
-    // Stamping it up front meant a read that failed -- an editor holding the
-    // file mid-save -- kept the old values, correctly, but recorded the new
-    // timestamp with them. reloadIfChanged() then saw nothing to do and that
-    // edit was never picked up for the rest of the session. The size-check bail
-    // above already avoided this; the read path did not.
-    if (haveInfo) m_lastWrite = info.ftLastWriteTime;
+    {
+        // The only stretch of parse() under the lock: the audit's bookkeeping,
+        // the swap, the note set's reset and the stamp. Nothing in here calls
+        // a getter or the log, so it cannot meet the lock again.
+        WriteGuard g(m_lock);
+        auditResolve(&parsed);
+        m_impl->values.swap(parsed);
+        m_impl->noteNoted.clear();
+        // Stamped only now, on the success path.
+        //
+        // Stamping it up front meant a read that failed -- an editor holding
+        // the file mid-save -- kept the old values, correctly, but recorded
+        // the new timestamp with them. reloadIfChanged() then saw nothing to
+        // do and that edit was never picked up for the rest of the session.
+        // The size-check bail above already avoided this; the read path did
+        // not.
+        if (haveInfo) m_lastWrite = info.ftLastWriteTime;
+    }
+    // `parsed` now owns the PREVIOUS map. It is freed when this function
+    // returns, after the lock is gone, so a reader is never held up by the
+    // destructor of a map it is not using.
     auditFlush();
 }
 
@@ -259,10 +349,15 @@ void Config::parse() {
 // lines named. Findings are queued -- the first parse runs before the log
 // opens -- and each is said once per session, so a live reload does not
 // repeat them.
+//
+// Runs under the exclusive lock (parse() takes it): it reads and writes
+// Impl's audit sets. It only queues; auditFlush() does the logging, unlocked.
 void Config::auditResolve(void* parsedMap) {
     if (!g_auditKnown || !m_impl) return;
-    auto& parsed = *static_cast<std::map<std::string, std::string>*>(parsedMap);
+    auto& parsed = *static_cast<ValueMap*>(parsedMap);
 
+    // The file every finding below is about: the one this parse read.
+    const std::string file = iniName();
     std::set<std::string> movedOld;
     std::set<std::string> synthesized;
     for (size_t i = 0; i < g_auditMovedCount; ++i) {
@@ -282,7 +377,7 @@ void Config::auditResolve(void* parsedMap) {
                 // synthesized from it.
                 if (m_impl->auditNoted.insert("mv:" + oldK).second) {
                     m_impl->auditPending.push_back(
-                        "edvr.ini: " + oldK + " has moved to " + newK +
+                        file + ": " + oldK + " has moved to " + newK +
                         ", and your line still carries the retired default (" +
                         o->second + "), so it is ignored and " + newK +
                         "'s own default applies. The installer's update "
@@ -296,7 +391,7 @@ void Config::auditResolve(void* parsedMap) {
             synthesized.insert(newK);
             if (m_impl->auditNoted.insert("mv:" + oldK).second) {
                 m_impl->auditPending.push_back(
-                    "edvr.ini: " + oldK + " has moved to " + newK +
+                    file + ": " + oldK + " has moved to " + newK +
                     " -- your value (" + o->second + ") is being read from "
                     "the old line this session. The installer's update "
                     "migrates the file, or move the line yourself.");
@@ -311,7 +406,7 @@ void Config::auditResolve(void* parsedMap) {
             // for a target genuinely set in the file.
             if (m_impl->auditNoted.insert("mv2:" + oldK).second) {
                 m_impl->auditPending.push_back(
-                    "edvr.ini: both " + oldK + " and " + newK + " are set, "
+                    file + ": both " + oldK + " and " + newK + " are set, "
                     "with different values. The new name wins (" + n->second +
                     "); delete the old line.");
             }
@@ -348,39 +443,111 @@ void Config::auditResolve(void* parsedMap) {
     if (deadCount) {
         if (deadCount > deadShown) dead += ", ...";
         m_impl->auditPending.push_back(
-            "edvr.ini: " + std::to_string(deadCount) +
+            file + ": " + std::to_string(deadCount) +
             " line(s) name settings this build does not read: " + dead +
             ". A typo or a retired setting -- those lines do nothing.");
     }
+    // One place, after every push above. The flag is what lets a getter skip
+    // the lock, so it must be up whenever a line waits: it stays up from an
+    // earlier parse until auditFlush() drains the queue.
+    if (!m_impl->auditPending.empty()) m_auditPending.store(true, std::memory_order_release);
 }
 
 void Config::auditFlush() const {
-    if (!m_impl || m_impl->auditPending.empty() || !Log::get().isOpen()) return;
-    for (const std::string& s : m_impl->auditPending) {
+    // Lock-free while there is nothing to say, which is nearly always: this
+    // runs on every getString, on whatever thread is reading.
+    if (!m_auditPending.load(std::memory_order_acquire)) return;
+    // The findings wait for the log: the first parse runs before Log::open,
+    // and the first config read after it opens is soon enough. The flag stays
+    // up meanwhile, so a closed log costs two loads per read and no lock.
+    if (!Log::get().isOpen()) return;
+
+    std::vector<std::string> lines;
+    {
+        // Exclusive, because this drains a queue that a parse on another
+        // thread may be appending to. Re-checked here rather than trusted from
+        // the flag: two threads can both get past the load above, and only the
+        // first finds anything -- the second swaps out an empty vector.
+        WriteGuard g(m_lock);
+        if (m_impl) lines.swap(m_impl->auditPending);
+        m_auditPending.store(false, std::memory_order_release);
+    }
+    // Written after the lock is gone: note() formats, takes the log's own spin
+    // lock and may start its flusher thread, none of which belongs inside ours.
+    for (const std::string& s : lines) {
         Log::get().note("%s", s.c_str());
     }
-    m_impl->auditPending.clear();
 }
 
 bool Config::reloadIfChanged() {
     WIN32_FILE_ATTRIBUTE_DATA data{};
     if (!GetFileAttributesExW(m_path.c_str(), GetFileExInfoStandard, &data)) return false;
-    if (CompareFileTime(&data.ftLastWriteTime, &m_lastWrite) == 0) return false;
+    // m_lastWrite is stamped by parse() under the lock, so it is read under it.
+    FILETIME last;
+    {
+        ReadGuard g(m_lock);
+        last = m_lastWrite;
+    }
+    if (CompareFileTime(&data.ftLastWriteTime, &last) == 0) return false;
     parse();
     return true;
 }
 
 std::string Config::getString(const char* key, const char* def) const {
-    if (!m_impl) return def ? def : "";
+    if (!runtimeProfileAllowsKey(key))
+        return key && std::strncmp(key, "hotkey.", 7) == 0 ? "" : "off";
     // The audit's findings wait here for the log: the first parse runs before
     // Log::open, and the first config read after it opens is soon enough.
     auditFlush();
-    auto it = m_impl->values.find(key);
-    if (it != m_impl->values.end()) return it->second;
+    {
+        // The value is copied out under the shared lock. A reload swaps the map
+        // and frees the old one, so nothing may still point into it once the
+        // lock is released -- which is why this returns a std::string and not a
+        // reference or a const char*.
+        ReadGuard g(m_lock);
+        if (m_impl) {
+            const auto it = m_impl->values.find(key);
+            if (it != m_impl->values.end()) return it->second;
+        }
+    }
     return std::string(def ? def : "");
 }
 
+std::string Config::requestedTemporalMode() const {
+    ReadGuard g(m_lock);
+    if (!m_impl) return "off";
+    const auto it = m_impl->values.find("fix.temporal_aa");
+    return it == m_impl->values.end() ? "off" : it->second;
+}
+
+// Said once per key per successful parse, and only once the log can take it.
+//
+// The getters below used to note a malformed value on EVERY read. A key read
+// each frame -- most of the ones that matter -- wrote 90 to 180 identical lines
+// a second until log.max_mb, after which the flight logged nothing at all.
+//
+// A parse clears the set, so an edit that leaves the value malformed is
+// reported again, once. A note the log cannot take is not spent: note() does
+// nothing before Log::open, and much is read before it (log.enabled, log.max_mb,
+// log.buffer_mb, everything at start-up), so marking the key then would lose
+// the line for good.
+//
+// Two threads reading the same key can both find it unsaid; emplace() decides,
+// under the exclusive lock, which of them says it. A read that straddles a
+// reload can be reported against the new parse's set. That costs at most one
+// suppressed repeat, of a value that has just been replaced.
+bool Config::firstNoteFor(const char* key) const {
+    if (!Log::get().isOpen()) return false;
+    {
+        ReadGuard g(m_lock);
+        if (!m_impl || m_impl->noteNoted.find(key) != m_impl->noteNoted.end()) return false;
+    }
+    WriteGuard g(m_lock);
+    return m_impl && m_impl->noteNoted.emplace(key).second;
+}
+
 bool Config::getBool(const char* key, bool def) const {
+    if (!runtimeProfileAllowsKey(key)) return false;
     std::string v = getString(key, "");
     if (v.empty()) return def;
     for (char& c : v) {
@@ -398,18 +565,25 @@ bool Config::getBool(const char* key, bool def) const {
     //
     // One key cannot be reported this way: log.enabled is read before the log is
     // open, and note() no-ops until then. Everything else lands.
-    Log::get().note("edvr.ini: %s = \"%s\" is not a yes/no value, so the default (%s) is "
-                    "being used. Write 1/0, true/false, yes/no or on/off.",
-                    key, v.c_str(), def ? "on" : "off");
+    //
+    // Once per key per parse (firstNoteFor), not once per read.
+    if (firstNoteFor(key)) {
+        Log::get().note("%s: %s = \"%s\" is not a yes/no value, so the default (%s) is "
+                        "being used. Write 1/0, true/false, yes/no or on/off.",
+                        iniName(), key, v.c_str(), def ? "on" : "off");
+    }
     return def;
 }
 
 void Config::set(const char* key, const char* value) {
     if (!key || !value) return;
-    if (!m_impl) m_impl = new Impl();
     std::string k(key);
     for (char& c : k) c = static_cast<char>(tolower(c));
+    WriteGuard g(m_lock);
+    if (!m_impl) m_impl = new Impl();
     m_impl->values[k] = value;
+    // A new value is a new thing to say about the key, as a parse would be.
+    m_impl->noteNoted.erase(k);
 }
 
 // Does the whole value parse, or only a prefix of it?
@@ -431,33 +605,46 @@ static bool wholeValueParsed(const char* s, const char* end) {
 }
 
 int Config::getInt(const char* key, int def) const {
+    if (!runtimeProfileAllowsKey(key)) return 0;
     const std::string v = getString(key, "");
     if (v.empty()) return def;
     const char* s = v.c_str();
     char* end = nullptr;
     const long raw = strtol(s, &end, 0);
     if (!wholeValueParsed(s, end)) {
-        Log::get().note("%s = \"%s\" is not a plain number; using %d. Everything "
-                        "after the digits was ignored before this, which made a "
-                        "typo read as a deliberate setting.", key, s, def);
+        if (firstNoteFor(key)) {
+            Log::get().note("%s = \"%s\" is not a plain number; using %d. Everything "
+                            "after the digits was ignored before this, which made a "
+                            "typo read as a deliberate setting.", key, s, def);
+        }
         return def;
     }
     return static_cast<int>(raw);
 }
 
 float Config::getFloat(const char* key, float def) const {
+    if (!runtimeProfileAllowsKey(key)) return 0.0f;
     const std::string v = getString(key, "");
     if (v.empty()) return def;
     // A value that does not parse reads 0.0 silently, and 0.0 is a legitimate
     // setting for most of these -- so "I typed 2,75 in a comma locale" and "I
     // meant 0" are indistinguishable in the log and in the headset. strtof's
     // endptr tells them apart, so it is used.
+    //
+    // All of it, and finite (2026-09-29). This used to ask only that SOMETHING
+    // parsed, so "2,75" read as 2 and "1.5x" as 1.5 -- the same silent
+    // truncation getInt was cured of. And strtof accepts "nan" and "inf", which
+    // no setting can use: NaN compares false against every bound a caller
+    // checks, so it walks past the range test that would have caught a bad
+    // number, and infinity turns the arithmetic after it into infinity.
     const char* s = v.c_str();
     char* end = nullptr;
     const float out = strtof(s, &end);
-    if (end == s) {
-        Log::get().note("%s = \"%s\" is not a number; using %g. If you meant a "
-                        "decimal, use a point rather than a comma.", key, s, def);
+    if (!wholeValueParsed(s, end) || !std::isfinite(out)) {
+        if (firstNoteFor(key)) {
+            Log::get().note("%s = \"%s\" is not a number; using %g. If you meant a "
+                            "decimal, use a point rather than a comma.", key, s, def);
+        }
         return def;
     }
     return out;
@@ -476,19 +663,24 @@ float Config::getFloat(const char* key, float def) const {
 // offset clamps: a refused value silently becomes a default that is nothing
 // like what was asked for, where a clamped one is the nearest thing that works.
 int Config::getIntInRange(const char* key, int def, int lo, int hi) const {
+    if (!runtimeProfileAllowsKey(key)) return 0;
     const std::string v = getString(key, "");
     if (v.empty()) return def;
     const char* s = v.c_str();
     char* end = nullptr;
     const long raw = strtol(s, &end, 0);
     if (!wholeValueParsed(s, end)) {
-        Log::get().note("%s = \"%s\" is not a number; using %d.", key, s, def);
+        if (firstNoteFor(key)) {
+            Log::get().note("%s = \"%s\" is not a number; using %d.", key, s, def);
+        }
         return def;
     }
     if (raw < lo || raw > hi) {
         const long c = raw < lo ? lo : hi;
-        Log::get().note("%s = %ld is outside %d..%d, so %ld is being used.",
-                        key, raw, lo, hi, c);
+        if (firstNoteFor(key)) {
+            Log::get().note("%s = %ld is outside %d..%d, so %ld is being used.",
+                            key, raw, lo, hi, c);
+        }
         return static_cast<int>(c);
     }
     return static_cast<int>(raw);

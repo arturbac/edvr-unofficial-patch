@@ -44,6 +44,7 @@ namespace edvr { void temporalPassDumpHistory(const char* trigger); }
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
+struct ID3D11Texture2D;
 
 namespace edvr {
 
@@ -78,6 +79,11 @@ bool nativeTemporalWarmTarget(ID3D11Device** dev, unsigned long* thread);
 // draw was another camera's on half the frames in space (2026-09-04).
 void temporalPassNoteSceneWrite(const void* res, const void* data, uint32_t bytes);
 void temporalPassNoteFirstEyeDraw(ID3D11DeviceContext* ctx);
+// Retrospective provenance only: latch the rows actually current at the first
+// supported rigid scene draw for each identified eye. The selection and motion
+// path do not read this state. `resource` is the VS b1 object used by the draw.
+bool temporalPassWantsRigidDraw(int eye);
+void temporalPassNoteRigidDraw(int eye, const void* resource, uint64_t vertexShaderHash);
 // This frame's rows become last frame's; called at the frame boundary.
 void temporalPassFrameBoundary();
 
@@ -86,19 +92,23 @@ void temporalPassFrameBoundary();
 // and per-eye motion metadata in edvr_logs\eyes. The paired run is the
 // default; advanced.eye_run_paired=0 keeps the older single-run selection.
 void temporalPassArmEyeDump();
+// Active eye-run diagnostic only, after the final crisp composition and before
+// the runtime's menu. region is the actual returned texture's unflipped bounds.
+void temporalPassCaptureFinalEye(uint64_t sequence, uint32_t eye, ID3D11Texture2D* texture,
+                                 const uint32_t region[4], bool composite, bool flipU, bool flipV);
 
 // The pass wants the scanner-chrome tracker (vscreen.cpp, beginPanelOverride)
 // running whenever it is on: the FSS's interface takes the head's path
 // while the scanner's screen is up (docs/fss-scanner.md, 2026-09-16), and
 // the tracker's stamp is how the pass knows the screen is up. The heal
 // gates the tracker too, but a rig with the heal off still needs the path.
-bool temporalPassWantsFssChrome();
-
-// The eye's offset from the head as the runtime last handed it to the pass
-// (metres, x toward the right), for the foveation's nasal shift. False
-// until a frame has been treated with a head delta and an offset: the
-// caller keeps its own default.
-bool temporalPassEyeOffset(int eye, float out[3]);
+//
+// Inline: asked by vscreen.cpp's beginPanelOverride, and the build has no
+// /GL to fold a cross-TU getter for one bool load.
+namespace detail {
+extern bool g_temporalPassWantedFssChrome;
+}  // namespace detail
+inline bool temporalPassWantsFssChrome() { return detail::g_temporalPassWantedFssChrome; }
 
 // For the periodic totals line: eye-submits treated, the measured price,
 // and the share of pixels whose history was rejected (off the image or
@@ -143,6 +153,13 @@ bool temporalPassRegistration(char* buf, size_t n, char* buf2, size_t n2, char* 
 // frame, each size change, each withhold). False when it never ran.
 bool temporalPassDlaaTotals(uint32_t* frames, double* avgMs, double* maxMs,
                             uint32_t* resets);
+
+// The UI resolve's full-frame dispatches this session, and how many of them
+// lacked each input it can go without (a dispatch lacking two counts once in
+// each): lacked[0] the coverage mask, [1] the source-edit mask, [2] the
+// history. A lacked input is skipped, not read as zeros from a null view
+// (ui_resolve.h). False until one has run.
+bool temporalPassUiResolveTotals(uint64_t* dispatches, uint64_t lacked[3]);
 
 // The trained totals of whichever engine fix.temporal_aa names RIGHT NOW,
 // with the word a display should print for it ("NVIDIA", or "fsr 3.1.2"),

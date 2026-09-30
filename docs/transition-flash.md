@@ -1,5 +1,28 @@
 # The one-frame flash at transitions
 
+## Status
+
+- **State: the in-engine fix retired 2026-09-29 (code removed, 68bddaaa).**
+  `advanced.transition_flash_prevent` and its module are deleted (see the
+  Status block of the design doc named below). The shipped fix is still the
+  trap below; `fix.transition_flash`, its detector and the other flash keys are
+  untouched.
+- **State (2026-09-23):** the shipped fix is still the trap below: detect the
+  bad frame, resubmit the previous one. An in-engine fix was built and flown
+  the same day (flight 184826). The flight REFUTED the engine chain it hooked;
+  that chain attaches system-scale objects, not the eye. See
+  `docs\design-transition-flash-engine-fix-2026-09-23.md`; read its Status
+  block first.
+- **What the bad frame is:** the eye origin `cb1[275]` collapses to the head
+  pose alone while the objects stay in a frame that is not seat-centred. The
+  ship/seat transform is missing for one frame. The code that composes it is
+  not found yet.
+- **Next:** re-anchor on the render side, with a call stack where the game
+  writes the eye origin's constant buffer.
+- **Open:** issue #34 (second and later jumps) was closed on timing and never
+  re-measured; false replacements in smooth forward flight.
+- **Ruled out:** listed at the end of the design doc.
+
 *Frontier issue [37825](https://issues.frontierstore.net/issue-detail/37825) —
 "VR - Random, glitchy frame(s) appearing when entering orbital glide on a
 planet"*

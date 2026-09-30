@@ -1,5 +1,9 @@
 // Production source capture, screen history and pixel reprojection on WARP.
+// This rig supplies its own binding shadow readers (below), so it asks the
+// header for declarations rather than the inline production ones.
+#define EDVR_BINDING_SHADOW_EXTERNAL 1
 #include "../../src/d3d11/screen_motion.cpp"
+#include "../../src/d3d11/gpu_census.h"
 #include <d3dcompiler.h>
 #include <d3d11sdklayers.h>
 #include <DirectXPackedVector.h>
@@ -17,20 +21,42 @@ ComPtr<ID3DBlob> compile(const char* s,const char* profile,const char* entry="ma
     if(FAILED(h)&&e)std::puts(static_cast<const char*>(e->GetBufferPointer()));hr(h);return c;
 }
 namespace edvr {
+ID3D11PixelShader* shaderSwapCreatePs(ID3D11DeviceContext* ctx,const void* bytes,size_t size,const char*,const char*) {
+    ComPtr<ID3D11Device> dev;ctx->GetDevice(&dev);ID3D11PixelShader* shader=nullptr;
+    if(FAILED(dev->CreatePixelShader(bytes,size,nullptr,&shader)))return nullptr;return shader;
+}
+
 ID3D11ShaderResourceView* testWeaponMotion=nullptr;
 void weaponMotionConfigure(bool){}
 void weaponMotionSource(ID3D11Texture2D*){}
 ID3D11ShaderResourceView* weaponMotionView(){return testWeaponMotion;}
-void weaponMotionFrameBoundary(){}
+void weaponMotionFrameBoundary(ID3D11DeviceContext*){}
 void weaponMotionShutdown(){}
 uint64_t testVs=0,testPs=0;ID3D11RenderTargetView* testRtv=nullptr;
 Log& Log::get(){static Log l;return l;}Log::~Log()=default;void Log::note(const char*,...){}
 std::string Config::getString(const char*,const char*)const{return "dlss";}
-bool Config::getBool(const char* key,bool def)const{check(!strcmp(key,"fix.weapon_stability")&&def,"weapon temporal motion uses existing live toggle");return true;}
-void* bindingGet(BindSlot s){return s==BindSlot::Rtv0?testRtv:nullptr;}
+bool Config::getBool(const char* key,bool def)const{
+    if(!strcmp(key,"advanced.temporal_aa_diagnostics"))return false;   // the engine counts (engine_velocity_test drives them)
+    check(!strcmp(key,"fix.weapon_stability")&&def,"weapon temporal motion uses existing live toggle");return true;
+}
+// engine_velocity.cpp is not linked here: the on-foot engine path is driven
+// by tools/engine_velocity_test (panel_tests.h). No source views: the screen
+// shader keeps the camera term, byte-identical to before.
+unsigned testSourceNotes=0;ID3D11Buffer* testSourceScene=nullptr;
+EngineVelocitySourceSignal testSourceSignal=EngineVelocitySourceSignal::Terrain;
+void engineVelocityNoteSource(ID3D11Texture2D*,ID3D11Buffer* scene,EngineVelocitySourceSignal signal){++testSourceNotes;testSourceScene=scene;testSourceSignal=signal;}
+bool engineVelocitySourceViews(ID3D11Texture2D*,EngineVelocityViews* out){if(out)*out=EngineVelocityViews{};return false;}
+void engineVelocityNotePanelPixels(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){}
+// The hangar cases: vs_EB52 stands for a pool family, vs_AACF for a pool
+// family that is also a first-person weapon or tool shader.
+constexpr uint64_t testPoolVs=0xEB5234DB6ADB491Dull,testWeaponVs=0xAACFDCF2FB9AD809ull;
+bool engineVelocityPoolFamilyVs(uint64_t h) noexcept {return h==testPoolVs || h==testWeaponVs;}
+bool weaponMotionFamilyVs(uint64_t h){return h==testWeaponVs;}
+void* testDsv=nullptr;
+void* bindingGet(BindSlot s){return s==BindSlot::Rtv0?testRtv:s==BindSlot::Dsv0?testDsv:nullptr;}
 uint64_t bindingShaderHash(BindSlot s){return s==BindSlot::Vs?testVs:s==BindSlot::Ps?testPs:0;}
 bool bindingResolve(void* view,ResourceInfo* info){
-    if(!view)return false;ComPtr<ID3D11Resource> r;static_cast<ID3D11RenderTargetView*>(view)->GetResource(&r);
+    if(!view)return false;ComPtr<ID3D11Resource> r;static_cast<ID3D11View*>(view)->GetResource(&r);
     ComPtr<ID3D11Texture2D> t;if(FAILED(r.As(&t)))return false;D3D11_TEXTURE2D_DESC d{};t->GetDesc(&d);
     info->isTexture2D=true;info->a=d.Width;info->b=d.Height;return true;
 }
@@ -39,6 +65,15 @@ ID3D11PixelShader* shaderSwapCompilePs(ID3D11DeviceContext* ctx,const char* s,si
     hr(d->CreatePixelShader(c->GetBufferPointer(),c->GetBufferSize(),nullptr,&p));return p;
 }
 void vScreenSetRenderTargetsRaw(ID3D11DeviceContext* c,UINT n,ID3D11RenderTargetView*const* r,ID3D11DepthStencilView* d){c->OMSetRenderTargets(n,r,d);}
+// fix.ui_quality (ui_layer.h): true while the UI layer has the draw; its
+// inline reader is the production one.
+namespace detail{bool g_uiLayerRedirecting=false;}
+// The GPU census (issue #38) is cross-cutting; this rig is about screen
+// motion's own effect, not the census's rotation or its calibration
+// (tools/gpu_census_test covers those), so it is stubbed like the other
+// cross-cutting hooks above.
+bool gpuCensusBegin(ID3D11DeviceContext*, GpuCensusSection) noexcept { return false; }
+void gpuCensusEnd(ID3D11DeviceContext*, GpuCensusSection) noexcept {}
 }
 using namespace edvr;
 void __stdcall draw(ID3D11DeviceContext* c,unsigned,unsigned,unsigned,int,unsigned){c->Draw(3,0);}
@@ -81,7 +116,7 @@ int main(int argc,char** argv){
     auto psCode=compile("float4 main():SV_Target{return 1;}","ps_5_0");ComPtr<ID3D11PixelShader> ps;hr(dev->CreatePixelShader(psCode->GetBufferPointer(),psCode->GetBufferSize(),nullptr,&ps));
     ctx->VSSetShader(vs.Get(),nullptr,0);ctx->PSSetShader(ps.Get(),nullptr,0);ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D11_VIEWPORT vp{0,0,float(W),float(H),0,1};ctx->RSSetViewports(1,&vp);UINT stride=8,offset=0;ctx->IASetVertexBuffers(1,1,vb.GetAddressOf(),&stride,&offset);
-    g.enabled=true;
+    detail::g_screenMotionEnabled=true;
     auto sourceDraw=[&](){
         ID3D11ShaderResourceView* none=nullptr;ctx->PSSetShaderResources(0,1,&none);
         ctx->OMSetRenderTargets(1,rt.GetAddressOf(),ds.Get());ctx->ClearDepthStencilView(ds.Get(),D3D11_CLEAR_DEPTH,.0025f,0);
@@ -96,20 +131,23 @@ int main(int argc,char** argv){
         ComPtr<ID3D11RenderTargetView> after;ctx->OMGetRenderTargets(1,&after,nullptr);check(after.Get()==er[e].Get(),"game colour target restored");
         ComPtr<ID3D11PixelShader> afterPs;ctx->PSGetShader(&afterPs,nullptr,nullptr);check(afterPs.Get()==ps.Get(),"game pixel shader restored");
     };
-    sourceDraw();check(!g.depth,"source work waits for actual screen");screenDraw(0);screenDraw(1);screenMotionFrameBoundary();
-    sourceDraw();screenDraw(0);screenDraw(1);check(!screenMotionView(0,W,H),"first source frame has no invented history");
-    screenMotionFrameBoundary();source[275][0]=.1f;sourceDraw();
+    sourceDraw();check(!g.depth,"source work waits for actual screen");check(!testSourceNotes,"no source named to the engine path before the screen");
+    screenDraw(0);screenDraw(1);screenMotionFrameBoundary(ctx.Get());
+    sourceDraw();check(testSourceNotes==1,"each source frame names its depth to the engine path (its MRT6 slot target follows it)");
+    check(testSourceScene==sc.Get(),"the naming hands the engine path the camera its draw reads (VS b1), for the source's camera rule");
+    screenDraw(0);screenDraw(1);check(!screenMotionView(0,W,H),"first source frame has no invented history");
+    screenMotionFrameBoundary(ctx.Get());source[275][0]=.1f;sourceDraw();
     // The game clears depth later in the frame: read completed depth now,
     // not a premature copy at the first terrain draw.
     ctx->ClearDepthStencilView(ds.Get(),D3D11_CLEAR_DEPTH,.005f,0);screenDraw(0);screenDraw(1);
     check(screenMotionView(0,W,H) && screenMotionView(1,W,H),"independent eye maps available");
     for(auto& e:g.eyes){auto a=read(dev.Get(),ctx.Get(),e.map.Get());for(unsigned i=0;i<W*H;++i)if(a[i*4+3]==1){check(std::fabs(a[i*4]-.64f)<.001f,"walking uses completed depth and source camera");check(std::fabs(a[i*4+1])<.001f,"walking X does not move Y");}}
-    screenMotionFrameBoundary();check(!screenMotionView(0,W,H),"map cannot outlive its frame");
-    screenMotionFrameBoundary();sourceDraw();screenDraw(0);screenDraw(1);check(!screenMotionView(0,W,H),"missing screen frame breaks history");
+    screenMotionFrameBoundary(ctx.Get());check(!screenMotionView(0,W,H),"map cannot outlive its frame");
+    screenMotionFrameBoundary(ctx.Get());sourceDraw();screenDraw(0);screenDraw(1);check(!screenMotionView(0,W,H),"missing screen frame breaks history");
     // Original source UI alpha (including discard), straight/premultiplied
     // blend contracts, source identity and per-frame mask lifetime.
     {
-        screenMotionFrameBoundary();source[275][0]+=.1f;sourceDraw();
+        screenMotionFrameBoundary(ctx.Get());source[275][0]+=.1f;sourceDraw();
         // The input list repeats the vertex shader's output order (TEXCOORD0
         // then SV_Position) so both land in the same registers: a pixel shader
         // that names only SV_Position puts it in v0 while the vertex shader
@@ -152,12 +190,22 @@ int main(int argc,char** argv){
             if(x>=18&&x<=46){check(a[i+3]==3,"source UI survives projection into both eye maps");check(std::fabs(a[i])<.001f,"source UI does not receive scenery translation");}
             if(x<14||x>50){check(a[i+3]==1,"transparent source/UI discard retains scenery");check(std::fabs(a[i]-.32f)<.001f,"scenery still receives source camera translation");}
         }}
-        screenMotionFrameBoundary();sourceDraw();screenDraw(0);
+        screenMotionFrameBoundary(ctx.Get());sourceDraw();screenDraw(0);
         auto a=read(dev.Get(),ctx.Get(),g.eyes[0].map.Get());for(UINT i=0;i<W*H;++i)check(a[i*4+3]!=3,"absent source UI cannot retain stale coverage");
-        screenMotionFrameBoundary();sourceDraw();ctx->PSSetShader(up.Get(),nullptr,0);ctx->OMSetBlendState(blend.Get(),nullptr,~0u);ctx->OMSetDepthStencilState(uds.Get(),14);
+        screenMotionFrameBoundary(ctx.Get());sourceDraw();ctx->PSSetShader(up.Get(),nullptr,0);ctx->OMSetBlendState(blend.Get(),nullptr,~0u);ctx->OMSetDepthStencilState(uds.Get(),14);
         testVs=0xA888D51024D9798Eull;testPs=0x015EF9349EC097E8ull;uiDraw();
         coverage=read(dev.Get(),ctx.Get(),g.ui.Get());check(std::fabs(coverage[20]-191/255.f)<1e-6,"new source frame clears previous opacity");
         ctx->PSSetShader(ps.Get(),nullptr,0);screenDraw(0);
+    }
+    {
+        auto d=screenMotionGpuDiagnostics();
+        check(d.collecting&&d.sourceFrames>0,"screen GPU diagnostics scope follows accepted source frames");
+        check(d.uiClearCalls>0&&d.uiDrawCalls>0&&d.eyeClearCalls>0&&d.projectionCalls>0,"screen GPU diagnostics count each eligible command class");
+        check(d.uiClearSubmitted<=d.uiClearSelected&&d.uiDrawSubmitted<=d.uiDrawSelected&&d.eyeClearSubmitted<=d.eyeClearSelected&&d.projectionSubmitted<=d.projectionSelected,"screen GPU diagnostics distinguish selected and submitted samples");
+        ctx->Flush();for(int i=0;i<4;++i){g_gpu.uiClear.timer.poll(ctx.Get());g_gpu.uiDraw.timer.poll(ctx.Get());g_gpu.eyeClear.timer.poll(ctx.Get());g_gpu.projection.timer.poll(ctx.Get());}
+        d=screenMotionGpuDiagnostics();
+        check(d.uiClearReady+d.uiClearInvalid<=d.uiClearSubmitted&&d.uiDrawReady+d.uiDrawInvalid<=d.uiDrawSubmitted&&d.eyeClearReady+d.eyeClearInvalid<=d.eyeClearSubmitted&&d.projectionReady+d.projectionInvalid<=d.projectionSubmitted,"screen GPU diagnostics retire only submitted samples");
+        check(d.uiClearReady+d.uiDrawReady+d.eyeClearReady+d.projectionReady>0,"screen GPU diagnostics retire WARP timestamp samples without waiting");
     }
     // The game's first-person stencil is independent of surface distance.
     // Exercise both eyes, scenery at the same depth, the previous screen
@@ -171,7 +219,7 @@ int main(int argc,char** argv){
         ComPtr<ID3D11Texture2D> mt;ComPtr<ID3D11ShaderResourceView> mv;hr(dev->CreateTexture2D(&motionDesc,&mi,&mt));hr(dev->CreateShaderResourceView(mt.Get(),nullptr,&mv));
         testWeaponMotion=mv.Get();
         for(int pass=0;pass<4;++pass){
-            screenMotionFrameBoundary();source[275][0]+=.1f;sourceDraw();
+            screenMotionFrameBoundary(ctx.Get());source[275][0]+=.1f;sourceDraw();
             check(bool(g.stencilSrv),"stencil SRV created from source depth");
             ctx->ClearDepthStencilView(ds.Get(),D3D11_CLEAR_STENCIL,1,pass==2?4:20);
             g.weapon=pass!=1;
@@ -188,11 +236,16 @@ int main(int argc,char** argv){
             ID3D11ShaderResourceView* none=nullptr;ctx->PSSetShaderResources(11,1,&none);
         }
         // Keep default fixture path unchanged, including missing-stencil fallback.
-        testWeaponMotion=nullptr;screenMotionFrameBoundary();sourceDraw();ctx->ClearDepthStencilView(ds.Get(),D3D11_CLEAR_STENCIL,1,20);screenDraw(0);
+        testWeaponMotion=nullptr;screenMotionFrameBoundary(ctx.Get());sourceDraw();ctx->ClearDepthStencilView(ds.Get(),D3D11_CLEAR_STENCIL,1,20);screenDraw(0);
         auto rejected=read(dev.Get(),ctx.Get(),g.eyes[0].map.Get());for(UINT i=0;i<W*H;++i)check(rejected[i*4+3]!=1,"missing weapon motion rejects history instead of assuming fixed UV");
         ID3D11ShaderResourceView* none=nullptr;ctx->PSSetShaderResources(11,1,&none);
         model[9][3]=0;td.Format=DXGI_FORMAT_R32_TYPELESS;depth.Reset();ds.Reset();hr(dev->CreateTexture2D(&td,nullptr,&depth));dd.Format=DXGI_FORMAT_D32_FLOAT;hr(dev->CreateDepthStencilView(depth.Get(),&dd,&ds));
-        screenMotionFrameBoundary();sourceDraw();check(!g.stencilSrv,"new source without stencil drops old mask");screenDraw(0);
+        screenMotionFrameBoundary(ctx.Get());sourceDraw();check(!g.stencilSrv,"new source without stencil drops old mask");screenDraw(0);
+        // fix.ui_quality's layer took the composite (ui_layer.h): the screen
+        // is drawn after the upscale, not into the pass's input, so no screen
+        // motion is drawn for it and the eye has no map that frame.
+        screenMotionFrameBoundary(ctx.Get());sourceDraw();detail::g_uiLayerRedirecting=true;screenDraw(0);detail::g_uiLayerRedirecting=false;
+        check(!screenMotionView(0,W,H),"a composite the UI layer took draws no screen motion");
     }
     // Optional recorded source/eye matrices and double-precision expected
     // projection. No proprietary assets are committed with the test.
@@ -207,10 +260,10 @@ int main(int argc,char** argv){
         ID3D11Buffer* cb[5]={sc.Get(),oldCb.Get(),mc.Get(),ec.Get(),e.settings.Get()};ctx->PSSetConstantBuffers(2,5,cb);
         ctx->PSSetShader(g.ps.Get(),nullptr,0);ctx->OMSetRenderTargets(1,preciseRtv.GetAddressOf(),nullptr);ctx->OMSetBlendState(g.blend.Get(),nullptr,~0u);ctx->OMSetDepthStencilState(g.ds.Get(),0);
         ID3D11ShaderResourceView* srv[2]={g.depthSrv.Get(),e.sizeSrv[0].Get()};ctx->PSSetShaderResources(8,2,srv);
-        float old[276][4]{},settings[8]{},uv[4]{},expected[2]{};
+        float old[276][4]{},settings[12]{},uv[4]{},expected[2]{};   // the fixture carries shape and extent; engine stays 0
         for(UINT k=0;k<n;++k){
             f.read(reinterpret_cast<char*>(source),sizeof(source));f.read(reinterpret_cast<char*>(old),sizeof(old));f.read(reinterpret_cast<char*>(model),sizeof(model));f.read(reinterpret_cast<char*>(camera),sizeof(camera));
-            f.read(reinterpret_cast<char*>(settings),sizeof(settings));f.read(reinterpret_cast<char*>(size),sizeof(size));f.read(reinterpret_cast<char*>(uv),sizeof(uv));f.read(reinterpret_cast<char*>(expected),sizeof(expected));check(bool(f),"fixture complete");
+            f.read(reinterpret_cast<char*>(settings),8*sizeof(float));f.read(reinterpret_cast<char*>(size),sizeof(size));f.read(reinterpret_cast<char*>(uv),sizeof(uv));f.read(reinterpret_cast<char*>(expected),sizeof(expected));check(bool(f),"fixture complete");
             ctx->UpdateSubresource(sc.Get(),0,nullptr,source,0,0);ctx->UpdateSubresource(oldCb.Get(),0,nullptr,old,0,0);ctx->UpdateSubresource(mc.Get(),0,nullptr,model,0,0);ctx->UpdateSubresource(ec.Get(),0,nullptr,camera,0,0);ctx->UpdateSubresource(e.settings.Get(),0,nullptr,settings,0,0);ctx->UpdateSubresource(uvCb.Get(),0,nullptr,uv,0,0);
             float sized[4]={size[0],size[1],0,0};ctx->UpdateSubresource(e.sizes[0].Get(),0,nullptr,sized,0,0);ctx->ClearDepthStencilView(ds.Get(),D3D11_CLEAR_DEPTH,uv[2],0);ctx->Draw(3,0);
             auto a=read(dev.Get(),ctx.Get(),precise.Get());
@@ -218,7 +271,118 @@ int main(int argc,char** argv){
             check(a[3]==1 && std::fabs(a[0]-expected[0])<.005f && std::fabs(a[1]-expected[1])<.005f,"captured camera/depth/curved-screen correspondence");
         }
     }
-    ctx->ClearState();screenMotionShutdown();
+    // Exercise collector boundaries without rendering a synthetic full window.
+    // A source change closes immediately, the cutoff abandons unresolved work,
+    // and one category cannot admit a second interval in the same frame.
+    g_gpu.reset(ctx.Get());g_gpu.noteSource(depth.Get(),W,H,g.frame);const uint64_t diagnosticScope=g_gpu.scope;
+    g_gpu.noteSource(colour.Get(),W,H,g.frame);check(g_gpu.phase==GpuDiagnostics::Phase::Draining&&g_gpu.scope==diagnosticScope,"screen GPU diagnostics source change closes the current scope");
+    g_gpu.uiClear.submitted=1;g_gpu.drainFrames=kGpuDrainFrames-1;g_gpu.tick(ctx.Get(),g.frame);
+    check(g_gpu.phase==GpuDiagnostics::Phase::Idle&&!g_gpu.uiClear.submitted,"screen GPU diagnostics abandon unresolved samples at the drain cutoff");
+    g_gpu.start(depth.Get(),W,H,g.frame);const bool firstAdmission=g_gpu.uiClear.begin(ctx.Get(),1,g_gpu.scope,g.frame);if(firstAdmission)g_gpu.uiClear.timer.end(ctx.Get());
+    const bool secondAdmission=g_gpu.uiClear.begin(ctx.Get(),1,g_gpu.scope,g.frame);
+    check(firstAdmission&&!secondAdmission&&g_gpu.uiClear.selected==2&&g_gpu.uiClear.submitted==1&&g_gpu.uiClear.budgetSkipped==1,"screen GPU diagnostics enforce one category admission per frame");
+    g_gpu.reset(ctx.Get());
+    // The hangar (flight 6, docs/kinematic-motion-injection-2026-09-19.md "The
+    // hangar"): no terrain or scene draw names the source. The pool family
+    // draws into the screen-sized depth are counted in one frame and name it
+    // in the next, at the first that is not a first-person weapon or tool
+    // shader, with its own VS b1 and the ScreenDepth signal; a shadow atlas
+    // (another size, depth only, two half viewports) that takes MORE pool
+    // draws is never counted and never names; a screen with nothing naming its
+    // source is said after kUnnamedNoteFrames; terrain names and holds the
+    // fallback off while it does.
+    {
+        ctx->ClearState();
+        g=State{};testSourceNotes=0;testSourceScene=nullptr;testDsv=nullptr;
+        D3D11_TEXTURE2D_DESC ad{};ad.Width=W*2;ad.Height=H/2;ad.MipLevels=ad.ArraySize=ad.SampleDesc.Count=1;
+        ad.Format=DXGI_FORMAT_R32_TYPELESS;ad.BindFlags=D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE;
+        ComPtr<ID3D11Texture2D> atlas;hr(dev->CreateTexture2D(&ad,nullptr,&atlas));
+        ComPtr<ID3D11DepthStencilView> atlasDs;hr(dev->CreateDepthStencilView(atlas.Get(),&dd,&atlasDs));
+        auto shown=[&](){g.seen=true;g.lastScreen=g.frame;};   // the 2D screen drawn this frame
+        auto poolDraw=[&](ID3D11DepthStencilView* d,ID3D11RenderTargetView* r,uint64_t vsHash){
+            ID3D11RenderTargetView* rts[1]={r};
+            ctx->OMSetRenderTargets(r?1:0,r?rts:nullptr,d);
+            if(d==atlasDs.Get()){D3D11_VIEWPORT half[2]={{0,0,float(W),float(H/2),0,1},{float(W),0,float(W),float(H/2),0,1}};ctx->RSSetViewports(2,half);}
+            testRtv=r;testDsv=d;testVs=vsHash;testPs=0;
+            ctx->UpdateSubresource(sc.Get(),0,nullptr,source,0,0);ctx->VSSetConstantBuffers(1,1,sc.GetAddressOf());
+            screenMotionSource(ctx.Get(),W,H);
+        };
+        // Frame 1: the atlas takes three pool draws, the screen's depth two;
+        // nothing names yet (no candidate from a previous frame).
+        shown();
+        for(int i=0;i<3;++i)poolDraw(atlasDs.Get(),nullptr,testPoolVs);
+        for(int i=0;i<2;++i)poolDraw(ds.Get(),rt.Get(),testPoolVs);
+        check(!testSourceNotes,"hangar: the first frame only counts the screen-sized pool depth");
+        screenMotionFrameBoundary(ctx.Get());
+        check(g.screenDepth==ds.Get() && g.screenDepthDraws==2,"hangar: the screen's depth is the busiest SCREEN-SIZED pool depth, not the atlas that took more");
+        // Frame 2: the atlas again, a first-person tool draw into the screen's
+        // depth (never names), then a world pool draw names it.
+        shown();
+        poolDraw(atlasDs.Get(),nullptr,testPoolVs);
+        check(!testSourceNotes,"hangar: a shadow atlas never names the source");
+        poolDraw(ds.Get(),rt.Get(),testWeaponVs);
+        check(!testSourceNotes,"hangar: a first-person weapon or tool shader never names the source");
+        poolDraw(ds.Get(),rt.Get(),testPoolVs);
+        check(testSourceNotes==1 && testSourceSignal==EngineVelocitySourceSignal::ScreenDepth && testSourceScene==sc.Get() &&
+              g.sourceFrame==g.frame && g.depth.Get()==depth.Get(),
+              "hangar: the first world pool draw into the screen's depth names the source, its signal the screen's depth, its camera the draw's VS b1");
+        poolDraw(ds.Get(),rt.Get(),testPoolVs);
+        check(testSourceNotes==1,"hangar: named once a frame");
+        screenMotionFrameBoundary(ctx.Get());
+        // Only the atlas from here: nothing names, and after
+        // kUnnamedNoteFrames screen frames the log says so.
+        for(unsigned i=0;i<kUnnamedNoteFrames+2;++i){shown();poolDraw(atlasDs.Get(),nullptr,testPoolVs);screenMotionFrameBoundary(ctx.Get());}
+        check(testSourceNotes==1 && g.unnamed>=kUnnamedNoteFrames && g.unnamedNoted,"hangar: a screen with nothing naming its source is counted and said");
+        // Terrain names (its own signal) and holds the fallback off: a pool
+        // draw into the screen's depth BEFORE the next frame's terrain draw
+        // does not name it; the terrain draw does.
+        shown();poolDraw(ds.Get(),rt.Get(),testPoolVs);screenMotionFrameBoundary(ctx.Get());   // counted: the candidate again
+        shown();poolDraw(ds.Get(),rt.Get(),testPoolVs);
+        check(testSourceNotes==2 && testSourceSignal==EngineVelocitySourceSignal::ScreenDepth,"hangar: the screen's depth names again");
+        screenMotionFrameBoundary(ctx.Get());
+        check(!g.unnamedNoted && !g.unnamed,"hangar: a naming clears the unnamed count and its note");
+        // A terrain frame: the terrain draw names first (its own signal), and a
+        // pool draw into the screen's depth after it is still counted.
+        shown();sourceDraw();
+        check(testSourceNotes==3 && testSourceSignal==EngineVelocitySourceSignal::Terrain && g.terrainFrame==g.frame,"hangar: terrain names with its own signal");
+        poolDraw(ds.Get(),rt.Get(),testPoolVs);
+        check(testSourceNotes==3,"hangar: named once a frame, terrain first");
+        screenMotionFrameBoundary(ctx.Get());
+        check(g.screenDepth==ds.Get(),"hangar: the screen's depth stays the candidate beside terrain");
+        // The next frame's first pool draw lands before its terrain draw: the
+        // candidate matches, but terrain named within kTerrainHoldFrames, so it
+        // holds off, and the terrain draw names.
+        shown();poolDraw(ds.Get(),rt.Get(),testPoolVs);
+        check(testSourceNotes==3,"hangar: terrain named last frame, so the screen's depth holds off");
+        sourceDraw();
+        check(testSourceNotes==4 && testSourceSignal==EngineVelocitySourceSignal::Terrain,"hangar: and the terrain draw names this frame");
+        screenMotionFrameBoundary(ctx.Get());
+        g=State{};testDsv=nullptr;
+    }
+    ctx->ClearState();
+    // The arming pair lives OUTSIDE State (screen_motion.h) so the draw path
+    // can read it inline, which means the three places that reset State
+    // wholesale must each say what happens to it. That is the coupling these
+    // checks exist to hold: screenMotionLive() is what the draw path believes,
+    // and it has to keep agreeing with the flags after every reset.
+    {
+        detail::g_screenMotionEnabled=true;detail::g_screenMotionFailed=false;
+        check(screenMotionLive(),"live with the feature armed and no failure");
+        detail::g_screenMotionFailed=true;
+        check(!screenMotionLive(),"a setup failure stands the draw path down");
+        // The idle reset (120 frames without a screen) clears the failure and
+        // KEEPS the arming -- it exists to let a transient failure retry.
+        g.seen=true;g.lastScreen=0;g.frame=121;
+        screenMotionFrameBoundary(nullptr);
+        check(detail::g_screenMotionEnabled&&!detail::g_screenMotionFailed&&screenMotionLive(),
+              "the idle State reset keeps the arming and clears the failure");
+        // Shutdown clears both, so a torn-down module can never read live.
+        screenMotionShutdown();
+        check(!detail::g_screenMotionEnabled&&!detail::g_screenMotionFailed&&!screenMotionLive(),
+              "shutdown clears the arming pair with State");
+    }
+    screenMotionShutdown();
+    {auto d=screenMotionGpuDiagnostics();check(!d.collecting&&!d.draining&&!d.sourceFrames&&!d.uiClearCalls&&!d.uiDrawCalls&&!d.eyeClearCalls&&!d.projectionCalls,"screen GPU diagnostics reset on shutdown");}
     testScreenConsumers(dev.Get(),ctx.Get());
     if(queue)for(UINT64 i=0;i<queue->GetNumStoredMessages();++i){SIZE_T messageBytes=0;queue->GetMessage(i,nullptr,&messageBytes);std::vector<unsigned char> b(messageBytes);auto* m=reinterpret_cast<D3D11_MESSAGE*>(b.data());queue->GetMessage(i,m,&messageBytes);if(m->Severity<=D3D11_MESSAGE_SEVERITY_WARNING){std::puts(m->pDescription);check(false,"D3D debug layer clean");}}
     std::printf("PASS: %u screen motion checks.\n",checks);

@@ -56,7 +56,7 @@
 //
 // ONE INTERACTION WORTH KNOWING. The blit's TARGETS were 1920x1080 in the
 // census, so the backdrop reaches the composite at that size whatever the
-// source was, and raising vscreen_res_width/_height does not raise it -- it
+// source was, and raising vscreen_res_width does not raise it -- it
 // magnifies it further while sharpening everything around it. A high panel
 // resolution makes this artifact MORE visible, not less. That is the opposite
 // of the intuition, and it is why the fix is here and not in fss_res.
@@ -85,7 +85,13 @@ class Config;
 void backdropConfigure(Config& cfg);
 
 // False in stock mode, which keeps the per-draw path free when off.
-bool backdropWantsDraws();
+//
+// Inline: asked per draw, and the build has no /GL to fold a cross-TU
+// getter for one bool load.
+namespace detail {
+extern bool g_backdropOn;
+}  // namespace detail
+inline bool backdropWantsDraws() { return detail::g_backdropOn; }
 
 // Is this draw the backdrop blit? Matched by shape and by what it reads: a
 // four-vertex non-indexed draw, one instance, whose pixel shader slot 0
@@ -100,6 +106,14 @@ bool backdropWantsDraws();
 // True means the substitute is built and ready to bind, so the caller should
 // wrap the draw in backdropBegin/backdropEnd. A first match builds it; a
 // build that fails answers false forever after and says why once.
+//
+// backdropBlitShape is the shape half (a four-vertex Draw*Instanced, one
+// instance), inline so the draw path asks it before the call: the call was
+// made for every offscreen draw and answered false, having touched nothing,
+// for any other shape. backdrop_fix.cpp matches through this same function.
+inline bool backdropBlitShape(char kind, uint32_t count, uint32_t instances) {
+    return kind == 'N' && count == 4 && instances == 1;
+}
 bool backdropOnDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                     uint32_t instances);
 
@@ -109,6 +123,12 @@ bool backdropOnDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
 // yes. True means the caller should wrap the draw in backdropBegin/End, which
 // hands the composite our FULL-RESOLUTION bake and so bypasses the engine's
 // downsample of the still into a smaller intermediate.
+//
+// backdropCompositeShape is its shape half (the six-index quad, one
+// instance), inline for the same reason as backdropBlitShape above.
+inline bool backdropCompositeShape(char kind, uint32_t count, uint32_t instances) {
+    return kind == 'X' && count == 6 && instances == 1;
+}
 bool backdropOnComposite(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                          uint32_t instances);
 
