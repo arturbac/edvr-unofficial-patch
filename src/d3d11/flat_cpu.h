@@ -15,11 +15,16 @@
 // time is subtracted from its parent, so the families partition the time and no nanosecond
 // is in two of them) and one call, into a per-thread cell -- a relaxed load, add and store
 // on a cache line only that thread writes, no lock and no contended atomic. The render
-// thread (the one that calls Present) is clocked on every call of every frame. Every other
-// thread is clocked only on SAMPLED frames, one in kSamplePeriod at a random position in
-// each block, because the game's job threads make thousands of hook calls a frame; on the
-// frames between, a scope costs a load of the gate and a compare. The gate is one 64-bit
-// word the render thread rewrites once a frame.
+// thread (the one that calls Present) is clocked on one frame in kRenderPeriod, at a random
+// position in each block of that many frames, and on a clocked frame every call is clocked: a
+// per-call cost is exact, and a per-frame figure is the mean over the clocked frames, which the
+// line counts. It was clocked on every call of every frame until 2026-09-30, when an on-foot
+// flight showed about 50,000 scopes a frame costing 1.7 ms and putting 0.8 ms of that into the
+// very total they measured. Every other thread is clocked only on SAMPLED frames, one in
+// kSamplePeriod and a subset of the render thread's clocked frames, because the game's job
+// threads make thousands of hook calls a frame; on the frames a thread is not clocked, a
+// scope costs a load of the gate and a compare. The gate is one 64-bit word the render thread
+// rewrites once a frame.
 //
 // ENGINE MOTION'S HOOKS ON THE GAME'S CODE (emit, rigid emit, copier, merge, clear, the job
 // and builder brackets, the Map/Unmap tees) are already timed by engine_motion_cpu.h, at the
@@ -72,6 +77,11 @@ inline int64_t qpcFrequency() noexcept {
 
 // One frame in this many is a sampled frame for every thread but the render thread.
 constexpr unsigned kSamplePeriod = 32;
+// The render thread is clocked on one frame in this many, and the sampled frames above are
+// among them (a frame that clocks every thread clocks the render thread too), so the render
+// thread is clocked on 1/16 of the frames, not 1/16 and 1/32 of them.
+constexpr unsigned kRenderPeriod = 16;
+static_assert(kSamplePeriod % kRenderPeriod == 0, "the sampled frames are a subset of the render thread's clocked frames");
 // The window the line covers.
 constexpr int64_t kWindowMs = 5000;
 
@@ -139,9 +149,13 @@ inline constexpr EmName kEmNames[] = {
 constexpr unsigned kEmNameCount = sizeof(kEmNames) / sizeof(kEmNames[0]);
 
 // ---- the gate -------------------------------------------------------------------------
-// Bit 63: this frame is a sampled frame (every thread is clocked). Bits 0-31: the render
-// thread's id (always clocked). Written by the render thread once a frame.
+// Bit 63: this frame is a sampled frame (every thread is clocked). Bits 0-31: the id of the
+// one thread clocked whatever the bit says: the render thread on a frame it is clocked on,
+// kNoThread on a frame it is not (a thread id no thread has, so the compare fails for all of
+// them, and the same word the calibration uses for a scope nobody clocks). Written by the
+// render thread once a frame.
 constexpr uint64_t kSampledBit = uint64_t(1) << 63;
+constexpr uint32_t kNoThread = 0xFFFFFFFFu;
 inline std::atomic<uint64_t> g_gate{0};
 static_assert(std::atomic<uint64_t>::is_always_lock_free, "the gate and the counters are plain moves on x64");
 
@@ -312,6 +326,42 @@ private:
     uint32_t rng_;
 };
 
+// Which frames are clocked. The render thread on exactly one frame in each block of
+// `renderPeriod`, at a position drawn afresh for every block; and of each `samplePeriod /
+// renderPeriod` of those clocked frames, exactly one is a sampled frame (every thread clocked),
+// chosen at random too. So a sampled frame is always a render-clocked one, the render thread
+// is clocked on 1/renderPeriod of the frames, and the other threads on 1/samplePeriod, exactly
+// one in each block of samplePeriod. Fixed seeds, so a rig can predict it.
+class ClockSchedule {
+public:
+    struct Frame {
+        bool render = false;   // the render thread is clocked on this frame
+        bool all = false;      // every thread is (a sampled frame); implies render
+    };
+    explicit ClockSchedule(unsigned renderPeriod = kRenderPeriod, unsigned samplePeriod = kSamplePeriod) noexcept
+        : render_(renderPeriod, 0x2545F491u),
+          per_(renderPeriod && samplePeriod > renderPeriod ? samplePeriod / renderPeriod : 1u) {}
+    Frame next() noexcept {
+        Frame f;
+        f.render = render_.next();
+        if (!f.render) return f;
+        if (clocked_ == 0) {
+            rng_ ^= rng_ << 13;
+            rng_ ^= rng_ >> 17;
+            rng_ ^= rng_ << 5;
+            pick_ = rng_ % per_;
+        }
+        f.all = clocked_ == pick_;
+        if (++clocked_ >= per_) clocked_ = 0;
+        return f;
+    }
+
+private:
+    SampleSchedule render_;
+    unsigned per_, clocked_ = 0, pick_ = 0;
+    uint32_t rng_ = 0x9E3779B9u;
+};
+
 // The clock floor: what a null scope costs (ns of wall time per scope, the best of a few tight
 // batches: a preemption only ever adds) and records (ns of ticks written into a cell, which
 // every clocked figure includes once per call).
@@ -347,7 +397,12 @@ struct WindowReport {
     bool valid = false;
     double seconds = 0;
     unsigned frames = 0, pausedFrames = 0, sampledFrames = 0;
+    // The frames the render thread was clocked on (a sampled frame is one of them). Every render
+    // figure below is a sum over these, and the line divides by this count, not by `frames`.
+    unsigned renderClockedFrames = 0;
+    unsigned renderPeriod = kRenderPeriod;
     unsigned samplePeriod = kSamplePeriod;
+    // From every frame, clocked or not.
     double presentP50Ms = 0, presentP95Ms = 0;
     double renderMs[kFamilies] = {};
     double otherMs[kFamilies] = {};
@@ -391,8 +446,13 @@ class Census {
 public:
     static constexpr unsigned kMaxSamples = 2048;
 
+    // `renderPeriod` 1 clocks the render thread on every frame, as the census did until 2026-09-30:
+    // what the rig compares a sampled window with.
+    explicit Census(unsigned renderPeriod = kRenderPeriod) noexcept
+        : renderPeriod_(renderPeriod ? renderPeriod : 1u), schedule_(renderPeriod ? renderPeriod : 1u, kSamplePeriod) {}
+
     // Once per Present, on the render thread. `paused`: the frame that just ended was a stood-down
-    // Paused one. Decides the next frame's sampling and writes the gates (this instrument's and
+    // Paused one. Decides the next frame's clocking and writes the gates (this instrument's and
     // engine motion's, which the census drives while it runs).
     void onFrame(int64_t nowTicks, int64_t freq, bool paused) noexcept {
         if (!primed_) {
@@ -424,6 +484,8 @@ public:
             emOtherTicks_[p] += emCut.otherTicks[p];
             emOtherCalls_[p] += emCut.otherCalls[p];
         }
+        // The frame that just ended: clocked on the render thread, and sampled for every thread.
+        if (renderNow_ || sampledNow_) ++renderClocked_;
         if (sampledNow_) ++sampled_;
         if (paused) ++paused_;
         const double ms = freq > 0 ? static_cast<double>(nowTicks - lastTick_) * 1000.0 / static_cast<double>(freq) : 0.0;
@@ -471,6 +533,8 @@ public:
         out.frames = frames_;
         out.pausedFrames = paused_;
         out.sampledFrames = sampled_;
+        out.renderClockedFrames = renderClocked_;
+        out.renderPeriod = samplingOk_ ? renderPeriod_ : 1u;
         out.samplePeriod = samplingOk_ ? kSamplePeriod : 1u;
         for (unsigned f = 0; f < kFamilies; ++f) {
             out.renderMs[f] = static_cast<double>(renderTicks_[f]) * msPerTick;
@@ -504,13 +568,21 @@ public:
 
 private:
     void decideNextFrame() noexcept {
-        sampledNow_ = samplingOk_ ? schedule_.next() : true;
-        const uint64_t gate = makeGate(sampledNow_, renderTid_);
+        if (samplingOk_) {
+            const ClockSchedule::Frame next = schedule_.next();
+            renderNow_ = next.render;
+            sampledNow_ = next.all;
+        } else {
+            renderNow_ = sampledNow_ = true;   // no thread id to compare with: every frame clocks everything
+        }
+        // A frame that clocks every thread clocks the render thread too. On a frame that clocks
+        // it, the gate names it; on one that does not, it names no thread and no one is clocked.
+        const uint64_t gate = makeGate(sampledNow_, renderNow_ || sampledNow_ ? renderTid_ : kNoThread);
         g_gate.store(gate, std::memory_order_relaxed);
         emcpu::g_gate.store(gate, std::memory_order_relaxed);
     }
     void resetWindow() noexcept {
-        frames_ = paused_ = sampled_ = 0;
+        frames_ = paused_ = sampled_ = renderClocked_ = 0;
         std::memset(renderTicks_, 0, sizeof(renderTicks_));
         std::memset(renderCalls_, 0, sizeof(renderCalls_));
         std::memset(otherTicks_, 0, sizeof(otherTicks_));
@@ -523,13 +595,14 @@ private:
         gpuFrame_ = gpuResolve_ = 0;
         gpuSkipped_ = gpuInvalid_ = 0;
     }
-    bool primed_ = false, samplingOk_ = true, sampledNow_ = false, floorsMeasured_ = false;
+    bool primed_ = false, samplingOk_ = true, sampledNow_ = false, renderNow_ = false, floorsMeasured_ = false;
     int64_t freq_ = 0, lastTick_ = 0, windowStart_ = 0;
     uint32_t renderTid_ = 0;
+    unsigned renderPeriod_;
     Floor floor_;
     emcpu::Floor emFloor_;
-    SampleSchedule schedule_;
-    unsigned frames_ = 0, paused_ = 0, sampled_ = 0, gpuFrame_ = 0, gpuResolve_ = 0;
+    ClockSchedule schedule_;
+    unsigned frames_ = 0, paused_ = 0, sampled_ = 0, renderClocked_ = 0, gpuFrame_ = 0, gpuResolve_ = 0;
     uint64_t renderTicks_[kFamilies] = {}, renderCalls_[kFamilies] = {};
     uint64_t otherTicks_[kFamilies] = {}, otherCalls_[kFamilies] = {};
     uint64_t emRenderTicks_[emcpu::kParts] = {}, emRenderCalls_[emcpu::kParts] = {};
@@ -555,7 +628,7 @@ struct Lines {
 };
 struct Tokens {
     struct Token {
-        char text[240];
+        char text[320];
         const char* sep;   // between this token and the one before it, on the same line
     };
     Token t[kMaxTokens];
@@ -592,38 +665,52 @@ inline void packLines(const Tokens& tk, Lines* out) {
         ++out->count;
     }
 }
-// The clocks' price on the render thread, per frame: every clocked scope of this instrument and of
-// engine motion's (its draw side included -- it is clocked even though the fold does not count it
-// twice) weighed by its calibrated floor. An estimate: the floor is measured in tight loops.
+// The clocks' price on the render thread: every clocked scope of this instrument and of engine
+// motion's (its draw side included -- it is clocked even though the fold does not count it twice)
+// weighed by its calibrated floor. An estimate: the floor is measured in tight loops. The scope
+// counts are sums over the clocked frames, so a clocked frame's price is the sum over the scopes
+// divided by the clocked frames; only those frames pay it, so what the run paid a frame is that
+// price times the share of frames that were clocked. (A scope on a frame it is not clocked on
+// costs a load of the gate and a compare, well under a nanosecond in a tight loop: not counted.)
 struct InstrumentCost {
-    double costMs = 0, recordedMs = 0, scopesPerFrame = 0;
+    double costMs = 0;          // a frame, on average over every frame of the window: what the run paid
+    double clockedMs = 0;       // a clocked frame
+    double recordedMs = 0;      // a clocked frame: the clock reads inside the per-clocked-frame total
+    double scopesPerFrame = 0;  // a clocked frame
 };
 inline InstrumentCost instrumentCost(const WindowReport& r) noexcept {
     InstrumentCost c;
-    if (!r.floor.measured || !r.frames) return c;
-    const double frames = static_cast<double>(r.frames);
+    if (!r.floor.measured || !r.frames || !r.renderClockedFrames) return c;
+    const double clocked = static_cast<double>(r.renderClockedFrames);
     for (unsigned f = 0; f < kFamilies; ++f) {
-        const double perFrame = static_cast<double>(r.renderCalls[f]) / frames;
+        const double perFrame = static_cast<double>(r.renderCalls[f]) / clocked;
         c.scopesPerFrame += perFrame;
-        c.costMs += perFrame * r.floor.costNs * 1e-6;
+        c.clockedMs += perFrame * r.floor.costNs * 1e-6;
         c.recordedMs += perFrame * r.floor.recordedNs * 1e-6;
     }
     if (r.emFloor.measured) {
         for (unsigned p = 0; p < emcpu::kParts; ++p) {
             if (!emcpu::kInfo[p].clocked) continue;
-            const double perFrame = static_cast<double>(r.emRenderCalls[p]) / frames;
+            const double perFrame = static_cast<double>(r.emRenderCalls[p]) / clocked;
             const bool paused = emcpu::kInfo[p].paused;
             c.scopesPerFrame += perFrame;
-            c.costMs += perFrame * (paused ? r.emFloor.pausedCostNs : r.emFloor.plainCostNs) * 1e-6;
+            c.clockedMs += perFrame * (paused ? r.emFloor.pausedCostNs : r.emFloor.plainCostNs) * 1e-6;
             c.recordedMs += perFrame * (paused ? r.emFloor.pausedRecordedNs : r.emFloor.plainRecordedNs) * 1e-6;
         }
     }
+    const double share = (std::min)(1.0, clocked / static_cast<double>(r.frames));
+    c.costMs = c.clockedMs * share;
     return c;
 }
 inline void formatWindow(const WindowReport& r, Lines* out) {
     Tokens tk;
     char calls[32];
     const double frames = r.frames ? static_cast<double>(r.frames) : 1.0;
+    // The render thread is clocked on some of the frames only (see the schedule), so its figures are
+    // sums over those and its per-frame figures divide by their number, the way the other threads'
+    // divide by their sampled frames. "-" is a window with no clocked frame, never a zero.
+    const bool anyClocked = r.renderClockedFrames > 0;
+    const double clocked = anyClocked ? static_cast<double>(r.renderClockedFrames) : 1.0;
     // Everything the render thread spent in the families, plus engine motion's hooks on it.
     double emRenderMs = 0;
     uint64_t emRenderCalls = 0;
@@ -635,14 +722,22 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
     double totalMs = emRenderMs;
     for (unsigned f = 0; f < kFamilies; ++f) totalMs += r.renderMs[f];
 
-    tk.add("", "flat cpu 5s: frames=%u (stood down %u%s) present p50 %.2f ms (p95 %.2f); EDVR per frame total %.3f ms",
-           r.frames, r.pausedFrames, r.standingDown ? ", stood down now" : "", r.presentP50Ms, r.presentP95Ms, totalMs / frames);
-    for (unsigned f = 0; f < kFamilies; ++f) {
-        callsText(calls, sizeof(calls), static_cast<double>(r.renderCalls[f]) / frames);
-        tk.add(f == 0 ? " = " : " + ", "%s %.3f ms (calls %s)", kInfo[f].name, r.renderMs[f] / frames, calls);
+    char total[32] = "-";
+    if (anyClocked) std::snprintf(total, sizeof(total), "%.3f ms", totalMs / clocked);
+    tk.add("", "flat cpu 5s: frames=%u (stood down %u%s) present p50 %.2f ms (p95 %.2f); render thread clocked on %u of %u frames, "
+               "one in %u (its figures are per clocked frame); EDVR per frame total %s",
+           r.frames, r.pausedFrames, r.standingDown ? ", stood down now" : "", r.presentP50Ms, r.presentP95Ms,
+           r.renderClockedFrames, r.frames, r.renderPeriod, total);
+    if (anyClocked) {
+        for (unsigned f = 0; f < kFamilies; ++f) {
+            callsText(calls, sizeof(calls), static_cast<double>(r.renderCalls[f]) / clocked);
+            tk.add(f == 0 ? " = " : " + ", "%s %.3f ms (calls %s)", kInfo[f].name, r.renderMs[f] / clocked, calls);
+        }
+        callsText(calls, sizeof(calls), static_cast<double>(emRenderCalls) / clocked);
+        tk.add(" + ", "engine motion hooks %.3f ms (calls %s)", emRenderMs / clocked, calls);
+    } else {
+        tk.add(" = ", "render thread: not clocked in this window (one frame in %u is, and none was)", r.renderPeriod);
     }
-    callsText(calls, sizeof(calls), static_cast<double>(emRenderCalls) / frames);
-    tk.add(" + ", "engine motion hooks %.3f ms (calls %s)", emRenderMs / frames, calls);
 
     // The game's other threads: per SAMPLED frame, thread-ms summed, because the rest of the
     // window they were not clocked. "-" is a window with no sampled frame, never a zero.
@@ -669,7 +764,7 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
     }
 
     const double witnessUs = r.renderCalls[kWitness] ? r.renderMs[kWitness] * 1000.0 / static_cast<double>(r.renderCalls[kWitness]) : 0.0;
-    tk.add("; ", "camera witness %.2f us/write (%llu writes)", witnessUs, static_cast<unsigned long long>(r.renderCalls[kWitness]));
+    tk.add("; ", "camera witness %.2f us/write (%llu writes clocked)", witnessUs, static_cast<unsigned long long>(r.renderCalls[kWitness]));
     tk.add("; ", "engine motion wrapper D3D calls %.0f/frame over %.1f substituted draws/frame",
            static_cast<double>(r.stateCalls) / frames, static_cast<double>(r.substitutedDraws) / frames);
     // The GPU spans, read back without waiting. No sample prints "-", never 0.00: a span that
@@ -684,10 +779,12 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
            r.floor.costNs, r.floor.recordedNs, r.emFloor.plainCostNs, r.emFloor.pausedCostNs,
            r.emFloor.plainRecordedNs, r.emFloor.pausedRecordedNs);
     // The instrument's own price on the render thread at this window's call rates: what the clocks cost
-    // a frame, and how much of the figures above is the clock reads themselves.
+    // a frame on average (only the clocked frames pay it), what a clocked frame costs, and how much of
+    // the per-clocked-frame figures above is the clock reads themselves.
     InstrumentCost price = instrumentCost(r);
-    tk.add("; ", "the clocks cost the render thread about %.3f ms a frame (%.0f scopes) and put about %.3f ms of the total above into it",
-           price.costMs, price.scopesPerFrame, price.recordedMs);
+    tk.add("; ", "the clocks cost the render thread about %.3f ms a frame on average (%.3f ms on a clocked frame, %.0f scopes; "
+                 "the gate checks on the other frames are not counted) and put about %.3f ms of the per-clocked-frame total above into it",
+           price.costMs, price.clockedMs, price.scopesPerFrame, price.recordedMs);
     packLines(tk, out);
 }
 
