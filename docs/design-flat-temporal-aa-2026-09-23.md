@@ -49,7 +49,7 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-80):** two rc.4 users refused every frame (AA, bloom, DoF);
-  a third treated at 7-13 fps. 80 flown 09-30: stand-down, F8 why, CPU census.
+  a third treated at 7-13 fps. 80 flown: on foot EDVR ~3 ms/frame; cut it.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -4894,3 +4894,25 @@ fullscreen at a 60 fps cap with RTSS). Two F8 faults, fixed on
 `claude/flat-warning-fix`, unflown: it warned for no-known-output-copy at startup
 (05:29:20) and flickered (shown 05:30:09.904, hidden 05:30:10.378, after a 2 s
 run); it now follows the stand-down and never warns for no-known-output-copy.
+
+**2026-09-30 note: flight 053745, on foot in a hangar (Epic, `ce6d511a`, EDHM
+chained, 1080p render, frame cap off, one spot).** Borderless: AA off about
+4.0 ms a frame (234-274 fps), DLSS present p50 8.5-8.9 ms. Exclusive
+fullscreen: DLSS 7.0-7.3 ms, AA off about 3.0 ms (331-351 fps).
+
+- ruled out: exclusive fullscreen as user 3's collapse, because DLSS adds the
+  same 4.2-4.7 ms in both modes and exclusive is the faster of the two.
+- Census on foot: EDVR's render thread 3.5-3.8 ms a frame, of which the
+  census's own clocks put about 0.8 ms in and cost about 1.7 ms in all (about
+  50,000 scopes a frame), so EDVR's own work is about 2.9 ms. The draw
+  wrapper 0.89 ms (13,549 D3D calls a frame over 1,130 substituted draws),
+  hook entry ("other") 0.94 ms over about 10,000 calls, camera rows 0.44 ms
+  over about 5,000, contract reduction, coverage, copy checks and the trace
+  ring about 0.2 ms each. On job threads the engine clear and merge observers
+  take about 2.2 ms a frame. GPU frame p50 5.9-7.2 ms, the DLSS resolve
+  0.40-0.86 ms.
+- So on foot EDVR costs about 3 ms of Sean's render thread a frame, four
+  times the 0.9 ms of flight 052916's scene: worth cutting for everyone, and
+  the census must be sampled before a release. User 3's roughly 50 ms a
+  frame is still unexplained by it (RTSS, or their system); next are user 3's
+  RTSS-off test and a census build on their machine.
