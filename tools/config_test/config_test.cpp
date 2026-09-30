@@ -35,6 +35,7 @@
 //     the reload had the file open.
 //
 // Usage: config_test.exe <dir containing edvr.ini> [scratch dir]
+//        config_test.exe --ininame-cases <scratch dir>   (its own child; see iniNameFixturesIsolated)
 #include <windows.h>
 
 #include <atomic>
@@ -637,11 +638,8 @@ static std::string narrow(const std::wstring& w) {
     return out;
 }
 
-static void iniNameCases(const std::wstring& scratch) {
-    const RuntimeProfile savedProfile = g_runtimeProfile;
-    Config& cfg = Config::get();
-
-    // The pure resolver, for a path a caller already holds.
+// The pure resolver, for a path a caller already holds.
+static void iniNamePathCases() {
     static const struct { const wchar_t* path; const char* want; const char* what; } kPaths[] = {
         {L"C:\\Games\\Elite\\edvr-flat.ini", "edvr-flat.ini", "a path to edvr-flat.ini names it"},
         {L"C:\\Games\\Elite\\edvr.ini", "edvr.ini", "a path to edvr.ini names it"},
@@ -656,10 +654,48 @@ static void iniNameCases(const std::wstring& scratch) {
         if (std::strcmp(got, p.want) == 0) ok(p.what);
         else fail(p.what, std::string("\"") + got + "\", wanted \"" + p.want + "\"");
     }
+}
 
-    // Four situations, each in a directory of its own with its own log. The file that is NOT read
-    // carries a different dead line and a different moved key, so a message about the wrong file
-    // shows in the text as well as in the name.
+// The directory this process's exe is in: the other place Config::init looks for a settings file.
+static std::wstring exeDirectory() {
+    wchar_t buf[MAX_PATH * 2]{};
+    const DWORD n = GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(sizeof(buf) / sizeof(buf[0])));
+    const std::wstring path(buf, n);
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
+}
+
+// Four situations, each in a directory of its own with its own log. The file that is NOT read
+// carries a different dead line and a different moved key, so a message about the wrong file
+// shows in the text as well as in the name.
+//
+// Run only by iniNameFixturesIsolated(), in a process whose exe directory holds no ini: Config::init
+// looks in the exe's directory too (a flat process reads <exe dir>\edvr-flat.ini when its module
+// directory has none), and in the build that is build\, where the flat edition's staged
+// edvr-flat.ini sits. The first version of these fixtures ran in this process, asked for "flat,
+// no edvr-flat.ini yet" and was handed build\'s file: the flat-fallback fixture failed in the
+// build and passed from a scratch directory, which is how it got past the author.
+static void iniNameFixtures(const std::wstring& scratch) {
+    const RuntimeProfile savedProfile = g_runtimeProfile;
+    Config& cfg = Config::get();
+
+    // The premise, asserted rather than assumed: nothing beside this exe for the loader to find.
+    {
+        const std::wstring exeDir = exeDirectory();
+        static const wchar_t* kBeside[] = {L"edvr.ini", L"edvr-flat.ini", L"edvr_profile.ini"};
+        std::string found;
+        for (const wchar_t* leaf : kBeside) {
+            if (GetFileAttributesW((exeDir + L"\\" + leaf).c_str()) != INVALID_FILE_ATTRIBUTES)
+                found += std::string(found.empty() ? "" : ", ") + narrow(leaf);
+        }
+        if (exeDir.empty() || !found.empty()) {
+            fail("the fixtures run beside no ini of their own",
+                 "the exe's directory " + narrow(exeDir) + " holds " + (found.empty() ? "no exe path" : found));
+            return;
+        }
+        ok("the fixtures run in a directory with no ini beside the exe");
+    }
+
     static const char* kKnown[] = {"advanced.d3d11_fixes", "experimental.new_name"};
     static const char* kMoved[][3] = {{"fix.old_name_1", "experimental.new_name", ""},
                                       {"fix.old_name_2", "experimental.new_name", ""},
@@ -756,6 +792,107 @@ static void iniNameCases(const std::wstring& scratch) {
         else fail((std::string(f.what) + ": it reported the file it did not read").c_str(), "a line of the other file is in the log");
     }
     g_runtimeProfile = savedProfile;
+    // The last line the parent looks for: a process that died part-way says nothing after its
+    // failures, and "no failure lines" must not read as "all four ran".
+    ok("the four situations ran to the end");
+}
+
+// Runs iniNameFixtures() in a copy of this exe kept in a directory that holds nothing else, and
+// takes its lines as this process's own. The copy is a child whose stdout goes to a file: a few
+// dozen lines, read back whole once it has exited.
+static void iniNameFixturesIsolated(const std::wstring& scratchArg) {
+    const char* const what = "the settings file's name in a process of its own";
+    wchar_t self[MAX_PATH * 2]{};
+    const DWORD selfLen = GetModuleFileNameW(nullptr, self, static_cast<DWORD>(sizeof(self) / sizeof(self[0])));
+    if (selfLen == 0 || selfLen >= sizeof(self) / sizeof(self[0])) {
+        fail(what, "could not find this exe's own path");
+        return;
+    }
+    // The child starts in a directory of its own, so it is given the scratch directory in full.
+    wchar_t full[MAX_PATH * 2]{};
+    const DWORD fullLen = GetFullPathNameW(scratchArg.c_str(), static_cast<DWORD>(sizeof(full) / sizeof(full[0])),
+                                           full, nullptr);
+    if (fullLen == 0 || fullLen >= sizeof(full) / sizeof(full[0])) {
+        fail(what, "could not make " + narrow(scratchArg) + " a full path");
+        return;
+    }
+    const std::wstring scratch(full, fullLen);
+    const std::wstring home = scratch + L"_ininame_exe";
+    const std::wstring exe = home + L"\\config_test.exe";
+    const std::wstring outPath = home + L"\\output.txt";
+    CreateDirectoryW(home.c_str(), nullptr);
+    if (!CopyFileW(self, exe.c_str(), FALSE)) {
+        fail(what, "could not copy the exe to " + narrow(home) + " (error " + std::to_string(GetLastError()) + ")");
+        return;
+    }
+
+    SECURITY_ATTRIBUTES inherit{};
+    inherit.nLength = sizeof(inherit);
+    inherit.bInheritHandle = TRUE;
+    HANDLE out = CreateFileW(outPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &inherit, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE) {
+        fail(what, "could not open " + narrow(outPath) + " (error " + std::to_string(GetLastError()) + ")");
+        return;
+    }
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = out;
+    si.hStdError = out;
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = L"\"" + exe + L"\" --ininame-cases \"" + scratch + L"\"";
+    const BOOL started = CreateProcessW(exe.c_str(), &cmd[0], nullptr, nullptr, TRUE, 0, nullptr,
+                                        home.c_str(), &si, &pi);
+    const DWORD startError = GetLastError();
+    CloseHandle(out);
+    if (!started) {
+        fail(what, "could not start " + narrow(exe) + " (error " + std::to_string(startError) + ")");
+        return;
+    }
+    DWORD code = 1;
+    if (WaitForSingleObject(pi.hProcess, 120000) != WAIT_OBJECT_0) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 5000);
+        fail(what, "the process did not finish in two minutes");
+    } else {
+        GetExitCodeProcess(pi.hProcess, &code);
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    std::string text;
+    if (FILE* f = _wfopen(outPath.c_str(), L"rb")) {
+        char chunk[4096];
+        size_t got;
+        while ((got = fread(chunk, 1, sizeof(chunk), f)) > 0) text.append(chunk, got);
+        fclose(f);
+    }
+    // Its lines are this run's lines; its failures are this run's failures.
+    bool sawLast = false;
+    bool sawFailure = false;
+    for (size_t at = 0; at < text.size();) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(at, end - at);
+        at = end + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (line.empty()) continue;
+        printf("%s\n", line.c_str());
+        if (line.compare(0, 6, "  FAIL") == 0) {
+            ++g_fails;
+            sawFailure = true;
+        } else if (line == "  ok    the four situations ran to the end") {
+            sawLast = true;
+        }
+    }
+    if (!sawLast && !sawFailure) fail(what, "the process printed no result (exit code " + std::to_string(code) + ")");
+    else if (code != 0 && !sawFailure) fail(what, "the process exited with code " + std::to_string(code));
+}
+
+static void iniNameCases(const std::wstring& scratch) {
+    iniNamePathCases();
+    iniNameFixturesIsolated(scratch);
 }
 
 // A message that spells the settings file's name is the fault; tools\config_test knows it by scanning.
@@ -902,6 +1039,13 @@ int main(int argc, char** argv) {
     // this test appeared to die before its first printf, which was only the
     // buffer being discarded.
     setvbuf(stdout, nullptr, _IONBF, 0);
+
+    // The child iniNameFixturesIsolated() starts from a directory of its own: only the resolver's
+    // four real-file situations, no shipped ini read, and an exit code that says whether all held.
+    if (argc == 3 && std::strcmp(argv[1], "--ininame-cases") == 0) {
+        iniNameFixtures(widen(argv[2]));
+        return g_fails == 0 ? 0 : 1;
+    }
 
     if (argc < 2) {
         printf("usage: config_test.exe <dir containing edvr.ini> [scratch dir]\n");
