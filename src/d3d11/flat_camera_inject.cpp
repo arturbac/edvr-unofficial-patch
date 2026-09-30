@@ -1093,7 +1093,6 @@ FlatCameraVrCounters flatCameraVrCounters() { return g_vr.tally().snapshot(); }
 size_t flatCameraVrExcluded(FlatCameraVrExcluded* out, size_t max) { return g_vr.excluded().copy(out, max); }
 
 const char* flatCameraVrStatus() { return flatCameraInjectObserveStatus(); }
-bool flatCameraVrQuiet() { return true; }
 
 bool flatCameraVrQuiet() { return flatCameraVrQuietFor(g_vrBits.load(std::memory_order_acquire), g_inject.injected.empty()); }
 
