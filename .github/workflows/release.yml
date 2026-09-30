@@ -82,10 +82,26 @@ jobs:
       SIGN: "${{ vars.SIGNPATH_SIGNING == 'true' && (github.event_name != 'workflow_dispatch' || inputs.sign) }}"
       DLSS: "${{ github.event_name != 'workflow_dispatch' || inputs.dlss }}"
     steps:
+      # Two rigs that read EDVR's own source (flat_temporal_test and
+      # ui_quality_test) end a function by searching for "\n}\n". A Windows
+      # runner's default checkout writes CRLF, which can never match, and
+      # every machine this repo is built on checks out LF (core.eol=lf,
+      # autocrlf off). Match them before the checkout writes a file.
+      - name: Check out with LF line endings
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
       - name: Check out EDVR
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Print line-ending state
+        run: |
+          git config --show-origin --get-all core.autocrlf
+          git config --show-origin --get-all core.eol
+          git ls-files --eol src/d3d11/ui_layer.cpp build.bat
 
       # The runner image's default python is whatever the image was built
       # with; pin one so the tools see the same interpreter every release.
@@ -94,13 +110,13 @@ jobs:
         with:
           python-version: '3.12'
 
-      # The rigs are standard-library Python except eye_draw_snapshot.py,
-      # whose self-test exports PNGs through Pillow; the runner's interpreter
-      # has nothing installed beyond the standard library.
+      # Everything else the tools import is the standard library, but the
+      # runner's interpreter has nothing beyond it: several gate tools import
+      # numpy and eye_draw_snapshot.py's self-test exports PNGs through Pillow.
       - name: Install Python packages the rigs need
         run: |
-          python -m pip install --disable-pip-version-check --quiet pillow
-          if ($LASTEXITCODE -ne 0) { throw "pip install pillow failed" }
+          python -m pip install --disable-pip-version-check --quiet numpy pillow
+          if ($LASTEXITCODE -ne 0) { throw "pip install numpy pillow failed" }
 
       - name: Compute release version
         run: |
@@ -154,8 +170,29 @@ jobs:
 
       # --keep-going: the pool reports every failing rig rather than the first, so one run shows the whole picture; the exit status is unchanged.
       - name: Build
+        id: build
         shell: cmd
         run: call "%GITHUB_WORKSPACE%\build.bat" --keep-going || exit /b 1
+
+      # journal_unload_test prints only failures, and build.bat turns its exit
+      # code into 1, so a crash and a failed assertion look alike in the log
+      # (run 36742004339 printed its header and nothing else). Rerun it bare
+      # on a failed build to see the real exit code and, for a crash, what
+      # Windows recorded about it. Diagnostic only; never fails the job.
+      - name: Diagnose journal_unload_test (failed build only)
+        if: failure() && steps.build.conclusion == 'failure'
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          if (-not (Test-Path build\journal_unload_test.exe)) { Write-Host "journal_unload_test.exe was not built"; exit 0 }
+          $started = Get-Date
+          & build\journal_unload_test.exe build\d3d11.dll
+          $code = $LASTEXITCODE
+          Write-Host ("journal_unload_test exit code: {0} (0x{1:X8})" -f $code, $code)
+          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $started } -ErrorAction SilentlyContinue |
+            Where-Object { $_.Level -le 3 } | Select-Object -First 6 |
+            ForEach-Object { Write-Host ("{0} {1}: {2}" -f $_.TimeCreated, $_.ProviderName, ($_.Message -replace '\s+', ' ')) }
+          exit 0
 
       - name: Check build outputs
         run: |
