@@ -310,12 +310,17 @@ struct Draw {
     int wbRouteSlot = -1;
 };
 Draw g_draw;
+// The SV_Position remap (ui_holo_remap.h): the two hologram sphere programs and, since 2026-09-30, the frosted
+// base. The "holo" names are the machinery's history; every counter below is per program slot or a total.
 ui_holo_remap::Cache g_holoCache;
 ui_holo_remap::Binding g_holoBinding;
+constexpr size_t kRemapPrograms = ui_holo_remap::kProgramCount;
 uint64_t g_holoEligible = 0, g_holoPrepared = 0, g_holoTaken = 0, g_holoRefused = 0;
-bool g_holoPrepareNoted[2]{}, g_holoTakeNoted[2]{}, g_holoRefusalNoted[2]{};
+uint64_t g_holoTakenBy[kRemapPrograms]{}, g_holoRefusedBy[kRemapPrograms]{};
+bool g_holoPrepareNoted[kRemapPrograms]{}, g_holoTakeNoted[kRemapPrograms]{},
+    g_holoRefusalNoted[kRemapPrograms]{};
 std::atomic<uint64_t> g_holoCaptureCalls{0}, g_holoCaptured{0};
-std::atomic<bool> g_holoCaptureNoted[2]{}, g_holoCaptureRefusalNoted[2]{};
+std::atomic<bool> g_holoCaptureNoted[kRemapPrograms]{}, g_holoCaptureRefusalNoted[kRemapPrograms]{};
 static_assert(ui_holo_remap::kVs == kHoloTargetSphere, "hologram classifier identity");
 uint64_t g_lastRedirectSeq = 0;
 bool g_familyEngaged[static_cast<size_t>(UiLayerFamily::kCount)] = {};
@@ -1358,6 +1363,34 @@ void sizeChangeTick() {
     if (now - c.ms > 30000) c.open = false;
 }
 
+// A pixel-shader sampler as one log phrase, for the frosted base's first take: the address mode of the sampler
+// its blurred-scene lookup runs through (s1) was on no census line. Whether a lookup past 1.0 folded back
+// (mirror), smeared (clamp) or repeated (wrap) is what the artifact looked like; the remap does not depend on
+// it, the log records which the game chose.
+void describeSampler(ID3D11DeviceContext* ctx, UINT slot, char* out, size_t n) {
+    static const char* const kAddress[] = {"?", "wrap", "mirror", "clamp", "border", "mirror-once"};
+    D3D11_SAMPLER_DESC sd{};
+    ID3D11SamplerState* sampler = nullptr;
+    bool read = false;
+    guarded("ui.frosted.sampler", [&] {
+        ctx->PSGetSamplers(slot, 1, &sampler);
+        if (sampler) {
+            sampler->GetDesc(&sd);
+            read = true;
+        }
+    });
+    ui_holo_remap::release(sampler);
+    auto name = [](D3D11_TEXTURE_ADDRESS_MODE m) {
+        return m >= 1 && m <= 5 ? kAddress[m] : kAddress[0];
+    };
+    if (!read) {
+        _snprintf_s(out, n, _TRUNCATE, "sampler s%u unreadable", slot);
+        return;
+    }
+    _snprintf_s(out, n, _TRUNCATE, "sampler s%u address %s/%s/%s, filter %u", slot, name(sd.AddressU),
+                name(sd.AddressV), name(sd.AddressW), static_cast<unsigned>(sd.Filter));
+}
+
 // One issue of a decided draw into the layer (which = 0) or into the
 // multiply transmittance (which = 1). the crisp-HUD half of fix.ui_quality: a decided draw with
 // g_draw.hdr goes into the eye's HDR HUD layer instead -- same map, jitter
@@ -1463,19 +1496,25 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
     ui_holo_remap::Params holoParams{};
     if (g_draw.holoPsHash) {
         const auto& v = g_draw.vp[0];
-        ctx->PSGetShaderResources(1, 1, &g_draw.holoDepthCheck);
+        const int slot = ui_holo_remap::index(g_draw.holoPsHash);
+        // Only the hologram programs load the scene depth at t1, and only they need it to be the target's own
+        // size; the frosted base looks its blurred scene up by UV, so nothing about its textures constrains
+        // the take.
+        const bool depthLoad = ui_holo_remap::kindOf(slot) == ui_holo_remap::Kind::kHologramDepth;
+        if (depthLoad) ctx->PSGetShaderResources(1, 1, &g_draw.holoDepthCheck);
         const bool valid = g_draw.vpCount == 1 && std::isfinite(v.TopLeftX) &&
             std::isfinite(v.TopLeftY) && std::isfinite(v.Width) && std::isfinite(v.Height) &&
             v.Width > 0 && v.Height > 0 &&
             ui_holo_remap::params(g_draw.targetW, g_draw.targetH, layerW, layerH,
                                   g_draw.jx, g_draw.jy, holoParams) &&
-            ui_holo_remap::depthSource(g_draw.holoDepthCheck, g_draw.targetW, g_draw.targetH);
+            (!depthLoad ||
+             ui_holo_remap::depthSource(g_draw.holoDepthCheck, g_draw.targetW, g_draw.targetH));
         if (!valid) {
-            ++g_holoRefused; ++g_win.refusedAtIssue;
-            const int slot = ui_holo_remap::index(g_draw.holoPsHash);
+            ++g_holoRefused; ++g_holoRefusedBy[slot]; ++g_win.refusedAtIssue;
             if (!g_holoRefusalNoted[slot]) {
-                Log::get().note("crisp holo remap: refused PS %016llX -- unsupported t1 depth, viewport, or map; stock complete draw retained.",
-                    static_cast<unsigned long long>(g_draw.holoPsHash));
+                Log::get().note("crisp holo remap: refused PS %016llX -- unsupported %s; stock complete draw retained.",
+                    static_cast<unsigned long long>(g_draw.holoPsHash),
+                    depthLoad ? "t1 depth, viewport, or map" : "viewport or map");
                 g_holoRefusalNoted[slot] = true;
             }
             releaseSaved(); return false;
@@ -1535,8 +1574,8 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
     uiLayerJitterCancel(g_draw.jx, g_draw.jy, m, &cx, &cy);
     if (g_draw.holoPsHash && !g_holoBinding.begin(ctx, g_draw.holoPatched, g_holoCache.constants(),
             holoParams, vScreenPSSetShaderRaw, g_draw.holoOriginal)) {
-        ++g_holoRefused; ++g_win.refusedAtIssue;
         const int slot = ui_holo_remap::index(g_draw.holoPsHash);
+        ++g_holoRefused; ++g_holoRefusedBy[slot]; ++g_win.refusedAtIssue;
         if (!g_holoRefusalNoted[slot]) {
             Log::get().note("crisp holo remap: refused PS %016llX at bind (original shader changed or dynamic classes); stock complete draw retained.",
                 static_cast<unsigned long long>(g_draw.holoPsHash));
@@ -1646,12 +1685,23 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
             uiBlendShapeName(shape));
     }
     if (g_draw.holoPsHash) {
-        ++g_holoTaken; const int slot = ui_holo_remap::index(g_draw.holoPsHash);
+        const int slot = ui_holo_remap::index(g_draw.holoPsHash);
+        ++g_holoTaken; ++g_holoTakenBy[slot];
         if (!g_holoTakeNoted[slot]) {
-            Log::get().note("crisp holo remap: admitted VS %016llX PS %016llX eye %d input %ux%u layer %ux%u inverse (%g,%g) bias (%g,%g); original t1/materials/alpha, seeded stencil and stock write-back retained.",
-                static_cast<unsigned long long>(ui_holo_remap::kVs), static_cast<unsigned long long>(g_draw.holoPsHash),
-                g_draw.eye, g_draw.targetW, g_draw.targetH, layerW, layerH,
-                double(holoParams.x), double(holoParams.y), double(holoParams.bx), double(holoParams.by));
+            if (ui_holo_remap::kindOf(slot) == ui_holo_remap::Kind::kFrostedBase) {
+                char sampler[96];
+                describeSampler(ctx, 1, sampler, sizeof(sampler));
+                Log::get().note("crisp holo remap: admitted frosted base PS %016llX eye %d input %ux%u layer %ux%u inverse (%g,%g) bias (%g,%g); its blurred-scene lookup reads the game's pixel position, not the layer's (%s).",
+                    static_cast<unsigned long long>(g_draw.holoPsHash), g_draw.eye,
+                    g_draw.targetW, g_draw.targetH, layerW, layerH,
+                    double(holoParams.x), double(holoParams.y), double(holoParams.bx), double(holoParams.by),
+                    sampler);
+            } else {
+                Log::get().note("crisp holo remap: admitted VS %016llX PS %016llX eye %d input %ux%u layer %ux%u inverse (%g,%g) bias (%g,%g); original t1/materials/alpha, seeded stencil and stock write-back retained.",
+                    static_cast<unsigned long long>(ui_holo_remap::kVs), static_cast<unsigned long long>(g_draw.holoPsHash),
+                    g_draw.eye, g_draw.targetW, g_draw.targetH, layerW, layerH,
+                    double(holoParams.x), double(holoParams.y), double(holoParams.bx), double(holoParams.by));
+            }
             g_holoTakeNoted[slot] = true;
         }
     }
@@ -2226,11 +2276,16 @@ void logMemory() {
 }
 
 void logTotals(double seconds) {
-    Log::get().note("crisp holo remap: cumulative capture_calls %llu captured %llu eligible %llu prepared %llu admitted %llu refused %llu; two exact PS only, zero admitted means no successful route, no extra scene-depth copy.",
+    // The frosted base's own count: the flight's answer to "did the station menu's base go through the
+    // remapped program" -- admitted must climb with the panels, refused stay 0.
+    const size_t frosted = static_cast<size_t>(ui_holo_remap::index(ui_holo_remap::kFrostedPs));
+    Log::get().note("crisp holo remap: cumulative capture_calls %llu captured %llu eligible %llu prepared %llu admitted %llu refused %llu; frosted base admitted %llu refused %llu; three exact PS only, zero admitted means no successful route, no extra scene-depth copy.",
         static_cast<unsigned long long>(g_holoCaptureCalls.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(g_holoCaptured.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(g_holoEligible), static_cast<unsigned long long>(g_holoPrepared),
-        static_cast<unsigned long long>(g_holoTaken), static_cast<unsigned long long>(g_holoRefused));
+        static_cast<unsigned long long>(g_holoTaken), static_cast<unsigned long long>(g_holoRefused),
+        static_cast<unsigned long long>(g_holoTakenBy[frosted]),
+        static_cast<unsigned long long>(g_holoRefusedBy[frosted]));
     g_seedCensus.report([](const char* line) { Log::get().note("%s", line); });
     g_hdrSeedGpu.report(g_hdrDrawTimingOn, [](const char* line) { Log::get().note("%s", line); });
     const double frames = g_win.frames ? static_cast<double>(g_win.frames) : 1.0;
@@ -2423,8 +2478,9 @@ void uiLayerRememberHoloPs(ID3D11PixelShader* shader, uint64_t hash,
     if (ran && ok) {
         g_holoCaptured.fetch_add(1, std::memory_order_relaxed);
         if (!g_holoCaptureNoted[slot].exchange(true, std::memory_order_relaxed))
-            Log::get().note("crisp holo remap: captured verified PS %016llX %zu bytes, exact SV_Position ftoi/t1 load and free shader b13; not yet admitted.",
-                static_cast<unsigned long long>(hash), count);
+            Log::get().note("crisp holo remap: captured verified PS %016llX %zu bytes (%s), exact SV_Position edit and free shader b13; not yet admitted.",
+                static_cast<unsigned long long>(hash), count,
+                ui_holo_remap::kindName(ui_holo_remap::kindOf(slot)));
     } else if (!g_holoCaptureRefusalNoted[slot].exchange(true, std::memory_order_relaxed)) {
         Log::get().note("crisp holo remap: PS %016llX capture refused (bytes/linkage/private identity unavailable); original shader untouched.",
             static_cast<unsigned long long>(hash));
@@ -2669,8 +2725,12 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
                           (f.blend != UiBlendShape::kMultiply || ensureMult(ctx, g_eye[f.eye], f.eye));
             d = uiLayerDecide(f);
         }
-        if (d == UiLayerDecision::kRedirect && f.crispHdr &&
-            bindingShaderHash(BindSlot::Vs) == ui_holo_remap::kVs) {
+        // The SV_Position remap's draws (ui_holo_remap.h needsRemap): the hologram sphere VS into the HDR HUD
+        // layer, and the frosted base wherever it is taken. A program that cannot be prepared is refused to
+        // stock: drawn unremapped into the layer, its lookup would run over the layer's pixels.
+        if (d == UiLayerDecision::kRedirect &&
+            ui_holo_remap::needsRemap(bindingShaderHash(BindSlot::Vs), bindingShaderHash(BindSlot::Ps),
+                                      f.crispHdr)) {
             const uint64_t ps = bindingShaderHash(BindSlot::Ps);
             ++g_holoEligible;
             ID3D11PixelShader* original = static_cast<ID3D11PixelShader*>(bindingGet(BindSlot::Ps));
@@ -2678,8 +2738,10 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
             const bool ran = guarded("ui.holo.prepare", [&] { prepared = g_holoCache.prepare(ctx, original, ps); });
             if (!ran || !prepared) {
                 ++g_holoRefused; d = UiLayerDecision::kLayerFailed;
-                _snprintf_s(detail, _TRUNCATE, "hologram PS bytecode/device preparation unavailable; stock complete draw retained");
                 const int slot = ui_holo_remap::index(ps);
+                if (slot >= 0) ++g_holoRefusedBy[slot];
+                _snprintf_s(detail, _TRUNCATE, "%s PS bytecode/device preparation unavailable; stock complete draw retained",
+                            slot >= 0 ? ui_holo_remap::kindName(ui_holo_remap::kindOf(slot)) : "hologram");
                 if (slot >= 0 && !g_holoRefusalNoted[slot]) {
                     Log::get().note("crisp holo remap: prepare refused PS %016llX before admission (verified bytecode, original identity, device or allocation unavailable); stock complete draw retained.",
                         static_cast<unsigned long long>(ps));

@@ -66,7 +66,8 @@ struct ID3D11PixelShader;
 struct ID3D11Texture2D;
 
 namespace edvr {
-// Successful CreatePS hook only: two exact originals, no disk/HLSL input.
+// Successful CreatePS hook only: three exact originals (the two hologram
+// sphere programs and the frosted base, ui_holo_remap.h), no disk/HLSL input.
 // The render-owner cache prepares their restricted DXBC remap before a take.
 void uiLayerRememberHoloPs(ID3D11PixelShader* shader, uint64_t hash,
                            const void* bytes, size_t count, bool linked);
