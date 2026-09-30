@@ -15,6 +15,9 @@
 #include "flat_dlss_negotiate.h"
 #include "flat_negotiated_eval.h"
 #include "flat_camera_producer_probe.h"
+#include "flat_standdown.h"
+#include "flat_temporal.h"
+#include "engine_velocity.h"
 #include "binding_shadow.h"
 #include "exposure_fix.h"
 #include "device_hook.h"
@@ -212,6 +215,20 @@ struct State {
     struct CoverageRefusedPair { uint64_t vs = 0, ps = 0; const char* reason = ""; uint64_t draws = 0; };
     CoverageRefusedPair covRefusedPairs[32]{};
     uint32_t covRefusedPairsUsed = 0;
+
+    // --- Stand-down (flat_standdown.h) ---------------------------------------
+    // While every frame is refused for the shape of the post chain the runtime
+    // stops its per-draw and per-call work. `work` is the mode of the frame in
+    // flight, decided at the Present that started it; `standDown` is the state
+    // machine that decides it; frameSeen/frameReason are this frame's verdict on
+    // its chain, recorded at the copy draw. A session whose frames are selected
+    // never leaves FlatWork::Full, and nothing below the mode checks changes for it.
+    FlatStandDown standDown;
+    FlatWork work = FlatWork::Full;
+    FlatFrameSeen frameSeen = FlatFrameSeen::None;
+    FlatMonoReason frameReason = FlatMonoReason::NoOutputCopy;
+    bool frameLive = false;      // the frame that just ended was watched (Full or Probe)
+    bool enginePaused = false;   // engine motion is configured off for the stand-down
 };
 // Driver objects retire on the owner Present; never release under loader lock.
 State& state() { static State* p = new State; return *p; }
@@ -1269,12 +1286,96 @@ bool depthView(ID3D11Texture2D* depth) {
     if (d.SampleDesc.Count != 1 || !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE) || FAILED(s.device->CreateShaderResourceView(depth, &v, &s.depthView))) return false;
     s.sceneDepth = depth; return true;
 }
+
+// --- Stand-down: what each mode does (flat_standdown.h) --------------------------
+// The one place the pieces are paused and resumed, called at every Present with the
+// mode of the frame that starts now (idempotent). Full is the runtime as it was
+// before the stand-down existed. Probe and Paused pull back everything named in
+// kFlatStandDownPausedWork; the gate of each piece, for the rig's source scan:
+//   coverage classification, legacy projection readiness, jitter preparation and
+//     constant-buffer shadow tracking: s.projection is released here and none of
+//     them runs without it (the draw scope, the Map/Unmap/Update tees, the dispatch
+//     scope and qualifyProjection all test it); the Present creates it in Full only
+//   the per-draw scope, and the Map/Unmap/Update/Written/Uavs/Dispatch tees: s.work
+//   the camera-write witness: s.work == FlatWork::Full at its call sites
+//   engine motion (hooks, tees, substitution): s.enginePaused, which the Present
+//     hands to engineVelocityConfigure
+//   the camera refresh hook: flatCameraInjectPause
+//   the discovery observers: flatTemporalSetPaused, on Paused frames only
+void applyWork(State& s, FlatWork next) {
+    const FlatWork was = s.work;
+    s.work = next;
+    if (was != next) flatTemporalSetPaused(next == FlatWork::Paused);
+    if (next != FlatWork::Full || was != FlatWork::Full) flatCameraInjectPause(next != FlatWork::Full);
+    if ((was == FlatWork::Paused) != (next == FlatWork::Paused)) {
+        // The UAV tracker stops with the pause and starts again from unknown, the
+        // state ExecuteCommandList leaves it in, so a stale binding never reads as live.
+        for (auto& u : s.uavs) u.Reset();
+    }
+    if (was == FlatWork::Full && next != FlatWork::Full) {
+        // Legacy projection readiness stops tracking constant-buffer writes and
+        // drops every shadow; it is rebuilt from nothing on resume, as after a resize.
+        if (s.projection) s.projection.reset();
+        s.projectionContext.Reset();
+        s.projectionFrames = 0;
+        // Local refusal's observation ends with the contract, as in a resize.
+        s.observing = false; s.covFrameLocallyRefused = false;
+        s.enginePaused = true;
+    } else if (was != FlatWork::Full && next == FlatWork::Full) {
+        s.enginePaused = false;
+    }
+}
+
+// The stand-down ends because something outside the frame changed (the AA mode, a
+// device or swap-chain reset, an F10 audit): back to Full at once, with one line if
+// a stand-down was in force.
+void endStandDown(State& s, uint64_t frame, const char* why) {
+    if (s.standDown.wake(GetTickCount64())) {
+        char text[512];
+        flatStandDownFormatResumed(text, sizeof(text), frame, s.standDown, why);
+        Log::get().note("%s", text);
+    }
+    // Nothing the frame in flight showed says anything about the new question.
+    s.frameSeen = FlatFrameSeen::None;
+    s.frameReason = FlatMonoReason::NoOutputCopy;
+    s.frameLive = false;
+    applyWork(s, FlatWork::Full);
+}
+
+// The stand-down's frame boundary: what the frame that just ended showed about its
+// chain, the state machine's verdict, and the mode of the frame that starts now.
+// Runs once per Present, before anything else in it reads s.work.
+void standDownFrame(State& s, uint64_t frame) {
+    const uint64_t now = GetTickCount64();
+    const bool watched = s.frameLive;
+    const FlatFrameSeen seen = s.frameSeen;
+    const FlatMonoReason reason = s.frameReason;
+    s.frameLive = false;
+    s.frameSeen = FlatFrameSeen::None;
+    s.frameReason = FlatMonoReason::NoOutputCopy;
+    const FlatStandDownEvent event = s.standDown.frameEnded(seen, reason, watched, now);
+    char text[1200];
+    if (event == FlatStandDownEvent::Entered) {
+        flatStandDownFormatEntered(text, sizeof(text), frame, s.standDown);
+        Log::get().note("%s", text);
+    } else if (event == FlatStandDownEvent::Resumed) {
+        flatStandDownFormatResumed(text, sizeof(text), frame, s.standDown, nullptr);
+        Log::get().note("%s", text);
+    } else if (s.standDown.reportDue(now)) {
+        flatStandDownFormatStill(text, sizeof(text), frame, s.standDown, now);
+        Log::get().note("%s", text);
+    }
+    applyWork(s, s.standDown.nextFrame(now));
+}
 }
 
 void flatRuntimeResize() {
     g_flatRuntimeLive.store(false, std::memory_order_release);
     nativeScale.store(false, std::memory_order_release);
     auto& s = state(); FlatComputeInternalScope guard; s.drawCapture.cancel("resize-or-stop"); flatMonoResolveReset();
+    // A reset (or the mode turned off) ends a stand-down: the new contract may well be
+    // one the selector recognises, and every paused piece restarts with it.
+    endStandDown(s, s.prefix.frame, "the swap chain or device was reset, or the mode was turned off");
     flatCameraInjectReset(); // history and the decision do not survive a resize; injected cameras stay known for the flush
     finishPhaseCensusFrame(s);
     if(s.phaseCensusFrames || s.phaseFailuresUsed || s.phaseOverflowCalls)
@@ -1387,7 +1488,10 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     }
     if (mode != s.mode) {
         s.haveResolvePlan=false;s.resolvePreflight={};s.resolvePreflightRetryMs=0;
-        s.mode = mode; reset(); engineVelocityConfigure(enabled);
+        s.mode = mode; reset();
+        // A new mode is a new question for the stand-down: everything restarts.
+        endStandDown(s, frame, "the anti-aliasing mode changed");
+        engineVelocityConfigure(enabled);
         s.phase.resetHistory();
         s.engine = _stricmp(mode.c_str(), "fsr") == 0 ? FlatMonoResolveMode::Fsr :
             _stricmp(mode.c_str(), "dlss") == 0 ? FlatMonoResolveMode::Dlss :
@@ -1395,13 +1499,26 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         Log::get().note("flat runtime: mode=%s experimental mono temporal; game SS controls render size; jitter uses qualified D3D11 projection scopes", mode.c_str());
     }
     g_flatRuntimeLive.store(false, std::memory_order_release);
-    engineVelocityConfigure(enabled);
+    // Engine motion follows the stand-down (s.enginePaused); the mode of the frame that
+    // starts now is decided below, and a change of it is handed over there.
+    const bool enginePausedThen = s.enginePaused;
+    engineVelocityConfigure(enabled && !enginePausedThen);
     if (!enabled) { if (s.device || s.output || s.cameraCount) flatRuntimeResize(); return; }
     FlatComputeInternalScope guard;
     Ptr<ID3D11Device> actualDevice; swap->GetDevice(IID_PPV_ARGS(&actualDevice));
     if (s.device && actualDevice.Get() != s.device.Get()) { flatRuntimeResize(); s.thread = GetCurrentThreadId(); }
     if (!s.device) { swap->GetDevice(IID_PPV_ARGS(&s.device)); if (s.device) s.device->GetImmediateContext(&s.context); }
     if (!s.device || !s.context) return;
+    // Stand-down (flat_standdown.h): what the frame that just ended showed about its
+    // chain, and the mode of the frame that starts now. Before anything below reads s.work.
+    bool engineConfiguredPaused = enginePausedThen;
+    const auto syncEngine = [&] {
+        if (s.enginePaused == engineConfiguredPaused) return;
+        engineConfiguredPaused = s.enginePaused;
+        engineVelocityConfigure(enabled && !s.enginePaused);
+    };
+    standDownFrame(s, frame);
+    syncEngine();
     // The completed frame is a draw-capture sample only if it was live: the resolver did not reset
     // it, and it ran at a nonzero phase unless the jitter is off on purpose. The two frames after an
     // F10 arm were neither, and their constants carry no phase (2026-09-29).
@@ -1440,7 +1557,9 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         Log::get().note("flat coverage: contract requalified at frame=%llu; warm-up resumes",
             (unsigned long long)frame);
     }
-    if(wanted && !s.projection) {
+    // Legacy projection readiness exists in Full frames only: a stand-down releases it and
+    // a resume creates it fresh here, as after a resize.
+    if(wanted && !s.projection && s.work == FlatWork::Full) {
         s.projection.reset(new(std::nothrow) FlatProjectionRuntime);
         s.context.As(&s.projectionContext);
         if(!s.projection || !s.projectionContext || !s.projection->initialize(s.context.Get())) {
@@ -1452,6 +1571,9 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         reportProjection(s,"complete");
     }
     if(projectionAuditRequested.exchange(false,std::memory_order_acq_rel)) {
+        // A diagnostic asks for everything, refused frames included: the stand-down ends.
+        endStandDown(s, frame, "an F10 audit asked for everything");
+        syncEngine();
         flatMonoResolveArmPixels(frame);
         s.drawCapture.arm(frame);
         if(s.projectionFrames)reportProjection(s,"rearmed");
@@ -1554,14 +1676,22 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     if(s.projection)s.projection->enableColdReadback(!nonzeroPhase(s));
     if(!wanted && !s.projectionFrames) {s.projection.reset();s.projectionContext.Reset();}
     for (auto& r : s.colors) r.Reset(); for (auto& r : s.depths) r.Reset();
-    s.prefix = FlatRuntimePrefix{}; s.prefix.frame = frame + 1;
+    // A Paused frame (stand-down) is not watched: no prefix to clear -- the frame's one
+    // large reset -- and no trace slot to rotate, so the ring keeps the last watched
+    // frames for an F10 dump instead of filling with empty ones.
+    if (s.work != FlatWork::Paused) s.prefix = FlatRuntimePrefix{};
+    s.prefix.frame = frame + 1;
     // Trace ring: seal the frame that just ended with the hash over every
-    // copy outcome it produced, then reset the contract for the next frame.
+    // copy outcome it produced, then reset the contract for the next frame. Through
+    // Paused frames the contract is the last watched frame's, untouched, so sealing
+    // again writes the same values into the same slot.
     flatTraceSeal(s.traceRing, s.traceContract.produced,
                   s.traceContract.produced ? flatFrameContractHash(s.traceContract) : 0);
-    s.traceContract = FlatFrameContract{};
-    flatTraceBeginFrame(s.traceRing, frame + 1, output.Get(), d.Width, d.Height, d.Format);
-    s.phaseCensusPending=s.jitterWanted;
+    if (s.work != FlatWork::Paused) {
+        s.traceContract = FlatFrameContract{};
+        flatTraceBeginFrame(s.traceRing, frame + 1, output.Get(), d.Width, d.Height, d.Format);
+    }
+    s.phaseCensusPending=s.jitterWanted && s.work != FlatWork::Paused;
     s.phaseCensusFailed=false;
     s.prefix.output = output.Get(); s.prefix.width = d.Width; s.prefix.height = d.Height; s.prefix.format = d.Format;
     s.namedDepth = s.namedConstants = nullptr; s.treated = false;
@@ -1677,6 +1807,8 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.covRefusedPairsUsed = 0;
         s.lastReport = now;
     }
+    // The frame that starts now is watched unless it is a Paused one (flat_standdown.h).
+    s.frameLive = s.work != FlatWork::Paused;
     g_flatRuntimeLive.store(true, std::memory_order_release);
 }
 void flatRuntimeViewport(UINT n, const D3D11_VIEWPORT* vp) { if (!owner()) return; auto& s = state(); s.viewportCount = n; if (n == 1 && vp) s.viewport = *vp; }
@@ -1684,9 +1816,19 @@ void flatRuntimeConstantBuffers(UINT start, UINT count, ID3D11Buffer* const* buf
     if (owner() && start <= 1 && 1-start < count && buffers && buffers[1-start]) camera(buffers[1-start], true);
 }
 void flatRuntimeClearBindings() { if (owner()) { state().viewportCount = 0; for (auto& u : state().uavs) u.Reset(); } }
-void flatRuntimeUnknown() { if (owner()) { flatTraceMark(state().traceRing, kFlatTraceEventMarkUncertain, nullptr); state().prefix.uncertain = true; state().viewportCount = 0; for (auto& c : state().cameras) c.valid = false; for (auto& u : state().uavs) u.Reset(); if(state().projection) {state().projection->invalidateAll();failPhase(state(),"unknown-context-state");} } }
-void flatRuntimeUavs(UINT start, UINT count, ID3D11UnorderedAccessView* const* views) {
+void flatRuntimeUnknown() {
     if (!owner()) return;
+    auto& s = state();
+    // The trackers lose what they knew in every mode; a Paused frame watches nothing
+    // else, so no trace mark and no prefix or shadow to invalidate.
+    s.viewportCount = 0; for (auto& u : s.uavs) u.Reset();
+    if (s.work == FlatWork::Paused) return;
+    flatTraceMark(s.traceRing, kFlatTraceEventMarkUncertain, nullptr); s.prefix.uncertain = true;
+    for (auto& c : s.cameras) c.valid = false;
+    if(s.projection) {s.projection->invalidateAll();failPhase(s,"unknown-context-state");}
+}
+void flatRuntimeUavs(UINT start, UINT count, ID3D11UnorderedAccessView* const* views) {
+    if (!owner() || state().work == FlatWork::Paused) return;
     for (UINT i = 0; i < count && start + i < 8; ++i) {
         ResourceInfo info{};
         if (views && views[i]) bindingResolve(views[i], &info);
@@ -1696,6 +1838,7 @@ void flatRuntimeUavs(UINT start, UINT count, ID3D11UnorderedAccessView* const* v
 FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
     if(!flatRuntimeActive())return;
     auto& s = state(); if (!owner() || ctx != s.context.Get()) { foreignWork.store(true, std::memory_order_release); return; }
+    if (s.work == FlatWork::Paused) return;
     if(s.projection) {
         if(s.projectionFrames)++s.projectionDispatches;
         // CSSetShader records only the pointer via bindingSet, unlike the
@@ -1730,28 +1873,34 @@ FlatRuntimeDispatchScope::FlatRuntimeDispatchScope(ID3D11DeviceContext* ctx) {
     }
     if(s.prefix.uncertain && s.projection)failPhase(s,"compute-source-invalidated");
 }
+// The per-call tees below return at once in a Paused frame (flat_standdown.h). A Probe
+// frame runs them as a Full one does except for the camera witness, which is diagnostics
+// for a frame that could be treated, and the projection shadows, which do not exist then.
 void flatRuntimeWritten(ID3D11Resource* res) {
-    if (!owner()) return; flatTraceMark(state().traceRing, kFlatTraceEventWriteResource, res);
+    if (!owner() || state().work == FlatWork::Paused) return;
+    flatTraceMark(state().traceRing, kFlatTraceEventWriteResource, res);
     flatRuntimeWritten(state().prefix, res);
     if (auto* c = camera(res, false)) c->valid = false;
     if(state().projection)state().projection->invalidate(res);
 }
 void flatRuntimeMap(ID3D11Resource* res, D3D11_MAP type, void* bytes) {
-    if (!owner() || type == D3D11_MAP_READ) return;
+    if (!owner() || type == D3D11_MAP_READ || state().work == FlatWork::Paused) return;
     flatRuntimeWritten(res); if (auto* c = camera(res, false)) c->mapped = bytes;
     if(state().projection)state().projection->observeMap(res,type,bytes);
 }
 void flatRuntimeUnmap(ID3D11Resource* res) {
-    if (!owner()) return; if(state().projection)state().projection->observeUnmap(res);
+    if (!owner() || state().work == FlatWork::Paused) return;
+    if(state().projection)state().projection->observeUnmap(res);
     if (auto* c = camera(res, false)) {
-        if (c->mapped) { capture(*c, c->mapped); cameraWitness(res); }
+        if (c->mapped) { capture(*c, c->mapped); if (state().work == FlatWork::Full) cameraWitness(res); }
         c->mapped = nullptr;
     }
 }
 void flatRuntimeUpdate(ID3D11Resource* res, const void* bytes, const D3D11_BOX* box) {
-    if (!owner()) return; flatRuntimeWritten(res);
+    if (!owner() || state().work == FlatWork::Paused) return;
+    flatRuntimeWritten(res);
     if (auto* c = camera(res, false)) {
-        if (!box || (box->left == 0 && box->right == c->width)) { capture(*c, bytes); cameraWitness(res); }
+        if (!box || (box->left == 0 && box->right == c->width)) { capture(*c, bytes); if (state().work == FlatWork::Full) cameraWitness(res); }
     }
     if(state().projection)state().projection->observeUpdate(res,bytes,box);
 }
@@ -1761,6 +1910,9 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
                                            int32_t base, uint32_t startInstance) {
     if (!flatRuntimeActive()) return;
     auto& s = state(); if (!owner() || context != s.context.Get()) { foreignWork.store(true, std::memory_order_release); return; }
+    // A Paused frame (flat_standdown.h) watches nothing: the scope is a no-op, ctx stays
+    // null and the destructor returns at its first line.
+    if (s.work == FlatWork::Paused) return;
     ctx = context; FlatRuntimeDraw d{}; auto& k = d.key;
     const FlatProjectionBindingPlan* projectionPlan=nullptr;
     const auto rt = view(BindSlot::Rtv0, 0), ds = view(BindSlot::Dsv0, 1);
@@ -1826,6 +1978,18 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
                     s.depths[oldTargets]=s.depths[i];break;
                 }
     }
+    // Stand-down (flat_standdown.h): this copy draw's verdict on the frame's chain --
+    // recorded here, before anything below can return -- merged so that a frame with
+    // any selecting copy draw is treatable whatever another copy said.
+    if (copy) {
+        const FlatFrameSeen seen = flatFrameSeenFor(selected.selected(), selected.reason);
+        if (seen >= s.frameSeen) { s.frameSeen = seen; s.frameReason = selected.reason; }
+    }
+    // A Probe frame is the contract observation above and nothing else: the prefix model
+    // and the selector, on the same inputs an active frame gives them. No coverage, no
+    // projection readiness, no source naming or substitution, no resolve. A copy draw the
+    // selector selects ends the stand-down at the Present.
+    if (s.work == FlatWork::Probe) return;
     // FP16 image intermediates use the same scene-size predicate; their
     // producer admission remains separate from the format-23/26 motion source.
     const bool sceneExtent = flatContractKind(false, k.color, k.depth, k.width, k.height, k.format==9?26:k.format, s.prefix.width, s.prefix.height, false) == kFlatContractScreen;

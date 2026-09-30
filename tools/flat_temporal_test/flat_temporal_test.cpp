@@ -21,6 +21,7 @@
 #include "flat_pixel_capture_tests.h"
 #include "flat_local_reject_tests.h"
 #include "flat_negotiated_eval_tests.h"
+#include "flat_standdown_tests.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -2065,6 +2066,213 @@ void testStaticSceneWiring() {
           "the staticScene assignment precedes the resolve call that reads it");
 }
 
+// Replays a MonoFixture frame (plus `extra` records between the tone pass and the copy) through
+// the online prefix model, as flatRuntimePrefixTests does, and returns the copy draw's verdict.
+edvr::FlatMonoFrame standDownReplay(MonoFixture& fixture, const edvr::FlatContractRecord* extra, uint32_t extraCount) {
+    using namespace edvr;
+    auto prefix = std::make_unique<FlatRuntimePrefix>();
+    prefix->frame = fixture.input.frame; prefix->output = fixture.input.output;
+    prefix->width = 1280; prefix->height = 720; prefix->format = 28;
+    struct Event { const FlatContractRecord* r; uint32_t q; } events[240]{};
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < fixture.input.worldCount; ++i) {
+        const auto& r = fixture.world[i];
+        for (uint32_t n = 0; n < r.draws; ++n)
+            events[count++] = {&r, r.first + (r.last-r.first)*n/(r.draws>1?r.draws-1:1)};
+    }
+    for (uint32_t i = 0; i < extraCount; ++i) events[count++] = {&extra[i], extra[i].first};
+    events[count++] = {&fixture.handoff[0], fixture.handoff[0].first};
+    events[count++] = {&fixture.handoff[1], fixture.handoff[1].first};
+    std::sort(events, events + count, [](const Event& a, const Event& b) { return a.q < b.q; });
+    FlatMonoFrame selected{};
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& r = *events[i].r; FlatRuntimeDraw d{}; d.key = r.key;
+        std::memcpy(d.camera, r.camera, sizeof(d.camera));
+        d.key.writeEpoch = prefix->frame; d.key.writeSeq = prefix->sequence + 1;
+        d.supported = engine_velocity_family::supportedPair(d.key.vs, d.key.ps);
+        d.instances = r.firstInstances;
+        selected = flatRuntimeObserve(*prefix, d);
+    }
+    return selected;
+}
+
+// The stand-down against real chains: the captured frame that selects, and the two rc.4 users'
+// refused chains (section 79) built from the same fixture. The verdicts come from the online
+// prefix model, the very function the runtime's copy draw calls; the machine is driven with them
+// at 60 fps on a mock clock.
+void testStandDownAgainstModel() {
+    using namespace edvr;
+    using stand_down_test::Sim;
+    auto verdictOf = [](const FlatMonoFrame& f) { return flatFrameSeenFor(f.selected(), f.reason); };
+
+    MonoFixture stock(1280);
+    const FlatMonoFrame ok = standDownReplay(stock, nullptr, 0);
+    check(ok.selected() && verdictOf(ok) == FlatFrameSeen::Treatable,
+          "the captured stock chain selects and is treatable");
+
+    // User 1 (4K, game AA on): the tone pass has a PS the selector has never seen, and two plain
+    // image passes sit between it and the copy, the second a format-27 target the copy reads.
+    MonoFixture user1(1280);
+    user1.handoff[0].key.ps = 0x6E83D02E7422C5BAull;
+    FlatContractRecord passes1[2]{};
+    user1.fill(passes1[0], kFlatContractScreen, 0x2710, 27, 938, 938, 1,
+               0x03D186CE0EC031E3ull, 0xBAB75803059C271Dull, 0, 0, false);
+    user1.fill(passes1[1], kFlatContractScreen, 0x2720, 27, 939, 939, 1,
+               0x98E6F9986FDC9A53ull, 0x4168985B52C5D7C4ull, 0, 0, false);
+    user1.handoff[1].key.srvView[0] = MonoFixture::token(0x2722);
+    user1.handoff[1].key.srvResource[0] = MonoFixture::token(0x2720);
+    const FlatMonoFrame refused1 = standDownReplay(user1, passes1, 2);
+    check(!refused1.selected() && refused1.reason == FlatMonoReason::NoTonePass &&
+          verdictOf(refused1) == FlatFrameSeen::Structural,
+          "user 1's chain (new tone PS, two passes before the copy) is refused for no-known-tone-pass: structural");
+
+    // User 2 (EDHM chained, bloom and DoF on): a KNOWN DoF-composite tone pass, then two passes on
+    // the copy's shared VS, the second a format-27 target the copy reads.
+    MonoFixture user2(1280);
+    user2.handoff[0].key.ps = flat_mono_detail::kToneDofCompositePs;
+    user2.handoff[0].key.srvView[0] = MonoFixture::token(0x2602);
+    user2.handoff[0].key.srvResource[0] = MonoFixture::token(0x2600);
+    user2.handoff[0].key.srvView[1] = MonoFixture::token(0x2B12);
+    user2.handoff[0].key.srvResource[1] = MonoFixture::token(0x2B10);
+    FlatContractRecord passes2[2]{};
+    user2.fill(passes2[0], kFlatContractScreen, 0x2710, 27, 938, 938, 1,
+               0x20F383BBAC05C031ull, 0x5AA08A96E3C14B10ull, 0, 0, false);
+    user2.fill(passes2[1], kFlatContractScreen, 0x2720, 27, 939, 939, 1,
+               0x20F383BBAC05C031ull, 0x2375CCCCBBFE7A4Dull, 0, 0, false);
+    user2.handoff[1].key.srvView[0] = MonoFixture::token(0x2722);
+    user2.handoff[1].key.srvResource[0] = MonoFixture::token(0x2720);
+    const FlatMonoFrame refused2 = standDownReplay(user2, passes2, 2);
+    check(!refused2.selected() && refused2.reason == FlatMonoReason::NoTonePass &&
+          verdictOf(refused2) == FlatFrameSeen::Structural,
+          "user 2's chain (known tone pass, passes after it) is refused for no-known-tone-pass: structural");
+
+    // A treated session: the selecting chain, 90 s at 60 fps, never leaves Full and never probes.
+    {
+        Sim sim;
+        for (int i = 0; i < 60 * 90; ++i) sim.frame(verdictOf(ok), ok.reason);
+        check(sim.machine.entries == 0 && sim.work == FlatWork::Full && sim.machine.probes == 0,
+              "frames the selector selects never stand the runtime down");
+    }
+    // Each user's session: refused every frame stands the work down after 5 s; the user turns the
+    // setting off in game (the chain becomes the stock one) at an arbitrary moment; the probe
+    // that sees it ends the stand-down within two seconds.
+    for (const FlatMonoFrame* refused : {&refused1, &refused2}) {
+        Sim sim;
+        FlatStandDownEvent event = FlatStandDownEvent::None;
+        while (event != FlatStandDownEvent::Entered)
+            event = sim.frame(verdictOf(*refused), refused->reason);
+        check(sim.machine.enteredReason == FlatMonoReason::NoTonePass && sim.work == FlatWork::Paused,
+              "a refused chain stands the work down and names the reason");
+        // 40 s stood down, probing on the cadence, every probe refused again.
+        const uint64_t enteredAt = sim.now;
+        while (sim.now - enteredAt < 40000) sim.frame(verdictOf(*refused), refused->reason);
+        check(sim.machine.standing && sim.machine.probes >= 24 && sim.machine.probes <= 27,
+              "40 s stood down is about 26 probes, each refused again");
+        const uint64_t settingChangedAt = sim.now + 333;
+        uint64_t resumedAt = 0;
+        while (!resumedAt && sim.now < settingChangedAt + 6000) {
+            const bool changed = sim.now >= settingChangedAt;
+            const FlatMonoFrame& shown = changed ? ok : *refused;
+            if (sim.frame(verdictOf(shown), shown.reason) == FlatStandDownEvent::Resumed) resumedAt = sim.now;
+        }
+        check(resumedAt && resumedAt - settingChangedAt <= 2000 && !sim.machine.standing && sim.work == FlatWork::Full,
+              "turning the setting off in game resumes the work within two seconds");
+    }
+}
+
+// The stand-down's wiring in the runtime and its neighbours, which no rig can run because the
+// flat runtime needs a game: held by a source scan of the exact lines that gate each piece, the
+// way testStaticSceneWiring holds the menu policy. Each needle is counted, and the count is
+// checked against the same text with the needle removed, so the scan is known to be able to fail.
+void testStandDownWiring() {
+    auto slurp = [](const char* path) {
+        std::ifstream in(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    };
+    const std::string runtimeCpp = slurp("src/d3d11/flat_runtime.cpp");
+    const std::string temporalCpp = slurp("src/d3d11/flat_temporal.cpp");
+    const std::string temporalH = slurp("src/d3d11/flat_temporal.h");
+    const std::string injectCpp = slurp("src/d3d11/flat_camera_inject.cpp");
+    check(!runtimeCpp.empty() && !temporalCpp.empty() && !temporalH.empty() && !injectCpp.empty(),
+          "the runtime, discovery and injector sources are readable from the repo root");
+    auto count = [](const std::string& text, const std::string& needle) {
+        unsigned n = 0;
+        for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
+        return n;
+    };
+    struct Pin { const std::string* text; const char* needle; unsigned times; const char* what; };
+    const Pin pins[] = {
+        // The mode of every frame, its verdict, and the Present that decides both.
+        {&runtimeCpp, "standDownFrame(s, frame);", 1, "the Present runs the stand-down's frame boundary once"},
+        {&runtimeCpp, "const FlatFrameSeen seen = flatFrameSeenFor(selected.selected(), selected.reason);", 1,
+         "the copy draw records its verdict from the selector's own result"},
+        {&runtimeCpp, "if (s.work == FlatWork::Probe) return;", 1, "a Probe frame ends after the contract observation"},
+        // The per-draw and per-call pieces, Paused frames.
+        {&runtimeCpp, "if (s.work == FlatWork::Paused) return;", 3, "draw scope, dispatch scope and flatRuntimeUnknown return in a Paused frame"},
+        {&runtimeCpp, "if (!owner() || state().work == FlatWork::Paused) return;", 4,
+         "Written, Uavs, Unmap and Update return after owner() in a Paused frame"},
+        {&runtimeCpp, "if (!owner() || type == D3D11_MAP_READ || state().work == FlatWork::Paused) return;", 1,
+         "Map returns after owner() in a Paused frame"},
+        // The camera witness runs in Full frames only.
+        {&runtimeCpp, "capture(*c, c->mapped); if (state().work == FlatWork::Full) cameraWitness(res);", 1,
+         "Unmap's camera witness is Full-only"},
+        {&runtimeCpp, "capture(*c, bytes); if (state().work == FlatWork::Full) cameraWitness(res);", 1,
+         "Update's camera witness is Full-only"},
+        // Legacy projection readiness, coverage, jitter preparation: released, and created in Full only.
+        {&runtimeCpp, "if (s.projection) s.projection.reset();", 1, "the stand-down releases legacy projection readiness"},
+        {&runtimeCpp, "if(wanted && !s.projection && s.work == FlatWork::Full) {", 1,
+         "the Present creates legacy projection readiness in Full frames only"},
+        // Engine motion, the camera hook, the discovery observers.
+        {&runtimeCpp, "engineVelocityConfigure(enabled && !enginePausedThen);", 1, "the Present hands the pause to engine motion"},
+        {&runtimeCpp, "engineVelocityConfigure(enabled && !s.enginePaused);", 1, "and again when the stand-down changed it"},
+        {&runtimeCpp, "flatCameraInjectPause(next != FlatWork::Full);", 1, "the stand-down pauses the camera refresh hook"},
+        {&runtimeCpp, "flatTemporalSetPaused(next == FlatWork::Paused);", 1, "the stand-down pauses the discovery observers on Paused frames"},
+        // The trace ring keeps the last watched frames.
+        {&runtimeCpp, "if (s.work != FlatWork::Paused) s.prefix = FlatRuntimePrefix{};", 1, "a Paused frame does not clear the prefix"},
+        {&runtimeCpp, "if (s.work != FlatWork::Paused) {", 1, "a Paused frame neither rotates the trace ring nor resets its contract"},
+        {&temporalH, "if (detail::g_flatTemporalPaused.load(std::memory_order_relaxed)) return false;", 1,
+         "discovery observers see nothing while paused"},
+        {&temporalCpp, "flatMonoReasonStructural(mono.reason)", 1, "the chain dump asks the shared structural-reason question"},
+        {&injectCpp, "if (paused && !g_inject.injected.empty()) return;", 1,
+         "the camera hook closes only when no camera holds an injected phase"},
+        {&injectCpp, "if (g_inject.permanentlyDown.load(std::memory_order_acquire)) return;", 1,
+         "a pause never reopens a hook that stood down for good"},
+    };
+    for (const Pin& pin : pins) {
+        check(count(*pin.text, pin.needle) == pin.times, pin.what);
+        // Control: with every occurrence removed the same scan finds none.
+        std::string without = *pin.text;
+        for (size_t at = without.find(pin.needle); at != std::string::npos; at = without.find(pin.needle))
+            without.erase(at, std::strlen(pin.needle));
+        check(count(without, pin.needle) == 0, "stand-down wiring control: a source with the line removed no longer contains it");
+    }
+    // The old eight-way reason list is gone from the discovery dump: one definition of "structural".
+    check(count(temporalCpp, "mono.reason == FlatMonoReason::NoTonePass") == 0,
+          "the chain dump no longer carries its own copy of the structural reasons");
+    // ORDER in the draw scope. The Probe frame ends after the contract observation -- the menu copy
+    // verification, the online prefix model and the selector all run for it -- and before every
+    // piece of per-draw work the stand-down pauses.
+    auto at = [&](const char* needle) { return runtimeCpp.find(needle); };
+    const size_t menuVerify = at("d.menuHdrCopyVerified=verifyMenuHdrCopy(ctx,d);");
+    const size_t observe = at("? flatRuntimeObserveContract(s.prefix, d, s.traceContract)");
+    const size_t record = at("flatTraceRecord(s.traceRing, d, foreignWork.load(std::memory_order_acquire));");
+    const size_t verdict = at("const FlatFrameSeen seen = flatFrameSeenFor(");
+    const size_t probeReturn = at("if (s.work == FlatWork::Probe) return;");
+    check(menuVerify != std::string::npos && observe != std::string::npos && record != std::string::npos &&
+          verdict != std::string::npos && probeReturn != std::string::npos &&
+          menuVerify < observe && observe < record && record < verdict && verdict < probeReturn,
+          "in the draw scope the menu copy verification, the model, the trace record and the verdict all precede the Probe return");
+    const char* afterProbe[] = {
+        "const bool sourceCandidate=", "engineVelocityNoteSource(", "++s.covSceneDraws;",
+        "qualifyProjection(s,recipes,", "engineVelocityBeforeDraw(ctx, false);",
+        "flatMonoResolve(s.device.Get(), ctx, f,", "projection.emplace(*projectionPlan);"};
+    for (const char* needle : afterProbe) {
+        const size_t where = at(needle);
+        check(where != std::string::npos && probeReturn != std::string::npos && probeReturn < where,
+              "coverage, source naming, substitution, jitter and the resolve all follow the Probe return");
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc == 3 && std::strcmp(argv[1], "--classify-dir") == 0)
         return flatShaderClassifierSweep(argv[2]);
@@ -2113,6 +2321,9 @@ int main(int argc, char** argv) {
     testFrameContractHashCoverage();
     testHullPairKeying();
     testStaticSceneWiring();
+    failures += flatStandDownTests();
+    testStandDownAgainstModel();
+    testStandDownWiring();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;

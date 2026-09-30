@@ -134,6 +134,10 @@ static_assert(offsetof(RefreshTls, realRet) == 0, "stubB reads realRet at the st
 
 struct InjectState {
     std::atomic<bool> installed{false};
+    // The runtime's stand-down wants the relay's gate closed (flatCameraInjectPause), and
+    // whether this hook stood down for good (write failures), which a pause never undoes.
+    std::atomic<bool> paused{false};
+    std::atomic<bool> permanentlyDown{false};
     CodeHook hook;
     uint8_t* relay = nullptr;
     const char* failReason = "not attempted";
@@ -489,7 +493,9 @@ void refreshPost() noexcept {
 }
 
 void standDown(const char* why) {
-    if (g_gate.exchange(0, std::memory_order_acq_rel) != 0) {
+    const bool first = !g_inject.permanentlyDown.exchange(true, std::memory_order_acq_rel);
+    g_gate.store(0, std::memory_order_release);
+    if (first) {
         Log::get().note("flat camera inject: %s; the refresh hook stays in place as an inert "
                         "pass-through for process lifetime", why);
     }
@@ -528,6 +534,17 @@ void flatCameraInjectArm() {
     g_inject.gate.arm(GetTickCount64());
 }
 void flatCameraInjectDisarm() { g_inject.gate.disarm(GetCurrentThreadId()); }
+
+void flatCameraInjectPause(bool paused) {
+    g_inject.paused.store(paused, std::memory_order_release);
+    if (!g_inject.installed.load(std::memory_order_acquire)) return; // the install opens the gate unless paused
+    if (g_inject.permanentlyDown.load(std::memory_order_acquire)) return; // never reopen a hook that failed for good
+    // Close only once nothing still holds an injected phase: that camera's first
+    // un-injected call is its flush, and a closed relay never sees the call. The
+    // runtime asks again every frame, so the gate closes the frame after the set empties.
+    if (paused && !g_inject.injected.empty()) return;
+    g_gate.store(paused ? 0 : 1, std::memory_order_release);
+}
 
 void flatCameraInjectClose(bool phaseNonzero, bool applied, bool clean, bool sceneNamed) {
     if (!g_inject.wanted) return;
@@ -632,7 +649,7 @@ void flatCameraInjectFrame(uint64_t frame, bool temporalModeEnabled) {
             return;
         }
         g_inject.installed.store(true, std::memory_order_release);
-        g_gate.store(1, std::memory_order_release);
+        g_gate.store(g_inject.paused.load(std::memory_order_acquire) ? 0 : 1, std::memory_order_release);
         Log::get().note("flat camera inject: refresh hook installed at EliteDangerous64.exe+0x%llX; "
                         "kind-3 cameras now get the temporal phase applied transiently at the source",
                         static_cast<unsigned long long>(kRefreshRva));

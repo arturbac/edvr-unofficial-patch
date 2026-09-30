@@ -1,6 +1,7 @@
 #include "flat_temporal.h"
 #include "flat_temporal_model.h"
 #include "flat_mono_frame.h"
+#include "flat_standdown.h"
 #include "flat_compute_capture.h"
 #include "flat_compute_model.h"
 #include "flat_runtime.h"
@@ -22,6 +23,7 @@
 namespace edvr {
 namespace detail {
 std::atomic<bool> g_flatTemporalCapturing{false};
+std::atomic<bool> g_flatTemporalPaused{false};
 std::atomic<DWORD> g_flatTemporalOwnerThread{0};
 std::atomic<uint64_t> g_flatTemporalForeignCalls{0};
 }
@@ -607,11 +609,9 @@ FlatMonoFrame printMonoInput(uint64_t frame) {
     // Only spend a dump once handoff records exist: startup refuses with empty
     // tables, and the budget burned there once hid the broken chain itself.
     static uint32_t chainRefusalDumps = 0;
+    // (flatMonoReasonStructural is the chain-shape set the runtime's stand-down uses too.)
     if (!mono.selected() && g.handoffContractCount && chainRefusalDumps < 2 &&
-        (mono.reason == FlatMonoReason::NoTonePass || mono.reason == FlatMonoReason::AmbiguousTonePass ||
-         mono.reason == FlatMonoReason::InvalidTonePass || mono.reason == FlatMonoReason::NoOutputCopy ||
-         mono.reason == FlatMonoReason::AmbiguousOutputCopy || mono.reason == FlatMonoReason::InvalidOutputCopy ||
-         mono.reason == FlatMonoReason::BrokenLineage || mono.reason == FlatMonoReason::WrongOrder)) {
+        flatMonoReasonStructural(mono.reason)) {
         ++chainRefusalDumps;
         printContracts(frame, true);
         for (uint32_t i = 0; i < g.handoffContractCount; ++i) {
@@ -881,6 +881,10 @@ void flatTemporalStop() {
     // atomics; the static collector has no resources to release or free.
     detail::g_flatTemporalCapturing.store(false, std::memory_order_release);
     g_waitingForPresent.store(false, std::memory_order_release);
+}
+
+void flatTemporalSetPaused(bool paused) {
+    detail::g_flatTemporalPaused.store(paused, std::memory_order_release);
 }
 
 void flatTemporalBeforePresent(IDXGISwapChain* swap, uint64_t frame, UINT flags) {

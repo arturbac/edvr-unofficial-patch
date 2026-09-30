@@ -52,6 +52,15 @@ void flatCameraInjectClose(bool phaseNonzero, bool applied, bool clean, bool sce
 // this session injected stay known so their first un-injected call flushes.
 void flatCameraInjectReset();
 
+// The runtime's stand-down (flat_standdown.h) pauses the refresh hook while every
+// frame is refused: the relay's gate closes and the game's camera refresh runs
+// straight through to the original, and reopens on resume. Called every frame from
+// the owner thread with the frame's desired state. A hook that stood down for good
+// (write failures) is never reopened by it, and the gate closes only once no camera
+// still holds an injected phase, because that camera's first un-injected call is the
+// flush and a closed relay would never see it.
+void flatCameraInjectPause(bool paused);
+
 // What the rest of flat_runtime needs:
 bool flatCameraInjectUpstreamOwns();  // this frame's ownership decision is Upstream
 bool flatCameraInjectBypassRefusal(const char* reason); // the legacy-only refusal classes
