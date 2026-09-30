@@ -49,7 +49,7 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-82):** users 1-2 refused every frame, 3 treated at 7-13
-  fps, 4 lost ~23 ms (ReShade). 80 flown, 81 HDR key off, 82 VR foot -1.8 ms
+  fps, 4 lost ~23 ms (ReShade). 80 flown, 81 key off, 82 chain seen, key later
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -5460,6 +5460,14 @@ resets, the transition-flash fix (jumps reset the resolve's history). (6)
 Sean: keep `vscreen_res_width` at 125% or study a lower width once the world
 has AA? (7) A separate flight key for the VR world route, off by default?
 
+**Decisions (Sean, 2026-09-30).** They answer (6) and (7).
+- (1) `fix.vscreen_res_width` stays at 125% (auto) for now. Once the VR world
+  route has flown, a lower width (3840) gets studied: the game's world render
+  up to 40% cheaper, real AA replacing what the extra width compensates for.
+- (2) The VR world route gets its own flight key, off by default like the HDR
+  route (section 81), and is built AFTER the flat HDR route has flown; it
+  reuses that machinery.
+
 - ruled out: `census_frames=1` as the retake, because the cap counts lines
   per census and frame 0 alone has 22.3k events against 16,384.
 - ruled out: the copy route as the on-foot world's resolve point, because the
@@ -5468,3 +5476,104 @@ has AA? (7) A separate flight key for the VR world route, off by default?
 - ruled out: eye jitter as a way to anti-alias the world's own edges, because
   the world texture is finished before the eyes exist: it can only recover
   what the texture holds.
+
+**Census retake, 2026-09-30 10:49:20 (`edvr_gfx_20260930_104653.log`).**
+Frontier, v0.18.0-rc.4-26-gc96b91f1 (the first capture's build), Pimax OpenXR
+on a Crystal Super, 90 Hz, HMD Quality 0.65 (eye 2620x2533, output 4032x3898,
+world 5040x2835), on foot. Shadows lowered, `census_offscreen` on,
+`census_frames` 1. The census is whole: `DC end` reads `lines=8281` of the
+16,384 ceiling, `truncated=0`: 7,909 offscreen draws, 149 copies, 94
+dispatches, 127 clears, the two eye draws. It supersedes answers 1 and 3 and
+risk (4) above. Two limits of the instrument bear on what it proves (last
+paragraph): it reads render-target slot 0 only and vertex constant buffer 0
+only.
+
+Chain (q = census sequence number; sizes 5040x2835 unless noted; H is the
+R11G11B10F target, R1 the D32S8 depth; `R`n names a resource):
+
+| q | pass | VS/PS | writes | reads |
+|---|---|---|---|---|
+| 3793-3927 | clears: R1 (reverse-Z, 0), R2 (R10G10B10A2), R3, R4 (R8G8B8A8), H | | | |
+| 3794-7832 | the world: 3,805 draws into R2, 4,141 into R1; 534 (533 of BBE58E40) read R8, a copy of R2 made at q 7292 | pool families | R2, R1 | R8 |
+| 7833-7845 | 8 dispatches, 3 full-screen draws (screen space, light lists); linear depth R9 (R32) came at 7293 | | R4, R10-R12 | R1, R9 |
+| 7846-7856 | 11 deferred-light draws | 7E38A6AA/7CECABDE, 10 more | H | R2, R3, R4, R9 |
+| 7857-7858 | two dispatches through UAVs (section 81's pair) | ch 5998146D, EB0245DE | H, R12 (R16) | R1, R9 |
+| 7859-8156 | 288 draws, 33 pairs (sky, glass, particles, holograms) | | H | |
+| 8157 | CopySubresourceRegion, H to R13 (a second R11G11B10F) | | R13 | H |
+| 8158-8161 | exposure reduction on the COPY: 1261x709, 320x180, 320x180 twice | CFA91824/0E0C65DA, /1344A274 | small | R13 |
+| 8162-8196 | 35 LATE draws: 27 refraction particles (they read R13), 8 others | A1CE8A95/C6CD9AEB; 5B0068AF/A5E23315 x4; 01A029C7/130FC0A7 x2; B553BB47/68ABCB9F; 94D5C556/912477AE | H | R13 |
+| 8198-8202 | three draws at 630x354 reading H, R12, R14; two dispatches (exposure) | DEF19B03/831DF02E; ch B8E727E9, F1FB2EEF | small | H (t0) |
+| 8203 | TONE, one triangle | F9CFC798/FEE777E9 | R15 (R8G8B8A8, UNORM views) | H (t1) |
+| 8204 | the game copy, a draw of 4 vertices | 20F383BB/DED87960 | R16, the screen texture | R15 |
+| 8205-8211 | HUD, 6 draws on its own depth R17 (depth test off) | B10B032B/DB899F4B x3, C4B4B334/0146ABCC, A888D510/015EF934 x2 | R16 | GUI surfaces 9307x8014, 8111x4871, 4742x824, 969x577, 512x512; the 320x180 exposure output |
+| 8213, 8220 | eye composite, one draw an eye | 5C36AF05/CFE84157 | 2620x2533 eye images | R16 |
+| 8226-8227 | the game's post pass on each eye image, into a 3840x2160 | 01C3B84C/DED87960 | 3840x2160 | eye images |
+| 8231-8275 | EDVR's per-eye DLSS (inferred from sizes and the log's dlss lines): copy of the eye, three kernels an eye, copy out | ch 6EB95466, A2E04768, C22AB2BD | 4032x3898 | eye image, history |
+
+**Answers.**
+1. Chain shape (supersedes answer 1): as guessed. H f26 with depth f19, the
+   exposure reduction, the tone, the game copy (a draw, into R16 rather than
+   the swap chain), the HUD on its own depth, the eye composite. The screen
+   texture is R8G8B8A8_TYPELESS with UNORM views: not sRGB, so the sketch's
+   mip chain averages in gamma space unless the mip copy is taken as sRGB. The
+   chain is the flat chain's, pair for pair (tone FEE777E9, copy DED87960,
+   panel A888D510/015EF934, exposure CFA91824, 1344A274, 831DF02E). This
+   frame has no bloom, no DoF and no E8948389 (none of DFED8E1C, FDB74215,
+   129F602B, BF2302BC appears) and no 1D65FB79/9F366C4E final: the eye
+   composite takes its place.
+2. Where the single-image AA sits: at the tone, as in flat. Section 81's rule
+   gives q=8203. H's first write is the clear (3927). After it, q=8198 has no
+   depth, a target other than H and H at t0, but its target is 630x354, an
+   eighth per axis, so (iv) drops it; the exposure draws read R13, another
+   resource, and the copy at 8157 is a copy, not a draw; q=8203 passes all
+   four. H's last draw is 8196, so the trigger is +7 (a clear, three draws and
+   two dispatches between), after 35 late draws as in flat. The downsample and
+   the exposure compute read the unresolved H, as in flat; the tone, the game
+   copy, the HUD and the eyes follow the resolve. R = D = 5040x2835 by
+   construction, so the gate binds at H's format only, and it is met.
+3. Does anything write the world after that point (the un-jitter question)?
+   H: nothing, on slot 0 (the runtime's `late-hdr-writes` counter watches
+   every slot). The screen texture R16, which both eyes read: yes, two things,
+   both the flat frame's post-tone writes: the game copy (8204) and six HUD
+   draws (8205-8211). They sample GUI surfaces and, for C4B4B334/0146ABCC, the
+   320x180 exposure output as its blurred-scene input; none reads H or R1. The
+   depth they bind, R17, is their own, with depth test off. So a resolve into
+   H leaves the HUD unresolved and crisp, as in flat (answer 3 above, now seen
+   in a census). Not shown: whether the HUD's camera carries the world's
+   jitter phase (below).
+4. New: the exposure reduction reads a full-size COPY of H (q 8157), not H;
+   section 81 inferred H from sizes. The 27 refraction particles among the
+   late draws sample the same copy. The rule is unaffected (a copy is not a
+   draw, R13 is not H), but a detector that counted a copy's source as a
+   consumer would fire at 8157, before the 35 late writes. Mutation case for
+   the HDR rig: H copied mid-frame.
+5. The per-eye DLSS sits after the game's frame (8231-8275). The log's price
+   line for this window (10:49:18) agrees with the cost table: upscaler 2.62
+   ms a pair (table 2.87-2.93), prep 0.40, UI 0.35.
+
+**Not in the capture.** (1) Constant buffers other than VS b0: the census
+prints the vertex stage's slot 0 only. There it is one 208-byte object buffer
+shared by the six HUD draws, the two composite draws and 74 world draws; the
+camera the injector would shift is b1 of the pool draws (`screenMotionSource`)
+and is not in the census. So whether the HUD draws read the world's camera
+buffer, and would take the injector's phase, is unobserved, and the injector
+stays off the VR path until it is. Cheapest: a census token for VS b1 beside
+the b0 read in `recordDraw` and `drawCensusDrawDirect` (identity is enough), or
+a camera-hash trace on foot. (2) Render-target slots 1-7: only slot 0 is read,
+so writes through the G-buffer's other slots (R3, R4 and the R6 and R7
+surfaces are cleared, sampled, never seen written) are invisible; "no write to
+H after the trigger" rests on slot 0 here and on the binding shadow's eight
+slots in the runtime counter. (3) One frame: flapping at the world-screen
+gate, boarding and disembark, and which draws are the first-person weapon
+(no stencil or pool column beyond `so=`) are not in it.
+
+What changes in the sketch: the trigger is the tone at q 8203 on the flat
+rule, unchanged; the layer's mip copy must treat R16 as UNORM data; a
+mid-frame copy of H is normal. Nothing is built for the VR path before the
+flat HDR route has flown (decision 2).
+
+- ruled out: a write to H after the tone trigger in the VR on-foot chain,
+  because the census shows none after q 8196 (slot 0; the runtime counter
+  covers the other slots).
+- ruled out: the q 8157 copy of H as the trigger, because it is a copy into
+  another resource and the rule takes draws that read H.
