@@ -37,10 +37,10 @@
 - **Ruled-out pointer:** the kinematic arc's Status records rejected motion
   estimates and the nonexistent engine velocity buffer. Reuse engine-record
   motion; do not revive estimation or the retired deferred UI replay.
-- **Next:** flight the HDR route (section 81): key off, then auto in the same
-  session, at the hangar and a bright star, bloom and DoF on and off. Then the
-  open items above: the section-75 confirming flight, section-76 matrix cells,
-  the section-77 fixes and section-78 recipes (older lists: Status detail).
+- **Next:** the HDR route flew (hangar, bright star) and is default auto
+  (section 81); legs still to fly: R < D, FSR, EDVR TAA, game FXAA, ReShade.
+  Then the open items above: section-75 confirming flight, section-76 matrix
+  cells, section-77 fixes, section-78 recipes (older lists: Status detail).
   Existing evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
   PS91/BFE or stale-resize hypotheses. The menu hangar-floor P1 defect remains
@@ -49,7 +49,7 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-82):** users 1-2 refused every frame, 3 treated at 7-13
-  fps, 4 lost ~23 ms (ReShade). 80 flown, 81 built, key off, 82 chain seen
+  fps, 4 lost ~23 ms (ReShade). 80 flown, 81 flown, default auto, 82 chain seen
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -4821,7 +4821,15 @@ warning: shown|changed (mode=DLSS, frames refused for no-known-tone-pass
 folder from the same header (`src/common/elite_graphics_folder.h`). Left
 alone: `eliteHmdMultiplier` (`device_hook.cpp`) picks the newest `.fxcfg` of
 ANY preset by write time, which is not the file the warning reads; user 3
-had `Custom.4.0` to `4.4` side by side.
+had `Custom.4.0` to `4.4` side by side. Since 2026-09-30 (section 81): with
+the HDR route active the Bloom and Depth of field advice is dropped, and
+when frames are refused, the route's key is auto and the game renders below
+the output (Elite's supersampling under 1.0, from the route's own measured
+sizes) a third paragraph follows the advice: `Supersampling is below 1.0.
+At 1.0 or above, EDVR anti-aliases before bloom and depth of field, so they
+no longer block it. Raising it costs GPU time.` The log line's brackets gain
+`, HDR route active` or `, supersampling below 1.0 (render WxH, output
+WxH)`, and it carries every paragraph.
 
 **The census** (`flat_cpu.h`; modelled on `engine_motion_cpu.h`, which the
 flat menu tick never reaches). One `flat cpu 5s:` line every 5 s while a
@@ -5306,9 +5314,12 @@ game FXAA on, ReShade chained; then the default flips to auto.
   DoF pass there; the bloom variant's tone pixel shader alone refused it.
 
 **Implementation note (2026-09-30).** Built on branch `claude/flat-hdr-route`
-from main 1de97469, decisions (a) to (e) all in. The key is off, so a build of
-this tree treats every frame as before until someone sets it. Not installed,
-not flown: everything below is what the rigs pin, not what a headset showed.
+from main 1de97469, decisions (a) to (e) all in. It was built with the key off,
+so the tree treated every frame as before until someone set it; it then flew
+the same day and the key is auto by default (the bullets Flight, R < D and F8
+supersampling line, near the end, say how). The bullets down to the flight
+plan describe the build as it stood before that flight: what the rigs pin,
+not what a headset showed.
 
 - Pieces. `src\d3d11\flat_hdr_route.h` is the pure half (key, detector,
   selector, R >= D gate, late-write latch, census window, every log line).
@@ -5320,8 +5331,10 @@ not flown: everything below is what the rigs pin, not what a headset showed.
   `fsr3_engine.cpp` take `hdr` as part of the feature or context key;
   `flat_trace.h` is EDVRFTR4.
 - The key. `experimental.temporal_aa_before_post = off|auto`, developer tier,
-  live (read at every Present). Anything that is not `auto` reads as off, so a
-  typo never turns a flight key on. A change wakes the stand-down, restarts
+  live (read at every Present). Built with default off; auto since 2026-09-30
+  (the flight, below). A line in the file that is not `auto` reads as off, so
+  a typo leaves the copy route and never switches the route on by accident; no
+  line at all reads as the default. A change wakes the stand-down, restarts
   history and, going off, rearms the latch. It is in the ini, the config
   contract, the settings schema and the flat allow-list; it has no panel row.
 - Key off. The detector still runs, observe-only, on every watched draw.
@@ -5367,10 +5380,11 @@ not flown: everything below is what the rigs pin, not what a headset showed.
   the copy stage's structural refusal of a frame that has an H and no consumer,
   and nothing else: a frame the copy route treats keeps its verdict. A probe
   frame runs trigger and selection without the resolve, and a probe the route
-  selects ends the stand-down. F8, while the
-  route is active (selected, and evaluating at R): no Bloom or DoF advice, the
-  Anti-aliasing advice kept (decision (d)); the log line says ", HDR route
-  active".
+  selects ends the stand-down. F8, while the route is active (selected, and
+  evaluating at R): no Bloom or DoF advice, the Anti-aliasing advice kept
+  (decision (d)); the log line says ", HDR route active". As built, the route
+  also merged its own refusals into a frame's stand-down verdict; that was a
+  bug at R < D, found and fixed on 2026-09-30 (the last bullets say how).
 - Latch. After the trigger, a draw into H, a dispatch whose UAV is H, an
   explicit write to H, or a draw into a scene-shaped HDR target that did not
   exist at the trigger counts as `late-hdr-writes`. A treated frame with any
@@ -5466,7 +5480,7 @@ not flown: everything below is what the rigs pin, not what a headset showed.
   0, `selection=` naming anything but `selected`, or `hdr-frames=0` in a 3D
   window (H is not R11G11B10F, or the candidate rule does not match this
   build). (3) Later: FSR, EDVR TAA at R = D, game FXAA on, ReShade chained;
-  then the default flips to auto.
+  then the default flips to auto (it did, on the flight below, ahead of these).
 - The log, verbatim. Once a session each:
   `flat hdr route: experimental.temporal_aa_before_post=<off|auto> (read at
   startup|changed) at frame=N: <what the key does>`
@@ -5498,12 +5512,79 @@ not flown: everything below is what the rigs pin, not what a headset showed.
   route, into the scene target) ...`; `dlss: the feature for eye N was created
   for the flat HDR route: HDR input and automatic exposure ...`; FSR's create
   and remake lines naming the HDR input; `flat settings warning: ... , HDR
-  route active)`; `flat cpu 5s:` gains `hdr route X ms (calls N)`; the renderer
-  cumulative line gains `hdr-resolves=N hdr-spatial=N`; the stand-down reason
-  `no-hdr-consumer`.
+  route active)` (and, for the supersampling paragraph, `flat settings warning:
+  ... , supersampling below 1.0 (render WxH, output WxH))`); `flat cpu 5s:`
+  gains `hdr route X ms (calls N)`; the renderer cumulative line gains
+  `hdr-resolves=N hdr-spatial=N`; the stand-down reason `no-hdr-consumer`.
 - Not built: the un-jitter contingency; the section-82 VR adapter, which
   reuses this detector (its rule (iii) already skips a copy of H, pinned,
-  because the VR frame's exposure chain reads one); the default flip.
+  because the VR frame's exposure chain reads one).
+- Flight (Epic, 2026-09-30). Log `edvr_gfx_20260930_125014.log`, version
+  v0.18.0-rc.4-57-g1cb352d7 (`edvr_log.py --expect-build 1cb352d7` exits 0).
+  The main-menu hangar and a bright star, key auto. Every `flat hdr route 5s:`
+  window from 12:54:10 to 12:55:15 shows `state=active`, `treated` equal or
+  nearly equal to `frames` (449 to 450 in 5 s), `declined=0`,
+  `late-hdr-writes=0`, and no `turned off` line; `last-trigger=` is VS
+  DFED8E1C9E191BEC PS 143AAE0597E2F7BF, `target=1920x1080 hdr=3840x2160`
+  (bloom's first level, the star pair pinned above). One window (12:54:50)
+  treated 389 of 417, with `selection=` including
+  `conflicting-hdr-target-or-camera`: seen once, not chased. Sean: "it looks
+  good, let's make it default". Not in this record: the Bloom and DoF off
+  legs, FSR, EDVR TAA at R = D, game FXAA on, ReShade chained, and any frame
+  at R < D, which the rigs pin and no flight has shown.
+- The default (2026-09-30). `experimental.temporal_aa_before_post` is auto
+  when the file has no line: the `getString` fallback in `hdrReadKey`, and the
+  shipped edvr.ini line and comment, say so, and `config_test` holds the two
+  to one answer (it reads the shipped ini, takes the literal out of
+  `flat_runtime.cpp` and proves a fallback put back to off is caught; the
+  contract checker compares names, not values). A line that is present and
+  not `auto` still reads as off. The invalid-profile case is not a default
+  pin: `Config::getString` answers a fixed "off" for any key a profile
+  refuses, whatever fallback the caller passes, so an invalid descriptor
+  still cannot turn the route on (pinned). Existing installs: an ini with no
+  line gets auto; a live ini seeded by a build since 0794b3ed carries
+  `= off` and keeps it until edited.
+- R < D under the default: a masking bug, found and fixed. The route merged
+  its own verdict into a frame's stand-down verdict like any other answer.
+  The order is None < Structural < Transient < Treatable and the trigger
+  comes before the output copy, so at R < D every frame showed Transient
+  (`hdr-route-needs-render-at-least-output`) first and the copy stage's
+  Structural (`no-known-tone-pass`, say) could not outrank it: the structural
+  run never reached five seconds, so a chain the copy route refuses never
+  stood down and the F8 warning never came up. The same held for EDVR's TAA
+  above D, which the route selects and then declines. The key off merged
+  nothing and the flight was at R = D, so neither met it; the default would
+  have handed it to every user below 1.0. Now the route adds Treatable only
+  where it will resolve the frame (`flatHdrTriggerSeen`: selected, and the
+  mode evaluates at the render size) and nothing otherwise. Pinned on the
+  merged verdict through the stand-down simulation (a refused chain at R < D
+  stands down and warns exactly as with the key off; the old merge is kept as
+  a control that never does), and by a source pin that the route's refusal is
+  no longer merged. A flip (off to auto, auto to off) runs `hdrReadKey` as
+  in the flight build, changed only in its fallback and in clearing the
+  published sizes (below).
+- F8 supersampling line (2026-09-30, Sean). A third paragraph of the flat
+  warning: "Supersampling is below 1.0. At 1.0 or above, EDVR anti-aliases
+  before bloom and depth of field, so they no longer block it. Raising it
+  costs GPU time." It appears when frames are refused (the warning's own
+  condition: stood down for a chain-shape reason that found an output copy),
+  the key is auto, the route is not treating them, and the game renders
+  below the output on both axes. The sizes are the route's own measurements,
+  not Elite's settings file: H's extent at the trigger (the extent refusal
+  now carries it) and the swap chain's size, published as one word and read
+  by the panel (`flatRuntimeHdrRouteBelowOutput`); the key off, a key change,
+  a selection at R >= D and a resize clear it. The bloom, depth-of-field and
+  game-AA advice stays above it. The warning's cache key carries the flag, so
+  the text comes and goes live as supersampling crosses 1.0, and the log line
+  carries the paragraph and, in its brackets, `supersampling below 1.0
+  (render WxH, output WxH)`. The warning is now up to 12 lines (10 at the
+  rig's ruler, worst case): the flat page is three rows, so a blank line and
+  12 fill the card's 16 lines, which `menu.cpp` static_asserts; the card
+  scales to the screen's height, so the longer warning shrinks its text a
+  little. Pinned in `flat_elite_settings_tests.h`: present for refused + R < D
+  + key auto and nowhere else (the key off, R = D and above, the route
+  treating, frames not refused), the words, the key, the wrap at the panel's
+  width and the log line; the wiring by source pins.
 
 - ruled out: "under half an ulp" as the requantisation bound, because the
   rig's device truncates toward zero (0.969 ulp worst, 659 of 768 texel
@@ -5518,6 +5599,15 @@ not flown: everything below is what the rigs pin, not what a headset showed.
 - ruled out: a constant field as a test of FSR's HDR flag, because the port
   returns it alike under both sets (39.97 and 40.00 for 40), so the rig pins
   the flags the context carries instead.
+- ruled out: the route's refusals as part of a frame's stand-down verdict,
+  because the order None < Structural < Transient < Treatable lets a
+  transient refusal mask the copy stage's structural one: at R < D every
+  trigger says hdr-route-needs-render-at-least-output, so no refused chain
+  could stand down or warn, and the F8 supersampling line could never have
+  shown.
+- ruled out: Elite's settings file as the source of the supersampling line's
+  R and D, because the route measures both (H's extent at its trigger, the
+  swap chain's size) and the file says only what was asked for.
 
 ## 82. VR on foot: resolve the world once instead of two eye passes (analysis, 2026-09-30)
 
