@@ -116,6 +116,13 @@ struct FlatMonoResolveFrame {
     // is nothing for the caller to swap into a binding. False, the default, is the copy route and every byte of it
     // unchanged.
     bool hdr = false;
+    // The upscaler feature slot the backend evaluates on (dlaa.h, kUpscalerSlots; dlaa.cpp and fsr3_engine.cpp keep one
+    // feature, one size key and one history per slot). 0 is the flat profile's and eye 0's -- the default, and every
+    // caller before the VR world route. The VR world route passes 2 (vr_world_route.h, kVrWorldFeatureSlot), because its two
+    // eyes own 0 and 1. The resolver's own continuity (its history, its TAA ping-pong) is one set: one caller per process at
+    // a time, which the flat and VR profiles already are. A slot outside 0..kUpscalerSlots-1 refuses the frame
+    // ("flat-resolve-invalid-slot") before anything is written.
+    uint32_t slot = 0;
 };
 // Planned input metadata available before the game's next raster phase. This
 // intentionally carries no frame resources: preflight can allocate the
