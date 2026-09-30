@@ -132,8 +132,8 @@ constexpr float kFsrDefaultFarZ = 50000.0f;
 
 ID3D11Device* g_device = nullptr;
 FfxInterface  g_backend{};
-// Scratch for two contexts (ffxGetScratchMemorySizeDX11(2)), owned for the
-// session once fsr3Available succeeds. The backend interface captures a
+// Scratch for kUpscalerSlots contexts (ffxGetScratchMemorySizeDX11(kUpscalerSlots): the eyes' two and the VR world route's
+// third, dlaa.h), owned for the session once fsr3Available succeeds. The backend interface captures a
 // pointer into this buffer at ffxGetInterfaceDX11 time, so it must not move
 // or be freed while any context could still be live -- it is only ever
 // grown once (in fsr3Available) and released in fsr3Shutdown, after
@@ -176,7 +176,7 @@ struct EyeCtx {
     // The create-failure latch (the same review, F5). A create that fails --
     // or, worse, one that throws out of AMD's port halfway -- used to be
     // retried on EVERY treated frame: ~90 half-creates a second, each one
-    // consuming a context slot out of the two the backend's scratch was sized
+    // consuming a context slot out of the kUpscalerSlots the backend's scratch was sized
     // for, while the seam's once-per-session refusal line said nothing more.
     // Latched per KEY, not per session: the key that failed is refused with
     // its stored reason and no retry, and a different size (or an explicit
@@ -189,10 +189,15 @@ struct EyeCtx {
     bool     failHdr = false;
     char     failWhy[256] = {};
 };
-// One per eye, keyed on (w, h, outW, outH) exactly as dlaa.cpp's
-// ensureFeature keys NGX (design doc 3.2): recreate on a key change,
-// destroying the old context first.
-EyeCtx g_ctx[2];
+// One per upscaler slot (dlaa.h, kUpscalerSlots: the eyes' two, and the VR world
+// route's third, made lazily on its first evaluation), keyed on (w, h, outW,
+// outH) exactly as dlaa.cpp's ensureFeature keys NGX (design doc 3.2): recreate
+// on a key change, destroying the old context first. Each slot keeps its own
+// context, key, create-failure latch and so its own history.
+EyeCtx g_ctx[kUpscalerSlots];
+// Test-only bookkeeping (fsr3TestContextCreations): how many contexts each slot has had made, so a rig can prove that
+// making or remaking one slot's context touches no other's. Counts successful creates only; never read by the engine.
+uint32_t g_testCreations[kUpscalerSlots] = {};
 
 // The GPU-price ring, dlaa.cpp's own discipline (QuerySlot/pollTimingRing/
 // acquireQuerySlot there): never awaited. FSR has one role (unlike DLAA's
@@ -393,9 +398,9 @@ void latchCreateFailure(EyeCtx& e, unsigned eye, uint32_t w, uint32_t h, uint32_
     e.failInfiniteDepth = infiniteDepth;
     e.failHdr = hdr;
     snprintf(e.failWhy, sizeof(e.failWhy), "%s", reason ? reason : "no reason given");
-    Log::get().note("fsr3: eye %u is stood down at %ux%u -> %ux%u for the rest of this session (a "
+    Log::get().note("fsr3: %s is stood down at %ux%u -> %ux%u for the rest of this session (a "
                     "different size, or a switch away and back, tries again): %s",
-                    eye, w, h, outW, outH, e.failWhy);
+                    upscalerSlotLabel(static_cast<int>(eye)), w, h, outW, outH, e.failWhy);
 }
 
 // AMD's port registers every texture handed to a dispatch through its own
@@ -433,15 +438,15 @@ bool g_testSkipBindCheck = false;
 // with nothing in the log to say so.
 bool g_fovFallbackNoted = false;
 
-// The per-eye context: made when missing or its key (the sizes) has moved,
+// The per-slot context (an eye's, or the VR world route's third): made when missing or its key (the sizes) has moved,
 // left alone otherwise. The ONE block fsr3Evaluate and fsr3Warm share, so
 // what the warm-up makes on the loading screen is exactly what the first
 // evaluation would have made (mirrors dlaa.cpp's ensureFeature).
 bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t outH,
                    const char** why, double* createMs, bool infiniteDepth, bool hdr = false) {
     if (createMs) *createMs = 0.0;
-    if (eye > 1) {
-        if (why) *why = "eye must be 0 or 1";
+    if (eye >= kUpscalerSlots) {
+        if (why) *why = "an upscaler slot out of range";
         return false;
     }
     // advanced.temporal_aa_diagnostics is a context-creation-time flag (the
@@ -475,9 +480,9 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
         // apart in the log from a live diagnostics flip or an HMD Quality
         // change, and from a context that was never made at all.
         Log::get().note(
-            "fsr3: the context for eye %u is remade -- %s (%ux%u -> %ux%u, AMD's debug checking "
+            "fsr3: the context for %s is remade -- %s (%ux%u -> %ux%u, AMD's debug checking "
             "%s, becomes %ux%u -> %ux%u, debug checking %s). Its history starts again.",
-            eye,
+            upscalerSlotLabel(static_cast<int>(eye)),
             (e.w != w || e.h != h || e.outW != outW || e.outH != outH)
                 ? "the sizes moved"
                 : e.infiniteDepth != infiniteDepth ? "the depth projection changed"
@@ -527,18 +532,18 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
     if (createMs) *createMs = ms;
     if (threw) {
         snprintf(g_reasonBuf, sizeof(g_reasonBuf),
-                 "AMD's context would not be created for eye %u at %ux%u -> %ux%u: a D3D11 call "
+                 "AMD's context would not be created for %s at %ux%u -> %ux%u: a D3D11 call "
                  "inside AMD's port failed and its backend raised a C++ exception instead of an "
                  "FfxErrorCode",
-                 eye, w, h, outW, outH);
+                 upscalerSlotLabel(static_cast<int>(eye)), w, h, outW, outH);
         g_reason = g_reasonBuf;
         // NO ffxFsr3UpscalerContextDestroy here, on purpose. The port threw
         // from inside its own create, so e.ctx holds whatever it had built
         // when the stack unwound, and the port offers no way to tell a
         // half-made context from an unmade one; destroying one is not safe.
         // WHAT LEAKS: whatever D3D11 objects that create had already made,
-        // and the one context slot it took out of the two the backend's
-        // scratch was sized for (ffxGetScratchMemorySizeDX11(2) in
+        // and the one context slot it took out of the kUpscalerSlots the backend's
+        // scratch was sized for (ffxGetScratchMemorySizeDX11(kUpscalerSlots) in
         // fsr3Available). Bounded because the failure is latched below and
         // never retried at this key; released only by fsr3Shutdown, which
         // drops the whole backend and its scratch.
@@ -548,8 +553,8 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
     }
     if (cr != FFX_OK) {
         snprintf(g_reasonBuf, sizeof(g_reasonBuf),
-                 "AMD's context would not be created for eye %u at %ux%u -> %ux%u: %s (0x%08X)",
-                 eye, w, h, outW, outH, ffxErrorName(cr), static_cast<unsigned>(cr));
+                 "AMD's context would not be created for %s at %ux%u -> %ux%u: %s (0x%08X)",
+                 upscalerSlotLabel(static_cast<int>(eye)), w, h, outW, outH, ffxErrorName(cr), static_cast<unsigned>(cr));
         g_reason = g_reasonBuf;
         // A clean FfxErrorCode: the port unwound its own create, so there is
         // nothing here to destroy. Latched all the same -- a create costs
@@ -569,10 +574,10 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
         releaseEyeSurfaces(e);
         ffxFsr3UpscalerContextDestroy(&e.ctx);
         snprintf(g_reasonBuf, sizeof(g_reasonBuf),
-                 "AMD's three caller-owned working surfaces would not be made for eye %u at "
+                 "AMD's three caller-owned working surfaces would not be made for %s at "
                  "%ux%u (dilated depth, dilated motion vectors, reconstructed previous nearest "
                  "depth): %s",
-                 eye, w, h,
+                 upscalerSlotLabel(static_cast<int>(eye)), w, h,
                  sr != FFX_OK ? "the port would not describe them" : "this device would not "
                                                                      "create one of them");
         g_reason = g_reasonBuf;
@@ -597,9 +602,9 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
             releaseEyeSurfaces(e);
             ffxFsr3UpscalerContextDestroy(&e.ctx);
             snprintf(g_reasonBuf, sizeof(g_reasonBuf),
-                     "AMD's own \"%s\" working surface for eye %u was made without %s, which its "
+                     "AMD's own \"%s\" working surface for %s was made without %s, which its "
                      "port needs to register it",
-                     s.name, eye, missing);
+                     s.name, upscalerSlotLabel(static_cast<int>(eye)), missing);
             g_reason = g_reasonBuf;
             latchCreateFailure(e, eye, w, h, outW, outH, diagnostics, infiniteDepth, hdr, g_reason);
             if (why) *why = e.failWhy;
@@ -613,6 +618,7 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
     e.infiniteDepth = infiniteDepth;
     e.hdr = hdr;
     e.createFlags = desc.flags;
+    ++g_testCreations[eye];
 
     // The figure is the three surfaces' own bytes (textureBytes), computed,
     // never a measured delta: see bytesPerPixel's comment for the flights
@@ -623,10 +629,10 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
                                   textureBytes(e.prevNearestDepth, &c2);
     const int uncounted = (c0 ? 0 : 1) + (c1 ? 0 : 1) + (c2 ? 0 : 1);
     Log::get().note(
-        "fsr3: the context is created for eye %u at %ux%u -> %ux%u%s; its three working "
+        "fsr3: the context is created for %s at %ux%u -> %ux%u%s; its three working "
         "surfaces take %.1f MB%s (the port's own history targets are not counted); the "
         "history starts here (made in %.0f ms).",
-        eye, w, h, outW, outH,
+        upscalerSlotLabel(static_cast<int>(eye)), w, h, outW, outH,
         hdr ? (diagnostics ? ", HDR input with automatic exposure (the flat HDR route), AMD's own debug checking on"
                            : ", HDR input with automatic exposure (the flat HDR route)")
             : (diagnostics ? ", AMD's own debug checking on" : ""),
@@ -704,11 +710,11 @@ bool fsr3Available(ID3D11Device* dev, const char** why) {
                              missing);
                     g_reason = g_reasonBuf;
                 } else {
-                    const size_t scratchSize = ffxGetScratchMemorySizeDX11(2);
+                    const size_t scratchSize = ffxGetScratchMemorySizeDX11(kUpscalerSlots);
                     g_scratch.assign(scratchSize, uint8_t{0});
                     const FfxDevice ffxDev = ffxGetDeviceDX11_Fsr31(dev);
                     const FfxErrorCode ir = ffxGetInterfaceDX11(&g_backend, ffxDev, g_scratch.data(),
-                                                                g_scratch.size(), 2);
+                                                                g_scratch.size(), kUpscalerSlots);
                     if (ir != FFX_OK) {
                         snprintf(g_reasonBuf, sizeof(g_reasonBuf),
                                  "the DX11 backend interface would not initialise: %s (0x%08X)",
@@ -784,8 +790,8 @@ bool fsr3Evaluate(ID3D11DeviceContext* ctx, unsigned eye, ID3D11Texture2D* colou
     if (why) *why = "this build was made without AMD's upscaler (EDVR_HAVE_FSR3)";
     return false;
 #else
-    if (!g_available || !ctx || !colour || !depth || !mv || !out || eye > 1 || !w || !h) {
-        if (why) *why = g_available ? "a missing input" : g_reason;
+    if (!g_available || !ctx || !colour || !depth || !mv || !out || eye >= kUpscalerSlots || !w || !h) {
+        if (why) *why = g_available ? (eye >= kUpscalerSlots ? "an upscaler slot out of range" : "a missing input") : g_reason;
         return false;
     }
     // Every texture, before a single one is registered (the review of
@@ -1062,7 +1068,12 @@ void fsr3TestSkipBindCheck(bool on) { g_testSkipBindCheck = on; }
 // Test-only, NOT part of fsr3_engine.h's contract: the flags (FfxFsr3UpscalerContextDescription::flags) this eye's
 // context was created with, 0 when it has none. tools\fsr3_engine_test reads it to prove the flat HDR route's bits
 // (hdr_backend_flags.h) reach the port, and that flipping the route remakes the context with the other set.
-uint32_t fsr3TestContextFlags(unsigned eye) { return eye < 2 && g_ctx[eye].valid ? g_ctx[eye].createFlags : 0u; }
+uint32_t fsr3TestContextFlags(unsigned eye) { return eye < kUpscalerSlots && g_ctx[eye].valid ? g_ctx[eye].createFlags : 0u; }
+
+// Test-only, NOT part of fsr3_engine.h's contract either: how many contexts this upscaler slot has had made (a rekey counts
+// again), 0 for a slot out of range. tools\fsr3_engine_test reads it to prove each slot's context is its own: making or
+// remaking the VR world's (slot 2) moves no eye's count, and an eye's rekey moves none of the others.
+uint32_t fsr3TestContextCreations(unsigned slot) { return slot < kUpscalerSlots ? g_testCreations[slot] : 0u; }
 #endif
 
 }  // namespace edvr

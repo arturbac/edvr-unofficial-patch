@@ -10,7 +10,8 @@ cbuffer Mono : register(b0) {
     float4 jitter; // current xy, previous zw; actual raster phase in render pixels
     float4 rowsJitter; // NDC shift the camera rows themselves carry: current xy, previous zw; all zero = unjittered rows
     uint4 route; // x: the HDR route (section 81): Color is R11G11B10F scene radiance and OutColor is fp16; y: with x, the
-                 // TAA output is final and the pixel-shader finish only copies it into H. All zero on the copy route.
+                 // TAA output is final and the pixel-shader finish only copies it into H. z: the first-person map (t9) and
+                 // stencil (t10) are bound and valid (section 82, prep only); w: free. All zero on the copy route without them.
 };
 cbuffer EngineNow : register(b1) { float4 EN[277]; };   // EN[276].x: the frame stamp
 cbuffer EngineBefore : register(b2) { float4 EB[276]; };
@@ -23,6 +24,9 @@ Texture2D<float> Rejection : register(t5);
 Texture2D<float> ExpectedDepth : register(t6);
 Texture2D<float4> History : register(t7);
 Texture2D<float> HistoryDepth : register(t8);
+Texture2D<float4> FirstPersonMotion : register(t9);   // prep only, bound when route.z != 0: the VR weapon map, render size,
+                                                      // xy previous minus current in render pixels, z depth, w 1 valid / 2 new / 0 none
+Texture2D<uint2> FirstPersonStencil : register(t10);  // prep only, bound when route.z != 0: the depth texture's stencil plane (.y)
 SamplerState LinearClamp : register(s0);
 RWTexture2D<float> OutDepth : register(u0);
 RWTexture2D<float2> OutMotion : register(u1);
@@ -101,7 +105,27 @@ void prep(uint3 id:SV_DispatchThreadID) {
     float2 rawUv=uv-jitter.xy/float2(size.xy);
     float depth=SceneDepth.Load(int3(q,0));
     float2 motion=0; float reject=1, expected=0;
-    if(flags.x==0 && isfinite(depth) && depth>=0 && depth<=1) {
+    // First-person pixels (section 82). The depth texture's stencil bit 0x10 marks what the first-person draws wrote, and the
+    // VR weapon map says, per texel, where that surface was a frame ago. Such a pixel takes the map's motion or rejects its
+    // history, and NEVER the engine or camera term below: the weapon is not world geometry, and the camera term at its depth
+    // and field of view would be wrong (a screen-fixed weapon ghosting in turns). Without the inputs route.z is zero and both
+    // views are unbound, so no pixel is attached and the branch below is the code that was here before.
+    bool attached=route.z!=0 && (FirstPersonStencil.Load(int3(q,0)).y&16)!=0;
+    if(attached) {
+        float4 m=FirstPersonMotion.Load(int3(q,0));
+        // The previous position in render pixels. Leaving the frame is disocclusion, not something to extrapolate.
+        float2 prevPx=float2(q)+.5+m.xy;
+        // The map's depth is fp16, within half an ulp (a relative 2^-11) of the surface; the .0005 covers that. A missing,
+        // occluded, new or ambiguous mesh (w != 1) must not borrow another surface's history, and a reset frame has none.
+        bool valid=flags.x==0 && m.w==1 && all(isfinite(m)) && abs(m.z-depth)<=max(abs(depth)*.0005,3e-8) &&
+                   all(prevPx>=0) && all(prevPx<=float2(size.xy));
+        // THE SEAM for a jittered world. The VR world is unjittered in this build, so the vector below is used as the map
+        // gives it. The map's vector is previous minus current at the two frames' own raster phases, and the backend wants
+        // both phases out of it: when the world gets a phase, a correction of (jitter.xy - jitter.zw) in render pixels
+        // belongs on m.xy here, its sign to be PROVEN on WARP against a map built with known phases (as the rows-jitter cases
+        // do for the camera term), not assumed.
+        motion=valid?m.xy:0; reject=valid?0:1; expected=valid?depth:0;
+    } else if(flags.x==0 && isfinite(depth) && depth>=0 && depth<=1) {
         float4 before;
         uint kind=engineBefore(q,rawUv,depth,before);
         // HLSL logical operators do not short-circuit: putting cameraBefore's

@@ -340,11 +340,14 @@ void rotationAndRealTimerCase(Device& d) {
         gpuCensusFrame(d.ctx.Get());
         visited[static_cast<size_t>(g_activeSection)] = true;
     }
-    bool ownersVisited = true, membersSkipped = true;
+    bool ownersVisited = true, membersSkipped = true, idleWorldSkipped = true;
     for (size_t i = 0; i < kSections; ++i) {
+        // The VR world route's sections are turns only once called this window (nextTurnOwner): none was here.
+        if (i >= kWorldFirst && i < kWorldFirst + kWorldSections) { idleWorldSkipped = idleWorldSkipped && !visited[i]; continue; }
         if (turnOwnerOf(static_cast<GpuCensusSection>(i)) == static_cast<GpuCensusSection>(i)) ownersVisited = ownersVisited && visited[i];
         else membersSkipped = membersSkipped && !visited[i];
     }
+    check(idleWorldSkipped, "world route: with the key off (its sections never called) the rotation gives them no turn, so the census samples as it did before they existed");
     check(ownersVisited && visited[static_cast<size_t>(GpuCensusSection::AlteredTerrain)] &&
               visited[static_cast<size_t>(GpuCensusSection::AlteredFixFirst)],
           "altered: the frame rotation visits every turn, the altered-draw ones and the fix sections' shared one too");
@@ -717,8 +720,22 @@ void alteredFixCases() {
         ++cycle;
         onlyOwners = onlyOwners && turnOwnerOf(static_cast<GpuCensusSection>(at)) == static_cast<GpuCensusSection>(at);
     } while (at != 0 && cycle < 200);
-    check(onlyOwners && cycle == static_cast<unsigned>(kSections) - kAlteredFixCount + 1 && cycle == 22,
-          "turns: the rotation lands only on turn owners, and a cycle is one turn for each section but the later fix ones (22: the 21 there were before the seed section, and its own)");
+    check(onlyOwners && cycle == static_cast<unsigned>(kSections) - kAlteredFixCount + 1 - static_cast<unsigned>(kWorldSections) && cycle == 22,
+          "turns: the rotation lands only on turn owners, and a cycle is one turn for each section but the later fix ones and the idle world-route ones (22: the 21 there were before the seed section, and its own; the key off changes nothing)");
+    // The same cycle once the VR world route's three sections have been called this window: they take turns, 25.
+    for (size_t i = kWorldFirst; i < kWorldFirst + kWorldSections; ++i) g_section[i].occurrences = 1;
+    at = 0;
+    cycle = 0;
+    bool worldVisited[kWorldSections] = {};
+    do {
+        at = nextTurnOwner(at);
+        ++cycle;
+        if (static_cast<size_t>(at) >= kWorldFirst && static_cast<size_t>(at) < kWorldFirst + kWorldSections)
+            worldVisited[static_cast<size_t>(at) - kWorldFirst] = true;
+    } while (at != 0 && cycle < 200);
+    check(cycle == 25 && worldVisited[0] && worldVisited[1] && worldVisited[2],
+          "turns: a world-route section that has been called this window takes its turn (25: the 22 and the three)");
+    for (size_t i = kWorldFirst; i < kWorldFirst + kWorldSections; ++i) g_section[i].occurrences = 0;
     for (auto& s : g_section) s = SectionState{};
     g_section[kAlteredFixFirst + 2].occurrences = 7;
     g_section[kAlteredFixFirst + 11].occurrences = 5;
@@ -855,18 +872,22 @@ void seedTableCases() {
     constexpr GpuCensusSection seed = GpuCensusSection::FrameUiLayerHdrSeed;
     check(!isDoorSection(seed) && occurrenceCapFor(seed) == 8 && turnOwnerOf(seed) == seed,
           "seed section: an in-frame section like the others: per draw, K = 8, a turn of its own in the rotation");
-    check(static_cast<size_t>(seed) == kDoorSections + 8 && static_cast<size_t>(seed) + 1 == kAlteredFirst &&
+    check(static_cast<size_t>(seed) == kDoorSections + 8 && static_cast<size_t>(seed) + 1 == kWorldFirst &&
+              kWorldFirst + kWorldSections == kAlteredFirst &&
               seed > GpuCensusSection::FrameUiLayerReissues && seed < GpuCensusSection::AlteredPoolFamily,
-          "seed section: the ninth and last in-frame section, so the altered-draw sections still follow the in-frame ones");
+          "seed section: the ninth in-frame section, followed by the three world-route ones, so the altered-draw sections still follow the in-frame ones");
     bool filled = true, distinct = true;
     for (size_t i = 0; i < kFrameSections; ++i) {
         filled = filled && kFrameBreakdownNames[i] && kFrameBreakdownNames[i][0];
         for (size_t j = i + 1; j < kFrameSections; ++j)
             distinct = distinct && std::strcmp(kFrameBreakdownNames[i], kFrameBreakdownNames[j]) != 0;
     }
-    check(kFrameSections == 9 && filled && distinct &&
-              std::strcmp(kFrameBreakdownNames[kFrameSections - 1], "HDR HUD depth-stencil seed") == 0,
-          "seed section: nine in-frame items, none alike, the ninth named what the UI layer's own line calls the stage");
+    check(kFrameSections == 12 && filled && distinct &&
+              std::strcmp(kFrameBreakdownNames[kSeedSection - kDoorSections], "HDR HUD depth-stencil seed") == 0 &&
+              std::strcmp(kFrameBreakdownNames[kFrameSections - 3], "world resolve") == 0 &&
+              std::strcmp(kFrameBreakdownNames[kFrameSections - 2], "world mips") == 0 &&
+              std::strcmp(kFrameBreakdownNames[kFrameSections - 1], "world layer") == 0,
+          "seed section: twelve in-frame items, none alike, the ninth named what the UI layer's own line calls the stage, the last three the world route's");
 }
 
 void seedLineCases() {

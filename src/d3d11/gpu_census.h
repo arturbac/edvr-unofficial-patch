@@ -56,6 +56,13 @@ enum class GpuCensusSection : uint8_t {
     FrameUiLayerHdrSeed,      // the HDR HUD layer's depth-stencil seed: the copy of the game's depth-stencil and the
                               // Seeder's passes into the layer's own target (ui_layer.cpp seedLayerDepth), counted
                               // once for each seed and only for that layer (GpuCensusSeedScope below)
+    // The VR on-foot world route's own GPU work (vr_world_route.cpp, design doc section 82), EDVR's cost like the
+    // sections above. They run only while experimental.temporal_aa_on_foot_world is auto and the route works; the
+    // rotation gives a turn to none of the three until one has been called (nextTurnOwner, gpu_census.cpp), so with
+    // the key off the census samples exactly as it did before they existed.
+    FrameWorldResolve,        // the route's resolve at the tone: the input copy, prep, upscaler and the finish into H
+    FrameWorldMips,           // the screen texture's copy into the mipped texture and its GenerateMips
+    FrameWorldLayer,          // the layer's re-issue of each eye's screen draw with the resolved, mipped screen
     // Elite's OWN draws that EDVR alters (see AlteredDrawClass below): the game's
     // draw timed whole, so each figure holds the game's own work in it plus what
     // EDVR adds by binding its target or swapping its shader. NOT EDVR's cost,

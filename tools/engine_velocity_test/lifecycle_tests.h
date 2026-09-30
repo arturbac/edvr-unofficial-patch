@@ -1418,6 +1418,25 @@ inline void run(const Harness& h) {
                 number(summary, "shader ") == 0, "flat overlay lifecycle: no guarded path fallback");
         edvr::g_runtimeProfile = edvr::RuntimeProfile::LegacyVr;
     }
+    // The VR world route's two reads of the on-foot naming (vr_world_route.cpp, design doc section 82): whether a depth is the
+    // source depth named in THIS present frame, and the named camera's rows 270..275 as the watch saw them written.
+    {
+        g.beginFrame(); g.writeScene(g.sceneA.Get(), g.rows[0]);
+        edvr::engineVelocityNoteSource(g.sourceDepth.Get(), g.sceneA.Get());
+        float camera[6][4]{};
+        h.check(edvr::engineVelocitySourceIsNamed(g.sourceDepth.Get()), "route reads: the depth named in this frame is named");
+        h.check(edvr::engineVelocitySourceCameraRows(camera) &&
+                    std::memcmp(camera, g.rows[0].data() + 270 * 4, sizeof(camera)) == 0,
+                "route reads: the named camera's rows 270..275 are the ones the game wrote to its scene constants");
+        h.check(!edvr::engineVelocitySourceIsNamed(g.depth[0].Get()) && !edvr::engineVelocitySourceIsNamed(nullptr),
+                "route reads: another depth, or none, is not the named one");
+        g.endFrame();
+        g.beginFrame();
+        float unnamed[6][4]{};
+        h.check(!edvr::engineVelocitySourceIsNamed(g.sourceDepth.Get()) && !edvr::engineVelocitySourceCameraRows(unnamed),
+                "route reads: a present frame in which nothing named the source answers neither (the naming is per frame)");
+        g.endFrame();
+    }
     const unsigned detachesBefore = lifecycle_fake::g_emitDetaches;
     edvr::engineVelocityShutdown();
     h.check(lifecycle_fake::g_emitDetaches == detachesBefore + 1, "P1: shutdown detaches the emit's want on the hook set");

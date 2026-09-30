@@ -116,6 +116,29 @@ struct FlatMonoResolveFrame {
     // is nothing for the caller to swap into a binding. False, the default, is the copy route and every byte of it
     // unchanged.
     bool hdr = false;
+    // The upscaler feature slot the backend evaluates on (dlaa.h, kUpscalerSlots; dlaa.cpp and fsr3_engine.cpp keep one
+    // feature, one size key and one history per slot). 0 is the flat profile's and eye 0's -- the default, and every
+    // caller before the VR world route. The VR world route passes 2 (vr_world_route.h, kVrWorldFeatureSlot), because its two
+    // eyes own 0 and 1. The resolver's own continuity (its history, its TAA ping-pong) is one set: one caller per process at
+    // a time, which the flat and VR profiles already are. A slot outside 0..kUpscalerSlots-1 refuses the frame
+    // ("flat-resolve-invalid-slot") before anything is written.
+    uint32_t slot = 0;
+    // The first-person ("weapon") fold-in of the VR world route (docs/design-flat-temporal-aa-2026-09-23.md section 82).
+    // The VR weapon-motion module rebuilds motion for first-person draws from their own animated vertices; the game's depth
+    // texture carries a first-person stencil bit. Both come in as inputs of the prep kernel, both borrowed, BOTH OR NEITHER
+    // (one without the other is treated as absent, counted in stats.firstPersonPartial). Null, the default, leaves the prep's
+    // arithmetic bit-for-bit what it was.
+    //   firstPersonMotion: R16G16B16A16_FLOAT, a Texture2D the size of the render (renderWidth x renderHeight). Per texel
+    //     xy = previous minus current position in RENDER pixels, z = depth (fp16), w = 1 valid / 2 new-rejected / 0 uncovered.
+    //   firstPersonStencil: the stencil plane view of the same depth texture, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, a
+    //     Texture2D view; bit 0x10 is set where first-person draws wrote it.
+    // A pair that fails validation (format, size, view dimension) is treated as absent, counted in stats.firstPersonRefused,
+    // and named once in the log; it never refuses the frame. Where the stencil bit is set ("attached") the prep takes the
+    // map's motion when the map is valid (w == 1, finite, its depth within max(|depth| * 0.0005, 3e-8) of the pixel's, its
+    // previous position inside the frame, and the frame not a reset) and otherwise REJECTS the pixel's history; an attached
+    // pixel never takes the engine or camera term. Every other pixel is treated exactly as without the inputs.
+    ID3D11ShaderResourceView* firstPersonMotion = nullptr;
+    ID3D11ShaderResourceView* firstPersonStencil = nullptr;
 };
 // Planned input metadata available before the game's next raster phase. This
 // intentionally carries no frame resources: preflight can allocate the
@@ -169,6 +192,11 @@ struct FlatMonoResolveStats {
     uint64_t currentContinueRun = 0, longestContinueRun = 0;
     // The HDR route's resolves and its pixel-shader spatial recoveries (written into H, so no output view).
     uint64_t hdrResolves = 0, hdrSpatial = 0;
+    // The first-person inputs (FlatMonoResolveFrame::firstPersonMotion and firstPersonStencil): frames whose prep took them,
+    // frames whose pair failed validation (firstPersonRefusal names the last reason, a static string, null until one has),
+    // and frames that passed only one of the two (treated as absent, and not a refusal). A frame with neither counts nowhere.
+    uint64_t firstPersonFrames = 0, firstPersonRefused = 0, firstPersonPartial = 0;
+    const char* firstPersonRefusal = nullptr;
     // The last resolve's EFFECTIVE reset (the requested one, or a lost history, a frame gap, an
     // invalid previous camera, a format change or a camera cut): what the pixel capture writes
     // as "reset" and what decides whether the frame is a live sample.

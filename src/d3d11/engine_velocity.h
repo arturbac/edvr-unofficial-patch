@@ -363,6 +363,12 @@ bool engineVelocityPoolFamilyVs(uint64_t vsHash) noexcept;
 // does not assert that the runtime shader patch or motion views are ready.
 bool engineVelocityPoolFamilyPair(uint64_t vsHash, uint64_t psHash) noexcept;
 bool engineVelocitySourceViews(ID3D11Texture2D* sourceDepth, EngineVelocityViews* out);
+// The VR world route's two reads of the source's naming (vr_world_route.cpp; docs section 82): is `depth` the source depth
+// screen_motion named in THIS present frame, and the source camera's rows 270..275 (the resolver's camera[6][4]: b1's first
+// 96 bytes from row 270) as the watch last saw them written for that naming. False when nothing was named this frame, the
+// depth is another, or the rows were not seen. Pure reads under the module's own lock: no GPU work, no allocation.
+bool engineVelocitySourceIsNamed(const ID3D11Texture2D* depth);
+bool engineVelocitySourceCameraRows(float (&rows)[6][4]);
 // The screen shader's panel counts without diagnostics: one present frame in
 // kPanelSampleFrames, one eye pixel in kPanelSampleStride squared (a grid on
 // the eye pixel), raw; pixelStride 1 = every pixel (diagnostics, motion_source).

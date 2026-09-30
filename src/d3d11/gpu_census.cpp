@@ -40,7 +40,8 @@ constexpr const char* kDoorBreakdownNames[8] = {
 constexpr const char* kFrameBreakdownNames[] = {
     "hologram passes", "UI depth coverage", "planet", "terrain",
     "screen motion", "weapon motion", "engine velocity",
-    "UI layer reissues", "HDR HUD depth-stencil seed"
+    "UI layer reissues", "HDR HUD depth-stencil seed",
+    "world resolve", "world mips", "world layer"
 };
 constexpr size_t kFrameSections = sizeof(kFrameBreakdownNames) / sizeof(kFrameBreakdownNames[0]);
 // Elite's own draws that EDVR alters (gpu_census.h): the game's draws timed whole, so they are
@@ -64,8 +65,14 @@ constexpr const char* kAlteredFixNames[kAlteredFixCount] = {
     "scanner-body resolve", "loading scrim", "menu backdrop", "unnamed fix"
 };
 static_assert(kAlteredClassSections == 3, "one name for each altered-draw class");
+// The VR world route's three sections (gpu_census.h) come right after the seed and are the last in-frame ones. The
+// rotation gives none of them a turn until it has been called this window, so a session with the key off samples as it did
+// before they existed.
+constexpr size_t kWorldFirst = static_cast<size_t>(GpuCensusSection::FrameWorldResolve);
+constexpr size_t kWorldSections = static_cast<size_t>(GpuCensusSection::FrameWorldLayer) - kWorldFirst + 1;
 static_assert(kAlteredFirst == kDoorSections + kFrameSections, "one name for each in-frame section, and the altered sections follow them");
-static_assert(kSeedSection == kAlteredFirst - 1, "the seed is the last in-frame section, so its item is the last of the in-frame ones");
+static_assert(kSeedSection + 1 == kWorldFirst && kWorldFirst + kWorldSections == kAlteredFirst && kWorldSections == 3,
+              "the seed is followed by the three world-route sections, which are the last in-frame ones");
 static_assert(kAlteredFixFirst + kAlteredFixCount == kSections, "the fix sections are the last ones");
 
 struct SectionState {
@@ -188,12 +195,15 @@ uint64_t turnOccurrences(GpuCensusSection owner) noexcept {
     for (size_t i = 0; i < static_cast<size_t>(kAlteredFixCount); ++i) total += g_section[kAlteredFixFirst + i].occurrences;
     return total;
 }
-// The next section to hold a turn: the fix sections after the first are not turns of their own.
+// The next section to hold a turn: the fix sections after the first are not turns of their own, and a world-route
+// section has none until it has been called this window (its first call counts whether or not it is on turn).
 int nextTurnOwner(int current) noexcept {
     int next = current;
     do {
         next = (next + 1) % static_cast<int>(kSections);
-    } while (turnOwnerOf(static_cast<GpuCensusSection>(next)) != static_cast<GpuCensusSection>(next));
+    } while (turnOwnerOf(static_cast<GpuCensusSection>(next)) != static_cast<GpuCensusSection>(next) ||
+             (static_cast<size_t>(next) >= kWorldFirst && static_cast<size_t>(next) < kWorldFirst + kWorldSections &&
+              g_section[static_cast<size_t>(next)].occurrences == 0));
     return next;
 }
 

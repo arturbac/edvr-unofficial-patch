@@ -2406,6 +2406,8 @@ void testWriteBack(Gpu& g) {
 #include "ui_seed_census_test.h"
 #include "ui_seed_freshness_test.h"
 #include "ui_after_ui_test.h"
+#include "ui_world_route_test.h"
+#include "ui_world_route_wiring_test.h"
 
 }  // namespace
 
@@ -2438,6 +2440,8 @@ int main(int argc, char** argv) {
     afterui::testRecordedTails();
     afterui::testStationPixels();
     afterui::testWiring();
+    worldroute::testAll();
+    worldroute::testWiring();
     testHudParity();
     testChains();
     testPanelScale();
