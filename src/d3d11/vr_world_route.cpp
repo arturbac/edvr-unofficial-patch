@@ -20,6 +20,7 @@
 #include "dlaa.h"
 #include "flat_mono_resolve.h"
 #include "gpu_census.h"
+#include "panel_curve.h"    // panelCurveWants: the curved screen's substitution, which the layer cannot re-issue
 #include "ui_layer.h"
 #include "vr_camera_census.h"
 #include "vr_world_mips.h"
@@ -471,8 +472,13 @@ void vrWorldRouteFrameBoundary() {
     }
     ++g_frameNo;
 
-    // The frame that ended.
-    const bool layerLive = uiLayerLiveForWorldRoute();
+    // The frame that ended. The layer re-issues the game's OWN screen draw, and a curved screen is not that draw (the geometry
+    // substitution swallows it), so with fix.panel_curvature on the layer would refuse every frame (curved-screen) and an owned
+    // route would pay for the world resolve while the eye route still served the eyes. The route does not own such a frame: the
+    // same predicate that decides the substitution (panel_curve.h) holds it off, with the reason in its one line. (Follow-up: a
+    // curve-aware re-issue through panelCurveSubstitute.)
+    const bool curved = panelCurveWants();
+    const bool layerLive = uiLayerLiveForWorldRoute() && !curved;
     const bool gate = uiLayerWorldScreenHeld();
     if (key == VrWorldKey::Auto) {
         if (g_win.hdr.frames == 0 && g_windowStartMs == 0) g_windowStartMs = GetTickCount64();
@@ -530,13 +536,14 @@ void vrWorldRouteFrameBoundary() {
         if (g_machine.state != VrWorldState::Latched) g_latchLogged = false;
         // The key is auto but the layer is not live: one line per reason, saying the route stays off and why.
         if (!layerLive) {
-            const char* why = uiLayerNotLiveReason();
+            const char* why = curved ? "fix.panel_curvature bends the on-foot screen and the layer cannot re-issue a curved screen yet"
+                                     : uiLayerNotLiveReason();
             if (!why) why = "the UI layer is not live";
             if (g_notLiveNoted != why && (!g_notLiveNoted || std::strcmp(g_notLiveNoted, why) != 0)) {
                 g_notLiveNoted = why;
                 Log::get().note("vr world route: experimental.temporal_aa_on_foot_world is auto but the route stays off, and "
                                 "on-foot VR keeps today's two-eye route: %s (the route hands the eyes the resolved screen through "
-                                "the UI layer, so keep fix.ui_quality on)", why);
+                                "the UI layer, so keep fix.ui_quality on and fix.panel_curvature at 0)", why);
             }
         } else {
             g_notLiveNoted = nullptr;

@@ -21,6 +21,7 @@
 #include "../../src/d3d11/fsr3_engine.h"
 #include "../../src/d3d11/engine_velocity.h"
 #include "../../src/d3d11/gpu_census.h"
+#include "../../src/d3d11/panel_curve.h"
 #include "../../src/d3d11/ui_layer.h"
 #include "../../src/d3d11/vr_camera_census.h"
 #include "../../src/d3d11/vr_world_mips.h"
@@ -75,6 +76,12 @@ constexpr float kEpicRows[6][4] = {
 }  // namespace
 
 namespace edvr {
+// panel_curve.h's state (panelCurveWants is inline over these): a scenario sets the curvature the way the config would.
+namespace detail {
+bool g_panelCurveStoodDown = false;
+float g_panelCurveCurvature = 0.0f;
+int g_panelCurveSegments = kDefaultSegments;
+}  // namespace detail
 thread_local bool g_flatComputeInternal = false;
 Log& Log::get() { static Log instance; return instance; }
 Log::~Log() = default;
@@ -277,6 +284,8 @@ void reset(World& w) {
     g_gate = g_layerLive = g_named = g_rowsKnown = g_viewsReady = true;
     g_panelW = kW; g_panelH = kH; g_realMismatch = false;
     g_namedDepth = w.depth.Get();
+    edvr::detail::g_panelCurveStoodDown = false; edvr::detail::g_panelCurveCurvature = 0.0f;
+    edvr::detail::g_panelCurveSegments = edvr::detail::kDefaultSegments;
 }
 
 void scenarios(World& w) {
@@ -446,6 +455,27 @@ void scenarios(World& w) {
         g_layerLive = true;
         frame(w); frame(w);
         check(g_backendCalls >= 1, "layer not live: live again, the route treats");
+    }
+    {   // the curved screen: the layer cannot re-issue it, so the route owns no frame while the substitution is wanted
+        reset(w);
+        configure(true);
+        edvr::detail::g_panelCurveCurvature = 0.3f;
+        for (int i = 0; i < 5; ++i) frame(w);
+        check(g_backendCalls == 0 && !g_vrWorldWants && countLines("the route stays off") == 1 && countLines("fix.panel_curvature bends") == 1,
+              "curved screen: five frames, no resolve, draws not watched, ONE line saying the route stays off and why (fix.panel_curvature)");
+        edvr::detail::g_panelCurveCurvature = 0.0f;
+        frame(w); frame(w);
+        check(g_backendCalls >= 1, "curved screen: curvature back to 0, the route treats");
+        reset(w);
+        configure(true);
+        edvr::detail::g_panelCurveSegments = edvr::detail::kDefaultSegments + 8;   // the identity test wants the substitution too
+        for (int i = 0; i < 3; ++i) frame(w);
+        check(g_backendCalls == 0 && countLines("fix.panel_curvature bends") == 1, "curved screen: a non-default segment count (the identity test) is the same substitution");
+        reset(w);
+        configure(true);
+        edvr::detail::g_panelCurveCurvature = 0.3f; edvr::detail::g_panelCurveStoodDown = true;   // the feature stood itself down
+        for (int i = 0; i < 3; ++i) frame(w);
+        check(g_backendCalls >= 1 && countLines("fix.panel_curvature bends") == 0, "curved screen: a substitution that stood itself down does not hold the route off");
     }
     {   // the gate lost while owned, then regained
         reset(w);

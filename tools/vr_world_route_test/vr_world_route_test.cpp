@@ -573,6 +573,19 @@ void sourcePins() {
               rt.find("kVrWorldFeatureSlot") != std::string::npos,
           "resolve: the resolver runs inside the internal scope, on the world's own upscaler slot");
     check(rt.find("GpuCensusSection::FrameWorldResolve") != std::string::npos, "census: the resolve is timed on its own GPU census section");
+    // A curved screen is not the game's own draw, which is all the layer re-issues: the route owns no frame while the
+    // substitution is wanted (panel_curve.h), and the reason it gives names the key to set.
+    check(boundary.find("const bool curved = panelCurveWants();") != std::string::npos &&
+              boundary.find("const bool layerLive = uiLayerLiveForWorldRoute() && !curved;") != std::string::npos &&
+              boundary.find("fix.panel_curvature bends the on-foot screen") != std::string::npos,
+          "curvature: the route stays off while fix.panel_curvature's substitution is wanted, and says so");
+    // The census's eye draw: the screen composite's own shader pair, read only with the census key on.
+    const std::string census = functionBody(vs, "__declspec(noinline) void cameraCensusEyeDraw(");
+    check(!census.empty() && census.find("0x5C36AF051B98B9F1ull") != std::string::npos && census.find("0xCFE84157BC76E921ull") != std::string::npos &&
+              census.find("vrCameraCensusEyeDraw(self,") != std::string::npos &&
+              vs.find("if (g_vrWorldWants && vrCameraCensusWanted()) cameraCensusEyeDraw(self);") != std::string::npos &&
+              count(vs, "cameraCensusEyeDraw(self)") == 1,
+          "census: the screen composite tells the census its eye, behind one flag test (the route's watch flag, true while the census is wanted)");
     // The layer-only door is asked twice an eye and sequence (the temporal door, then the sharpen pass): the 5 s line's
     // door-layer-only counts an eye once, or it would read twice eye-takes on a healthy flight.
     const std::string door = functionBody(rt, "bool vrWorldRouteDoorLayerOnly(");

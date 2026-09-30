@@ -3694,6 +3694,20 @@ __declspec(noinline) void crispHudTonemapReissue(ID3D11DeviceContext* self, char
 // reason, named once) and the eye to the eye route. The route's own D3D calls step past these hooks
 // (VrWorldInternalScope). NOINLINE for the reason pureDrawReissue is: two draws a frame, and only while the route
 // owns the world.
+// The VR camera census (vr_camera_census.h, advanced.vr_camera_census): at the 2D screen's composite draw, which is one
+// an eye, tell the census the eye, so it can read that eye's view constants (b1 rows 270..273) back and log what EDVR
+// advertised for it. Observes only: the census copies and maps under the flat compute scope and never writes a binding.
+// NOINLINE and reached only with the census key on (the caller tests the flag); two draws a frame, and only the first
+// few on-foot frames spend anything (the census's own budget).
+__declspec(noinline) void cameraCensusEyeDraw(ID3D11DeviceContext* self) {
+    if (bindingShaderHash(BindSlot::Vs) != 0x5C36AF051B98B9F1ull || bindingShaderHash(BindSlot::Ps) != 0xCFE84157BC76E921ull) return;
+    ResourceInfo info{};
+    if (!bindingResolve(bindingGet(BindSlot::Rtv0), &info) || !info.isTexture2D) return;
+    const int eye = uiDepthEyeOfTarget(info.resource, info.a, info.b, info.fmt);
+    if (eye < 0 || eye > 1) return;
+    vrCameraCensusEyeDraw(self, static_cast<uint32_t>(eye));
+}
+
 __declspec(noinline) void worldScreenReissue(ID3D11DeviceContext* self, char kind, UINT count,
                                              UINT instances, const DrawArgs& args) {
     if (uiLayerIssueBlocked()) return;
@@ -4710,6 +4724,9 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
                 }
                 if(scene)scene->Release();
             }
+            // The VR camera census (vr_camera_census.h): at the 2D screen's composite, once an eye. g_vrWorldWants is true
+            // whenever the census is wanted, so with the key off this is one load of a false bool.
+            if (g_vrWorldWants && vrCameraCensusWanted()) cameraCensusEyeDraw(self);
             // The VR world route re-issues this 2D screen composite into the eye's layer right after the game's
             // own issue (ui_layer.h), and the door runs layer-only for the eye: the per-eye motion reissues below
             // are unused while the route owns it (0.24 ms), so they are skipped -- but the RECOGNITION still runs.
