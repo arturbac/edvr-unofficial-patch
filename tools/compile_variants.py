@@ -93,7 +93,11 @@ def main(argv=None):
         sys.exit(f"no R\"HLSL(...)HLSL\" literal in {src}")
     d3d = ctypes.WinDLL("d3dcompiler_47.dll")
 
-    print(f"{os.path.relpath(src, REPO)}: {len(hlsl)} bytes of HLSL")
+    try:
+        shown = os.path.relpath(src, REPO)
+    except ValueError:   # another drive than the repository's (a runner's TEMP): no relative path exists
+        shown = src
+    print(f"{shown}: {len(hlsl)} bytes of HLSL")
     failed = 0
     for d in [None] + defines:
         ok, hr, errors = compile_variant(d3d, hlsl, d, target)
