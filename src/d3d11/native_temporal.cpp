@@ -4,6 +4,7 @@
 #include "dlss_floor.h"
 #include "ui_layer.h"
 #include "ui_surfaces.h"
+#include "vr_camera_census.h"   // nativeTemporalEyeGeometry's declaration, so its definition below is checked against it
 #include "../common/config.h"
 #include "../common/frame_flag.h"
 #include "../common/temporal_math.h"
@@ -456,6 +457,21 @@ bool nativeTemporalDrawJitter(uint32_t eye, uint64_t* sequence, float* jx, float
   if (jy) *jy = (s.height[eye] && bt != 0.0f) ? s.shift[eye][1] * float(s.height[eye]) / bt : 0.0f;
   if (w) *w = s.width[eye];
   if (h) *h = s.height[eye];
+  return true;
+}
+// The VR camera census (vr_camera_census.h): what EDVR advertised for `eye` this sequence, at an eye composite draw --
+// the frustum the host was given ({left, right, down, up} tangents) and the tangent shift the eye jitter moved it by
+// (zero when the pass is not jittering). The same discipline as nativeTemporalDrawJitter: the render thread, outside
+// treat(), under the channel's mutex; false before the first beginFrame, once the channel closes, or for an eye that
+// does not exist.
+bool nativeTemporalEyeGeometry(uint32_t eye, uint64_t* sequence, float frustum[4], float shift[2]) {
+  if (t_insideTreat) return false;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!current || !current->active || !current->begun || eye > 1) return false;
+  const State& s = *current;
+  if (sequence) *sequence = s.sequence;
+  if (frustum) std::memcpy(frustum, s.frusta[eye], 4 * sizeof(float));
+  if (shift) { shift[0] = s.shift[eye][0]; shift[1] = s.shift[eye][1]; }
   return true;
 }
 // fix.ui_quality's panels and instruments (ui_surfaces.h): the size, max over eyes, the

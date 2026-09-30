@@ -1145,6 +1145,21 @@ if errorlevel 1 ( echo [edvr] ERROR: c2 coexist test build failed & exit /b 1 )
 "%BUILD%\c2_coexist_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_vr_camera_census_test
+echo [edvr] === vr_camera_census_test.exe ===
+REM The VR camera census (design doc section 82): the pure half the DLL compiles, run against the derive model, plus the
+REM source scans that hold "key off = nothing" and "the detour never writes a camera" (they read src\d3d11 from the repo
+REM root), plus tools\camera_census_fixture.log held to exactly what the formatters write -- the file that
+REM edvr_log.py --camera-census's own self-test reads.
+if not exist "%OBJ%\vrcamcensus" mkdir "%OBJ%\vrcamcensus"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\vrcamcensus\\" ^
+    /Fe"%BUILD%\vr_camera_census_test.exe" "tools\vr_camera_census_test\vr_camera_census_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: vr camera census test build failed & exit /b 1 )
+"%BUILD%\vr_camera_census_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_config_test
 echo [edvr] === config_test.exe ===
 REM The real parser over the real shipped edvr.ini. The file's own layout

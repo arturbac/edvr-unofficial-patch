@@ -14,6 +14,7 @@
 #include "../../src/d3d11/temporal_pass.h"
 #include "../../src/d3d11/ui_layer.h"
 #include "../../src/d3d11/ui_surfaces.h"
+#include "../../src/d3d11/vr_camera_census.h"
 #include "../../src/d3d11/dlss_floor.h"
 #include "../../src/openxr/native_temporal_client.h"
 #include "../../src/common/system_d3d11.h"
@@ -34,13 +35,14 @@ Call note;std::vector<Call> calls;bool passSucceeds=true;
 // CreateTexture2D -- where fix.ui_quality's surfaces ask for the
 // recommendation. The stub asks from there, exactly as the create hook
 // would; MSVC's std::mutex throws on a re-lock from its own thread.
-unsigned reentries=0,reentryThrows=0;uint32_t reentryRecW=0,reentryRecH=0;bool reentryJitter=true,reentryWarm=true;
+unsigned reentries=0,reentryThrows=0;uint32_t reentryRecW=0,reentryRecH=0;bool reentryJitter=true,reentryWarm=true,reentryGeometry=true;
 float reentryUp=0,reentryDown=0;
 void askFromInsideTreat(){
   ++reentries;
   try{uint32_t w=0,h=0;if(edvr::nativeTemporalRecommended(&w,&h)){reentryRecW=w;reentryRecH=h;}
       edvr::nativeTemporalVerticalTangents(&reentryUp,&reentryDown);
       uint64_t sq=0;float x=0,y=0;uint32_t a=0,b=0;reentryJitter=edvr::nativeTemporalDrawJitter(0,&sq,&x,&y,&a,&b);
+      float fr[4]{},sh[2]{};reentryGeometry=edvr::nativeTemporalEyeGeometry(0,&sq,fr,sh);
       ID3D11Device* dv=nullptr;unsigned long th=0;reentryWarm=edvr::nativeTemporalWarmTarget(&dv,&th);}
   catch(...){++reentryThrows;}
 }
@@ -125,7 +127,7 @@ void run(){
   check(reentries>=2&&reentryThrows==0,"asked from inside treat (as the create hook asks), nothing re-locks the channel's mutex");
   check(reentryRecW==480&&reentryRecH==360,"...and the recommendation is the frame's, read without the lock");
   check(closeFloat(reentryUp,.9f)&&closeFloat(reentryDown,1.1f),"...and so is its vertical frustum (the panel rule's field of view)");
-  check(!reentryJitter&&!reentryWarm,"...and the readers that take the lock answer no there instead of throwing");
+  check(!reentryJitter&&!reentryWarm&&!reentryGeometry,"...and the readers that take the lock (the eye geometry the VR camera census reads included) answer no there instead of throwing");
   {uint32_t rw=0,rh=0;check(edvr::nativeTemporalRecommended(&rw,&rh)&&rw==480&&rh==360,"the recommendation outside treat");}
   {uint32_t aw=1,ah=1;check(!edvr::nativeTemporalAsked(&aw,&ah),"no ask when the host does not say (the recommendation is the answer)");}
   check(calls.back().flags&1,"first history reset");check(!calls.back().head,"first frame has no invented head pair");
@@ -147,6 +149,17 @@ void run(){
    check(edvr::nativeTemporalDrawJitter(0,&ds,&djx,&djy,&dw,&dh)&&ds==2&&closeFloat(djx,c.jx)&&closeFloat(djy,c.jy)&&dw==320&&dh==240,
          "draw-time jitter is the pixel jitter the pass receives, for the frame being drawn");
    check(!edvr::nativeTemporalDrawJitter(2,&ds,&djx,&djy,&dw,&dh),"draw-time jitter refuses an eye that does not exist");}
+  // The VR camera census reads what EDVR advertised for an eye at its composite draw (vr_camera_census.h): the frame's
+  // sequence, the frustum the host gave (frame()'s, {left, right, down, up}) and the tangent shift the jitter moved it by.
+  {uint64_t es=0;float fr[4]{},sh[2]{};
+   check(edvr::nativeTemporalEyeGeometry(0,&es,fr,sh)&&es==2&&closeFloat(fr[0],-1.2f)&&closeFloat(fr[1],.7f)&&closeFloat(fr[2],-.9f)&&
+         closeFloat(fr[3],1.1f)&&closeFloat(sh[0],p.tangentShift[0][0])&&closeFloat(sh[1],p.tangentShift[0][1])&&
+         (std::fabs(sh[0])>0||std::fabs(sh[1])>0),
+         "the eye geometry is the frustum the host was given and the tangent shift the frame carried, for eye 0 of the frame being drawn");
+   check(edvr::nativeTemporalEyeGeometry(1,&es,fr,sh)&&closeFloat(fr[0],-.8f)&&closeFloat(fr[1],1.4f)&&closeFloat(sh[0],p.tangentShift[1][0])&&closeFloat(sh[1],p.tangentShift[1][1]),
+         "...and eye 1's own");
+   check(!edvr::nativeTemporalEyeGeometry(2,&es,fr,sh),"the eye geometry refuses an eye that does not exist");
+   check(edvr::nativeTemporalEyeGeometry(0,nullptr,nullptr,nullptr),"a caller may ask for any subset of the answer");}
   check(uiLayerNotes>=3&&uiLayerNoteSeq==2&&uiLayerNoteEye==0&&uiLayerNoteOut==source.Get(),"each treated eye is noted to the UI layer with the pass's output");
   check(uiLayerSubmits>=3&&uiLayerSubmitted[0]==source.Get()&&uiLayerSubmitted[1]==source.Get(),"the game's submitted texture is noted per eye for the UI layer's eye check");
   check(std::fabs(c.jx)>.01f||std::fabs(c.jy)>.01f,"known-size jitter engaged");
@@ -159,6 +172,7 @@ void run(){
   f=frame(11,5);f.referenceGeneration=2;begin(t,f);check(treat(t,5,0,source.Get())==S_OK&&(calls.back().flags&1),"reference change reset");
   check(t.invalidate(t.context)==S_OK,"CPU invalidation");check(treat(t,5,0,source.Get())==E_INVALIDARG,"invalidated frame cannot treat");check(t.beginFrame(t.context,&f,&p)==E_INVALIDARG,"invalidated sequence cannot reopen");
   {uint32_t rw=0,rh=0;float u=0,dn=0;check(!edvr::nativeTemporalRecommended(&rw,&rh)&&!edvr::nativeTemporalVerticalTangents(&u,&dn)&&!edvr::nativeTemporalAsked(&rw,&rh)&&!edvr::nativeTemporalTrueVerticalTangents(&u,&dn),"no recommendation, frustum, ask or true frustum once the channel is invalidated");}
+  {uint64_t es=0;float fr[4]{},sh[2]{};check(!edvr::nativeTemporalEyeGeometry(0,&es,fr,sh),"no eye geometry once the channel is invalidated");}
   f=frame(11,6);p=begin(t,f);auto larger=d.texture(640,480);check(treat(t,6,0,larger.Get())==S_OK,"resize treatment");c=calls.back();
   check(c.flags&1,"resize reset");check(closeFloat(c.jx,-p.tangentShift[0][0]*640/1.9f),"resize converts jitter to actual pixels");
   Device other;auto foreign=other.texture();check(treat(t,6,1,foreign.Get())==E_INVALIDARG,"wrong device rejected");
