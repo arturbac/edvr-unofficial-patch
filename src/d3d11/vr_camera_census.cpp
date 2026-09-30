@@ -146,13 +146,10 @@ void observePost(uintptr_t camera, uintptr_t /*ctx*/) noexcept {
     vrCensusSigFromSnap(snap, &sig);
     float tangents[4] = {};
     const bool tangentsValid = vrCensusTangents(sig, tangents);
-    float rows[16] = {};
-    const bool rowsValid = vrCensusComposeRows(snap, rows);
-    if (p.record) {
+    if (p.record) {   // the rows are only for a call that is being recorded: none once the sequences are out
         p.record->postSeen = true;
         p.record->postFlags = sig.flags;
-        p.record->rowsValid = rowsValid;
-        if (rowsValid) std::memcpy(p.record->rows, rows, sizeof(rows));
+        p.record->rowsValid = vrCensusComposeRows(snap, p.record->rows);
     }
     s->cameras.note(camera, sig, tangents, tangentsValid, s->frame, p.callerRva, p.ordinal, p.draw, p.drawKnown, p.tone);
 }

@@ -754,6 +754,40 @@ def _cfmt_tone(counts):
     return ", ".join("%s x%d" % (k, counts[k]) for k in sorted(counts)) or "none"
 
 
+def census_expected_measure(frustum, dx, dy):
+    """What flatCameraMeasureRowShift reads off the rows of a projection built from
+    the window {left, right, down, up} moved by (dx, dy): (-(R+L)/(R-L), -(U+D)/(U-D)),
+    the model's off-centre terms p8 and p9. None when the window has no width."""
+    left, right, down, up = frustum[0] + dx, frustum[1] + dx, frustum[2] + dy, frustum[3] + dy
+    if right == left or up == down:
+        return None
+    return (-(right + left) / (right - left), -(up + down) / (up - down))
+
+
+def census_shift_fit(meas, frustum, shift):
+    """Which way the eye's rows carry the shift EDVR advertised. The DLL's `leak=`
+    column assumes the game builds its eye camera from the frustum moved by +shift;
+    that sign is not proven, so the reader tries every sign of each axis and the
+    unshifted frustum and names the best fit. Returns (label, residual, runner-up
+    label, its residual), residuals being the largest |measured - expected| of the
+    two axes, in NDC."""
+    fits = []
+    for name, sx, sy in (("the advertised frustum moved by (+shift.x, +shift.y)", 1, 1),
+                         ("the frustum moved by (+shift.x, -shift.y)", 1, -1),
+                         ("the frustum moved by (-shift.x, +shift.y)", -1, 1),
+                         ("the frustum moved by (-shift.x, -shift.y)", -1, -1),
+                         ("the unshifted frustum (the shift is not in the rows)", 0, 0)):
+        expected = census_expected_measure(frustum, sx * shift[0], sy * shift[1])
+        if expected is None or meas is None or len(meas) != 2:
+            continue
+        fits.append((max(abs(meas[0] - expected[0]), abs(meas[1] - expected[1])), name))
+    if not fits:
+        return None
+    fits.sort()
+    runner = fits[1] if len(fits) > 1 else (None, None)
+    return fits[0][1], fits[0][0], runner[1], runner[0]
+
+
 def print_camera_census(text):
     """The --camera-census report. Returns the process exit code: 0 when the log
     has census lines, 1 when it has none."""
@@ -867,13 +901,19 @@ def print_camera_census(text):
             print("    EDVR advertised seq %s frustum %s shift %s; expected measure %s, shifted %s; leak %s"
                   % (g["seq"], _cg(tuple(g["frustum"]) if g["frustum"] else None), _cg(g["shift"]),
                      _cg(g["expect"]), _cg(g["expect_shifted"]), _cg(g["leak"])))
+            fit = census_shift_fit(e["meas"], g["frustum"], g["shift"]) if g["frustum"] and g["shift"] else None
+            if fit:
+                print("    the rows measure as %s (residual %.2e NDC; next best: %s, %.2e)"
+                      % (fit[0], fit[1], fit[2], fit[3]))
         else:
             print("    EDVR advertised geometry: unavailable")
     leaks = [max(abs(v) for v in g["leak"]) for g in c["geometry"].values()
              if g["known"] and g["leak"] and all(v == v for v in g["leak"])]
     if leaks:
         print("leak measure over %d eye draw(s): largest |leak| = %.3e NDC (no world phase is injected in this census, "
-              "so this is the baseline a leak detector must clear; a world phase of half a pixel at 5040 wide is 2e-4)"
+              "so this is the baseline a leak detector must clear; a world phase of half a pixel at 5040 wide is 2e-4; "
+              "`leak` assumes the game builds its eye camera from the frustum moved by +shift, which the "
+              "`the rows measure as` line above checks)"
               % (len(leaks), max(leaks)))
 
     print("\n== the offline join (B): eye rows against the rows of every logged call, tolerance %g ==" % CENSUS_JOIN_TOL)
@@ -2421,6 +2461,7 @@ def self_test_camera_census():
         "(D) caller: eye camera(s) call from +0x594FE1; the world camera from +0x594E13, +0x594EAB, +0x594FE1; shared: +0x594FE1 -- the caller alone does not separate them",
         "(E) tangents: the eye camera's tangents match the frustum EDVR advertised for its eye to within 9.01e-05 (compared on 2 draw(s) in the camera's first frame)",
         "leak measure over 8 eye draw(s): largest |leak| = 5.945e-08 NDC",
+        "the rows measure as the advertised frustum moved by (+shift.x, +shift.y) (residual 6.84e-08 NDC; next best: the",
     ]
     if rc != 0:
         fail("the fixture reported exit %d" % rc)
@@ -2489,6 +2530,21 @@ def self_test_camera_census():
             _chex("0x241dc2e2960") != 0x241DC2E2960 or _chex("-") is not None or _ctuple("(1,2)") != (1.0, 2.0) or \
             _ctuple("-") is not None or _clist("[1,2,3]") != [1.0, 2.0, 3.0] or _clist("-") is not None:
         fail("the value parsers")
+    # The sign of the shift in the rows: the fit names the convention the rows carry, whichever it is.
+    frustum = [-1.2, 0.7, -0.9, 1.1]
+    shift = (0.001, 0.0005)
+    for label, sx, sy in (("(+shift.x, +shift.y)", 1, 1), ("(+shift.x, -shift.y)", 1, -1),
+                          ("(-shift.x, +shift.y)", -1, 1), ("(-shift.x, -shift.y)", -1, -1)):
+        meas = census_expected_measure(frustum, sx * shift[0], sy * shift[1])
+        fit = census_shift_fit(meas, frustum, shift)
+        if not fit or label not in fit[0] or fit[1] > 1e-12 or not fit[3] > 1e-5:
+            fail("census_shift_fit did not find %s: %r" % (label, fit))
+    meas = census_expected_measure(frustum, 0.0, 0.0)
+    fit = census_shift_fit(meas, frustum, shift)
+    if not fit or "unshifted" not in fit[0]:
+        fail("census_shift_fit did not find the unshifted frustum: %r" % (fit,))
+    if census_expected_measure([1, 1, 0, 1], 0, 0) is not None or census_shift_fit(None, frustum, shift) is not None:
+        fail("a degenerate window or a missing measurement produced a fit")
     # A frame with more runs than the report shows names how many it left out.
     many = []
     for i in range(40):

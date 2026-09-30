@@ -14,9 +14,11 @@
 #include <io.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -1018,6 +1020,63 @@ std::string fixtureLog() {
     return out;
 }
 
+// Two log texts are the same when they differ at most in the last digits of the numbers in them: every line's text is
+// identical and every number is within 1e-5 (relative above one). The scripted session builds its cameras with the
+// library's tan, cos, sin and atan, which may round their last bit differently on another CPU, so the rows it prints can
+// differ in the seventh digit from one machine to the next; the text the formatters write cannot.
+bool sameWithinRounding(const std::string& a, const std::string& b, std::string* why) {
+    size_t i = 0, j = 0;
+    auto number = [](const std::string& s, size_t at, size_t* end, double* value) {
+        size_t k = at;
+        if (k < s.size() && s[k] == '-') ++k;
+        if (k >= s.size() || !std::isdigit(static_cast<unsigned char>(s[k]))) return false;
+        // A hex literal (0x241dc2e2960, +0x594E13, fl=0x1C) is text, not a number.
+        if (s[k] == '0' && k + 1 < s.size() && s[k + 1] == 'x') return false;
+        while (k < s.size() && std::isdigit(static_cast<unsigned char>(s[k]))) ++k;
+        if (k + 1 < s.size() && s[k] == '.' && std::isdigit(static_cast<unsigned char>(s[k + 1]))) {
+            ++k;
+            while (k < s.size() && std::isdigit(static_cast<unsigned char>(s[k]))) ++k;
+        }
+        if (k + 1 < s.size() && (s[k] == 'e' || s[k] == 'E') &&
+            (std::isdigit(static_cast<unsigned char>(s[k + 1])) ||
+             ((s[k + 1] == '-' || s[k + 1] == '+') && k + 2 < s.size() && std::isdigit(static_cast<unsigned char>(s[k + 2]))))) {
+            k += 2;
+            while (k < s.size() && std::isdigit(static_cast<unsigned char>(s[k]))) ++k;
+        }
+        *end = k;
+        *value = std::strtod(s.substr(at, k - at).c_str(), nullptr);
+        return true;
+    };
+    auto hexEnd = [](const std::string& s, size_t at) {   // the end of a 0x literal starting at `at`, or `at` when there is none
+        if (at + 1 >= s.size() || s[at] != '0' || s[at + 1] != 'x') return at;
+        size_t k = at + 2;
+        while (k < s.size() && std::isxdigit(static_cast<unsigned char>(s[k]))) ++k;
+        return k;
+    };
+    while (i < a.size() && j < b.size()) {
+        const size_t ha = hexEnd(a, i), hb = hexEnd(b, j);
+        if (ha != i || hb != j) {   // a hex literal is text, every digit of it
+            if (a.compare(i, ha - i, b, j, hb - j) != 0 || ha == i || hb == j) { if (why) *why = "hex differs near: " + a.substr(i, 40); return false; }
+            i = ha; j = hb;
+            continue;
+        }
+        size_t ea = 0, eb = 0;
+        double va = 0, vb = 0;
+        const bool na = number(a, i, &ea, &va), nb = number(b, j, &eb, &vb);
+        if (na != nb) { if (why) *why = "a number against text near: " + a.substr(i, 40); return false; }
+        if (na) {
+            const double scale = std::max(1.0, std::max(std::fabs(va), std::fabs(vb)));
+            if (!(std::fabs(va - vb) <= 1.0e-5 * scale)) { if (why) *why = "numbers differ near: " + a.substr(i, 40); return false; }
+            i = ea; j = eb;
+            continue;
+        }
+        if (a[i] != b[j]) { if (why) *why = "text differs near: " + a.substr(i, 40); return false; }
+        ++i; ++j;
+    }
+    if (i != a.size() || j != b.size()) { if (why) *why = "one text is longer"; return false; }
+    return true;
+}
+
 void testReaderFixture() {
     std::printf("the reader's fixture\n");
     const std::string fixture = slurp("tools/camera_census_fixture.log");
@@ -1025,8 +1084,15 @@ void testReaderFixture() {
     std::string normalised;
     for (char ch : fixture) if (ch != '\r') normalised += ch;
     check(!fixture.empty(), "tools/camera_census_fixture.log is readable from the repo root");
-    check(normalised == built,
-          "the reader's fixture file is exactly what the DLL's formatters write for the scripted session (python tools\\edvr_log.py --camera-census reads it; regenerate with --print-fixture)");
+    std::string why;
+    const bool same = sameWithinRounding(normalised, built, &why);
+    if (!same) std::printf("  note  %s\n", why.c_str());
+    check(same,
+          "the reader's fixture file is what the DLL's formatters write for the scripted session, to the last digits of its numbers (python tools\\edvr_log.py --camera-census reads it; regenerate with --print-fixture)");
+    check(sameWithinRounding("a 1.0000001 b 0x1F", "a 1.0000002 b 0x1F", nullptr) && !sameWithinRounding("a 1.0001 b", "a 1.0002 b", nullptr) &&
+          !sameWithinRounding("a 1 b 0x1F", "a 1 b 0x1E", nullptr) && !sameWithinRounding("a 1 b", "a 1 c", nullptr) && !sameWithinRounding("a 1", "a 1 ", nullptr) &&
+          sameWithinRounding("x=-0 y=1e-09", "x=0 y=3e-09", nullptr),
+          "the comparison tolerates the seventh digit and a hex literal is text: a digit off at 1e-4, a changed word or hex, a longer line are all different");
     // The golden lines are pinned above; the fixture carries lines of the same classes from the scripted session.
     const char* classes[] = {"vr camera census 5s: frames=", "vr camera census: camera=0x", "vr camera census: changed: camera=0x",
                              "vr camera census: sequence frame=", "vr camera census: call frame=", "vr camera census: eye=",
@@ -1037,7 +1103,12 @@ void testReaderFixture() {
     std::string mutated = normalised;
     const size_t at = mutated.find("vr camera census 5s:");
     if (at != std::string::npos) mutated[at + 3] = '#';
-    check(mutated != built, "control: a fixture file with one character altered is no longer the formatters' output, so the row above can fail");
+    check(!sameWithinRounding(mutated, built, nullptr), "control: a fixture file with one character altered is no longer the formatters' output, so the row above can fail");
+    std::string nudged = normalised;
+    const size_t num = nudged.find("aspect=1.777778");
+    if (num != std::string::npos) nudged.replace(num, 15, "aspect=1.777879");
+    check(num != std::string::npos && !sameWithinRounding(nudged, built, nullptr),
+          "control: a number moved in its fifth digit is no longer the formatters' output either");
 }
 
 int runSelfTest() {
