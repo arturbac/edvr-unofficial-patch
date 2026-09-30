@@ -331,8 +331,22 @@ void scenarios(World& w) {
     vrWorldRouteNoteEyeTaken(0, 77);
     check(vrWorldRouteDoorLayerOnly(0, 77) && !vrWorldRouteDoorLayerOnly(1, 77) && !vrWorldRouteDoorLayerOnly(0, 78),
           "owned: the layer's take of eye 0 in sequence 77 is what makes the door layer-only, for that eye and sequence only");
+    // The temporal door and then the sharpen pass both ask, so the same eye and sequence is asked twice: the answer is the
+    // same and the 5 s line counts it once. The window prints at the first boundary after five seconds (real time).
+    check(vrWorldRouteDoorLayerOnly(0, 77), "owned: the door's second question about the same eye and sequence gets the same answer");
+    Sleep(5100);
     vrWorldRouteFrameBoundary();
     bindingFrameBoundary();
+    {
+        bool lineOk = false, stateOk = false;
+        for (const auto& l : g_log) {
+            if (l.find("vr world route 5s:") == std::string::npos) continue;
+            lineOk = l.find("eye-takes=1 door-layer-only=1 ") != std::string::npos;
+            stateOk = l.find("state=owned") != std::string::npos && l.find("selection=selected") != std::string::npos;
+        }
+        check(lineOk, "owned: the 5 s line counts the eye's take once and the layer-only door once (asked twice)");
+        check(stateOk, "owned: the 5 s line names the state (owned) and the selection (selected)");
+    }
     check(!vrWorldRouteDoorLayerOnly(0, 77), "owned: the per-frame tags are cleared at the boundary");
     const auto stats = flatMonoResolveStats();
     check(stats.hdrResolves >= uint64_t(kVrWorldWarmFrames), "auto: the resolver counted its HDR resolves");

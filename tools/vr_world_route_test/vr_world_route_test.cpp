@@ -573,6 +573,23 @@ void sourcePins() {
               rt.find("kVrWorldFeatureSlot") != std::string::npos,
           "resolve: the resolver runs inside the internal scope, on the world's own upscaler slot");
     check(rt.find("GpuCensusSection::FrameWorldResolve") != std::string::npos, "census: the resolve is timed on its own GPU census section");
+    // The layer-only door is asked twice an eye and sequence (the temporal door, then the sharpen pass): the 5 s line's
+    // door-layer-only counts an eye once, or it would read twice eye-takes on a healthy flight.
+    const std::string door = functionBody(rt, "bool vrWorldRouteDoorLayerOnly(");
+    check(!door.empty() && door.find("g_countedLayerOnly[eye] != sequence") != std::string::npos &&
+              before(door, "g_countedLayerOnly[eye] != sequence", "++g_win.layerOnly") &&
+              count(rt, "++g_win.layerOnly") == 1 && rt.find("g_countedLayerOnly[0] = g_countedLayerOnly[1] = 0;") != std::string::npos,
+          "door: the layer-only door is counted once per eye and sequence, and the tag is cleared at the boundary");
+    // Where the door asks. The temporal pass and the sharpen pass both read the route; nothing else does.
+    const std::string nt = readFile("src\\d3d11\\native_temporal.cpp");
+    const std::string ns = readFile("src\\d3d11\\native_sharpen.cpp");
+    check(!nt.empty() && !ns.empty() && count(nt, "vrWorldRouteDoorLayerOnly(") == 1 && count(ns, "vrWorldRouteDoorLayerOnly(") == 1,
+          "door: the temporal pass and the sharpen pass each ask the route once per eye");
+    check(nt.find("&&!edvr::vrWorldRouteOwnsNextFrame()") != std::string::npos,
+          "eye shift: native_temporal advertises the shift only while the route does not own the next frame");
+    const std::string skip = functionBody(nt, "HRESULT WINAPI skipEye(");
+    check(!skip.empty() && before(skip, "edvr::vrWorldRouteNoteSceneReset();", "s->history[eye]={}"),
+          "scene reset: a withheld eye frame tells the route before it touches the eye's history");
 }
 
 int runSelfTest() {

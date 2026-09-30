@@ -62,6 +62,7 @@ bool g_firstTriggerLogged = false, g_latchLogged = false, g_lateWriteLogged = fa
 uint32_t g_declineLines = 0;
 std::atomic<bool> g_ownsNext{false};
 uint64_t g_takenSequence[2] = {0, 0};
+uint64_t g_countedLayerOnly[2] = {0, 0};     // the sequence each eye's layer-only door was last counted for (it is asked twice an eye)
 bool g_startedOwned = false;                 // the frame now running started owned (the eye shift was off)
 bool g_resourcesLive = false;                // the resolver (and the mipped screen) made resources: release them when the key goes off
 bool g_gatePrev = false, g_gateSeen = false; // the on-foot gate at the last boundary, for the window's flip count
@@ -366,7 +367,8 @@ void vrWorldRouteNoteEyeTaken(uint32_t eye, uint64_t sequence) {
 }
 bool vrWorldRouteDoorLayerOnly(uint32_t eye, uint64_t sequence) {
     if (eye >= 2 || !vrWorldDoorLayerOnly(g_takenSequence[eye], sequence)) return false;
-    ++g_win.layerOnly;
+    // Asked twice an eye and sequence (the temporal door and then the sharpen pass): counted once.
+    if (g_countedLayerOnly[eye] != sequence) { g_countedLayerOnly[eye] = sequence; ++g_win.layerOnly; }
     return true;
 }
 void vrWorldRouteNoteSceneReset() {
@@ -585,6 +587,7 @@ void vrWorldRouteFrameBoundary() {
     std::memset(g_f.candDepth, 0, sizeof(g_f.candDepth));
     g_f.depthMixed = false; g_f.treated = false; g_f.triggered = false;
     g_takenSequence[0] = g_takenSequence[1] = 0;
+    g_countedLayerOnly[0] = g_countedLayerOnly[1] = 0;
 }
 
 }  // namespace edvr
