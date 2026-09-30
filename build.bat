@@ -166,6 +166,9 @@ python tools\check_status_blocks.py --self-test || exit /b 1
 python tools\check_status_blocks.py || exit /b 1
 REM The physics the black-hole shader is held to (docs\black-holes.md).
 python tools\blackhole_optics.py --self-test || exit /b 1
+REM Kerr optics and the hot flow the Sagittarius A* design is held to
+REM (docs\design-sagittarius-a-2026-09-30.md).
+python tools\sgra_optics.py --self-test || exit /b 1
 REM The guard tools\run_jobs.py holds every rig to (no window, no console, no
 REM move of the keyboard focus); its own self-test, run below with the rigs,
 REM starts it on real processes, so this one fails first and fast.
