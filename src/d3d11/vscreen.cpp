@@ -1649,7 +1649,11 @@ __declspec(noinline) bool ensureOurCompositeCb(ID3D11DeviceContext* self, State*
 //
 // Kept as one expression, in the original order, so that a future subscriber
 // is added HERE and nowhere else -- which is the mistake the use site's
-// comment records three times over.
+// comment records three times over. The wake pulse and night vision repeated
+// it: both act below the gate (wakePulseSkips in the offscreen branch,
+// nightVisionMatches on the eye draw) and neither was listed, so with every
+// other subscriber off the gate closed and neither ever ran. They are the last
+// two terms.
 bool drawGateSubscribed(State* s) {
     return s->distanceEnabled || s->countForFlashFix ||
         headOffsetGateWantsPanel() || s->censusSkipCount != 0 ||
@@ -1666,7 +1670,8 @@ bool drawGateSubscribed(State* s) {
         objectProbeWantsDraws() ||
         panelCurveWants() || particleWantsDraws() || backdropWantsDraws() ||
         scrimWantsDraws() || quadProbeWants() || loaderPanelWants() ||
-        introProbeWants() || introPanelWants();
+        introProbeWants() || introPanelWants() ||
+        wakePulseWantsDraws() || nightVisionWantsDraws();
 }
 
 // The bound target's resolve, for the wake pulse, memoised on Rtv0's binding
