@@ -8,6 +8,11 @@ the repo, applies one textual edit (or a few that belong together), compiles the
 common sources, runs it, and requires it to fail on a scenario that belongs to the rule (a FAIL label that starts with one of the mutation's
 scenario ids and a dot). Nothing is written inside the repo; the temp directory is removed at the end.
 
+Two things are linked unmutated beside the module: the common sources and src\\d3d11\\panel_curve.cpp (the module asks it for fix.panel_curvature
+and whether the surface strip is wanted or stood down; its own rules are held by tools\\panel_curve_test). And the screen-space rule is
+src\\d3d11\\intro_curve_math.h's now: the mutations that flip it edit a COPY of that header written beside the module's copy (file "h"), so a
+quoted include finds the mutated one first; the two call-site mutations edit the module itself.
+
   python tools\\intro_curve_test\\mutants.py --self-test       text only: every anchor is found exactly once in the module as it is now,
                                                               every scenario named is in the rig, every scenario of the rig has a mutation
                                                               or a stated reason it has none, and build.bat compiles the rig the way this
@@ -36,10 +41,14 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 SRC = ROOT / "src" / "d3d11"
 MODULE = SRC / "intro_panel.cpp"
+MATH_H = SRC / "intro_curve_math.h"   # the screen-space rule lives here now (S1's pure header); its mutations edit this copy, beside the module's
+FILES = {"cpp": MODULE, "h": MATH_H}
 RIG = HERE / "intro_curve_test.cpp"
 BUILD_BAT = ROOT / "build.bat"
 RIG_LABEL = ":rig_intro_curve_test"
-COMMON = [ROOT / "src" / "common" / n for n in ("config.cpp", "log.cpp", "guard.cpp", "proxy.cpp")]
+# Linked for real, unmutated: the config, the log, the fault guard, the proxy's breadcrumb, and panel_curve.cpp (fix.panel_curvature, the
+# surface strip's wanted() and its stand-down, which the module asks); panel_curve.cpp's own rules are held by tools\panel_curve_test.
+COMMON = [ROOT / "src" / "common" / n for n in ("config.cpp", "log.cpp", "guard.cpp", "proxy.cpp")] + [SRC / "panel_curve.cpp"]
 LIBS = ["user32.lib", "version.lib"]
 
 # How build.bat compiles the rig; --self-test checks that the label still says the same.
@@ -48,15 +57,16 @@ RUN_TIMEOUT = 300.0
 
 
 class Mutant:
-    def __init__(self, name, caught, edits, why):
+    def __init__(self, name, caught, edits, why, file="cpp"):
         self.name = name
         self.caught = tuple([caught] if isinstance(caught, str) else caught)   # scenario ids whose checks must report it
-        self.edits = list(edits)                                                # (old, new) pairs, applied in order
+        self.edits = list(edits)                                                # (old, new) pairs, applied in order, to `file`
         self.why = why
+        self.file = file                                                        # "cpp" (intro_panel.cpp) or "h" (intro_curve_math.h)
 
 
-def M(name, caught, edits, why):
-    return Mutant(name, caught, edits, why)
+def M(name, caught, edits, why, file="cpp"):
+    return Mutant(name, caught, edits, why, file)
 
 
 def drop(old):
@@ -74,7 +84,7 @@ MAX_SLOTS = "constexpr uint32_t kMaxSlots = 2;\n"
 SPLASH_W = "constexpr float kSplashHalfWidthNdc = 1.0440f;\n"
 MAX_SIZE = "constexpr float kMaxSize = 8.0f;\n"
 EYE_EPS = "                constexpr float kEyeCentreEps = 0.02f;\n"
-LOOKS = "bool looksScreenSpace(const float* f) {\n"
+LOOKS = "inline bool introCbLooksScreenSpace(const float f[20]) {\n"   # in intro_curve_math.h: the SS_* anchors below are lines of it
 SS_W12 = "    if (!zero(f[7]) || !zero(f[11])) return false;       // cb2[1].w, cb2[2].w\n"
 SS_LOOP = "    for (uint32_t i = 12; i < 16; ++i) {                 // cb2[3] entirely\n"
 SS_W = "    if (f[19] < 0.999f || f[19] > 1.001f) return false;  // cb2[4].w == 1\n"
@@ -104,7 +114,7 @@ NO_TANGENTS = '    if (!eyeTangents(&outer, &inner)) {\n        *why = "no eye t
 SPAN = '    if (span < 1e-3f) { *why = "the published tangents are degenerate"; return false; }\n'
 VERT = '               "are present -- a partial publish";\n        return false;\n'
 BEHIND = "    if (!(c0[2] < 0.0f)) {\n"
-FINITE = "        if (!isFiniteF(cx[i]) || !isFiniteF(cy[i]) || !isFiniteF(c0[i])) {\n"
+FINITE = "        if (!isFiniteF(cx[i]) || !isFiniteF(cy[i]) || !isFiniteF(c0[i]) || !isFiniteF(cz[i])) {\n"
 VIEWPORT = "                if (nvp == 0 || vp.Width <= 0.0f || vp.Height <= 0.0f ||\n"
 RESTORE = "        ctx->VSSetConstantBuffers(kVsSlot, 1, &orig);\n        g_restore = nullptr;\n"
 BIND = "            ctx->VSSetConstantBuffers(kVsSlot, 1, &ours);\n"
@@ -146,6 +156,42 @@ NOTED_LOCK = ('                        g_lockRefusedNoted = true;\n             
 ANCHORED = "                    g_anchored = true;\n"
 ENGAGED = "            if (++g_applied == 1) {\n"
 OURS_SLOT = "            s->key = cb;\n"
+# the curved movie (step 2)
+SS_CALL = "            if (!introCbLooksScreenSpace(f)) {\n"
+CZ_LOOP = "    for (int i = 0; i < 3; ++i) cz[i] = At(i, 2);\n"
+ISFINITE = "bool isFiniteF(float v) { return v == v && v <= 3.4e38f && v >= -3.4e38f; }\n"
+COL_CZ = "    if (curved) col(cz, false, out + 12);\n"
+ARMED_RESET = "    g_stripArmed = false;   // armed is for the bind this call makes, and for no other\n"
+ARMED_INIT = "            bool armed = false;\n"
+ARMED_SET = "                armed = curved;\n"
+GATE = "                const bool curved = panelCurveSurfaceWanted();\n"
+CURVED_ARG = "                                  g_anchored ? nullptr : &yawDeg, curved)) {\n"
+ARMED_ON = "                g_stripArmed = true;\n                ++g_armedDraws;\n"
+ARMED_NOTED = "                    g_armedNoted = true;\n"
+ARMED_LOG_COLS = "                        ci.segments, static_cast<double>(ci.curvature),\n"
+ARMED_LOG_GAIN = "                        static_cast<double>(kScreenHalfW), g_frame);\n"
+END_DRAW_CLEAR = "    g_stripArmed = false;   // the draw is made: nothing is armed past it\n"
+SHUTDOWN_CLEAR = "    g_restore = nullptr;\n    g_stripArmed = false;\n}"
+GAIN_RET = "float introPanelStripGain() { return kScreenHalfW; }\n"
+RETIRE_ARMED_IF = "            if (g_armedDraws) {\n"
+RETIRE_ARMED_ARG = "                            g_armedDraws);\n"
+
+# A test of the bent edges put back, as three edits of the module (the mutated column write decides a flag, `armed` follows the flag): where the
+# strip's z column is written, compute the two edge midpoints' view-space z -- centre -+ x' cx plus z' cz, with the bent strip's own arc
+# x' = sin(pi c)/(pi c), z' = W (1 - cos(pi c))/(pi c) -- and write the column (and set the flag) only if `condition` holds on zl and zr.
+EDGE_FLAG = (ISFINITE, ISFINITE + "bool g_mutBent = false;   // MUTATION: the draw is bent only if the re-introduced edge test passed\n")
+EDGE_ARMED = (ARMED_SET, "                armed = g_mutBent;\n")
+
+
+def edge_test(condition):
+    return ("    g_mutBent = false;\n"
+            "    if (curved) {\n"
+            "        const float k = 3.14159265f * panelCurveInfo().curvature;\n"
+            "        const float xe = sinf(k) / k, ze = kScreenHalfW * (1.0f - cosf(k)) / k;\n"
+            "        const float zl = c0[2] - xe * cx[2] + ze * cz[2], zr = c0[2] + xe * cx[2] + ze * cz[2];\n"
+            "        if (%s) { col(cz, false, out + 12); g_mutBent = true; }\n"
+            "    }\n" % condition)
+
 
 MUTANTS = [
     # ---- golden: the bytes of cb2 -----------------------------------------------------------------------------------------------
@@ -197,30 +243,34 @@ MUTANTS = [
     M("max-size-4", "head", [(MAX_SIZE, "constexpr float kMaxSize = 4.0f;\n")], "the factor is held at 4 rather than 8"),
     M("max-size-removed", "head-clamp-high", [(SCALE_HI, "")], "the factor has no ceiling"),
     M("min-size-removed", "head-clamp-low", [(SCALE_LO, "")], "the panel may shrink below its own size"),
-    # ---- splash, refuse-*: the screen-space test ---------------------------------------------------------------------------------
-    M("ss-always-true", "splash", [(LOOKS, LOOKS + "    return true;\n")], "every buffer reads as screen-space, the splash's included"),
-    M("ss-drop-cb1-w", "refuse-cb2-1-w", [(SS_W12, "    if (!zero(f[11])) return false;\n")], "cb2[1].w is not looked at"),
-    M("ss-drop-cb2-w", "refuse-cb2-2-w", [(SS_W12, "    if (!zero(f[7])) return false;\n")], "cb2[2].w is not looked at"),
-    M("ss-cb3-skips-x", "refuse-cb2-3-x", [(SS_LOOP, "    for (uint32_t i = 13; i < 16; ++i) {                 // cb2[3] entirely\n")], "cb2[3].x is not looked at"),
-    M("ss-cb3-skips-w", "refuse-cb2-3-w", [(SS_LOOP, "    for (uint32_t i = 12; i < 15; ++i) {                 // cb2[3] entirely\n")], "cb2[3].w is not looked at"),
-    M("ss-cb3-skips-zw", "refuse-cb2-3-z", [(SS_LOOP, "    for (uint32_t i = 12; i < 14; ++i) {                 // cb2[3] entirely\n")], "cb2[3].z and .w are not looked at"),
-    M("ss-cb3-x-only", "refuse-cb2-3-y", [(SS_LOOP, "    for (uint32_t i = 12; i < 13; ++i) {                 // cb2[3] entirely\n")], "only cb2[3].x is looked at"),
-    M("ss-w-window-wide", ("refuse-w-low", "refuse-w-high"), [(SS_W, "    if (f[19] < 0.9f || f[19] > 1.1f) return false;  // cb2[4].w == 1\n")], "cb2[4].w may be anywhere within a tenth of 1"),
-    M("ss-w-window-narrow", ("accept-w-in-low", "accept-w-in-high"), [(SS_W, "    if (f[19] < 0.99999f || f[19] > 1.00001f) return false;  // cb2[4].w == 1\n")], "cb2[4].w must be 1 to five decimals"),
-    M("ss-scale-floor-1", ("refuse-scale-x", "refuse-scale-y"), [(SS_SCALE, "    if (f[0] < 1.0f || f[1] < 1.0f) return false;\n")], "a scale of 8 reads as a plausible half-size in pixels"),
-    M("ss-scale-x-only", "refuse-scale-y", [(SS_SCALE, "    if (f[0] < 16.0f) return false;\n")], "cb2[0].y is not looked at"),
-    M("ss-scale-y-only", "refuse-scale-x", [(SS_SCALE, "    if (f[1] < 16.0f) return false;\n")], "cb2[0].x is not looked at"),
+    # ---- splash, refuse-*: the screen-space test. The rule is intro_curve_math.h's introCbLooksScreenSpace now (the pure header's own rig,
+    # tools\intro_curve_math_test, holds it to every boundary on its own); these mutate THAT copy and run the real module's refusal through it, so
+    # they also prove the module asks the shared rule (the two call-site mutations at the end of the block) and that nothing else decides. -------
+    M("ss-always-true", ("splash", "curved-splash"), [(LOOKS, LOOKS + "    return true;\n")], "every buffer reads as screen-space, the splash's included", "h"),
+    M("ss-drop-cb1-w", "refuse-cb2-1-w", [(SS_W12, "    if (!zero(f[11])) return false;\n")], "cb2[1].w is not looked at", "h"),
+    M("ss-drop-cb2-w", "refuse-cb2-2-w", [(SS_W12, "    if (!zero(f[7])) return false;\n")], "cb2[2].w is not looked at", "h"),
+    M("ss-cb3-skips-x", "refuse-cb2-3-x", [(SS_LOOP, "    for (uint32_t i = 13; i < 16; ++i) {                 // cb2[3] entirely\n")], "cb2[3].x is not looked at", "h"),
+    M("ss-cb3-skips-w", "refuse-cb2-3-w", [(SS_LOOP, "    for (uint32_t i = 12; i < 15; ++i) {                 // cb2[3] entirely\n")], "cb2[3].w is not looked at", "h"),
+    M("ss-cb3-skips-zw", "refuse-cb2-3-z", [(SS_LOOP, "    for (uint32_t i = 12; i < 14; ++i) {                 // cb2[3] entirely\n")], "cb2[3].z and .w are not looked at", "h"),
+    M("ss-cb3-x-only", "refuse-cb2-3-y", [(SS_LOOP, "    for (uint32_t i = 12; i < 13; ++i) {                 // cb2[3] entirely\n")], "only cb2[3].x is looked at", "h"),
+    M("ss-w-window-wide", ("refuse-w-low", "refuse-w-high"), [(SS_W, "    if (f[19] < 0.9f || f[19] > 1.1f) return false;  // cb2[4].w == 1\n")], "cb2[4].w may be anywhere within a tenth of 1", "h"),
+    M("ss-w-window-narrow", ("accept-w-in-low", "accept-w-in-high"), [(SS_W, "    if (f[19] < 0.99999f || f[19] > 1.00001f) return false;  // cb2[4].w == 1\n")], "cb2[4].w must be 1 to five decimals", "h"),
+    M("ss-scale-floor-1", ("refuse-scale-x", "refuse-scale-y"), [(SS_SCALE, "    if (f[0] < 1.0f || f[1] < 1.0f) return false;\n")], "a scale of 8 reads as a plausible half-size in pixels", "h"),
+    M("ss-scale-x-only", "refuse-scale-y", [(SS_SCALE, "    if (f[0] < 16.0f) return false;\n")], "cb2[0].y is not looked at", "h"),
+    M("ss-scale-y-only", "refuse-scale-x", [(SS_SCALE, "    if (f[1] < 16.0f) return false;\n")], "cb2[0].x is not looked at", "h"),
+    M("ss-call-inverted", "golden", [(SS_CALL, "            if (introCbLooksScreenSpace(f)) {\n")], "the movie's own constants are refused and the splash's accepted"),
+    M("ss-call-dropped", "splash", [(SS_CALL, "            if (false) {\n")], "nothing is ever refused: the splash's constants are resized like the movie's"),
     M("refusal-not-for-the-session", ("splash", "refuse-cb2-3-x"), [(REFUSE, REFUSE.replace("                g_refused = true;\n", ""))], "a buffer that does not read as screen-space is not remembered"),
     M("wants-ignores-refusal", "splash", [(WANTS_T, "        (g_matchSplash || g_size != 1.0f || g_worldLock);\n")], "the panel is still wanted after a refusal"),
     # ---- the lock's refusals ------------------------------------------------------------------------------------------------------
-    M("no-pose-not-refused", "no-pose", [(NO_POSE, "    headPose(pose);\n")], "a missing pose is not a reason to leave the movie alone"),
-    M("no-tangents-not-refused", "no-tangents", [(NO_TANGENTS, "    eyeTangents(&outer, &inner);\n")], "missing tangents are not a reason to leave the movie alone"),
+    M("no-pose-not-refused", ("no-pose", "curved-refused"), [(NO_POSE, "    headPose(pose);\n")], "a missing pose is not a reason to leave the movie alone"),
+    M("no-tangents-not-refused", ("no-tangents", "curved-refused"), [(NO_TANGENTS, "    eyeTangents(&outer, &inner);\n")], "missing tangents are not a reason to leave the movie alone"),
     M("degenerate-span-accepted", "degenerate-tangents", [(SPAN, '    if (span < 0.0f) { *why = "the published tangents are degenerate"; return false; }\n')], "a span of nothing is a frustum"),
     M("vertical-derived-again", "no-vertical", [(VERT, '               "are present -- a partial publish";\n        tp = -0.5f * span;\n        bt = 0.5f * span;\n')], "a missing vertical pair is derived as symmetric, as it used to be"),
-    M("behind-not-refused", "behind", [(BEHIND, "    if (false) {\n")], "a panel behind the eye is drawn (and clipped away: the movie vanishes)"),
+    M("behind-not-refused", ("behind", "curved-refused"), [(BEHIND, "    if (false) {\n")], "a panel behind the eye is drawn (and clipped away: the movie vanishes)"),
     M("behind-inverted", ("golden", "behind"), [(BEHIND, "    if (c0[2] < 0.0f) {\n")], "a panel in front of the eye is refused"),
     M("non-finite-not-refused", "non-finite", [(FINITE, "        if (false) {\n")], "a NaN reaches the constant buffer"),
-    M("viewport-not-checked", "viewport", [(VIEWPORT, "                if (false ||\n")], "a degenerate viewport does not stop the lock"),
+    M("viewport-not-checked", ("viewport", "curved-refused"), [(VIEWPORT, "                if (false ||\n")], "a degenerate viewport does not stop the lock"),
     M("lock-line-repeats", "no-pose", [(NOTED_LOCK, NOTED_LOCK.replace("                        g_lockRefusedNoted = true;\n", ""))], "the lock's refusal is logged at every draw"),
     M("eyes-line-repeats", "eyes-alike", [(NOTED_EYES, NOTED_EYES.replace("                        g_lockRefusedNoted = true;\n", ""))], "the eye refusal is logged at every draw"),
     # ---- the eye ----------------------------------------------------------------------------------------------------------------------
@@ -229,12 +279,12 @@ MUTANTS = [
     M("eye-eps-0.04", "eyes-faint-known", [(EYE_EPS, "                constexpr float kEyeCentreEps = 0.04f;\n")], "a centre of +-0.03 is too faint to name the eye"),
     M("eye-always-known", ("eyes-symmetric", "eyes-near-symmetric"), [(KNOWN, "                s.eyeKnown = true;\n")], "the eye is always known, a symmetric headset's included"),
     M("eye-sign-inverted", ("golden", "eyes-swapped"), [(LEFT, "                s.leftEye = f[16] < 0.0f;\n")], "the left eye is the one with the negative centre"),
-    M("eyes-agreeing-accepted", "eyes-alike", [(EYES_REFUSED, "                if (!s->eyeKnown) {\n")], "two buffers that read the same eye are both drawn"),
+    M("eyes-agreeing-accepted", ("eyes-alike", "curved-eyes-alike"), [(EYES_REFUSED, "                if (!s->eyeKnown) {\n")], "two buffers that read the same eye are both drawn"),
     M("eyes-disagree-inverted", "golden", [(DISAGREE, "                    if (o.leftEye != s->leftEye) eyesDisagree = false;\n")], "two buffers that name different eyes are refused"),
     # ---- config -----------------------------------------------------------------------------------------------------------------------
     M("stock-matches-splash", "config", [(CFG_SPLASH, "    g_matchSplash = true;\n")], "stock still matches the splash"),
     M("stock-resizes", "config", [(CFG_SIZE, "    g_size = 0.0f;   // derived at readback when on\n")], "stock still resizes"),
-    M("head-locks", "head", [(CFG_LOCK, "    g_worldLock = true;\n")], "head mode still holds the panel on the world"),
+    M("head-locks", ("head", "curved-head"), [(CFG_LOCK, "    g_worldLock = true;\n")], "head mode still holds the panel on the world"),
     M("wants-needs-both", "config", [(WANTS_R, "    return (wantsTransform && introUpscaleWants()) && !g_retired;\n")], "the transform and the resampler must both be wanted"),
     M("wants-ignores-retirement", ("retire-used", "retire-unseen"), [(WANTS_R, "    return (wantsTransform || introUpscaleWants());\n")], "the panel is still wanted after the intro is over"),
     M("distance-floor-removed", "distance", [(DIST_LO, "")], "the distance may be under a metre"),
@@ -249,7 +299,7 @@ MUTANTS = [
     M("fill-no-size", "gates", [(FILL_SIZE, "")], "any surface is the fill's surface"),
     M("fill-width-only", "gates", [(FILL_SIZE, "    if (srvW != g_fillW) return false;\n")], "the surface's height is not compared"),
     M("fill-not-needed", "splash-no-fill", [(FILL, "")], "the splash is read without a fill"),
-    M("lock-only-read", "stock", [(LOCK_ONLY, "        if (false) {\n")], "at stock the constants are read back and replaced like the movie's"),
+    M("lock-only-read", ("stock", "curved-stock"), [(LOCK_ONLY, "        if (false) {\n")], "at stock the constants are read back and replaced like the movie's"),
     M("recentre-every-time", ("golden", "gates"), [(RECENTRE, "    if (!sceneArrived()) {\n")], "every composite asks the vr half to recentre"),
     M("recentre-after-the-scene", "scene-arrived", [(RECENTRE, "    if (!g_recentreRequested) {\n")], "the recentre is asked for after the scene has arrived"),
     M("third-buffer-served", "third-buffer", [(MAX_SLOTS, "constexpr uint32_t kMaxSlots = 3;\n")], "a third buffer gets a slot"),
@@ -259,11 +309,50 @@ MUTANTS = [
     M("resampler-left-running", ("retire-used", "retire-unseen"), [(UP_SHUTDOWN, "")], "the resample chain stays resident after the intro"),
     M("reconfigure-revives", ("retire-used", "retire-unseen"), [(CFG_FIRST, "    g_retired = false;\n" + CFG_FIRST)], "a reload of the config brings the panel back after the intro"),
     M("slot-key-lost", "shutdown-relearn", [(OURS_SLOT, "                s->key = nullptr;\n")], "a slot cannot find its buffer again"),
+    # ---- curved*: the movie follows fix.panel_curvature (step 2; round 3 took the test of the bent edges out) ------------------------
+    # the z column, cb2[3]
+    M("cz-column-dropped", "curved", [(COL_CZ, "")], "cb2[3] stays zero at curvature 0.3: the strip has no depth direction to scale"),
+    M("cz-sign-flipped", "curved", [(CZ_LOOP, "    for (int i = 0; i < 3; ++i) cz[i] = -At(i, 2);\n")], "the z column points away from the viewer"),
+    M("cz-wrong-axis", "curved", [(CZ_LOOP, "    for (int i = 0; i < 3; ++i) cz[i] = At(i, 1);\n")], "the z column is the panel's y axis"),
+    M("cz-scaled-by-half-width", "curved", [(CZ_LOOP, "    for (int i = 0; i < 3; ++i) cz[i] = At(i, 2) * kScreenHalfW;\n")], "the z column is not unit length"),
+    M("cz-scaled-by-curvature", ("curved", "curved-live"), [(CZ_LOOP, "    for (int i = 0; i < 3; ++i) cz[i] = At(i, 2) * panelCurveInfo().curvature;\n")], "the z column depends on the curvature"),
+    M("cz-over-the-y-column", "curved", [(COL_CZ, "    if (curved) col(cz, false, out + 8);\n")], "the z column lands in cb2[2], over the y column"),
+    M("cz-drops-the-vertical-shift", "curved-asymmetric", [(COL_CZ, "    if (curved) { float t[4]; col(cz, false, t); out[12] = t[0]; out[14] = t[2]; out[15] = t[3]; }\n")],
+      "the z column's y leaves out the frustum's vertical shift (m12), invisible on a symmetric headset"),
+    M("cz-written-when-flat", ("golden", "golden-zero"), [(COL_CZ, "    col(cz, false, out + 12);\n")], "cb2[3] is written whether or not the movie is bent"),
+    # a test of the bent edges against the eye, put back: there is none, and it popped the whole bend off at about 20 degrees of head yaw. Each is
+    # the round-2 test in the module's own terms (three edits: a flag, the test deciding it, and `armed` following it): the nearer edge midpoint
+    # must be in front of the eye -- by nothing, by 5 cm, on the left only, on the right only -- or the draw is not bent. They all bite where
+    # curved-no-edge-test stands, with the centre in front and an edge at or behind the eye.
+    M("edge-test-hard", "curved-no-edge-test", [EDGE_FLAG, (COL_CZ, edge_test("zl < 0.0f && zr < 0.0f")), EDGE_ARMED], "a bent edge behind the eye keeps the draw flat"),
+    M("edge-test-margin", "curved-no-edge-test", [EDGE_FLAG, (COL_CZ, edge_test("zl < -0.05f && zr < -0.05f")), EDGE_ARMED], "a bent edge within 5 cm of the eye keeps the draw flat"),
+    M("edge-test-left-only", "curved-no-edge-test", [EDGE_FLAG, (COL_CZ, edge_test("zl < 0.0f")), EDGE_ARMED], "a bent edge behind the eye on one side keeps the draw flat"),
+    M("edge-test-right-only", "curved-no-edge-test", [EDGE_FLAG, (COL_CZ, edge_test("zr < 0.0f")), EDGE_ARMED], "a bent edge behind the eye on the other side keeps the draw flat"),
+    # which curvature, and whether the strip is wanted
+    M("curved-not-passed", "curved", [(CURVED_ARG, "                                  g_anchored ? nullptr : &yawDeg, false)) {\n")], "the curve never reaches the transform"),
+    M("gate-ignores-stand-down", "curved-stood-down", [(GATE, "                const bool curved = panelCurveInfo().curvature > 0.0f;\n")], "a stood-down surface strip is still bent for"),
+    M("gate-follows-the-screens-wants", "curved-stood-down", [(GATE, "                const bool curved = panelCurveWants();\n")], "the screen's own flag decides, not the surface's"),
+    M("gate-always-bends", ("golden", "golden-zero"), [(GATE, "                const bool curved = true;\n")], "curvature 0 still bends the movie"),
+    # armed, and its scope
+    M("armed-never", "curved", [(ARMED_ON, "                ++g_armedDraws;\n")], "the strip is never armed"),
+    M("armed-in-every-bind", "curved-head", [(ARMED_INIT, "            bool armed = panelCurveSurfaceWanted();\n")], "a size-only bind arms the strip too"),
+    M("armed-not-cleared-by-endDraw", "curved", [(END_DRAW_CLEAR, "")], "the strip stays armed after the draw"),
+    M("armed-not-reset-by-the-next-call", "curved-armed-scope", [(ARMED_RESET, "")], "a call that binds nothing leaves the last bind's strip armed"),
+    M("armed-survives-shutdown", "curved-armed-scope", [(SHUTDOWN_CLEAR, "    g_restore = nullptr;\n}")], "the shutdown leaves the strip armed"),
+    M("armed-from-the-top", ("curved-stock", "curved-head", "curved-splash", "curved-eyes-alike", "curved-refused"),
+      [(ARMED_RESET, "    g_stripArmed = panelCurveSurfaceWanted();   // armed is for the bind this call makes, and for no other\n")], "the strip is armed by the curvature alone, bind or no bind"),
+    M("gain-is-the-half-height", "curved", [(GAIN_RET, "float introPanelStripGain() { return kScreenHalfH; }\n")], "the strip's depth gain is the panel's half-height"),
+    # the lines
+    M("armed-line-repeats", "curved-live", [(ARMED_NOTED, "")], "the first-armed line is written at every armed draw"),
+    M("armed-line-constant-columns", "curved", [(ARMED_LOG_COLS, "                        64, static_cast<double>(ci.curvature),\n")], "the line says 64 columns whatever is configured"),
+    M("armed-line-gain", "curved", [(ARMED_LOG_GAIN, "                        static_cast<double>(kScreenHalfH), g_frame);\n")], "the line names the panel's half-height as the gain"),
+    M("retirement-count-dropped", ("curved", "curved-live"), [(ARMED_ON, "                g_stripArmed = true;\n")], "the retirement line's count of armed draws is never counted"),
+    M("retirement-count-always", "retire-used", [(RETIRE_ARMED_IF, "            if (true) {\n")], "the retirement line counts armed draws even when there were none"),
+    M("retirement-count-wrong", ("curved-live", "curved-stood-down"), [(RETIRE_ARMED_ARG, "                            g_applied);\n")], "the armed count in the retirement line is the resized count"),
 ]
 
 # Scenarios no mutation is tied to, and why: they pin something no one-rule edit of the module can break.
 NO_MUTANT = {
-    "golden-zero": "the module does not read fix.panel_curvature today, so it is golden with the key set to 0; it exists for the change that will",
     "head-symmetric": "head mode never reads the eye: its absence of a refusal is what a refusal would have to add",
 }
 
@@ -413,7 +502,8 @@ def run_all(only=None, jobs=None, keep=False, dry_run=False, verbose=False, out=
         return 0
     gen = find_gen()
     tc = Toolchain()
-    module_text = read_source(MODULE)
+    sources = {k: read_source(p) for k, p in FILES.items()}
+    module_text = sources["cpp"]
     work = Path(tempfile.mkdtemp(prefix="icm_"))
     workers = jobs or min(4, os.cpu_count() or 2)
     try:
@@ -448,12 +538,15 @@ def run_all(only=None, jobs=None, keep=False, dry_run=False, verbose=False, out=
 
         def one(index, m):
             try:
-                mutated = apply_edits(module_text, m.edits, m.name)
+                mutated = apply_edits(sources[m.file], m.edits, m.name)
             except ValueError as error:
                 return m, "badedit", str(error)
             d = work / ("m%02d" % index)
             d.mkdir()
-            (d / "intro_panel.cpp").write_text(mutated, encoding="utf-8", newline="\n")
+            # the module is compiled from this directory, and a mutated header sits beside it: a quoted include finds it before src\d3d11's
+            (d / "intro_panel.cpp").write_text(mutated if m.file == "cpp" else module_text, encoding="utf-8", newline="\n")
+            if m.file == "h":
+                (d / MATH_H.name).write_text(mutated, encoding="utf-8", newline="\n")
             code, text, mobj = compile_obj(tc, d / "intro_panel.cpp", d, [d] + base_inc)
             if code != 0:
                 return m, "nocompile", (text.strip().splitlines() or [""])[-1]
@@ -510,17 +603,20 @@ def self_test(build_bat=BUILD_BAT):
     check(joined is not None and [" ".join(l.split()) for l in joined] == ["x y", "exit /b 0"], "label_block joins continuations and stops at the next label")
     check(rig_scenarios('{"golden", scnGolden}, {"refuse-w-low", scnVariant<8>}') == {"golden", "refuse-w-low"}, "rig_scenarios reads the scenario table")
 
-    # every mutation against the module as it is now, and against the rig
-    module = read_source(MODULE)
+    # every mutation against the sources as they are now (the module, or the pure header for the screen-space rule), and against the rig
+    sources = {k: read_source(p) for k, p in FILES.items()}
     rig = read_source(RIG)
     scenarios = rig_scenarios(rig)
     names = [m.name for m in MUTANTS]
     check(len(names) == len(set(names)), "mutation names are unique")
     check(len(MUTANTS) >= 14, "the mutation list did not shrink below 14 (%d)" % len(MUTANTS))
     for m in MUTANTS:
+        check(m.file in FILES, "%s edits %s, which this tool does not know" % (m.name, m.file))
+        if m.file not in FILES:
+            continue
         try:
-            mutated = apply_edits(module, m.edits, m.name)
-            check(mutated != module, "%s changes the module" % m.name)
+            mutated = apply_edits(sources[m.file], m.edits, m.name)
+            check(mutated != sources[m.file], "%s changes its source" % m.name)
         except ValueError as error:
             failures.append(str(error))
         for c in m.caught:
@@ -533,7 +629,9 @@ def self_test(build_bat=BUILD_BAT):
         check(s not in covered, "%s has a mutation and is also listed as having none" % s)
 
     # the module still has the sources and headers the rig stubs against
-    check(MODULE.is_file() and (SRC / "intro_panel.h").is_file() and (SRC / "intro_upscale.h").is_file(), "the module's headers are where the rig includes them from")
+    check(MODULE.is_file() and MATH_H.is_file() and (SRC / "intro_panel.h").is_file() and (SRC / "intro_upscale.h").is_file() and (SRC / "panel_curve.h").is_file() and
+          (SRC / "screen_motion.h").is_file(), "the module's headers are where the rig includes them from")
+    check('#include "intro_curve_math.h"' in sources["cpp"], "intro_panel.cpp includes intro_curve_math.h (the screen-space rule's mutations edit a copy of that header beside the module)")
 
     # build.bat compiles the rig the way this tool does, and runs this tool's self-test
     bat = Path(build_bat).read_bytes().decode("utf-8", errors="replace")
@@ -544,8 +642,8 @@ def self_test(build_bat=BUILD_BAT):
         cl = next((l for l in block if l.strip().lower().startswith("cl.exe")), "")
         for flag in CL_FLAGS:
             check(flag in cl, "build.bat's rig compile has %s" % flag)
-        for src in ("tools\\intro_curve_test\\intro_curve_test.cpp", "src\\d3d11\\intro_panel.cpp", "src\\common\\config.cpp", "src\\common\\log.cpp",
-                    "src\\common\\guard.cpp", "src\\common\\proxy.cpp"):
+        for src in ("tools\\intro_curve_test\\intro_curve_test.cpp", "src\\d3d11\\intro_panel.cpp", "src\\d3d11\\panel_curve.cpp", "src\\common\\config.cpp",
+                    "src\\common\\log.cpp", "src\\common\\guard.cpp", "src\\common\\proxy.cpp"):
             check(src in cl, "build.bat's rig compile has %s (the sources this tool links)" % src)
         check('/I"src\\d3d11"' in cl, "build.bat's rig compile finds the headers through /I src\\d3d11")
         for lib in LIBS:

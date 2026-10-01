@@ -39,6 +39,19 @@
 //   C11 THE PIPELINE      nothing but slot-0 vertex buffer, index buffer and topology is touched: the VS constant buffers, the PS resource,
 //                         the sampler, the rasterizer state and viewport, the output merger and vertex slots 1..3 are the game's at draw time
 //                         and afterwards.
+//   C12 THE SURFACE STRIP panelCurveSurfaceWanted / Draw / Info, the strip of the intro movie and the splash (a composite that is not the
+//                         screen): the arc of the screen over the CALLER's gain and direction (toward +1 is sign -1 in the screen's terms),
+//                         the vertex bytes equal an independent recomputation (curvature 0.1..1 x columns 8/64/256 x toward +1/-1 x gain
+//                         1/4.44444/100), one build per change of curvature, columns, gain or direction and none otherwise, nothing wanted
+//                         or built at curvature 0 (the identity test's one column included) or above 1 or below 0, no SIZE and no override
+//                         needed, no motion pass; drawn with the game's rasterizer state with the cull OFF and every other field the game's,
+//                         that state created once per distinct description of the game's (and one that culls nothing, or none bound, left
+//                         alone), the game's state back and no reference left on it; a null context or draw, a gain that is not a positive
+//                         number and a direction that is not +-1 draw nothing and stand nothing down; the shutdown releases the strip.
+//   C13 SURFACE VS SCREEN the two strips side by side: the surface leaves the screen's strip, gain, ready flag and counters alone; one generator
+//                         builds both (the screen at sign -1 is the surface at toward +1, byte for byte); a fault of the screen's stands only
+//                         the screen down, a fault of the surface's only the surface (the input assembler AND the rasterizer state back, the
+//                         surface off for the session whatever the configuration or the shutdown does), each in its own log line.
 //
 // tools\panel_curve_test\mutants.py compiles this rig against a copy of the module with ONE rule flipped and requires the rig to fail on the
 // case that belongs to the rule: every check below carries a label "C<case>.<what>", and that prefix is what the tool looks for.
@@ -375,6 +388,8 @@ struct Gpu {
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11SamplerState> sampler;
     ComPtr<ID3D11RasterizerState> rs;
+    ComPtr<ID3D11RasterizerState> rsOdd;    // a state with every field off the default and the cull on the FRONT: what the cull-off copy must keep
+    ComPtr<ID3D11RasterizerState> rsNone;   // a state that already culls nothing
     ComPtr<ID3D11BlendState> blend;
     ComPtr<ID3D11DepthStencilState> dss;
     bool ok = false;
@@ -446,6 +461,25 @@ Gpu makeGpu() {
     rd.CullMode = D3D11_CULL_BACK;   // the game's: back faces culled, so the winding is load-bearing
     rd.DepthClipEnable = TRUE;
     dev->CreateRasterizerState(&rd, &g.rs);
+    D3D11_RASTERIZER_DESC odd{};
+    odd.FillMode = D3D11_FILL_SOLID;
+    odd.CullMode = D3D11_CULL_FRONT;
+    odd.FrontCounterClockwise = TRUE;
+    odd.DepthBias = 7;
+    odd.DepthBiasClamp = 0.5f;
+    odd.SlopeScaledDepthBias = 1.25f;
+    odd.DepthClipEnable = FALSE;
+    odd.ScissorEnable = TRUE;
+    odd.MultisampleEnable = FALSE;
+    odd.AntialiasedLineEnable = TRUE;
+    dev->CreateRasterizerState(&odd, &g.rsOdd);
+    D3D11_RASTERIZER_DESC none = rd;
+    none.CullMode = D3D11_CULL_NONE;
+    // Not the cull-off copy of the game's state under another name: the runtime hands back ONE object for identical descriptions, so a
+    // state equal to what the module derives from rs would share its reference count with the module's cache and hide a leak (or look like one).
+    none.DepthBias = 3;
+    none.SlopeScaledDepthBias = 0.5f;
+    dev->CreateRasterizerState(&none, &g.rsNone);
     D3D11_BLEND_DESC bd{};
     bd.RenderTarget[0].BlendEnable = TRUE;
     bd.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
@@ -465,7 +499,7 @@ Gpu makeGpu() {
     dd.BackFace = dd.FrontFace;
     dev->CreateDepthStencilState(&dd, &g.dss);
 
-    g.ok = g.gameVb && g.gameIb16 && g.gameIb32 && g.sizeVb && g.cb0 && g.cb1 && g.srv && g.rtv && g.sampler && g.rs && g.blend && g.dss;
+    g.ok = g.gameVb && g.gameIb16 && g.gameIb32 && g.sizeVb && g.cb0 && g.cb1 && g.srv && g.rtv && g.sampler && g.rs && g.rsOdd && g.rsNone && g.blend && g.dss;
     return g;
 }
 
@@ -654,16 +688,32 @@ void verifyStripDraw(const std::string& tag, const char* who, const DrawRecord& 
 // How many references the game's own input-assembler buffers carry. The module takes one on each with IAGet* and gives it back in the
 // restore; a restore that forgets leaks the game's buffers, one reference a draw. Measured around a call, with the rig's own references
 // (the snapshot taken before it) alive at both ends.
+// The rasterizer states are in it too: the surface strip takes a reference on the game's with RSGetState and owes it back.
 struct Refs {
-    ULONG vb = 0, ib16 = 0, ib32 = 0;
-    bool operator==(const Refs& o) const { return vb == o.vb && ib16 == o.ib16 && ib32 == o.ib32; }
+    ULONG vb = 0, ib16 = 0, ib32 = 0, rs = 0, rsOdd = 0, rsNone = 0;
+    bool operator==(const Refs& o) const { return vb == o.vb && ib16 == o.ib16 && ib32 == o.ib32 && rs == o.rs && rsOdd == o.rsOdd && rsNone == o.rsNone; }
 };
 ULONG refCount(IUnknown* u) {
     if (!u) return 0;
     u->AddRef();
     return u->Release();
 }
-Refs takeRefs(const Gpu& g) { return Refs{refCount(g.gameVb.Get()), refCount(g.gameIb16.Get()), refCount(g.gameIb32.Get())}; }
+Refs takeRefs(const Gpu& g) {
+    Refs r{refCount(g.gameVb.Get()), refCount(g.gameIb16.Get()), refCount(g.gameIb32.Get()), refCount(g.rs.Get()), refCount(g.rsOdd.Get()), refCount(g.rsNone.Get())};
+    // The recorders' snapshots hold whatever rasterizer state was bound at each draw -- the game's own, for a draw that did not change it. Those
+    // are the rig's references, not the module's, and they come and go with the recorders: taken out, so a reference the MODULE forgot to give
+    // back is still one too many. (The recorded buffers are the strips', never the game's, so the buffer counts need no such correction.)
+    auto held = [&](const Snapshot& s) {
+        const ID3D11RasterizerState* at = s.rs.Get();
+        if (!at) return;
+        if (at == g.rs.Get()) --r.rs;
+        else if (at == g.rsOdd.Get()) --r.rsOdd;
+        else if (at == g.rsNone.Get()) --r.rsNone;
+    };
+    for (const DrawRecord& d : g_draws) held(d.snap);
+    for (const MotionCall& m : g_motion) held(m.snap);
+    return r;
+}
 
 // The game's state back after a call: the input assembler exactly as it was, everything else too, and no reference left behind.
 void verifyRestored(const std::string& tag, const char* who, const Snapshot& before, const Snapshot& after, const Refs* refs0 = nullptr, const Refs* refs1 = nullptr) {
@@ -671,7 +721,8 @@ void verifyRestored(const std::string& tag, const char* who, const Snapshot& bef
     check(pipelineDiff(before, after) == 0, L(tag, who, "restored-pipeline"), fmt("the pipeline differs afterwards (bits %u)", pipelineDiff(before, after)));
     if (refs0 && refs1)
         check(*refs0 == *refs1, L(tag, who, "restored-refs"),
-              fmt("references on the game's vertex / index buffers went from %lu/%lu/%lu to %lu/%lu/%lu", refs0->vb, refs0->ib16, refs0->ib32, refs1->vb, refs1->ib16, refs1->ib32));
+              fmt("references on the game's vertex / index buffers and rasterizer states went from %lu/%lu/%lu and %lu/%lu/%lu to %lu/%lu/%lu and %lu/%lu/%lu", refs0->vb, refs0->ib16,
+                  refs0->ib32, refs0->rs, refs0->rsOdd, refs0->rsNone, refs1->vb, refs1->ib16, refs1->ib32, refs1->rs, refs1->rsOdd, refs1->rsNone));
 }
 
 // The motion pass of a substitution: once, the strip's own draw arguments, the original function pointer, the curve {pi c, columns, -sign gain, 0},
@@ -1236,15 +1287,456 @@ void case11(Gpu& g) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
+// C12 and C13: the surface strip (panelCurveSurfaceWanted / Draw / Info), the intro movie's and the splash's.
+// ---------------------------------------------------------------------------------------------------------------------------------
+constexpr float kSurfaceGain = 4.44444f;   // the panel's half-width in metres: the caller's, the same for the movie and the splash
+
+// The strip a surface asks for, in the generator's own terms: toward +1 (a step in +z' moves toward the viewer) is sign -1 there.
+Spec surfaceSpec(float curvature, int columns, int toward, float gain) { return Spec{curvature, columns, -toward, gain}; }
+
+// Everything but the cull: what the cull-off copy of a game's rasterizer state must keep.
+bool sameButCull(const D3D11_RASTERIZER_DESC& a, const D3D11_RASTERIZER_DESC& b) {
+    return a.FillMode == b.FillMode && a.FrontCounterClockwise == b.FrontCounterClockwise && a.DepthBias == b.DepthBias && a.DepthBiasClamp == b.DepthBiasClamp &&
+           a.SlopeScaledDepthBias == b.SlopeScaledDepthBias && a.DepthClipEnable == b.DepthClipEnable && a.ScissorEnable == b.ScissorEnable &&
+           a.MultisampleEnable == b.MultisampleEnable && a.AntialiasedLineEnable == b.AntialiasedLineEnable;
+}
+
+// One surface draw: our own buffers bound (not the game's, and not the screen's strip), the arguments, the bytes against the independent bend,
+// every other binding the game's, and the rasterizer state the game's with the cull off (or the game's own, when it culls nothing or is unset).
+void verifySurfaceDraw(const std::string& tag, const char* who, const DrawRecord& d, const Spec& s, const Gpu& g, ID3D11DeviceContext* ctx, const Snapshot& baseline,
+                       ID3D11Buffer* notThisVb) {
+    const UINT n = static_cast<UINT>(s.columns);
+    check(d.ctx == ctx, L(tag, who, "context"), "the draw was handed another context");
+    check(d.count == 6 * n && d.instances == 1 && d.start == 0 && d.base == 0 && d.startInstance == 0, L(tag, who, "arguments"),
+          fmt("drawn with (%u, %u, %u, %d, %u), want (%u, 1, 0, 0, 0)", d.count, d.instances, d.start, d.base, d.startInstance, 6 * n));
+    check(d.snap.vb0 && d.snap.vb0 != g.gameVb && d.snap.vb0.Get() != notThisVb && d.snap.stride0 == 20 && d.snap.offset0 == 0, L(tag, who, "vertex-buffer"),
+          "slot 0 held " + describeIa(d.snap) + " (the surface strip's own buffer is wanted: not the game's, not the screen's)");
+    check(d.snap.ib && d.snap.ib != g.gameIb16 && d.snap.ib != g.gameIb32 && d.snap.ibFmt == DXGI_FORMAT_R16_UINT && d.snap.ibOffset == 0, L(tag, who, "index-buffer"),
+          "the index buffer was " + describeIa(d.snap));
+    check(d.snap.topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, L(tag, who, "topology"), fmt("topology %d at the draw", static_cast<int>(d.snap.topo)));
+    check(d.vbBytes.size() == 20u * 2u * (n + 1) && d.ibBytes.size() == 2u * 6u * n, L(tag, who, "sizes"),
+          fmt("%zu vertex bytes and %zu index bytes, want %u and %u", d.vbBytes.size(), d.ibBytes.size(), 20u * 2u * (n + 1), 2u * 6u * n));
+    const std::string problem = stripProblem(d.vbBytes, d.ibBytes, s);
+    check(problem.empty(), L(tag, who, "bytes"), problem);
+    check((pipelineDiff(d.snap, baseline) & ~static_cast<unsigned>(kDiffRs)) == 0 && std::memcmp(&d.snap.vp, &baseline.vp, sizeof(baseline.vp)) == 0, L(tag, who, "pipeline"),
+          fmt("the pipeline around the draw differs from the game's (bits %u)", pipelineDiff(d.snap, baseline)));
+    ID3D11RasterizerState* gameRs = baseline.rs.Get();
+    D3D11_RASTERIZER_DESC gd{}, dd{};
+    if (gameRs) gameRs->GetDesc(&gd);
+    if (gameRs && gd.CullMode != D3D11_CULL_NONE) {
+        ID3D11RasterizerState* at = d.snap.rs.Get();
+        if (at) at->GetDesc(&dd);
+        check(at && at != gameRs && dd.CullMode == D3D11_CULL_NONE && sameButCull(dd, gd), L(tag, who, "cull-off"),
+              "the draw's rasterizer state is not the game's with the cull off and every other field the game's");
+    } else {
+        check(d.snap.rs.Get() == gameRs, L(tag, who, "rasterizer-left-alone"), "a state that culls nothing (or no state at all) was replaced");
+    }
+}
+
+// The surface strip's own counters, as a change from where they stood (the counters are the session's: a case does not start at zero).
+bool surfaceMoved(const PanelCurveSurfaceInfo& from, uint64_t built, uint64_t drawn, uint64_t states) {
+    const PanelCurveSurfaceInfo i = panelCurveSurfaceInfo();
+    return i.built == from.built + built && i.drawn == from.drawn + drawn && i.rasterStates == from.rasterStates + states;
+}
+
+// A call to panelCurveSurfaceDraw with everything around it measured: the snapshots, the references, the recorder.
+struct SurfaceCall {
+    bool returned = false;
+    Snapshot before, after;
+    Refs refs0, refs1;
+};
+SurfaceCall surfaceCall(Gpu& g, float gain, int toward, edvr::PanelCurveDrawFn draw = recordingDraw) {
+    ID3D11DeviceContext* ctx = g.ctx.Get();
+    SurfaceCall c;
+    resetRecorders();
+    c.before = takeSnapshot(ctx);
+    c.refs0 = takeRefs(g);
+    c.returned = panelCurveSurfaceDraw(ctx, gain, toward, draw);
+    c.refs1 = takeRefs(g);   // (the recorders' own references on the game's state are taken out there)
+    c.after = takeSnapshot(ctx);
+    return c;
+}
+
+void case12(Gpu& g) {
+    std::printf("C12 the surface strip: nothing at curvature 0; above it the screen's own arc over the caller's gain and direction\n");
+    ID3D11DeviceContext* ctx = g.ctx.Get();
+    const std::string tag = "C12";
+    bindGame(g, GameState::Canonical);
+    const PanelCurveSurfaceInfo start = panelCurveSurfaceInfo();
+    const PanelCurveInfo screen0 = panelCurveInfo();
+
+    // ---- curvature 0: nothing is wanted, nothing is built, nothing is drawn -- and the identity test's column count does not change that.
+    for (int cols : {64, 1}) {
+        applyConfig("0", cols, 1, "0");
+        g_note = fmt("%d columns at curvature 0", cols);
+        const bool screenWants = panelCurveWants();
+        const SurfaceCall c = surfaceCall(g, kSurfaceGain, 1);
+        check(screenWants == (cols == 1), "C12.off-fixture", "the screen's own wants() is true for the identity test (1 column) and false at the default: the point of the two cases");
+        check(!panelCurveSurfaceWanted(), "C12.off-wanted", "the surface is wanted at curvature 0 (it follows the live curvature, not panelCurveWants())");
+        check(!c.returned && g_draws.empty() && g_motion.empty(), "C12.off-draw", "the surface strip drew, or said it did, at curvature 0");
+        check(surfaceMoved(start, 0, 0, 0) && !panelCurveSurfaceInfo().standDown, "C12.off-nothing-built", "a strip or a state was built, or the surface stood down, at curvature 0");
+        verifyRestored(tag, "off", c.before, c.after, &c.refs0, &c.refs1);
+    }
+    g_note.clear();
+
+    // ---- curvature 0.3: wanted, and independent of everything the screen has to learn (no z gain, no SIZE bound).
+    applyConfig("0.3", 64, 1, "0");
+    bindSizeSlot(g, false);
+    const Spec base = surfaceSpec(0.3f, 64, 1, kSurfaceGain);
+    check(panelCurveSurfaceWanted(), "C12.wanted", "the surface is not wanted at curvature 0.3");
+    {
+        const bool reissueReady0 = panelCurveReissueReady();
+        const SurfaceCall c = surfaceCall(g, kSurfaceGain, 1);
+        check(c.returned && g_draws.size() == 1, "C12.first-draw", fmt("returned %d, %zu draws: the surface strip needs no SIZE and no gain override", c.returned, g_draws.size()));
+        check(g_motion.empty(), "C12.no-motion", "the surface strip issued the screen's motion pass (the movie and the splash have none)");
+        if (g_draws.size() == 1) verifySurfaceDraw(tag, "first", g_draws[0], base, g, ctx, c.before, nullptr);
+        verifyRestored(tag, "first", c.before, c.after, &c.refs0, &c.refs1);
+        check(surfaceMoved(start, 1, 1, 1) && !panelCurveSurfaceInfo().standDown, "C12.first-counters", "one strip, one draw, one rasterizer state");
+        const PanelCurveInfo si = panelCurveInfo();
+        check(si.standDown == screen0.standDown && si.ready == screen0.ready && si.gain == screen0.gain && si.reissues == screen0.reissues && panelCurveReissueReady() == reissueReady0,
+              "C12.screen-untouched",
+              fmt("the screen's own state moved: standDown=%d ready=%d gain=%g reissues=%llu", si.standDown, si.ready, si.gain, static_cast<unsigned long long>(si.reissues)));
+    }
+
+    // ---- the table: curvature x columns x direction x gain; each combination changes the key, so each builds exactly one strip.
+    {
+        const char* curvatures[] = {"0.1", "0.3", "0.7", "1.0"};
+        const int columns[] = {8, 64, 256};
+        const int directions[] = {1, -1};
+        const float gains[] = {1.0f, kSurfaceGain, 100.0f};
+        const PanelCurveSurfaceInfo i0 = panelCurveSurfaceInfo();
+        unsigned combos = 0;
+        for (const char* cv : curvatures)
+            for (int n : columns)
+                for (int dir : directions)
+                    for (float gn : gains) {
+                        g_note = fmt("curvature %s, %d columns, toward %+d, gain %g", cv, n, dir, static_cast<double>(gn));
+                        applyConfig(cv, n, 1, "0");
+                        const SurfaceCall c = surfaceCall(g, gn, dir);
+                        check(c.returned && g_draws.size() == 1, "C12.table-drawn", fmt("returned %d, %zu draws", c.returned, g_draws.size()));
+                        if (g_draws.size() == 1) verifySurfaceDraw(tag, "table", g_draws[0], surfaceSpec(std::strtof(cv, nullptr), n, dir, gn), g, ctx, c.before, nullptr);
+                        verifyRestored(tag, "table", c.before, c.after, &c.refs0, &c.refs1);
+                        ++combos;
+                    }
+        g_note.clear();
+        const PanelCurveSurfaceInfo i1 = panelCurveSurfaceInfo();
+        check(combos == 4 * 3 * 2 * 3 && surfaceMoved(i0, combos, combos, 0), "C12.table-counters",
+              fmt("%u combinations built %llu strips, drew %llu times and created %llu rasterizer states (the game's one state was derived by the first draw)", combos,
+                  static_cast<unsigned long long>(i1.built - i0.built), static_cast<unsigned long long>(i1.drawn - i0.drawn), static_cast<unsigned long long>(i1.rasterStates - i0.rasterStates)));
+    }
+
+    // ---- a strip is built when curvature, columns, gain or direction changes, and not otherwise.
+    {
+        applyConfig("0.3", 64, 1, "0");
+        SurfaceCall c = surfaceCall(g, kSurfaceGain, 1);   // the base key (rebuilt: the table ended on another)
+        const ID3D11Buffer* strip0 = g_draws.size() == 1 ? g_draws[0].snap.vb0.Get() : nullptr;
+        const uint64_t b0 = panelCurveSurfaceInfo().built;
+        c = surfaceCall(g, kSurfaceGain, 1);
+        check(c.returned && g_draws.size() == 1 && g_draws[0].snap.vb0.Get() == strip0 && panelCurveSurfaceInfo().built == b0, "C12.kept", "an unchanged key rebuilt the strip");
+        struct Change {
+            const char* what;
+            const char* curvature;
+            int columns;
+            float gain;
+            int toward;
+        };
+        const Change changes[] = {{"curvature", "0.5", 64, kSurfaceGain, 1}, {"columns", "0.3", 32, kSurfaceGain, 1}, {"gain", "0.3", 64, 5.0f, 1}, {"direction", "0.3", 64, kSurfaceGain, -1}};
+        uint64_t built = b0;
+        for (const Change& ch : changes) {
+            const std::string w = std::string("C12.key-") + ch.what;
+            applyConfig(ch.curvature, ch.columns, 1, "0");
+            c = surfaceCall(g, ch.gain, ch.toward);
+            ++built;
+            check(c.returned && panelCurveSurfaceInfo().built == built, w, fmt("a changed %s did not build exactly one new strip (built %llu, want %llu)", ch.what,
+                  static_cast<unsigned long long>(panelCurveSurfaceInfo().built), static_cast<unsigned long long>(built)));
+            if (g_draws.size() == 1) verifySurfaceDraw(tag, ch.what, g_draws[0], surfaceSpec(std::strtof(ch.curvature, nullptr), ch.columns, ch.toward, ch.gain), g, ctx, c.before, nullptr);
+            applyConfig("0.3", 64, 1, "0");
+            c = surfaceCall(g, kSurfaceGain, 1);   // and back: the base strip again, one more build
+            ++built;
+            check(c.returned && panelCurveSurfaceInfo().built == built, w + "-back", "changing back did not build exactly one strip");
+        }
+    }
+
+    // ---- the rasterizer state: the game's with the cull off, created once per distinct state of the game's, put back, no reference left.
+    {
+        applyConfig("0.3", 64, 1, "0");
+        const uint64_t created0 = panelCurveSurfaceInfo().rasterStates;
+        const struct { const char* name; ID3D11RasterizerState* rs; uint64_t newStates; } states[] = {
+            {"cull-back", g.rs.Get(), 0}, {"odd", g.rsOdd.Get(), 1}, {"cull-none", g.rsNone.Get(), 0}, {"unbound", nullptr, 0}, {"cull-back-again", g.rs.Get(), 0}, {"odd-again", g.rsOdd.Get(), 0}};
+        uint64_t created = created0;
+        for (const auto& st : states) {
+            ctx->RSSetState(st.rs);
+            for (int k = 0; k < 3; ++k) {
+                g_note = fmt("the game's state is %s, draw %d", st.name, k);
+                const SurfaceCall c = surfaceCall(g, kSurfaceGain, 1);
+                check(c.returned && g_draws.size() == 1, "C12.rs-drawn", fmt("returned %d, %zu draws", c.returned, g_draws.size()));
+                if (g_draws.size() == 1) verifySurfaceDraw(tag, "rs", g_draws[0], base, g, ctx, c.before, nullptr);
+                verifyRestored(tag, "rs", c.before, c.after, &c.refs0, &c.refs1);
+                check(c.after.rs.Get() == st.rs, "C12.rs-back", "the game's rasterizer state is not the one bound afterwards");
+            }
+            created += st.newStates;
+            check(panelCurveSurfaceInfo().rasterStates == created, "C12.rs-created-once",
+                  fmt("%llu states created after %s, want %llu: one per distinct state, none per draw", static_cast<unsigned long long>(panelCurveSurfaceInfo().rasterStates), st.name,
+                      static_cast<unsigned long long>(created)));
+        }
+        g_note.clear();
+        ctx->RSSetState(g.rs.Get());
+    }
+
+    // ---- more distinct states of the game's than the cache holds, differing in ONE field (the depth bias) and in pairs sharing a cull mode:
+    //      each is derived from its own description (never served another state's copy), each draw is right, the game's state is back after each,
+    //      and the module holds no reference on any of the game's states.
+    {
+        std::vector<ComPtr<ID3D11RasterizerState>> many;
+        for (int k = 0; k < 7; ++k) {
+            D3D11_RASTERIZER_DESC rd{};
+            rd.FillMode = D3D11_FILL_SOLID;
+            rd.CullMode = (k % 4 < 2) ? D3D11_CULL_BACK : D3D11_CULL_FRONT;
+            rd.DepthClipEnable = TRUE;
+            rd.DepthBias = 100 + k;
+            ComPtr<ID3D11RasterizerState> s;
+            g.dev->CreateRasterizerState(&rd, &s);
+            check(s != nullptr, "C12.many-fixture", "a rasterizer state could not be created");
+            many.push_back(s);
+        }
+        for (int round = 0; round < 2; ++round) {
+            for (size_t k = 0; k < many.size(); ++k) {
+                if (!many[k]) continue;
+                g_note = fmt("distinct state %zu of %zu, round %d", k, many.size(), round);
+                ctx->RSSetState(many[k].Get());
+                const ULONG held0 = refCount(many[k].Get());
+                {
+                    const SurfaceCall c = surfaceCall(g, kSurfaceGain, 1);
+                    check(c.returned && g_draws.size() == 1, "C12.many-drawn", fmt("returned %d, %zu draws", c.returned, g_draws.size()));
+                    if (g_draws.size() == 1) verifySurfaceDraw(tag, "many", g_draws[0], base, g, ctx, c.before, nullptr);
+                    verifyRestored(tag, "many", c.before, c.after, &c.refs0, &c.refs1);
+                    check(c.after.rs.Get() == many[k].Get(), "C12.many-back", "the game's rasterizer state is not the one bound afterwards");
+                }
+                resetRecorders();
+                check(refCount(many[k].Get()) == held0, "C12.many-refs", fmt("references on the game's state went from %lu to %lu", held0, refCount(many[k].Get())));
+            }
+        }
+        g_note.clear();
+        ctx->RSSetState(g.rs.Get());
+        // The cache is bounded: fourteen draws over seven distinct states went through it, and what the module still holds is at most its four
+        // slots' worth (a state it evicted is given back). The derived state is the object the runtime returns for the same description, so the
+        // references beyond the rig's own are the module's.
+        ULONG heldByModule = 0;
+        for (const ComPtr<ID3D11RasterizerState>& st : many) {
+            if (!st) continue;
+            D3D11_RASTERIZER_DESC d{};
+            st->GetDesc(&d);
+            d.CullMode = D3D11_CULL_NONE;
+            ComPtr<ID3D11RasterizerState> derived;
+            if (SUCCEEDED(g.dev->CreateRasterizerState(&d, &derived)) && derived) heldByModule += refCount(derived.Get()) - 1;
+        }
+        check(heldByModule <= 4, "C12.many-cache-bounded", fmt("the module holds %lu references on derived states of seven distinct game states; its cache has four slots", heldByModule));
+    }
+
+    // ---- what it refuses to do: nothing is drawn or built from a call that cannot be served, and nothing is stood down by it.
+    {
+        applyConfig("0.3", 64, 1, "0");
+        const PanelCurveSurfaceInfo i0 = panelCurveSurfaceInfo();
+        resetRecorders();
+        const bool refused[] = {panelCurveSurfaceDraw(nullptr, kSurfaceGain, 1, recordingDraw), panelCurveSurfaceDraw(ctx, kSurfaceGain, 1, nullptr),
+                                panelCurveSurfaceDraw(ctx, 0.0f, 1, recordingDraw), panelCurveSurfaceDraw(ctx, -4.0f, 1, recordingDraw),
+                                panelCurveSurfaceDraw(ctx, std::nanf(""), 1, recordingDraw), panelCurveSurfaceDraw(ctx, HUGE_VALF, 1, recordingDraw),
+                                panelCurveSurfaceDraw(ctx, kSurfaceGain, 0, recordingDraw), panelCurveSurfaceDraw(ctx, kSurfaceGain, 2, recordingDraw),
+                                panelCurveSurfaceDraw(ctx, kSurfaceGain, -2, recordingDraw)};
+        bool any = false;
+        for (bool b : refused) any = any || b;
+        const PanelCurveSurfaceInfo i1 = panelCurveSurfaceInfo();
+        check(!any && g_draws.empty(), "C12.refused", "a null context or draw function, a gain that is not a positive number, or a direction that is not +-1 was served");
+        check(i1.built == i0.built && i1.drawn == i0.drawn && !i1.standDown && panelCurveSurfaceWanted(), "C12.refused-quiet", "a refused call built, counted or stood the surface down");
+    }
+
+    // ---- live: back at curvature 0 the surface is not wanted and draws nothing (a curvature the config holds to be off -- above 1, below 0 --
+    //      is the same off); the shutdown releases the strip and the states.
+    {
+        for (const char* off : {"0", "1.5", "-0.2"}) {
+            applyConfig(off, 64, 1, "0");
+            g_note = fmt("curvature %s", off);
+            const SurfaceCall c = surfaceCall(g, kSurfaceGain, 1);
+            check(!panelCurveSurfaceWanted() && !c.returned && g_draws.empty(), "C12.live-off", "switching the curvature off live did not switch the surface off");
+        }
+        g_note.clear();
+        applyConfig("0.3", 64, 1, "0");
+        check(panelCurveSurfaceWanted(), "C12.live-on", "switching the curvature back on live did not switch the surface back on");
+        // The derived state the module keeps is the object the runtime hands back for the same description, so its reference count says whether
+        // the cache holds it: one reference beyond the rig's own while the strip is live, none once the shutdown has released it.
+        const auto cacheRefs = [&]() -> ULONG {
+            D3D11_RASTERIZER_DESC d{};
+            g.rs->GetDesc(&d);
+            d.CullMode = D3D11_CULL_NONE;
+            ComPtr<ID3D11RasterizerState> s;
+            if (FAILED(g.dev->CreateRasterizerState(&d, &s)) || !s) return 1000;
+            return refCount(s.Get()) - 1;   // the rig's own is not the module's
+        };
+        ctx->RSSetState(g.rs.Get());
+        {
+            const SurfaceCall w = surfaceCall(g, kSurfaceGain, 1);
+            const bool drew = w.returned;
+            resetRecorders();   // the recorder's snapshot of the draw holds the derived state too, and is the rig's
+            check(drew && cacheRefs() == 1, "C12.cache-holds-the-state", fmt("the module holds %lu references on the derived state of the game's, want 1", cacheRefs()));
+        }
+        const PanelCurveSurfaceInfo i0 = panelCurveSurfaceInfo();
+        panelCurveShutdown();
+        check(cacheRefs() == 0, "C12.shutdown-releases-the-states", fmt("the module still holds %lu references on the derived state after the shutdown", cacheRefs()));
+        const SurfaceCall d = surfaceCall(g, kSurfaceGain, 1);
+        const PanelCurveSurfaceInfo i1 = panelCurveSurfaceInfo();
+        check(d.returned && g_draws.size() == 1, "C12.after-shutdown", "the surface did not draw after a shutdown");
+        check(i1.built == i0.built + 1 && i1.rasterStates == i0.rasterStates + 1 && i1.drawn == i0.drawn + 1, "C12.shutdown-released",
+              "the shutdown did not release the strip and the cull-off states (the next draw should rebuild both)");
+        if (g_draws.size() == 1) verifySurfaceDraw(tag, "after-shutdown", g_draws[0], base, g, ctx, d.before, nullptr);
+    }
+    applyConfig("0", 64, 1, "0");
+    bindSizeSlot(g, true);
+    bindGame(g, GameState::Canonical);
+}
+
+// The screen's strip and the surface strip side by side: neither touches the other, one generator builds both, and a fault of one never stands
+// the other down.
+void case13(Gpu& g) {
+    std::printf("C13 the surface strip beside the screen's: separate state, one generator, independent stand-downs\n");
+    ID3D11DeviceContext* ctx = g.ctx.Get();
+    const std::string tag = "C13";
+    panelCurveShutdown();   // no strip of either kind in hand, whatever the cases before left (the surface's counters and stand-down stay: they are the session's)
+    bindPipeline(g);
+    bindGame(g, GameState::Canonical);
+    clearStandDown();
+    applyConfig("0.3", 64, 1, "35.556");
+    check(beginLog(L"pcsurf"), "C13.log", "the scratch log opens");
+    resetRecorders();
+    check(panelCurveSubstitute(ctx, recordingDraw, true) && g_draws.size() == 1, "C13.setup", "the screen's substitution drew its strip");
+    if (g_draws.size() != 1) { endLog(L"pcsurf"); return; }
+    const DrawRecord screenSub = g_draws[0];
+    const PanelCurveInfo screenInfo = panelCurveInfo();
+    const PanelCurveSurfaceInfo surf0 = panelCurveSurfaceInfo();
+
+    // ---- the surface draws its own strip and leaves the screen's alone.
+    {
+        const SurfaceCall c = surfaceCall(g, kSurfaceGain, 1);
+        check(c.returned && g_draws.size() == 1, "C13.surface-drawn", fmt("returned %d, %zu draws", c.returned, g_draws.size()));
+        if (g_draws.size() == 1) verifySurfaceDraw(tag, "surface", g_draws[0], surfaceSpec(0.3f, 64, 1, kSurfaceGain), g, ctx, c.before, screenSub.snap.vb0.Get());
+        verifyRestored(tag, "surface", c.before, c.after, &c.refs0, &c.refs1);
+        const PanelCurveInfo i = panelCurveInfo();
+        check(i.standDown == screenInfo.standDown && i.ready == screenInfo.ready && i.gain == screenInfo.gain && i.reissues == screenInfo.reissues && i.wanted == screenInfo.wanted &&
+                  panelCurveReissueReady(),
+              "C13.screen-info-untouched", fmt("the screen's own numbers moved: ready=%d gain=%g reissues=%llu", i.ready, i.gain, static_cast<unsigned long long>(i.reissues)));
+        resetRecorders();
+        const bool re = panelCurveReissue(ctx, recordingDraw);
+        check(re && g_draws.size() == 1 && drawDifference(g_draws[0], screenSub).empty(), "C13.screen-strip-untouched",
+              "the screen's re-issue after a surface draw is not its own substitution's draw: " + (g_draws.size() == 1 ? drawDifference(g_draws[0], screenSub) : std::string("no draw")));
+        check(panelCurveInfo().reissues == screenInfo.reissues + 1, "C13.screen-counter", "the surface draw moved the screen's re-issue counter (only the screen's own re-issue does)");
+        check(surfaceMoved(surf0, 1, 1, 1), "C13.surface-counters", "the surface's counters did not move by exactly one strip, one draw and one rasterizer state");
+    }
+
+    // ---- one generator: the screen at sign -1 and the surface at toward +1 build the same strip, byte for byte, at the same gain.
+    {
+        applyConfig("0.3", 64, -1, "4.44444");
+        resetRecorders();
+        const bool sub = panelCurveSubstitute(ctx, recordingDraw, true);
+        const std::vector<uint8_t> sv = g_draws.size() == 1 ? g_draws[0].vbBytes : std::vector<uint8_t>(), si = g_draws.size() == 1 ? g_draws[0].ibBytes : std::vector<uint8_t>();
+        const SurfaceCall c = surfaceCall(g, kSurfaceGain, 1);
+        check(sub && c.returned && g_draws.size() == 1 && !sv.empty() && sv == g_draws[0].vbBytes && si == g_draws[0].ibBytes, "C13.same-generator",
+              "the screen's strip (sign -1, gain 4.44444) and the surface's (toward +1, gain 4.44444) are not byte for byte the same");
+        // and the other way: the screen at sign +1 against the surface at toward -1
+        applyConfig("0.3", 64, 1, "4.44444");
+        resetRecorders();
+        const bool sub2 = panelCurveSubstitute(ctx, recordingDraw, true);
+        const std::vector<uint8_t> sv2 = g_draws.size() == 1 ? g_draws[0].vbBytes : std::vector<uint8_t>();
+        const SurfaceCall c2 = surfaceCall(g, kSurfaceGain, -1);
+        check(sub2 && c2.returned && g_draws.size() == 1 && !sv2.empty() && sv2 == g_draws[0].vbBytes && sv2 != sv, "C13.same-generator-away",
+              "the screen's strip (sign +1) and the surface's (toward -1) at the same gain are not byte for byte the same, or the two directions gave the same strip");
+        // the screen as it was, rebuilt: the same strip as its first substitution's, byte for byte
+        applyConfig("0.3", 64, 1, "35.556");
+        resetRecorders();
+        const bool sub3 = panelCurveSubstitute(ctx, recordingDraw, true);
+        check(sub3 && g_draws.size() == 1 && g_draws[0].vbBytes == screenSub.vbBytes && g_draws[0].ibBytes == screenSub.ibBytes, "C13.screen-rebuilt",
+              "the screen's strip, rebuilt after the surface's was drawn at other settings, is not the one it first drew");
+    }
+
+    // ---- a fault of the screen's stands the screen down and not the surface; the surface keeps drawing, with the strip it had.
+    //      (The screen's fault budget is five for the whole process and C9 spent three of them: this is the fourth, the last the rig makes.)
+    {
+        resetRecorders();
+        const PanelCurveSurfaceInfo s0 = panelCurveSurfaceInfo();
+        const bool screen = panelCurveSubstitute(ctx, faultingDraw, true);
+        check(!screen && panelCurveInfo().standDown && g_faultDraws == 1, "C13.screen-fault", "the screen's faulting substitution did not stand the screen down");
+        check(panelCurveSurfaceWanted() && !panelCurveSurfaceInfo().standDown, "C13.screen-fault-surface-wanted", "a fault of the screen's stood the surface down");
+        applyConfig("0.3", 64, 1, "35.556");   // a configure while the screen is down changes nothing of the surface's
+        check(panelCurveSurfaceWanted(), "C13.screen-fault-configure", "a configure with the screen stood down switched the surface off");
+        const SurfaceCall c = surfaceCall(g, kSurfaceGain, -1);
+        check(c.returned && g_draws.size() == 1, "C13.screen-fault-surface-draws", fmt("the surface did not draw after a fault of the screen's (returned %d, %zu draws)", c.returned, g_draws.size()));
+        if (g_draws.size() == 1) verifySurfaceDraw(tag, "after-screen-fault", g_draws[0], surfaceSpec(0.3f, 64, -1, kSurfaceGain), g, ctx, c.before, nullptr);
+        verifyRestored(tag, "after-screen-fault", c.before, c.after, &c.refs0, &c.refs1);
+        check(panelCurveSurfaceInfo().drawn == s0.drawn + 1 && !panelCurveSurfaceInfo().standDown, "C13.screen-fault-surface-counted", "the surface's own counters did not move by the one draw");
+        clearStandDown();   // the rig's: the screen's stand-down is for the session
+    }
+
+    // ---- a fault of the surface's stands the surface down and not the screen; the game's state is back (the input assembler, and the
+    //      rasterizer state the cull-off copy had replaced); the screen keeps drawing; and only this consumer's own line is logged.
+    {
+        resetRecorders();
+        applyConfig("0.3", 64, 1, "35.556");
+        check(panelCurveSubstitute(ctx, recordingDraw, true) && panelCurveReissueReady(), "C13.setup-surface-fault", "the screen's strip is not in hand and ready");
+        bindGame(g, GameState::Odd);   // so a restore that did not happen is visible
+        ctx->RSSetState(g.rs.Get());   // a state that culls, so the surface swaps its own in before the fault and owes the game's back
+        const PanelCurveInfo screen0 = panelCurveInfo();
+        const PanelCurveSurfaceInfo s0 = panelCurveSurfaceInfo();
+        const SurfaceCall c = surfaceCall(g, kSurfaceGain, 1, faultingDraw);
+        const PanelCurveSurfaceInfo s1 = panelCurveSurfaceInfo();
+        check(!c.returned && g_faultDraws == 1, "C13.surface-fault", fmt("the faulting surface draw returned %d after %u call(s)", c.returned, g_faultDraws));
+        check(s1.standDown && !panelCurveSurfaceWanted(), "C13.surface-standdown", "a fault in the surface's draw did not stand the surface down");
+        check(s1.drawn == s0.drawn, "C13.surface-fault-uncounted", "a draw that faulted was counted as drawn");
+        verifyRestored(tag, "surface-fault", c.before, c.after, &c.refs0, &c.refs1);
+        check(c.after.rs.Get() == g.rs.Get(), "C13.surface-fault-rasterizer", "the game's rasterizer state is not the one bound after the fault");
+        const PanelCurveInfo screen1 = panelCurveInfo();
+        check(!screen1.standDown && screen1.ready == screen0.ready && screen1.gain == screen0.gain && screen1.reissues == screen0.reissues && panelCurveWants() && panelCurveReissueReady(),
+              "C13.surface-fault-screen-untouched", "a fault in the surface's draw moved the screen's flags, gain or counters");
+        resetRecorders();
+        const bool again = panelCurveSurfaceDraw(ctx, kSurfaceGain, 1, recordingDraw);
+        check(!again && g_draws.empty() && panelCurveSurfaceInfo().drawn == s1.drawn, "C13.surface-later", "a stood-down surface drew again");
+        resetRecorders();
+        const bool sub = panelCurveSubstitute(ctx, recordingDraw, true);
+        const bool re = panelCurveReissue(ctx, recordingDraw);
+        check(sub && re && g_draws.size() == 2, "C13.screen-draws-after-surface-fault", "the screen did not draw after a fault of the surface's");
+        // the live configuration cannot bring it back: the stand-down is for the session
+        applyConfig("0.3", 64, 1, "35.556");
+        check(!panelCurveSurfaceWanted(), "C13.surface-stays-down", "reconfiguring brought a stood-down surface back");
+        applyConfig("0.5", 32, 1, "35.556");
+        resetRecorders();
+        check(!panelCurveSurfaceWanted() && !panelCurveSurfaceDraw(ctx, kSurfaceGain, 1, recordingDraw) && g_draws.empty(), "C13.surface-stays-down-changed", "a changed configuration brought a stood-down surface back");
+        // ... and neither does the shutdown: the stand-down is the session's
+        panelCurveShutdown();
+        check(panelCurveSurfaceInfo().standDown && !panelCurveSurfaceWanted(), "C13.surface-shutdown-keeps-standdown", "the shutdown cleared the surface's stand-down");
+        bindGame(g, GameState::Canonical);
+    }
+
+    // ---- the log: the screen's fault and the surface's are each said once, in their own words.
+    {
+        const std::string log = endLog(L"pcsurf");
+        check(count(log, "the substitution faulted, so it is off for the rest of this session") == 1, "C13.log-screen", fmt("%zu lines for the screen's fault", count(log, "the substitution faulted, so it is off for the rest of this session")));
+        check(count(log, "the surface strip (the intro movie and the splash) faulted, so those two are flat for the rest of this session") == 1, "C13.log-surface",
+              fmt("%zu lines for the surface's fault", count(log, "the surface strip (the intro movie and the splash) faulted, so those two are flat for the rest of this session")));
+        const uint64_t builds = panelCurveSurfaceInfo().built - surf0.built;
+        check(builds >= 3 && count(log, "-column SURFACE strip") == builds, "C13.log-built", fmt("%zu surface-strip lines for %llu builds", count(log, "-column SURFACE strip"), static_cast<unsigned long long>(builds)));
+    }
+    applyConfig("0", 64, 1, "35.556");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------
 // The runner.
 // ---------------------------------------------------------------------------------------------------------------------------------
 struct Case {
     const char* id;
     void (*run)(Gpu&);
 };
-// Order matters once: C8 runs second because the module never forgets a SIZE it has read, and the cases after it run on the z-gain override.
-const Case kCases[] = {{"C1", case1}, {"C8", case8}, {"C2", case2}, {"C3", case3}, {"C4", case4}, {"C5", case5},
-                       {"C6", case6}, {"C7", case7}, {"C9", case9}, {"C10", case10}, {"C11", case11}};
+// Order matters twice: C8 runs right after C1 and C12 (neither reads a SIZE) because the module never forgets a SIZE it has read, and the
+// cases after it run on the z-gain override; C13 runs last because it stands the surface strip down for the session (the screen's own
+// stand-down the rig can clear, the surface's it cannot: that is what is pinned).
+const Case kCases[] = {{"C1", case1},  {"C12", case12}, {"C8", case8},   {"C2", case2},   {"C3", case3},   {"C4", case4}, {"C5", case5},
+                       {"C6", case6},  {"C7", case7},   {"C9", case9},   {"C10", case10}, {"C11", case11}, {"C13", case13}};
 
 void removeScratch() {
     WIN32_FIND_DATAW fd{};
@@ -1282,7 +1774,7 @@ int run(bool keep) {
         c.run(gpu);
         ++ran;
     }
-    check(ran == sizeof(kCases) / sizeof(kCases[0]) && ran == 11, "C0.cases: all eleven cases ran", fmt("%u cases", ran));
+    check(ran == sizeof(kCases) / sizeof(kCases[0]) && ran == 13, "C0.cases: all thirteen cases ran", fmt("%u cases", ran));
 
     panelCurveShutdown();
     resetRecorders();
@@ -1318,7 +1810,7 @@ int main(int argc, char** argv) {
     }
     const int rc = run(keep);
     if (rc == 0) {
-        std::printf("PASS: %u panel curve checks (%zu cases: the substitution, its re-issue and the faults, on WARP)\n", g_checks, sizeof(kCases) / sizeof(kCases[0]));
+        std::printf("PASS: %u panel curve checks (%zu cases: the substitution, its re-issue, the surface strip and the faults, on WARP)\n", g_checks, sizeof(kCases) / sizeof(kCases[0]));
     } else {
         std::printf("FAIL: panel curve: %u of %u checks failed, %zu distinct\n", g_failed, g_checks, g_failCount.size());
     }

@@ -3,8 +3,18 @@
 //
 // The change to come must leave this module byte-identical at curvature 0, so this rig pins what the real module does now, on a WARP
 // device, with the real Config, Log and fault guard, and stubs only for what it calls from elsewhere: the vr half's published pose and
-// tangents (frame_flag.h), the resampler (intro_upscale.h) and the binding shadow's resolver. The draw is the rig's own recording draw
-// function, called the way vscreen.cpp forwards the game's draw: after introPanelOnComposite, before introPanelEndDraw.
+// tangents (frame_flag.h), the resampler (intro_upscale.h), the binding shadow's resolver and the on-foot screen's motion pass (the module
+// links panel_curve.cpp for real now). The draw is the rig's own recording draw function, called the way vscreen.cpp forwards the game's
+// draw: after introPanelOnComposite, before introPanelEndDraw.
+//
+// STEP 2 (the movie follows fix.panel_curvature; docs/intro-video.md, 2026-10-01). Every scenario of step 1 above passes UNCHANGED, with one
+// strengthening: every step of every scenario also says introPanelStripArmed() is false at the draw and after it (curvature 0 arms nothing).
+// The curved-* scenarios pin the new part: at curvature above 0 -- the surface strip wanted and not stood down -- the world constants carry the
+// z column in cb2[3] (the seated +z axis through the projection), every other float the flat panel's to the bit; the strip is armed from a
+// successful bind until introPanelEndDraw; stock, head, the refusals, the settle frames, a stood-down surface and curvature 0 never arm
+// anything. There is NO test of the bent edges against the eye (round 3 removed the one round 2 had: D3D clips what is behind the eye in
+// homogeneous space, a test popped the whole bend off at about 20 degrees of head yaw): the centre's is the only one, and curved-no-edge-test
+// pins the absence where a test would bite hardest.
 //
 // ONE PROCESS PER SCENARIO. The module keeps latches nothing resets: g_refused (set when the constants do not read as screen-space: the
 // transform is off for the session), g_retired, g_lockRefusedNoted and g_anchored (each log line is once per process), g_recentreRequested,
@@ -35,6 +45,19 @@
 //                         the eye is read from the game's own cb2[4].x; two buffers that do not tell the eyes apart are refused
 //   retire-used, retire-settling, retire-unseen   the first rendered scene stands everything down for the session
 //   shutdown-relearn, third-buffer, small-cb, distance, gates, scene-arrived   the rest of what is observable
+//   curved                curvature 0.3, 48 columns, five poses (A, B, C, D, I): every one bends the movie (bytes to the bit against the curved
+//                         goldens, the flat panel's floats everywhere but cb2[3], the strip armed at the draw and not after); the gain, the
+//                         first-armed line, the retirement line's count of armed draws, no line about an edge
+//   curved-asymmetric     the Quest-like vertical frustum: the shear of the z column (m12)
+//   curved-no-edge-test   the worst places for a test of the bent edges that is not there: distance at its 1 m floor with curvature 1.0 and a
+//                         head yawed 40 degrees, one at 0.3 and 25 degrees, both ways round, the centre in front: armed, cb2[3] = col(cz), every
+//                         time (the rig's own arithmetic shows a nearer edge would be behind the eye in each)
+//   curved-live           the curvature switched live: flat, bent (every float but cb2[3] the flat panel's), flat again to the bit; the z column
+//                         does not depend on the curvature; the retirement line's armed count against its resized count
+//   curved-stood-down     a faulting strip draw stands the surface down: the movie is flat from then on whatever the configuration
+//   curved-armed-scope    armed is for the bind the last call made: a call that binds nothing clears it, and so does the shutdown
+//   curved-refused        no pose, no tangents, behind, a degenerate viewport at curvature 0.3: nothing armed; the retry bends
+//   curved-stock, curved-head, curved-splash, curved-eyes-alike   the step-1 scenarios of those names at curvature 0.3: unchanged, never armed
 //
 // tools\intro_curve_test\mutants.py compiles this rig against a copy of the module with ONE rule flipped and requires the rig to fail on
 // a scenario that belongs to the rule.
@@ -69,6 +92,8 @@
 #include "binding_shadow.h"
 #include "intro_panel.h"
 #include "intro_upscale.h"
+#include "panel_curve.h"
+#include "screen_motion.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -303,6 +328,10 @@ void introUpscaleEnd(ID3D11DeviceContext*) { ++stub::upEnd; }
 void introUpscaleFrameEnd() { ++stub::upFrameEnd; }
 void introUpscaleShutdown() { ++stub::upShutdown; }
 
+// panel_curve.cpp is linked for real (fix.panel_curvature, and whether the surface strip is wanted); its on-foot half calls the screen's motion
+// pass, which nothing here reaches.
+void screenMotionDraw(ID3D11DeviceContext*, PanelCurveDrawFn, unsigned, unsigned, unsigned, int, unsigned, const float*) {}
+
 // The real resolver is binding_shadow.cpp, which carries the whole hook layer. The module reads only a buffer's byte width (info.a).
 bool bindingResolveResource(void* resource, ResourceInfo* out) {
     if (!resource || !out) return false;
@@ -379,6 +408,18 @@ const float kPoseB[12] = {0.8f, -0.36f, -0.48f, -0.1f,   0.0f, 0.8f, -0.6f, 1.2f
 const float kPoseI[12] = {1, 0, 0, 0,   0, 1, 0, 0,   0, 0, 1, 0};
 // A half turn: the runtime's own quirk on the measured rig (yaw 180 from the first frame). The panel at the game's forward is then behind.
 const float kPoseBehind[12] = {-1, 0, 0, 0,   0, 1, 0, 0,   0, 0, -1, 0};
+
+// The curved movie's poses. Every one of them bends the movie (a pose cannot keep it flat: the bent edges are not tested, only the centre).
+//   C: yaw atan2(0.28, 0.96) = 16.26 deg to the left, a few centimetres off the origin
+//   D: C mirrored
+//   Yaw40Pos/Neg, Yaw25Pos/Neg: a head turned 40 (or 25) degrees about the vertical, either way, at the origin: where a bent panel's nearer edge is
+//      beside or behind the eye (the worst places for a test of the edges that is not there: curved-no-edge-test)
+const float kPoseC[12] = {0.96f, 0.0f, 0.28f, 0.10f,   0.0f, 1.0f, 0.0f, 0.05f,   -0.28f, 0.0f, 0.96f, -0.20f};
+const float kPoseD[12] = {0.96f, 0.0f, -0.28f, -0.10f,   0.0f, 1.0f, 0.0f, 0.05f,   0.28f, 0.0f, 0.96f, -0.20f};
+const float kPoseYaw40Pos[12] = {0.76604444f, 0.0f, 0.64278761f, 0.0f,   0.0f, 1.0f, 0.0f, 0.0f,   -0.64278761f, 0.0f, 0.76604444f, 0.0f};
+const float kPoseYaw40Neg[12] = {0.76604444f, 0.0f, -0.64278761f, 0.0f,   0.0f, 1.0f, 0.0f, 0.0f,   0.64278761f, 0.0f, 0.76604444f, 0.0f};
+const float kPoseYaw25Pos[12] = {0.90630779f, 0.0f, 0.42261826f, 0.0f,   0.0f, 1.0f, 0.0f, 0.0f,   -0.42261826f, 0.0f, 0.90630779f, 0.0f};
+const float kPoseYaw25Neg[12] = {0.90630779f, 0.0f, -0.42261826f, 0.0f,   0.0f, 1.0f, 0.0f, 0.0f,   0.42261826f, 0.0f, 0.90630779f, 0.0f};
 
 // ---------------------------------------------------------------------------------------------------------------------------------
 // The goldens: the 80 bytes of cb2 the draw sees at VS b2, from the module's output (see the header). Emitted by --emit-golden.
@@ -470,6 +511,102 @@ const Golden kGoldens[] = {
         0.0f, 0.0f, 0.0f, 0.0f,   // cb2[3]
         1.77666044f, -1.3768698f, 0.706799924f, 1.41359985f   // cb2[4]
     }},
+    // THE CURVED MOVIE (fix.panel_curvature 0.3; step 2): the flat panel's cb2 with cb2[3] = the seated +z axis through the same projection -- the
+    // view-space image of +z, cz = (A(0,2), A(1,2), A(2,2)) = the pose's third row, unit length -- as (m00 cz.x + m02 cz.z, m11 cz.y + m12 cz.z,
+    // -cz.z / 2, -cz.z). Every other float is the flat panel's, to the bit (the A, B and I goldens are the flat A, B and I goldens with column 3
+    // filled; no pose keeps the movie flat, so A and B -- a head turned 53 degrees, 37 degrees the other way, where a nearer edge is beside or
+    // behind the eye -- are curved goldens too, as C, D and I).
+    // Reviewed by hand. I (cz = (0, 0, 1)): column 3 = (m02, m12, -0.5, -1) = (-/+0.193973, 0, -0.5, -1), the left eye with the negative. C (a head
+    // yawed 16.26 degrees, cz = (-0.28, 0, 0.96)): x = 0.780732 * -0.28 -/+ 0.193973 * 0.96 = -0.404819 left, -0.032391 right; w = -0.96, z =
+    // -0.48. D is C mirrored: cz = (0.28, 0, 0.96), so +0.032391 and +0.404819 with the eyes swapped. A (cz = (-0.8, 0.168, 0.576)): x =
+    // 0.780732 * -0.8 -/+ 0.193973 * 0.576 = -0.736315 left, -0.512857 right; y = 0.790639 * 0.168 = 0.132828; z = -0.288, w = -0.576. B (cz = (0.6,
+    // 0.48, 0.64)): x = 0.780732 * 0.6 -/+ 0.193973 * 0.64 = 0.344296 left, 0.592582 right; y = 0.790639 * 0.48 = 0.379507; z = -0.32, w = -0.64.
+    // QC (the Quest-like vertical frustum, pose C): y = m12 * 0.96 = -0.19318 * 0.96 = -0.185439, and x = 0.902731 * -0.28 + (-0.083277 left,
+    // +0.083277 right) * 0.96 = -0.332711 and -0.172819.
+    {"A-left-curved", {
+        1.0f, 1.0f, 0.0f, 0.0f,   // cb2[0]
+        -1.41985583f, -0.787124157f, 1.70666492f, 3.41332984f,   // cb2[1]
+        0.135780931f, 1.89753318f, 0.349999994f, 0.699999988f,   // cb2[2]
+        -0.736313581f, 0.132827327f, -0.287999988f, -0.575999975f,   // cb2[3]
+        1.96175122f, -1.56135356f, 0.706799924f, 1.41359985f   // cb2[4]
+    }},
+    {"A-right-curved", {
+        1.0f, 1.0f, 0.0f, 0.0f,   // cb2[0]
+        -2.74404168f, -0.787124157f, 1.70666492f, 3.41332984f,   // cb2[1]
+        -0.135780931f, 1.89753318f, 0.349999994f, 0.699999988f,   // cb2[2]
+        -0.51285696f, 0.132827327f, -0.287999988f, -0.575999975f,   // cb2[3]
+        1.36416531f, -1.56135356f, 0.706799924f, 1.41359985f   // cb2[4]
+    }},
+    {"B-left-curved", {
+        1.0f, 1.0f, 0.0f, 0.0f,   // cb2[0]
+        -3.1897397f, 1.26502097f, -1.06666553f, -2.13333106f,   // cb2[1]
+        0.29095912f, 1.58127773f, 0.75f, 1.5f,   // cb2[2]
+        0.344296396f, 0.379506648f, -0.319999993f, -0.639999986f,   // cb2[3]
+        -1.29997981f, -2.17267561f, 0.831999898f, 1.6639998f   // cb2[4]
+    }},
+    {"B-right-curved", {
+        1.0f, 1.0f, 0.0f, 0.0f,   // cb2[0]
+        -2.36212349f, 1.26502097f, -1.06666553f, -2.13333106f,   // cb2[1]
+        -0.29095912f, 1.58127773f, 0.75f, 1.5f,   // cb2[2]
+        0.592581511f, 0.379506648f, -0.319999993f, -0.639999986f,   // cb2[3]
+        -1.99470723f, -2.17267561f, 0.831999898f, 1.6639998f   // cb2[4]
+    }},
+    {"C-left-curved", {
+        1.0f, 1.0f, 0.0f, 0.0f,   // cb2[0]
+        -3.08972979f, -0.0f, 0.622221589f, 1.24444318f,   // cb2[1]
+        0.0f, 1.97659719f, -0.0f, -0.0f,   // cb2[2]
+        -0.404818654f, 0.0f, -0.479999989f, -0.959999979f,   // cb2[3]
+        1.23025274f, -0.0395319425f, 1.5259999f, 3.05199981f   // cb2[4]
+    }},
+    {"C-right-curved", {
+        1.0f, 1.0f, 0.0f, 0.0f,   // cb2[0]
+        -3.57250595f, -0.0f, 0.622221589f, 1.24444318f,   // cb2[1]
+        0.0f, 1.97659719f, -0.0f, -0.0f,   // cb2[2]
+        -0.0323909968f, 0.0f, -0.479999989f, -0.959999979f,   // cb2[3]
+        -0.00294286013f, -0.0395319425f, 1.5259999f, 3.05199981f   // cb2[4]
+    }},
+    {"D-left-curved", {
+        1.0f, 1.0f, 0.0f, 0.0f,   // cb2[0]
+        -3.57250595f, 0.0f, -0.622221589f, -1.24444318f,   // cb2[1]
+        0.0f, 1.97659719f, -0.0f, -0.0f,   // cb2[2]
+        0.0323909968f, 0.0f, -0.479999989f, -0.959999979f,   // cb2[3]
+        0.00294286013f, -0.0395319425f, 1.5259999f, 3.05199981f   // cb2[4]
+    }},
+    {"D-right-curved", {
+        1.0f, 1.0f, 0.0f, 0.0f,   // cb2[0]
+        -3.08972979f, 0.0f, -0.622221589f, -1.24444318f,   // cb2[1]
+        0.0f, 1.97659719f, -0.0f, -0.0f,   // cb2[2]
+        0.404818654f, 0.0f, -0.479999989f, -0.959999979f,   // cb2[3]
+        -1.23025274f, -0.0395319425f, 1.5259999f, 3.05199981f   // cb2[4]
+    }},
+    {"I-left-curved", {
+        1.0f, 1.0f, 0.0f, 0.0f,   // cb2[0]
+        -3.46991444f, -0.0f, 0.0f, 0.0f,   // cb2[1]
+        0.0f, 1.97659719f, -0.0f, -0.0f,   // cb2[2]
+        -0.193972751f, 0.0f, -0.5f, -1.0f,   // cb2[3]
+        0.67440176f, -0.0f, 1.67499995f, 3.3499999f   // cb2[4]
+    }},
+    {"I-right-curved", {
+        1.0f, 1.0f, 0.0f, 0.0f,   // cb2[0]
+        -3.46991444f, -0.0f, 0.0f, 0.0f,   // cb2[1]
+        0.0f, 1.97659719f, -0.0f, -0.0f,   // cb2[2]
+        0.193972751f, 0.0f, -0.5f, -1.0f,   // cb2[3]
+        -0.67440176f, -0.0f, 1.67499995f, 3.3499999f   // cb2[4]
+    }},
+    {"QC-left-curved", {
+        1.0f, 1.0f, 0.0f, 0.0f,   // cb2[0]
+        -3.74801397f, 0.240383729f, 0.622221589f, 1.24444318f,   // cb2[1]
+        0.0f, 2.08872914f, -0.0f, -0.0f,   // cb2[2]
+        -0.332710534f, -0.185439065f, -0.479999989f, -0.959999979f,   // cb2[3]
+        0.992143631f, 0.547767103f, 1.5259999f, 3.05199981f   // cb2[4]
+    }},
+    {"QC-right-curved", {
+        1.0f, 1.0f, 0.0f, 0.0f,   // cb2[0]
+        -3.95528078f, 0.240383729f, 0.622221589f, 1.24444318f,   // cb2[1]
+        0.0f, 2.08872914f, -0.0f, -0.0f,   // cb2[2]
+        -0.17281875f, -0.185439065f, -0.479999989f, -0.959999979f,   // cb2[3]
+        0.426949114f, 0.547767103f, 1.5259999f, 3.05199981f   // cb2[4]
+    }},
     // GOLDENS-END
 };
 const Golden* findGolden(const char* name) {
@@ -484,24 +621,48 @@ std::string hexOf(float f) {
     return fmt("0x%08X", u);
 }
 
-// What cb2 should be, from buildWorldCb's own comments and nothing of its code: the panel's three basis vectors and centre brought into
-// view space by the head's inverse, the eye's lateral offset, and the eye's asymmetric frustum, as columns of Proj * View * Model with
-// cb2[0] = (1, 1), cb2[3] zero and z = w/2. In double.
-std::array<double, 20> expectedWorld(const float* pose, bool left, double dist, double outer, double inner, double top, double bot) {
+constexpr double kPiD = 3.14159265358979323846;
+constexpr double kHalfW = 4.44444, kHalfH = 2.5;
+// The panel's basis in view space, from the comments and nothing of the code, in double: cx and cy the panel's x and y columns (half-extents
+// included), cz the seated +z axis -- from the panel toward the viewer, unit length -- and c0 the panel's centre, for one eye.
+struct Basis {
+    double cx[3], cy[3], cz[3], c0[3];
+};
+Basis expectedBasis(const float* pose, bool left, double dist) {
     double R[3][3], t[3];
     for (int r = 0; r < 3; ++r) {
         for (int c = 0; c < 3; ++c) R[r][c] = pose[r * 4 + c];
         t[r] = pose[r * 4 + 3];
     }
-    const double W = 4.44444, H = 2.5, halfIpd = 0.0315;
+    const double halfIpd = 0.0315;
     auto A = [&](int i, int j) { return R[j][i]; };   // the head's inverse is the rotation's transpose
-    double cx[3], cy[3], c0[3];
+    Basis b{};
     for (int i = 0; i < 3; ++i) {
-        cx[i] = A(i, 0) * -W;   // the panel's +x is the viewer's LEFT (the game's own convention on both of its panels)
-        cy[i] = A(i, 1) * H;
-        c0[i] = A(i, 0) * (0.0 - t[0]) + A(i, 1) * (0.0 - t[1]) + A(i, 2) * (-dist - t[2]);   // the panel at (0,0,-dist) seen from the head
+        b.cx[i] = A(i, 0) * -kHalfW;   // the panel's +x is the viewer's LEFT (the game's own convention on both of its panels)
+        b.cy[i] = A(i, 1) * kHalfH;
+        b.cz[i] = A(i, 2);
+        b.c0[i] = A(i, 0) * (0.0 - t[0]) + A(i, 1) * (0.0 - t[1]) + A(i, 2) * (-dist - t[2]);   // the panel at (0,0,-dist) seen from the head
     }
-    c0[0] -= left ? -halfIpd : halfIpd;
+    b.c0[0] -= left ? -halfIpd : halfIpd;
+    return b;
+}
+
+// FIXTURE ONLY, for curved-no-edge-test: where a bent panel's NEARER edge midpoint (x = -1 or +1, y = 0) lands in view space, z, in double: the
+// centre plus x' cx plus z' cz with the strip's own arc x' = sin(pi c) / (pi c) and z' = W (1 - cos(pi c)) / (pi c) (panel_curve.cpp, the gain
+// W the panel's half-width in metres). Negative is in front of the eye. The module has no test of it (the bent edges are not tested); this is
+// here to show that a pose and distance a scenario picks really is one where a test of it WOULD have bitten -- the nearer edge at or behind the
+// eye -- so the scenario means what it says if the geometry is ever changed.
+double nearerEdgeViewZ(const float* pose, bool left, double dist, double curvature) {
+    const Basis b = expectedBasis(pose, left, dist);
+    const double k = kPiD * curvature, xe = std::sin(k) / k, ze = kHalfW * (1.0 - std::cos(k)) / k;
+    return std::max(b.c0[2] - xe * b.cx[2] + ze * b.cz[2], b.c0[2] + xe * b.cx[2] + ze * b.cz[2]);
+}
+
+// What cb2 should be, from buildWorldCb's own comments and nothing of its code: the panel's three basis vectors and centre brought into view space
+// by the head's inverse, the eye's lateral offset, and the eye's asymmetric frustum, as columns of Proj * View * Model with cb2[0] = (1, 1),
+// cb2[3] zero for a flat panel -- or, for a bent one (`curved`), the z column: cz through the same projection. z = w/2. In double.
+std::array<double, 20> expectedWorld(const float* pose, bool left, double dist, double outer, double inner, double top, double bot, bool curved = false) {
+    const Basis b = expectedBasis(pose, left, dist);
     const double lt = left ? -outer : -inner, rt = left ? inner : outer, tp = -top, bt = bot;
     const double m00 = 2.0 / (rt - lt), m02 = (rt + lt) / (rt - lt), m11 = 2.0 / (bt - tp), m12 = (bt + tp) / (bt - tp);
     auto col = [&](const double* v, double* d) {
@@ -512,9 +673,10 @@ std::array<double, 20> expectedWorld(const float* pose, bool left, double dist, 
     };
     std::array<double, 20> out{};
     out[0] = out[1] = 1.0;
-    col(cx, &out[4]);
-    col(cy, &out[8]);
-    col(c0, &out[16]);
+    col(b.cx, &out[4]);
+    col(b.cy, &out[8]);
+    if (curved) col(b.cz, &out[12]);
+    col(b.c0, &out[16]);
     return out;
 }
 
@@ -716,6 +878,8 @@ Refs takeRefs(const Gpu& g) { return Refs{refCount(g.eyeCb[0].Get()), refCount(g
 // ---------------------------------------------------------------------------------------------------------------------------------
 struct Step {
     bool bound = false;
+    bool armed = false;        // introPanelStripArmed() between the module's answer and the game's draw: the strip is to be drawn, not the quad
+    bool armedAfter = false;   // ... and after introPanelEndDraw, or after the answer when it was false (nothing is armed past a draw)
     DrawRecord draw;
     Snapshot before, after;
     Refs refs0, refs1;
@@ -734,9 +898,11 @@ Step compositeWith(Gpu& g, ID3D11Buffer* cb, uint32_t srvW = kFillW, uint32_t sr
     s.before = takeSnapshot(ctx);
     s.refs0 = takeRefs(g);
     s.bound = introPanelOnComposite(ctx, kind, count, instances, srvW, srvH);
+    s.armed = introPanelStripArmed();
     recordDraw(ctx, count, instances, 0, 0, 0);   // the game's own draw, forwarded either way
     s.draw = g_draws.back();
     if (s.bound) introPanelEndDraw(ctx);
+    s.armedAfter = introPanelStripArmed();
     s.refs1 = takeRefs(g);
     s.after = takeSnapshot(ctx);
     if (g_trace)
@@ -760,11 +926,15 @@ FrameResult runFrame(Gpu& g, bool fill = true, bool scene = false) {
 
 // The contract of one composite, bound or not: the draw's arguments are the game's, the pipeline at the draw is the game's except VS b2
 // (ours when bound, the game's own buffer when not), the game's buffer is back afterwards, and no reference is left behind. cb2: -1 follows
-// `wantBound`; 0 says VS b2 is the game's even though the call returned true (the resampler alone matched); 1 says ours.
-void expectStep(const Step& s, bool wantBound, const char* what, Gpu& g, int cb2 = -1) {
+// `wantBound`; 0 says VS b2 is the game's even though the call returned true (the resampler alone matched); 1 says ours. wantArmed: the strip is
+// armed at the draw (the movie is bent) -- false everywhere at curvature 0, in every refused, stock, head and settling step at any curvature, and
+// after the draw in every case.
+void expectStep(const Step& s, bool wantBound, const char* what, Gpu& g, int cb2 = -1, bool wantArmed = false) {
     const std::string w = lab(what);
     const bool ours = cb2 < 0 ? wantBound : cb2 != 0;
     check(s.bound == wantBound, w + "-returned", fmt("introPanelOnComposite returned %d, want %d", s.bound, wantBound));
+    check(s.armed == wantArmed, w + "-armed", fmt("introPanelStripArmed() was %d at the draw, want %d", s.armed, wantArmed));
+    check(!s.armedAfter, w + "-armed-after", "introPanelStripArmed() was still true after the draw (introPanelEndDraw) was made");
     check(s.draw.count == s.reqCount && s.draw.instances == s.reqInstances && s.draw.start == 0 && s.draw.base == 0 && s.draw.startInstance == 0, w + "-arguments",
           fmt("the game's draw was (%u, %u, %u, %d, %u)", s.draw.count, s.draw.instances, s.draw.start, s.draw.base, s.draw.startInstance));
     const unsigned d = diffBits(s.before, s.draw.snap);
@@ -784,12 +954,23 @@ void expectStep(const Step& s, bool wantBound, const char* what, Gpu& g, int cb2
 
 void setPose(const float* p) { std::memcpy(stub::pose, p, sizeof(stub::pose)); }
 
-void configure(const char* video, const char* distance = nullptr, const char* curvature = nullptr) {
+// g_curvature: the curvature the curved-* wrappers of the older scenarios run them at (fix.panel_curvature), when the call does not say; null
+// leaves the key unset, which is the shipped 0. configure() hands the same Config to panel_curve.cpp (the surface strip is wanted from it) and
+// to the intro module (which reads only its own keys), as the DLL's config reload does.
+const char* g_curvature = nullptr;
+double g_liveCurvature = 0.0;   // what fix.panel_curvature was last set to (0 until it is): what boundFrame expects the module to bend by
+void configure(const char* video, const char* distance = nullptr, const char* curvature = nullptr, const char* segments = nullptr) {
     Config& c = Config::get();
     if (video) c.set("fix.intro_video", video);
     if (distance) c.set("advanced.intro_video_distance", distance);
-    if (curvature) c.set("fix.panel_curvature", curvature);
+    if (!curvature) curvature = g_curvature;
+    if (curvature) {
+        c.set("fix.panel_curvature", curvature);
+        g_liveCurvature = std::atof(curvature);
+    }
+    if (segments) c.set("advanced.panel_curvature_segments", segments);
     introPanelConfigure(c);
+    panelCurveConfigure(c);
 }
 
 // Frames until the buffers have settled: the first composite of a buffer starts a readback, retired at the fourth frame edge after it.
@@ -883,7 +1064,8 @@ void goldenBody(Gpu& g, bool zeroKey) {
     check(count(log, "intro video size: engaged") == 1, lab("log-engaged"), "the 'engaged' line is not written exactly once");
     check(count(log, "read the movie panel's own constants") == 2 && has(log, "half-size 512 x 288 pixels") && has(log, "centred at 0.1939") && has(log, "centred at -0.1940"), lab("log-read"),
           "the readback line, once per eye, with the movie's own numbers (512 x 288, centred at +0.1939 and -0.1940)");
-    check(!has(log, "do not read as a screen-space") && !has(log, "lock: cannot tell") && !has(log, "FAULT"), lab("log-clean"), "a refusal or a fault was logged on the golden path");
+    check(!has(log, "do not read as a screen-space") && !has(log, "lock: cannot tell") && !has(log, "FAULT") && !has(log, "intro video curve"), lab("log-clean"),
+          "a refusal, a fault or a line about the curve was logged on the golden path (curvature 0, or the key unset, says nothing about it)");
 }
 void scnGolden(Gpu& g) { goldenBody(g, false); }
 void scnGoldenZero(Gpu& g) { goldenBody(g, true); }
@@ -903,20 +1085,26 @@ std::array<float, 20> stockWith(const float* base, int index, float value) {
 }
 
 // The 80 bytes the draw saw for a bound step, against the arithmetic (the review half of a golden).
-void expectWorldBytes(const Step& s, const float* pose, bool left, double dist, const char* what) {
-    const std::array<double, 20> want = expectedWorld(pose, left, dist, stub::outer, stub::inner, stub::top, stub::bot);
+void expectWorldBytes(const Step& s, const float* pose, bool left, double dist, const char* what, bool curved = false) {
+    const std::array<double, 20> want = expectedWorld(pose, left, dist, stub::outer, stub::inner, stub::top, stub::bot, curved);
     const std::string prob = expectedProblem(s.draw.cb2Bytes, want);
     check(prob.empty(), lab(what), prob);
 }
 
-// One frame in which both eyes must be bound, and whose bytes must be the arithmetic's for `pose` (eye 0 is the left, as the buffers say).
-FrameResult boundFrame(Gpu& g, const float* pose, const char* what, double dist = 3.35, bool eye0Left = true) {
+// One frame in which both eyes must be bound, and whose bytes must be the arithmetic's for `pose` (eye 0 is the left, as the buffers say). The
+// panel is expected flat -- cb2[3] zero and nothing armed -- unless the curvature the config has now is above 0 (`curvature` below 0 is that
+// one; 0 for none is every older scenario): then the z column is in the bytes and the strip is armed, whatever the pose (there is no test of
+// the bent edges: a pose that keeps the CENTRE in front is bound, and bent).
+FrameResult boundFrame(Gpu& g, const float* pose, const char* what, double dist = 3.35, bool eye0Left = true, double curvature = -1.0) {
+    if (curvature < 0.0) curvature = g_liveCurvature;
     setPose(pose);
     FrameResult fr = runFrame(g);
     for (int e = 0; e < 2; ++e) {
         g_note = fmt("%s eye", e ? "right" : "left");
-        expectStep(fr.eye[e], true, what, g);
-        if (fr.eye[e].bound) expectWorldBytes(fr.eye[e], pose, (e == 0) == eye0Left, dist, "world-bytes");
+        const bool left = (e == 0) == eye0Left;
+        const bool bent = curvature > 0.0;
+        expectStep(fr.eye[e], true, what, g, -1, bent);
+        if (fr.eye[e].bound) expectWorldBytes(fr.eye[e], pose, left, dist, "world-bytes", bent);
     }
     g_note.clear();
     return fr;
@@ -996,7 +1184,7 @@ void headBody(Gpu& g, const HeadCase& hc) {
     check(has(log, (std::string("so matching it is ") + hc.scaleLog + " here").c_str()) && count(log, "intro video size: engaged") == 1 &&
               has(log, (std::string(hc.scaleLog) + " its own size").c_str()),
           lab("log-scale"), std::string("the derived scale (") + hc.scaleLog + ") is logged, and 'engaged' once");
-    check(!has(log, "holding") && !has(log, "cannot tell") && !has(log, "do not read as"), lab("log-clean"), "a lock or refusal line on the head path");
+    check(!has(log, "holding") && !has(log, "cannot tell") && !has(log, "do not read as") && !has(log, "intro video curve"), lab("log-clean"), "a lock, refusal or curve line on the head path");
 }
 void scnHead(Gpu& g) { headBody(g, HeadCase{}); }
 void scnHeadSymmetric(Gpu& g) { HeadCase hc; hc.symmetric = true; headBody(g, hc); }
@@ -1291,7 +1479,8 @@ void scnRetireUsed(Gpu& g) {
     introPanelTick(g.ctx.Get(), true);
     afterRetirement(g);
     const std::string log = endLog();
-    check(count(log, "a rendered scene arrived -- the intro is over") == 1 && has(log, "It resized 4 draw(s)"), lab("log-retired"), "the retirement line, once, with the four draws it resized");
+    check(count(log, "a rendered scene arrived -- the intro is over") == 1 && has(log, "It resized 4 draw(s)."), lab("log-retired"), "the retirement line, once, with the four draws it resized");
+    check(!has(log, "of them were armed"), lab("log-retired-unarmed"), "the retirement line counts armed draws at curvature 0, where there are none");
 }
 void scnRetireSettling(Gpu& g) {
     check(beginLog(), lab("log"), "the scratch log opens");
@@ -1432,6 +1621,322 @@ void scnSceneArrived(Gpu& g) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------
+// THE CURVED MOVIE (fix.panel_curvature above 0): the world panel's cb2[3] carries the seated +z axis through the projection, and the strip is
+// armed for the caller (vscreen.cpp draws panel_curve.cpp's strip instead of the quad); at curvature 0, at stock and head, in the settle
+// frames, when the lock is refused and when the surface strip has stood down, the bytes are the flat panel's to the bit and nothing is
+// armed. The bent edges are not tested against the eye (round 3): whatever the pose, a movie the lock holds with its centre in front is bent.
+// ---------------------------------------------------------------------------------------------------------------------------------
+const float* poseByName(const char* name) {
+    if (!std::strcmp(name, "A")) return kPoseA;
+    if (!std::strcmp(name, "B")) return kPoseB;
+    if (!std::strcmp(name, "C")) return kPoseC;
+    if (!std::strcmp(name, "D")) return kPoseD;
+    if (!std::strcmp(name, "I")) return kPoseI;
+    return nullptr;
+}
+
+// Whether two cb2 images are the same in every float of columns 0, 1, 2 and 4 (and what the one in column 3 is, is another question).
+bool sameButColumn3(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    if (a.size() != 80 || b.size() != 80) return false;
+    return std::memcmp(a.data(), b.data(), 48) == 0 && std::memcmp(a.data() + 64, b.data() + 64, 16) == 0;
+}
+bool column3IsZero(const std::vector<uint8_t>& a) {
+    if (a.size() != 80) return false;
+    const uint8_t zero[16] = {0};
+    return std::memcmp(a.data() + 48, zero, 16) == 0;   // exactly +0.0f in all four: the flat panel's, not merely a small number
+}
+
+// The bytes of one bent step against their golden "<pose>-<eye>-curved" and, when a curvature-0 golden of the pose exists (A, B and I do), in
+// every float but column 3 against that one: the bend changes the z column and nothing else.
+void expectCurvedGolden(const Step& s, const char* pose, bool left, std::map<std::string, std::vector<uint8_t>>* emit) {
+    const std::string base = fmt("%s-%s", pose, left ? "left" : "right");
+    const Golden* flat = findGolden(base.c_str());
+    const std::string name = base + "-curved";
+    if (emit) (*emit)[name] = s.draw.cb2Bytes;
+    else {
+        const std::string gp = goldenProblem(s.draw.cb2Bytes, findGolden(name.c_str()));
+        check(gp.empty(), lab("golden"), name + ": " + gp);
+    }
+    if (flat) {
+        std::vector<uint8_t> f(80);
+        std::memcpy(f.data(), flat->v, 80);
+        check(sameButColumn3(s.draw.cb2Bytes, f), lab("columns-unchanged"), base + ": columns 0, 1, 2 and 4 are not the curvature-0 golden's to the bit");
+    }
+    check(!column3IsZero(s.draw.cb2Bytes), lab("column3-written"), base + ": cb2[3] is still zero in a bent step");
+}
+
+// The lines of the edge test that is not there must not come back: no line about a bent edge, whatever the pose.
+void expectNoEdgeLine(const std::string& log) {
+    check(!has(log, "stays flat") && !has(log, "nearer edge") && !has(log, "edge of the bent panel"), lab("log-no-edge-line"), "the log has a line about a bent edge being behind the eye, and nothing tests the edges");
+}
+
+// curved: the screen mode at curvature 0.3 and 48 columns over five poses -- A (a head turned 53 degrees, where an edge of the bent panel is
+// beside or behind the eye), B (the same, the other way), C, D and the identity: every one bends the movie. Bytes to the bit, the strip armed
+// for every draw and for none after introPanelEndDraw, the gain, the first-armed line once, the retirement line's count, no edge line.
+void scnCurved(Gpu& g) {
+    ID3D11DeviceContext* ctx = g.ctx.Get();
+    check(beginLog(), lab("log"), "the scratch log opens");
+    configure("screen", nullptr, "0.3", "48");
+    check(introPanelWants(), lab("wants"), "the panel is wanted");
+    check(introPanelStripGain() == 4.44444f, lab("gain"), fmt("introPanelStripGain() is %.9g, want the panel's half-width 4.44444", static_cast<double>(introPanelStripGain())));
+    check(!introPanelStripArmed(), lab("armed-idle"), "the strip is armed before any composite");
+    setPose(kPoseC);
+    settle(g, "settle", true);   // nothing is bound, so nothing is armed (expectStep's default)
+    const char* const frames[] = {"C", "A", "I", "B", "D", "C"};
+    std::map<std::string, std::vector<uint8_t>> emit;
+    unsigned bound = 0, armed = 0;
+    for (size_t k = 0; k < sizeof(frames) / sizeof(frames[0]); ++k) {
+        const float* pose = poseByName(frames[k]);
+        setPose(pose);
+        FrameResult fr = runFrame(g);
+        for (int e = 0; e < 2; ++e) {
+            const Step& s = fr.eye[e];
+            g_note = fmt("frame %zu (pose %s), %s eye", k, frames[k], e ? "right" : "left");
+            expectStep(s, true, "bound", g, -1, true);
+            if (!s.bound) continue;
+            ++bound;
+            if (s.armed) ++armed;
+            expectWorldBytes(s, pose, e == 0, 3.35, "arithmetic", true);
+            expectCurvedGolden(s, frames[k], e == 0, g_emit ? &emit : nullptr);
+            check(introPanelStripGain() == 4.44444f, lab("gain"), "introPanelStripGain() changed while the movie played");
+        }
+    }
+    g_note.clear();
+    for (const auto& b : emit) emitGolden(b.first, b.second);
+    check(bound == 12 && armed == 12, lab("counts"), fmt("%u bound draws, %u armed, want 12 and 12 (six frames of two eyes, every one bent)", bound, armed));
+    check(!introPanelStripArmed(), lab("armed-after"), "the strip is armed between draws");
+    introPanelTick(ctx, true);   // the first rendered scene: the intro is over
+    check(!introPanelStripArmed() && introPanelStripGain() == 4.44444f, lab("armed-retired"), "the strip is armed after the intro, or the gain moved");
+    const std::string log = endLog();
+    check(count(log, "intro video curve: the movie is drawn as a 48-column strip at curvature 0.300, gain 4.444 m") == 1, lab("log-armed"),
+          "the first-armed line is not written once, with the live column count, the curvature and the gain");
+    expectNoEdgeLine(log);
+    check(count(log, "intro video lock: holding") == 1 && count(log, "intro video size: engaged") == 1, lab("log-lock"), "the 'holding' or 'engaged' line is not written once");
+    check(has(log, "It resized 12 draw(s). 12 of them were armed for the curved strip."), lab("log-retired"), "the retirement line does not count 12 draws, 12 of them armed");
+    check(!has(log, "do not read as a screen-space") && !has(log, "lock: cannot tell") && !has(log, "FAULT"), lab("log-clean"), "a refusal or a fault was logged");
+}
+
+// curved-asymmetric: the Quest-like vertical frustum (m12 is not zero), curvature 0.3, pose C: the z column goes through the same projection, so
+// its y is m11 cz.y + m12 cz.z -- the shear a symmetric headset cannot show.
+void scnCurvedAsymmetric(Gpu& g) {
+    stub::outer = 1.2000f;
+    stub::inner = 1.0155f;
+    stub::top = 1.4281f;
+    stub::bot = 0.9657f;
+    check(beginLog(), lab("log"), "the scratch log opens");
+    configure("screen", nullptr, "0.3");
+    settle(g, "settle");
+    std::map<std::string, std::vector<uint8_t>> emit;
+    for (int k = 0; k < 2; ++k) {
+        FrameResult fr = boundFrame(g, kPoseC, "bound");   // bent, by the arithmetic (g_liveCurvature = 0.3), and the bytes follow it
+        for (int e = 0; e < 2; ++e) {
+            const Step& s = fr.eye[e];
+            g_note = fmt("bound frame %d, %s eye", k, e ? "right" : "left");
+            if (k != 0 || !s.bound) continue;
+            const std::string name = std::string("QC-") + (e ? "right" : "left") + "-curved";
+            if (g_emit) emit[name] = s.draw.cb2Bytes;
+            else {
+                const std::string gp = goldenProblem(s.draw.cb2Bytes, findGolden(name.c_str()));
+                check(gp.empty(), lab("golden"), name + ": " + gp);
+            }
+        }
+    }
+    g_note.clear();
+    for (const auto& b : emit) emitGolden(b.first, b.second);
+}
+
+// curved-no-edge-test: the bent edges are NOT tested against the eye. D3D clips what is behind the eye in homogeneous space (clip z = w/2 here, so
+// the plane is w = 0), so an edge beside or behind the eye just loses that part of the surface and the rest of the bend stays; the only test is
+// the centre's (the 'behind' scenarios). Round 2 had a test of the edges (view z below -0.05); it popped the whole bend off at about 20 degrees of
+// head yaw and could differ between the eyes near its threshold. These are the worst places for it: where the rig's own arithmetic puts a nearer
+// edge at or behind the eye (and the centre still in front), every row is bound and ARMED in both eyes with cb2[3] = col(cz), bytes to the
+// arithmetic -- the distance at its 1 m floor with curvature 1.0 (a closed cylinder, both edges 2.83 m toward the viewer) and a head yawed 40
+// degrees either way and straight ahead; curvature 0.3 with a head yawed 25 degrees either way, at the default distance and at 1 m.
+void scnCurvedNoEdgeTest(Gpu& g) {
+    check(beginLog(), lab("log"), "the scratch log opens");
+    configure("screen", nullptr, "0.3");
+    setPose(kPoseI);
+    settle(g, "settle");
+    struct Row {
+        const char* name;
+        const float* pose;
+        const char* curvature;
+        const char* distance;
+    };
+    const Row rows[] = {
+        {"closed-1m-yaw40-pos", kPoseYaw40Pos, "1.0", "1"},        {"closed-1m-yaw40-neg", kPoseYaw40Neg, "1.0", "1"},
+        {"closed-1m-identity", kPoseI, "1.0", "1"},                 {"gentle-default-yaw25-pos", kPoseYaw25Pos, "0.3", "3.35"},
+        {"gentle-default-yaw25-neg", kPoseYaw25Neg, "0.3", "3.35"}, {"gentle-1m-yaw25-pos", kPoseYaw25Pos, "0.3", "1"},
+        {"gentle-1m-yaw25-neg", kPoseYaw25Neg, "0.3", "1"},
+    };
+    for (const Row& r : rows) {
+        configure(nullptr, r.distance, r.curvature);   // advanced.intro_video_distance and fix.panel_curvature, live
+        const double c = std::atof(r.curvature), dist = std::atof(r.distance);
+        g_note = fmt("%s: curvature %s, distance %s m", r.name, r.curvature, r.distance);
+        for (int e = 0; e < 2; ++e) {
+            check(expectedBasis(r.pose, e == 0, dist).c0[2] < 0.0, lab("fixture-centre"),
+                  "the rig's own arithmetic puts the CENTRE behind the eye: the centre's test would refuse this draw, which is not what this row is about");
+            check(nearerEdgeViewZ(r.pose, e == 0, dist, c) >= -0.05, lab("fixture-edge"),
+                  "the rig's own arithmetic puts the nearer edge in front of the eye by a margin: a test of the edges would pass this row, so it shows nothing");
+        }
+        boundFrame(g, r.pose, "frame", dist, true, c);   // bound and armed in both eyes, cb2[3] = col(cz), bytes against the arithmetic
+    }
+    g_note.clear();
+    const std::string log = endLog();
+    expectNoEdgeLine(log);
+    check(count(log, "intro video curve: the movie is drawn as a 64-column strip at curvature 1.000, gain 4.444 m") == 1, lab("log-armed"),
+          "the first-armed line is not written once, at the first row's curvature");
+}
+
+// curved-live: the curvature switched while the movie plays -- the same pose at 0 (flat), 0.3 (bent: every float but cb2[3] the flat panel's, to the
+// bit), 0 again (the flat bytes exactly: nothing lingers), 0.5, 0.7 and 1.0 -- a bent z column that does not depend on the curvature (0.7 and 1.0
+// give the same bytes), and the retirement line's count of armed draws against the draws it resized (the two curvature-0 frames are resized, not armed).
+void scnCurvedLive(Gpu& g) {
+    ID3D11DeviceContext* ctx = g.ctx.Get();
+    check(beginLog(), lab("log"), "the scratch log opens");
+    configure("screen", nullptr, "0");
+    setPose(kPoseC);
+    settle(g, "settle");
+    unsigned binds = 0, armedBinds = 0;
+    const auto tally = [&](const FrameResult& fr) {
+        for (int e = 0; e < 2; ++e) {
+            if (fr.eye[e].bound) ++binds;
+            if (fr.eye[e].armed) ++armedBinds;
+        }
+    };
+    std::array<std::vector<uint8_t>, 2> flatC, bentC, bentI07;
+    {
+        FrameResult fr = boundFrame(g, kPoseC, "flat");
+        tally(fr);
+        for (int e = 0; e < 2; ++e) flatC[static_cast<size_t>(e)] = fr.eye[e].draw.cb2Bytes;
+    }
+    configure(nullptr, nullptr, "0.3");
+    {
+        FrameResult fr = boundFrame(g, kPoseC, "bent");
+        tally(fr);
+        for (int e = 0; e < 2; ++e) {
+            bentC[static_cast<size_t>(e)] = fr.eye[e].draw.cb2Bytes;
+            g_note = e ? "right eye" : "left eye";
+            check(sameButColumn3(bentC[static_cast<size_t>(e)], flatC[static_cast<size_t>(e)]) && !column3IsZero(bentC[static_cast<size_t>(e)]), lab("columns-unchanged"),
+                  "switching the curvature on changed more than cb2[3], or left it zero");
+        }
+    }
+    configure(nullptr, nullptr, "0");
+    {
+        FrameResult fr = boundFrame(g, kPoseC, "flat-again");
+        tally(fr);
+        for (int e = 0; e < 2; ++e) {
+            g_note = e ? "right eye" : "left eye";
+            check(fr.eye[e].draw.cb2Bytes == flatC[static_cast<size_t>(e)], lab("flat-again-bytes"), "back at curvature 0 the bytes are not the first flat frame's, to the bit");
+        }
+    }
+    configure(nullptr, nullptr, "0.5");
+    tally(boundFrame(g, kPoseC, "bent-0.5"));   // pose C bends at 0.5 as at 0.3: the curvature decides whether, not how far, and no pose keeps it flat
+    configure(nullptr, nullptr, "0.7");
+    FrameResult at07 = boundFrame(g, kPoseI, "bent-0.7");
+    tally(at07);
+    for (int e = 0; e < 2; ++e) bentI07[static_cast<size_t>(e)] = at07.eye[e].draw.cb2Bytes;
+    configure(nullptr, nullptr, "1.0");
+    FrameResult at10 = boundFrame(g, kPoseI, "bent-1.0");
+    tally(at10);
+    for (int e = 0; e < 2; ++e) {
+        g_note = e ? "right eye" : "left eye";
+        check(at10.eye[e].draw.cb2Bytes == bentI07[static_cast<size_t>(e)], lab("z-column-independent"), "cb2[3] changed with the curvature (it is the axis, not the bend)");
+    }
+    g_note.clear();
+    check(binds == 12 && armedBinds == 8, lab("counts"), fmt("%u binds, %u armed, want 12 and 8 (six frames of two eyes, two of them at curvature 0)", binds, armedBinds));
+    introPanelTick(ctx, true);   // the first rendered scene: the intro is over
+    const std::string log = endLog();
+    check(count(log, "intro video curve: the movie is drawn as a 64-column strip at curvature 0.300") == 1 && count(log, "intro video curve: the movie is drawn") == 1, lab("log-armed"),
+          "the first-armed line is not written once, at the curvature the strip was first armed at");
+    check(has(log, "It resized 12 draw(s). 8 of them were armed for the curved strip."), lab("log-retired"), "the retirement line does not count 12 draws resized, 8 of them armed");
+    expectNoEdgeLine(log);
+}
+
+// curved-stood-down: the surface strip faults (the rig's draw function raises an access violation, as in panel_curve_test) and stands down for the
+// session: the movie is flat from then on -- still held on the game's forward, bytes the flat panel's, nothing armed -- whatever the configuration.
+void scnCurvedStoodDown(Gpu& g) {
+    ID3D11DeviceContext* ctx = g.ctx.Get();
+    check(beginLog(), lab("log"), "the scratch log opens");
+    configure("screen", nullptr, "0.3");
+    setPose(kPoseI);
+    settle(g, "settle");
+    boundFrame(g, kPoseI, "bent");   // bent, by the arithmetic at curvature 0.3
+    check(panelCurveSurfaceWanted(), lab("wanted"), "the surface strip is not wanted at curvature 0.3");
+    const bool drew = panelCurveSurfaceDraw(ctx, introPanelStripGain(), 1, [](ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT) {
+        *reinterpret_cast<volatile int*>(static_cast<uintptr_t>(0x10)) = 1;
+    });
+    check(!drew && panelCurveSurfaceInfo().standDown && !panelCurveSurfaceWanted(), lab("faulted"), "the faulting strip draw did not stand the surface strip down");
+    g_liveCurvature = 0.0;   // the module is told curvature 0.3 and must still draw flat: what boundFrame expects is the flat panel
+    for (int f = 0; f < 3; ++f) {
+        g_note = fmt("frame %d after the stand-down", f);
+        boundFrame(g, kPoseI, "flat", 3.35, true, 0.0);
+    }
+    configure("screen", nullptr, "0.7");   // a reload does not bring it back
+    boundFrame(g, kPoseI, "flat-reconfigured", 3.35, true, 0.0);
+    g_note.clear();
+    check(introPanelStripGain() == 4.44444f, lab("gain"), "the gain moved");
+    introPanelTick(ctx, true);   // the first rendered scene: the intro is over
+    const std::string log = endLog();
+    check(count(log, "intro video curve: the movie is drawn") == 1, lab("log-armed"), "the first-armed line is not written exactly once (the bent frame before the fault)");
+    check(count(log, "the surface strip (the intro movie and the splash) faulted") == 1, lab("log-faulted"), "the stand-down line is not written once");
+    check(has(log, "It resized 10 draw(s). 2 of them were armed for the curved strip."), lab("log-retired"),
+          "the retirement line does not count 10 draws resized (five frames), 2 of them armed (the one before the fault)");
+    expectNoEdgeLine(log);
+}
+
+// curved-armed-scope: armed belongs to the bind the last introPanelOnComposite made and to no other: a call that does not bind clears it (the
+// caller may have skipped introPanelEndDraw), and a shutdown clears it.
+void scnCurvedArmedScope(Gpu& g) {
+    ID3D11DeviceContext* ctx = g.ctx.Get();
+    check(beginLog(), lab("log"), "the scratch log opens");
+    configure("screen", nullptr, "0.3");
+    setPose(kPoseI);
+    settle(g, "settle");
+    introPanelNoteFill(kFillW, kFillH);
+    ID3D11Buffer* game = g.eyeCb[0].Get();
+    ctx->VSSetConstantBuffers(2, 1, &game);
+    check(introPanelOnComposite(ctx, 'X', 6, 1, kFillW, kFillH) && introPanelStripArmed(), lab("armed"), "a bent bind did not arm the strip");
+    // the caller forgot introPanelEndDraw; the next composite is one of the wrong shape: it binds nothing and nothing is armed any longer
+    check(!introPanelOnComposite(ctx, 'N', 6, 1, kFillW, kFillH) && !introPanelStripArmed(), lab("cleared-by-the-next-call"), "a call that did not bind left the previous bind's strip armed");
+    introPanelEndDraw(ctx);
+    ctx->VSSetConstantBuffers(2, 1, &game);
+    check(introPanelOnComposite(ctx, 'X', 6, 1, kFillW, kFillH) && introPanelStripArmed(), lab("armed-again"), "the second bent bind did not arm the strip");
+    introPanelShutdown();
+    check(!introPanelStripArmed(), lab("cleared-by-shutdown"), "the shutdown left the strip armed");
+    ctx->VSSetConstantBuffers(2, 1, &game);
+    check(!introPanelStripArmed(), lab("idle"), "the strip is armed with no bind in progress");
+}
+
+// curved-refused: at curvature 0.3 and a pose that bends, every refusal of the lock leaves the movie as the game drew it with nothing armed, and the
+// retry (what was missing is published) bends it.
+void scnCurvedRefused(Gpu& g) {
+    check(beginLog(), lab("log"), "the scratch log opens");
+    configure("screen", nullptr, "0.3");
+    setPose(kPoseI);
+    settle(g, "settle");
+    const int which[] = {0, 1, 4, 6};   // no pose, no tangents, behind, a degenerate viewport (kRefusals above)
+    for (int idx : which) {
+        const Refusal& r = kRefusals[idx];
+        g_note = r.needle;
+        r.setup(g);
+        unboundFrames(g, 2, "refused");
+        r.fix(g);
+        boundFrame(g, kPoseI, "retried");
+    }
+    g_note.clear();
+    check(introPanelWants(), lab("wants"), "a refusal of the lock is per draw: the panel is still wanted");
+}
+
+// The older scenarios at curvature 0.3: stock never applies the transform, head locks to the head with no pose, the splash's constants are
+// refused for the session, and two buffers that do not tell the eyes apart are refused -- none of them bends or arms anything, and each of those
+// bodies already says so (expectStep's default is "not armed").
+void scnCurvedStock(Gpu& g) { g_curvature = "0.3"; scnStock(g); }
+void scnCurvedHead(Gpu& g) { g_curvature = "0.3"; scnHead(g); }
+void scnCurvedSplash(Gpu& g) { g_curvature = "0.3"; scnSplash(g); }
+void scnCurvedEyesAlike(Gpu& g) { g_curvature = "0.3"; scnEyesAlike(g); }
+
+// ---------------------------------------------------------------------------------------------------------------------------------
 // The runner: one process per scenario.
 // ---------------------------------------------------------------------------------------------------------------------------------
 struct Scenario {
@@ -1484,6 +1989,17 @@ const Scenario kScenarios[] = {
     {"distance", scnDistance},
     {"gates", scnGates},
     {"scene-arrived", scnSceneArrived},
+    {"curved", scnCurved},
+    {"curved-asymmetric", scnCurvedAsymmetric},
+    {"curved-no-edge-test", scnCurvedNoEdgeTest},
+    {"curved-live", scnCurvedLive},
+    {"curved-stood-down", scnCurvedStoodDown},
+    {"curved-armed-scope", scnCurvedArmedScope},
+    {"curved-refused", scnCurvedRefused},
+    {"curved-stock", scnCurvedStock},
+    {"curved-head", scnCurvedHead},
+    {"curved-splash", scnCurvedSplash},
+    {"curved-eyes-alike", scnCurvedEyesAlike},
 };
 
 std::wstring widen(const char* s) {
@@ -1676,7 +2192,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (emitAll) {
-        for (const char* id : {"golden", "head", "golden-asymmetric"}) {
+        for (const char* id : {"golden", "head", "golden-asymmetric", "curved", "curved-asymmetric"}) {
             std::string out;
             runChild(std::wstring(L"--scenario ") + widen(id) + L" --emit", &out);
             for (const std::string& line : linesOf(out))

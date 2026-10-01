@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """The mutation proof for tools\\panel_curve_test: the rig fails when a rule of the curved screen's module is flipped.
 
-The rig (panel_curve_test.cpp) runs the REAL src\\d3d11\\panel_curve.cpp on a WARP device, in eleven cases C1..C11 (its header says
-which); every check it makes carries a label "C<case>.<what>". A rig that passes proves little until it is seen to FAIL on a module that
+The rig (panel_curve_test.cpp) runs the REAL src\\d3d11\\panel_curve.cpp on a WARP device, in thirteen cases C1..C13 (its header says
+which; C12 and C13 are the surface strip of the intro movie and the splash); every check it makes carries a label "C<case>.<what>". A rig that passes proves little until it is seen to FAIL on a module that
 breaks the rule it pins. This tool does that: for each mutation below it copies panel_curve.cpp (and panel_curve.h where the rule lives
 there) into a temp directory OUTSIDE the repo, applies one textual edit (or a few that belong together), compiles the module (and the
 rig, when the header changed) against that copy, links the rig with the unmutated common sources, runs it, and requires it to fail on a
@@ -70,9 +70,9 @@ def drop(old):
 SAVE_VB = "    ctx->IAGetVertexBuffers(0, 1, &g_savedVb, &g_savedStride, &g_savedOffset);\n"
 SAVE_IB = "    ctx->IAGetIndexBuffer(&g_savedIb, &g_savedFmt, &g_savedIbOffset);\n"
 SAVE_TOPO = "    ctx->IAGetPrimitiveTopology(&g_savedTopo);\n"
-BIND_IB = "    ctx->IASetIndexBuffer(g_ib, DXGI_FORMAT_R16_UINT, 0);\n"
+BIND_IB = "    ctx->IASetIndexBuffer(ib, DXGI_FORMAT_R16_UINT, 0);\n"
 BIND_TOPO = "    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);\n"
-THE_DRAW = "    draw(ctx, g_indexCount, 1, 0, 0, 0);\n"
+THE_DRAW = "    draw(ctx, indexCount, 1, 0, 0, 0);\n"
 RESTORE_VB = "    ctx->IASetVertexBuffers(0, 1, &g_savedVb, &g_savedStride, &g_savedOffset);\n"
 RESTORE_IB = "    ctx->IASetIndexBuffer(g_savedIb, g_savedFmt, g_savedIbOffset);\n"
 RESTORE_TOPO = "    ctx->IASetPrimitiveTopology(g_savedTopo);\n"
@@ -123,7 +123,7 @@ SIZE_LEARNED = "                g_sizeLearned = true;\n"
 GAIN_RANGE = "    if (g_zGainCfg < 0.0f || g_zGainCfg > 10000.0f) g_zGainCfg = 0.0f;\n"
 GAIN_OVERRIDE = "    if (g_zGainCfg > 0.0f) return g_zGainCfg;\n"
 RESTORE_RELEASE ="    if (g_savedVb) { g_savedVb->Release(); g_savedVb = nullptr; }\n    if (g_savedIb) { g_savedIb->Release(); g_savedIb = nullptr; }\n}\n"
-REISSUE_RETURN = "    return drawn;\n"
+REISSUE_RETURN = "            detail::g_panelCurveSegments, detail::g_panelCurveCurvature);\n    }\n    return drawn;\n"
 CURVATURE_RANGE = "    if (c < 0.0f || c > kMaxCurvature) {\n"
 SEGMENTS_RANGE = "                                   kDefaultSegments, kMinSegments, kMaxSegments);\n"
 DEFAULT_MOTION = "bool panelCurveSubstitute(ID3D11DeviceContext* ctx, PanelCurveDrawFn draw, bool withMotion = true);\n"
@@ -134,6 +134,35 @@ INFO_SEGMENTS = "    i.segments = detail::g_panelCurveSegments;\n"
 INFO_REISSUES = "    i.reissues = detail::g_panelCurveReissues;\n"
 DEFAULT_CURVATURE = '    float c = cfg.getFloat("fix.panel_curvature", 0.0f);\n'
 DEFAULT_SEGMENTS = "constexpr int kDefaultSegments = 64;\n"
+# the surface strip (C12, C13)
+S_WANTED_CFG = "    g_sWanted = c > 0.0f && !g_sStoodDown;   // the surface strip follows the live curvature, and nothing else of the screen's\n"
+S_WANTED_RET = "bool panelCurveSurfaceWanted() {\n    return g_sWanted;\n}\n"
+S_DRAW_GUARD = "    if (!ctx || !draw || !g_sWanted) return false;\n"
+S_ARG_GUARD = "    if (!(gain > 0.0f && gain < 1.0e6f) || (toward != 1 && toward != -1)) return false;\n"
+S_BUDGET = "    const bool ok = guardedBudget(g_sBudget, [&] {\n"
+S_CURRENT_ALL = ("    return g_sVb && g_sIb && g_sBuiltCurvature == detail::g_panelCurveCurvature && g_sBuiltSegments == detail::g_panelCurveSegments &&\n"
+                 "           g_sBuiltGain == gain && g_sBuiltToward == toward;\n")
+S_REBUILD = "        if (!surfaceCurrent(gain, toward)) {\n            if (!buildSurface(ctx, gain, toward)) return;\n        }\n"
+S_FILL = "    fillStrip(n, detail::g_panelCurveCurvature, -toward, gain, vb, ib);\n"
+S_BUILT_COUNT = "    ++g_sBuilt;\n"
+S_RS_CULL = "            if (game.CullMode != D3D11_CULL_NONE) {\n"
+S_RS_SWAP = "                ctx->RSSetState(off);\n                g_sRsSwapped = true;\n"
+S_DRAW_TAIL = "        drawStripHeld(ctx, draw, g_sVb, g_sIb, g_sIndexCount);\n        restoreSaved(ctx);\n        restoreSurfaceRs(ctx);\n"
+S_DRAWN = "        drawn = true;\n        ++g_sDrawn;\n"
+S_RS_RESTORE = "    if (swapped) ctx->RSSetState(g_sSavedRs);\n    if (g_sSavedRs) { g_sSavedRs->Release(); g_sSavedRs = nullptr; }\n"
+S_CULL_OFF = "    d.CullMode = D3D11_CULL_NONE;\n"
+S_CACHE_HIT = "        if (s.off && memcmp(&s.game, &game, sizeof(game)) == 0) return s.off;\n"
+S_RS_COUNT = "    ++g_sRasterStates;\n"
+S_STAND_FLAGS = "    g_sStoodDown = true;\n    g_sWanted = false;\n"
+S_STAND_IA = '    guarded("panelCurve.surface.restore", [&] { restoreSaved(ctx); });\n'
+S_STAND_RS = '    guarded("panelCurve.surface.restoreRs", [&] { restoreSurfaceRs(ctx); });\n'
+S_STAND_LOG = '        "panel curvature: the surface strip (the intro movie and the splash) faulted, so those two are flat for the rest of this session and "\n'
+S_INFO_BUILT = "    i.built = g_sBuilt;\n"
+S_INFO_STAND = "    i.standDown = g_sStoodDown;\n"
+S_INFO_STATES = "    i.rasterStates = g_sRasterStates;\n"
+S_SHUT_CULL = "    for (CullOffState& s : g_sCullOff) {\n        if (s.off) { s.off->Release(); s.off = nullptr; }\n"
+S_EVICT = "    if (slot.off) slot.off->Release();\n"
+S_SHUT_INDEX = "    g_sIndexCount = 0;\n    g_sBuiltCurvature = -1.0f;\n"
 
 MUTANTS = [
     # ---- C1: nothing is wanted at curvature 0 -------------------------------------------------------------------------------
@@ -151,11 +180,11 @@ MUTANTS = [
     M("uv-from-bent-x", "C2", [(STRIP_U, "        const float u = (bx + 1.0f) * 0.5f;\n")], "the UV follows the bent x, so the bend moves texels"),
     M("winding-first-flipped", ("C2", "C7"), [(WIND_1, "        ib[w++] = bl; ib[w++] = br; ib[w++] = tr;\n")], "the first triangle of each quad is wound the other way"),
     M("winding-second-flipped", ("C2", "C7"), [(WIND_2, "        ib[w++] = bl; ib[w++] = tr; ib[w++] = tl;\n")], "the second triangle of each quad is wound the other way"),
-    M("index-format-r32", "C2", [(BIND_IB, "    ctx->IASetIndexBuffer(g_ib, DXGI_FORMAT_R32_UINT, 0);\n")], "the strip's indices are bound as 32-bit"),
+    M("index-format-r32", "C2", [(BIND_IB, "    ctx->IASetIndexBuffer(ib, DXGI_FORMAT_R32_UINT, 0);\n")], "the strip's indices are bound as 32-bit"),
     M("topology-strip", "C2", [(BIND_TOPO, "    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);\n")], "the strip is drawn as a triangle strip"),
-    M("draw-through-the-context", "C2", [(THE_DRAW, "    ctx->DrawIndexedInstanced(g_indexCount, 1, 0, 0, 0);\n")],
+    M("draw-through-the-context", "C2", [(THE_DRAW, "    ctx->DrawIndexedInstanced(indexCount, 1, 0, 0, 0);\n")],
       "the draw goes through the context's own entry, not the original pointer it is handed (our hook would recurse)"),
-    M("draw-start-instance-one", "C2", [(THE_DRAW, "    draw(ctx, g_indexCount, 1, 0, 0, 1);\n")], "the draw starts at instance 1"),
+    M("draw-start-instance-one", "C2", [(THE_DRAW, "    draw(ctx, indexCount, 1, 0, 0, 1);\n")], "the draw starts at instance 1"),
     M("restore-skips-topology", "C2", [(RESTORE_TOPO, "")], "the game's topology is not put back"),
     M("restore-skips-index-buffer", "C2", [(RESTORE_IB, "")], "the game's index buffer is not put back"),
     M("restore-forgets-index-offset", "C2", [(RESTORE_IB, "    ctx->IASetIndexBuffer(g_savedIb, g_savedFmt, 0);\n")], "the game's index buffer comes back at offset 0"),
@@ -179,7 +208,8 @@ MUTANTS = [
     M("reissue-issues-the-motion-pass", "C4", [(REISSUE_BODY, "        drawStripHeld(ctx, draw);\n        screenMotionDraw(ctx, draw, g_indexCount, 1, 0, 0, 0, nullptr);\n        restoreSaved(ctx);\n        drawn = true;\n")],
       "the re-issue also issues the motion pass"),
     M("reissue-skips-the-restore", "C4", [(REISSUE_BODY, "        drawStripHeld(ctx, draw);\n        drawn = true;\n")], "the re-issue leaves the strip bound"),
-    M("reissue-returns-false-on-success", "C4", [(REISSUE_RETURN, "    return false;\n")], "the re-issue drew but says it did not (the route's bracket would be closed without the eye)"),
+    M("reissue-returns-false-on-success", "C4", [(REISSUE_RETURN, "            detail::g_panelCurveSegments, detail::g_panelCurveCurvature);\n    }\n    return false;\n")],
+      "the re-issue drew but says it did not (the route's bracket would be closed without the eye)"),
     M("reissue-counter-never-counts", "C4", [(REISSUE_COUNT, "    if (detail::g_panelCurveReissues == 1) {\n")], "the re-issue counter never moves"),
     M("reissue-note-every-time", "C4", [(REISSUE_COUNT, "    if (++detail::g_panelCurveReissues >= 1) {\n")], "the first-call line is written at every re-issue"),
     # ---- C5: a live change ---------------------------------------------------------------------------------------------------
@@ -243,6 +273,58 @@ MUTANTS = [
     M("draw-clears-the-ps-resource", "C11", [(BIND_TOPO, BIND_TOPO + "    { ID3D11ShaderResourceView* none = nullptr; ctx->PSSetShaderResources(0, 1, &none); }\n")],
       "the strip's draw unbinds the pixel shader's resource"),
     M("draw-clears-the-rasterizer", "C11", [(THE_DRAW, THE_DRAW + "    ctx->RSSetState(nullptr);\n")], "the strip's draw leaves the default rasterizer state bound"),
+    # ---- C12: the surface strip -----------------------------------------------------------------------------------------------
+    M("surface-wanted-at-curvature-zero", "C12", [(S_WANTED_CFG, S_WANTED_CFG.replace("c > 0.0f", "c >= 0.0f"))], "the surface strip is wanted at curvature 0"),
+    M("surface-wanted-is-the-screens", "C12", [(S_WANTED_RET, "bool panelCurveSurfaceWanted() {\n    return panelCurveWants() && !g_sStoodDown;\n}\n")],
+      "the surface is wanted whenever the screen is, the identity test's one column at curvature 0 included"),
+    M("surface-draws-when-not-wanted", "C12", [(S_DRAW_GUARD, "    if (!ctx || !draw) return false;\n")], "the draw does not check that the surface is wanted: it draws at curvature 0"),
+    M("surface-null-context-not-refused", "C12", [(S_DRAW_GUARD, "    if (!draw || !g_sWanted) return false;\n")], "a null context reaches the draw (and stands the surface down)"),
+    M("surface-null-draw-not-refused", "C12", [(S_DRAW_GUARD, "    if (!ctx || !g_sWanted) return false;\n")], "a null draw function is called (and stands the surface down)"),
+    M("surface-gain-not-checked", "C12", [(S_ARG_GUARD, "    if (toward != 1 && toward != -1) return false;\n")], "a gain of 0, a negative gain, NaN or infinity is built and drawn"),
+    M("surface-gain-no-upper-bound", "C12", [(S_ARG_GUARD, "    if (!(gain > 0.0f) || (toward != 1 && toward != -1)) return false;\n")], "an infinite gain is built and drawn"),
+    M("surface-direction-not-checked", "C12", [(S_ARG_GUARD, "    if (!(gain > 0.0f && gain < 1.0e6f)) return false;\n")], "a direction other than +-1 is built and drawn"),
+    M("surface-key-ignores-curvature", "C12", [(S_CURRENT_ALL, S_CURRENT_ALL.replace(" g_sBuiltCurvature == detail::g_panelCurveCurvature &&", ""))], "a changed curvature does not make the surface strip stale"),
+    M("surface-key-ignores-columns", "C12", [(S_CURRENT_ALL, S_CURRENT_ALL.replace(" g_sBuiltSegments == detail::g_panelCurveSegments &&", ""))], "a changed column count does not make the surface strip stale"),
+    M("surface-key-ignores-gain", "C12", [(S_CURRENT_ALL, S_CURRENT_ALL.replace("g_sBuiltGain == gain && ", ""))], "a changed gain does not make the surface strip stale"),
+    M("surface-key-ignores-direction", "C12", [(S_CURRENT_ALL, S_CURRENT_ALL.replace(" && g_sBuiltToward == toward", ""))], "a changed direction does not make the surface strip stale"),
+    M("surface-always-rebuilds", "C12", [(S_REBUILD, "        if (true) {\n            if (!buildSurface(ctx, gain, toward)) return;\n        }\n")], "the surface strip is rebuilt at every draw"),
+    M("surface-direction-inverted", "C12", [(S_FILL, "    fillStrip(n, detail::g_panelCurveCurvature, toward, gain, vb, ib);\n")], "toward +1 bends away from the viewer (the sign is not flipped)"),
+    M("surface-gain-ignored", "C12", [(S_FILL, "    fillStrip(n, detail::g_panelCurveCurvature, -toward, 1.0f, vb, ib);\n")], "the caller's gain does not reach the strip"),
+    M("surface-build-uncounted", "C12", [(S_BUILT_COUNT, "")], "a built strip is not counted"),
+    M("surface-draw-uncounted", "C12", [(S_DRAWN, "        drawn = true;\n")], "a drawn strip is not counted"),
+    M("surface-draws-the-screens-strip", "C12", [(S_DRAW_TAIL, S_DRAW_TAIL.replace("drawStripHeld(ctx, draw, g_sVb, g_sIb, g_sIndexCount);", "drawStripHeld(ctx, draw);"))],
+      "the surface is drawn with the screen's own strip"),
+    M("surface-draws-the-screens-index-count", "C12", [(S_DRAW_TAIL, S_DRAW_TAIL.replace("g_sVb, g_sIb, g_sIndexCount);", "g_sVb, g_sIb, g_indexCount);"))], "the surface's draw takes the screen's index count"),
+    M("surface-keeps-the-games-cull", "C12", [(S_RS_CULL, "            if (false) {\n")], "the strip is drawn with the game's own cull mode"),
+    M("surface-swaps-a-state-that-culls-nothing", "C12", [(S_RS_CULL, "            if (true) {\n")], "a state that already culls nothing is replaced by a derived copy too"),
+    M("cull-off-keeps-the-cull", "C12", [(S_CULL_OFF, "")], "the derived state is the game's, cull and all"),
+    M("cull-off-drops-a-field", "C12", [(S_CULL_OFF, S_CULL_OFF + "    d.DepthBias = 0;\n")], "the derived state loses the game's depth bias"),
+    M("cull-off-drops-the-winding", "C12", [(S_CULL_OFF, S_CULL_OFF + "    d.FrontCounterClockwise = FALSE;\n")], "the derived state loses the game's winding convention"),
+    M("cull-off-cache-never-hits", "C12", [(S_CACHE_HIT, "        if (false) return s.off;\n")], "a derived state is created for every draw"),
+    M("cull-off-cache-keyed-by-cull-only", "C12", [(S_CACHE_HIT, "        if (s.off && s.game.CullMode == game.CullMode) return s.off;\n")], "two states of the game's with the same cull share one derived copy"),
+    M("cull-off-cache-keyed-by-nothing", "C12", [(S_CACHE_HIT, "        if (s.off) return s.off;\n")], "every state of the game's is served the first derived copy"),
+    M("cull-off-uncounted", "C12", [(S_RS_COUNT, "")], "a derived state is not counted when it is created"),
+    M("rs-not-rebound", "C12", [(S_RS_RESTORE, "    if (g_sSavedRs) { g_sSavedRs->Release(); g_sSavedRs = nullptr; }\n")], "the game's rasterizer state is not bound again after the draw"),
+    M("rs-reference-leaked", "C12", [(S_RS_RESTORE, "    if (swapped) ctx->RSSetState(g_sSavedRs);\n")], "the reference taken on the game's rasterizer state is never given back"),
+    M("rs-swap-not-flagged", "C12", [(S_RS_SWAP, "                ctx->RSSetState(off);\n")], "the swap is not recorded, so nothing is owed a rebind"),
+    M("rs-restore-skipped", "C12", [(S_DRAW_TAIL, "        drawStripHeld(ctx, draw, g_sVb, g_sIb, g_sIndexCount);\n        restoreSaved(ctx);\n")], "the surface's draw never puts the game's rasterizer state back"),
+    M("shutdown-keeps-the-cull-off-states", "C12", [(S_SHUT_CULL, "    for (CullOffState& s : g_sCullOff) {\n")], "the shutdown keeps the derived rasterizer states"),
+    M("cull-off-evicted-state-leaked", "C12", [(S_EVICT, "")], "a derived state pushed out of the cache is never released"),
+    M("surface-info-built-is-drawn", "C12", [(S_INFO_BUILT, "    i.built = g_sDrawn;\n")], "the info reports draws as builds"),
+    M("surface-info-states-zero", "C12", [(S_INFO_STATES, "    i.rasterStates = 0;\n")], "the info never reports a derived state"),
+    # ---- C13: the surface strip beside the screen's ------------------------------------------------------------------------------
+    M("surface-fault-does-not-stand-down", "C13", [(S_STAND_FLAGS, "    g_sWanted = false;\n")], "a fault in the surface's draw does not stand it down for the session"),
+    M("surface-fault-leaves-it-wanted", "C13", [(S_STAND_FLAGS, "    g_sStoodDown = true;\n")], "a fault stands the surface down but leaves it wanted until the next configure"),
+    M("surface-fault-skips-the-restore", "C13", [(S_STAND_IA, "")], "a fault in the surface's draw leaves its strip bound in the input assembler"),
+    M("surface-fault-skips-the-rs-restore", "C13", [(S_STAND_RS, "")], "a fault in the surface's draw leaves the cull-off state bound"),
+    M("surface-fault-stands-the-screen-down", "C13", [(S_STAND_FLAGS, S_STAND_FLAGS + "    detail::g_panelCurveStoodDown = true;\n")], "a fault of the surface's stands the on-foot screen down too"),
+    M("surface-fault-clears-the-screens-ready", "C13", [(S_STAND_FLAGS, S_STAND_FLAGS + "    detail::g_panelCurveReady = false;\n")], "a fault of the surface's clears the on-foot screen's ready flag"),
+    M("screen-fault-stands-the-surface-down", "C13", [(STAND_DOWN_READY, STAND_DOWN_READY + "    g_sStoodDown = true;\n    g_sWanted = false;\n")], "a fault of the screen's stands the surface down too"),
+    M("surface-fault-uses-the-screens-budget", "C13", [(S_BUDGET, "    const bool ok = guardedBudget(g_budget, [&] {\n")], "the surface's faults are charged to the screen's fault budget"),
+    M("surface-fault-line-is-the-screens", "C13", [(S_STAND_LOG, '        "panel curvature: the substitution faulted, so it is off for the rest of this session and "\n')],
+      "the surface's fault is logged in the screen's words"),
+    M("surface-info-standdown-false", "C13", [(S_INFO_STAND, "    i.standDown = false;\n")], "the info never says the surface stood down"),
+    M("shutdown-clears-the-surface-stand-down", "C13", [(S_SHUT_INDEX, "    g_sStoodDown = false;\n" + S_SHUT_INDEX)], "the shutdown brings a stood-down surface back"),
 ]
 
 
