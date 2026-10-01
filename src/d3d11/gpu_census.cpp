@@ -417,7 +417,7 @@ void logAndResetWindow(uint64_t now) {
         "EDVR GPU census, the other fix-wrapped draws above by the fix that wraps each (the same draws, the game's own "
         "work in each figure as above): %s; \"-\" means no draw of that fix ran this window.",
         fixItems.c_str());
-    char gapDetail[900];
+    char gapDetail[1100];   // the stalls clause (gpu_frame_gap.h) made 900 too small by about a hundred characters
     formatGapDetail(gapDetail, sizeof(gapDetail), gap);
     Log::get().note("%s", gapDetail);
 

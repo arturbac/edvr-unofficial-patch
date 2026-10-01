@@ -13,6 +13,11 @@ directory OUTSIDE the repo, runs it, and requires it to fail on a check whose la
   gpu    src\\d3d11\\vr_world_route.cpp: the edited copy replaces the production file in the rig's compile line (everything else is
          the real tree, found through /I); the rig takes about half a minute to run (it waits out real 5 s windows);
   layer  src\\d3d11\\ui_layer.cpp: the same, for the layer's rig.
+  wiring src\\d3d11\\vscreen.cpp, for the SURFACE STRIP's wiring pins (intro movie and splash; docs\\intro-video.md, job 3), which are source
+         scans: tools\\ui_quality_test is built ONCE from the real tree (build.bat's :rig_ui_quality_test compile line) and run with
+         --wiring in a temp tree whose src\\d3d11 holds the edited vscreen.cpp (the rig reads its sources from the working directory, and the
+         files beside vscreen.cpp it scans are copied unedited). Nothing is compiled per mutation, so the whole rig takes seconds. It proves
+         the pins end to end on the real file, where the controls inside the rig prove each pin function on a copy.
 
 Nothing is written inside the repo; the temp directory is removed at the end. (The route's SOURCE pins hold their own controls inside
 the rigs: tools\\vr_world_route_test curveBoundaryControls, tools\\ui_quality_test testControls, tools\\on_foot_maps_test P4a.)
@@ -20,7 +25,7 @@ the rigs: tools\\vr_world_route_test curveBoundaryControls, tools\\ui_quality_te
   python tools\\vr_world_route_test\\mutants.py --self-test          text only: every anchor is found exactly once in its file as it is
                                                                      now, every label named is in its rig, and build.bat compiles the
                                                                      rigs the way this tool does and runs this self-test
-  python tools\\vr_world_route_test\\mutants.py --run [--rig pure|gpu|layer] [--only a,b] [--jobs N] [--keep]
+  python tools\\vr_world_route_test\\mutants.py --run [--rig pure|gpu|layer|wiring] [--only a,b] [--jobs N] [--keep]
   python tools\\vr_world_route_test\\mutants.py --list
   python tools\\vr_world_route_test\\mutants.py --run --dry-run      the plan; writes nothing, starts nothing
 
@@ -77,7 +82,20 @@ RIGS = {
         "include_gen": True,
         "flags": ["/DUNICODE", "/D_UNICODE"],
     },
+    "wiring": {
+        "rig": ROOT / "tools" / "ui_quality_test" / "ui_quality_test.cpp",
+        # the text the failing labels live in (the rig includes it): the self-test looks for each label's text here
+        "labels": [ROOT / "tools" / "ui_quality_test" / "ui_intro_curve_wiring_test.h"],
+        "label": ":rig_ui_quality_test",
+        "target": SRC / "vscreen.cpp",
+        "sources": ["tools\\ui_quality_test\\ui_quality_test.cpp"],
+        "libs": ["d3dcompiler.lib"],
+        "include_gen": True,
+        # the other files `ui_quality_test --wiring` scans, copied unedited beside the edited vscreen.cpp
+        "reads": ["src/d3d11/ui_layer.cpp", "src/d3d11/native_temporal.cpp", "src/d3d11/native_sharpen.cpp"],
+    },
 }
+WIRING_EXE = {}   # the wiring rig, built once by its control and run in every mutation's tree
 CL_FLAGS = ["/nologo", "/O2", "/MT", "/std:c++17", "/EHsc", "/W4", "/DWIN32_LEAN_AND_MEAN", "/DNOMINMAX", "/D_CRT_SECURE_NO_WARNINGS"]
 RUN_TIMEOUT = 300.0
 
@@ -98,6 +116,37 @@ class Mutant:
 
 def M(name, rig, expect, edits, why):
     return Mutant(name, rig, expect, edits, why)
+
+
+# ---- wiring: the raw text of vscreen.cpp's blocks the mutations move or delete (the self-test finds each exactly once) ------------------
+W_CLEAR = "    s->curveThisDraw = false;\n    s->introCurveThisDraw = false;\n"
+W_SET = "    if (kind == 'X' && count == 6 && introCurveWants()) {\n        s->introCurveThisDraw = introCurveOnComposite(self, kind, count, instances);\n    }\n"
+W_END = "    if (g_state->introCurveThisDraw) {\n        g_state->introCurveThisDraw = false;\n        introCurveEndDraw();\n    }\n"
+W_AFTER_BACKDROP = "        return DrawVerdict::kBackdrop;\n    }\n\n    // The FSS panel composite pair"
+W_BEGIN = "    if (v != DrawVerdict::kNone) forwardVerdictBegin(self, v);\n"
+W_OBSERVED = ("    const bool originalIssued=observedDraw(alteredClass == AlteredDrawClass::Verdict\n"
+              "                                               ? AlteredDraw(alteredClass, alteredFixOf(v)) : AlteredDraw(alteredClass));\n")
+W_STRIP_START = "    float stripGain = 0.0f;\n"
+W_GUARD = ("    if (panelCurveWants() && srv0IsPanelSized(s, kind, count) &&\n"
+           "        !(kind == 'X' && count == 6 && bindingShaderHash(BindSlot::Vs) == kIntroCompositeVsHash)) {\n")
+W_GATE = ("        vscreenFootprintWanted() ||   // the footprint instrument (vscreen_footprint.h): it reads the 2D screen's composite\n"
+          "        introCurveWants();")
+W_DIM = ("            if (!(stripIssued && panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced))) {\n"
+         "                draw(AlteredDrawClass::None);\n            }\n")
+W_REFUSAL = ("        if (owner && uiLayerIssueBlocked()) return false;\n"
+             "        if (stripIssued) return true;   // the strip was issued in its place: nothing more, and something was\n")
+W_CANDIDATE = "if ((v == DrawVerdict::kIntroPanel || g_state->introCurveThisDraw) && owner && panelCurveSurfaceWanted()) {"
+W_STRIP_CALL = "stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced);"
+W_TICK = ("        tkIntroCurve.run([&] {\n            const bool sceneFrame = g_state->eyeDrawsLastFrame >= kSceneEyeDraws;\n"
+          "            introCurveTick(g_state->ownerCtx, sceneFrame);\n            if (sceneFrame) introCurveNoteRetired();\n        });\n")
+W_RETIRE_TEXT = "in all (the movie's, the splash's and the splash dim's re-issues of either)"
+W_MOVIE_COMMENT = "    // The intro movie's panel (intro_panel.h). First thing in the eye\n"
+W_CENSUS_LINE = "    // The census line for this draw, recorded while its bindings are certainly\n"
+
+
+def wiring(name, pin, edits, why):
+    """One mutation of the wiring rig: the rig must fail on the check the named pin makes."""
+    return M(name, "wiring", "intro curve wiring [%s]" % pin, edits, why)
 
 
 # ---- anchors: the sources, verbatim (the self-test finds each exactly once) -----------------------------------------------------------
@@ -230,6 +279,95 @@ MUTANTS = [
         "        return;\n    }\n    ++g_win.worldReissued;")], "a draw that did not land is not counted as a fault"),
     M("end-eye-not-marked", "layer", "the eye is the route's, as a flat screen's is",
       [("    g_eye[plan.eye].worldSeq = plan.seq;\n", "")], "a landed re-issue does not mark the eye as the route's"),
+    # ---- wiring: the surface strip in vscreen.cpp (the movie and the splash), end to end through ui_quality_test --wiring ------------------
+    wiring("iw-flag-never-cleared", "flag-lifetime", [(W_CLEAR, "    s->curveThisDraw = false;\n")], "the splash's flag is not cleared at the top of beginPanelOverride"),
+    wiring("iw-flag-thunk-leaves-it", "flag-lifetime", [(W_END, "")], "the thunk never puts the numbers and the flag away"),
+    wiring("iw-flag-put-away-before-the-draw", "flag-lifetime",
+           [(W_END, ""), ("    const DrawVerdict v = beginPanelOverride(self, 'X', perInstance, instances, args);\n",
+                          "    const DrawVerdict v = beginPanelOverride(self, 'X', perInstance, instances, args);\n" + W_END)],
+           "the numbers are put away before the draw and the dim have used them"),
+    wiring("iw-recognition-without-wants", "recognition", [("if (kind == 'X' && count == 6 && introCurveWants()) {", "if (kind == 'X' && count == 6) {")],
+           "the recogniser is asked at curvature 0 too"),
+    wiring("iw-recognition-below-the-backdrop", "recognition",
+           [(W_SET, ""), (W_AFTER_BACKDROP, "        return DrawVerdict::kBackdrop;\n    }\n" + W_SET + "\n    // The FSS panel composite pair")],
+           "the recognition sits below the eye-side backdrop claim, which returns first"),
+    wiring("iw-recognition-always-armed", "recognition",
+           [("s->introCurveThisDraw = introCurveOnComposite(self, kind, count, instances);\n",
+             "introCurveOnComposite(self, kind, count, instances);\n        s->introCurveThisDraw = true;\n")],
+           "the flag is set whatever the recogniser said"),
+    wiring("iw-recognition-above-the-movie", "after-movie", [(W_SET, ""), (W_MOVIE_COMMENT, W_SET + "\n" + W_MOVIE_COMMENT)],
+           "the recognition sits above the movie's claim: the movie's own draws reach the recogniser and their stock pairs are learned (and logged) as flat"),
+    wiring("iw-recognition-away-from-the-movie", "after-movie", [(W_SET, ""), (W_CENSUS_LINE, W_SET + "\n" + W_CENSUS_LINE)],
+           "the recognition sits a block below the movie's claim, no longer right after it"),
+    wiring("iw-guard-gone", "guard", [(W_GUARD, "    if (panelCurveWants() && srv0IsPanelSized(s, kind, count)) {\n")], "the on-foot recognition claims the intro composite again"),
+    wiring("iw-guard-before-the-gate", "guard",
+           [(W_GUARD, "    if (!(kind == 'X' && count == 6 && bindingShaderHash(BindSlot::Vs) == kIntroCompositeVsHash) && panelCurveWants() && srv0IsPanelSized(s, kind, count)) {\n")],
+           "the guard is read before panelCurveWants(): curvature 0 reads something new"),
+    wiring("iw-gate-unlisted", "gate", [(W_GATE, "        vscreenFootprintWanted();   // the footprint instrument (vscreen_footprint.h): it reads the 2D screen's composite\n        (")],
+           "the draw gate does not list the recogniser"),
+    wiring("iw-site-before-the-verdict-begin", "strip-site", [(W_BEGIN, ""), (W_OBSERVED, W_BEGIN + W_OBSERVED)],
+           "the verdict's Begin runs after the strip: kBackdrop's slot swap is not in place for it"),
+    wiring("iw-site-after-the-game-draw", "strip-site", [(W_OBSERVED, ""), (W_STRIP_START, W_OBSERVED + W_STRIP_START)],
+           "the strip is drawn after the game's own issue"),
+    wiring("iw-site-dim-is-flat", "strip-site", [(W_DIM, "            draw(AlteredDrawClass::None);\n")], "the splash dim does not follow the strip"),
+    wiring("iw-site-third-call", "strip-site", [(W_END, W_END + "    panelCurveSurfaceDraw(self, 1.0f, 1, g_state->realDrawIndexedInstanced);\n")],
+           "a third place draws the strip"),
+    wiring("iw-unarmed-early-return-first", "unarmed-text",
+           [(W_REFUSAL, "        if (stripIssued) return true;   // the strip was issued in its place: nothing more, and something was\n"
+                        "        if (owner && uiLayerIssueBlocked()) return false;\n")],
+           "observedDraw answers for the strip before its own refusal"),
+    wiring("iw-unarmed-no-early-return", "unarmed-text", [("        if (stripIssued) return true;   // the strip was issued in its place: nothing more, and something was\n", "")],
+           "the game's own draw is issued a second time over the strip"),
+    wiring("iw-unarmed-original-issued", "unarmed-text",
+           [("const bool originalIssued=observedDraw(alteredClass", "const bool originalIssued = stripIssued || observedDraw(alteredClass")],
+           "originalIssued is no longer observedDraw's answer"),
+    wiring("iw-unarmed-dim-ungated", "unarmed-text",
+           [("if (!(stripIssued && panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced))) {",
+             "if (!(panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced))) {")],
+           "the dim draws the strip even when the main draw's strip did not draw"),
+    wiring("iw-candidate-asks-first", "candidate",
+           [(W_CANDIDATE, "if (panelCurveSurfaceWanted() && (v == DrawVerdict::kIntroPanel || g_state->introCurveThisDraw) && owner) {")],
+           "every draw pays the cross-TU question"),
+    wiring("iw-candidate-every-draw", "candidate", [(W_CANDIDATE, "if (owner && panelCurveSurfaceWanted()) {")], "every draw is a candidate for the strip"),
+    wiring("iw-args-movie-gain", "strip-args", [("stripGain = introPanelStripGain();", "stripGain = introCurveGain();")], "the movie is drawn at the splash's gain"),
+    wiring("iw-args-movie-direction", "strip-args", [("                stripToward = 1;\n", "                stripToward = -1;\n")], "the movie bends the other way"),
+    wiring("iw-args-splash-direction", "strip-args", [("stripToward = introCurveToward();", "stripToward = 1;")], "the splash's direction is a constant"),
+    wiring("iw-args-no-draw-function", "strip-args", [(W_STRIP_CALL, "stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward, nullptr);")],
+           "the strip is drawn through no draw function"),
+    wiring("iw-args-past-the-refusal", "strip-args", [("if (stripToward != 0 && !uiLayerIssueBlocked()) {", "if (stripToward != 0) {")],
+           "the strip is asked past observedDraw's own refusal"),
+    wiring("iw-fallback-always-issued", "fallback",
+           [(W_STRIP_CALL, "panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced);\n            stripIssued = true;")],
+           "the strip counts as issued whatever it returned: the game's quad is never drawn"),
+    wiring("iw-fallback-starts-true", "fallback", [("bool stripIssued = false;", "bool stripIssued = true;")], "every draw starts as the strip's"),
+    wiring("iw-onfoot-flag-rides", "not-on-foot-flag",
+           [("        s->introCurveThisDraw = introCurveOnComposite(self, kind, count, instances);\n",
+             "        s->introCurveThisDraw = introCurveOnComposite(self, kind, count, instances);\n        s->curveThisDraw = s->introCurveThisDraw;\n")],
+           "the splash's strip rides the on-foot flag, whose branch returns before the verdict's Begin and the dim"),
+    wiring("iw-onfoot-flag-read", "not-on-foot-flag",
+           [("(v == DrawVerdict::kIntroPanel || g_state->introCurveThisDraw) && owner",
+             "(v == DrawVerdict::kIntroPanel || g_state->introCurveThisDraw || g_state->curveThisDraw) && owner")],
+           "the strip's site also reads the on-foot flag"),
+    wiring("iw-tick-missing", "tick", [(W_TICK, "")], "the recogniser is never ticked: it never retires"),
+    wiring("iw-tick-no-scene", "tick", [("introCurveTick(g_state->ownerCtx, sceneFrame);", "introCurveTick(g_state->ownerCtx, false);")], "the tick is told no scene"),
+    wiring("iw-tick-before-the-movie", "tick", [(W_TICK, ""), ("        tkIntroPanel.run([&] {\n", W_TICK + "        tkIntroPanel.run([&] {\n")],
+           "the tick runs before the movie's"),
+    wiring("iw-tick-line-every-frame", "tick", [("if (sceneFrame) introCurveNoteRetired();", "introCurveNoteRetired();")], "the retirement line is called every frame"),
+    wiring("iw-shutdown-missing", "shutdown", [("    introPanelShutdown();\n    introCurveShutdown();\n", "    introPanelShutdown();\n")],
+           "the shutdown never releases the recogniser's staging buffers"),
+    wiring("iw-retire-reworded", "retire-line", [(W_RETIRE_TEXT, "in all (the movie's and the splash's together)")],
+           "the retirement line is reworded: it no longer says the dim's re-issues are counted"),
+    wiring("iw-retire-old-text", "retire-line",
+           [("\"intro curve: %llu strip draw(s) in all (the movie's, the splash's and the splash dim's re-issues of either); the splash recogniser handed over %llu composite draw(s)\",",
+             "\"intro curve: strip draws %llu (the movie's and the splash's together), %llu of them the splash's\",")],
+           "the retirement line says the old text again: the splash's count is called a share of the strip's total"),
+    wiring("iw-retire-every-time", "retire-line", [("    if (said) return;\n    said = true;\n", "")], "the retirement line is said every time it is asked"),
+    wiring("iw-retire-at-curvature-0", "retire-line", [("    if (drawn == 0 && !panelCurveSurfaceWanted()) return;\n", "")],
+           "the retirement line is said at curvature 0 with nothing drawn"),
+    wiring("iw-retire-swapped-counts", "retire-line",
+           [("static_cast<unsigned long long>(drawn), static_cast<unsigned long long>(introCurveInfo().armed));",
+             "static_cast<unsigned long long>(introCurveInfo().armed), static_cast<unsigned long long>(drawn));")],
+           "the retirement line swaps the strip's total and the splash's count"),
 ]
 
 
@@ -325,9 +463,53 @@ class Toolchain:
         self.cl = str(found)
 
 
+def run_rig_exe(tc, run_cmd, cwd):
+    """('pass'|'fail'|'crash'|'timeout', detail) of one run of a built rig; a 'fail' detail is the failing labels, joined with ' | '."""
+    try:
+        run = subprocess.run(run_cmd, capture_output=True, text=True, env=tc.env, errors="replace", timeout=RUN_TIMEOUT, cwd=str(cwd))
+    except subprocess.TimeoutExpired:
+        return "timeout", "no result within %d s" % RUN_TIMEOUT
+    out = run.stdout + "\n" + run.stderr
+    if run.returncode == 0:
+        return "pass", ""
+    labels = failing_labels(out)
+    if not labels:
+        return "crash", "exit 0x%08X" % (run.returncode & 0xFFFFFFFF)
+    return "fail", " | ".join(labels)
+
+
+def build_and_run_wiring(tc, tree, edited_text):
+    """The wiring rig: ui_quality_test built ONCE (by the control, in its own tree, from the real sources, the way build.bat builds it) and run
+    with --wiring in `tree`, whose src/d3d11 holds `edited_text` as vscreen.cpp beside unedited copies of the other files the scans read."""
+    spec = RIGS["wiring"]
+    tree.mkdir(parents=True, exist_ok=True)
+    exe = WIRING_EXE.get("exe")
+    if exe is None:
+        if not GEN.is_dir():
+            return "nocompile", "build\\gen is missing: run one build first"
+        exe = tree / "rig.exe"
+        cmd = [tc.cl] + CL_FLAGS + ["/I" + str(GEN), "/Fo" + str(tree) + os.sep, "/Fe" + str(exe)] + [str(ROOT / s) for s in spec["sources"]] + \
+              ["/link", "/INCREMENTAL:NO"] + spec["libs"]
+        done = subprocess.run(cmd, capture_output=True, text=True, env=tc.env, errors="replace", cwd=str(ROOT))
+        if done.returncode != 0:
+            errors = [l.strip() for l in (done.stdout + done.stderr).splitlines() if "error" in l]
+            return "nocompile", " | ".join(errors[:8])[:1500]
+        WIRING_EXE["exe"] = exe
+    for rel in spec["reads"]:
+        dest = tree / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / rel, dest)
+    target = tree / spec["target"].relative_to(ROOT)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(edited_text, encoding="utf-8", newline="\n")
+    return run_rig_exe(tc, [str(exe), "--wiring"], tree)
+
+
 def build_and_run(tc, rig_key, tree, edited_text):
     """('nocompile'|'pass'|'fail'|'crash'|'timeout', detail): the rig built in `tree` with `edited_text` in place of its mutable file (the
     unedited text for the control) and run. A 'fail' detail is the failing labels, joined with ' | '."""
+    if rig_key == "wiring":
+        return build_and_run_wiring(tc, tree, edited_text)
     spec = RIGS[rig_key]
     tree.mkdir(parents=True, exist_ok=True)
     exe = tree / "rig.exe"
@@ -470,10 +652,16 @@ def self_test():
 
     # every mutation against the file it edits as it is now, and against its rig
     sources = {key: read_source(spec["target"]) for key, spec in RIGS.items()}
-    rigs = {key: read_source(spec["rig"]) for key, spec in RIGS.items()}
+    rigs = {key: read_source(spec["rig"]) + "".join(read_source(p) for p in spec.get("labels", [])) for key, spec in RIGS.items()}
     names = [m.name for m in MUTANTS]
     check(len(names) == len(set(names)), "mutation names are unique")
-    check(len(MUTANTS) >= 38, "the mutation list did not shrink (%d)" % len(MUTANTS))
+    check(len(MUTANTS) >= 75, "the mutation list did not shrink (%d)" % len(MUTANTS))
+    # the wiring rig: the rig has the --wiring mode this tool runs, includes the header its labels live in, and the files it scans exist
+    wiring_spec = RIGS["wiring"]
+    check('"--wiring"' in read_source(wiring_spec["rig"]) and '#include "ui_intro_curve_wiring_test.h"' in read_source(wiring_spec["rig"]),
+          "ui_quality_test has the --wiring mode and includes ui_intro_curve_wiring_test.h")
+    for rel in wiring_spec["reads"]:
+        check((ROOT / rel).is_file(), "the wiring rig scans %s, which exists" % rel)
     for m in MUTANTS:
         check(m.rig in RIGS, "%s names a rig this tool knows" % m.name)
         if m.rig not in RIGS:
