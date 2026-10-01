@@ -48,7 +48,7 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-82):** users 1-2 refused every frame, 3 at 7-13 fps, 4
-  lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED; fix BUILT, unflown;
+  lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED; fix FLOWN OK 10-01;
   vscreen auto-fit (width fitted to the eye, route on) BUILT 10-01, unflown.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
@@ -7382,7 +7382,8 @@ settlement. Sean: "it looks beautiful". He reported no mover ghosting, but he
 did not look for it (people walking, a ship landing, doors), so the caveat is
 unchecked, not cleared.
 
-HMD CINEMA ON FOOT (reported with it; recorded only, not in scope here): the
+HMD CINEMA ON FOOT (CORRECTED in FLIGHT 4 below: an arrival spell, not
+Cinema; reported with it; recorded only, not in scope here): the
 route declined every frame (about 450 a 5 s window, gate=no; reasons
 `depth-not-screen-motion-source` and `engine-views-unavailable`), so it never
 owned the world, and the whole panel ghosted and flickered. That is a separate,
@@ -7689,3 +7690,30 @@ the failed condition. FAIL: no `vscreen footprint` line (never ran), draws=0 (th
 composite not recognised), skipped= large (a source is not what it assumes,
 why= says which), SHAPE off 16:9 (the corner arithmetic or the eye size is
 wrong), a width in the rule line that its own tokens do not give.
+
+FLIGHT 4, 2026-10-01: the depth-validated steady detail PASSED, key on, in
+flat and VR (85119ce9; Epic log 071356, Frontier log 074129).
+- Flat, Epic, at the hose spools: `flat steady detail 5s: depth-check=
+  383..435/0`, so the check ran on every resolve and skipped none. Sean:
+  "Flat looks great".
+- VR main menu (owned 07:42:19-07:42:45, explicit 3504x1971): stale-kept 40-44 M
+  a window against stale-refused about 1 k; refused-pct 0.000.
+- VR on foot (owned 07:43:20-07:43:59): refused-pct 0.008-2.3%, stale-refused
+  42 k-623 k against stale-kept 61-167 M a window. The check refuses a few
+  (movers, disocclusions) and keeps the rest. Sean: HMD Cinema looks good at
+  the main menu and on foot, and normal HMD looks good on foot. Movers were not
+  looked at on purpose.
+- CORRECTION to "HMD CINEMA ON FOOT" above: the decline is not specific to
+  Cinema. Both sessions open on-foot play with a declined spell straight after
+  loading in (all `depth-not-screen-motion-source` or `engine-views-
+  unavailable`), then the route owns:
+  - 060011: 06:00:58-06:02:00, about 60 s.
+  - 074129: from the journal's LoadGame at 07:42:53 to 07:43:20, about 27 s.
+  ruled out: "the route declines every frame in Cinema on foot", because
+  074129 owned in Cinema on foot after the arrival spell.
+  Open: what ends the spell (the arrival camera? the first on-foot source
+  frame?). During it the eye route serves the panel without screen motion,
+  which is the ghost Sean saw while moving. That is pre-existing for the eye
+  route.
+- Next: steady detail default ON for VR and flat (the key-off pins move with
+  it), shipped with Phase 1 and the auto-fit.
