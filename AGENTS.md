@@ -160,6 +160,13 @@ minutes after a flight finally reproduced the effect being chased.
 - **Config values name the functionality, never the mechanism.** A key
   says what the user gets — `on`, `off`, `auto` — not the name of the
   technique inside.
+- **Every key is one a user would set.** A key added to chase an effect
+  (an A/B switch, an instrument switch, a threshold tuned by a flight) is
+  temporary: list it in the arc's `## Status` block, and when the arc
+  closes, ship the winning value as the behaviour and propose removing the
+  key, quoted, as Scope control requires. A fix that always helps gets no
+  toggle. The holo config sweep and the jitter and steady keys in the
+  2026-10 cleanup build were both this debt, paid late.
 
 ## Scope control
 
