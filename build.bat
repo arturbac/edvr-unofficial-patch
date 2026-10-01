@@ -1118,6 +1118,32 @@ if errorlevel 1 ( echo [edvr] ERROR: freeze_log_test build failed & exit /b 1 )
 python "tools\freeze_log_test\mutants.py" --self-test || exit /b 1
 exit /b 0
 
+:rig_heartbeat_writer_test
+echo [edvr] === heartbeat_writer_test.exe ===
+REM Build gate for the breadcrumb heartbeat's writer thread (src\common\heartbeat_writer.h, src\common\proxy.cpp,
+REM docs\freeze-diagnostics-2026-10-01.md, issue 63): the heartbeat's file write is off the render thread, and the
+REM file still MEANS what it meant. The sink never runs on the posting thread and a sink stuck for 600 ms does not
+REM slow post(); a writer held up writes the newest post and never an older one after a newer; it writes nothing of
+REM its own (a hung render thread stops the heartbeat); a record is whole; close and closeAndDrain drop what is
+REM pending and wait, for a bounded time, for what has begun; through the real breadcrumbHeartbeat and the real
+REM breadcrumb file; a child that crashes (the file's last line is the crash filter's, never a heartbeat) and one
+REM that is killed (the last line is a whole heartbeat); and by source text that the render thread's function
+REM writes no file and DllMain and the crash filter close the heartbeat before their closing lines. The rig's
+REM exe lives in its own obj directory so edvr_breadcrumbs.txt, which is written beside the exe, is its own.
+REM tools\heartbeat_writer_test\mutants.py --self-test holds the mutation list to the sources as they are.
+if not exist "%OBJ%\heartbeat" mkdir "%OBJ%\heartbeat"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\common" ^
+    /Fo"%OBJ%\heartbeat"\ /Fe"%OBJ%\heartbeat\heartbeat_writer_test.exe" ^
+    "tools\heartbeat_writer_test\heartbeat_writer_test.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" "src\common\proxy.cpp" ^
+    /link /INCREMENTAL:NO user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: heartbeat_writer_test build failed & exit /b 1 )
+"%OBJ%\heartbeat\heartbeat_writer_test.exe" --dry-run || exit /b 1
+"%OBJ%\heartbeat\heartbeat_writer_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\heartbeat_writer_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
 :rig_stall_sampler_test
 if "%EDVR_RIG_STEP%"=="run" goto stall_sampler_test_run
 echo [edvr] === stall_sampler_test.exe ===
