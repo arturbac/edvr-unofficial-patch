@@ -46,8 +46,10 @@
   screen depth 4 draws a frame) and the layer took the 2D screen at 1.99 a
   frame. Section 8.6 says what the build does there with the key off and on.
 - **Environment:** EDVR's OpenXR runtime; Pimax Crystal Super, 90 Hz, HMD
-  quality 0.65 (eye 2620x2533, output 4032x3898); 2D screen 5040x2835
-  (`fix.vscreen_res_width` auto); DLSS preset K. Phase 1 needs the UI layer
+  quality 0.65 (eye 2620x2533, output 4032x3898); 2D screen 5040x2835 in
+  flight 1 (`fix.vscreen_res_width` auto, the legacy rule; main's auto-fit,
+  merged here, fits it to the eye when the game LAUNCHES with the route auto:
+  section 9); DLSS preset K. Phase 1 needs the UI layer
   live (`fix.ui_quality` above 0 and `fix.temporal_aa` on, the defaults);
   with it off, or under the Oculus native SDK, the on-foot map keeps its
   smear.
@@ -469,6 +471,16 @@ before the flight and between legs as written:
 [experimental] temporal_aa_on_foot_world = off | auto   (per leg)
                on_foot_maps_sharp = off | on             (per leg, toggled live)
 ```
+Screen width. `fix.vscreen_res_width = auto` is decided when the game launches
+and does not change live (main's vscreen auto-fit, merged into this branch;
+design-flat-temporal-aa-2026-09-23.md section 82). Launched with the route off,
+as leg 1 sets it, the width is the legacy 5040 of flight 1. Launched with
+`temporal_aa_on_foot_world = auto` and `fix.panel_curvature = 0` it is the
+fitted width (3504 on Sean's rig until a session on foot has measured it), and
+the mip-0 sampling in the WATCH line below is then of a smaller screen. Launch
+once, in leg 1's state, and keep every leg in that session; the log's
+`vScreen resolution:` line names the width and the rule.
+
 Note the clock at every open and close. Frontier, the environment above.
 1. *Cockpit* (census on, both keys off): 30 s; galaxy map (5 s still, 10 s drag
    and rotate, 5 s zoom), close; system map the same; disembark.
@@ -498,6 +510,7 @@ world route:|luma probe"`.
   the detour's CPU.
 - STOP: a TAKES in the world, a panel period under 10 frames, a black eye, a
   lasting dark fade after a hand-back, taken composites with `recognised=0`.
-- WATCH: map lines shimmering (the layer samples the 5040-wide screen at mip 0:
-  the cure is the route's mipped screen), ringing on menu text (8.9a),
+- WATCH: map lines shimmering (the layer samples the screen at mip 0, 5040 wide
+  in leg 1's launch state: the cure is the route's mipped screen), ringing on
+  menu text (8.9a),
   `door-not-empty` above 0, Cinema world TAKES.
