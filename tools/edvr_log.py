@@ -777,6 +777,7 @@ ROUTE_EVENT_MARKERS = (
     ("jittered", "the world is JITTERED from frame="),
     ("window-open", "camera window was open"),
     ("released", "vr world route: RELEASED the world at frame="),
+    ("excluded", "camera call EXCLUDED, not a screen view"),
 )
 
 
@@ -799,9 +800,10 @@ def route_tok(window, key):
     return None
 
 
-def route_hdr(windows):
+def route_hdr(windows, events=None):
     """The size the world phase is in (render pixels): the route line's `hdr=WxH`, the commonest that is not 0x0
-    (it reads 0x0 while the route has no frame). (W, H, where from), or None when no route line has one."""
+    (it reads 0x0 while the route has no frame); failing that the size the route's own `the world is JITTERED from
+    frame=` line names (`phase (x,y) px in WxH`). (W, H, where from), or None when the log has neither."""
     sizes = {}
     for w in windows:
         m = re.match(r"^(\d+)x(\d+)$", route_tok(w, "hdr") or "")
@@ -811,6 +813,10 @@ def route_hdr(windows):
     if sizes:
         w, h = sorted(sizes.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
         return w, h, "a `vr world route 5s:` line's hdr="
+    for line in (events or {}).get("jittered", []):
+        m = re.search(r" px in (\d+)x(\d+),", line)
+        if m and int(m.group(1)) and int(m.group(2)):
+            return int(m.group(1)), int(m.group(2)), "the route's `the world is JITTERED` line"
     return None
 
 
@@ -1182,7 +1188,7 @@ def census_verdict(c, routes, roles=None, events=None):
                 "1e-8; a phase leaking into an eye would read 1e-4)" % (base, worst, measured, CENSUS_LEAK_PASS))
 
     # ---- (ii) the kind-3 calls carry the phase ----
-    size = route_hdr(routes)
+    size = route_hdr(routes, events)
     sampled = [s for s in seqs if s["phase_state"] == "on" and _phase_nonzero(s["phase"])]
     calls_have_inj = any(r["inj"] is not None for r in census_all_rows(c))
     if not seqs or not (tokens_seen or route_tokens):
@@ -1374,8 +1380,10 @@ def census_verdict(c, routes, roles=None, events=None):
         parts.append("inj-shut=%d: camera calls were INJECTED on a frame whose window the route had shut (it must always be 0)" % shut)
     if events.get("shut"):
         parts.append("the route logged: %s" % events["shut"][0][:200])
-    if events.get("stop"):
-        parts.append("the route's own STOP line: %s" % events["stop"][0][:200])
+    # The route's STOP lines other than the two named here: a kind-other STOP is (iii)'s, and a shut-window STOP is quoted once, above.
+    stops = [l for l in events.get("stop", []) if "kind other than 3" not in l and l not in events.get("shut", [])]
+    if stops:
+        parts.append("the route's own STOP line: %s" % stops[0][:200])
     if faults:
         parts.append("jitter=fault in %d route window(s)" % faults)
     if parts:
@@ -1400,6 +1408,13 @@ def census_verdict(c, routes, roles=None, events=None):
         add("note", "WARN" if bad else "note",
             "the route's own pair check of the rows it believes: %d checked, %d inconsistent%s"
             % (checked, bad, " (the rows do not carry the phase the route claims)" if bad else ""))
+    if events.get("excluded"):
+        sigs = []
+        for line in events["excluded"]:
+            m = re.search(r"kind 3 (aspect=\S+ fov=\S+ near=\S+ far=\S+ caller=\S+).*?: (\d+) call\(s\) so far", line)
+            sigs.append("%s (%s call(s) so far)" % (m.group(1), m.group(2)) if m else line[:120])
+        add("note", "note", "the route excluded %d kind-3 call signature(s) by role and never injected them (they need a role before they get a phase): %s"
+            % (len(sigs), "; ".join(sigs[:4]) + ("; ..." if len(sigs) > 4 else "")))
     full = [k for k in window_kv if _cint(k.get("frames")) and k.get("on-foot-frames") == k.get("frames")]
     frames = sum(_cint(k["frames"]) for k in full)
     if frames:
@@ -3725,13 +3740,35 @@ def self_test_camera_census():
         fail("inj-shut above 0 was not a STOP:\n%s" % verdict_line(out, "vi"))
     route_stop = text + "[12:00:10.000] vr world route: STOP at frame=812: camera calls were injected on a frame whose window the route had shut (decision: unnamed)\n"
     _, out = report(route_stop)
-    if status(out, "vi") != "STOP" or "the route's own STOP line: " not in verdict_line(out, "vi") or \
-            "the route logged: " not in verdict_line(out, "vi"):
-        fail("the route's own STOP line was not quoted as a STOP:\n%s" % verdict_line(out, "vi"))
+    if status(out, "vi") != "STOP" or "the route logged: " not in verdict_line(out, "vi") or \
+            "the route's own STOP line: " in verdict_line(out, "vi"):
+        fail("the route's shut-window STOP line was not quoted once as a STOP:\n%s" % verdict_line(out, "vi"))
+    other_stop = text + "[12:00:10.000] vr world route: STOP at frame=813: some other route-side invariant failed\n"
+    _, out = report(other_stop)
+    if status(out, "vi") != "STOP" or "the route's own STOP line: " not in verdict_line(out, "vi"):
+        fail("any other route STOP line was not quoted as a STOP:\n%s" % verdict_line(out, "vi"))
     kind_other = text + "[12:00:10.000] vr world route: STOP at frame=9: camera calls of a kind other than 3 were INJECTED (kind 5 x2)\n"
     _, out = report(kind_other)
     if status(out, "iii") != "STOP" or "the route logged: " not in verdict_line(out, "iii"):
         fail("the route's 'kind other than 3 were INJECTED' line was not a STOP in (iii):\n%s" % verdict_line(out, "iii"))
+    if status(out, "vi") == "STOP":
+        fail("the route's kind-other STOP line was counted against the injection window as well:\n%s" % verdict_line(out, "vi"))
+    # The size the phase is in may come from the route's own JITTERED line when no 5 s line has an hdr=; hdr= wins when both are there.
+    jittered = "[12:00:10.000] vr world route: the world is JITTERED from frame=13805: phase (0.2520,-0.1260) px in 5040x2835, 12 scene and 3 first-person " \
+               "camera call(s) injected this frame (kind 3 only; the eye cameras, kind 5, are never written)\n"
+    _, out = report(re.sub(r" hdr=\d+x\d+ ", " hdr=0x0 ", text) + jittered)
+    if status(out, "ii") != "PASS" or "(from the route's `the world is JITTERED` line)" not in verdict_line(out, "ii"):
+        fail("the render size was not taken from the route's JITTERED line when no 5 s line has one:\n%s" % verdict_line(out, "ii"))
+    _, out = report(text + jittered.replace("5040x2835", "2520x1417"))
+    if status(out, "ii") != "PASS" or "(from a `vr world route 5s:` line's hdr=)" not in verdict_line(out, "ii"):
+        fail("the JITTERED line's size beat the route line's hdr=:\n%s" % verdict_line(out, "ii"))
+    # The signatures the route excluded by role are quoted, so the roles that still need deciding are in the verdict.
+    excluded = text + "[12:00:10.000] vr world route: camera call EXCLUDED, not a screen view: kind 3 aspect=1.0000 fov=1.5708 near=0.1000 far=50000.0 " \
+                      "caller=+0x58DE73 (the screen's aspect is 1.7778; a screen view is within 4%): 6 call(s) so far, never injected\n"
+    _, out = report(excluded)
+    if "the route excluded 1 kind-3 call signature(s) by role and never injected them" not in out or \
+            "aspect=1.0000 fov=1.5708 near=0.1000 far=50000.0 caller=+0x58DE73 (6 call(s) so far)" not in out:
+        fail("the route's EXCLUDED line was not quoted as a note:\n%s" % out)
     fault = text.replace("jitter=on", "jitter=fault")
     _, out = report(fault)
     if status(out, "vi") != "STOP" or "jitter=fault in 1 route window(s)" not in verdict_line(out, "vi"):
