@@ -371,31 +371,32 @@ void testFrameBuffer() {
 void testWindow() {
     std::printf("5 s window\n");
     VrCensusWindow w;
-    w.noteCall(true, 3, 0x594E13, 0xA0, VrCensusTone::Before, false);
-    w.noteCall(true, 3, 0x594EAB, 0xA0, VrCensusTone::After, false);
-    w.noteCall(true, 0, 0x594E13, 0xB0, VrCensusTone::After, true);
-    w.noteCall(false, 0, 0x58DE73, 0xC0, VrCensusTone::None, false);
-    w.noteCall(true, 9, 0x111111, 0xB0, VrCensusTone::None, false);
+    w.noteCall(true, 3, 0x594E13, 0xA0, VrCensusTone::Before, false, true);    // an injected world call
+    w.noteCall(true, 3, 0x594EAB, 0xA0, VrCensusTone::After, false, false);    // not injected (after the trigger)
+    w.noteCall(true, 0, 0x594E13, 0xB0, VrCensusTone::After, true, false);
+    w.noteCall(false, 0, 0x58DE73, 0xC0, VrCensusTone::None, false, false);
+    w.noteCall(true, 9, 0x111111, 0xB0, VrCensusTone::None, false, true);      // (a kind the detour never injects, but the window only counts)
     check(w.calls == 5 && w.stale == 1 && w.kinds[3] == 2 && w.kinds[0] == 1 && w.kinds[7] == 1 && w.kinds[6] == 1 &&
           w.cameraCount == 3 && w.callerCount == 4 && w.toneBefore == 1 && w.toneAfter == 2 && w.toneNone == 2,
           "a window counts calls, stale calls, kinds (other and unreadable apart), distinct cameras and callers, and tone positions");
+    check(w.injCalls == 2, "a window counts the calls the observer heard with willInject set (inj-calls)");
     VrCensusWindowText text;
     text.hook = "installed";
     text.camerasTotal = 3;
     char line[kVrCensusLineBytes + 1];
     vrCensusFormatWindow(line, sizeof(line), w, text);
     check(std::strstr(line, "kinds=0:1,3:2,other:1,unreadable:1") != nullptr && std::strstr(line, "callers=+0x594E13:2,+0x594EAB:1,+0x58DE73:1,+0x111111:1") != nullptr &&
-          std::strstr(line, "cameras-seen=3 cameras-total=3 tone=1/2/2") != nullptr,
-          "the 5 s line names the kinds and the callers busiest first, and the tone split");
+          std::strstr(line, "cameras-seen=3 cameras-total=3 tone=1/2/2") != nullptr && std::strstr(line, " stale=1 inj-calls=2 kinds=") != nullptr,
+          "the 5 s line names the kinds and the callers busiest first, and the tone split, and the injected calls beside the stale ones");
     VrCensusWindow empty;
     vrCensusFormatWindow(line, sizeof(line), empty, VrCensusWindowText{});
-    check(std::strstr(line, "frames=0 calls=0 posts=0 off-thread=0 stale=0 kinds=- callers=- cameras-seen=0") != nullptr &&
+    check(std::strstr(line, "frames=0 calls=0 posts=0 off-thread=0 stale=0 inj-calls=0 kinds=- callers=- cameras-seen=0") != nullptr &&
           std::strstr(line, "progress=no hook=pending windows=0") != nullptr,
           "an empty window still prints every field (zeros included): an absent line is what 'the census never ran' looks like");
     // The worst case still fits a log line: sixteen callers, every kind, six-digit counts.
     VrCensusWindow big;
-    for (uint32_t i = 0; i < 40; ++i) big.noteCall(i % 9 != 8, i % 9, 0x594E13 + i, 0x1000 + i, static_cast<VrCensusTone>(i % 3), (i & 1) != 0);
-    big.frames = big.calls = big.posts = 99999999999ull;
+    for (uint32_t i = 0; i < 40; ++i) big.noteCall(i % 9 != 8, i % 9, 0x594E13 + i, 0x1000 + i, static_cast<VrCensusTone>(i % 3), (i & 1) != 0, (i % 3) == 0);
+    big.frames = big.calls = big.posts = big.injCalls = 99999999999ull;
     big.onFootFrames = big.eyeDraws = big.eyeOnFoot = 99999999999ull;
     big.windows = 12;
     VrCensusWindowText bigText;
@@ -496,7 +497,7 @@ std::vector<Golden> goldenLines() {
     auto add = [&](const char* name) { out.push_back({name, line}); };
 
     VrCensusWindow w;
-    w.frames = 450; w.calls = 10012; w.posts = 10012; w.stale = 0;
+    w.frames = 450; w.calls = 10012; w.posts = 10012; w.stale = 0; w.injCalls = 6750;
     w.kinds[0] = 1800; w.kinds[1] = 600; w.kinds[3] = 7612;
     w.callers[0] = {0x594E13, 3337}; w.callers[1] = {0x594EAB, 3337}; w.callers[2] = {0x594FE1, 3337}; w.callers[3] = {0x58DE73, 1}; w.callerCount = 4;
     w.cameraCount = 14; w.toneBefore = 9000; w.toneAfter = 1012; w.toneNone = 0;
@@ -536,31 +537,44 @@ std::vector<Golden> goldenLines() {
     vrCensusFormatChanged(line, sizeof(line), moved);
     add("changed");
 
-    vrCensusFormatSequence(line, sizeof(line), 4, 1, VrCensusFoot::Yes, 107, 107);
+    const VrCensusPhase jitter{true, 0.252f, -0.126f};
+    vrCensusFormatSequence(line, sizeof(line), 4, 1, VrCensusFoot::Yes, jitter, 107, 107);
     add("sequence");
+    vrCensusFormatSequence(line, sizeof(line), 5, 2, VrCensusFoot::Off, VrCensusPhase{}, 107, 100);
+    add("sequence-no-route");
 
     VrCensusCall call;
     call.camera = 0x241dc2e2960; call.view = 0x241dd00a000; call.kind = 3; call.kindReadable = true; call.callerRva = 0x594E13; call.draw = 6500; call.drawKnown = true;
     call.tone = VrCensusTone::Before; call.preFlags = 0x1C; call.postFlags = 0; call.postSeen = true; call.rowsValid = true;
+    call.willInject = true; call.role = 0;
     const float rowsWorld[16] = {0.5625f, 0, 0, 0.8f, 0, 1.0f, 0, -0.1f, 0.2f, 0, 1.0f, 0.6f, 0, 0, 0.025f, 0};
     std::memcpy(call.rows, rowsWorld, sizeof(rowsWorld));
     vrCensusFormatCall(line, sizeof(line), 4, 1, call);
     add("call-world");
+    VrCensusCall firstPerson = call;
+    firstPerson.role = 1;
+    vrCensusFormatCall(line, sizeof(line), 4, 13, firstPerson);
+    add("call-first-person");
+    VrCensusCall aux = call;
+    aux.willInject = false; aux.role = 2; aux.callerRva = 0x58DE73;
+    vrCensusFormatCall(line, sizeof(line), 4, 14, aux);
+    add("call-aux");
     VrCensusCall eyeCall = call;
     eyeCall.camera = 0x241df6d0bb0; eyeCall.view = 0x241dd00e000; eyeCall.callerRva = 0x594FE1; eyeCall.draw = 8210; eyeCall.tone = VrCensusTone::After;
+    eyeCall.kind = 5; eyeCall.willInject = false; eyeCall.role = kVrCensusRoleNone;
     const float rowsEye[16] = {1.1f, 0, 0, 0.8f, 0, 1.0f, 0, -0.1f, 0.2f, 0, 1.0f, 0.6f, 0, 0, 0.05f, 0};
     std::memcpy(eyeCall.rows, rowsEye, sizeof(rowsEye));
     vrCensusFormatCall(line, sizeof(line), 4, 98, eyeCall);
     add("call-eye");
     VrCensusCall ortho = call;
     ortho.camera = 0x241de000100; ortho.view = 0x241dd00c000; ortho.kind = 1; ortho.callerRva = 0x58DE73; ortho.draw = 0; ortho.drawKnown = false;
-    ortho.tone = VrCensusTone::None; ortho.postSeen = false; ortho.rowsValid = false;
+    ortho.tone = VrCensusTone::None; ortho.postSeen = false; ortho.rowsValid = false; ortho.willInject = false; ortho.role = kVrCensusRoleNone;
     vrCensusFormatCall(line, sizeof(line), 4, 2, ortho);
     add("call-ortho");
 
-    vrCensusFormatEye(line, sizeof(line), 0, 4, VrCensusFoot::Yes, true, 8213, 0x1eb2e751e20ull, 0, 5376, rowsEye, true, 0.0002, -0.0001, nullptr);
+    vrCensusFormatEye(line, sizeof(line), 0, 4, VrCensusFoot::Yes, jitter, true, 8213, 0x1eb2e751e20ull, 0, 5376, rowsEye, true, 0.0002, -0.0001, nullptr);
     add("eye");
-    vrCensusFormatEye(line, sizeof(line), 1, 4, VrCensusFoot::Yes, true, 8220, 0x1eb2e751e20ull, 0, 5376, nullptr, false, 0, 0, "map");
+    vrCensusFormatEye(line, sizeof(line), 1, 4, VrCensusFoot::Yes, VrCensusPhase{}, true, 8220, 0x1eb2e751e20ull, 0, 5376, nullptr, false, 0, 0, "map");
     add("eye-failed");
     const float frustum[4] = {-1.2f, 0.7f, -0.9f, 1.1f}, shift[2] = {0.0f, 0.0f};
     double trueX = 0, trueY = 0;
@@ -585,10 +599,10 @@ void testFormats() {
         return std::string("<missing ") + name + ">";
     };
     check(at("window") ==
-              "vr camera census 5s: frames=450 calls=10012 posts=10012 off-thread=0 stale=0 kinds=0:1800,1:600,3:7612 "
+              "vr camera census 5s: frames=450 calls=10012 posts=10012 off-thread=0 stale=0 inj-calls=6750 kinds=0:1800,1:600,3:7612 "
               "callers=+0x594E13:3337,+0x594EAB:3337,+0x594FE1:3337,+0x58DE73:1 cameras-seen=14 cameras-total=14 tone=9000/1012/0 "
               "tone-frames=450 on-foot-frames=450 foot=yes eye-draws=900/900 progress=yes hook=installed windows=1 cam-overflow=0 thread-overflow=0",
-          "the 5 s line: frames, calls, posts, off-thread, stale, kinds, callers, cameras, tone split, tone frames, sampled frames, the journal, eye draws, progress, hook");
+          "the 5 s line: frames, calls, posts, off-thread, stale, injected calls, kinds, callers, cameras, tone split, tone frames, sampled frames, the journal, eye draws, progress, hook");
     check(at("camera-world") ==
               "vr camera census: camera=0x241dc2e2960 kind=3 caller=+0x594E13 thread=owner aspect=1.777778 near=0.025 far=50000 fov=1.0122 "
               "bound=(0,0) offcentre=(0,0) viewport=(5040,2835) tan=(-0.5625,0.5625,-0.3164,0.3164) view=0x241dd00a000 vctx=0x241dd00a100 "
@@ -602,24 +616,34 @@ void testFormats() {
     check(at("changed") ==
               "vr camera census: changed: camera=0x241df6d0bb0 frame=2 n=7 near=0.05->0.06 bound=(-0.03,0.011)->(-0.0297,0.011)",
           "the changed line names only the fields that moved, old->new");
-    check(at("sequence") == "vr camera census: sequence frame=4 index=1/3 foot=yes calls=107 recorded=107 truncated=0",
-          "the sequence header names what the journal said");
+    check(at("sequence") == "vr camera census: sequence frame=4 index=1/3 foot=yes phase=0.2520,-0.1260 calls=107 recorded=107 truncated=0",
+          "the sequence header names what the journal said and the phase the route chose for the frame (render pixels, four decimals)");
+    check(at("sequence-no-route") == "vr camera census: sequence frame=5 index=2/3 foot=off phase=- calls=107 recorded=100 truncated=7",
+          "a frame the route was not jittering has phase=-: a zero phase of a warm-up frame (0.0000,0.0000) and no route at all read differently");
     check(at("call-world") ==
-              "vr camera census: call frame=4 n=1 camera=0x241dc2e2960 kind=3 caller=+0x594E13 draw=6500 tone=before fl=0x1C>0x0 "
+              "vr camera census: call frame=4 n=1 camera=0x241dc2e2960 kind=3 caller=+0x594E13 draw=6500 tone=before inj=1 role=scene fl=0x1C>0x0 "
               "view=0x241dd00a000 rows=[0.5625,0,0,0.8,0,1,0,-0.1,0.2,0,1,0.6,0,0,0.025,0]",
-          "a call line: ordinal, camera, kind, caller, draw, tone, dirty flags before>after, the view, the sixteen composed floats");
+          "a call line: ordinal, camera, kind, caller, draw, tone, what the detour decided (inj, role), dirty flags before>after, the view, the sixteen composed floats");
+    check(at("call-first-person") ==
+              "vr camera census: call frame=4 n=13 camera=0x241dc2e2960 kind=3 caller=+0x594E13 draw=6500 tone=before inj=1 role=fp fl=0x1C>0x0 "
+              "view=0x241dd00a000 rows=[0.5625,0,0,0.8,0,1,0,-0.1,0.2,0,1,0.6,0,0,0.025,0]",
+          "the first-person role prints as fp");
+    check(at("call-aux") ==
+              "vr camera census: call frame=4 n=14 camera=0x241dc2e2960 kind=3 caller=+0x58DE73 draw=6500 tone=before inj=0 role=aux fl=0x1C>0x0 "
+              "view=0x241dd00a000 rows=[0.5625,0,0,0.8,0,1,0,-0.1,0.2,0,1,0.6,0,0,0.025,0]",
+          "an excluded kind-3 call prints inj=0 role=aux");
     check(at("call-eye") ==
-              "vr camera census: call frame=4 n=98 camera=0x241df6d0bb0 kind=3 caller=+0x594FE1 draw=8210 tone=after fl=0x1C>0x0 "
+              "vr camera census: call frame=4 n=98 camera=0x241df6d0bb0 kind=5 caller=+0x594FE1 draw=8210 tone=after inj=0 role=- fl=0x1C>0x0 "
               "view=0x241dd00e000 rows=[1.1,0,0,0.8,0,1,0,-0.1,0.2,0,1,0.6,0,0,0.05,0]",
-          "an eye camera's call, after the tone");
+          "an eye camera's call (kind 5), after the tone, is never injected and has no role");
     check(at("call-ortho") ==
-              "vr camera census: call frame=4 n=2 camera=0x241de000100 kind=1 caller=+0x58DE73 draw=- tone=none fl=0x1C>- view=0x241dd00c000 rows=-",
+              "vr camera census: call frame=4 n=2 camera=0x241de000100 kind=1 caller=+0x58DE73 draw=- tone=none inj=0 role=- fl=0x1C>- view=0x241dd00c000 rows=-",
           "a call with no draw progress, no post half and no rows prints dashes, never a guess");
     check(at("eye") ==
-              "vr camera census: eye=0 frame=4 foot=yes draw=8213 b1=0x1eb2e751e20 first=0 bytes=5376 "
+              "vr camera census: eye=0 frame=4 foot=yes phase=0.2520,-0.1260 draw=8213 b1=0x1eb2e751e20 first=0 bytes=5376 "
               "rows=[1.1,0,0,0.8,0,1,0,-0.1,0.2,0,1,0.6,0,0,0.05,0] meas=(0.0002,-0.0001)",
-          "an eye draw's line: the b1 buffer, its rows 270..273, the measured shift");
-    check(at("eye-failed") == "vr camera census: eye=1 frame=4 foot=yes draw=8220 b1=0x1eb2e751e20 first=0 bytes=5376 rows=- meas=- why=map",
+          "an eye draw's line: the frame's phase, the b1 buffer, its rows 270..273, the measured shift");
+    check(at("eye-failed") == "vr camera census: eye=1 frame=4 foot=yes phase=- draw=8220 b1=0x1eb2e751e20 first=0 bytes=5376 rows=- meas=- why=map",
           "a failed readback says why and never prints rows");
     check(at("eye-geometry") ==
               "vr camera census: eye-geometry eye=0 frame=4 seq=4711 frustum=[-1.2,0.7,-0.9,1.1] shift=(0,0) expect=(0.2631579,-0.1) "
@@ -637,12 +661,41 @@ void testFormats() {
     VrCensusCall worst;
     worst.camera = 0x7FFFFFFFFFFFull; worst.view = 0x7FFFFFFFFFFFull; worst.kind = 5; worst.kindReadable = true; worst.callerRva = 0xFFFFFFF;
     worst.draw = 999999; worst.drawKnown = true; worst.tone = VrCensusTone::Before; worst.preFlags = worst.postFlags = 0xFF; worst.postSeen = worst.rowsValid = true;
+    worst.willInject = true; worst.role = 0;   // the longest words the new tokens take: inj=1 role=scene
     for (int i = 0; i < 16; ++i) worst.rows[i] = -1.2345678e-05f * (i + 1);
     char line[kVrCensusLineBytes + 1];
     const int n = vrCensusFormatCall(line, sizeof(line), 999999999ull, 160, worst);
-    check(n > 0 && std::strlen(line) <= kVrCensusLineBytes && std::strstr(line, "rows=[") != nullptr && line[std::strlen(line) - 1] == ']',
-          "the widest realistic call line (pointers, a long frame number and sixteen long floats) still fits 400 characters whole");
+    check(n > 0 && std::strlen(line) <= kVrCensusLineBytes && std::strstr(line, "rows=[") != nullptr && line[std::strlen(line) - 1] == ']' &&
+              std::strstr(line, " inj=1 role=scene ") != nullptr,
+          "the widest realistic call line (pointers, a long frame number, inj and role, and sixteen long floats) still fits 400 characters whole");
     std::printf("  note  widest realistic call line: %zu characters\n", std::strlen(line));
+    // The eye line at its widest realistic: sixteen long floats, a b1 pointer, a long frame, the journal's longest word, a phase of a
+    // pixel either way, and the measured shift at its longest.
+    {
+        float eyeRows[16];
+        for (int i = 0; i < 16; ++i) eyeRows[i] = -1.2345678e-05f * (i + 1);
+        const VrCensusPhase wide{true, -0.9999f, -0.9999f};
+        char eyeLine[kVrCensusLineBytes + 1];
+        const int en = vrCensusFormatEye(eyeLine, sizeof(eyeLine), 1, 999999999ull, VrCensusFoot::Unknown, wide, true, 999999, 0x7FFFFFFFFFFFull, 0,
+                                         16777216, eyeRows, true, -1.2345678e-05, -1.2345678e-05, nullptr);
+        check(en > 0 && std::strlen(eyeLine) <= kVrCensusLineBytes && eyeLine[std::strlen(eyeLine) - 1] == ')' && std::strstr(eyeLine, "phase=-0.9999,-0.9999 ") != nullptr,
+              "the widest realistic eye line (phase included) still fits 400 characters whole, its measured shift last");
+        std::printf("  note  widest realistic eye line: %zu characters\n", std::strlen(eyeLine));
+        char seqLine[kVrCensusLineBytes + 1];
+        const int sn = vrCensusFormatSequence(seqLine, sizeof(seqLine), 999999999ull, 3, VrCensusFoot::Unknown, wide, 160, 160);
+        check(sn > 0 && std::strlen(seqLine) <= kVrCensusLineBytes && std::strstr(seqLine, " phase=-0.9999,-0.9999 calls=160 recorded=160 truncated=0") != nullptr,
+              "a sequence header at its widest fits, and ends with its counts");
+        const VrCensusPhase odd[] = {{true, -0.00002f, 0.00004f}, {true, std::nanf(""), 0.5f}, {true, -0.0f, 0.0f}};
+        char oddLine[kVrCensusLineBytes + 1];
+        vrCensusFormatSequence(oddLine, sizeof(oddLine), 1, 1, VrCensusFoot::Yes, odd[0], 1, 1);
+        const bool tiny = std::strstr(oddLine, " phase=0.0000,0.0000 ") != nullptr;
+        vrCensusFormatSequence(oddLine, sizeof(oddLine), 1, 1, VrCensusFoot::Yes, odd[1], 1, 1);
+        const bool notANumber = std::strstr(oddLine, " phase=nan,0.5000 ") != nullptr;
+        vrCensusFormatSequence(oddLine, sizeof(oddLine), 1, 1, VrCensusFoot::Yes, odd[2], 1, 1);
+        const bool negZero = std::strstr(oddLine, " phase=0.0000,0.0000 ") != nullptr && std::strstr(oddLine, "-0.0000") == nullptr;
+        check(tiny && notANumber && negZero,
+              "a phase that rounds to zero prints 0.0000 (never -0.0000), a jittering warm-up frame's zero is 0.0000,0.0000, and a NaN axis prints nan");
+    }
     worst.rows[3] = std::nanf("");
     vrCensusFormatCall(line, sizeof(line), 1, 1, worst);
     check(std::strstr(line, ",nan,") != nullptr && std::strstr(line, "-nan") == nullptr && std::strstr(line, "(ind)") == nullptr,
@@ -665,25 +718,29 @@ struct Sim {
     VrCensusCameraTable cameras;
     VrCensusBudget budget;
     VrCensusFoot foot = VrCensusFoot::Yes;   // what the journal says; the glue reads it once a boundary
+    VrCensusPhase phase;                     // what the route chose for the frame in progress, latched at the boundary that opened it
     bool progressAvailable = true;           // false: vrWorldRouteDrawProgress answers false (the skeleton, a route that does not watch)
     uint32_t sequencesLogged = 0;
     uint64_t frameNo = 1, toneFrames = 0, sampledFrames = 0;
     std::vector<std::string> log;
     void say(VrCensusLines c, const char* line) { if (budget.take(c)) log.emplace_back(line); }
-    void call(uintptr_t camera, uint32_t kind, uint32_t caller, bool tone, const VrCensusSig& sig) {
-        const bool recording = vrCensusMayRecord(foot) && vrCensusPrintsSequence(true, sequencesLogged);
+    void call(uintptr_t camera, uint32_t kind, uint32_t caller, bool tone, const VrCensusSig& sig, bool inject = false,
+              uint8_t role = kVrCensusRoleNone) {
+        const bool recording = vrCensusMayRecord(foot, phase) && vrCensusPrintsSequence(true, sequencesLogged);
         VrCensusCall* rec = recording ? frame.add() : (++frame.calls, nullptr);
         if (progressAvailable) { frame.progress = true; if (tone) frame.toneSeen = true; }
         const VrCensusTone where = !progressAvailable ? VrCensusTone::None : tone ? VrCensusTone::After : VrCensusTone::Before;
         if (rec) { rec->camera = camera; rec->view = camera + 0x5000; rec->kind = kind; rec->kindReadable = true; rec->callerRva = caller;
-                   rec->drawKnown = progressAvailable; rec->draw = frame.calls; rec->tone = where; rec->postSeen = true; rec->rowsValid = true; }
+                   rec->drawKnown = progressAvailable; rec->draw = frame.calls; rec->tone = where; rec->postSeen = true; rec->rowsValid = true;
+                   rec->willInject = inject; rec->role = role; }
         const float noTan[4] = {};
         cameras.note(camera, sig, noTan, false, callAt(frameNo, caller, frame.calls, frame.calls, progressAvailable, where,
                                                        camera + 0x5000, camera + 0x5100));
     }
-    void boundary() {
+    // The Present boundary: the frame that ended is judged under the phase latched when it began, then the next frame's is latched.
+    void boundary(const VrCensusPhase& next = VrCensusPhase{}) {
         char line[kVrCensusLineBytes + 1];
-        const bool sampled = vrCensusSamplesFrame(frame.toneSeen, frame.progress, foot);
+        const bool sampled = vrCensusSamplesFrame(frame.toneSeen, frame.progress, foot, phase);
         if (frame.toneSeen) ++toneFrames;
         if (sampled) ++sampledFrames;
         for (size_t i = 0; i < cameras.used(); ++i) {
@@ -692,12 +749,13 @@ struct Sim {
         }
         if (vrCensusPrintsSequence(sampled, sequencesLogged) && frame.recorded > 0) {
             ++sequencesLogged;
-            vrCensusFormatSequence(line, sizeof(line), frameNo, sequencesLogged, foot, frame.calls, frame.recorded);
+            vrCensusFormatSequence(line, sizeof(line), frameNo, sequencesLogged, foot, phase, frame.calls, frame.recorded);
             say(VrCensusLines::Call, line);
             for (uint32_t i = 0; i < frame.recorded; ++i) { vrCensusFormatCall(line, sizeof(line), frameNo, i + 1, frame.call[i]); say(VrCensusLines::Call, line); }
         }
         frame.reset();
         ++frameNo;
+        phase = next;
     }
 };
 
@@ -797,28 +855,165 @@ void testSession() {
     }
 }
 
+// STAGE 2: the world route jitters. Its first frames are a warm-up with a ZERO phase (vrWorldRouteWorldPhase answers true and 0,0);
+// an eye camera with no phase in the world cameras has nothing to leak, so those frames must not spend the samples (flight 1 spent
+// all of them there). The frames after carry a phase and are sampled. One frame's phase is latched at the boundary that opens it.
+void testPhaseSession() {
+    std::printf("a scripted session with the route jittering: a zero-phase warm-up, then phases\n");
+    const VrCensusSig world = sigOf(3, 1.7778f, 0.025f, 1.0122f), eye = sigOf(3, 0.95f, 0.025f, 1.5997f, 0.0891f, 0.0f);
+    const VrCensusPhase zero{true, 0.0f, 0.0f};
+    const VrCensusPhase moving[] = {{true, 0.252f, -0.126f}, {true, -0.189f, 0.063f}, {true, 0.126f, 0.252f},
+                                    {true, -0.252f, -0.063f}, {true, 0.063f, 0.189f}};
+    // One on-foot frame: the injected scene calls and the first-person ones before the tone, an auxiliary one (excluded), the eyes' after.
+    auto frame = [&](Sim& s) {
+        for (int i = 0; i < 12; ++i) s.call(0x1000, 3, i % 3 ? 0x594EAB : 0x594E13, false, world, s.phase.jittering && vrCensusPhaseNonZero(s.phase), 0);
+        for (int i = 0; i < 3; ++i) s.call(0x1000, 3, 0x594E13, false, world, s.phase.jittering && vrCensusPhaseNonZero(s.phase), 1);
+        s.call(0x2000, 3, 0x58DE73, false, sigOf(3, 1.0f, 0.1f, 1.5f), false, 2);
+        for (int i = 0; i < 6; ++i) s.call(0x3000 + 0x100 * (i / 3), 5, 0x594FE1, true, eye);
+    };
+    Sim jit;
+    jit.foot = VrCensusFoot::Yes;
+    jit.phase = zero;   // frame 1's choice, latched at the boundary before it
+    for (int f = 0; f < 3; ++f) {   // the warm-up: jittering, zero phase
+        frame(jit);
+        check(jit.frame.recorded == 0 && jit.frame.calls == 22 && jit.frame.toneSeen,
+              "a warm-up frame (the route jitters, the phase is zero) counts its 22 calls and records none: the tone was seen and the commander is on foot, but nothing can leak");
+        jit.boundary(f < 2 ? zero : moving[0]);
+    }
+    check(jit.sequencesLogged == 0 && jit.sampledFrames == 0 && jit.toneFrames == 3,
+          "three warm-up frames are tone frames and none is sampled: no sequence is spent on them");
+    bool noSequence = true;
+    for (const std::string& l : jit.log) noSequence = noSequence && l.find("sequence frame=") == std::string::npos;
+    check(noSequence, "...and the log holds no sequence header for them");
+    for (int f = 0; f < 5; ++f) {   // frames 4..8 carry a phase
+        frame(jit);
+        const bool records = f < 3;
+        check((jit.frame.recorded == 22) == records, "a frame with a non-zero phase records its calls while sequences are still wanted (the first three)");
+        jit.boundary(f < 4 ? moving[f + 1] : zero);
+    }
+    check(jit.sequencesLogged == 3 && jit.sampledFrames == 5,
+          "the five frames that carry a phase are sampled and the first three of them print their sequence: the budget is spent on frames that can leak");
+    std::vector<std::string> headers, calls;
+    for (const std::string& l : jit.log) {
+        if (l.find("sequence frame=") != std::string::npos) headers.push_back(l);
+        if (l.find(": call frame=") != std::string::npos) calls.push_back(l);
+    }
+    check(headers.size() == 3 &&
+              headers[0] == "vr camera census: sequence frame=4 index=1/3 foot=yes phase=0.2520,-0.1260 calls=22 recorded=22 truncated=0" &&
+              headers[1] == "vr camera census: sequence frame=5 index=2/3 foot=yes phase=-0.1890,0.0630 calls=22 recorded=22 truncated=0" &&
+              headers[2] == "vr camera census: sequence frame=6 index=3/3 foot=yes phase=0.1260,0.2520 calls=22 recorded=22 truncated=0",
+          "each sequence header carries the phase of ITS frame, latched at the boundary that opened it (not the next frame's)");
+    unsigned scene = 0, fp = 0, aux = 0, eyes = 0, injected = 0;
+    for (const std::string& l : calls) {
+        if (l.find(" kind=3 ") != std::string::npos && l.find(" inj=1 role=scene ") != std::string::npos) { ++scene; ++injected; }
+        if (l.find(" kind=3 ") != std::string::npos && l.find(" inj=1 role=fp ") != std::string::npos) { ++fp; ++injected; }
+        if (l.find(" kind=3 ") != std::string::npos && l.find(" inj=0 role=aux ") != std::string::npos) ++aux;
+        if (l.find(" kind=5 ") != std::string::npos && l.find(" inj=0 role=- ") != std::string::npos) ++eyes;
+    }
+    check(calls.size() == 66 && scene == 36 && fp == 9 && aux == 3 && eyes == 18 && injected == 45,
+          "the logged calls say what the detour decided: 36 injected scene, 9 injected first-person, 3 excluded auxiliary, and the eyes' 18 kind-5 calls never injected");
+    // With the route NOT jittering the same frames are sampled the old way: the first three print, phase=-.
+    Sim plain;
+    plain.foot = VrCensusFoot::Yes;
+    for (int f = 0; f < 5; ++f) { frame(plain); plain.boundary(); }
+    bool dashes = plain.sequencesLogged == 3 && plain.sampledFrames == 5;
+    for (const std::string& l : plain.log) if (l.find("sequence frame=") != std::string::npos) dashes = dashes && l.find(" foot=yes phase=- calls=22 ") != std::string::npos;
+    check(dashes, "with the route not jittering the rule is exactly what it was: the first three on-foot frames print (phase=-), five are sampled");
+    // The rule the census would run if it ignored the phase: it samples the warm-up (the control the row above sees).
+    const VrCensusPhase notJittering{};
+    check(vrCensusSamplesFrame(true, true, VrCensusFoot::Yes, notJittering) && !vrCensusSamplesFrame(true, true, VrCensusFoot::Yes, zero),
+          "control: a sampler that ignored the phase would sample a warm-up frame, and this one does not");
+    // The route stops jittering mid-session (idle, released): the frames after are judged by today's rule again.
+    Sim idle;
+    idle.foot = VrCensusFoot::Yes;
+    idle.phase = moving[0];
+    frame(idle); idle.boundary(notJittering);   // frame 1 carried a phase and is sampled
+    frame(idle); idle.boundary(notJittering);   // frame 2: the route is not jittering, today's rule samples it
+    check(idle.sampledFrames == 2 && idle.sequencesLogged == 2, "a route that stops jittering leaves the frames judged by the old rule: both are sampled");
+}
+
 void testSampling() {
     std::printf("which frames are sampled\n");
     check(vrCensusFootFrom(false, false, false) == VrCensusFoot::Off && vrCensusFootFrom(false, true, true) == VrCensusFoot::Off &&
           vrCensusFootFrom(true, false, false) == VrCensusFoot::Unknown && vrCensusFootFrom(true, false, true) == VrCensusFoot::Unknown &&
           vrCensusFootFrom(true, true, false) == VrCensusFoot::No && vrCensusFootFrom(true, true, true) == VrCensusFoot::Yes,
           "the journal's state: off when it is not read, unknown (a menu) without Flags2, no in a ship, yes on foot");
+    const VrCensusPhase none{};   // the route is not jittering: the phase has no say
     bool samples = true, never = true, record = true;
     for (int foot = 0; foot < 4; ++foot) {
         const VrCensusFoot f = static_cast<VrCensusFoot>(foot);
         const bool allows = f == VrCensusFoot::Yes || f == VrCensusFoot::Off;
-        if (vrCensusSamplesFrame(true, true, f) != allows) samples = false;     // progress available, tone seen
-        if (vrCensusSamplesFrame(false, true, f)) never = false;                // progress available, no tone: never
-        if (vrCensusSamplesFrame(false, false, f) != (f == VrCensusFoot::Yes)) samples = false;   // no progress: the journal alone
-        if (vrCensusSamplesFrame(true, false, f) != (f == VrCensusFoot::Yes)) samples = false;
-        if (vrCensusMayRecord(f) != allows) record = false;
+        if (vrCensusSamplesFrame(true, true, f, none) != allows) samples = false;     // progress available, tone seen
+        if (vrCensusSamplesFrame(false, true, f, none)) never = false;                // progress available, no tone: never
+        if (vrCensusSamplesFrame(false, false, f, none) != (f == VrCensusFoot::Yes)) samples = false;   // no progress: the journal alone
+        if (vrCensusSamplesFrame(true, false, f, none) != (f == VrCensusFoot::Yes)) samples = false;
+        if (vrCensusMayRecord(f, none) != allows) record = false;
     }
     check(samples && never && record,
-          "with draw progress a frame is sampled when the tone was seen and the journal says on foot or is not read, and never without the tone; "
-          "with none only a journal that says on foot samples");
+          "with the route not jittering, with draw progress a frame is sampled when the tone was seen and the journal says on foot or is not read, and never "
+          "without the tone; with none only a journal that says on foot samples (exactly the rule before stage 2)");
     auto toneOnly = [](bool tone, VrCensusFoot) { return tone; };   // the brief's rule, as the census would run without the journal
-    check(toneOnly(true, VrCensusFoot::No) && !vrCensusSamplesFrame(true, true, VrCensusFoot::No),
+    check(toneOnly(true, VrCensusFoot::No) && !vrCensusSamplesFrame(true, true, VrCensusFoot::No, none),
           "control: the tone alone would sample a cockpit frame, and the journal's word keeps it out");
+
+    // THE PHASE: the truth table. While the route jitters a frame is sampled only with a non-zero phase; the journal, the tone and the
+    // progress keep their say on top of it (the phase can only take a sample away). Every cell is checked against the rule written out.
+    struct PhaseCase { const char* what; VrCensusPhase p; bool allows; };
+    const PhaseCase phases[] = {
+        {"not jittering, zero", {false, 0.0f, 0.0f}, true},
+        {"not jittering, a phase the route left behind", {false, 0.25f, -0.1f}, true},
+        {"jittering, zero (a warm-up frame)", {true, 0.0f, 0.0f}, false},
+        {"jittering, negative zero", {true, -0.0f, -0.0f}, false},
+        {"jittering, x only", {true, 0.25f, 0.0f}, true},
+        {"jittering, y only", {true, 0.0f, -0.1f}, true},
+        {"jittering, both", {true, -0.25f, 0.1f}, true},
+        {"jittering, a tiny phase", {true, 1.0e-6f, 0.0f}, true},
+        {"jittering, a NaN axis and a zero", {true, std::nanf(""), 0.0f}, false},
+    };
+    bool table = true, phaseOnly = true, never2 = true;
+    unsigned cells = 0;
+    for (const PhaseCase& pc : phases) {
+        if (vrCensusPhaseAllowsSample(pc.p) != pc.allows) { table = false; std::printf("  note  phase case '%s' disagrees\n", pc.what); }
+        for (int foot = 0; foot < 4; ++foot) {
+            const VrCensusFoot f = static_cast<VrCensusFoot>(foot);
+            for (int tone = 0; tone < 2; ++tone) {
+                for (int progress = 0; progress < 2; ++progress) {
+                    const bool base = progress ? (tone && (f == VrCensusFoot::Yes || f == VrCensusFoot::Off)) : f == VrCensusFoot::Yes;
+                    const bool want = base && pc.allows;
+                    if (vrCensusSamplesFrame(tone != 0, progress != 0, f, pc.p) != want) table = false;
+                    if (!base && vrCensusSamplesFrame(tone != 0, progress != 0, f, pc.p)) never2 = false;   // a phase never ADDS a sample
+                    ++cells;
+                }
+            }
+            const bool mayRecord = (f == VrCensusFoot::Yes || f == VrCensusFoot::Off) && pc.allows;
+            if (vrCensusMayRecord(f, pc.p) != mayRecord) record = false;
+        }
+        // The same frame with and without the phase differs exactly when the route jitters with nothing to show.
+        if (vrCensusSamplesFrame(true, true, VrCensusFoot::Yes, pc.p) != pc.allows) phaseOnly = false;
+    }
+    check(table && record && cells == 9 * 4 * 2 * 2,
+          "the phase truth table: nine phase states x four journal states x tone x progress (144 cells) are sampled exactly when the old rule says so AND the route is "
+          "not jittering or its phase is non-zero; calls are recorded under the same condition");
+    check(phaseOnly && never2,
+          "a frame on foot with the tone seen is sampled exactly when the phase allows it, and a phase never adds a sample the old rule refused");
+    check(vrCensusPhaseNonZero({true, 0.0f, 1.0e-30f}) && !vrCensusPhaseNonZero({true, 0.0f, 0.0f}) && !vrCensusPhaseNonZero({true, -0.0f, 0.0f}) &&
+              vrCensusAbs(-2.5f) == 2.5f && vrCensusAbs(2.5f) == 2.5f && vrCensusAbs(-0.0f) == 0.0f,
+          "a phase is non-zero when either axis is: |x| + |y| > 0, however small, of either sign");
+    // The control the rows above see: two wrong rules, each of which the table catches. One ignores the phase (the warm-up would be
+    // sampled again); the other applies the zero test even when the route is not jittering (the frames of a route that is off would
+    // starve, which is not "exactly today's rule").
+    auto mutantIgnoresPhase = [](const VrCensusPhase&) { return true; };
+    auto mutantZeroTestAlways = [](const VrCensusPhase& p) { return vrCensusPhaseNonZero(p); };
+    auto mutantBackwards = [](const VrCensusPhase& p) { return p.jittering || vrCensusPhaseNonZero(p); };
+    bool ignoreCaught = false, zeroCaught = false, backwardsCaught = false;
+    for (const PhaseCase& pc : phases) {
+        if (mutantIgnoresPhase(pc.p) != pc.allows) ignoreCaught = true;
+        if (mutantZeroTestAlways(pc.p) != pc.allows) zeroCaught = true;
+        if (mutantBackwards(pc.p) != pc.allows) backwardsCaught = true;
+    }
+    check(ignoreCaught && zeroCaught && backwardsCaught,
+          "control: a rule that ignored the phase, one that applied the zero test to a route that is not jittering, and one with the jittering test inverted "
+          "each disagree with the table at a cell, so the table can fail");
     check(std::strcmp(vrCensusFootName(VrCensusFoot::Yes), "yes") == 0 && std::strcmp(vrCensusFootName(VrCensusFoot::No), "no") == 0 &&
           std::strcmp(vrCensusFootName(VrCensusFoot::Unknown), "unknown") == 0 && std::strcmp(vrCensusFootName(VrCensusFoot::Off), "off") == 0,
           "the journal's states have the words the log uses");
@@ -886,13 +1081,41 @@ void testSourcePins(const std::string& injectCpp) {
     check(count(censusCode, "new (std::nothrow) State") == 1 && count(censusCode, "new ") == 1 && count(censusCode, "malloc") == 0 &&
           count(censusCode, "std::vector") == 0 && count(censusCode, "std::string ") == 1,
           "the only allocation in the census's code is the one State, made at the first boundary with the key on (the key's one std::string is a three-character small string)");
+    const std::string sampleAsk = "if (!vrCensusSamplesFrame(toneSeen, have, s->foot, phase)) return;";
     check(count(censusCpp, "journalOnFootKnown()") == 1 && count(censusCpp, "journalOnFoot()") == 1 &&
           boundary.find("s->foot = currentFoot();") != std::string::npos && boundary.find("s->foot = currentFoot();") < boundary.find("rollFrame(s);") &&
-          eyeDraw.find("if (!vrCensusSamplesFrame(toneSeen, have, s->foot)) return;") != std::string::npos &&
-          eyeDraw.find("if (!vrCensusSamplesFrame(toneSeen, have, s->foot)) return;") < eyeDraw.find("s->eye.take(s->frame)") &&
-          eyeDraw.find("if (!vrCensusSamplesFrame(toneSeen, have, s->foot)) return;") < eyeDraw.find("readEyeRows("),
-          "the journal is asked in one place (currentFoot), once a boundary ahead of the frame's roll, and an eye draw the journal rules out is "
-          "returned before it spends the eye budget or stalls on a readback");
+          eyeDraw.find(sampleAsk) != std::string::npos &&
+          eyeDraw.find(sampleAsk) < eyeDraw.find("s->eye.take(s->frame)") &&
+          eyeDraw.find(sampleAsk) < eyeDraw.find("readEyeRows("),
+          "the journal is asked in one place (currentFoot), once a boundary ahead of the frame's roll, and an eye draw the journal or the route's phase rules "
+          "out is returned before it spends the eye budget or stalls on a readback");
+    // THE PHASE (stage 2): the census asks the route for it in one place, latches it at the boundary AFTER the frame that ended has been
+    // judged under the previous one, and reads it at the eye draw before the sampling decision uses it.
+    const std::string rollBody = functionBody(censusCpp, "void rollFrame(State* s) {");
+    const std::string preBody = functionBody(censusCpp, "bool observePre(const FlatCameraObserveCall& call) noexcept {");
+    check(!rollBody.empty() && !preBody.empty() && count(censusCpp, "vrWorldRouteWorldPhase(") == 1 && count(censusCpp, "readPhase()") == 3,
+          "the route's phase is asked in one place, readPhase(), which the boundary and the eye draw call (definition plus two calls)");
+    check(boundary.find("rollFrame(s);") != std::string::npos && boundary.find("s->phase = readPhase();") != std::string::npos &&
+          boundary.find("rollFrame(s);") < boundary.find("s->phase = readPhase();") &&
+          boundary.find("s->phase = readPhase();") < boundary.find("flatCameraInjectObserveFrame()") &&
+          boundary.find("s->phase = readPhase();") > boundary.find("if (!wanted) {"),
+          "the boundary judges the frame that ended under the phase latched when it began (rollFrame), THEN latches the next frame's, before the window opens; "
+          "with the key off it returns before asking the route for anything");
+    check(rollBody.find("vrCensusSamplesFrame(s->current.toneSeen, s->current.progress, s->foot, s->phase)") != std::string::npos &&
+          rollBody.find("readPhase()") == std::string::npos &&
+          censusCpp.find("vrCensusFormatSequence(line, kVrCensusLineBytes + 1, s->frame, s->sequencesLogged, s->foot, s->phase, f.calls, f.recorded);") != std::string::npos,
+          "the roll and the sequence header use the phase latched for that frame, never a fresh ask (the route's boundary has moved on by then)");
+    check(eyeDraw.find("const VrCensusPhase phase = readPhase();") != std::string::npos &&
+          eyeDraw.find("const VrCensusPhase phase = readPhase();") > eyeDraw.find("if (!g_wanted) return;") &&
+          eyeDraw.find("const VrCensusPhase phase = readPhase();") < eyeDraw.find(sampleAsk) &&
+          eyeDraw.find("vrCensusFormatEye(line, kVrCensusLineBytes + 1, eye, s->frame, s->foot, phase,") != std::string::npos,
+          "the eye draw reads the running frame's phase after the key-off return and before it decides, and prints that same phase on its line");
+    check(preBody.find("vrCensusMayRecord(s->foot, s->phase)") != std::string::npos &&
+          preBody.find("call.willInject") != std::string::npos && preBody.find("record->willInject = call.willInject;") != std::string::npos &&
+          preBody.find("record->role = call.role;") != std::string::npos && preBody.find("vrWorldRouteWorldPhase") == std::string::npos &&
+          preBody.find("readPhase") == std::string::npos,
+          "the refresh's pre half decides recording from the latched phase and copies what the detour decided (willInject, role) into the record and the window; "
+          "it never asks the route (no call into the route on the hot path)");
     check(count(censusCpp, "flatCameraInjectSetObserver(&g_observer)") == 1 && count(censusCpp, "flatCameraInjectObserveFrame()") == 1 &&
           count(censusCpp, "flatCameraInjectPause(") == 2,
           "the hook is asked for from one place (the boundary, after the key is on), and paused and unpaused from the two edges of it");
@@ -967,10 +1190,17 @@ void testSourcePins(const std::string& injectCpp) {
 // --camera-census self-test reads tools\camera_census_fixture.log; this rig holds that file to exactly what the formatters
 // write (--print-fixture regenerates it), so a drift of either the writer or the reader breaks a build.
 //
-// The story: an on-foot session with a world camera, a weapon camera, an ortho UI camera and an eye camera per eye. The
-// world and the weapon are symmetric (near 0.025 and 0.0675); the eyes are asymmetric, call from the caller the world's
-// third call site also uses, and are refreshed only after the tone. Four on-foot frames: the first three carry a call
-// sequence, all four an eye draw per eye.
+// The story is flight 1's, one stage on: an on-foot session with the world route jittering (stage 2).
+//   - the WORLD camera is one object that was the left EYE camera in the cockpit (its first-sight line says kind 5) and is the
+//     kind-3 world camera on foot; it is refreshed with two projections, the scene's (near 0.025) and the first-person weapon
+//     camera's (a tighter field of view, near 0.0675), both carrying the frame's phase in their bound pair (the injector's own
+//     rule: bound += (jx / W, -jy / H), so the rows measure flatProjectionJitter's shift);
+//   - an ortho UI camera (kind 1), an AUXILIARY kind-3 camera (excluded: inj=0 role=aux) that was a kind-5 call in the first logged
+//     frame (one camera, two kinds in two frames), and an eye camera per eye (kind 5, three call sites each, after the tone, never
+//     injected, the eye shift off because the route owns the world);
+//   - four on-foot frames 4..7, each with a NON-ZERO phase (a zero-phase frame is not sampled while the route jitters): the first three
+//     carry a call sequence, all four an eye draw per eye;
+//   - the route's own two 5 s lines, back to back, before each census 5 s line (the route's side is written here as text).
 // ---------------------------------------------------------------------------
 struct FixtureCam {
     uintptr_t ptr;
@@ -996,30 +1226,88 @@ std::string fixtureLog() {
     put("version 0.18.0-rc.4-31-g0a1b2c3d (build 68C0A1F2) -- synthetic fixture for edvr_log.py --camera-census");
     put("vr camera census: on (advanced.vr_camera_census); observe-only, nothing is written to any camera; owner thread 4321; "
         "5 s line per window for 36 windows, then one per 12; cameras first 64, call sequences first 3 and eye draws first 4 "
-        "on-foot frames (the tone drawn while the journal, read=yes, says on foot); line budget 724");
-    put("flat camera inject: refresh hook installed at EliteDangerous64.exe+0x592200 in OBSERVE-ONLY mode (the VR camera census): "
-        "no camera is ever written");
+        "on-foot frames (the tone drawn while the journal, read=yes, says on foot; while the world route jitters, only a frame "
+        "whose phase is non-zero); line budget 724");
 
-    const FixtureCam world{0x241dc2e2960, 3, 1.0122f, 5040.0f / 2835.0f, 0.025f, 0x594E13, 5040.0f, 2835.0f, 0x241dd00a000};
-    const FixtureCam weapon{0x241de100200, 3, 0.8236f, 5040.0f / 2835.0f, 0.0675f, 0x594E13, 5040.0f, 2835.0f, 0x241dd00b000};
-    const FixtureCam ui{0x241de000100, 1, 0.0f, 1.0f, 0.1f, 0x58DE73, 5040.0f, 2835.0f, 0x241dd00c000};
+    const float renderW = 5040.0f, renderH = 2835.0f;
+    const FixtureCam world{0x241dc2e2960, 3, 1.0122f, renderW / renderH, 0.025f, 0x594E13, renderW, renderH, 0x241dd00a000};
+    const float firstPersonFov = 0.8453f, firstPersonNear = 0.0675f;   // x1.23 tighter, a larger near plane: flight 1's weapon camera
+    const uintptr_t worldViews[3] = {0x241dd00a000, 0x241dd00a800, 0x241dd00b000};
+    const FixtureCam ui{0x241de000100, 1, 0.0f, 1.0f, 0.1f, 0x58DE73, renderW, renderH, 0x241dd00c000};
+    const uintptr_t auxPtr = 0x241de100200, auxView = 0x241dd00c800;
     const float frustumOf[2][4] = {{-1.2f, 0.7f, -0.9f, 1.1f}, {-0.7f, 1.2f, -0.9f, 1.1f}};
     const uintptr_t eyePtr[2] = {0x241df6d0bb0, 0x241df6d0ff0};
     const uintptr_t eyeView[2] = {0x241dd00e000, 0x241dd00f000};
-    // The first 5 s line: a commander in a ship. The tone is drawn every frame, the journal says not on foot, so nothing is sampled.
+    const uint32_t callers3[3] = {0x594E13, 0x594EAB, 0x594FE1};
+    // What the route chose for each on-foot frame 4..7: the raster phase in render pixels, positive right/down (about 1e-4 NDC).
+    const VrCensusPhase phaseOf[4] = {{true, 0.2520f, -0.1260f}, {true, -0.1890f, 0.0630f}, {true, 0.1260f, 0.2520f}, {true, -0.2520f, -0.0630f}};
+    // The eye cameras: built from EDVR's advertised frustum with the eye shift OFF (the route owns the world), so the bound pair is the
+    // frustum's own and does not move from frame to frame.
+    struct EyeCam { float bx, by, aspect, fov; };
+    EyeCam eyeCam[2];
+    for (int e = 0; e < 2; ++e) {
+        const double l = frustumOf[e][0], r = frustumOf[e][1], d = frustumOf[e][2], u = frustumOf[e][3];
+        const double wHalf = (r - l) / 2, tanHalf = (u - d) / 2;
+        eyeCam[e].bx = static_cast<float>(-(r + l) / (4 * wHalf));
+        eyeCam[e].by = static_cast<float>(-(u + d) / (4 * tanHalf));
+        eyeCam[e].aspect = static_cast<float>(wHalf / tanHalf);
+        eyeCam[e].fov = static_cast<float>(2 * std::atan(tanHalf));
+    }
+    const EyeCam auxEye{0.0f, 0.0f, 1.0f, 1.5708f};   // the auxiliary camera's kind-5 face in the first logged frame
+    // The injector's own rule: the frame's phase goes into the bound pair as (jx / W, -jy / H); the rows then measure 2x that.
+    auto phaseBound = [&](const VrCensusPhase& p, float* bx, float* by) { *bx = p.x / renderW; *by = -p.y / renderH; };
+
+    // Two lines of the world route's 5 s window, as the route writes them (the route's side of the contract; the route's own formatter is
+    // not part of the census): the route line with the stage 2 tokens between last= and last-trigger=, then the inject line.
+    auto routeWindow = [&](const char* state, const char* gate, const char* counters, const char* last, const char* jitter, const char* phase,
+                           const char* rows, const char* fpMode, const char* vs, const char* ps, const char* target, const char* hdr,
+                           const char* selection, const char* inject) {
+        char text[1200];
+        std::snprintf(text, sizeof(text),
+                      "vr world route 5s: key=auto state=%s layer=live gate=%s %s (last=none) scene-resets=0 late-hdr-writes=0 (in 0 frames) "
+                      "last=%s jitter=%s phase=%s rows=%s fp-mode=%s last-trigger=VS=%s PS=%s target=%s hdr=%s selection=%s",
+                      state, gate, counters, last, jitter, phase, rows, fpMode, vs, ps, target, hdr, selection);
+        put(text);
+        std::snprintf(text, sizeof(text), "vr world route inject 5s: %s", inject);
+        put(text);
+    };
+
+    // The first window: a commander in a ship. The route is idle, the tone is drawn every frame, the journal says not on foot, so
+    // nothing is sampled.
+    routeWindow("observing", "no",
+                "frames=448 gate-frames=448 gate-flips=0 hdr-frames=0 trigger=0 none=0 ambiguous=0 treated=0 declined=0 owned-frames=0 "
+                "eye-takes=0 door-layer-only=0 enters=0 releases=0",
+                "none", "idle", "0.0000,0.0000", "0.0000,0.0000", "0/0/0", "0000000000000000", "0000000000000000", "0x0", "0x0", "none",
+                "inj-scene=0 inj-fp=0 inj-refused=0 warming=0 aux=0 after=0 unsupported=0 other-kind=0 unreadable=0 off-thread=0 write-fail=0 "
+                "inj-kinds=none pair-checked=0 pair-bad=0 inj-unnamed=0 inj-shut=0");
     {
         VrCensusWindow w;
-        w.frames = 448; w.calls = 39100; w.posts = 39100;
-        w.kinds[1] = 896; w.kinds[3] = 38204;
-        w.callers[0] = {0x594E13, 12999}; w.callers[1] = {0x594EAB, 12999}; w.callers[2] = {0x594FE1, 12999}; w.callers[3] = {0x58DE73, 103}; w.callerCount = 4;
-        w.cameraCount = 3; w.toneBefore = 30000; w.toneAfter = 9100; w.toneFrames = 448; w.windows = 1; w.progressSeen = true;
+        w.frames = 448; w.calls = 41788; w.posts = 41788;
+        w.kinds[1] = 896; w.kinds[3] = 38204; w.kinds[5] = 2688;
+        w.callers[0] = {0x594E13, 13895}; w.callers[1] = {0x594EAB, 13895}; w.callers[2] = {0x594FE1, 13895}; w.callers[3] = {0x58DE73, 103}; w.callerCount = 4;
+        w.cameraCount = 3; w.toneBefore = 32000; w.toneAfter = 9788; w.toneFrames = 448; w.windows = 1; w.progressSeen = true;
         w.eyeDraws = 896;
         VrCensusWindowText t;
         t.hook = "installed"; t.camerasTotal = 3; t.foot = VrCensusFoot::No;
         vrCensusFormatWindow(line, sizeof(line), w, t);
         put(line);
     }
-    // Camera lines: the first sight of each, in the order the boundary prints them.
+
+    // Camera lines: the first sight of each, in the order the boundary prints them. A kind-5 camera (an eye's) is the game's custom matrix:
+    // the bound pair is zero, the off-centre terms are the matrix's own, there are no tangents and no viewport (as flight 1's lines were).
+    auto cam5Line = [&](uintptr_t ptr, uint32_t caller, uintptr_t view, const EyeCam& ec, VrCensusTone tone, uint32_t ordinal, bool drawKnown,
+                        uint32_t draw, uint64_t frame) {
+        VrCensusCamera row;
+        row.camera = ptr;
+        VrCensusSig& s = row.firstSig;
+        s.kind = 5; s.aspect = ec.aspect; s.nearZ = 0.025f; s.farZ = 50000.0f; s.fov = ec.fov;
+        s.boundX = 0.0f; s.boundY = 0.0f; s.viewportW = 0.0f; s.viewportH = 0.0f; s.p8 = 2.0f * ec.bx; s.p9 = 2.0f * ec.by;
+        row.tanValid = false;
+        row.callerRva = caller; row.firstOrdinal = ordinal; row.firstDraw = draw; row.firstDrawKnown = drawKnown; row.firstTone = tone; row.firstFrame = frame;
+        row.firstView = view; row.firstCtx = 0x241dce749f40ull;
+        vrCensusFormatCamera(line, sizeof(line), row);
+        put(line);
+    };
     auto camLine = [&](const FixtureCam& c, float bx, float by, VrCensusTone tone, uint32_t ordinal, uint32_t draw, uint64_t frame) {
         Model m(c.kind, c.fov, c.aspect, bx, by, c.nearZ, 50000.0f);
         c2derive::camF(m.cam, c2derive::kCamViewportW) = c.viewportW;   // not part of the derivation: no re-derive needed
@@ -1033,86 +1321,99 @@ std::string fixtureLog() {
         vrCensusFormatCamera(line, sizeof(line), row);
         put(line);
     };
-    struct EyeFrame { float bx[2], by[2], aspect[2], fov[2]; float shift[2][2]; };
-    EyeFrame eyeFrame[4];
-    for (int f = 0; f < 4; ++f) {
-        for (int e = 0; e < 2; ++e) {
-            eyeFrame[f].shift[e][0] = 0.00011f * static_cast<float>((f + 1) % 4) - 0.0002f;
-            eyeFrame[f].shift[e][1] = -0.00007f * static_cast<float>((f + 2) % 3) + 0.00005f;
-            const double l = frustumOf[e][0] + eyeFrame[f].shift[e][0], r = frustumOf[e][1] + eyeFrame[f].shift[e][0];
-            const double d = frustumOf[e][2] + eyeFrame[f].shift[e][1], u = frustumOf[e][3] + eyeFrame[f].shift[e][1];
-            const double wHalf = (r - l) / 2, tanHalf = (u - d) / 2;
-            eyeFrame[f].bx[e] = static_cast<float>(-(r + l) / (4 * wHalf));
-            eyeFrame[f].by[e] = static_cast<float>(-(u + d) / (4 * tanHalf));
-            eyeFrame[f].aspect[e] = static_cast<float>(wHalf / tanHalf);
-            eyeFrame[f].fov[e] = static_cast<float>(2 * std::atan(tanHalf));
-        }
-    }
-    camLine(world, 0.0f, 0.0f, VrCensusTone::Before, 1, 0, 1);
+    // The world camera's object was the LEFT EYE camera in the cockpit: its first-sight line, at the first frame, says kind 5 and is the
+    // eye's (tone none: the route reported no progress yet).
+    cam5Line(world.ptr, 0x594E13, eyeView[0], eyeCam[0], VrCensusTone::None, 19, false, 0, 1);
     camLine(ui, 0.0f, 0.0f, VrCensusTone::Before, 2, 0, 1);
-    // The on-foot frames 4..7: the cameras of the first three are first seen in frame 4.
+    // The on-foot frames 4..7: the cameras first seen on foot (an auxiliary camera that is a kind-5 call in frame 4, and the two eyes).
     const uint64_t firstOnFoot = 4;
-    camLine(weapon, 0.0f, 0.0f, VrCensusTone::Before, 13, 2100, firstOnFoot);
-    for (int e = 0; e < 2; ++e) {
-        const FixtureCam eyeCam{eyePtr[e], 3, eyeFrame[0].fov[e], eyeFrame[0].aspect[e], 0.05f, 0x594FE1, 2620.0f, 2533.0f, eyeView[e]};
-        camLine(eyeCam, eyeFrame[0].bx[e], eyeFrame[0].by[e], VrCensusTone::After, 18 + e, 8210 + e, firstOnFoot);
-    }
+    cam5Line(auxPtr, 0x594FE1, auxView, auxEye, VrCensusTone::After, 97, true, 8209, firstOnFoot);
+    for (int e = 0; e < 2; ++e) cam5Line(eyePtr[e], 0x594E13, eyeView[e], eyeCam[e], VrCensusTone::After, 103 + 3 * e, true, 8210 + static_cast<uint32_t>(e), firstOnFoot);
+
+    // One 'changed:' line as the boundary prints it: the signature the camera had, the one it has now.
+    auto changedLine = [&](uintptr_t ptr, uint64_t frame, uint32_t n, const VrCensusSig& from, const VrCensusSig& to) {
+        VrCensusCamera row;
+        row.camera = ptr;
+        row.changeFrom = from; row.sig = to; row.changeFrame = frame; row.changes = n;
+        vrCensusFormatChanged(line, sizeof(line), row);
+        put(line);
+    };
+    auto sigFor = [&](uint32_t kind, float aspect, float nearZ, float fov, float bx, float by, float vw, float vh) {
+        VrCensusSig s = sigOf(kind, aspect, nearZ, fov, bx, by);
+        s.viewportW = vw; s.viewportH = vh;
+        return s;
+    };
+    auto axesOf = [](Model& m, float yaw, float pitch) {
+        float* a = &c2derive::camF(m.cam, c2derive::kCamAxes);
+        const float cy = std::cos(yaw), sy = std::sin(yaw), cp = std::cos(pitch), sp = std::sin(pitch);
+        a[0] = cy; a[1] = 0.0f; a[2] = -sy; a[3] = 0.0f;
+        a[4] = sy * sp; a[5] = cp; a[6] = cy * sp; a[7] = 0.0f;
+        a[8] = sy * cp; a[9] = -sp; a[10] = cy * cp;
+        c2derive::camU(m.cam, c2derive::kCamFlags) |= c2derive::kFlagProj | c2derive::kFlagVP;
+        c2derive::derive(m.cam);
+    };
+    // The camera a call composed its rows from: a perspective model with the call's own terms, the head turned as the frame turns it. The
+    // world's first-person camera shares the world camera's object, so it turns with it; the eyes follow the head, not the world.
+    auto composeCall = [&](float fov, float aspect, float bx, float by, float nearZ, float yaw, float rows[16]) {
+        Model m(3, fov, aspect, bx, by, nearZ);
+        axesOf(m, yaw, -0.12f);
+        return vrCensusComposeRows(m.snap(), rows);
+    };
+
     // One sequence per on-foot frame (4, 5, 6), then the eye draws of frames 4..7 with their geometry and leak.
+    uint32_t worldChanges = 0;
     for (int f = 0; f < 4; ++f) {
         const uint64_t frame = firstOnFoot + f;
-        // The "changed:" line of an eye camera whose bound moved since the last frame.
-        if (f > 0 && f < 3) {
-            for (int e = 0; e < 2; ++e) {
-                VrCensusCamera row;
-                row.camera = eyePtr[e];
-                Model before(3, eyeFrame[f - 1].fov[e], eyeFrame[f - 1].aspect[e], eyeFrame[f - 1].bx[e], eyeFrame[f - 1].by[e], 0.05f);
-                Model after(3, eyeFrame[f].fov[e], eyeFrame[f].aspect[e], eyeFrame[f].bx[e], eyeFrame[f].by[e], 0.05f);
-                vrCensusSigFromSnap(before.snap(), &row.changeFrom);
-                vrCensusSigFromSnap(after.snap(), &row.sig);
-                row.changeFrame = frame; row.changes = static_cast<uint32_t>(f * 9);
-                vrCensusFormatChanged(line, sizeof(line), row);
-                put(line);
-            }
+        float bx = 0.0f, by = 0.0f, prevBx = 0.0f, prevBy = 0.0f;
+        phaseBound(phaseOf[f], &bx, &by);
+        if (f > 0) phaseBound(phaseOf[f - 1], &prevBx, &prevBy);
+        // The 'changed:' lines of a camera whose terms moved since the last frame: the world camera's kind and field at the first on-foot frame,
+        // its bound pair (the phase) in every frame; the auxiliary camera's kind when it stopped being a kind-5 call.
+        if (f < 3) {
+            worldChanges += 9;
+            const VrCensusSig from = f == 0 ? sigFor(5, eyeCam[0].aspect, 0.025f, eyeCam[0].fov, 0.0f, 0.0f, 0.0f, 0.0f)
+                                            : sigFor(3, world.aspect, 0.025f, world.fov, prevBx, prevBy, renderW, renderH);
+            changedLine(world.ptr, frame, worldChanges, from, sigFor(3, world.aspect, 0.025f, world.fov, bx, by, renderW, renderH));
+            if (f == 1) changedLine(auxPtr, frame, 1, sigFor(5, auxEye.aspect, 0.025f, auxEye.fov, 0.0f, 0.0f, 0.0f, 0.0f),
+                                    sigFor(3, 1.0f, 0.1f, 1.5708f, 0.0f, 0.0f, 2048.0f, 2048.0f));
         }
         if (f < 3) {
-            struct Call { const FixtureCam* cam; float bx, by, fov, aspect; uint32_t caller, draw; bool rows; VrCensusTone tone; };
+            struct Call { uintptr_t ptr, view; uint32_t kind; float fov, aspect, bx, by, nearZ, yaw; uint32_t caller, draw; bool rows; VrCensusTone tone; bool inject; uint8_t role; };
             std::vector<Call> calls;
-            const uint32_t callers3[3] = {0x594E13, 0x594EAB, 0x594FE1};
+            const float worldYaw = 0.35f + 0.004f * static_cast<float>(f), eyeYaw = 0.02f * static_cast<float>(f);
             uint32_t draw = 40;
-            for (int i = 0; i < 12; ++i) { draw += 310 + 17 * i; calls.push_back({&world, 0, 0, world.fov, world.aspect, callers3[i % 3], draw, true, VrCensusTone::Before}); }
-            for (int i = 0; i < 3; ++i) { draw += 55; calls.push_back({&weapon, 0, 0, weapon.fov, weapon.aspect, 0x594E13, draw, true, VrCensusTone::Before}); }
-            for (int i = 0; i < 2; ++i) { calls.push_back({&ui, 0, 0, ui.fov, ui.aspect, 0x58DE73, draw + 9, false, VrCensusTone::Before}); }
-            for (int i = 0; i < 4; ++i) {
-                const int e = i % 2;
-                calls.push_back({nullptr, eyeFrame[f].bx[e], eyeFrame[f].by[e], eyeFrame[f].fov[e], eyeFrame[f].aspect[e], 0x594FE1, 8210u + static_cast<uint32_t>(i), true, VrCensusTone::After});
+            for (int i = 0; i < 12; ++i) {
+                draw += 310 + 17 * i;
+                calls.push_back({world.ptr, worldViews[i % 3], 3, world.fov, world.aspect, bx, by, world.nearZ, worldYaw, callers3[i % 3], draw, true,
+                                 VrCensusTone::Before, true, 0});
             }
-            vrCensusFormatSequence(line, sizeof(line), frame, static_cast<uint32_t>(f + 1), VrCensusFoot::Yes, static_cast<uint32_t>(calls.size()),
-                                   static_cast<uint32_t>(calls.size()));
+            for (int i = 0; i < 3; ++i) {
+                draw += 55;
+                calls.push_back({world.ptr, worldViews[2], 3, firstPersonFov, world.aspect, bx, by, firstPersonNear, worldYaw, 0x594E13, draw, true,
+                                 VrCensusTone::Before, true, 1});
+            }
+            for (int i = 0; i < 2; ++i) calls.push_back({ui.ptr, ui.view, 1, ui.fov, ui.aspect, 0.0f, 0.0f, ui.nearZ, worldYaw, 0x58DE73, draw + 9, false,
+                                                         VrCensusTone::Before, false, kVrCensusRoleNone});
+            if (f == 0) calls.push_back({auxPtr, auxView, 5, auxEye.fov, auxEye.aspect, 0.0f, 0.0f, 0.025f, eyeYaw, 0x594FE1, 8209, true,
+                                         VrCensusTone::After, false, kVrCensusRoleNone});
+            else calls.push_back({auxPtr, auxView, 3, 1.5708f, 1.0f, 0.0f, 0.0f, 0.1f, worldYaw, 0x58DE73, draw + 12, true, VrCensusTone::Before, false, 2});
+            for (int i = 0; i < 6; ++i) {
+                const int e = i / 3;
+                calls.push_back({eyePtr[e], eyeView[e], 5, eyeCam[e].fov, eyeCam[e].aspect, eyeCam[e].bx, eyeCam[e].by, 0.025f, eyeYaw, callers3[i % 3],
+                                 8210u + static_cast<uint32_t>(i), true, VrCensusTone::After, false, kVrCensusRoleNone});
+            }
+            vrCensusFormatSequence(line, sizeof(line), frame, static_cast<uint32_t>(f + 1), VrCensusFoot::Yes, phaseOf[f],
+                                   static_cast<uint32_t>(calls.size()), static_cast<uint32_t>(calls.size()));
             put(line);
             uint32_t ordinal = 0;
             for (const Call& c : calls) {
                 ++ordinal;
-                const bool isEye = c.cam == nullptr;
-                // The last four calls are the eyes', left then right twice.
-                const uint32_t eyeIndex = isEye ? (ordinal - static_cast<uint32_t>(calls.size() - 4) - 1) % 2 : 0;
-                const uintptr_t ptr = isEye ? eyePtr[eyeIndex] : c.cam->ptr;
-                const uint32_t kind = isEye ? 3u : c.cam->kind;
-                const float near0 = isEye ? 0.05f : c.cam->nearZ;
-                Model m(kind, c.fov, c.aspect, c.bx, c.by, near0);
-                // The head and the world do not turn alike: the world's first-person camera drifts, the eyes follow the head.
-                float* a = &c2derive::camF(m.cam, c2derive::kCamAxes);
-                const float yaw = (isEye ? 0.02f * static_cast<float>(f) : 0.35f + 0.004f * static_cast<float>(f)), pitch = -0.12f;
-                const float cy = std::cos(yaw), sy = std::sin(yaw), cp = std::cos(pitch), sp = std::sin(pitch);
-                a[0] = cy; a[1] = 0.0f; a[2] = -sy; a[3] = 0.0f;
-                a[4] = sy * sp; a[5] = cp; a[6] = cy * sp; a[7] = 0.0f;
-                a[8] = sy * cp; a[9] = -sp; a[10] = cy * cp;
-                c2derive::camU(m.cam, c2derive::kCamFlags) |= c2derive::kFlagProj | c2derive::kFlagVP;
-                c2derive::derive(m.cam);
                 VrCensusCall rec;
-                rec.camera = ptr; rec.view = isEye ? eyeView[eyeIndex] : c.cam->view; rec.kind = kind; rec.kindReadable = true; rec.callerRva = c.caller;
+                rec.camera = c.ptr; rec.view = c.view; rec.kind = c.kind; rec.kindReadable = true; rec.callerRva = c.caller;
                 rec.draw = c.draw; rec.drawKnown = true;
                 rec.tone = c.tone; rec.preFlags = 0x1C; rec.postSeen = true;
-                rec.rowsValid = c.rows && vrCensusComposeRows(m.snap(), rec.rows);
+                rec.willInject = c.inject; rec.role = c.role;
+                rec.rowsValid = c.rows && composeCall(c.fov, c.aspect, c.bx, c.by, c.nearZ, c.yaw, rec.rows);
                 rec.postFlags = c.rows ? 0x0 : 0x4;
                 vrCensusFormatCall(line, sizeof(line), frame, ordinal, rec);
                 put(line);
@@ -1120,46 +1421,43 @@ std::string fixtureLog() {
         }
         // The eye draws of this frame: the rows the same camera composed in the sequence, read back from b1.
         for (int e = 0; e < 2; ++e) {
-            Model m(3, eyeFrame[f].fov[e], eyeFrame[f].aspect[e], eyeFrame[f].bx[e], eyeFrame[f].by[e], 0.05f);
-            float* a = &c2derive::camF(m.cam, c2derive::kCamAxes);
-            const float yaw = 0.02f * static_cast<float>(f), pitch = -0.12f;
-            const float cy = std::cos(yaw), sy = std::sin(yaw), cp = std::cos(pitch), sp = std::sin(pitch);
-            a[0] = cy; a[1] = 0.0f; a[2] = -sy; a[3] = 0.0f;
-            a[4] = sy * sp; a[5] = cp; a[6] = cy * sp; a[7] = 0.0f;
-            a[8] = sy * cp; a[9] = -sp; a[10] = cy * cp;
-            c2derive::camU(m.cam, c2derive::kCamFlags) |= c2derive::kFlagProj | c2derive::kFlagVP;
-            c2derive::derive(m.cam);
             float rows[16];
-            vrCensusComposeRows(m.snap(), rows);
+            composeCall(eyeCam[e].fov, eyeCam[e].aspect, eyeCam[e].bx, eyeCam[e].by, 0.025f, 0.02f * static_cast<float>(f), rows);
             float six[6][4] = {};
             std::memcpy(six, rows, sizeof(rows));
             double mx = 0, my = 0;
             const bool measured = flatCameraMeasureRowShift(six, mx, my);
-            vrCensusFormatEye(line, sizeof(line), static_cast<uint32_t>(e), frame, VrCensusFoot::Yes, true, 8213u + 7u * static_cast<uint32_t>(e),
+            vrCensusFormatEye(line, sizeof(line), static_cast<uint32_t>(e), frame, VrCensusFoot::Yes, phaseOf[f], true, 8213u + 7u * static_cast<uint32_t>(e),
                               0x1eb2e751e20ull, 0, 5376, rows, measured, mx, my, nullptr);
             put(line);
-            vrCensusFormatEyeGeometry(line, sizeof(line), static_cast<uint32_t>(e), frame, true, 4700 + frame, frustumOf[e], eyeFrame[f].shift[e], measured, mx, my);
+            const float noShift[2] = {0.0f, 0.0f};
+            vrCensusFormatEyeGeometry(line, sizeof(line), static_cast<uint32_t>(e), frame, true, 4700 + frame, frustumOf[e], noShift, measured, mx, my);
             put(line);
         }
     }
-    // A call on another thread and a later 5 s line (the on-foot one), so the reader sees both shapes.
-    VrCensusOffThread::Entry other;
-    other.thread = 4321; other.camera = 0x241dc2e2960; other.kind = 3; other.kindReadable = true; other.callerRva = 0x594E13; other.calls = 57;
-    vrCensusFormatOtherThread(line, sizeof(line), other);
-    put(line);
+    // The on-foot window: the route's two lines, then the census's 5 s line, which says how many calls the detour injected.
+    routeWindow("owned", "held",
+                "frames=450 gate-frames=450 gate-flips=1 hdr-frames=450 trigger=450 none=0 ambiguous=0 treated=450 declined=0 owned-frames=450 "
+                "eye-takes=900 door-layer-only=900 enters=1 releases=0",
+                "treated", "on", "-0.2520,-0.0630", "0.1260,0.2520", "0/450/0", "DFED8E1C9E191BEC", "143AAE0597E2F7BF", "2520x1417", "5040x2835",
+                "selected:450",
+                "inj-scene=5400 inj-fp=1350 inj-refused=0 warming=0 aux=450 after=0 unsupported=2700 other-kind=900 unreadable=0 off-thread=0 write-fail=0 "
+                "inj-kinds=3:6750 pair-checked=448 pair-bad=0 inj-unnamed=0 inj-shut=0");
     {
         VrCensusWindow w;
-        w.frames = 450; w.calls = 48600; w.posts = 48600; w.stale = 0; w.kinds[1] = 900; w.kinds[3] = 47700;
-        w.callers[0] = {0x594E13, 16200}; w.callers[1] = {0x594EAB, 16200}; w.callers[2] = {0x594FE1, 16200}; w.callers[3] = {0x58DE73, 0}; w.callerCount = 3;
-        w.cameraCount = 5; w.toneBefore = 40500; w.toneAfter = 8100; w.toneFrames = 450; w.onFootFrames = 450; w.eyeDraws = 900; w.eyeOnFoot = 900;
+        w.frames = 450; w.calls = 10800; w.posts = 10800; w.stale = 0; w.injCalls = 6750;
+        w.kinds[1] = 900; w.kinds[3] = 7200; w.kinds[5] = 2700;
+        w.callers[0] = {0x594E13, 3150}; w.callers[1] = {0x594EAB, 3150}; w.callers[2] = {0x594FE1, 3150}; w.callers[3] = {0x58DE73, 1350}; w.callerCount = 4;
+        w.cameraCount = 5; w.toneBefore = 8100; w.toneAfter = 2700; w.toneFrames = 450; w.onFootFrames = 450; w.eyeDraws = 900; w.eyeOnFoot = 900;
         w.windows = 1; w.progressSeen = true;
         VrCensusWindowText t;
-        t.hook = "installed"; t.camerasTotal = 5; t.offThread = 57; t.foot = VrCensusFoot::Yes;
+        t.hook = "installed"; t.camerasTotal = 5; t.foot = VrCensusFoot::Yes;
         vrCensusFormatWindow(line, sizeof(line), w, t);
         put(line);
     }
     return out;
 }
+
 
 // Two log texts are the same when they differ at most in the last digits of the numbers in them: every line's text is
 // identical and every number is within 1e-5 (relative above one). The scripted session builds its cameras with the
@@ -1234,22 +1532,35 @@ void testReaderFixture() {
           !sameWithinRounding("a 1 b 0x1F", "a 1 b 0x1E", nullptr) && !sameWithinRounding("a 1 b", "a 1 c", nullptr) && !sameWithinRounding("a 1", "a 1 ", nullptr) &&
           sameWithinRounding("x=-0 y=1e-09", "x=0 y=3e-09", nullptr),
           "the comparison tolerates the seventh digit and a hex literal is text: a digit off at 1e-4, a changed word or hex, a longer line are all different");
-    // The golden lines are pinned above; the fixture carries lines of the same classes from the scripted session.
+    // The golden lines are pinned above; the fixture carries lines of the same classes from the scripted session (the off-thread line is
+    // not in it: the fixture is a clean flight, so the reader's verdict on it can PASS, and the reader's own self-test adds that line).
     const char* classes[] = {"vr camera census 5s: frames=", "vr camera census: camera=0x", "vr camera census: changed: camera=0x",
                              "vr camera census: sequence frame=", "vr camera census: call frame=", "vr camera census: eye=",
-                             "vr camera census: eye-geometry eye=", "vr camera census: other-thread tid="};
+                             "vr camera census: eye-geometry eye=",
+                             "vr world route 5s: key=auto state=owned", "vr world route inject 5s: inj-scene=5400"};
     unsigned found = 0;
     for (const char* cls : classes) if (built.find(cls) != std::string::npos) ++found;
-    check(found == 8, "the fixture holds a line of every class the rig pins: 5 s, camera, changed, sequence, call, eye, eye-geometry, other-thread");
+    check(found == 9, "the fixture holds a line of every class the rig pins: 5 s, camera, changed, sequence, call, eye, eye-geometry, and the route's two lines");
+    // The stage 2 tokens are in the fixture's census lines, from the formatters: a sampled frame's phase, what the detour decided for a call.
+    check(built.find(" phase=0.2520,-0.1260 calls=24 recorded=24 truncated=0") != std::string::npos &&
+              built.find(" inj=1 role=scene ") != std::string::npos && built.find(" inj=1 role=fp ") != std::string::npos &&
+              built.find(" inj=0 role=aux ") != std::string::npos && built.find(" kind=5 caller=+0x594FE1 draw=8212 tone=after inj=0 role=- ") != std::string::npos &&
+              built.find(" stale=0 inj-calls=6750 kinds=1:900,3:7200,5:2700 ") != std::string::npos,
+          "the fixture carries the new tokens: a sequence's phase, injected scene and first-person calls, an excluded auxiliary call, kind-5 eye calls with no role, inj-calls");
     std::string mutated = normalised;
     const size_t at = mutated.find("vr camera census 5s:");
     if (at != std::string::npos) mutated[at + 3] = '#';
     check(!sameWithinRounding(mutated, built, nullptr), "control: a fixture file with one character altered is no longer the formatters' output, so the row above can fail");
     std::string nudged = normalised;
-    const size_t num = nudged.find("aspect=1.777778");
-    if (num != std::string::npos) nudged.replace(num, 15, "aspect=1.777879");
+    const size_t num = nudged.find("phase=0.2520,-0.1260");
+    if (num != std::string::npos) nudged.replace(num, 20, "phase=0.2521,-0.1260");
     check(num != std::string::npos && !sameWithinRounding(nudged, built, nullptr),
-          "control: a number moved in its fifth digit is no longer the formatters' output either");
+          "control: a number moved in its fourth decimal is no longer the formatters' output either");
+    std::string toggled = normalised;
+    const size_t inj = toggled.find(" inj=1 role=scene ");
+    if (inj != std::string::npos) toggled[inj + 5] = '0';
+    check(inj != std::string::npos && !sameWithinRounding(toggled, built, nullptr),
+          "control: a call line whose inj= was flipped is no longer the formatters' output");
 }
 
 int runSelfTest() {
@@ -1265,6 +1576,7 @@ int runSelfTest() {
     testOffThread();
     testFormats();
     testSession();
+    testPhaseSession();
     testSampling();
     testSourcePins(injectCpp);
     testReaderFixture();

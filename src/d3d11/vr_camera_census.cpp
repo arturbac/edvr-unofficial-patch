@@ -46,6 +46,7 @@ struct Pending {
 struct State {
     bool active = false;
     VrCensusFoot foot = VrCensusFoot::Off;   // what Elite's journal said at the last boundary
+    VrCensusPhase phase;              // what the world route chose for the frame in progress, latched at the boundary that opened it
     uint64_t frame = 0;               // the frame in progress, 1-based; 0 before the first boundary
     uint64_t lastWindowMs = 0;
     uint32_t tick = 0;                // 5 s windows since the census started
@@ -106,10 +107,10 @@ bool observePre(const FlatCameraObserveCall& call) noexcept {
         if (toneSeen) s->current.toneSeen = true;
     }
     const uint32_t callerRva = static_cast<uint32_t>(call.callerRva);
-    s->window.noteCall(call.kindReadable, call.kind, callerRva, call.camera, tone, call.window != 0);
-    // A sequence is recorded only while one is still wanted and the journal does not rule the frame out (the last one is
-    // printed at the boundary that finds its frame sampled); otherwise a call is counted and nothing else.
-    const bool recording = vrCensusMayRecord(s->foot) && vrCensusPrintsSequence(true, s->sequencesLogged);
+    s->window.noteCall(call.kindReadable, call.kind, callerRva, call.camera, tone, call.window != 0, call.willInject);
+    // A sequence is recorded only while one is still wanted and neither the journal nor the route's phase rules the frame out
+    // (the last one is printed at the boundary that finds its frame sampled); otherwise a call is counted and nothing else.
+    const bool recording = vrCensusMayRecord(s->foot, s->phase) && vrCensusPrintsSequence(true, s->sequencesLogged);
     VrCensusCall* record = nullptr;
     if (recording) record = s->current.add(); else ++s->current.calls;
     Pending& p = s->pending;
@@ -128,6 +129,8 @@ bool observePre(const FlatCameraObserveCall& call) noexcept {
         record->view = call.p2;
         record->kind = call.kind;
         record->kindReadable = call.kindReadable;
+        record->willInject = call.willInject;   // what the detour decided for this call, before the body runs
+        record->role = call.role;
         record->callerRva = callerRva;
         record->draw = draw;
         record->drawKnown = have;
@@ -183,6 +186,20 @@ VrCensusFoot currentFoot() {
     return vrCensusFootFrom(journalWatchActive(), journalOnFootKnown(), journalOnFoot());
 }
 
+// What the world route chose for the frame that is running NOW (vr_world_route.h vrWorldRouteWorldPhase): whether it is
+// jittering this frame and the phase it asked the injector for, in render pixels. The route's boundary runs before the census's,
+// so asked at the census's boundary it is the frame that STARTS there (latched into s->phase for that frame's whole run, its
+// sequence header and its sampling decision at the next boundary), and asked at an eye draw it is the running frame's.
+// False (not jittering) leaves the phase out of the decision. This is the census's one question of the route's phase.
+VrCensusPhase readPhase() {
+    VrCensusPhase p;
+    float x = 0.0f, y = 0.0f;
+    p.jittering = vrWorldRouteWorldPhase(&x, &y);
+    p.x = x;
+    p.y = y;
+    return p;
+}
+
 // ---- the key ---------------------------------------------------------------------------------------------------------
 bool readWanted() {
     if (!runtimeVrProfile()) return false;   // a flat profile reads the key off already (Config refuses it); asked twice
@@ -194,6 +211,7 @@ bool readWanted() {
 void activate(State* s) {
     s->active = true;
     s->foot = currentFoot();
+    s->phase = VrCensusPhase{};                 // the first boundary latches the first frame's
     s->frame = 0;
     s->current.reset();
     s->pending = Pending{};
@@ -206,7 +224,8 @@ void activate(State* s) {
         Log::get().note("vr camera census: on (advanced.vr_camera_census); observe-only, nothing is written to any camera; "
                         "owner thread %lu; 5 s line per window for %u windows, then one per %u; cameras first %u, "
                         "call sequences first %u and eye draws first %u on-foot frames (the tone drawn while the journal, "
-                        "read=%s, says on foot); line budget %u",
+                        "read=%s, says on foot; while the world route jitters, only a frame whose phase is non-zero); "
+                        "line budget %u",
                         static_cast<unsigned long>(GetCurrentThreadId()), kVrCensusEveryWindow, kVrCensusThinTo,
                         static_cast<unsigned>(VrCensusCameraTable::kCapacity), kVrCensusMaxSequences, kVrCensusMaxEyeFrames,
                         journalWatchActive() ? "yes" : "no: the tone alone decides", VrCensusBudget::capTotal());
@@ -256,7 +275,7 @@ void printSequence(State* s) {
     char line[kVrCensusLineBytes + 16];
     const VrCensusFrame& f = s->current;
     ++s->sequencesLogged;
-    vrCensusFormatSequence(line, kVrCensusLineBytes + 1, s->frame, s->sequencesLogged, s->foot, f.calls, f.recorded);
+    vrCensusFormatSequence(line, kVrCensusLineBytes + 1, s->frame, s->sequencesLogged, s->foot, s->phase, f.calls, f.recorded);
     say(s, VrCensusLines::Call, line);
     for (uint32_t i = 0; i < f.recorded; ++i) {
         vrCensusFormatCall(line, kVrCensusLineBytes + 1, s->frame, i + 1, f.call[i]);
@@ -267,7 +286,8 @@ void printSequence(State* s) {
 // The frame that just ended is accounted and printed; the next one starts empty.
 void rollFrame(State* s) {
     if (s->frame) {
-        const bool sampled = vrCensusSamplesFrame(s->current.toneSeen, s->current.progress, s->foot);
+        // The frame that ended was run under the phase latched at the boundary that opened it (s->phase, not yet replaced).
+        const bool sampled = vrCensusSamplesFrame(s->current.toneSeen, s->current.progress, s->foot, s->phase);
         ++s->window.frames;
         if (s->current.toneSeen) ++s->window.toneFrames;
         if (sampled) ++s->window.onFootFrames;
@@ -361,7 +381,8 @@ void vrCameraCensusFrameBoundary() {
     g_wanted = true;
     flatCameraInjectDisarm();          // the Present edge: the window closes and THIS thread is the owner
     s->foot = currentFoot();           // the journal's word for the frame that ended, and for the one that starts
-    rollFrame(s);
+    rollFrame(s);                      // the frame that ended, under the phase latched when it began
+    s->phase = readPhase();            // the route's boundary ran first: this is the choice for the frame that starts
     flatCameraInjectObserveFrame();    // installs the hook once (observe-only), opens the window
     tickWindow(s);
 }
@@ -381,8 +402,10 @@ void vrCameraCensusEyeDraw(ID3D11DeviceContext* ctx, uint32_t eye) {
         if (toneSeen) s->current.toneSeen = true;
     }
     // Only a frame the census samples is read back: the tone drawn before this draw and the journal, when it is read, saying
-    // on foot; or, with no draw progress at all, the journal alone saying on foot.
-    if (!vrCensusSamplesFrame(toneSeen, have, s->foot)) return;
+    // on foot; or, with no draw progress at all, the journal alone saying on foot; and, while the route jitters, a non-zero
+    // phase (asked here, where the running frame's choice is wanted, and printed on the line).
+    const VrCensusPhase phase = readPhase();
+    if (!vrCensusSamplesFrame(toneSeen, have, s->foot, phase)) return;
     ++s->window.eyeOnFoot;
     if (!s->eye.take(s->frame)) return;
 
@@ -403,7 +426,7 @@ void vrCameraCensusEyeDraw(ID3D11DeviceContext* ctx, uint32_t eye) {
         measured = flatCameraMeasureRowShift(six, measX, measY);
     }
     char line[kVrCensusLineBytes + 16];
-    vrCensusFormatEye(line, kVrCensusLineBytes + 1, eye, s->frame, s->foot, true, draw, b1, first, bytes,
+    vrCensusFormatEye(line, kVrCensusLineBytes + 1, eye, s->frame, s->foot, phase, true, draw, b1, first, bytes,
                       read ? rows : nullptr, measured, measX, measY, read ? nullptr : why);
     say(s, VrCensusLines::Eye, line);
     uint64_t sequence = 0;

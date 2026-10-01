@@ -9,13 +9,17 @@
 //   - a 5 s line every window (zeros included): calls, calls on other threads, kinds, callers, distinct cameras, where in
 //     the frame the calls fell against the tone draw;
 //   - per distinct camera (the first 64): its kind, caller, view and field signature, and any later change of it;
-//   - the FULL call sequence of the first three on-foot frames, one line a call, with the rows the composer produced;
+//   - the FULL call sequence of the first three on-foot frames, one line a call, with the rows the composer produced, what
+//     the detour decided for the call (inj, role) and, in the sequence's header, the phase the route chose for the frame;
 //   - at the eye composite draw of the first four on-foot frames (eight draws): the eye's b1 rows 270..273 read back
-//     from the GPU, what EDVR advertised for that eye, and the leak measure.
+//     from the GPU, what EDVR advertised for that eye, the leak measure and the frame's phase.
 // An on-foot frame is one in which the world route's detector saw the tone AND Elite's journal, when it is read, says on
 // foot (vrCensusSamplesFrame in the core): the detector draws the same tone in a cockpit, a hangar and a menu, and those
 // frames must not spend the samples. When the route reports no draw progress at all (vrWorldRouteDrawProgress false) there
-// is no tone and the journal alone decides. `python tools\edvr_log.py --camera-census` reads the log back and does the join.
+// is no tone and the journal alone decides. While the route IS jittering the world (vrWorldRouteWorldPhase true), a frame is
+// also sampled only when its phase is non-zero: the route's warm-up frames carry none, and only a frame that does can show a
+// leak into the eyes. Flight 1 spent its whole sample on warm-up frames. With the route not jittering the rule is unchanged.
+// `python tools\edvr_log.py --camera-census` reads the log back, does the join and judges the injection (the stage 2 verdict).
 #pragma once
 #include <cstdint>
 
@@ -28,7 +32,8 @@ namespace edvr {
 bool vrCameraCensusWanted();
 // Once a frame at the Present boundary, AFTER vrWorldRouteFrameBoundary(): runs the injector's per-frame protocol in observe
 // mode (the Present edge, the hook, the window), rolls the per-frame call sequence, prints the 5 s line and the bounded
-// per-camera lines.
+// per-camera lines, and latches the world route's phase for the frame that starts (the route's boundary ran first, so
+// vrWorldRouteWorldPhase() is that frame's).
 void vrCameraCensusFrameBoundary();
 // At each eye composite draw (2 a frame), after the game's own draw: logs, for the first few on-foot frames, the eye's VS b1
 // rows 270..273 and the frustum and shift EDVR advertised for that eye this sequence. Render thread.

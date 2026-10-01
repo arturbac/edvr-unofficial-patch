@@ -13,10 +13,18 @@
 // One flight with advanced.vr_camera_census = on records enough to decide: this header is what it records and how each
 // record is written. `python tools\edvr_log.py --camera-census` reads it back and does the join offline.
 //
+// FLIGHT 1 ANSWERED IT (4.63 million calls): the eye cameras are kind 5 and the world's on-foot camera is kind 3, read from
+// the KIND OF EACH CALL, never from the camera object (one object was the left eye camera in the cockpit and the world
+// camera on foot). STAGE 2 then puts a sub-pixel phase into the kind-3 world cameras through the same detour, and the census
+// verifies it in the same flight: the eye draws' measured rows must not move while the kind-3 calls' rows carry the phase.
+// So each call line also says what the detour decided for it (inj, role), each sample says the phase the route chose for
+// its frame, and a frame is sampled only when that phase can show a leak (vrCensusSamplesFrame).
+//
 // WHAT IS HERE. Everything the census decides and every line it prints, with no D3D, no log, no game and no allocation
 // (tools\vr_camera_census_test runs each function, and the DLL compiles the very same text):
 //   - the key and the decision to run (VR profile and the key on; anything else is nothing at all);
-//   - which frames are sampled (the tone seen, and the journal, when it is read, saying on foot);
+//   - which frames are sampled (the tone seen, and the journal, when it is read, saying on foot; while the route jitters,
+//     a non-zero phase too);
 //   - the camera struct's field signature and the rows the composer writes for it, ported from
 //     tools\c2_derive_test\c2_derive_model.h (composeSceneCb), so a camera's rows are known without reading the game's
 //     own constant buffer and can be compared with an eye draw's;
@@ -220,7 +228,8 @@ inline const char* vrCensusToneName(VrCensusTone t) {
 // every frame, and a cockpit, a hangar and a menu draw the same tone: without a second witness the first three call
 // sequences and the first four eye frames would be spent before the commander is on foot. The second witness is Elite's
 // own journal (Status.json Flags2 bit 0, journal_watch.h): while it is being read, a frame is sampled only when it says on
-// foot; with no journal the tone alone decides, as the brief has it. The journal lags the game by about a second.
+// foot; with no journal the tone alone decides, as the brief has it. The journal lags the game by about a second. The third
+// is the route's phase (below): the first frames on foot are the route's warm-up and carry none.
 enum class VrCensusFoot : uint8_t {
     Off,      // the journal is not being read (disabled, no folder, faults): no second witness
     Unknown,  // read, but no Flags2 in the file: a menu, or shutdown
@@ -233,17 +242,45 @@ inline const char* vrCensusFootName(VrCensusFoot f) {
 inline VrCensusFoot vrCensusFootFrom(bool journalActive, bool known, bool onFoot) {
     return !journalActive ? VrCensusFoot::Off : !known ? VrCensusFoot::Unknown : onFoot ? VrCensusFoot::Yes : VrCensusFoot::No;
 }
+// What the world route chose for a frame (vrWorldRouteWorldPhase, the camera injector's stage 2): whether it is jittering the
+// world at all this frame and the raster phase it asked the injector for, in render pixels, positive right/down. The phase is
+// the frame's CHOICE, so it is zero for the first frames of a warm-up even while the route jitters; those frames cannot show
+// a leak (an eye camera with a zero phase in the world cameras has nothing to leak), and flight 1 spent its whole sample on
+// them. `jittering` false means the route is not asking for a phase (key off, not warming or owned, no hook): the frame is
+// judged exactly as it was before stage 2.
+struct VrCensusPhase {
+    bool jittering = false;
+    float x = 0.0f, y = 0.0f;
+};
+constexpr float vrCensusAbs(float v) { return v < 0.0f ? -v : v; }
+// A phase that can leak: some axis is not zero. NaN is no phase (every comparison with it is false).
+constexpr bool vrCensusPhaseNonZero(const VrCensusPhase& p) { return vrCensusAbs(p.x) + vrCensusAbs(p.y) > 0.0f; }
+// While the route jitters a frame is worth sampling only with a non-zero phase; with the route not jittering the phase has no say.
+constexpr bool vrCensusPhaseAllowsSample(const VrCensusPhase& p) { return !p.jittering || vrCensusPhaseNonZero(p); }
 // A frame the census samples (a call sequence, an eye readback). With the world route's draw progress available it is the
 // brief's rule plus the journal's: the tone was seen, and the journal, if it is read, says on foot. With no progress (the
 // route does not report, or does not watch draws) there is no tone to see: the journal alone decides, and only a journal
 // that positively says on foot does (neither witness would sample the first frames of a session, menu frames, for nothing).
-constexpr bool vrCensusSamplesFrame(bool toneSeen, bool progressAvailable, VrCensusFoot foot) {
-    return progressAvailable ? (toneSeen && (foot == VrCensusFoot::Yes || foot == VrCensusFoot::Off)) : foot == VrCensusFoot::Yes;
+// And, while the route jitters, the frame's phase must be non-zero (vrCensusPhaseAllowsSample). The phase is passed
+// explicitly, never defaulted: a caller that forgot it would sample the warm-up frames again.
+constexpr bool vrCensusSamplesFrame(bool toneSeen, bool progressAvailable, VrCensusFoot foot, const VrCensusPhase& phase) {
+    return (progressAvailable ? (toneSeen && (foot == VrCensusFoot::Yes || foot == VrCensusFoot::Off)) : foot == VrCensusFoot::Yes) &&
+           vrCensusPhaseAllowsSample(phase);
 }
-// Whether a call is worth recording at all: a frame the journal says is not on foot is never sampled, so its calls are only counted.
-constexpr bool vrCensusMayRecord(VrCensusFoot foot) { return foot == VrCensusFoot::Yes || foot == VrCensusFoot::Off; }
+// Whether a call is worth recording at all: a frame the journal says is not on foot, or the route's zero-phase frame, is never
+// sampled, so its calls are only counted.
+constexpr bool vrCensusMayRecord(VrCensusFoot foot, const VrCensusPhase& phase) {
+    return (foot == VrCensusFoot::Yes || foot == VrCensusFoot::Off) && vrCensusPhaseAllowsSample(phase);
+}
 
 // ---- the bounded tables -----------------------------------------------------------------------------------------
+// What the detour decided for a kind-3 call in the route's injection mode (FlatCameraObserveCall::role): 0 scene, 1 first-person,
+// 2 auxiliary, 255 not a role (every other kind, or the detour is not in injection mode). The log says it in words.
+constexpr uint8_t kVrCensusRoleNone = 255;
+inline const char* vrCensusRoleName(uint8_t role) {
+    return role == 0 ? "scene" : role == 1 ? "fp" : role == 2 ? "aux" : "-";
+}
+
 struct VrCensusCall {
     uintptr_t camera = 0;
     uintptr_t view = 0;     // the refresh's second argument: the view (pass) object the camera belongs to
@@ -252,6 +289,8 @@ struct VrCensusCall {
     uint32_t draw = 0;
     uint32_t preFlags = 0, postFlags = 0;
     bool kindReadable = false, drawKnown = false, postSeen = false, rowsValid = false;
+    bool willInject = false;                 // the detour will inject this call with a non-zero phase (the route's stage 2)
+    uint8_t role = kVrCensusRoleNone;        // FlatCameraObserveCall::role
     VrCensusTone tone = VrCensusTone::None;
     float rows[16] = {};
 };
@@ -442,6 +481,7 @@ struct VrCensusWindow {
     static constexpr size_t kCallers = 16, kCameras = 64;
     struct Caller { uint32_t rva = 0; uint64_t n = 0; };
     uint64_t frames = 0, calls = 0, posts = 0, stale = 0;
+    uint64_t injCalls = 0;                  // calls the observer heard with willInject set (the route's stage 2)
     uint64_t kinds[8] = {};                 // 0..5, 6 = other, 7 = unreadable
     Caller callers[kCallers];
     uint32_t callerCount = 0;
@@ -455,9 +495,11 @@ struct VrCensusWindow {
     uint64_t eyeDraws = 0, eyeOnFoot = 0;   // eye composite draws reported, and those of a sampled frame
     uint32_t windows = 0;                   // 5 s windows this line covers
     bool progressSeen = false;              // vrWorldRouteDrawProgress answered at least once
-    void noteCall(bool kindReadable, uint32_t kind, uint32_t callerRva, uintptr_t camera, VrCensusTone tone, bool lapsed) {
+    void noteCall(bool kindReadable, uint32_t kind, uint32_t callerRva, uintptr_t camera, VrCensusTone tone, bool lapsed,
+                  bool willInject) {
         ++calls;
         if (lapsed) ++stale;
+        if (willInject) ++injCalls;
         ++kinds[!kindReadable ? 7 : kind <= 5 ? kind : 6];
         size_t i = 0;
         for (; i < callerCount; ++i) if (callers[i].rva == callerRva) break;
@@ -574,6 +616,19 @@ struct Out {
     }
     void pair(float a, float b) { put("("); f(a); put(","); f(b); put(")"); }
     void draw(bool known, uint32_t draw) { if (known) put("%u", draw); else put("-"); }
+    // One phase axis in render pixels, four decimals ("0.2520"); whatever rounds to zero is "0.0000", never "-0.0000".
+    void px(float v) {
+        if (!std::isfinite(v)) { put("nan"); return; }
+        char text[24];
+        std::snprintf(text, sizeof(text), "%.4f", static_cast<double>(v));
+        put("%s", std::strcmp(text, "-0.0000") == 0 ? "0.0000" : text);
+    }
+    // The frame's phase as the reader takes it: "X,Y" in render pixels while the route jitters, "-" when it does not (so a
+    // zero phase of a jittering warm-up frame and a route that is not jittering at all read differently).
+    void phase(const VrCensusPhase& ph) {
+        if (!ph.jittering) { put("-"); return; }
+        px(ph.x); put(","); px(ph.y);
+    }
 };
 }  // namespace vrcensus_detail
 
@@ -586,9 +641,9 @@ struct VrCensusWindowText {
 };
 inline int vrCensusFormatWindow(char* out, size_t size, const VrCensusWindow& w, const VrCensusWindowText& t) {
     vrcensus_detail::Out o(out, size);
-    o.put("vr camera census 5s: frames=%llu calls=%llu posts=%llu off-thread=%llu stale=%llu kinds=",
+    o.put("vr camera census 5s: frames=%llu calls=%llu posts=%llu off-thread=%llu stale=%llu inj-calls=%llu kinds=",
           (unsigned long long)w.frames, (unsigned long long)w.calls, (unsigned long long)w.posts,
-          (unsigned long long)t.offThread, (unsigned long long)w.stale);
+          (unsigned long long)t.offThread, (unsigned long long)w.stale, (unsigned long long)w.injCalls);
     bool any = false;
     for (int k = 0; k < 8; ++k) {
         if (!w.kinds[k]) continue;
@@ -667,11 +722,16 @@ inline int vrCensusFormatChanged(char* out, size_t size, const VrCensusCamera& c
     return static_cast<int>(o.n);
 }
 
-inline int vrCensusFormatSequence(char* out, size_t size, uint64_t frame, uint32_t index, VrCensusFoot foot, uint32_t calls,
-                                  uint32_t recorded) {
-    return std::snprintf(out, size, "vr camera census: sequence frame=%llu index=%u/%u foot=%s calls=%u recorded=%u truncated=%u",
-                         (unsigned long long)frame, index, kVrCensusMaxSequences, vrCensusFootName(foot), calls, recorded,
-                         calls - recorded);
+// `phase` is what the route chose for this frame (vrWorldRouteWorldPhase, latched at the boundary that opened it): "X,Y" in
+// render pixels, or "-" when the route was not jittering.
+inline int vrCensusFormatSequence(char* out, size_t size, uint64_t frame, uint32_t index, VrCensusFoot foot,
+                                  const VrCensusPhase& phase, uint32_t calls, uint32_t recorded) {
+    vrcensus_detail::Out o(out, size);
+    o.put("vr camera census: sequence frame=%llu index=%u/%u foot=%s phase=", (unsigned long long)frame, index,
+          kVrCensusMaxSequences, vrCensusFootName(foot));
+    o.phase(phase);
+    o.put(" calls=%u recorded=%u truncated=%u", calls, recorded, calls - recorded);
+    return static_cast<int>(o.n);
 }
 
 inline int vrCensusFormatCall(char* out, size_t size, uint64_t frame, uint32_t ordinal, const VrCensusCall& c) {
@@ -681,7 +741,8 @@ inline int vrCensusFormatCall(char* out, size_t size, uint64_t frame, uint32_t o
     if (c.kindReadable) o.put("%u", c.kind); else o.put("-");
     o.put(" caller=+0x%X draw=", c.callerRva);
     o.draw(c.drawKnown, c.draw);
-    o.put(" tone=%s fl=0x%X>", vrCensusToneName(c.tone), c.preFlags);
+    o.put(" tone=%s inj=%u role=%s fl=0x%X>", vrCensusToneName(c.tone), c.willInject ? 1u : 0u, vrCensusRoleName(c.role),
+          c.preFlags);
     if (c.postSeen) o.put("0x%X", c.postFlags); else o.put("-");
     o.put(" view=0x%llx rows=", (unsigned long long)c.view);
     if (c.rowsValid) o.list(c.rows, 16); else o.put("-");
@@ -689,11 +750,14 @@ inline int vrCensusFormatCall(char* out, size_t size, uint64_t frame, uint32_t o
 }
 
 // The eye draw's own rows and what they measure. why: null when the rows were read, else the reason they were not.
-inline int vrCensusFormatEye(char* out, size_t size, uint32_t eye, uint64_t frame, VrCensusFoot foot, bool drawKnown,
-                             uint32_t draw, uint64_t b1, uint32_t firstConstant, uint32_t bytes, const float rows[16],
-                             bool measured, double measX, double measY, const char* why) {
+inline int vrCensusFormatEye(char* out, size_t size, uint32_t eye, uint64_t frame, VrCensusFoot foot,
+                             const VrCensusPhase& phase, bool drawKnown, uint32_t draw, uint64_t b1, uint32_t firstConstant,
+                             uint32_t bytes, const float rows[16], bool measured, double measX, double measY,
+                             const char* why) {
     vrcensus_detail::Out o(out, size);
-    o.put("vr camera census: eye=%u frame=%llu foot=%s draw=", eye, (unsigned long long)frame, vrCensusFootName(foot));
+    o.put("vr camera census: eye=%u frame=%llu foot=%s phase=", eye, (unsigned long long)frame, vrCensusFootName(foot));
+    o.phase(phase);
+    o.put(" draw=");
     o.draw(drawKnown, draw);
     o.put(" b1=0x%llx first=%u bytes=%u rows=", (unsigned long long)b1, firstConstant, bytes);
     if (rows) o.list(rows, 16); else o.put("-");
@@ -704,8 +768,10 @@ inline int vrCensusFormatEye(char* out, size_t size, uint32_t eye, uint64_t fram
 }
 
 // What EDVR advertised for the eye this sequence, and the leak: the measured shift of the eye's rows minus the shift the
-// advertised frustum and shift should give. Nothing but the eye shift moves an eye camera today, so the leak reads zero
-// (within float rounding) in this census; the number is the baseline the world route's leak detector will be judged against.
+// advertised frustum and shift should give. Nothing but the eye shift moves an eye camera, so the leak reads zero (within
+// float rounding: 1e-8 in flight 1) unless the world route's phase reaches an eye camera, which would read about 1e-4 (half
+// a pixel at 5040 wide is 2e-4). With the route jittering this is stage 2's leak detector, and edvr_log.py's verdict judges it
+// against the eye line's phase= (PASS below 1e-6, STOP above 1e-5).
 inline int vrCensusFormatEyeGeometry(char* out, size_t size, uint32_t eye, uint64_t frame, bool known, uint64_t sequence,
                                      const float frustum[4], const float shift[2], bool measured, double measX,
                                      double measY) {

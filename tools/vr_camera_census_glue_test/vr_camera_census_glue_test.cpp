@@ -23,11 +23,21 @@
 //                       for: S P D F at the first boundary, D F at every later one; the key going off detaches the observer
 //                       and closes the gate, going on again reopens it.
 //   SAMPLING            the ship frames (the journal says not on foot) print no sequence and spend no eye readback; the
-//                       frame the journal flips at prints no empty sequence; the next three do; eight eye draws in four
-//                       frames, with an unbound b1 and a too-small b1 named, and a ninth frame reads nothing.
+//                       frame the journal flips at prints no empty sequence; and, STAGE 2, the route's zero-phase warm-up
+//                       (vrWorldRouteWorldPhase true with a phase of 0, 0 for four frames, the commander on foot, the tone
+//                       drawn, the eye draws finding no b1) is not sampled: no sequence, no eye line. The next three frames,
+//                       which carry a phase, print a sequence each (the header naming ITS frame's phase) and eight eye draws
+//                       in four frames read back, with an unbound b1 and a too-small b1 named, and a fifth frame reads nothing.
+//   STAGE 2 TOKENS      the harness plays the detour: it puts the frame's phase into the world and first-person cameras' bound
+//                       pair (the injector's rule) and tells the observer what it decided (willInject, role); the call lines,
+//                       the 5 s line's inj-calls and the sequence and eye lines' phase= say it; a key-off census never asks
+//                       the route for its phase.
 //   THE LOG             every line class present, bounded, at most 400 characters a line, and the 5 s line's counters equal
 //                       to what the script drove.
-//   THE READER          its own join finds the eye cameras.
+//   THE READER          its own join finds the eye cameras (kind 5, by the content join) and the world camera (kind 3, by
+//                       its calls), and its stage 2 verdict, run over the glue's own text, measures the injected phase in the
+//                       kind-3 rows and finds no leak in the eyes: STOP for the seven off-thread calls and WARN for the four
+//                       failed readbacks the log holds on purpose, PASS on all six lines once those are taken out.
 //
 // --self-test runs it and prints "vr camera census glue: PASS" only when every check holds. Run from the repo root (the
 // reader is tools\edvr_log.py). --dry-run prints a line and does nothing.
@@ -97,6 +107,10 @@ uint32_t progressDraw = 0;
 bool journalActive = true, journalKnown = true, journalOnFoot = true;
 bool geometryKnown = true;
 uint64_t geometrySequence = 4700;
+// The world route's phase for the frame (vrWorldRouteWorldPhase): whether it is jittering and the phase it chose, in render pixels.
+bool phaseJittering = false;
+float phaseX = 0.0f, phaseY = 0.0f;
+int phaseCalls = 0;
 // The order the injector was asked things in, one letter each: S set-observer, P pause, D disarm, F observe-frame.
 char order[64] = {};
 size_t orderN = 0;
@@ -121,6 +135,14 @@ bool vrWorldRouteDrawProgress(uint32_t* drawOrdinal, bool* toneSeen, uint64_t* f
     *toneSeen = stub::progressTone;
     *frame = 1;
     return true;
+}
+
+// STAGE 2: the route's phase, as the skeleton states it (false with 0, 0 when the route is not jittering).
+bool vrWorldRouteWorldPhase(float* x, float* y) {
+    ++stub::phaseCalls;
+    if (x) *x = stub::phaseJittering ? stub::phaseX : 0.0f;
+    if (y) *y = stub::phaseJittering ? stub::phaseY : 0.0f;
+    return stub::phaseJittering;
 }
 
 bool journalWatchActive() { return stub::journalActive; }
@@ -196,6 +218,7 @@ std::string censusLinesOnly(const std::string& log) {
 // ---- a camera in the game's own layout, derived by the decompile-cited model ----
 struct Model {
     c2derive::Cam cam;
+    bool custom = false;   // a kind-5 camera (an eye's): the game gives it its matrix, the model derives it as a perspective camera
     Model(uint32_t kind, float fov, float aspect, float bx, float by, float nearZ, float vw, float vh) {
         using namespace c2derive;
         makeCamera(cam);   // leaves the view, projection and view-projection dirty, as a camera the game has just set up is
@@ -225,7 +248,14 @@ struct Model {
         a[8] = sy * cp; a[9] = -sp;   a[10] = cy * cp;
         dirty();
     }
-    void body() { c2derive::derive(cam); }   // what the game's refresh does between the observer's two halves
+    // A kind-5 camera, the eye's kind in the real game (flight 1): its struct says 5 and the projection is the game's custom matrix, so
+    // the model derives it as the perspective camera it was built from and leaves the kind word at 5.
+    void makeKind5() { custom = true; c2derive::camU(cam, c2derive::kCamKind) = 5; }
+    void body() {   // what the game's refresh does between the observer's two halves
+        if (custom) c2derive::camU(cam, c2derive::kCamKind) = 3;
+        c2derive::derive(cam);
+        if (custom) c2derive::camU(cam, c2derive::kCamKind) = 5;
+    }
     uint64_t hash() const { return fnv1a64(cam.b, sizeof(cam.b)); }
 };
 
@@ -247,9 +277,12 @@ struct HotPath {
 } g_hot;
 
 uint64_t g_callNo = 0;
+uint64_t g_injectedCalls = 0, g_injectedScene = 0, g_injectedFirstPerson = 0;   // calls the harness, playing the detour, told the observer it injected
 // One refresh call as the detour makes it: the pre half, the game's body (the model's derive), the post half when the pre
-// half asked for it. With no observer the hook's gate is shut and the body runs straight through.
-void refresh(Model& m, View& v, uint32_t caller, bool toneNow) {
+// half asked for it. With no observer the hook's gate is shut and the body runs straight through. `inject` and `role` are what the
+// detour decided for the call before the observer hears of it (the route's stage 2): the harness has already put the frame's phase
+// into the camera's bound pair at the frame's start (driveFrame), as the detour writes it before the game's body.
+void refresh(Model& m, View& v, uint32_t caller, bool toneNow, bool inject = false, uint8_t role = kVrCensusRoleNone) {
     stub::progressTone = toneNow;
     FlatCameraObserveCall call;
     call.camera = m.ptr();
@@ -260,6 +293,13 @@ void refresh(Model& m, View& v, uint32_t caller, bool toneNow) {
     call.kind = m.kind();
     call.kindReadable = true;
     call.window = 0;
+    call.willInject = inject;
+    call.role = role;
+    if (stub::observer && inject) {
+        ++g_injectedCalls;
+        if (role == 0) ++g_injectedScene;
+        if (role == 1) ++g_injectedFirstPerson;
+    }
     if (!stub::observer) { m.body(); return; }
     const uint64_t camBefore = m.hash(), viewBefore = v.hash();
     const uint64_t a0 = t_allocs;
@@ -379,30 +419,41 @@ std::string runReader(const std::wstring& log, int* rc) {
 Model g_world(3, 1.0122f, 5040.0f / 2835.0f, 0.0f, 0.0f, 0.025f, 5040.0f, 2835.0f);
 Model g_weapon(3, 0.8236f, 5040.0f / 2835.0f, 0.0f, 0.0f, 0.0675f, 5040.0f, 2835.0f);
 Model g_ui(1, 0.0f, 1.0f, 0.0f, 0.0f, 0.1f, 5040.0f, 2835.0f);
-// The eye cameras are the game's kind-3 encoding of four tangents: a large bound pair, a narrow aspect (tangents about
-// (-1.2, 0.7, -0.9, 1.1) and (-0.7, 1.2, -0.9, 1.1)).
-Model g_eyeL(3, 1.5708f, 0.95f, 0.1316f, -0.05f, 0.05f, 2620.0f, 2533.0f);
-Model g_eyeR(3, 1.5708f, 0.95f, -0.1316f, -0.05f, 0.05f, 2620.0f, 2533.0f);
+// The eye cameras are kind 5, the game's custom matrix (flight 1: every eye call in 4.63 million was kind 5), built from EXACTLY the
+// four tangents EDVR advertises for each eye ({-1.2, 0.7, -0.9, 1.1} and {-0.7, 1.2, -0.9, 1.1}; bound +-0.5/3.8 = +-0.131579,
+// fov 2 atan(1)), so an eye that nothing touches leaks about 1e-8.
+constexpr float kEyeBound = 0.5f / 3.8f, kEyeFov = 1.5707964f;
+Model g_eyeL(3, kEyeFov, 0.95f, kEyeBound, -0.05f, 0.025f, 0.0f, 0.0f);
+Model g_eyeR(3, kEyeFov, 0.95f, -kEyeBound, -0.05f, 0.025f, 0.0f, 0.0f);
 View g_viewWorld, g_viewWeapon, g_viewUi, g_viewEyeL, g_viewEyeR;
+constexpr float kRenderW = 5040.0f, kRenderH = 2835.0f;
 
 // One frame of the game's refresh traffic: the world's passes before the tone, the eye views after it, then the eye
-// composite draws. Returns the number of refresh calls made.
+// composite draws. Returns the number of refresh calls made. The route's phase for the frame is the stub's (what the census reads
+// at this frame's eye draws too): when the route jitters with a phase that is not zero the harness, playing the detour, puts it into
+// the world and first-person cameras' bound pair before the game's body (the injector's own rule, bound += (jx / W, -jy / H)) and
+// tells the observer it is injecting those calls (role 0 scene, 1 first-person); a kind-5 eye call is never injected.
 int driveFrame(int n, Gpu& gpu) {
     stub::progressDraw = 0;
+    const bool inject = stub::phaseJittering && (stub::phaseX != 0.0f || stub::phaseY != 0.0f);
+    const float phaseBx = inject ? stub::phaseX / kRenderW : 0.0f, phaseBy = inject ? -stub::phaseY / kRenderH : 0.0f;
     g_world.turn(0.35f + 0.004f * static_cast<float>(n));
     g_weapon.turn(0.35f + 0.004f * static_cast<float>(n));
+    g_world.bound(phaseBx, phaseBy);
+    g_weapon.bound(phaseBx, phaseBy);
     g_ui.dirty();
     g_eyeL.turn(0.02f * static_cast<float>(n));
     g_eyeR.turn(0.02f * static_cast<float>(n));
-    // EDVR's eye shift moves the eye cameras' bound pair: once, at frame 3, so a 'changed:' line is due for each eye camera.
+    // A remnant of the eye shift moves the eye cameras' bound pair by 3e-7: once, at frame 3, so a 'changed:' line is due for each
+    // eye camera (the bound threshold is 1e-7), and small enough that the rows it makes leak 6e-7, under the verdict's 1e-6.
     if (n == 3) {
-        g_eyeL.bound(0.1316f + 2.0e-6f, -0.05f + 2.0e-6f);
-        g_eyeR.bound(-0.1316f + 2.0e-6f, -0.05f + 2.0e-6f);
+        g_eyeL.bound(kEyeBound + 3.0e-7f, -0.05f + 3.0e-7f);
+        g_eyeR.bound(-kEyeBound + 3.0e-7f, -0.05f + 3.0e-7f);
     }
     int calls = 0;
     const uint32_t callers[3] = {0x594E13, 0x594EAB, 0x594FE1};
-    for (int i = 0; i < 36; ++i) { refresh(g_world, g_viewWorld, callers[i % 3], false); ++calls; }
-    for (int i = 0; i < 6; ++i) { refresh(g_weapon, g_viewWeapon, 0x594E13, false); ++calls; }
+    for (int i = 0; i < 36; ++i) { refresh(g_world, g_viewWorld, callers[i % 3], false, inject, 0); ++calls; }
+    for (int i = 0; i < 6; ++i) { refresh(g_weapon, g_viewWeapon, 0x594E13, false, inject, 1); ++calls; }
     for (int i = 0; i < 2; ++i) { refresh(g_ui, g_viewUi, 0x58DE73, false); ++calls; }
     for (int i = 0; i < 2; ++i) {
         refresh(g_eyeL, g_viewEyeL, 0x594FE1, true);
@@ -421,8 +472,8 @@ int driveFrame(int n, Gpu& gpu) {
 // machine may close one early, so the totals are what hold, not any one line.
 struct WindowSums {
     unsigned lines = 0;
-    unsigned long long calls = 0, posts = 0, offThread = 0, eyeDraws = 0, eyeOnFoot = 0, toneFrames = 0;
-    bool kind1 = false, kind3 = false, hook = false, progress = false, footYes = false;
+    unsigned long long calls = 0, posts = 0, offThread = 0, eyeDraws = 0, eyeOnFoot = 0, toneFrames = 0, onFootFrames = 0, injCalls = 0;
+    bool kind1 = false, kind3 = false, kind5 = false, hook = false, progress = false, footYes = false;
 };
 WindowSums sumWindows(const std::string& log) {
     WindowSums s;
@@ -434,6 +485,8 @@ WindowSums sumWindows(const std::string& log) {
         s.posts += valueOf(line, " posts=");
         s.offThread += valueOf(line, " off-thread=");
         s.toneFrames += valueOf(line, " tone-frames=");
+        s.onFootFrames += valueOf(line, " on-foot-frames=");
+        s.injCalls += valueOf(line, " inj-calls=");
         const size_t e = line.find(" eye-draws=");
         if (e != std::string::npos) {
             s.eyeDraws += std::strtoull(line.c_str() + e + 11, nullptr, 10);
@@ -442,6 +495,7 @@ WindowSums sumWindows(const std::string& log) {
         }
         s.kind1 = s.kind1 || has(line, " kinds=1:") || has(line, ",1:");
         s.kind3 = s.kind3 || has(line, " kinds=3:") || has(line, ",3:");
+        s.kind5 = s.kind5 || has(line, " kinds=5:") || has(line, ",5:");
         s.hook = s.hook || has(line, " hook=installed");
         s.progress = s.progress || has(line, " progress=yes");
         s.footYes = s.footYes || has(line, " foot=yes");
@@ -461,6 +515,8 @@ int run() {
     g_runtimeProfile = RuntimeProfile::Vr;
     writeIni("[advanced]\nvr_camera_census = off\n");
     Config::get().init(g_dir);
+    g_eyeL.makeKind5();   // the eye cameras are the game's kind 5
+    g_eyeR.makeKind5();
 
     Gpu gpu;
     check(gpu.ok, "a WARP device and two constant buffers are available for the eye readback");
@@ -489,6 +545,7 @@ int run() {
     }
     check(!vrCameraCensusWanted() && stub::setObserverCalls == 0 && stub::disarmCalls == 0 && stub::observeFrameCalls == 0,
           "KEY ON IN THE FLAT PROFILE: ...and ask the injector for nothing (the flat profile never runs the census)");
+    check(stub::phaseCalls == 0, "KEY OFF (both cases): the census never asked the world route for its phase");
     Log::get().close();
     {
         const std::string quiet = slurp(newestLog(tagOff.c_str()));
@@ -503,6 +560,19 @@ int run() {
     check(Log::get().open(g_dir, tagOn.c_str()), "a second log opens for the session");
     stub::journalOnFoot = false;   // in a ship: Flags2 is read and OnFoot is clear
     const uint64_t viewHashes[5] = {g_viewWorld.hash(), g_viewWeapon.hash(), g_viewUi.hash(), g_viewEyeL.hash(), g_viewEyeR.hash()};
+    // The world route's choice for each frame. In a ship (frames 1-3) it is not jittering. On foot it jitters from frame 4: a WARM-UP with
+    // a ZERO phase (frames 4-7: what flight 1's whole sample was spent on), then a phase of about 1e-4 NDC that moves every frame (frames
+    // 8-12). The census samples frames 8-12 only. The script sets the stub for frame f before the frame runs, and for frame f + 1 just
+    // before the census's boundary that closes frame f (the route's boundary runs first).
+    struct Choice { bool jittering; float x, y; };
+    static const float kPhaseX[5] = {0.2520f, -0.1890f, 0.1260f, -0.2520f, 0.0630f}, kPhaseY[5] = {-0.1260f, 0.0630f, 0.2520f, -0.0630f, 0.1890f};
+    auto choice = [](int f) -> Choice {
+        if (f <= 3) return {false, 0.0f, 0.0f};
+        if (f <= 7 || f >= 13) return {true, 0.0f, 0.0f};   // the warm-up, and the route warming again after the last frame (the boundaries of section 3)
+        return {true, kPhaseX[f - 8], kPhaseY[f - 8]};
+    };
+    auto route = [&](int f) { const Choice c = choice(f); stub::phaseJittering = c.jittering; stub::phaseX = c.x; stub::phaseY = c.y; };
+    route(1);
     stub::clearOrder();
     const uint64_t allocsBeforeOn = t_allocs;
     vrCameraCensusFrameBoundary();
@@ -517,30 +587,62 @@ int run() {
     int perFrame = 0;
     unsigned toneFrames = 0;
     gpu.bindScene();
-    for (int f = 1; f <= 3; ++f) {   // three frames in a ship, each with the tone and its eye draws on a real b1
+    // One frame: the route has set its choice for the frame (route(f)); the game draws it; then the route chooses the next frame's and
+    // the census's boundary closes this one.
+    auto frame = [&](int f) {
         stub::clearOrder();
+        route(f);
         perFrame = driveFrame(f, gpu);
         driven += static_cast<uint64_t>(perFrame);
         ++toneFrames;
+        route(f + 1);
         vrCameraCensusFrameBoundary();
+    };
+    for (int f = 1; f <= 3; ++f) {   // three frames in a ship, each with the tone and its eye draws on a real b1
+        frame(f);
         if (f == 1) check(std::strcmp(stub::order, "DF") == 0, "every later boundary is D F: the owner named, the window opened, nothing registered again");
     }
     // The journal flips to on foot now: the boundary that follows frame 4 is the first to read it, so frame 4 was recorded
     // under the old word (nothing) and is the flip frame.
     stub::journalOnFoot = true;
-    driven += static_cast<uint64_t>(driveFrame(4, gpu)); ++toneFrames; vrCameraCensusFrameBoundary();
-    gpu.unbind();     // frame 5: the eye draws find no b1 bound
-    driven += static_cast<uint64_t>(driveFrame(5, gpu)); ++toneFrames; vrCameraCensusFrameBoundary();
-    gpu.bindTiny();   // frame 6: a b1 too small to hold rows 270..273
-    driven += static_cast<uint64_t>(driveFrame(6, gpu)); ++toneFrames; vrCameraCensusFrameBoundary();
-    gpu.bindScene();  // frames 7 and 8: the real scene buffer; frame 9 is past the eight-draw budget
-    for (int f = 7; f <= 9; ++f) { driven += static_cast<uint64_t>(driveFrame(f, gpu)); ++toneFrames; vrCameraCensusFrameBoundary(); }
+    frame(4);
+    // Frames 5-7 are the route's warm-up (it jitters, the phase is zero): the journal says on foot and the tone is drawn, but nothing can
+    // leak, so they are not sampled. Their eye draws find NO b1 bound: a census that sampled them would log a 'why=no-b1' line for each.
+    gpu.unbind();
+    for (int f = 5; f <= 7; ++f) frame(f);
+    frame(8);         // the first frame with a phase: sampled, and its eye draws find no b1 bound
+    gpu.bindTiny();   // frame 9: a b1 too small to hold rows 270..273
+    frame(9);
+    gpu.bindScene();  // frames 10 and 11: the real scene buffer; frame 12 is past the eight-draw budget
+    for (int f = 10; f <= 12; ++f) frame(f);
 
     std::printf("the observer's contract over %llu refresh calls\n", static_cast<unsigned long long>(g_hot.calls));
-    check(g_hot.calls == driven && driven == static_cast<uint64_t>(perFrame) * 9u && perFrame == 48, "the script drove 9 frames of 48 refresh calls through the observer");
+    check(g_hot.calls == driven && driven == static_cast<uint64_t>(perFrame) * 12u && perFrame == 48, "the script drove 12 frames of 48 refresh calls through the observer");
     check(g_hot.allocs == 0, "HOT PATH: across every call the observer's two halves allocated nothing");
     check(g_hot.writes == 0, "ZERO MUTATION: across every call neither half changed a byte of the camera or of the view it was handed");
-    check(g_hot.bodyChanges >= 9 * 5, "...and that hashing does see a change: the model's derive changed the camera on each camera's first call of every frame");
+    check(g_hot.bodyChanges >= 12 * 5, "...and that hashing does see a change: the model's derive changed the camera on each camera's first call of every frame");
+    check(g_injectedCalls == 210 && g_injectedScene == 180 && g_injectedFirstPerson == 30,
+          "the script injected 210 calls the observer heard, 36 scene and 6 first-person a frame in the five frames with a phase, none in the warm-up");
+    check(stub::phaseCalls == 1 + 12 + 24,
+          "the census asked the route for its phase once at the activation boundary, once at each of the 12 frame boundaries, and at each of the 24 eye draws "
+          "(before the sampling decision uses it, sampled or not)");
+    // The world route's two 5 s lines, as the route writes them (written here through the real Log, in the route's format, from what the
+    // script drove): the reader's verdict needs the render size (hdr=) and the route's own counts.
+    {
+        char text[1200];
+        std::snprintf(text, sizeof(text),
+                      "vr world route 5s: key=auto state=owned layer=live gate=held frames=12 gate-frames=12 gate-flips=1 hdr-frames=12 trigger=12 none=0 "
+                      "ambiguous=0 treated=12 declined=0 owned-frames=5 eye-takes=10 door-layer-only=10 enters=1 releases=0 (last=none) scene-resets=0 "
+                      "late-hdr-writes=0 (in 0 frames) last=treated jitter=on phase=0.0630,0.1890 rows=-0.2520,-0.0630 fp-mode=0/12/0 "
+                      "last-trigger=VS=DFED8E1C9E191BEC PS=143AAE0597E2F7BF target=2520x1417 hdr=5040x2835 selection=selected:12");
+        Log::get().note("%s", text);
+        std::snprintf(text, sizeof(text),
+                      "vr world route inject 5s: inj-scene=%llu inj-fp=%llu inj-refused=0 warming=%d aux=0 after=0 unsupported=%d other-kind=%d unreadable=0 "
+                      "off-thread=0 write-fail=0 inj-kinds=3:%llu pair-checked=5 pair-bad=0 inj-unnamed=0 inj-shut=0",
+                      static_cast<unsigned long long>(g_injectedScene), static_cast<unsigned long long>(g_injectedFirstPerson), 4 * 42, 12 * 4, 12 * 2,
+                      static_cast<unsigned long long>(g_injectedCalls));
+        Log::get().note("%s", text);
+    }
     check(g_hot.posts == g_hot.calls && g_hot.preAsksPost == g_hot.calls, "every pre half asked for its post half, and every post half ran");
     {
         const uint64_t after[5] = {g_viewWorld.hash(), g_viewWeapon.hash(), g_viewUi.hash(), g_viewEyeL.hash(), g_viewEyeR.hash()};
@@ -597,63 +699,99 @@ int run() {
     check(!log.empty(), "the glue wrote a log");
     check(occurrences(log, "vr camera census: on (advanced.vr_camera_census)") == 1 && occurrences(log, "vr camera census: off (advanced.vr_camera_census)") == 1,
           "it says once that the census is on and once that it went off (a second activation does not announce itself again)");
+    check(has(lineWith(log, "vr camera census: on (advanced.vr_camera_census)"), "while the world route jitters, only a frame whose phase is non-zero"),
+          "the announcement says that while the route jitters only a frame with a non-zero phase is sampled");
     check(occurrences(log, "vr camera census: camera=0x") == 5, "one line for each of the five cameras, printed once");
-    check(occurrences(log, "vr camera census: changed: camera=") == 2 && has(lineWith(log, "vr camera census: changed: camera="), " frame=3 n=1 bound=("),
-          "the bound pair EDVR moved at frame 3 is a 'changed:' line for each eye camera, and only for them");
     {
-        char want[128];
+        // The eye cameras' bound moved by a remnant of the eye shift at frame 3: one line each. The world's and the first-person camera's bound
+        // pair carries the route's phase, which moves every frame once it is non-zero (frames 8-12): each prints its four lines and counts the rest.
+        const std::string eyeL = "changed: camera=" + hexOf(g_eyeL.ptr(), false) + " frame=3 n=1 bound=(", eyeR = "changed: camera=" + hexOf(g_eyeR.ptr(), false) + " frame=3 n=1 bound=(";
+        check(occurrences(log, "vr camera census: changed: camera=") == 10 && occurrences(log, eyeL) == 1 && occurrences(log, eyeR) == 1 &&
+                  occurrences(log, "changed: camera=" + hexOf(g_world.ptr(), false) + " ") == 4 && occurrences(log, "changed: camera=" + hexOf(g_weapon.ptr(), false) + " ") == 4,
+              "the bound pair EDVR moved at frame 3 is a 'changed:' line for each eye camera; the injected phase moves the world's and the first-person camera's bound every "
+              "frame, four lines each (the per-camera cap), and nothing else changed");
+    }
+    {
+        // The sequences are of frames 8, 9 and 10: the first three frames that carry a phase. The warm-up frames 4-7 (the route jittering with a zero
+        // phase, the commander on foot, the tone drawn) are not sampled and print none.
+        const char* phases[3] = {"0.2520,-0.1260", "-0.1890,0.0630", "0.1260,0.2520"};
+        char want[160];
         bool all = true;
         for (int i = 1; i <= 3; ++i) {
-            std::snprintf(want, sizeof(want), "vr camera census: sequence frame=%d index=%d/3 foot=yes calls=%d recorded=%d truncated=0", 4 + i, i, perFrame, perFrame);
+            std::snprintf(want, sizeof(want), "vr camera census: sequence frame=%d index=%d/3 foot=yes phase=%s calls=%d recorded=%d truncated=0", 7 + i, i, phases[i - 1], perFrame, perFrame);
             all = all && occurrences(log, want) == 1;
         }
-        check(all, "three call sequences, of frames 5, 6 and 7 -- the on-foot frames after the flip -- each of all 48 calls");
+        check(all, "three call sequences, of frames 8, 9 and 10 -- the first frames with a phase -- each of all 48 calls, each header naming ITS frame's phase");
+        bool none = true;
+        for (int f : {1, 2, 3, 4, 5, 6, 7, 11, 12}) {
+            std::snprintf(want, sizeof(want), "vr camera census: sequence frame=%d ", f);
+            none = none && occurrences(log, want) == 0;
+        }
+        check(none && occurrences(log, "vr camera census: sequence frame=") == 3 && occurrences(log, "foot=no calls=") == 0 && occurrences(log, "phase=- calls=") == 0,
+              "no sequence for the ship frames 1-3, none for the flip frame 4 (recorded under the old word), none for the warm-up frames 5-7 (a zero phase while the route "
+              "jitters), none past the third");
     }
-    check(occurrences(log, "vr camera census: sequence frame=") == 3 && occurrences(log, "foot=no calls=") == 0,
-          "no sequence for the ship frames 1-3, none for the flip frame 4 (recorded under the old word), none past the third");
     check(occurrences(log, ": call frame=") == 3u * static_cast<unsigned>(perFrame), "every call of each sequence is a line");
     check(occurrences(log, " fl=0xE>0x0 ") == 15 && occurrences(log, " fl=0x0>0x0 ") == 3u * 48u - 15u,
           "each camera's first call of a frame shows the dirty bits the body cleared (0xE>0x0), its later calls none (0x0>0x0)");
+    check(occurrences(log, " inj=1 role=scene ") == 108 && occurrences(log, " inj=1 role=fp ") == 18 && occurrences(log, " inj=0 role=- ") == 18 &&
+              occurrences(log, " inj=1 ") == 126 && occurrences(log, " inj=0 role=aux ") == 0,
+          "the call lines say what the detour decided: 108 scene and 18 first-person calls injected (36 and 6 in each of three frames), and the UI camera's and the eyes' "
+          "18 calls neither injected nor given a role");
     {
         // The eye camera's call lines name the view it was refreshed with and carry its composed rows. (" draw=" is what a
         // call line has after the caller and the camera line does not: the camera line has " thread=owner".)
-        const std::string eyeLine = lineWith(log, "camera=" + hexOf(g_eyeL.ptr(), false) + " kind=3 caller=+0x594FE1 draw=");
-        check(has(eyeLine, ": call frame=") && has(eyeLine, "tone=after") && has(eyeLine, "view=" + hexOf(g_viewEyeL.ptr(), false)) && has(eyeLine, "rows=[") &&
+        const std::string eyeLine = lineWith(log, "camera=" + hexOf(g_eyeL.ptr(), false) + " kind=5 caller=+0x594FE1 draw=");
+        check(has(eyeLine, ": call frame=") && has(eyeLine, "tone=after inj=0 role=- ") && has(eyeLine, "view=" + hexOf(g_viewEyeL.ptr(), false)) && has(eyeLine, "rows=[") &&
               !has(eyeLine, "rows=-"),
-              "a call line for an eye camera says tone=after, names that camera's view, and carries the 16 composed rows");
+              "a call line for an eye camera says kind=5 tone=after, is never injected, names that camera's view, and carries the 16 composed rows");
         const std::string worldLine = lineWith(log, "camera=" + hexOf(g_world.ptr(), false) + " kind=3 caller=+0x594E13 draw=");
-        check(has(worldLine, ": call frame=") && has(worldLine, "tone=before") && has(worldLine, "view=" + hexOf(g_viewWorld.ptr(), false)),
-              "...and one for the world camera says tone=before and names the world view");
+        check(has(worldLine, ": call frame=") && has(worldLine, "tone=before inj=1 role=scene ") && has(worldLine, "view=" + hexOf(g_viewWorld.ptr(), false)),
+              "...and one for the world camera says tone=before, injected, scene, and names the world view");
     }
     check(occurrences(log, "vr camera census: eye=") == 8 && occurrences(log, "vr camera census: eye-geometry eye=") == 8,
           "eight eye draws in all (four frames, both eyes), each with its geometry line, and no ninth");
     {
         bool lines = true;
-        for (int f = 5; f <= 8; ++f) {
+        const char* phases[4] = {"0.2520,-0.1260", "-0.1890,0.0630", "0.1260,0.2520", "-0.2520,-0.0630"};
+        for (int f = 8; f <= 11; ++f) {
             for (int e = 0; e < 2; ++e) {
-                char key[80];
-                std::snprintf(key, sizeof(key), "vr camera census: eye=%d frame=%d foot=yes ", e, f);
+                char key[120];
+                std::snprintf(key, sizeof(key), "vr camera census: eye=%d frame=%d foot=yes phase=%s ", e, f, phases[f - 8]);
                 const std::string l = lineWith(log, key);
-                const char* why = f == 5 ? "why=no-b1" : f == 6 ? "why=b1-too-small" : nullptr;
+                const char* why = f == 8 ? "why=no-b1" : f == 9 ? "why=b1-too-small" : nullptr;
                 if (why) lines = lines && has(l, why) && has(l, "rows=- meas=-");
                 else lines = lines && has(l, "bytes=5376") && has(l, " first=0 ") && has(l, " meas=(") && !has(l, "why=");
             }
         }
-        check(lines, "frames 5-8, both eyes, and only those: an unbound b1, a too-small b1 (named), then two frames of real rows and a measure");
+        check(lines, "frames 8-11, both eyes, and only those, each line carrying its frame's phase: an unbound b1, a too-small b1 (named), then two frames of real rows and a measure");
     }
-    check(occurrences(log, "vr camera census: eye=0 frame=9 ") == 0 && occurrences(log, "vr camera census: eye=0 frame=4 ") == 0 &&
-          occurrences(log, "vr camera census: eye=0 frame=3 ") == 0,
-          "no eye line for the ship frames, the flip frame or the frame past the budget");
+    {
+        bool none = true;
+        char key[80];
+        for (int f : {1, 2, 3, 4, 5, 6, 7, 12}) {
+            std::snprintf(key, sizeof(key), "vr camera census: eye=0 frame=%d ", f);
+            none = none && occurrences(log, key) == 0;
+            std::snprintf(key, sizeof(key), "vr camera census: eye=1 frame=%d ", f);
+            none = none && occurrences(log, key) == 0;
+        }
+        check(none && occurrences(log, "why=no-b1") == 2,
+              "no eye line for the ship frames, the flip frame, the warm-up frames 5-7 (their eye draws found no b1: a sampled frame would have logged 'why=no-b1') or the frame past the budget");
+    }
     check(occurrences(log, "vr camera census: other-thread tid=") == 1 && has(lineWith(log, "vr camera census: other-thread tid="), "caller=+0x594E13 calls=7"),
           "the seven calls on another thread are reported once, with their count");
+    check(occurrences(log, "vr world route 5s: key=auto") == 1 && occurrences(log, "vr world route inject 5s: inj-scene=180 inj-fp=30 ") == 1,
+          "the world route's two 5 s lines the script wrote through the log are there, back to back");
     {
         const WindowSums w = sumWindows(log);
         check(w.lines >= 1, "the 5 s line printed after five seconds");
         check(w.calls == driven && w.posts == driven && w.offThread == 7,
               "the 5 s lines count every refresh call the script drove, each with its post half, and the seven off-thread");
-        check(w.toneFrames == toneFrames && w.eyeDraws == 18 && w.eyeOnFoot == 10,
-              "...the frames in which the tone was drawn, the 18 eye draws made and the 10 that fell in frames the journal said were on foot");
-        check(w.kind1 && w.kind3 && w.hook && w.progress && w.footYes, "...by kind, the hook's status, the route's draw progress and the journal's word");
+        check(w.toneFrames == toneFrames && w.eyeDraws == 24 && w.eyeOnFoot == 10 && w.onFootFrames == 5,
+              "...the frames in which the tone was drawn (12), the 24 eye draws made, the 10 that fell in the five frames the census sampled (8-12: the route's zero-phase "
+              "warm-up is not one) and the five frames");
+        check(w.injCalls == 210 && w.injCalls == g_injectedCalls, "...and inj-calls counts the 210 calls the observer heard with willInject set, none more");
+        check(w.kind1 && w.kind3 && w.kind5 && w.hook && w.progress && w.footYes, "...by kind (1, 3 and 5), the hook's status, the route's draw progress and the journal's word");
     }
     {
         // Bounded: about 400 lines a session, at most 400 characters of census text a line.
@@ -676,36 +814,98 @@ int run() {
     check(rc == 0 && report.find("camera census:") != std::string::npos, "tools\\edvr_log.py --camera-census ran over the glue's log and exited 0");
     {
         const std::string eyes = lineWith(report, "eye camera(s): ");
-        check(has(eyes, hexOf(g_eyeL.ptr(), true)) && has(eyes, hexOf(g_eyeR.ptr(), true)) && has(eyes, "world camera: " + hexOf(g_world.ptr(), true)),
-              "the reader names both eye cameras and the world camera: the content join found the cameras whose composed rows equal what the eye draws read from the GPU");
-        const std::string a = lineWith(report, "(A) field signature:");
-        check(has(a, "aspect") && has(a, "near") && has(a, "fov") && has(a, "bound") && has(a, "viewport") && has(a, "separate every eye camera from EVERY world-side kind-3 camera"),
-              "(A) a field signature (aspect, near, fov, bound, viewport) separates the eye cameras from every world-side camera, the weapon's included");
+        check(has(eyes, hexOf(g_eyeL.ptr(), true)) && has(eyes, hexOf(g_eyeR.ptr(), true)) && has(eyes, "world camera: " + hexOf(g_world.ptr(), true)) &&
+                  has(eyes, "other world-side kind-3 camera(s): " + hexOf(g_weapon.ptr(), true)),
+              "the reader names both eye cameras, the world camera and the first-person camera: the content join found the cameras whose composed rows equal what the eye draws read from the GPU");
+        const std::string world = lineWith(report, "world camera " + hexOf(g_world.ptr(), true) + ": ");
+        check(has(world, "108 kind-3 call(s) over 3 logged frame(s) = 36.0 a frame, 108 of them before the tone") && has(world, "(1 projection(s); its first-seen kind was 3)"),
+              "the world camera is named for its kind-3 calls before the tone (36 a frame), with its one projection");
+        check(has(report, "camera " + hexOf(g_eyeL.ptr(), true) + " EYE: k5 x6 over 3 logged frame(s) (2.0 a frame)") &&
+                  has(report, "camera " + hexOf(g_weapon.ptr(), true) + " world-side: k3 x18 over 3 logged frame(s) (6.0 a frame)"),
+              "the roles section labels each camera by the kinds of its calls: the eyes kind 5, the first-person camera kind 3");
+        const std::string a = lineWith(report, "(A) call signature");
+        check(has(a, "kind, aspect, fov, shift separate every eye camera from EVERY world-side kind-3 camera"),
+              "(A) a call's signature (kind, aspect, fov, off-centre) separates the eye cameras' calls from every world-side call, the first-person camera's included; the near plane "
+              "(0.025, the scene's too) does not");
         const std::string b = lineWith(report, "(B) content join:");
         check(has(b, "2 of 8 eye draw(s) joined") && has(b, hexOf(g_eyeL.ptr(), true)) && has(b, hexOf(g_eyeR.ptr(), true)),
-              "(B) two of the eight eye draws joined: frame 7's; the four whose readback failed and the two past the third sequence could not");
+              "(B) two of the eight eye draws joined: frame 10's; the four whose readback failed and the two past the third sequence could not");
         const size_t joinAt = report.find("== the offline join (B)");
-        const std::string j0 = lineWith(report, "eye 0 frame 7 draw", joinAt == std::string::npos ? 0 : joinAt);
-        const std::string j1 = lineWith(report, "eye 1 frame 7 draw", joinAt == std::string::npos ? 0 : joinAt);
-        check(joinAt != std::string::npos && has(j0, "camera " + hexOf(g_eyeL.ptr(), true)) && has(j1, "camera " + hexOf(g_eyeR.ptr(), true)) && has(j0, "tone after"),
-              "...eye 0's rows joined to the LEFT eye camera and eye 1's to the RIGHT one, at tone after");
+        const std::string j0 = lineWith(report, "eye 0 frame 10 draw", joinAt == std::string::npos ? 0 : joinAt);
+        const std::string j1 = lineWith(report, "eye 1 frame 10 draw", joinAt == std::string::npos ? 0 : joinAt);
+        check(joinAt != std::string::npos && has(j0, "camera " + hexOf(g_eyeL.ptr(), true) + " (kind 5)") && has(j1, "camera " + hexOf(g_eyeR.ptr(), true) + " (kind 5)") && has(j0, "tone after"),
+              "...eye 0's rows joined to the LEFT eye camera and eye 1's to the RIGHT one, kind 5, at tone after");
         check(occurrences(report, "no rows were read (no-b1)") == 2 && occurrences(report, "no rows were read (b1-too-small)") == 2 &&
-              occurrences(report, "frame 8's call sequence was not logged") == 2,
-              "...and the joins that could not be made say why: no b1, a too-small b1, and no sequence logged for frame 8");
+              occurrences(report, "frame 11's call sequence was not logged") == 2,
+              "...and the joins that could not be made say why: no b1, a too-small b1, and no sequence logged for frame 11");
         check(has(lineWith(report, "(C) place in the frame:"), "every refresh of a world-side camera precedes every refresh of an eye camera in 3 of 3 logged sequence(s)"),
               "(C) the world's refreshes precede the eyes' in all three logged sequences");
-        check(has(lineWith(report, "(D) caller:"), "+0x594FE1") && has(lineWith(report, "(D) caller:"), "the caller alone does not separate them"),
-              "(D) the caller is shared with the world camera, so it does not separate them");
+        check(has(lineWith(report, "(D) caller:"), "+0x594FE1") && has(lineWith(report, "(D) caller:"), "the caller alone does not separate them") &&
+                  !has(report, "not enough calls logged to say"),
+              "(D) the caller is shared with the world camera, so it does not separate them, and nothing says 'not enough calls'");
         check(has(lineWith(report, "(F) view"), "no view is shared: the view separates them"),
               "(F) the view (the refresh's second argument) separates the eye cameras from the world's");
         check(report.find("(E) tangents:") != std::string::npos, "(E) the tangents comparison is reported (compared, or said why not)");
         check(occurrences(report, "the rows cannot tell which way the shift is carried") == 4 && report.find("\n    the rows measure as ") == std::string::npos,
               "the advertised shift is nothing here, so for each of the four eye draws that read rows the reader says the shift's sign cannot be told, and names none");
         check(report.find("leak measure over 4 eye draw(s): largest |leak| = ") != std::string::npos,
-              "the leak baseline is reported over the four eye draws that read rows");
-        check(report.find("3 call sequence(s)") != std::string::npos && report.find("journal foot=yes") != std::string::npos &&
+              "the leak is reported over the four eye draws that read rows");
+        check(report.find("3 call sequence(s)") != std::string::npos && report.find("journal foot=yes, phase (0.2520, -0.1260) px") != std::string::npos &&
               report.find("1 other-thread entry") != std::string::npos,
-              "the summary line counts three call sequences and the other-thread entry, and the sequences carry the journal's word");
+              "the summary line counts three call sequences and the other-thread entry, and the sequences carry the journal's word and the route's phase");
+    }
+    {
+        // THE VERDICT over the glue's own log. The log holds deliberate faults: four eye draws whose readback failed (no b1, a too-small b1) and seven calls on
+        // another thread. So: (i) cannot measure four eye draws (WARN), (iv) STOP for the off-thread calls; (ii), (iii), (v) PASS.
+        auto verdict = [](const std::string& text, const char* tag) {
+            const std::string key = std::string("(") + tag + ") ";
+            for (size_t p = 0; p < text.size();) {
+                size_t e = text.find('\n', p);
+                if (e == std::string::npos) e = text.size();
+                const std::string l = text.substr(p, e - p);
+                const size_t at = l.find(key);
+                if (at != std::string::npos && at <= 6 && (l.compare(0, 4, "PASS") == 0 || l.compare(0, 4, "WARN") == 0 || l.compare(0, 4, "STOP") == 0 || l.compare(0, 3, "n/a") == 0)) return l;
+                p = e + 1;
+            }
+            return std::string();
+        };
+        const std::string i = verdict(report, "i"), ii = verdict(report, "ii"), iii = verdict(report, "iii"), iv = verdict(report, "iv"), v = verdict(report, "v");
+        check(i.compare(0, 4, "WARN") == 0 && has(i, "8 of 8 eye draw(s) had a non-zero world phase") && has(i, "4 eye draw(s) could not be measured") && has(i, "over 4 measured"),
+              "THE VERDICT (i): every eye draw of the glue's log had a non-zero phase; four could not be measured (their readback failed): a WARN, never a PASS");
+        check(ii.compare(0, 4, "PASS") == 0 && has(ii, "126 injected kind-3 call(s) in 3 sequence(s) with a non-zero phase measure the phase they were given (scene 108 call(s)") &&
+                  has(ii, "first-person 18 call(s)") && has(ii, "at 5040x2835 (from a `vr world route 5s:` line's hdr=)"),
+              "THE VERDICT (ii): the 126 injected calls of the three sequences carry the phase the headers name, measured from the rows the real glue logged, at the render size the route line gave");
+        check(iii.compare(0, 4, "PASS") == 0 && has(iii, "route inj-kinds=3:210 over 1 window(s); 126 logged call(s) with inj=1, all kind 3"),
+              "THE VERDICT (iii): only kind 3 was injected, by the route's inj-kinds= and by the census's own call lines");
+        check(iv.compare(0, 4, "STOP") == 0 && has(iv, "the census counted 7 call(s) off the render thread"),
+              "THE VERDICT (iv): the seven calls on another thread are a STOP");
+        check(v.compare(0, 4, "PASS") == 0 && has(v, "inj-scene 180, inj-fp 30") && has(v, "scene 108 (108 injected), first-person 18 (18 injected)"),
+              "THE VERDICT (v): the roles, from the route's counts and the logged calls");
+        check(report.find("stage 2 verdict: STOP (") != std::string::npos, "...so the verdict over this log is STOP");
+        // The same log with its faults taken out (the four failed readbacks' lines, the off-thread calls): every line PASSES. The text is the glue's own.
+        std::string clean;
+        for (size_t p = 0; p < log.size();) {
+            size_t e = log.find('\n', p);
+            if (e == std::string::npos) e = log.size();
+            std::string l = log.substr(p, e - p);
+            p = e + 1;
+            const bool eyeLine = l.find("vr camera census: eye=") != std::string::npos || l.find("vr camera census: eye-geometry eye=") != std::string::npos;
+            if (eyeLine && (l.find(" frame=8 ") != std::string::npos || l.find(" frame=9 ") != std::string::npos)) continue;
+            if (l.find("vr camera census: other-thread tid=") != std::string::npos) continue;
+            const size_t off = l.find(" off-thread=7 ");
+            if (off != std::string::npos) l.replace(off, 14, " off-thread=0 ");
+            clean += l;
+            clean += '\n';
+        }
+        const std::wstring cleanPath = g_dir + L"\\clean_census.log";
+        if (FILE* f = _wfopen(cleanPath.c_str(), L"wb")) { std::fwrite(clean.data(), 1, clean.size(), f); std::fclose(f); }
+        int rc2 = -1;
+        const std::string report2 = runReader(cleanPath, &rc2);
+        check(rc2 == 0 && report2.find("stage 2 verdict: PASS (6 PASS, 0 WARN, 0 STOP, 0 n/a)") != std::string::npos &&
+                  has(verdict(report2, "i"), "4 of 4 eye draw(s) had a non-zero world phase") && has(verdict(report2, "i"), "below 1e-06"),
+              "THE VERDICT over the same log with the failed readbacks and the off-thread calls taken out is PASS on all six lines: the eyes' rows did not move (leak below 1e-6 "
+              "with a world phase of 1e-4) while the kind-3 calls carried it");
+        if (g_failures) std::printf("---- the clean log's report verdict ----\n%s\n", report2.substr(report2.find("== stage 2 verdict") == std::string::npos ? 0 : report2.find("== stage 2 verdict")).c_str());
     }
     if (g_failures) std::printf("---- the reader's report ----\n%s\n---- the census log, census lines only ----\n%s\n", report.c_str(), censusLinesOnly(log).c_str());
     return g_failures;
