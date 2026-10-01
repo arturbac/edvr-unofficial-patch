@@ -583,6 +583,15 @@ void panelCurveConfigure(Config& cfg) {
     }
 }
 
+bool panelCurveWantedByConfig(Config& cfg) {
+    // Keep in step with panelCurveConfigure above: the same keys, the same bounds, the same "out of range is off".
+    float c = cfg.getFloat("fix.panel_curvature", 0.0f);
+    if (c < 0.0f || c > kMaxCurvature) c = 0.0f;
+    const int segments = cfg.getIntInRange("advanced.panel_curvature_segments",
+                                           kDefaultSegments, kMinSegments, kMaxSegments);
+    return c > 0.0f || segments != kDefaultSegments;
+}
+
 bool panelCurveSubstitute(ID3D11DeviceContext* ctx, PanelCurveDrawFn draw) {
     if (!ctx || !draw || detail::g_panelCurveStoodDown) return false;
 

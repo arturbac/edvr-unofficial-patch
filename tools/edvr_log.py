@@ -11,6 +11,7 @@
     python tools/edvr_log.py --target frontier --tally periodic --window-ms 250
     python tools/edvr_log.py --target frontier --tally periodic --infer-runs
     python tools/edvr_log.py --target frontier --camera-census --expect-build HEAD
+    python tools/edvr_log.py --target frontier --vscreen-fit --expect-build HEAD
     python tools/edvr_log.py --list
 
 This is the sanctioned replacement for `Get-Content <some path> -Tail 200 |
@@ -100,9 +101,24 @@ the weapon's role (inj-fp against the fold-in's mode counts and the struct's fov
 A log with no census lines exits 1; the verdict never changes the exit code (read
 its lines).
 
+--vscreen-fit reads a flight with fix.vscreen_res_width = auto (design doc section 82,
+the "vscreen auto-fit" entry). It prints the launch's rule line (`vScreen resolution:
+auto = N wide: rule=fitted|legacy ...`: the rule that chose the width and why, from
+which footprint, and which world-route condition failed when it is legacy), the
+width the panel patch applied, the footprint instrument's arming line and every
+`vscreen footprint 30s:` window (samples on foot and elsewhere, the screen's width in
+eye pixels, its range and shape, the footprint at panel distance 1, the session
+median, what is stored for the next launch and the width it would fit), then the
+verdict lines, PASS / WARN / STOP / n/a: RULE (the width follows the rule's own
+tokens and is what was applied), INSTRUMENT (it ran, saw the composite and read its
+sources), ON FOOT, STABLE, SHAPE (the footprint's pixel aspect is 16:9), DISTANCE LAW
+(the footprint at distance 1 agrees across panel distances), CALIBRATION (Sean's
+3504 at distance 0.7 on a 4032 px eye) and STORED. A log with none of these lines
+exits 1; the verdict never changes the exit code (read its lines).
+
 Exit 0 when a log was read, 1 when none was found (or --camera-census found no
-census line), 2 when --expect-build did not match (--tally periodic checks the
-runtime log against it too).
+census line, or --vscreen-fit no auto-fit line), 2 when --expect-build did not
+match (--tally periodic checks the runtime log against it too).
 """
 
 import argparse
@@ -822,12 +838,15 @@ ROUTE_EVENT_MARKERS = (
 
 
 def route_events(text):
-    """{key: [line, ...]} for every line of the log that carries one of ROUTE_EVENT_MARKERS' phrases."""
+    """{key: [line, ...]} for every line of the log that carries one of ROUTE_EVENT_MARKERS' phrases, and under "vscreen-applied" the
+    panel patch's `vScreen resolution: WxH -> WxH at N site(s)` line (the on-foot screen's size, the size the route resolves at)."""
     events = {}
     for raw in text.splitlines():
         for key, needle in ROUTE_EVENT_MARKERS:
             if needle in raw:
                 events.setdefault(key, []).append(raw.strip())
+        if "vScreen resolution: " in raw and " -> " in raw and re.search(r"vScreen resolution: \d+x\d+ -> \d+x\d+ at \d+ site", raw):
+            events.setdefault("vscreen-applied", []).append(raw.strip())
     return events
 
 
@@ -857,6 +876,12 @@ def route_hdr(windows, events=None):
         m = re.search(r" px in (\d+)x(\d+),", line)
         if m and int(m.group(1)) and int(m.group(2)):
             return int(m.group(1)), int(m.group(2)), "the route's `the world is JITTERED` line"
+    # The route resolves the world at the on-foot screen's own size (R = D), which the panel patch's line names: the logged size, for a
+    # log whose route lines are missing or read 0x0.
+    for line in (events or {}).get("vscreen-applied", []):
+        m = re.search(r" -> (\d+)x(\d+) at \d+ site", line)
+        if m and int(m.group(1)) and int(m.group(2)):
+            return int(m.group(1)), int(m.group(2)), "the panel patch's `vScreen resolution:` line"
     return None
 
 
@@ -1391,6 +1416,10 @@ def census_verdict(c, routes, roles=None, events=None):
     older = "this log predates stage 2: no phase= token on the census lines%s" % (
         "" if not route_tokens else ", though the route line has jitter=")
 
+    # The render size the world phase is in, from the log itself (the route's hdr=, the JITTERED line, or the panel patch's size): never
+    # assumed (5040x2835 is what the legacy width gives a 4032 px eye, not what every rig has).
+    size = route_hdr(routes, events)
+
     # ---- (i) the leak into the eye cameras ----
     nonzero = [e for e in eyes if e["phase_state"] == "on" and _phase_nonzero(e["phase"])]
     geometry = c["geometry"]
@@ -1435,10 +1464,15 @@ def census_verdict(c, routes, roles=None, events=None):
             measured += 1
             if leak > worst:
                 worst, worst_at = leak, (e["eye"], e["frame"])
-        ndc = max(max(abs(census_phase_ndc(e["phase"], 5040, 2835)[0]), abs(census_phase_ndc(e["phase"], 5040, 2835)[1]))
-                  for e in nonzero)
-        base = ("%d of %d eye draw(s) had a non-zero world phase (up to %.4f px, about %.1e NDC at 5040x2835)"
-                % (len(nonzero), len(eyes), max(max(abs(e["phase"][0]), abs(e["phase"][1])) for e in nonzero), ndc))
+        px = max(max(abs(e["phase"][0]), abs(e["phase"][1])) for e in nonzero)
+        if size is not None:
+            ndc = max(max(abs(census_phase_ndc(e["phase"], size[0], size[1])[0]), abs(census_phase_ndc(e["phase"], size[0], size[1])[1]))
+                      for e in nonzero)
+            base = ("%d of %d eye draw(s) had a non-zero world phase (up to %.4f px, about %.1e NDC at %dx%d)"
+                    % (len(nonzero), len(eyes), px, ndc, size[0], size[1]))
+        else:
+            base = ("%d of %d eye draw(s) had a non-zero world phase (up to %.4f px; the render size is not in this log, so no NDC figure)"
+                    % (len(nonzero), len(eyes), px))
         # the same frame's two phases (the sequence header's and the eye line's) are one number
         disagree = []
         for e in nonzero:
@@ -1470,8 +1504,7 @@ def census_verdict(c, routes, roles=None, events=None):
                 "1e-8; a phase leaking into an eye would read 1e-4)" % (base, worst, measured, CENSUS_LEAK_PASS))
 
     # ---- (ii) the kind-3 calls carry the phase ----
-    size = route_hdr(routes, events)
-    sampled = [s for s in seqs if s["phase_state"] == "on" and _phase_nonzero(s["phase"])]
+    sampled =[s for s in seqs if s["phase_state"] == "on" and _phase_nonzero(s["phase"])]
     calls_have_inj = any(r["inj"] is not None for r in census_all_rows(c))
     if not seqs or not (tokens_seen or route_tokens):
         add("ii", "n/a", "KIND-3 ROWS CARRY THE PHASE: not judged: %s" % (older if seqs else "no call sequence was logged"))
@@ -3022,6 +3055,328 @@ def resolve_target(spec):
     return found[0]
 
 
+# ---------------------------------------------------------------------------------------------------------------------------------------
+# --vscreen-fit: fix.vscreen_res_width = auto, fitted to what each eye shows (design doc section 82, the "vscreen auto-fit" entry).
+# src/common/vscreen_fit.h writes the `vScreen resolution: auto = ...` rule line and the `vscreen footprint 30s:` line; the armed line
+# is src/d3d11/vscreen_footprint.cpp's. tools\vscreen_fit_test holds the formatters to tools\vscreen_fit_fixture.log, the file this
+# reader's own self-test reads. The constants below are that header's (kMultiplier, kFloorWidth, kLegacyMultiplier, the calibration
+# point); the rig pins the header, and self_test_vscreen_fit pins this copy of it to the header's text.
+# ---------------------------------------------------------------------------------------------------------------------------------------
+VSCREEN_M = 1.0                 # kMultiplier
+VSCREEN_FLOOR = 2880            # kFloorWidth
+VSCREEN_LEGACY_M = 1.25         # kLegacyMultiplier
+VSCREEN_SEED = (3504.0, 0.7, 4032.0)   # kSeedWidthPx, kSeedDistance, kSeedEyeWidthPx: Sean's calibration point
+VSCREEN_SHAPE = 16.0 / 9.0
+VSCREEN_STABLE = 0.02           # the screen's width may move this much (relative) between windows, and inside one
+VSCREEN_SHAPE_WARN = 0.03
+VSCREEN_SHAPE_STOP = 0.15
+VSCREEN_LAW = 0.02              # footprint at distance 1 may differ this much between windows at different distances
+VSCREEN_CALIBRATION = 0.03      # the measured footprint may differ this much from the calibration point before m is re-derived
+
+VSCREEN_RULE_RE = re.compile(r"^(?:\[(?P<ts>[0-9:.]+)\] )?vScreen resolution: auto = (?P<w>\d+) wide: (?P<rest>.*)$")
+VSCREEN_APPLY_RE = re.compile(r"^(?:\[(?P<ts>[0-9:.]+)\] )?vScreen resolution: (?P<sw>\d+)x(?P<sh>\d+) -> (?P<w>\d+)x(?P<h>\d+) at (?P<sites>\d+) site")
+VSCREEN_EXPLICIT_RE = re.compile(r"^(?:\[(?P<ts>[0-9:.]+)\] )?vScreen resolution: explicit (?P<w>\d+) wide")
+VSCREEN_FOOT_RE = re.compile(r"^(?:\[(?P<ts>[0-9:.]+)\] )?vscreen footprint 30s: (?P<rest>.*)$")
+VSCREEN_ARMED_RE = re.compile(r"^(?:\[(?P<ts>[0-9:.]+)\] )?vscreen footprint: (?P<what>armed|not armed|STOOD DOWN)")
+
+
+def _vround16(value):
+    return int(value / 16.0 + 0.5) * 16
+
+
+def _vnum(text):
+    """A token's number (a leading float), else None: `3504`, `0.8690`, `-` -> 3504.0, 0.869, None."""
+    m = re.match(r"^-?\d+(?:\.\d+)?", text or "")
+    return float(m.group(0)) if m else None
+
+
+def parse_vscreen_fit(text):
+    """The log's vscreen auto-fit lines: {rule: {ts, width, kv, prose} (the launch's first auto line) or None, explicit: width or None,
+    no_eye: bool (auto with no eye width on record), off: bool, applied: {ts, src, w, h, sites} or None, armed: [(ts, what)],
+    windows: [{ts, kv}]}. A line cut short or garbled is skipped, never fatal."""
+    f = {"rule": None, "explicit": None, "no_eye": False, "off": False, "applied": None, "armed": [], "windows": []}
+    for raw in text.splitlines():
+        try:
+            m = VSCREEN_RULE_RE.match(raw)
+            if m:
+                head, _, prose = m.group("rest").partition(" -- ")
+                if f["rule"] is None:
+                    f["rule"] = {"ts": m.group("ts") or "", "width": int(m.group("w")), "kv": _ckv(head), "prose": prose}
+                continue
+            m = VSCREEN_APPLY_RE.match(raw)
+            if m:
+                if f["applied"] is None:
+                    f["applied"] = {"ts": m.group("ts") or "", "src": (int(m.group("sw")), int(m.group("sh"))),
+                                    "w": int(m.group("w")), "h": int(m.group("h")), "sites": int(m.group("sites"))}
+                continue
+            m = VSCREEN_EXPLICIT_RE.match(raw)
+            if m:
+                f["explicit"] = int(m.group("w"))
+                continue
+            if "vScreen resolution: auto, but no per-eye render width is on record" in raw:
+                f["no_eye"] = True
+                continue
+            if "vScreen resolution: off (set to " in raw:
+                f["off"] = True
+                continue
+            m = VSCREEN_ARMED_RE.match(raw)
+            if m:
+                f["armed"].append((m.group("ts") or "", m.group("what")))
+                continue
+            m = VSCREEN_FOOT_RE.match(raw)
+            if m:
+                f["windows"].append({"ts": m.group("ts") or "", "kv": _ckv(m.group("rest"))})
+        except (ValueError, TypeError):
+            continue
+    return f
+
+
+def vscreen_fit_windows(f):
+    """Each window's tokens as numbers: [{window, samples, on_foot, other, skipped, late, draws, why, distance, applied, eye (w, h) or None,
+    fp, frac, lo, hi, h, shape, other_fp, at1, frac1, session_n, session_frac1, persisted, fit, legacy}]."""
+    out = []
+    for w in f["windows"]:
+        kv = w["kv"]
+        eye = re.match(r"^(\d+)x(\d+)$", kv.get("eye", ""))
+        rng = re.match(r"^(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?)$", kv.get("range", ""))
+        out.append({
+            "ts": w["ts"], "window": _cint(kv.get("window")), "samples": _cint(kv.get("samples")) or 0, "on_foot": _cint(kv.get("on-foot")) or 0,
+            "other": _cint(kv.get("other")) or 0, "skipped": _cint(kv.get("skipped")) or 0, "late": _cint(kv.get("late")) or 0,
+            "draws": _cint(kv.get("draws")) or 0, "why": kv.get("why", ""), "distance": _vnum(kv.get("distance")), "applied": _vnum(kv.get("applied")),
+            "eye": (int(eye.group(1)), int(eye.group(2))) if eye else None, "fp": _vnum(kv.get("fp")), "frac": _vnum(kv.get("frac")),
+            "lo": float(rng.group(1)) if rng else None, "hi": float(rng.group(2)) if rng else None, "h": _vnum(kv.get("h")),
+            "shape": _vnum(kv.get("shape")), "other_fp": _vnum(kv.get("other-fp")), "at1": _vnum(kv.get("at1")), "frac1": _vnum(kv.get("frac1")),
+            "session_n": _cint(kv.get("session-n")) or 0, "session_frac1": _vnum(kv.get("session-frac1")), "persisted": _vnum(kv.get("persisted")),
+            "fit": _vnum(kv.get("fit")), "legacy": _vnum(kv.get("legacy"))})
+    return out
+
+
+def vscreen_fit_verdict(f):
+    """The verdict on one flight: [(tag, status, text)], status PASS, WARN, STOP or n/a (what the log cannot say). The tags are the
+    questions the flight plan asks: RULE (did auto choose by the rule it names, and was that what was applied), INSTRUMENT (did the
+    footprint instrument run, see the composite and read its sources), ON FOOT (was the screen measured on foot), STABLE, SHAPE (the
+    corner arithmetic and the eye size agree that the screen is 16:9), DISTANCE LAW (A varies as 1/d), CALIBRATION (does m = 1.0 give
+    Sean's 3504), STORED (what the next launch will fit)."""
+    out = []
+
+    def add(tag, status, text):
+        out.append((tag, status, text))
+
+    wins = vscreen_fit_windows(f)
+    rule = f["rule"]
+    applied = f["applied"]
+
+    # ---- RULE ----
+    if f["explicit"]:
+        add("RULE", "n/a", "an explicit width (%d), used exactly: auto's rule is not in play" % f["explicit"])
+    elif f["no_eye"]:
+        add("RULE", "n/a", "auto with no per-eye width on record yet: the panel stayed at the game's own 1920x1080 (a fresh install's first launch)")
+    elif rule is None:
+        add("RULE", "n/a", "no `vScreen resolution: auto =` line: a log that predates the rule, or a session that never reached the panel patch")
+    else:
+        kv = rule["kv"]
+        width = rule["width"]
+        name = kv.get("rule")
+        eye = _vnum(kv.get("eye"))
+        text = ""
+        status = "PASS"
+        if name == "fitted":
+            fp, m, floor, cap = _vnum(kv.get("footprint")), _vnum(kv.get("m")), _vnum(kv.get("floor")), _vnum(kv.get("cap"))
+            if None in (fp, m, floor, cap):
+                status, text = "WARN", "rule=fitted but its footprint, m, floor or cap token is missing: the width cannot be recomputed"
+            else:
+                lo = min(floor, cap)
+                want = _vround16(min(max(m * fp, lo), cap))
+                nudged = kv.get("nudged") == "yes"
+                if width == want or (nudged and 0 < abs(width - want) <= 16 * 8):
+                    text = ("FITTED to %d wide from a %s footprint of %.0f px at fix.panel_distance %s on a %d px eye (m=%.2f, floor %d, cap %d, clamp %s%s); "
+                            "legacy would have been %s"
+                            % (width, kv.get("source", "?"), fp, kv.get("distance", "?"), eye or 0, m, floor, cap, kv.get("clamp", "?"),
+                               ", nudged off another target's size" if nudged else "", kv.get("legacy", "?")))
+                else:
+                    status, text = "STOP", ("the line says %d wide but its own tokens (footprint %.0f, m %.2f, floor %d, cap %d) give %d" % (width, fp, m, floor, cap, want))
+        elif name == "legacy":
+            want = _vround16((eye or 0) * VSCREEN_LEGACY_M) if eye else None
+            why = rule["prose"].partition("because the world route will not run:")[2].partition(". Without the route")[0].strip()
+            if want is not None and width != min(max(want, 640), 8192):
+                status, text = "STOP", "the legacy width %d is not 125%% of the %d px eye (%d)" % (width, eye, want)
+            elif not why:
+                status, text = "WARN", "legacy %d wide, but the line does not say which route condition failed" % width
+            else:
+                text = "LEGACY %d wide (125%% of the %d px eye): the world route will not run: %s" % (width, eye or 0, why)
+        else:
+            status, text = "WARN", "the auto line has no rule= token (%r): an older build's line" % kv.get("rule")
+        if status != "STOP" and applied is not None and applied["w"] != width:
+            status, text = "STOP", "%s -- but the panel patch applied %dx%d, not %d wide" % (text, applied["w"], applied["h"], width)
+        elif status == "PASS" and applied is None:
+            text += " (no `vScreen resolution: ... ->` apply line in this log: the patch did not write, or the line was cut)"
+        elif status == "PASS":
+            text += "; applied %dx%d at %d site(s)" % (applied["w"], applied["h"], applied["sites"])
+        add("RULE", status, text)
+
+    # ---- INSTRUMENT ----
+    armed = [a for a in f["armed"] if a[1] == "armed"]
+    notarmed = [a for a in f["armed"] if a[1] != "armed"]
+    if f["explicit"] and not wins:
+        add("INSTRUMENT", "n/a", "not armed by design: an explicit width has nothing to fit%s" % (" (the log says so)" if notarmed else ""))
+    elif not f["armed"] and not wins:
+        add("INSTRUMENT", "STOP", "no `vscreen footprint` line at all, not even the arming line: the instrument never ran (a build that predates it, the flat "
+            "profile, or a session that never reached its first frame boundary)")
+    elif notarmed and not armed and not wins:
+        add("INSTRUMENT", "n/a", "not armed: %s" % notarmed[0][1])
+    elif not wins:
+        add("INSTRUMENT", "WARN", "armed, but no 30 s window closed: the session was shorter than 30 s")
+    else:
+        total = sum(w["samples"] for w in wins)
+        foot = sum(w["on_foot"] for w in wins)
+        draws = sum(w["draws"] for w in wins)
+        skipped = sum(w["skipped"] for w in wins)
+        late = sum(w["late"] for w in wins)
+        why = {}
+        for w in wins:
+            for part in w["why"].split(","):
+                key, _, n = part.partition(":")
+                if key and n.isdigit():
+                    why[key] = why.get(key, 0) + int(n)
+        base = "%d window(s): %d sample(s) (%d on foot, %d other), %d composite draw(s) seen, %d skipped%s, %d late" % (
+            len(wins), total, foot, total - foot, draws, skipped, " (%s)" % ", ".join("%s x%d" % kv for kv in sorted(why.items())) if why else "", late)
+        if draws == 0:
+            add("INSTRUMENT", "STOP", "armed and ticking, but the 2D screen's composite was never seen (draws=0 in every window): the recognition did not match, "
+                "or the screen was never on show. " + base)
+        elif total == 0:
+            add("INSTRUMENT", "STOP", "the composite was seen but not one sample could be read: " + base)
+        elif skipped > total:
+            add("INSTRUMENT", "WARN", "more samples skipped than read: " + base)
+        elif late:
+            add("INSTRUMENT", "WARN", "a copy was not ready in time: " + base)
+        else:
+            add("INSTRUMENT", "PASS", base)
+
+    # ---- ON FOOT ----
+    foot_wins = [w for w in wins if w["on_foot"] and w["fp"] is not None]
+    if wins:
+        if not foot_wins:
+            others = [w["other_fp"] for w in wins if w["other_fp"] is not None]
+            add("ON FOOT", "WARN", "no on-foot sample: the screen was measured at the menu only%s, and nothing on foot was stored for the next launch"
+                % (" (%.0f px)" % statistics.median(others) if others else ""))
+        else:
+            fps = [w["fp"] for w in foot_wins]
+            add("ON FOOT", "PASS", "%d on-foot window(s), %d sample(s); the screen spans %.0f px (median of the windows' medians %.0f..%.0f) of the eye"
+                % (len(foot_wins), sum(w["on_foot"] for w in foot_wins), statistics.median(fps), min(fps), max(fps)))
+            # ---- STABLE ----
+            med = statistics.median(fps)
+            spread = (max(fps) - min(fps)) / med if med else 0.0
+            inside = max(((w["hi"] - w["lo"]) / w["fp"] for w in foot_wins if w["lo"] is not None and w["hi"] is not None and w["fp"]), default=0.0)
+            if spread > VSCREEN_STABLE or inside > VSCREEN_STABLE:
+                add("STABLE", "WARN", "the screen's width moved: %.1f%% between windows, up to %.1f%% inside one (over %.0f%%): the head, a menu, or the panel distance "
+                    "changed during the flight" % (spread * 100.0, inside * 100.0, VSCREEN_STABLE * 100.0))
+            else:
+                add("STABLE", "PASS", "the screen's width held: %.1f%% between windows, up to %.1f%% inside one (under %.0f%%)" % (spread * 100.0, inside * 100.0, VSCREEN_STABLE * 100.0))
+            # ---- SHAPE ----
+            shapes = [w["shape"] for w in foot_wins if w["shape"] is not None]
+            if not shapes:
+                add("SHAPE", "n/a", "no shape= token: the eye's height was not known (the runtime had not published its sizing)")
+            else:
+                worst = max(abs(s / VSCREEN_SHAPE - 1.0) for s in shapes)
+                status = "STOP" if worst > VSCREEN_SHAPE_STOP else ("WARN" if worst > VSCREEN_SHAPE_WARN else "PASS")
+                add("SHAPE", status, "the footprint's pixel aspect reads %.3f..%.3f against 16:9 = %.3f (worst %.1f%% off)%s"
+                    % (min(shapes), max(shapes), VSCREEN_SHAPE, worst * 100.0,
+                       "" if status == "PASS" else ": the corner arithmetic, the eye size or the screen's stretch is not what the instrument assumes"))
+            # ---- DISTANCE LAW ----
+            by_d = {}
+            for w in foot_wins:
+                if w["applied"] and w["frac1"] is not None:
+                    by_d.setdefault(round(w["applied"], 2), []).append(w["frac1"])
+            if len(by_d) < 2:
+                add("DISTANCE LAW", "n/a", "one panel distance in this log (%s): a restart leg or a live change at another fix.panel_distance tests the 1/d law"
+                    % (", ".join("%.2f" % d for d in by_d) or "unknown"))
+            else:
+                meds = {d: statistics.median(v) for d, v in by_d.items()}
+                lo, hi = min(meds.values()), max(meds.values())
+                spread = (hi - lo) / statistics.median(meds.values())
+                add("DISTANCE LAW", "PASS" if spread <= VSCREEN_LAW else "STOP",
+                    "the footprint at distance 1 over %d distances (%s): %.1f%% apart (%s %.0f%%): A %s 1/d"
+                    % (len(meds), ", ".join("%.2f -> %.4f" % (d, meds[d]) for d in sorted(meds)), spread * 100.0,
+                       "under" if spread <= VSCREEN_LAW else "over", VSCREEN_LAW * 100.0, "varies as" if spread <= VSCREEN_LAW else "does NOT vary as"))
+            # ---- CALIBRATION ----
+            seed_w, seed_d, seed_e = VSCREEN_SEED
+            at_seed = [w for w in foot_wins if w["eye"] and w["eye"][0] == int(seed_e) and w["applied"] and abs(w["applied"] - seed_d) < 0.011]
+            if at_seed:
+                got = statistics.median([w["fp"] for w in at_seed])
+                ratio = got / seed_w
+                if abs(ratio - 1.0) <= VSCREEN_CALIBRATION:
+                    add("CALIBRATION", "PASS", "at Sean's calibration point (a %d px eye at distance %.1f) the screen spans %.0f px against the 3504 he flew (%.1f%%): m = 1.0 "
+                        "reproduces his width" % (int(seed_e), seed_d, got, ratio * 100.0))
+                else:
+                    add("CALIBRATION", "WARN", "at Sean's calibration point the screen spans %.0f px, not the 3504 he flew (%.1f%%): m = 1.0 would fit %d wide there; "
+                        "m = %.3f reproduces 3504 -- his call whether 3504 or the measurement is right (vscreen_fit.h kMultiplier, kSeed*)"
+                        % (got, ratio * 100.0, _vround16(got), seed_w / got))
+            else:
+                add("CALIBRATION", "n/a", "not at the calibration point (a %d px eye at panel distance %.1f)" % (int(seed_e), seed_d))
+
+    # ---- STORED ----
+    if wins:
+        last = wins[-1]
+        persisted = [w for w in wins if w["persisted"] is not None]
+        if persisted:
+            p = persisted[-1]
+            fit = p["fit"]
+            note = ""
+            if applied is not None and fit:
+                note = "; the next launch fits %d wide (this launch: %d)" % (fit, applied["w"]) if abs(fit - applied["w"]) > 16 else \
+                    "; the next launch fits %d wide, the width this launch ran at (%d)" % (fit, applied["w"])
+            if rule is not None and rule["kv"].get("route") == "no":
+                note += " -- this launch's route=no (legacy), so a launch fits only once the world route will run"
+            add("STORED", "PASS", "the on-foot median is stored: %.4f of the eye at panel distance 1 (%d sample(s))%s" % (p["persisted"], p["session_n"], note))
+        elif foot_wins:
+            add("STORED", "WARN", "on-foot samples were taken (%d) but nothing was stored: the file needs at least 12 on-foot samples in the session"
+                % sum(w["on_foot"] for w in foot_wins))
+        else:
+            add("STORED", "n/a", "nothing was stored: no on-foot samples")
+    return out
+
+
+def vscreen_fit_summary(verdict):
+    counts = {"PASS": 0, "WARN": 0, "STOP": 0, "n/a": 0}
+    for _, status, _ in verdict:
+        counts[status] = counts.get(status, 0) + 1
+    worst = "STOP" if counts["STOP"] else ("WARN" if counts["WARN"] else ("PASS" if counts["PASS"] else "n/a"))
+    return "vscreen fit verdict: %s (%d PASS, %d WARN, %d STOP, %d n/a)" % (worst, counts["PASS"], counts["WARN"], counts["STOP"], counts["n/a"])
+
+
+def print_vscreen_fit(text):
+    """The --vscreen-fit report. Returns the process exit code: 0 when the log has any of the auto-fit lines, 1 when it has none (a log
+    from a build that predates them, or no VR session); the verdict never changes the exit code (read its lines)."""
+    f = parse_vscreen_fit(text)
+    wins = vscreen_fit_windows(f)
+    lines = (1 if f["rule"] else 0) + (1 if f["explicit"] else 0) + (1 if f["no_eye"] else 0) + len(f["armed"]) + len(wins)
+    if not lines:
+        print("[edvr] no vscreen auto-fit line in this log (a build that predates the fit, or a session that never reached the panel patch).")
+        return 1
+    print("[edvr] vscreen fit: %s, %s, %d arming line(s), %d footprint window(s)"
+          % ("the rule line" if f["rule"] else ("an explicit-width line" if f["explicit"] else "no rule line"),
+             "an apply line" if f["applied"] else "no apply line", len(f["armed"]), len(wins)))
+    if f["rule"]:
+        kv = f["rule"]["kv"]
+        print("launch: auto = %d wide, rule=%s source=%s route=%s eye=%s distance=%s footprint=%s clamp=%s legacy=%s%s"
+              % (f["rule"]["width"], kv.get("rule", "?"), kv.get("source", "?"), kv.get("route", "?"), kv.get("eye", "?"), kv.get("distance", "?"),
+                 kv.get("footprint", "-"), kv.get("clamp", "-"), kv.get("legacy", "?"),
+                 "; applied %dx%d" % (f["applied"]["w"], f["applied"]["h"]) if f["applied"] else ""))
+    for w in wins:
+        print("window %s: samples %d (on foot %d, other %d), draws %d, skipped %d, late %d; eye %s distance %s applied %s; on foot fp=%s frac=%s range=%s..%s "
+              "shape=%s; at distance 1 %s px (%s); session n=%d median %s persisted %s; next launch fits %s (legacy %s)"
+              % (w["window"], w["samples"], w["on_foot"], w["other"], w["draws"], w["skipped"], w["late"],
+                 "%dx%d" % w["eye"] if w["eye"] else "-", w["distance"], w["applied"], "%.0f" % w["fp"] if w["fp"] is not None else "-",
+                 w["frac"], "%.0f" % w["lo"] if w["lo"] is not None else "-", "%.0f" % w["hi"] if w["hi"] is not None else "-", w["shape"],
+                 "%.0f" % w["at1"] if w["at1"] is not None else "-", w["frac1"], w["session_n"], w["session_frac1"], w["persisted"],
+                 "%.0f" % w["fit"] if w["fit"] is not None else "-", "%.0f" % w["legacy"] if w["legacy"] is not None else "-"))
+    verdict = vscreen_fit_verdict(f)
+    for tag, status, text_ in verdict:
+        print("%s (%s) %s" % (status, tag, text_))
+    print(vscreen_fit_summary(verdict))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Locate and read EDVR flight logs.")
@@ -3067,6 +3422,14 @@ def main(argv=None):
                          "place in the frame, tangents and view tell it from the "
                          "world's -- and the stage 2 verdict (PASS / WARN / STOP) "
                          "on the world route's injected phase")
+    ap.add_argument("--vscreen-fit", action="store_true",
+                    help="report a fix.vscreen_res_width = auto flight: the `vScreen "
+                         "resolution:` rule line (fitted or legacy, and why) and the "
+                         "width applied, the footprint instrument's arming line and "
+                         "its 30 s lines (the on-foot screen's width in eye pixels, "
+                         "its stability, shape and 1/d law, against Sean's 3504 "
+                         "calibration point) and what is stored for the next launch; "
+                         "PASS / WARN / STOP lines")
     ap.add_argument("--window-ms", type=float, default=100.0,
                     help="with --tally periodic, a long frame coincides with a "
                          "periodic event when the event's end time is inside "
@@ -3168,6 +3531,8 @@ def main(argv=None):
     if args.version:
         return 0
 
+    if args.vscreen_fit:
+        return print_vscreen_fit(text)
     if args.camera_census:
         return print_camera_census(text)
     if args.tally == "periodic":
@@ -3511,9 +3876,254 @@ def self_test():
         ok = False
     if not self_test_camera_census():
         ok = False
+    if not self_test_vscreen_fit():
+        ok = False
 
     print("self-test: %s" % ("ok" if ok else "FAILED"))
     return 0 if ok else 1
+
+
+VSCREEN_FIXTURE = "vscreen_fit_fixture.log"
+
+
+def self_test_vscreen_fit():
+    """--vscreen-fit on the checked-in synthetic flight (tools\\vscreen_fit_fixture.log, which tools\\vscreen_fit_test holds to
+    exactly what the DLL's formatters write), then on logs altered to take away each thing the report depends on and to break each thing
+    the verdict judges, and the census verdict's size read from the log. Returns ok."""
+    import contextlib
+    import io
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("vscreen fit: %s" % msg)
+        ok = False
+
+    def report(text):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = print_vscreen_fit(text)
+        return rc, buf.getvalue()
+
+    def sub(text, old, new, count=-1):
+        """text with `old` replaced by `new`; fails the test (and returns text) when `old` is not there: a mutation that changes
+        nothing would pass every check for the wrong reason."""
+        if old not in text:
+            fail("the mutation %r -> %r found nothing to change" % (old, new))
+            return text
+        return text.replace(old, new, count)
+
+    def statuses(text):
+        """{tag: status} of the verdict lines of a log."""
+        _, out = report(text)
+        found = {}
+        for line in out.splitlines():
+            m = re.match(r"^(PASS|WARN|STOP|n/a) \(([A-Z ]+)\) ", line)
+            if m:
+                found[m.group(2)] = m.group(1)
+        return found, out
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    fixture = os.path.join(here, VSCREEN_FIXTURE)
+    if not os.path.isfile(fixture):
+        fail("the fixture %s is missing beside this script" % VSCREEN_FIXTURE)
+        return False
+    text = read_text(fixture)
+
+    # ---- this copy of the rule's constants is the header's ----
+    header = os.path.join(os.path.dirname(here), "src", "common", "vscreen_fit.h")
+    if os.path.isfile(header):
+        h = read_text(header)
+        for name, value in (("kMultiplier", VSCREEN_M), ("kFloorWidth", VSCREEN_FLOOR), ("kLegacyMultiplier", VSCREEN_LEGACY_M),
+                            ("kSeedWidthPx", VSCREEN_SEED[0]), ("kSeedDistance", VSCREEN_SEED[1]), ("kSeedEyeWidthPx", VSCREEN_SEED[2])):
+            m = re.search(r"constexpr (?:double|uint32_t) %s = ([0-9.]+);" % name, h)
+            if not m or abs(float(m.group(1)) - value) > 1e-9:
+                fail("this reader's constant for %s (%r) is not src\\common\\vscreen_fit.h's (%r)" % (name, value, m.group(1) if m else None))
+    else:
+        fail("src\\common\\vscreen_fit.h is not where the self-test looks for it (%s)" % header)
+
+    # ---- the parser ----
+    f = parse_vscreen_fit(text)
+    kv = f["rule"]["kv"] if f["rule"] else {}
+    if not f["rule"] or f["rule"]["width"] != 3504 or kv.get("rule") != "fitted" or kv.get("source") != "seed" or kv.get("route") != "run" or \
+            kv.get("eye") != "4032" or kv.get("distance") != "0.700" or kv.get("legacy") != "5040" or kv.get("footprint") != "3504" or \
+            kv.get("m") != "1.00" or kv.get("floor") != "2880" or kv.get("cap") != "5040" or kv.get("clamp") != "none":
+        fail("the fixture's rule line parsed as %r" % (f["rule"],))
+    if not f["applied"] or (f["applied"]["w"], f["applied"]["h"], f["applied"]["sites"]) != (3504, 1971, 6) or len(f["armed"]) != 1 or \
+            f["armed"][0][1] != "armed" or len(f["windows"]) != 4:
+        fail("the fixture parsed as applied %r, %d arming line(s), %d window(s)" % (f["applied"], len(f["armed"]), len(f["windows"])))
+    w = vscreen_fit_windows(f)
+    if len(w) != 4 or (w[0]["samples"], w[0]["on_foot"], w[0]["other"], w[0]["draws"], w[0]["fp"], w[0]["other_fp"], w[0]["applied"]) != (44, 0, 44, 5280, None, 3503.0, None) or \
+            (w[1]["fp"], w[1]["lo"], w[1]["hi"], w[1]["shape"], w[1]["at1"], w[1]["persisted"], w[1]["fit"], w[1]["legacy"], w[1]["eye"]) != \
+            (3497.0, 3489.0, 3505.0, 1.778, 2448.0, 0.6071, 3504.0, 5040.0, (4032, 3898)) or w[3]["session_n"] != 177:
+        fail("the fixture's windows parsed as %r" % (w,))
+    # A line cut short or garbled is skipped, never fatal.
+    g = parse_vscreen_fit("vscreen footprint 30s: window=x samples=y on-foot=\nvScreen resolution: auto = 12 wide\n"
+                          "vScreen resolution: 1920x1080 -> 3504x1971 at\nnothing at all\nvscreen footprint: armed -- x\n")
+    if g["rule"] is not None or g["applied"] is not None or len(g["armed"]) != 1 or len(g["windows"]) != 1:
+        fail("a cut-short line was mis-parsed: %r" % (g,))
+
+    # ---- the report on the fixture: every question PASSes, the one the log cannot answer says so ----
+    rc, out = report(text)
+    flat = re.sub(r"[ ]+", " ", out)
+    for want in (
+            "vscreen fit: the rule line, an apply line, 1 arming line(s), 4 footprint window(s)",
+            "launch: auto = 3504 wide, rule=fitted source=seed route=run eye=4032 distance=0.700 footprint=3504 clamp=none legacy=5040; applied 3504x1971",
+            "window 1: samples 44 (on foot 0, other 44), draws 5280, skipped 0, late 0; eye 4032x3898",
+            "window 4: samples 59 (on foot 59, other 0), draws 5400, skipped 0, late 0; eye 4032x3898 distance 0.7 applied 0.7; on foot fp=3499",
+            "PASS (RULE) FITTED to 3504 wide from a seed footprint of 3504 px at fix.panel_distance 0.700 on a 4032 px eye (m=1.00, floor 2880, cap 5040, "
+            "clamp none); legacy would have been 5040; applied 3504x1971 at 6 site(s)",
+            "PASS (INSTRUMENT) 4 window(s): 221 sample(s) (177 on foot, 44 other), 21480 composite draw(s) seen, 0 skipped, 0 late",
+            "PASS (ON FOOT) 3 on-foot window(s), 177 sample(s); the screen spans 3499 px",
+            "PASS (STABLE) the screen's width held",
+            "PASS (SHAPE) the footprint's pixel aspect reads 1.778..1.778 against 16:9 = 1.778",
+            "n/a (DISTANCE LAW) one panel distance in this log (0.70)",
+            "PASS (CALIBRATION) at Sean's calibration point (a 4032 px eye at distance 0.7) the screen spans 3499 px against the 3504 he flew (99.9%): m = 1.0 reproduces his width",
+            "PASS (STORED) the on-foot median is stored: 0.6075 of the eye at panel distance 1 (177 sample(s)); the next launch fits 3504 wide, the width this launch ran at (3504)",
+            "vscreen fit verdict: PASS (7 PASS, 0 WARN, 0 STOP, 1 n/a)"):
+        if want not in flat:
+            fail("the fixture's report lacks %r:\n%s" % (want, out))
+    if rc != 0:
+        fail("the fixture reported exit %d" % rc)
+
+    # ---- the rule line, taken apart ----
+    legacy_line = ("[06:07:03.620] vScreen resolution: auto = 5040 wide: rule=legacy source=none route=no eye=4032 distance=0.700 legacy=5040 m=1.25 -- LEGACY: "
+                   "125% of the 4032 px the runtime last rendered per eye, because the world route will not run: fix.panel_curvature is above 0 (the route "
+                   "stands aside for a curved screen). Without the route nothing anti-aliases the on-foot world before it reaches the panel, and the extra "
+                   "width does that job.")
+    rule_line = next(l for l in text.splitlines() if "vScreen resolution: auto = " in l)
+    legacy = sub(sub(text, rule_line, legacy_line), "-> 3504x1971", "-> 5040x2835")
+    st, out = statuses(legacy)
+    if st.get("RULE") != "PASS" or "LEGACY 5040 wide (125% of the 4032 px eye): the world route will not run: fix.panel_curvature is above 0" not in re.sub(r"[ ]+", " ", out):
+        fail("a legacy launch did not say which condition failed: %r\n%s" % (st, out))
+    if st.get("STORED") != "PASS" or "this launch's route=no (legacy), so a launch fits only once the world route will run" not in out:
+        fail("a legacy launch's stored footprint did not say the next launch fits only when the route will run: %r\n%s" % (st, out))
+    st, out = statuses(sub(legacy, "auto = 5040 wide", "auto = 4800 wide"))
+    if st.get("RULE") != "STOP":
+        fail("a legacy width that is not 125%% of the eye did not STOP: %r" % (st,))
+    st, out = statuses(sub(text, "-> 3504x1971", "-> 5040x2835"))
+    if st.get("RULE") != "STOP" or "the panel patch applied 5040x2835, not 3504 wide" not in out:
+        fail("a width that was not the one applied did not STOP: %r\n%s" % (st, out))
+    st, out = statuses(sub(text, "auto = 3504 wide", "auto = 3600 wide"))
+    if st.get("RULE") != "STOP" or "its own tokens" not in out:
+        fail("a width that is not what its own tokens give did not STOP: %r\n%s" % (st, out))
+    st, out = statuses(sub(text, "footprint=3504 m=1.00", "footprint=3504 m=0.95"))
+    if st.get("RULE") != "STOP":
+        fail("a different m in the tokens did not change the recomputed width: %r" % (st,))
+    st, out = statuses(sub(sub(text, "clamp=none", "clamp=floor nudged=yes"), "auto = 3504 wide", "auto = 3520 wide").replace("-> 3504x1971", "-> 3520x1980"))
+    if st.get("RULE") != "PASS":
+        fail("a nudged width within a few steps of the recomputed one was refused: %r\n%s" % (st, out))
+    st, out = statuses("\n".join(l for l in text.splitlines() if "-> 3504x1971" not in l))
+    if st.get("RULE") != "PASS" or "no `vScreen resolution: ... ->` apply line" not in out:
+        fail("a log with no apply line did not say so: %r" % (st,))
+    explicit = "[06:07:03.620] vScreen resolution: explicit 3504 wide (fix.vscreen_res_width), 3504x1971 at 16:9, used exactly: auto's rule is not in play."
+    not_armed = ("[06:07:05.412] vscreen footprint: not armed -- fix.vscreen_res_width is \"3504\", not auto: an explicit width is used exactly and there is "
+                 "nothing to fit.")
+    ex = "\n".join([l for l in text.splitlines() if "version" in l] + [explicit, not_armed])
+    st, out = statuses(ex)
+    if st.get("RULE") != "n/a" or st.get("INSTRUMENT") != "n/a" or report(ex)[0] != 0:
+        fail("an explicit width did not read n/a for the rule and the instrument: %r" % (st,))
+    fresh = "[06:07:03.620] vScreen resolution: auto, but no per-eye render width is on record yet for this install -- the on-foot screen stays at the game's own 1920x1080"
+    st, out = statuses(fresh)
+    if st.get("RULE") != "n/a" or "fresh install" not in out:
+        fail("an auto with no eye width on record did not say so: %r" % (st,))
+
+    # ---- the instrument ----
+    nothing = "\n".join(l for l in text.splitlines() if not re.match(r"^\[[0-9:.]+\] vscreen footprint", l))
+    st, out = statuses(nothing)
+    if st.get("INSTRUMENT") != "STOP" or "never ran" not in out:
+        fail("a launch with no footprint line at all did not STOP the instrument: %r\n%s" % (st, out))
+    armed_only = "\n".join(l for l in text.splitlines() if not re.match(r"^\[[0-9:.]+\] vscreen footprint 30s:", l))
+    st, out = statuses(armed_only)
+    if st.get("INSTRUMENT") != "WARN" or "shorter than 30 s" not in out:
+        fail("an armed instrument with no closed window did not WARN: %r" % (st,))
+    st, out = statuses(sub(text, "draws=5400", "draws=0").replace("draws=5280", "draws=0"))
+    if st.get("INSTRUMENT") != "STOP" or "never seen" not in out:
+        fail("draws=0 in every window did not STOP: %r\n%s" % (st, out))
+    st, out = statuses(re.sub(r"samples=\d+ on-foot=\d+ other=\d+", "samples=0 on-foot=0 other=0", text))
+    if st.get("INSTRUMENT") != "STOP" or "not one sample" not in out:
+        fail("a composite seen but not one sample read did not STOP: %r\n%s" % (st, out))
+    st, out = statuses(sub(text, "window=2 samples=60 on-foot=60 other=0 skipped=0 late=0", "window=2 samples=60 on-foot=60 other=0 skipped=2 late=0 why=vb0-stride:2"))
+    if st.get("INSTRUMENT") != "PASS" or "2 skipped (vb0-stride x2)" not in out:
+        fail("skipped samples were not counted by reason: %r\n%s" % (st, out))
+    st, out = statuses(sub(text, "window=2 samples=60 on-foot=60 other=0 skipped=0 late=0", "window=2 samples=60 on-foot=60 other=0 skipped=0 late=3"))
+    if st.get("INSTRUMENT") != "WARN" or "not ready in time" not in out:
+        fail("late copies did not WARN: %r" % (st,))
+
+    # ---- on foot, stable, shape, the distance law, the calibration point, what is stored ----
+    menu_only = "\n".join(l for l in text.splitlines() if "window=2 " not in l and "window=3 " not in l and "window=4 " not in l)
+    st, out = statuses(menu_only)
+    if st.get("ON FOOT") != "WARN" or st.get("STORED") != "n/a" or "menu only (3503 px)" not in out:
+        fail("a menu-only session did not WARN on foot and store nothing: %r\n%s" % (st, out))
+    st, out = statuses(sub(text, "fp=3501 frac=0.8683 range=3493..3509", "fp=3700 frac=0.9177 range=3693..3709"))
+    if st.get("STABLE") != "WARN" or "the screen's width moved" not in out:
+        fail("a window that moved by 5%% did not WARN stable: %r" % (st,))
+    st, out = statuses(sub(text, "fp=3501 frac=0.8683 range=3493..3509", "fp=3501 frac=0.8683 range=3300..3709"))
+    if st.get("STABLE") != "WARN":
+        fail("a wide range inside a window did not WARN stable: %r" % (st,))
+    st, out = statuses(text.replace("shape=1.778", "shape=1.700"))
+    if st.get("SHAPE") != "WARN":
+        fail("a shape 4%% off 16:9 did not WARN: %r" % (st,))
+    st, out = statuses(text.replace("shape=1.778", "shape=1.200"))
+    if st.get("SHAPE") != "STOP" or "not what the instrument assumes" not in out:
+        fail("a shape 32%% off 16:9 did not STOP: %r\n%s" % (st, out))
+    st, out = statuses(text.replace(" shape=1.778", ""))
+    if st.get("SHAPE") != "n/a":
+        fail("windows with no shape token did not read n/a: %r" % (st,))
+    # Two distances: the last window flown at 1.0 with the footprint scaled by 1/d (A at distance 1 unchanged): the law holds; if it did not
+    # scale (the screen the same width at another distance) it does not.
+    w4 = next(l for l in text.splitlines() if "window=4 " in l)
+    w4d = (w4.replace("distance=0.700 applied=0.700", "distance=1.000 applied=1.000").replace("fp=3499 frac=0.8678 range=3491..3507 h=0.5049",
+                                                                                             "fp=2449 frac=0.6074 range=2441..2457 h=0.3533"))
+    st, out = statuses(text.replace(w4, w4d))
+    if st.get("DISTANCE LAW") != "PASS" or "varies as 1/d" not in out:
+        fail("a window flown at another panel distance with the footprint scaled by 1/d did not PASS the law: %r\n%s" % (st, out))
+    w4bad = w4d.replace("at1=2449 frac1=0.6075", "at1=3499 frac1=0.8678")
+    st, out = statuses(text.replace(w4, w4bad))
+    if st.get("DISTANCE LAW") != "STOP" or "does NOT vary as 1/d" not in out:
+        fail("a footprint that did not scale with the distance did not STOP the law: %r\n%s" % (st, out))
+    off = text.replace("fp=3497", "fp=3200").replace("fp=3501", "fp=3200").replace("fp=3499", "fp=3200")
+    st, out = statuses(off)
+    if st.get("CALIBRATION") != "WARN" or "m = 1.095" not in out:
+        fail("a measurement 9%% under Sean's 3504 did not WARN and name the m that reproduces it: %r\n%s" % (st, out))
+    st, out = statuses(text.replace("eye=4032x3898", "eye=3296x3186"))
+    if st.get("CALIBRATION") != "n/a":
+        fail("another eye did not read n/a at the calibration point: %r" % (st,))
+    st, out = statuses(re.sub(r"persisted=[0-9.]+", "persisted=no", text))
+    if st.get("STORED") != "WARN" or "needs at least 12 on-foot samples" not in out:
+        fail("on-foot samples with nothing stored did not WARN: %r" % (st,))
+    st, out = statuses(sub(text, "persisted=0.6075 fit=3504", "persisted=0.6075 fit=3856"))
+    if st.get("STORED") != "PASS" or "the next launch fits 3856 wide (this launch: 3504)" not in out:
+        fail("a next launch that would change the width did not say so: %r\n%s" % (st, out))
+    rc, out = report("nothing of the kind\nvr camera census: x\n")
+    if rc != 1 or "no vscreen auto-fit line" not in out:
+        fail("a log with none of the lines did not exit 1 and say so:\n%s" % out)
+
+    # ---- the census verdict reads the render size from the log, never assumes it ----
+    census_path = os.path.join(here, CENSUS_FIXTURE)
+    if os.path.isfile(census_path):
+        census = read_text(census_path)
+        apply_line = "[00:00:01.000] vScreen resolution: 1920x1080 -> 3504x1971 at 6 site(s). This writes to game CODE\n"
+        blind = census.replace("hdr=5040x2835", "hdr=0x0").replace(" px in 5040x2835,", " px in 0x0,")
+        if blind == census:
+            fail("the census fixture has no hdr= or JITTERED size to blank")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_camera_census(apply_line + blind)
+        got = buf.getvalue()
+        if "about 1.8e-04" in got or "NDC at 3504x1971" not in got:
+            fail("with the route's sizes blanked the census verdict did not read the size the panel patch logged (3504x1971):\n%s" % got)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_camera_census(blind)
+        leak = [l for l in buf.getvalue().splitlines() if "(i) LEAK" in l]
+        if len(leak) != 1 or "NDC at" in leak[0] or "the render size is not in this log" not in leak[0]:
+            fail("with no size anywhere in the log the census verdict's LEAK line still assumed one: %r" % (leak,))
+        if route_hdr([], route_events(apply_line)) != (3504, 1971, "the panel patch's `vScreen resolution:` line"):
+            fail("route_hdr did not fall back to the panel patch's line: %r" % (route_hdr([], route_events(apply_line)),))
+    else:
+        fail("the census fixture %s is missing beside this script" % CENSUS_FIXTURE)
+    return ok
 
 
 def self_test_camera_census():
