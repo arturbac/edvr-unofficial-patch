@@ -33,7 +33,9 @@ inline int flatHdrCrumbTests() {
         if (!ok) { std::printf("FAIL: hdr crumbs %s\n", name); ++failures; }
     };
     auto& out = hdr_crumb_rig::lines();
-    const auto fresh = [&] { hdrCrumbReset(); out.clear(); };
+    // A new session on a DXMT device: the device gate (flat_hdr_crumbs.h, THE GATE) open, which only the runtime does, from the markers.
+    // Every section below but the gate's own is the DXMT case.
+    const auto fresh = [&] { hdrCrumbReset(); hdrCrumbEnable(true); out.clear(); };
     const auto written = [&] { return g_hdrCrumbs.written.load(); };
     // One frame as the runtime drives it: the route admits it, it reaches the resolver (or is declined), a step with another
     // inside it, then the Present's end.
@@ -249,6 +251,67 @@ inline int flatHdrCrumbTests() {
     // The budget holds the worst session (DXMT's): three reaching frames, two declined ones, the preflight (about 115) and the
     // explicit capture's 44 group crumbs, with room over.
     expect(kHdrCrumbCap >= 115 + 44 + 16, "the crumb budget holds a session that also writes the explicit capture's eleven groups each way");
+
+    // ---- THE DEVICE GATE: DXMT only. Shut, which is every process the runtime has not told otherwise (every Windows one), the route ----
+    // ---- writes not one crumb, counts nothing and opens nothing; open, it is the route that was written above ------------------
+    hdrCrumbReset();
+    hdrCrumbEnable(false);
+    out.clear();
+    expect(!hdrCrumbEnabled(), "the gate is shut when it is shut");
+    expect(!hdrCrumbArmed("auto") && out.empty() && g_hdrCrumbs.armedSaid == 0,
+           "shut: the armed line, the one line of the trail that is not a frame's, is not written and not counted");
+    for (uint64_t n = 1; n <= 8; ++n) frame(n, n % 2 == 0);   // admitted and declined, admitted and reached, steps, frame ends
+    {
+        HdrCrumbSpan idle(true, "prep", "groups=%ux%u", 1u, 1u);
+        expect(!idle.armed(), "shut: a step, the route's own flag on, is not armed");
+        // The Present hook's pair (device_hook.cpp) and the explicit capture's first-use gates, called as they are called.
+        hdrCrumbWrite("present", "begin");
+        hdrCrumbWrite("present", "end", "hr=0x%08X removed=0x%08X", 0u, 0u);
+        hdrCrumbWrite("capture-ia", "begin");
+        hdrCrumbDeclined("engine-source-not-ready");
+        expect(!hdrCrumbFirstCapture(true) && !hdrCrumbFirstRestore(true) && !g_hdrCrumbs.captureCrumbed && !g_hdrCrumbs.restoreCrumbed,
+               "shut: the explicit capture's per-group gates stay shut and unspent");
+    }
+    expect(out.empty() && written() == 0 && !hdrCrumbLive() && !hdrCrumbPresentSide() && g_hdrCrumbs.reached == 0 &&
+               g_hdrCrumbs.declinedFrames == 0 && !g_hdrCrumbs.frameReached && !g_hdrCrumbs.spent,
+           "shut: eight frames, a Present pair and a declined step write no crumb, count none against the budget, and open no frame");
+    {
+        // Even the budget's own stress writes nothing: a thousand spans inside a frame that cannot open.
+        hdrCrumbAdmit(1, "dlss");
+        hdrCrumbReach(1, "dlss", "resolve");
+        for (int i = 0; i < 1000; ++i) { HdrCrumbSpan spin(true, "spin"); }
+        { HdrCrumbFrameEnd end(0); }
+        expect(out.empty() && written() == 0 && !g_hdrCrumbs.spent, "shut: a thousand spans in an admitted frame write nothing and never start the budget");
+    }
+    // Open, it is the route that was always written, the armed line and the budget included.
+    hdrCrumbEnable(true);
+    expect(hdrCrumbEnabled() && hdrCrumbArmed("auto") && out.size() == 1 && out[0].find("gfx: hdr-treat armed key=auto") == 0,
+           "open: the armed line is written");
+    frame(100, true);
+    expect(t::balanced(t::trail(out)) && out.size() == 11 && t::count(t::trail(out), "reached", "") == 1,
+           "open: a frame writes what it always wrote (ten crumbs and the armed line)");
+    // Shutting it inside a frame ends the frame: no step after it writes, and the frame's end closes nothing and writes nothing.
+    hdrCrumbReset();
+    out.clear();
+    hdrCrumbAdmit(1, "dlss");
+    hdrCrumbReach(1, "dlss", "resolve");
+    expect(hdrCrumbLive() && hdrCrumbPresentSide() && !out.empty(), "open: the frame is live and has written its admission and reach");
+    const size_t beforeShut = out.size();
+    hdrCrumbEnable(false);
+    {
+        HdrCrumbSpan after(true, "prep");
+        hdrCrumbWrite("present", "begin");
+        expect(!hdrCrumbLive() && !hdrCrumbPresentSide() && !after.armed(), "shutting the gate inside a frame ends it: nothing after it is armed");
+    }
+    { HdrCrumbFrameEnd end(0); }
+    expect(out.size() == beforeShut, "and nothing more is written, the frame's end included");
+    // A session reset is not the gate: it says which device this is.
+    hdrCrumbEnable(true);
+    hdrCrumbReset();
+    expect(hdrCrumbEnabled(), "a session reset leaves an open gate open");
+    hdrCrumbEnable(false);
+    hdrCrumbReset();
+    expect(!hdrCrumbEnabled(), "and a shut one shut");
     return failures;
 }
 
@@ -459,5 +522,55 @@ inline int flatHdrCrumbWiringTests() {
                   "makeSharedSurface(shared.dilatedDepth", "HdrCrumbSpan evaluate(hdr, \"backend-evaluate\"", "ffxFsr3UpscalerContextDispatch(&e.ctx, &dd);",
                   "evaluate.close();"},
             "AMD's context creation and dispatch are each crumbed around the port's call");
+
+    // -- THE DEVICE GATE (flat_hdr_crumbs.h): the crumbs are DXMT's alone --
+    const std::string crumbs = slurp("src/d3d11/flat_hdr_crumbs.h");
+    const std::string isolation = slurp("src/d3d11/flat_context_isolation.h");
+    expect(!crumbs.empty() && !isolation.empty(), "the crumbs and the isolation headers are readable from the repo root");
+    // The one writer and the three entry points test the gate first, before any state moves; the gate is the first thing each does.
+    ordered(body(crumbs, "inline void hdrCrumbEmit("), {"if (!hdrCrumbEnabled()) return;", "c.written.fetch_add("},
+            "the one writer tests the device gate before it counts or writes");
+    ordered(body(crumbs, "inline bool hdrCrumbArmed("), {"if (!hdrCrumbEnabled() || c.armedSaid >= 3) return false;", "++c.armedSaid;", "breadcrumb(line);"},
+            "the armed line tests the device gate before it counts or writes");
+    ordered(body(crumbs, "inline void hdrCrumbAdmit("), {"if (!hdrCrumbEnabled() || c.reached >= kHdrCrumbFrames || c.spent) return;", "c.live.store(true"},
+            "a frame is admitted only through the device gate");
+    ordered(body(crumbs, "inline void hdrCrumbReach("), {"if (!hdrCrumbEnabled() || c.frameReached || c.reached >= kHdrCrumbFrames || c.spent) return;", "c.live.store(true"},
+            "a frame reaches the resolver, for the crumbs, only through the device gate");
+    expect(count(crumbs, "live.store(true") == 2 && count(crumbs, "breadcrumb(line);") == 2,
+           "the frame goes live in exactly two places (admit and reach) and the header writes through breadcrumb() in exactly two (the writer and the armed line), all gated");
+    ordered(body(crumbs, "inline void hdrCrumbEnable("), {"c.enabled.store(on", "if (!on) c.live.store(false"},
+            "shutting the gate lowers a frame in progress");
+    // Every crumb line is written by that header and by nothing else: no other file starts a string literal with the route's prefix.
+    {
+        size_t others = 0;
+        std::string where;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator("src")) {
+            if (!entry.is_regular_file()) continue;
+            const std::string ext = entry.path().extension().string();
+            if (ext != ".cpp" && ext != ".h" && ext != ".hpp") continue;
+            const std::string name = entry.path().generic_string();
+            if (name == "src/d3d11/flat_hdr_crumbs.h") continue;
+            if (slurp(name.c_str()).find("\"gfx: hdr-treat") != std::string::npos) { ++others; where += " " + name; }
+        }
+        expect(others == 0, "no file but the crumbs header writes a line that starts \"gfx: hdr-treat\", so nothing bypasses the gate");
+        if (others) std::printf("  (also written in:%s)\n", where.c_str());
+    }
+    // The runtime opens the gate from the markers, once, before the route's accounting and before the key's first read arms the trail,
+    // and the isolation key has no part in it.
+    ordered(runtime, {"if (!s.crumbGateRead) {", "s.crumbGateRead = true;", "hdrCrumbEnable(flatCrumbsWantedFor(flatDetectDxmt(s.device.Get(), s.context.Get())));",
+                      "hdrFrameEnd(s, frame);", "hdrReadKey(s, frame);"},
+            "the runtime sets the crumbs' gate from the DXMT markers, once, before the route's frame accounting and before the key's first read arms the trail");
+    {
+        const size_t g = runtime.find("if (!s.crumbGateRead) {");
+        const size_t gEnd = g == std::string::npos ? g : runtime.find("\n    }\n", g);
+        const std::string gate = (g == std::string::npos || gEnd == std::string::npos) ? std::string() : runtime.substr(g, gEnd - g);
+        expect(!gate.empty() && gate.find("isolation") == std::string::npos && gate.find("Isolation") == std::string::npos &&
+                   gate.find("getString") == std::string::npos && gate.find("Config") == std::string::npos,
+               "the gate is the detection alone: forcing the capture on Windows (advanced.flat_context_isolation) cannot open it");
+    }
+    expect(count(runtime, "hdrCrumbEnable(") == 1 && count(slurp("src/d3d11/device_hook.cpp"), "hdrCrumbEnable(") == 0,
+           "the runtime opens the gate in one place, and nothing else does");
+    expect(isolation.find("inline bool flatCrumbsWantedFor(const FlatDxmtDetection& d) { return d.dxmt(); }") != std::string::npos,
+           "the gate's question is the markers' answer and no argument but the detection");
     return failures;
 }

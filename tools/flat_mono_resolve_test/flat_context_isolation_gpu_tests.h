@@ -672,6 +672,18 @@ inline void decisionTests(ID3D11Device* device, ID3D11DeviceContext* context) {
         check(c(FlatContextIsolation::Swap, positive).mode == FlatContextIsolation::Swap && c(FlatContextIsolation::Swap, positive).forced &&
                   c(FlatContextIsolation::Capture, none).mode == FlatContextIsolation::Capture && c(FlatContextIsolation::Capture, none).forced,
               "isolation: a forced mode is honoured whatever the device says");
+        // The breadcrumbs' device gate is the markers' answer and nothing else: no key, no isolation mode is an argument, so forcing the
+        // capture on a Windows device (or anywhere) cannot open it, and forcing the swap on DXMT cannot shut it.
+        check(!flatCrumbsWantedFor(none) && flatCrumbsWantedFor(adapterOnly) && flatCrumbsWantedFor(positive) && flatCrumbsWantedFor(both),
+              "isolation: the crumbs' gate is open for a device any marker calls DXMT (the adapter name included), and shut for one none does");
+        bool independent = true;
+        for (const FlatContextIsolation request : {FlatContextIsolation::Auto, FlatContextIsolation::Swap, FlatContextIsolation::Capture})
+            for (const FlatDxmtDetection* d : {&none, &adapterOnly, &positive, &both})
+                independent = independent && flatCrumbsWantedFor(*d) == d->dxmt() &&
+                              (request != FlatContextIsolation::Capture || d->dxmt() || !flatCrumbsWantedFor(*d));
+        check(independent && flatChooseContextIsolation(FlatContextIsolation::Capture, none).mode == FlatContextIsolation::Capture && !flatCrumbsWantedFor(none) &&
+                  flatChooseContextIsolation(FlatContextIsolation::Swap, positive).mode == FlatContextIsolation::Swap && flatCrumbsWantedFor(positive),
+              "isolation: forcing the capture on a device no marker calls DXMT leaves the crumbs' gate shut, and forcing the swap on a DXMT device leaves it open");
         // The one line, for each case.
         char line[512];
         flatFormatContextIsolationLine(c(FlatContextIsolation::Auto, none), none, line, sizeof(line));
@@ -749,9 +761,10 @@ inline void blockTests(Fixture& fx) {
         check(filled, "isolation: the game's state has an object in every stage, every range's ends and middle, both UAV kinds, SO, predication and the D3D11.1 windows");
     }
 
-    // ---- the cycle the resolver makes, with the crumbs live -----------------------------------------------------------------
+    // ---- the cycle the resolver makes, with the crumbs live (the DXMT case: the crumbs' device gate open) --------------------------
     crumbLines.clear();
     edvr::hdrCrumbReset();
+    edvr::hdrCrumbEnable(true);
     edvr::hdrCrumbAdmit(1, "dlss");
     edvr::hdrCrumbReach(1, "dlss", "resolve");
     FlatContextState block;
@@ -987,6 +1000,7 @@ inline void resolverTests(ID3D11Device* device, ID3D11DeviceContext* context, Fi
         isolationLines.clear();
         crumbLines.clear();
         edvr::hdrCrumbReset();
+        edvr::hdrCrumbEnable(true);   // the DXMT case; the gate shut (every Windows device) is flat_hdr_route_gpu_tests.h's (g), forced capture included
 
         // The game's state bound from scratch, its snapshot, and its objects' reference counts as they stand with it bound.
         std::vector<ULONG> refsBase;
@@ -1184,6 +1198,7 @@ inline void contextIsolationGpuTests(ID3D11Device* device, ID3D11DeviceContext* 
     blockTests(fx);
     resolverTests(device, context, fx);
     context->ClearState();
+    edvr::hdrCrumbEnable(false);   // the rig's default for whoever runs next: shut, as on a Windows device
 }
 }  // namespace isogpu
 

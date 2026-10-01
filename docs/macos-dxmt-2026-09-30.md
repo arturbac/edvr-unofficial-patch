@@ -5,35 +5,41 @@ D3D11-to-Metal layer. One rc.4 log from that setup showed the flat runtime
 treating no frames at all; two later logs show the game exiting about 30 s in,
 a run with the HDR route's key off shows its first treatment is the trigger,
 and the crumbs then named the step: DXMT aborts in SwapDeviceContextState.
-Read the Status block first.
+The explicit capture that replaces it flew clean: the HDR route runs on the Mac,
+with DLSS and FSR. Read the Status block first.
 
 ## Status
 
-- **State (2026-09-30, night):** the crumbs found the step. On
-  v0.18.0-rc.4-69-ge44db9c2 (bundle `edvr-logs-20260930-163519.zip`; CrossOver,
-  DXMT, Apple M4 Max, key `auto`, DLSS) the trail ends at `capture-state begin`,
-  the first step of the HDR route's first treatment, and CrossOver's log has
-  DXMT saying `SwapDeviceContextState is not implemented.`, then `raise (22)`
-  (abort), then `LdrShutdownProcess`. The resolver isolates the game's pipeline
-  state with that call, and DXMT aborts in it. Nothing after it had run.
-- **Fix, built and rig-tested on WARP (no debug layer), NOT FLOWN** (branch `claude/hdr-route-crumbs`): on
-  a DXMT device the resolver isolates by an explicit capture and restore of the
-  whole context state (`flat_context_state.h`); every other device keeps the
-  swap, unchanged. DXMT is recognised by its own markers, the adapter name only
-  as the fallback (`flat_context_isolation.h`). Key
-  `advanced.flat_context_isolation = auto|swap|capture`, for testing.
-- **Next flight:** that build on the Mac, key `auto`, DLSS. The log should say
-  `flat resolver: context isolation by explicit state capture (DXMT: ...)`; the
-  crumbs `capture-state begin by=capture`, eleven `capture-...` groups whose end
-  lines say what Elite had bound, then the steps after them. If the process ends
-  again the last crumb and CrossOver's `err:` line name the next call. Watch
-  DLSS's evaluate: this CrossOver redirects `nvngx.dll` to D3DMetal's while the
-  backend is DXMT (`redirect_nvngx_to_d3dmetal`); an FSR run separates that.
-- **Hypotheses:** (1) confirmed and now named: the first treatment's first call,
-  the context state swap; what DXMT refuses after it is open (the prep and
-  finish shaders and the backend's HDR flags had not run); (3) confirmed as the
-  mechanism: a DXMT fatal error (UNIMPLEMENTED aborts) that ends the process
-  without an exception; (2) ruled out, below. Detail: the last three entries.
+- **State (2026-09-30, night): the exit is SOLVED by the explicit capture, and
+  the HDR route runs on the Mac.** On v0.18.0-rc.4-114-g20031385 (bundle
+  `edvr-logs-20260930-175527.zip`; CrossOver, DXMT, Apple M4 Max, key `auto`)
+  the isolation line names all four DXMT markers, DLSS is created for the HDR
+  route, and so is FSR after a menu switch. Every full 5 s window from 17:53:23
+  to 17:53:58 reads `state=active`, frames=265-300, treated equal to frames,
+  declined=0, late-hdr-writes=0. The cause was DXMT aborting in
+  `SwapDeviceContextState` (the crumbs entry names the step).
+- **By eye (Sean, Mac, this build):** "Black floor outlines went away and
+  everything looks aliased appropriately, tested with bloom and DoF on as
+  well." Read: the outlines are gone, the edges are anti-aliased as they should
+  be, and it holds with Elite's bloom and depth of field on. The copy route
+  refuses that chain on the Mac (`no-known-tone-pass`); the HDR route resolves
+  before bloom and DoF. The visual check is closed.
+- **On main:** on a DXMT device the resolver isolates by an explicit capture and
+  restore of the whole context state (`flat_context_state.h`); every other
+  device keeps the swap, unchanged. DXMT is recognised by its own markers, the
+  adapter name only as the fallback (`flat_context_isolation.h`); key
+  `advanced.flat_context_isolation = auto|swap|capture`, for testing. The
+  `gfx: hdr-treat` crumbs stay, DXMT-only: the markers open their gate, the key
+  cannot, and Windows gets none in `edvr_breadcrumbs.txt` (`flat_hdr_crumbs.h`,
+  THE GATE). The 5 s line's step counts stay everywhere.
+- **Still open:** CrossOver's DXMT is another revision than DXMT main (its "not
+  implemented" wording differs). Every call the capture makes ran on it, three
+  frames and both ways, with no DXMT error line; what else differs is unknown.
+  The route also took no frames at the session's start (to frame 1650) and from
+  17:53:59 on (`no-known-tone-pass`, a stand-down, probes to the end of the
+  log); the log does not say what was on screen.
+- **Hypotheses:** none open. (1) and (3) confirmed and fixed (the swap, a DXMT
+  fatal error that ends the process without an exception); (2) ruled out below.
 - **The key-off run** (`..._144722.log`, DLSS): the copy route refused every
   frame (`no-observed-hdr-writes`, then `no-known-tone-pass`), treated=0,
   stand-down at frame=3736, F8 warning shown. The HDR route, observing, would
@@ -42,14 +48,12 @@ Read the Status block first.
   target, R10G10B10A2_TYPELESS, is the G-buffer; Windows draws one too. The flat
   runtime's HDR checks are written for format 26 (`flatHdrCandidateDraw`;
   `k.format != 26` in `flat_mono_frame.h`); why rc.4 saw no HDR writes is open.
-- **DXMT's signature:** "47 of 49 d3d11 exports did not resolve" (DXMT's
-  d3d11.dll has 2 of the 49 the proxy forwards); the adapter line reports
-  `vendor=0x10DE` for "Apple M4 Max".
-- **The damage (rc.4):** black outlines on floor markings; engine motion's
-  substitution and the overlay guard kept running on refused frames, 1,719
-  full-frame copies, 101 GB in 30 s. Main's stand-down (`flat_standdown.h`,
-  ce6d511a) pauses that after 5 s of `no-known-tone-pass`; `no-observed-hdr-writes`
-  is not structural, so a session that stays on it is not stood down.
+- **DXMT's signature:** "47 of 49 d3d11 exports did not resolve" (it has 2 of
+  the 49 the proxy forwards); `vendor=0x10DE` for "Apple M4 Max".
+- **The damage (rc.4):** black outlines on floor markings, gone on the fix build
+  by eye; engine motion's substitution and the overlay guard ran on refused
+  frames (1,719 full-frame copies, 101 GB in 30 s), now paused by main's
+  stand-down (`flat_standdown.h`, ce6d511a) after 5 s of `no-known-tone-pass`.
 - ruled out: "DXMT offers less for R11G11B10_FLOAT, so Elite renders its world
   in R10G10B10A2", because DXMT reports full R11G11B10_FLOAT support, the scene
   HDR target is R11G11B10_FLOAT on the Mac as on Windows, and the format-23
@@ -59,10 +63,9 @@ Read the Status block first.
   with the overlay guard active. Evidence: the key-off entry.
 - ruled out: the route's creations (shaders, private textures, the target view)
   as the cause of the exit, because every one returned hr=0 and the trail runs
-  past `create-rtv end` to `capture-state begin`. Evidence: the newest entry.
-- **Decision (Sean, 2026-09-30):** no DXMT guard that turns the HDR route off
-  on Apple adapters ("we'll fix crossover properly"). The route gets fixed on
-  DXMT.
+  past `create-rtv end` to `capture-state begin`. Evidence: the crumbs entry.
+- **Decision (Sean, 2026-09-30):** no DXMT guard that turns the HDR route off on
+  Apple adapters ("we'll fix crossover properly"); the route gets fixed on DXMT.
 
 ## 2026-09-30: the instrument
 
@@ -379,3 +382,109 @@ are seconds of the same counter.
    and what comes after the swap (the prep dispatch, the DLSS evaluate, the
    finish draw). The CrossOver log's environment block has `DXMT_ENABLE_NVEXT=1`,
    `D3DM_ENABLE_METALFX=1` and `CX_GRAPHICS_BACKEND=dxmt`.
+
+## 2026-09-30: the fix flew on the Mac, and the crumbs go DXMT-only
+
+Sean ran the fix build on the Mac: v0.18.0-rc.4-114-g20031385 (build 6ABD9EAC,
+linked 2026-09-30 23:43 UTC), CrossOver with DXMT, adapter "Apple M4 Max", key
+`auto`. Evidence: the bundle `edvr-logs-20260930-175527.zip`
+(`edvr_gfx_20260930_175233.log`, `edvr_breadcrumbs.txt`) and CrossOver's log,
+`Steam 3.cxlog`. The log runs 17:52:33 to 17:55:18. The game was still running
+when the bundle was taken: the last `alive` crumb is frame 8935 and there is no
+`process exit`.
+
+1. The isolation line, at the first resolver initialisation (17:52:59.971, and
+   again at 17:53:13.385 when a mode switch rebuilt the renderer):
+
+       flat resolver: context isolation by explicit state capture (DXMT: device interface IMTLD3D11DeviceExt, context interface IMTLD3D11ContextExt, module version resource ProductName=DXMT, adapter name "Apple M4 Max")
+
+   All four markers answered on CrossOver's DXMT, so its private interfaces
+   and version resource are the ones DXMT main has, and the adapter-name
+   fallback was not needed.
+
+2. The first treated frame, in the crumbs (frame 1653; frames 1651 and 1652 had
+   been declined for `engine-source-not-ready`). Every step ran and balanced,
+   and so did the next two frames (2/3 and 3/3, reset=0). What Elite had bound
+   at that draw, from the capture's end lines:
+
+       capture-ia end layout=1 vb=1 ib=0 topology=5
+       capture-vs end shader=1 srv=0 cb=3 sampler=1
+       capture-hs, capture-ds, capture-gs end shader=0 srv=0 cb=0 sampler=0
+       capture-ps end shader=1 srv=1 cb=2 sampler=3
+       capture-cs end shader=0 srv=0 cb=3 sampler=2 uav=0
+       capture-so end targets=0
+       capture-om end rtv=1 dsv=0 uav=0 blend=1 depth-stencil=1
+       capture-rs end state=1 viewports=1 scissors=1
+       capture-predication end predicate=0 value=0
+
+   A triangle-strip draw into one target, with a small state. The flight read
+   every group but set back only the ones with something in them: DXMT's Set
+   paths for hull, domain and geometry shaders, stream output, UAVs, the index
+   buffer, a depth view and predication have not run with objects in them on the
+   Mac (the rig has run them on WARP). Then, in order: `backend-available`
+   ok=1, `copy-h`, `prep groups=640x180`, `backend-query`, `backend-create ngx
+   feature in=5120x1440 out=5120x1440 quality=5 flags=0x4B`, `backend-evaluate`
+   (685 ms the first time, which holds the feature's first run; 0 to 1 ms on
+   the next two), `finish-bind`, `finish-draw`, the eleven `restore-` groups,
+   `before-present`, `present end hr=0x00000000 removed=0x00000000`, `frame-end`.
+   The capture took 4 ms the first time and under 1 ms after.
+
+3. DLSS and FSR, both:
+
+       17:53:00.023 dlaa: NGX initialised in 50 ms on device 000000000080B8C8.
+       17:53:00.053 dlss: the feature for eye 0 was created for the flat HDR route: HDR input and automatic exposure (IsHDR | AutoExposure with MVLowRes | DepthInverted); the history starts here.
+       17:53:05.582 menu: fix.temporal_aa dlss -> fsr (written to edvr-flat.ini; live).
+       17:53:05.616 fsr3: first asked for on Apple M4 Max, AMD's port version fsr 3.1.2.
+       17:53:05.628 fsr3: the context is created for eye 0 at 5120x1440 -> 5120x1440, HDR input with automatic exposure (the flat HDR route); its three working surfaces take 84.4 MB ...; the history starts here (made in 11 ms).
+
+   DLSS runs through CrossOver's nvngx redirect: `Steam 3.cxlog` has three
+   `redirect_nvngx_to_d3dmetal HACK: redirecting nvngx.dll to D3DMetal original`
+   lines, the first 71 ms before the capture of the first treated frame. Sean
+   then switched modes in the menu, from dlss to fsr, back to dlss, on, off, on,
+   dlss, fsr and dlss again (17:53:05 to 17:53:17), and the process went on.
+
+4. The route's 5 s windows. 17:53:03 to 17:53:18 are the mode switches
+   (frames=186 treated=182 declined=2; 280/282/0; 220/219/2; 288/291/0). Then
+   eight windows, 17:53:23 to 17:53:58, each `state=active`, frames=265-300,
+   treated equal to frames, declined=0, late-hdr-writes=0, and
+   `steps: admitted=reached=captured=copied=prepped=backend=finished=restored`
+   equal to treated in every one. `Steam 3.cxlog` has no DXMT "not
+   implemented" line and no `trace:seh:raise` at all.
+
+5. By eye, Sean on the Mac with this build: "Black floor outlines went away and
+   everything looks aliased appropriately, tested with bloom and DoF on as
+   well." Read: the black outlines are gone, the edges are anti-aliased as they
+   should be, and it holds with Elite's bloom and depth of field on. On the Mac
+   the copy route refuses that chain (`no-known-tone-pass`); the HDR route
+   resolves H before bloom and DoF, so they run on the resolved image. This
+   closes the open item "Sean confirms by eye that the outlines are gone".
+
+6. After the good minute the route took no frames again. 17:53:59.737 `flat
+   runtime early fallback: frame=5088 temporal=no-known-tone-pass`; 17:54:01.728
+   engine motion released its on-foot source (`no on-foot source for 120
+   frames`, frame 5208); 17:54:04.745 `flat stand-down: entered at frame=5388:
+   every frame for 5.0 s (301 frames) was refused for no-known-tone-pass`; the
+   windows read frames=3-4 and treated=0 to the end of the log, with 39 probes
+   by 17:55:04 (the last one `no-known-tone-pass`). The session's start looked the same
+   (stand-down at 17:52:40, `first trigger at frame=1650` at 17:52:59, "resumed
+   ... after 19.8 s stood down (13 probes)"). The log does not say what was on
+   screen either time. This is the refusal rc.4 already had where Elite's chain
+   is not recognised; the fix did not touch it.
+
+7. The crumbs go DXMT-only (this commit). The exit is solved, and the crumbs are
+   still the way to see what DXMT does with the next call, so they stay, on DXMT
+   and nowhere else. The flat runtime opens a gate once, at the first Present with
+   a temporal mode on, from the markers alone (`flatCrumbsWantedFor`); every
+   `gfx: hdr-treat` writer, the `armed` line, `admitted`, `reached`, `declined`,
+   every span, the frame end, the Present hook's pair and the capture's eleven
+   groups, returns before it touches any state while the gate is shut. The
+   isolation key is not asked: `advanced.flat_context_isolation=capture` on a
+   Windows device runs the capture and writes no crumb, and `swap` on a DXMT
+   device keeps them. On Windows `edvr_breadcrumbs.txt` gets none of them, the
+   "crash-safe trail on" log line is not written, and the budget never starts.
+   The 5 s line's step counts are plain counters and stay everywhere. Pinned in
+   `flat_temporal_test` (the gate in each writer, the runtime's one call, no other
+   file writing a `gfx: hdr-treat` line, the gate never reading the key; five
+   broken gates each fail it) and in `flat_mono_resolve_test` (a preflight, three
+   resolves, a refused backend and a recovery write no crumb with the gate shut,
+   swap and forced capture alike, while the step counts count them).

@@ -427,6 +427,9 @@ inline void hdrRouteGpuTests(ID3D11Device* device, ID3D11DeviceContext* context)
     // not the route's writes nothing, and after the third frame to reach the resolver the resolver writes nothing at all.
     {
         namespace ct = hdr_crumb_trail;
+        // Everything in this block but (g) is the DXMT case: the crumbs' device gate (flat_hdr_crumbs.h, THE GATE) is open, which the
+        // runtime does from the markers and WARP's device would not answer. (g) shuts it, as it is on every Windows device.
+        edvr::hdrCrumbEnable(true);
         const auto inOrder = [&](const std::vector<ct::Crumb>& trail, std::initializer_list<std::pair<const char*, const char*>> steps) {
             int at = -1;
             for (const auto& step : steps) {
@@ -659,6 +662,61 @@ inline void hdrRouteGpuTests(ID3D11Device* device, ID3D11DeviceContext* context)
                   "breadcrumbs: the copy route's resolve and its recovery are not counted as the HDR route's steps");
         }
         { edvr::HdrCrumbFrameEnd end(0); }
+
+        // (g) THE DEVICE GATE: the same route with the gate shut, as the runtime leaves it on every device the markers do not call DXMT.
+        // A cold preflight, three frames that reach the resolver, a refused backend and a spatial recovery write not one crumb, the armed
+        // line included, and the 5 s line's step counts count the frames all the same (they are plain counters, read into a log line).
+        // The same again with the explicit capture FORCED (advanced.flat_context_isolation=capture), which is what a tester on Windows
+        // would do: the capture runs, and the gate, which is the detection's alone, stays shut.
+        for (const bool forcedCapture : {false, true}) {
+            restart();
+            edvr::hdrCrumbEnable(false);
+            edvr::flatMonoResolveSetIsolation(forcedCapture ? edvr::FlatContextIsolation::Capture : edvr::FlatContextIsolation::Auto);
+            edvr::flatMonoResolveReset();
+            const char* what = forcedCapture ? "breadcrumbs, gate shut, capture forced" : "breadcrumbs, gate shut";
+            char name[200];
+            const auto say = [&](const char* text) { std::snprintf(name, sizeof(name), "%s: %s", what, text); return name; };
+            check(!edvr::hdrCrumbArmed("auto") && crumbLines.empty(), say("the armed line is not written"));
+            {
+                edvr::FlatMonoResolvePreflight planned{};
+                planned.renderWidth = w; planned.renderHeight = h; planned.outputWidth = w; planned.outputHeight = h;
+                planned.mode = FlatMonoResolveMode::Dlss; planned.hdr = true;
+                planned.colorViewFormat = DXGI_FORMAT_R11G11B10_FLOAT; planned.depthViewFormat = DXGI_FORMAT_R32_FLOAT;
+                edvr::hdrCrumbAdmit(f.frame, "dlss");
+                edvr::HdrCrumbFrameEnd end(0);
+                check(edvr::flatMonoResolvePreflight(device, context, planned).readyForRasterJitter(), say("the preflight is the one that was always ready"));
+            }
+            const auto gate0 = edvr::flatMonoResolveStats();
+            for (int n = 0; n < 3; ++n) {
+                f.reset = n == 0; ++f.frame;
+                routeFrame("dlss", [&] { run(true); });
+            }
+            const auto gate1 = edvr::flatMonoResolveStats();
+            backendFail = true;
+            f.reset = true; ++f.frame;
+            routeFrame("dlss", [&] { run(false); });
+            backendFail = false;
+            edvr::hdrCrumbAdmit(f.frame, "dlss");
+            edvr::hdrCrumbReach(f.frame, "dlss", "spatial-recovery");
+            {
+                bindOriginal();
+                ComPtr<ID3D11ShaderResourceView> noView; const char* recoverWhy = nullptr;
+                check(edvr::flatMonoResolveSpatialFallback(device, context, f, noView.GetAddressOf(), &recoverWhy) && restored(), say("the recovery still recovers"));
+            }
+            { edvr::HdrCrumbFrameEnd end(0); }
+            check(crumbLines.empty() && edvr::g_hdrCrumbs.written.load() == 0 && !edvr::hdrCrumbLive() && edvr::g_hdrCrumbs.reached == 0 && !edvr::g_hdrCrumbs.spent,
+                  say("a preflight, three resolves, a refused backend and a recovery write no crumb at all and start no budget"));
+            check(gate1.hdrCaptured - gate0.hdrCaptured == 3 && gate1.hdrCopied - gate0.hdrCopied == 3 && gate1.hdrPrepped - gate0.hdrPrepped == 3 &&
+                      gate1.hdrBackend - gate0.hdrBackend == 3 && gate1.hdrFinished - gate0.hdrFinished == 3 && gate1.hdrRestored - gate0.hdrRestored == 3,
+                  say("the 5 s line's step counts count all three frames at every step, as they do with the gate open"));
+            const auto gate2 = edvr::flatMonoResolveStats();
+            check(forcedCapture ? (gate2.isolationCaptures > gate0.isolationCaptures && gate2.isolation && !std::strcmp(gate2.isolation, "capture"))
+                                : (gate2.isolationSwaps > gate0.isolationSwaps && gate2.isolation && !std::strcmp(gate2.isolation, "swap")),
+                  say(forcedCapture ? "the explicit capture ran (it is forced) and wrote no crumb: the gate is the markers', not the key's"
+                                    : "the swap ran, as on every Windows device"));
+        }
+        edvr::flatMonoResolveSetIsolation(edvr::FlatContextIsolation::Auto);
+        edvr::hdrCrumbEnable(true);   // (the gate is open again for the printout below, which the cold-resolve count came from)
         edvr::hdrCrumbReset();
         // What it comes to, for the cap (flat_hdr_crumbs.h, WHAT IT COSTS): the real thing adds the depth view (2), the SDK's own
         // create and evaluate (2 and 2), before-present (2) and the Present (2) that only the game's process can write.
@@ -666,5 +724,7 @@ inline void hdrRouteGpuTests(ID3D11Device* device, ID3D11DeviceContext* context)
                     "(resolver, admission and frame end; the game's process adds 6 more a frame), a cold resolve %zu; the budget is %u and a frame "
                     "past the third writes none\n", coldPreflightCrumbs, sizes[0], sizes[2] - sizes[1], coldFrameCrumbs,
                     static_cast<unsigned>(edvr::kHdrCrumbCap));
+        // The rig's default for whoever runs next: the gate shut, as on a Windows device.
+        edvr::hdrCrumbEnable(false);
     }
 }

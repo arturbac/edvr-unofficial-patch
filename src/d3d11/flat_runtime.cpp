@@ -271,6 +271,7 @@ struct State {
     bool gpuFrameTried = false;                   // this frame already tried to open its span
     bool censusHooked = false;                    // the resolver's span hooks are installed
     bool isolationRead = false;                   // advanced.flat_context_isolation is handed to the resolver (once, before its first call)
+    bool crumbGateRead = false;                   // the HDR route's breadcrumbs gate has been set from the DXMT markers (once, first)
 };
 // Driver objects retire on the owner Present; never release under loader lock.
 State& state() { static State* p = new State; return *p; }
@@ -1689,7 +1690,8 @@ static void hdrReadKey(State& s, uint64_t frame) {
     if (key == FlatHdrKey::Off) { s.hdrLatch.reset(); s.hdrEligible = false; }
     // The crash-safe trail's first line (flat_hdr_crumbs.h): proof, in edvr_breadcrumbs.txt itself, that this build has the
     // crumbs and that the route is on, so a trail without an "admitted" after it is a session that ended before the route
-    // took a frame, and a file without it came from a build that has none. The log says so too, for whoever reads it first.
+    // took a frame, and a file without it came from a build that has none or from a device that is not DXMT's (the gate: this
+    // writes nothing, and the log says nothing, off DXMT). The log says so too, for whoever reads it first.
     if (key == FlatHdrKey::Auto && hdrCrumbArmed(flatHdrKeyName(key)))
         Log::get().note("flat hdr route: crash-safe trail on: edvr_breadcrumbs.txt gets a line before and after every step of the first "
                         "%u frames that reach the resolver, at most %u lines a session; if the process ends inside the treatment, the last "
@@ -1856,6 +1858,13 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         engineConfiguredPaused = s.enginePaused;
         engineVelocityConfigure(enabled && !s.enginePaused);
     };
+    // The HDR route's breadcrumbs are DXMT's alone (flat_hdr_crumbs.h, THE GATE): the markers decide, once, here, with the device
+    // in hand and before the key's first read arms the trail. Only the detection decides: advanced.flat_context_isolation is not
+    // asked, so forcing the capture on a Windows device writes no crumb. The 5 s line's step counts below do not depend on it.
+    if (!s.crumbGateRead) {
+        s.crumbGateRead = true;
+        hdrCrumbEnable(flatCrumbsWantedFor(flatDetectDxmt(s.device.Get(), s.context.Get())));
+    }
     // The HDR route (flat_hdr_route.h): the frame that just ended is accounted, then the key is read for the frame that
     // starts now. Before the stand-down reads the frame's verdict, which the route may have added to.
     hdrFrameEnd(s, frame);

@@ -26,7 +26,8 @@
 //                      vendor id). Only the fallback: it alone makes the decision when no other marker answered, because
 //                      D3DMetal and MoltenVK devices carry Apple names too and the explicit capture is safe on any device.
 //
-// A device with none of them is a device whose swap works.
+// A device with none of them is a device whose swap works, and whose breadcrumbs file stays empty of the HDR route's crumbs
+// (flatCrumbsWantedFor).
 #pragma once
 
 #include <windows.h>
@@ -165,6 +166,11 @@ inline FlatContextIsolationChoice flatChooseContextIsolation(FlatContextIsolatio
     }
     return c;
 }
+
+// The HDR route's breadcrumbs (flat_hdr_crumbs.h) are DXMT's alone: a device that any marker calls DXMT opens their gate, and
+// nothing else does. The isolation request is deliberately not an argument: advanced.flat_context_isolation=capture on a Windows
+// device changes how the resolver isolates the game's state, and turns no crumb on.
+inline bool flatCrumbsWantedFor(const FlatDxmtDetection& d) { return d.dxmt(); }
 
 // "device interface IMTLD3D11DeviceExt, context interface IMTLD3D11ContextExt, module version resource ProductName=DXMT,
 // adapter name "Apple M4 Max"": what answered, in that order. "none" when nothing did.

@@ -8,20 +8,37 @@
 // (engine-source-not-ready), engine motion's "substitution starts", and then nothing. Which step of the treatment
 // ends the process is therefore not in the log. It is in edvr_breadcrumbs.txt, if the steps write there.
 //
-// HOW THE FILE IS WRITTEN (answered, not assumed). breadcrumb() (src\common\proxy.cpp) builds the path by hand, opens
+// THAT EXIT IS SOLVED, AND THE CRUMBS STAY FOR DXMT ONLY (docs\macos-dxmt-2026-09-30.md). The trail named the step: DXMT
+// aborts in ID3D11DeviceContext1::SwapDeviceContextState, and the resolver now isolates by an explicit capture there
+// (flat_context_state.h). The Mac flight that carried it ran the route's treatment for minutes, DLSS and FSR both. The
+// crumbs are still the way to see what DXMT does with the next call EDVR makes, so they stay, written on DXMT and on
+// nothing else:
+//
+// THE GATE. Nothing here writes unless the flat runtime has found the device to be DXMT's and said so with
+// hdrCrumbEnable(true). The finding is the markers' (flat_context_isolation.h: the device's or the context's private
+// interface, the module's version resource, an adapter name that begins Apple), made once, at the first Present with a
+// temporal mode on, before the route's key is first read. The gate is that detection and nothing else:
+// advanced.flat_context_isolation=capture on a Windows device changes how the resolver isolates the game's state and
+// turns no crumb on. With the gate shut every writer below returns before it touches any state: the armed line,
+// admitted, reached and declined, every span (the resolver's, the backends', the explicit capture's eleven groups), the
+// frame end, and the Present hook's pair. edvr_breadcrumbs.txt on Windows holds none of them, and the budget is never
+// started. What stays on every device is no crumb: the 5 s line's step counts (FlatMonoResolveStats::hdrCaptured and the
+// rest, the route's own window) are plain counters read into a log line.
+//// HOW THE FILE IS WRITTEN (answered, not assumed). breadcrumb() (src\common\proxy.cpp) builds the path by hand, opens
 // edvr_breadcrumbs.txt for FILE_APPEND_DATA, calls WriteFile ONCE with the whole line, and closes the handle, every
 // call. No buffer of ours stands between the call and the operating system: no stdio, no log ring, no flusher thread.
 // When breadcrumb() returns the line is in the OS's (under Wine, the host's) file cache, and a process that dies
 // afterwards, by any route, leaves it there. It is not FILE_FLAG_WRITE_THROUGH, which only matters if the machine
 // itself goes down. So these crumbs use it as it is, and the last line of the file names the last step that began.
 //
-// THE RULES. (1) The first kHdrCrumbFrames frames of a session that REACH the resolver write a crumb before and after
-// every step, from the route's selection to the frame's Present. A frame the route admits but declines before it gets
-// there (engine motion not ready yet, say) does not use one of the three up: it writes "admitted" and "declined" and
-// its own frame end, for at most kHdrCrumbDeclined such frames, so a run of early declines cannot spend the trail
-// before the first real treatment and cannot hide it. (2) The whole session writes at most kHdrCrumbCap crumbs, the
-// last of them a line saying the budget ran out. (3) After the third frame, and after the budget, every site costs
-// one relaxed load and one branch: nothing is formatted, nothing is written. (4) Crumbs change nothing the route does.
+// THE RULES, every one of them behind THE GATE above. (1) The first kHdrCrumbFrames frames of a session that REACH the
+// resolver write a crumb before and after every step, from the route's selection to the frame's Present. A frame the route
+// admits but declines before it gets there (engine motion not ready yet, say) does not use one of the three up: it writes
+// "admitted" and "declined" and its own frame end, for at most kHdrCrumbDeclined such frames, so a run of early declines
+// cannot spend the trail before the first real treatment and cannot hide it. (2) The whole session writes at most
+// kHdrCrumbCap crumbs, the last of them a line saying the budget ran out. (3) After the third frame, and after the budget,
+// every site costs one relaxed load and one branch: nothing is formatted, nothing is written. (4) Crumbs change nothing the
+// route does.
 //
 // THE LINE. "gfx: hdr-treat K/3 <step> [begin|end] [detail]", after the stamp breadcrumb() puts in front of every
 // line. K is the frame's number among those that reach the resolver (1, 2 or 3); before a frame has reached it, it is
@@ -30,9 +47,10 @@
 // carries the result (hr=0x.., ok=..); E_PENDING (0x8000000A) in an hr field means that call was never reached.
 //
 // ONE LINE TELLS THE TRAIL FROM NO TRAIL. "gfx: hdr-treat armed key=auto frames=3 declined=3 cap=192" is written once when
-// the route is switched on (the key read as auto, at startup or later; three a session at most, outside the budget). A
-// file with no such line came from a build without these crumbs. A file with it and no "admitted" after it is a session
-// that ended before the route took a frame. One with "admitted" and nothing after names the step the route was in.
+// the route is switched on (the key read as auto, at startup or later; three a session at most, outside the budget) and the gate
+// is open. A file with no such line came from a build without these crumbs, or from a device that is not DXMT's. A file with it
+// and no "admitted" after it is a session that ended before the route took a frame. One with "admitted" and nothing after names
+// the step the route was in.
 //
 // THE CRUMBS, in the order a normal frame writes them (function names; the line numbers move):
 //
@@ -105,6 +123,7 @@ constexpr uint32_t kHdrCrumbDeclined = 3;
 constexpr uint32_t kHdrCrumbCap = 192;
 
 struct HdrCrumbState {
+    std::atomic<bool> enabled{false};    // THE GATE: the device is DXMT's (hdrCrumbEnable); shut in every process that has not been told
     std::atomic<bool> live{false};       // a frame that writes is in progress: from its admission or reach to its Present
     std::atomic<uint32_t> written{0};    // crumbs written or refused for the budget, this session
     uint32_t reached = 0;                // frames that reached the resolver, this session
@@ -120,10 +139,22 @@ struct HdrCrumbState {
 // get their own. Plain data with a trivial destructor, so static destruction under the loader lock touches nothing.
 inline HdrCrumbState g_hdrCrumbs;
 
-// The gate every site tests: a frame that writes is in progress.
+// THE GATE (the header's second paragraph): open only on a DXMT device. The flat runtime opens it once, from the markers
+// (flatCrumbsWantedFor, flat_context_isolation.h); a process nobody has told has it shut, which is every Windows process, and
+// every writer below tests it before it touches anything else. Shutting it ends a frame in progress.
+inline bool hdrCrumbEnabled() noexcept { return g_hdrCrumbs.enabled.load(std::memory_order_relaxed); }
+inline void hdrCrumbEnable(bool on) noexcept {
+    HdrCrumbState& c = g_hdrCrumbs;
+    c.enabled.store(on, std::memory_order_relaxed);
+    if (!on) c.live.store(false, std::memory_order_relaxed);
+}
+
+// The gate every site tests: a frame that writes is in progress. It can only become true with the gate open (hdrCrumbAdmit and
+// hdrCrumbReach, the two places that raise it, test the gate first), and shutting the gate lowers it.
 inline bool hdrCrumbLive() noexcept { return g_hdrCrumbs.live.load(std::memory_order_relaxed); }
 
-// Test only: a session starts once per process.
+// Test only: a session starts once per process. The gate is not session state (it says which device this is), so a reset leaves it
+// as it is.
 inline void hdrCrumbReset() noexcept {
     HdrCrumbState& c = g_hdrCrumbs;
     c.live.store(false, std::memory_order_relaxed);
@@ -160,6 +191,7 @@ inline bool hdrCrumbFirstRestore(bool on) noexcept {
 // cap-th crumb of a session is the line that says the budget is spent, and closes the gate.
 inline void hdrCrumbEmit(const char* step, const char* edge, const char* detail) noexcept {
     HdrCrumbState& c = g_hdrCrumbs;
+    if (!hdrCrumbEnabled()) return;   // the gate, at the one writer too: a caller that skipped its own test still writes nothing, and counts nothing
     const uint32_t ordinal = c.written.fetch_add(1, std::memory_order_relaxed) + 1;
     if (ordinal > kHdrCrumbCap) return;
     char line[232];
@@ -231,7 +263,7 @@ inline const char* hdrCrumbFormat(uint32_t format) noexcept {
 // the key can be flipped off and on, and a line per flip would be a line the trail does not need. True when it wrote.
 inline bool hdrCrumbArmed(const char* key) noexcept {
     HdrCrumbState& c = g_hdrCrumbs;
-    if (c.armedSaid >= 3) return false;
+    if (!hdrCrumbEnabled() || c.armedSaid >= 3) return false;
     ++c.armedSaid;
     char line[160];
     _snprintf_s(line, sizeof(line), _TRUNCATE, "gfx: hdr-treat armed key=%s frames=%u declined=%u cap=%u", key ? key : "?",
@@ -244,7 +276,7 @@ inline bool hdrCrumbArmed(const char* key) noexcept {
 // is spent, this is one compare and a return.
 inline void hdrCrumbAdmit(uint64_t frame, const char* backend) noexcept {
     HdrCrumbState& c = g_hdrCrumbs;
-    if (c.reached >= kHdrCrumbFrames || c.spent) return;
+    if (!hdrCrumbEnabled() || c.reached >= kHdrCrumbFrames || c.spent) return;
     c.frameReached = c.frameDeclined = false;
     if (c.declinedFrames >= kHdrCrumbDeclined) { c.live.store(false, std::memory_order_relaxed); return; }
     c.live.store(true, std::memory_order_relaxed);
@@ -261,7 +293,7 @@ inline void hdrCrumbDeclined(const char* why) noexcept {
 // even if its admission was silent because the allowance for declined frames was spent. Once per frame.
 inline void hdrCrumbReach(uint64_t frame, const char* backend, const char* step) noexcept {
     HdrCrumbState& c = g_hdrCrumbs;
-    if (c.frameReached || c.reached >= kHdrCrumbFrames || c.spent) return;
+    if (!hdrCrumbEnabled() || c.frameReached || c.reached >= kHdrCrumbFrames || c.spent) return;
     c.frameReached = true;
     ++c.reached;
     c.live.store(true, std::memory_order_relaxed);
