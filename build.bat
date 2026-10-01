@@ -2997,6 +2997,30 @@ if errorlevel 1 ( echo [edvr] ERROR: intro_curve_module_test build failed & exit
 python "tools\intro_curve_module_test\mutants.py" --self-test || exit /b 1
 exit /b 0
 
+:rig_surface_strip_render_test
+echo [edvr] === surface_strip_render_test.exe ===
+REM Which way the curved intro picture faces, looked at in pixels (the surface strip of src\d3d11\panel_curve.cpp; fix.panel_curvature). The
+REM production strip, the movie's wiring (intro_panel.cpp) and the splash's (intro_curve.cpp) are compiled for real with the real Config, Log
+REM and fault guard and drawn on a WARP device through a vertex shader that is the intro composite's own (docs\shaders\intro-composite-vs.asm,
+REM written out as HLSL in the rig), a point-sampling pixel shader and the game's rasterizer state (cull back) onto a 128x72 target, from a
+REM texture whose corners are red, green, blue and white: left stays left and up stays up for the on-foot screen, the movie and the splash
+REM (the first flight showed the movie and the splash mirrored: the composite's +x runs to the viewer's left and the strip's u ran with x).
+REM The same draws with the other flag come out mirrored (the controls that prove the rig can see it), and a placement whose +x runs right
+REM comes out upright with the flag the other way. tools\surface_strip_render_test\mutants.py --self-test holds the mutation list to the
+REM sources as they are; the list itself (--run, on demand) proves the rig fails when each rule that decides the direction is flipped.
+REM Built under obj\ and taking System32's device through src\common\system_d3d11.h, so it links without d3d11.lib.
+if not exist "%OBJ%\surfacestrip" mkdir "%OBJ%\surfacestrip"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /I"src\d3d11" ^
+    /Fo"%OBJ%\surfacestrip\\" /Fe"%OBJ%\surfacestrip\surface_strip_render_test.exe" ^
+    "tools\surface_strip_render_test\surface_strip_render_test.cpp" "src\d3d11\intro_panel.cpp" "src\d3d11\intro_curve.cpp" "src\d3d11\panel_curve.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" "src\common\proxy.cpp" ^
+    /link /INCREMENTAL:NO user32.lib version.lib d3dcompiler.lib
+if errorlevel 1 ( echo [edvr] ERROR: surface_strip_render_test build failed & exit /b 1 )
+"%OBJ%\surfacestrip\surface_strip_render_test.exe" --dry-run || exit /b 1
+"%OBJ%\surfacestrip\surface_strip_render_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\surface_strip_render_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
 :rig_pixel_probe_test
 echo [edvr] === pixel_probe_test.exe ===
 REM Build gate for advanced.pixel_probe (src/d3d11/pixel_probe.*), the "who
