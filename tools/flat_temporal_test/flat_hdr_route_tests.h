@@ -1192,6 +1192,22 @@ inline int flatHdrRouteTests() {
                "the key, the log line and the panel's words all take the same two conditions");
         expect(count(menu, "static_assert(static_cast<int>(kFlatPageRowCount) + 1 + FlatSettingsWarning::kMaxLines <= kMenuMaxLines,") == 1,
                "the flat page's rows, a blank line and a full warning are held to the card's lines at compile time");
+        // THE DEPTH-VALIDATED STEADY DETAIL on foot (design doc section 82): the flat runtime reads the VR world route's key
+        // experimental.temporal_aa_on_foot_world_steady_detail once a Present (default off) and hands it to the resolver at the two treatment
+        // call sites. The 3D menu's own blanket policy (FlatMonoResolveFrame::staticScene, from the verified menu copy) is not the key's and
+        // its lines are exactly what they were: four mentions of f.staticScene in the file, none of them an assignment from the key.
+        expect(count(runtime, "Config::get().getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"off\")") == 1 &&
+                   count(runtime, "steadyReadKey(s, frame);") == 1 && count(runtime, "bool steadyDetail=false, steadyKeyRead=false;") == 1,
+               "the steady-detail key is read once a Present, by steadyReadKey, and its state starts off");
+        expect(count(runtime, "f.staticScene=flatFrameThroughMenuCopy(s.prefix,selected.hdr);\n    if(f.staticScene)++s.staticSceneFrames;\n"
+                              "    f.steadyDetail=s.steadyDetail;") == 1 &&
+                   count(runtime, "f.staticScene = flatFrameThroughMenuCopy(s.prefix, selected.hdr);\n    if (f.staticScene) ++s.staticSceneFrames;\n"
+                                  "    f.steadyDetail = s.steadyDetail;") == 1 &&
+                   count(runtime, "f.steadyDetail") == 2 && count(runtime, "f.staticScene") == 4,
+               "both treatment call sites (the copy route and the HDR route) hand the resolver the key right after the 3D menu's blanket policy, whose lines are unchanged");
+        expect(count(runtime, "flat steady detail 5s: steady-detail=%s depth-check=%llu/%llu;") == 1 &&
+                   count(runtime, "flatMonoResolveTakeRefusalCensus()") == 1,
+               "the 5 s block says the key's state and the resolver's depth-check frames, zeros and the key off included, once a window");
     }
 
     return failures;

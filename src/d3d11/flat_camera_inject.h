@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "flat_camera_phase.h"
 
@@ -167,6 +168,12 @@ struct FlatCameraVrCounters {
                                         // pass-through). With it, calls == the sum of the first-level outcomes in every mode (flat_camera_vr.h, flatCameraVrOutcomeSum)
     uint32_t flushed = 0;               // cameras flushed: the one-time dirty-bit write on a camera injected earlier and now not (not an outcome: a
                                         // flush accompanies whichever outcome the call had)
+    // Appended by the stage 2 experiment build (design doc section 82): the narrowest and the widest struct field of view (rad) among
+    // the frame's screen views (Scene or First-person role, whose frustum was read: an injected, warming or after-trigger call), NaN
+    // when none was read. Two different values say the struct carries a tighter weapon camera; one says the field-of-view test of the
+    // role cannot tell the weapon from the scene (the route's inject line prints them as fov=narrowest..widest).
+    float fovNarrowest = std::numeric_limits<float>::quiet_NaN();
+    float fovWidest = std::numeric_limits<float>::quiet_NaN();
 };
 // One distinct excluded signature (the route logs the first eight, once each).
 struct FlatCameraVrExcluded {

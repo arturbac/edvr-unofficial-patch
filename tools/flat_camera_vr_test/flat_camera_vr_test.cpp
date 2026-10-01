@@ -2,7 +2,8 @@
 // runs it; design doc section 82, stage 2). Nothing here needs the game: what the detour DECIDES is a pure header this rig runs,
 // and what it WRITES is held by source pins and by the flat path's own text, hashed.
 //
-//   R1   the role of a kind-3 camera: the 4% tolerance edges, the 1.5x near ratio edges, non-finite and zero, and the anchor
+//   R1   the role of a kind-3 camera: the 4% tolerance edges, the 1.5x near ratio edges, the 0.92 field-of-view ratio edge (the
+//        stage 2 experiment build), non-finite and zero, and the anchors (the near plane's, kept; the field of view's, per frame)
 //   R2   the admission matrix: every combination of kind 0..7, unreadable, gate verdict, pass-through / observe / inject, window,
 //        phase and role, against a table written from the brief -- and the rule that Inject needs all of them
 //   R3   the injected-kind invariant, exhaustively: no input combination increments injectedKind[k] for k != 3
@@ -17,6 +18,8 @@
 //   R10  the flat profile: flatCameraAdmit and the flush table answer exactly what they answered, and their text is hashed
 //   R11  source pins on the detour: the flat path's regions are byte-for-byte (hashed), the VR branch's place, the order of the
 //        call's steps, no write reachable from a pass-through or observe-only call, no call-path I/O, one outcome per call
+//   R12  the weapon's role from the struct as flight 2 logged it (the stage 2 experiment build): flight 2's frame of 78 world calls,
+//        the first-person calls it credits, the field-of-view range the counters keep, and the frames that must stay all-scene
 //
 // Every check prints "  ok    <label>: <what>" or "  FAIL  <label>: <what>"; --self-test [root] runs them all (root: the repo root,
 // default "."; tools\flat_camera_vr_test\mutants.py points it at a scratch copy with one rule flipped) and prints
@@ -121,6 +124,55 @@ void testRole() {
           static_cast<int>(Role::Scene) == 0 && static_cast<int>(Role::FirstPerson) == 1 && static_cast<int>(Role::Auxiliary) == 2,
           "R1n", "the roles have the numbers the observer's role field documents (0 scene, 1 first-person, 2 auxiliary) and their names");
 
+    // THE FIELD-OF-VIEW TEST (the stage 2 experiment build). Flight 2 logged the struct of the weapon's calls with the SAME near plane as the
+    // scene's (0.025: the 0.0675 is in the composed rows) and a different field of view (0.8203 against about 0.9831 rad), so the near test
+    // never fired and every first-person call was counted as a scene call. The weapon is the call whose fov is at most 0.92 x the frame's
+    // scene fov. 25.0 x 0.92 = 23.0 exactly in doubles, so the edge is exact there.
+    auto roleF = [](float fov, float sceneFov, float nearZ = 0.025f, float sceneNear = 0.025f) {
+        return flatCameraVrRole(kS, nearZ, kS, sceneNear, fov, sceneFov);
+    };
+    check(roleF(0.8203f, 0.9831f) == Role::FirstPerson && roleF(0.9831f, 0.9831f) == Role::Scene,
+          "R1t", "flight 2's struct: the weapon's fov 0.8203 against the scene's 0.9831 is the first-person camera although the near plane is equal (0.025); the scene's own fov is a scene call");
+    check(roleF(23.0f, 25.0f) == Role::FirstPerson && roleF(23.001f, 25.0f) == Role::Scene && roleF(22.999f, 25.0f) == Role::FirstPerson,
+          "R1u", "the edge is 0.92 of the scene's fov, inclusive: 23.0 against 25.0 is the weapon (<=, not <), 23.001 is not");
+    check(roleF(0.9f, 1.0f) == Role::FirstPerson && roleF(0.95f, 1.0f) == Role::Scene && roleF(0.5f, 1.0f) == Role::FirstPerson,
+          "R1v", "a fov 0.90 of the scene's is the weapon, 0.95 is not (the ratio is neither 0.85 nor 0.97), and a much tighter one is");
+    check(roleF(0.8203f, 0.0f) == Role::Scene && roleF(0.8203f, -1.0f) == Role::Scene && roleF(0.8203f, kNaN) == Role::Scene &&
+          roleF(0.8203f, kInf) == Role::Scene && roleF(0.8203f, -kInf) == Role::Scene,
+          "R1w", "no scene field of view yet (zero, negative, NaN, infinite): a screen view is a scene call, never a guess at the weapon");
+    check(roleF(kNaN, 0.9831f) == Role::Scene && roleF(0.0f, 0.9831f) == Role::Scene && roleF(-0.5f, 0.9831f) == Role::Scene &&
+          roleF(kInf, 0.9831f) == Role::Scene && roleF(-kInf, 0.9831f) == Role::Scene,
+          "R1x", "a field of view that is NaN, zero, negative or infinite is a scene call");
+    check(roleF(1.2f, 1.0f) == Role::Scene && roleF(1.0f, 1.0f) == Role::Scene,
+          "R1y", "a field of view as wide as the scene's or wider is a scene call (only a TIGHTER camera is the weapon)");
+    check(flatCameraVrRole(kS, 0.0675f, kS, 0.025f, 0.9831f, 0.9831f) == Role::FirstPerson && flatCameraVrRole(kS, 0.0675f, kS, 0.025f) == Role::FirstPerson &&
+          flatCameraVrRole(1.0f, 0.025f, kS, 0.025f, 0.5f, 1.0f) == Role::Auxiliary,
+          "R1z", "the near test still holds with or without a field of view, and the aspect test comes first: a square camera is auxiliary whatever its fov");
+    {   // The fov anchor: the frame's own, following Scene calls only, reset by beginFrame; the near anchor is kept.
+        FlatCameraVrRoleTracker t;
+        const Role weaponFirst = t.classify(kS, 0.025f, kS, 0.8203f);   // before any scene call: no anchor, a scene call, and it sets the anchor
+        const float anchorAfterWeapon = t.sceneFov();
+        const Role scene = t.classify(kS, 0.025f, kS, 0.9831f);          // the widest so far: raises the anchor
+        const float anchorAfterScene = t.sceneFov();
+        const Role weapon = t.classify(kS, 0.025f, kS, 0.8203f);         // now recognised
+        check(weaponFirst == Role::Scene && anchorAfterWeapon == 0.8203f && scene == Role::Scene && anchorAfterScene == 0.9831f &&
+                  weapon == Role::FirstPerson && t.sceneFov() == 0.9831f,
+              "R1aa", "the fov anchor is the widest Scene call of the frame: a weapon call that arrives first is taken for a scene call, the scene call raises the anchor, every later weapon call is right, and a first-person call never raises it");
+        t.classify(1.0f, 0.025f, kS, 2.0f);   // auxiliary: no update
+        t.classify(kS, 0.025f, kS, kNaN);     // not a number: no update
+        t.classify(kS, 0.025f, kS, 0.0f);     // zero: no update
+        t.classify(kS, 0.025f, kS, -1.0f);    // negative: no update
+        t.classify(kS, 0.025f, kS, kInf);     // infinite: no update
+        t.classify(kS, 0.025f, kS, 0.7f);     // tighter than the anchor (a first-person call): never moves it
+        check(t.sceneFov() == 0.9831f, "R1ab", "an auxiliary camera, a fov that is NaN, zero, negative or infinite, and a first-person call never move the fov anchor");
+        t.beginFrame();
+        check(t.sceneFov() == 0.0f && t.sceneNear() == 0.025f, "R1ac", "beginFrame clears the fov anchor and keeps the near anchor");
+        t.classify(kS, 0.025f, kS, 0.6f);     // a scene camera that zoomed: the new frame's own anchor
+        check(t.classify(kS, 0.025f, kS, 0.6f) == Role::Scene && t.sceneFov() == 0.6f,
+              "R1ad", "a zoomed scene camera is a scene call in its own frame: the anchor is not last frame's wider one");
+        t.reset();
+        check(t.sceneFov() == 0.0f && t.sceneNear() == 0.0f, "R1ae", "reset clears both anchors");
+    }
     // The anchor: the smallest near among screen views, kept across calls.
     {
         FlatCameraVrRoleTracker t;
@@ -303,6 +355,94 @@ FlatCameraVrFrustum weaponCam() { FlatCameraVrFrustum f; f.aspect = kS; f.fov = 
 FlatCameraVrFrustum squareCam() { FlatCameraVrFrustum f; f.aspect = 1.0f; f.fov = 1.5708f; f.nearZ = 0.1f; f.farZ = 1000.0f; return f; }
 FlatCameraVrFrustum zoomCam() { FlatCameraVrFrustum f; f.aspect = 1.4f; f.fov = 0.236f; f.nearZ = 0.3f; f.farZ = 9000.0f; return f; }
 FlatCameraVrFrustum eyeCam() { FlatCameraVrFrustum f; f.aspect = 1.03441f; f.fov = 1.59971f; f.nearZ = 0.025f; f.farZ = 50000.0f; return f; }
+
+// ---------------------------------------------------------------------------
+// R12: the weapon's role from the struct as flight 2 logged it (the stage 2 experiment build): the weapon's calls carry the scene's near
+// plane (0.025) and a tighter field of view (0.8203 against 0.9831 rad), so the role is the call's fov against the SAME FRAME's scene
+// camera. Flight 2's frame, from the census (draws 1201..1465 of frame 2): the world camera's 78 calls are, in order, 3 weapon calls,
+// 15 scene, 3 weapon, 12 scene, 3 weapon, 24 scene, 3 weapon, 12 scene, 3 weapon (15 weapon calls in five groups, 63 scene calls).
+// ---------------------------------------------------------------------------
+void testWeaponRole() {
+    std::printf("weapon role\n");
+    const auto sceneS = [] { FlatCameraVrFrustum f; f.aspect = kS; f.fov = 0.9831f; f.nearZ = 0.025f; f.farZ = 50000.0f; return f; };
+    const auto weaponS = [] { FlatCameraVrFrustum f; f.aspect = kS; f.fov = 0.8203f; f.nearZ = 0.025f; f.farZ = 50000.0f; return f; };
+    const uintptr_t world = 0x28074A12250;
+    const int groups[] = {3, 15, 3, 12, 3, 24, 3, 12, 3};
+    auto feed = [&](Sim& sim, bool refuseWeapon, const FlatCameraVrFrustum& wf, const FlatCameraVrFrustum& sf) {
+        std::vector<Role> roles;
+        bool weapon = true;
+        for (int count : groups) {
+            for (int i = 0; i < count; ++i)
+                roles.push_back(sim.call(world, true, 3, weapon ? wf : sf, Gate::Admit, 0x594E13, !(refuseWeapon && weapon)).plan.role);
+            weapon = !weapon;
+        }
+        return roles;
+    };
+    auto countRole = [](const std::vector<Role>& roles, Role r) { return static_cast<unsigned>(std::count(roles.begin(), roles.end(), r)); };
+    {
+        Sim sim;
+        sim.frame(true, false, 0.25f, -0.125f);
+        const std::vector<Role> roles = feed(sim, false, weaponS(), sceneS());
+        const FlatCameraVrCounters c = sim.core.tally().snapshot();
+        check(roles.size() == 78 && countRole(roles, Role::FirstPerson) == 12 && countRole(roles, Role::Scene) == 66 &&
+                  roles[0] == Role::Scene && roles[1] == Role::Scene && roles[2] == Role::Scene && roles[18] == Role::FirstPerson,
+              "R12a", "flight 2's frame (78 world calls, the weapon's three at the start): 12 of the 15 weapon calls are first-person, the first group arrives before any scene call and is counted as scene");
+        check(c.calls == 78 && c.firstPersonInjected == 12 && c.sceneInjected == 66 && c.firstPersonRefused == 0 && c.sceneRefused == 0 &&
+                  flatCameraVrOutcomeSum(c) == c.calls,
+              "R12b", "the injector's counters read inj-fp 12 and inj-scene 66, nothing refused, and still one outcome per call: the route's 'first-person injected, none refused' holds");
+        check(c.fovNarrowest == 0.8203f && c.fovWidest == 0.9831f,
+              "R12c", "the frame's fov range is the struct's own: 0.8203 (the weapon) to 0.9831 (the scene)");
+        sim.frame(true, false, -0.375f, 0.0625f);   // the next frame: the same sequence
+        const std::vector<Role> again = feed(sim, false, weaponS(), sceneS());
+        check(countRole(again, Role::FirstPerson) == 12 && again[0] == Role::Scene && sim.core.tally().snapshot().firstPersonInjected == 12,
+              "R12d", "the fov anchor is not carried across frames: the next frame's first weapon group is a scene call again (12 first-person, not 15) and the counters were reset");
+    }
+    {   // A zoomed scene camera: every call is the scene's, in a frame of its own.
+        Sim sim;
+        sim.frame(true, false, 0.25f, -0.125f);
+        feed(sim, false, weaponS(), sceneS());
+        sim.frame(true, false, 0.125f, 0.25f);
+        FlatCameraVrFrustum zoomed = sceneS(); zoomed.fov = 0.6f;
+        std::vector<Role> roles;
+        for (int i = 0; i < 63; ++i) roles.push_back(sim.call(world, true, 3, zoomed, Gate::Admit, 0x594EAB).plan.role);
+        const FlatCameraVrCounters c = sim.core.tally().snapshot();
+        check(countRole(roles, Role::FirstPerson) == 0 && c.sceneInjected == 63 && c.firstPersonInjected == 0 && c.fovNarrowest == 0.6f && c.fovWidest == 0.6f,
+              "R12e", "a frame in which the scene camera zoomed (fov 0.6 against last frame's 0.9831) is all scene calls: nothing is first-person against last frame's wider anchor");
+    }
+    {   // Warming (a zero phase) reads the frustum too; an auxiliary camera, an eye and an unreadable camera never touch the fov range.
+        Sim sim;
+        sim.frame(true, false, 0.0f, 0.0f);
+        feed(sim, false, weaponS(), sceneS());
+        sim.call(0x5000, true, 3, squareCam());            // auxiliary: aspect 1.0, fov 1.5708
+        sim.call(0x5001, true, 5, eyeCam());               // an eye: never read
+        sim.call(0x5002, false, 3, sceneS());              // unreadable kind
+        const FlatCameraVrCounters c = sim.core.tally().snapshot();
+        check(c.warming == 78 && c.auxiliary == 1 && c.fovNarrowest == 0.8203f && c.fovWidest == 0.9831f,
+              "R12f", "a zero-phase (warming) frame reads the same fov range, and an auxiliary camera (fov 1.5708), an eye and an unreadable camera do not widen it");
+        Sim idle;
+        idle.frame(true, false, 0.25f, -0.125f);
+        idle.call(0x5001, true, 5, eyeCam());
+        idle.call(0x5003, true, 1, sceneS());
+        const FlatCameraVrCounters e = idle.core.tally().snapshot();
+        check(std::isnan(e.fovNarrowest) && std::isnan(e.fovWidest), "R12g", "a frame whose calls read no screen view's frustum has no fov range (NaN, NaN)");
+    }
+    {   // A weapon call whose write failed is a refused FIRST-PERSON call once it is recognised: the route declines the frame, as for any refusal.
+        Sim sim;
+        sim.frame(true, false, 0.25f, -0.125f);
+        feed(sim, true, weaponS(), sceneS());
+        const FlatCameraVrCounters c = sim.core.tally().snapshot();
+        check(c.firstPersonRefused == 12 && c.sceneRefused == 3 && c.firstPersonInjected == 0 && c.sceneInjected == 63 && flatCameraVrOutcomeSum(c) == c.calls,
+              "R12h", "when the weapon's writes fail, 12 calls are refused first-person and the 3 that were counted as scene are refused scene: every refusal reaches a counter the route's decline test reads");
+    }
+    {   // The struct where the field of view is the same for both (the weapon indistinguishable): nothing is guessed, inj-fp stays 0.
+        Sim sim;
+        sim.frame(true, false, 0.25f, -0.125f);
+        const std::vector<Role> roles = feed(sim, false, sceneS(), sceneS());
+        const FlatCameraVrCounters c = sim.core.tally().snapshot();
+        check(countRole(roles, Role::FirstPerson) == 0 && c.firstPersonInjected == 0 && c.sceneInjected == 78 && c.fovNarrowest == c.fovWidest,
+              "R12i", "when the struct carries one field of view the weapon cannot be told from the scene and no call is called first-person (the route's mode stays 2, as in flight 2), and the fov range says why (narrowest == widest)");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // R3: the injected-kind invariant.
@@ -1243,6 +1383,7 @@ void testSourcePins() {
 
 int runSelfTest() {
     testRole();
+    testWeaponRole();
     testAdmission();
     testInjectedKind();
     testOutcomes();

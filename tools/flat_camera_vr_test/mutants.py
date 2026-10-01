@@ -84,7 +84,7 @@ WINDOW_LINE = "            if (!in.windowOpen) return FlatCameraVrAdmit::AfterTr
 STALE_CASE = "case FlatCameraAdmit::GateClosed: return FlatCameraVrAdmit::Stale;"
 UPSTREAM = "base.upstreamOwns = in.mode == FlatCameraVrMode::Inject;"
 OBSERVEONLY = "base.observeOnly = in.mode == FlatCameraVrMode::Observe;"
-NOTE_HEAD = "        ++c_.calls;\n        switch (admit) {"
+NOTE_HEAD = "        ++c_.calls;\n        if (role != FlatCameraVrRole::Auxiliary && std::isfinite(fov) && fov > 0.0f &&"
 KIND_COUNT = "                if (landed) ++c_.injectedKind[flatCameraVrKindIndex(readable, kind)];\n"
 KIND_INDEX = "!readable ? 7u : kind <= 5u ? kind : 6u"
 CALLS_LINE = "        ++c_.calls;\n"
@@ -107,9 +107,24 @@ PLAN_PHASE = "        a.phaseNonzero = phaseNonzero_;"
 PLAN_WINDOW = "        a.windowOpen = windowOpen();"
 PLAN_EXCLUDED = ("        if (p.admit == FlatCameraVrAdmit::RoleExcluded)\n"
                  "            excluded_.note(frustum.aspect, frustum.fov, frustum.nearZ, frustum.farZ, in.callerRva);\n")
-FINISH_NOTE = "        tally_.note(plan.admit, plan.role, in.readable, in.kind, landed);"
-BEGIN_FRAME = "        tally_.reset();\n        windowOpen_.store(true, std::memory_order_release);\n"
-CLASSIFY = "p.role = roles_.classify(frustum.aspect, frustum.nearZ, screenAspect_);"
+FINISH_NOTE = "        tally_.note(plan.admit, plan.role, in.readable, in.kind, landed, plan.fov);"
+BEGIN_TALLY = "        tally_.reset();\n"
+BEGIN_ROLES = "        roles_.beginFrame();   // the field-of-view anchor is the frame's own (the near anchor is kept)\n"
+BEGIN_WINDOW = "        windowOpen_.store(true, std::memory_order_release);\n"
+BEGIN_FRAME = BEGIN_TALLY + BEGIN_ROLES + BEGIN_WINDOW
+CLASSIFY = "p.role = roles_.classify(frustum.aspect, frustum.nearZ, screenAspect_, frustum.fov);"
+# the field-of-view test (the stage 2 experiment build)
+FOV_RATIO = "kFlatCameraVrFirstPersonFovRatio = 0.92;"
+FOV_LE = "static_cast<double>(fov) <= kFlatCameraVrFirstPersonFovRatio * static_cast<double>(sceneFov))"
+FOV_GUARD = "if (std::isfinite(fov) && fov > 0.0f && std::isfinite(sceneFov) && sceneFov > 0.0f &&"
+FOV_RAISE = "if (role == FlatCameraVrRole::Scene && std::isfinite(fov) && fov > 0.0f && fov > sceneFov_)"
+FOV_BEGIN_FN = "void beginFrame() { sceneFov_ = 0.0f; }"
+FOV_RESET_FN = "void reset() { sceneNear_ = 0.0f; sceneFov_ = 0.0f; }"
+PLAN_FOV = "            p.fov = frustum.fov;\n"
+FOV_NOTE_COND = ("        if (role != FlatCameraVrRole::Auxiliary && std::isfinite(fov) && fov > 0.0f &&\n"
+                 "            (admit == FlatCameraVrAdmit::Inject || admit == FlatCameraVrAdmit::Warming || admit == FlatCameraVrAdmit::AfterTrigger)) {\n")
+FOV_RANGE = ("            if (!(c_.fovNarrowest <= fov)) c_.fovNarrowest = fov;   // a NaN is not <= anything: the first reading sets both\n"
+             "            if (!(c_.fovWidest >= fov)) c_.fovWidest = fov;\n")
 KIND3 = "    if (in.kind != 3) return FlatCameraAdmit::OtherKind;\n"
 EYES = "    if (in.kind == 4 || in.kind == 5) return FlatCameraAdmit::Unsupported;\n"
 OBSERVE_SWITCH = "    if (in.observeOnly) return FlatCameraAdmit::Observed;\n"
@@ -156,7 +171,26 @@ MUTANTS = [
     M("near-ratio-strict", "vr", "R1", [(NEAR_GE, "> kFlatCameraVrFirstPersonNearRatio * static_cast<double>(sceneNear))")], "exactly 1.5x is a scene call"),
     M("anchor-not-a-minimum", "vr", "R1", [(ANCHOR_MIN, "(!(sceneNear_ > 0.0f) || nearZ > sceneNear_))")], "the anchor follows the largest near"),
     M("anchor-moved-by-auxiliary", "vr", "R1", [(ANCHOR_AUX, "if (std::isfinite(nearZ) && nearZ > 0.0f &&")], "an auxiliary camera's near plane moves the anchor"),
-    M("role-from-fov", "vr", ["R1", "R5"], [(CLASSIFY, "p.role = roles_.classify(frustum.aspect, frustum.fov, screenAspect_);")], "the planner hands the role test the fov as the near plane"),
+    M("role-from-fov", "vr", ["R1", "R5"], [(CLASSIFY, "p.role = roles_.classify(frustum.aspect, frustum.fov, screenAspect_, frustum.fov);")], "the planner hands the role test the fov as the near plane"),
+    # ---- R1, R12: the field-of-view test (the stage 2 experiment build) ----------------------------------------------------------------
+    M("fov-ratio-0.85", "vr", "R1", [(FOV_RATIO, "kFlatCameraVrFirstPersonFovRatio = 0.85;")], "a field of view 0.90 of the scene's is not the weapon"),
+    M("fov-ratio-0.97", "vr", "R1", [(FOV_RATIO, "kFlatCameraVrFirstPersonFovRatio = 0.97;")], "a field of view 0.95 of the scene's is the weapon"),
+    M("fov-edge-strict", "vr", "R1", [(FOV_LE, FOV_LE.replace("<=", "<"))], "exactly 0.92 of the scene's field of view is a scene call"),
+    M("fov-wider-is-the-weapon", "vr", ["R1", "R12"], [(FOV_LE, FOV_LE.replace("<=", ">="))], "the wider camera is the weapon, not the tighter one"),
+    M("fov-rule-ignores-an-infinite-anchor", "vr", "R1", [(FOV_GUARD, "if (std::isfinite(fov) && fov > 0.0f && sceneFov > 0.0f &&")], "an infinite scene field of view makes every camera the weapon"),
+    M("fov-rule-ignores-a-bad-fov", "vr", "R1", [(FOV_GUARD, "if (std::isfinite(sceneFov) && sceneFov > 0.0f &&")], "a negative field of view is the weapon"),
+    M("fov-anchor-not-a-maximum", "vr", ["R1", "R12"], [(FOV_RAISE, FOV_RAISE.replace("fov > sceneFov_", "fov < sceneFov_"))], "the anchor follows the narrowest scene field of view"),
+    M("fov-anchor-moved-by-auxiliary", "vr", "R1", [(FOV_RAISE, FOV_RAISE.replace("role == FlatCameraVrRole::Scene && ", ""))], "an auxiliary camera's field of view moves the anchor"),
+    M("fov-anchor-kept-by-the-tracker-frame-step", "vr", ["R1", "R12"], [(FOV_BEGIN_FN, "void beginFrame() {}")], "the tracker carries last frame's field-of-view anchor"),
+    M("fov-anchor-kept-by-the-core-frame-step", "vr", "R12", drop(BEGIN_ROLES), "the core's frame step never clears the field-of-view anchor"),
+    M("fov-anchor-kept-by-reset", "vr", "R1", [(FOV_RESET_FN, "void reset() { sceneNear_ = 0.0f; }")], "reset leaves the field-of-view anchor"),
+    M("planner-gives-the-role-no-fov", "vr", "R12", [(CLASSIFY, "p.role = roles_.classify(frustum.aspect, frustum.nearZ, screenAspect_);")], "the role test is never given the call's field of view"),
+    M("plan-carries-no-fov", "vr", "R12", drop(PLAN_FOV), "the plan does not carry the field of view to the counters"),
+    M("outcome-told-no-fov", "vr", "R12", [(FINISH_NOTE, "        tally_.note(plan.admit, plan.role, in.readable, in.kind, landed);")], "the counters are not told the call's field of view"),
+    M("fov-range-never-kept", "vr", "R12", drop(FOV_RANGE), "the counters keep no field-of-view range"),
+    M("fov-range-swapped", "vr", "R12", [(FOV_RANGE, FOV_RANGE.replace("c_.fovNarrowest <= fov", "c_.fovNarrowest >= fov").replace("c_.fovWidest >= fov", "c_.fovWidest <= fov"))],
+      "the narrowest and the widest field of view are swapped"),
+    M("fov-range-with-excluded-calls", "vr", "R12", [(FOV_NOTE_COND, "        if (std::isfinite(fov) && fov > 0.0f) {\n")], "an excluded (auxiliary) camera's field of view widens the range"),
     # ---- R2: the admission ----------------------------------------------------------------------------------------------------------
     M("window-rule-gone", "vr", "R2", drop(WINDOW_LINE), "a screen view after the trigger is admitted"),
     M("after-trigger-needs-a-phase", "vr", "R2",
@@ -177,7 +211,7 @@ MUTANTS = [
     M("frame-window-ignored", "phase", ["R2", "R10"], drop(GATE_LINE), "a closed frame window admits a kind-3 call"),
     M("write-failure-limit-9", "phase", "R9", [(LIMIT, "constexpr uint64_t kFlatCameraWriteFailureLimit = 9;")], "nine failed writes stand the hook down, not eight"),
     # ---- R3, R4: the counters --------------------------------------------------------------------------------------------------------
-    M("kind-counted-on-every-call", "vr", ["R3", "R4"], [(NOTE_HEAD, "        ++c_.calls;\n        ++c_.injectedKind[flatCameraVrKindIndex(readable, kind)];\n        switch (admit) {")],
+    M("kind-counted-on-every-call", "vr", ["R3", "R4"], [(NOTE_HEAD, NOTE_HEAD.replace("        ++c_.calls;\n", "        ++c_.calls;\n        ++c_.injectedKind[flatCameraVrKindIndex(readable, kind)];\n"))],
       "every call, whatever its kind, is counted as injected by kind"),
     M("kind-counted-when-refused", "vr", ["R3", "R4"], [(KIND_COUNT, "                ++c_.injectedKind[flatCameraVrKindIndex(readable, kind)];\n")],
       "an injection that did not land is counted by kind"),
@@ -187,10 +221,10 @@ MUTANTS = [
     M("calls-counted-twice", "vr", "R4", [(CALLS_LINE, CALLS_LINE + CALLS_LINE)], "an owner-thread call is counted twice"),
     M("stale-counted-as-other-kind", "vr", "R4", [(STALE_COUNT, "case FlatCameraVrAdmit::Stale: ++c_.otherKind; break;")], "a stale call is counted in otherKind"),
     M("refused-counted-as-injected", "vr", "R4", [(SCENE_COUNT, "else { ++c_.sceneInjected; }")], "a scene call whose write failed is counted as injected"),
-    M("outcome-told-plan-not-landing", "vr", "R4", [(FINISH_NOTE, "        tally_.note(plan.admit, plan.role, in.readable, in.kind, plan.inject);")],
+    M("outcome-told-plan-not-landing", "vr", "R4", [(FINISH_NOTE, "        tally_.note(plan.admit, plan.role, in.readable, in.kind, plan.inject, plan.fov);")],
       "the tally is told the call landed whenever the plan injected it"),
-    M("frame-step-keeps-counters", "vr", "R4", [(BEGIN_FRAME, "        windowOpen_.store(true, std::memory_order_release);\n")], "the frame step does not reset the counters"),
-    M("frame-step-keeps-window-closed", "vr", ["R4", "R5"], [(BEGIN_FRAME, "        tally_.reset();\n")], "the frame step does not reopen the injection window"),
+    M("frame-step-keeps-counters", "vr", "R4", [(BEGIN_FRAME, BEGIN_ROLES + BEGIN_WINDOW)], "the frame step does not reset the counters"),
+    M("frame-step-keeps-window-closed", "vr", ["R4", "R5"], [(BEGIN_FRAME, BEGIN_TALLY + BEGIN_ROLES)], "the frame step does not reopen the injection window"),
     M("plan-injects-in-warm-up", "vr", ["R3", "R4"], [(PLAN_INJECT, "        p.inject = p.admit == FlatCameraVrAdmit::Inject || p.admit == FlatCameraVrAdmit::Warming;")],
       "the plan writes a phase in a warm-up frame"),
     M("plan-phase-always-set", "vr", ["R4", "R5"], [(PLAN_PHASE, "        a.phaseNonzero = true;")], "a zero phase is never warming"),

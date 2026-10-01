@@ -335,6 +335,9 @@ static int generate(const Options& o) {
         {"kFlatMonoTaaBytecode", "flat_mono_taa_cs", "taa", nullptr, {}, true},
         {"kFlatMonoFinishBytecode", "flat_mono_finish_cs", "finish", nullptr, {}, true},
         {"kFlatMonoSpatialBytecode", "flat_mono_spatial_cs", "spatial", nullptr, {}, true},
+        // The VR world route's refusal census (design doc section 82, stage 2 experiment build): one counting pass over the class
+        // texture the prep writes on a frame that samples. Made on first use, so a profile that never asks never creates it.
+        {"kFlatMonoCensusBytecode", "flat_mono_census_cs", "census", nullptr, {}, true},
         // The HDR route's pixel-shader half (section 81): the result goes back into the game's HDR target, a render
         // target, so the finish and the spatial recovery are draws: one triangle vertex shader and two pixel shaders.
         {"kFlatMonoHdrVsBytecode", "flat_mono_hdr_vs", "hdrVs", nullptr, {}, true, nullptr, "vs_5_0"},
@@ -503,7 +506,7 @@ static void selfTest() {
           "a missing, reordered or doubled marker, or a resource inside, fails the build");
     const std::string production = extractCore(edvr::kTemporalCsHlsl);
     const std::string flat = production + edvr::kFlatMonoShaderSource;
-    static const char* flatEntries[] = {"prep", "taa", "finish", "spatial"};
+    static const char* flatEntries[] = {"prep", "taa", "finish", "spatial", "census"};
     for (const char* entry : flatEntries) {
         Variant mono{"kFlatSelfTest", "flat_mono_self_test", entry, nullptr, {}, true};
         check(compile(compiler.fn, flat.c_str(), mono), "production flat mono shader compilation");

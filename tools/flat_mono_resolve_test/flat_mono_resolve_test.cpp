@@ -186,6 +186,8 @@ bool fsr3Evaluate(ID3D11DeviceContext* c,unsigned slot,ID3D11Texture2D* colour,I
 #include "flat_upscaler_slot_gpu_tests.h"
 #include "flat_first_person_gpu_tests.h"
 #include "flat_first_person_phase_gpu_tests.h"
+#include "flat_refusal_gpu_tests.h"
+#include "flat_steady_depth_gpu_tests.h"
 #include "flat_context_isolation_gpu_tests.h"
 int main(int argc,char** argv) {
     const bool printGoldens=argc==2 && !std::strcmp(argv[1],"--print-goldens"); // --self-test plus the recorded key-off hashes, for re-recording
@@ -777,6 +779,12 @@ int main(int argc,char** argv) {
     upscalerSlotGpuTests(device.Get(),context.Get());
     firstPersonGpuTests(device.Get(),context.Get());
     firstPersonPhaseGpuTests(device.Get(),context.Get());
+    // The stage 2 experiment build's refusal census and view: the prep's class byte, the counting pass and its read-back, the steady-detail
+    // rule's effect on the counts, and the HDR finish's paint.
+    refusalGpuTests(device.Get(),context.Get());
+    // The depth-validated steady detail (the same section, the key's second form): the prep's depth check, its tolerance and its previous depth,
+    // through the DLSS and FSR stubs and EDVR's own TAA, and the same scenario against the prep with one rule flipped at a time.
+    steadyDepthGpuTests(device.Get(),context.Get());
     // The resolver's context isolation (the swap, and the explicit capture DXMT gets): also before the message check, so its calls are held to it.
     contextIsolationGpuTests(device.Get(),context.Get());
     if(messages)for(UINT64 i=0;i<messages->GetNumStoredMessages();++i){SIZE_T n=0;messages->GetMessage(i,nullptr,&n);std::vector<unsigned char> bytes(n);

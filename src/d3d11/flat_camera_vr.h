@@ -33,14 +33,21 @@ namespace edvr {
 //
 // A SCREEN VIEW is a camera whose aspect is the panel's: finite, positive and within 4% (relative) of the route's screen aspect
 // (renderW / renderH). Scene and first-person cameras are screen views; a probe, a spot light's square camera or a zoom-like
-// camera is not. Of the screen views the first-person one has the larger near plane: near >= 1.5 x the smallest near a screen
-// view has shown (0.0675 against 0.025 in the census). Everything else -- a different aspect, a non-finite number, a screen
-// aspect that is not positive -- is AUXILIARY: an unknown role is never guessed, and an auxiliary camera is never injected.
+// camera is not. Of the screen views the first-person one has either the larger near plane (near >= 1.5 x the smallest near a
+// screen view has shown: the census's composed rows read 0.0675 against 0.025) or, relative to the SAME FRAME's scene camera, the
+// tighter field of view (fov <= 0.92 x the widest field of view the frame's screen views have shown). Flight 2 found the
+// struct's near plane equal for both (0.025, the 0.0675 is in the composed rows) and the struct's fov different (0.8203 against
+// about 0.98 rad), so the near test never fired and every first-person call was counted as a scene call. Everything else -- a
+// different aspect, a non-finite number, a screen aspect that is not positive -- is AUXILIARY: an unknown role is never guessed,
+// and an auxiliary camera is never injected.
 // ---------------------------------------------------------------------------
 constexpr double kFlatCameraVrScreenTolerance = 0.04;        // relative, against the screen aspect
 constexpr double kFlatCameraVrFirstPersonNearRatio = 1.5;    // near / sceneNear at or above this is the weapon
+constexpr double kFlatCameraVrFirstPersonFovRatio = 0.92;    // fov / the frame's widest screen-view fov at or below this is the weapon
 
-inline FlatCameraVrRole flatCameraVrRole(float aspect, float nearZ, float screenAspect, float sceneNear) {
+inline FlatCameraVrRole flatCameraVrRole(float aspect, float nearZ, float screenAspect, float sceneNear,
+                                         float fov = std::numeric_limits<float>::quiet_NaN(),
+                                         float sceneFov = std::numeric_limits<float>::quiet_NaN()) {
     if (!std::isfinite(screenAspect) || !(screenAspect > 0.0f)) return FlatCameraVrRole::Auxiliary;
     if (!std::isfinite(aspect) || !(aspect > 0.0f)) return FlatCameraVrRole::Auxiliary;
     const double anchor = static_cast<double>(screenAspect);
@@ -48,6 +55,11 @@ inline FlatCameraVrRole flatCameraVrRole(float aspect, float nearZ, float screen
         return FlatCameraVrRole::Auxiliary;
     // A NaN on either side of the comparison is false: no anchor (or no near plane) is a scene call, never a guess.
     if (sceneNear > 0.0f && static_cast<double>(nearZ) >= kFlatCameraVrFirstPersonNearRatio * static_cast<double>(sceneNear))
+        return FlatCameraVrRole::FirstPerson;
+    // The same camera object with a tighter field of view than the frame's scene camera: no field of view, or no scene field of
+    // view yet this frame (the weapon's first calls arrive before any scene call), is a scene call, never a guess.
+    if (std::isfinite(fov) && fov > 0.0f && std::isfinite(sceneFov) && sceneFov > 0.0f &&
+        static_cast<double>(fov) <= kFlatCameraVrFirstPersonFovRatio * static_cast<double>(sceneFov))
         return FlatCameraVrRole::FirstPerson;
     return FlatCameraVrRole::Scene;
 }
@@ -64,19 +76,32 @@ inline const char* flatCameraVrRoleName(FlatCameraVrRole role) {
 // frame is already classified. A first-person call that arrives before any scene call is taken for a scene call (no anchor
 // yet); the scene call that follows lowers the anchor, and every later call is right. Both get the same phase, so the only
 // thing the mistake can change is a counter.
+//
+// The anchor of the field-of-view test is the FRAME's own: the widest field of view a Scene-role screen view has shown since
+// beginFrame, and nothing before the first one. It is never carried across frames, because a scene camera that zooms (an aimed
+// weapon) must not turn every scene call of the next frame into a first-person one against last frame's wider anchor; the price is
+// that a first-person call arriving before the frame's first scene call is counted as a scene call (flight 2's sequence starts
+// with three weapon calls, so four of the five groups are recognised: 12 of 15 calls). The anchor follows Scene calls only, so a
+// first-person call never raises it.
 class FlatCameraVrRoleTracker {
 public:
-    FlatCameraVrRole classify(float aspect, float nearZ, float screenAspect) {
-        const FlatCameraVrRole role = flatCameraVrRole(aspect, nearZ, screenAspect, sceneNear_);
+    FlatCameraVrRole classify(float aspect, float nearZ, float screenAspect,
+                              float fov = std::numeric_limits<float>::quiet_NaN()) {
+        const FlatCameraVrRole role = flatCameraVrRole(aspect, nearZ, screenAspect, sceneNear_, fov, sceneFov_);
         if (role != FlatCameraVrRole::Auxiliary && std::isfinite(nearZ) && nearZ > 0.0f &&
             (!(sceneNear_ > 0.0f) || nearZ < sceneNear_))
             sceneNear_ = nearZ;
+        if (role == FlatCameraVrRole::Scene && std::isfinite(fov) && fov > 0.0f && fov > sceneFov_)
+            sceneFov_ = fov;
         return role;
     }
     float sceneNear() const { return sceneNear_; }
-    void reset() { sceneNear_ = 0.0f; }
+    float sceneFov() const { return sceneFov_; }
+    void beginFrame() { sceneFov_ = 0.0f; }   // the near anchor is kept across frames, the fov anchor is the frame's own
+    void reset() { sceneNear_ = 0.0f; sceneFov_ = 0.0f; }
 private:
     float sceneNear_ = 0.0f;
+    float sceneFov_ = 0.0f;
 };
 
 // ---------------------------------------------------------------------------
@@ -222,10 +247,18 @@ public:
         c_ = FlatCameraVrCounters{};
         offThread_.store(0, std::memory_order_relaxed);
     }
-    // One call's outcome. `landed`: an Inject call whose phase was written and whose return was redirected.
-    void note(FlatCameraVrAdmit admit, FlatCameraVrRole role, bool readable, uint32_t kind, bool landed) {
+    // One call's outcome. `landed`: an Inject call whose phase was written and whose return was redirected. `fov`: the struct's
+    // field of view when the call's frustum was read (NaN otherwise); the narrowest and widest of the screen views' (not an
+    // outcome: a diagnostic for the route's 5 s line, which shows whether the struct carries two fields of view at all).
+    void note(FlatCameraVrAdmit admit, FlatCameraVrRole role, bool readable, uint32_t kind, bool landed,
+              float fov = std::numeric_limits<float>::quiet_NaN()) {
         if (admit == FlatCameraVrAdmit::OffThread) { noteOffThread(); return; }
         ++c_.calls;
+        if (role != FlatCameraVrRole::Auxiliary && std::isfinite(fov) && fov > 0.0f &&
+            (admit == FlatCameraVrAdmit::Inject || admit == FlatCameraVrAdmit::Warming || admit == FlatCameraVrAdmit::AfterTrigger)) {
+            if (!(c_.fovNarrowest <= fov)) c_.fovNarrowest = fov;   // a NaN is not <= anything: the first reading sets both
+            if (!(c_.fovWidest >= fov)) c_.fovWidest = fov;
+        }
         switch (admit) {
             case FlatCameraVrAdmit::Inject:
                 if (role == FlatCameraVrRole::FirstPerson) { if (landed) ++c_.firstPersonInjected; else ++c_.firstPersonRefused; }
@@ -418,6 +451,7 @@ struct FlatCameraVrPlan {
     bool roleKnown = false;   // the role was decided for this call (kind 3, injection, frame window open)
     bool flush = false;       // the camera was in the injected set and has left it: raise its dirty bits now
     bool inject = false;      // write the phase
+    float fov = std::numeric_limits<float>::quiet_NaN();   // the struct's field of view, when the role was decided (NaN otherwise)
 };
 
 class FlatCameraVrCore {
@@ -430,6 +464,7 @@ public:
         phaseNonzero_ = flatCameraVrPhaseNonzero(frame.phaseX, frame.phaseY, frame.renderW, frame.renderH);
         stepAtMs_ = nowMs ? nowMs : 1;
         tally_.reset();
+        roles_.beginFrame();   // the field-of-view anchor is the frame's own (the near anchor is kept)
         windowOpen_.store(true, std::memory_order_release);
     }
     void closeWindow() { windowOpen_.store(false, std::memory_order_release); }
@@ -457,7 +492,8 @@ public:
         FlatCameraVrAdmitInput a = admitInput(in);
         p.roleKnown = flatCameraVrWantsRole(a);
         if (p.roleKnown) {
-            p.role = roles_.classify(frustum.aspect, frustum.nearZ, screenAspect_);
+            p.role = roles_.classify(frustum.aspect, frustum.nearZ, screenAspect_, frustum.fov);
+            p.fov = frustum.fov;
             a.role = p.role;
         }
         p.admit = flatCameraVrAdmit(a);
@@ -469,7 +505,7 @@ public:
     }
     // The call's one outcome. `landed`: the phase was written and the return redirected.
     void finish(const FlatCameraVrPlan& plan, const FlatCameraVrCallIn& in, bool landed) {
-        tally_.note(plan.admit, plan.role, in.readable, in.kind, landed);
+        tally_.note(plan.admit, plan.role, in.readable, in.kind, landed, plan.fov);
     }
     // The bound pair for the frame's phase (what the detour writes).
     void bound(float entryX, float entryY, float* outX, float* outY) const {

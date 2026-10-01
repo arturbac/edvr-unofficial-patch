@@ -144,6 +144,10 @@ struct State {
     uint64_t hdrCopiesAccepted=0,hdrCopiesRefused=0;
     uint64_t menuCopiesAccepted=0,menuCopiesRefused=0;
     uint64_t staticSceneFrames=0;
+    // The steady-detail key (experimental.temporal_aa_on_foot_world_steady_detail), read once a Present (steadyReadKey): on, the resolver gives a
+    // stale-slot pixel the camera term where last frame's depth confirms it (FlatMonoResolveFrame::steadyDetail, set at the two treatment
+    // call sites). Off by default; the 3D menu's blanket policy (staticSceneFrames above) wins where it applies and is not this key's.
+    bool steadyDetail=false, steadyKeyRead=false;
     FlatMonoResolvePreflight plannedResolve{};
     FlatMonoResolvePreflightResult resolvePreflight{};
     bool haveResolvePlan = false;
@@ -1708,6 +1712,23 @@ static void hdrReadKey(State& s, uint64_t frame) {
         s.phase.resetHistory(); reset();
     }
 }
+// experimental.temporal_aa_on_foot_world_steady_detail (design doc section 82, the depth-validated steady detail), read at every Present:
+// off unless the file says "on" (any case; a typo never relaxes anything). It is the same key the VR world route reads, and the same rule:
+// a pixel whose engine slot a later draw overdrew takes the camera term instead of refusing its history only where last frame's depth
+// confirms it (the resolver keeps that depth when it is asked), and is refused where it does not. It starts no history and resets nothing:
+// a change is said once, and the next frame that reaches the resolver carries it.
+static void steadyReadKey(State& s, uint64_t frame) {
+    const bool on = _stricmp(Config::get().getString("experimental.temporal_aa_on_foot_world_steady_detail", "off").c_str(), "on") == 0;
+    if (s.steadyKeyRead && on == s.steadyDetail) return;
+    const bool first = !s.steadyKeyRead;
+    s.steadyDetail = on; s.steadyKeyRead = true;
+    if (first && !on) return;   // the default says nothing: only a session that turns it on, or turns it off again, has a line
+    Log::get().note("flat runtime: steady-detail is %s from frame=%llu (experimental.temporal_aa_on_foot_world_steady_detail%s): %s",
+        on ? "ON" : "OFF", static_cast<unsigned long long>(frame), first ? ", read at startup" : ", changed",
+        on ? "a pixel whose engine slot a later draw overdrew takes the camera term instead of refusing its history where last frame's depth "
+             "confirms it, and is refused where it does not; masked records and corrupt slots stay refused; the 3D menu keeps its own blanket rule"
+           : "a pixel whose engine slot a later draw overdrew refuses its history, as before");
+}
 // The frame that just ended, as the route saw it: the census token (every watched frame, the key off included), the
 // late-write accounting with its latch, and, only with the key auto, the chain verdict of a frame that had an HDR
 // target and no consumer. Runs once per Present, before the stand-down reads s.frameSeen.
@@ -1869,6 +1890,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // starts now. Before the stand-down reads the frame's verdict, which the route may have added to.
     hdrFrameEnd(s, frame);
     hdrReadKey(s, frame);
+    steadyReadKey(s, frame);
     const bool endedPaused = s.work == FlatWork::Paused;
     standDownFrame(s, frame);
     syncEngine();
@@ -2101,6 +2123,16 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         // flat runtime line's last= and accepted counts say why.
         Log::get().note("flat menu HDR copy: accepted=%llu refused=%llu static-scene-frames=%llu; source requires current scene/depth/camera provenance",
             (unsigned long long)s.menuCopiesAccepted,(unsigned long long)s.menuCopiesRefused,(unsigned long long)s.staticSceneFrames);
+        // The steady-detail rule (experimental.temporal_aa_on_foot_world_steady_detail), every window while a temporal mode runs, zeros and the
+        // key off included: its state and, with it on, the resolves whose prep ran the depth check against last frame's depth (ran) and the ones
+        // that could not (skipped: a reset frame is neither). "steady-detail=on depth-check=0/0" is the key reaching the runtime and no frame
+        // reaching the resolver; "on" with ran=0 and skipped above 0 is the check never having had a depth to check against.
+        {
+            const FlatMonoRefusalCensus steady=flatMonoResolveTakeRefusalCensus();
+            Log::get().note("flat steady detail 5s: steady-detail=%s depth-check=%llu/%llu; a stale-slot pixel takes the camera term only where "
+                            "last frame's depth confirms it (ran/skipped resolves this window)",
+                s.steadyDetail?"on":"off",(unsigned long long)steady.checked,(unsigned long long)steady.skipped);
+        }
         // The census of unkeyed pairs, every window while a temporal mode runs (empty
         // included: an absent line is what "this block never ran" looks like). A pair
         // named here draws in a known pool family with no keyed pixel shader, so its
@@ -2735,6 +2767,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     // other frame, and the shader is then bit-identical to what it was before the field.
     f.staticScene=flatFrameThroughMenuCopy(s.prefix,selected.hdr);
     if(f.staticScene)++s.staticSceneFrames;
+    f.steadyDetail=s.steadyDetail;   // experimental.temporal_aa_on_foot_world_steady_detail: the depth-validated rule, off unless the key says on
     // Metadata is frozen from the qualified handoff for a future frame's
     // preflight. It cannot authorize jitter in this already rendered frame.
     Ptr<ID3D11Texture2D> colorTexture;
@@ -3024,6 +3057,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
     f.configuredDlssPreset = s.preset;
     f.staticScene = flatFrameThroughMenuCopy(s.prefix, selected.hdr);
     if (f.staticScene) ++s.staticSceneFrames;
+    f.steadyDetail = s.steadyDetail;   // experimental.temporal_aa_on_foot_world_steady_detail: the depth-validated rule, off unless the key says on
     // The plan, frozen from the qualified trigger for the next frame's preflight, as the copy route freezes its own.
     Ptr<ID3D11Texture2D> colorTexture;
     if (s.projection && SUCCEEDED(hdrResource.As(&colorTexture))) {

@@ -931,10 +931,26 @@ int run() {
         for (int i = 0; i < 12; ++i) rw.hdr.noteSelection("selected");
         rw.inject.scene = g_injectedScene; rw.inject.firstPerson = g_injectedFirstPerson; rw.inject.warming = 4 * 42;
         rw.inject.unsupported = 12 * 4; rw.inject.otherKind = 12 * 2; rw.inject.injectedKind[3] = g_injectedCalls; rw.inject.pairChecked = 5;
+        rw.inject.fovNarrowest = 0.8203f; rw.inject.fovWidest = 0.9831f;
         char text[1400];
         vrWorldFormatWindow(text, sizeof(text), VrWorldKey::Auto, VrWorldState::Owned, true, true, rw);
         Log::get().note("%s", text);
         vrWorldFormatInjectWindow(text, sizeof(text), rw.inject);
+        Log::get().note("%s", text);
+        // The refusal census's line (the experiment build): the census key is on here, three samples were read back, 3.0% of their pixels refused (2.0% stale, 1.0% sky).
+        VrWorldRefusalWindow rf;
+        rf.census = true; rf.every = kFlatMonoRefusalEvery; rf.treated = 12; rf.asked = 12; rf.sampled = 3; rf.read = 3; rf.dropped = 0;
+        rf.width = 5040; rf.height = 2835; rf.pixels = 3ull * 5040ull * 2835ull;
+        rf.counts[kFlatMonoClassStale] = 857304; rf.counts[kFlatMonoClassSentinel] = 428652;
+        vrWorldFormatRefusalWindow(text, sizeof(text), rf);
+        Log::get().note("%s", text);
+        // The same window with the steady-detail key on (the depth-validated form): the 857304 stale pixels split in two, 90% kept (last frame's depth
+        // confirmed the camera term) and 10% refused (it did not), and the resolver's depth check counted twelve frames, eleven that ran and one that could not.
+        VrWorldRefusalWindow ro = rf;
+        ro.steady = "on";
+        ro.counts[kFlatMonoClassStale] = 85730; ro.counts[kFlatMonoRefusalStaleKept] = 771574;
+        ro.checked = 11; ro.skipped = 1;
+        vrWorldFormatRefusalWindow(text, sizeof(text), ro);
         Log::get().note("%s", text);
     }
     check(g_hot.posts == g_hot.calls && g_hot.preAsksPost == g_hot.calls, "every pre half asked for its post half, and every post half ran");
@@ -1198,6 +1214,14 @@ int run() {
         check(v.compare(0, 4, "PASS") == 0 && has(v, "inj-scene 180, inj-fp 30") && has(v, "scene 108 (108 injected), first-person 18 (18 injected)"),
               "THE VERDICT (v): the roles, from the route's counts and the logged calls");
         check(report.find("stage 2 verdict: STOP (") != std::string::npos, "...so the verdict over this log is STOP");
+        check(has(report, "== refusal census") &&
+                  has(report, "MEASURED 3 sample(s) of 5040x2835 (12 asked, 3 dispatched, 0 dropped), treated 12; pixels 42865200; refused 3.000% (1285956): stale-refused 2.000%, sentinel 1.000%; stale-kept 0.000%") &&
+                  has(report, "steady-detail=on view=off census=on: MEASURED 3 sample(s) of 5040x2835 (12 asked, 3 dispatched, 0 dropped), treated 12; pixels 42865200; refused 1.200% (514382): "
+                              "stale-refused 0.200%, sentinel 1.000%; stale-kept 1.800% (90.0% of the stale pixels); depth-check 11 ran, 1 skipped") &&
+                  has(report, "refusal census: consistent (2 of 2 window(s) measured)") && has(v, "struct field of view 0.8203..0.9831 rad over 1 window(s)"),
+              "THE REFUSAL CENSUS: the route's refusal lines, written by its own formatter through the real Log, are read by the real reader as two measured windows: the key off (3.000% refused: 2.000% stale-refused, "
+              "1.000% sky, nothing kept) and the key on (the stale pixels split: 1.800% kept, 90% of them, 0.200% refused, and the depth check's eleven ran and one skipped frames), consistent, "
+              "and (v) carries the inject line's field-of-view range");
         // The same log with its faults taken out (the four failed readbacks' lines, the off-thread calls): every line PASSES. The text is the glue's own.
         std::string clean;
         for (size_t p = 0; p < log.size();) {

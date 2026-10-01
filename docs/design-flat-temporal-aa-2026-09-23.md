@@ -48,8 +48,8 @@
   `d9f86b09` belongs to the main/openxr-perf-gaps line.
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
-- **Field reports (79-82):** users 1-2 refused every frame, 3 treated at 7-13
-  fps, 4 lost ~23 ms (ReShade). 80-81 flown. 82 (VR): 2 flights, shimmer open.
+- **Field reports (79-82):** users 1-2 refused every frame, 3 at 7-13 fps, 4
+  lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED; fix BUILT, unflown.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -7064,3 +7064,495 @@ hypothesis).
   shimmer: advanced.texture_lod_bias 0 for on-foot play, at the cockpit's cost.
   The route's 5 s line should name the bias in force.
 - Weapon: item 3. Every key off stays exactly as today.
+
+**Stage 2 experiment build: one flight to settle (f) against (c) and to test
+the fix direction (2026-10-01).** Sean approved ("Go", relayed by the
+coordinator) the build the flight-2 analysis proposed. Five items and nothing
+else; out of scope by decision: a route-aware mip bias, keying the named pairs,
+the depth-validated camera term. Environment: VR, Frontier install, native
+OpenXR over the Pimax runtime (flight 2's headset, eye 2016x1949 into a
+4032x3898 layer, HMDRenderTargetMultiplier 0.500), H 5040x2835 R11G11B10F
+resolved by DLAA preset K on slot 2, automatic exposure, DLSS DLL version not
+logged. Every new read sits inside the route key's auto branch: the flat
+profile never runs it (flat coverage is a feasibility note at the end, not
+built).
+
+EVIDENCE SINCE THE ANALYSIS (Sean and the coordinator, 2026-10-01).
+1. Sean, asked whether plain ground and walls shimmer: "not everything
+   shimmered, only certain textures". Selective by texture leans (f), a
+   property of the draw, over (c), which would touch every fine pattern alike;
+   it does not rule (c) out (a bias shows only on textures with fine detail),
+   so both legs stay.
+2. The shimmer reproduces in FLAT: Epic, v0.18.0-rc.4-114-g20031385, flat HDR
+   route at 3840x2160 (R = D), DLSS, on foot, standing still, log
+   `edvr_gfx_20261001_051141.log`: the blue hose spools and the bright top edge
+   of a metal fence. The F10 audit at 05:17:25 saved 11 unknown-projection
+   pairs (22 stages).
+3. The flat legs in `edvr_gfx_20261001_052230.log`, same spot: the copy route
+   still shimmers (before_post off 05:24:55-05:25:02, the 5 s line shows HDR
+   treated=0); TAA (on) and FSR shimmer too (05:25:15-05:25:49, short legs); AA
+   off (05:25:19.9-05:25:47.2) is calm; fix.render_sharpness 0.7 to 0.0 at
+   05:25:55 "changed the pattern of the shimmer, but still shimmered".
+4. THE ROUTE OWNS IN HMD CINEMA AT THE MAIN MENU (Frontier, 80a8cc7d, log
+   `edvr_gfx_20261001_053139.log`; Sean set the game's 3D mode to HMD Cinema
+   and fix.vscreen_res_width = 4032). The 5 s line reads state=owned layer=live
+   gate=held jitter=on, phase = rows, door-layer-only = eye-takes, and target
+   and hdr both 4032x2268: the route follows the width (H is the screen's size,
+   not 5040x2835). Sean: "some lines shimmering on my ship, but not all". He
+   took an eye dump at 05:32:44 (FinalCrisp L/R 02-15 crops and overviews, the
+   route owning the frame); the route RELEASED at 05:32:52 (no-trigger x3) as he
+   left.
+   The reading (coordinator): the flat Krait hull-line case in VR. The flat
+   menu's stale-slot-takes-the-camera-term policy fixed it in flat on 09-29; the
+   route keeps `staticScene` false. It also fits flat on foot shimmering
+   (`staticScene` false there) and AA off being calm everywhere. Consequence for
+   the plan: leg A runs first at the main menu in cinema mode (a static scene,
+   repeatable, no settlement trip) and again at a settlement as the second
+   check. Checked: nothing in the key, the census or the view is gated on the
+   journal or on foot: the keys are read at the boundary inside the auto
+   branch, the census and view fields are set in treatWorld, and the only gate
+   the route has (uiLayerWorldScreenHeld) held at the menu, which is why it
+   owned there.
+
+- ruled out: (c), the mip bias, as a NECESSARY cause, because flat shimmers
+  with every sampler at bias +0.00 (one at +1.00) in the texture-filtering
+  census. In VR the -1.00 can only be an amplifier; leg B measures how much.
+- ruled out: (f) through unkeyed pairs as the FLAT cause, because `flat engine
+  motion unkeyed 5s: live=1 binds=0 distinct=0 pairs=[]` at 05:17:26, the
+  window of the F10 audit, with the shimmer on screen. The pairs VR flight 2
+  named (vs_DE545DC8EE4FBB87 with ps_A6070F9DD1CFB601 and ps_91F8937EDA723663;
+  vs_EB5234DB6ADB491D with ps_B7D50283329322C3) are a VR-route fact this does
+  not touch.
+- ruled out: (h), resolving in HDR before the tone, as the cause, because the
+  copy route (after the tone) shimmers the same.
+- ruled out: (g), a backend-specific cause, because TAA and FSR shimmer too;
+  and AA off is calm, so the raw image is steady and the shimmer is made by the
+  jittered resolve path the backends share.
+- ruled out: (e), the sharpen pass, as the cause, because 0.7 to 0.0 changed the
+  pattern and left the shimmer; an amplifier only. VR leg A's last step repeats
+  it.
+- open, the lead: (f'), the shared prep's refusal of a pixel's history (a stale
+  engine slot, or a record whose history has a gap) and the raw jittered input
+  the finish shows there. It is shared by every backend and both routes, and
+  on foot `staticScene` is false in flat as in VR. Flat counted 3,861
+  engine-motion history gaps in the window at 05:15:49 (2,360 of 9-64 frames,
+  604 over 64), so in flat the MASKED class may matter more than the stale one;
+  VR flight 2's first-seen and gap masks were 5,601 of 2.18 M records in 30 s
+  (0.26%). This build measures both in VR: stale against masked.
+
+THE BUILD, piece by piece. Each piece: what it is, its log fields, what the
+log shows if the code never ran, and its key-off contract.
+
+1. STEADY DETAIL, the live A/B for (f).
+   `experimental.temporal_aa_on_foot_world_steady_detail = off | on`, default
+   off, beside the jitter key, developer tier (`# dev: choices on, off`), so
+   the in-headset menu's Experimental page flips it live exactly as Sean
+   flipped the jitter key in flight 2. Read at every boundary while the route
+   key is auto. On: a pixel whose engine slot a later draw overdrew (the slot's
+   depth bits are not the pixel's) takes the camera term instead of refusing
+   history: `FlatMonoResolveFrame::staticScene`, the flat 3D menu's policy
+   since 09-29 (Krait menu shimmer), set in treatWorld by the line that was
+   `false`. STALE SLOTS ONLY. Masked records (first seen, or after a gap),
+   corrupt slots, the sky and the weapon's attached pixels stay refused. The
+   masked path COULD be the shimmering pixels (geometry that popped in or
+   changed record; flat's 3,861 gaps); the census's `masked=` and the view's
+   red answer it, and the key is deliberately not widened to them. A moving
+   object drawn by a shader the engine table does not name can ghost while it
+   is on (the flat menu has nothing moving). The route's 5 s line carries
+   `steady-detail=on|off` after `fp-mode`, and one line says `steady-detail is
+   ON|OFF from frame=N` at the first boundary that reads the key and at every
+   change. If the code never ran: no token and no line (an older build).
+   OFF CONTRACT: with it off, the census off and the view off, the resolver
+   gets flight 2's inputs (`staticScene` false, no class texture, the `debug`
+   constants zero, the shader's branches not taken). Pinned by the route rig's
+   source pins (read once, inside the auto branch after the early return,
+   assigned in one place, cleared with the route's state), by config_test
+   (shipped default off equals the code's fallback, with a control mutation; a
+   flat profile reads it off), and by the resolver rig on WARP (on: the 16
+   stale pixels forgiven, the 4 masked, corrupt and sky pixels still refused;
+   off: all 20 refused, as before).
+2. THE REFUSAL CENSUS. Gate: `advanced.vr_camera_census` (existing, live; no
+   new key). On the resolves it samples (one in four of those that ask, so a
+   window holds about 110) the prep writes one class byte a pixel into a
+   private R8 texture (low seven bits what the pixel is, bit 7 refused), a
+   `census` kernel sums the refused pixels by class in group-shared counters
+   (16 stripes of atomics), and a ring of four staging slots reads the sums back
+   with DO_NOT_WAIT (a full ring drops the sample: `dropped=`). A third line
+   follows the route's two every 5 s window:
+   `vr world route refusal 5s: census=on every=4 treated=N asked=N sampled=N
+   read=N dropped=N size=WxH pixels=N refused=N refused-pct=X stale=N masked=N
+   corrupt=N sentinel=N unreprojectable=N camera=N range=N depth=N weapon=N
+   other=N forgiven=N steady-detail=on|off view=on|off`. `pixels` is what the
+   read-back samples examined, so every share is of pixels; `forgiven` is the
+   stale pixels the key sent to the camera term (so the stale share stays
+   measurable with the key on); `weapon` is attached first-person pixels the
+   weapon's map could not place. "Ran, 0 refused" is pixels > 0, refused=0.
+   "Never ran" is no line (the census key off, the route not engaged, or an
+   older build), or treated=0 (not owning the world), or asked=0 with
+   treated > 0 (the key reached the route and not the resolver), or read=0
+   (nothing came back): the reader names each. GPU cost: not measurable on
+   WARP; one dispatch and the class write on a quarter of the resolves. Measure
+   it live: census key off then on at one spot, `world resolve` in the EDVR GPU
+   census (the camera census's own observer is CPU and outside that section).
+3. THE VIEW. `advanced.temporal_aa_debug = motion_source`, live, while the
+   route resolves: the HDR finish paints the prep's class in the eye path's
+   colours before the game's tone pass (each colour scaled by the pixel's own
+   level, so the hue survives the tone and the absolute colour does not): green
+   joined, red masked, blue pool surface (camera term), yellow stale slot,
+   magenta corrupt, orange stale stamp, cyan first-person, white any other
+   refusal, dim no engine slot. It paints the CLASS, not the refusal: with the
+   key on the yellow pixels are the same pixels, now forgiven. One line says
+   `the refusal view is ON|OFF from frame=N`; the 5 s lines say `view=on`. The
+   eye path's own motion_source view is untouched. Never ran: no line, and the
+   picture is the world's.
+4. THE WEAPON'S ROLE. Flight 2's `inj-fp` was 0 because the rule keyed on the
+   struct's near plane, 0.025 for the weapon too. First-person is now a
+   screen-aspect call whose struct fov is at most 0.92 of the widest fov any
+   scene call of the SAME frame showed (flight 2: 0.8203 against 0.9831, ratio
+   0.834); the near test stays. Relative, not 0.8203 hard-coded: nothing shows
+   the game fixes the weapon's fov whatever the player's FOV setting is, and a
+   frame-local anchor never lets a zoomed scene camera turn next frame's scene
+   calls into first-person. The price: a weapon call before the frame's first
+   scene call counts as scene, and flight 2's frame opens with three, so 12 of
+   its 15 weapon calls are recognised and 3 are counted scene (same phase, only
+   a counter). The inject line now ends `fov=<narrowest>..<widest>` (radians;
+   `fov=-` no frustum read), so the log says whether the struct carries a
+   second field of view. The fold-in's rule is unchanged: a drawn weapon is
+   credited the world's phase only when a first-person call was injected and
+   none refused; otherwise mode 2 as before. Expected after the fix, weapon
+   drawn: `inj-fp` about 12 a weapon frame, `fov=0.82..0.98`, `fp-mode=0/N/0`
+   with N about the weapon frames. MODE 1 IS UNFLOWN. What marks it wrong: (a)
+   `fp-mode` mode 1 with `pair-bad` above 0 (the rows do not carry the phase the
+   fold-in adds); (b) `inj-fp` about as large as `inj-scene` (a wider
+   screen-aspect camera set the anchor: the `fov=` range shows it; the reader
+   WARNs); (c) `inj-fp` 0 with the weapon drawn (the reader WARNs and says
+   whether the struct has two fields of view or one); (d) the refusal line's
+   `weapon=` not falling against a mode-2 window; (e) Sean seeing the weapon
+   swim against the world with jitter on and not off while the log says mode 1.
+5. THE READER, `edvr_log.py --camera-census`: parses the refusal line, the
+   steady-detail and view lines and the inject line's `fov=`; prints a refusal
+   section (per window: key state, view, treated, samples, share refused and
+   its cause mix, forgiven, with the route's `fp-mode`, `inj-fp` and fov beside
+   it; totals by key state; findings: the contradictions above, never-measured
+   windows, drops, unnamed causes); extends (v) ROLES with the weapon rules (a)-
+   (c). The census rig regenerated its fixture and a glue rig reads the route's
+   own formatted lines through the real reader; `--self-test` fixtures cover
+   each finding, with negative controls.
+
+EVIDENCE FROM THE RIGS (no flight). The full build is green: 101 rigs in 121 s,
+187 s end to end, the config contract at 231 keys read and 231 documented. The
+resolver rig on WARP (new flat_refusal_gpu_tests.h) holds the HLSL class
+numbers to the header's, no resources when nothing asks, the census counts to
+the rejection mask's popcount (stale 16, masked 1, corrupt 1, sky 2 of 20),
+the key's forgiven count, eight asking resolves giving two samples, reset
+frames never asking, and the view's colours (yellow, magenta, white, blue,
+dim, red, green; nothing with it off). The route rig (207 checks) holds the key
+parse, every line's format, "ran, 0 refused" against "never ran", the buffers
+and the source pins. The camera rig's R12 runs flight 2's 78-call frame (12
+first-person, 66 scene; the anchor not carried; a zoomed frame all scene; the
+fov range), and its mutation proof catches all 22 new mutants (119 in all).
+The reader's self-test has a negative control for each finding. NOT measured:
+the census's GPU cost (WARP cannot time it) and anything in a headset.
+
+THE BIAS KEY. `advanced.texture_lod_bias = 0` means no bias override (the
+game's own samplers stand; device_hook.cpp reads it with the other texture
+keys, 0 with 0 anisotropy switches the whole override off). It is read at
+device creation: a restart. The ini line is commented out (`#texture_lod_bias =
+auto`); the flight sets `texture_lod_bias = 0` under [advanced].
+
+FLIGHT PLAN (Frontier, a settlement, flight 2's settings: eye fraction 0.5,
+curvature 0, UI quality on, route auto, jitter on; install by
+tools\install_edvr.py; `edvr_log.py --target frontier --expect-build HEAD
+--version` first, then `--camera-census`). Turn `advanced.vr_camera_census` on
+live AFTER the route owns the world (legs A, B); leg C's weapon numbers are on
+the always-on route lines and need no census key. Sean scores the shimmer 0-3
+at one grate, standing still, 20 s a step.
+A. Live, one spot, first at the MAIN MENU in HMD Cinema (fix.vscreen_res_width
+   4032; look at the ship: static, repeatable, nothing moves but the camera, so
+   the key's ghosting caveat cannot bite), then at a settlement grate standing
+   still. A1 key off (baseline). A2 key on. A3 off. A4 on. A5 key off,
+   `advanced.temporal_aa_debug = motion_source`: THE DECIDING TEST is whether
+   the view paints exactly the shimmering textures yellow or red (supports (f))
+   and the calm ones green or blue, or not (against it). Sean names the colour
+   of the ship's shimmering lines (or the grate) and of something calm. A6 view
+   off, fix.render_sharpness 0 (flat already says: pattern changes, shimmer
+   stays). If the in-headset menu cannot be opened at the main menu, the same
+   keys are plain ini lines the route reads at every boundary (live).
+   (f) confirmed: A2 and A4 calm, A1 and A3 shimmer; the refusal line at A1
+   shows `stale=` as the larger cause (the shimmering area's share or more; at
+   the menu the flat Krait case read 22.5% of the frame) and at A2 `stale=0`
+   with `forgiven=` about A1's `stale=`; A5 yellow on the ship's lines or the
+   grate. (f') by the MASKED class: A2 unchanged, `masked=` the large cause,
+   A5 red on the grate; the next build would relax the gap fallback, not
+   built. (c) alone: A2 unchanged, A5 green or blue (accepted pixels), B
+   calm. Neither: A2 unchanged, A5 green or blue on the shimmering textures,
+   refused share a few percent (sky, range), B no calmer: the cause is on
+   ACCEPTED pixels (the camera term's reprojection, the phase pairing, the
+   backend's accumulation) and this build cannot separate those.
+B. Restart with `texture_lod_bias = 0`, census on; the same spot (the menu's
+   ship again, or the grate): B1 key off, B2 key on, 20 s each; the log's
+   texture-filtering line must say bias 0 (the bias is baked at device
+   creation, so it applies at the menu too). (c) as
+   an amplifier: B1 much calmer than A1, B2 the calmest. Not an amplifier: B1
+   as A1. Flat shimmers at +0.00, so a calm B1 is not expected if (f') holds.
+C. Weapon: 30 s holstered, 30 s drawn, key off. Pass: `inj-fp` 0 holstered and
+   about 12 a weapon frame drawn, `fov=0.82..0.98` drawn (one value holstered),
+   `fp-mode=0/N/0` drawn and no `pair-bad`, (v) PASS with `mode 1:`; the census
+   `weapon=` below a mode-2 window if one is available. Wrong: (a)-(e), item 4.
+COST. Census key off then on at the A spot: `world resolve` within 0.1 ms of
+off is cheap enough; the view's cost is the finish's one extra read while on.
+
+WHAT THE VR LEGS CAN AND CANNOT TELL. They can separate STALE from MASKED from
+neither at the shimmering textures (the view) and size each (the census), and
+the key tests the stale half as a fix. They cannot test (h) or (g): the VR
+route resolves in HDR with one backend and has no copy route to compare, and
+the flat legs above ruled both out without a headset. A "neither" lands on
+accepted pixels. The cheap additions that would discriminate there, proposed
+and NOT built: (1) a flicker census: keep the previous resolved output on the
+sampled frames and sum |out(N) - out(N-1)| by class and by luminance bucket
+(with the camera still, that is the shimmer itself, attributed to refused or
+accepted pixels and to bright or dark ones); one extra R11G11B10F copy
+(about 57 MB) and a compare dispatch on a quarter of the resolves; (2) log the
+exposure the backend is given (HDR flag with automatic exposure, pre-exposure
+1; dlaa.cpp passes InPreExposure 1, InExposureScale 1) so a bright-pixel
+difference has a number to read.
+
+FLAT COVERAGE (feasibility; NOT built). The resolver is shared, so the three
+instruments can run on the flat route on foot: both call sites in
+flat_runtime.cpp (the copy route and the HDR route, `f.staticScene =
+flatFrameThroughMenuCopy(...)`) take one OR and two assignments, and the 5 s
+window that prints `flat menu HDR copy:` is where the census is taken and its
+line printed (the same formatter with a `flat route` prefix). The view paints
+in the HDR route only (the resolver paints when `hdr`), which is the default on
+foot. The catch is the flat allowlist (runtime_profile.h): the VR census and
+view gates are `advanced.vr_camera_census` and `advanced.temporal_aa_debug`, and
+the latter, with `advanced.temporal_aa_diagnostics`, has readers across the
+tree (the FSR context's AMD debug flag, UI and engine-velocity diagnostics, the
+eye path's debug views): allowlisting them wakes all of those in flat. So
+either the flat route reads the gates through one explicit accessor like
+`requestedTemporalMode()` (no new key, a config.cpp addition, config_test pin),
+or flat gets its own allowlisted keys (new keys: Sean's call). Cost: files
+runtime_profile.h (one key: the steady-detail one), config.h/.cpp (accessor),
+flat_runtime.cpp (about 45 lines), the refusal formatter moved into
+flat_mono_refusal.h, edvr_log.py (the section on a log with no census lines,
+plus a fixture), flat_temporal_test and config_test pins; one full build
+(about 3 min) and one --dll-only promotion, and the flight is at Sean's desk.
+Risk: low to moderate; flat_runtime.cpp is production for Epic testers, but
+every key defaults off and the resolver's off contract is already rig-pinned.
+The VR key-off contract does not change (the VR route's pins are separate and
+its lines must stay byte-identical: the route rig and the census fixture hold
+them). A smaller first step: only the steady-detail key (one allowlist line,
+two OR lines, a token on the flat 5 s line): it settles the stale half of
+(f') at the desk; the census and view are needed only if it changes nothing.
+
+KNOWN LIMITS. The census samples a quarter of the resolves: a window's share
+is an estimate (every sample is a whole frame). The view's colours are
+scaled by the tone pass. Class 'joined' and 'not-rig' pixels are accepted and
+not counted (the contended counters cost more than the answer). The role test's
+first weapon group of a frame is counted scene. Mode 1 is unflown. GPU cost is
+unmeasured. A screen-aspect camera wider than 1.087 times the scene's fov would
+turn the scene's calls into first-person: the `fov=` range and the reader's
+check (b) show it.
+
+FLIGHT 3, 2026-10-01 05:49: (f') CONFIRMED. Frontier, 02c1c456, log 054902;
+the game's 3D mode HMD Cinema, the main menu with the ship in view,
+`fix.vscreen_res_width = 4032`, the route owned at 4032x2268, census on.
+Steady-detail went ON at 05:50:05, OFF at 05:50:22, ON at 05:50:28; the view
+went ON at 05:50:40. The one whole key-off window (05:50:28) refused 5.674% of
+the pixels, all but `range=` of it `stale=` (58,105,650 of 58,111,623). Every
+whole key-on window refused 0.001-0.003% (`range=` only, `stale=0`) and
+forgave about 58 M pixels, the same ~5.7%. Sean: the shimmer on the ship's
+lines stops with the key on ("That fixed it!"). With the view on he took an
+eye dump: the fine YELLOW (stale-slot) lines are the ones that shimmered, so
+the deciding test (the view paints exactly the shimmering lines) passed as
+well as the A/B. So the shimmer is the prep's
+stale-slot refusal (a later draw overdrew the pixel's engine slot) showing
+the jittered raw input. Flat on foot runs the same rule (staticScene false),
+which explains the hoses there. Not yet checked: movers (the key gives an
+overdrawn slot the camera term, so a moving object drawn that way can ghost),
+the settlement leg, flat. Proposed next (Sean's call): a depth-validated
+camera term for stale slots in the shared resolver (keep history where last
+frame's depth at the camera-reprojected spot matches, refuse otherwise), so
+flat on foot gets it too; then a settlement check with movers and a desk
+check in flat before any default changes.
+
+SETTLEMENT FLIGHT, 2026-10-01 (log 060011): the blanket form of the key
+(02c1c456: every stale slot takes the camera term) works on foot at the
+settlement. Sean: "it looks beautiful". He reported no mover ghosting, but he
+did not look for it (people walking, a ship landing, doors), so the caveat is
+unchecked, not cleared.
+
+HMD CINEMA ON FOOT (reported with it; recorded only, not in scope here): the
+route declined every frame (about 450 a 5 s window, gate=no; reasons
+`depth-not-screen-motion-source` and `engine-views-unavailable`), so it never
+owned the world, and the whole panel ghosted and flickered. That is a separate,
+pre-existing cinema-mode problem, not the steady-detail key's, and nothing in
+the entry below widens to it.
+
+2026-10-01, THE DEPTH-VALIDATED STEADY DETAIL, VR AND FLAT (built and
+rig-proven; NOT FLOWN). The proposal at the end of FLIGHT 3, built
+as one rule in the shared resolver, one key, two readers.
+
+THE CHECK (flat_mono_shader_source.h, the prep). A pixel whose engine slot
+holds another depth than the pixel (a later draw overdrew it: "stale") takes
+the camera term, as every pixel without a slot does, and then has to pass one
+test: last frame's depth, in the best of the four texels around the position
+the camera term sends the pixel to in last frame's raster, must be within
+max(1e-6, 1% of expected) of `expected`, the depth the camera term says this
+surface had there. The position is the camera term's true previous uv times
+the render size, plus the previous raster phase (jitter.zw), minus half a
+texel; the four texels are the bilinear footprint, clamped to the image. Pass:
+the camera term stands (not refused; class stale, counted `stale-kept`). Fail:
+refused exactly as with the key off (counted `stale-refused`). Masked,
+corrupt, sentinel and sky pixels and the weapon's never reach the test, and
+the 3D menu's blanket policy (staticScene) wins and does not run it.
+
+THE TOLERANCE AND WHY (a throwaway simulation, numbers below; no flight).
+- Depth is reversed-Z float32, infinite far: d = near / z, sky 0. The float32
+  spacing is 0.7e-7 to 1.2e-7 of d at every range from 0.025 m to 1e8 m, so a
+  relative error in d is the same relative error in z at any distance: the
+  tolerance is relative. The floor 1e-6 equals 1% at d = 1e-4 (z = 250 m with
+  near 0.025 m); farther than that the floor is the tolerance (4% of d at
+  1 km, 40% at 10 km). The resolver's own TAA applies the same 1% and 1e-6 to
+  its history depth in taa() today, so the two cannot disagree.
+- Edges and thin lines, the shimmer's own geometry (a static line, the jitter
+  phases of consecutive frames): the nearest texel keeps a 1 px line 62.5%
+  (0 deg) to 74% (45 deg) of the time and a 2 px line 81-87%, so it would
+  refuse the very pixels this exists for; the four texels keep every line of
+  1 px or more 100%, a 0.5 px line at 30 deg 100% (the nearest: 44.5%) and at
+  45 deg 80.5% (53%). A 0.5 px line at 0 deg keeps 25% in every footprint.
+  3x3 is no better on lines and leaks farther at edges.
+- Slanted planes (a static plane, relative depth change per pixel g): with
+  four texels at 1%, g = 1% keeps 100%, 2% 99.9%, 3% 91%, 5% 67%. g is 2% per
+  pixel at a 1 deg grazing angle at VR 5040x2835 (2.6% flat 3840x2160), 0.2%
+  at 10 deg. At 0.3% a 1% plane keeps 99.8% and a 2% one 58%; so 1% is the
+  loosest that does not start refusing ordinary floors.
+- Movers: a face moving in depth by 0.5-1% a frame is kept, 2% a frame is
+  refused: at 5 m and 90 fps that is 9 m/s, so only fast depth movers are
+  seen. A flat-faced lateral mover 40 px wide at 1 px a frame keeps 98.75% of
+  its stale pixels (3x3: 99.2%): its two edge columns are refused and its
+  interior passes, as under the blanket form, carrying a history that is
+  misregistered by the step. HONEST LIMIT: the check refuses edges,
+  disocclusions and surfaces that changed depth; it cannot see a surface
+  that slides sideways at constant depth. Also at an edge the best of four
+  keeps the trailing 1 px of a surface that moved away (the background beside
+  it was there a texel over): the rig pins it (9 of 16 refused, 7 kept).
+- ruled out: the nearest texel alone, because it refuses 25-93% of static
+  thin lines; 3x3, because it is no better on lines and leaks farther; 0.3%,
+  because a plane at 2% a pixel (a 1 deg grazing floor) keeps only 58% there;
+  3%, because a face moving 2% a frame in depth is then kept.
+
+THE KEY OFF CONTRACT. `experimental.temporal_aa_on_foot_world_steady_detail`
+keeps its name and values; off is the default and refuses a stale slot as
+before, byte for byte: the prep's arithmetic and every output are what they
+were (the resolver rig's recorded key-off hashes still pass, unchanged), no
+second depth image is made, the backend is handed the same image as always,
+and the depth-check frames count zero. "on" now means the depth-checked form.
+The blanket form is gone from the VR route (the route rig pins that it never
+sets staticScene); it survives for the flat 3D main menu alone, untouched.
+
+PREVIOUS DEPTH AND ITS COST. EDVR's TAA already keeps last frame's depth. DLSS
+and FSR keep none, so the first frame with the key on makes a second R32_FLOAT
+image at the render size (57 MB at 5040x2835, 33 MB at 3840x2160) and from
+then the depth the backend is handed alternates between the two images: the
+prep writes this frame's depth into the one that is not last frame's and reads
+last frame's as t8. No copy and no extra write: memory only. A frame with the
+key off writes the first image as before, so the key can flip live. If the
+image cannot be made the log says so once and the frames run as with the key
+off (`depth-check` counts them as skipped). GPU: only a stale pixel pays, four
+4-byte loads and a few dozen ALU ops; with 5.7% of a VR frame stale (flight 3)
+that is 0.8 M pixels, 13 MB of reads, about 0.03-0.05 ms at 5040x2835; the
+flat Krait menu's 22.5% at 4K would be about 0.06 ms. An estimate: WARP cannot
+time it. The flight reads `world resolve` ms on the route line key off against
+key on.
+
+FLAT USES THE SAME KEY. runtime_profile.h: one allowlist line. flat_runtime.cpp:
+steadyReadKey once a Present (off unless the file says "on", any case), the
+state handed to the resolver at both treatment sites (the copy route and the
+HDR route) right after the menu's `f.staticScene` lines, which are unchanged
+(four mentions, none from the key; the flat temporal rig pins it). The log says
+`flat runtime: steady-detail is ON|OFF from frame=N (...)` when the key
+changes (and at startup when it is on; nothing while it is off) and, every
+5 s while a temporal mode runs, `flat steady detail 5s: steady-detail=on|off
+depth-check=RAN/SKIPPED`. No flat census or view (the stale share on foot in
+flat stays unmeasured). Backends: DLSS, DLAA, FSR and EDVR's TAA all take the
+check.
+A flat-specific key is not needed. Flat's ini is edvr-flat.ini:
+  [experimental]
+  temporal_aa_on_foot_world_steady_detail = on
+VR's is edvr.ini, the same two lines (the line is already there, off).
+
+THE VR CENSUS (`advanced.vr_camera_census`). The refusal line's `stale=` is
+now `stale-refused=` (refused: with the key off every stale pixel, on the
+ones the check refused) and `forgiven=` is `stale-kept=` (not refused: the
+camera term, confirmed by last frame's depth); new `depth-check=RAN/SKIPPED`
+(resolves with the key on whose prep ran the check, and those that could not;
+a reset frame is neither). The line now also prints while only the key is on.
+`edvr_log.py --camera-census` reads both spellings, totals each key state
+alone, prints stale-kept as a share of all pixels and, with the key on, of
+the stale pixels, and WARNs on: key on and no depth-check frame at all, key on
+and the check never ran, key off with stale-kept or checked frames; one note:
+key on, the check ran and kept nothing.
+
+EVIDENCE FROM THE RIGS (no flight). Resolver rig (WARP, the new
+flat_steady_depth_gpu_tests.h), through DLSS's stub, FSR's and EDVR's TAA: key
+off refuses a stale block and makes no second image; key on keeps it in a
+still scene and the backend is handed THIS frame's depth through eight frames
+with the key flipped on and off; a surface that arrived is refused and kept
+once it has been there a frame; 0.9% and 1.1% each way and the floor (1e-5
+deep, 5% inside it, 20% outside); a 1 px line one texel over is found in both
+axes and both signs of the previous phase, two texels over is not; a camera
+three pixels over reads the depth where it sends the pixel; a camera moved
+along its view axis compares with `expected`, not the pixel's depth; the
+menu's blanket policy keeps a stale pixel whatever the depth says and the
+check neither runs nor counts; a reset frame refuses all and counts nothing
+and the next frame has its depth; corrupt, sentinel, sky and masked stay
+refused with the key on; the census splits 16 stale pixels into kept or
+refused; through the TAA a kept pixel reaches its history (122 and 134) and a
+refused one takes the current colour (64 and 192). 22 mutants of the shader
+are each caught (the tolerance at 0, 0.5% and 5%, the floor at 0 and 1e-3, min
+for max, no check, inverted, the wrong position, the pixel's own depth for
+`expected`, no previous phase, the wrong sign, the current phase, no half
+texel, one and sixteen texels, this frame's depth, the blanket form, key
+refuses, sky and corrupt kept, a refused pixel counted as range). The route
+rig, the census rig and its fixture, the glue rig (real formatter into the
+real reader, a key-on window), the reader's self-test (both spellings),
+config_test (the key off in the shipped ini, both readers' fallbacks, the flat
+allowlist) and flat_temporal_test pin the rest. NOT measured: the GPU cost;
+the real DLSS and FSR SDKs given alternating depth images (the rig's backends
+are stubs that read the same textures); anything in a headset or at the desk.
+
+UNSURE. (1) The SDKs take the depth resource per evaluate call, so alternating
+should be inert, but the stubs cannot show it; a quality change at the key
+flip with `depth-check` ran > 0 would be the sign, and the key is the revert.
+(2) Lateral movers: the check cannot see them; flight 2 below tests it.
+(3) Flat's stale share on foot is unknown, so "kept" there has no number
+until a flat census exists.
+
+FLIGHT PLAN (install by tools\install_edvr.py; `edvr_log.py --target <t>
+--expect-build HEAD --version` first; VR legs `--camera-census` with
+`advanced.vr_camera_census = on`, flat legs `--grep "steady"`).
+1. VR, the main menu, HMD Cinema (fix.vscreen_res_width 4032), key on: calm as
+   with the blanket key (flight 3); the census `stale-kept` about 5.7% of the
+   pixels (flight 3's stale share) and `stale-refused` near 0; `depth-check`
+   ran in about every frame of a window (450) and skipped 0.
+2. VR at the settlement, standing still, then with movers (people walking,
+   a ship landing, doors), key off then on, twice: static detail calm with
+   the key on; no ghost trailing a mover (Sean looks at one mover on purpose,
+   twice); the stale-refused share rises where something moves; `world
+   resolve` ms key off against on.
+3. Flat, Epic, at the desk (edvr-flat.ini above, temporal_aa on, any
+   backend, on foot): hose spools and hull plating calm with the key on,
+   shimmering off; the 5 s line says on with `depth-check` ran about every
+   frame; the menu is unchanged (key on or off).
+Pass: 1 calm and nearly all stale kept; 2 calm with no ghost; 3 calm. If 2
+ghosts, the check is too loose for movers and the answer is a motion
+signal, not a tighter depth tolerance (ruled out above).
+
+PROPOSED, NOT BUILT. (a) A near-miss counter: stale pixels refused by less
+than twice the tolerance, so the tolerance's edge has a number from a flight.
+(b) The flicker census of FLIGHT 2's plan, if the shimmer outlasts the key.
+(c) A flat census and view, if the flat stale share is wanted: the VR formatter
+moved into flat_mono_refusal.h and a gate that is not
+advanced.temporal_aa_debug (its readers across the tree make that key unsafe
+to allowlist in flat). (d) A flat-specific key name: not needed.

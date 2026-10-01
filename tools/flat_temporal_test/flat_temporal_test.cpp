@@ -2057,8 +2057,8 @@ void testStaticSceneWiring() {
          "the flat runtime counts the frames it hands the resolver with the policy on"},
         {&runtimeCpp, "static-scene-frames=%llu",
          "the menu HDR copy line carries the static-scene-frames field"},
-        {&resolveCpp, "constants.flags[3]=f.staticScene?1u:0u;",
-         "the resolver hands the frame's staticScene to the shader as flags.w"},
+        {&resolveCpp, "constants.flags[3]=f.staticScene?1u:(depthCheck?2u:0u);",
+         "the resolver hands the frame's staticScene to the shader as flags.w (1), the steady-detail depth check's frame as 2 behind it, else 0"},
     };
     for (const Link& link : links) {
         const size_t at = link.text->find(link.needle);

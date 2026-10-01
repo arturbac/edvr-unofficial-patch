@@ -94,6 +94,14 @@ const char* g_missWhy = nullptr;                // the reason of the last untrea
 uint32_t g_missRun = 0;                         // consecutive untreated frames (for the RELEASED line)
 uint32_t g_declineRunLines = 0, g_declineLinesSession = 0;   // decline lines logged in this run of declines / this session
 
+// ---- the stage 2 experiment build (design doc section 82) -----------------------------------------------------------------------
+// Read at the frame boundary, only while the route key is auto (readExperimentKeys), and used by the resolve at the trigger. All three
+// default to off: with experimental.temporal_aa_on_foot_world_steady_detail off, advanced.temporal_aa_debug anything but motion_source and
+// advanced.vr_camera_census off, treatWorld hands the resolver exactly what it handed it in flight 2.
+VrWorldSteadyKey g_steadyKey = VrWorldSteadyKey::Off;   // experimental.temporal_aa_on_foot_world_steady_detail: stale slots take the camera term where last frame's depth confirms it
+VrWorldSteadyKey g_steadyReported = VrWorldSteadyKey::Off;   // the state the log last said: a change logs once
+bool g_viewOn = false, g_viewReported = false;          // advanced.temporal_aa_debug = motion_source: the resolver paints the prep's classes into H
+
 // ---- the per-frame detector state ------------------------------------------------------------------------------------
 struct ViewEntry {
     const void* view = nullptr;      // the shadow's view pointer this entry answers for
@@ -189,6 +197,7 @@ VrWorldInjectFrame readInjectFrame() {
     f.warming = c.warming; f.auxiliary = c.auxiliary; f.afterTrigger = c.afterTrigger; f.unsupported = c.unsupported;
     f.otherKind = c.otherKind; f.unreadable = c.unreadable; f.writeFailures = c.writeFailures; f.offThread = c.offThread;
     for (int i = 0; i < 8; ++i) f.injectedKind[i] = c.injectedKind[i];
+    f.fovNarrowest = c.fovNarrowest; f.fovWidest = c.fovWidest;
     return f;
 }
 
@@ -320,7 +329,6 @@ void treatWorld(ID3D11DeviceContext* ctx) {
     f.frame = g_frameNo;
     f.mode = mode;
     f.slot = kVrWorldFeatureSlot;
-    f.staticScene = false;
     std::memcpy(f.camera, rows, sizeof(f.camera));
     const bool resetMissing = !g_prev.valid;
     const bool resetGap = g_prev.valid && g_prev.frame + 1 != g_frameNo;
@@ -329,6 +337,14 @@ void treatWorld(ID3D11DeviceContext* ctx) {
     const bool resetExtent = g_prev.valid && (g_prev.w != t.hdrWidth || g_prev.h != t.hdrHeight);
     const bool resetScene = g_sceneResetPending;
     f.reset = resetMissing || resetGap || resetDepth || resetColor || resetExtent || resetScene;
+    // THE EXPERIMENT BUILD. The steady-detail key sends a pixel whose engine slot a later draw overdrew to the camera term instead of
+    // refusing its history, but only where last frame's depth confirms the camera term (FlatMonoResolveFrame::steadyDetail, the
+    // depth-validated form; the blanket form, staticScene, is the flat 3D menu's alone and this route never sets it); the census key
+    // counts the refused pixels by cause and the debug key's motion_source paints them. Each is the resolver's own contract and each
+    // is off by default, so a frame with all three off is the frame flight 2 resolved.
+    f.steadyDetail = g_steadyKey == VrWorldSteadyKey::On;
+    f.refusalCensus = g_census;
+    f.refusalView = g_viewOn ? 1u : 0u;
     // THE PHASE (stage 2). What the injector did to the world's cameras BEFORE the trigger is final: the route closed its window
     // at the trigger. The phase the frame APPLIED is the one it was given when a scene camera call took it, zero otherwise (a
     // frame the route meant to jitter and could not is resolved unjittered, and says so); the backend gets that phase as its
@@ -637,6 +653,26 @@ void driveInjector(bool wantsInjection) {
     if (want != VrWorldJitter::On) g_jitterLiveLogged = false;
     g_jitter = want;
 }
+// The stage 2 experiment build's three keys, read at the boundary while the route key is auto (design doc section 82): the
+// steady-detail key (default off), the debug key's motion_source (the refusal view), and what the census key said at the top of the
+// boundary (g_census). A change is said once, in the log, with what the state does.
+void readExperimentKeys() {
+    g_steadyKey = vrWorldSteadyKeyFromText(
+        Config::get().getString("experimental.temporal_aa_on_foot_world_steady_detail", "off").c_str());
+    g_viewOn = _stricmp(Config::get().getString("advanced.temporal_aa_debug", "off").c_str(), "motion_source") == 0;
+    if (g_steadyKey != g_steadyReported) {
+        g_steadyReported = g_steadyKey;
+        char line[512];
+        vrWorldFormatSteadyChanged(line, sizeof(line), g_frameNo, g_steadyKey);
+        Log::get().note("%s", line);
+    }
+    if (g_viewOn != g_viewReported) {
+        g_viewReported = g_viewOn;
+        char line[768];
+        vrWorldFormatViewChanged(line, sizeof(line), g_frameNo, g_viewOn);
+        Log::get().note("%s", line);
+    }
+}
 // The route's key is off (live): nothing is injected; an engaged injector is wound down once it has nothing left to flush.
 void windDownInjector() {
     g_injectFault = false;           // flipping the key off is what clears a STOP
@@ -677,6 +713,7 @@ void vrWorldRouteFrameBoundary() {
     const bool layerLive = uiLayerLiveForWorldRoute() && !curved;
     const bool gate = uiLayerWorldScreenHeld();
     if (key == VrWorldKey::Auto) {
+        readExperimentKeys();
         if (g_win.hdr.frames == 0 && g_windowStartMs == 0) g_windowStartMs = GetTickCount64();
         if (g_vrWorldWants) {
             g_win.hdr.noteFrame(g_f.hdr);
@@ -795,11 +832,31 @@ void vrWorldRouteFrameBoundary() {
         if (g_windowStartMs && now - g_windowStartMs >= 5000) {
             char line[1200];
             g_win.jitter = vrWorldJitterName(g_jitter);
+            g_win.steady = vrWorldSteadyKeyName(g_steadyKey);
             vrWorldFormatWindow(line, sizeof(line), key, g_machine.state, layerLive, gate, g_win);
             Log::get().note("%s", line);
             char injectLine[512];
             vrWorldFormatInjectWindow(injectLine, sizeof(injectLine), g_win.inject);
             Log::get().note("%s", injectLine);
+            // The refusal census's line (the census key on, samples still in flight from before it went off, or the steady-detail key on,
+            // whose depth check counts its own frames): the resolver's sums since the last window beside the route's own treated count.
+            // Absent when neither the census nor the key was wanted.
+            const FlatMonoRefusalCensus rc = flatMonoResolveTakeRefusalCensus();
+            if (g_census || rc.asked || rc.sampled || rc.frames || rc.checked || rc.skipped) {
+                VrWorldRefusalWindow rw;
+                rw.census = g_census;
+                rw.treated = g_win.hdr.treated;
+                rw.asked = rc.asked; rw.sampled = rc.sampled; rw.dropped = rc.dropped; rw.read = rc.frames;
+                rw.every = rc.every;
+                rw.width = rc.width; rw.height = rc.height; rw.pixels = rc.pixels;
+                for (uint32_t i = 0; i < kFlatMonoRefusalSlots; ++i) rw.counts[i] = rc.counts[i];
+                rw.checked = rc.checked; rw.skipped = rc.skipped;
+                rw.steady = vrWorldSteadyKeyName(g_steadyKey);
+                rw.view = g_viewOn ? "on" : "off";
+                char refusalLine[1024];
+                vrWorldFormatRefusalWindow(refusalLine, sizeof(refusalLine), rw);
+                Log::get().note("%s", refusalLine);
+            }
             g_win.reset();
             g_windowStartMs = now;
         }
@@ -814,6 +871,7 @@ void vrWorldRouteFrameBoundary() {
         }
         g_ownedFramesEpisode = 0; g_tookNoted = false; g_win.reset(); g_windowStartMs = 0;
         g_sceneResetPending = g_sceneResetEvent = false; g_prev.valid = false; g_declineRunLines = g_declineLinesSession = 0;
+        g_steadyKey = g_steadyReported = VrWorldSteadyKey::Off; g_viewOn = g_viewReported = false;   // the experiment build's keys are only read while the key is auto
         g_missRun = 0; g_missWhy = nullptr; g_declineWhy = nullptr;
         windDownInjector();
         if (g_resourcesLive) {

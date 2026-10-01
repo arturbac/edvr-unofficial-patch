@@ -113,6 +113,9 @@ inline bool runtimeProfileAllowsKey(const char* key) {
         std::strcmp(key, "experimental.temporal_aa_jitter") == 0 ||
         std::strcmp(key, "experimental.temporal_aa_partial") == 0 ||
         // The HDR route's key (flat_hdr_route.h, design doc section 81; auto by default); developer tier, no flat panel row.
-        std::strcmp(key, "experimental.temporal_aa_before_post") == 0);
+        std::strcmp(key, "experimental.temporal_aa_before_post") == 0 ||
+        // The steady-detail key (design doc section 82, the depth-validated steady detail): the VR world route's key, read by the flat runtime
+        // on foot too (flat_runtime.cpp steadyReadKey); off by default; developer tier, no flat panel row.
+        std::strcmp(key, "experimental.temporal_aa_on_foot_world_steady_detail") == 0);
 }
 } // namespace edvr
