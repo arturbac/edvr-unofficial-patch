@@ -64,12 +64,17 @@
 #include "../../src/common/log.h"
 #include "../../src/common/runtime_profile.h"
 #include "../../src/common/system_d3d11.h"
+#include "../../src/d3d11/binding_shadow.h"
+#include "../../src/d3d11/depth_probe.h"
 #include "../../src/d3d11/flat_camera_inject.h"
 #include "../../src/d3d11/journal_watch.h"
+#include "../../src/d3d11/temporal_pass.h"
+#include "../../src/d3d11/ui_layer.h"
 #include "../../src/d3d11/vr_camera_census.h"
 #include "../../src/d3d11/vr_camera_census_core.h"
 #include "../../src/d3d11/vr_world_route.h"
 #include "../../src/d3d11/vr_world_route_math.h"   // the route's REAL 5 s line formatters: the log the reader reads carries the route's own text
+#include "../../src/d3d11/vscreen.h"
 
 // ---------------------------------------------------------------------------------------------------------------------
 // An allocation counter: every global operator new is counted on the thread that made it, so a section of code can say
@@ -116,6 +121,19 @@ int phaseCalls = 0;
 // flatCameraVrQuiet: the detour is quiet when this frame asked for neither injection nor observation and no injected camera still waits for its
 // flush. True for a census-only process; false while the world route injects.
 bool vrQuiet = true;
+// THE EPISODES: what the glue's questions about the game's state are answered with. Status.json's GuiFocus; the rows the temporal pass chose for the frame
+// (temporalPassChosenRows); the depth views the binding shadow's probe resolves and their sizes; the depth probe's scene pair (which view is which eye); the
+// panel's and the eye's sizes (vscreen.h).
+bool guiKnown = false;
+uint32_t gui = 0;
+bool chosenValid = false, chosenBound = false;
+float chosen[12] = {};
+struct Target { const void* ptr; uint32_t w, h; };
+Target targets[8] = {};
+size_t targetCount = 0;
+const void* eyeDsv[2] = {nullptr, nullptr};
+constexpr uint32_t kPanelW = 5040, kPanelH = 2835, kEyeW = 2620, kEyeH = 2533;
+int resolveCalls = 0;
 // The order the injector was asked things in, one letter each: S set-observer, P pause, D disarm, F observe-frame.
 char order[64] = {};
 size_t orderN = 0;
@@ -154,6 +172,52 @@ bool vrWorldRouteWorldPhase(float* x, float* y) {
 bool journalWatchActive() { return stub::journalActive; }
 bool journalOnFootKnown() { return stub::journalActive && stub::journalKnown; }
 bool journalOnFoot() { return stub::journalOnFoot; }
+bool journalGuiFocus(uint32_t* focus) {
+    if (!stub::guiKnown) return false;
+    if (focus) *focus = stub::gui;
+    return true;
+}
+
+// ui_layer.h's two counters, which uiLayerLastFrameNamed() reads: the layer's frame count at its boundary, and the frame a draw last named the 2D screen's source at.
+// "The frame that just ended named its source" is NamedAt + 1 == GateFrame, so the script sets both at each boundary.
+namespace detail {
+uint64_t g_uiLayerGateFrame = 0;
+uint64_t g_uiLayerNamedAt = 0;
+BindingSlot g_bindingSlots[static_cast<size_t>(BindSlot::Count)];   // the binding shadow's storage (binding_shadow.h reads it inline): the script binds depths and shaders in it
+}  // namespace detail
+bool bindingResolveProbe(void* view, ResourceInfo* out) {
+    ++stub::resolveCalls;
+    for (size_t i = 0; i < stub::targetCount; ++i) {
+        if (stub::targets[i].ptr != view) continue;
+        *out = ResourceInfo{};
+        out->isTexture2D = true;
+        out->a = stub::targets[i].w;
+        out->b = stub::targets[i].h;
+        out->resource = view;
+        return true;
+    }
+    return false;
+}
+bool vScreenPanelSize(uint32_t* w, uint32_t* h) {
+    if (w) *w = stub::kPanelW;
+    if (h) *h = stub::kPanelH;
+    return true;
+}
+bool vScreenIsEyeSized(uint32_t w, uint32_t h) { return w == stub::kEyeW && h == stub::kEyeH; }
+bool depthProbeCurrentSceneEyeOf(ID3D11DepthStencilView* dsv, int* outEye, int* outTargetIndex) {
+    if (outEye) *outEye = -1;
+    if (outTargetIndex) *outTargetIndex = -1;
+    for (int eye = 0; eye < 2; ++eye) {
+        if (stub::eyeDsv[eye] && stub::eyeDsv[eye] == static_cast<const void*>(dsv)) { if (outEye) *outEye = eye; return true; }
+    }
+    return false;
+}
+bool temporalPassChosenRows(float rows[12], bool* bound) {
+    if (!stub::chosenValid) return false;
+    std::memcpy(rows, stub::chosen, sizeof(stub::chosen));
+    if (bound) *bound = stub::chosenBound;
+    return true;
+}
 
 // EDVR's advertised eye geometry: the frusta the camera model below was built to match within about 4e-5 (the same
 // numbers the reader's fixture uses), and a shift of nothing.
@@ -193,6 +257,22 @@ std::string lineWith(const std::string& text, const std::string& needle, size_t 
     return text.substr(begin, (end == std::string::npos ? text.size() : end) - begin);
 }
 bool has(const std::string& line, const std::string& needle) { return !line.empty() && line.find(needle) != std::string::npos; }
+// A log line from its census text on (the log puts a stamp before it).
+std::string bodyOf(const std::string& line) {
+    const size_t at = line.find("vr camera census");
+    std::string body = at == std::string::npos ? std::string() : line.substr(at);
+    while (!body.empty() && (body.back() == '\r' || body.back() == '\n')) body.pop_back();
+    return body;
+}
+// The LAST line that holds `needle` (a 5 s window may close earlier than the script expects; the one that matters is the final one).
+std::string lastLineWith(const std::string& text, const std::string& needle) {
+    const size_t at = text.rfind(needle);
+    if (at == std::string::npos) return std::string();
+    const size_t prev = text.rfind('\n', at);
+    const size_t begin = prev == std::string::npos ? 0 : prev + 1;
+    const size_t end = text.find('\n', at);
+    return text.substr(begin, (end == std::string::npos ? text.size() : end) - begin);
+}
 std::string slurp(const std::wstring& path) {
     std::ifstream in(path.c_str(), std::ios::binary);
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -509,6 +589,209 @@ WindowSums sumWindows(const std::string& log) {
     return s;
 }
 
+// ---- 7. THE EPISODES (design-world-camera-motion-2026-09-30.md section 6, Phase 0) ------------------------------------------------------------
+// Two episodes through the real glue, with the key on and the WARP device behind the join's readbacks:
+//   - the KEY-ON episode, aboard (the journal says not on foot, GuiFocus 0): frame 31 records ALL its calls (the first-three rule would record none of an aboard frame), and at its
+//     draws the join finds the screen's depth and each eye's: signatures per (depth, vertex shader, pixel shader), the depth write read from the bound state, the b1 size, and the
+//     rows 270..273 read back for the first signature of each depth and matched to the calls that composed them; the temporal pass's rows (stubbed) are matched to the calls' view axes;
+//   - an episode armed by the journal flipping to on foot (frame 41, sampled at 71) while a GuiFocus change and a naming flip arrive after it (both counted and skipped), sampled
+//     with the naming held and the screen's depth drawn into.
+// And the contract around them: the per-draw hook is null except in a sampled frame, a depth view is resolved once a frame, nothing allocates (the observer's halves, the join's
+// draws), the reader reports each episode and the window's counters, runs and detour lines.
+int runEpisodes(Gpu& gpu) {
+    std::printf("episodes\n");
+    const std::wstring tagEp = L"glueep";
+    check(Log::get().open(g_dir, tagEp.c_str()), "a third log opens for the episodes");
+    const uint64_t allocsAtStart = g_hot.allocs, writesAtStart = g_hot.writes;
+    static char shadowDsv, eyeLDsv, eyeRDsv, screenDsv;   // the depth views' identities
+    stub::targets[0] = {&shadowDsv, 4096, 4096};
+    stub::targets[1] = {&eyeLDsv, stub::kEyeW, stub::kEyeH};
+    stub::targets[2] = {&eyeRDsv, stub::kEyeW, stub::kEyeH};
+    stub::targets[3] = {&screenDsv, stub::kPanelW, stub::kPanelH};
+    stub::targetCount = 4;
+    stub::eyeDsv[0] = &eyeLDsv;
+    stub::eyeDsv[1] = &eyeRDsv;
+    ComPtr<ID3D11DepthStencilState> dssWrite, dssRead;
+    D3D11_DEPTH_STENCIL_DESC dd{};
+    dd.DepthEnable = TRUE;
+    dd.DepthFunc = D3D11_COMPARISON_LESS;
+    dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    check(SUCCEEDED(gpu.device->CreateDepthStencilState(&dd, &dssWrite)), "a depth-stencil state that writes depth");
+    dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    check(SUCCEEDED(gpu.device->CreateDepthStencilState(&dd, &dssRead)), "a depth-stencil state that does not");
+
+    stub::journalOnFoot = false;      // aboard
+    stub::guiKnown = true;
+    stub::gui = 0;
+    stub::phaseJittering = false;
+    uint32_t drawNo = 0;
+    uint64_t joinAllocs = 0, joinDraws = 0;
+    int hookNonNullFrames = 0;
+    std::vector<int> liveFrames;
+    auto bindDepth = [&](const void* dsv, uint64_t vs, uint64_t ps, ID3D11DepthStencilState* dss) {
+        detail::g_bindingSlots[static_cast<size_t>(BindSlot::Dsv0)].ptr = const_cast<void*>(dsv);
+        detail::g_bindingSlots[static_cast<size_t>(BindSlot::Vs)].hash = vs;
+        detail::g_bindingSlots[static_cast<size_t>(BindSlot::Ps)].hash = ps;
+        gpu.context->OMSetDepthStencilState(dss, 0);
+    };
+    auto draws = [&](int n) {   // what the route's per-draw hook does: one call through the pointer, when it is set
+        for (int i = 0; i < n; ++i) {
+            ++drawNo;
+            if (!detail::g_vrCensusJoinDraw) continue;
+            const uint64_t a0 = t_allocs;
+            detail::g_vrCensusJoinDraw(gpu.context.Get(), drawNo);
+            joinAllocs += t_allocs - a0;
+            ++joinDraws;
+        }
+    };
+    const uint32_t callers[3] = {0x594E13, 0x594EAB, 0x594FE1};
+    auto frame = [&](int k, bool named) {
+        stub::progressDraw = 0;
+        drawNo = 0;
+        g_world.turn(0.35f + 0.004f * static_cast<float>(k));
+        g_eyeL.turn(0.02f * static_cast<float>(k));
+        g_eyeR.turn(0.02f * static_cast<float>(k));
+        for (int i = 0; i < 2; ++i) refresh(g_ui, g_viewUi, 0x58DE73, false);
+        for (int i = 0; i < 4; ++i) refresh(g_world, g_viewWorld, callers[i % 3], false);
+        for (int i = 0; i < 2; ++i) { refresh(g_eyeL, g_viewEyeL, 0x594FE1, true); refresh(g_eyeR, g_viewEyeR, 0x594FE1, true); }
+        // The pass chose the left eye's view axes this frame (the stub), from the block bound at the first scene draw.
+        stub::chosenValid = true;
+        stub::chosenBound = true;
+        std::memcpy(stub::chosen, &c2derive::camF(g_eyeL.cam, c2derive::kCamAxes), sizeof(stub::chosen));
+        if (detail::g_vrCensusJoinDraw) { ++hookNonNullFrames; liveFrames.push_back(k); }
+        gpu.bindScene();
+        bindDepth(&shadowDsv, 0x01, 0x02, dssWrite.Get());   draws(20);   // a shadow map: neither the screen's depth nor an eye's
+        gpu.setEyeRows(g_eyeL);
+        bindDepth(&eyeLDsv, 0xA1, 0xB1, dssWrite.Get());     draws(30);
+        bindDepth(&eyeLDsv, 0xC1, 0xB1, dssRead.Get());      draws(5);    // a second signature into the left eye's depth: no readback
+        gpu.setEyeRows(g_eyeR);
+        bindDepth(&eyeRDsv, 0xA1, 0xB1, dssWrite.Get());     draws(30);
+        gpu.setEyeRows(g_world);
+        bindDepth(&screenDsv, 0xD1, 0xE1, dssWrite.Get());   draws(10);   // the 2D screen's depth, drawn through the world camera's block
+        detail::g_uiLayerGateFrame = static_cast<uint64_t>(k) + 1;        // the layer's boundary counted this frame; did a draw name the screen's source in it
+        detail::g_uiLayerNamedAt = named ? static_cast<uint64_t>(k) : 0;
+        vrCameraCensusFrameBoundary();
+    };
+    check(detail::g_vrCensusJoinDraw == nullptr && vrCameraCensusWanted(), "before any episode's frame the per-draw hook is null (and the census is on)");
+    // The census was turned on last by section 4 (frame 1 started there, the key-on trigger armed an episode for frame 31): frames 1..31 are aboard.
+    for (int k = 1; k <= 39; ++k) frame(k, false);
+    check(liveFrames.size() == 1 && liveFrames[0] == 31 && detail::g_vrCensusJoinDraw == nullptr,
+          "the per-draw hook was set for exactly one frame (the 31st, thirty frames after the key went on) and is null again after its boundary");
+    stub::journalOnFoot = true;       // the journal flips to on foot: read at the boundary that ends frame 40, an episode is armed for frame 71 ...
+    stub::gui = 6;                    // ... and a GuiFocus change at that boundary arrives while it is armed: counted, skipped
+    for (int k = 40; k <= 49; ++k) frame(k, false);
+    for (int k = 50; k <= 76; ++k) frame(k, true);   // the naming flips and holds from frame 50: a third trigger, skipped as well
+    check(liveFrames.size() == 2 && liveFrames[1] == 71 && detail::g_vrCensusJoinDraw == nullptr && hookNonNullFrames == 2,
+          "the second episode's frame is the 71st (thirty frames after the journal's flip was read), and the hook is null at every other frame");
+    check(stub::resolveCalls == 8, "each depth view was resolved once a sampled frame (four a frame, two frames): the cache answers every later draw");
+    check(joinDraws == 2 * (20 + 30 + 5 + 30 + 10) && joinAllocs == 0, "the join's hook was called for every draw of the two frames (190) and allocated nothing");
+    check(g_hot.allocs == allocsAtStart && g_hot.writes == writesAtStart,
+          "HOT PATH: across the episodes' frames (every call of them recorded into the episode buffer) the observer's halves allocated nothing and wrote not a byte of any camera or view");
+    Sleep(5200);
+    vrCameraCensusFrameBoundary();    // the 5 s window is due: its line and its three companions
+
+    // KEY OFF with an episode armed is dropped: arm one (a GuiFocus change), then turn the census off before its frame.
+    stub::gui = 0;
+    frame(77, true);
+    Config::get().set("advanced.vr_camera_census", "off");
+    vrCameraCensusFrameBoundary();
+    check(!vrCameraCensusWanted() && detail::g_vrCensusJoinDraw == nullptr,
+          "the key going off while an episode is armed leaves the per-draw hook null (nothing runs for the dropped episode)");
+    Log::get().close();
+
+    // ---- the log ----
+    const std::wstring epPath = newestLog(tagEp.c_str());
+    const std::string log = slurp(epPath);
+    check(!log.empty(), "the glue wrote the episodes' log");
+    const std::string head3 = bodyOf(lineWith(log, "vr camera census: episode frame=31 "));
+    check(head3 == "vr camera census: episode frame=31 n=3/10 trigger=key-on armed=1 foot=no gui=0 named=0 phase=- calls=10 recorded=10 printed=10 kinds=1:2,3:4,5:4 "
+                   "callers=+0x594FE1:5,+0x58DE73:2,+0x594E13:2,+0x594EAB:1",
+          "EPISODE 3 (the key-on one, aboard): frame 31, armed at frame 1, the journal says not on foot, GuiFocus 0, all 10 calls recorded and tallied by kind and caller");
+    if (head3.empty()) std::printf("  note  %s\n", censusLinesOnly(log).c_str());
+    const std::string head4 = bodyOf(lineWith(log, "vr camera census: episode frame=71 "));
+    check(head4 == "vr camera census: episode frame=71 n=4/10 trigger=foot:no>yes armed=41 foot=yes gui=6 named=1 phase=- calls=10 recorded=10 printed=10 kinds=1:2,3:4,5:4 "
+                   "callers=+0x594FE1:5,+0x58DE73:2,+0x594E13:2,+0x594EAB:1",
+          "EPISODE 4: armed by the journal's flip (foot:no>yes) at frame 41, sampled at 71 with the journal on foot, GuiFocus 6 and the naming held");
+    check(occurrences(log, "vr camera census: episode frame=") == 2 && occurrences(log, "vr camera census: sequence frame=") == 0,
+          "exactly two episodes printed, and no first-three sequence (all three were printed before): the episodes' frames are not spent twice");
+    // The calls of episode 3: all ten, in order, kind 1, 3 and 5, the eyes' two kind-5 calls each aboard.
+    {
+        unsigned calls3 = 0, calls4 = 0;
+        for (size_t at = log.find(": call frame=31 n="); at != std::string::npos; at = log.find(": call frame=31 n=", at + 1)) ++calls3;
+        for (size_t at = log.find(": call frame=71 n="); at != std::string::npos; at = log.find(": call frame=71 n=", at + 1)) ++calls4;
+        const std::string eyeCall = lineWith(log, "call frame=31 n=7 camera=" + hexOf(g_eyeL.ptr(), false) + " kind=5 ");
+        check(calls3 == 10 && calls4 == 10 && has(eyeCall, "tone=after") && has(eyeCall, "view=" + hexOf(g_viewEyeL.ptr(), false)) && has(eyeCall, "rows=["),
+              "each episode printed all ten calls, and an eye's kind-5 call (n=7: the first of the left eye's two) names its view and carries its composed rows");
+    }
+    const std::string b1 = hexOf(reinterpret_cast<uintptr_t>(gpu.scene.Get()), false);
+    {
+        // The join of episode 3: four signatures in the order their first draws came (the shadow map's draws joined nothing).
+        const std::string s1 = lineWith(log, "vr camera census: join ep=3 sig=1 "), s2 = lineWith(log, "vr camera census: join ep=3 sig=2 "),
+                          s3 = lineWith(log, "vr camera census: join ep=3 sig=3 "), s4 = lineWith(log, "vr camera census: join ep=3 sig=4 ");
+        check(has(s1, "depth=eye eye=0 size=2620x2533 draw=21 draws=30 vs=0xA1 ps=0xB1 dw=yes b1=" + b1 + " first=0 bytes=5376 rows=read match=7,9") &&
+                  has(s2, "depth=eye eye=0 size=2620x2533 draw=51 draws=5 vs=0xC1 ps=0xB1 dw=no b1=" + b1 + " first=0 bytes=5376 rows=- why=skip") &&
+                  has(s3, "depth=eye eye=1 size=2620x2533 draw=56 draws=30 vs=0xA1 ps=0xB1 dw=yes b1=" + b1 + " first=0 bytes=5376 rows=read match=8,10") &&
+                  has(s4, "depth=screen eye=- size=5040x2835 draw=86 draws=10 vs=0xD1 ps=0xE1 dw=yes b1=" + b1 + " first=0 bytes=5376 rows=read match=3,4,5,6"),
+              "EPISODE 3's join: the left eye's depth (draws 21-50, writes depth, rows matched to the left eye's kind-5 calls 7 and 9), a second shader pair into it (5 draws, no depth "
+              "write, no readback), the right eye's (matched to 8 and 10) and the screen's depth (matched to the world camera's four calls): the rows were read from the GPU and equal what "
+              "each camera's calls composed");
+        if (s1.empty() || s4.empty()) std::printf("  note  %s\n", censusLinesOnly(log).c_str());
+        check(occurrences(log, "vr camera census: join-rows ep=3 sig=") == 3 && occurrences(log, "vr camera census: join-rows ep=4 sig=") == 3 &&
+                  occurrences(log, "vr camera census: join ep=3 ") == 4 && occurrences(log, "vr camera census: join ep=4 ") == 4,
+              "a rows line for each signature that read them (three of four), a join line for each of the four, in both episodes: at most four readbacks an episode");
+        check(occurrences(log, "vr camera census: join-draws ep=3 seen=95 relevant=75 views=4 signatures=4") == 1 && occurrences(log, "vr camera census: join-draws ep=4 seen=95 relevant=75 views=4 signatures=4") == 1,
+              "each episode says what its per-draw hook was handed: 95 draws (the 20 into the shadow map included), 75 of them into the screen's or an eye's depth, four views resolved, four signatures kept");
+        const std::string p3 = lineWith(log, "vr camera census: pass-rows ep=3 ");
+        check(has(p3, "frame=31 valid=1 bound=1 rows=[") && has(p3, " axes-match=7,8,9,10 how=identity nearest=7 diff=0.000e+00"),
+              "EPISODE 3's pass rows: the left eye's view axes, which equal those of both eyes' four kind-5 calls (the eyes turn together): 7, 8, 9 and 10, read as they are");
+    }
+    check(occurrences(log, "vr camera census: episodes windows=1 taken=4/10 triggers=7 skipped=3 state=idle") == 1,
+          "the window's counters line: 4 episodes taken, 7 triggers (the key going on three times in the session, the journal's flip, GuiFocus, the naming), 3 skipped, nothing armed now");
+    {
+        const std::string runs = lastLineWith(log, "vr camera census: runs windows=1 ");
+        check(has(runs, " unnamed=1:0,2:0,3:0,4-8:0,9-30:1,31-89:0,90+:0 ") && has(runs, " open=named:"),
+              "the naming runs: on foot from frame 40, ten unnamed frames (a run in the 9-30 bin) and then named, the named run still open when the window printed");
+        const std::string detour = lastLineWith(log, "vr camera census: detour windows=1 ");
+        check(has(detour, " every=16 timed=observer-halves ") && !has(detour, " sampled=0 ") && !has(detour, " est-ms-frame=- ") && has(detour, " inj-calls=0 ") &&
+                  !has(detour, " obs-pre-us=- ") && !has(detour, " obs-post-us=- "),
+              "the detour's CPU line: observer halves timed on one call in sixteen, both halves measured (neither says a dash), an estimate made, no injected call in this scenario");
+    }
+    check(occurrences(log, "vr camera census: off (advanced.vr_camera_census)") == 1, "the key-off said so once");
+
+    // ---- the real reader over the episodes' log ----
+    int rc = -1;
+    const std::string report = runReader(epPath, &rc);
+    check(rc == 0 && report.find("== episodes (2 printed; the last `episodes` line: 4 taken of 10, 7 trigger(s), 3 skipped) ==") != std::string::npos,
+          "tools\\edvr_log.py --camera-census over the episodes' log: two episodes printed, four taken, seven triggers, three skipped");
+    {
+        const size_t at = report.find("== episodes (");
+        const std::string eps = at == std::string::npos ? std::string() : report.substr(at);
+        const std::string eyeL = hexOf(g_eyeL.ptr(), true), eyeR = hexOf(g_eyeR.ptr(), true), world = hexOf(g_world.ptr(), true);
+        check(has(eps, "episode 3/10: frame 31, trigger key-on (armed at frame 1); journal foot=no, GuiFocus 0, naming unnamed") &&
+                  has(eps, "episode 4/10: frame 71, trigger foot no>yes (armed at frame 41); journal foot=yes, GuiFocus 6, naming NAMED"),
+              "the reader names each episode: its trigger, the frame it was armed at, the journal, GuiFocus and the naming");
+        check(has(eps, "10 call(s), 10 recorded, 10 printed; by kind: k1 x2, k3 x4, k5 x4;") &&
+                  has(eps, "join: 4 signature(s); the per-draw hook was handed 95 draw(s), 75 of them into a screen- or eye-sized depth, 4 depth view(s) resolved"),
+              "...its calls by kind and caller, and its four join signatures with the draws the hook was handed");
+        check(has(eps, "eye 0 2620x2533: first draw 21 (30 draw(s)), vs 0xA1 ps 0xB1, depth write yes, b1 " + hexOf(reinterpret_cast<uintptr_t>(gpu.scene.Get()), true)) &&
+                  has(eps, "rows 270..273 equal the composed rows of: camera " + eyeL + " (kind 5) caller +0x594FE1, 2 call(s) n=7/9, view " + hexOf(g_viewEyeL.ptr(), true) + ", tone after") &&
+                  has(eps, "rows 270..273 equal the composed rows of: camera " + eyeR + " (kind 5) caller +0x594FE1, 2 call(s) n=8/10") &&
+                  has(eps, "screen 5040x2835: first draw 86 (10 draw(s)), vs 0xD1 ps 0xE1, depth write yes") &&
+                  has(eps, "rows 270..273 equal the composed rows of: camera " + world + " (kind 3)") && has(eps, "depth write no") && has(eps, "rows not read (skip)"),
+              "the reader joins each depth's first draw to the camera whose calls composed its rows: the left eye's depth to the left eye's kind-5 calls, the right eye's to the right's, the screen's to "
+              "the world camera's kind-3 calls; the second signature has no rows and says why");
+        check(has(eps, "the pass's chosen rows (bound block yes) equal the view axes (as they are) of: camera " + eyeL + " (kind 5)") && has(eps, "-> the rows are an eye camera's (kind 5)"),
+              "the pass's rows are reported as the eye cameras' view axes (kind 5), read as they are");
+        check(has(eps, "H3 (the cockpit's maps are driven by kind-5 eye cameras' rows): 1 aboard episode(s)") &&
+                  has(eps, "episode 3 (key-on, GuiFocus 0): eye 0 depth rows equal kind 5 call(s); eye 1 depth rows equal kind 5 call(s); the pass's rows equal kind 5 call(s)' axes"),
+              "H3's facts: the aboard episode's eye depths' rows and the pass's rows are kind-5 calls'");
+        check(has(eps, "== on-foot naming runs") && has(eps, "H2 (the longest unnamed run in an on-foot world stays under 3 frames): 1 unnamed run(s) of 3 frames or more, and 0 of 1 or 2") &&
+                  has(eps, "== the detour's CPU (the observer's two halves, 1 call in 16 timed;"),
+              "the naming runs (H2: the ten unnamed frames are one run of three or more) and the detour's CPU sections follow");
+    }
+    return g_failures;
+}
+
 int run() {
     wchar_t temp[MAX_PATH]{};
     GetTempPathW(MAX_PATH, temp);
@@ -541,6 +824,8 @@ int run() {
     }
     check(!vrCameraCensusWanted() && stub::setObserverCalls == 0 && stub::pauseCalls == 0 && stub::disarmCalls == 0 && stub::observeFrameCalls == 0,
           "KEY OFF: ...and ask the injector for nothing: no observer, no owner, no hook, no pause");
+    check(detail::g_vrCensusJoinDraw == nullptr && stub::resolveCalls == 0,
+          "KEY OFF: ...and the episodes' per-draw hook is null (the route's draw costs one load of a null pointer) and no depth view was ever resolved");
     g_runtimeProfile = RuntimeProfile::Flat;
     Config::get().set("advanced.vr_camera_census", "on");
     {
@@ -729,6 +1014,9 @@ int run() {
           "the announcement says the census itself never writes a camera (the route's injection is its own), and the key-off line says the observer is detached");
     check(has(lineWith(log, "vr camera census: on (advanced.vr_camera_census)"), "while the route jitters, only a non-zero phase"),
           "the announcement says that while the route jitters only a frame with a non-zero phase is sampled");
+    check(occurrences(log, "vr camera census: episodes: up to 10, one frame each, 30 frames after a trigger") == 1 &&
+              occurrences(log, "vr camera census: episodes: a trigger (1 of 2 so far) arrived while an episode was armed") == 1,
+          "the episodes are announced once, and the first trigger that found one armed (the journal's flip at frame 4, while the key-on episode waited for frame 31) is said once, with the count");
     check(occurrences(log, "vr camera census: camera=0x") == 5, "one line for each of the five cameras, printed once");
     {
         // The eye cameras' bound moved by a remnant of the eye shift at frame 3: one line each. The world's and the first-person camera's bound
@@ -935,6 +1223,7 @@ int run() {
               "with a world phase of 1e-4) while the kind-3 calls carried it");
         if (g_failures) std::printf("---- the clean log's report verdict ----\n%s\n", report2.substr(report2.find("== stage 2 verdict") == std::string::npos ? 0 : report2.find("== stage 2 verdict")).c_str());
     }
+    runEpisodes(gpu);
     if (g_failures) std::printf("---- the reader's report ----\n%s\n---- the census log, census lines only ----\n%s\n", report.c_str(), censusLinesOnly(log).c_str());
     return g_failures;
 }

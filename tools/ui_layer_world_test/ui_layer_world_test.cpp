@@ -24,6 +24,10 @@
 //      draw's bindings changed before the re-issue, abandoned).
 //   5. THE HOOKS STEP ASIDE: every raw entry the re-issue calls runs with VrWorldInternalScope up, without an outer one.
 //   6. THE DOOR'S PREFLIGHT and the accessors, the lost-draw counter, the stats.
+//   7. THE ON-FOOT MAPS GATE (experimental.on_foot_maps_sharp, docs/design-world-camera-motion-2026-09-30.md, Phase 1), the layer's
+//      half: the key off is today's gate frame by frame and logs nothing; the key on follows the naming (hold 2, release 3), a
+//      taken 2D screen marks the eye and the door's predicate answers for it while nothing else went into an eye-sized target, and
+//      every line is made in its order (testMapsGate below).
 // Exit codes: 0 pass, 1 a check failed, 2 usage. --dry-run touches nothing; --hardware runs the same checks on the default adapter.
 #include <windows.h>
 
@@ -36,11 +40,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "../../src/common/config.h"
 #include "../../src/common/guard.h"
+#include "../../src/common/log.h"
 #include "../../src/common/system_d3d11.h"
 #include "../../src/d3d11/binding_shadow.h"
 #include "../../src/d3d11/depth_probe.h"
@@ -52,6 +59,7 @@
 #include "../../src/d3d11/ui_depth.h"
 #include "../../src/d3d11/ui_layer.h"
 #include "../../src/d3d11/ui_layer_math.h"
+#include "../../src/d3d11/ui_maps_math.h"
 #include "../../src/d3d11/ui_panel_scale.h"
 #include "../../src/d3d11/ui_surfaces.h"
 #include "../../src/d3d11/vr_world_mips.h"
@@ -94,6 +102,12 @@ struct Stubs {
     // the journal, the eye table
     bool journalKnown = true, journalOnFoot = true;
     const void* eyeRes[2] = {nullptr, nullptr};
+    // the on-foot maps gate's neighbours: the route's own answer to the door's question, the draws into eye-sized targets the hooks
+    // counted this frame (vscreen.cpp), the depth probe's count of the 2D screen's depth
+    bool routeDoor = false;
+    uint32_t eyeDraws = 0;
+    bool depthKnown = false;
+    uint32_t depthDraws = 0;
     // raw entries: did any run with the route's internal scope up / down
     unsigned rawCalls = 0, rawInternal = 0;
 };
@@ -109,8 +123,15 @@ BindingSlot g_bindingSlots[static_cast<size_t>(BindSlot::Count)];
 }  // namespace detail
 void breadcrumb(const char*) {}  // production guard.cpp's crash-channel dependency
 
+// screen_motion.h's two flags (screenMotionLive is inline over them): the rig sets them the way fix.temporal_aa would.
+namespace detail {
+bool g_screenMotionEnabled = true;
+bool g_screenMotionFailed = false;
+}  // namespace detail
 bool vrWorldRouteEnabled() { return g_stubs.enabled; }
 bool vrWorldRouteLayerMayTake() { return g_stubs.mayTake; }
+bool vrWorldRouteDoorLayerOnly(uint32_t, uint64_t) { return g_stubs.routeDoor; }
+uint32_t vScreenEyeDrawsThisFrame() { return g_stubs.eyeDraws; }
 void vrWorldRouteNoteEyeTaken(uint32_t eye, uint64_t sequence) {
     ++g_stubs.tookCalls;
     g_stubs.tookEye = eye;
@@ -155,7 +176,10 @@ bool bindingResolve(void* view, ResourceInfo* out) {
     return true;
 }
 bool bindingResolveResource(void*, ResourceInfo*) { return false; }
-bool depthProbeDrawsAtSize(uint32_t, uint32_t, uint32_t*) { return false; }
+bool depthProbeDrawsAtSize(uint32_t, uint32_t, uint32_t* draws) {
+    if (draws) *draws = g_stubs.depthDraws;
+    return g_stubs.depthKnown;
+}
 bool deviceHookHmdQuality(float*) { return false; }
 bool gpuCensusBegin(ID3D11DeviceContext*, GpuCensusSection) noexcept { return false; }
 void gpuCensusEnd(ID3D11DeviceContext*, GpuCensusSection) noexcept {}
@@ -1019,9 +1043,345 @@ void testDoorGaps(Rig& r) {
 }
 }  // namespace
 
+// ================================================================ the on-foot maps gate (experimental.on_foot_maps_sharp)
+// The layer's half, the real ui_layer.cpp (docs/design-world-camera-motion-2026-09-30.md, Phase 1; the pure half and the source pins
+// are tools\on_foot_maps_test). The boundary is driven the way vscreen.cpp drives it, once a frame, with the frame's naming told
+// first (uiLayerNoteScreenNamed: screen_motion.cpp's one call); the 2D screen composite is taken the way forwardWithVerdict takes it
+// (decide, Begin around the game's own draw, End). What it proves, against the production functions:
+//   1. KEY OFF: the gate is today's journal-or-depth, frame by frame over a scripted run of every input, and nothing of the feature
+//      is on, marked, asked or logged.
+//   2. KEY ON: the gate follows the naming alone -- held on the second named frame, released on the third unnamed -- carried from
+//      today's gate at the switch; a taken screen composite marks the eye, and the door's predicate answers for it only while every
+//      draw into an eye-sized target was taken; the route's re-issue is not a take; the key off, the layer off and screen motion off
+//      each hand the gate back to today's, with a line saying why.
+//   3. THE LINES: every one of them, in the order the script makes them, and none while the key is off.
+bool boundaryFrame(Rig& r, bool named) {
+    if (named) uiLayerNoteScreenNamed();
+    uiLayerFrameBoundary(r.ctx.Get());
+    return uiLayerWorldScreenHeld();
+}
+
+// A taken 2D screen composite, as forwardWithVerdict handles it: the decision, the layer's Begin around the game's own draw, End.
+bool takeScreen(Rig& r, int eye) {
+    bindGame(r, eye);
+    const bool decided = uiLayerDecide(r.ctx.Get(), static_cast<int>(UiLayerFamily::kScreen), true, false);
+    if (!decided) return false;
+    const bool layered = uiLayerBegin(r.ctx.Get());
+    r.ctx->Draw(4, 0);
+    if (layered) uiLayerEnd(r.ctx.Get());
+    return layered;
+}
+
+std::vector<std::string> mapsLines(const std::wstring& dir) {
+    std::vector<std::string> out;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"\\*.log").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    do {
+        std::ifstream in(dir + L"\\" + fd.cFileName, std::ios::binary);
+        std::string line;
+        while (std::getline(in, line)) {
+            const size_t at = line.find("on foot maps sharp");
+            if (at == std::string::npos) continue;
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            out.push_back(line.substr(at));
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return out;
+}
+
+void testMapsGate(Rig& r) {
+    auto& cfg = Config::get();
+    wchar_t temp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, temp);
+    const std::wstring dir = std::wstring(temp) + L"edvr_ui_layer_world_maps_" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    check(Log::get().open(dir, L"uilwmaps"), "maps: the rig's log opens in a temp directory (its lines are read back at the end)");
+
+    // ---- 1. KEY OFF: today's gate, frame by frame, and nothing of the feature anywhere.
+    cfg.set("experimental.on_foot_maps_sharp", "off");
+    uiLayerConfigure(cfg);
+    {
+        UiOnFootGate refJournal;
+        UiWorldScreenGate refDepth;
+        uint32_t bits = 7;
+        bool same = true, off = true, doorOff = true;
+        const uint32_t counts[4] = {0, 10, 100, 5000};
+        unsigned held = 0, open = 0;
+        // 400 frames in four stretches, so both signals and the depth's hysteresis (2 busy frames to hold, 90 quiet ones to let go) are
+        // all exercised: the journal alone with no depth count; the depth busy with the journal aboard; the depth quiet long enough to
+        // let go; every input at random.
+        for (unsigned i = 0; i < 400; ++i) {
+            bits = bits * 1664525u + 1013904223u;
+            g_stubs.journalKnown = true;                       // (an unknown reading holds for 3 s of the wall clock; the pure rig has it)
+            if (i < 100) {
+                g_stubs.journalOnFoot = (bits >> 8) & 1u;
+                g_stubs.depthKnown = false;
+                g_stubs.depthDraws = 0;
+            } else if (i < 130) {
+                g_stubs.journalOnFoot = false;
+                g_stubs.depthKnown = true;
+                g_stubs.depthDraws = 5000;
+            } else if (i < 300) {
+                g_stubs.journalOnFoot = false;
+                g_stubs.depthKnown = true;
+                g_stubs.depthDraws = 3;
+            } else {
+                g_stubs.journalOnFoot = (bits >> 8) & 1u;
+                g_stubs.depthKnown = ((bits >> 9) & 3u) != 0;
+                g_stubs.depthDraws = counts[(bits >> 12) & 3u];
+            }
+            const bool named = ((bits >> 16) & 1u) != 0;       // the naming is told every other frame: with the key off nobody reads it
+            // The frozen copy of today's gate (ui_layer.cpp onFootGateTick before the maps gate): both steps run every frame, then OR.
+            const bool wantJournal = uiLayerOnFootStep(refJournal, true, g_stubs.journalOnFoot, 1000 + i * 11);
+            const bool wantDepth = uiLayerWorldScreenStep(refDepth, g_stubs.depthKnown, g_stubs.depthKnown ? g_stubs.depthDraws : 0);
+            const bool want = wantJournal || wantDepth;
+            const bool got = boundaryFrame(r, named);
+            if (i >= 2) same = same && got == want;            // the layer's gates were seeded by the rig's earlier frames: two frames converge them
+            off = off && !uiLayerMapsOn();
+            held += got ? 1u : 0u;
+            open += got ? 0u : 1u;
+            g_stubs.routeDoor = false;
+            doorOff = doorOff && !uiLayerDoorLayerOnly(0, r.seq) && !uiLayerDoorLayerOnly(1, r.seq);
+        }
+        check(same, "maps, key off: the gate is the journal's on-foot reading OR the screen's own depth, frame by frame over 400 scripted inputs");
+        check(held > 100 && open > 100, "maps, key off: (setup) the script held the gate and opened it, both for a good part of the run");
+        check(off && doorOff, "maps, key off: the maps gate is never on and the door's predicate answers for the route's question alone (false here)");
+        g_stubs.routeDoor = true;
+        check(uiLayerDoorLayerOnly(0, r.seq) && uiLayerDoorLayerOnly(1, 77), "maps, key off: ... and answers true exactly when the route says so");
+        g_stubs.routeDoor = false;
+    }
+
+    // ---- 2. KEY ON, from a world held by the journal.
+    g_stubs.journalKnown = g_stubs.journalOnFoot = true;
+    g_stubs.depthKnown = false;
+    g_stubs.depthDraws = 0;
+    boundaryFrame(r, true);
+    boundaryFrame(r, true);
+    check(uiLayerWorldScreenHeld(), "maps: (setup) on foot, the journal holds the screen");
+    cfg.set("experimental.on_foot_maps_sharp", "on");
+    uiLayerConfigure(cfg);
+    check(boundaryFrame(r, true) && uiLayerMapsOn(), "maps, key on: the first boundary switches the naming in, carrying the world today's gate held");
+    check(boundaryFrame(r, true) && boundaryFrame(r, true) && uiLayerWorldScreenHeld(), "maps: named frames keep the world held");
+    // The journal still says on foot throughout: with the key on it is not asked.
+    check(boundaryFrame(r, false) && boundaryFrame(r, false), "maps: two unnamed frames (a map's first two) release nothing");
+    check(!boundaryFrame(r, false) && uiLayerMapsOn(), "maps: the third unnamed frame releases the panel to the layer, though the journal still says on foot");
+    check(!boundaryFrame(r, false) && !boundaryFrame(r, false), "maps: a map that goes on stays with the layer");
+
+    // The take: the layer takes the 2D screen composite, marks the eye, and the door's predicate answers for it.
+    {
+        g_stubs.mayTake = false;
+        g_stubs.eyeDraws = 0;
+        const uint64_t seq = nextArmed(r);
+        g_stubs.eyeDraws = 1;   // the game drew one composite into an eye-sized target
+        const bool took0 = takeScreen(r, 0);
+        check(took0, "maps: with the gate on and the panel the layer's, the 2D screen composite is TAKEN (decided, Begin, drawn into the layer)");
+        const auto px = readPixels(r, r.eye[0].tex.Get());
+        check(at(px, kEyeW, 30, 20) == kVoid, "maps: ... and the game's eye image holds nothing of it (the draw went into the layer)");
+        check(uiLayerDoorLayerOnly(0, seq), "maps: the door runs layer-only for the eye whose 2D screen was taken when every eye draw was taken");
+        check(uiLayerDoorLayerOnly(0, seq), "maps: ... and answers the same the second time it is asked (the sharpen door asks again)");
+        check(!uiLayerDoorLayerOnly(1, seq), "maps: the other eye, whose screen was not taken, is not layer-only");
+        check(!uiLayerDoorLayerOnly(0, seq + 1) && !uiLayerDoorLayerOnly(0, 0), "maps: another sequence, or sequence 0, never matches the mark");
+        check(uiLayerWorldDoorGap(seq, 0, r.frame[0].tex.Get()) == 0, "maps: the door's preflight finds the layer holding the eye's frame");
+        g_stubs.eyeDraws = 2;   // the game drew a second thing into an eye-sized target that the layer did not take
+        check(!uiLayerDoorLayerOnly(0, seq), "maps: one eye draw the layer did not take leaves the eye with something else in it: it keeps the upscaler");
+        const bool took1 = takeScreen(r, 1);
+        check(took1 && uiLayerDoorLayerOnly(0, seq) && uiLayerDoorLayerOnly(1, seq),
+              "maps: with both composites taken and both eye draws counted, both eyes are layer-only");
+        const uint32_t whole[4] = {0, 0, kDoorW, kDoorH};
+        const float uv[4] = {0, 0, 1, 1};
+        ID3D11Texture2D* out = uiLayerComposite(seq, 0, r.frame[0].tex.Get(), whole, uv);
+        check(out != nullptr, "maps: the layer composites over the door's black frame");
+        if (out) {
+            const auto lp = readPixels(r, out);
+            check(region(lp, kDoorW, 12, 12, 84, 60, kRed) && at(lp, kDoorW, 2, 2) == kBlack,
+                  "maps: the layer holds the screen the game drew (its own texture, sharp) where the quad is, over black");
+            out->Release();
+        }
+    }
+
+    // The hand-back, and the route's re-issue is not a take.
+    check(!boundaryFrame(r, true) && boundaryFrame(r, true), "maps: the second named frame in a row holds the world again");
+    {
+        g_stubs.mayTake = true;
+        g_stubs.eyeDraws = 0;
+        const uint64_t seq = nextArmed(r);
+        g_stubs.eyeDraws = 1;   // the game's own composite lands in the eye; the re-issue is the layer's one counted draw: the counts would pass
+        bindGame(r, 0);
+        const Drawn d = drawScreen(r);
+        check(!d.taken && d.reissued, "maps: with the route owning the world the screen composite is re-issued, not taken, as before the key");
+        g_stubs.routeDoor = false;
+        check(!uiLayerDoorLayerOnly(0, seq), "maps: a re-issue is not a take: the maps gate's door answers no for it");
+        g_stubs.routeDoor = true;
+        check(uiLayerDoorLayerOnly(0, seq), "maps: ... and the route's own answer comes first");
+        g_stubs.routeDoor = false;
+        g_stubs.mayTake = false;
+    }
+
+    // A second map opens; then the key goes off while the layer holds it: the gate is today's again at once.
+    boundaryFrame(r, false);
+    boundaryFrame(r, false);
+    check(!boundaryFrame(r, false), "maps: (setup) the second map is released to the layer on its third unnamed frame");
+    {
+        g_stubs.mayTake = false;
+        g_stubs.eyeDraws = 0;
+        const uint64_t seq = nextArmed(r);
+        g_stubs.eyeDraws = 1;
+        check(takeScreen(r, 0) && uiLayerDoorLayerOnly(0, seq), "maps: (setup) a taken screen the door would run layer-only for");
+        cfg.set("experimental.on_foot_maps_sharp", "off");
+        uiLayerConfigure(cfg);
+        check(boundaryFrame(r, false) && !uiLayerMapsOn(), "maps, key off live: the gate is the journal's again at once (on foot: held), the maps gate off");
+        check(!uiLayerDoorLayerOnly(0, seq), "maps, key off live: ... and the door's predicate no longer answers for a mark made under the key");
+    }
+
+    // The key back on while a map is showing: carried from today's gate (held), released in the usual three.
+    cfg.set("experimental.on_foot_maps_sharp", "on");
+    uiLayerConfigure(cfg);
+    check(boundaryFrame(r, false) && uiLayerMapsOn(), "maps, key on live: carried from today's gate: the world, though the screen names nothing");
+    check(boundaryFrame(r, false) && !boundaryFrame(r, false), "maps: ... and released on the third unnamed frame after the switch");
+
+    // The layer not live (fix.ui_quality off): the naming stops deciding, and says why.
+    cfg.set("fix.ui_quality", "off");
+    uiLayerConfigure(cfg);
+    check(!uiLayerLive(), "maps: (setup) fix.ui_quality off: the layer is not live");
+    boundaryFrame(r, false);
+    check(!uiLayerMapsOn(), "maps, layer not live: the maps gate is off (a layer that does not run decides nothing)");
+    cfg.set("fix.ui_quality", "100");
+    uiLayerConfigure(cfg);
+    check(uiLayerLive(), "maps: (setup) fix.ui_quality back: the layer is live");
+    check(boundaryFrame(r, false) && uiLayerMapsOn(), "maps: the naming decides again, carried from today's gate (on foot: the world)");
+
+    // Screen motion not live (fix.temporal_aa off): the gate is today's, with a line.
+    detail::g_screenMotionEnabled = false;
+    check(boundaryFrame(r, false) && !uiLayerMapsOn(), "maps, screen motion not live: the gate is today's (on foot: held), the maps gate off");
+    boundaryFrame(r, false);
+    detail::g_screenMotionEnabled = true;
+    check(boundaryFrame(r, false) && uiLayerMapsOn(), "maps: screen motion back: the naming decides again");
+
+    cfg.set("experimental.on_foot_maps_sharp", "off");
+    uiLayerConfigure(cfg);
+    boundaryFrame(r, false);
+    check(!uiLayerMapsOn(), "maps: (cleanup) key off");
+
+    // ---- 3. THE LINES, in the order the script made them.
+    Log::get().close();
+    const std::vector<std::string> lines = mapsLines(dir);
+    struct Want { const char* start; const char* piece; };
+    const Want want[] = {
+        {"on foot maps sharp: ON at frame=", "the world (the journal: on foot)"},
+        {"on foot maps sharp: the layer TAKES the 2D screen at frame=", "no world camera named its source for 3 frames in a row"},
+        {"on foot maps sharp: the layer took the 2D screen for eye 0", "the eye keeps the upscaler"},
+        {"on foot maps sharp: the layer HANDS BACK the 2D screen at frame=", "a world camera named the screen's source for 2 frames in a row"},
+        {"on foot maps sharp: the layer TAKES the 2D screen at frame=", "no world camera named its source for 3 frames in a row"},
+        {"on foot maps sharp: OFF at frame=", "(the key went off)"},
+        {"on foot maps sharp: ON at frame=", "the world (the journal: on foot)"},
+        {"on foot maps sharp: the layer TAKES the 2D screen at frame=", "no world camera named its source for 3 frames in a row"},
+        {"on foot maps sharp: OFF at frame=", "the layer held a panel at that moment"},
+        {"on foot maps sharp: experimental.on_foot_maps_sharp is on but", "fix.ui_quality is off"},
+        {"on foot maps sharp: ON at frame=", "the world (the journal: on foot)"},
+        {"on foot maps sharp: OFF at frame=", "(screen motion is not live)"},
+        {"on foot maps sharp: experimental.on_foot_maps_sharp is on but", "screen motion is not live"},
+        {"on foot maps sharp: ON at frame=", "the world (the journal: on foot)"},
+        {"on foot maps sharp: OFF at frame=", "(the key went off)"},
+    };
+    bool orderOk = lines.size() == sizeof(want) / sizeof(want[0]);
+    std::string first = "(none)";
+    for (size_t i = 0; orderOk && i < lines.size(); ++i) {
+        if (lines[i].compare(0, std::strlen(want[i].start), want[i].start) != 0 || lines[i].find(want[i].piece) == std::string::npos) {
+            orderOk = false;
+            first = lines[i];
+        }
+    }
+    check(orderOk, "maps: the lines the script makes are ON, TAKES, not-empty, HANDS BACK, TAKES, OFF (key), ON, TAKES, OFF (layer), not-live (layer), ON, "
+                   "OFF (screen motion), not-live (screen motion), ON, OFF (key), in that order and none before the first");
+    if (!orderOk) {
+        std::printf("      got %zu line(s), want %zu; the first that differs: %s\n", lines.size(), sizeof(want) / sizeof(want[0]), first.c_str());
+        for (const auto& l : lines) std::printf("      | %s\n", l.c_str());
+    }
+    // Remove the rig's temp log.
+    {
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((dir + L"\\*.log").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do { DeleteFileW((dir + L"\\" + fd.cFileName).c_str()); } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        RemoveDirectoryW(dir.c_str());
+    }
+}
+
+// --bench (not part of the gate): what the on-foot maps gate costs the CPU, measured against the real boundary and the real door
+// predicate. The boundary's own work (the journal and depth steps, the layer's warm compile, the window bookkeeping) is the same in
+// every column, so the difference between the columns is the feature's.
+void benchMaps(Rig& r) {
+    auto& cfg = Config::get();
+    LARGE_INTEGER freq, a, b;
+    QueryPerformanceFrequency(&freq);
+    g_stubs.journalKnown = g_stubs.journalOnFoot = true;
+    g_stubs.depthKnown = false;
+    const uint32_t n = 200000;
+    auto perCall = [&](const char* what, auto&& body) {
+        for (uint32_t i = 0; i < 2000; ++i) body(i);   // warm
+        QueryPerformanceCounter(&a);
+        for (uint32_t i = 0; i < n; ++i) body(i);
+        QueryPerformanceCounter(&b);
+        const double ns = 1e9 * static_cast<double>(b.QuadPart - a.QuadPart) / static_cast<double>(freq.QuadPart) / n;
+        std::printf("  %-64s %8.1f ns\n", what, ns);
+        return ns;
+    };
+    std::puts("ui_layer_world_test --bench: CPU of the on-foot maps gate, per call");
+    cfg.set("experimental.on_foot_maps_sharp", "off");
+    uiLayerConfigure(cfg);
+    perCall("frame boundary, key off, first run (cold caches)", [&](uint32_t) { uiLayerFrameBoundary(r.ctx.Get()); });
+    const double off = perCall("frame boundary, key off (the journal and depth gate as today)", [&](uint32_t) { uiLayerFrameBoundary(r.ctx.Get()); });
+    cfg.set("experimental.on_foot_maps_sharp", "on");
+    uiLayerConfigure(cfg);
+    const double named = perCall("frame boundary, key on, a world camera named the source", [&](uint32_t) {
+        uiLayerNoteScreenNamed();
+        uiLayerFrameBoundary(r.ctx.Get());
+    });
+    const double unnamed = perCall("frame boundary, key on, nothing named (a map)", [&](uint32_t) { uiLayerFrameBoundary(r.ctx.Get()); });
+    const double told = perCall("uiLayerNoteScreenNamed alone (screen_motion.cpp, once per named frame)", [&](uint32_t) { uiLayerNoteScreenNamed(); });
+    // The door's question, key on after a take: the route's answer first, then the mark and the counts.
+    g_stubs.eyeDraws = 0;
+    const uint64_t seq = nextArmed(r);
+    g_stubs.eyeDraws = 1;
+    takeScreen(r, 0);
+    volatile bool sink = false;
+    const double doorOn = perCall("door predicate, key on, a take in this sequence", [&](uint32_t) { sink = sink | uiLayerDoorLayerOnly(0, seq); });
+    const double doorMiss = perCall("door predicate, key on, no take for the eye", [&](uint32_t) { sink = sink | uiLayerDoorLayerOnly(1, seq); });
+    cfg.set("experimental.on_foot_maps_sharp", "off");
+    uiLayerConfigure(cfg);
+    uiLayerFrameBoundary(r.ctx.Get());
+    const double doorOff = perCall("door predicate, key off (the route's question and one load)", [&](uint32_t) { sink = sink | uiLayerDoorLayerOnly(0, seq); });
+    std::printf("the feature's cost a frame: boundary +%.1f ns named / +%.1f ns unnamed, the naming told +%.1f ns, four door questions %.1f ns "
+                "(a take) / %.1f ns (key off)\n",
+                named - off, unnamed - off, told, 4 * doorOn, 4 * doorOff);
+    (void)doorMiss;
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--dry-run") == 0) {
         std::puts("ui_layer_world_test: dry-run (no device, no files)");
+        return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--bench") == 0) {
+        Rig r;
+        if (!setup(r, false)) {
+            std::puts("FAIL: a device, the textures and the test shaders");
+            return 1;
+        }
+        auto& cfg = Config::get();
+        cfg.set("fix.ui_quality", "100");
+        cfg.set("fix.temporal_aa", "dlss");
+        cfg.set("advanced.temporal_aa_jitter_sign", "as_is");
+        cfg.set("advanced.temporal_aa_jitter_lag", "0");
+        uiLayerConfigure(cfg);
+        uiLayerFrameBoundary(r.ctx.Get());
+        r.seq = 1;
+        benchMaps(r);
+        uiLayerShutdown();
         return 0;
     }
     // --hardware: the same checks on the default hardware adapter instead of WARP, by hand (the gate runs --self-test; a build
@@ -1064,6 +1424,7 @@ int main(int argc, char** argv) {
     testDoorGaps(r);
     test125(r);
     testAccessors(r);
+    testMapsGate(r);
     uiLayerShutdown();
     std::printf("ui_layer_world_test: %u checks, %u failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

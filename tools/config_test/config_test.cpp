@@ -1261,6 +1261,39 @@ int main(int argc, char** argv) {
         }
     }
 
+    // The on-foot maps gate (design-world-camera-motion-2026-09-30.md, Phase 1: experimental.on_foot_maps_sharp) is OFF by
+    // default: it is unflown, and with it on the layer takes a map's or a menu's 2D screen on foot. The shipped file and the
+    // code's fallback for an ini that predates the key must say the same thing; the control turns the fallback to on (a gate
+    // that switched itself on for every install) and must be caught.
+    expectStr("experimental.on_foot_maps_sharp", "off", "the shipped edvr.ini ships the on-foot maps gate off");
+    {
+        const std::string shippedMaps = Config::get().getString("experimental.on_foot_maps_sharp", "<unset>");
+        const std::string layerSource = readRepoFile(dir, L"src\\d3d11\\ui_layer.cpp");
+        if (layerSource.empty()) {
+            fail("ui_layer.cpp is readable from the repo root (maps key)", "could not read it");
+        } else {
+            const std::string fallback = codeFallbackOf(layerSource, "experimental.on_foot_maps_sharp");
+            if (fallback == shippedMaps) {
+                ok("the code's fallback for experimental.on_foot_maps_sharp is the shipped default");
+            } else {
+                fail("the code's fallback for experimental.on_foot_maps_sharp is the shipped default",
+                     "ui_layer.cpp falls back to \"" + fallback + "\", the ini ships \"" + shippedMaps + "\"");
+            }
+            std::string flipped = layerSource;
+            const std::string from = "getString(\"experimental.on_foot_maps_sharp\", \"" + fallback + "\")";
+            const size_t at = flipped.find(from);
+            if (at != std::string::npos)
+                flipped.replace(at, from.size(), "getString(\"experimental.on_foot_maps_sharp\", \"on\")");
+            if (at != std::string::npos && codeFallbackOf(flipped, "experimental.on_foot_maps_sharp") != shippedMaps) {
+                ok("control: the on-foot maps gate's fallback turned to on is caught");
+            } else {
+                fail("control: the on-foot maps gate's fallback turned to on is caught",
+                     at == std::string::npos ? "the call was not found to alter"
+                                             : "the flipped source still matched the ini");
+            }
+        }
+    }
+
     // The VR camera census (design doc section 82, advanced.vr_camera_census) installs a game hook when it is on, so it
     // is OFF by default in both places that can say so: the shipped file and the code's fallback for an ini that predates
     // the key. The same pair of checks as the world route's, with the same control.
@@ -1768,6 +1801,9 @@ int main(int argc, char** argv) {
     // ... and so is its jitter key: a flat profile reads it off whatever the file says (it never asks).
     Config::get().set("experimental.temporal_aa_on_foot_world_jitter", "on");
     expectStr("experimental.temporal_aa_on_foot_world_jitter", "off", "flat scope refuses the VR world jitter's key");
+    // ... and the on-foot maps gate's: a VR-profile key, so a flat profile reads it off whatever the file says.
+    Config::get().set("experimental.on_foot_maps_sharp", "on");
+    expectStr("experimental.on_foot_maps_sharp", "off", "flat scope refuses the on-foot maps gate's key");
     // The VR camera census's key is a VR-profile key too: a flat profile must never install its hook.
     Config::get().set("advanced.vr_camera_census", "on");
     expectStr("advanced.vr_camera_census", "off", "flat scope refuses the VR camera census's key");
@@ -1855,6 +1891,8 @@ int main(int argc, char** argv) {
     expectStr("experimental.temporal_aa_on_foot_world_jitter", "off", "VR profile reads the VR world jitter's explicit off");
     Config::get().set("experimental.temporal_aa_on_foot_world_jitter", "on");
     expectStr("experimental.temporal_aa_on_foot_world_jitter", "on", "VR profile reads the VR world jitter's explicit on");
+    Config::get().set("experimental.on_foot_maps_sharp", "on");
+    expectStr("experimental.on_foot_maps_sharp", "on", "VR profile reads the on-foot maps gate's explicit on");
     Config::get().set("advanced.vr_camera_census", "on");
     expectStr("advanced.vr_camera_census", "on", "VR profile reads the VR camera census's explicit on");
     g_runtimeProfile = RuntimeProfile::LegacyVr;

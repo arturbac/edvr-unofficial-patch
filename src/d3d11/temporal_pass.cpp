@@ -6774,6 +6774,12 @@ void temporalPassFrameBoundary() {
     g_curValid = false;
 }
 
+bool temporalPassChosenRows(float rows[12], bool* bound) {
+    if (!detail::g_temporalPassWantedFssChrome || !g_chosenThisFrame || !g_curValid || !rows) return false;
+    memcpy(rows, g_curRows, sizeof(g_curRows));
+    if (bound) *bound = g_curRowsBound;
+    return true;
+}
 
 bool temporalPassTotals(uint32_t* treated, double* avgMs, double* maxMs,
                         double* rejectPct, double* clipPct) {

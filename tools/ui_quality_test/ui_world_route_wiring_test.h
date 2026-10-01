@@ -145,7 +145,12 @@ void testWiringVscreen() {
                                "if(screenMotionLive()&&!uiLayerRedirecting()&&!uiLayerWorldReissuePending()){", "screenMotionUiDraw(self,", "screenMotionDraw(self,"},
                         &missing),
                 missing, "the tail of the game's draw: a draw the route re-issues runs the recognition alone, and skips the per-eye screen motion reissues (the two existing calls are untouched, behind one more term)");
-    check(countOf(afterui::squeeze(text), "screenMotionRecognize()") == 1, "the recognition is called in exactly one place in vscreen.cpp");
+    // The recognition is called in exactly two places: the route's (above, unchanged) and, behind the on-foot maps gate's flag, a 2D screen
+    // composite the layer TOOK (design-world-camera-motion-2026-09-30.md, Phase 1: a take swallows the per-eye call, and naming stops two
+    // frames after the last recognised composite). With the key off uiLayerMapsOn() is false and the second is one load.
+    check(countOf(afterui::squeeze(text), "screenMotionRecognize()") == 2 &&
+              has(afterui::squeeze(text), "if(uiLayer&&uiFamily==UiLayerFamily::kScreen&&uiLayerMapsOn()&&screenMotionLive()&&screenMotionRecognize())uiLayerMapsNoteRecognised();"),
+          "the recognition is called in exactly two places in vscreen.cpp: the route's, and a taken 2D screen's behind uiLayerMapsOn()");
 }
 
 void testWiringDoor() {
@@ -164,10 +169,10 @@ void testWiringDoor() {
     check(!has(treat.substr(0, treat.find("void*raw=edvrTemporalAa(")), "s->continuity[eye]=") && !has(treat.substr(0, treat.find("if(layerOnlyTreat(")), "hst.valid=true"),
           "...and leaves the eye's continuity alone (a later eye-route frame finds it broken and resets the history)");
     const std::string helper = bodyOf(temporalText, "bool layerOnlyTreat(State& s,", "layerOnlyTreat");
-    reportOrder(inOrder(helper, {"if(!edvr::vrWorldRouteDoorLayerOnly(eye,seq))returnfalse;", "blankFrame(s,eye,outW,outH,format)", "edvr::uiLayerWorldDoorGap(seq,eye,frame)",
+    reportOrder(inOrder(helper, {"if(!edvr::uiLayerDoorLayerOnly(eye,seq))returnfalse;", "blankFrame(s,eye,outW,outH,format)", "edvr::uiLayerWorldDoorGap(seq,eye,frame)",
                                  "returnfalse;}", "frame->AddRef();*output=frame;", "edvr::uiLayerNoteTemporal(seq,eye,frame);", "++s.layerOnly;", "returntrue;}"},
                         &missing),
-                missing, "layerOnlyTreat: only for an eye the route took, the black frame, the layer's preflight (a gap leaves the eye to the pass), then the frame handed on and noted to the layer");
+                missing, "layerOnlyTreat: only for an eye the layer holds whole (the route's world, or a map or menu under the maps gate), the black frame, the layer's preflight (a gap leaves the eye to the pass), then the frame handed on and noted to the layer");
     check(!has(helper, "returnS_FALSE") && !has(helper, "returnE_") && !has(helper, "*output=nullptr") && !has(helper, "s.continuity") && !has(helper, "s.history"),
           "...and it has no S_FALSE, no error, no null output, and touches neither continuity nor history");
     const std::string blank = bodyOf(temporalText, "ID3D11Texture2D* blankFrame(State& s,", "blankFrame");
@@ -179,7 +184,7 @@ void testWiringDoor() {
     const std::string sharpenText = readText("src/d3d11/native_sharpen.cpp");
     check(!sharpenText.empty(), "src/d3d11/native_sharpen.cpp is readable from the working directory");
     const std::string sharpen = bodyOf(sharpenText, "HRESULT WINAPI treat(void* p,uint64_t seq,", "native_sharpen treat()");
-    const size_t only = sharpen.find("if(edvr::vrWorldRouteDoorLayerOnly(eye,seq)){");
+    const size_t only = sharpen.find("if(edvr::uiLayerDoorLayerOnly(eye,seq)){");
     const size_t ordinary = sharpen.rfind("if(s->strength<=0.f||s->stoodDown){");
     check(only != std::string::npos && ordinary != std::string::npos && only < ordinary, "sharpen: the layer-only branch precedes the ordinary path");
     if (only != std::string::npos && ordinary != std::string::npos && only < ordinary) {
@@ -195,7 +200,7 @@ void testWiringDoor() {
         check(rest.find("edvrSharpen(source,int(eye),bounds,s->strength)") < rest.find("edvr::uiLayerComposite(seq,eye,result,whole,layerUv)"),
               "sharpen: every other eye keeps the ordinary order (RCAS on the frame, then the layer over it)");
     }
-    check(countOf(sharpen, "vrWorldRouteDoorLayerOnly(") == 1, "sharpen asks the route once");
+    check(countOf(sharpen, "uiLayerDoorLayerOnly(") == 1, "sharpen asks the layer's door predicate once");
 }
 
 void testWiring() {

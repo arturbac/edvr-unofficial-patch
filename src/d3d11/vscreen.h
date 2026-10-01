@@ -107,6 +107,11 @@ inline bool eyeShapedAtScale(uint32_t w, uint32_t h, uint32_t eyeW, uint32_t eye
 // is the same "disable yourself" answer it already acted on.
 bool vScreenIsEyeSized(uint32_t w, uint32_t h);
 
+// The draws into eye-sized colour targets this frame so far, BOTH eyes through the one counter (the draw hooks' eye branch). The
+// frame's submits come before its Present, so a door asked at Submit reads the whole frame's count. The on-foot maps gate's door
+// (ui_layer.cpp uiLayerDoorLayerOnly) compares it with the draws the layer took: when every one was taken the eye holds nothing else.
+uint32_t vScreenEyeDrawsThisFrame();
+
 // The context's OMSetRenderTargets through the ORIGINAL entry, past the
 // hook and the binding shadow: for a fix that rebinds around one draw and
 // puts the game's bindings back before anything else looks (ui_depth binds

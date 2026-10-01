@@ -15,6 +15,7 @@
 #include "ui_layer.h"
 
 #include "ui_layer_math.h"
+#include "ui_maps_math.h"   // the on-foot maps gate: the key, the step, the door's predicate, the lines
 #include "ui_holo_remap.h"
 #include "ui_layer_draw_timing.h"
 #include "ui_layer_shaders.h"
@@ -32,6 +33,7 @@
 #include "gpu_census.h"    // issue #38: the per-feature GPU cost census
 #include "graphics_runtime.h"
 #include "journal_watch.h" // the on-foot gate's reading: Status.json's Flags2 bit 0, GuiFocus
+#include "screen_motion.h" // screenMotionLive: the maps gate decides by screen motion's naming only while it runs
 #include "shader_swap.h"
 #include "ui_depth.h"      // uiDepthEyeOfTarget: the eye, by the pass's own table
 #include "ui_panel_scale.h" // the engine-side panel sizing, configured and ticked with the key
@@ -70,6 +72,9 @@ bool g_uiLayerIssueBlocked = false;
 bool g_uiLayerCrispOn = false;      // the HDR HUD take/re-issue armed this frame (with the layer)
 bool g_uiLayerCrispPending = false; // a tonemap draw was admitted; its re-issue follows its draw
 bool g_uiLayerWorldReissue = false; // the VR world route: the screen composite just decided is re-issued after the game's draw
+bool g_uiLayerMapsOn = false;       // experimental.on_foot_maps_sharp: on, the layer and screen motion live -- naming decides the gate
+uint64_t g_uiLayerGateFrame = 0;    // frame boundaries the layer has seen: what a naming is attributed to (ui_layer.h)
+uint64_t g_uiLayerNamedAt = ~0ull;  // the gate frame in which a draw last named the screen's source (never: ~0)
 }  // namespace detail
 
 namespace {
@@ -186,6 +191,10 @@ struct Eye {
     // The frame whose 2D screen draw the VR world route re-issued into this layer (End of the re-issue): the eye
     // is the layer's alone that frame, and a draw the game left in its own eye image after it is lost (counted).
     uint64_t worldSeq = 0;
+    // The frame whose 2D screen composite the on-foot maps gate gave the layer: TAKEN into this layer, not re-issued (ui_maps_math.h).
+    // With nothing else drawn into an eye-sized target that frame, the layer holds the eye's whole picture and the door runs
+    // layer-only for it (uiLayerDoorLayerOnly).
+    uint64_t screenTakenSeq = 0;
     // The identity is still a link of the pre-UI chain the crisp re-issue opened
     // (the tonemap's output A, before the game's post pass carried it to B): a
     // small pass reading it carries it on, once (uiLayerFollowReader,
@@ -281,6 +290,7 @@ struct Draw {
     bool saved = false;    // the game's state is held below: restore it on any exit
     bool counted = false;  // this decision's draw is counted (a fallback re-issue is not)
     bool hdr = false;      // the crisp-HUD half of fix.ui_quality: the draw goes to the HDR HUD layer, not the 8-bit one
+    bool reissue = false;  // the VR world route's re-issue of the 2D screen (the game's own draw lands in its eye): not a take
     int eye = -1;
     UiLayerFamily family = UiLayerFamily::kNone;
     uint64_t holoPsHash = 0;
@@ -480,6 +490,28 @@ UiWorldScreenGate g_world;
 int8_t g_screenHeld = -1;  // -1 never read; 0 the screen is taken; 1 it is the world: left
 uint64_t g_heldSinceMs = 0;
 bool g_journalOffNoted = false;
+
+// The on-foot maps gate (ui_maps_math.h; experimental.on_foot_maps_sharp). The key is read where the layer's other keys are
+// (uiLayerConfigure, live) and latched at the frame boundary into detail::g_uiLayerMapsOn, so every draw of a frame sees one
+// answer. With the key off none of this is touched but the one load of keyCfg at the boundary.
+struct Maps {
+    UiMapsKey keyCfg = UiMapsKey::Off;    // the ini's value as last read
+    bool active = false;                  // the world camera's naming decided the gate at the last boundary
+    UiMapsGate gate;                      // the step's state (carried from today's gate when the feature switches in)
+    uint64_t episodeFrames = 0;           // frames in the current world period, or panel period
+    uint64_t episodeStartMs = 0;
+    uint64_t panelLayerOnly = 0;          // this panel period's eyes through the layer-only door
+    uint64_t panelNotEmpty = 0;           // ... and the eyes the layer took the screen for but the upscaler kept
+    uint64_t layerOnlySeq[2] = {0, 0};    // per eye, the last sequence counted: the two doors ask for each eye
+    uint64_t notEmptySeq[2] = {0, 0};
+    uint32_t notEmptyLines = 0;           // the "took the screen but the eye holds more" line, the first few only
+    const char* notLiveWhy = nullptr;     // the reason the key is on and nothing changes (one line per reason)
+    uint64_t windowStartMs = 0;
+    UiMapsWindow win;
+};
+Maps g_maps;
+uint32_t g_frameTakenDraws = 0;           // draws taken into either layer since the last frame boundary (the door's emptiness test)
+constexpr uint64_t kMapsWindowMs = 5000;
 
 // ------------------------------------------------------------ the price
 //
@@ -863,6 +895,7 @@ bool releaseLayers() {
         e.seq = 0;
         e.draws = 0;
         e.worldSeq = 0;
+        e.screenTakenSeq = 0;
         e.chainOpen = false;
         e.mTex.Reset();
         e.mRtv.Reset();
@@ -1650,6 +1683,7 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
     // the same draw too.
     if (!g_draw.counted) {
         g_draw.counted = true;
+        ++g_frameTakenDraws;
         if (g_draw.hdr) {
             ++e.hdrDraws;
             ++g_win.hdrRedirected;
@@ -1660,6 +1694,12 @@ bool beginInner(ID3D11DeviceContext* ctx, int which) {
         ++g_win.redirected;
         ++g_sessionRedirected;
         noteTaken(g_draw.family, g_draw.eye, layerW, layerH);
+        // The on-foot maps gate gave the layer the 2D screen (a TAKE; the route's re-issue, where the game's own draw lands in
+        // its eye, is not): this eye's picture is the layer's, and the door may run layer-only for it (uiLayerDoorLayerOnly).
+        if (g_draw.family == UiLayerFamily::kScreen && !g_draw.hdr && !g_draw.reissue && detail::g_uiLayerMapsOn) {
+            e.screenTakenSeq = g_draw.seq;
+            ++g_maps.win.screenTakes;
+        }
         if (g_draw.family == UiLayerFamily::kAfterUi) ++g_win.afterTaken;
         g_win.viewportRemaps += g_draw.vpCount;
         if (g_draw.scissorSet) g_win.scissorRemaps += g_draw.scCount;
@@ -2111,12 +2151,141 @@ const char* journalReading(bool active, bool known, bool onFoot) {
                             : "aboard";
 }
 
+// ---- the on-foot maps gate (ui_maps_math.h): the lines, the 5 s window, the switch in and out
+// The key is on and nothing changes: one line per reason (the route's habit), so "on, and silent" is never the answer.
+void mapsNoteNotLive(const char* why) {
+    Maps& m = g_maps;
+    if (m.notLiveWhy && std::strcmp(m.notLiveWhy, why) == 0) return;
+    m.notLiveWhy = why;
+    char line[640];
+    uiMapsFormatNotLive(line, sizeof(line), why);
+    Log::get().note("%s", line);
+}
+
+// The 5 s window, zeros included while the key is on: an absent line is what "the code never ran" looks like.
+void mapsWindowTick(uint64_t now, bool held) {
+    Maps& m = g_maps;
+    if (!m.windowStartMs) {
+        m.windowStartMs = now;
+        return;
+    }
+    if (now - m.windowStartMs < kMapsWindowMs) return;
+    char line[760];
+    uiMapsFormatWindow(line, sizeof(line), static_cast<double>(now - m.windowStartMs) / 1000.0,
+                       m.active ? "naming" : "fallback", held, m.win);
+    Log::get().note("%s", line);
+    m.win.reset();
+    m.windowStartMs = now;
+}
+
+// The naming stops deciding the gate (the key went off, screen motion stopped, the layer stopped): one line, the gate is
+// today's again from this frame.
+void mapsSwitchOut(uint64_t gateFrame, const char* why) {
+    Maps& m = g_maps;
+    char line[760];
+    uiMapsFormatOff(line, sizeof(line), gateFrame, why, !m.gate.world);
+    Log::get().note("%s", line);
+    m.active = false;
+    m.gate = UiMapsGate{};
+    m.episodeFrames = 0;
+    m.panelLayerOnly = m.panelNotEmpty = 0;
+    detail::g_uiLayerMapsOn = false;
+}
+
+// The layer is not live: the gate does not run, so neither does the naming. With the key off this is two loads.
+void mapsLayerNotLive(uint64_t gateFrame) {
+    Maps& m = g_maps;
+    if (m.keyCfg != UiMapsKey::On && !m.active) {
+        m.windowStartMs = 0;
+        return;
+    }
+    const char* why = uiLayerNotLiveReason();
+    if (!why) why = "the UI layer is not live";
+    if (m.active) mapsSwitchOut(gateFrame, why);
+    if (m.keyCfg != UiMapsKey::On) return;
+    ++m.win.notLive;
+    mapsNoteNotLive(why);
+    mapsWindowTick(GetTickCount64(), g_screenHeld == 1);
+}
+
+// One frame of the gate while the layer is live: today's verdict (byJournal || byDepth) is always computed by the caller;
+// with the key on and screen motion live the world camera's naming replaces it. Returns the gate for the frame that starts.
+bool mapsGate(uint64_t now, uint64_t gateFrame, bool today, bool known, bool onFoot, bool* decided) {
+    Maps& m = g_maps;
+    const bool keyOn = m.keyCfg == UiMapsKey::On;
+    if (!keyOn && !m.active) {
+        // The key-off path: nothing else runs, nothing is logged.
+        m.windowStartMs = 0;
+        detail::g_uiLayerMapsOn = false;
+        *decided = false;
+        return today;
+    }
+    const bool smLive = screenMotionLive();
+    const bool can = keyOn && smLive;
+    char line[900];
+    if (can && !m.active) {
+        uiMapsCarry(m.gate, today);
+        m.active = true;
+        m.episodeFrames = 0;
+        m.episodeStartMs = now;
+        m.panelLayerOnly = m.panelNotEmpty = 0;
+        uiMapsFormatOn(line, sizeof(line), gateFrame, today, journalReading(journalWatchActive(), known, onFoot));
+        Log::get().note("%s", line);
+    } else if (!can && m.active) {
+        mapsSwitchOut(gateFrame, keyOn ? "screen motion is not live" : "the key went off");
+    }
+    if (keyOn && !smLive) {
+        ++m.win.notLive;
+        mapsNoteNotLive("screen motion is not live (fix.temporal_aa is off, or it stood down)");
+    } else if (keyOn) {
+        m.notLiveWhy = nullptr;
+    }
+    bool held = today;
+    if (m.active) {
+        const bool named = detail::g_uiLayerNamedAt == gateFrame;
+        ++m.win.frames;
+        if (named) ++m.win.named; else ++m.win.unnamed;
+        const UiMapsEdge edge = uiMapsStep(m.gate, named);
+        ++m.episodeFrames;
+        const double seconds = static_cast<double>(now - m.episodeStartMs) / 1000.0;
+        if (edge == UiMapsEdge::Release) {
+            ++m.win.releases;
+            uiMapsFormatTake(line, sizeof(line), gateFrame, kUiMapsReleaseFrames, m.episodeFrames, seconds,
+                             journalReading(journalWatchActive(), known, onFoot));
+            Log::get().note("%s", line);
+            m.episodeFrames = 0;
+            m.episodeStartMs = now;
+            m.panelLayerOnly = m.panelNotEmpty = 0;
+        } else if (edge == UiMapsEdge::Hold) {
+            ++m.win.holds;
+            char why[96];
+            uiMapsFormatNamedWhy(why, sizeof(why), kUiMapsHoldFrames);
+            uiMapsFormatHandBack(line, sizeof(line), gateFrame, m.episodeFrames, seconds, m.panelLayerOnly, m.panelNotEmpty, why);
+            Log::get().note("%s", line);
+            m.episodeFrames = 0;
+            m.episodeStartMs = now;
+            m.panelLayerOnly = m.panelNotEmpty = 0;
+        }
+        held = m.gate.world;
+        if (held) ++m.win.worldFrames; else ++m.win.panelFrames;
+    }
+    *decided = m.active;
+    detail::g_uiLayerMapsOn = m.active;
+    if (keyOn) mapsWindowTick(now, held); else { m.windowStartMs = 0; m.win.reset(); }
+    return held;
+}
+
 // Once a frame while the layer is live, on the render thread -- the thread
 // that ticks the journal watcher and counts the depth probe's draws. Every
 // flip of the combined gate is one line, either way, never rate-limited,
 // naming which signal held and the count it judged by.
 void onFootGateTick() {
-    if (!detail::g_uiLayerLive) return;
+    // The frame that is ending: a draw that names the screen's source attributes itself to this count (ui_layer.h).
+    const uint64_t gateFrame = detail::g_uiLayerGateFrame++;
+    if (!detail::g_uiLayerLive) {
+        mapsLayerNotLive(gateFrame);
+        return;
+    }
     const bool active = journalWatchActive();
     const bool known = journalOnFootKnown(), onFoot = journalOnFoot();
     const uint64_t now = GetTickCount64();
@@ -2151,9 +2320,12 @@ void onFootGateTick() {
                                   "2D screen is taken on foot too, where it is the world");
     }
     const int8_t before = g_screenHeld;
-    const bool held = byJournal || byDepth;
+    // Today's verdict, unless experimental.on_foot_maps_sharp is on and screen motion runs: then the world camera's naming
+    // decides and says so in its own lines (mapsGate), and the lines below -- which speak of the journal and the depth -- stay quiet.
+    bool decidedByNaming = false;
+    const bool held = mapsGate(now, gateFrame, byJournal || byDepth, known, onFoot, &decidedByNaming);
     g_screenHeld = held ? 1 : 0;
-    if (g_screenHeld == before) return;
+    if (g_screenHeld == before || decidedByNaming) return;
     char depth[128];
     if (counted) {
         _snprintf_s(depth, sizeof(depth), _TRUNCATE, "%u draws a frame into its %ux%u depth target",
@@ -2209,7 +2381,7 @@ void logWorldScreen() {
         "now, %u at most this window, %llu frames counted; over %u for %u frames holds it, under %u for "
         "%u frames lets go); held %llu of %llu frames -- %llu by the journal alone, %llu by the depth "
         "alone, %llu by both; %llu 2D screen draws asked, %llu left in the picture, %llu re-issued into the "
-        "layer by the VR world route; the screen's depth at most, by GuiFocus: %s.",
+        "layer by the VR world route; the screen's depth at most, by GuiFocus: %s%s.",
         g_screenHeld == 1 ? "holds" : g_screenHeld == 0 ? "is open" : "has never been read",
         journalReading(active, journalOnFootKnown(), journalOnFoot()), g_world.draws, g_win.depthMax,
         static_cast<unsigned long long>(g_win.depthCounted), kUiWorldEnterDraws, kUiWorldEnterFrames,
@@ -2224,7 +2396,10 @@ void logWorldScreen() {
             g_win.decided[static_cast<size_t>(UiLayerFamily::kScreen)]
                          [static_cast<size_t>(UiLayerDecision::kWorldScreen)]),
         static_cast<unsigned long long>(g_win.worldReissued),
-        focus.empty() ? "nothing counted" : focus.c_str());
+        focus.empty() ? "nothing counted" : focus.c_str(),
+        g_maps.active ? " -- the gate is decided by experimental.on_foot_maps_sharp (the world camera's naming), not by these two "
+                        "signals; see the \"on foot maps sharp 5s:\" line"
+                      : "");
 }
 
 // The VR world route's own line: the screen draws the layer re-issued and, for the ones it did not, why -- the
@@ -2544,6 +2719,8 @@ bool crispTakeReady(ID3D11DeviceContext* ctx, int eye);
 // --------------------------------------------------------------- the API
 
 void uiLayerConfigure(Config& cfg) {
+    // The on-foot maps gate's key, live: the boundary latches it. A value that is not "on" reads as off.
+    g_maps.keyCfg = uiMapsKeyFromText(cfg.getString("experimental.on_foot_maps_sharp", "off").c_str());
     g_hdrDrawTimingOn = cfg.getBool("advanced.temporal_aa_diagnostics", false);
     detail::g_uiSeedDiagnostics = g_hdrDrawTimingOn;
     g_seedCensus.configure(g_hdrDrawTimingOn);
@@ -2801,6 +2978,7 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     g_draw.decided = false;
     g_draw.counted = false;
     g_draw.hdr = false;
+    g_draw.reissue = false;
     g_draw.holoPsHash = 0; g_draw.holoOriginal = nullptr; g_draw.holoPatched = nullptr;
     g_draw.holoRestoreOk = true;
     g_draw.ds = UiDsEffect{};
@@ -3749,6 +3927,7 @@ bool uiLayerWorldReissueBegin(ID3D11DeviceContext* ctx) {
             g_draw.decided = true;
             g_draw.counted = false;
             g_draw.hdr = false;
+            g_draw.reissue = true;  // the route's: the game's own draw lands in its eye image, this one is not a take
             g_draw.holoPsHash = 0;
             g_draw.holoOriginal = nullptr;
             g_draw.holoPatched = nullptr;
@@ -3820,6 +3999,7 @@ void uiLayerWorldReissueEnd(ID3D11DeviceContext* ctx) {
     worldReleaseSaved(plan);
     g_draw.decided = false;
     g_draw.counted = false;
+    g_draw.reissue = false;
     if (!putBack) standDown("a fault while putting the game's texture and sampler back after the world route's re-issue");
     if (!putBack || (g_stoodDown && !wasDown)) {
         // The state could not be trusted back: the eye is not the layer's (the eye route serves it, or the layer
@@ -3858,6 +4038,42 @@ int uiLayerWorldDoorGap(uint64_t sequence, uint32_t eye, ID3D11Texture2D* frame)
     const float whole[4] = {0.0f, 0.0f, 1.0f, 1.0f};
     f.aspectMatches = uiLayerRegionMatches(d.Width, d.Height, whole, e.w, e.h);
     return static_cast<int>(uiWorldDoorGap(f));
+}
+
+// ---- the on-foot maps gate: what the door and the draw path ask (ui_layer.h; ui_maps_math.h)
+
+void uiLayerMapsNoteRecognised() { ++g_maps.win.recognised; }
+
+// The layer holds the eye's whole picture for this sequence. The route's re-issued world first (unchanged); then, with the key on
+// and the naming deciding the gate, a 2D screen the layer TOOK while nothing else went into an eye-sized target. Asked by the
+// temporal door and again by the sharpen door, so each eye and sequence is counted once.
+bool uiLayerDoorLayerOnly(uint32_t eye, uint64_t sequence) {
+    if (vrWorldRouteDoorLayerOnly(eye, sequence)) return true;
+    if (!detail::g_uiLayerMapsOn || eye > 1) return false;
+    Maps& m = g_maps;
+    const uint32_t eyeDraws = vScreenEyeDrawsThisFrame();
+    const UiMapsDoor door = uiMapsDoor(g_eye[eye].screenTakenSeq, sequence, eyeDraws, g_frameTakenDraws);
+    if (door == UiMapsDoor::No) return false;
+    if (door == UiMapsDoor::Yes) {
+        if (m.layerOnlySeq[eye] != sequence) {
+            m.layerOnlySeq[eye] = sequence;
+            ++m.win.doorLayerOnly;
+            ++m.panelLayerOnly;
+        }
+        return true;
+    }
+    if (m.notEmptySeq[eye] != sequence) {
+        m.notEmptySeq[eye] = sequence;
+        ++m.win.doorNotEmpty;
+        ++m.panelNotEmpty;
+        if (m.notEmptyLines < 3) {
+            ++m.notEmptyLines;
+            char line[480];
+            uiMapsFormatNotEmpty(line, sizeof(line), eye, sequence, eyeDraws, g_frameTakenDraws);
+            Log::get().note("%s", line);
+        }
+    }
+    return false;
 }
 
 bool uiLayerNoteOther(ID3D11DeviceContext* ctx, uint32_t count, bool verdictForwards, bool substituted,
@@ -4253,6 +4469,7 @@ void uiLayerFrameBoundary(ID3D11DeviceContext* ctx) {
     // ...nor does the VR world route's pending re-issue (a screen draw the game's frame never issued).
     worldReissueReset();
     ++g_win.frames;
+    g_frameTakenDraws = 0;  // the door's emptiness test (uiLayerDoorLayerOnly) counts this frame's takes alone
     // The route's timers read back (the door reads them too).
     routePoll(ctx);
     g_hdrSeedGpu.poll(ctx);
@@ -4319,6 +4536,9 @@ void uiLayerShutdown() {
     g_crispSave = CrispToneSave{};
     detail::g_uiLayerCrispPending = false;
     worldReissueReset();
+    g_maps = Maps{};
+    g_frameTakenDraws = 0;
+    detail::g_uiLayerMapsOn = false;
     releaseLayers();
     for (RouteSlot& s : g_route) {
         s.timer.reset();

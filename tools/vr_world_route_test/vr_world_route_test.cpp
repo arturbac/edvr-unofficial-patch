@@ -23,9 +23,15 @@
 //      weapon fold-in's mode, the injector counters' window and its line, the STOP on an injected kind other than 3, the
 //      excluded-call, no-scene and rows-mismatch lines, the decline log's cap per run of declines, and the RELEASED line's
 //      last decline.
+//   8. THE ON-FOOT MAPS GATE AND THE ROUTE (docs/design-world-camera-motion-2026-09-30.md, Phase 1): the gate's release count is
+//      the route's grace, so a map's opening releases both on one boundary; the gate holds the world again two named frames
+//      after the map closes and the route, which needs the gate, owns again kVrWorldWarmFrames treated frames after that, and is
+//      never owned while the gate is open. Run through the two real machines the way the boundaries order them (the layer's
+//      gate first, then the route's, which reads it).
 // --self-test <repo root> runs everything and prints "vr world route: PASS" only when every check holds.
 
 #include "../../src/d3d11/vr_world_route_math.h"
+#include "../../src/d3d11/ui_maps_math.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -694,6 +700,82 @@ void stage2Cases() {
     check(n > 0 && n < 400, "RELEASED line: at its longest reason it stays well inside the log's line");
 }
 
+// ---- 8. the on-foot maps gate and the route ------------------------------------------------------------------------------------
+static_assert(kUiMapsReleaseFrames == kVrWorldGraceFrames, "the maps gate releases on the route's grace: both let go on one boundary");
+
+// The two boundaries in the order vscreen.cpp runs them: the layer's gate steps with the frame's naming, then the route's machine
+// reads that gate and the facts of the frame that ended. The route only watches draws while the gate held when the frame began
+// (g_vrWorldWants), and a frame it watches is treated when the world camera named the screen's source in it.
+struct Boundaries {
+    UiMapsGate gate;
+    VrWorldMachine route;
+    uint64_t frames = 0;
+    uint64_t gateHeldAt = 0, gateReleasedAt = 0, routeOwnedAt = 0, routeReleasedAt = 0;
+    VrWorldRelease releaseReason = VrWorldRelease::None;
+    bool invariantHeld = true;   // the route is never owned while the gate is open
+    void frame(bool named) {
+        const bool heldWhenItBegan = gate.world;
+        const bool treated = named && heldWhenItBegan;
+        const UiMapsEdge edge = uiMapsStep(gate, named);
+        if (edge == UiMapsEdge::Hold) gateHeldAt = frames;
+        if (edge == UiMapsEdge::Release) gateReleasedAt = frames;
+        VrWorldFrameEnd f;
+        f.keyOn = true; f.layerLive = true; f.gate = gate.world; f.treated = treated;
+        const VrWorldStep s = route.frameEnd(f);
+        if (s.entered) routeOwnedAt = frames;
+        if (s.released != VrWorldRelease::None) { routeReleasedAt = frames; releaseReason = s.released; }
+        invariantHeld = invariantHeld && (!route.owned() || gate.world);
+        ++frames;
+    }
+    void run(unsigned n, bool named) { for (unsigned i = 0; i < n; ++i) frame(named); }
+};
+
+void mapsGateCases() {
+    check(kUiMapsReleaseFrames == kVrWorldGraceFrames, "maps gate: the release count is the route's grace (3 unnamed frames let both go)");
+    check(kUiMapsHoldFrames == 2, "maps gate: the hold count is two named frames");
+    Boundaries b;
+    b.run(40, true);   // the world: frames 0..39
+    check(b.gateHeldAt == 1, "maps gate: from a gate that does not hold the world, the second named frame holds it");
+    check(b.route.owned() && b.routeOwnedAt == b.gateHeldAt + kVrWorldWarmFrames,
+          "maps gate: the route, which needs the gate, owns the world kVrWorldWarmFrames treated frames after the gate holds it");
+    const uint64_t mapOpens = b.frames;
+    b.run(kUiMapsReleaseFrames - 1, false);   // the first two frames of a map: the route's grace and the gate's run both still hold
+    check(b.route.owned() && b.gate.world, "maps gate: two unnamed frames release neither the gate nor the route");
+    b.run(1, false);   // the third
+    check(!b.route.owned() && !b.gate.world && b.gateReleasedAt == mapOpens + 2 && b.routeReleasedAt == mapOpens + 2,
+          "maps gate: the third unnamed frame releases the gate and the route on ONE boundary");
+    check(b.releaseReason == VrWorldRelease::GateLost,
+          "maps gate: ... and the route's reason is the gate (on-foot-gate-lost): the gate ran first and the route read it");
+    b.run(30, false);   // the map goes on
+    check(!b.route.owned() && !b.gate.world, "maps gate: a map that goes on keeps both released");
+    const uint64_t mapCloses = b.frames;
+    b.run(1, true);
+    check(!b.gate.world && !b.route.owned(), "maps gate: the first named frame after a map holds nothing yet");
+    b.run(1, true);
+    check(b.gate.world && b.gateHeldAt == mapCloses + 1, "maps gate: the second named frame after a map holds the world again");
+    check(!b.route.owned() && b.route.state == VrWorldState::Observing,
+          "maps gate: the route has not owned anything yet; it needs the gate and then its warm-up");
+    b.run(kVrWorldWarmFrames, true);
+    check(b.route.owned() && b.routeOwnedAt == b.gateHeldAt + kVrWorldWarmFrames,
+          "maps gate: the route owns again kVrWorldWarmFrames treated frames after the gate held, the eye route serving the frames between");
+    check(b.invariantHeld, "maps gate: at no boundary of the whole replay was the route owned while the gate was open");
+
+    // Flight 1's runs, through both machines: the world was named for 13,044 frames, a map showed for 1,597, the world for 98, a map for 929.
+    Boundaries f1;
+    f1.run(13044, true);
+    f1.run(1597, false);
+    f1.run(98, true);
+    // The 98-frame world between the maps: two frames for the gate, then the route's eight treated frames fit in what is left.
+    check(f1.route.owned() && f1.routeOwnedAt == 13044 + 1597 + 1 + kVrWorldWarmFrames,
+          "flight 1 replay: the 98-frame world between the maps is long enough for the route to own it again");
+    f1.run(929, false);
+    f1.run(40, true);
+    check(f1.invariantHeld, "flight 1 replay: the route is never owned while the gate is open");
+    check(f1.gateReleasedAt == 13044 + 1597 + 98 + 2 && f1.routeReleasedAt == f1.gateReleasedAt,
+          "flight 1 replay: the second map releases the gate and the route on one boundary");
+    check(f1.route.owned(), "flight 1 replay: after the last map the route owns again");
+}
+
 // ---- 6. the source pins --------------------------------------------------------------------------------------------------
 std::string g_root;
 std::string readFile(const char* rel) {
@@ -782,6 +864,11 @@ void sourcePins() {
     check(draw.find("new ") == std::string::npos && draw.find("std::vector") == std::string::npos && draw.find("std::string") == std::string::npos &&
               draw.find("std::mutex") == std::string::npos && draw.find("lock_guard") == std::string::npos,
           "cost: the per-draw path allocates nothing and takes no lock");
+    // The census's episodes (vr_camera_census.h): the join is reached from here, behind one null-tested pointer that is set only for an episode's sampled frame, so with the census off (or
+    // outside that frame) a draw costs one load; it sits before the colour-target test because the join wants depth-only draws too.
+    check(draw.find("if (detail::g_vrCensusJoinDraw) detail::g_vrCensusJoinDraw(ctx, f.draws);") != std::string::npos && before(draw, "++f.draws;", "detail::g_vrCensusJoinDraw") &&
+              before(draw, "detail::g_vrCensusJoinDraw", "bindingGet(BindSlot::Rtv0)") && count(rt, "g_vrCensusJoinDraw") == 2,
+          "census: the per-draw path counts the draw, then reaches the census's episode join through one null-tested pointer (set only for an episode's sampled frame), before the colour-target test; nothing else in the route touches it");
     const std::string boundary = functionBody(rt, "void vrWorldRouteFrameBoundary(");
     // THE KEY-OFF CONTRACT. With the key off, from the start, the boundary's first test returns and nothing below it runs: no
     // camera detour, no phase, no extra counter. Stage 2 adds exactly one thing to that test, the flag that says the injector
@@ -880,8 +967,16 @@ void sourcePins() {
     // Where the door asks. The temporal pass and the sharpen pass both read the route; nothing else does.
     const std::string nt = readFile("src\\d3d11\\native_temporal.cpp");
     const std::string ns = readFile("src\\d3d11\\native_sharpen.cpp");
-    check(!nt.empty() && !ns.empty() && count(nt, "vrWorldRouteDoorLayerOnly(") == 1 && count(ns, "vrWorldRouteDoorLayerOnly(") == 1,
-          "door: the temporal pass and the sharpen pass each ask the route once per eye");
+    // The doors ask the layer's one predicate (ui_layer.h uiLayerDoorLayerOnly), which asks the route first and then, with
+    // experimental.on_foot_maps_sharp on, the maps gate's; with that key off the layer answers the route's alone.
+    const std::string ly = readFile("src\\d3d11\\ui_layer.cpp");
+    check(!nt.empty() && !ns.empty() && count(nt, "uiLayerDoorLayerOnly(") == 1 && count(ns, "uiLayerDoorLayerOnly(") == 1 &&
+              count(nt, "vrWorldRouteDoorLayerOnly(") == 0 && count(ns, "vrWorldRouteDoorLayerOnly(") == 0 &&
+              count(ly, "vrWorldRouteDoorLayerOnly(") == 1,
+          "door: the temporal pass and the sharpen pass each ask the layer's predicate once per eye, and only the layer asks the route");
+    check(before(functionBody(ly, "bool uiLayerDoorLayerOnly(uint32_t eye, uint64_t sequence) {"), "if (vrWorldRouteDoorLayerOnly(eye, sequence)) return true;",
+                 "if (!detail::g_uiLayerMapsOn || eye > 1) return false;"),
+          "door: the layer's predicate answers the route's question first and the maps gate's only when the key is on");
     check(nt.find("&&!edvr::vrWorldRouteOwnsNextFrame()") != std::string::npos,
           "eye shift: native_temporal advertises the shift only while the route does not own the next frame");
     const std::string skip = functionBody(nt, "HRESULT WINAPI skipEye(");
@@ -899,6 +994,7 @@ int runSelfTest() {
     triggerCases();
     lineCases();
     stage2Cases();
+    mapsGateCases();
     sourcePins();
     if (g_failures) {
         std::printf("vr world route: %d of %d checks FAILED\n", g_failures, g_checks);

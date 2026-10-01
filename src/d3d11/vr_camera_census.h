@@ -21,13 +21,30 @@
 // is no tone and the journal alone decides. While the route IS jittering the world (vrWorldRouteWorldPhase true), a frame is
 // also sampled only when its phase is non-zero: the route's warm-up frames carry none, and only a frame that does can show a
 // leak into the eyes. Flight 1 spent its whole sample on warm-up frames. With the route not jittering the rule is unchanged.
-// `python tools\edvr_log.py --camera-census` reads the log back, does the join and judges the injection (the stage 2 verdict).
+//
+// EPISODES (design-world-camera-motion-2026-09-30.md section 6, Phase 0): the first three on-foot frames are all of that, and never an aboard frame, so
+// the census could see neither a map nor the cockpit. An episode is ONE frame sampled 30 frames after a trigger (the journal's on-foot reading flips,
+// the naming of the 2D screen's source flips and holds three frames, Status.json's GuiFocus changes, or the census turns on), whatever the frame is, at
+// most ten a session: every refresh call of it, aboard ones included, tallied by kind and caller; at its first draw into each kind of depth the screen's
+// size or an eye's, the vertex and pixel shader, whether the draw writes depth, the b1 size and the b1 rows 270..273 read back and matched to the calls;
+// and the temporal pass's chosen rows matched to the calls' view axes. The 5 s line is unchanged; three companion lines follow it in each window: the
+// episodes' counters (taken, triggers, skipped and state, zeros included), the on-foot naming runs and the observer halves' own CPU. Every part runs with
+// the key on only: with it off nothing is installed, allocated, timed or logged, and the per-draw hook below is never set.
+// `python tools\edvr_log.py --camera-census` reads the log back, does the join and judges the injection (the stage 2 verdict), and reports each episode.
 #pragma once
 #include <cstdint>
 
 struct ID3D11DeviceContext;
 
 namespace edvr {
+
+// The episodes' join hook (see above): the world route's per-draw hook (vr_world_route.cpp vrWorldRouteDraw, which runs for every game draw on the owner
+// context while the census is wanted) calls through this pointer, which is null always except while an episode's sampled frame is running. So every other
+// draw, and every draw with the key off, costs one load of a null pointer, and no rig that links the route needs a definition (a C++17 inline variable).
+namespace detail {
+using VrCensusJoinDrawFn = void (*)(ID3D11DeviceContext* ctx, uint32_t drawOrdinal);
+inline VrCensusJoinDrawFn g_vrCensusJoinDraw = nullptr;
+}  // namespace detail
 
 // The key is on in the VR profile (read at the last boundary). Render thread. The world route's detector watches draws while
 // this is true, so the census can say where in the frame each refresh call falls.

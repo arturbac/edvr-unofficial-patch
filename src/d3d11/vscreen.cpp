@@ -3891,6 +3891,14 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
             // The VR world route does not TAKE the 2D screen's composite: the game's draw is issued as it always
             // was and re-issued into the layer right after it (worldScreenReissue below).
             worldReissue.on = uiLayerWorldReissuePending();
+            // The on-foot maps gate (ui_layer.h; experimental.on_foot_maps_sharp). While the layer TAKES the 2D screen's composite
+            // the per-eye screen-motion calls at the tail of the game's draw stand aside (uiLayerRedirecting), and with them the
+            // recognition that keeps naming the world's source: naming stops two frames after the last recognised composite, and
+            // the panel would never come back to the eye route. It is made here instead, before the draw's own issue, so the
+            // curved screen's substitution (which returns before that tail) is covered too. With the key off uiLayerMapsOn()
+            // is false and this is one load of it, and only for a taken 2D screen composite.
+            if (uiLayer && uiFamily == UiLayerFamily::kScreen && uiLayerMapsOn() && screenMotionLive() && screenMotionRecognize())
+                uiLayerMapsNoteRecognised();
         }
     } else if (owner && uiLayerLive() && v != DrawVerdict::kQuadSkip) {
         // The two composites into a target vScreen does not call an eye's:
@@ -5277,6 +5285,11 @@ bool vScreenIsEyeSized(uint32_t w, uint32_t h) {
     if (s->eyeW && near2(w, s->eyeW) && near2(h, s->eyeH)) return true;
     if (s->renderW && near2(w, s->renderW) && near2(h, s->renderH)) return true;
     return false;
+}
+
+uint32_t vScreenEyeDrawsThisFrame() {
+    const State* s = g_state;
+    return s ? s->eyeDrawsThisFrame : 0;
 }
 
 void vScreenRefreshConfig() {

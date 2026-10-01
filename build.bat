@@ -2735,6 +2735,27 @@ if errorlevel 1 ( echo [edvr] ERROR: ui layer world test build failed & exit /b 
 "%OBJ%\uilayerworld\ui_layer_world_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_on_foot_maps_test
+echo [edvr] === on_foot_maps_test.exe ===
+REM The on-foot maps gate (experimental.on_foot_maps_sharp; docs\design-world-camera-motion-2026-09-30.md, Phase 1): the pure
+REM half, src\d3d11\ui_maps_math.h, compiled alone -- the key, the step (2 named frames hold the panel as the world, 3 unnamed
+REM release it), flight 1's runs replayed (13,044 named, 1,597 unnamed, 98, 929: a hold and four flips), the gate's combine with
+REM the key off held to a frozen copy of today's journal-OR-depth for every input, the carry, the door's predicate and the text of
+REM every line -- plus the source pins from the repo root (the key-off contract: nothing new is read, counted, logged or issued
+REM with the key off; the recognition's two call sites; the one place the naming is told). tools\on_foot_maps_test\mutants.py
+REM --self-test holds the mutation list to the header as it is; the list itself (--run, on demand, about a minute) proves the rig
+REM fails when each rule is flipped. Pure C++ and source scans: no D3D.
+if not exist "%OBJ%\onfootmaps" mkdir "%OBJ%\onfootmaps"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\d3d11" /Fo"%OBJ%\onfootmaps"\ ^
+    /Fe"%BUILD%\on_foot_maps_test.exe" "tools\on_foot_maps_test\on_foot_maps_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: on foot maps test build failed & exit /b 1 )
+"%BUILD%\on_foot_maps_test.exe" --dry-run || exit /b 1
+"%BUILD%\on_foot_maps_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\on_foot_maps_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
 :rig_pixel_probe_test
 echo [edvr] === pixel_probe_test.exe ===
 REM Build gate for advanced.pixel_probe (src/d3d11/pixel_probe.*), the "who

@@ -83,6 +83,9 @@ extern bool g_uiLayerIssueBlocked;
 extern bool g_uiLayerCrispOn;
 extern bool g_uiLayerCrispPending;
 extern bool g_uiLayerWorldReissue;
+extern bool g_uiLayerMapsOn;
+extern uint64_t g_uiLayerGateFrame;
+extern uint64_t g_uiLayerNamedAt;
 }  // namespace detail
 
 // The draw path's one gate: fix.ui_quality is on, a temporal mode is on, and
@@ -249,6 +252,33 @@ struct UiLayerWorldStats {
     uint64_t refused[16] = {};
 };
 UiLayerWorldStats uiLayerWorldStats();
+
+// ---- the on-foot maps gate (experimental.on_foot_maps_sharp; ui_maps_math.h; docs/design-world-camera-motion-2026-09-30.md) ----
+//
+// With the key on, the layer's world-screen gate is decided by the world camera alone: the 2D screen is the world only while
+// a draw that reads the world camera names its source (screen_motion.cpp), 2 frames in a row to hold, 3 to release. A map or a
+// menu on foot names nothing, so the layer takes its composite -- sharp, after the upscaler -- and an eye that holds nothing
+// else skips the upscaler (the layer-only door below). With the key off none of this is ever true or ever called.
+//
+// The key is on, the layer and screen motion are live, so the naming decides the gate (latched at the frame boundary, so every
+// draw of a frame sees one answer). One load.
+inline bool uiLayerMapsOn() { return detail::g_uiLayerMapsOn; }
+// screen_motion.cpp, once, at the draw that names the screen's source for the frame in flight (the world camera's terrain or
+// scene draw, or the pool-family fallback): the gate judges the frame that ends at the next boundary by it. Attributed to the
+// layer's own frame count, so it is right whichever boundary runs first. Two loads and a store.
+inline void uiLayerNoteScreenNamed() { detail::g_uiLayerNamedAt = detail::g_uiLayerGateFrame; }
+// Did a draw name the screen's source in the frame that has just ended? Valid at any boundary that runs AFTER the layer's (the route's, the
+// census's, screen motion's): the layer's own boundary has counted the frame by then, whether or not the layer is live. Independent of every
+// key -- screen_motion.cpp tells the layer whenever it names a source -- so the VR camera census reads the naming flips with it.
+inline bool uiLayerLastFrameNamed() { return detail::g_uiLayerGateFrame != 0 && detail::g_uiLayerNamedAt + 1 == detail::g_uiLayerGateFrame; }
+// vscreen.cpp, at a 2D screen composite the layer took while the maps gate is on: screen motion's recognition of that composite
+// matched (it is what keeps naming the world's source for the next frames; a take swallows the per-eye call that used to run it).
+void uiLayerMapsNoteRecognised();
+// The door runs layer-only for this eye in this sequence: the layer holds the eye's WHOLE picture. Either the VR world route's
+// re-issued world (vrWorldRouteDoorLayerOnly) or, with the maps gate on, a 2D screen the layer TOOK in this sequence while
+// nothing else was drawn into an eye-sized target (ui_maps_math.h uiMapsDoor). Asked by the temporal door and again by the
+// sharpen door for the same eye and sequence, with the same answer.
+bool uiLayerDoorLayerOnly(uint32_t eye, uint64_t sequence);
 
 // True between a successful uiLayerBegin and its End (owner context only):
 // the passes that ride the game's own draw -- the screen's motion and UI

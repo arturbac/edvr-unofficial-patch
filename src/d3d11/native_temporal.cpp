@@ -282,27 +282,28 @@ ID3D11Texture2D* blankFrame(State& s,unsigned eye,uint32_t w,uint32_t h,DXGI_FOR
   if(!made){texture->Release();return nullptr;}
   mine.texture=texture;mine.w=w;mine.h=h;mine.format=format;return texture;
 }
-// The layer-only door: the VR world route's layer re-issued this eye's screen draw this frame (the layer holds the
-// whole eye), so no upscaler runs for it -- the door hands on a black frame of the size the upscaler's output would
-// have had, tells the layer it was the pass's (so the layer arms for the next frame), and leaves the eye's history
-// alone (a later eye-route frame sees the continuity broken and resets it). True: *output holds the frame (one
-// reference for the caller) and outBox the full bounds; the caller returns S_OK, exactly as the upscaler's path
-// does. False: the route did not take this eye, or the composite that has to produce the eye was not CERTAIN to
-// run (the layer's own preflight, uiLayerWorldDoorGap) or the frame could not be made -- the caller goes on
-// through the ordinary pass in the SAME call, so the eye is never handed a black frame it cannot have a picture
-// over. The layer-only path itself has no refusal of its own: it never answers "no output" (a null from here
+// The layer-only door: the UI layer holds this eye's whole picture this frame -- the VR world route's layer re-issued the
+// eye's screen draw, or (experimental.on_foot_maps_sharp) the layer took a map's or a menu's 2D screen and nothing else was
+// drawn into an eye-sized target (uiLayerDoorLayerOnly asks both) -- so no upscaler runs for it: the door hands on a black
+// frame of the size the upscaler's output would have had, tells the layer it was the pass's (so the layer arms for the
+// next frame), and leaves the eye's history alone (a later eye-route frame sees the continuity broken and resets it).
+// True: *output holds the frame (one reference for the caller) and outBox the full bounds; the caller returns S_OK,
+// exactly as the upscaler's path does. False: the layer does not hold this eye, or the composite that has to produce
+// the eye was not CERTAIN to run (the layer's own preflight, uiLayerWorldDoorGap) or the frame could not be made -- the
+// caller goes on through the ordinary pass in the SAME call, so the eye is never handed a black frame it cannot have a
+// picture over. The layer-only path itself has no refusal of its own: it never answers "no output" (a null from here
 // would stand the pass down for the session) and never S_FALSE with a shift (the host moves the advertised field
 // of view by the shift when there is no output).
 bool layerOnlyTreat(State& s,uint64_t seq,unsigned eye,uint32_t outW,uint32_t outH,DXGI_FORMAT format,
     const float* b,ID3D11Texture2D** output,float* outBox) {
-  if(!edvr::vrWorldRouteDoorLayerOnly(eye,seq))return false;
+  if(!edvr::uiLayerDoorLayerOnly(eye,seq))return false;
   ID3D11Texture2D* frame=blankFrame(s,eye,outW,outH,format);
   int gap=frame?edvr::uiLayerWorldDoorGap(seq,eye,frame):-1;
   if(!frame||gap!=0){
     ++s.layerOnlyDeclined;
     const uint16_t id=frame?uint16_t(gap):uint16_t(100);
     if(s.layerOnlyReasons.first(id))edvr::Log::get().note("native temporal: layer-only declined for eye %u (sequence %llu): %s; "
-        "the eye route serves this eye through the pass, as it does without the VR world route.",eye,(unsigned long long)seq,
+        "the eye route serves this eye through the pass, as it does without the layer-only door.",eye,(unsigned long long)seq,
         frame?edvr::uiWorldDoorGapName(static_cast<edvr::UiWorldDoorGap>(gap)):"the black frame could not be made");
     return false;
   }
@@ -310,9 +311,10 @@ bool layerOnlyTreat(State& s,uint64_t seq,unsigned eye,uint32_t outW,uint32_t ou
   outBox[0]=b[0]>b[2]?1.f:0.f;outBox[2]=b[0]>b[2]?0.f:1.f;outBox[1]=b[1]>b[3]?1.f:0.f;outBox[3]=b[1]>b[3]?0.f:1.f;
   edvr::uiLayerNoteTemporal(seq,eye,frame);
   ++s.layerOnly;
-  if(!s.layerOnlyNoted){s.layerOnlyNoted=true;edvr::Log::get().note("native temporal: LAYER-ONLY engaged, eye %u, sequence %llu: the VR world "
-      "route owns the world and the UI layer holds the whole eye, so no upscaler runs for it -- a black %ux%u frame is handed on "
-      "and the layer is composited over it (the eye's history is left alone).",eye,(unsigned long long)seq,outW,outH);}
+  if(!s.layerOnlyNoted){s.layerOnlyNoted=true;edvr::Log::get().note("native temporal: LAYER-ONLY engaged, eye %u, sequence %llu: the UI layer "
+      "holds the whole eye (the VR world route's resolved world, or a map's or a menu's 2D screen under experimental.on_foot_maps_sharp), "
+      "so no upscaler runs for it -- a black %ux%u frame is handed on and the layer is composited over it (the eye's history is left "
+      "alone).",eye,(unsigned long long)seq,outW,outH);}
   return true;
 }
 

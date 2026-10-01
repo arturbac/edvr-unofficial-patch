@@ -11,6 +11,7 @@
     python tools/edvr_log.py --target frontier --tally periodic --window-ms 250
     python tools/edvr_log.py --target frontier --tally periodic --infer-runs
     python tools/edvr_log.py --target frontier --camera-census --expect-build HEAD
+    python tools/edvr_log.py --target frontier --maps-sharp --expect-build HEAD
     python tools/edvr_log.py --list
 
 This is the sanctioned replacement for `Get-Content <some path> -Tail 200 |
@@ -93,6 +94,16 @@ the route's `vr world route 5s:` and `vr world route inject 5s:` lines and a few
 its own log lines too; a log that predates stage 2 gets n/a lines, never a crash.
 A log with no census lines exits 1; the verdict never changes the exit code (read
 its lines).
+
+The census's EPISODES (design-world-camera-motion-2026-09-30.md section 6, Phase 0)
+add three sections before the verdict: `== episodes ==` (per episode, one frame
+sampled 30 frames after a trigger, aboard frames included: the trigger, the journal,
+GuiFocus and the naming, the calls by kind and caller, the printed calls, the join of
+each depth's first draw to the calls that composed its b1 rows, and the temporal
+pass's chosen rows against the calls' view axes, then the facts for H1, H2 and H3),
+`== on-foot naming runs ==` (the run-length histogram of the 5 s windows summed) and
+`== the detour's CPU ==` (the observer halves' sampled cost). A log with none of those
+lines reports exactly as before.
 
 Exit 0 when a log was read, 1 when none was found (or --camera-census found no
 census line), 2 when --expect-build did not match (--tally periodic checks the
@@ -471,6 +482,20 @@ def print_vh_tally(text, frame):
 #   vr camera census: eye-geometry eye=E frame=F seq=S frustum=[l,r,d,u] shift=(..,..)
 #       expect=(..,..) expect-shifted=(..,..) leak=(..,..)
 #   vr camera census: other-thread tid=T camera=0xPTR kind=K caller=+0xRVA calls=N
+# the EPISODES (Phase 0; one frame sampled 30 frames after a trigger; every line is written by vrCensusPrintEpisode and the formatters below it):
+#   vr camera census: episode frame=F n=N/10 trigger=key-on|foot:no>yes|naming:named>unnamed|gui:0>6 armed=F foot=.. gui=N|- named=0|1 phase=X,Y|-
+#       calls=N recorded=R printed=P kinds=0:N,.. callers=+0xRVA:N,..,+more:N       (the call lines that follow are its calls)
+#   vr camera census: call frame=F n=N ...                                         (the same call line, up to 120 an episode, the matched ones first)
+#   vr camera census: pass-rows ep=N frame=F valid=1|0 bound=1|0|- rows=[12 floats]|- axes-match=n,n+K|- how=identity|transpose|- nearest=n|- diff=..
+#   vr camera census: join ep=N sig=S depth=screen|eye eye=0|1|- size=WxH draw=D draws=N vs=0x.. ps=0x.. dw=yes|no|- b1=0xPTR|- first=N bytes=N
+#       rows=read match=n,n+K|-  |  rows=- why=skip|no-b1|b1-too-small|map|staging
+#   vr camera census: join-rows ep=N sig=S rows=[16 floats]                          (a signature that read its rows)
+#   vr camera census: join-more ep=N signatures=N draws=N                            (signatures the table could not keep)
+# and, with each 5 s line, three companions (the 5 s line itself is full at 400 characters):
+#   vr camera census: episodes windows=W taken=N/10 triggers=N skipped=N state=idle|armed|live [trigger=.. armed=F sample=F]
+#   vr camera census: runs windows=W frames=N named=1:n,2:n,3:n,4-8:n,9-30:n,31-89:n,90+:n unnamed=.. longest=named:N,unnamed:N open=named:N|unnamed:N|-
+#   vr camera census: detour windows=W every=16 timed=observer-halves frames=N calls=N sampled=N est-ms-frame=X|-
+#       obs-calls=N obs-sampled=N obs-pre-us=mean/max|- obs-post-us=.. inj-calls=N inj-sampled=N inj-pre-us=.. inj-post-us=..
 # and, from the world route (src/d3d11/vr_world_route.cpp), two lines a 5 s window, back to back:
 #   vr world route 5s: ... last=<verdict> jitter=on|off|idle|unnamed|no-hook|fault phase=X,Y rows=X,Y fp-mode=a/b/c
 #       last-trigger=.. target=WxH hdr=WxH selection=..
@@ -618,6 +643,95 @@ def _ckv(rest):
     return kv
 
 
+def _ckindmap(text):
+    """An episode header's `kinds=` (`0:12,3:290,5:10,other:2,unreadable:1`, `-` for none) -> {0: 12, 3: 290, 5: 10, "other": 2, "unreadable": 1}; None when it is not one."""
+    if text is None:
+        return None
+    if text == "-":
+        return {}
+    out = {}
+    for part in text.split(","):
+        key, sep, value = part.partition(":")
+        if not sep or not value.isdigit():
+            return None
+        out[int(key) if key.isdigit() else key] = out.get(int(key) if key.isdigit() else key, 0) + int(value)
+    return out
+
+
+def _ccallers(text):
+    """An episode header's `callers=` (`+0x58DE73:300,+0x594E13:130,+more:1`, `-` for none) -> ([(rva, n), ...], more); None when it is not one."""
+    if text is None:
+        return None
+    if text == "-":
+        return [], 0
+    callers, more = [], 0
+    for part in text.split(","):
+        key, sep, value = part.rpartition(":")
+        if not sep or not value.isdigit():
+            return None
+        if key == "+more":
+            more += int(value)
+            continue
+        rva = _chex(key)
+        if rva is None:
+            return None
+        callers.append((rva, int(value)))
+    return callers, more
+
+
+def _ctrigger(text):
+    """A `trigger=` token: `key-on`, `foot:no>yes`, `naming:unnamed>named`, `gui:0>6` -> (kind, from, to) with from and to None for key-on."""
+    if text == "key-on":
+        return ("key-on", None, None)
+    kind, sep, rest = (text or "").partition(":")
+    if not sep or kind not in ("foot", "naming", "gui"):
+        return None
+    old, arrow, new = rest.partition(">")
+    return (kind, old, new) if arrow and old and new else None
+
+
+def _cmatch(text):
+    """A `match=` / `axes-match=` token: `98,101`, `1,2,3,4,5,6+48`, `-` -> ([ordinals], how many more matched than are listed); None when it is not one."""
+    if text is None:
+        return None
+    if text == "-":
+        return [], 0
+    listed, plus, extra = text.partition("+")
+    if plus and not extra.isdigit():
+        return None
+    ordinals = []
+    for part in listed.split(","):
+        if not part.isdigit():
+            return None
+        ordinals.append(int(part))
+    return ordinals, int(extra) if plus else 0
+
+
+CENSUS_RUN_BINS = ("1", "2", "3", "4-8", "9-30", "31-89", "90+")
+
+
+def _cbins(text):
+    """A `named=` / `unnamed=` token of a runs line (`1:1,2:0,3:0,4-8:0,9-30:0,31-89:1,90+:1`) -> {bin name: runs}; None unless it has exactly the seven bins in order."""
+    if text is None:
+        return None
+    out = {}
+    for part in text.split(","):
+        key, sep, value = part.rpartition(":")
+        if not sep or not value.isdigit():
+            return None
+        out[key] = int(value)
+    return out if tuple(out) == CENSUS_RUN_BINS else None
+
+
+def _cpair_us(text):
+    """A detour line's `mean/max` microseconds (`25/30`, `0.31/4.2`, `-`) -> (mean, max) floats, or None."""
+    if not text or "/" not in text:
+        return None
+    a, _, b = text.partition("/")
+    mean, peak = _cf(a), _cf(b)
+    return (mean, peak) if mean == mean and peak == peak else None
+
+
 def census_geometry(rows):
     """What a call's composed rows (rows 270..273, sixteen floats) say about the camera that made them, read back
     out of them and free of how the head is turned: the projection's x and y scale, the aspect and field of view
@@ -649,10 +763,17 @@ def parse_camera_census(text):
     eyes [dict], geometry {(eye, frame): dict}, threads [dict], info [text]. A call
     row is {n, camera, kind, caller, draw, tone, inj, role, pre, post, view, rows,
     geo}; a value the DLL printed as `-` is None, and a token an older census never
-    printed (inj, role, phase) is None or `absent`."""
+    printed (inj, role, phase) is None or `absent`.
+
+    The EPISODES (Phase 0): episodes [dict] (a header's fields, `rows` the call lines that followed it, `joins` the join
+    signatures and their rows, `pass` the pass's rows line, `join_more`), episode_counters, runs and detour (the 5 s
+    window's three companion lines; they are not windows: `windows` holds the 5 s lines only). An episode's call lines
+    are NOT in `sequences`: the legacy analyses read the first three on-foot frames alone."""
     c = {"lines": 0, "unparsed": 0, "windows": [], "cameras": {}, "order": [], "changes": {},
-         "sequences": [], "eyes": [], "geometry": {}, "threads": [], "info": []}
+         "sequences": [], "eyes": [], "geometry": {}, "threads": [], "info": [],
+         "episodes": [], "episode_counters": [], "runs": [], "detour": []}
     current = None
+    episode_by_n = {}
     for raw in text.splitlines():
         m = CENSUS_LINE_RE.match(raw)
         if not m:
@@ -738,6 +859,110 @@ def parse_camera_census(text):
                 c["threads"].append({"tid": kv.get("tid"), "camera": _chex(kv.get("camera")),
                                      "kind": kv.get("kind"), "caller": _chex(kv.get("caller")),
                                      "calls": kv.get("calls")})
+            elif rest.startswith("episode "):
+                # An episode's header; the call lines that follow it (the same frame) are its calls.
+                n, _, of = kv.get("n", "0/0").partition("/")
+                state, phase = _cphase(kv.get("phase"))
+                trigger = _ctrigger(kv.get("trigger"))
+                callers = _ccallers(kv.get("callers"))
+                kinds = _ckindmap(kv.get("kinds"))
+                if not n.isdigit() or trigger is None or kinds is None or callers is None:
+                    c["unparsed"] += 1
+                    continue
+                ep = {"n": int(n), "of": int(of) if of.isdigit() else None, "frame": int(kv.get("frame", "-1")),
+                      "armed": _cint(kv.get("armed")), "trigger": trigger, "foot": kv.get("foot"),
+                      "gui": _cint(kv.get("gui")), "named": kv.get("named") == "1",
+                      "phase_state": state, "phase": phase,
+                      "calls": int(kv.get("calls", "0")), "recorded": int(kv.get("recorded", "0")),
+                      "printed": int(kv.get("printed", "0")), "kinds": kinds, "callers": callers[0],
+                      "callers_more": callers[1], "rows": [], "joins": [], "pass": None, "join_more": None, "join_draws": None}
+                c["episodes"].append(ep)
+                episode_by_n[ep["n"]] = ep
+                current = ep
+            elif rest.startswith("join-rows "):
+                ep = episode_by_n.get(_cint(kv.get("ep")))
+                sig = _cint(kv.get("sig"))
+                rows = _clist(kv.get("rows"))
+                row = next((j for j in ep["joins"] if j["sig"] == sig), None) if ep else None
+                if row is None or rows is None or len(rows) != 16:
+                    c["unparsed"] += 1
+                    continue
+                row["rows"] = rows
+            elif rest.startswith("join-draws "):
+                ep = episode_by_n.get(_cint(kv.get("ep")))
+                counts = [_cint(kv.get(k)) for k in ("seen", "relevant", "views", "signatures")]
+                if not ep or any(v is None for v in counts):
+                    c["unparsed"] += 1
+                    continue
+                ep["join_draws"] = dict(zip(("seen", "relevant", "views", "signatures"), counts))
+            elif rest.startswith("join-more "):
+                ep = episode_by_n.get(_cint(kv.get("ep")))
+                if not ep:
+                    c["unparsed"] += 1
+                    continue
+                ep["join_more"] = {"signatures": _cint(kv.get("signatures")), "draws": _cint(kv.get("draws"))}
+            elif rest.startswith("join "):
+                ep = episode_by_n.get(_cint(kv.get("ep")))
+                size = re.match(r"^(\d+)x(\d+)$", kv.get("size", ""))
+                match = _cmatch(kv.get("match")) if "match" in kv else None
+                if not ep or _cint(kv.get("sig")) is None or not size or kv.get("depth") not in ("screen", "eye") or \
+                        ("match" in kv and match is None):
+                    c["unparsed"] += 1
+                    continue
+                ep["joins"].append({
+                    "sig": int(kv["sig"]), "depth": kv["depth"], "eye": _cint(kv.get("eye")),
+                    "w": int(size.group(1)), "h": int(size.group(2)),
+                    "draw": _cint(kv.get("draw")), "draws": _cint(kv.get("draws")),
+                    "vs": _chex(kv.get("vs")), "ps": _chex(kv.get("ps")),
+                    "dw": {"yes": True, "no": False}.get(kv.get("dw")),
+                    "b1": _chex(kv.get("b1")), "first": _cint(kv.get("first")), "bytes": _cint(kv.get("bytes")),
+                    "read": kv.get("rows") == "read", "why": kv.get("why"),
+                    "match": match[0] if match else None, "match_more": match[1] if match else 0,
+                    "rows": None})
+            elif rest.startswith("pass-rows "):
+                ep = episode_by_n.get(_cint(kv.get("ep")))
+                valid = kv.get("valid") == "1"
+                rows = _clist(kv.get("rows")) if valid else None
+                match = _cmatch(kv.get("axes-match")) if valid else ([], 0)
+                if not ep or kv.get("valid") not in ("0", "1") or (valid and (rows is None or len(rows) != 12 or match is None)):
+                    c["unparsed"] += 1
+                    continue
+                ep["pass"] = {"valid": valid, "bound": {"1": True, "0": False}.get(kv.get("bound")), "rows": rows,
+                              "match": match[0], "match_more": match[1],
+                              "how": kv.get("how") if kv.get("how") in ("identity", "transpose") else None,
+                              "nearest": _cint(kv.get("nearest")), "diff": _cf(kv.get("diff"))}
+            elif rest.startswith("episodes "):
+                taken, _, of = kv.get("taken", "").partition("/")
+                if not taken.isdigit() or _cint(kv.get("triggers")) is None or _cint(kv.get("skipped")) is None:
+                    c["unparsed"] += 1
+                    continue
+                c["episode_counters"].append({
+                    "ts": m.group("ts") or "", "windows": _cint(kv.get("windows")), "taken": int(taken),
+                    "of": int(of) if of.isdigit() else None, "triggers": int(kv["triggers"]), "skipped": int(kv["skipped"]),
+                    "state": kv.get("state"), "trigger": _ctrigger(kv.get("trigger")),
+                    "armed": _cint(kv.get("armed")), "sample": _cint(kv.get("sample"))})
+            elif rest.startswith("runs "):
+                named, unnamed = _cbins(kv.get("named")), _cbins(kv.get("unnamed"))
+                longest = re.match(r"^named:(\d+),unnamed:(\d+)$", kv.get("longest", ""))
+                opened = re.match(r"^(named|unnamed):(\d+)$", kv.get("open", ""))
+                if named is None or unnamed is None or not longest or (kv.get("open") != "-" and not opened) or \
+                        _cint(kv.get("frames")) is None:
+                    c["unparsed"] += 1
+                    continue
+                c["runs"].append({
+                    "ts": m.group("ts") or "", "windows": _cint(kv.get("windows")), "frames": int(kv["frames"]),
+                    "named": named, "unnamed": unnamed,
+                    "longest_named": int(longest.group(1)), "longest_unnamed": int(longest.group(2)),
+                    "open": (opened.group(1), int(opened.group(2))) if opened else None})
+            elif rest.startswith("detour "):
+                c["detour"].append({
+                    "ts": m.group("ts") or "", "windows": _cint(kv.get("windows")), "every": _cint(kv.get("every")),
+                    "timed": kv.get("timed"), "frames": _cint(kv.get("frames")), "calls": _cint(kv.get("calls")),
+                    "sampled": _cint(kv.get("sampled")),
+                    "est_ms": _cf(kv.get("est-ms-frame")) if kv.get("est-ms-frame", "-") != "-" else None,
+                    "modes": {name: {"calls": _cint(kv.get(name + "-calls")), "sampled": _cint(kv.get(name + "-sampled")),
+                                     "pre": _cpair_us(kv.get(name + "-pre-us")), "post": _cpair_us(kv.get(name + "-post-us"))}
+                              for name in ("obs", "inj")}})
             else:
                 c["info"].append(rest)
         except (ValueError, TypeError, KeyError, IndexError):
@@ -1475,6 +1700,294 @@ def _phase_text(state, phase):
     return "no phase= token (a census that predates stage 2)"
 
 
+# ---- the episodes (design-world-camera-motion-2026-09-30.md section 6, Phase 0) ----------------------------------------
+# One frame sampled 30 frames after a trigger, whatever the frame is (src/d3d11/vr_camera_census_core.h: the lines are written by one function,
+# vrCensusPrintEpisode, which tools\vr_camera_census_test also builds tools\camera_census_fixture.log with). Per episode: the header (the trigger, the journal,
+# GuiFocus, the naming, the calls by kind and caller over ALL the frame's calls), the calls that printed (up to 120, those that matched something first), the pass's
+# chosen rows with the calls whose view axes equal them, and the join: the first draw of each (depth, vertex shader, pixel shader) into the 2D screen's depth or an eye's, whether
+# it writes depth, its b1 size and, for the first of each depth, the b1 rows 270..273 read back and the calls that composed them. The DLL matches over every call the frame
+# recorded; this reader matches again over the calls that printed (the tolerance of the eye-draw join), so a call the cap kept out is named by its ordinal and said not to be printed.
+CENSUS_EPISODE_RUNS_SHOWN = 12
+
+
+def census_episode_call_label(r):
+    """One call as the episode report names it: its camera, kind, caller, view and place against the tone."""
+    return "camera 0x%X kind %s caller %s view %s tone %s draw %s" % (
+        r["camera"], "-" if r["kind"] is None else r["kind"], "+0x%X" % r["caller"] if r["caller"] is not None else "-",
+        "0x%X" % r["view"] if r["view"] else "-", r["tone"], "-" if r["draw"] is None else r["draw"])
+
+
+def census_episode_join(ep, tol=CENSUS_JOIN_TOL):
+    """Each join signature against the episode's printed calls. Returns one dict per signature: {join, printed [call rows whose composed rows are the
+    rows the draw read, within tol], listed [the ordinals the DLL listed], unprinted [listed ordinals that are not among the printed calls], more [matches
+    the DLL counted past its list], disagree [printed calls the two rules judge differently, when the DLL's list is whole]}. A signature whose rows were not
+    read has none of these (`read` False)."""
+    by_n = {r["n"]: r for r in ep["rows"]}
+    out = []
+    for j in ep["joins"]:
+        entry = {"join": j, "read": j["rows"] is not None, "printed": [], "listed": list(j["match"] or []), "more": j["match_more"],
+                 "unprinted": [], "disagree": []}
+        if entry["read"]:
+            entry["printed"] = [r for r in ep["rows"] if r["rows"] and len(r["rows"]) == len(j["rows"]) and
+                                all(abs(a - b) <= tol for a, b in zip(r["rows"], j["rows"]))]
+            entry["unprinted"] = [n for n in entry["listed"] if n not in by_n]
+            if j["match"] is not None and not entry["more"]:
+                printed_n = {r["n"] for r in entry["printed"]}
+                entry["disagree"] = sorted(printed_n.symmetric_difference(n for n in entry["listed"] if n in by_n))
+        out.append(entry)
+    return out
+
+
+def census_episode_pass(ep):
+    """The pass's chosen rows against the printed calls: {pass, matched [call rows the DLL listed as equal, that printed], unprinted [listed ordinals not
+    printed], nearest [the nearest call's row, or None]}, or None when the pass chose nothing in the frame."""
+    p = ep["pass"]
+    if not p or not p["valid"]:
+        return None
+    by_n = {r["n"]: r for r in ep["rows"]}
+    return {"pass": p, "matched": [by_n[n] for n in p["match"] if n in by_n], "unprinted": [n for n in p["match"] if n not in by_n],
+            "nearest": by_n.get(p["nearest"])}
+
+
+def _kinds_phrase(kinds):
+    """{3: 290, 5: 10, "other": 2} -> `k3 x290, k5 x10, kother x2`, kinds in order."""
+    order = sorted(kinds, key=lambda k: (not isinstance(k, int), k if isinstance(k, int) else str(k)))
+    return ", ".join("k%s x%d" % (k, kinds[k]) for k in order) or "none"
+
+
+def _calls_phrase(rows):
+    """Printed calls grouped by camera: `camera 0x.. kind 5 caller +0x.., +0x.. (n=9/10/11) view 0x.. tone after`, one per camera."""
+    by_camera = {}
+    for r in rows:
+        by_camera.setdefault((r["camera"], r["kind"]), []).append(r)
+    parts = []
+    for (ptr, kind), ms in sorted(by_camera.items(), key=lambda kv: (kv[1][0]["n"], kv[0][0])):
+        parts.append("camera 0x%X (kind %s) caller %s, %d call(s) n=%s, view %s, tone %s"
+                     % (ptr, "-" if kind is None else kind, ", ".join(sorted({"+0x%X" % m["caller"] if m["caller"] is not None else "-" for m in ms})),
+                        len(ms), "/".join(str(m["n"]) for m in ms),
+                        ", ".join(sorted({"0x%X" % m["view"] if m["view"] else "-" for m in ms})), "/".join(sorted({str(m["tone"]) for m in ms}))))
+    return "; ".join(parts)
+
+
+def _depth_label(j):
+    return "screen" if j["depth"] == "screen" else ("eye %d" % j["eye"] if j["eye"] is not None else "eye ?")
+
+
+def _trigger_text(trigger):
+    """(kind, from, to) -> `key-on`, `foot no>yes`, `naming unnamed>named`, `gui 0>6`."""
+    if not trigger:
+        return "?"
+    kind, old, new = trigger
+    return kind if old is None else "%s %s>%s" % (kind, old, new)
+
+
+def print_census_episodes(c):
+    """The episodes section of --camera-census, then the naming runs (H2) and the detour's CPU (D). Prints nothing for a log that has none of their lines (an
+    older census), so a legacy report is byte-for-byte what it was."""
+    eps, counters = c["episodes"], c["episode_counters"]
+    if not (eps or counters or c["runs"] or c["detour"]):
+        return
+    last = counters[-1] if counters else None
+    head = "%d printed" % len(eps)
+    if last:
+        head += "; the last `episodes` line: %d taken of %s, %d trigger(s), %d skipped" % (last["taken"], last["of"] if last["of"] is not None else 10,
+                                                                                        last["triggers"], last["skipped"])
+    print("\n== episodes (%s) ==" % head)
+    if not counters:
+        print("no `vr camera census: episodes` line (the window's counters): a census that predates the episodes, or a log that ends before its first 5 s window")
+    elif last["taken"] > len(eps):
+        print("%d episode(s) were armed and not printed: the log ended, or the key went off, before the frame they were to sample%s"
+              % (last["taken"] - len(eps), "; one is armed now (trigger %s, armed at frame %s, samples frame %s)" % (
+                  _trigger_text(last["trigger"]), last["armed"], last["sample"]) if last["state"] != "idle" and last["trigger"] else ""))
+    if last and last["skipped"]:
+        print("%d trigger(s) arrived while an episode was armed (or after the session's ten): counted, never sampled" % last["skipped"])
+    if not eps:
+        print("none: no episode was sampled (the census was on for under 31 frames, or no frame of the session reached an armed trigger's sampled frame)")
+    for ep in eps:
+        print("episode %d/%s: frame %d, trigger %s (armed at frame %s); journal foot=%s, GuiFocus %s, naming %s, %s"
+              % (ep["n"], ep["of"] if ep["of"] is not None else "?", ep["frame"], _trigger_text(ep["trigger"]), ep["armed"], ep["foot"],
+                 ep["gui"] if ep["gui"] is not None else "unknown", "NAMED (a draw named the screen's source)" if ep["named"] else "unnamed",
+                 _phase_text(ep["phase_state"], ep["phase"])))
+        print("    %d call(s), %d recorded%s, %d printed; by kind: %s; by caller: %s%s"
+              % (ep["calls"], ep["recorded"], " (%d past the buffer: counted, not recorded)" % (ep["calls"] - ep["recorded"])
+                 if ep["calls"] > ep["recorded"] else "", ep["printed"], _kinds_phrase(ep["kinds"]),
+                 ", ".join("+0x%X x%d" % (rva, n) for rva, n in sorted(ep["callers"], key=lambda t: (-t[1], t[0]))) or "none",
+                 " and %d more caller(s)" % ep["callers_more"] if ep["callers_more"] else ""))
+        if ep["printed"] < ep["recorded"]:
+            print("    the call lines are capped at 120 an episode (%d of %d recorded calls printed): the calls that matched a join or the pass's rows first, then every kind-5 call, "
+                  "then the first call of each run, then the rest in order; the counts above are of all %d calls" % (ep["printed"], ep["recorded"], ep["calls"]))
+        if len(ep["rows"]) != ep["printed"]:
+            print("    !! %d call line(s) of the %d the header says printed are in this log (the log's own line budget, or lines cut short)"
+                  % (len(ep["rows"]), ep["printed"]))
+        runs = census_runs(ep["rows"])
+        half = CENSUS_EPISODE_RUNS_SHOWN // 2
+        for i, (rkind, caller, tone, count, first, last_n) in enumerate(runs):
+            if len(runs) > CENSUS_EPISODE_RUNS_SHOWN and half <= i < len(runs) - half:
+                if i == half:
+                    print("    ... %d more run(s) of the printed calls ..." % (len(runs) - 2 * half))
+                continue
+            cams = sorted({r["camera"] for r in ep["rows"] if first <= r["n"] <= last_n and (r["kind"], r["caller"], r["tone"]) == (rkind, caller, tone)})
+            print("    k%s %s %-6s x%-3d (calls %d..%d) camera %s"
+                  % ("-" if rkind is None else rkind, "+0x%X" % caller if caller is not None else "-", tone, count, first, last_n,
+                     ", ".join("0x%X" % p for p in cams)))
+        joined = census_episode_join(ep)
+        jd = ep["join_draws"]
+        print("    join: %d signature(s)%s%s (a signature is a depth, a vertex shader and a pixel shader; the first of each depth has its rows read back)"
+              % (len(joined), "; %d more did not fit the table (%s draw(s))" % (ep["join_more"]["signatures"], ep["join_more"]["draws"]) if ep["join_more"] else "",
+                 "; the per-draw hook was handed %d draw(s), %d of them into a screen- or eye-sized depth, %d depth view(s) resolved" % (jd["seen"], jd["relevant"], jd["views"])
+                 if jd else "; no `join-draws` line: the hook's draw counts are not in this log"))
+        if jd and not jd["seen"]:
+            print("        !! the join's per-draw hook was handed NO draw in the sampled frame: the route's per-draw path never reached it (the census was on, but no draw "
+                  "watch ran), so nothing could be joined; this is not 'no draw into a screen- or eye-sized depth'")
+        elif not joined:
+            print("        none: %s" % ("the hook saw %d draw(s) and none went into a depth of the 2D screen's size or an eye's size" % jd["seen"] if jd
+                                        else "no draw of the sampled frame went into a depth of the 2D screen's size or an eye's size (no draw counts to say how many were seen)"))
+        for entry in joined:
+            j = entry["join"]
+            print("        %s %dx%d: first draw %s (%s draw(s)), vs 0x%X ps 0x%X, depth write %s, b1 %s%s"
+                  % (_depth_label(j), j["w"], j["h"], "-" if j["draw"] is None else j["draw"], "-" if j["draws"] is None else j["draws"],
+                     j["vs"] or 0, j["ps"] or 0, {True: "yes", False: "no", None: "unknown"}[j["dw"]],
+                     "0x%X (%s bytes, first constant %s)" % (j["b1"], j["bytes"], j["first"]) if j["b1"] else "not bound",
+                     "" if entry["read"] else "; the rows were read but their `join-rows` line is not in this log" if j["read"]
+                     else "; rows not read (%s)" % (j["why"] or "?")))
+            if not entry["read"]:
+                continue
+            if entry["printed"]:
+                print("            rows 270..273 equal the composed rows of: %s" % _calls_phrase(entry["printed"]))
+            elif entry["listed"] or entry["more"]:
+                print("            rows 270..273 equal the composed rows of call(s) n=%s, none of which is among the printed calls" % ",".join(str(n) for n in entry["listed"]))
+            else:
+                print("            rows 270..273 equal the composed rows of NO call of this frame: whatever composed them is not at the refresh (or came from another frame)")
+            if entry["unprinted"]:
+                print("            the DLL also lists call(s) n=%s%s, not among the printed lines" % (",".join(str(n) for n in entry["unprinted"]),
+                                                                                                       " and %d more" % entry["more"] if entry["more"] else ""))
+            if entry["disagree"]:
+                print("            !! the DLL's match and this reader's disagree on call(s) n=%s" % ",".join(str(n) for n in entry["disagree"]))
+        analysis = census_episode_pass(ep)
+        if ep["pass"] is None:
+            print("    the pass's chosen rows: no `pass-rows` line for this episode")
+        elif analysis is None:
+            print("    the pass's chosen rows: none (valid=0: the pass chose no camera rows this frame: it is off, or nothing was treated)")
+        else:
+            p = analysis["pass"]
+            relation = "as they are" if p["how"] == "identity" else "transposed" if p["how"] == "transpose" else "-"
+            if p["match"] or p["match_more"]:
+                print("    the pass's chosen rows (bound block %s) equal the view axes (%s) of: %s%s"
+                      % ({True: "yes", False: "no", None: "?"}[p["bound"]], relation, _calls_phrase(analysis["matched"]) or "call(s) n=%s, not printed" % ",".join(str(n) for n in p["match"]),
+                         " (+%d more call(s))" % p["match_more"] if p["match_more"] else ""))
+                kinds = {r["kind"] for r in analysis["matched"]}
+                if kinds and kinds != {5} and 5 in ep["kinds"]:
+                    print("    -> the chooser STRAYS: the rows equal a kind %s camera's axes, not an eye camera's (this frame has %d kind-5 call(s))"
+                          % ("/".join(sorted(str(k) for k in kinds)), ep["kinds"][5]))
+                elif kinds == {5}:
+                    print("    -> the rows are an eye camera's (kind 5)")
+            else:
+                print("    the pass's chosen rows (bound block %s) equal the view axes of NO recorded call; the nearest is call n=%s at a distance of %.3e%s%s"
+                      % ({True: "yes", False: "no", None: "?"}[p["bound"]], p["nearest"] if p["nearest"] is not None else "-", p["diff"],
+                         " (%s, read %s)" % (census_episode_call_label(analysis["nearest"]), relation) if analysis["nearest"] else "",
+                         ": the rows are not a refresh call's axes (or not in the convention compared)" if p["nearest"] is not None else ""))
+    if eps:
+        print("\n== reading the episodes (facts for H1, H2 and H3, no verdict) ==")
+        foot_yes = [e for e in eps if e["foot"] == "yes"]
+        unnamed = [e for e in foot_yes if not e["named"]]
+        print("H1 (on-foot maps and menus never name a source): %d on-foot episode(s) (journal foot=yes), %d of them unnamed (no draw named the 2D screen's source)%s"
+              % (len(foot_yes), len(unnamed), ": episode(s) %s" % ", ".join(str(e["n"]) for e in unnamed) if unnamed else ""))
+        for e in unnamed:
+            screens = [en for en in census_episode_join(e) if en["join"]["depth"] == "screen"]
+            read = [en for en in screens if en["read"]]
+            if not screens:
+                what = "no draw went into a screen-sized depth"
+            elif not read:
+                what = "%d signature(s) drew into a screen-sized depth, their rows not read" % len(screens)
+            else:
+                kinds = sorted({str(r["kind"]) for en in read for r in en["printed"]})
+                what = "%d signature(s) drew into a screen-sized depth; the first draw's rows %s" % (
+                    len(screens), "equal the composed rows of kind %s call(s)" % "/".join(kinds) if kinds else "equal no printed call's composed rows")
+            print("    episode %d: %s" % (e["n"], what))
+        aboard = [e for e in eps if e["foot"] in ("no", "off")]
+        print("H3 (the cockpit's maps are driven by kind-5 eye cameras' rows): %d aboard episode(s) (journal foot=no or off)" % len(aboard))
+        for e in aboard:
+            parts = []
+            for en in census_episode_join(e):
+                if en["join"]["depth"] == "eye" and en["read"]:
+                    kinds = sorted({str(r["kind"]) for r in en["printed"]})
+                    parts.append("%s depth rows equal %s" % (_depth_label(en["join"]), "kind %s call(s)" % "/".join(kinds) if kinds else "no printed call's rows"))
+            analysis = census_episode_pass(e)
+            if analysis:
+                kinds = sorted({str(r["kind"]) for r in analysis["matched"]})
+                parts.append("the pass's rows equal %s" % ("kind %s call(s)' axes" % "/".join(kinds) if kinds else "no recorded call's axes (nearest n=%s)" % analysis["pass"]["nearest"]))
+            print("    episode %d (%s, GuiFocus %s): %s" % (e["n"], _trigger_text(e["trigger"]), e["gui"] if e["gui"] is not None else "unknown",
+                                                            "; ".join(parts) or "no eye-depth rows read and no pass rows"))
+    print_census_runs(c)
+    print_census_detour(c)
+
+
+def census_runs_total(c):
+    """The runs lines summed: {named {bin: n}, unnamed {bin: n}, frames, longest_named, longest_unnamed, windows, lines}."""
+    total = {"named": dict.fromkeys(CENSUS_RUN_BINS, 0), "unnamed": dict.fromkeys(CENSUS_RUN_BINS, 0), "frames": 0, "longest_named": 0,
+             "longest_unnamed": 0, "windows": 0, "lines": len(c["runs"])}
+    for r in c["runs"]:
+        for way in ("named", "unnamed"):
+            for b in CENSUS_RUN_BINS:
+                total[way][b] += r[way][b]
+        total["frames"] += r["frames"]
+        total["longest_named"] = max(total["longest_named"], r["longest_named"])
+        total["longest_unnamed"] = max(total["longest_unnamed"], r["longest_unnamed"])
+        total["windows"] += r["windows"] or 0
+    return total
+
+
+def print_census_runs(c):
+    if not c["runs"]:
+        return
+    t = census_runs_total(c)
+    print("\n== on-foot naming runs (the `runs` lines summed over %d 5 s window(s); frames the journal says on foot: %d) ==" % (t["windows"], t["frames"]))
+    print("a run is consecutive on-foot frames that all named the 2D screen's source (named) or none did (unnamed), counted when it ends")
+    print("%-9s %s" % ("run of", "  ".join("%6s" % b for b in CENSUS_RUN_BINS)))
+    for way in ("named", "unnamed"):
+        print("%-9s %s" % (way, "  ".join("%6d" % t[way][b] for b in CENSUS_RUN_BINS)))
+    long_unnamed = sum(t["unnamed"][b] for b in CENSUS_RUN_BINS[2:])
+    print("longest named run %d frame(s), longest unnamed run %d frame(s)" % (t["longest_named"], t["longest_unnamed"]))
+    print("H2 (the longest unnamed run in an on-foot world stays under 3 frames): %d unnamed run(s) of 3 frames or more, and %d of 1 or 2; a map or a menu opened on foot is "
+          "one of the long ones, so this reads the world only over a stretch with none open" % (long_unnamed, t["unnamed"]["1"] + t["unnamed"]["2"]))
+    last = c["runs"][-1]
+    if last["open"]:
+        print("the run open at the last window: %s for %d frame(s) so far" % last["open"])
+
+
+def print_census_detour(c):
+    if not c["detour"]:
+        return
+    lines = c["detour"]
+    frames = sum(d["frames"] or 0 for d in lines)
+    calls = sum(d["calls"] or 0 for d in lines)
+    sampled = sum(d["sampled"] or 0 for d in lines)
+    every = lines[0]["every"]
+    print("\n== the detour's CPU (the observer's two halves, %s call in %s timed; %d `detour` line(s) over %d 5 s window(s)) =="
+          % ("1" if every else "?", every if every else "?", len(lines), sum(d["windows"] or 0 for d in lines)))
+    print("what is timed: %s -- the census's work inside the detour (the clock is read at the start and end of each half). The detour's own prologue, the injection's "
+          "writes and the game's body are not in it." % (lines[0]["timed"] or "?"))
+    print("%d frame(s), %d refresh call(s), %d timed" % (frames, calls, sampled))
+    est = [(d["est_ms"], d["frames"] or 0) for d in lines if d["est_ms"] is not None]
+    if est:
+        weight = sum(f for _, f in est)
+        mean = sum(e * f for e, f in est) / float(weight) if weight else sum(e for e, _ in est) / float(len(est))
+        print("estimated ms a frame: mean %.3f over %d window line(s) (lowest %.3f, highest %.3f); calls a frame: %.1f"
+              % (mean, len(est), min(e for e, _ in est), max(e for e, _ in est), calls / float(frames) if frames else 0.0))
+    else:
+        print("estimated ms a frame: none (no window had both calls and timed calls)")
+    for name, label in (("obs", "observed calls (the detour did not inject for them)"), ("inj", "injected calls (the route's phase was written for them)")):
+        n_calls = sum(d["modes"][name]["calls"] or 0 for d in lines)
+        n_sampled = sum(d["modes"][name]["sampled"] or 0 for d in lines)
+        parts = []
+        for half in ("pre", "post"):
+            weighted = [(d["modes"][name][half], d["modes"][name]["sampled"] or 0) for d in lines if d["modes"][name][half]]
+            weight = sum(w for _, w in weighted)
+            if weight:
+                parts.append("%s half: mean %.3g us, longest %.3g us" % (half, sum(p[0] * w for p, w in weighted) / float(weight), max(p[1] for p, _ in weighted)))
+        print("%s: %d call(s), %d timed%s" % (label, n_calls, n_sampled, "; " + "; ".join(parts) if parts else "; nothing timed"))
+
+
 def _camera_role_label(ptr, roles):
     return "EYE" if ptr in roles["eye"] else "WORLD" if ptr == roles["world"] \
         else "world-side" if ptr in roles["world_side"] else "other"
@@ -1492,9 +2005,10 @@ def print_camera_census(text):
     routes = parse_world_route(text)
     events = route_events(text)
     print("[edvr] camera census: %d census line(s): %d 5 s line(s), %d camera(s), "
-          "%d call sequence(s), %d eye draw(s), %d other-thread entr%s"
+          "%d call sequence(s), %d eye draw(s), %d other-thread entr%s%s"
           % (c["lines"], len(c["windows"]), len(c["order"]), len(c["sequences"]),
-             len(c["eyes"]), len(c["threads"]), "y" if len(c["threads"]) == 1 else "ies"))
+             len(c["eyes"]), len(c["threads"]), "y" if len(c["threads"]) == 1 else "ies",
+             ", %d episode(s)" % len(c["episodes"]) if c["episodes"] else ""))
     if c["unparsed"]:
         print("[edvr]   %d census line(s) could not be parsed (cut short or garbled) and were skipped" % c["unparsed"])
     for info in c["info"]:
@@ -1748,6 +2262,7 @@ def print_camera_census(text):
               "%s%s" % ("(The join found no matching call in a logged frame: see above.)" if join else "(No eye draw was read back.)",
                         " Cameras with kind-5 calls in the logged sequences (candidates, not joined): %s"
                         % ", ".join("0x%X" % p for p in candidates) if candidates else ""))
+        print_census_episodes(c)
         print_stage2_verdict(c, routes, roles, events)
         return 0
     print("eye camera(s): %s; world camera: %s; other world-side kind-3 camera(s): %s"
@@ -1844,8 +2359,232 @@ def print_camera_census(text):
     else:
         print("(E) tangents: no eye draw fell in the frame an eye camera's line was printed, so the camera's tangents "
               "and the advertised frustum were not compared (their difference is the eye shift, about 1e-4, per frame)")
+    print_census_episodes(c)
     print_stage2_verdict(c, routes, roles, events)
     return 0
+
+
+# --maps-sharp: the on-foot maps gate (experimental.on_foot_maps_sharp, docs/design-world-camera-motion-2026-09-30.md, Phase 1).
+# The lines it reads are written by src/d3d11/ui_maps_math.h's formatters (their wording is the anchors below); the rig
+# tools/on_foot_maps_test compares tools/maps_sharp_fixture.log to those formatters byte for byte, and this reader's self-test
+# parses the same file, so a formatter that drifts fails in the build rather than in the ten minutes after a flight.
+MAPS_STAMP_RE = re.compile(r"^\[(?P<ts>\d\d:\d\d:\d\d\.\d{3})\] (?P<msg>.*)$")
+MAPS_ON_RE = re.compile(r"^on foot maps sharp: ON at frame=(?P<frame>\d+) .*gate starts as .*: (?P<start>the world|not the world) "
+                        r"\(the journal: (?P<journal>[^)]*)\)\.$")
+MAPS_OFF_RE = re.compile(r"^on foot maps sharp: OFF at frame=(?P<frame>\d+) \((?P<why>[^)]*)\): ")
+MAPS_TAKE_RE = re.compile(r"^on foot maps sharp: the layer TAKES the 2D screen at frame=(?P<frame>\d+): no world camera named its source "
+                          r"for (?P<run>\d+) frames in a row \(after (?P<world>\d+) world frames, (?P<secs>[0-9.]+) s; the journal: "
+                          r"(?P<journal>[^)]*)\)\.")
+MAPS_BACK_RE = re.compile(r"^on foot maps sharp: the layer HANDS BACK the 2D screen at frame=(?P<frame>\d+) after (?P<frames>\d+) panel "
+                          r"frames \((?P<secs>[0-9.]+) s; (?P<only>\d+) eyes through the layer-only door, (?P<kept>\d+) kept the "
+                          r"upscaler because the game drew something else into them\): (?P<why>.*)\.$")
+MAPS_NOTEMPTY_RE = re.compile(r"^on foot maps sharp: the layer took the 2D screen for eye (?P<eye>\d) \(sequence (?P<seq>\d+)\) but the "
+                              r"game drew (?P<draws>\d+) draw\(s\) into eye-sized targets this frame and the layer took (?P<taken>\d+): ")
+MAPS_NOTLIVE_RE = re.compile(r"^on foot maps sharp: experimental\.on_foot_maps_sharp is on but .*: (?P<why>[^:]*)\.$")
+MAPS_WINDOW_RE = re.compile(r"^on foot maps sharp 5s: key=on (?P<secs>[0-9.]+) s mode=(?P<mode>\w+) gate=(?P<gate>world|panel) "
+                            r"frames=(?P<frames>\d+) named=(?P<named>\d+) unnamed=(?P<unnamed>\d+) world-frames=(?P<world>\d+) "
+                            r"panel-frames=(?P<panel>\d+) holds=(?P<holds>\d+) releases=(?P<releases>\d+) "
+                            r"screen-takes=(?P<takes>\d+) recognised=(?P<recognised>\d+) door-layer-only=(?P<only>\d+) "
+                            r"door-not-empty=(?P<notempty>\d+) not-live-frames=(?P<notlive>\d+)")
+MAPS_ROUTE_RELEASED_RE = re.compile(r"vr world route: RELEASED the world at frame=(?P<frame>\d+) \((?P<why>[^)]*)\)")
+MAPS_ROUTE_OWNS_RE = re.compile(r"vr world route: OWNS the world from frame=(?P<frame>\d+) ")
+MAPS_BLACK_NEEDLES = ("native sharpen: LAYER-ONLY eye", "first black stage is")
+MAPS_SHORT_PANEL_FRAMES = 10     # a panel period shorter than this (0.11 s at 90 Hz) is a flap in the world, not a map or a menu a person opened
+MAPS_DOOR_SHARE = 0.9            # eyes through the layer-only door, of the 2 x panel-frames a panel period should have had
+MAPS_SAME_BOUNDARY_S = 0.05      # the route lets go on the gate's boundary: its RELEASED line is within this of the TAKES line
+
+
+def _clock_s(ts):
+    h, m, rest = ts.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(rest)
+
+
+def parse_maps_sharp(text):
+    """The feature's lines, in log order: {events: [{kind, ts, t, ...}], windows: [{ts, t, ...ints}], route: [{kind, ts, t, ...}],
+    black: [{ts, t, line}], declined: [...]}. A line that starts "on foot maps sharp" but is none of the kinds goes in `unparsed`."""
+    out = {"events": [], "windows": [], "route": [], "black": [], "declined": [], "unparsed": []}
+    for raw in text.splitlines():
+        m = MAPS_STAMP_RE.match(raw.rstrip("\r"))
+        if not m:
+            continue
+        ts, msg = m.group("ts"), m.group("msg")
+        t = _clock_s(ts)
+        if msg.startswith("on foot maps sharp 5s:"):
+            w = MAPS_WINDOW_RE.match(msg)
+            if not w:
+                out["unparsed"].append(raw)
+                continue
+            d = {k: int(v) for k, v in w.groupdict().items() if k not in ("secs", "mode", "gate")}
+            d.update(ts=ts, t=t, secs=float(w.group("secs")), mode=w.group("mode"), gate=w.group("gate"))
+            out["windows"].append(d)
+        elif msg.startswith("on foot maps sharp:"):
+            for kind, rx in (("on", MAPS_ON_RE), ("off", MAPS_OFF_RE), ("take", MAPS_TAKE_RE), ("back", MAPS_BACK_RE),
+                             ("notempty", MAPS_NOTEMPTY_RE), ("notlive", MAPS_NOTLIVE_RE)):
+                e = rx.match(msg)
+                if e:
+                    ev = {"kind": kind, "ts": ts, "t": t}
+                    for k, v in e.groupdict().items():
+                        ev[k] = float(v) if k == "secs" else int(v) if v.isdigit() else v
+                    out["events"].append(ev)
+                    break
+            else:
+                out["unparsed"].append(raw)
+        elif "vr world route: RELEASED the world" in msg:
+            e = MAPS_ROUTE_RELEASED_RE.search(msg)
+            if e:
+                out["route"].append({"kind": "released", "ts": ts, "t": t, "frame": int(e.group("frame")), "why": e.group("why")})
+        elif "vr world route: OWNS the world" in msg:
+            e = MAPS_ROUTE_OWNS_RE.search(msg)
+            if e:
+                out["route"].append({"kind": "owns", "ts": ts, "t": t, "frame": int(e.group("frame"))})
+        elif any(n in msg for n in MAPS_BLACK_NEEDLES):
+            out["black"].append({"ts": ts, "t": t, "line": msg[:160]})
+        elif "native temporal: layer-only declined" in msg:
+            out["declined"].append({"ts": ts, "t": t, "line": msg[:200]})
+    return out
+
+
+def maps_sharp_episodes(p):
+    """Panel periods: each TAKES line paired with the next HANDS BACK or OFF line. {take, end, frames, secs, only, kept, why, route_released,
+    route_owns, open}. `open` is a TAKES still unanswered at the end of the log."""
+    eps = []
+    cur = None
+    for ev in p["events"]:
+        if ev["kind"] == "take":
+            if cur is not None:   # a second take with no hand-back between (a switch in and out): the earlier one ended unseen
+                cur["open"] = True
+                eps.append(cur)
+            cur = {"take": ev, "end": None, "open": False}
+        elif ev["kind"] in ("back", "off") and cur is not None:
+            cur["end"] = ev
+            if ev["kind"] == "back":
+                cur.update(frames=ev["frames"], secs=ev["secs"], only=ev["only"], kept=ev["kept"], why=ev["why"])
+            else:
+                cur.update(frames=None, secs=ev["t"] - cur["take"]["t"], only=None, kept=None, why="the gate stopped: " + ev["why"])
+            eps.append(cur)
+            cur = None
+    if cur is not None:
+        cur["open"] = True
+        eps.append(cur)
+    for e in eps:
+        t0 = e["take"]["t"]
+        rel = [r for r in p["route"] if r["kind"] == "released" and abs(r["t"] - t0) <= 1.0]
+        e["route_released"] = min(rel, key=lambda r: abs(r["t"] - t0)) if rel else None
+        if e["end"] is not None and e["end"]["kind"] == "back":
+            owns = [r for r in p["route"] if r["kind"] == "owns" and 0 <= r["t"] - e["end"]["t"] <= 2.0]
+            e["route_owns"] = min(owns, key=lambda r: r["t"]) if owns else None
+        else:
+            e["route_owns"] = None
+    return eps
+
+
+def maps_sharp_judge(p, eps):
+    """(stops, warns, notes): lists of sentences. STOP is what would ruin a flight (the design's STOP list: a release in the world, flapping, a
+    black eye); WARN is what says the feature did not do all it should (an eye kept the upscaler, a door that ran for too few eyes, the route
+    and the gate letting go apart); notes are facts."""
+    stops, warns, notes = [], [], []
+    ws = p["windows"]
+    for w in ws:
+        if w["takes"] and not w["recognised"]:
+            stops.append("%s: %d taken 2D screen composites and none recognised -- screen motion's recognition never ran for a taken screen, so "
+                         "the panel could never come back to the eye route (the design's trap)" % (w["ts"], w["takes"]))
+        elif w["takes"] and w["recognised"] * 10 < w["takes"] * 9:
+            warns.append("%s: only %d of %d taken composites were recognised" % (w["ts"], w["recognised"], w["takes"]))
+        if w["notlive"]:
+            warns.append("%s: the key is on but the gate was not decided by naming for %d frame(s)" % (w["ts"], w["notlive"]))
+        if w["notempty"]:
+            warns.append("%s: %d eye(s) had the screen taken but the game drew something else into an eye-sized target, so the upscaler ran for "
+                         "them (door-not-empty)" % (w["ts"], w["notempty"]))
+        if w["panel"] and w["only"] < MAPS_DOOR_SHARE * 2 * w["panel"] and not w["notempty"]:
+            warns.append("%s: %d panel frames but only %d eyes through the layer-only door (expected about %d): the upscaler ran for the rest "
+                         "without a counted reason" % (w["ts"], w["panel"], w["only"], 2 * w["panel"]))
+    for e in eps:
+        t0 = e["take"]["ts"]
+        if e["end"] is None or e["open"]:
+            notes.append("%s: the panel period starting here was still open at the end of the log" % t0)
+            continue
+        if e["frames"] is not None and e["frames"] < MAPS_SHORT_PANEL_FRAMES:
+            stops.append("%s: a panel period of %d frames (%.2f s) -- shorter than a person opens a map or a menu: the gate released in the world "
+                         "and held again (a flap)" % (t0, e["frames"], e["secs"]))
+        if e["kept"]:
+            warns.append("%s: %d eye(s) of this panel period kept the upscaler because something else was drawn into them" % (t0, e["kept"]))
+        if e["route_released"] is not None and abs(e["route_released"]["t"] - e["take"]["t"]) > MAPS_SAME_BOUNDARY_S:
+            warns.append("%s: the VR world route let go %.0f ms from the gate (not the same boundary)"
+                         % (t0, 1000 * abs(e["route_released"]["t"] - e["take"]["t"])))
+    for b in p["black"]:
+        stops.append("%s: a black eye was reported (%s)" % (b["ts"], b["line"]))
+    for d in p["declined"]:
+        warns.append("%s: the layer-only door declined an eye (%s)" % (d["ts"], d["line"]))
+    if not ws:
+        warns.append("no 5 s window line: the feature printed nothing while the key was on, so it never ran")
+    if p["unparsed"]:
+        warns.append("%d 'on foot maps sharp' line(s) the reader does not know (the formatters changed?)" % len(p["unparsed"]))
+    if not any(e["end"] is not None and not e["open"] and e["end"]["kind"] == "back" for e in eps):
+        warns.append("no panel period closed in this log: nothing was taken and handed back (a map or a menu opened and closed is what "
+                     "the flight is for)")
+    return stops, warns, notes
+
+
+def print_maps_sharp(text):
+    """--maps-sharp: the on-foot maps gate's flight in one report; exit 0 (PASS or WARN), 1 (STOP), 3 (no line of the feature in the log)."""
+    p = parse_maps_sharp(text)
+    if not p["events"] and not p["windows"]:
+        print("[edvr] maps-sharp: no 'on foot maps sharp' line in this log. The key experimental.on_foot_maps_sharp was off, the UI layer "
+              "was not live, or this build does not have the feature; with the key on and the layer live the feature prints an ON line and "
+              "a 5 s line, zeros included.")
+        return 3
+    eps = maps_sharp_episodes(p)
+    ws = p["windows"]
+    tot = {k: sum(w[k] for w in ws) for k in ("frames", "named", "unnamed", "world", "panel", "holds", "releases", "takes", "recognised",
+                                               "only", "notempty", "notlive")}
+    print("[edvr] maps-sharp: %d event line(s), %d five-second window(s), %d panel period(s)" % (len(p["events"]), len(ws), len(eps)))
+    for ev in p["events"]:
+        if ev["kind"] == "on":
+            print("  %s  ON   frame %d, the gate starts as %s (the journal: %s)" % (ev["ts"], ev["frame"], ev["start"], ev["journal"]))
+        elif ev["kind"] == "off":
+            print("  %s  OFF  frame %d (%s)" % (ev["ts"], ev["frame"], ev["why"]))
+        elif ev["kind"] == "notlive":
+            print("  %s  NOT LIVE: %s" % (ev["ts"], ev["why"]))
+        elif ev["kind"] == "notempty":
+            print("  %s  eye %d sequence %d: %d eye draws, the layer took %d" % (ev["ts"], ev["eye"], ev["seq"], ev["draws"], ev["taken"]))
+    print("panel periods (a map or a menu the layer held):")
+    for e in eps:
+        t = e["take"]
+        if e["end"] is None or e["open"]:
+            print("  %s  TAKES frame %d after %d world frames (%.1f s) -> still open at the end of the log" % (t["ts"], t["frame"], t["world"], t["secs"]))
+            continue
+        if e["frames"] is not None:
+            tail = "%d frames (%.1f s), %d eyes layer-only, %d kept the upscaler -> %s" % (e["frames"], e["secs"], e["only"], e["kept"], e["why"])
+        else:
+            tail = "%.1f s, then %s" % (e["secs"], e["why"])
+        print("  %s  TAKES frame %d after %d world frames (%.1f s of world)  ->  %s  %s"
+              % (t["ts"], t["frame"], t["world"], t["secs"], e["end"]["ts"], tail))
+        if e["route_released"] is not None:
+            print("      the VR world route let go at %s (%+.0f ms from the take: %s)"
+                  % (e["route_released"]["ts"], 1000 * (e["route_released"]["t"] - t["t"]), e["route_released"]["why"]))
+        if e["route_owns"] is not None:
+            print("      the route owned the world again at %s (%.0f ms after the hand-back)"
+                  % (e["route_owns"]["ts"], 1000 * (e["route_owns"]["t"] - e["end"]["t"])))
+    if ws:
+        print("5 s windows, summed (%d): %d frames, named %d / unnamed %d, world %d / panel %d, %d hold(s), %d release(s); %d screen takes, %d "
+              "recognised; %d eyes through the layer-only door, %d kept the upscaler; %d frame(s) not decided by naming"
+              % (len(ws), tot["frames"], tot["named"], tot["unnamed"], tot["world"], tot["panel"], tot["holds"], tot["releases"], tot["takes"],
+                 tot["recognised"], tot["only"], tot["notempty"], tot["notlive"]))
+        if tot["panel"]:
+            print("  panel frames: %d; the layer-only door ran for %.1f%% of their %d eyes" % (tot["panel"], 100.0 * tot["only"] / (2 * tot["panel"]), 2 * tot["panel"]))
+    stops, warns, notes = maps_sharp_judge(p, eps)
+    for n in notes:
+        print("  note: %s" % n)
+    for w in warns:
+        print("  WARN: %s" % w)
+    for s in stops:
+        print("  STOP: %s" % s)
+    verdict = "STOP" if stops else "WARN" if warns else "PASS"
+    print("maps-sharp verdict: %s (%d STOP, %d WARN). PASS: every map and menu was taken within 3 frames (the TAKES line) and handed back within "
+          "2 named frames of closing, no flap in the world, no black eye, the recognition ran for every taken composite, the door ran for the "
+          "eyes. STOP: a release in the world, a flap, a black eye, a taken screen never recognised. WARN: an eye kept the upscaler, a door "
+          "short of its eyes, the route and the gate letting go apart." % (verdict, len(stops), len(warns)))
+    return 1 if stops else 0
 
 
 # --tally periodic: the phase-0 timing of periodic work, laid against long
@@ -2746,8 +3485,17 @@ def main(argv=None):
                          "offline join of those rows to the calls' -- which "
                          "camera is an eye's, and which of its caller, signature, "
                          "place in the frame, tangents and view tell it from the "
-                         "world's -- and the stage 2 verdict (PASS / WARN / STOP) "
-                         "on the world route's injected phase")
+                         "world's -- the episodes (a sampled frame per trigger, "
+                         "aboard or on foot: its calls, its join to the b1 rows, "
+                         "the pass's rows), the on-foot naming runs and the "
+                         "detour's CPU, and the stage 2 verdict (PASS / WARN / "
+                         "STOP) on the world route's injected phase")
+    ap.add_argument("--maps-sharp", action="store_true",
+                    help="report an on-foot maps gate flight (experimental.on_foot_maps_sharp "
+                         "= on): every map or menu the layer took and handed back "
+                         "(when, how long, how many eyes skipped the upscaler), the 5 s "
+                         "counters summed, whether the VR world route let go and "
+                         "re-owned with the gate, and a PASS / WARN / STOP verdict")
     ap.add_argument("--window-ms", type=float, default=100.0,
                     help="with --tally periodic, a long frame coincides with a "
                          "periodic event when the event's end time is inside "
@@ -2851,6 +3599,8 @@ def main(argv=None):
 
     if args.camera_census:
         return print_camera_census(text)
+    if args.maps_sharp:
+        return print_maps_sharp(text)
     if args.tally == "periodic":
         return print_periodic_report(path, text, ver, want, args, native_dirs)
     if args.tally:
@@ -3192,9 +3942,124 @@ def self_test():
         ok = False
     if not self_test_camera_census():
         ok = False
+    if not self_test_maps_sharp():
+        ok = False
 
     print("self-test: %s" % ("ok" if ok else "FAILED"))
     return 0 if ok else 1
+
+
+def self_test_maps_sharp():
+    """--maps-sharp on the checked-in synthetic flight (tools\\maps_sharp_fixture.log, which tools\\on_foot_maps_test holds to exactly what the
+    DLL's formatters write), then on logs altered to remove each thing the verdict judges. Returns ok."""
+    import contextlib
+    import io
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("maps-sharp: %s" % msg)
+        ok = False
+
+    path = os.path.join(repo_root(), "tools", "maps_sharp_fixture.log")
+    try:
+        base = read_text(path)
+    except OSError:
+        fail("the fixture %s is missing" % path)
+        return False
+    p = parse_maps_sharp(base)
+    kinds = [e["kind"] for e in p["events"]]
+    if kinds != ["on", "take", "notempty", "back", "take", "back", "take", "back", "off"]:
+        fail("the fixture's events read as %s" % kinds)
+    if len(p["windows"]) != 7 or p["unparsed"]:
+        fail("the fixture has %d windows (want 7) and %d unparsed line(s)" % (len(p["windows"]), len(p["unparsed"])))
+    on = p["events"][0] if p["events"] else {}
+    if (on.get("frame"), on.get("start"), on.get("journal")) != (900, "the world", "on foot"):
+        fail("the ON line reads as %r" % on)
+    take = p["events"][1] if len(p["events"]) > 1 else {}
+    if (take.get("frame"), take.get("run"), take.get("world"), take.get("secs"), take.get("journal")) != (27844, 3, 26944, 149.9, "on foot"):
+        fail("the first TAKES line reads as %r" % take)
+    back = p["events"][3] if len(p["events"]) > 3 else {}
+    if (back.get("frame"), back.get("frames"), back.get("secs"), back.get("only"), back.get("kept"), back.get("why")) != (
+            29443, 1599, 17.8, 3190, 2, "a world camera named the screen's source for 2 frames in a row"):
+        fail("the first HANDS BACK line reads as %r" % back)
+    ne = p["events"][2] if len(p["events"]) > 2 else {}
+    if (ne.get("eye"), ne.get("seq"), ne.get("draws"), ne.get("taken")) != (0, 31200, 3, 2):
+        fail("the not-empty line reads as %r" % ne)
+    w = p["windows"][3] if len(p["windows"]) > 3 else {}
+    if (w.get("gate"), w.get("frames"), w.get("unnamed"), w.get("panel"), w.get("takes"), w.get("recognised"), w.get("only"), w.get("notempty")) != (
+            "panel", 450, 450, 450, 900, 900, 898, 2):
+        fail("the fourth window reads as %r" % w)
+    if [r["kind"] for r in p["route"]] != ["released", "owns"]:
+        fail("the fixture's route lines read as %s" % [r["kind"] for r in p["route"]])
+    eps = maps_sharp_episodes(p)
+    if len(eps) != 3 or [e["frames"] for e in eps] != [1599, 4, 900]:
+        fail("the fixture's panel periods read as %s" % [e.get("frames") for e in eps])
+    elif eps[0]["route_released"] is None or abs(eps[0]["route_released"]["t"] - eps[0]["take"]["t"]) > 1e-6 or \
+            eps[0]["route_owns"] is None or abs((eps[0]["route_owns"]["t"] - eps[0]["end"]["t"]) - 0.144) > 1e-6 or eps[1]["route_released"] is not None:
+        fail("the first panel period's route pairing: released %r, owns %r" % (eps[0]["route_released"], eps[0]["route_owns"]))
+
+    def run(text):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = print_maps_sharp(text)
+        return rc, buf.getvalue()
+
+    # The fixture as it is: a 4-frame panel period is a flap (STOP), the not-empty eyes are a WARN, and the report says all of it.
+    rc, out = run(base)
+    if rc != 1 or "maps-sharp verdict: STOP" not in out or "a flap" not in out or "door-not-empty" not in out or "VR world route let go at" not in out:
+        fail("the fixture's report (rc=%d) lacks its flap STOP, its not-empty WARN or its route pairing:\n%s" % (rc, out))
+    if "the route owned the world again at 16:23:00.126 (144 ms after the hand-back)" not in out:
+        fail("the report does not say the route owned again 144 ms after the first hand-back:\n%s" % out)
+
+    # A clean flight: the flap, the not-empty eyes and their counters removed.
+    clean_lines = []
+    for raw in base.splitlines():
+        if "16:23:20.000" in raw[:14] or "16:23:20.050" in raw[:14] or "the layer took the 2D screen for eye" in raw:
+            continue
+        raw = raw.replace("door-layer-only=898 door-not-empty=2", "door-layer-only=900 door-not-empty=0")
+        raw = raw.replace("2 kept the upscaler", "0 kept the upscaler")
+        clean_lines.append(raw)
+    clean = "\n".join(clean_lines) + "\n"
+    rc, out = run(clean)
+    if rc != 0 or "maps-sharp verdict: PASS" not in out:
+        fail("the clean flight does not PASS (rc=%d):\n%s" % (rc, out))
+
+    def altered(what, text, want_rc, want_verdict, want_in_out):
+        rc2, out2 = run(text)
+        if rc2 != want_rc or ("maps-sharp verdict: " + want_verdict) not in out2 or want_in_out not in out2:
+            fail("%s: rc=%d, wanted %d %s mentioning %r:\n%s" % (what, rc2, want_rc, want_verdict, want_in_out, out2))
+
+    # The trap: taken composites that were never recognised.
+    altered("recognised=0 with screen-takes>0", clean.replace("screen-takes=810 recognised=810", "screen-takes=810 recognised=0"), 1, "STOP",
+            "none recognised")
+    # A black eye reported by the sharpen door or the luma probe.
+    altered("a black eye", clean + "[16:23:41.000] native sharpen: LAYER-ONLY eye 0 (sequence 5) got NO composite from the UI layer -- the eye "
+                                   "is BLACK for this frame (1 so far); the layer stands down\n", 1, "STOP", "a black eye was reported")
+    altered("a luma black stage", clean + "[16:23:41.000] luma probe: eye=0 first black stage is game (game 0.000 dlss_out 0.000 final 0.000).\n",
+            1, "STOP", "a black eye was reported")
+    # The route letting go apart from the gate.
+    altered("the route apart", clean.replace("[16:22:41.915] vr world route: RELEASED", "[16:22:42.300] vr world route: RELEASED"), 0, "WARN",
+            "not the same boundary")
+    # The door short of its eyes without a counted reason.
+    altered("the door short", clean.replace("panel-frames=450 holds=0 releases=0 screen-takes=900 recognised=900 door-layer-only=900",
+                                            "panel-frames=450 holds=0 releases=0 screen-takes=900 recognised=900 door-layer-only=300"), 0, "WARN",
+            "only 300 eyes through the layer-only door")
+    # The key on but the gate not decided by naming.
+    altered("not live frames", clean.replace("not-live-frames=0", "not-live-frames=12", 1), 0, "WARN", "not decided by naming")
+    # A declined layer-only eye.
+    altered("a declined door", clean + "[16:23:41.000] native temporal: layer-only declined for eye 0 (sequence 7): the UI layer is not live; the "
+                                       "eye route serves this eye through the pass, as it does without the layer-only door.\n", 0, "WARN",
+            "declined an eye")
+    # No panel period closed.
+    altered("nothing handed back", "\n".join(l for l in clean.splitlines() if "HANDS BACK" not in l) + "\n", 0, "WARN", "no panel period closed")
+    # A log with no line of the feature says so, and exits 3.
+    rc, out = run("[16:20:00.000] version v0.0.0 (build 1) -- this DLL was linked x\n[16:20:01.000] something else\n")
+    if rc != 3 or "no 'on foot maps sharp' line" not in out:
+        fail("a log with no feature line (rc=%d):\n%s" % (rc, out))
+    # A line of the feature the reader does not know is reported, not dropped.
+    altered("an unknown line", clean + "[16:23:41.000] on foot maps sharp: something the formatters never wrote\n", 0, "WARN", "the reader does not know")
+    return ok
 
 
 def self_test_camera_census():
@@ -3365,7 +4230,7 @@ def self_test_camera_census():
     rc, out = report(text)
     flat = squash(out)
     want = [
-        "103 census line(s): 2 5 s line(s), 5 camera(s), 3 call sequence(s), 8 eye draw(s), 0 other-thread entries",
+        "165 census line(s): 2 5 s line(s), 5 camera(s), 3 call sequence(s), 8 eye draw(s), 0 other-thread entries, 3 episode(s)",
         "off-thread calls: 0 in every window -- the refresh runs on the render thread",
         "frames with the tone drawn: 898; sampled (tone while the journal says on foot, or no journal; while the world route "
         "jitters, with a non-zero phase): 450; the journal said: no, yes",
@@ -3921,12 +4786,260 @@ def self_test_camera_census():
     if "(D) caller: eye camera(s) call from +0x594E13; the world camera from +0x594E13; shared: +0x594E13" not in out:
         fail("two cameras calling from one site were separated by the caller:\n%s" % out)
 
+    # ---- the episodes (Phase 0): the value parsers, the parser, the report, and logs altered to take away each thing the section depends on ----
+    if (_ckindmap("0:12,3:290,5:10"), _ckindmap("-"), _ckindmap("1:2,other:3,unreadable:4"), _ckindmap("x"), _ckindmap(None)) != \
+            ({0: 12, 3: 290, 5: 10}, {}, {1: 2, "other": 3, "unreadable": 4}, None, None):
+        fail("_ckindmap")
+    if (_ccallers("+0x58DE73:300,+0x594E13:130,+more:2"), _ccallers("-"), _ccallers("+0x1:1,"), _ccallers(None)) != \
+            (([(0x58DE73, 300), (0x594E13, 130)], 2), ([], 0), None, None):
+        fail("_ccallers")
+    if (_ctrigger("key-on"), _ctrigger("gui:0>6"), _ctrigger("naming:unnamed>named"), _ctrigger("foot:no"), _ctrigger(""), _ctrigger("bogus:1>2"),
+            _ctrigger("zzz"), _ctrigger("gui:>6"), _ctrigger(None)) != \
+            (("key-on", None, None), ("gui", "0", "6"), ("naming", "unnamed", "named"), None, None, None, None, None, None):
+        fail("_ctrigger")
+    if (_cmatch("98,101"), _cmatch("1,2,3,4,5,6+48"), _cmatch("-"), _cmatch("1,x"), _cmatch("3+"), _cmatch(None)) != \
+            (([98, 101], 0), ([1, 2, 3, 4, 5, 6], 48), ([], 0), None, None, None):
+        fail("_cmatch")
+    if _cbins("1:1,2:0,3:0,4-8:0,9-30:0,31-89:1,90+:1") != {"1": 1, "2": 0, "3": 0, "4-8": 0, "9-30": 0, "31-89": 1, "90+": 1} or \
+            _cbins("1:1,2:0") is not None or _cbins("2:1,1:0,3:0,4-8:0,9-30:0,31-89:0,90+:0") is not None or _cbins(None) is not None:
+        fail("_cbins")
+    if (_cpair_us("25/30"), _cpair_us("0.31/4.2"), _cpair_us("-"), _cpair_us("a/b"), _cpair_us(None)) != ((25.0, 30.0), (0.31, 4.2), None, None, None):
+        fail("_cpair_us")
+
+    c = parse_camera_census(text)
+    eps = c["episodes"]
+    if len(c["windows"]) != 2 or (len(eps), len(c["episode_counters"]), len(c["runs"]), len(c["detour"])) != (3, 2, 2, 2) or c["unparsed"]:
+        fail("the fixture parsed as %r episodes, counters, runs, detour lines (want 3, 2, 2, 2), %d 5 s windows (want 2: the companions are not windows), %d unparsed"
+             % ((len(eps), len(c["episode_counters"]), len(c["runs"]), len(c["detour"])), len(c["windows"]), c["unparsed"]))
+    e1, e2, e3 = eps
+    if (e1["n"], e1["of"], e1["frame"], e1["armed"], e1["trigger"], e1["foot"], e1["gui"], e1["named"], e1["phase_state"]) != \
+            (1, 10, 31, 1, ("key-on", None, None), "no", 0, False, "off") or \
+            (e2["trigger"], e2["gui"], e2["armed"], e2["frame"]) != (("gui", "0", "6"), 6, 1530, 1560) or \
+            (e3["trigger"], e3["foot"], e3["gui"], e3["phase"], e3["named"]) != (("naming", "named", "unnamed"), "yes", None, (0.252, -0.126), False):
+        fail("the episode headers parsed wrong: %r" % ([{k: v for k, v in e.items() if k not in ("rows", "joins", "pass")} for e in eps],))
+    if (e1["calls"], e1["recorded"], e1["printed"], len(e1["rows"])) != (14, 14, 14, 14) or e1["kinds"] != {1: 2, 3: 6, 5: 6} or \
+            sorted(e1["callers"]) != [(0x58DE73, 2), (0x594E13, 4), (0x594EAB, 4), (0x594FE1, 4)] or e1["callers_more"] != 0 or \
+            [r["kind"] for r in e1["rows"]] != [1, 1] + [3] * 6 + [5] * 6 or any(r["frame"] != 31 for r in e1["rows"]) or \
+            len(c["sequences"]) != 3:
+        fail("an episode's call lines did not follow its header, or leaked into the first three sequences: %r" % ([r["kind"] for r in e1["rows"]],))
+    j1 = e1["joins"]
+    if [(j["sig"], j["depth"], j["eye"], j["w"], j["h"], j["draw"], j["draws"], j["dw"], j["b1"], j["bytes"], j["read"], j["why"], j["match"]) for j in j1] != \
+            [(1, "eye", 0, 2620, 2533, 8210, 1432, True, 0x1EB2E751E20, 5376, True, None, [9, 10, 11]),
+             (2, "eye", 0, 2620, 2533, 8650, 61, False, 0x1EB2E751E20, 5376, False, "skip", None),
+             (3, "eye", 1, 2620, 2533, 8215, 1432, True, 0x1EB2E751E20, 5376, True, None, [12, 13, 14])] or \
+            [len(j["rows"]) if j["rows"] else None for j in j1] != [16, None, 16] or j1[0]["vs"] != 0x5C36AF051B98B9F1 or j1[0]["ps"] != 0xCFE84157BC76E921:
+        fail("the join signatures of episode 1 parsed wrong: %r" % (j1,))
+    j3 = e3["joins"]
+    if [(j["depth"], j["eye"], j["match"], j["b1"], j["why"]) for j in j3] != \
+            [("screen", None, [], 0x1EB2E751E20, None), ("screen", None, None, 0x1EB2E751E20, "skip"), ("eye", None, None, None, "no-b1")]:
+        fail("the join signatures of episode 3 (a screen depth, no match, a skipped signature, no b1) parsed wrong: %r" % (j3,))
+    p1, p2, p3 = e1["pass"], e2["pass"], e3["pass"]
+    if (p1["valid"], p1["bound"], len(p1["rows"]), p1["match"], p1["how"], p1["nearest"], p1["diff"]) != (True, True, 12, [9, 10, 11], "identity", 9, 0.0) or \
+            (p2["valid"], p2["bound"], p2["match"], p2["how"], p2["nearest"]) != (True, False, [5, 6, 7, 8, 9], "transpose", 5) or \
+            (p3["valid"], p3["rows"], p3["match"], p3["how"]) != (False, None, [], None):
+        fail("the pass's rows parsed wrong: %r" % ((p1, p2, p3),))
+    r2 = c["runs"][1]
+    if r2["frames"] != 413 or r2["named"]["31-89"] != 1 or r2["unnamed"]["4-8"] != 1 or (r2["longest_named"], r2["longest_unnamed"]) != (211, 7) or \
+            r2["open"] != ("named", 211) or c["runs"][0]["open"] is not None:
+        fail("a runs line parsed wrong: %r" % (r2,))
+    d2 = c["detour"][1]
+    if (d2["every"], d2["frames"], d2["calls"], d2["sampled"]) != (16, 450, 10800, 676) or abs(d2["est_ms"] - 0.155) > 1e-9 or \
+            d2["modes"]["inj"]["calls"] != 6750 or d2["modes"]["obs"]["pre"] != (3.35, 3.6) or d2["modes"]["inj"]["post"] != (2.7, 2.8) or c["detour"][0]["modes"]["inj"]["pre"] is not None:
+        fail("a detour line parsed wrong: %r" % (d2,))
+    if [e["join_draws"] for e in eps] != [{"seen": 3100, "relevant": 2925, "views": 4, "signatures": 3}, {"seen": 2100, "relevant": 1800, "views": 3, "signatures": 2},
+                                          {"seen": 905, "relevant": 337, "views": 5, "signatures": 3}]:
+        fail("the join-draws lines parsed wrong: %r" % ([e["join_draws"] for e in eps],))
+    k2 = c["episode_counters"][1]
+    if (k2["taken"], k2["of"], k2["triggers"], k2["skipped"], k2["state"], k2["trigger"]) != (3, 10, 5, 2, "idle", None):
+        fail("an episodes (counters) line parsed wrong: %r" % (k2,))
+    armed = parse_camera_census("[00:00:01.000] vr camera census: episodes windows=1 taken=2/10 triggers=3 skipped=0 state=armed trigger=gui:0>6 armed=100 sample=130\n")
+    if armed["episode_counters"][0]["trigger"] != ("gui", "0", "6") or (armed["episode_counters"][0]["armed"], armed["episode_counters"][0]["sample"]) != (100, 130):
+        fail("an armed episodes line parsed wrong: %r" % (armed["episode_counters"],))
+    # A line cut short or garbled is counted and skipped; a join line of an episode whose header is not there has nowhere to go.
+    bad = parse_camera_census("vr camera census: episode frame=5 n=1/10 trigger=zzz armed=1 foot=no gui=- named=0 phase=- calls=1 recorded=1 printed=1 kinds=- callers=-\n"
+                              "vr camera census: join ep=9 sig=1 depth=eye eye=0 size=2620x2533 draw=1 draws=1 vs=0x1 ps=0x1 dw=yes b1=- first=- bytes=- rows=- why=no-b1\n"
+                              "vr camera census: pass-rows ep=9 frame=5 valid=0 bound=- rows=- axes-match=- how=- nearest=- diff=-\n"
+                              "vr camera census: join-rows ep=9 sig=1 rows=[1,2]\n"
+                              "vr camera census: join-draws ep=9 seen=1 relevant=1 views=1 signatures=1\n")
+    if bad["unparsed"] != 5 or bad["episodes"]:
+        fail("a garbled header and lines of an episode with no header were not skipped and counted: %r" % (bad["unparsed"],))
+
+    # ---- the report ----
+    rc, out = report(text)
+    flat = squash(out)
+    want_episodes = [
+        "== episodes (3 printed; the last `episodes` line: 3 taken of 10, 5 trigger(s), 2 skipped) ==",
+        "2 trigger(s) arrived while an episode was armed (or after the session's ten): counted, never sampled",
+        "episode 1/10: frame 31, trigger key-on (armed at frame 1); journal foot=no, GuiFocus 0, naming unnamed, the route was not jittering (phase=-)",
+        "14 call(s), 14 recorded, 14 printed; by kind: k1 x2, k3 x6, k5 x6; by caller: +0x594E13 x4, +0x594EAB x4, +0x594FE1 x4, +0x58DE73 x2",
+        "k5 +0x594E13 after x1 (calls 9..9) camera 0x241DF6D0BB0",
+        "join: 3 signature(s); the per-draw hook was handed 3100 draw(s), 2925 of them into a screen- or eye-sized depth, 4 depth view(s) resolved (a signature is a depth, a vertex "
+        "shader and a pixel shader; the first of each depth has its rows read back)",
+        "join: 3 signature(s); the per-draw hook was handed 905 draw(s), 337 of them into a screen- or eye-sized depth, 5 depth view(s) resolved",
+        "eye 0 2620x2533: first draw 8210 (1432 draw(s)), vs 0x5C36AF051B98B9F1 ps 0xCFE84157BC76E921, depth write yes, b1 0x1EB2E751E20 (5376 bytes, first constant 0)",
+        "rows 270..273 equal the composed rows of: camera 0x241DF6D0BB0 (kind 5) caller +0x594E13, +0x594EAB, +0x594FE1, 3 call(s) n=9/10/11, view 0x241DD00E000, tone after",
+        "depth write no, b1 0x1EB2E751E20 (5376 bytes, first constant 0); rows not read (skip)",
+        "the pass's chosen rows (bound block yes) equal the view axes (as they are) of: camera 0x241DF6D0BB0 (kind 5) caller +0x594E13, +0x594EAB, +0x594FE1, 3 call(s) n=9/10/11",
+        "-> the rows are an eye camera's (kind 5)",
+        "episode 2/10: frame 1560, trigger gui 0>6 (armed at frame 1530); journal foot=no, GuiFocus 6, naming unnamed",
+        "eye 0 2620x2533: first draw 8300 (900 draw(s)), vs 0x5C36AF051B98B9F1 ps 0xCFE84157BC76E921, depth write yes, b1 0x1EB2E751E20 (5376 bytes, first constant 0); rows not read (map)",
+        "the pass's chosen rows (bound block no) equal the view axes (transposed) of: camera 0x241DC2E2960 (kind 3) caller +0x594E13, +0x594EAB, +0x594FE1, 5 call(s) n=5/6/7/8/9",
+        "-> the chooser STRAYS: the rows equal a kind 3 camera's axes, not an eye camera's (this frame has 6 kind-5 call(s))",
+        "episode 3/10: frame 6120, trigger naming named>unnamed (armed at frame 6090); journal foot=yes, GuiFocus unknown, naming unnamed, phase (0.2520, -0.1260) px",
+        "screen 5040x2835: first draw 41 (22 draw(s)), vs 0xDFED8E1C9E191BEC ps 0x143AAE0597E2F7BF, depth write yes, b1 0x1EB2E751E20 (5376 bytes, first constant 0)",
+        "rows 270..273 equal the composed rows of NO call of this frame: whatever composed them is not at the refresh (or came from another frame)",
+        "eye ? 2620x2533: first draw 90 (4 draw(s)), vs 0x11A2B3C4D5E6F708 ps 0xCFE84157BC76E921, depth write yes, b1 not bound; rows not read (no-b1)",
+        "the pass's chosen rows: none (valid=0: the pass chose no camera rows this frame: it is off, or nothing was treated)",
+        "== reading the episodes (facts for H1, H2 and H3, no verdict) ==",
+        "H1 (on-foot maps and menus never name a source): 1 on-foot episode(s) (journal foot=yes), 1 of them unnamed (no draw named the 2D screen's source): episode(s) 3",
+        "episode 3: 2 signature(s) drew into a screen-sized depth; the first draw's rows equal no printed call's composed rows",
+        "H3 (the cockpit's maps are driven by kind-5 eye cameras' rows): 2 aboard episode(s) (journal foot=no or off)",
+        "episode 1 (key-on, GuiFocus 0): eye 0 depth rows equal kind 5 call(s); eye 1 depth rows equal kind 5 call(s); the pass's rows equal kind 5 call(s)' axes",
+        "episode 2 (gui 0>6, GuiFocus 6): eye 1 depth rows equal kind 5 call(s); the pass's rows equal kind 3 call(s)' axes",
+        "== on-foot naming runs (the `runs` lines summed over 2 5 s window(s); frames the journal says on foot: 413) ==",
+        "named 1 0 0 0 0 1 1",
+        "unnamed 2 1 0 1 0 0 0",
+        "longest named run 211 frame(s), longest unnamed run 7 frame(s)",
+        "H2 (the longest unnamed run in an on-foot world stays under 3 frames): 1 unnamed run(s) of 3 frames or more, and 3 of 1 or 2",
+        "the run open at the last window: named for 211 frame(s) so far",
+        "== the detour's CPU (the observer's two halves, 1 call in 16 timed; 2 `detour` line(s) over 2 5 s window(s)) ==",
+        "898 frame(s), 52588 refresh call(s), 3289 timed",
+        "estimated ms a frame: mean 0.344 over 2 window line(s) (lowest 0.155, highest 0.533); calls a frame: 58.6",
+        "observed calls (the detour did not inject for them): 45838 call(s), 2866 timed; pre half: mean 3.32 us, longest 52 us; post half: mean 2.41 us, longest 2.7 us",
+        "injected calls (the route's phase was written for them): 6750 call(s), 423 timed; pre half: mean 4.08 us, longest 61 us; post half: mean 2.7 us, longest 2.8 us",
+    ]
+    for w in want_episodes:
+        if w not in flat:
+            fail("the report on the fixture lacks %r:\n%s" % (w, out[out.find("== episodes"):out.find("== stage 2 verdict")]))
+            break
+    if out.index("== episodes") > out.index("== stage 2 verdict") or "== stage 2 verdict" not in out or "stage 2 verdict: PASS (6 PASS" not in out:
+        fail("the episodes come after the stage 2 verdict, or the verdict changed with them in the log:\n%s" % out[-600:])
+
+    def drop(log, prefix):
+        return mutate(log, prefix, lambda line: "")
+
+    episode_calls = ("call frame=31 ", "call frame=1560 ", "call frame=6120 ")   # the fixture's three episodes' call lines (no sequence is made of them)
+
+    # A log with none of the new lines is the report it was: no episodes section, no sections of runs and detour, and the summary line without a count of episodes.
+    legacy = text
+    for prefix in ("episode ", "join ", "join-rows ", "join-more ", "join-draws ", "pass-rows ", "episodes ", "runs ", "detour ") + episode_calls:
+        legacy = drop(legacy, prefix)
+    rc, out = report(legacy)
+    if rc != 0 or "== episodes" in out or "== on-foot naming runs" in out or "== the detour's CPU" in out or "episode(s)" in out.split("\n")[0] or \
+            "stage 2 verdict: PASS (6 PASS" not in out or "3 call sequence(s), 8 eye draw(s)" not in out:
+        fail("a census log with none of the episode lines (an older census) did not report exactly as before:\n%s" % out)
+    # No `episodes` counters line: the section says so (and still prints the episodes).
+    _, out = report(drop(text, "episodes "))
+    if "no `vr camera census: episodes` line (the window's counters)" not in out or "== episodes (3 printed)" not in out:
+        fail("a log with no episode counters line did not say so:\n%s" % out)
+    # An episode armed and never printed (the log ends before its frame): the counters line says it, with its trigger and the frame it samples.
+    armed_log = text
+    for prefix in ("episode ", "join ", "join-rows ", "join-draws ", "pass-rows ") + episode_calls:
+        armed_log = drop(armed_log, prefix)
+    armed_log += \
+        "[12:00:09.000] vr camera census: episodes windows=1 taken=4/10 triggers=6 skipped=2 state=armed trigger=gui:6>0 armed=7000 sample=7030\n"
+    _, out = report(armed_log)
+    if "4 episode(s) were armed and not printed" not in out or "one is armed now (trigger gui 6>0, armed at frame 7000, samples frame 7030)" not in out or \
+            "none: no episode was sampled" not in out:
+        fail("an armed episode that never printed was not reported:\n%s" % out)
+    # The pass's rows line is missing, or valid=0.
+    _, out = report(drop(text, "pass-rows ep=1 "))
+    if "episode 1/10" not in out or "the pass's chosen rows: no `pass-rows` line for this episode" not in squash(out):
+        fail("an episode with no pass-rows line did not say so:\n%s" % out)
+    # The join's hook was never handed a draw (seen=0) is not 'no draw joined': the first says the route's per-draw path never reached the census; the second counts what was seen.
+    never = sub(drop(drop(drop(text, "join ep=3 "), "join-rows ep=3 "), "join-more ep=3 "), "join-draws ep=3 seen=905 relevant=337 views=5 signatures=3",
+                "join-draws ep=3 seen=0 relevant=0 views=0 signatures=0")
+    _, out = report(never)
+    part = squash(out)[squash(out).find("episode 3/10"):]
+    if "the per-draw hook was handed 0 draw(s), 0 of them into a screen- or eye-sized depth, 0 depth view(s) resolved" not in part or \
+            "!! the join's per-draw hook was handed NO draw in the sampled frame" not in part or "none: the hook saw" in part:
+        fail("an episode whose join hook never ran was not told from one with no draw joined:\n%s" % part[:1200])
+    quiet = sub(drop(drop(drop(text, "join ep=3 "), "join-rows ep=3 "), "join-more ep=3 "), "join-draws ep=3 seen=905 relevant=337 views=5 signatures=3",
+                "join-draws ep=3 seen=905 relevant=0 views=5 signatures=0")
+    _, out = report(quiet)
+    part = squash(out)[squash(out).find("episode 3/10"):]
+    if "none: the hook saw 905 draw(s) and none went into a depth of the 2D screen's size or an eye's size" not in part or "NO draw in the sampled frame" in part:
+        fail("an episode whose draws saw no screen- or eye-sized depth was not named with its draw count:\n%s" % part[:1200])
+    _, out = report(drop(text, "join-draws ep=3 "))
+    if "no `join-draws` line: the hook's draw counts are not in this log" not in squash(out):
+        fail("an episode with no join-draws line did not say so:\n%s" % out[out.find("episode 3/10"):][:900])
+    # A rows line missing: the join says the rows were read and the line is not here (and does not read as 'no call matched').
+    _, out = report(drop(text, "join-rows ep=1 sig=1 "))
+    if "the rows were read but their `join-rows` line is not in this log" not in out:
+        fail("a join signature whose rows line is missing was not named:\n%s" % out)
+    # The calls the join matched are not in the log (the DLL's own list names them): said, never 'no call composed them'.
+    no_eyes = "\n".join(l for l in text.split("\n") if not (": call frame=31 " in l and " kind=5 " in l))
+    _, out = report(no_eyes)
+    if "equal the composed rows of call(s) n=9,10,11, none of which is among the printed calls" not in squash(out) or \
+            "equal the composed rows of NO call of this frame" in out.split("episode 2/10")[0]:
+        fail("matched calls that were not printed were not named by their ordinals, or read as 'no call':\n%s" % out[out.find("== episodes"):out.find("episode 2/10")])
+    # The DLL lists an ordinal that is not printed beside printed ones; and the reader's own match disagreeing with the DLL's is flagged.
+    more = sub(text, "rows=read match=9,10,11", "rows=read match=9,10,11,99+3")
+    _, out = report(more)
+    if "the DLL also lists call(s) n=99 and 3 more, not among the printed lines" not in squash(out):
+        fail("an ordinal the DLL listed that is not printed (and a count past its list) was not said:\n%s" % out[out.find("== episodes"):out.find("episode 2/10")])
+    nudged = mutate(text, "call frame=31 n=10 ", lambda line: re.sub(r"rows=\[([^,\]]+)", lambda m: "rows=[%.9g" % (float(m.group(1)) + 5e-5), line, count=1))
+    _, out = report(nudged)
+    if "the DLL's match and this reader's disagree on call(s) n=10" not in squash(out):
+        fail("a printed call whose rows the reader does not match, though the DLL listed it, was not flagged:\n%s" % out[out.find("== episodes"):out.find("episode 2/10")])
+    # The chooser: rows that equal no call's axes name the nearest and how near; rows equal to an eye camera's axes do not say STRAYS.
+    _, out = report(sub(text, "axes-match=5,6,7,8,9 how=transpose nearest=5 diff=0.000e+00", "axes-match=- how=identity nearest=15 diff=2.500e-03"))
+    if "equal the view axes of NO recorded call; the nearest is call n=15 at a distance of 2.500e-03" not in squash(out) or "STRAYS" in out:
+        fail("pass rows that equal no call's axes were not reported with the nearest call:\n%s" % out[out.find("episode 2/10"):out.find("episode 3/10")])
+    # No kind-5 call in the frame: a kind-3 match is not a stray (there is no eye camera to stray from).
+    solo = sub(text, "kinds=1:4,3:5,5:6", "kinds=1:4,3:5")
+    _, out = report(solo)
+    if "STRAYS" in out:
+        fail("a frame with no kind-5 call reported a stray chooser:\n%s" % out)
+    # The call lines are capped (more calls recorded than printed): said once for the episode, with the order the cap keeps; a header that promises more lines than the log holds is flagged.
+    _, out = report(sub(text, "calls=14 recorded=14 printed=14", "calls=20 recorded=18 printed=14"))
+    part = squash(out).split("episode 2/10")[0]
+    if "the call lines are capped at 120 an episode (14 of 18 recorded calls printed)" not in part or "the counts above are of all 20 calls" not in part or \
+            "call line(s) of the" in part or "(2 past the buffer: counted, not recorded)" not in part:
+        fail("an episode whose calls were capped was not said so:\n%s" % part[:900])
+    _, out = report(sub(text, "calls=14 recorded=14 printed=14", "calls=14 recorded=14 printed=20"))
+    if "!! 14 call line(s) of the 20 the header says printed are in this log" not in squash(out):
+        fail("a header that says more call lines printed than the log holds was not flagged:\n%s" % out[out.find("== episodes"):out.find("episode 2/10")])
+    # Runs: no `runs` lines, no section; a log whose longest unnamed run is under 3 says 0 long runs.
+    _, out = report(drop(text, "runs "))
+    if "== on-foot naming runs" in out or "== the detour's CPU" not in out:
+        fail("a log with no runs lines still printed the naming runs, or dropped the detour section:\n%s" % out)
+    short = sub(sub(text, "unnamed=1:2,2:1,3:0,4-8:1,9-30:0,31-89:0,90+:0", "unnamed=1:2,2:1,3:0,4-8:0,9-30:0,31-89:0,90+:0"), "longest=named:211,unnamed:7", "longest=named:211,unnamed:2")
+    _, out = report(short)
+    if "H2 (the longest unnamed run in an on-foot world stays under 3 frames): 0 unnamed run(s) of 3 frames or more, and 3 of 1 or 2" not in squash(out) or \
+            "longest named run 211 frame(s), longest unnamed run 2 frame(s)" not in squash(out):
+        fail("runs that stay under three frames were not reported as none of 3 or more:\n%s" % out[out.find("== on-foot naming runs"):])
+    # A run of exactly three unnamed frames is a long one (the bin of 3 counts): the release the design waits for.
+    three = sub(text, "unnamed=1:2,2:1,3:0,4-8:1,9-30:0,31-89:0,90+:0", "unnamed=1:2,2:1,3:1,4-8:0,9-30:0,31-89:0,90+:0")
+    _, out = report(three)
+    if "H2 (the longest unnamed run in an on-foot world stays under 3 frames): 1 unnamed run(s) of 3 frames or more, and 3 of 1 or 2" not in squash(out):
+        fail("an unnamed run of exactly three frames was not counted as one of three or more:\n%s" % out[out.find("== on-foot naming runs"):])
+    # Detour: no lines, no section; no timed call at all says nothing was estimated.
+    _, out = report(drop(text, "detour "))
+    if "== the detour's CPU" in out or "== on-foot naming runs" not in out:
+        fail("a log with no detour lines still printed the CPU section, or dropped the runs:\n%s" % out)
+    # The mean estimate is weighted by each window's frames: a window of 45 frames counts a tenth of one of 448.
+    _, out = report(sub(text, "windows=1 every=16 timed=observer-halves frames=450 ", "windows=1 every=16 timed=observer-halves frames=45 "))
+    if not re.search(r"estimated ms a frame: mean 0\.49\d over 2 window line\(s\) \(lowest 0\.155, highest 0\.533\)", squash(out)):
+        fail("the detour's mean estimate was not weighted by each window's frames:\n%s" % out[out.find("== the detour's CPU"):])
+    untimed = re.sub(r"(vr camera census: detour [^\n]*?) est-ms-frame=\S+", r"\1 est-ms-frame=-", text)
+    _, out = report(untimed)
+    if "estimated ms a frame: none (no window had both calls and timed calls)" not in out:
+        fail("detour lines with no estimate were not said so:\n%s" % out[out.find("== the detour's CPU"):])
+    # The episode lines are in the log of a census that never had a legacy sequence (a cockpit-only session): the report still finishes and joins eye draws as it did.
+    cockpit_only = text
+    for prefix in ("sequence ", "call frame=4 ", "call frame=5 ", "call frame=6 ", "eye=", "eye-geometry "):
+        cockpit_only = drop(cockpit_only, prefix)
+    rc, out = report(cockpit_only)
+    if rc != 0 or "== episodes (3 printed" not in out or "episode 1/10" not in out or "no eye draw was read back" not in out.lower():
+        fail("a session with episodes and no on-foot sequence did not report both sides:\n%s" % out[:1500])
+
     # ---- the command line ----
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         rc = main(["--file", fixture, "--camera-census"])
     if rc != 0 or "== which signal separates the eye cameras (A)-(F) ==" not in buf.getvalue() or \
-            "== stage 2 verdict" not in buf.getvalue():
+            "== stage 2 verdict" not in buf.getvalue() or "== episodes (3 printed" not in buf.getvalue():
         fail("--camera-census through main() returned %d:\n%s" % (rc, buf.getvalue()))
     return ok
 

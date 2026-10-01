@@ -3,7 +3,6 @@
 #include "ui_layer.h"
 #include "ui_layer_math.h"  // uiLayerUvFromRegion
 #include "temporal_pass.h"
-#include "vr_world_route.h"  // the VR world route: did the layer take this eye's screen draw (layer-only)
 #include "../common/config.h"
 #include "../common/log.h"
 #include "../common/supersample_math.h"
@@ -23,7 +22,7 @@ struct State {
   bool consumed[2]{};
   float strength = 0;
   uint64_t treated = 0, off = 0, refusals = 0, invalidations = 0;
-  // The layer-only door (vr_world_route.h): eyes whose frame at this door was the temporal door's black one, and, of
+  // The layer-only door (ui_layer.h uiLayerDoorLayerOnly): eyes whose frame at this door was the temporal door's black one, and, of
   // those, the eyes whose composite did not run (a black eye for the frame: counted, and the first eight named).
   uint64_t layerOnly = 0, layerOnlyBlack = 0;
 };
@@ -72,11 +71,12 @@ HRESULT WINAPI treat(void* p,uint64_t seq,uint32_t eye,ID3D11Texture2D* source,c
   // source's size -- the same whether the frame is the source or the
   // sharpened copy of that region.
   float layerUv[4]; edvr::uiLayerUvFromRegion(region,desc.Width,desc.Height,layerUv);
-  // The VR world route's layer-only eye (vr_world_route.h): the layer holds the WHOLE eye and the frame here is the
-  // black one the temporal door handed on. So the layer is composited FIRST and RCAS runs over the composited eye --
-  // the order the ordinary path reverses (RCAS on the frame, then the layer over it, so the sharpener never rings
-  // the text), which would sharpen a black frame. The strength rules are the ordinary ones (fix.render_sharpness).
-  if(edvr::vrWorldRouteDoorLayerOnly(eye,seq)) {
+  // A layer-only eye (ui_layer.h uiLayerDoorLayerOnly: the VR world route's world, or a map's or a menu's 2D screen under
+  // experimental.on_foot_maps_sharp): the layer holds the WHOLE eye and the frame here is the black one the temporal door
+  // handed on. So the layer is composited FIRST and RCAS runs over the composited eye -- the order the ordinary path
+  // reverses (RCAS on the frame, then the layer over it, so the sharpener never rings the text), which would sharpen a
+  // black frame. The strength rules are the ordinary ones (fix.render_sharpness).
+  if(edvr::uiLayerDoorLayerOnly(eye,seq)) {
     ++s->layerOnly;
     ID3D11Texture2D* layered=edvr::uiLayerComposite(seq,eye,source,region,layerUv);
     const uint32_t whole[4]={0,0,region[2]-region[0],region[3]-region[1]};
@@ -86,7 +86,7 @@ HRESULT WINAPI treat(void* p,uint64_t seq,uint32_t eye,ID3D11Texture2D* source,c
       // stands the layer down, and the route lets go at the next boundary. Loud, because nothing else is.
       ++s->layerOnlyBlack;
       if(s->layerOnlyBlack<=8)edvr::Log::get().note("native sharpen: LAYER-ONLY eye %u (sequence %llu) got NO composite from the UI layer -- "
-          "the eye is BLACK for this frame (%llu so far); the layer stands down and the VR world route lets go at the next frame boundary.",
+          "the eye is BLACK for this frame (%llu so far); the layer stands down and the VR world route and the on-foot maps gate let go at the next frame boundary.",
           eye,(unsigned long long)seq,(unsigned long long)s->layerOnlyBlack);
       edvr::temporalPassCaptureFinalEye(seq,eye,source,region,false,flipU,flipV);
       return S_FALSE;

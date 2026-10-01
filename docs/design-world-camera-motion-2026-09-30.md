@@ -2,11 +2,21 @@
 
 ## Status
 
-- **State:** design only (no code, build or flight), from tree `1e05ef59`
-  and flight 1 of the VR world route (design-flat-temporal-aa-2026-09-23.md
-  section 82; `edvr_gfx_20260930_161545.log`, Frontier,
-  v0.18.0-rc.4-104-gbde47f81). Sean's direction: every view's temporal-AA
-  motion comes from the game camera that renders it, not head heuristics.
+- **State (2026-10-01):** Phase 0 (census episodes) and Phase 1 (the
+  on-foot panel gate, with the layer-only door under it) are BUILT together on
+  branch `claude/on-foot-maps-sharp`, riding one build and one flight, NOT
+  FLOWN. Sean approved the design 2026-10-01: (i) for Phase 1; Phase 0 and 1
+  on one build; any non-world panel to the layer, not just the maps; the eyes
+  skip the upscaler under a held panel. Implementation note and flight plan:
+  sections 8 and 9. Phases 2 and 3 untouched. Origin: flight 1 of the VR world
+  route (design-flat-temporal-aa-2026-09-23.md section 82;
+  `edvr_gfx_20260930_161545.log`, v0.18.0-rc.4-104-gbde47f81). Sean's
+  direction: every view's temporal-AA motion comes from the game camera that
+  renders it, not head heuristics.
+- **Keys:** `experimental.on_foot_maps_sharp = off|on` (default off, live;
+  covers menus too, a better name is `on_foot_panels_sharp`) and the existing
+  `advanced.vr_camera_census` (episodes, naming runs and the detour's CPU ride
+  it). No other key. Key off is today's gate for every input, pinned.
 - **Trigger (Sean's correction):** the maps smear when dragged ON FOOT,
   where the game draws them into the 2D panel. The gate keeps the panel in
   the eye route (the journal says on foot), nothing names its camera, and
@@ -26,8 +36,15 @@
   cockpit maps are fine because kind-5 eye cameras' rows drive the world
   path (code reading).
 - **Ruled out:** end of section 1.
-- **Next flight:** Phase 0 (section 6); Phase 1's key toggled live in a
-  second on-foot leg if both ride one build (question 2).
+- **Next flight:** the plan in section 9: census on, Phase 1's key toggled
+  live in its own on-foot leg, route off and then auto, plus a Cinema-on-foot
+  leg. Read with `python tools\edvr_log.py --target frontier --expect-build
+  HEAD --maps-sharp` and `--camera-census`.
+- **Open (new, 2026-10-01):** HMD Cinema on foot. `edvr_gfx_20261001_060011.log`
+  06:01:02-06:01:57: the route declined every frame
+  (`depth-not-screen-motion-source`), the gate was open (journal: no Flags2;
+  screen depth 4 draws a frame) and the layer took the 2D screen at 1.99 a
+  frame. Section 8.6 says what the build does there with the key off and on.
 - **Environment:** EDVR's OpenXR runtime; Pimax Crystal Super, 90 Hz, HMD
   quality 0.65 (eye 2620x2533, output 4032x3898); 2D screen 5040x2835
   (`fix.vscreen_res_width` auto); DLSS preset K. Phase 1 needs the UI layer
@@ -249,3 +266,238 @@ the scene, head for the interface), external views, the menu backdrop, and
 5. The detour in VR by default once Phase 2 flies (observe-only; 4.63
    million calls without a fault)? Recommend yes, behind its key, once
    Phase 0 has measured its CPU.
+
+Sean's answers, 2026-10-01: 1 (i). 2 yes, one build and one flight, Phase 1's
+key live in its own on-foot leg. 3 broader than asked: any non-world panel,
+menus included, under the same key. 4 yes, now: the eyes skip the upscaler
+while the layer holds a non-world panel. 5 open (needs the detour's CPU,
+which this build measures).
+
+## 8. Phase 0 and Phase 1 as built (2026-10-01)
+
+Branch `claude/on-foot-maps-sharp`, from origin/main `e35b0725`. Built, rigged
+and mutated, NOT FLOWN.
+
+**8.1 What Phase 1 does.** With `experimental.on_foot_maps_sharp = on`, the
+layer's world-screen gate (ui_layer.cpp `onFootGateTick`, then `mapsGate`) is
+decided by the world camera alone: a frame is named when a draw that reads the
+world camera names the screen's source (screen_motion.cpp, the one place it
+sets `g.sourceFrame`, which now tells the layer through
+`uiLayerNoteScreenNamed`). Two named frames in a row hold the panel as the
+world (it stays in the eye route); three unnamed release it (the layer takes
+the composite, sharp, after the upscaler). Three is the route's grace
+`kVrWorldGraceFrames`, asserted in vr_world_route_test, so the route and the
+gate let go on one boundary. Today's journal-or-depth gate is still stepped
+every frame, so a key flip is a carry, not a restart: switching in takes
+today's verdict as its first state (no two-frame glitch in a held world), and
+switching out hands the gate back at once. The naming is attributed to the
+layer's own frame count, so it is right whichever boundary runs first (the
+design's "whichever boundary runs first").
+
+*The trap, closed.* A taken composite swallows screen_motion's per-eye call
+(`screenMotionDraw` returns at `uiLayerRedirecting`), the only caller of the
+recognition, and naming stops two frames after the last recognised composite:
+the panel would never come back. `forwardWithVerdict` now recognises a taken
+2D screen itself, right after the decision and before the curved-screen
+substitution, behind `uiLayerMapsOn()`. screen_motion_test shows the naming
+running out two frames into a taken screen without it and continuing with it.
+
+*The door.* While the layer holds a non-world panel the eye skips the upscaler
+through the layer-only door the route already uses: black base, the layer's
+composite, RCAS after, no DLSS, motion prep or UI resolve, the eye's history
+left alone (the next eye-route frame finds the continuity broken and resets,
+so no dark fade). One predicate, `uiLayerDoorLayerOnly(eye, seq)`, answers for
+both doors: the route's re-issued world first, then, with the gate on, a 2D
+screen the layer TOOK in this sequence (`Eye::screenTakenSeq`, set only for a
+real take, never the route's re-issue) while every draw the game made into an
+eye-sized target this frame was taken (`vScreenEyeDrawsThisFrame` against the
+layer's per-frame taken count; Submit comes before Present, so both are whole
+at the door). Anything else drawn into the eye (a menu backdrop, a cockpit)
+makes it `door-not-empty` and the eye keeps the upscaler, exactly as without
+the key. That check is why this could ride the build: the log of 2026-09-30
+shows on-foot eye draws at 2 a frame, the composites.
+
+**8.2 Log lines** (all `on foot maps sharp`, none while the key is off; the
+reader is `edvr_log.py --maps-sharp`, fixture `tools\maps_sharp_fixture.log`
+held to the formatters by on_foot_maps_test P7):
+- `ON at frame=` once per switch in, with the carried state and the journal;
+  `OFF at frame=` (key went off / screen motion is not live / the layer's own
+  not-live reason).
+- `the layer TAKES the 2D screen at frame=N: no world camera named its source
+  for 3 frames in a row (after W world frames, S s; the journal: ...)`.
+- `the layer HANDS BACK the 2D screen at frame=N after P panel frames (T s; E
+  eyes through the layer-only door, K kept the upscaler ...): a world camera
+  named the screen's source for 2 frames in a row.`
+- `experimental.on_foot_maps_sharp is on but ...: <why>` once per reason
+  (layer not live, screen motion not live), and `the layer took the 2D screen
+  for eye E ... the eye keeps the upscaler` (first three).
+- every 5 s while the key is on, zeros included: `on foot maps sharp 5s: key=on
+  5 s mode=naming|fallback gate=world|panel frames= named= unnamed= world-frames=
+  panel-frames= holds= releases= screen-takes= recognised= door-layer-only=
+  door-not-empty= not-live-frames=`. If the code never ran there is no such
+  line; if the trap were alive the line shows `screen-takes>0 recognised=0`.
+- The reader's verdict. STOP: a panel period under 10 frames (a flap in the
+  world), a black eye (`native sharpen: LAYER-ONLY eye ... NO composite`, a
+  luma probe black stage), taken composites never recognised. WARN: an eye kept
+  the upscaler, the door short of its eyes, the route and the gate letting go
+  more than 50 ms apart, a layer-only decline, frames not decided by naming.
+
+**8.3 Key-off contract.** The gate equals a frozen copy of today's expression
+for every input: `uiMapsGateHeld` exhaustive in on_foot_maps_test R5, and the
+real layer driven frame by frame over 400 scripted journal and depth inputs
+against the same copy in ui_layer_world_test; the first test of `mapsGate` is
+the key and it returns today's verdict before anything is read, stepped,
+counted or logged (source pin P1a/b); the door answers the route's question
+and one load; no line in the log; recognition's two call sites pinned
+(ui_world_route_wiring_test, count 2, the new one behind `uiLayerMapsOn()`).
+49 mutations of ui_maps_math.h are each caught by their own rule; the runtime
+was also mutated by hand (the route's re-issue counted as a take is caught).
+
+**8.4 The route.** What happens, frame by frame, with the route auto:
+- *Map opens.* M0, M1: not named, not treated, the route's grace holds, the
+  game's composite lands in the eye and the eye route serves it (the eye shift
+  stays off while the route is Owned). At M2's boundary the third unnamed frame
+  releases the gate and the route together (the layer's boundary runs first;
+  the route's reason reads `on-foot-gate-lost`, not `frames-not-treated`).
+  M3 on: the layer takes the composite, layer-only. The map goes through the
+  upscaler as a cut for three frames, then sharp.
+- *Map closes.* C0, C1: still the layer's: the world shows sharp without
+  temporal filtering while the route, not watching (the gate is closed), waits.
+  C1's boundary holds the gate. C2 on: the game's composite lands in the eye
+  again, the eye route runs the upscaler with a reset history, and the route
+  treats C2..C9 (Warming; the eye shift is on) and owns at C9's boundary.
+  So the hand-back is to the eye route, not straight to the route: the
+  route's warm-up needs eight treated frames whose eyes are the eye route's,
+  by design (an upscaler needs about that many to stop reading new). Two layer
+  frames plus eight warming frames, the same eye-route stretch every release
+  has today. No eye-route frame can be skipped without changing the route.
+  Replayed through both real machines in vr_world_route_test, flight 1's runs
+  included: the route is never owned while the gate is open.
+
+**8.5 `fix.panel_curvature` above 0.** The route needs 0 because its re-issue
+repeats the game's screen draw and the curved substitution swallows it. The
+take does not: with curvature on the decision is made with `substituted =
+true`, the opaque composite passes it, and `panelCurveSubstitute` draws the
+curved strip inside the layer's bracket, so a curved map is drawn sharp into
+the layer. The recognition sits before that branch, so a curved take still
+keeps the naming alive (the curved branch returns before the tail where the
+route's call is). The world frames stay the eye route's and the route stays
+off with its own line. Code reading only; the flight keeps 0 (the census join
+reads the eye composite, which a curved screen replaces).
+
+**8.6 HMD Cinema on foot** (`edvr_gfx_20261001_060011.log`,
+v0.18.0-rc.5-19-g02c1c456, 06:01:02-06:01:57). In those 55 s the journal
+reported no Flags2, the screen's depth saw 4 draws a frame, the gate was
+open, the route declined 100% (`depth-not-screen-motion-source`), and the
+layer's own 30 s lines say it took the 2D screen at 1.99 and 2.00 a frame:
+the panel was the layer's, not the eye route's, and the upscaler's `full`
+price reads 0.00. At 06:02:00.107 the screen's depth jumped to 12,049 draws a
+frame at 4032x2268, the gate held and the route owned 2 s later, so naming
+works in the Cinema world once the world is drawn into a screen-sized depth;
+the 55 s before it are the naming failure, not diagnosed here.
+- Key off: byte for byte today's: the gate open, the layer takes the screen.
+- Key on: the same gate (nothing names, so the panel is not the world), the
+  same take, the same sharp unfiltered picture, plus the door skipping the
+  upscaler (the log shows 2 eye draws a frame, so the eye is empty and the
+  skip is allowed), plus the recognition keeping naming alive. When the world
+  starts naming (06:02:00 here) two named frames hold it and the eye route and
+  the route take over as today.
+- Risk, stated: if a Cinema WORLD were drawn into a depth that never names, the
+  key on would hand a world the journal or the depth count holds today to the
+  layer (sharp, no temporal AA) after three frames. The log above does not show
+  that; the Cinema leg of the flight is there to see it.
+Ghost and flicker with movement is therefore not the eye route filtering the
+panel in that stretch (the layer composites the raw screen); if it persists
+with the key on it is in the game's own image or the layer, and the census
+episodes name the depth sizes (join lines) that explain the naming failure.
+
+**8.7 Phase 0 as built** (vr_camera_census_core.h, vr_camera_census.cpp; no
+new key, it rides `advanced.vr_camera_census`). An episode is ONE frame
+sampled 30 frames after a trigger (the journal's on-foot flip, a naming flip
+held 3 frames, a GuiFocus change, key on), whatever the frame is, aboard
+included, at most 10 a session (the design's protocol has about 14
+transitions: raise `kVrCensusMaxEpisodes` if it truncates, the caps follow).
+Per episode: a header (`episode frame= n=k/10 trigger= foot= gui= named=
+calls= recorded= printed= kinds= callers=`), every refresh call of the frame
+(120 printed, the matched and kind-5 first), the pass's chosen rows matched to
+the calls' view axes (`pass-rows ... axes-match= how=identity|transpose`) and
+the join: at the frame's first draw into each kind of screen-sized or eye-sized
+depth, per eye where known, the VS and PS, the depth write, b1's size and rows
+270..273 read back and matched to the calls (`join ep= sig= depth=screen|eye
+eye= size= draw= draws= vs= ps= dw= b1= bytes= rows=read|skip match=`,
+`join-rows`, `join-draws seen= relevant=`). The 5 s window gains three
+companion lines (the 5 s line was full at 400 characters): `episodes windows=
+taken=/10 triggers= skipped= state=`, `runs ... named=1:n,2:n,3:n,4-8:n,9-30:n,
+31-89:n,90+:n unnamed=... longest=`, `detour ... est-ms-frame= obs-pre-us=
+obs-post-us=` (1 call in 16 timed). The reader's `--camera-census` reports each
+episode, the naming runs (H2) and the detour's CPU. Cost: key off nothing (the
+per-draw hook is a null pointer, set only for a sampled frame); key on about
+100-150 ns a call in the sampled frame only, 4 synchronous readbacks an episode
+(one frame may drop in the sampled frame). Unflown: the real join (the depth
+probe's eye pair, the shadow resolver) and Status.json's GuiFocus on a real
+install; the rigs stand WARP in. 70 mutants of the core header, 69 caught (one
+equivalent).
+
+**8.8 Cost and saving of Phase 1.** CPU, measured on the real layer: the gate's
+step and the combine 2.5 ns a frame, the boundary +1.2 ns (+2.5 ns unnamed),
+four door questions +1.6 ns, the naming told one store, the recognition two
+hash loads per taken composite (about 10 ns): under 20 ns a frame in all, and
+nothing measurable key off. GPU, from flight 1's own lines (4032x3898 a eye,
+preset K, Pimax Crystal Super, 90 Hz): a map frame through the eye route costs
+the upscaler 2.5 ms a pair, motion prep 0.12, UI resolve 0.2, about 2.9 ms; the
+layer's composite adds 0.24-0.39; net about 2.5-2.7 ms a frame saved, a fifth
+of the 11.1 ms budget, plus about 0.15 ms of CPU (the pass's 0.16 ms against
+0.013). Flight 1's two map stretches were 1,597 and 929 frames.
+
+**8.9 Unsure, and proposals.** (a) RCAS runs after the composite on a
+layer-only eye, the door's existing order, so it sharpens menu text too (the
+ordinary taken-UI path leaves text unsharpened); watch for ringing, and if it
+shows the cure is RCAS off for a non-world panel eye. (b) The key name: it
+covers menus and any non-world panel, so `experimental.on_foot_panels_sharp`
+says what the user gets; changing it is one edit in ui_layer.cpp, edvr.ini and
+the config rig. (c) The unnamed Cinema world above. (d) A frame where the
+layer is not armed (after a withheld eye) leaves the game's composite in the
+eye and the upscaler runs: one frame, as today.
+
+## 9. Flight plan (one build, one flight)
+
+Live `edvr.ini` edited with the Edit tool (never a regex); all keys live. Set
+before the flight and between legs as written:
+```
+[fix]          panel_curvature = 0   (ui_quality and temporal_aa as shipped)
+[advanced]     vr_camera_census = on
+[experimental] temporal_aa_on_foot_world = off | auto   (per leg)
+               on_foot_maps_sharp = off | on             (per leg, toggled live)
+```
+Note the clock at every open and close. Frontier, the environment above.
+1. *Cockpit* (census on, both keys off): 30 s; galaxy map (5 s still, 10 s drag
+   and rotate, 5 s zoom), close; system map the same; disembark.
+2. *On foot, route off, maps key off* (the reference): world 30 s; galaxy map
+   dragged 10 s, close; 10 s world; system map the same; a terminal or station
+   menu 10 s.
+3. *On foot, route off, key toggled live:* world 30 s; key on in the world (no
+   change); open the galaxy map: 5 s still, 10 s drag; close; 10 s world;
+   system map the same with the key set off for 5 s in the middle and on again;
+   the menu 10 s; world 30 s.
+4. *On foot, route auto, key on:* world 30 s (the route owns); galaxy map 15 s,
+   close, 10 s world, system map 15 s, close; the menu 10 s; world 30 s. Then
+   one map with the key off as the reference for the hand-off.
+5. *HMD Cinema on foot* (set it in the game, then): world 30 s, key off then
+   on; a map 15 s; the menu 10 s; the main menu. This leg is for 8.6.
+6. Board; a cockpit map (the stereo maps, a regression check); census off.
+Read, each with `--target frontier --expect-build HEAD`: `--version`,
+`--maps-sharp`, `--camera-census`, `--grep "world screen|screen motion:|vr
+world route:|luma probe"`.
+- PASS: a TAKES line within 3 frames of each map and menu opening, a HANDS
+  BACK within 2 named frames of closing, no TAKES in a stretch of world, the map
+  sharp under a drag (look), the HUD intact, `recognised` about `screen-takes`,
+  `door-layer-only` about twice the panel frames, route and gate released on
+  one boundary and the route owning again 8 frames after a hand-back, no luma
+  black stage at an edge, the reader's verdict PASS. The census answers H1 (maps
+  and menus unnamed), H2 (the longest unnamed run in the world under 3), H3 and
+  the detour's CPU.
+- STOP: a TAKES in the world, a panel period under 10 frames, a black eye, a
+  lasting dark fade after a hand-back, taken composites with `recognised=0`.
+- WATCH: map lines shimmering (the layer samples the 5040-wide screen at mip 0:
+  the cure is the route's mipped screen), ringing on menu text (8.9a),
+  `door-not-empty` above 0, Cinema world TAKES.

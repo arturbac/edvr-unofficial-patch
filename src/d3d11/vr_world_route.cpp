@@ -519,6 +519,9 @@ void vrWorldRouteNoteRtvClear(void* rtv) {
 void vrWorldRouteDraw(ID3D11DeviceContext* ctx) {
     Frame& f = g_f;
     ++f.draws;
+    // The census's episodes (vr_camera_census.h): the pointer is set only while an episode's sampled frame runs, so any other draw, and every draw with the
+    // census off, costs this one load. Before the colour-target test below: the join wants depth-only draws too.
+    if (detail::g_vrCensusJoinDraw) detail::g_vrCensusJoinDraw(ctx, f.draws);
     void* rtv = bindingGet(BindSlot::Rtv0);
     if (!rtv) return;                                   // depth-only: no colour target, so no candidate, consumer or H write
     const uint32_t q = ++f.seq;

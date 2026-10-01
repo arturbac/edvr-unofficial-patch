@@ -22,6 +22,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -425,13 +426,31 @@ void testBudget() {
     std::printf("line budget\n");
     VrCensusBudget b;
     unsigned taken = 0;
-    while (b.take(VrCensusLines::Camera)) ++taken;
+    while (taken < 100000 && b.take(VrCensusLines::Camera)) ++taken;   // the bounds keep a cap that never closes from hanging the rig
     check(taken == 64 && b.suppressed[static_cast<size_t>(VrCensusLines::Camera)] == 1 && b.take(VrCensusLines::Changed),
           "a class is capped on its own (cameras 64) and a full class does not starve the others");
     unsigned calls = 0;
-    while (b.take(VrCensusLines::Call)) ++calls;
-    check(calls == 480 && VrCensusBudget::capTotal() == 100 + 64 + 24 + 480 + 16 + 16 + 24,
-          "call lines are capped at 480 (three sequences of the 160-call frame) and the caps add up to 724");
+    while (calls < 100000 && b.take(VrCensusLines::Call)) ++calls;
+    check(calls == 480 && VrCensusBudget::capTotal() == 100 + 64 + 24 + 480 + 16 + 16 + 24 + 220 + 1200 + 100 + 100 + 100,
+          "call lines are capped at 480 (three sequences of the 160-call frame) and the caps add up to 2,444: the 724 of the first three sequences, plus the episodes' own "
+          "classes (220 header, pass, join-draws and join lines; 1,200 call lines) and the three companion lines a 5 s window adds (100 each)");
+    unsigned episodeLines = 0, episodeCalls = 0;
+    while (episodeLines < 100000 && b.take(VrCensusLines::Episode)) ++episodeLines;
+    while (episodeCalls < 100000 && b.take(VrCensusLines::EpisodeCall)) ++episodeCalls;
+    check(episodeLines == 220 && episodeCalls == kVrCensusMaxEpisodes * kVrCensusEpisodeLines &&
+              episodeLines >= kVrCensusMaxEpisodes * (1 + 1 + 1 + kVrCensusJoinRows + 4 + 1),
+          "ten episodes fit their classes: a header, the pass's rows, the join's draw counts, twelve join signatures, four rows lines and the overflow note each (200 of the 220), "
+          "and 120 call lines each (1,200)");
+    VrCensusBudget separate;
+    for (unsigned guard = 0; guard < 100000 && separate.take(VrCensusLines::EpisodeCall); ++guard) {}
+    for (unsigned guard = 0; guard < 100000 && separate.take(VrCensusLines::Episode); ++guard) {}
+    check(separate.take(VrCensusLines::Call) && separate.take(VrCensusLines::Window) && separate.take(VrCensusLines::Runs) && separate.take(VrCensusLines::Cpu) &&
+              separate.take(VrCensusLines::Counters),
+          "the episodes' classes are their own: an episode that used every one of its lines starves neither the first three sequences, the 5 s lines nor the window's companions");
+    check(std::strcmp(vrCensusLinesName(VrCensusLines::Episode), "episode") == 0 && std::strcmp(vrCensusLinesName(VrCensusLines::EpisodeCall), "episode-call") == 0 &&
+              std::strcmp(vrCensusLinesName(VrCensusLines::Runs), "runs") == 0 && std::strcmp(vrCensusLinesName(VrCensusLines::Cpu), "detour") == 0 &&
+              std::strcmp(vrCensusLinesName(VrCensusLines::Counters), "episodes") == 0,
+          "the new classes have names for the 'line budget reached' note");
     std::printf("  note  a hard worst case of %u lines, about 400 in a real session (see the budget's comment)\n", VrCensusBudget::capTotal());
     // A realistic session: ten minutes, twenty cameras, three sequences of 110 calls, eight eye draws.
     VrCensusBudget real;
@@ -483,6 +502,656 @@ void testOffThread() {
     while (c.takeNew(&x)) sum += x.calls;
     check(c.total() == 40000 && sum + c.overflow() == 40000 && c.used() == 8,
           "four threads noting ten thousand calls each lose none: the entries' counts and the overflow add to the total");
+}
+
+// ---------------------------------------------------------------------------
+// The episodes (design-world-camera-motion-2026-09-30.md section 6, Phase 0): the trigger machine, the sampled frame's calls, the join, the matches, the
+// call-line selection, the naming runs and the observer's CPU. Pure: the glue (vr_camera_census.cpp) drives the same classes in the same order.
+// ---------------------------------------------------------------------------
+VrCensusEpisodes::Inputs readings(VrCensusFoot foot, bool named, bool guiKnown = false, uint32_t gui = 0) {
+    VrCensusEpisodes::Inputs in;
+    in.foot = foot; in.named = named; in.guiKnown = guiKnown; in.gui = gui;
+    return in;
+}
+
+void testEpisodeMachine() {
+    std::printf("episodes: the triggers\n");
+    // The key-on trigger: armed at the boundary that starts frame 1, sampled kVrCensusEpisodeDelay (30) frames later.
+    {
+        VrCensusEpisodes e;
+        e.restart();
+        e.keyOn(1);
+        check(e.armed() && e.started() == 1 && e.triggers() == 1 && e.skipped() == 0 && e.armedFrame() == 1 && e.sampleFrame() == 31 &&
+                  e.trigger().kind == VrCensusTriggerKind::KeyOn && std::strcmp(e.stateName(), "armed") == 0,
+              "the census turning on arms one episode for 30 frames later");
+        bool early = false;
+        for (uint64_t f = 1; f <= 30; ++f) early = early || e.boundary(f, f > 1, readings(VrCensusFoot::No, false));
+        check(!early && e.armed(), "no boundary before the sampled frame takes the episode live");
+        check(e.boundary(31, true, readings(VrCensusFoot::No, false)) && e.live() && std::strcmp(e.stateName(), "live") == 0 &&
+                  !e.boundary(32, true, readings(VrCensusFoot::No, false)) && e.live(),
+              "the boundary that starts frame 31 takes it live, once; it stays live until it is finished");
+        e.finish();
+        check(!e.live() && !e.armed() && e.started() == 1 && std::strcmp(e.stateName(), "idle") == 0, "finish() ends it; the count of episodes taken stays");
+    }
+    // The journal's on-foot reading flips, either way. The first known reading is a baseline; unknown and off say nothing.
+    {
+        VrCensusEpisodes e;
+        e.restart();
+        e.boundary(2, true, readings(VrCensusFoot::No, false));
+        check(e.triggers() == 0, "the first known reading of the journal is a baseline, not a flip");
+        e.boundary(3, true, readings(VrCensusFoot::Unknown, false));
+        e.boundary(4, true, readings(VrCensusFoot::Off, false));
+        e.boundary(5, true, readings(VrCensusFoot::No, false));
+        check(e.triggers() == 0, "unknown (a menu) and off (no journal) between two readings of 'not on foot' are no flip");
+        e.boundary(6, true, readings(VrCensusFoot::Yes, false));
+        check(e.armed() && e.started() == 1 && e.trigger().kind == VrCensusTriggerKind::Foot && e.trigger().from == 0 && e.trigger().to == 1 &&
+                  e.armedFrame() == 6 && e.sampleFrame() == 36,
+              "no -> yes is a trigger: foot:no>yes, armed at the boundary that read it");
+        for (uint64_t f = 7; f <= 36; ++f) e.boundary(f, true, readings(VrCensusFoot::Yes, false));
+        check(e.live(), "...and the episode of it goes live at frame 36");
+        e.finish();
+        e.boundary(37, true, readings(VrCensusFoot::Unknown, false));   // a menu, then back to the same word: no flip
+        e.boundary(38, true, readings(VrCensusFoot::Yes, false));
+        check(e.triggers() == 1, "yes -> unknown -> yes is not a flip");
+        e.boundary(39, true, readings(VrCensusFoot::No, false));
+        check(e.armed() && e.trigger().kind == VrCensusTriggerKind::Foot && e.trigger().from == 1 && e.trigger().to == 0 && e.triggers() == 2,
+              "yes -> no (boarding) is a trigger too: foot:yes>no");
+    }
+    // The naming flips and holds kVrCensusNamingHold frames.
+    {
+        VrCensusEpisodes e;
+        e.restart();
+        e.boundary(2, true, readings(VrCensusFoot::Yes, false));   // baseline: unnamed
+        e.boundary(3, true, readings(VrCensusFoot::Yes, true));
+        e.boundary(4, true, readings(VrCensusFoot::Yes, true));
+        check(e.triggers() == 0, "a flip to named that has held two frames is not yet a trigger");
+        e.boundary(5, true, readings(VrCensusFoot::Yes, false));   // a blip: back to the held value
+        e.boundary(6, true, readings(VrCensusFoot::Yes, true));
+        e.boundary(7, true, readings(VrCensusFoot::Yes, true));
+        check(e.triggers() == 0, "a blip back to the held value starts the count again");
+        e.boundary(8, true, readings(VrCensusFoot::Yes, true));
+        check(e.armed() && e.trigger().kind == VrCensusTriggerKind::Naming && e.trigger().from == 0 && e.trigger().to == 1 && e.armedFrame() == 8 && e.triggers() == 1,
+              "three frames in a row of the new value are the flip: naming:unnamed>named, at the third");
+        for (uint64_t f = 9; f <= 38; ++f) e.boundary(f, true, readings(VrCensusFoot::Yes, true));
+        e.finish();
+        check(e.triggers() == 1, "a value that stays is no further trigger");
+        e.boundary(39, true, readings(VrCensusFoot::Yes, false));
+        e.boundary(40, true, readings(VrCensusFoot::Yes, false));
+        e.boundary(41, true, readings(VrCensusFoot::Yes, false));
+        check(e.armed() && e.trigger().kind == VrCensusTriggerKind::Naming && e.trigger().from == 1 && e.trigger().to == 0 && e.triggers() == 2,
+              "and back: naming:named>unnamed after three unnamed frames");
+        // Two of one value then the other candidate: the run restarts on a change of candidate, not a sum.
+        VrCensusEpisodes f;
+        f.restart();
+        f.boundary(2, true, readings(VrCensusFoot::Yes, false));
+        f.boundary(3, true, readings(VrCensusFoot::Yes, true));
+        f.boundary(4, true, readings(VrCensusFoot::Yes, true));
+        f.boundary(5, true, readings(VrCensusFoot::Yes, false));
+        f.boundary(6, true, readings(VrCensusFoot::Yes, true));
+        check(f.triggers() == 0, "named, named, unnamed, named is no flip: the hold is of consecutive frames");
+    }
+    // GuiFocus: a change between two known values.
+    {
+        VrCensusEpisodes e;
+        e.restart();
+        e.boundary(2, true, readings(VrCensusFoot::No, false, true, 0));
+        e.boundary(3, true, readings(VrCensusFoot::No, false, false, 0));   // Status.json unreadable for a moment
+        e.boundary(4, true, readings(VrCensusFoot::No, false, true, 0));
+        check(e.triggers() == 0, "GuiFocus unknown between two readings of the same value is no change");
+        {   // the discriminating case: an unreadable Status.json comes with a 0 in the reading, and that 0 is not a GuiFocus
+            VrCensusEpisodes keep;
+            keep.restart();
+            keep.boundary(2, true, readings(VrCensusFoot::No, false, true, 6));    // the galaxy map is open
+            keep.boundary(3, true, readings(VrCensusFoot::No, false, false, 0));   // Status.json unreadable for a moment: handed as 0, known = false
+            keep.boundary(4, true, readings(VrCensusFoot::No, false, true, 6));
+            check(keep.triggers() == 0, "GuiFocus 6, then unreadable (the reading's 0 is no value), then 6 again: no trigger either way (the open map is not a change)");
+        }
+        e.boundary(5, true, readings(VrCensusFoot::No, false, true, 6));
+        check(e.armed() && e.trigger().kind == VrCensusTriggerKind::Gui && e.trigger().from == 0 && e.trigger().to == 6 && e.armedFrame() == 5,
+              "0 -> 6 (the galaxy map opening) is a trigger: gui:0>6");
+        e.abandon();
+        check(!e.armed() && e.started() == 1, "abandon() drops an armed episode (the census went off); the count stays");
+        // On foot GuiFocus is unknown on every frame (flight 1): never a trigger.
+        VrCensusEpisodes foot;
+        foot.restart();
+        for (uint64_t f = 2; f < 40; ++f) foot.boundary(f, true, readings(VrCensusFoot::Yes, true, false, 0));
+        check(foot.triggers() == 0, "a GuiFocus that is never known is never a trigger");
+    }
+    // Triggers that arrive while an episode is armed are counted and said once; so are those after the cap.
+    {
+        VrCensusEpisodes e;
+        e.restart();
+        e.keyOn(1);
+        e.boundary(2, true, readings(VrCensusFoot::No, false));
+        e.boundary(3, true, readings(VrCensusFoot::Yes, false));   // a flip while armed
+        e.boundary(4, true, readings(VrCensusFoot::No, false));    // and another
+        const char* why = nullptr;
+        check(e.triggers() == 3 && e.skipped() == 2 && e.started() == 1 && e.takeSkipNote(&why) && std::strstr(why, "armed") != nullptr && !e.takeSkipNote(&why),
+              "two triggers while an episode is armed are counted (3 triggers, 2 skipped) and said once, naming why");
+        // The session's cap: ten episodes, then every trigger is skipped; the first skip here was the cap's.
+        VrCensusEpisodes cap;
+        cap.restart();
+        uint64_t frame = 1;
+        for (uint32_t i = 0; i < kVrCensusMaxEpisodes; ++i) {
+            cap.keyOn(frame);
+            // Bounded: an episode that never goes live must fail the checks below, not hang the rig.
+            for (uint32_t guard = 0; guard < 200 && !cap.boundary(frame, true, readings(VrCensusFoot::No, false)); ++guard) ++frame;
+            cap.finish();
+            ++frame;
+        }
+        check(cap.started() == kVrCensusMaxEpisodes && cap.skipped() == 0 && cap.triggers() == kVrCensusMaxEpisodes, "ten episodes can be taken in a session");
+        cap.keyOn(frame);
+        cap.boundary(frame, true, readings(VrCensusFoot::No, false));
+        const char* capWhy = nullptr;
+        check(!cap.armed() && cap.started() == kVrCensusMaxEpisodes && cap.skipped() == 1 && cap.takeSkipNote(&capWhy) && std::strstr(capWhy, "all taken") != nullptr,
+              "an eleventh trigger is counted and never sampled, and the note says the session's episodes were all taken");
+        // A restart (the census off and on) keeps the count and the cap, and forgets the readings.
+        VrCensusEpisodes r;
+        r.restart();
+        r.boundary(2, true, readings(VrCensusFoot::Yes, false, true, 6));
+        r.restart();
+        r.boundary(2, true, readings(VrCensusFoot::No, true, true, 0));
+        check(r.triggers() == 0, "after a restart no flip is judged against a reading from before it: yes -> no across the gap is a baseline, not a trigger");
+        VrCensusEpisodes kept;
+        kept.restart();
+        kept.keyOn(1);
+        kept.restart();
+        check(!kept.armed() && kept.started() == 1 && kept.triggers() == 1, "a restart drops what was armed and keeps the counters");
+    }
+    // Several triggers at one boundary: the first arms, the rest are skipped (order: foot, naming, GuiFocus).
+    {
+        VrCensusEpisodes both;
+        both.restart();
+        both.boundary(2, true, readings(VrCensusFoot::No, false, true, 0));
+        both.boundary(3, true, readings(VrCensusFoot::Yes, false, true, 7));
+        check(both.armed() && both.trigger().kind == VrCensusTriggerKind::Foot && both.triggers() == 2 && both.skipped() == 1,
+              "a journal flip and a GuiFocus change at one boundary: the flip arms the episode, the change is counted as skipped");
+    }
+}
+
+void testNamingRuns() {
+    std::printf("episodes: the on-foot naming runs\n");
+    check(VrCensusRuns::bin(1) == 0 && VrCensusRuns::bin(2) == 1 && VrCensusRuns::bin(3) == 2 && VrCensusRuns::bin(4) == 3 && VrCensusRuns::bin(8) == 3 &&
+              VrCensusRuns::bin(9) == 4 && VrCensusRuns::bin(30) == 4 && VrCensusRuns::bin(31) == 5 && VrCensusRuns::bin(89) == 5 && VrCensusRuns::bin(90) == 6 &&
+              VrCensusRuns::bin(100000) == 6,
+          "the bins are 1, 2, 3, 4-8, 9-30, 31-89 and 90+ frames, at their edges");
+    check(std::strcmp(VrCensusRuns::binName(0), "1") == 0 && std::strcmp(VrCensusRuns::binName(3), "4-8") == 0 && std::strcmp(VrCensusRuns::binName(6), "90+") == 0,
+          "...and they are named as the line writes them");
+    VrCensusRuns r;
+    auto frames = [&](int n, bool onFoot, bool named) { for (int i = 0; i < n; ++i) r.noteFrame(onFoot, named); };
+    frames(5, true, true);     // a named run of 5
+    frames(1, true, false);    // an unnamed run of 1
+    frames(3, true, true);     // named 3
+    frames(2, true, false);    // unnamed 2
+    frames(100, true, true);   // named 100 (still open)
+    check(r.frames == 111 && r.named[3] == 1 && r.named[2] == 1 && r.named[6] == 0 && r.unnamed[0] == 1 && r.unnamed[1] == 1 && r.open == 1 && r.openLength == 100 &&
+              r.longestNamed == 100 && r.longestUnnamed == 2,
+          "a run is counted when it ends: 5 named, 1 unnamed, 3 named, 2 unnamed are in their bins, the 100 still open is not, and it is the longest named already");
+    r.endRun();
+    frames(0, true, true);
+    check(r.named[6] == 1 && r.open == -1, "the open run is counted when it ends");
+    // The carry: a window prints with a run open; the next window does not count it again, and carries its length.
+    VrCensusRuns w;
+    for (int i = 0; i < 7; ++i) w.noteFrame(true, true);
+    w.resetWindow();
+    check(w.frames == 0 && w.named[3] == 0 && w.open == 1 && w.openLength == 7 && w.longestNamed == 7 && w.longestUnnamed == 0,
+          "a window's reset empties its counts and carries the open run, which is the longest of its kind already");
+    {   // ...and with runs counted in both kinds first: every bin of both is emptied
+        VrCensusRuns full;
+        for (int i = 0; i < 5; ++i) full.noteFrame(true, true);
+        for (int i = 0; i < 2; ++i) full.noteFrame(true, false);
+        for (int i = 0; i < 3; ++i) full.noteFrame(true, true);   // a named 5 and an unnamed 2 are counted; a named 3 is open
+        check(full.named[3] == 1 && full.unnamed[1] == 1 && full.open == 1 && full.openLength == 3, "a window with a named run of 5 and an unnamed run of 2 counted, and a named run of 3 open");
+        full.resetWindow();
+        uint64_t left = 0;
+        for (int b = 0; b < VrCensusRuns::kBins; ++b) left += full.named[b] + full.unnamed[b];
+        check(left == 0 && full.frames == 0 && full.open == 1 && full.openLength == 3 && full.longestNamed == 3 && full.longestUnnamed == 0,
+              "a window's reset empties every bin of both kinds, the frame count and the longest of the unnamed, and carries the open named run of 3");
+    }
+    for (int i = 0; i < 3; ++i) w.noteFrame(true, true);
+    w.noteFrame(true, false);   // ends the named run at 10
+    check(w.named[4] == 1 && w.frames == 4 && w.longestNamed == 10 && w.open == 0 && w.openLength == 1,
+          "...and when it ends in the next window it is counted once, at its whole length (10: the 9-30 bin)");
+    // Not on foot ends the run and counts no frame.
+    VrCensusRuns off;
+    for (int i = 0; i < 4; ++i) off.noteFrame(true, false);
+    off.noteFrame(false, false);
+    off.noteFrame(false, true);
+    check(off.frames == 4 && off.unnamed[3] == 1 && off.open == -1 && off.longestUnnamed == 4,
+          "a frame the journal does not say on foot ends the run and is not counted (a ship's frames are no on-foot frame)");
+    // H2's discriminator: a world where the naming blips for one or two frames, and a map that holds it for ten.
+    VrCensusRuns h2;
+    for (int i = 0; i < 300; ++i) h2.noteFrame(true, !(i == 50 || i == 51 || i == 120 || (i >= 200 && i < 210)));
+    check(h2.unnamed[0] == 1 && h2.unnamed[1] == 1 && h2.unnamed[2] == 0 && h2.unnamed[4] == 1 && h2.longestUnnamed == 10,
+          "H2's reading: a blip of one frame, one of two, and a map's ten unnamed frames land in the 1, 2 and 9-30 bins, nothing in the 3 bin, longest 10");
+}
+
+void testObserverCpu() {
+    std::printf("episodes: the observer halves' CPU\n");
+    VrCensusCpu c;
+    unsigned picked = 0;
+    for (int i = 1; i <= 64; ++i) if (c.pick()) ++picked;
+    check(picked == 4, "one call in sixteen is picked: 4 of 64");
+    VrCensusCpu d;
+    bool first15 = false;
+    for (int i = 1; i <= 15; ++i) first15 = first15 || d.pick();
+    check(!first15 && d.pick(), "the sixteenth call is the first picked: the first fifteen cost a counter and a compare");
+    c.notePre(false, 100); c.notePre(false, 300); c.notePost(false, 50); c.notePost(false, 150);
+    c.notePre(true, 400); c.notePost(true, 200);
+    check(c.mode[0].sampled == 2 && c.mode[0].preTicks == 400 && c.mode[0].preMax == 300 && c.mode[0].postSampled == 2 && c.mode[0].postMax == 150 &&
+              c.mode[1].sampled == 1 && c.mode[1].preTicks == 400 && c.mode[1].postTicks == 200,
+          "the halves of an observed call and of an injected call are accumulated apart: sampled, sum, longest");
+    const uint32_t tickBefore = c.tick;
+    c.resetWindow();
+    check(c.mode[0].sampled == 0 && c.mode[1].preTicks == 0 && c.tick == tickBefore, "a window's reset empties the sums and keeps the call counter");
+    // The line, from a clock of 10 MHz (ticks of 0.1 us): 2 timed observed calls (pre mean 20 us, max 30; post mean 10, max 15), 1 injected (40 and 20).
+    VrCensusCpu e;
+    e.notePre(false, 100 * 2); e.notePre(false, 100 * 3 * 1); e.notePost(false, 100); e.notePost(false, 150);
+    e.notePre(true, 400); e.notePost(true, 200);
+    VrCensusWindow w;
+    w.frames = 100; w.calls = 1000; w.injCalls = 400;
+    char line[kVrCensusLineBytes + 1];
+    vrCensusFormatCpu(line, sizeof(line), w, e, 10000000, 3);
+    // Observed: 600 calls x (25 us + 12.5 us) = 22500 us; injected: 400 x (40 + 20) = 24000 us; 46500 us over 100 frames = 0.465 ms a frame.
+    check(std::strcmp(line,
+                      "vr camera census: detour windows=3 every=16 timed=observer-halves frames=100 calls=1000 sampled=3 est-ms-frame=0.465 "
+                      "obs-calls=600 obs-sampled=2 obs-pre-us=25/30 obs-post-us=12.5/15 inj-calls=400 inj-sampled=1 inj-pre-us=40/40 inj-post-us=20/20") == 0,
+          "the detour line: windows, how it is sampled, frames, calls, sampled, the estimated ms a frame, and per mode the calls, the sampled and the mean/longest microseconds of each half");
+    if (std::strstr(line, "est-ms-frame=0.465") == nullptr) std::printf("  note  %s\n", line);
+    VrCensusCpu none;
+    vrCensusFormatCpu(line, sizeof(line), w, none, 10000000, 1);
+    check(std::strstr(line, " sampled=0 est-ms-frame=- obs-calls=600 obs-sampled=0 obs-pre-us=- obs-post-us=- inj-calls=400 inj-sampled=0 inj-pre-us=- inj-post-us=-") != nullptr,
+          "with no call timed every figure is a dash, never a zero: a window that timed nothing cannot be read as a free detour");
+    VrCensusWindow idle;
+    vrCensusFormatCpu(line, sizeof(line), idle, none, 10000000, 1);
+    check(std::strstr(line, "frames=0 calls=0 sampled=0 est-ms-frame=- obs-calls=0 ") != nullptr, "an empty window still prints the line (zeros included): an absent line is what 'the census never ran' looks like");
+    vrCensusFormatCpu(line, sizeof(line), w, e, 0, 1);
+    check(std::strstr(line, " est-ms-frame=- ") != nullptr && std::strstr(line, "obs-pre-us=-") != nullptr, "a clock whose frequency is unknown prints dashes");
+    VrCensusCpu onlyObserved;
+    onlyObserved.notePre(false, 100); onlyObserved.notePost(false, 100);
+    vrCensusFormatCpu(line, sizeof(line), w, onlyObserved, 10000000, 1);
+    check(std::strstr(line, "est-ms-frame=-") != nullptr, "calls injected in the window with no injected call timed make the estimate a dash (a mode with calls and no sample cannot be estimated)");
+}
+
+// An episode frame's calls, the join, the matches and the selection.
+void testEpisodeFrame() {
+    std::printf("episodes: the sampled frame's calls, the join and the matches\n");
+    std::unique_ptr<VrCensusEpisodeFrame> fp(new VrCensusEpisodeFrame);
+    VrCensusEpisodeFrame& f = *fp;
+    f.reset();
+    // The cockpit has hundreds of refresh calls a frame: the buffer holds 640, tallies every one and says how many it could not hold.
+    uint32_t added = 0;
+    for (uint32_t i = 0; i < 700; ++i) {
+        VrCensusCall* c = f.add(i % 50 != 49, i % 50 == 49 ? 0 : (i % 7 == 0 ? 5 : i % 7 == 1 ? 9 : 3), 0x594E00 + (i % 20));
+        if (c) { ++added; c->camera = 0x1000 + i; }
+    }
+    check(added == 640 && f.calls == 700 && f.recorded == 640 && f.truncated() == 60, "an episode frame records its first 640 calls and counts the rest (700 calls, 60 truncated)");
+    uint64_t kinds = 0;
+    for (int k = 0; k < 8; ++k) kinds += f.kinds[k];
+    check(kinds == 700 && f.kinds[5] > 0 && f.kinds[6] > 0 && f.kinds[7] == 14,
+          "the kind tally covers every call, recorded or not (other kinds and unreadable ones in their own slots)");
+    uint64_t inTable = 0;
+    for (uint32_t i = 0; i < f.callerCount; ++i) inTable += f.callers[i].n;
+    check(f.callerCount == 16 && inTable == 16 * 35 && f.callerOverflow == 4 * 35,
+          "the caller tally holds sixteen distinct callers and counts the calls of the rest in an overflow (twenty were called from, 35 calls each)");
+    f.reset();
+    check(f.calls == 0 && f.recorded == 0 && f.kinds[3] == 0 && f.callerCount == 0 && f.callerOverflow == 0, "a go-live empties the buffer and every tally");
+    VrCensusCall* fresh = f.add(true, 3, 0x1);
+    check(fresh && fresh->camera == 0 && !fresh->rowsValid && !fresh->axesValid && fresh->tone == VrCensusTone::None,
+          "a record handed out is initialised (it never carries the last episode's rows or axes)");
+
+    // The join: signatures, the first of a depth, the cap.
+    VrCensusJoin join;
+    join.begin();
+    VrCensusJoinRow* a = join.add(VrCensusJoinDepth::Screen, 5040, 2835, 0xAA, 0xBB, 100);
+    check(a && join.used == 1 && a->draws == 1 && a->firstDraw == 100 && join.find(VrCensusJoinDepth::Screen, 0xAA, 0xBB) == a &&
+              join.find(VrCensusJoinDepth::Screen, 0xAA, 0xCC) == nullptr && join.find(VrCensusJoinDepth::Eye0, 0xAA, 0xBB) == nullptr,
+          "a row is a (depth, vertex shader, pixel shader): the same pair into another depth, or another pixel shader, is another row");
+    check(join.hasDepth(VrCensusJoinDepth::Screen) && !join.hasDepth(VrCensusJoinDepth::Eye0), "a depth's first row is known by hasDepth (the readback is spent on it only)");
+    for (uint32_t i = 1; i < kVrCensusJoinRows; ++i) join.add(VrCensusJoinDepth::Eye1, 2620, 2533, 0x10 + i, 0x20, 200 + i);
+    check(join.used == kVrCensusJoinRows && join.add(VrCensusJoinDepth::Eye1, 2620, 2533, 0x999, 0x20, 300) == nullptr && join.overflowRows == 1 && join.overflowDraws == 1,
+          "the table keeps twelve signatures; a thirteenth is counted in the overflow, never lost silently");
+    join.seen = 77;
+    join.views = 3;
+    check(join.relevantDraws() == kVrCensusJoinRows + 1, "the draws that reached a screen's or an eye's depth are the twelve rows' first draws and the one past the table");
+    join.begin();
+    check(join.used == 0 && join.overflowRows == 0 && join.overflowDraws == 0 && join.seen == 0 && join.views == 0 && join.relevantDraws() == 0,
+          "an episode's go-live empties the join: its rows, its overflow, the draws the hook was handed and the views resolved");
+    VrCensusDepthCache cache;
+    for (uintptr_t i = 1; i <= VrCensusDepthCache::kSize; ++i) cache.put(reinterpret_cast<const void*>(i * 0x100), i % 2 == 0, VrCensusJoinDepth::Eye0, 2620, 2533);
+    check(cache.find(reinterpret_cast<const void*>(0x300)) && cache.find(reinterpret_cast<const void*>(0x300))->relevant == false && cache.find(reinterpret_cast<const void*>(0x400))->relevant &&
+              cache.find(reinterpret_cast<const void*>(0x900)) == nullptr,
+          "the depth cache remembers each view's answer, relevant or not");
+    cache.put(reinterpret_cast<const void*>(0x900), true, VrCensusJoinDepth::Screen, 5040, 2835);
+    check(cache.find(reinterpret_cast<const void*>(0x900)) && cache.find(reinterpret_cast<const void*>(0x800)) == nullptr,
+          "a ninth view replaces the last (the cache is for the handful of depth targets a frame binds)");
+    cache.clear();
+    check(cache.find(reinterpret_cast<const void*>(0x100)) == nullptr, "...and clear() forgets them");
+
+    // Matching the join's rows to the calls' composed rows (the reader's join rule, 1e-5).
+    f.reset();
+    Model eyeModel(3, 1.5708f, 0.95f, 0.13f, -0.05f), worldModel(3, 1.0122f, 5040.0f / 2835.0f, 0.0f, 0.0f);
+    float eyeRows[16], worldRows[16];
+    check(vrCensusComposeRows(eyeModel.snap(), eyeRows) && vrCensusComposeRows(worldModel.snap(), worldRows), "the two models compose rows");
+    for (int i = 0; i < 5; ++i) {   // five calls: world, eye, eye again (the same pose twice), a call with no rows, world
+        VrCensusCall* c = f.add(true, i == 1 || i == 2 ? 5 : 3, 0x594E13);
+        c->kind = i == 1 || i == 2 ? 5 : 3;
+        c->kindReadable = true;
+        c->rowsValid = i != 3;
+        std::memcpy(c->rows, i == 1 || i == 2 ? eyeRows : worldRows, sizeof(eyeRows));
+    }
+    uint32_t ordinals[6] = {};
+    check(vrCensusMatchRows(f, eyeRows, kVrCensusRowsTol, ordinals, 6) == 2 && ordinals[0] == 2 && ordinals[1] == 3,
+          "rows equal to a call's composed rows match it: the two calls that composed the eye's rows, by their 1-based ordinals");
+    float nudged[16];
+    std::memcpy(nudged, eyeRows, sizeof(nudged));
+    nudged[0] += 9.0e-6f;
+    const uint32_t near1 = vrCensusMatchRows(f, nudged, kVrCensusRowsTol, ordinals, 6);
+    nudged[0] += 2.0e-5f;
+    check(near1 == 2 && vrCensusMatchRows(f, nudged, kVrCensusRowsTol, ordinals, 6) == 0, "9e-6 apart still matches, 3e-5 apart does not (the reader's tolerance, 1e-5)");
+    check(vrCensusMatchRows(f, worldRows, kVrCensusRowsTol, ordinals, 1) == 2 && ordinals[0] == 1, "a list shorter than the match count still counts them all (2 matched, 1 listed)");
+    VrCensusEpisodeFrame& g = f;
+    for (uint32_t i = 0; i < 40; ++i) { VrCensusCall* c = g.add(true, 3, 0x1); c->rowsValid = true; std::memcpy(c->rows, worldRows, sizeof(worldRows)); }
+    check(vrCensusMatchRows(g, worldRows, kVrCensusRowsTol, ordinals, 6) == 42, "forty more calls with the same rows: 42 matched, six listed");
+    float nan16[16];
+    for (float& v : nan16) v = std::nanf("");
+    check(vrCensusMatchRows(g, nan16, kVrCensusRowsTol, ordinals, 6) == 0, "NaN rows match nothing");
+
+    // The pass's chosen rows against the calls' view axes: identity, transposed, nothing near.
+    f.reset();
+    const float axesA[12] = {0.9f, 0.1f, -0.2f, 5.0f, 0.3f, 0.8f, 0.1f, 6.0f, -0.1f, 0.2f, 0.95f, 7.0f};   // rotation lanes 0..2 of three rows; lane 3 differs on purpose
+    float axesT[12];
+    for (int r = 0; r < 3; ++r) { for (int c = 0; c < 3; ++c) axesT[r * 4 + c] = axesA[c * 4 + r]; axesT[r * 4 + 3] = 0.0f; }
+    float chosenA[12];
+    std::memcpy(chosenA, axesA, sizeof(chosenA));
+    chosenA[3] = chosenA[7] = chosenA[11] = 0.0f;   // the translation lane is not compared
+    for (int i = 0; i < 4; ++i) {
+        VrCensusCall* c = f.add(true, i == 2 ? 5 : 3, 0x594E13);
+        c->axesValid = i != 3;
+        std::memcpy(c->axes, i == 1 ? axesT : axesA, sizeof(axesA));   // call 2 holds the transposed matrix, 1 and 3 the plain one, 4 has no axes
+        if (i == 0) c->axes[0] += 0.5f;                                // call 1 is the plain one moved well away
+    }
+    VrCensusAxesMatch m = vrCensusMatchAxes(f, chosenA, kVrCensusAxesTol);
+    check(m.count == 2 && m.ordinals[0] == 2 && m.ordinals[1] == 3 && m.nearest == 3 && m.nearestDiff == 0.0f && !m.nearestTransposed,
+          "the rows equal call 3's axes exactly and call 2's transposed: both match, the exact one (3) is the nearest and the relation is named identity");
+    VrCensusAxesMatch t = vrCensusMatchAxes(f, axesT, kVrCensusAxesTol);
+    check(t.count >= 1 && t.nearest != 0 && t.nearestDiff == 0.0f, "rows that are the transpose of a call's axes match it under the transposed reading (distance 0)");
+    float far[12];
+    std::memcpy(far, chosenA, sizeof(far));
+    far[0] += 0.05f;
+    far[5] += 0.05f;
+    const VrCensusAxesMatch farMatch = vrCensusMatchAxes(f, far, kVrCensusAxesTol);
+    check(farMatch.count == 0 && farMatch.nearest != 0 && farMatch.nearestDiff > 0.04f && farMatch.nearestDiff < 0.06f,
+          "rows 0.05 away from every call match none, and the nearest call and how near it is are still said");
+    std::unique_ptr<VrCensusEpisodeFrame> emptyFrame(new VrCensusEpisodeFrame);
+    emptyFrame->reset();
+    const VrCensusAxesMatch none = vrCensusMatchAxes(*emptyFrame, chosenA, kVrCensusAxesTol);
+    check(none.count == 0 && none.nearest == 0, "a frame with no call that has axes has no nearest call");
+    float nanRows[12];
+    for (float& v : nanRows) v = std::nanf("");
+    const VrCensusAxesMatch nan = vrCensusMatchAxes(f, nanRows, kVrCensusAxesTol);
+    check(nan.count == 0, "NaN rows equal no call's axes");
+    std::memcpy(far, chosenA, sizeof(far));
+    far[3] = 99.0f;
+    check(vrCensusMatchAxes(f, far, kVrCensusAxesTol).count == 2, "the translation lane (3, 7, 11) is not compared: it changes nothing");
+    {   // The tolerance is inclusive (0.75 and 1.0 are exact in a float, so the difference is exactly 0.25).
+        std::unique_ptr<VrCensusEpisodeFrame> edgeFrame(new VrCensusEpisodeFrame);
+        edgeFrame->reset();
+        VrCensusCall* edgeCall = edgeFrame->add(true, 3, 0x1);
+        edgeCall->axesValid = true;
+        std::memset(edgeCall->axes, 0, sizeof(edgeCall->axes));
+        edgeCall->axes[0] = 1.0f;
+        float edge[12] = {};
+        edge[0] = 0.75f;
+        check(vrCensusMatchAxes(*edgeFrame, edge, 0.25f).count == 1 && vrCensusMatchAxes(*edgeFrame, edge, 0.2499f).count == 0,
+              "the axes tolerance is inclusive: a difference of exactly the tolerance matches, a hair under it does not");
+    }
+
+    // The selection: which calls print when the lines are fewer than the calls.
+    std::unique_ptr<VrCensusEpisodeFrame> sp(new VrCensusEpisodeFrame);
+    VrCensusEpisodeFrame& big = *sp;
+    big.reset();
+    for (uint32_t i = 0; i < 500; ++i) {   // 400 kind-1 calls from one caller, 90 kind-3 calls whose caller alternates (each its own run), then ten kind-5 calls of ONE run
+        const uint32_t caller = i < 400 ? 0x58DE73 : i < 490 ? 0x594E13 + (i & 1) : 0x594FE1;
+        VrCensusCall* c = big.add(true, i < 400 ? 1 : i < 490 ? 3 : 5, caller);
+        c->kind = i < 400 ? 1 : i < 490 ? 3 : 5;
+        c->kindReadable = true;
+        c->callerRva = caller;
+        c->tone = i < 450 ? VrCensusTone::Before : VrCensusTone::After;
+    }
+    bool matched[640] = {}, selected[640] = {};
+    matched[17] = matched[333] = true;
+    const uint32_t picked = vrCensusSelectCalls(big, matched, 120, selected);
+    uint32_t count = 0, kind5 = 0;
+    for (uint32_t i = 0; i < 500; ++i) { if (selected[i]) ++count; if (selected[i] && big.call[i].kind == 5) ++kind5; }
+    check(picked == 120 && count == 120 && selected[17] && selected[333] && kind5 == 10,
+          "of 500 calls and 120 lines: the two that matched something print, and every kind-5 call (ten of them), whatever place they are in");
+    bool runStarts = selected[0] && selected[400] && selected[450];
+    check(runStarts, "...and the first call of each run of one (kind, caller, tone) too, so the runs the reader reduces are all there");
+    check(picked == count && selected[0] && selected[1] && selected[2], "...and the rest of the lines go to the first calls in order");
+    bool few[640] = {}, fewSel[640] = {};
+    const uint32_t all = vrCensusSelectCalls(f, few, 120, fewSel);
+    check(all == f.recorded && fewSel[0] && fewSel[f.recorded - 1], "a frame with fewer calls than lines prints every one");
+    matched[17] = matched[333] = false;
+    bool mixed[640] = {};
+    for (uint32_t i = 0; i < 200; ++i) mixed[i] = true;
+    const uint32_t capped = vrCensusSelectCalls(big, mixed, 120, selected);
+    check(capped == 120 && selected[119] && !selected[120] && !selected[150] && !selected[495],
+          "when the matched calls alone exceed the lines the first of them take them, and not even a kind-5 call is added past the cap: never more lines than the cap");
+    {   // A run is (kind, caller, tone): calls that differ only in the tone are two runs.
+        std::unique_ptr<VrCensusEpisodeFrame> tp(new VrCensusEpisodeFrame);
+        tp->reset();
+        for (uint32_t i = 0; i < 20; ++i) {
+            VrCensusCall* c = tp->add(true, 3, 0x594E13);
+            c->kind = 3;
+            c->kindReadable = true;
+            c->callerRva = 0x594E13;
+            c->tone = i < 10 ? VrCensusTone::Before : VrCensusTone::After;
+        }
+        bool noMatch[640] = {}, toneSel[640] = {};
+        const uint32_t two = vrCensusSelectCalls(*tp, noMatch, 2, toneSel);
+        check(two == 2 && toneSel[0] && toneSel[10] && !toneSel[1],
+              "a change of the tone alone starts a run: with two lines the first call and the first call after the tone changed print, not the second call");
+    }
+}
+
+// One whole episode, printed by the function the DLL prints it with: the order of its lines, the cap on call lines, and the matches made over ALL the recorded calls.
+void testEpisodePrint() {
+    std::printf("episodes: one episode printed\n");
+    std::unique_ptr<VrCensusEpisodeFrame> fp(new VrCensusEpisodeFrame);
+    VrCensusEpisodeFrame& f = *fp;
+    f.reset();
+    Model eye(3, 1.5708f, 0.95f, 0.13f, -0.05f), scene(3, 1.0122f, 5040.0f / 2835.0f, 0.0f, 0.0f);
+    float eyeRows[16], sceneRows[16];
+    check(vrCensusComposeRows(eye.snap(), eyeRows) && vrCensusComposeRows(scene.snap(), sceneRows), "two cameras compose rows");
+    float sceneAxes[12], eyeAxes[12];
+    {   // the cameras' axes as the census snapshots them (camera+0x20)
+        const VrCensusSnap sn = scene.snap();
+        std::memcpy(sceneAxes, sn.bytes, sizeof(sceneAxes));
+        std::memcpy(eyeAxes, sn.bytes, sizeof(eyeAxes));
+        eyeAxes[1] += 0.2f;   // the eye's pose is not the scene camera's
+    }
+    // 300 recorded calls: 284 kind-1 calls (each its own rows and axes), the scene camera's call at n=250 (the one the join's rows and the pass's rows match), and fifteen kind-5 calls
+    // from n=286 (the eye camera's, with rows and axes of their own).
+    for (uint32_t i = 0; i < 300; ++i) {
+        const bool isScene = i == 249, isEye = i >= 285;
+        VrCensusCall* c = f.add(true, isEye ? 5 : isScene ? 3 : 1, isEye ? 0x594FE1 : 0x58DE73);
+        c->kind = isEye ? 5 : isScene ? 3 : 1;
+        c->kindReadable = true;
+        c->callerRva = isEye ? 0x594FE1 : 0x58DE73;
+        c->tone = isEye ? VrCensusTone::After : VrCensusTone::Before;
+        c->rowsValid = true;
+        std::memcpy(c->rows, isScene ? sceneRows : eyeRows, sizeof(c->rows));
+        if (!isScene && !isEye) c->rows[0] += 0.5f + 0.001f * static_cast<float>(i);   // a UI call's rows are its own
+        c->axesValid = true;
+        std::memcpy(c->axes, isScene ? sceneAxes : eyeAxes, sizeof(c->axes));
+        if (!isScene && !isEye) c->axes[0] += 0.3f + 0.001f * static_cast<float>(i);
+    }
+    VrCensusJoin join;
+    join.begin();
+    VrCensusJoinRow* a = join.add(VrCensusJoinDepth::Screen, 5040, 2835, 0xD1, 0xE1, 41);
+    a->draws = 22; a->depthWrite = 1; a->b1Bound = true; a->b1 = 0x1eb2e751e20ull; a->b1Bytes = 5376; a->rowsAsked = a->rowsRead = true;
+    std::memcpy(a->rows, sceneRows, sizeof(a->rows));
+    VrCensusJoinRow* b = join.add(VrCensusJoinDepth::Screen, 5040, 2835, 0xD2, 0xE1, 77);
+    b->draws = 300; b->depthWrite = 0; b->b1Bound = true; b->b1 = 0x1eb2e751e20ull; b->b1Bytes = 5376; b->why = "skip";
+    join.seen = 900; join.views = 3;
+    VrCensusEpisodePrint in;
+    in.n = 7; in.frame = 400; in.armedFrame = 370; in.trigger = VrCensusTrigger{VrCensusTriggerKind::Naming, 1, 0};
+    in.foot = VrCensusFoot::Yes; in.named = false; in.haveChosen = true; in.chosenBound = true;
+    std::memcpy(in.chosen, sceneAxes, sizeof(in.chosen));   // the pass chose the scene camera's rows
+    std::vector<std::pair<VrCensusLines, std::string>> out;
+    vrCensusPrintEpisode([&](VrCensusLines cls, const char* text) { out.emplace_back(cls, text); }, in, f, join);
+    unsigned callLines = 0, tooLong = 0;
+    bool has250 = false, has286 = false;
+    size_t firstCall = out.size(), lastCall = 0, passAt = out.size(), drawsAt = out.size(), joinAt = out.size();
+    for (size_t i = 0; i < out.size(); ++i) {
+        if (out[i].second.size() > kVrCensusLineBytes) ++tooLong;
+        if (out[i].first == VrCensusLines::EpisodeCall) {
+            ++callLines;
+            if (firstCall == out.size()) firstCall = i;
+            lastCall = i;
+            has250 = has250 || out[i].second.find(" n=250 ") != std::string::npos;
+            has286 = has286 || out[i].second.find(" n=286 ") != std::string::npos;
+        }
+        if (out[i].second.find("pass-rows ep=7 ") != std::string::npos) passAt = i;
+        if (out[i].second.find("join-draws ep=7 ") != std::string::npos) drawsAt = i;
+        if (out[i].second.find("join ep=7 sig=1 ") != std::string::npos) joinAt = i;
+    }
+    check(out.size() > 0 && out[0].first == VrCensusLines::Episode &&
+              out[0].second.find("vr camera census: episode frame=400 n=7/10 trigger=naming:named>unnamed armed=370 foot=yes gui=- named=0 phase=- calls=300 recorded=300 printed=120 ") == 0,
+          "the first line is the episode's header, and says 300 calls recorded and 120 printed");
+    check(callLines == 120 && tooLong == 0, "the call lines are capped at 120 (kVrCensusEpisodeLines) and no line is over 400 characters");
+    check(has250 && has286, "the scene camera's call (n=250) that the join's rows and the pass's rows matched is printed though it is past the 120th call, and so is a kind-5 call (n=286)");
+    check(firstCall < passAt && lastCall < passAt && passAt < drawsAt && drawsAt < joinAt,
+          "the order is the header, the call lines, the pass's rows, the join's draw counts, then the join's signatures");
+    unsigned sceneJoin = 0;
+    for (const auto& l : out) if (l.second.find("join ep=7 sig=1 ") != std::string::npos && l.second.find("rows=read match=250") != std::string::npos) ++sceneJoin;
+    unsigned passLine = 0;
+    for (const auto& l : out) if (l.second.find("pass-rows ep=7 frame=400 valid=1 bound=1 ") != std::string::npos && l.second.find(" axes-match=250 how=identity nearest=250 diff=0.000e+00") != std::string::npos) ++passLine;
+    check(sceneJoin == 1 && passLine == 1,
+          "the join's rows matched call 250 (over all 300 recorded calls, not the printed ones) and the pass's rows equal call 250's view axes, read as they are");
+    unsigned rowsLines = 0, drawsLine = 0, skipLine = 0;
+    for (const auto& l : out) {
+        if (l.second.find("join-rows ep=7 sig=1 ") != std::string::npos) ++rowsLines;
+        if (l.second.find("join-draws ep=7 seen=900 relevant=322 views=3 signatures=2") != std::string::npos) ++drawsLine;
+        if (l.second.find("join ep=7 sig=2 ") != std::string::npos && l.second.find(" rows=- why=skip") != std::string::npos) ++skipLine;
+    }
+    check(rowsLines == 1 && drawsLine == 1 && skipLine == 1,
+          "a rows line only for the signature that read its rows; the draw counts say 900 seen, 322 relevant (22 + 300), 3 views, 2 signatures; the second signature says why=skip");
+    // The cap on the Episode class is a real ceiling: the lines of one episode never exceed 1 + 1 + 1 + 12 + 4 + 1 (the join-more note) of that class.
+    VrCensusJoin full;
+    full.begin();
+    for (uint32_t i = 0; i < kVrCensusJoinRows + 3; ++i) {
+        VrCensusJoinRow* r = full.add(VrCensusJoinDepth::Eye0, 2620, 2533, 0x100 + i, 0x200, 10 + i);
+        if (r) { r->draws = 2; r->rowsAsked = r->rowsRead = i < 4; r->why = i < 4 ? nullptr : "skip"; std::memcpy(r->rows, eyeRows, sizeof(r->rows)); }
+    }
+    full.seen = 50;
+    f.reset();
+    std::vector<std::pair<VrCensusLines, std::string>> out2;
+    in.haveChosen = false;
+    vrCensusPrintEpisode([&](VrCensusLines cls, const char* text) { out2.emplace_back(cls, text); }, in, f, full);
+    unsigned episodeClass = 0;
+    bool more = false, noCalls = true;
+    for (const auto& l : out2) {
+        if (l.first == VrCensusLines::Episode) ++episodeClass;
+        if (l.first == VrCensusLines::EpisodeCall) noCalls = false;
+        if (l.second.find("join-more ep=7 signatures=3 draws=3") != std::string::npos) more = true;
+    }
+    check(more && noCalls && episodeClass == 1 + 1 + 1 + kVrCensusJoinRows + 4 + 1 && out2[1].second.find("pass-rows ep=7 frame=400 valid=0 ") != std::string::npos,
+          "an episode of a frame with no call, fifteen signatures (twelve kept, four of them with rows) and no pass rows prints its header, pass-rows valid=0, join-draws, the twelve "
+          "signatures, four rows lines and the overflow note: exactly the Episode class's per-episode ceiling, and no call line");
+}
+
+// The episodes' part of a boundary, in the order the glue runs it (vr_camera_census.cpp): the frame that ended is rolled (an episode's frame prints and finishes),
+// then the triggers its readings make are judged and the armed frame goes live. The recording rule of a call is the glue's: an episode frame records every call
+// into the episode buffer, any other frame by the old rule into the ordinary one.
+struct EpisodeSim {
+    VrCensusEpisodes eps;
+    std::unique_ptr<VrCensusEpisodeFrame> epFrame{new VrCensusEpisodeFrame};
+    VrCensusFrame frame;
+    VrCensusFoot foot = VrCensusFoot::No;
+    bool named = false, guiKnown = false;
+    uint32_t gui = 0;
+    uint64_t frameNo = 1;
+    uint32_t sequencesLogged = 0;
+    std::vector<uint64_t> printedEpisodeFrames;       // the frame numbers of the episodes that printed
+    std::vector<uint32_t> printedEpisodeRecorded;     // ...and how many calls each recorded
+    std::vector<uint64_t> printedSequenceFrames;
+    EpisodeSim() { eps.restart(); eps.keyOn(frameNo); epFrame->reset(); }   // the census turned on: frame 1 starts, the key-on trigger arms for frame 31
+    void call(uint32_t kind, uint32_t caller, bool tone) {
+        const bool episodeFrame = eps.live();
+        const bool recording = !episodeFrame && vrCensusMayRecord(foot, VrCensusPhase{}) && vrCensusPrintsSequence(true, sequencesLogged);
+        if (episodeFrame) { ++frame.calls; epFrame->add(true, kind, caller); }
+        else if (recording) frame.add(); else ++frame.calls;
+        frame.progress = true;
+        if (tone) frame.toneSeen = true;
+    }
+    void boundary() {
+        const bool sampled = vrCensusSamplesFrame(frame.toneSeen, frame.progress, foot, VrCensusPhase{});
+        if (vrCensusPrintsSequence(sampled, sequencesLogged) && frame.recorded > 0) { ++sequencesLogged; printedSequenceFrames.push_back(frameNo); }
+        if (eps.live()) { printedEpisodeFrames.push_back(frameNo); printedEpisodeRecorded.push_back(epFrame->recorded); eps.finish(); }
+        frame.reset();
+        ++frameNo;
+        VrCensusEpisodes::Inputs in;
+        in.foot = foot; in.named = named; in.guiKnown = guiKnown; in.gui = gui;
+        if (eps.boundary(frameNo, frameNo > 1, in)) epFrame->reset();
+    }
+};
+
+void testEpisodeSession() {
+    std::printf("episodes: a scripted session through the core\n");
+    // The key-on episode: a cockpit frame (the journal says not on foot), every call of it recorded -- the ordinary rule would record none.
+    {
+        EpisodeSim sim;
+        bool ordinaryRecordedNothing = true, sampledAllCalls = false;
+        for (int f = 1; f <= 40; ++f) {
+            for (int i = 0; i < 300; ++i) sim.call(i % 3 == 0 ? 5 : 3, 0x594E13, i > 250);
+            ordinaryRecordedNothing = ordinaryRecordedNothing && sim.frame.recorded == 0;
+            if (f == 31) sampledAllCalls = sim.epFrame->calls == 300 && sim.epFrame->recorded == 300 && sim.epFrame->kinds[5] == 100 && sim.epFrame->kinds[3] == 200;
+            sim.boundary();
+        }
+        check(ordinaryRecordedNothing, "an aboard frame records nothing by the ordinary rule (the journal says not on foot), the sampled one included");
+        check(sampledAllCalls, "...and the sampled frame, aboard, recorded and tallied all 300 of its calls into the episode buffer, kind 5 and kind 3 apart");
+        check(sim.printedEpisodeFrames.size() == 1 && sim.printedEpisodeFrames[0] == 31 && sim.printedEpisodeRecorded[0] == 300 && sim.printedSequenceFrames.empty() && sim.eps.started() == 1,
+              "one episode, of frame 31 (30 frames after the key went on), and no first-three sequence: the commander was never on foot");
+    }
+    // Triggers: a map opens (GuiFocus 0 -> 6) while the key-on episode is still armed (skipped), a map closes after it was taken (armed and sampled).
+    {
+        EpisodeSim sim;
+        sim.guiKnown = true;
+        for (int f = 1; f <= 100; ++f) {
+            if (f == 10) sim.gui = 6;     // read at the boundary that ends frame 10: a trigger, but the key-on episode is armed until frame 31
+            if (f == 50) sim.gui = 0;     // the map closes: read at the boundary that ends frame 50, armed for frame 51, sampled at 81
+            for (int i = 0; i < 10; ++i) sim.call(3, 0x594E13, false);
+            sim.boundary();
+        }
+        check(sim.eps.started() == 2 && sim.eps.triggers() == 3 && sim.eps.skipped() == 1 && sim.printedEpisodeFrames.size() == 2 &&
+                  sim.printedEpisodeFrames[0] == 31 && sim.printedEpisodeFrames[1] == 81,
+              "key-on (sampled at frame 31), a map opening (GuiFocus 0 -> 6) while it was armed (skipped), a map closing (6 -> 0, sampled at frame 81): started 2, triggers 3, skipped 1");
+    }
+    // An on-foot frame the first-three rule would have recorded, when it is the episode's frame: the episode takes it, the ordinary buffer records nothing and the frame
+    // spends none of the three sequences (the next on-foot frame prints as the first).
+    {
+        EpisodeSim sim;
+        sim.foot = VrCensusFoot::Yes;
+        for (int f = 1; f <= 34; ++f) {
+            for (int i = 0; i < 20; ++i) sim.call(3, 0x594E13, i >= 16);
+            sim.boundary();
+        }
+        check(sim.printedEpisodeFrames.size() == 1 && sim.printedEpisodeFrames[0] == 31 && sim.sequencesLogged == 3 &&
+                  std::find(sim.printedSequenceFrames.begin(), sim.printedSequenceFrames.end(), 31ull) == sim.printedSequenceFrames.end() &&
+                  sim.printedSequenceFrames[0] == 1 && sim.printedSequenceFrames[1] == 2 && sim.printedSequenceFrames[2] == 3,
+              "on foot the first three frames print as sequences (1, 2, 3) as before; the key-on episode's frame (31) is the episode's only: no duplicate lines, no sequence spent");
+        EpisodeSim late;
+        late.foot = VrCensusFoot::Yes;
+        late.sequencesLogged = 2;   // two of the three already printed
+        for (int f = 1; f <= 33; ++f) {
+            for (int i = 0; i < 20; ++i) late.call(3, 0x594E13, i >= 16);
+            late.boundary();
+        }
+        check(late.printedEpisodeFrames.size() == 1 && late.sequencesLogged == 3 && late.printedSequenceFrames.size() == 1 && late.printedSequenceFrames[0] == 1,
+              "with one sequence left, the episode's frame (31) does not take it: frame 1 prints it as before");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +1258,106 @@ std::vector<Golden> goldenLines() {
     other.thread = 4321; other.camera = 0x241dc2e2960; other.kind = 3; other.kindReadable = true; other.callerRva = 0x594E13; other.calls = 57;
     vrCensusFormatOtherThread(line, sizeof(line), other);
     add("other-thread");
+
+    // The episodes' lines (Phase 0). A cockpit episode 30 frames after the galaxy map opened (GuiFocus 0 -> 6), and an on-foot one after the naming flipped to unnamed.
+    VrCensusEpisodeHeader eh;
+    eh.n = 3; eh.frame = 5231; eh.armedFrame = 5201;
+    eh.trigger = VrCensusTrigger{VrCensusTriggerKind::Gui, 0, 6};
+    eh.foot = VrCensusFoot::No; eh.guiKnown = true; eh.gui = 6; eh.named = false;
+    eh.calls = 612; eh.recorded = 612; eh.printed = 120;
+    eh.kinds[0] = 12; eh.kinds[1] = 300; eh.kinds[3] = 290; eh.kinds[5] = 10;
+    const VrCensusEpisodeFrame::Caller ehCallers[5] = {{0x594E13, 130}, {0x594EAB, 130}, {0x594FE1, 40}, {0x58DE73, 300}, {0x59A010, 12}};
+    eh.callers = ehCallers; eh.callerCount = 5;
+    vrCensusFormatEpisode(line, sizeof(line), eh);
+    add("episode-cockpit");
+    VrCensusEpisodeHeader ef;
+    ef.n = 4; ef.frame = 6120; ef.armedFrame = 6090;
+    ef.trigger = VrCensusTrigger{VrCensusTriggerKind::Naming, 1, 0};
+    ef.foot = VrCensusFoot::Yes; ef.guiKnown = false; ef.named = false; ef.phase = jitter;
+    ef.calls = 107; ef.recorded = 107; ef.printed = 107;
+    ef.kinds[1] = 8; ef.kinds[3] = 93; ef.kinds[5] = 6;
+    const VrCensusEpisodeFrame::Caller efCallers[3] = {{0x594E13, 40}, {0x594EAB, 40}, {0x594FE1, 27}};
+    ef.callers = efCallers; ef.callerCount = 3;
+    vrCensusFormatEpisode(line, sizeof(line), ef);
+    add("episode-foot");
+    VrCensusEpisodeHeader ek;
+    ek.n = 1; ek.frame = 31; ek.armedFrame = 1; ek.trigger = VrCensusTrigger{VrCensusTriggerKind::KeyOn, 0, 0};
+    ek.foot = VrCensusFoot::Off; ek.calls = 0; ek.recorded = 0; ek.printed = 0;
+    vrCensusFormatEpisode(line, sizeof(line), ek);
+    add("episode-key-on-empty");
+    VrCensusEpisodeHeader eg = ek;
+    eg.trigger = VrCensusTrigger{VrCensusTriggerKind::Foot, 0, 1};
+    vrCensusFormatEpisode(line, sizeof(line), eg);
+    add("episode-foot-flip");
+
+    const float passRows[12] = {0.9f, 0, -0.1f, 0.5f, 0, 1.0f, 0, -1.5f, 0.1f, 0, 0.9f, 2.5f};
+    VrCensusAxesMatch pm;
+    pm.count = 2; pm.ordinals[0] = 98; pm.ordinals[1] = 101; pm.nearest = 98; pm.nearestDiff = 0.0f;
+    vrCensusFormatPassRows(line, sizeof(line), 3, 5231, true, true, passRows, pm);
+    add("pass-rows");
+    VrCensusAxesMatch pn;
+    pn.nearest = 17; pn.nearestDiff = 1.5e-3f; pn.nearestTransposed = true;
+    vrCensusFormatPassRows(line, sizeof(line), 3, 5231, true, false, passRows, pn);
+    add("pass-rows-no-match");
+    vrCensusFormatPassRows(line, sizeof(line), 3, 5231, false, false, nullptr, VrCensusAxesMatch{});
+    add("pass-rows-none");
+
+    VrCensusJoinRow jr;
+    jr.depth = VrCensusJoinDepth::Eye0; jr.w = 2620; jr.h = 2533; jr.vs = 0x5C36AF051B98B9F1ull; jr.ps = 0xCFE84157BC76E921ull; jr.firstDraw = 8210; jr.draws = 1432;
+    jr.depthWrite = 1; jr.b1Bound = true; jr.b1 = 0x1eb2e751e20ull; jr.b1First = 0; jr.b1Bytes = 5376; jr.rowsAsked = true; jr.rowsRead = true;
+    jr.matchCount = 2; jr.matches[0] = 98; jr.matches[1] = 101;
+    std::memcpy(jr.rows, rowsEye, sizeof(rowsEye));
+    vrCensusFormatJoin(line, sizeof(line), 3, 1, jr);
+    add("join");
+    vrCensusFormatJoinRows(line, sizeof(line), 3, 1, jr.rows);
+    add("join-rows");
+    VrCensusJoinRow js;
+    js.depth = VrCensusJoinDepth::Screen; js.w = 5040; js.h = 2835; js.vs = 0xDFED8E1C9E191BECull; js.ps = 0x143AAE0597E2F7BFull; js.firstDraw = 6500; js.draws = 22;
+    js.depthWrite = 0; js.b1Bound = true; js.b1 = 0x1eb2e751e20ull; js.b1Bytes = 5376; js.why = "skip";
+    vrCensusFormatJoin(line, sizeof(line), 3, 2, js);
+    add("join-skip");
+    VrCensusJoinRow jn;
+    jn.depth = VrCensusJoinDepth::EyeUnknown; jn.w = 2620; jn.h = 2533; jn.firstDraw = 91; jn.draws = 3; jn.rowsAsked = true; jn.why = "no-b1";
+    vrCensusFormatJoin(line, sizeof(line), 3, 3, jn);
+    add("join-no-b1");
+    VrCensusJoinRow jt = jr;
+    jt.depth = VrCensusJoinDepth::Eye1; jt.matchCount = 0;
+    vrCensusFormatJoin(line, sizeof(line), 3, 4, jt);
+    add("join-no-match");
+    vrCensusFormatJoinMore(line, sizeof(line), 3, 4, 212);
+    add("join-more");
+    vrCensusFormatJoinDraws(line, sizeof(line), 3, 95, 75, 4, 4);
+    add("join-draws");
+    vrCensusFormatJoinDraws(line, sizeof(line), 4, 0, 0, 0, 0);
+    add("join-draws-none");
+
+    VrCensusRuns runs;
+    runs.frames = 4500;
+    runs.named[0] = 1; runs.named[6] = 1;
+    runs.unnamed[0] = 3; runs.unnamed[1] = 1; runs.unnamed[2] = 2; runs.unnamed[4] = 1;
+    runs.longestNamed = 3012; runs.longestUnnamed = 14; runs.open = 1; runs.openLength = 3012;
+    vrCensusFormatRuns(line, sizeof(line), runs, 1);
+    add("runs");
+    vrCensusFormatRuns(line, sizeof(line), VrCensusRuns{}, 12);
+    add("runs-empty");
+    VrCensusCpu cpuSums;
+    cpuSums.notePre(false, 200); cpuSums.notePre(false, 300); cpuSums.notePost(false, 100); cpuSums.notePost(false, 150);
+    cpuSums.notePre(true, 400); cpuSums.notePost(true, 200);
+    VrCensusWindow cpuWindow;
+    cpuWindow.frames = 100; cpuWindow.calls = 1000; cpuWindow.injCalls = 400;
+    vrCensusFormatCpu(line, sizeof(line), cpuWindow, cpuSums, 10000000, 3);
+    add("detour");
+    vrCensusFormatCpu(line, sizeof(line), VrCensusWindow{}, VrCensusCpu{}, 10000000, 1);
+    add("detour-empty");
+    VrCensusEpisodeCounters counters;
+    counters.taken = 3; counters.triggers = 5; counters.skipped = 2;
+    vrCensusFormatEpisodeCounters(line, sizeof(line), counters, 1, false);
+    add("episodes-idle");
+    counters.state = "armed"; counters.trigger = VrCensusTrigger{VrCensusTriggerKind::Gui, 0, 6}; counters.armedFrame = 5201; counters.sampleFrame = 5231;
+    vrCensusFormatEpisodeCounters(line, sizeof(line), counters, 12, true);
+    add("episodes-armed");
+    vrCensusFormatEpisodeCounters(line, sizeof(line), VrCensusEpisodeCounters{}, 1, false);
+    add("episodes-zero");
     return out;
 }
 
@@ -654,6 +1423,62 @@ void testFormats() {
           "no advertised geometry is said, not invented");
     check(at("other-thread") == "vr camera census: other-thread tid=4321 camera=0x241dc2e2960 kind=3 caller=+0x594E13 calls=57",
           "a call on another thread: thread, camera, kind, caller, count");
+    // THE EPISODES' LINES.
+    check(at("episode-cockpit") ==
+              "vr camera census: episode frame=5231 n=3/10 trigger=gui:0>6 armed=5201 foot=no gui=6 named=0 phase=- calls=612 recorded=612 printed=120 "
+              "kinds=0:12,1:300,3:290,5:10 callers=+0x58DE73:300,+0x594E13:130,+0x594EAB:130,+0x594FE1:40,+more:1",
+          "an episode's header: the sampled frame, its ordinal of ten, the trigger (gui:0>6, the galaxy map opening), the frame it was armed at, the journal, GuiFocus, the naming, "
+          "the route's phase, the calls (all, recorded, printed), the kinds of all of them and the four busiest callers, the rest counted");
+    check(at("episode-foot") ==
+              "vr camera census: episode frame=6120 n=4/10 trigger=naming:named>unnamed armed=6090 foot=yes gui=- named=0 phase=0.2520,-0.1260 calls=107 recorded=107 printed=107 "
+              "kinds=1:8,3:93,5:6 callers=+0x594E13:40,+0x594EAB:40,+0x594FE1:27",
+          "an on-foot episode: GuiFocus unknown is a dash, the naming flip is named>unnamed, the route's phase rides on the line");
+    check(at("episode-key-on-empty") ==
+              "vr camera census: episode frame=31 n=1/10 trigger=key-on armed=1 foot=off gui=- named=0 phase=- calls=0 recorded=0 printed=0 kinds=- callers=-" &&
+              at("episode-foot-flip").find(" trigger=foot:no>yes armed=1 ") != std::string::npos,
+          "an episode of a frame with no call prints dashes, never invented counts; the journal's flip is foot:no>yes");
+    check(at("pass-rows") ==
+              "vr camera census: pass-rows ep=3 frame=5231 valid=1 bound=1 rows=[0.9,0,-0.1,0.5,0,1,0,-1.5,0.1,0,0.9,2.5] axes-match=98,101 how=identity nearest=98 diff=0.000e+00",
+          "the pass's chosen rows: whether the block bound at the scene's first draw was the one chosen, the twelve floats, the calls whose view axes equal them, the nearest and how it fits");
+    check(at("pass-rows-no-match") ==
+              "vr camera census: pass-rows ep=3 frame=5231 valid=1 bound=0 rows=[0.9,0,-0.1,0.5,0,1,0,-1.5,0.1,0,0.9,2.5] axes-match=- how=transpose nearest=17 diff=1.500e-03" &&
+              at("pass-rows-none") == "vr camera census: pass-rows ep=3 frame=5231 valid=0 bound=- rows=- axes-match=- how=- nearest=- diff=-",
+          "no call whose axes equal the rows still names the nearest and how near; a frame the pass chose nothing in says valid=0 and prints dashes");
+    check(at("join") ==
+              "vr camera census: join ep=3 sig=1 depth=eye eye=0 size=2620x2533 draw=8210 draws=1432 vs=0x5C36AF051B98B9F1 ps=0xCFE84157BC76E921 dw=yes b1=0x1eb2e751e20 first=0 "
+              "bytes=5376 rows=read match=98,101" &&
+              at("join-rows") == "vr camera census: join-rows ep=3 sig=1 rows=[1.1,0,0,0.8,0,1,0,-0.1,0.2,0,1,0.6,0,0,0.05,0]",
+          "a join signature: the depth (screen or eye, and which), its size, the first draw, the draws it took, the shaders, whether it writes depth, b1 and its size, the calls its rows "
+          "matched; its rows follow on a line of their own, in a call line's format");
+    check(at("join-skip") ==
+              "vr camera census: join ep=3 sig=2 depth=screen eye=- size=5040x2835 draw=6500 draws=22 vs=0xDFED8E1C9E191BEC ps=0x143AAE0597E2F7BF dw=no b1=0x1eb2e751e20 first=0 "
+              "bytes=5376 rows=- why=skip" &&
+              at("join-no-b1") == "vr camera census: join ep=3 sig=3 depth=eye eye=- size=2620x2533 draw=91 draws=3 vs=0x0 ps=0x0 dw=- b1=- first=- bytes=- rows=- why=no-b1" &&
+              at("join-no-match").find(" rows=read match=-") != std::string::npos,
+          "a signature after the first of its depth costs no readback and says why=skip; a draw with no b1 bound says why=no-b1 and prints dashes; rows that matched no call say match=-");
+    check(at("join-more") == "vr camera census: join-more ep=3 signatures=4 draws=212", "the signatures the table could not keep are counted");
+    check(at("join-draws") == "vr camera census: join-draws ep=3 seen=95 relevant=75 views=4 signatures=4" &&
+              at("join-draws-none") == "vr camera census: join-draws ep=4 seen=0 relevant=0 views=0 signatures=0",
+          "the join's draw counts: every draw the per-draw hook was handed, those into the screen's or an eye's depth, the views it resolved, the signatures it kept; seen=0 is a hook that "
+          "never ran, which a frame with no draw into those depths (seen=95, relevant=0) is not");
+    check(at("runs") ==
+              "vr camera census: runs windows=1 frames=4500 named=1:1,2:0,3:0,4-8:0,9-30:0,31-89:0,90+:1 unnamed=1:3,2:1,3:2,4-8:0,9-30:1,31-89:0,90+:0 longest=named:3012,unnamed:14 "
+              "open=named:3012" &&
+              at("runs-empty") == "vr camera census: runs windows=12 frames=0 named=1:0,2:0,3:0,4-8:0,9-30:0,31-89:0,90+:0 unnamed=1:0,2:0,3:0,4-8:0,9-30:0,31-89:0,90+:0 "
+                                  "longest=named:0,unnamed:0 open=-",
+          "the naming runs line: the bins 1, 2, 3, 4-8, 9-30, 31-89 and 90+ for each way, the longest of each, the run still open; an empty window prints every bin (zeros included)");
+    check(at("episodes-idle") == "vr camera census: episodes windows=1 taken=3/10 triggers=5 skipped=2 state=idle" &&
+              at("episodes-armed") == "vr camera census: episodes windows=12 taken=3/10 triggers=5 skipped=2 state=armed trigger=gui:0>6 armed=5201 sample=5231" &&
+              at("episodes-zero") == "vr camera census: episodes windows=1 taken=0/10 triggers=0 skipped=0 state=idle",
+          "the episodes' counters line, with every window and zeros included (an absent line is what 'the episode code never ran' looks like): episodes taken of ten, triggers, those skipped, "
+          "and, while one is armed or live, its trigger, the frame it was armed at and the frame it samples");
+    check(at("detour") ==
+              "vr camera census: detour windows=3 every=16 timed=observer-halves frames=100 calls=1000 sampled=3 est-ms-frame=0.465 obs-calls=600 obs-sampled=2 obs-pre-us=25/30 "
+              "obs-post-us=12.5/15 inj-calls=400 inj-sampled=1 inj-pre-us=40/40 inj-post-us=20/20" &&
+              at("detour-empty") ==
+                  "vr camera census: detour windows=1 every=16 timed=observer-halves frames=0 calls=0 sampled=0 est-ms-frame=- obs-calls=0 obs-sampled=0 obs-pre-us=- obs-post-us=- "
+                  "inj-calls=0 inj-sampled=0 inj-pre-us=- inj-post-us=-",
+          "the detour's CPU line says what is timed and how often, and per mode the calls, the timed ones and mean/longest microseconds; nothing timed is a dash, never a zero");
     bool lengthOk = true;
     for (const Golden& x : g) if (x.text.size() > kVrCensusLineBytes) lengthOk = false;
     check(lengthOk, "every line above is at most 400 characters");
@@ -696,6 +1521,67 @@ void testFormats() {
         const bool negZero = std::strstr(oddLine, " phase=0.0000,0.0000 ") != nullptr && std::strstr(oddLine, "-0.0000") == nullptr;
         check(tiny && notANumber && negZero,
               "a phase that rounds to zero prints 0.0000 (never -0.0000), a jittering warm-up frame's zero is 0.0000,0.0000, and a NaN axis prints nan");
+    }
+    // The episodes' lines at their widest realistic: a 9-digit frame, every kind and caller with five-digit counts, the longest words, long floats, eleven-digit window counts.
+    {
+        char wide[kVrCensusLineBytes + 1];
+        VrCensusEpisodeHeader h;
+        h.n = 10; h.frame = 999999999ull; h.armedFrame = 999999969ull;
+        h.trigger = VrCensusTrigger{VrCensusTriggerKind::Naming, 0, 1};
+        h.foot = VrCensusFoot::Unknown; h.guiKnown = true; h.gui = 999; h.named = true; h.phase = VrCensusPhase{true, -0.9999f, -0.9999f};
+        h.calls = 99999; h.recorded = 640; h.printed = 120;
+        for (int k = 0; k < 8; ++k) h.kinds[k] = 99999;
+        VrCensusEpisodeFrame::Caller callers[16];
+        for (int i = 0; i < 16; ++i) callers[i] = {0xFFFFFFFu - static_cast<uint32_t>(i), 99999ull};
+        h.callers = callers; h.callerCount = 16; h.callerOverflow = 99999999ull;
+        const int hn = vrCensusFormatEpisode(wide, sizeof(wide), h);
+        check(hn > 0 && std::strlen(wide) <= kVrCensusLineBytes && std::strstr(wide, ",+more:") != nullptr && std::strstr(wide, "kinds=0:99999,1:99999,2:99999,3:99999,4:99999,5:99999,other:99999,unreadable:99999") != nullptr,
+              "the widest realistic episode header (nine-digit frame, every kind, sixteen callers, the longest trigger and phase) fits 400 characters whole, kinds and callers both");
+        std::printf("  note  widest realistic episode header: %zu characters\n", std::strlen(wide));
+        VrCensusJoinRow jw;
+        jw.depth = VrCensusJoinDepth::Screen; jw.w = 16384; jw.h = 16384; jw.vs = ~0ull; jw.ps = ~0ull; jw.firstDraw = 999999; jw.draws = 99999999999ull; jw.depthWrite = 1;
+        jw.b1Bound = true; jw.b1 = 0x7FFFFFFFFFFFull; jw.b1First = 4294967295u; jw.b1Bytes = 4294967295u; jw.rowsRead = true; jw.matchCount = 99999;
+        for (int i = 0; i < 6; ++i) jw.matches[i] = 640 - static_cast<uint32_t>(i);
+        const int jn = vrCensusFormatJoin(wide, sizeof(wide), 10, 12, jw);
+        check(jn > 0 && std::strlen(wide) <= kVrCensusLineBytes && std::strstr(wide, " match=640,639,638,637,636,635+99993") != nullptr,
+              "the widest realistic join line (a full-width hash pair, 16384-square, eleven-digit draws, six matches and a count of the rest) fits whole, its matches last");
+        std::printf("  note  widest realistic join line: %zu characters\n", std::strlen(wide));
+        float wideRows[16];
+        for (int i = 0; i < 16; ++i) wideRows[i] = -1.2345678e-05f * (i + 1);
+        const int rn = vrCensusFormatJoinRows(wide, sizeof(wide), 10, 12, wideRows);
+        check(rn > 0 && std::strlen(wide) <= kVrCensusLineBytes && wide[std::strlen(wide) - 1] == ']', "the widest join rows line (sixteen long floats) fits whole");
+        std::printf("  note  widest realistic join-rows line: %zu characters\n", std::strlen(wide));
+        VrCensusAxesMatch pw;
+        pw.count = 99999; pw.nearest = 640; pw.nearestDiff = 3.0e38f; pw.nearestTransposed = true;
+        for (uint32_t i = 0; i < VrCensusAxesMatch::kMax; ++i) pw.ordinals[i] = 640 - i;
+        const int pn = vrCensusFormatPassRows(wide, sizeof(wide), 10, 999999999ull, true, true, wideRows, pw);
+        check(pn > 0 && std::strlen(wide) <= kVrCensusLineBytes && std::strstr(wide, " diff=3.000e+38") != nullptr && std::strstr(wide, " axes-match=640,639,638,637,636,635+99993 ") != nullptr,
+              "the widest realistic pass-rows line (twelve long floats, six matches, the nearest call and its distance) fits whole, the distance last");
+        std::printf("  note  widest realistic pass-rows line: %zu characters\n", std::strlen(wide));
+        VrCensusRuns rw;
+        rw.frames = 99999999999ull; rw.longestNamed = rw.longestUnnamed = 4294967295u; rw.open = 0; rw.openLength = 4294967295u;
+        for (int b = 0; b < VrCensusRuns::kBins; ++b) { rw.named[b] = rw.unnamed[b] = 99999999999ull; }
+        const int un = vrCensusFormatRuns(wide, sizeof(wide), rw, 12);
+        check(un > 0 && std::strlen(wide) <= kVrCensusLineBytes && std::strstr(wide, " open=unnamed:4294967295") != nullptr,
+              "the widest realistic runs line (eleven-digit counts in every bin, the longest runs and the open one) fits whole, the open run last");
+        std::printf("  note  widest realistic runs line: %zu characters\n", std::strlen(wide));
+        VrCensusCpu cw;
+        cw.mode[0].sampled = cw.mode[1].sampled = cw.mode[0].postSampled = cw.mode[1].postSampled = 99999999999ull;
+        cw.mode[0].preTicks = cw.mode[1].preTicks = cw.mode[0].postTicks = cw.mode[1].postTicks = 99999999999ull * 100;
+        cw.mode[0].preMax = cw.mode[1].preMax = cw.mode[0].postMax = cw.mode[1].postMax = 999999999999ull;
+        VrCensusWindow ww;
+        ww.frames = ww.calls = 99999999999ull; ww.injCalls = 49999999999ull;
+        const int cn = vrCensusFormatCpu(wide, sizeof(wide), ww, cw, 10000000, 12);
+        check(cn > 0 && std::strlen(wide) <= kVrCensusLineBytes && std::strstr(wide, " inj-post-us=") != nullptr && wide[std::strlen(wide) - 1] != ' ',
+              "the widest realistic detour line (eleven-digit counts, long means and maxima) fits whole, down to the injected post half");
+        std::printf("  note  widest realistic detour line: %zu characters\n", std::strlen(wide));
+        // The 5 s line is untouched by the episodes (it is full at 400 characters): the counters are their own line, and at their widest they fit whole.
+        VrCensusEpisodeCounters wc;
+        wc.taken = 10; wc.triggers = wc.skipped = 4294967295u; wc.state = "armed"; wc.trigger = VrCensusTrigger{VrCensusTriggerKind::Naming, 0, 1};
+        wc.armedFrame = wc.sampleFrame = 999999999ull;
+        const int cn2 = vrCensusFormatEpisodeCounters(wide, sizeof(wide), wc, 12, true);
+        check(cn2 > 0 && std::strlen(wide) <= kVrCensusLineBytes && std::strstr(wide, " sample=999999999") != nullptr, "the widest episode counters line fits whole");
+        std::printf("  note  widest episode counters line: %zu characters\n", std::strlen(wide));
     }
     worst.rows[3] = std::nanf("");
     vrCensusFormatCall(line, sizeof(line), 1, 1, worst);
@@ -1193,11 +2079,74 @@ void testSourcePins(const std::string& injectCpp) {
     check(count(censusH, "bool nativeTemporalEyeGeometry(uint32_t eye, uint64_t* sequence, float frustum[4], float shift[2]);") == 1,
           "the getter's declaration is in the census header, where native_temporal.cpp includes it");
 
+    // THE EPISODES (design-world-camera-motion-2026-09-30.md section 6, Phase 0): with the key off nothing of them is installed, allocated, timed or logged.
+    const std::string joinBody = functionBody(censusCpp, "void joinDraw(ID3D11DeviceContext* ctx, uint32_t ordinal) {");
+    const std::string goLiveBody = functionBody(censusCpp, "void goLive(State* s) {");
+    const std::string stepBody = functionBody(censusCpp, "void episodeStep(State* s) {");
+    const std::string printEpisodeBody = functionBody(censusCpp, "void printEpisode(State* s) {");
+    const std::string joinFacts = functionBody(censusCpp, "void readJoinFacts(State* s, ID3D11DeviceContext* ctx, VrCensusJoinRow* row, bool wantRows) {");
+    check(!joinBody.empty() && !goLiveBody.empty() && !stepBody.empty() && !printEpisodeBody.empty() && !joinFacts.empty(), "the episodes' functions can be delimited in the source");
+    check(startsWith(joinBody, "void joinDraw(ID3D11DeviceContext* ctx, uint32_t ordinal) {", "\n    State* s = g_state;\n    if (!s || !s->active || !ctx || !s->episodes.live()) return;\n"),
+          "KEY OFF: the join's per-draw function returns first unless a census is active and an episode is live (and it is reachable only through the pointer goLive sets)");
+    check(count(censusCpp, "detail::g_vrCensusJoinDraw = &joinDraw;") == 1 && goLiveBody.find("detail::g_vrCensusJoinDraw = &joinDraw;") != std::string::npos &&
+              count(censusCpp, "goLive(s)") == 1 && stepBody.find("if (s->episodes.boundary(s->frame, ended, in)) goLive(s);") != std::string::npos,
+          "KEY OFF: the join's pointer is set in one place (goLive), which only the episode step calls, when the episode machine says the armed frame has come");
+    check(count(censusCpp, "detail::g_vrCensusJoinDraw = nullptr;") == 3 && functionBody(censusCpp, "void deactivate() {").find("detail::g_vrCensusJoinDraw = nullptr;") != std::string::npos &&
+              activateBody.find("detail::g_vrCensusJoinDraw = nullptr;") != std::string::npos && rollBody.find("detail::g_vrCensusJoinDraw = nullptr;") < rollBody.find("printEpisode(s);") &&
+              rollBody.find("printEpisode(s);") < rollBody.find("s->episodes.finish();"),
+          "the pointer is cleared in three places: the census turning on, the key going off, and the boundary that ends the sampled frame (before the frame is printed)");
+    check(count(censusH, "inline VrCensusJoinDrawFn g_vrCensusJoinDraw = nullptr;") == 1 && count(censusCpp + censusH, "g_vrCensusJoinDraw = &") == 1,
+          "KEY OFF: the pointer starts null in its one definition, and is never given a value anywhere but goLive");
+    check(boundary.find("if (!wanted) {") < boundary.find("episodeStep(s);") && boundary.find("rollFrame(s);") < boundary.find("episodeStep(s);") &&
+              boundary.find("episodeStep(s);") < boundary.find("s->phase = readPhase();") && boundary.find("s->named = uiLayerLastFrameNamed();") < boundary.find("rollFrame(s);") &&
+              boundary.find("journalGuiFocus(&s->gui)") < boundary.find("rollFrame(s);") && count(censusCpp, "uiLayerLastFrameNamed()") == 1 && count(censusCpp, "journalGuiFocus(") == 1,
+          "the boundary reads the naming and GuiFocus of the frame that ended once, before it rolls it, steps the episodes after the roll (s->frame is then the frame that starts) and "
+          "before the phase is latched; with the key off it returned before any of it");
+    check(preBody.find("const bool timed = s->cpu.pick();") != std::string::npos && preBody.find("const bool timed = s->cpu.pick();") < preBody.find("ticksNow()") &&
+              preBody.find("const int64_t t0 = timed ? ticksNow() : 0;") != std::string::npos && count(preBody, "ticksNow()") == 2 &&
+              preBody.find("if (timed) s->cpu.notePre(call.willInject, static_cast<uint64_t>(ticksNow() - t0));") != std::string::npos &&
+              count(censusCpp, "QueryPerformanceCounter(") == 1 && count(censusCpp, "PostTimer timer(s, p.timed, p.injected);") == 1 &&
+              censusCpp.find("t0(isTimed ? ticksNow() : 0)") != std::string::npos,
+          "THE DETOUR'S CPU: the clock is read only for the one call in sixteen the counter picks (both halves: a counter and a compare for every other call), by one performance-counter call, "
+          "and the post half's timer reads it only when its call was picked");
+    check(preBody.find("const bool episodeFrame = s->episodes.live();") != std::string::npos && preBody.find("record = s->epFrame.add(call.kindReadable, call.kind, callerRva);") != std::string::npos &&
+              preBody.find("const bool recording = !episodeFrame && vrCensusMayRecord(s->foot, s->phase) && vrCensusPrintsSequence(true, s->sequencesLogged);") != std::string::npos,
+          "an episode's frame records every call into its own buffer; the first-three-frames rule is untouched and never records the episode's frame (no duplicate lines)");
+    check(count(censusCpp, "temporalPassChosenRows(") == 1 && printEpisodeBody.find("temporalPassChosenRows(in.chosen, &in.chosenBound)") != std::string::npos &&
+              printEpisodeBody.find("temporalPassChosenRows(") < printEpisodeBody.find("vrCensusPrintEpisode(") && count(censusCpp, "vrCensusPrintEpisode(") == 1,
+          "the pass's chosen rows are read once, in printEpisode, at the end of the sampled frame, where the pass's own boundary has not yet reset them, and the lines are the core's own "
+          "(the same code the reader's fixture is built with)");
+    check(startsWith(joinFacts, "void readJoinFacts(State* s, ID3D11DeviceContext* ctx, VrCensusJoinRow* row, bool wantRows) {", "\n    FlatComputeInternalScope internal;") &&
+              joinFacts.find("depthWriteOf(ctx)") != std::string::npos &&
+              joinFacts.find("readEyeRows(s, ctx, rows, &b1, &first, &bytes, &why, wantRows)") != std::string::npos,
+          "the join's state reads and its one copy go through the same readback function as the eye draw's, inside the flat compute scope, and rows are asked for only when the signature is its depth's first");
+    check(joinBody.find("bindingGet(BindSlot::Dsv0)") != std::string::npos && joinBody.find("depthCache.find(dsv)") != std::string::npos &&
+              joinBody.find("if (dsv == s->joinLastDsv && vs == s->joinLastVs && ps == s->joinLastPs) {") < joinBody.find("depthCache.find(dsv)") &&
+              joinBody.find("readJoinFacts(s, ctx, row, firstOfDepth);") != std::string::npos && joinBody.substr(joinBody.find('\n')).find("D3D11") == std::string::npos &&
+              joinBody.find("->Get") == std::string::npos && joinBody.find("ctx->") == std::string::npos,
+          "the common draw (the same depth and shaders as the one before) is three compares and no D3D call; a view is resolved once a frame, and only a new signature reads state");
+    {   // the route's per-draw hook, and the temporal pass's accessor (read-only)
+        const std::string routeCpp = slurp("src/d3d11/vr_world_route.cpp");
+        const std::string routeDraw = functionBody(routeCpp, "void vrWorldRouteDraw(");
+        check(!routeDraw.empty() && count(routeCpp, "g_vrCensusJoinDraw") == 2 &&
+                  routeDraw.find("if (detail::g_vrCensusJoinDraw) detail::g_vrCensusJoinDraw(ctx, f.draws);") != std::string::npos &&
+                  routeDraw.find("++f.draws;") < routeDraw.find("detail::g_vrCensusJoinDraw") && routeDraw.find("detail::g_vrCensusJoinDraw") < routeDraw.find("bindingGet(BindSlot::Rtv0)"),
+              "the route's per-draw hook reaches the census's join through one null-tested pointer, after it counted the draw and before it looks at the colour target (depth-only draws count), "
+              "and nothing else in the route touches it: a draw with the census off, or outside an episode's frame, costs one load");
+        const std::string tpCpp = slurp("src/d3d11/temporal_pass.cpp");
+        const std::string chosen = functionBody(tpCpp, "bool temporalPassChosenRows(float rows[12], bool* bound) {");
+        check(!chosen.empty() && chosen.find("chooseCameraRows") == std::string::npos && chosen.find("g_chosenThisFrame =") == std::string::npos &&
+                  chosen.find("g_curValid =") == std::string::npos && chosen.find("++") == std::string::npos && chosen.find("memcpy(rows, g_curRows, sizeof(g_curRows));") != std::string::npos &&
+                  chosen.find("!g_chosenThisFrame || !g_curValid") != std::string::npos,
+              "the accessor of the pass's chosen rows only reads: it chooses nothing, latches nothing and counts nothing, and answers only for a frame the pass chose rows in");
+    }
+
     const std::vector<Pin> pins = {
-        {&censusCpp, "FlatComputeInternalScope internal;", 1, "the eye readback's copy, Map and Unmap run inside FlatComputeInternalScope (the hooks step aside)"},
-        {&censusCpp, "D3D11_USAGE_STAGING", 1, "the readback goes through one staging buffer"},
+        {&censusCpp, "FlatComputeInternalScope internal;", 2, "the eye readback's copy, Map and Unmap, and the join's state reads and copy, run inside FlatComputeInternalScope (the hooks step aside)"},
+        {&censusCpp, "D3D11_USAGE_STAGING", 1, "the readback goes through one staging buffer (the eye's and the join's)"},
         {&censusCpp, "box{offset, 0, 0, offset + 64u, 1, 1}", 1, "the copy is the 64 bytes of rows 270..273 only"},
         {&censusCpp, "s->eye.take(s->frame)", 1, "an eye draw is read back only when the eye budget takes it"},
+        {&censusCpp, "const bool firstOfDepth = !s->join.hasDepth(d->depth);", 1, "a join readback is spent on a depth's first signature only (at most four a frame)"},
     };
     runPins(pins, "source pin control: a source with the line removed no longer contains it");
 }
@@ -1302,6 +2251,19 @@ std::string fixtureLog() {
         VrCensusWindowText t;
         t.hook = "installed"; t.camerasTotal = 3; t.foot = VrCensusFoot::No;
         vrCensusFormatWindow(line, sizeof(line), w, t);
+        put(line);
+        // The window's companions: the episodes' counters (the key-on trigger armed the first episode, sampled at frame 31), no on-foot frame (the journal says not on foot), and the
+        // observer halves timed on 1 call in 16 (a 10 MHz clock: a tick is 0.1 us).
+        VrCensusEpisodeCounters counters;
+        counters.taken = 1; counters.triggers = 1; counters.skipped = 0;
+        vrCensusFormatEpisodeCounters(line, sizeof(line), counters, 1, false);
+        put(line);
+        vrCensusFormatRuns(line, sizeof(line), VrCensusRuns{}, 1);
+        put(line);
+        VrCensusCpu cpu;
+        for (int i = 0; i < 2612; ++i) { cpu.notePre(false, 30 + (i % 7)); cpu.notePost(false, 22 + (i % 5)); }
+        cpu.notePre(false, 520);
+        vrCensusFormatCpu(line, sizeof(line), w, cpu, 10000000, 1);
         put(line);
     }
 
@@ -1447,6 +2409,107 @@ std::string fixtureLog() {
             put(line);
         }
     }
+    // THE EPISODES (Phase 0), written by the very function the DLL prints them with (vrCensusPrintEpisode), from calls built by the derive model so the rows a join read
+    // back are the rows a call composed and the axes the pass's rows are matched against are the axes of that call's camera.
+    //   1. the key-on episode, frame 31, in the cockpit (the journal says not on foot, GuiFocus 0): the eyes' kind-5 calls, a kind-3 scene camera and the UI's kind 1; the join finds
+    //      each eye's first draw into its depth, matches its rows to that eye's kind-5 calls, and the pass chose rows equal to eye 0's view axes (H3: the eye cameras' rows drive it);
+    //   2. a GuiFocus 0 -> 6 episode (the galaxy map), frame 1560: the pass's rows are NOT an eye camera's but a kind-3 camera's, and as the transpose (where the chooser strays);
+    //   3. a naming flip on foot (named -> unnamed: a map opened), frame 6120, the 2D screen's depth: its first draw's rows match nothing the refresh composed.
+    {
+        struct EpCall { uintptr_t ptr, view; uint32_t kind; float fov, aspect, bx, by, nearZ, yaw; uint32_t caller, draw; VrCensusTone tone; };
+        auto fillCall = [&](VrCensusEpisodeFrame& ep, const EpCall& c, float rowsOut[16], float axesOut[12]) {
+            Model m(3, c.fov, c.aspect, c.bx, c.by, c.nearZ);
+            axesOf(m, c.yaw, -0.12f);
+            VrCensusCall* rec = ep.add(true, c.kind, c.caller);
+            rec->camera = c.ptr; rec->view = c.view; rec->kind = c.kind; rec->kindReadable = true; rec->callerRva = c.caller;
+            rec->draw = c.draw; rec->drawKnown = true; rec->tone = c.tone; rec->preFlags = 0x1C; rec->postSeen = true; rec->postFlags = 0x0;
+            rec->rowsValid = vrCensusComposeRows(m.snap(), rec->rows);
+            const VrCensusSnap snap = m.snap();
+            std::memcpy(rec->axes, snap.bytes + (kVrCensusAxes - kVrCensusSnapFrom), sizeof(rec->axes));
+            rec->axesValid = true;
+            if (rowsOut) std::memcpy(rowsOut, rec->rows, sizeof(rec->rows));
+            if (axesOut) std::memcpy(axesOut, rec->axes, sizeof(rec->axes));
+        };
+        auto printEp = [&](const VrCensusEpisodePrint& in, VrCensusEpisodeFrame& ep, VrCensusJoin& join) {
+            vrCensusPrintEpisode([&](VrCensusLines, const char* text) { put(text); }, in, ep, join);
+        };
+        auto joinRow = [&](VrCensusJoin& join, VrCensusJoinDepth depth, uint32_t w, uint32_t h, uint64_t vs, uint64_t ps, uint32_t draw, uint64_t draws, int8_t dw, uint64_t b1,
+                           const float* rows, const char* why) {
+            VrCensusJoinRow* r = join.add(depth, w, h, vs, ps, draw);
+            r->draws = draws; r->depthWrite = dw; r->b1Bound = b1 != 0; r->b1 = b1; r->b1Bytes = b1 ? 5376 : 0; r->rowsAsked = rows != nullptr || why != nullptr;
+            if (rows) { r->rowsRead = true; std::memcpy(r->rows, rows, sizeof(r->rows)); } else r->why = why;
+            return r;
+        };
+        std::unique_ptr<VrCensusEpisodeFrame> ep(new VrCensusEpisodeFrame);
+        VrCensusJoin join;
+        const uint64_t sceneVs = 0x5C36AF051B98B9F1ull, scenePs = 0xCFE84157BC76E921ull, glassVs = 0x11A2B3C4D5E6F708ull, glassPs = 0x0F0E0D0C0B0A0908ull;
+        float eyeRows0[16], eyeRows1[16], sceneRows[16], eyeAxes0[12], sceneAxes[12];
+        {   // 1. key-on, in the cockpit
+            ep->reset();
+            join.begin();
+            for (int i = 0; i < 2; ++i) fillCall(*ep, {ui.ptr, ui.view, 1, ui.fov, ui.aspect, 0.0f, 0.0f, ui.nearZ, 0.7f, 0x58DE73, 0, VrCensusTone::Before}, nullptr, nullptr);
+            for (int i = 0; i < 6; ++i)
+                fillCall(*ep, {world.ptr, worldViews[i % 3], 3, world.fov, world.aspect, 0.0f, 0.0f, world.nearZ, 0.35f + 0.01f * static_cast<float>(i / 2), callers3[i % 3],
+                               static_cast<uint32_t>(120 + 40 * i), VrCensusTone::Before}, i == 0 ? sceneRows : nullptr, i == 0 ? sceneAxes : nullptr);
+            for (int i = 0; i < 6; ++i) {
+                const int e = i / 3;
+                fillCall(*ep, {eyePtr[e], eyeView[e], 5, eyeCam[e].fov, eyeCam[e].aspect, eyeCam[e].bx, eyeCam[e].by, 0.025f, 0.02f + 0.001f * static_cast<float>(e), callers3[i % 3],
+                               8210u + static_cast<uint32_t>(i), VrCensusTone::After}, i % 3 == 0 ? (e == 0 ? eyeRows0 : eyeRows1) : nullptr, i == 0 ? eyeAxes0 : nullptr);
+            }
+            joinRow(join, VrCensusJoinDepth::Eye0, 2620, 2533, sceneVs, scenePs, 8210, 1432, 1, 0x1eb2e751e20ull, eyeRows0, nullptr);
+            joinRow(join, VrCensusJoinDepth::Eye0, 2620, 2533, glassVs, glassPs, 8650, 61, 0, 0x1eb2e751e20ull, nullptr, "skip");
+            joinRow(join, VrCensusJoinDepth::Eye1, 2620, 2533, sceneVs, scenePs, 8215, 1432, 1, 0x1eb2e751e20ull, eyeRows1, nullptr);
+            join.seen = 3100; join.views = 4;   // the shadow atlas and the three depths joined (2,925 draws into them)
+            VrCensusEpisodePrint in;
+            in.n = 1; in.frame = 31; in.armedFrame = 1; in.trigger = VrCensusTrigger{VrCensusTriggerKind::KeyOn, 0, 0};
+            in.foot = VrCensusFoot::No; in.guiKnown = true; in.gui = 0; in.named = false;
+            in.haveChosen = true; in.chosenBound = true;
+            std::memcpy(in.chosen, eyeAxes0, sizeof(in.chosen));
+            in.chosen[3] = in.chosen[7] = in.chosen[11] = 0.0f;
+            printEp(in, *ep, join);
+        }
+        {   // 2. the galaxy map opened (GuiFocus 0 -> 6): the pass's rows are the scene camera's axes, transposed
+            ep->reset();
+            join.begin();
+            for (int i = 0; i < 4; ++i) fillCall(*ep, {ui.ptr, ui.view, 1, ui.fov, ui.aspect, 0.0f, 0.0f, ui.nearZ, 0.5f, 0x58DE73, 0, VrCensusTone::Before}, nullptr, nullptr);
+            for (int i = 0; i < 5; ++i)
+                fillCall(*ep, {world.ptr, worldViews[i % 3], 3, world.fov, world.aspect, 0.0f, 0.0f, world.nearZ, 0.9f, callers3[i % 3], static_cast<uint32_t>(90 + 30 * i),
+                               VrCensusTone::Before}, i == 0 ? sceneRows : nullptr, i == 0 ? sceneAxes : nullptr);
+            float eye1Rows[16];
+            for (int i = 0; i < 6; ++i) {
+                const int e = i / 3;
+                fillCall(*ep, {eyePtr[e], eyeView[e], 5, eyeCam[e].fov, eyeCam[e].aspect, eyeCam[e].bx, eyeCam[e].by, 0.025f, 0.5f, callers3[i % 3], 8300u + static_cast<uint32_t>(i),
+                               VrCensusTone::After}, i == 3 ? eye1Rows : nullptr, nullptr);
+            }
+            joinRow(join, VrCensusJoinDepth::Eye0, 2620, 2533, sceneVs, scenePs, 8300, 900, 1, 0x1eb2e751e20ull, nullptr, "map");
+            joinRow(join, VrCensusJoinDepth::Eye1, 2620, 2533, sceneVs, scenePs, 8305, 900, 1, 0x1eb2e751e20ull, eye1Rows, nullptr);
+            join.seen = 2100; join.views = 3;
+            VrCensusEpisodePrint in;
+            in.n = 2; in.frame = 1560; in.armedFrame = 1530; in.trigger = VrCensusTrigger{VrCensusTriggerKind::Gui, 0, 6};
+            in.foot = VrCensusFoot::No; in.guiKnown = true; in.gui = 6; in.named = false;
+            in.haveChosen = true; in.chosenBound = false;
+            for (int r = 0; r < 3; ++r) for (int c = 0; c < 4; ++c) in.chosen[r * 4 + c] = c < 3 ? sceneAxes[c * 4 + r] : 0.0f;   // the transpose of the scene camera's axes
+            printEp(in, *ep, join);
+        }
+        {   // 3. on foot, the naming flipped to unnamed (a map): the 2D screen's own depth, whose first draw's rows no refresh call composed
+            ep->reset();
+            join.begin();
+            for (int i = 0; i < 6; ++i)
+                fillCall(*ep, {world.ptr, worldViews[i % 3], 3, world.fov, world.aspect, 0.0f, 0.0f, world.nearZ, 0.6f, callers3[i % 3], static_cast<uint32_t>(60 + 25 * i),
+                               VrCensusTone::Before}, nullptr, nullptr);
+            float mapRows[16];
+            for (int i = 0; i < 16; ++i) mapRows[i] = 0.01f * static_cast<float>(i + 1);
+            joinRow(join, VrCensusJoinDepth::Screen, 5040, 2835, 0xDFED8E1C9E191BECull, 0x143AAE0597E2F7BFull, 41, 22, 1, 0x1eb2e751e20ull, mapRows, nullptr);
+            joinRow(join, VrCensusJoinDepth::Screen, 5040, 2835, glassVs, glassPs, 77, 311, 0, 0x1eb2e751e20ull, nullptr, "skip");
+            joinRow(join, VrCensusJoinDepth::EyeUnknown, 2620, 2533, glassVs, scenePs, 90, 4, 1, 0, nullptr, "no-b1");
+            join.seen = 905; join.views = 5;
+            VrCensusEpisodePrint in;
+            in.n = 3; in.frame = 6120; in.armedFrame = 6090; in.trigger = VrCensusTrigger{VrCensusTriggerKind::Naming, 1, 0};
+            in.foot = VrCensusFoot::Yes; in.guiKnown = false; in.named = false; in.phase = phaseOf[0];
+            in.haveChosen = false;
+            printEp(in, *ep, join);
+        }
+    }
     // The on-foot window: the route's two lines, then the census's 5 s line, which says how many calls the detour injected.
     {
         VrWorldWindow rw;
@@ -1472,6 +2535,25 @@ std::string fixtureLog() {
         VrCensusWindowText t;
         t.hook = "installed"; t.camerasTotal = 5; t.foot = VrCensusFoot::Yes;
         vrCensusFormatWindow(line, sizeof(line), w, t);
+        put(line);
+        // The episodes taken: key-on, the galaxy map, a map on foot; two triggers found one armed.
+        VrCensusEpisodeCounters counters;
+        counters.taken = 3; counters.triggers = 5; counters.skipped = 2;
+        vrCensusFormatEpisodeCounters(line, sizeof(line), counters, 1, false);
+        put(line);
+        // On foot: 413 frames counted, the world named almost all of them; two one-frame blips and a two-frame one of unnamed, and a seven-frame stretch (a map).
+        VrCensusRuns runs;
+        runs.frames = 413;
+        runs.named[0] = 1; runs.named[5] = 1; runs.named[6] = 1;
+        runs.unnamed[0] = 2; runs.unnamed[1] = 1; runs.unnamed[3] = 1;
+        runs.longestNamed = 211; runs.longestUnnamed = 7; runs.open = 1; runs.openLength = 211;
+        vrCensusFormatRuns(line, sizeof(line), runs, 1);
+        put(line);
+        VrCensusCpu cpu;
+        for (int i = 0; i < 253; ++i) { cpu.notePre(false, 31 + (i % 6)); cpu.notePost(false, 24 + (i % 4)); }
+        for (int i = 0; i < 422; ++i) { cpu.notePre(true, 36 + (i % 8)); cpu.notePost(true, 26 + (i % 3)); }
+        cpu.notePre(true, 610);
+        vrCensusFormatCpu(line, sizeof(line), w, cpu, 10000000, 1);
         put(line);
     }
     return out;
@@ -1556,10 +2638,21 @@ void testReaderFixture() {
     const char* classes[] = {"vr camera census 5s: frames=", "vr camera census: camera=0x", "vr camera census: changed: camera=0x",
                              "vr camera census: sequence frame=", "vr camera census: call frame=", "vr camera census: eye=",
                              "vr camera census: eye-geometry eye=",
-                             "vr world route 5s: key=auto state=owned", "vr world route inject 5s: inj-scene=5400"};
+                             "vr world route 5s: key=auto state=owned", "vr world route inject 5s: inj-scene=5400",
+                             "vr camera census: episode frame=", "vr camera census: pass-rows ep=", "vr camera census: join ep=", "vr camera census: join-rows ep=",
+                             "vr camera census: runs windows=", "vr camera census: detour windows=", "vr camera census: episodes windows=",
+                             "vr camera census: join-draws ep="};
     unsigned found = 0;
     for (const char* cls : classes) if (built.find(cls) != std::string::npos) ++found;
-    check(found == 9, "the fixture holds a line of every class the rig pins: 5 s, camera, changed, sequence, call, eye, eye-geometry, and the route's two lines");
+    check(found == 17, "the fixture holds a line of every class the rig pins: 5 s, camera, changed, sequence, call, eye, eye-geometry, the route's two lines, and the episodes' header, "
+                       "pass rows, join draw counts, join, join rows and the window's three companions (episode counters, runs, detour)");
+    check(built.find(" kind=5 caller=+0x594FE1 draw=8212 tone=after inj=0 role=- ") != std::string::npos && built.find(" trigger=key-on ") != std::string::npos &&
+              built.find(" trigger=gui:0>6 ") != std::string::npos && built.find(" trigger=naming:named>unnamed ") != std::string::npos &&
+              built.find(" how=identity ") != std::string::npos && built.find(" how=transpose ") != std::string::npos && built.find(" rows=- why=map") != std::string::npos &&
+              built.find(" rows=- why=skip") != std::string::npos && built.find(" rows=- why=no-b1") != std::string::npos && built.find(" rows=read match=-") != std::string::npos &&
+              built.find("vr camera census: episodes windows=1 taken=3/10 triggers=5 skipped=2 state=idle") != std::string::npos,
+          "the fixture carries each shape the reader's episodes section reads: three triggers, the pass's rows as the axes and as their transpose, a join that matched calls and one that "
+          "matched none, a readback that failed, a skipped signature, a draw with no b1, and the counters of the 5 s line");
     // The stage 2 tokens are in the fixture's census lines, from the formatters: a sampled frame's phase, what the detour decided for a call.
     check(built.find(" phase=0.2520,-0.1260 calls=24 recorded=24 truncated=0") != std::string::npos &&
               built.find(" inj=1 role=scene ") != std::string::npos && built.find(" inj=1 role=fp ") != std::string::npos &&
@@ -1593,6 +2686,12 @@ int runSelfTest() {
     testWindow();
     testBudget();
     testOffThread();
+    testEpisodeMachine();
+    testNamingRuns();
+    testObserverCpu();
+    testEpisodeFrame();
+    testEpisodePrint();
+    testEpisodeSession();
     testFormats();
     testSession();
     testPhaseSession();
