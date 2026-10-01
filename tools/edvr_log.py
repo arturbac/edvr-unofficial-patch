@@ -16,6 +16,7 @@
     python tools/edvr_log.py --target epic --flat-upscale --expect-build HEAD
     python tools/edvr_log.py --target frontier --vr-supersampling --expect-build HEAD
     python tools/edvr_log.py --target frontier --route-curve --expect-build HEAD
+    python tools/edvr_log.py --target steam --freezes --expect-build HEAD
     python tools/edvr_log.py --list
 
 This is the sanctioned replacement for `Get-Content <some path> -Tail 200 |
@@ -173,11 +174,33 @@ STOP), OWNS (its sentence names the curve the next window shows) and FAULT. Like
 the log has no route line. A log from before the curved route has no curve tokens:
 that is a WARN which says so, never a PASS.
 
+--freezes reads one flight's freeze diagnostics (issue 63). A frame or runtime cycle of
+250 ms or more is a freeze and always gets a line, so the report lays them out from both
+logs (the runtime log is paired as --tally periodic pairs it; --runtime-file names one;
+every time printed is local): FREEZES (each FREEZE line of the graphics log with its
+LONG FRAME line, the runtime's native_long_cycle line of that sequence and its main
+phase, the stall sampler's samples inside it with their age and owner, and the GPU
+census's kept stall of that sequence), RUNTIME CYCLES of 250 ms or more (marked
+`runtime only` when no FREEZE line goes with one), COUNTS (the latest counts line of each
+half, by size bucket), WORST (the latest worst-few set of each half), STALL SAMPLER
+(armed or off, samples by owner module, failed samples by reason, the longest suspension,
+EDVR code on the stack) and GPU CLOCK; then PASS / WARN / STOP lines: INSTRUMENT (the
+counts line is the proof the logging ran), UNWRITTEN FREEZES (over_250ms_unwritten above
+0 is a STOP), FREEZE LINES (a runtime cycle of 250 ms or more with no FREEZE line, beside
+a graphics counts line, is a STOP; a FREEZE line with no LONG FRAME line a WARN), SAMPLER,
+SUSPENSION (over 5000 us a WARN, over 50000 a STOP), FREEZE TEST (a log written with
+advanced.freeze_test_ms: its deliberate sleep must be a FREEZE with its LONG FRAME line, runtime
+cycle and stall samples, EDVR's own code on the stack) and NO FREEZE. A value a log does not
+carry prints `-`, never 0. Like --route-curve its exit code carries the verdict: 0 for
+PASS or WARN, 1 for STOP, 2 for a wrong build (the runtime log is checked too), 3 when the
+log holds none of the freeze lines (a build from before the freeze logging).
+
 Exit 0 when a log was read, 1 when none was found (or --camera-census found no
 census line, or --vscreen-fit no auto-fit line, or --flat-upscale no flat line, or
 --vr-supersampling no VR line), 2 when --expect-build did not match (--tally periodic
-checks the runtime log against it too). --maps-sharp's and --route-curve's codes for a
-log they read are their own (above): 0, 1 and 3 mean a verdict, not "no log".
+and --freezes check the runtime log against it too). --maps-sharp's, --route-curve's and
+--freezes's codes for a log they read are their own (above): 0, 1 and 3 mean a verdict,
+not "no log".
 """
 
 import argparse
@@ -3384,7 +3407,7 @@ def _note_line(scan, msg, t):
 
 
 def scan_flight_log(text, kind, base_days=0, start_tod=None,
-                    to_local=datetime.timedelta(0)):
+                    to_local=datetime.timedelta(0), on_line=None):
     """One pass over a log: its `periodic work:` lines and its long frames on
     the common clock, plus the first and last stamped line.
 
@@ -3393,7 +3416,12 @@ def scan_flight_log(text, kind, base_days=0, start_tod=None,
     log opened; the prefix has no date, so the day rolls over whenever the clock
     goes back by more than half a day (a line stamped just before a midnight
     already crossed, which threads can write out of order, keeps the old day).
-    kind "rt": a full UTC prefix, turned to local by to_local."""
+    kind "rt": a full UTC prefix, turned to local by to_local.
+
+    on_line(message, t), when given, is called for every stamped line with the
+    text after its prefix and its time on the common clock, after the line is
+    filed here: --freezes reads its own lines through it, on this one clock,
+    instead of keeping a second copy of the day and zone arithmetic."""
     scan = {"kind": kind, "stamped": 0, "first": None, "last": None,
             "ops": {}, "events": [], "frames": [], "windows": [],
             "cycle_summary": None, "frame_cap": None,
@@ -3432,15 +3460,20 @@ def scan_flight_log(text, kind, base_days=0, start_tod=None,
             scan["first"] = t
         if scan["last"] is None or t > scan["last"]:
             scan["last"] = t
-        _note_line(scan, raw[m.end():], t)
+        msg = raw[m.end():]
+        _note_line(scan, msg, t)
+        if on_line is not None:
+            on_line(msg, t)
     return scan
 
 
-def scan_flight(gfx_path, gfx_text, rt_path=None, rt_text=None):
+def scan_flight(gfx_path, gfx_text, rt_path=None, rt_text=None,
+                gfx_on_line=None, rt_on_line=None):
     """Both logs scanned onto the one local clock. Returns (graphics scan,
     runtime scan or None, clock), clock naming how the runtime's UTC became
     local. The graphics log's date is the one its file name carries; without a
-    usable name it is the runtime log's first local day."""
+    usable name it is the runtime log's first local day. gfx_on_line and
+    rt_on_line are scan_flight_log's on_line for the two logs."""
     to_local, how, first_utc = datetime.timedelta(0), None, None
     if rt_text is not None:
         to_local, how, first_utc = runtime_to_local(rt_path, rt_text)
@@ -3453,10 +3486,12 @@ def scan_flight(gfx_path, gfx_text, rt_path=None, rt_text=None):
     elif first_utc is not None:
         first_day = (first_utc + to_local).date()
     base_days = (first_day - EPOCH.date()).days if first_day else 0
-    gscan = scan_flight_log(gfx_text, "gfx", base_days, start_tod)
+    gscan = scan_flight_log(gfx_text, "gfx", base_days, start_tod,
+                            on_line=gfx_on_line)
     rscan = None
     if rt_text is not None:
-        rscan = scan_flight_log(rt_text, "rt", to_local=to_local)
+        rscan = scan_flight_log(rt_text, "rt", to_local=to_local,
+                                on_line=rt_on_line)
     clock = {"to_local": to_local if rt_text is not None else None,
              "how": how}
     return gscan, rscan, clock
@@ -3675,18 +3710,23 @@ def _fmt_zone(delta):
                                abs(minutes) // 60, abs(minutes) % 60)
 
 
-def print_periodic_report(gfx_path, gfx_text, gfx_ver, want, args, native_dirs):
-    """The --tally periodic report. Returns the process exit code."""
-    window_s = args.window_ms / 1000.0
-
-    # The runtime log that goes with this graphics log, and whether it is the
-    # right build: its lines are as much evidence as the graphics log's.
+def open_runtime_log(gfx_path, gfx_ver, want, runtime_file, native_dirs,
+                     lacking="native_long_cycle and frame_cycle_report lines "
+                             "are unavailable"):
+    """The runtime log that goes with a graphics log, read, and whether it is
+    the right build: its lines are as much evidence as the graphics log's.
+    runtime_file (--runtime-file) names it, else pair_runtime_log finds the one
+    that opened nearest. Prints what it found. Returns (path or None, text or
+    None, exit code or None): a code means stop and return it (1 for a
+    --runtime-file that is not there, 2 for a runtime log of another build than
+    the one --expect-build named). `lacking` says what a missing runtime log
+    takes away from the report that asked."""
     rt_path = rt_why = None
-    if args.runtime_file:
-        rt_path = os.path.abspath(args.runtime_file)
+    if runtime_file:
+        rt_path = os.path.abspath(runtime_file)
         if not os.path.isfile(rt_path):
             print("[edvr] no such runtime log: %s" % rt_path)
-            return 1
+            return None, None, 1
     else:
         rt_path, rt_why = pair_runtime_log(gfx_path, native_dirs)
     rt_text = None
@@ -3710,15 +3750,25 @@ def print_periodic_report(gfx_path, gfx_text, gfx_ver, want, args, native_dirs):
                       "       This flight is not evidence about that build. "
                       "Reinstall and fly again."
                       % (rt_ver or "(nothing)", want))
-                return 2
+                return rt_path, rt_text, 2
         elif gfx_ver and rt_ver and not version_matches(gfx_ver, rt_ver):
             print("[edvr] WARNING: the runtime log is from build %s and the "
                   "graphics log from %s; they are not one flight of one build."
                   % (rt_ver, gfx_ver))
     else:
         print("[edvr] runtime log: NONE FOUND -- %s.\n"
-              "       native_long_cycle and frame_cycle_report lines are "
-              "unavailable; only the graphics log is read." % rt_why)
+              "       %s; only the graphics log is read." % (rt_why, lacking))
+    return rt_path, rt_text, None
+
+
+def print_periodic_report(gfx_path, gfx_text, gfx_ver, want, args, native_dirs):
+    """The --tally periodic report. Returns the process exit code."""
+    window_s = args.window_ms / 1000.0
+
+    rt_path, rt_text, rc = open_runtime_log(gfx_path, gfx_ver, want,
+                                            args.runtime_file, native_dirs)
+    if rc is not None:
+        return rc
 
     gscan, rscan, clock = scan_flight(gfx_path, gfx_text, rt_path, rt_text)
     if gscan["stamped"] == 0:
@@ -5530,6 +5580,1490 @@ def self_test_route_curve():
     return ok
 
 
+# --freezes: one flight's freeze diagnostics (issue 63). A frame or runtime cycle of 250 ms or more is a FREEZE and ALWAYS gets a line, whatever the
+# rate limit says (src/common/freeze_book.h kFreezeAlwaysLogMs), so this reads both logs for those lines, joins them across the two clocks, and says
+# whether the instrument itself ran. What each source writes (a graphics log line is `[HH:MM:SS.mmm] ` local time, a runtime log line
+# `YYYY-MM-DD HH:MM:SS.mmm UTC pid=.. tid=.. `; scan_flight puts both on the one local clock, --tally periodic's own):
+#
+#   graphics log   `monitor: FREEZE -- <ms> ms between Presents, ended now: frame N, runtime sequence S; runtime cycle <ms ...|unavailable ...>;
+#                  freeze K of this session[; stall sampler <state>]. ...` (perf_monitor.cpp freezeLine), written right after the frame's LONG
+#                  FRAME line, so both carry the END of the freeze, which covers [time - ms, time]; `monitor: long frame counts reason=<periodic|
+#                  session_close|shutdown> key=value ...; prose` (writeFreezeSummary: the frames by size, written or not, blips apart); `monitor:
+#                  worst long frame R of N: ...` (up to five, a later set replaces an earlier one); the stall sampler's `stall sampler: armed|off`,
+#                  `stall: ...` (one line per sample, its tail the suspension and whether EDVR's own code was on the stack, or one that failed)
+#                  and `stall sampler counts reason=...`; the GPU census's frame-gap line, which keeps a pair over 1 s as a stall and names its
+#                  runtime sequence (gpu_frame_gap.h formatGapDetail).
+#   runtime log    `native_long_cycle,...` (every cycle over twice the period; from 250 ms up never rate limited), `native_long_cycle_worst,rank=R,
+#                  of=N,utc=...,...` (the same fields, a cycle's end in UTC), `native_long_cycle_counts,reason=...,...` every five minutes and
+#                  `native_long_cycle_summary,...` at session close (the three old fields, then the counts by size).
+#
+# The exit code carries the verdict, as --route-curve's does: 0 for PASS or WARN, 1 for STOP, 3 when the log holds none of the freeze lines (a build
+# from before the freeze logging; main() answers 2 for a wrong build before this runs, and this answers 2 for a runtime log of another build). A line
+# that opens like one of these and matches none of the formats is counted and named, never dropped, because a reader that drifted from the C++ would
+# otherwise look like a quiet flight. self_test_freezes builds its logs from the exact lines the C++ writes.
+
+FREEZE_MS = 250.0               # a frame or cycle this long is a freeze (freeze_book.h kFreezeAlwaysLogMs)
+FREEZE_LONG_FRAME_S = 0.050     # a LONG FRAME line goes with a FREEZE line when its runtime sequence agrees or its time is this close
+FREEZE_STALL_PAD_S = 0.050      # a stall sample goes with a freeze when it was taken in [end - gap - this, end + this]
+FREEZE_CYCLE_S = 0.150          # a runtime cycle goes with a FREEZE line when its sequence is within one or its time this close
+FREEZE_SUSPEND_WARN_US = 5000   # a sample that stopped the render thread longer than this is a WARN
+FREEZE_SUSPEND_STOP_US = 50000  # ...and longer than this a STOP: far longer than a sample should take
+FREEZE_DETAIL_MAX = 12          # the FREEZES section prints the full joins for this many freezes, the longest; the rest get a row and one summary line
+# The size buckets of the counts lines, in the order the keys are written (freeze_book.h freezeBucketKey), each with its words. Only the first
+# three can be unwritten: from 250 ms up every frame is written, so the counts line has no unwritten_ key for the others and their cell prints `-`.
+FREEZE_BUCKETS = (("lt50", "under 50 ms"), ("50_100", "50-100 ms"), ("100_250", "100-250 ms"), ("250_1000", "250-1000 ms"), ("ge1000", "1 s and over"))
+
+FZ_FREEZE_RE = re.compile(
+    r"monitor: FREEZE -- (?P<ms>[0-9.]+) ms between Presents, ended now: frame (?P<frame>\d+), runtime sequence (?P<seq>\d+); "
+    r"runtime cycle (?P<cycle>.*?); freeze (?P<n>\d+) of this session")
+FZ_FREEZE_CYCLE_RE = re.compile(
+    r"(?P<ms>[0-9.]+) ms \((?P<head>[0-9.]+) ms from the pose wait's return to this Present, the previous cycle (?P<prev>[0-9.]+) ms\)")
+# The stall sampler's own clause, which sits right before the final sentence (and is absent from a build without the sampler): its state is
+# `off (...)`, `took N sample(s), the last in <module>+0x<rva>` or `took no sample (...)`, and may hold periods, so it ends at the sentence's start.
+FZ_FREEZE_SAMPLER_RE = re.compile(r"; stall sampler (?P<state>.+?)(?:\. A frame of |\.?$)")
+FZ_KV_RE = re.compile(r"(?P<k>\w+)=(?P<v>\d+)")
+FZ_GFX_COUNTS_RE = re.compile(r"monitor: long frame counts reason=(?P<reason>\w+) (?P<kv>[^;]*)")
+FZ_GFX_WORST_RE = re.compile(
+    r"monitor: worst long frame (?P<rank>\d+) of (?P<of>\d+): (?P<ms>[0-9.]+) ms between Presents, ended (?P<ended>\d\d:\d\d:\d\d\.\d{3}) "
+    r"\(frame (?P<frame>\d+), runtime sequence (?P<seq>\d+), runtime cycle (?P<cycle>[0-9.]+ ms|unavailable)\)(?:; (?P<note>.*?))?\s*$")
+# The sampler's one state line, at the first Present: `armed. ...`, `off (advanced.freeze_location = off). ...` or `could not start its watchdog thread; ...`.
+FZ_SAMPLER_STATE_RE = re.compile(r"stall sampler: (?P<text>(?P<state>armed|off|could not start)\b.*?)\s*$")
+FZ_STALL_COUNTS_RE = re.compile(r"stall sampler counts reason=(?P<reason>\w+) (?P<kv>[^;]*)")
+# advanced.freeze_test_ms: the test trigger's two lines (the key as read, then the sleep itself, written just before the render thread sleeps).
+FZ_TEST_ARMED_RE = re.compile(r"freeze test: advanced\.freeze_test_ms = (?P<ms>\d+)\.")
+FZ_TEST_SLEEP_RE = re.compile(r"freeze test: the render thread sleeps (?P<ms>\d+) ms now\.")
+# A sample's line: the head is fixed; what follows `thread N` is read piece by piece, because it grew (`suspended N us`, then a note that the stack
+# pointer was outside the thread's stack, then `EDVR code on the stack: yes|no`, with the frame count and the innermost EDVR frame when yes).
+FZ_STALL_RE = re.compile(
+    r"stall: the render thread stalled (?P<age>[0-9.]+) ms in (?P<top>[^;]+?); owner (?P<owner>[^;]+?); stack (?P<stack>[^;]*?); "
+    r"sample (?P<k>\d+) of (?P<of>\d+), last Present returned in frame (?P<frame>\d+), thread (?P<tid>\d+)")
+FZ_STALL_SUSPEND_RE = re.compile(r"\bsuspended (?P<us>\d+) us\b")
+FZ_STALL_EDVR_RE = re.compile(r"EDVR code on the stack: (?P<yes>yes|no)\b(?: \((?P<frames>\d+) frames?, innermost (?P<where>[^)]+)\))?")
+FZ_STALL_FAIL_RE = re.compile(
+    r"stall: sample (?P<k>\d+) of (?P<of>\d+) at (?P<at>[0-9.]+) ms failed: (?P<why>[^;]+?); last Present returned in frame (?P<frame>\d+), "
+    r"thread (?P<tid>\d+)")
+FZ_GPU_HEAD = "EDVR GPU census, frame gap:"
+FZ_GPU_STALL_RE = re.compile(
+    r"(?P<n>\d+) pairs? over 1 s KEPT as stalls \([^)]*?longest (?P<longest>[0-9.]+) ms[^)]*\):(?P<pairs>.*)$")
+FZ_GPU_PAIR_RE = re.compile(r"\bsequence (?P<seq>\d+) (?P<ms>[0-9.]+) ms")
+FZ_GPU_MORE_RE = re.compile(r"\(and (?P<n>\d+) more\)")
+FZ_UTC_RE = re.compile(r"^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)\.(\d{3})Z$")
+# The phases of a long cycle that can hold its time, in the order the line writes them. When the Present split is unavailable the three
+# between the second Submit and the next wait are one phase.
+FZ_PHASES_BEFORE = ("game_before_first_submit", "first_submit_roundtrip", "between_eye_calls", "second_submit_roundtrip")
+FZ_PHASES_SPLIT = ("pre_present", "present_hook", "post_present")
+FZ_PHASE_UNSPLIT = "post_second_submit_to_next_wait"
+FZ_PHASES_AFTER = ("next_wait_roundtrip",)
+
+
+def _fz_unparsed(fz, msg):
+    """A line that opens like one of the freeze lines but matches none of the formats: the C++ wording changed. Counted and shown, as _unparsed does
+    for the periodic report."""
+    fz["unparsed"]["count"] += 1
+    if len(fz["unparsed"]["samples"]) < 2:
+        fz["unparsed"]["samples"].append(msg[:120])
+
+
+def _fz_fields(msg):
+    """A runtime log line's comma-separated key=value fields, its first word (the line's name) as `_name`. The first of a repeated key wins."""
+    parts = msg.strip().split(",")
+    out = {"_name": parts[0]}
+    for part in parts[1:]:
+        key, sep, val = part.partition("=")
+        key = key.strip()
+        if sep and key and key not in out:
+            out[key] = val.strip()
+    return out
+
+
+def _fz_num(fields, key):
+    """A field as a float, or None when the line does not have it (an older build) or it is not a number."""
+    try:
+        return float(fields[key])
+    except (KeyError, ValueError):
+        return None
+
+
+def _fz_ints(fields):
+    """The all-digit fields of a runtime counts line as ints (count, logged, candidates, long_lt50, ...)."""
+    return {k: int(v) for k, v in fields.items() if k != "_name" and v.isdigit()}
+
+
+def _fz_utc(text):
+    """The naive UTC datetime of a worst-list line's `utc=YYYY-MM-DDTHH:MM:SS.mmmZ`, or None (`utc=unknown`, or not a date)."""
+    u = FZ_UTC_RE.match(text)
+    if not u:
+        return None
+    try:
+        return datetime.datetime(int(u.group(1)), int(u.group(2)), int(u.group(3)), int(u.group(4)), int(u.group(5)), int(u.group(6)),
+                                 int(u.group(7)) * 1000)
+    except ValueError:
+        return None
+
+
+def _fz_worst_add(sets, entry):
+    """File one worst-list line. The lines of one set are written together with rising ranks, so a rank that does not rise starts the next set (a
+    later set replaces an earlier one: the list is reprinted when it changed, and at the end)."""
+    if not sets or entry["rank"] <= sets[-1][-1]["rank"]:
+        sets.append([entry])
+    else:
+        sets[-1].append(entry)
+
+
+def _fz_gfx_line(fz, msg, t):
+    """File one graphics log line (the text after its prefix, t its time on the common clock) if it is one of the freeze lines. LONG FRAME lines are
+    scan_flight_log's own (its frames), read from there."""
+    if msg.startswith("monitor: FREEZE -- "):
+        m = FZ_FREEZE_RE.match(msg)
+        if not m:
+            _fz_unparsed(fz, msg)
+            return
+        cyc = FZ_FREEZE_CYCLE_RE.match(m.group("cycle"))
+        smp = FZ_FREEZE_SAMPLER_RE.search(msg, m.end())
+        fz["freezes"].append({
+            "t": t, "ms": float(m.group("ms")), "frame": int(m.group("frame")), "seq": int(m.group("seq")), "n": int(m.group("n")),
+            "cycle_ms": float(cyc.group("ms")) if cyc else None, "head_ms": float(cyc.group("head")) if cyc else None,
+            "prev_ms": float(cyc.group("prev")) if cyc else None, "sampler": smp.group("state") if smp else None})
+    elif msg.startswith("monitor: long frame counts "):
+        m = FZ_GFX_COUNTS_RE.match(msg)
+        kv = {k: int(v) for k, v in FZ_KV_RE.findall(m.group("kv"))} if m else {}
+        if not m or "candidates" not in kv:
+            _fz_unparsed(fz, msg)
+            return
+        fz["gfx_counts"].append({"t": t, "reason": m.group("reason"), "kv": kv})
+    elif msg.startswith("monitor: worst long frame "):
+        m = FZ_GFX_WORST_RE.match(msg)
+        if not m:
+            _fz_unparsed(fz, msg)
+            return
+        cycle = m.group("cycle")
+        _fz_worst_add(fz["gfx_worst_sets"], {
+            "t": t, "rank": int(m.group("rank")), "of": int(m.group("of")), "ms": float(m.group("ms")), "ended": m.group("ended"),
+            "frame": int(m.group("frame")), "seq": int(m.group("seq")), "cycle_ms": None if cycle == "unavailable" else float(cycle.split()[0]),
+            "note": m.group("note")})
+    elif msg.startswith("stall sampler: "):
+        m = FZ_SAMPLER_STATE_RE.match(msg)
+        if not m:
+            _fz_unparsed(fz, msg)
+            return
+        fz["sampler_state"] = {"t": t, "state": "failed" if m.group("state") == "could not start" else m.group("state"), "text": m.group("text")}
+    elif msg.startswith("freeze test: "):
+        armed, slept = FZ_TEST_ARMED_RE.match(msg), FZ_TEST_SLEEP_RE.match(msg)
+        if not (armed or slept):
+            _fz_unparsed(fz, msg)
+            return
+        fz["tests"].append({"kind": "armed" if armed else "sleep", "ms": int((armed or slept).group("ms")), "t": t})
+    elif msg.startswith("stall sampler counts "):
+        m = FZ_STALL_COUNTS_RE.match(msg)
+        if not m:
+            _fz_unparsed(fz, msg)
+            return
+        fz["stall_counts"].append({"t": t, "reason": m.group("reason"), "kv": {k: int(v) for k, v in FZ_KV_RE.findall(m.group("kv"))}})
+    elif msg.startswith("stall: "):
+        m = FZ_STALL_RE.match(msg)
+        if m:
+            sus = FZ_STALL_SUSPEND_RE.search(msg, m.end())
+            if not sus:
+                _fz_unparsed(fz, msg)
+                return
+            edvr = FZ_STALL_EDVR_RE.search(msg, m.end())
+            fz["stalls"].append({
+                "kind": "stall", "t": t, "age_ms": float(m.group("age")), "top": m.group("top").strip(), "owner": m.group("owner").strip(),
+                "stack": [p.strip() for p in m.group("stack").split(" < ") if p.strip()], "k": int(m.group("k")), "of": int(m.group("of")),
+                "frame": int(m.group("frame")), "tid": int(m.group("tid")), "us": int(sus.group("us")),
+                "outside": "outside the thread's stack" in msg[m.end():],
+                "edvr": None if not edvr else edvr.group("yes") == "yes",
+                "edvr_frames": int(edvr.group("frames")) if edvr and edvr.group("frames") else None,
+                "edvr_where": edvr.group("where").strip() if edvr and edvr.group("where") else None})
+            return
+        m = FZ_STALL_FAIL_RE.match(msg)
+        if not m:
+            _fz_unparsed(fz, msg)
+            return
+        fz["stall_fails"].append({
+            "kind": "fail", "t": t, "k": int(m.group("k")), "of": int(m.group("of")), "at_ms": float(m.group("at")), "why": m.group("why").strip(),
+            "frame": int(m.group("frame")), "tid": int(m.group("tid"))})
+    elif msg.startswith(FZ_GPU_HEAD) and " KEPT as stalls" in msg:
+        m = FZ_GPU_STALL_RE.search(msg)
+        if not m:
+            _fz_unparsed(fz, msg)
+            return
+        more = FZ_GPU_MORE_RE.search(m.group("pairs"))
+        fz["gpu"].append({
+            "t": t, "n": int(m.group("n")), "longest_ms": float(m.group("longest")), "more": int(more.group("n")) if more else 0,
+            "pairs": [{"seq": int(p.group("seq")), "ms": float(p.group("ms"))} for p in FZ_GPU_PAIR_RE.finditer(m.group("pairs"))]})
+
+
+def _fz_rt_line(fz, msg, t):
+    """File one runtime log line (the text after its UTC prefix, t its time converted to local) if it is one of the freeze lines. A worst-list
+    line's own time is when the list was written; the cycle's end is its `utc=` field, turned to local once the clock is known (parse_freezes)."""
+    if msg.startswith("native_long_cycle,") or msg.startswith("native_long_cycle_worst,"):
+        worst = msg.startswith("native_long_cycle_worst,")
+        f = _fz_fields(msg)
+        try:
+            seq, ms = int(f["sequence"]), float(f["cycle_ms"])
+            rank, of = (int(f["rank"]), int(f["of"])) if worst else (0, 0)
+        except (KeyError, ValueError):
+            _fz_unparsed(fz, msg)
+            return
+        if not worst:
+            fz["cycles"].append({"src": "line", "t": t, "seq": seq, "ms": ms, "f": f, "key": (seq, f["cycle_ms"])})
+            return
+        _fz_worst_add(fz["rt_worst_sets"], {
+            "line_t": t, "t": None, "rank": rank, "of": of, "seq": seq, "ms": ms, "f": f, "key": (seq, f["cycle_ms"]),
+            "utc": _fz_utc(f.get("utc", ""))})
+    elif msg.startswith("native_long_cycle_counts,") or msg.startswith("native_long_cycle_summary,"):
+        f = _fz_fields(msg)
+        kv = _fz_ints(f)
+        if "count" not in kv:
+            _fz_unparsed(fz, msg)
+            return
+        fz["rt_counts"].append({"t": t, "kind": "summary" if msg.startswith("native_long_cycle_summary,") else "counts",
+                                "reason": f.get("reason"), "kv": kv})
+
+
+def parse_freezes(gfx_path, gfx_text, rt_path=None, rt_text=None):
+    """What --freezes reads out of a flight's two logs, on the one local clock (scan_flight's). freezes: the FREEZE lines. long_frames: the LONG FRAME
+    lines (scan_flight_log's, with their runtime sequence). gfx_counts / rt_counts: the counts lines (the runtime's include the summary), in file
+    order. gfx_worst_sets / rt_worst_sets: the worst-list lines in sets, the last set the live one. sampler_state, stalls, stall_fails, stall_counts:
+    the stall sampler's lines. gpu: the GPU census's kept stalls. tests: the freeze test trigger's lines (advanced.freeze_test_ms). cycles: the
+    runtime's long cycles, one per (sequence, cycle_ms), a `native_long_cycle` line preferred over the worst-list line that repeats it. unparsed:
+    lines that open like these and match nothing. gscan, rscan, clock are scan_flight's."""
+    fz = {"freezes": [], "gfx_counts": [], "gfx_worst_sets": [], "sampler_state": None, "stalls": [], "stall_fails": [], "stall_counts": [],
+          "gpu": [], "tests": [], "cycles": [], "rt_worst_sets": [], "rt_counts": [], "unparsed": {"count": 0, "samples": []}}
+    gscan, rscan, clock = scan_flight(gfx_path, gfx_text, rt_path, rt_text,
+                                      lambda msg, t: _fz_gfx_line(fz, msg, t), lambda msg, t: _fz_rt_line(fz, msg, t))
+    fz["gscan"], fz["rscan"], fz["clock"] = gscan, rscan, clock
+    fz["long_frames"] = [f for f in gscan["frames"] if f["src"] == "gfx"]
+    to_local = clock["to_local"]
+    seen = {c["key"] for c in fz["cycles"]}
+    for entries in fz["rt_worst_sets"]:
+        for e in entries:
+            if e["utc"] is not None and to_local is not None:
+                e["t"] = (e["utc"] + to_local - EPOCH).total_seconds()
+            if e["key"] not in seen:
+                seen.add(e["key"])
+                fz["cycles"].append({"src": "worst", "t": e["t"], "seq": e["seq"], "ms": e["ms"], "f": e["f"], "key": e["key"]})
+    fz["cycles"].sort(key=lambda c: (c["t"] is None, c["t"] or 0.0))
+    return fz
+
+
+def _fz_has_lines(fz):
+    """Does the log hold any line of the freeze logging itself? The runtime's `native_long_cycle` line and its old three-field summary are not
+    that: a build from before the freeze logging wrote both. A line that opened like one of these and could not be read counts, so a reader
+    that drifted from the C++ says so instead of calling the build old."""
+    return bool(fz["freezes"] or fz["gfx_counts"] or fz["gfx_worst_sets"] or fz["sampler_state"] or fz["stalls"] or fz["stall_fails"]
+                or fz["stall_counts"] or fz["gpu"] or fz["tests"] or fz["rt_worst_sets"] or fz["unparsed"]["count"]
+                or any(c["kind"] == "counts" or "candidates" in c["kv"] for c in fz["rt_counts"]))
+
+
+def _fz_paired(freeze, cycle):
+    """Does a runtime cycle belong to a FREEZE line: its sequence within one of the freeze's, or (sequences unknown or apart) its time within
+    FREEZE_CYCLE_S of the freeze's end. Both ends of a freeze are on the one local clock."""
+    if freeze["seq"] and cycle["seq"] and abs(freeze["seq"] - cycle["seq"]) <= 1:
+        return True
+    return cycle["t"] is not None and abs(cycle["t"] - freeze["t"]) <= FREEZE_CYCLE_S
+
+
+def _fz_phase(fields):
+    """(name, ms) of the largest phase of a long cycle's fields, or None when it has none. Present is split into pre_present, present_hook and
+    post_present when present_split is ok, and is one phase otherwise; a present_hook whose real Present call (hook_real_present) is more than half
+    of it is named real_Present, and carries that call's ms."""
+    names = list(FZ_PHASES_BEFORE) + (list(FZ_PHASES_SPLIT) if fields.get("present_split") == "ok" else [FZ_PHASE_UNSPLIT]) + list(FZ_PHASES_AFTER)
+    vals = [(n, _fz_num(fields, n)) for n in names]
+    vals = [(n, v) for n, v in vals if v is not None]
+    if not vals:
+        return None
+    name, ms = max(vals, key=lambda nv: nv[1])
+    if name == "present_hook":
+        real = _fz_num(fields, "hook_real_present")
+        if real is not None and real > ms / 2.0:
+            return "real_Present", real
+    return name, ms
+
+
+def _fz_phase_text(fields):
+    p = _fz_phase(fields)
+    return "-" if p is None else "%s %.1f ms" % p
+
+
+def _fz_module(where):
+    """The module of a `module+0xrva` address."""
+    return where.split("+", 1)[0]
+
+
+def freeze_rows(fz):
+    """One row per FREEZE line, joined: lf (its LONG FRAME line, the same runtime sequence or within FREEZE_LONG_FRAME_S, the one whose ms agrees
+    first), cycle (the runtime's long cycle that goes with it, see _fz_paired; the same sequence first, a native_long_cycle line before a
+    worst-list one), stalls (the stall sampler's lines taken in [end - gap - pad, end + pad], by time) and gpu (the GPU census's kept stalls with
+    its runtime sequence), test (the freeze test trigger's sleep line inside it, or None). Returns (rows, loose): loose is the stall samples that belong
+    to no freeze."""
+    rows = []
+    for i, f in enumerate(fz["freezes"], 1):
+        near = [lf for lf in fz["long_frames"] if (f["seq"] and lf["seq"] == f["seq"]) or abs(lf["t"] - f["t"]) <= FREEZE_LONG_FRAME_S]
+        lf = min(near, key=lambda lf: (abs(lf["ms"] - f["ms"]) > 0.05, abs(lf["t"] - f["t"]))) if near else None
+        cycles = [c for c in fz["cycles"] if _fz_paired(f, c)]
+        cycle = min(cycles, key=lambda c: (abs(c["seq"] - f["seq"]) if f["seq"] and c["seq"] else 99, c["src"] != "line",
+                                           abs(c["t"] - f["t"]) if c["t"] is not None else 1e9)) if cycles else None
+        gpu = [p for g in fz["gpu"] for p in g["pairs"] if f["seq"] and p["seq"] == f["seq"]]
+        # The test trigger's sleep (written just before the thread sleeps) lies in the freeze it makes: after the Present that began it.
+        test = next((t for t in fz["tests"] if t["kind"] == "sleep"
+                     and f["t"] - f["ms"] / 1000.0 - FREEZE_STALL_PAD_S <= t["t"] <= f["t"] + FREEZE_STALL_PAD_S), None)
+        rows.append({"i": i, "f": f, "lf": lf, "cycle": cycle, "stalls": [], "gpu": gpu, "test": test})
+    loose = []
+    for s in sorted(fz["stalls"] + fz["stall_fails"], key=lambda s: s["t"]):
+        best = None
+        for row in rows:
+            f = row["f"]
+            begin = f["t"] - f["ms"] / 1000.0
+            if begin - FREEZE_STALL_PAD_S <= s["t"] <= f["t"] + FREEZE_STALL_PAD_S:
+                key = (0 if begin <= s["t"] <= f["t"] else 1, abs(s["t"] - f["t"]))
+                if best is None or key < best[0]:
+                    best = (key, row)
+        if best:
+            best[1]["stalls"].append(s)
+        else:
+            loose.append(s)
+    return rows, loose
+
+
+def _fz_cycle_pairs(rows, cycles):
+    """[(cycle, row or None)] for the runtime cycles of FREEZE_MS or more: the FREEZE row each goes with (_fz_paired), None when no FREEZE line
+    does, which is `runtime only`."""
+    return [(c, next((r for r in rows if _fz_paired(r["f"], c)), None)) for c in cycles if c["ms"] >= FREEZE_MS]
+
+
+def _fz_cell(kv, key):
+    """A counts-line value for a table cell: `-` when the line does not carry the key (an older build, a half with no such count, no line)."""
+    return "-" if kv is None or key not in kv else str(kv[key])
+
+
+def _fz_edvr_text(s):
+    """A stall sample's `EDVR code on the stack`: yes (with the frame count and the innermost EDVR frame the line gives), no, or `-` for a sample
+    line that does not say."""
+    if s["edvr"] is None:
+        return "-"
+    if not s["edvr"]:
+        return "no"
+    bits = []
+    if s["edvr_frames"] is not None:
+        bits.append("%d frame%s" % (s["edvr_frames"], "" if s["edvr_frames"] == 1 else "s"))
+    if s["edvr_where"]:
+        bits.append("innermost %s" % s["edvr_where"])
+    return "yes (%s)" % ", ".join(bits) if bits else "yes"
+
+
+def _fz_counts_problems(kv, half):
+    """What does not add up in one counts line, as sentences. freeze_book.h keeps these identities by construction, so a line that breaks one has
+    been cut, or its writer has a bug. A key the line lacks is nothing to add up."""
+    out = []
+    longs = ["long_" + k for k, _ in FREEZE_BUCKETS]
+    blips = ["blip_" + k for k, _ in FREEZE_BUCKETS]
+    if "long" in kv and all(k in kv for k in longs) and sum(kv[k] for k in longs) != kv["long"]:
+        out.append("long=%d but its size buckets add to %d" % (kv["long"], sum(kv[k] for k in longs)))
+    if half == "graphics" and "blips" in kv and all(k in kv for k in blips) and sum(kv[k] for k in blips) != kv["blips"]:
+        out.append("blips=%d but its size buckets add to %d" % (kv["blips"], sum(kv[k] for k in blips)))
+    if half == "graphics" and all(k in kv for k in ("candidates", "long", "blips")) and kv["candidates"] != kv["long"] + kv["blips"]:
+        out.append("candidates=%d is not long=%d plus blips=%d" % (kv["candidates"], kv["long"], kv["blips"]))
+    if half == "runtime" and all(k in kv for k in ("candidates", "long")) and kv["candidates"] != kv["long"]:
+        out.append("candidates=%d is not long=%d" % (kv["candidates"], kv["long"]))
+    if all(k in kv for k in ("long", "written", "unwritten")) and kv["written"] + kv["unwritten"] != kv["long"]:
+        out.append("written=%d plus unwritten=%d is not long=%d" % (kv["written"], kv["unwritten"], kv["long"]))
+    if all(k in kv for k in ("over_250ms", "long_250_1000", "long_ge1000")) and kv["over_250ms"] != kv["long_250_1000"] + kv["long_ge1000"]:
+        out.append("over_250ms=%d is not long_250_1000=%d plus long_ge1000=%d" % (kv["over_250ms"], kv["long_250_1000"], kv["long_ge1000"]))
+    return out
+
+
+def _fz_row_summary(row, rt_read):
+    """One line of what joined to a freeze whose full joins are left out of the report (see FREEZE_DETAIL_MAX), and what did not."""
+    lf, c = row["lf"], row["cycle"]
+    bits = ["LONG FRAME line %s" % ("yes" if lf is not None else "NO LONG FRAME LINE")]
+    if c is not None:
+        bits.append("runtime cycle %.1f ms, main phase %s" % (c["ms"], _fz_phase_text(c["f"])))
+    else:
+        bits.append("no runtime cycle" if rt_read else "runtime cycle - (no runtime log was read)")
+    got = [s for s in row["stalls"] if s["kind"] == "stall"]
+    if got:
+        bits.append("%d stall sample(s), owner %s" % (len(got), ", ".join(sorted({s["owner"] for s in got}))))
+    elif row["stalls"]:
+        bits.append("%d failed stall sample(s)" % len(row["stalls"]))
+    if row["gpu"]:
+        bits.append("GPU clock kept %.1f ms as a stall" % row["gpu"][0]["ms"])
+    if row["test"] is not None:
+        bits.append("holds the deliberate test sleep of %d ms" % row["test"]["ms"])
+    return "; ".join(bits)
+
+
+def _fz_print_freezes(rows, rt_read, clk):
+    # A bad flight can hold hundreds of freezes: every one gets its row, and the longest FREEZE_DETAIL_MAX their full joins.
+    detail = {r["i"] for r in sorted(rows, key=lambda r: (-r["f"]["ms"], r["i"]))[:FREEZE_DETAIL_MAX]}
+    print("FREEZES (%d FREEZE line(s); each covers [end - gap, end]%s):" % (
+        len(rows), "; the joins are printed in full for the %d longest" % FREEZE_DETAIL_MAX if len(rows) > FREEZE_DETAIL_MAX else ""))
+    print("  %-3s %-14s %9s %8s %9s  %s" % ("#", "end (local)", "gap ms", "frame", "sequence", "runtime cycle ms"))
+    for row in rows:
+        f, lf, c = row["f"], row["lf"], row["cycle"]
+        print("  %-3d %-14s %9.1f %8d %9d  %s" % (row["i"], clk(f["t"]), f["ms"], f["frame"], f["seq"],
+                                                  "unavailable" if f["cycle_ms"] is None else "%.1f" % f["cycle_ms"]))
+        if row["i"] not in detail:
+            print("      joins: %s" % _fz_row_summary(row, rt_read))
+            continue
+        if f["head_ms"] is not None:
+            print("      the graphics half's view: %.1f ms from the pose wait's return to this Present, the previous cycle %.1f ms"
+                  % (f["head_ms"], f["prev_ms"]))
+        if lf is not None:
+            print("      LONG FRAME line: %s, %.1f ms, runtime sequence %s" % (clk(lf["t"]), lf["ms"], lf["seq"] or "-"))
+        else:
+            print("      LONG FRAME line: NO LONG FRAME LINE (a LONG FRAME line is written first, and from 250 ms up not under the rate limit)")
+        if c is not None:
+            split = c["f"].get("present_split")
+            print("      runtime cycle: %s sequence %d, %.1f ms, ended %s, main phase %s%s"
+                  % ("native_long_cycle" if c["src"] == "line" else "native_long_cycle_worst", c["seq"], c["ms"], clk(c["t"]), _fz_phase_text(c["f"]),
+                     "" if split in (None, "ok") else " (Present split unavailable: %s)" % split))
+        elif rt_read:
+            print("      runtime cycle: none with sequence %s or within one of it, or ending within %.0f ms of this freeze"
+                  % (f["seq"] or "-", FREEZE_CYCLE_S * 1000.0))
+        else:
+            print("      runtime cycle: - (no runtime log was read)")
+        for s in row["stalls"]:
+            if s["kind"] == "stall":
+                print("      stall sample %d of %d at %s: stalled %g ms in %s, owner %s, suspended %d us, EDVR code on the stack: %s%s"
+                      % (s["k"], s["of"], clk(s["t"]), s["age_ms"], s["top"], s["owner"], s["us"], _fz_edvr_text(s),
+                         "; the stack pointer was outside the thread's stack: one frame only" if s["outside"] else ""))
+            else:
+                print("      stall sample %d of %d at %s: FAILED at %g ms (%s)" % (s["k"], s["of"], clk(s["t"]), s["at_ms"], s["why"]))
+        if f["sampler"] is not None:
+            print("      the FREEZE line's stall sampler clause: %s" % f["sampler"])
+        for p in row["gpu"]:
+            print("      GPU clock: the GPU census kept the gap before sequence %d, %.1f ms, as a stall" % (p["seq"], p["ms"]))
+        if row["test"] is not None:
+            print("      freeze test: this freeze holds the deliberate sleep of %d ms (advanced.freeze_test_ms), logged at %s"
+                  % (row["test"]["ms"], clk(row["test"]["t"])))
+
+
+def _fz_print_cycles(pairs, clk):
+    print("RUNTIME CYCLES of 250 ms or more (%d, one per sequence):" % len(pairs))
+    print("  %-14s %9s %9s  %-36s %s" % ("end (local)", "sequence", "cycle ms", "main phase", "FREEZE line"))
+    for c, row in pairs:
+        print("  %-14s %9d %9.1f  %-36s %s%s" % (
+            clk(c["t"]), c["seq"], c["ms"], _fz_phase_text(c["f"]), "runtime only" if row is None else "#%d (frame %d)" % (row["i"], row["f"]["frame"]),
+            "" if c["src"] == "line" else "  [worst list only]"))
+
+
+def _fz_print_counts(fz, rt_read, clk):
+    g = fz["gfx_counts"][-1] if fz["gfx_counts"] else None
+    r = fz["rt_counts"][-1] if rt_read and fz["rt_counts"] else None
+    if g is None and r is None:
+        return
+    gk = g["kv"] if g else None
+    rk = r["kv"] if r else None
+    print("COUNTS (the latest counts line of each half: graphics %s; runtime %s):" % (
+        "reason=%s at %s" % (g["reason"], clk(g["t"])) if g else "none",
+        "%s%s at %s" % ("native_long_cycle_summary" if r["kind"] == "summary" else "native_long_cycle_counts",
+                        " reason=%s" % r["reason"] if r["reason"] else "", clk(r["t"])) if r else "none"))
+    print("  %-14s %9s %9s %13s  %8s %13s" % ("size", "gfx long", "gfx blips", "gfx unwritten", "rt long", "rt unwritten"))
+    for key, words in FREEZE_BUCKETS:
+        print("  %-14s %9s %9s %13s  %8s %13s" % (words, _fz_cell(gk, "long_" + key), _fz_cell(gk, "blip_" + key), _fz_cell(gk, "unwritten_" + key),
+                                                  _fz_cell(rk, "long_" + key), _fz_cell(rk, "unwritten_" + key)))
+    print("  %-14s %9s %9s %13s  %8s %13s" % ("total", _fz_cell(gk, "long"), _fz_cell(gk, "blips"), _fz_cell(gk, "unwritten"),
+                                              _fz_cell(rk, "long"), _fz_cell(rk, "unwritten")))
+    print("  graphics: candidates %s, written %s; over 250 ms %s, of them unwritten %s"
+          % (_fz_cell(gk, "candidates"), _fz_cell(gk, "written"), _fz_cell(gk, "over_250ms"), _fz_cell(gk, "over_250ms_unwritten")))
+    print("  runtime:  candidates %s, written %s; over 250 ms %s, of them unwritten %s; count %s, logged %s"
+          % (_fz_cell(rk, "candidates"), _fz_cell(rk, "written"), _fz_cell(rk, "over_250ms"), _fz_cell(rk, "over_250ms_unwritten"),
+             _fz_cell(rk, "count"), _fz_cell(rk, "logged")))
+    print("  `-` = the line does not carry that count (from 250 ms up a frame is always written, so no unwritten count exists for it; blips are "
+          "the graphics half's alone; an older runtime's summary has only count and logged)")
+    for kv, half in ((gk, "graphics"), (rk, "runtime")):
+        if kv:
+            bad = _fz_counts_problems(kv, half)
+            if bad:
+                print("  the %s counts do not add up: %s" % (half, "; ".join(bad)))
+
+
+def _fz_print_worst(fz, rt_read, clk):
+    sets = fz["gfx_worst_sets"]
+    if sets:
+        last = sets[-1]
+        print("WORST (graphics log: the latest of %d set(s), %d line(s), written %s):" % (len(sets), len(last), clk(last[0]["t"])))
+        for e in last:
+            print("  %d of %d  %9.1f ms  ended %s  frame %d  sequence %d  runtime cycle %s%s"
+                  % (e["rank"], e["of"], e["ms"], e["ended"], e["frame"], e["seq"], "unavailable" if e["cycle_ms"] is None else "%.1f ms" % e["cycle_ms"],
+                     "  %s" % e["note"] if e["note"] else ""))
+    sets = fz["rt_worst_sets"]
+    if sets and rt_read:
+        last = sets[-1]
+        print("WORST (runtime log: the latest of %d set(s), %d line(s), written %s):" % (len(sets), len(last), clk(last[0]["line_t"])))
+        for e in last:
+            print("  %d of %d  %9.1f ms  ended %s  sequence %d  main phase %s  (utc=%s)"
+                  % (e["rank"], e["of"], e["ms"], clk(e["t"]), e["seq"], _fz_phase_text(e["f"]), e["f"].get("utc", "-")))
+
+
+def _fz_print_sampler(fz, rows, loose, clk):
+    st = fz["sampler_state"]
+    samples, fails = fz["stalls"], fz["stall_fails"]
+    if st is None and not (samples or fails or fz["stall_counts"]):
+        return
+    if st is not None:
+        print("STALL SAMPLER: %s" % (st["text"] if len(st["text"]) <= 150 else st["text"][:147] + "..."))
+    else:
+        print("STALL SAMPLER: the log has no `stall sampler:` state line, but it has the sampler's other lines")
+    if samples:
+        owners = {}
+        for s in samples:
+            owners[_fz_module(s["owner"])] = owners.get(_fz_module(s["owner"]), 0) + 1
+        inside = sum(1 for r in rows for s in r["stalls"] if s["kind"] == "stall")
+        print("  samples by owner module (%d sample line(s), %d inside a freeze, %d outside any): %s"
+              % (len(samples), inside, sum(1 for s in loose if s["kind"] == "stall"),
+                 ", ".join("%s %d" % kv for kv in sorted(owners.items(), key=lambda kv: (-kv[1], kv[0])))))
+        longest = max(samples, key=lambda s: s["us"])
+        print("  longest suspended: %d us (sample %d of %d at %s)" % (longest["us"], longest["k"], longest["of"], clk(longest["t"])))
+        outside = sum(1 for s in samples if s["outside"])
+        if outside:
+            print("  samples taken with the stack pointer outside the thread's stack (one frame only): %d of %d" % (outside, len(samples)))
+        known = [s for s in samples if s["edvr"] is not None]
+        mine = [s for s in samples if s["edvr"]]
+        if not known:
+            print("  EDVR code on the stack: - (no sample line says)")
+        else:
+            print("  EDVR code on the stack: %d of %d sample(s)%s" % (len(mine), len(known), "; EDVR's own code was in the freeze:" if mine else ""))
+            for s in mine:
+                print("    sample %d of %d at %s: %s" % (s["k"], s["of"], clk(s["t"]), _fz_edvr_text(s)))
+    if fails:
+        reasons = {}
+        for s in fails:
+            reasons[s["why"]] = reasons.get(s["why"], 0) + 1
+        print("  failed samples (%d) by reason: %s" % (len(fails), ", ".join("%s %d" % kv for kv in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0])))))
+    if fz["stall_counts"]:
+        c = fz["stall_counts"][-1]
+        print("  latest counts (reason=%s, %s): %s" % (c["reason"], clk(c["t"]), " ".join("%s=%d" % kv for kv in c["kv"].items())))
+
+
+def _fz_print_gpu(fz, rows, clk):
+    if not fz["gpu"]:
+        return
+    pairs = {}
+    for g in fz["gpu"]:
+        for p in g["pairs"]:
+            pairs.setdefault((p["seq"], p["ms"]), p)
+    print("GPU CLOCK (the GPU census kept %d frame-gap pair(s) over 1 s as stalls, in %d line(s); each is the gap on the GPU clock before that runtime "
+          "sequence):" % (sum(g["n"] for g in fz["gpu"]), len(fz["gpu"])))
+    for p in sorted(pairs.values(), key=lambda p: (p["seq"], p["ms"])):
+        row = next((r for r in rows if r["f"]["seq"] and r["f"]["seq"] == p["seq"]), None)
+        print("  sequence %d  %.1f ms  %s" % (p["seq"], p["ms"], "FREEZE #%d (frame %d, %.1f ms between Presents)" % (row["i"], row["f"]["frame"], row["f"]["ms"])
+                                              if row else "no FREEZE line has this sequence"))
+    unlisted = sum(g["more"] for g in fz["gpu"])
+    if unlisted:
+        print("  (and %d more the lines did not list)" % unlisted)
+
+
+def freezes_judge(fz, rows, pairs, rt_read, clk):
+    """[(key, status, text)] in the order of the rules: INSTRUMENT, UNWRITTEN FREEZES, FREEZE LINES, SAMPLER, SUSPENSION, NO FREEZE (and PARSE, a line
+    this reader could not read). status is PASS, WARN, STOP or note; a note is a fact and never changes the verdict."""
+    out = []
+
+    def add(key, status, text):
+        out.append((key, status, text))
+
+    gc = fz["gfx_counts"]
+    rc = fz["rt_counts"] if rt_read else []
+    rc_new = [c for c in rc if "candidates" in c["kv"]]
+
+    # INSTRUMENT: the counts lines are the proof that the freeze logging ran at all (a quiet session's zeros are written too).
+    if gc:
+        text = "a `monitor: long frame counts` line is in the graphics log (%d line(s), the last reason=%s at %s): the freeze logging ran" % (
+            len(gc), gc[-1]["reason"], clk(gc[-1]["t"]))
+        if rc_new:
+            text += "; the runtime log has %d summary or counts line(s) with the counts too" % len(rc_new)
+        add("INSTRUMENT", "PASS", text)
+    else:
+        add("INSTRUMENT", "WARN", "no `monitor: long frame counts` line in the graphics log: an older DLL, or a session that ended without a clean runtime "
+            "close in under five minutes (the counts are written every five minutes and at the end), so this log cannot show that the freeze logging ran")
+    if not rt_read:
+        add("INSTRUMENT", "WARN", "no runtime log was read, so the runtime's native_long_cycle lines and its counts are not in this report")
+    elif not rc:
+        add("INSTRUMENT", "WARN", "the runtime log has no native_long_cycle_summary or native_long_cycle_counts line (its session did not close and ran under "
+            "five minutes, or it is an older runtime)")
+    elif not rc_new:
+        add("INSTRUMENT", "WARN", "the runtime log's summary has only the three old fields (count, logged, threshold): an older runtime, so its counts by "
+            "size and over_250ms_unwritten read `-`")
+
+    # UNWRITTEN FREEZES: over_250ms_unwritten is how many frames of 250 ms or more did not get a line. It is 0 by construction; anything else is a bug.
+    keyed = [("graphics", c) for c in gc if "over_250ms_unwritten" in c["kv"]] + [("runtime", c) for c in rc if "over_250ms_unwritten" in c["kv"]]
+    bad = [(h, c) for h, c in keyed if c["kv"]["over_250ms_unwritten"] > 0]
+    if bad:
+        h, c = max(bad, key=lambda hc: hc[1]["kv"]["over_250ms_unwritten"])
+        add("UNWRITTEN FREEZES", "STOP", "over_250ms_unwritten=%d in the %s counts line at %s%s: a frame of 250 ms or more got no line, which the freeze "
+            "logging must never allow%s" % (c["kv"]["over_250ms_unwritten"], h, clk(c["t"]), " (reason=%s)" % c["reason"] if c.get("reason") else "",
+                                            "" if len(bad) == 1 else " (%d counts lines say so)" % len(bad)))
+    elif keyed:
+        add("UNWRITTEN FREEZES", "PASS", "over_250ms_unwritten=0 in every counts line that carries it (%d graphics, %d runtime)"
+            % (sum(1 for h, _ in keyed if h == "graphics"), sum(1 for h, _ in keyed if h == "runtime")))
+    else:
+        add("UNWRITTEN FREEZES", "note", "no counts line carries over_250ms_unwritten, so there is nothing to judge (see INSTRUMENT)")
+
+    # FREEZE LINES: every freeze has its LONG FRAME line, and every runtime cycle of 250 ms or more has its FREEZE line.
+    only = [c for c, row in pairs if row is None]
+    no_long = [r for r in rows if r["lf"] is None]
+    problems = False
+    if only:
+        listing = "; ".join("sequence %d, %.1f ms, ended %s" % (c["seq"], c["ms"], clk(c["t"])) for c in only[:4]) + ("; ..." if len(only) > 4 else "")
+        if gc:
+            problems = True
+            add("FREEZE LINES", "STOP", "%d runtime cycle(s) of 250 ms or more have no FREEZE line although the graphics log has a counts line, so the "
+                "graphics half did not write a freeze: %s" % (len(only), listing))
+        else:
+            problems = True
+            add("FREEZE LINES", "note", "%d runtime cycle(s) of 250 ms or more have no FREEZE line, but the graphics log has no counts line, so it may not "
+                "have the freeze logging at all: %s" % (len(only), listing))
+    if no_long:
+        problems = True
+        add("FREEZE LINES", "WARN", "%d FREEZE line(s) have no LONG FRAME line (the FREEZE line follows its LONG FRAME line, which from 250 ms up is "
+            "not under the rate limit): %s" % (len(no_long), "; ".join("frame %d at %s" % (r["f"]["frame"], clk(r["f"]["t"])) for r in no_long[:4])
+                                               + ("; ..." if len(no_long) > 4 else "")))
+    if not problems and (rows or pairs):
+        if rt_read:
+            add("FREEZE LINES", "PASS", "each of the %d FREEZE line(s) has its LONG FRAME line, and each of the %d runtime cycle(s) of 250 ms or more has "
+                "its FREEZE line" % (len(rows), len(pairs)))
+        else:
+            add("FREEZE LINES", "PASS", "each of the %d FREEZE line(s) has its LONG FRAME line (no runtime log was read, so no runtime cycle was checked)"
+                % len(rows))
+
+    # SAMPLER: named an owner for a freeze, or armed and never did. Off (or absent) says nothing here; a watchdog that could not start is its own WARN.
+    st = fz["sampler_state"]
+    armed = (st is not None and st["state"] == "armed") or (st is None and bool(fz["stalls"] or fz["stall_fails"] or fz["stall_counts"]))
+    if st is not None and st["state"] == "failed":
+        add("SAMPLER", "WARN", "the stall sampler could not start its watchdog thread, so no freeze in this log was sampled: %s" % st["text"][:120])
+    if armed and rows:
+        owned = [r for r in rows if any(s["kind"] == "stall" for s in r["stalls"])]
+        if owned:
+            owners = {}
+            for r in owned:
+                for s in r["stalls"]:
+                    if s["kind"] == "stall":
+                        owners[s["owner"]] = owners.get(s["owner"], 0) + 1
+            add("SAMPLER", "PASS", "the stall sampler named an owner for %d of %d freeze(s): %s" % (
+                len(owned), len(rows), ", ".join("%s (%d sample(s))" % kv for kv in sorted(owners.items(), key=lambda kv: (-kv[1], kv[0]))[:4])))
+        else:
+            failed = sum(1 for r in rows for s in r["stalls"] if s["kind"] == "fail")
+            clauses = sorted({r["f"]["sampler"] for r in rows if r["f"]["sampler"]})
+            add("SAMPLER", "WARN", "the stall sampler is armed and %d freeze(s) were logged, but no `stall:` sample with an owner falls inside any of them%s%s"
+                % (len(rows), " (%d failed sample line(s) do)" % failed if failed else "",
+                   "; the FREEZE line(s) say: %s" % "; ".join(clauses) if clauses else ""))
+
+    # SUSPENSION: how long a sample held the render thread. Each is microseconds; the counts line keeps the longest of all.
+    us = [(s["us"], "sample %d of %d at %s" % (s["k"], s["of"], clk(s["t"]))) for s in fz["stalls"]]
+    us += [(c["kv"]["longest_suspend_us"], "longest_suspend_us in the counts line at %s" % clk(c["t"])) for c in fz["stall_counts"]
+           if "longest_suspend_us" in c["kv"]]
+    if us:
+        top, where = max(us, key=lambda x: x[0])
+        if top > FREEZE_SUSPEND_STOP_US:
+            add("SUSPENSION", "STOP", "a stall sample held the render thread stopped for %d us (%s): far longer than a sample should take (the limit for a "
+                "STOP is %d us)" % (top, where, FREEZE_SUSPEND_STOP_US))
+        elif top > FREEZE_SUSPEND_WARN_US:
+            add("SUSPENSION", "WARN", "a stall sample held the render thread stopped for %d us (%s), over the %d us a sample should stay under"
+                % (top, where, FREEZE_SUSPEND_WARN_US))
+        else:
+            add("SUSPENSION", "PASS", "the longest a stall sample held the render thread stopped was %d us (%s), within %d us"
+                % (top, where, FREEZE_SUSPEND_WARN_US))
+
+    # FREEZE TEST: advanced.freeze_test_ms makes the render thread sleep once, 60 s in, so one flight shows the whole chain. The sleep is a frame of
+    # 250 ms or more, so it must have a FREEZE line; its stall samples must name an owner, and since the thread sleeps inside EDVR's own DLL the
+    # sampler should find EDVR's code on the stack.
+    tests = fz["tests"]
+    if tests:
+        key = "advanced.freeze_test_ms = %d" % tests[-1]["ms"]
+        slept = [t for t in tests if t["kind"] == "sleep"]
+        if not slept:
+            add("FREEZE TEST", "WARN", "%s was read, but the log has no `the render thread sleeps` line: the session ended before the sleep, 60 s in" % key)
+        for sl in slept:
+            holder = next((r for r in rows if r["test"] is sl), None)
+            if sl["ms"] < FREEZE_MS:
+                add("FREEZE TEST", "note", "the test slept %d ms at %s: under 250 ms, so no FREEZE line is due" % (sl["ms"], clk(sl["t"])))
+            elif holder is None:
+                add("FREEZE TEST", "STOP", "the test slept %d ms at %s, a frame of 250 ms or more, and no FREEZE line holds it: it must always get a line"
+                    % (sl["ms"], clk(sl["t"])))
+            else:
+                got = [s for s in holder["stalls"] if s["kind"] == "stall"]
+                missing = []
+                if holder["lf"] is None:
+                    missing.append("its LONG FRAME line")
+                if rt_read and (holder["cycle"] is None or holder["cycle"]["ms"] < 0.8 * sl["ms"]):
+                    missing.append("a runtime cycle of about that length")
+                if armed and not got:
+                    missing.append("a stall sample with an owner")
+                elif armed and not any(s["edvr"] for s in got):
+                    missing.append("EDVR code on the stack in any sample (the sleep is inside EDVR's own DLL)")
+                head = "the deliberate %d ms sleep at %s is FREEZE #%d (frame %d, %.1f ms between Presents)" % (
+                    sl["ms"], clk(sl["t"]), holder["i"], holder["f"]["frame"], holder["f"]["ms"])
+                if missing:
+                    add("FREEZE TEST", "WARN", "%s, but the chain lacks %s" % (head, "; ".join(missing)))
+                else:
+                    have = ["its LONG FRAME line"]
+                    if holder["cycle"] is not None:
+                        have.append("a runtime cycle of %.1f ms" % holder["cycle"]["ms"])
+                    if armed:
+                        have.append("%d stall sample(s) naming %s, EDVR code on the stack in %d of them"
+                                    % (len(got), ", ".join(sorted({s["owner"] for s in got})), sum(1 for s in got if s["edvr"])))
+                    else:
+                        have.append("no stall samples (the sampler is not armed, so none were due)")
+                    add("FREEZE TEST", "PASS", "%s, with %s" % (head, ", ".join(have)))
+
+    # NO FREEZE: the plain answer for a flight without one.
+    if not rows and not pairs:
+        add("NO FREEZE", "PASS", "no frame of 250 ms or more (no FREEZE line%s)"
+            % (", no runtime cycle of 250 ms or more" if rt_read else "; no runtime log was read to look for a cycle in"))
+
+    if fz["unparsed"]["count"]:
+        add("PARSE", "WARN", "%d line(s) open like a freeze-diagnostics line but match none of the formats this reads (the C++ wording changed?), and "
+            "what is above leaves them out. First: %s" % (fz["unparsed"]["count"], " | ".join(fz["unparsed"]["samples"])))
+    return out
+
+
+def print_freezes(gfx_path, gfx_text, gfx_ver, want, args, native_dirs):
+    """--freezes: one flight's freeze diagnostics in one report. Returns the exit code: 0 (PASS or WARN), 1 (STOP), 2 (the runtime log is of another
+    build than --expect-build named; main() has checked the graphics log's), 3 (the log holds none of the freeze lines)."""
+    rt_path, rt_text, rc = open_runtime_log(gfx_path, gfx_ver, want, args.runtime_file, native_dirs,
+                                            lacking="native_long_cycle lines and the runtime's counts are unavailable")
+    if rc is not None:
+        return rc
+    fz = parse_freezes(gfx_path, gfx_text, rt_path, rt_text)
+    gscan, rscan, clock = fz["gscan"], fz["rscan"], fz["clock"]
+    if gscan["stamped"] == 0:
+        print("[edvr] freezes: the graphics log has no [HH:MM:SS.mmm] lines; --freezes reads edvr_gfx_*.log (a runtime log goes to --runtime-file).")
+        return 3
+    if rscan is not None and rscan["stamped"] == 0:
+        print("[edvr] WARNING: the runtime log has no 'YYYY-MM-DD HH:MM:SS.mmm UTC pid= tid=' lines; it is not used.")
+        rscan = None
+    if not _fz_has_lines(fz):
+        print("[edvr] freezes: none of the freeze-diagnostics lines is in this log (no FREEZE, long frame counts, worst long frame, stall sampler, "
+              "native_long_cycle_worst or native_long_cycle_counts line), so it is from a build before the freeze logging.")
+        return 3
+    rt_read = rscan is not None
+    rows, loose = freeze_rows(fz)
+    pairs = _fz_cycle_pairs(rows, fz["cycles"] if rt_read else [])
+    day0 = int(gscan["first"] // DAY)
+
+    def clk(t):
+        return "-" if t is None else fmt_clock(t, day0)
+
+    print("[edvr] freezes: %s, runtime log %s; build %s; %d FREEZE line(s), %d runtime cycle(s) of 250 ms or more"
+          % (os.path.basename(gfx_path), os.path.basename(rt_path) if rt_read else "none", gfx_ver or "(no version line)", len(rows), len(pairs)))
+    if rt_read:
+        print("[edvr] clocks: every time below is LOCAL; the runtime log's UTC prefix is converted at %s (%s)"
+              % (_fmt_zone(clock["to_local"]), clock["how"]))
+        if rscan["last"] < gscan["first"] or rscan["first"] > gscan["last"]:
+            print("[edvr] WARNING: the two logs' time spans do not overlap: the clock conversion is wrong, or these are not one flight.")
+        shared, median = clock_check(gscan["frames"] + rscan["frames"])
+        if median is not None and abs(median) > 300000.0:
+            print("[edvr] WARNING: %d LONG FRAME line(s) share a runtime sequence with a native_long_cycle line, %.0f s apart at the median: the UTC offset "
+                  "is wrong, and a join across the two logs by time cannot be trusted" % (shared, median / 1000.0))
+        elif median is not None:
+            print("[edvr] clock check: %d LONG FRAME line(s) share a runtime sequence with a native_long_cycle line, %+.0f ms apart at the median"
+                  % (shared, median))
+    else:
+        print("[edvr] clocks: every time below is LOCAL, the graphics log's own [HH:MM:SS.mmm] prefix")
+    if rows:
+        _fz_print_freezes(rows, rt_read, clk)
+    if pairs:
+        _fz_print_cycles(pairs, clk)
+    _fz_print_counts(fz, rt_read, clk)
+    _fz_print_worst(fz, rt_read, clk)
+    _fz_print_sampler(fz, rows, loose, clk)
+    _fz_print_gpu(fz, rows, clk)
+    findings = freezes_judge(fz, rows, pairs, rt_read, clk)
+    for key, status, text in findings:
+        print("  %-4s  %s: %s" % (status, key, text))
+    stops = sum(1 for f in findings if f[1] == "STOP")
+    warns = sum(1 for f in findings if f[1] == "WARN")
+    print("freezes verdict: %s (%d STOP, %d WARN). STOP: a frame of 250 ms or more that got no line, a runtime cycle of 250 ms or more the graphics half "
+          "did not write, or a sample that held the render thread over %d us. WARN: the counts missing, a FREEZE line without its LONG FRAME line, an armed "
+          "sampler that named no owner, a sample over %d us, or a line this reader could not read."
+          % ("STOP" if stops else "WARN" if warns else "PASS", stops, warns, FREEZE_SUSPEND_STOP_US, FREEZE_SUSPEND_WARN_US))
+    return 1 if stops else 0
+
+
+def self_test_freezes():
+    """--freezes on logs built from the exact lines the C++ writes (perf_monitor.cpp freezeLine and writeFreezeSummary, freeze_book.h, long_cycle_line.h,
+    gpu_frame_gap.h, and the stall sampler's own): a healthy flight with a 1858 ms freeze, then each way a log can differ from it, every case asserting the
+    printed section and verdict keys and the exit code through main(). The pins at the top tie the reader's phrases to the sources that write them, and
+    the run asserts that --freezes opens nothing for writing. Returns ok."""
+    import builtins
+    import contextlib
+    import io
+    import shutil
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("freezes: %s" % msg)
+        ok = False
+
+    # The pins: each phrase the reader keys on must still be in the source that writes it, on one line there. A reworded line fails here with the file
+    # named, instead of making a flight's report quietly wrong.
+    root = repo_root()
+    for rel, needles in (
+            (("src", "d3d11", "perf_monitor.cpp"), (
+                "monitor: FREEZE -- %.1f ms between Presents, ended now: frame %llu, runtime sequence %llu;",
+                "ms from the pose wait's return to this Present, the previous cycle %.1f ms)",
+                "freeze %llu of this session; stall sampler %s.",
+                "monitor: long frame counts reason=%s %s;",
+                "monitor: worst long frame %u of %u: %.1f ms between Presents, ended %s (frame %llu, runtime",
+                "runtime cycle %s)%s%s",
+                "freeze test: advanced.freeze_test_ms = %d.",
+                "freeze test: the render thread sleeps %d ms now.")),
+            (("src", "common", "stall_sampler.h"), (
+                '"stall: the render thread stalled %u ms in "', '"; owner "', '"; stack "',
+                '"; sample %u of %u, last Present returned in frame %llu, thread %lu, suspended %u us"',
+                '" (the stack pointer was outside the thread\'s stack: one frame only)"',
+                '"; EDVR code on the stack: yes (%u frame%s, innermost "', '"; EDVR code on the stack: no."',
+                '"stall: sample %u of %u at %u ms failed: %s; last Present returned in frame %llu, thread %lu."')),
+            (("src", "d3d11", "stall_watch.cpp"), (
+                "stall sampler: off (advanced.freeze_location = off).", "stall sampler: armed. The render thread (thread %lu)",
+                "stall sampler: could not start its watchdog thread", "stall sampler counts reason=%s episodes=%u samples=%u skipped_rate_limit=%u failures=%u")),
+            (("src", "openxr", "long_cycle_line.h"), ('"native_long_cycle_worst,rank=%u,of=%u,utc=%s,%s"',
+                                                      '"%s,reason=%s,count=%llu,logged=%llu,threshold=2x_period,%s"')),
+            (("src", "common", "freeze_book.h"), ('add("over_250ms_unwritten"', '"long_%s"', '"blip_%s"', '"unwritten_%s"', 'return "lt50";', 'return "50_100";',
+                                                  'return "100_250";', 'return "250_1000";', 'return "ge1000";')),
+            (("src", "d3d11", "gpu_frame_gap.h"), ("EDVR GPU census, frame gap:", "pair%s over 1 s KEPT as stalls (not in the percentiles or the max; longest %.1f ms; each is the gap",
+                                                    '"%s sequence %llu %.1f ms"'))):
+        try:
+            body = read_text(os.path.join(root, *rel))
+        except OSError:
+            fail("%s is not where the self-test looks for it" % "\\".join(rel))
+            continue
+        for needle in needles:
+            if needle not in body:
+                fail("%s no longer has %r, which --freezes reads; change this reader and its pin together" % ("\\".join(rel), needle))
+
+    VERSION = "0.17.0-5-gabcdef1"
+    ZONE_H = 8                           # local is UTC+8: the runtime log's file name (local) against its first line (UTC) says so
+    T0 = 23 * 3600 + 20 * 60             # both logs open at 23:20:00 local
+    END = T0 + 4 * 60 + 19.790           # the freeze under test ends at 23:24:19.790 local, 15:24:19.790 UTC
+    CLOSE = T0 + 39 * 60                 # the session closes at 23:59:00
+    GFX_NAME = "edvr_gfx_20261001_232000.log"
+    RT_NAME = "edvr_openxr_20261001_232000_100_4242.log"
+    BUCKETS = ("lt50", "50_100", "100_250", "250_1000", "ge1000")
+
+    def hms(t):
+        ms = int(round(t * 1000.0))
+        h, rest = divmod(ms, 3600000)
+        m, rest = divmod(rest, 60000)
+        s, milli = divmod(rest, 1000)
+        return "%02d:%02d:%02d.%03d" % (h, m, s, milli)
+
+    def g(t, msg):
+        """A graphics log line at local time t (seconds of the day)."""
+        return "[%s] %s" % (hms(t), msg)
+
+    def r(t, msg):
+        """A runtime log line at local time t: its prefix is UTC."""
+        return "2026-10-01 %s UTC pid=4242 tid=9 %s" % (hms(t - ZONE_H * 3600), msg)
+
+    def utc(t):
+        return "2026-10-01T%sZ" % hms(t - ZONE_H * 3600)
+
+    # ---- the graphics log's lines, as the C++ formats them ----
+    def long_frame(ms, seq, frame=47211):
+        return ("monitor: LONG FRAME -- %.1f ms between Presents (runtime predicted period 11.1 ms), no WaitGetPoses, CPU busy, compositor, reprojection, "
+                "or door samples; game creations: 0 textures, 0 buffers, 0 shaders (0.0 MB); EDVR events: none. This is frame %d; the flip timeline is not "
+                "armed, so there are no table changes to order against it. %sgame work 4.92 ms."
+                % (ms, frame, "runtime sequence %d, " % seq if seq else ""))
+
+    sampler_3 = "took 3 samples, the last in nvwgf2umx.dll+0x1a2b3c4"
+
+    def freeze(ms=1858.0, frame=47211, seq=44415, n=1, cycle=True, sampler=sampler_3):
+        if cycle:
+            c = "%.1f ms (%.1f ms from the pose wait's return to this Present, the previous cycle 11.2 ms)" % (ms, ms - 7.3)
+        else:
+            c = "unavailable (no two pose-wait returns: not the native path, or no open runtime session)"
+        return ("monitor: FREEZE -- %.1f ms between Presents, ended now: frame %d, runtime sequence %d; runtime cycle %s; freeze %d of this session%s. "
+                "A frame of 250 ms or more always gets this line and a LONG FRAME line, with no cap and no rate limit."
+                % (ms, frame, seq, c, n, "; stall sampler %s" % sampler if sampler else ""))
+
+    def counts_pairs(long_b=(40, 15, 4, 0, 1), blip_b=(330, 20, 1, 0, 0), unwritten_b=(1, 1, 0), over_unwritten=0, blips=True):
+        """The counts freeze_book.h's formatCounts writes, in its order, with totals that add up (a case that breaks one does so on purpose)."""
+        long_n, blip_n = sum(long_b), sum(blip_b)
+        unwritten = sum(unwritten_b) + over_unwritten
+        pairs = [("candidates", long_n + (blip_n if blips else 0)), ("long", long_n)]
+        if blips:
+            pairs.append(("blips", blip_n))
+        pairs += [("written", long_n - unwritten), ("unwritten", unwritten), ("over_250ms", long_b[3] + long_b[4]), ("over_250ms_unwritten", over_unwritten)]
+        pairs += [("long_" + k, v) for k, v in zip(BUCKETS, long_b)]
+        if blips:
+            pairs += [("blip_" + k, v) for k, v in zip(BUCKETS, blip_b)]
+        pairs += [("unwritten_" + k, v) for k, v in zip(BUCKETS, unwritten_b)]
+        return pairs
+
+    def gcounts(reason="periodic", **kw):
+        return ("monitor: long frame counts reason=%s %s; candidates are Present gaps over twice the runtime's predicted period; a candidate the runtime's "
+                "cycle did not confirm is a blip, counted and not written; the others are long, written one every 5 s up to 60 a session; every frame of "
+                "250 ms or more is written whatever the limit says, and over_250ms_unwritten counts any that was not."
+                % (reason, " ".join("%s=%d" % kv for kv in counts_pairs(**kw))))
+
+    def gworst(rank, of, ms, ended, frame, seq, note="; stalled in nvwgf2umx.dll+0x1a2b3c4 (3 samples, longest at 1003 ms, EDVR code on the stack)", cycle=None):
+        return ("monitor: worst long frame %d of %d: %.1f ms between Presents, ended %s (frame %d, runtime sequence %d, runtime cycle %s)%s"
+                % (rank, of, ms, ended, frame, seq, "%.1f ms" % ms if cycle is None else cycle, note))
+
+    def stall(age, k, us=14, owner="nvwgf2umx.dll+0x1a2b3c4", tail="; EDVR code on the stack: no"):
+        """(age in ms into the freeze, the line): one stall sampler sample."""
+        return (age, "stall: the render thread stalled %d ms in ntdll.dll+0x9d5c4; owner %s; stack ntdll.dll+0x9d5c4 < KERNELBASE.dll+0x4f2 < %s < dxgi.dll+0x1234 "
+                     "< EliteDangerous64.exe+0x99c0f4; sample %d of 3, last Present returned in frame 47210, thread 12345, suspended %d us%s."
+                % (age, owner, owner, k, us, tail))
+
+    def stall_fail(k, at, why="suspend_failed"):
+        return (at, "stall: sample %d of 3 at %d ms failed: %s; last Present returned in frame 47210, thread 12345." % (k, at, why))
+
+    def sampler_counts(reason="session_close", samples=3, failures=0, longest_us=41):
+        return ("stall sampler counts reason=%s episodes=1 samples=%d skipped_rate_limit=0 failures=%d longest_suspend_us=%d longest_stall_ms=1858; an episode "
+                "is a run of frames with no Present for 150 ms or more; skipped_rate_limit counts episodes whose first sample the rate limit refused; a stall "
+                "of any length is also a FREEZE line when it reached 250 ms." % (reason, samples, failures, longest_us))
+
+    def gpu_stall(pairs, more=0):
+        listed = "".join("%s sequence %d %.1f ms" % ("," if i else "", s, ms) for i, (s, ms) in enumerate(pairs))
+        n = len(pairs) + more
+        return ("EDVR GPU census, frame gap: the time on the GPU clock from the end of one frame's last EDVR-timed span on the game's device (after the door "
+                "work) to the start of the next frame's first, p50 0.42 ms, p95 1.10 ms, max 3.30 ms over 2699 pairs of 2700 valid frames, %d pair%s over 1 s "
+                "KEPT as stalls (not in the percentiles or the max; longest %.1f ms; each is the gap before that runtime sequence):%s%s. This is an upper "
+                "bound on GPU idle, not idle: SteamVR's compositor (another process on the same GPU), the runtime's transfers and the Present copy run in it "
+                "too, so a gap of about 1 ms is not proof of idleness; a gap near 0 says the GPU never waited."
+                % (n, "" if n == 1 else "s", max(ms for _, ms in pairs), listed, " (and %d more)" % more if more else ""))
+
+    # ---- the runtime log's lines ----
+    def cycle_fields(seq, ms, split="ok", **over):
+        base = [("sequence", seq), ("cycle_ms", "%.4f" % ms), ("period_ms", "11.1111"), ("game_before_first_submit", "3.1000"),
+                ("first_submit_roundtrip", "0.9000"), ("first_submit_owner_body", "0.2000"), ("between_eye_calls", "0.4000"),
+                ("second_submit_roundtrip", "0.8000"), ("second_submit_owner_body", "0.2000"), ("first_submit_render_park", "0.1000"),
+                ("second_submit_render_park", "0.1000"), ("post_second_submit_to_next_wait", "%.4f" % (ms - 7.3)), ("present_split", split)]
+        if split == "ok":
+            base += [("pre_present", "0.07"), ("present_hook", "%.1f" % (ms - 7.5)), ("hook_before_real", "0.01"), ("hook_real_present", "%.1f" % (ms - 7.6)),
+                     ("hook_after_real", "0.01"), ("hook_render_callback", "0.03"), ("post_present", "0.1")]
+        base += [("next_wait_roundtrip", "1.2000"), ("next_wait_owner_body", "0.3000"), ("units", "wall_ms")]
+        return ",".join("%s=%s" % ((k, over.get(k, v))) for k, v in base)
+
+    def native_cycle(seq, ms, **kw):
+        return "native_long_cycle,%s" % cycle_fields(seq, ms, **kw)
+
+    def native_worst(rank, of, end, seq, ms, **kw):
+        return "native_long_cycle_worst,rank=%d,of=%d,utc=%s,%s" % (rank, of, utc(end), cycle_fields(seq, ms, **kw))
+
+    def rcounts(head="native_long_cycle_counts", reason="periodic", count=None, **kw):
+        """The runtime's counts line: no blips (it judges by its own cycle), `count` and `logged` the old fields."""
+        pairs = counts_pairs(blips=False, **kw)
+        count = dict(pairs)["long"] if count is None else count
+        return "%s,%scount=%d,logged=%d,threshold=2x_period,%s" % (head, "reason=%s," % reason if reason else "", count, count,
+                                                                 ",".join("%s=%d" % kv for kv in pairs))
+
+    old_summary = "native_long_cycle_summary,count=88,logged=1,threshold=2x_period"
+
+    # ---- the two logs of a flight ----
+    gopen = [g(T0, "EDVR log -- unofficial VR fixes for Elite Dangerous: Odyssey"),
+             g(T0 + 0.002, "version %s (build 68C0A1F2) -- this DLL was linked 2026-10-01 14:20:00 UTC" % VERSION)]
+    ropen = [r(T0 + 0.3, "module_init,version=%s,durable_log=1" % VERSION)]
+    # The sampler's state line as stall_watch.cpp writes it (the numbers are PolicyConfig's defaults), and the same line as the first design wrote it.
+    armed = g(T0 + 1.5, "stall sampler: armed. The render thread (thread 12345) is watched from its first Present: a stall is no Present for 150 ms, and the "
+                        "thread is stopped for a few tens of microseconds at 150, 500 and 1000 ms of it, its stack copied and the thread released, and the log then "
+                        "names the modules on it (stall: lines). At most 200 episodes a session, 6 back to back and one more every 2 s. In this process only: no "
+                        "other thread, no other process, nothing written to the thread. advanced.freeze_location = off turns it off.")
+    armed_short = g(T0 + 1.5, "stall sampler: armed (the render thread is sampled at roughly 150, 500 and 1000 ms of a stall)")
+    sampler_off = g(T0 + 1.5, "stall sampler: off (advanced.freeze_location = off). The log will not name where the render thread was during a freeze; the FREEZE "
+                              "and LONG FRAME lines are unaffected.")
+    sampler_off_short = g(T0 + 1.5, "stall sampler: off (advanced.freeze_location = off).")
+    sampler_failed = g(T0 + 1.5, "stall sampler: could not start its watchdog thread; no stall will be sampled.")
+    healthy_items = [stall(163, 1), stall(512, 2), stall(1003, 3)]
+    counts_kw = dict(long_b=(40, 15, 4, 0, 1))                              # the graphics half's: 351 blips beside, two long frames unwritten
+    rt_counts_kw = dict(long_b=(40, 2, 2, 0, 1), unwritten_b=(0, 0, 0))     # the runtime's own: the same freeze, every long cycle written
+
+    def gfx_flight(items=None, sampler=None, long=True, fkw=None, gpu=((44415, 1851.2),), gpu_more=0, counts=None, worst=True, scounts=True, ms=1858.0,
+                   end=END):
+        """A graphics log with one freeze of `ms` ending at `end`: the stall sampler's `items` inside it, its LONG FRAME and FREEZE lines, then the GPU
+        census, the counts and the worst list as the periodic pass writes them and again at the session's close."""
+        sampler = armed if sampler is None else sampler
+        items = healthy_items if items is None else items
+        counts = counts_kw if counts is None else counts
+        seq = (fkw or {}).get("seq", 44415)
+        frame = (fkw or {}).get("frame", 47211)
+        out = list(gopen)
+        if sampler:
+            out.append(sampler)
+        out += [g(end - ms / 1000.0 + age / 1000.0, msg) for age, msg in items]
+        if long:
+            out.append(g(end, long_frame(ms, seq, frame)))
+        out.append(g(end, freeze(ms, **(fkw or {}))))
+        if gpu:
+            out.append(g(end + 40.3, gpu_stall(list(gpu), gpu_more)))
+        out.append(g(end + 40.4, gcounts("periodic", **counts)))
+        if worst:
+            out.append(g(end + 40.5, gworst(1, 1, ms, hms(end), frame, seq)))
+        if scounts and sampler and "armed" in sampler:
+            out.append(g(CLOSE, sampler_counts()))
+        out.append(g(CLOSE + 0.001, gcounts("session_close", **counts)))
+        if worst:
+            out.append(g(CLOSE + 0.002, gworst(1, 1, ms, hms(end), frame, seq)))
+        return out
+
+    def rt_flight(cycles=None, counts=None, summary=True, worst=True):
+        """A runtime log: `cycles` as (end, sequence, ms, field overrides), the counts every five minutes, the summary and the worst list at the close."""
+        cycles = [(END, 44415, 1858.0, {})] if cycles is None else cycles
+        counts = rt_counts_kw if counts is None else counts
+        out = list(ropen)
+        out += [r(t, native_cycle(seq, ms, **kw)) for t, seq, ms, kw in cycles]
+        out.append(r(END + 40.5, rcounts(**counts)))
+        if summary:
+            out.append(r(CLOSE, rcounts("native_long_cycle_summary", None, **counts) if summary is True else summary))
+        if worst:
+            top = sorted(cycles, key=lambda c: -c[2])[:5]
+            out += [r(CLOSE + 0.001, native_worst(i, len(top), t, seq, ms, **kw)) for i, (t, seq, ms, kw) in enumerate(top, 1)]
+        return out
+
+    old_gfx = list(gopen) + [g(END, long_frame(1858.0, 44415)), g(END + 1.0, "monitor: 4 dropped or long frames were logged this session (of 60 at most).")]
+    old_rt = list(ropen) + [r(END - 0.001, native_cycle(44415, 1858.0)), r(CLOSE, old_summary)]
+
+    tmp = tempfile.mkdtemp(prefix="edvr_freezes_")
+    serial = [0]
+    violations = []
+    real_open = builtins.open
+
+    @contextlib.contextmanager
+    def read_only():
+        """--freezes writes nothing: inside this, an open for writing or a call that creates or removes a file is a recorded failure."""
+        names = ("makedirs", "mkdir", "remove", "unlink", "rename", "replace", "rmdir")
+        saved = {n: getattr(os, n) for n in names}
+
+        def guarded_open(file, mode="r", *a, **k):
+            if any(c in str(mode) for c in "wax+"):
+                violations.append("open(%r, %r)" % (file, mode))
+            return real_open(file, mode, *a, **k)
+
+        def tripwire(name):
+            def hit(*a, **k):
+                violations.append("os.%s%r" % (name, a))
+                raise OSError("--freezes must not write")
+            return hit
+        builtins.open = guarded_open
+        for n in names:
+            setattr(os, n, tripwire(n))
+        try:
+            yield
+        finally:
+            builtins.open = real_open
+            for n, fn in saved.items():
+                setattr(os, n, fn)
+
+    def put(path, lines, crlf=False):
+        nl = "\r\n" if crlf else "\n"
+        with real_open(path, "wb") as f:
+            f.write((nl.join(lines) + nl).encode("utf-8"))
+
+    def run(gfx, rt=None, *extra, crlf=False, rt_name=RT_NAME, explicit_rt=False):
+        """Write a flight's logs to a directory of their own and run --freezes on the graphics log through main(); (exit code, output). explicit_rt
+        names the runtime log with --runtime-file instead of leaving it to be paired by the time its file name says."""
+        serial[0] += 1
+        d = os.path.join(tmp, "f%02d" % serial[0])
+        os.makedirs(d)
+        gp = os.path.join(d, GFX_NAME)
+        put(gp, gfx, crlf)
+        argv = ["--file", gp, "--freezes"] + list(extra)
+        if rt is not None:
+            put(os.path.join(d, rt_name), rt, crlf)
+            if explicit_rt:
+                argv += ["--runtime-file", os.path.join(d, rt_name)]
+        buf = io.StringIO()
+        with read_only(), contextlib.redirect_stdout(buf):
+            rc = main(argv)
+        return rc, buf.getvalue()
+
+    def rx(pattern):
+        """A whitespace-flexible line pattern for the tables: lines anchored, runs of spaces matched by ` +`."""
+        return re.compile(pattern, re.M)
+
+    def seen(item, out):
+        return item.search(out) is not None if hasattr(item, "search") else item in out
+
+    def case(what, result, rc_want, verdict, *has, absent=()):
+        rc, out = result
+        problems = []
+        if rc != rc_want:
+            problems.append("exit %d, wanted %d" % (rc, rc_want))
+        if verdict and ("freezes verdict: %s (" % verdict) not in out:
+            problems.append("the verdict is not %s" % verdict)
+        problems += ["lacks %r" % getattr(h, "pattern", h) for h in has if not seen(h, out)]
+        problems += ["has %r" % getattr(a, "pattern", a) for a in absent if seen(a, out)]
+        if problems:
+            fail("%s: %s:\n%s" % (what, "; ".join(problems), out))
+
+    no_stop_warn = ("  STOP  ", "  WARN  ")
+
+    try:
+        # ---- the parser, on the exact lines ----
+        fz = parse_freezes(os.path.join(tmp, GFX_NAME), "\n".join(gfx_flight()) + "\n", os.path.join(tmp, RT_NAME), "\n".join(rt_flight()) + "\n")
+        f0 = fz["freezes"][0] if len(fz["freezes"]) == 1 else None
+        if (f0 is None or (f0["ms"], f0["frame"], f0["seq"], f0["n"], f0["cycle_ms"], f0["head_ms"], f0["prev_ms"], f0["sampler"])
+                != (1858.0, 47211, 44415, 1, 1858.0, 1850.7, 11.2, sampler_3)):
+            fail("the FREEZE line reads as %r" % (f0,))
+        if (len(fz["stalls"]), [s["us"] for s in fz["stalls"]], fz["stalls"][0]["stack"][2], fz["stalls"][0]["owner"], fz["stalls"][0]["edvr"]) != (
+                3, [14, 14, 14], "nvwgf2umx.dll+0x1a2b3c4", "nvwgf2umx.dll+0x1a2b3c4", False):
+            fail("the stall lines read as %r" % fz["stalls"])
+        if fz["gfx_counts"][0]["kv"]["over_250ms_unwritten"] != 0 or fz["gfx_counts"][0]["kv"]["blip_lt50"] != 330 or fz["gfx_counts"][-1]["reason"] != "session_close":
+            fail("the graphics counts lines read as %r" % fz["gfx_counts"])
+        if fz["rt_counts"][-1]["kind"] != "summary" or fz["rt_counts"][0]["reason"] != "periodic" or "blips" in fz["rt_counts"][0]["kv"]:
+            fail("the runtime counts lines read as %r" % fz["rt_counts"])
+        if fz["gpu"][0]["pairs"] != [{"seq": 44415, "ms": 1851.2}] or fz["gpu"][0]["n"] != 1:
+            fail("the GPU census line reads as %r" % fz["gpu"])
+        w = fz["rt_worst_sets"][-1][0]
+        day = (datetime.date(2026, 10, 1) - EPOCH.date()).days * DAY
+        if (w["rank"], w["of"], w["seq"], w["ms"]) != (1, 1, 44415, 1858.0) or w["t"] is None or abs(w["t"] - (day + END)) > 1e-6:
+            fail("the runtime worst line reads as %r (its utc= should come out at local %s)" % (w, hms(END)))
+        if fz["cycles"][0]["src"] != "line" or len(fz["cycles"]) != 1 or abs(fz["cycles"][0]["t"] - (day + END)) > 1e-6:
+            fail("the runtime cycle and its worst-list line should be one cycle, the line's, at local %s: %r" % (hms(END), fz["cycles"]))
+        if fz["unparsed"]["count"]:
+            fail("exact lines were left unparsed: %r" % fz["unparsed"])
+
+        # ---- the healthy flight: one freeze, every line there, PASS ----
+        healthy = run(gfx_flight(), rt_flight(), "--expect-build", VERSION)
+        case("a healthy flight with a 1858 ms freeze", healthy, 0, "PASS",
+             "[edvr] freezes: %s, runtime log %s; build %s; 1 FREEZE line(s), 1 runtime cycle(s) of 250 ms or more" % (GFX_NAME, RT_NAME, VERSION),
+             "runtime log's UTC prefix is converted at UTC+08:00",
+             "[edvr] clock check: 1 LONG FRAME line(s) share a runtime sequence with a native_long_cycle line, +0 ms apart at the median",
+             "FREEZES (1 FREEZE line(s)", "RUNTIME CYCLES of 250 ms or more (1,", "COUNTS (", "WORST (graphics log", "WORST (runtime log", "STALL SAMPLER: armed",
+             "GPU CLOCK (",
+             rx(r"^  1 +23:24:19\.790 +1858\.0 +47211 +44415 +1858\.0$"),
+             "the graphics half's view: 1850.7 ms from the pose wait's return to this Present, the previous cycle 11.2 ms",
+             "LONG FRAME line: 23:24:19.790, 1858.0 ms, runtime sequence 44415",
+             "runtime cycle: native_long_cycle sequence 44415, 1858.0 ms, ended 23:24:19.790, main phase real_Present 1850.4 ms",
+             "stall sample 1 of 3 at 23:24:18.095: stalled 163 ms in ntdll.dll+0x9d5c4, owner nvwgf2umx.dll+0x1a2b3c4, suspended 14 us, EDVR code on the stack: no",
+             "GPU clock: the GPU census kept the gap before sequence 44415, 1851.2 ms, as a stall",
+             "the FREEZE line's stall sampler clause: took 3 samples, the last in nvwgf2umx.dll+0x1a2b3c4",
+             "samples by owner module (3 sample line(s), 3 inside a freeze, 0 outside any): nvwgf2umx.dll 3",
+             "sequence 44415  1851.2 ms  FREEZE #1 (frame 47211, 1858.0 ms between Presents)",
+             rx(r"^  23:24:19\.790 +44415 +1858\.0 +real_Present 1850\.4 ms +#1 \(frame 47211\)$"),
+             rx(r"^  1 of 1 +1858\.0 ms +ended 23:24:19\.790 +frame 47211 +sequence 44415 +runtime cycle 1858\.0 ms +"
+                r"stalled in nvwgf2umx\.dll\+0x1a2b3c4 \(3 samples, longest at 1003 ms, EDVR code on the stack\)$"),
+             rx(r"^  1 of 1 +1858\.0 ms +ended 23:24:19\.790 +sequence 44415 +main phase real_Present 1850\.4 ms +\(utc=2026-10-01T15:24:19\.790Z\)$"),
+             rx(r"^  under 50 ms +40 +330 +1 +40 +0$"), rx(r"^  250-1000 ms +0 +0 +- +0 +-$"), rx(r"^  1 s and over +1 +0 +- +1 +-$"),
+             rx(r"^  total +60 +351 +2 +45 +0$"),
+             "  graphics: candidates 411, written 58; over 250 ms 1, of them unwritten 0",
+             "  runtime:  candidates 45, written 45; over 250 ms 1, of them unwritten 0; count 45, logged 45",
+             "latest counts (reason=session_close, 23:59:00.000): episodes=1 samples=3 skipped_rate_limit=0 failures=0 longest_suspend_us=41 longest_stall_ms=1858",
+             "  PASS  INSTRUMENT: a `monitor: long frame counts` line is in the graphics log (2 line(s), the last reason=session_close at 23:59:00.001): the freeze "
+             "logging ran; the runtime log has 2 summary or counts line(s) with the counts too",
+             "  PASS  UNWRITTEN FREEZES: over_250ms_unwritten=0 in every counts line that carries it (2 graphics, 2 runtime)",
+             "  PASS  FREEZE LINES: each of the 1 FREEZE line(s) has its LONG FRAME line, and each of the 1 runtime cycle(s) of 250 ms or more has its FREEZE line",
+             "  PASS  SAMPLER: the stall sampler named an owner for 1 of 1 freeze(s): nvwgf2umx.dll+0x1a2b3c4 (3 sample(s))",
+             "  PASS  SUSPENSION: the longest a stall sample held the render thread stopped was 41 us", "freezes verdict: PASS (0 STOP, 0 WARN)",
+             "[edvr] build matches: %s" % VERSION, "[edvr] runtime build matches: %s" % VERSION,
+             absent=no_stop_warn + ("NO FREEZE", "runtime only", "NO LONG FRAME LINE", "do not add up"))
+        case("the same flight with CRLF line ends", run(gfx_flight(), rt_flight(), crlf=True), 0, "PASS", "  PASS  SAMPLER:", "  PASS  FREEZE LINES:",
+             absent=no_stop_warn)
+
+        # ---- a log from before the freeze logging ----
+        old = run(old_gfx, old_rt)
+        case("an old-build log with none of the new lines", old, 3, None,
+             "[edvr] freezes: none of the freeze-diagnostics lines is in this log", "so it is from a build before the freeze logging.",
+             absent=("freezes verdict", "FREEZES (", "  PASS  ", "  STOP  "))
+        sentence = [l for l in old[1].splitlines() if l.startswith("[edvr] freezes:")]
+        if len(sentence) != 1 or ". " in sentence[0] or not sentence[0].endswith("."):
+            fail("the old-build message should be one line and one sentence: %r" % sentence)
+        case("an old-build graphics log alone", run(old_gfx), 3, None, "none of the freeze-diagnostics lines", "runtime log: NONE FOUND")
+        case("a graphics log with no [HH:MM:SS.mmm] lines (a runtime log given as the log)", run(rt_flight(), None), 3, None,
+             "the graphics log has no [HH:MM:SS.mmm] lines", "--runtime-file")
+
+        # ---- the instrument's own proof: the counts ----
+        case("over_250ms_unwritten=2 in the graphics counts line is a bug and a STOP",
+             run(gfx_flight(counts=dict(long_b=(40, 15, 4, 0, 1), over_unwritten=2)), rt_flight()), 1, "STOP",
+             "  STOP  UNWRITTEN FREEZES: over_250ms_unwritten=2 in the graphics counts line at", "a frame of 250 ms or more got no line",
+             "freezes verdict: STOP (1 STOP, 0 WARN)")
+        case("over_250ms_unwritten above 0 in the runtime's counts line is a STOP too",
+             run(gfx_flight(), rt_flight(counts=dict(long_b=(40, 2, 2, 0, 1), over_unwritten=1))), 1, "STOP",
+             "  STOP  UNWRITTEN FREEZES: over_250ms_unwritten=1 in the runtime counts line at")
+        case("the counts lines that do not add up are named, and change no verdict",
+             run([l.replace(" long=60 ", " long=61 ") for l in gfx_flight()], rt_flight()), 0, "PASS",
+             "the graphics counts do not add up: long=61 but its size buckets add to 60")
+        no_gfx_counts = [l for l in gfx_flight() if "long frame counts" not in l]
+        case("no graphics counts line: a WARN that says why (an older DLL, or a session that never closed)", run(no_gfx_counts, rt_flight()), 0, "WARN",
+             "  WARN  INSTRUMENT: no `monitor: long frame counts` line in the graphics log", "a session that ended without a clean runtime close in under five minutes",
+             "  PASS  UNWRITTEN FREEZES: over_250ms_unwritten=0 in every counts line that carries it (0 graphics, 2 runtime)",
+             "COUNTS (the latest counts line of each half: graphics none;", rx(r"^  under 50 ms +- +- +- +40 +0$"), absent=("  PASS  INSTRUMENT", "STOP  "))
+        case("no counts line anywhere: UNWRITTEN FREEZES has nothing to judge, and says so", run(no_gfx_counts, [l for l in rt_flight(summary=old_summary)
+             if "native_long_cycle_counts" not in l]), 0, "WARN", "  note  UNWRITTEN FREEZES: no counts line carries over_250ms_unwritten, so there is nothing to judge",
+             absent=("  PASS  UNWRITTEN FREEZES", "  STOP  "))
+        case("no runtime log: INSTRUMENT warns, the graphics half still reads", run(gfx_flight(), None), 0, "WARN",
+             "runtime log: NONE FOUND", "[edvr] freezes: %s, runtime log none; build %s" % (GFX_NAME, VERSION),
+             "  WARN  INSTRUMENT: no runtime log was read", "runtime cycle: - (no runtime log was read)", "  PASS  INSTRUMENT:", "  PASS  FREEZE LINES:",
+             absent=("RUNTIME CYCLES",))
+        case("a runtime log with no summary and no counts line",
+             run(gfx_flight(), [l for l in rt_flight() if "native_long_cycle_summary" not in l and "native_long_cycle_counts" not in l]), 0, "WARN",
+             "  WARN  INSTRUMENT: the runtime log has no native_long_cycle_summary or native_long_cycle_counts line", "COUNTS (")
+        old_form = run(gfx_flight(), [l for l in rt_flight(summary=old_summary) if "native_long_cycle_counts" not in l])
+        case("the runtime summary in its old three-field form: tolerated, every count it lacks prints `-`", old_form, 0, "WARN",
+             "  WARN  INSTRUMENT: the runtime log's summary has only the three old fields",
+             "runtime:  candidates -, written -; over 250 ms -, of them unwritten -; count 88, logged 1",
+             "  PASS  INSTRUMENT: a `monitor: long frame counts` line", "  PASS  UNWRITTEN FREEZES: over_250ms_unwritten=0 in every counts line that carries it (2 graphics, 0 runtime)",
+             absent=("  STOP  ",))
+        if re.search(r"^  under 50 ms +40 +330 +1 +-", old_form[1], re.M) is None:
+            fail("the old summary's cells should read `-` beside the graphics counts:\n%s" % old_form[1])
+
+        # ---- FREEZE LINES: the freeze and the runtime cycle must each have the other ----
+        game_held = dict(game_before_first_submit="330.2000", post_second_submit_to_next_wait="10.0000", present_hook="5.0", hook_real_present="4.0")
+        runtime_only = [(END, 44415, 1858.0, {}), (T0 + 600.0, 51000, 349.0, game_held)]
+        case("a runtime-only 349 ms cycle beside a graphics counts line is a STOP", run(gfx_flight(), rt_flight(cycles=runtime_only)), 1, "STOP",
+             "  STOP  FREEZE LINES: 1 runtime cycle(s) of 250 ms or more have no FREEZE line although the graphics log has a counts line",
+             "sequence 51000, 349.0 ms, ended 23:30:00.000", "RUNTIME CYCLES of 250 ms or more (2,",
+             rx(r"^  23:30:00\.000 +51000 +349\.0 +game_before_first_submit 330\.2 ms +runtime only$"), "#1 (frame 47211)",
+             "freezes verdict: STOP (1 STOP, 0 WARN)")
+        no_counts = [l for l in gfx_flight(items=[], long=True) if "long frame counts" not in l and "worst long frame" not in l]
+        case("the same cycle with no graphics counts line is a note, not a STOP", run(no_counts, rt_flight(cycles=runtime_only)), 0, "WARN",
+             "  note  FREEZE LINES: 1 runtime cycle(s) of 250 ms or more have no FREEZE line, but the graphics log has no counts line", absent=("  STOP  ",))
+        case("a cycle only in the worst list is still a cycle of 250 ms or more",
+             run(gfx_flight(), [l for l in rt_flight(cycles=runtime_only) if "native_long_cycle,sequence=51000," not in l]), 1,
+             "STOP", "[worst list only]", "runtime only", "  STOP  FREEZE LINES:")
+        case("one cycle in the log and in the worst list is one row",
+             run(gfx_flight(), rt_flight()), 0, "PASS", "RUNTIME CYCLES of 250 ms or more (1,", absent=("[worst list only]",))
+        case("a runtime cycle whose sequence is within one of the freeze's goes with it",
+             run(gfx_flight(), rt_flight(cycles=[(END + 0.200, 44416, 1858.0, {})])), 0, "PASS", "runtime cycle: native_long_cycle sequence 44416",
+             "#1 (frame 47211)", absent=("runtime only",))
+        case("a runtime cycle two sequences away and 1 s away is not the freeze's",
+             run(gfx_flight(), rt_flight(cycles=[(END + 1.0, 44417, 1858.0, {})])), 1, "STOP", "runtime only",
+             "runtime cycle: none with sequence 44415 or within one of it")
+        case("a runtime log whose cycle times are two hours off the graphics log's: the clock check says so, the sequence still joins",
+             run(gfx_flight(), rt_flight(cycles=[(END + 7200.0, 44415, 1858.0, {})])), 0, "PASS",
+             "[edvr] WARNING: 1 LONG FRAME line(s) share a runtime sequence with a native_long_cycle line, -7200 s apart at the median: the UTC offset is wrong",
+             "runtime cycle: native_long_cycle sequence 44415", "#1 (frame 47211)")
+        case("a runtime log of the day before does not overlap the graphics log",
+             run(gfx_flight(), ["2026-09-30 04:00:00.300 UTC pid=4242 tid=1 module_init,version=%s,durable_log=1" % VERSION],
+                 rt_name="edvr_openxr_20260930_120000_100_4242.log", explicit_rt=True), 0, "WARN",
+             "WARNING: the two logs' time spans do not overlap", "runtime log's UTC prefix is converted at UTC+08:00")
+        case("a runtime cycle with no matching sequence but within 150 ms of the freeze's end goes with it",
+             run(gfx_flight(fkw=dict(seq=0)), rt_flight(cycles=[(END + 0.140, 44417, 1858.0, {})])), 0, "PASS", "#1 (frame 47211)", absent=("runtime only",))
+        case("a FREEZE line with no LONG FRAME line is a WARN", run(gfx_flight(long=False), rt_flight()), 0, "WARN",
+             "LONG FRAME line: NO LONG FRAME LINE", "  WARN  FREEZE LINES: 1 FREEZE line(s) have no LONG FRAME line", "frame 47211 at 23:24:19.790",
+             "freezes verdict: WARN (0 STOP, 1 WARN)", absent=("  STOP  ", "  PASS  FREEZE LINES"))
+        near = gfx_flight(long=False) + [g(END + 0.030, long_frame(41.0, 44418, 47212))]
+        case("a LONG FRAME line within 50 ms of the freeze's end is its own, whatever its sequence", run(near, rt_flight()), 0, "PASS",
+             "LONG FRAME line: 23:24:19.820, 41.0 ms, runtime sequence 44418", absent=("NO LONG FRAME LINE",))
+        far = gfx_flight(long=False) + [g(END + 0.060, long_frame(41.0, 44418, 47212))]
+        case("a LONG FRAME line 60 ms away with another sequence is not", run(far, rt_flight()), 0, "WARN", "NO LONG FRAME LINE")
+        case("a LONG FRAME line of the same sequence is its own, however far its time",
+             run(gfx_flight(long=False) + [g(END + 5.0, long_frame(1858.0, 44415))], rt_flight()), 0, "PASS", "LONG FRAME line: 23:24:24.790, 1858.0 ms, runtime sequence 44415")
+        case("a FREEZE line with no runtime cycle and no sequence: unavailable, and the time joins it",
+             run(gfx_flight(fkw=dict(cycle=False, seq=0, sampler=None), long=False), rt_flight()), 0, "WARN",
+             "unavailable", "runtime cycle: native_long_cycle sequence 44415", "NO LONG FRAME LINE", absent=("the graphics half's view", "stall sampler clause"))
+
+        # ---- the stall sampler ----
+        owners = [stall(163, 1, owner="nvwgf2umx.dll+0x1a2b3c4"), stall(512, 2, owner="dxgi.dll+0x1234"), stall(1003, 3, owner="nvwgf2umx.dll+0x1a2b3c4")]
+        case("the owner census across three samples", run(gfx_flight(items=owners), rt_flight()), 0, "PASS",
+             "samples by owner module (3 sample line(s), 3 inside a freeze, 0 outside any): nvwgf2umx.dll 2, dxgi.dll 1",
+             "  PASS  SAMPLER: the stall sampler named an owner for 1 of 1 freeze(s): nvwgf2umx.dll+0x1a2b3c4 (2 sample(s)), dxgi.dll+0x1234 (1 sample(s))")
+        failed = [stall(163, 1), stall_fail(2, 512), stall(1003, 3)]
+        case("a failed sample is listed and counted by reason", run(gfx_flight(items=failed), rt_flight()), 0, "PASS",
+             "stall sample 2 of 3 at 23:24:18.444: FAILED at 512 ms (suspend_failed)", "failed samples (1) by reason: suspend_failed 1",
+             "samples by owner module (2 sample line(s)", "  PASS  SAMPLER:")
+        case("a freeze whose samples all failed named no owner: a WARN", run(gfx_flight(items=[stall_fail(1, 150, "suspend_failed"), stall_fail(2, 512, "no_thread")]), rt_flight()),
+             0, "WARN", "  WARN  SAMPLER: the stall sampler is armed and 1 freeze(s) were logged, but no `stall:` sample with an owner falls inside any of them (2 failed sample line(s) do)",
+             "failed samples (2) by reason: no_thread 1, suspend_failed 1", absent=("  PASS  SAMPLER", "STOP  "))
+        no_sample = "took no sample (the rate limit, a failed suspend, or the stall began before the sampler was armed)"
+        case("armed, a freeze, and no stall line at all: a WARN that quotes the FREEZE line's clause",
+             run(gfx_flight(items=[], fkw=dict(sampler=no_sample)), rt_flight()), 0, "WARN",
+             "  WARN  SAMPLER: the stall sampler is armed and 1 freeze(s) were logged, but no `stall:` sample with an owner falls inside any of them; the FREEZE line(s) "
+             "say: %s" % no_sample, "the FREEZE line's stall sampler clause: %s" % no_sample)
+        case("the first design's armed line (`armed (...)`) reads as armed too", run(gfx_flight(sampler=armed_short), rt_flight()), 0, "PASS",
+             "STALL SAMPLER: armed (the render thread is sampled at roughly 150, 500 and 1000 ms of a stall)", "  PASS  SAMPLER:", absent=("  WARN  PARSE",))
+        case("a sampler that could not start its watchdog thread is a WARN of its own",
+             run(gfx_flight(items=[], sampler=sampler_failed, fkw=dict(sampler="not running (the watchdog thread never started)"), scounts=False), rt_flight()),
+             0, "WARN", "STALL SAMPLER: could not start its watchdog thread; no stall will be sampled.",
+             "  WARN  SAMPLER: the stall sampler could not start its watchdog thread, so no freeze in this log was sampled",
+             "the FREEZE line's stall sampler clause: not running (the watchdog thread never started)", absent=("  PASS  SAMPLER", "  WARN  PARSE", "  STOP  "))
+        case("a stall line a minute before the freeze belongs to no freeze",
+             run(gfx_flight(items=[(-60000, stall(150, 1)[1]), stall(163, 1)]), rt_flight()), 0, "PASS",
+             "samples by owner module (2 sample line(s), 1 inside a freeze, 1 outside any)", "  PASS  SAMPLER:")
+        for off_line in (sampler_off, sampler_off_short):
+            case("the sampler off: its state is shown and no SAMPLER verdict is made", run(gfx_flight(items=[], sampler=off_line,
+                 fkw=dict(sampler="off (advanced.freeze_location = off)")), rt_flight()), 0, "PASS",
+                 "STALL SAMPLER: off (advanced.freeze_location = off).", "the FREEZE line's stall sampler clause: off (advanced.freeze_location = off)",
+                 absent=("  SAMPLER:", "  WARN  ", "  STOP  ", "  PASS  SAMPLER", "  PASS  SUSPENSION"))
+        case("no sampler lines at all (a build between the two commits): no STALL SAMPLER section, no SAMPLER verdict",
+             run(gfx_flight(items=[], sampler="", fkw=dict(sampler=None), scounts=False), rt_flight()), 0, "PASS", absent=("STALL SAMPLER", "SAMPLER:", "SUSPENSION"))
+        case("EDVR code on the stack is reported with its innermost frame",
+             run(gfx_flight(items=[stall(163, 1), stall(512, 2, tail="; EDVR code on the stack: yes (2 frames, innermost d3d11.dll+0x1c4a3)"),
+                                   stall(1003, 3, tail="; EDVR code on the stack: yes (1 frame, innermost openvr_api.dll+0x77)")]), rt_flight()), 0, "PASS",
+             "EDVR code on the stack: yes (2 frames, innermost d3d11.dll+0x1c4a3)", "EDVR code on the stack: yes (1 frame, innermost openvr_api.dll+0x77)",
+             "  EDVR code on the stack: 2 of 3 sample(s); EDVR's own code was in the freeze:", "    sample 2 of 3 at 23:24:18.444: yes (2 frames, innermost d3d11.dll+0x1c4a3)",
+             "    sample 3 of 3 at 23:24:18.935: yes (1 frame, innermost openvr_api.dll+0x77)")
+        case("a sample taken with the stack pointer outside the thread's stack",
+             run(gfx_flight(items=[stall(163, 1, tail=" (the stack pointer was outside the thread's stack: one frame only); EDVR code on the stack: no"),
+                                   stall(512, 2, tail=" (the stack pointer was outside the thread's stack: one frame only); EDVR code on the stack: yes (1 frame, innermost "
+                                                      "d3d11.dll+0x1c4a3)")]), rt_flight()), 0, "PASS", "samples by owner module (2 sample line(s), 2 inside a freeze",
+             "suspended 14 us, EDVR code on the stack: no; the stack pointer was outside the thread's stack: one frame only",
+             "suspended 14 us, EDVR code on the stack: yes (1 frame, innermost d3d11.dll+0x1c4a3); the stack pointer was outside the thread's stack: one frame only",
+             "  samples taken with the stack pointer outside the thread's stack (one frame only): 2 of 2",
+             "  EDVR code on the stack: 1 of 2 sample(s); EDVR's own code was in the freeze:", absent=("do not add up", "UNPARSED", "  WARN  PARSE"))
+        case("a sample line of the older form (no EDVR clause) says `-`", run(gfx_flight(items=[stall(163, 1, tail=""), stall(512, 2, tail="")]), rt_flight()), 0, "PASS",
+             "suspended 14 us, EDVR code on the stack: -", "  EDVR code on the stack: - (no sample line says)")
+        def suspend(us):
+            return run(gfx_flight(items=[stall(163, 1, us=us)]), rt_flight())
+        case("suspended 60000 us is a STOP", suspend(60000), 1, "STOP", "  STOP  SUSPENSION: a stall sample held the render thread stopped for 60000 us (sample 1 of 3 at 23:24:18.095)")
+        case("suspended 50000 us is a WARN, not a STOP", suspend(50000), 0, "WARN", "  WARN  SUSPENSION: a stall sample held the render thread stopped for 50000 us")
+        case("suspended 5001 us is a WARN", suspend(5001), 0, "WARN", "  WARN  SUSPENSION:")
+        case("suspended 5000 us is within the limit", suspend(5000), 0, "PASS", "  PASS  SUSPENSION: the longest a stall sample held the render thread stopped was 5000 us")
+        case("a longer suspension in the counts line than in any sample line", run([l.replace("longest_suspend_us=41", "longest_suspend_us=70000") for l in gfx_flight()], rt_flight()),
+             1, "STOP", "  STOP  SUSPENSION: a stall sample held the render thread stopped for 70000 us (longest_suspend_us in the counts line at 23:59:00.000)")
+
+        # ---- GPU CLOCK ----
+        case("two GPU stalls, one with a freeze's sequence and one without, and the pairs the line did not list",
+             run(gfx_flight(gpu=((44415, 1851.2), (44500, 1200.0))), rt_flight()), 0, "PASS",
+             "GPU CLOCK (the GPU census kept 2 frame-gap pair(s) over 1 s as stalls, in 1 line(s)", "sequence 44415  1851.2 ms  FREEZE #1 (frame 47211, 1858.0 ms between Presents)",
+             "sequence 44500  1200.0 ms  no FREEZE line has this sequence")
+        case("a GPU census line that lists fewer pairs than it kept", run(gfx_flight(gpu=((44415, 1851.2),), gpu_more=2), rt_flight()), 0, "PASS",
+             "kept 3 frame-gap pair(s)", "(and 2 more the lines did not list)")
+        case("no GPU stall: no GPU CLOCK section", run(gfx_flight(gpu=()), rt_flight()), 0, "PASS", absent=("GPU CLOCK", "GPU clock:"))
+
+        # ---- the main phase of a cycle ----
+        def phase_of(**kw):
+            return run(gfx_flight(), rt_flight(cycles=[(END, 44415, 1858.0, kw)]))
+        case("a hook whose real Present is under half of it keeps its own name", phase_of(hook_real_present="900.0"), 0, "PASS", "main phase present_hook 1850.5 ms")
+        case("a hook whose real Present is over half of it is real_Present, with that call's ms", phase_of(hook_real_present="1000.0"), 0, "PASS",
+             "main phase real_Present 1000.0 ms")
+        case("a cycle held in the game's own work", phase_of(game_before_first_submit="1800.0", post_second_submit_to_next_wait="50.0", present_hook="40.0",
+                                                            hook_real_present="10.0"), 0, "PASS", "main phase game_before_first_submit 1800.0 ms")
+        case("a cycle held in the next wait", phase_of(next_wait_roundtrip="1900.0"), 0, "PASS", "main phase next_wait_roundtrip 1900.0 ms")
+        unsplit = [(END, 44415, 1858.0, dict(split="lost_or_inflight_present_history"))]
+        case("a cycle with no Present split uses the one phase after the second Submit", run(gfx_flight(), rt_flight(cycles=unsplit)), 0, "PASS",
+             "main phase post_second_submit_to_next_wait 1850.7 ms (Present split unavailable: lost_or_inflight_present_history)")
+
+        # ---- the worst lists: a later set replaces an earlier one ----
+        two_sets = gfx_flight() + [g(CLOSE + 0.003, gworst(1, 2, 2400.0, "23:41:00.000", 51000, 51000, note="")),
+                                   g(CLOSE + 0.004, gworst(2, 2, 1858.0, "23:24:19.790", 47211, 44415, note=""))]
+        case("the latest worst set is the one printed, and only it", run(two_sets, rt_flight()), 0, "PASS",
+             "WORST (graphics log: the latest of 3 set(s), 2 line(s), written 23:59:00.003):",
+             rx(r"^  1 of 2 +2400\.0 ms +ended 23:41:00\.000 +frame 51000 +sequence 51000 +runtime cycle 2400\.0 ms$"),
+             rx(r"^  2 of 2 +1858\.0 ms +ended 23:24:19\.790 +frame 47211 +sequence 44415 +runtime cycle 1858\.0 ms$"),
+             absent=("stalled in nvwgf2umx.dll+0x1a2b3c4",))
+
+        # ---- many freezes: every one gets a row, the longest FREEZE_DETAIL_MAX their full joins ----
+        many_g = list(gopen) + [sampler_off]
+        many_cycles = []
+        for i in range(14):
+            end_i, ms_i = T0 + 120.0 + 20.0 * i, 300.0 + 100.0 * i          # 300 ms up to 1600 ms
+            many_g += [g(end_i, long_frame(ms_i, 44000 + i, 47000 + i)), g(end_i, freeze(ms_i, 47000 + i, 44000 + i, n=i + 1, sampler=None))]
+            many_cycles.append((end_i, 44000 + i, ms_i, {}))
+        many_g.append(g(CLOSE + 0.001, gcounts("session_close", long_b=(40, 15, 4, 12, 2))))
+        many = run(many_g, rt_flight(cycles=many_cycles, counts=dict(long_b=(40, 2, 2, 12, 2), unwritten_b=(0, 0, 0))))
+        case("fourteen freezes: a row each, the joins in full for the twelve longest", many, 0, "PASS",
+             "FREEZES (14 FREEZE line(s); each covers [end - gap, end]; the joins are printed in full for the 12 longest):",
+             rx(r"^  1 +23:22:00\.000 +300\.0 +47000 +44000 +300\.0$"), rx(r"^  14 +23:26:20\.000 +1600\.0 +47013 +44013 +1600\.0$"),
+             "      joins: LONG FRAME line yes; runtime cycle 300.0 ms, main phase real_Present 292.4 ms",
+             "      joins: LONG FRAME line yes; runtime cycle 400.0 ms, main phase real_Present 392.4 ms",
+             "RUNTIME CYCLES of 250 ms or more (14,", absent=("runtime only", "joins: LONG FRAME line yes; runtime cycle 500.0 ms"))
+        if many[1].count("\n      LONG FRAME line:") != 12 or many[1].count("\n      joins: ") != 2:
+            fail("fourteen freezes should print 12 full joins and 2 summaries, not %d and %d:\n%s"
+                 % (many[1].count("\n      LONG FRAME line:"), many[1].count("\n      joins: "), many[1]))
+
+        # ---- no freeze at all ----
+        quiet_counts = dict(long_b=(40, 15, 4, 0, 0), blip_b=(330, 20, 1, 0, 0))
+        quiet_g = list(gopen) + [armed, g(T0 + 300.0, gcounts("periodic", **quiet_counts)), g(CLOSE, sampler_counts("session_close", 0, 0, 0)),
+                                 g(CLOSE + 0.001, gcounts("session_close", **quiet_counts))]
+        quiet_r = list(ropen) + [r(T0 + 300.0, rcounts(**quiet_counts)), r(CLOSE, rcounts("native_long_cycle_summary", None, **quiet_counts))]
+        case("a flight with no frame of 250 ms or more", run(quiet_g, quiet_r), 0, "PASS", "  PASS  NO FREEZE: no frame of 250 ms or more (no FREEZE line, no runtime cycle of 250 ms or more)",
+             "  PASS  INSTRUMENT:", "  PASS  UNWRITTEN FREEZES:", rx(r"^  1 s and over +0 +0 +- +0 +-$"),
+             "0 FREEZE line(s), 0 runtime cycle(s)", absent=("FREEZES (", "RUNTIME CYCLES", "  WARN  ", "  STOP  ", "  PASS  FREEZE LINES", "PASS  SAMPLER"))
+        case("no freeze and no runtime log", run(quiet_g, None), 0, "WARN", "  PASS  NO FREEZE: no frame of 250 ms or more (no FREEZE line; no runtime log was read",
+             "  WARN  INSTRUMENT: no runtime log was read")
+
+        # ---- the test trigger, advanced.freeze_test_ms: the sleep must be a FREEZE with its whole chain ----
+        test_armed = "freeze test: advanced.freeze_test_ms = %d. Sixty seconds from now the render thread sleeps %d ms, once, to test the freeze lines and the " \
+                     "stall sampler. Set it back to 0."
+        test_sleep = "freeze test: the render thread sleeps %d ms now."
+        edvr_yes = "; EDVR code on the stack: yes (3 frames, innermost d3d11.dll+0x52a1)"
+        own = "d3d11.dll+0x52a1"
+
+        def test_items(tail=edvr_yes, ms=1200):
+            return [(-59000, test_armed % (ms, ms)), (4, test_sleep % ms), stall(154, 1, owner=own, tail=tail), stall(508, 2, owner=own, tail=tail),
+                    stall(1015, 3, owner=own, tail=tail)]
+
+        t_cycles = [(END, 44415, 1200.0, {})]
+        t_head = "the deliberate 1200 ms sleep at 23:24:18.594 is FREEZE #1 (frame 47211, 1200.0 ms between Presents)"
+        case("the test trigger's sleep is a FREEZE with its whole chain", run(gfx_flight(items=test_items(), ms=1200.0, gpu=((44415, 1190.4),)),
+                                                                              rt_flight(cycles=t_cycles)), 0, "PASS",
+             "freeze test: this freeze holds the deliberate sleep of 1200 ms (advanced.freeze_test_ms), logged at 23:24:18.594",
+             "  PASS  FREEZE TEST: %s, with its LONG FRAME line, a runtime cycle of 1200.0 ms, 3 stall sample(s) naming %s, EDVR code on the stack in 3 of them" % (t_head, own),
+             "samples by owner module (3 sample line(s), 3 inside a freeze, 0 outside any): d3d11.dll 3", "EDVR code on the stack: 3 of 3 sample(s); EDVR's own code was in the freeze:",
+             absent=no_stop_warn + ("UNPARSED",))
+        case("a test sleep whose samples show no EDVR code on the stack is a WARN", run(gfx_flight(items=test_items(tail="; EDVR code on the stack: no"), ms=1200.0),
+                                                                                         rt_flight(cycles=t_cycles)), 0, "WARN",
+             "  WARN  FREEZE TEST: %s, but the chain lacks EDVR code on the stack in any sample (the sleep is inside EDVR's own DLL)" % t_head)
+        case("a test sleep with no runtime cycle of its length is a WARN", run(gfx_flight(items=test_items(), ms=1200.0), rt_flight(cycles=[(END, 44415, 800.0, {})])), 0, "WARN",
+             "  WARN  FREEZE TEST: %s, but the chain lacks a runtime cycle of about that length" % t_head)
+        case("a test sleep whose freeze has no LONG FRAME line and no stall samples lacks both", run(gfx_flight(items=test_items()[:2], ms=1200.0, long=False),
+                                                                                                     rt_flight(cycles=t_cycles)), 0, "WARN",
+             "  WARN  FREEZE TEST: %s, but the chain lacks its LONG FRAME line; a stall sample with an owner" % t_head)
+        case("the test with the sampler off needs no samples", run(gfx_flight(items=test_items()[:2], ms=1200.0, sampler=sampler_off,
+                                                                              fkw=dict(sampler="off (advanced.freeze_location = off)")), rt_flight(cycles=t_cycles)),
+             0, "PASS", "  PASS  FREEZE TEST: %s, with its LONG FRAME line, a runtime cycle of 1200.0 ms, no stall samples (the sampler is not armed, so none were due)" % t_head)
+        lonely = list(gopen) + [armed, g(T0 + 2.0, test_armed % (1200, 1200)), g(T0 + 62.0, test_sleep % 1200), g(CLOSE, gcounts("session_close", long_b=(40, 15, 4, 0, 0)))]
+        case("a test sleep that no FREEZE line holds is a STOP", run(lonely, quiet_r), 1, "STOP",
+             "  STOP  FREEZE TEST: the test slept 1200 ms at 23:21:02.000, a frame of 250 ms or more, and no FREEZE line holds it: it must always get a line",
+             "freezes verdict: STOP (1 STOP, 0 WARN)")
+        case("the key read and no sleep line: the session ended first", run(lonely[:-2] + lonely[-1:], quiet_r), 0, "WARN",
+             "  WARN  FREEZE TEST: advanced.freeze_test_ms = 1200 was read, but the log has no `the render thread sleeps` line: the session ended before the sleep, 60 s in")
+        short_sleep = list(gopen) + [armed, g(T0 + 62.0, test_sleep % 200), g(CLOSE, gcounts("session_close", long_b=(40, 15, 4, 0, 0)))]
+        case("a test sleep under 250 ms owes no FREEZE line", run(short_sleep, quiet_r), 0, "PASS",
+             "  note  FREEZE TEST: the test slept 200 ms at 23:21:02.000: under 250 ms, so no FREEZE line is due", absent=no_stop_warn)
+
+        # ---- a line the reader cannot read ----
+        bad = gfx_flight() + [g(CLOSE + 1.0, "monitor: FREEZE -- a format this reader never saw")]
+        case("a line that opens like a FREEZE line and matches nothing", run(bad, rt_flight()), 0, "WARN",
+             "  WARN  PARSE: 1 line(s) open like a freeze-diagnostics line but match none of the formats this reads", "a format this reader never saw")
+        case("a log whose only freeze-diagnostics line cannot be read is not an old build", run(list(gopen) + [g(T0 + 5.0, "stall: something the sampler never wrote")], None), 0, "WARN",
+             "  WARN  PARSE:", absent=("before the freeze logging",))
+
+        # ---- the command line: the flag, the build checks, the exit codes ----
+        case("--expect-build that does not match the graphics log", run(gfx_flight(), rt_flight(), "--expect-build", "0.17.0-9-g1234567"), 2, None,
+             "BUILD MISMATCH", "log says   %s" % VERSION, absent=("freezes verdict",))
+        other_rt = [l.replace(VERSION, "0.17.0-9-g1234567") for l in rt_flight()]
+        case("--expect-build that the runtime log does not match", run(gfx_flight(), other_rt, "--expect-build", VERSION), 2, None,
+             "BUILD MISMATCH (runtime log)", absent=("freezes verdict",))
+        case("a runtime log of another build, with no --expect-build, is a printed warning", run(gfx_flight(), other_rt), 0, "PASS",
+             "WARNING: the runtime log is from build 0.17.0-9-g1234567 and the graphics log from %s" % VERSION)
+        serial[0] += 1
+        d = os.path.join(tmp, "f%02d" % serial[0])
+        os.makedirs(d)
+        put(os.path.join(d, GFX_NAME), gfx_flight())
+        put(os.path.join(d, "somewhere_else.log"), rt_flight())
+        buf = io.StringIO()
+        with read_only(), contextlib.redirect_stdout(buf):
+            rc = main(["--file", os.path.join(d, GFX_NAME), "--freezes", "--runtime-file", os.path.join(d, "somewhere_else.log")])
+        case("--runtime-file names the runtime log", (rc, buf.getvalue()), 0, "PASS", "runtime log somewhere_else.log")
+        buf = io.StringIO()
+        with read_only(), contextlib.redirect_stdout(buf):
+            rc = main(["--file", os.path.join(d, GFX_NAME), "--freezes", "--runtime-file", os.path.join(d, "nope.log")])
+        case("--runtime-file that is not there", (rc, buf.getvalue()), 1, None, "no such runtime log", absent=("freezes verdict",))
+        buf = io.StringIO()
+        with read_only(), contextlib.redirect_stdout(buf):
+            rc = main(["--dir", d, "--tag", "openxr", "--freezes"])
+        case("--freezes reads the graphics log, not a runtime --tag", (rc, buf.getvalue()), 1, None, "--freezes reads the graphics log (--tag gfx)")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                main(["--help"])
+            except SystemExit as e:
+                if e.code not in (0, None):
+                    fail("--help exited %r" % (e.code,))
+        helped = buf.getvalue()
+        if "--freezes" not in helped or "with --tally periodic or --freezes" not in " ".join(helped.split()):
+            fail("--help should list --freezes and say --runtime-file serves it:\n%s" % helped)
+        if "--freezes" not in (__doc__ or ""):
+            fail("the module docstring should list --freezes")
+        if violations:
+            fail("--freezes wrote, or tried to: %s" % "; ".join(violations[:5]))
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print("freezes: the checks stopped at an exception (above)")
+        ok = False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return ok
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Locate and read EDVR flight logs.")
@@ -5610,14 +7144,27 @@ def main(argv=None):
                          "verdict (strips drawn against eye takes, pending, stood-down, a stale "
                          "build, the OWNS sentence, a fault); exit 0 for PASS or WARN, 1 for "
                          "STOP, 3 when the log has no route line")
+    ap.add_argument("--freezes", action="store_true",
+                    help="report a flight's freeze diagnostics (issue 63): the graphics log's "
+                         "FREEZE lines (a frame of 250 ms or more, never rate limited) joined "
+                         "to their LONG FRAME lines, the runtime log's native_long_cycle lines "
+                         "(cycle and main phase), the stall sampler's samples (age and owner), "
+                         "and the GPU census's kept stalls by runtime sequence; the runtime "
+                         "cycles of 250 ms or more with no FREEZE line; the counts by size and "
+                         "the worst few of each half; the sampler's owner census; and a PASS / "
+                         "WARN / STOP verdict (INSTRUMENT, UNWRITTEN FREEZES, FREEZE LINES, "
+                         "SAMPLER, SUSPENSION, FREEZE TEST, NO FREEZE). Pairs the runtime log like --tally "
+                         "periodic (--runtime-file names one). Exit 0 for PASS or WARN, 1 for "
+                         "STOP, 2 for a wrong build, 3 when the log holds none of the freeze "
+                         "lines (a build from before the freeze logging)")
     ap.add_argument("--window-ms", type=float, default=100.0,
                     help="with --tally periodic, a long frame coincides with a "
                          "periodic event when the event's end time is inside "
                          "the frame or within this many ms of it (default 100)")
     ap.add_argument("--runtime-file", default=None,
-                    help="with --tally periodic, read exactly this runtime "
-                         "(edvr_openxr_*.log) log instead of pairing the one "
-                         "that opened nearest the graphics log")
+                    help="with --tally periodic or --freezes, read exactly this "
+                         "runtime (edvr_openxr_*.log) log instead of pairing the "
+                         "one that opened nearest the graphics log")
     ap.add_argument("--infer-runs", action="store_true",
                     help="with --tally periodic, also place the runs nobody "
                          "logged where a fixed cadence says they ran (only for "
@@ -5643,6 +7190,11 @@ def main(argv=None):
             return 1
         if args.frame is not None:
             print("[edvr] --frame belongs to --tally vh; ignored here.")
+
+    if args.freezes and not args.file and args.tag.lower() != "gfx":
+        print("[edvr] --freezes reads the graphics log (--tag gfx) and pairs "
+              "its runtime log itself; drop --tag %s." % args.tag)
+        return 1
 
     native_dirs = None
     if args.file:
@@ -5723,6 +7275,8 @@ def main(argv=None):
         return print_maps_sharp(text)
     if args.route_curve:
         return print_route_curve(text, path)
+    if args.freezes:
+        return print_freezes(path, text, ver, want, args, native_dirs)
     if args.tally == "periodic":
         return print_periodic_report(path, text, ver, want, args, native_dirs)
     if args.tally:
@@ -6071,6 +7625,8 @@ def self_test():
     if not self_test_flat_upscale():
         ok = False
     if not self_test_route_curve():
+        ok = False
+    if not self_test_freezes():
         ok = False
 
     print("self-test: %s" % ("ok" if ok else "FAILED"))

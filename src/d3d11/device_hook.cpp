@@ -70,6 +70,7 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "flat_temporal.h"   // flat profile discovery at owned Present
 #include "flat_shader_capture.h"
 #include "perf_monitor.h"
+#include "stall_watch.h"     // stallWatchBeat: the stall sampler's heartbeat, once per owned Present
 #include "frame_ticks.h"     // g_frameTicks: what the Present hook's own work cost, by name
 #include "boundary_tick.h"   // one fault budget per frame-boundary tick
 #include "vscreen.h"
@@ -1732,6 +1733,10 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
     const int64_t presentT0 = qpcNow();
     const HRESULT hr = g_state->realPresent(self, syncInterval, flags);
     const int64_t presentT1 = qpcNow();
+    // The stall sampler's heartbeat (stall_watch.h): the render thread has just presented. A relaxed store and a
+    // compare; the first call starts the watchdog thread, or says that advanced.freeze_location turned it off.
+    // frameCounter is the frame this Present ended, the number the long-frame lines call "frame".
+    stallWatchBeat(presentT1, g_state->frameCounter);
     if (routeCrumbs)
         hdrCrumbWrite("present", "end", "hr=0x%08X removed=0x%08X", static_cast<unsigned>(hr),
                       static_cast<unsigned>(g_state->device->GetDeviceRemovedReason()));

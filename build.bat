@@ -495,6 +495,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\oculus_route.cpp" ^
     "src\d3d11\menu_keys.cpp" ^
     "src\d3d11\menu_panel.cpp" "src\d3d11\perf_monitor.cpp" "src\d3d11\native_perf_history.cpp" "src\d3d11\native_benchmark_collector.cpp" ^
+    "src\d3d11\stall_watch.cpp" ^
     "src\d3d11\native_menu.cpp" ^
     "src\d3d11\native_temporal.cpp" "src\d3d11\flat_temporal.cpp" "src\d3d11\flat_compute_capture.cpp" "src\d3d11\flat_compute_readback.cpp" ^
     "src\d3d11\flat_runtime.cpp" "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
@@ -682,7 +683,7 @@ set "RUN_JOBS_ARGS="
 if defined EDVR_JOBS set "RUN_JOBS_ARGS=--jobs %EDVR_JOBS%"
 python tools\run_jobs.py --self-test || exit /b 1
 python tools\run_jobs.py --script "%ROOT%\build.bat" --times "%BUILD%\rig_times.json" ^
-    --exe-dir "%BUILD%" --quiet native_timing_test,gpu_timing_test,gpu_census_test,vtable_test ^
+    --exe-dir "%BUILD%" --quiet native_timing_test,gpu_timing_test,gpu_census_test,vtable_test,stall_sampler_test ^
     --after openxr_module_test=openxr_exports_test ^
     %RUN_JOBS_ARGS% || exit /b 1
 
@@ -1115,6 +1116,40 @@ if errorlevel 1 ( echo [edvr] ERROR: freeze_log_test build failed & exit /b 1 )
 "%OBJ%\freezelog\freeze_log_test.exe" --dry-run || exit /b 1
 "%OBJ%\freezelog\freeze_log_test.exe" --self-test "%ROOT%" || exit /b 1
 python "tools\freeze_log_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
+:rig_stall_sampler_test
+if "%EDVR_RIG_STEP%"=="run" goto stall_sampler_test_run
+echo [edvr] === stall_sampler_test.exe ===
+REM Build gate for the stall sampler (src\common\stall_sampler.h, src\d3d11\stall_watch.cpp,
+REM docs\freeze-diagnostics-2026-10-01.md, issue 63): the REAL capture, walk and naming code against threads the rig
+REM blocks in places it knows -- a Sleep, a wait, a busy loop in this exe, a busy loop in stall_target.dll (so a
+REM module that is not the exe is named), a stack 21 KB deep that uses RBP as its frame register -- and that the
+REM thread it stopped is ALWAYS running again (a failed context read, a stack pointer outside the stack, an exited
+REM thread, three hundred stops in a row); that the walk reads the COPY (the thread has run on and overwritten the
+REM stack, and the sample still names its frames); the watchdog end to end on a real clock (1.3 s of stall, three
+REM samples at 150/500/1000 ms); the policy on a fake one (thresholds, rate limit, session cap); and by source text
+REM that no injection-shaped API appears and the window between the stop and the resume is straight-line. It holds
+REM wall-clock intervals against a real thread, so it is a --quiet rig: its compiles run in the pool and its run
+REM alone, after the others. tools\stall_sampler_test\mutants.py --self-test holds the mutation list to the sources
+REM as they are; --run builds the rig against each edit (about four minutes, serial: it is judged by the clock).
+if not exist "%OBJ%\stallsampler" mkdir "%OBJ%\stallsampler"
+cl.exe /nologo /O2 /MT /LD /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\stallsampler"\ /Fe"%OBJ%\stallsampler\stall_target.dll" ^
+    "tools\stall_sampler_test\stall_target_dll.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: stall_target.dll build failed & exit /b 1 )
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\common" ^
+    /Fo"%OBJ%\stallsampler"\ /Fe"%OBJ%\stallsampler\stall_sampler_test.exe" ^
+    "tools\stall_sampler_test\stall_sampler_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: stall_sampler_test build failed & exit /b 1 )
+if "%EDVR_RIG_STEP%"=="build" exit /b 0
+:stall_sampler_test_run
+"%OBJ%\stallsampler\stall_sampler_test.exe" --dry-run || exit /b 1
+"%OBJ%\stallsampler\stall_sampler_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\stall_sampler_test\mutants.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_flat_temporal_test

@@ -25,6 +25,7 @@
 #include "../common/vtable_hook.h"  // vtableWatchDumpRecent, the flip timeline
 #include "device_hook.h"
 #include "sharpen_pass.h"
+#include "stall_watch.h"
 #include "temporal_pass.h"
 // fsr3_engine.h is deliberately NOT included: the EDVR PASSES tile reaches
 // AMD's price through temporal_pass.h's temporalPassTrainedTotals, which
@@ -198,6 +199,11 @@ struct State {
     bool     freezeFinalWritten = false;
     uint64_t freezeFinalCandidates = 0;
     uint32_t freezeFinalRevision = 0;
+    // advanced.freeze_test_ms (freezeTestTick): read at the first frame, fired once.
+    bool     freezeTestRead = false;
+    bool     freezeTestDone = false;
+    int      freezeTestMs = 0;
+    uint64_t freezeTestArmedMs = 0;
 
     // The drop log's rate limit, and the last drop for the page.
     uint64_t dropLogMs = 0;
@@ -591,7 +597,7 @@ private:
 // carry this -- at its worst it is 1154 characters of the 1160 the log keeps (native_perf_history_test) --
 // and what this adds is what the person reading a freeze asks first: how long was the runtime's own cycle,
 // and where in it did the time go.
-void freezeLine(double gapMs, const CycleView& cv, uint64_t frame, uint64_t freezeNo) {
+void freezeLine(double gapMs, const CycleView& cv, uint64_t frame, uint64_t freezeNo, const char* sampler) {
     char cycle[200];
     if (cv.known) {
         snprintf(cycle, sizeof(cycle),
@@ -603,10 +609,39 @@ void freezeLine(double gapMs, const CycleView& cv, uint64_t frame, uint64_t free
     }
     Log::get().note(
         "monitor: FREEZE -- %.1f ms between Presents, ended now: frame %llu, runtime sequence %llu; runtime "
-        "cycle %s; freeze %llu of this session. A frame of %.0f ms or more always gets this line and a "
-        "LONG FRAME line, with no cap and no rate limit.",
+        "cycle %s; freeze %llu of this session; stall sampler %s. A frame of %.0f ms or more always gets this "
+        "line and a LONG FRAME line, with no cap and no rate limit.",
         gapMs, static_cast<unsigned long long>(frame), static_cast<unsigned long long>(cv.sequence), cycle,
-        static_cast<unsigned long long>(freezeNo), kFreezeAlwaysLogMs);
+        static_cast<unsigned long long>(freezeNo), sampler, kFreezeAlwaysLogMs);
+}
+
+// What the stall sampler (stall_watch.h) found out about the stall that this freeze ends: written into `state`
+// for the FREEZE line, and into `note` for the worst list ("" when it took no sample). The stall began after the
+// previous Present, which is this frame's edge less its length, and the sampler's beat for it was taken a few
+// hundred microseconds from that edge, so the match is made within 100 ms.
+void samplerFor(int64_t qpc, double gapMs, char* state, size_t stateSize, char* note, size_t noteSize) {
+    note[0] = 0;
+    switch (stallWatchState()) {
+        case StallWatchState::Off:
+            snprintf(state, stateSize, "off (advanced.freeze_location = off)");
+            return;
+        case StallWatchState::NotStarted:
+        case StallWatchState::Failed:
+            snprintf(state, stateSize, "not running (the watchdog thread never started)");
+            return;
+        case StallWatchState::Running:
+            break;
+    }
+    StallEpisode ep;
+    const int64_t freq = qpcFrequency();
+    const int64_t began = freq > 0 ? qpc - static_cast<int64_t>(gapMs * static_cast<double>(freq) / 1000.0) : 0;
+    if (began > 0 && stallWatchEpisodeAround(began, 100.0, &ep)) {
+        snprintf(state, stateSize, "took %u sample%s, the last in %s", ep.samples, ep.samples == 1 ? "" : "s", ep.owner);
+        snprintf(note, noteSize, "stalled in %s (%u sample%s, longest at %u ms%s)", ep.owner, ep.samples,
+                 ep.samples == 1 ? "" : "s", ep.maxAgeMs, ep.edvrOnStack ? ", EDVR code on the stack" : "");
+    } else {
+        snprintf(state, stateSize, "took no sample (the rate limit, a failed suspend, or the stall began before the sampler was armed)");
+    }
 }
 
 // Decide what a Present gap over twice the period is, and write what it earns.
@@ -633,6 +668,10 @@ void judgeLongFrame(const Frame& f, float budgetMs, double gapMs, int64_t qpc) {
     const bool write = outcome.write;
     const uint64_t inProgressNow = vtableWatchFrame();
     const uint64_t frameNo = inProgressNow ? inProgressNow - 1 : 0;
+    // The stall sampler can only have taken a sample of a stall that reached its first threshold (150 ms).
+    char samplerState[200] = {};
+    char samplerNote[120] = {};
+    if (gapMs >= 150.0) samplerFor(qpc, gapMs, samplerState, sizeof(samplerState), samplerNote, sizeof(samplerNote));
     uint64_t freezeNo = 0;
     {
         FreezeLock lock(s.freezeLock);
@@ -643,6 +682,7 @@ void judgeLongFrame(const Frame& f, float budgetMs, double gapMs, int64_t qpc) {
         w.frame = frameNo;
         w.cycleMs = cv.known ? cv.longestMs() : 0.0;
         localStamp(w.stamp, sizeof(w.stamp));
+        freezeCopyText(w.note, sizeof(w.note), samplerNote);
         s.freeze.offerWorst(w);
         freezeNo = s.freeze.freezes;
     }
@@ -668,7 +708,7 @@ void judgeLongFrame(const Frame& f, float budgetMs, double gapMs, int64_t qpc) {
     // shape of a hang.
     vtableWatchDumpRecent("monitor: LONG FRAME", frameNo);
     if (write) dropLine(f, budgetMs, gapMs, !freeze);
-    if (freeze) freezeLine(gapMs, cv, frameNo, freezeNo);
+    if (freeze) freezeLine(gapMs, cv, frameNo, freezeNo, samplerState);
 }
 
 // The long-frame counts, and the worst few, as log lines (freeze_book.h).
@@ -710,6 +750,8 @@ void writeFreezeSummary(const char* reason, bool final) {
         "written; the others are long, written one every %u s up to %u a session; every frame of %.0f ms or "
         "more is written whatever the limit says, and over_250ms_unwritten counts any that was not.",
         reason, counts, static_cast<unsigned>(kDropLogEveryMs / 1000), kDropLogMax, kFreezeAlwaysLogMs);
+    // The stall sampler's own counts, beside the long-frame counts they explain (silent when it is off).
+    stallWatchWriteCounts(reason);
     if (!copy.worstCount() || (!final && copy.worstRevision == worstPrinted)) return;
     for (unsigned i = 0; i < copy.worstCount(); ++i) {
         const FreezeWorst& w = copy.worstAt(i);
@@ -722,6 +764,33 @@ void writeFreezeSummary(const char* reason, bool final) {
             i + 1, copy.worstCount(), w.ms, w.stamp, static_cast<unsigned long long>(w.frame),
             static_cast<unsigned long long>(w.sequence), cycle, w.note[0] ? "; " : "", w.note);
     }
+}
+
+// A TEST-ONLY TRIGGER, advanced.freeze_test_ms (0 = off, the default): sixty seconds into the session the render
+// thread sleeps that many milliseconds, once, so a flight can show the whole chain -- the LONG FRAME and FREEZE
+// lines, the stall sampler's lines naming where the thread was (here: an ntdll sleep, called from this DLL, so
+// "EDVR code on the stack: yes" is the expected answer), the counts and the worst list -- without waiting for a
+// real freeze. It stops the game on purpose; it is not a feature, and a value above 0 is logged when it is read.
+void freezeTestTick() {
+    State& s = g_s;
+    if (s.freezeTestDone) return;
+    if (!s.freezeTestRead) {
+        s.freezeTestRead = true;
+        s.freezeTestMs = Config::get().getIntInRange("advanced.freeze_test_ms", 0, 0, 5000);
+        s.freezeTestArmedMs = stampMs();
+        if (s.freezeTestMs > 0) {
+            Log::get().note("freeze test: advanced.freeze_test_ms = %d. Sixty seconds from now the render thread "
+                            "sleeps %d ms, once, to test the freeze lines and the stall sampler. Set it back to 0.",
+                            s.freezeTestMs, s.freezeTestMs);
+        } else {
+            s.freezeTestDone = true;
+        }
+        return;
+    }
+    if (!elapsedMs(s.freezeTestArmedMs, 60000)) return;
+    s.freezeTestDone = true;
+    Log::get().note("freeze test: the render thread sleeps %d ms now.", s.freezeTestMs);
+    Sleep(static_cast<DWORD>(s.freezeTestMs));
 }
 
 float budgetNow() {
@@ -1058,6 +1127,7 @@ void perfMonitorFrame(ID3D11Device* dev) {
         s.freezeCountsMs = stampMs();
         writeFreezeSummary("periodic", false);
     }
+    freezeTestTick();
 
     if (s.active || (s.activeUntilMs && nowMs() < s.activeUntilMs)) {
         if (dueMs(s.slowMs, kSlowEveryMs)) {
@@ -1613,6 +1683,7 @@ const CloseObserverRegistration g_closeObserverRegistration;
 void perfMonitorShutdown() {
     State& s = g_s;
     writeFreezeSummary("shutdown", true);
+    stallWatchShutdown();
     s.nativeHistory.clear();
     if (s.adapter3) {
         s.adapter3->Release();
