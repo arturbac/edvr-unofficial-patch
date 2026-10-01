@@ -97,6 +97,14 @@ follow: the camera that renders the content drives its motion.
 - ruled out: the screen's depth count as the world witness, because a 3D map
   draws into the same depth (22 a frame here; a busier one could pass the
   64-draw hold); only a draw that reads the world camera proves the world.
+- ruled out: "in the arrival spell the eye route serves the panel without
+  screen motion, and that is the ghost Sean saw" (design-flat-temporal-aa
+  section 82, FLIGHT 4), because the layer's world-screen line reads 5,174 and
+  5,396 2D screen draws asked, 0 left in the picture (060011, 30 s windows
+  ending 06:01:12 and 06:01:42): the layer took every one, and the luma probe's
+  final stage, read after the layer's composite (native_sharpen.cpp), is 100%
+  black at every sample of both spells. A ghost Sean saw was not the eye route
+  filtering the panel in the spell, or it was not in the spell (8.6).
 
 ## 2. Inventory
 
@@ -407,11 +415,16 @@ both show today's gate.
   (`depth-not-screen-motion-source`, the tone pass running on all of them), the
   layer's world-screen gate is open (the journal: no Flags2 in Status.json; the
   screen's depth 4 draws a frame; held 0 of 2,587 and 2,698 frames in 060011's
-  30 s windows ending 06:01:12 and 06:01:42), the eyes hold only the two
-  composites (2 eye draws a
+  30 s windows ending 06:01:12 and 06:01:42; 5,174 and 5,396 2D screen draws
+  asked in them, 0 left in the picture, so the layer took every one and the eye
+  route served none), the eyes hold only the two composites (2 eye draws a
   frame) and the luma probe reads 100% black at the game, dlss_out and final
-  stages at every 2 s sample (060011 to 06:01:59, 074129 07:42:51-07:43:19):
-  the screen is empty, not an unnamed world. 074129: first decline 07:42:53.317,
+  stages at every 2 s sample (060011 to 06:01:59, 074129 07:42:51-07:43:19).
+  The final stage is read after the layer's composite (native_sharpen.cpp), so
+  the submitted eye is black with the layer's screen in it: nothing visible
+  waits on a name, and the census agrees (6 kind-3 camera calls a frame in
+  074129's last three spell windows against 118-140 once the world draws). 074129:
+  first decline 07:42:53.317,
   `journal: LoadGame` 07:42:53.643, the world at 07:43:19.853 (26.5 s). 060011:
   06:00:58-06:02:00.107 (62 s). The pass ran on every eye throughout (the 30 s
   `gates` lines: "the pass treated 5,174 and 5,396 eyes" in the same two 060011
