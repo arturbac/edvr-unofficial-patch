@@ -20,8 +20,11 @@
 //      state, PS slots 0 and 1 (textures and samplers), shaders -- exactly the game's objects, after a landed
 //      re-issue and after every refusal.
 //   4. EVERY REFUSAL: a named counter, the game's state untouched, nothing taken, the route never told (no mips, no
-//      sampler, no sampler bound, no source texture, a curved screen, a blending draw, depth state, not armed, the
-//      draw's bindings changed before the re-issue, abandoned).
+//      sampler, no sampler bound, no source texture, a blending draw (a substituted one too), depth state, not armed,
+//      the draw's bindings changed before the re-issue, abandoned).
+//   4b. A CURVED SCREEN is no refusal: the game's draw is the curve substitution's strip (uiLayerDecide's `substituted`), the plan
+//      accepts it like a flat one, the re-issue lands in the layer exactly as a flat draw's does and takes the eye; and a strip
+//      draw that did not happen (End told landed = false) closes the bracket without taking the eye, counted as a fault.
 //   5. THE HOOKS STEP ASIDE: every raw entry the re-issue calls runs with VrWorldInternalScope up, without an outer one.
 //   6. THE DOOR'S PREFLIGHT and the accessors, the lost-draw counter, the stats.
 //   7. THE ON-FOOT MAPS GATE (experimental.on_foot_maps_sharp, docs/design-world-camera-motion-2026-09-30.md, Phase 1), the layer's
@@ -811,10 +814,14 @@ void testRefusals(Rig& r) {
         ID3D11ShaderResourceView* none = nullptr;
         r.ctx->PSSetShaderResources(0, 1, &none);
     });
-    refusal(r, "a curved screen", UiWorldRefuse::kCurved, UiLayerDecision::kRedirect, [] {}, /*substituted=*/true);
+    // (A curved screen is no refusal: its draw is the curve substitution's strip and the plan accepts it like a flat draw, testCurvedScreen below.
+    // It is refused for the same other reasons a flat draw is: here, a blend.)
     refusal(r, "a blending draw", UiWorldRefuse::kNotOpaque, UiLayerDecision::kRedirect, [&] {
         bindGame(r, 0, r.premul.Get());
     });
+    refusal(r, "a substituted (curved) draw that blends", UiWorldRefuse::kNotOpaque, UiLayerDecision::kRedirect, [&] {
+        bindGame(r, 0, r.premul.Get());
+    }, /*substituted=*/true);
     refusal(r, "a blend the layer cannot convert", UiWorldRefuse::kNone, UiLayerDecision::kBlendRefused, [&] {
         bindGame(r, 0, r.maxBlend.Get());
     });
@@ -925,6 +932,117 @@ void testRefusals(Rig& r) {
             check(!uiLayerWorldReissueBegin(r.ctx.Get()), "...and the plan with it: a Begin after that decision finds nothing to re-issue");
         }
         uiLayerWorldReissueAbandon();
+    }
+}
+
+// A CURVED screen (fix.panel_curvature above 0). The game's draw is the curve substitution's strip, which uiLayerDecide is told as `substituted`;
+// the route's re-issue repeats that strip (vscreen.cpp worldScreenReissueCurved, between Begin and End), and End is told whether the strip's draw
+// happened. This rig draws the quad for both issues, as for a flat screen: what is proven here is the layer's half -- the plan accepts a substituted
+// draw like a flat one, Begin and End land it and take the eye, and a draw that did not happen takes nothing.
+void testCurvedScreen(Rig& r) {
+    g_stubs.mayTake = true;
+    g_stubs.mipsAnswer = r.mipsSrv.Get();
+    g_stubs.samplerAnswer = r.mipSampler.Get();
+    const uint32_t whole[4] = {0, 0, kDoorW, kDoorH};
+    const float uv[4] = {0, 0, 1, 1};
+    const auto layerOf = [&](uint64_t seq) {
+        std::vector<uint32_t> px;
+        if (ID3D11Texture2D* out = uiLayerComposite(seq, 0, r.frame[0].tex.Get(), whole, uv)) {
+            px = readPixels(r, out);
+            out->Release();
+        }
+        return px;
+    };
+    // The flat draw first, as the control: what its layer holds.
+    uint64_t seq = nextArmed(r);
+    bindGame(r, 0);
+    const Drawn flat = drawScreen(r, false);
+    const std::vector<uint32_t> flatLayer = layerOf(seq);
+    check(flat.reissued && !flat.taken && !flatLayer.empty() && region(flatLayer, kDoorW, 12, 12, 84, 60, kGreen),
+          "a flat draw (the control): re-issued, and its layer holds the screen where the quad is");
+
+    // A substituted draw: planned and re-issued exactly like it.
+    seq = nextArmed(r);
+    bindGame(r, 0);
+    const Snap before = take(r.ctx.Get());
+    const auto s0 = statsNow();
+    const unsigned took0 = g_stubs.tookCalls;
+    const Drawn d = drawScreen(r, /*substituted=*/true);
+    check(!d.taken && d.pendingAfterDecide && d.reissued,
+          "a substituted (curved) screen draw: the decision is the route's (never a take), the draw is held for the re-issue and the re-issue lands -- as for a flat one");
+    const auto s1 = statsNow();
+    bool refusedAny = false;
+    for (size_t i = 0; i < static_cast<size_t>(UiWorldRefuse::kCount); ++i) refusedAny = refusedAny || s1.refused[i] != s0.refused[i];
+    check(!refusedAny && s1.reissued == s0.reissued + 1 &&
+              s1.screenDecided[static_cast<size_t>(UiLayerDecision::kRedirect)] == s0.screenDecided[static_cast<size_t>(UiLayerDecision::kRedirect)],
+          "...no refusal of any kind is counted (a curved screen is not one), and the draw is counted as a re-issue, not as a screen draw redirected into the layer");
+    check(g_stubs.tookCalls == took0 + 1 && g_stubs.tookEye == 0 && g_stubs.tookSeq == seq, "...the route is told eye 0 was taken, for this sequence, once");
+    check(same(before, take(r.ctx.Get())) && !uiLayerWorldReissuePending() && !uiLayerRedirecting(),
+          "...every changed state is back, and nothing is pending or redirecting afterwards");
+    {   // The eye is the route's for this frame, as a flat screen's is: a post pass the game leaves in its eye image is counted as lost.
+        ID3D11ShaderResourceView* post = r.eye[1].srv.Get();
+        r.ctx->PSSetShaderResources(0, 1, &post);
+        detail::g_bindingSlots[static_cast<size_t>(BindSlot::PsSrv0)].ptr = post;
+        uiLayerNoteOther(r.ctx.Get(), 3, true, false, false, false, 1, 0, 'D');
+        detail::g_bindingSlots[static_cast<size_t>(BindSlot::PsSrv0)].ptr = nullptr;
+        check(statsNow().lostDraws == s1.lostDraws + 1, "...the eye is the route's, as a flat screen's is: a post pass the game leaves in its eye image is counted as a lost draw");
+    }
+    const std::vector<uint32_t> curvedLayer = layerOf(seq);
+    check(!curvedLayer.empty() && curvedLayer == flatLayer,
+          "...and the layer holds exactly what a flat draw's layer holds (the substitution changes nothing about how the layer takes the draw)");
+
+    // The strip's draw did not happen (panel_curve.h panelCurveReissue returned false after Begin): End(landed = false) closes the bracket
+    // and takes nothing -- the eye route serves the eye -- and the refusal is counted as a fault.
+    seq = nextArmed(r);
+    bindGame(r, 0);
+    const Snap beforeFault = take(r.ctx.Get());
+    const auto f0 = statsNow();
+    const unsigned tookF0 = g_stubs.tookCalls;
+    const bool taken = uiLayerDecide(r.ctx.Get(), static_cast<int>(UiLayerFamily::kScreen), true, /*substituted=*/true);
+    r.ctx->Draw(4, 0);   // the game's own issue
+    check(!taken && uiLayerWorldReissuePending(), "a re-issue whose strip draw faults: the decision held the draw");
+    {
+        VrWorldInternalScope internal;   // worldScreenReissueCurved's scope, around Begin and End
+        const bool began = uiLayerWorldReissueBegin(r.ctx.Get());
+        check(began && uiLayerRedirecting(), "...Begin lands: the layer is bound, with the mipped screen and the sampler at PS slot 0");
+        // (the draw between Begin and End did not happen)
+        uiLayerWorldReissueEnd(r.ctx.Get(), /*landed=*/false);
+    }
+    const auto f1 = statsNow();
+    check(same(beforeFault, take(r.ctx.Get())) && !uiLayerRedirecting() && !uiLayerWorldReissuePending(),
+          "...End(landed = false) puts every changed state back and closes the bracket");
+    check(g_stubs.tookCalls == tookF0 && f1.reissued == f0.reissued &&
+              f1.refused[static_cast<size_t>(UiWorldRefuse::kFault)] == f0.refused[static_cast<size_t>(UiWorldRefuse::kFault)] + 1,
+          "...the eye is NOT taken (the route is not told, nothing is counted as a re-issue) and the refusal is counted as a fault");
+    {   // The eye is not the route's: a draw the game then leaves in its own eye image (a post pass over it) is not counted as lost, as it is
+        // for a re-issued eye (above and testLostDraws) -- the eye route serves this eye.
+        ID3D11ShaderResourceView* post = r.eye[1].srv.Get();
+        r.ctx->PSSetShaderResources(0, 1, &post);
+        detail::g_bindingSlots[static_cast<size_t>(BindSlot::PsSrv0)].ptr = post;
+        uiLayerNoteOther(r.ctx.Get(), 3, true, false, false, false, 1, 0, 'D');
+        detail::g_bindingSlots[static_cast<size_t>(BindSlot::PsSrv0)].ptr = nullptr;
+        check(statsNow().lostDraws == f1.lostDraws, "...the eye is not the route's: a post pass the game leaves in its eye image is not counted as a lost draw");
+    }
+    uiLayerWorldReissueEnd(r.ctx.Get(), false);   // a second End without a Begin changes nothing
+    check(statsNow().refused[static_cast<size_t>(UiWorldRefuse::kFault)] == f1.refused[static_cast<size_t>(UiWorldRefuse::kFault)] && g_stubs.tookCalls == tookF0,
+          "...and a stray End(landed = false) counts nothing more");
+    // Nothing is left stuck: the next frame's draw lands and takes the eye as usual.
+    const uint64_t next = nextArmed(r);
+    bindGame(r, 0);
+    const Drawn again = drawScreen(r, true);
+    check(again.reissued && g_stubs.tookCalls == tookF0 + 1 && g_stubs.tookSeq == next, "...and the next frame's substituted draw lands and takes the eye (nothing is stuck)");
+    // A draw that landed, told so by default, is what it always was: End(ctx) and End(ctx, true) are one thing (every flat caller passes nothing).
+    const uint64_t last = nextArmed(r);
+    bindGame(r, 0);
+    uiLayerDecide(r.ctx.Get(), static_cast<int>(UiLayerFamily::kScreen), true, false);
+    r.ctx->Draw(4, 0);
+    const unsigned tookL0 = g_stubs.tookCalls;
+    {
+        VrWorldInternalScope internal;
+        const bool began = uiLayerWorldReissueBegin(r.ctx.Get());
+        r.ctx->Draw(4, 0);
+        uiLayerWorldReissueEnd(r.ctx.Get(), /*landed=*/true);
+        check(began && g_stubs.tookCalls == tookL0 + 1 && g_stubs.tookSeq == last, "End(landed = true) takes the eye, exactly as End(ctx) with no second argument does");
     }
 }
 
@@ -1581,6 +1699,7 @@ int main(int argc, char** argv) {
     testReissue(r);
     testJitterCancel(r);
     testRefusals(r);
+    testCurvedScreen(r);
     testBeginWithoutOuterScope(r);
     testLostDraws(r);
     testDoorGaps(r);

@@ -1112,6 +1112,10 @@ exit /b 0
 echo [edvr] === vr_world_route_test.exe ===
 REM The VR on-foot world route (design doc section 82): the pure half, the detector's glue on the census retake's chain, the
 REM key-off contract and the hook pins. Pure C++ and source scans: no D3D.
+REM The curved route's pins (a curved screen does not hold the route off; the curve is named in the 5 s line and the OWNS line) hold
+REM their own controls: copies of the source with one edit that must trip the pin. tools\vr_world_route_test\mutants.py --self-test
+REM holds the mutation list of this rig, of vr_world_route_gpu_test and of ui_layer_world_test below to the sources as they are; its
+REM --run (on demand) builds each rig against one edited production file and requires a check that names the edit to fail.
 if not exist "%OBJ%\vrworldroutetest" mkdir "%OBJ%\vrworldroutetest"
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\vrworldroutetest"\ ^
@@ -1119,6 +1123,7 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /link /INCREMENTAL:NO kernel32.lib
 if errorlevel 1 ( echo [edvr] ERROR: vr world route test build failed & exit /b 1 )
 "%BUILD%\vr_world_route_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\vr_world_route_test\mutants.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_vr_world_route_gpu_test
@@ -1126,7 +1131,8 @@ echo [edvr] === vr_world_route_gpu_test.exe ===
 REM The VR world route's runtime (vr_world_route.cpp, linked as shipped) on WARP: the real binding shadow, the real Config and
 REM the real flat resolver with its backends stubbed, a synthetic copy of the census retake's chain drawn through the same
 REM per-draw entry the hooks call. Key off, the happy path, every refusal, the internal flags, the latch, scene resets,
-REM frame gaps and the key going off while owned.
+REM frame gaps and the key going off while owned. The curved screen's scenarios (the route runs with fix.panel_curvature above 0, and
+REM its lines name the curve) are held by tools\vr_world_route_test\mutants.py (its --run builds this rig against an edited route).
 if not exist "%OBJ%\vrworldroutegpu" mkdir "%OBJ%\vrworldroutegpu"
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /Fo"%OBJ%\vrworldroutegpu\\" ^
@@ -2762,7 +2768,9 @@ REM route's mode is never a take; the re-issue draws the screen composite into t
 REM screen through the trilinear sampler (a mip chain of one flat colour a level shows which level the map's
 REM minification selects) and the composite of that layer over a frame is the eye; every changed state comes back
 REM after a landed re-issue and after every refusal; every refusal is counted by reason and tells the route
-REM nothing; the raw entries run with the route's internal scope up. Built outside build\ like the seed rig above.
+REM nothing; the raw entries run with the route's internal scope up. A curved screen's draw (the curve substitution's strip) is
+REM planned like a flat one, and a re-issue that did not land takes no eye (held by tools\vr_world_route_test\mutants.py --run).
+REM Built outside build\ like the seed rig above.
 if not exist "%OBJ%\uilayerworld" mkdir "%OBJ%\uilayerworld"
 cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
     /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE ^
@@ -2795,6 +2803,31 @@ if errorlevel 1 ( echo [edvr] ERROR: on foot maps test build failed & exit /b 1 
 "%BUILD%\on_foot_maps_test.exe" --dry-run || exit /b 1
 "%BUILD%\on_foot_maps_test.exe" --self-test "%ROOT%" || exit /b 1
 python "tools\on_foot_maps_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
+:rig_panel_curve_test
+echo [edvr] === panel_curve_test.exe ===
+REM The curved screen's strip (src\d3d11\panel_curve.cpp; fix.panel_curvature) compiled for real with the real Config, Log and fault
+REM guard, and stubs for what it calls (the binding shadow's resolver, the screen's motion pass): on a WARP device with the game's
+REM state bound (the canonical quad and its index pattern at their offsets, the SIZE record, the placement constants, a sampler,
+REM the rasterizer state) and a recording draw function, the substitution and the VR world route's re-issue of the same strip are
+REM compared draw for draw: the arguments, the input assembler state at the draw, the buffer bytes against an independent bend,
+REM the motion pass's curve, the game's state put back (canonical, odd and empty), a live config change, a table of curvature by
+REM columns by sign by gain, the one-column identity strip against the game's quad, the SIZE read after its 50 ms lag (the clock
+REM is stepped, not slept), a faulting draw standing the feature down, panelCurveInfo() and the shutdown, and the rest of the
+REM pipeline left alone. tools\panel_curve_test\mutants.py --self-test holds the mutation list to the sources as they are; the
+REM list itself (--run, on demand, about a minute) proves the rig fails when each rule of the module is flipped. Built under obj\
+REM and taking System32's device through src\common\system_d3d11.h, so it links without d3d11.lib.
+if not exist "%OBJ%\panelcurve" mkdir "%OBJ%\panelcurve"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /I"src\d3d11" ^
+    /Fo"%OBJ%\panelcurve\\" /Fe"%OBJ%\panelcurve\panel_curve_test.exe" ^
+    "tools\panel_curve_test\panel_curve_test.cpp" "src\d3d11\panel_curve.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" "src\common\proxy.cpp" ^
+    /link /INCREMENTAL:NO user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: panel_curve_test build failed & exit /b 1 )
+"%OBJ%\panelcurve\panel_curve_test.exe" --dry-run || exit /b 1
+"%OBJ%\panelcurve\panel_curve_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\panel_curve_test\mutants.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_pixel_probe_test

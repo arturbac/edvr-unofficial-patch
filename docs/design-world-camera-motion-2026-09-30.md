@@ -408,6 +408,12 @@ keeps the naming alive (the curved branch returns before the tail where the
 route's call is). The world frames stay the eye route's and the route stays
 off with its own line. Code reading only; the flight keeps 0 (the census join
 reads the eye composite, which a curved screen replaces).
+SUPERSEDED for the route, 2026-10-01 (branch `claude/vr-route-curvature`):
+the route no longer needs 0. Its re-issue repeats the curve substitution's
+strip, so a curved screen is re-issued, not refused; the take is as written
+here (design-flat-temporal-aa-2026-09-23.md section 82, "The curved route",
+BUILT, NOT FLOWN; the flight plan there has the Phase 1 take with curvature as
+its leg E).
 
 **8.6 The arrival spell** (coordinator's correction, 2026-10-01: the declines
 in `edvr_gfx_20261001_060011.log`, v0.18.0-rc.5-19-g02c1c456, are not a Cinema

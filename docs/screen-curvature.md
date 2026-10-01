@@ -36,6 +36,17 @@ second — so tune by eye from there.
   edges come nearer rather than the middle moving away. The image itself is
   untouched — the same texels, on bent geometry.
 
+**With the VR on-foot world route** (`experimental.temporal_aa_on_foot_world =
+auto`; design-flat-temporal-aa-2026-09-23.md, section 82, "The curved route",
+2026-10-01) the curve stays on. The route hands each eye its own resolved copy of
+the screen through the UI layer, and for a curved screen the layer draws that
+copy through the very same bent strip the game's own draw uses, by the same code,
+so the bend and the placement are identical with the route on or off. The route's
+5 s log line names the curve in use (`curve=`). A bent screen's edges come
+nearer than its middle, so on a near screen they show the picture enlarged more
+than the middle does; if they look softer than the middle at
+`vscreen_res_width = auto`, type a width.
+
 Under `[advanced]`: `panel_curvature_segments` (how finely the screen is
 tessellated; 64 is past what the eye can see, and below ~8 the bend visibly
 facets), `panel_curvature_sign` (which way the bend goes — the escape hatch

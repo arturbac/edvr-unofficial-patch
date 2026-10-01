@@ -345,13 +345,33 @@ inline int vrWorldFormatWindow(char* out, size_t size, VrWorldKey key, VrWorldSt
     return n;
 }
 // The route took the world: the first frame its layer took a screen draw after being warm.
-// `curve` is vrWorldFormatCurve's text at that boundary: anything but "off" adds the curve the layer's re-issue is drawn through.
+// `curve` is vrWorldFormatCurve's text at that boundary, and the line adds ONE sentence that says what is true of the screen in that state
+// (each keeps "(curve=<text>)", the part a reader keys on):
+//   off, or null    nothing: a flat screen's line is what it always was;
+//   "C/S/G"         a strip is in hand: the layer draws the very strip the game's own draw is substituted with;
+//   "pending"       asked for and no strip built yet: the game and the layer both draw the flat quad until it is;
+//   "stood-down"    the substitution turned itself off for the session: the game draws its own flat quad and the layer re-issues it flat.
+constexpr char kVrWorldEnteredStripHead[] = "; the screen is curved (curve=";
+constexpr char kVrWorldEnteredStripTail[] =
+    "): the layer draws the same strip the game's own draw is substituted with, so the bend and the placement are the game's";
+constexpr char kVrWorldEnteredPending[] =
+    "; the screen is set to curve (curve=pending): the strip is not built yet, so the game and the layer both draw the flat quad until it is";
+constexpr char kVrWorldEnteredStoodDown[] =
+    "; the screen is set to curve but the curve stood down (curve=stood-down): the game draws its own flat quad and the layer re-issues it flat";
+constexpr size_t kVrWorldEnteredTailBytes = 224;
+// The longest sentence of each state fits the suffix buffer (the strip's with the widest curve text a window holds): a longer one fails the
+// build, not the log line.
+static_assert(sizeof(kVrWorldEnteredStripHead) + sizeof(kVrWorldEnteredStripTail) - 1 + (sizeof(VrWorldWindow::curve) - 1) <= kVrWorldEnteredTailBytes,
+              "the OWNS line's strip sentence (with the widest curve text) must fit the suffix buffer");
+static_assert(sizeof(kVrWorldEnteredPending) <= kVrWorldEnteredTailBytes, "the OWNS line's pending sentence must fit the suffix buffer");
+static_assert(sizeof(kVrWorldEnteredStoodDown) <= kVrWorldEnteredTailBytes, "the OWNS line's stood-down sentence must fit the suffix buffer");
 inline int vrWorldFormatEntered(char* out, size_t size, uint64_t frame, uint32_t warmFrames, const char* curve = nullptr) {
-    char tail[224] = "";
-    if (curve && std::strcmp(curve, "off") != 0)
-        std::snprintf(tail, sizeof(tail),
-                      "; the screen is curved (curve=%s): the layer draws the same strip the game's own draw is substituted with, "
-                      "so the bend and the placement are the game's", curve);
+    char tail[kVrWorldEnteredTailBytes] = "";
+    if (curve && std::strcmp(curve, "off") != 0) {
+        if (std::strcmp(curve, "pending") == 0) std::snprintf(tail, sizeof(tail), "%s", kVrWorldEnteredPending);
+        else if (std::strcmp(curve, "stood-down") == 0) std::snprintf(tail, sizeof(tail), "%s", kVrWorldEnteredStoodDown);
+        else std::snprintf(tail, sizeof(tail), "%s%s%s", kVrWorldEnteredStripHead, curve, kVrWorldEnteredStripTail);
+    }
     return std::snprintf(out, size,
         "vr world route: OWNS the world from frame=%llu after %u treated frames in a row; the eye shift is off and the "
         "layer takes the screen draw on every frame the route treats (the eye route serves the rest)%s",

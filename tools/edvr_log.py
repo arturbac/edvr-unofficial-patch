@@ -5158,13 +5158,13 @@ def self_test_vscreen_fit():
 
     # ---- the rule line, taken apart ----
     legacy_line = ("[06:07:03.620] vScreen resolution: auto = 5040 wide: rule=legacy source=none route=no eye=4032 distance=0.700 legacy=5040 m=1.25 -- LEGACY: "
-                   "125% of the 4032 px the runtime last rendered per eye, because the world route will not run: fix.panel_curvature is above 0 (the route "
-                   "stands aside for a curved screen). Without the route nothing anti-aliases the on-foot world before it reaches the panel, and the extra "
+                   "125% of the 4032 px the runtime last rendered per eye, because the world route will not run: experimental.temporal_aa_on_foot_world is "
+                   "not auto. Without the route nothing anti-aliases the on-foot world before it reaches the panel, and the extra "
                    "width does that job.")
     rule_line = next(l for l in text.splitlines() if "vScreen resolution: auto = " in l)
     legacy = sub(sub(text, rule_line, legacy_line), "-> 3504x1971", "-> 5040x2835")
     st, out = statuses(legacy)
-    if st.get("RULE") != "PASS" or "LEGACY 5040 wide (125% of the 4032 px eye): the world route will not run: fix.panel_curvature is above 0" not in re.sub(r"[ ]+", " ", out):
+    if st.get("RULE") != "PASS" or "LEGACY 5040 wide (125% of the 4032 px eye): the world route will not run: experimental.temporal_aa_on_foot_world is not auto" not in re.sub(r"[ ]+", " ", out):
         fail("a legacy launch did not say which condition failed: %r\n%s" % (st, out))
     if st.get("STORED") != "PASS" or "this launch's route=no (legacy), so a launch fits only once the world route will run" not in out:
         fail("a legacy launch's stored footprint did not say the next launch fits only when the route will run: %r\n%s" % (st, out))

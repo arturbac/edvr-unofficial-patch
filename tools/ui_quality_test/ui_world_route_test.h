@@ -265,7 +265,7 @@ void testReasons() {
     check(ok, "the first eight distinct reasons are logged, each once (a repeat is not logged again)");
     check(!log.first(9) && !log.first(40) && !log.first(1), "...and the ninth distinct reason is not logged, nor is a repeat of the first");
     UiWorldReasonLog mixed;
-    check(mixed.first(uiWorldReasonId(UiWorldRefuse::kCurved)) && !mixed.first(uiWorldReasonId(UiWorldRefuse::kCurved)) &&
+    check(mixed.first(uiWorldReasonId(UiWorldRefuse::kDepthState)) && !mixed.first(uiWorldReasonId(UiWorldRefuse::kDepthState)) &&
               mixed.first(uiWorldReasonId(UiLayerDecision::kNotArmed)) && !mixed.first(uiWorldReasonId(UiLayerDecision::kNotArmed)),
           "a route reason and a decision's are distinct entries");
 
