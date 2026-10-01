@@ -49,7 +49,7 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-82):** users 1-2 refused every frame, 3 treated at 7-13
-  fps, 4 lost ~23 ms (ReShade). 80-81 flown. 82 (VR): flown once; stage 2 built.
+  fps, 4 lost ~23 ms (ReShade). 80-81 flown. 82 (VR): 2 flights, shimmer open.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -6769,3 +6769,298 @@ module (not done).
 - ruled out: reading "the ~6 other kind-3 calls" as two other cameras, because
   frame 13804 shows them as the weapon's refreshes inside the 54 and the table's
   two other kind-3 cameras never appear on foot.
+
+**Flight 2 of the route (stage 2's first flight), analysed (2026-09-30).** Read
+and diagnosed; no code changed. Log `edvr_gfx_20260930_202113.log` (8,721 lines,
+20:21:13-20:31:43), v0.18.0-rc.4-132-g80a8cc7d (`edvr_log.py --target frontier
+--expect-build 80a8cc7d` exits 0; Sean tagged rc.5 at c7241450, so `describe`
+now reads rc.5-17). The same build's first session (`..._201531.log`) has the
+route owning 12,872 frames (20:17:47-20:20:11), jitter on throughout, no census;
+not analysed further. Environment: native OpenXR over the Pimax OpenXR runtime,
+90 Hz, Crystal Super; eye 2016x1949 into a 4032x3898 layer (Elite's
+HMDRenderTargetMultiplier 0.500; flight 1's was 0.850); the 2D screen and H
+5040x2835 R11G11B10F; the world resolved by DLAA preset K on slot 2 (HDR,
+automatic exposure; created once, 20:22:53.517; the DLSS DLL version is not
+logged); fix.ui_quality 100, fix.panel_curvature 0, fix.render_sharpness 0.3,
+advanced.texture_lod_bias auto, route auto, the jitter key flipped live from the
+in-VR menu. SEAN, at a settlement: "seeing some textures shimmer that don't
+without it": metal grates, hoses wrapped around a spool, any fine repeating
+pattern, his parked ship's fine lines; smooth surfaces fine; "happened even
+while standing still"; not with jitter off; "didn't notice any difference on my
+weapon".
+
+TIMELINE (log clock). On foot from 20:22:53 (OWNS at frame 11103). Jitter off/on
+by Sean: 20:22:56.8/20:23:07.0, 20:23:53.7/20:23:59.5, 20:31:09.0/20:31:19.7,
+20:31:26.1/20:31:28.3. RELEASED 20:24:15 after 7,317 owned frames (ship and
+hangar on the eye route; OWNS again 20:29:10.8); census on 20:29:47, after the
+route owned the world; NumLock draw censuses 20:30:07 and 20:31:00; RELEASED and
+re-OWNED 20:30:17-19; the end, a 12-call transition frame at 20:31:39.566 (frame
+56693) and RELEASED 20:31:39.8 after 6,708 owned frames. The weapon was drawn
+from about 20:30:40 (item 3). Over the 125 route windows: 19,749 frames, 19,443
+treated, 16,385 frames in 40 jitter-on windows, 3,144 in 7 jitter-off ones; no
+route-off leg (the key stayed auto); 1,444,776 kind-3 calls injected (median 78
+a frame, 34-113 by scene); `inj-refused`, `write-fail`, `off-thread`,
+`unreadable`, `inj-unnamed`, `inj-shut`, `late-hdr-writes` all 0; `pair-checked`
+16,838, `pair-bad` 0; the 162 declines are entry, exit and gap frames; no STOP;
+no map opened.
+
+1. THE CENSUS VERDICT (`--camera-census`; 3 sequences, 8 eye draws, from
+20:29:47). (i) LEAK PASS: worst |leak| 8.84e-09 NDC at world phases up to 0.3889
+px (2.7e-04 NDC). (ii) KIND-3 ROWS CARRY THE PHASE PASS: 234 injected calls
+measure the phase given to 7.62e-08 NDC. (iii) INJECTED KINDS PASS (kind 3
+only). (iv) OFF-THREAD / UNREADABLE PASS. (v) ROLES WARN. (vi) INJECTION WINDOW
+PASS: `inj-shut` 0, `inj-unnamed` 0, 7 JITTERED episodes, 3 RELEASED. `stage 2
+verdict: WARN (5 PASS, 1 WARN, 0 STOP)`. The WARN is two understood things:
+`inj-fp` 0 (item 3, a defect of the role rule) and one frame, 20:31:39.566, that
+wanted a phase and found no scene call (the transition frame before the exit,
+resolved unjittered and said so: the last 5 s line's `phase=0.3750,0.0556
+rows=0.0000,0.0000`). The world camera 0x28074A12250 makes 78.0 calls a frame
+from three sites (26 each) in two projections, all injected as `scene`: 63 at
+near 0.025 and 15 at near 0.0675, 1.231 times tighter (the weapon's); the census
+note's 92.6 a frame (design 54-68) is the settlement, the design a station. Not
+injected: auxiliary cameras (aspect 1.0 at 90 degrees, 0.6118, a 0.149 rad zoom
+camera; none the screen's aspect; 37,272 calls), kinds 0 and 1 (21 a frame), the
+kind-4 camera (3 a frame) and the eyes (6): so `unsupported` about 9 a frame is
+the eyes plus the kind-4 camera, and `other-kind` 21-24 is kinds 0 and 1.
+
+2. THE SHIMMER. What Sean's facts say first: it appears only with the jitter on,
+in one session where the mip bias (-1.00), the layer path and the sharpening
+(0.3) are the same with it off; it is on fine repeating patterns, not smooth
+surfaces; it happens at rest, on his parked ship too. So the cause changes with
+the jitter for fine content and is not motion: a bias or a downstream resample
+alone cannot make it (the jitter-off legs have both), nor can a camera or
+motion-vector error at rest. Ranked, each with what the log shows; the lead was
+found last, by reading what the route does with a pixel it will not accumulate.
+
+(f) THE ROUTE'S OWN HISTORY REFUSAL SHOWS JITTERED RAW COLOUR (lead; a
+hypothesis, no pixel evidence). The prep refuses history for a pixel whose
+engine slot is STALE (a keyed draw wrote it, a later draw changed the depth:
+`engineBefore`, flat_mono_shader_source.h:77, everywhere but the 3D main menu,
+which the route never is: `f.staticScene = false`, vr_world_route.cpp:323) or
+whose record is masked (first seen, gap). For an output pixel whose 2x2 raster
+footprint (the four texels around the +jitter sample) holds a refused pixel,
+`finishHdr` (:224-236) writes the raw input sampled bilinearly at +jitter
+instead of the backend's result: never accumulated, never anti-aliased, and
+shown through a filter whose weights follow the eight phases. A 2 px pattern's
+amplitude is multiplied by 1 - 2|frac x|: over one cycle 1.0, 0.5, 0.5, 0.25,
+0.75, 0.75, 0.25, 0.125 (y: 0.67, 0.67, 0.22, 0.89, 0.44, 0.44, 0.89, 0.22), an
+11.25 Hz pulse at 90 fps; smooth surfaces are unchanged. With jitter off the
+offset is 0: the raw texel, static. That is each of Sean's facts. And it is the
+flat route's own bug of 2026-09-29, found with the camera path and phase exactly
+right (rows carried it to 1e-7): the Krait's main-menu hull lines dashed because
+the stale-slot rule refused 22.5% of the frame, the plating pair
+66DE2CAD/235567BE being unkeyed and overdrawing keyed draws' slots; fixed for
+flat by keying it (flat only; VR "stays as it was",
+engine_velocity_families.h:35) and a menu-only static policy, Sean "Yep shimmer
+fixed" (design-flat-camera-integration.md, "Krait main-menu shimmer"). The VR
+route inherits the flat resolver and rule and none of the flat fixes, and until
+stage 2 it could not show: with jitter 0 a refused pixel is a static raw texel.
+
+Log evidence that the precondition holds on foot: the engine-motion family lines
+name unkeyed pixel shaders "left stock": vs_DE545DC8EE4FBB87 with
+ps_A6070F9DD1CFB601 in the on-foot windows ending 20:23:14, 20:23:44, 20:30:14
+and 20:30:43 (the family draws 172k-265k a 30 s window), with
+ps_91F8937EDA723663 (keyed for flat, not VR) in the ship and hangar and the
+window ending 20:31:14, and vs_EB5234DB6ADB491D with ps_B7D50283329322C3 in the
+ship and hangar (the line names one pair a family a window and counts none of
+its draws). Masked records refuse too (5,601 of 2.18 million in the 20:30:14
+window: first seen 453, gap 5,140). No pixel count exists: the route has no
+refusal census, the `panel pixels:` counters of the engine-motion line belong to
+the eye route's screen-motion pass (one frame in 300, every frame with
+`advanced.temporal_aa_diagnostics = 1`; none of 349 logs over 300 KB holds a
+non-empty one) and the route ignores `temporal_aa_debug`. The share refused on
+foot has never been measured (the flat case was a hull-heavy menu frame).
+Against: no unkeyed pair is named for vs_66DE2CAD, the Krait plating's family
+(patched ps_864F1F94 only), so Sean's ship is not explained by the pair that bit
+the Krait; "any fine repeating pattern" is wider than overdrawn objects (if
+plain ground or wall textures shimmer too, (f) is not all of it); and the
+weapon's attached pixels take the same raw path (item 3) with nothing noticed,
+weak evidence, a weapon being mostly smooth.
+
+(c) MIP BIAS: an amplifier, not a cause by itself. EDVR adds -1.00 to the mip
+bias of the game's linear and anisotropic samplers (device_hook.cpp; baked at
+device creation, restart to change). `auto` is log2 of Elite's
+HMDRenderTargetMultiplier: flight 1's log (161545) reads 0.850 and -0.23, the
+three logs after it (18:22, 20:15, 20:21) read 0.500 and -1.00, so the on-foot
+textures were 0.77 mip levels sharper in flight 2, the flight with the jitter.
+The multiplier is the EYE render fraction (the cockpit's DLSS upscale); the
+on-foot screen is drawn at 5040x2835 whatever it is and the route resolves it at
+R = D, where EDVR's own rule (log2 of the fraction) is 0.0. The log's check
+("they agree, so the mips are right for this frame") compares with the eye
+fraction and cannot see that. NVIDIA's DLSS guide gives log2(R/D) - 1 (from
+memory; the SDK docs are not in the tree): -1.0 at R = D, so the value in force
+is what NVIDIA recommends for DLAA, not an error by that rule. The same-session
+toggles say it is not the sole cause (jitter off at -1.00 is calm); it hands the
+accumulator, and (f)'s raw pixels, more sub-pixel energy to fail on. A leg at 0
+sizes it.
+
+(e) DOWNSTREAM OF THE RESOLVE: an amplifier too. The layer takes the 5040x2835
+screen into the 4032x3898 eye layers by trilinear from a mipped copy and RCAS
+(0.3; its ini text says it "makes fine-line shimmer worse") follows, with no
+temporal filter at the eye grid while the route owns the world (the door is
+layer-only: eye-takes = door-layer-only = 38,838). A resolved H holds more fine
+detail than the jitter-off one and head micro-motion resamples it. The
+jitter-off legs share the path, so it cannot start the shimmer; it can scale it.
+Leg: fix.render_sharpness 0, live.
+
+(g) NGX'S INTEGRATION OF FINE HDR CONTENT, not separable here: eight Halton
+phases at 90 Hz repeat at 11.25 Hz (`kTemporalJitterCount` 8, NVIDIA's minimum
+at R = D, from memory), preset K with IsHDR and AutoExposure, pre-tonemap
+specular on metal. The flat route runs the same call and sequence. The same
+jitter into another backend (fix.temporal_aa on, then fsr, both live) shows
+whether it is NGX; the same shimmer in all three puts it upstream.
+
+(b) REGISTRATION: cleared at every link the log exposes. Phase written (census
+headers, frames 2-4: (-0.375,-0.0556), (0.125,0.2778), (-0.125,-0.2778)) against
+rows measured: 7.62e-08 NDC over 234 calls, where a flipped sign or no removal
+reads 0.5-1.1 px. The route's pair check reads the NAMING DRAW's scene constants
+as the game last wrote them (`engineVelocitySourceCameraRows`, b1 rows
+270..275), not the camera call's output: 16,838 consecutive pairs differ by the
+phases they claim, 0 bad, at 2e-6 NDC. The prep's cancellation replayed on the
+real census rows (a scratch replica of the shader arithmetic) leaves
+0.0003-0.0013 px of camera-term motion at rest (frames 2->3, 3->4), against
+0.50-0.56 with no removal, 0.67-1.11 flipped in y, 0.50-1.00 flipped in x,
+0.25-0.28 at half scale; the repo's rig proves the same on WARP. The float the
+injector was given is the float NGX gets (`worldApplied` -> `f.jitterX/Y` ->
+`InJitterOffsetX/Y`, dlaa.cpp:740, unmodified): the eye path's and the flat
+route's call, content displaced right/down by +jx/+jy (NDC +2 px/W, -2 py/H;
+Unreal's). No history churn: 4 resolver reset events in the route's 8.8 minutes
+(first treat 20:22:53.5; camera cut 20:23:37.5, 216.9 m; re-entries after 295.8
+s and 1.735 s); `scene-resets` 84, all in the 17 idle ship-and-hangar windows
+(the eyes' detector), none in an owned window; the slot-2 feature created once.
+Unseen: NGX's own acceptance of history. `phase=` and `rows=` on the 5 s line
+are not independent (`rows=` is the phase the frame applied); frame 56693 is the
+one place they differ.
+
+(d) ENGINE-RECORD MOTION CARRYING THE PHASE: no evidence; the record path
+applies the same `unjitterRow` to the engine snapshots EN and EB, and at rest a
+static record's motion is the camera term. (a) UN-JITTERED DRAWS: no evidence,
+one direct check. The camera rule holds every source pool draw to the naming's
+camera: 1,437,786 checks in nine windows, 0 declines on other scene constants or
+unseen rows; the 8,626 declines are 3,284 draws before the naming
+(20:23:44-20:24:44) and 5,342 of vs_AACFDCF2FB9AD809, a weapon family
+(weapon_motion.cpp), whose rows 270..273 differ at 0.000 m from the naming's:
+the weapon's projection. So pool families (props, machinery, ships) and the
+naming draw read the injected rows. Unchecked: terrain, non-pool draws, the
+weapon family's own buffer. The NumLock censuses cannot help: census_offscreen
+is 0 and census_cb_watch empty, so each logs the 6 eye-composite draws (VS
+5C36AF05, PS CFE84157, 2016x1949) and about 450 copies and 310 dispatches, no
+world draw; they say nothing about Sean's ship.
+
+RANK: (f); (c) and (e) as amplifiers; (g); then (b), (d), (a) (cleared or no
+evidence). (f) fits all four facts and has a precedent here; its weakness is
+that nothing counts pixels. The rest is judgment, not measurement.
+
+NEXT FLIGHT, no build. Same spot, standing still, the grates or the ship in
+view, 45 s a leg; Sean scores the shimmer 0-3. Ask first: does a fine pattern on
+plain ground or a wall shimmer, or only objects? ((f): objects only; (c): all.)
+L1 baseline, route auto, jitter on. L2, for (f):
+experimental.temporal_aa_on_foot_world off (the eye route) with
+advanced.temporal_aa_debug motion_source and advanced.temporal_aa_diagnostics 1,
+all live: are the shimmering structures yellow (stale slot) or red (masked
+record) and not green or blue? The 30 s `engine motion` line should then print
+`panel pixels:` shares (`--grep 'panel pixels'`). The eye route handles stale
+pixels its own way (the ini says yellow takes the camera's motion), so this
+classifies pixels, not the route's output. L3, for (g): route on,
+fix.temporal_aa on, then fsr, jitter on (the prep and its raw fallback are
+shared, so (f), (c), (e) are unchanged by it). L4, for (e): fix.render_sharpness
+0. L5, for (c): restart with advanced.texture_lod_bias 0, then 0.5, route auto,
+jitter on and off. Predictions: (f) structures yellow or red, shimmer less at L4
+and L5; (c) all fine patterns including ground, gone or much less at L5; (g)
+gone in L3's other backends. L2 and L5 settle the top two.
+
+3. THE WEAPON. `inj-fp` is 0 in every window because the role rule cannot tell
+the weapon's calls from the world's: it keys on the camera struct's NEAR
+(flat_camera_vr.h:41-51, at least 1.5 times the smallest near seen; read at
+flat_camera_inject.cpp:120, 427-430) and the struct's near is 0.025 for the
+weapon's calls too (the census camera line of the object's first call, a
+weapon-projection call: near 0.025, fov 0.8203). The 0.0675 of the flight 1
+entry and the stage 2 note is the composed rows' near, another number: a spec
+error of mine that the rule inherited (decision (a) stands, its input was
+wrong). The weapon's 15 calls a frame (five groups of three adjacent calls, one
+per site) were injected as `scene` and carry the phase to 7.6e-08 NDC: the
+weapon IS jittered with the world, as designed. But the route needs
+`firstPersonInjected > 0` to say so, so `vrWorldFirstPersonMode` answered 2
+(refuse attached pixels' history) on 12,563 of 12,869 weapon-mapped frames in
+jitter-on windows (97.6%), 306 in mode 0, never mode 1. The map is bound
+whenever weapon motion runs; the weapon was drawn from about 20:30:40 (373
+frames of the family's declines in the 20:30:44 window, 2,160 in the next). Mode
+2 is consistent: attached pixels carry reject=1, so finish shows the raw input
+at +jitter, registered, filtered, not accumulated, motion 0 for a weapon locked
+to the screen. It is the same raw resample as (f); Sean saw nothing. The
+jittered fold-in (mode 1) is still unflown. Fix, not built: classify
+first-person by the struct's fov (0.8203 for the weapon against about 0.98 for
+the eyes and scene; field +0x280, already read), or drop the role from the mode:
+every screen-view call carries the same phase, so "one injected, none refused"
+is the claim it needs.
+
+4. COST. No route-off leg exists and the jitter-off stretches (10.1, 5.8, 10.7,
+2.2 s) sit inside 30 s census windows; the native benchmark windows (whole-frame
+GPU and CPU p50), which end at every settings change, resolve them. One spot
+(20:23:43-20:24:17): jitter on 8.0 s, off 1.7 s, on 15.1 s read GPU p50 / CPU
+p50 7.382/1.698, 7.598/1.718, 7.433/1.706 ms: jitter on costs no more than off
+(the off leg is 0.2 ms higher, 153 frames) and the injector's CPU, about 80
+calls a frame, is not measurable. The 20:31 spot (on 1.7, off 5.3, on 2.8
+seconds): 10.051/4.884, 9.329/3.897, 9.622/4.235, a drift that follows where
+Sean looked, not the leg. EDVR ~ (GPU census, 30 s): wholly owned with jitter on
+3.281 (20:23:44: door 0.587, world resolve 1.888, mips 0.056, world layer 0.050,
+layer composite 0.307, sharpen 0.263; application render p50 8.40), 3.094
+(20:29:44) and 4.532 (20:30:14, the heaviest view: application render 11.48,
+game 6.95); with a 1.7 s release 3.735 (20:30:44); with 5-6 s of jitter off
+2.812 (20:24:14) and 3.487 (20:31:14). The world resolve is 1.59-1.95 ms in
+every owned window. The eye route in the ship, for scale: 5.1-5.8 ms (door
+3.7-4.3, upscaler 2.5-3.0). The plan's gate (jitter on within 0.2 ms of off) is
+met by the same-spot pair. Not measured: a route-off leg at the settlement,
+which would price the route's gain.
+
+- ruled out: a sign, scale or unit error in the jitter handed to the backend,
+  because the rows measure the phase to 7.6e-08 NDC, the prep cancels it to
+  0.0013 px on the real rows, 16,838 consecutive naming-draw row pairs agree and
+  the call is the flat route's own.
+- ruled out: a history reset or a phase pairing offset each frame, because there
+  were 4 resolver resets in the route's 8.8 minutes, all at state changes, no
+  scene reset in an owned window, the slot-2 feature was created once and no
+  consecutive pair disagreed.
+- ruled out (pool families): draws reading a camera without the phase, because
+  1,437,786 checks held to the naming's rows and the only "another camera" is
+  the weapon family.
+- ruled out: the bias alone or the layer path alone as the cause, because Sean's
+  jitter-off legs in the same session share both and are calm (they stay
+  candidates as amplifiers).
+- ruled out: the NumLock censuses and the `rows=` field of the 5 s line as
+  evidence about world draws, because with census_offscreen 0 the censuses log
+  the eye-composite draws only and `rows=` is the phase the frame applied.
+
+FIX PROPOSALS, nothing built. Nothing ships on (f) until a leg or a census shows
+the shimmering structures are refused pixels (AGENTS.md: no fix on an untested
+hypothesis).
+
+- (f) 1. The decisive build, small: a dev key that sets `staticScene` for the
+  route (vr_world_route.cpp:323), the flat menu's stale-slot policy applied on
+  foot (every stale pixel takes the camera term; flat 1B, valid there on 1,822
+  of 1,822 stale pixels), live, default off = today, named on the 5 s line (a
+  name that says what the user gets). One flight with the key toggled at the
+  grates: the shimmer gone with it on settles (f); the cost is that a moving
+  object drawn by an unkeyed pair ghosts while it is on. With a refusal census
+  and view (per-cause pixel counts on every 90th frame from the prep, in the 5 s
+  line, and a live view painting refused pixels in H, yellow stale and red
+  masked) it also sizes the share.
+- (f) 2. The root-cause fixes, only if (f) holds: key the pairs the log names
+  for VR (91F8937E and 235567BE already have flat keys; A6070F9D and B7D50283
+  need their bytecode captured with `glare_shader_dump` and the harness first);
+  and replace "stale means refuse" on foot with a depth-validated camera term: a
+  stale pixel takes the camera term, accepted only when the previous frame's
+  depth at the reprojected position matches the expected depth within the 1% the
+  TAA path already uses (`taa()`, :173-177). A moving unkeyed object fails the
+  test and is refused as today; a static one is accumulated. That removes the
+  class and not just the named pairs; the route needs its own previous depth for
+  it.
+- (c) The world's bias belongs to the world's own render fraction. While the
+  route owns the world the samplers that draw it want EDVR's rule at R = D
+  (0.0), not log2 of the eye fraction. A bias is baked at sampler creation, so
+  the proposal is two variants of each game sampler (the creation hook holds all
+  67) and a choice where the game binds samplers for the pass; no bind-time hook
+  was found, so its hot-path cost is measured first. Stopgap if L5 removes the
+  shimmer: advanced.texture_lod_bias 0 for on-foot play, at the cockpit's cost.
+  The route's 5 s line should name the bias in force.
+- Weapon: item 3. Every key off stays exactly as today.
