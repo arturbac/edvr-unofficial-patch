@@ -548,6 +548,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\quad_probe.cpp" ^
     "src\d3d11\intro_probe.cpp" ^
     "src\d3d11\intro_panel.cpp" ^
+    "src\d3d11\intro_curve.cpp" ^
     "src\d3d11\intro_skip.cpp" ^
     "src\d3d11\intro_upscale.cpp" ^
     "src\d3d11\temporal_pass.cpp" ^
@@ -1203,7 +1204,8 @@ REM key-off contract and the hook pins. Pure C++ and source scans: no D3D.
 REM The curved route's pins (a curved screen does not hold the route off; the curve is named in the 5 s line and the OWNS line) hold
 REM their own controls: copies of the source with one edit that must trip the pin. tools\vr_world_route_test\mutants.py --self-test
 REM holds the mutation list of this rig, of vr_world_route_gpu_test and of ui_layer_world_test below to the sources as they are; its
-REM --run (on demand) builds each rig against one edited production file and requires a check that names the edit to fail.
+REM --run (on demand) builds each rig against one edited production file and requires a check that names the edit to fail. Its wiring rig
+REM (--run --rig wiring) proves the surface strip's wiring pins (:rig_ui_quality_test, --wiring) on edited copies of vscreen.cpp, in seconds.
 if not exist "%OBJ%\vrworldroutetest" mkdir "%OBJ%\vrworldroutetest"
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\vrworldroutetest"\ ^
@@ -2926,6 +2928,73 @@ if errorlevel 1 ( echo [edvr] ERROR: panel_curve_test build failed & exit /b 1 )
 "%OBJ%\panelcurve\panel_curve_test.exe" --dry-run || exit /b 1
 "%OBJ%\panelcurve\panel_curve_test.exe" --self-test "%ROOT%" || exit /b 1
 python "tools\panel_curve_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
+:rig_intro_curve_test
+echo [edvr] === intro_curve_test.exe ===
+REM src\d3d11\intro_panel.cpp for real (movie world lock, splash refusal, screen-space test, config, retirement) on WARP, goldens bit for bit;
+REM one process per scenario because the module's latches cannot be reset. tools\intro_curve_test\mutants.py --self-test holds the mutation list to the module.
+if not exist "%OBJ%\introcurve" mkdir "%OBJ%\introcurve"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" /I"src\d3d11" ^
+    /Fo"%OBJ%\introcurve\\" /Fe"%OBJ%\introcurve\intro_curve_test.exe" ^
+    "tools\intro_curve_test\intro_curve_test.cpp" "src\d3d11\intro_panel.cpp" "src\d3d11\panel_curve.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" "src\common\proxy.cpp" ^
+    /link /INCREMENTAL:NO user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: intro_curve_test build failed & exit /b 1 )
+"%OBJ%\introcurve\intro_curve_test.exe" --dry-run || exit /b 1
+"%OBJ%\introcurve\intro_curve_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\intro_curve_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
+:rig_intro_curve_math_test
+echo [edvr] === intro_curve_math_test.exe ===
+REM The intro composite's constants read as a world-space panel (src\d3d11\intro_curve_math.h; docs\shaders\intro-composite-vs.asm): the
+REM pure half of the intro movie and the splash following fix.panel_curvature, compiled alone. Today's screen-space rule
+REM (introCbLooksScreenSpace) against a verbatim copy of intro_panel.cpp's looksScreenSpace over every boundary and the float either
+REM side of it, one slot, two slots and a deterministic sample of whole vectors at a time, and on a table of hand-derived answers; the
+REM world-space reading (introReadWorldCb) on the game's two real splash captures (the panel in front, and behind after a 180-degree
+REM yaw: ok, half-width 4.44444, toward +1) and the movie's stock constants (screen space, refused), every refusal in its own words
+REM and in its order, NaN and infinity in each of the 20 slots, the length, w and half-size ranges at their edges, and the depth
+REM direction by the signs of cb2[3].w and cb2[4].w. tools\intro_curve_math_test\mutants.py --self-test holds the mutation list to the
+REM header as it is; the list itself (--run, on demand, about a minute) proves the rig fails when each rule is flipped. Pure C++: no D3D.
+if not exist "%OBJ%\introcurvemath" mkdir "%OBJ%\introcurvemath"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\d3d11" /Fo"%OBJ%\introcurvemath"\ ^
+    /Fe"%BUILD%\intro_curve_math_test.exe" "tools\intro_curve_math_test\intro_curve_math_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: intro curve math test build failed & exit /b 1 )
+"%BUILD%\intro_curve_math_test.exe" --dry-run || exit /b 1
+"%BUILD%\intro_curve_math_test.exe" --self-test || exit /b 1
+python "tools\intro_curve_math_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
+:rig_intro_curve_module_test
+echo [edvr] === intro_curve_module_test.exe ===
+REM The splash's recogniser (src\d3d11\intro_curve.cpp; fix.panel_curvature, the game-placed composite the movie's vertex shader draws)
+REM compiled for real with the real Config, Log, fault guard and the real strip (panel_curve.cpp's surface API, drawing through a
+REM recording draw function), on a WARP device with the game's state bound: 80-byte constant buffers at VS slot 2 holding the game's
+REM two real splash captures and the movie's stock constants, decoys in the slots round them, the sampled surface in the binding
+REM shadow. A pair is learned by one copy of its 80 bytes read four ticks later: unknown through the settle frames, then armed with
+REM the half-width and direction the capture gives (4.44444, toward the viewer) or left as the game drew it with the reason and the
+REM 20 floats logged; a new surface or buffer is learned afresh; at curvature 0 nothing is created, copied or logged; only the
+REM composite's shape is recognised; sixteen pairs and the least recently drawn pushed out; unseen for 180 frames forgotten; a flat pair copied again every 60;
+REM the first rendered scene retires it for good; a fault in the draw or the readback stands only this module down; every reference
+REM taken is given back (the game's buffer, the device, the readback buffers); both eyes of the splash share one strip. The module's
+REM process-wide state is reset between cases through EDVR_INTRO_CURVE_RIG's two doors. tools\intro_curve_module_test\mutants.py
+REM --self-test holds the mutation list to the sources as they are; the list itself (--run, on demand, about a minute) proves the rig
+REM fails when each rule of the module is flipped. Built under obj\ and taking System32's device through src\common\system_d3d11.h,
+REM so it links without d3d11.lib.
+if not exist "%OBJ%\introcurvemodule" mkdir "%OBJ%\introcurvemodule"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /DEDVR_INTRO_CURVE_RIG ^
+    /DINTRO_CURVE_RIG_REAL_STRIP /I"%GEN%" /I"src\d3d11" ^
+    /Fo"%OBJ%\introcurvemodule\\" /Fe"%OBJ%\introcurvemodule\intro_curve_module_test.exe" ^
+    "tools\intro_curve_module_test\intro_curve_module_test.cpp" "src\d3d11\intro_curve.cpp" "src\d3d11\panel_curve.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" "src\common\proxy.cpp" ^
+    /link /INCREMENTAL:NO user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: intro_curve_module_test build failed & exit /b 1 )
+"%OBJ%\introcurvemodule\intro_curve_module_test.exe" --dry-run || exit /b 1
+"%OBJ%\introcurvemodule\intro_curve_module_test.exe" --self-test || exit /b 1
+python "tools\intro_curve_module_test\mutants.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_pixel_probe_test

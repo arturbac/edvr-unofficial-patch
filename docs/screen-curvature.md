@@ -47,6 +47,20 @@ nearer than its middle, so on a near screen they show the picture enlarged more
 than the middle does; if they look softer than the middle at
 `vscreen_res_width = auto`, type a width.
 
+**The intro movie and the splash screen follow the same setting** (design:
+intro-video.md, 2026-10-01). EDVR places the movie's quad itself
+(`fix.intro_video = screen`), so above 0 it is drawn as the same bent strip, with
+the depth axis added to the placement it builds. The splash is the game's own
+world-space panel: EDVR copies its placement constants (again every 60 frames
+while they read as anything but a world-space panel), reads from them the
+panel's half-width and which way its depth runs, and then draws the same strip
+through the game's own constants. Both draw the strip without back-face culling,
+because nobody has recorded that composite's index order. At curvature 0 none of
+this runs and a rig holds the movie's and the splash's draws byte for byte. What
+has no depth to bend stays flat: the movie in `stock` and `head` modes (head-locked
+screen space) and any composite whose constants do not read as a world-space
+panel; the log says which and why.
+
 Under `[advanced]`: `panel_curvature_segments` (how finely the screen is
 tessellated; 64 is past what the eye can see, and below ~8 the bend visibly
 facets), `panel_curvature_sign` (which way the bend goes — the escape hatch

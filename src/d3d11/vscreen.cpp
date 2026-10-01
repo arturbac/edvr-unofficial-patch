@@ -74,6 +74,7 @@
 #include "flat_temporal.h"   // bounded, flat-profile-only scene discovery
 #include "../common/runtime_profile.h"
 #include "intro_panel.h"
+#include "intro_curve.h"     // the splash's recogniser: which composite draws are the game's own world-space panel
 #include "intro_skip.h"
 #include "intro_upscale.h"
 #include "intro_probe.h"
@@ -702,6 +703,12 @@ struct State {
     // at the top of every beginPanelOverride, so it can never outlive the draw
     // that set it.
     bool     curveThisDraw = false;
+
+    // Set by beginPanelOverride when intro_curve.h recognised this draw as the splash's (or a menu loop's) game-placed world-space composite, to
+    // be drawn as the surface strip, consumed by forwardWithVerdict and put away by the thunk. A flag for curveThisDraw's reason and NOT curveThisDraw
+    // itself: that one is the on-foot screen's, and its branch returns before the verdict's Begin and the splash dim. Cleared at the top of every
+    // beginPanelOverride, so it can never outlive the draw that set it.
+    bool     introCurveThisDraw = false;
 
     void*    compositeCb = nullptr;
     uint8_t  shadow[512] = {};
@@ -1693,7 +1700,9 @@ bool drawGateSubscribed(State* s) {
         introProbeWants() || introPanelWants() ||
         wakePulseWantsDraws() || nightVisionWantsDraws() ||
         witchspaceStarsHidden() || depthProbeWanted() ||
-        vscreenFootprintWanted();   // the footprint instrument (vscreen_footprint.h): it reads the 2D screen's composite
+        vscreenFootprintWanted() ||   // the footprint instrument (vscreen_footprint.h): it reads the 2D screen's composite
+        introCurveWants();            // the splash's surface strip (intro_curve.h): it acts in the eye branch, below this gate -- and panelCurveWants()
+                                      // above is the ON-FOOT strip's flag, which stands down on its own while this one does not
 }
 
 // The bound target's resolve, for the wake pulse, memoised on Rtv0's binding
@@ -1915,6 +1924,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // Cleared before anything can set it, on every draw, so a substitution
     // can never be attributed to a draw that did not ask for one.
     s->curveThisDraw = false;
+    s->introCurveThisDraw = false;
     t_uiDepthThisDraw = false;
     // Counting eye draws is not part of the panel distance fix, even though it
     // happens here.
@@ -2360,6 +2370,17 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         }
     }
 
+    // The splash's composite, and the main menu's loops: the same six-index draw through the movie's vertex shader with the GAME's own world-space
+    // placement (intro_curve.h). Recognised by shape, the VS and a one-shot copy of the game's constants, and drawn as the bent surface strip in
+    // forwardWithVerdict when fix.panel_curvature asks for it. Right AFTER the movie's claim above, so a draw the movie claims -- its placement is
+    // EDVR's own (intro_panel.h), drawn as its own strip -- is never asked; only the few settle frames before the movie has a placement of its
+    // own reach this, and its stock constants read screen-space and flat then, said once. It claims nothing: a flag, not a verdict, so it
+    // composes with kBackdrop's slot swap and the splash dim (and NOT curveThisDraw, which is the on-foot screen's and returns before both).
+    // Shape first, then introCurveWants(), which is one load at curvature 0 -- and then nothing below it runs.
+    if (kind == 'X' && count == 6 && introCurveWants()) {
+        s->introCurveThisDraw = introCurveOnComposite(self, kind, count, instances);
+    }
+
     // Nominate the scene camera for the world shader: a big eye-target
     // draw's 208-byte constants are the engine-standard camera block
     // with THIS eye's true rows -- the head-look clamp never touches
@@ -2634,7 +2655,13 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     //
     // It sets a flag instead of returning a verdict because it has to compose
     // with the distance fix, which returns kPanel for this very draw.
-    if (panelCurveWants() && srv0IsPanelSized(s, kind, count)) {
+    //
+    // NOT the intro composite (kIntroCompositeVsHash, intro_curve.h). The movie's and the splash's six-index composite samples a surface of the
+    // panel's size under a stock vscreen_res (1920x1080, the front end's own), this recognition is by size alone, and a substitution for it finds
+    // no SIZE in vertex slots 1..3 and stands the WHOLE on-foot curve down for the session. Those two surfaces are the surface strip's
+    // (introCurveThisDraw, forwardWithVerdict). The new term sits behind panelCurveWants(), so at curvature 0 nothing new is read.
+    if (panelCurveWants() && srv0IsPanelSized(s, kind, count) &&
+        !(kind == 'X' && count == 6 && bindingShaderHash(BindSlot::Vs) == kIntroCompositeVsHash)) {
         s->curveThisDraw = true;
     }
 
@@ -3908,11 +3935,15 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
             if (on) uiLayerWorldReissueAbandon();
         }
     } worldReissue;
+    // Set below, before the game's own issue, when the surface strip drew the intro movie's or the splash's composite in the place of the game's
+    // flat quad (intro_curve.h, panel_curve.h panelCurveSurfaceDraw): the game's own draw is then not issued a second time.
+    bool stripIssued = false;
     // The game's own draw, and only it: the class says which kind of altered draw it is
     // (gpu_census.h), so the thunk's real-draw call can be timed as that section. Every
     // other issue through `draw` below passes None and is timed by its own section.
     auto observedDraw = [&](AlteredDraw altered) {
         if (owner && uiLayerIssueBlocked()) return false;
+        if (stripIssued) return true;   // the strip was issued in its place: nothing more, and something was
         const bool issued = draw(altered);
         if (seedOutcome.on) seedOutcome.original = seedOutcome.original || issued;
         return issued;
@@ -4047,6 +4078,34 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // A Verdict-class draw also carries the fix that wraps it (alteredFixOf): the census names each.
     const AlteredDrawClass alteredClass = classifyAlteredDraw(owner, v == DrawVerdict::kNone,
                                                               engineVelocityDrawSubstituted(), layered);
+    // THE SURFACE STRIP (docs\intro-video.md, 2026-10-01). With fix.panel_curvature above 0 the intro movie's composite (EDVR places its quad;
+    // intro_panel.h) and the splash's (the game's own placement; intro_curve.h) are drawn as the bent strip IN THE PLACE of the game's flat quad.
+    // Here and not in the on-foot branch above, which returns before the verdict's Begin: kBackdrop's slot swap is in place by now, and the splash
+    // dim below follows the strip. The candidate test is two cheap tests, so an ordinary draw pays nothing and at curvature 0 nothing runs; the
+    // same refusal observedDraw makes comes first; and a strip that cannot be drawn leaves stripIssued false, so the game's own draw is issued
+    // below exactly as it always was -- flat, never missing.
+    float stripGain = 0.0f;
+    int stripToward = 0;
+    if ((v == DrawVerdict::kIntroPanel || g_state->introCurveThisDraw) && owner && panelCurveSurfaceWanted()) {
+        if (v == DrawVerdict::kIntroPanel) {
+            // The movie: its quad is EDVR's, at the splash's half-width, with +z' toward the viewer.
+            if (introPanelStripArmed()) {
+                stripGain = introPanelStripGain();
+                stripToward = 1;
+            }
+        } else {
+            // The splash: the half-width and the direction the game's own constants gave.
+            stripGain = introCurveGain();
+            stripToward = introCurveToward();
+        }
+        if (stripToward != 0 && !uiLayerIssueBlocked()) {
+            stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced);
+            if (seedOutcome.on && stripIssued) {
+                seedOutcome.substituted = true;
+                seedOutcome.known = false;   // the strip's mesh is not the game's draw: its original count is not the strip's
+            }
+        }
+    }
     const bool originalIssued=observedDraw(alteredClass == AlteredDrawClass::Verdict
                                                ? AlteredDraw(alteredClass, alteredFixOf(v)) : AlteredDraw(alteredClass));
     if (layered) {
@@ -4140,7 +4199,11 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         // re-issue needs is still bound either way.
         if ((v == DrawVerdict::kBackdrop || v == DrawVerdict::kIntroPanel) &&
             splashDimBegin(self)) {
-            draw(AlteredDrawClass::None);
+            // The dim is the same draw through the dark shader, so it follows the strip when the strip drew this one: the game's flat quad
+            // would dim a rectangle over a screen whose edges have come nearer. A strip that fails here leaves the game's own draw.
+            if (!(stripIssued && panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced))) {
+                draw(AlteredDrawClass::None);
+            }
             splashDimEnd(self);
         }
         // Every other verdict's End, in the ladder's old order
@@ -4790,6 +4853,12 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     });
     if (v == DrawVerdict::kPanel) endPanelOverride(self);
     if (v == DrawVerdict::kIntroPanel) introPanelEndDraw(self);
+    // The splash's numbers are put away after the draw and the dim have used them (forwardWithVerdict), and the flag with them, on every way out of
+    // that call: it cannot outlive the draw that set it.
+    if (g_state->introCurveThisDraw) {
+        g_state->introCurveThisDraw = false;
+        introCurveEndDraw();
+    }
     if (self == g_state->ownerCtx) pixelProbeAfterEye(g_state, self, perInstance, instances, false);
 }
 
@@ -5580,6 +5649,7 @@ EDVR_BOUNDARY_TICK(tkDepthProbe, "depth_probe");
 EDVR_BOUNDARY_TICK(tkGpuCensus, "gpu_census");
 EDVR_BOUNDARY_TICK(tkSceneArrived, "scene_arrived");
 EDVR_BOUNDARY_TICK(tkIntroPanel, "intro_panel");
+EDVR_BOUNDARY_TICK(tkIntroCurve, "intro_curve");
 EDVR_BOUNDARY_TICK(tkIntroSkip, "intro_skip");
 EDVR_BOUNDARY_TICK(tkLoaderPanel, "loader_panel");
 EDVR_BOUNDARY_TICK(tkIntroProbe, "intro_probe");
@@ -5589,6 +5659,20 @@ EDVR_BOUNDARY_TICK(tkFssReveal, "fss_reveal");
 EDVR_BOUNDARY_TICK(tkFssDump, "fss_dump");
 EDVR_BOUNDARY_TICK(tkFssPacing, "fss_pacing");
 EDVR_BOUNDARY_TICK(tkRemlok, "remlok");
+
+// The one line the surface strip adds when the intro ends, said once, at the first rendered scene: how many strip draws the intro had in all
+// (panel_curve.h counts every one it drew: the movie's, the splash's, and the splash dim's re-issues of either) and how many composite draws the
+// splash recogniser handed over to it (intro_curve.h). It is what tells "never ran" -- nothing, or 0 and 0 with the strip asked for -- from "ran
+// and invisible": draws counted, nothing seen. Nothing at curvature 0 unless something was drawn.
+void introCurveNoteRetired() {
+    static bool said = false;
+    if (said) return;
+    said = true;
+    const uint64_t drawn = panelCurveSurfaceInfo().drawn;
+    if (drawn == 0 && !panelCurveSurfaceWanted()) return;
+    Log::get().note("intro curve: %llu strip draw(s) in all (the movie's, the splash's and the splash dim's re-issues of either); the splash recogniser handed over %llu composite draw(s)",
+                    static_cast<unsigned long long>(drawn), static_cast<unsigned long long>(introCurveInfo().armed));
+}
 }  // namespace
 
 void vScreenFrameBoundary() {
@@ -5648,6 +5732,14 @@ void vScreenFrameBoundary() {
         tkIntroPanel.run([&] {
             introPanelTick(g_state->ownerCtx,
                            g_state->eyeDrawsLastFrame >= kSceneEyeDraws);
+        });
+        // The splash's recogniser (intro_curve.h), on the same boundary and the same scene signal as the movie's: it counts the frame, reads the
+        // copies that have settled and retires itself at the first rendered scene. At curvature 0 that is a frame counter and one load. Its one
+        // line, what the strip drew over the intro, is said from here once.
+        tkIntroCurve.run([&] {
+            const bool sceneFrame = g_state->eyeDrawsLastFrame >= kSceneEyeDraws;
+            introCurveTick(g_state->ownerCtx, sceneFrame);
+            if (sceneFrame) introCurveNoteRetired();
         });
         // The same boundary closes the skip's verdict: refused, drawn, or
         // neither, said once when the scene arrives.
@@ -6982,6 +7074,7 @@ void shutdownVScreenFixes() {
     // that ended without a rendered scene ever arriving -- quitting from the
     // menu -- freed nothing at all.
     introPanelShutdown();
+    introCurveShutdown();
     introUpscaleShutdown();
     introSkipShutdown();
     temporalPassShutdown();
