@@ -14,6 +14,7 @@
 #include <dxgi.h>
 
 #include "../common/log.h"
+#include "flat_hdr_crumbs.h"   // the flat HDR route's crash-safe breadcrumbs around the feature's steps
 #include "perf_monitor.h"   // the feature's creation is an event with a duration
 #include "gpu_timing.h"
 #include "gpu_adapter_name.h"  // adapterName -- shared with fsr3_engine.cpp
@@ -379,6 +380,9 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
         float sharpness = 0.0f;
         bool optKnown = false;
         NVSDK_NGX_Result optErr = NVSDK_NGX_Result_Success;
+        // The flat HDR route's crumbs (flat_hdr_crumbs.h): the runtime's own questions about render sizes, then the
+        // feature's creation and (in dlaaEvaluate) its evaluation, each bracketed where only the route's bit writes.
+        HdrCrumbSpan query(hdr, "backend-query", "in=%ux%u out=%ux%u", w, h, outW, outH);
         if (outW == w && outH == h) {
             optErr = NGX_DLSS_GET_OPTIMAL_SETTINGS(g_caps, w, h, quality, &optW, &optH, &maxW,
                                                    &maxH, &minW, &minH, &sharpness);
@@ -442,6 +446,8 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
                 return false;
             }
         }
+        query.result("ok=%u ngx=0x%08X", optKnown ? 1u : 0u, static_cast<unsigned>(optErr));
+        query.close();
         if (!optKnown && !g_optimalFailNoted) {
             g_optimalFailNoted = true;
             Log::get().note(
@@ -464,6 +470,8 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
         // An event with a duration for the monitor's drop attribution: the
         // feature's creation is the mod's own heaviest one-off on the render
         // thread, and it recurs at every size change.
+        HdrCrumbSpan create(hdr, "backend-create", "ngx feature in=%ux%u out=%ux%u quality=%d flags=0x%X", w, h, outW, outH,
+                            static_cast<int>(quality), static_cast<unsigned>(cp.InFeatureCreateFlags));
         const int64_t createT0 = qpcNow();
         const NVSDK_NGX_Result cr =
             NGX_D3D11_CREATE_DLSS_EXT(ctx, &f.handle, g_params, &cp);
@@ -471,6 +479,8 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
                               ? static_cast<double>(qpcNow() - createT0) * 1000.0 /
                                     static_cast<double>(qpcFrequency())
                               : 0.0;
+        create.result("ngx=0x%08X handle=%u", static_cast<unsigned>(cr), f.handle ? 1u : 0u);
+        create.close();   // after the duration above is taken: the crumb's own write is not part of the creation's time
         perfMonitorNoteEvent(kEvNgx, ms);
         if (createMs) *createMs = ms;
         if (NVSDK_NGX_FAILED(cr) || !f.handle) {
@@ -745,7 +755,10 @@ bool dlaaEvaluate(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour,
     const int qs = dev ? acquireQuerySlot(dev, ctx) : -1;
     if (dev) dev->Release();
     if (qs >= 0) { g_qring[qs].role = DlaaRole::Full; g_qring[qs].eye = eye; }
+    HdrCrumbSpan evaluate(hdr, "backend-evaluate", "ngx in=%ux%u out=%ux%u reset=%u", w, h, outW, outH, reset ? 1u : 0u);
     const NVSDK_NGX_Result er = NGX_D3D11_EVALUATE_DLSS_EXT(ctx, f.handle, g_params, &ep);
+    evaluate.result("ngx=0x%08X", static_cast<unsigned>(er));
+    evaluate.close();
     if (qs >= 0) g_qring[qs].timer.end(ctx); // Poll consumes failed End samples too.
     if (NVSDK_NGX_FAILED(er)) {
         ID3D11Device* failedDevice = nullptr;

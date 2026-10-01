@@ -10,6 +10,7 @@
 
 #include "../common/config.h"
 #include "../common/log.h"
+#include "flat_hdr_crumbs.h"   // the flat HDR route's crash-safe breadcrumbs around the context's steps
 #include "perf_monitor.h"   // the context's creation is an event with a duration
 #include "gpu_timing.h"
 #include "gpu_adapter_name.h"  // adapterName -- shared with dlaa.cpp
@@ -350,7 +351,10 @@ constexpr FormatCheck kFsrUavFormats[] = {
 // the description AMD's port itself hands back rather than to numbers
 // copied out of it: a port update that changes a format or a size is then
 // a clean refusal with a reason, not a silently wrong surface.
-bool makeSharedSurface(const FfxCreateResourceDescription& want, ID3D11Texture2D** out) {
+// `crumbs` and `role`: the flat HDR route's breadcrumbs (flat_hdr_crumbs.h) name each surface made, with its format, size
+// and HRESULT, when the context is the route's.
+bool makeSharedSurface(const FfxCreateResourceDescription& want, ID3D11Texture2D** out, bool crumbs = false,
+                       const char* role = "surface") {
     *out = nullptr;
     if (!g_device || want.resourceDescription.type != FFX_RESOURCE_TYPE_TEXTURE2D) return false;
     DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
@@ -374,7 +378,11 @@ bool makeSharedSurface(const FfxCreateResourceDescription& want, ID3D11Texture2D
     // turns a failed CreateShaderResourceView into a bare `throw 1`.
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
     if (!td.Width || !td.Height) return false;
-    return SUCCEEDED(g_device->CreateTexture2D(&td, nullptr, out)) && *out != nullptr;
+    HdrCrumbSpan span(crumbs, "create-texture", "role=%s fmt=%s(%u) size=%ux%u uav=1", role,
+                      hdrCrumbFormat(static_cast<uint32_t>(fmt)), static_cast<unsigned>(fmt), td.Width, td.Height);
+    const HRESULT hr = g_device->CreateTexture2D(&td, nullptr, out);
+    span.result("hr=0x%08X", static_cast<unsigned>(hr));
+    return SUCCEEDED(hr) && *out != nullptr;
 }
 
 void releaseEyeSurfaces(EyeCtx& e) {
@@ -506,6 +514,10 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
     desc.fpMessage = &FsrMessage;
     desc.backendInterface = g_backend;
 
+    // The flat HDR route's crumbs (flat_hdr_crumbs.h): the context's creation and, in fsr3Evaluate, the dispatch, each
+    // bracketed where only the route's bit writes. AMD's port makes its own pipelines and textures inside this call.
+    HdrCrumbSpan create(hdr, "backend-create", "fsr3 context in=%ux%u out=%ux%u flags=0x%X", w, h, outW, outH,
+                        static_cast<unsigned>(desc.flags));
     const int64_t createT0 = qpcNow();
     // AMD's DX11 backend does not always fail through FfxErrorCode: its TIF
     // helper (ffx_dx11.cpp) answers a failed D3D11 call mid-create with a
@@ -528,6 +540,8 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
                           ? static_cast<double>(qpcNow() - createT0) * 1000.0 /
                                 static_cast<double>(qpcFrequency())
                           : 0.0;
+    create.result("ffx=0x%08X threw=%u", static_cast<unsigned>(cr), threw ? 1u : 0u);
+    create.close();   // after the duration above is taken: the crumb's own write is not part of the creation's time
     perfMonitorNoteEvent(kEvFsr, ms);
     if (createMs) *createMs = ms;
     if (threw) {
@@ -568,9 +582,9 @@ bool ensureContext(unsigned eye, uint32_t w, uint32_t h, uint32_t outW, uint32_t
     // port reports, it is a silent loss of every motion vector.
     FfxFsr3UpscalerSharedResourceDescriptions shared{};
     const FfxErrorCode sr = ffxFsr3UpscalerGetSharedResourceDescriptions(&e.ctx, &shared);
-    if (sr != FFX_OK || !makeSharedSurface(shared.dilatedDepth, &e.dilatedDepth) ||
-        !makeSharedSurface(shared.dilatedMotionVectors, &e.dilatedMv) ||
-        !makeSharedSurface(shared.reconstructedPrevNearestDepth, &e.prevNearestDepth)) {
+    if (sr != FFX_OK || !makeSharedSurface(shared.dilatedDepth, &e.dilatedDepth, hdr, "fsr-dilated-depth") ||
+        !makeSharedSurface(shared.dilatedMotionVectors, &e.dilatedMv, hdr, "fsr-dilated-motion") ||
+        !makeSharedSurface(shared.reconstructedPrevNearestDepth, &e.prevNearestDepth, hdr, "fsr-previous-nearest-depth")) {
         releaseEyeSurfaces(e);
         ffxFsr3UpscalerContextDestroy(&e.ctx);
         snprintf(g_reasonBuf, sizeof(g_reasonBuf),
@@ -941,11 +955,14 @@ bool fsr3Evaluate(ID3D11DeviceContext* ctx, unsigned eye, ID3D11Texture2D* colou
     // can reach), folded into the same why-string contract rather than crashing.
     FfxErrorCode dr = FFX_ERROR_BACKEND_API_ERROR;
     bool threw = false;
+    HdrCrumbSpan evaluate(hdr, "backend-evaluate", "fsr3 in=%ux%u out=%ux%u reset=%u", w, h, outW, outH, reset ? 1u : 0u);
     try {
         dr = ffxFsr3UpscalerContextDispatch(&e.ctx, &dd);
     } catch (...) {
         threw = true;
     }
+    evaluate.result("ffx=0x%08X threw=%u", static_cast<unsigned>(dr), threw ? 1u : 0u);
+    evaluate.close();
     if (qs >= 0) g_qring[qs].timer.end(ctx);  // Poll consumes failed End samples too.
     if (threw) {
         snprintf(g_reasonBuf, sizeof(g_reasonBuf),
