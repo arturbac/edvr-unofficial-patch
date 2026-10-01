@@ -4932,13 +4932,28 @@ def print_vr_supersampling(text):
 # named and the layer did not take (the layer not armed for a frame, the world-screen gate holding the 2D screen) is also left in the scene and
 # shows with its family, beside the reasons the layer's `left in the game's frame` line already gives. A log with the layer's 30 s lines and no
 # composites line is a build from before this census, or a census that never ran: that is what the zeros are for.
+# One pair is neither taken nor a defect: the engine's NULL-OUTPUT QUAD (vs B018D143700AB803 / ps 258B95AC99520C1F), which samples a leftover interface
+# surface and writes nothing (docs/ui-layer-2026-09-23.md, 2026-10-01, "the composite the 15:09 flight left in the scene"). The census keeps it out of the
+# count of composites left and says it in a clause of its own at the end of <detail>: `vs <16 hex> ps <16 hex> (<name>, kept in the scene by design) <n>
+# draws, <rate> a frame`, after `none: ...` when nothing else is left. Builds before that (13c62cd6 to 069ebee4) counted it as a composite no family names,
+# which this reader called a STOP on every loading screen: the kept clause ends that, and a log from one of those builds is read the same way (its pair is
+# in UICOMP_KEPT_PAIRS, so its "no family" line is read as kept, with a note).
 UICOMP_STAMP_RE = re.compile(r"^\[(?P<ts>\d\d:\d\d:\d\d\.\d{3})\]\s*(?P<msg>.*)$")
 UICOMP_PREFIX = "ui quality: composites left in the scene: "
 UICOMP_RE = re.compile(r"^ui quality: composites left in the scene: (?P<left>\d+) of (?P<seen>\d+) composite draws \((?P<rate>[0-9.]+) a frame\) "
                        r"in (?P<frames>\d+) frames \((?P<live>\d+) live\) -- (?P<detail>.*)\.$")
 UICOMP_OFF_RE = re.compile(r"^ui quality: composites left in the scene: NOT COUNTED \((?P<why>.*)\) in (?P<frames>\d+) frames\.$")
 UICOMP_PAIR_RE = re.compile(r"vs (?P<vs>[0-9A-F]{16}) ps (?P<ps>[0-9A-F]{16}) \((?P<family>[^)]*)\) (?P<rate>[0-9.]+) a frame")
+UICOMP_KEPT_RE = re.compile(r"vs (?P<vs>[0-9A-F]{16}) ps (?P<ps>[0-9A-F]{16}) \((?P<name>[^)]*), kept in the scene by design\) (?P<n>\d+) draws, (?P<rate>[0-9.]+) a frame")
 UICOMP_PAST_RE = re.compile(r"(?P<n>\d+) draws of pairs past the table's (?P<cap>\d+) \((?P<rate>[0-9.]+) a frame\)")
+# Why each kept pair is not a defect, by the name the line gives it (the line says only "kept in the scene by design"; the reason lives here and in the doc).
+UICOMP_KEPT_WHY = {
+    "null-output quad": "its pixel shader writes zero and reads nothing, its blend is straight alpha and its depth and stencil are off, so it changes no pixel; the surface it "
+                        "samples is a leftover binding, and ui depth excludes its vertex shader by hash, so the layer never takes it",
+}
+# The pairs the DLL keeps (src/d3d11/ui_scene_composites.h kUiSceneKeptPairs; the self-test holds this table to that one). A log from a build between 13c62cd6 and
+# 069ebee4 has no kept clause and counts the pair as a composite left with no family: read as kept, with a note, so such a log does not STOP on a no-op.
+UICOMP_KEPT_PAIRS = {("B018D143700AB803", "258B95AC99520C1F"): "null-output quad"}
 UICOMP_NONE = "none: every interface composite drawn into an eye went into the layer"
 UICOMP_IDLE = "no draw into an eye sampled an interface surface in this window"
 UICOMP_NO_FAMILY = "no family"
@@ -4948,8 +4963,9 @@ UICOMP_SUSTAINED = 0.5
 
 
 def parse_ui_composites(text):
-    """{windows: [{ts, t, kind: 'count' | 'off', left, seen, rate, frames, live, state: 'none' | 'idle' | 'left', pairs: [{vs, ps, family, rate}], past: {n, cap,
-    rate} or None}], layer_windows: the layer's own 30 s lines, unparsed: [raw lines that start with the prefix and are none of the shapes]}."""
+    """{windows: [{ts, t, kind: 'count' | 'off', left, seen, rate, frames, live, state: 'none' | 'idle' | 'left', pairs: [{vs, ps, family, rate}], kept: [{vs, ps,
+    name, n, rate}], past: {n, cap, rate} or None}], layer_windows: the layer's own 30 s lines, unparsed: [raw lines that start with the prefix and are none of
+    the shapes]}. `left` is the headline's count of composites left (the kept pair, a clause of its own, is not in it); `seen` includes the kept draws."""
     out = {"windows": [], "layer_windows": 0, "unparsed": []}
     for raw in text.splitlines():
         m = UICOMP_STAMP_RE.match(raw.rstrip("\r"))
@@ -4965,7 +4981,7 @@ def parse_ui_composites(text):
         off = UICOMP_OFF_RE.match(msg)
         if off:
             out["windows"].append({"ts": ts, "t": t, "kind": "off", "left": 0, "seen": 0, "rate": 0.0, "frames": int(off.group("frames")), "live": 0,
-                                   "state": "off", "pairs": [], "past": None, "why": off.group("why")})
+                                   "state": "off", "pairs": [], "kept": [], "past": None, "why": off.group("why")})
             continue
         c = UICOMP_RE.match(msg)
         if not c:
@@ -4973,13 +4989,19 @@ def parse_ui_composites(text):
             continue
         detail = c.group("detail")
         w = {"ts": ts, "t": t, "kind": "count", "left": int(c.group("left")), "seen": int(c.group("seen")), "rate": float(c.group("rate")),
-             "frames": int(c.group("frames")), "live": int(c.group("live")), "state": "left", "pairs": [], "past": None}
-        if detail == UICOMP_NONE:
-            w["state"] = "none"
-        elif detail == UICOMP_IDLE:
+             "frames": int(c.group("frames")), "live": int(c.group("live")), "state": "left", "pairs": [], "kept": [], "past": None}
+        if detail == UICOMP_IDLE:
             w["state"] = "idle"
         else:
-            for item in detail.split("; "):
+            items = detail.split("; ")
+            if items[0] == UICOMP_NONE:
+                w["state"] = "none"
+                items = items[1:]
+            for item in items:
+                k = UICOMP_KEPT_RE.fullmatch(item)
+                if k:
+                    w["kept"].append({"vs": k.group("vs"), "ps": k.group("ps"), "name": k.group("name"), "n": int(k.group("n")), "rate": float(k.group("rate"))})
+                    continue
                 p = UICOMP_PAIR_RE.fullmatch(item)
                 if p:
                     family = p.group("family")
@@ -4994,6 +5016,18 @@ def parse_ui_composites(text):
         if w["state"] == "unreadable" or (w["state"] == "left" and not w["pairs"] and not w["past"]):
             out["unparsed"].append(raw)
             continue
+        # An older build (13c62cd6 to 069ebee4) has no kept clause: it counted the null-output quad as a composite left with no family. Read it as kept. When it was the
+        # only thing left the headline's own count is the draw count, exact; beside other pairs the draws are the rate over the frames (the line prints the rate to 0.01).
+        old = [pr for pr in w["pairs"] if pr["family"] == UICOMP_NO_FAMILY and (pr["vs"], pr["ps"]) in UICOMP_KEPT_PAIRS]
+        if old and w["state"] == "left":
+            rest = [pr for pr in w["pairs"] if pr not in old]
+            alone = not rest and not w["past"] and len(old) == 1
+            for pr in old:
+                w["kept"].append({"vs": pr["vs"], "ps": pr["ps"], "name": UICOMP_KEPT_PAIRS[(pr["vs"], pr["ps"])],
+                                  "n": w["left"] if alone else int(round(pr["rate"] * w["frames"])), "rate": pr["rate"], "legacy": True})
+            w["pairs"] = rest
+            if alone:
+                w["left"], w["rate"], w["state"] = 0, 0.0, "none"
         out["windows"].append(w)
     return out
 
@@ -5002,7 +5036,8 @@ def ui_composites_verdict(p):
     """[(tag, status, text)]: INSTRUMENT (the census ran: the line is there; zero lines beside the layer's own is a build before it or a census that never ran),
     DETECTOR (a window the interface depth pass was off), UNCLAIMED (a composite no family names, left in the scene: sustained is a STOP, a stray a WARN),
     NAMED (a family named it and it was not taken: a WARN, the layer's `left in the game's frame` line says why), OVERFLOW (more different pairs left than the
-    table names), TAKEN (every composite drawn into an eye went into the layer) and SHAPE (a line the reader could not parse)."""
+    table names), KEPT (a pair the scene keeps on purpose, the null-output quad: a PASS that says why it is not a defect), TAKEN (every composite drawn into an
+    eye went into the layer) and SHAPE (a line the reader could not parse)."""
     out = []
 
     def add(tag, status, text):
@@ -5049,13 +5084,31 @@ def ui_composites_verdict(p):
         worst = max(w["past"]["rate"] for w in past)
         add("OVERFLOW", "STOP" if worst >= UICOMP_SUSTAINED else "WARN",
             "%d window(s) left draws of more different pairs than the table names (%d), up to %.2f draws a frame unnamed" % (len(past), past[0]["past"]["cap"], worst))
+    # The pairs the scene keeps on purpose (a clause of their own, never in the count of composites left): said, with why, and never a finding.
+    kept_pairs = {}
+    for w in counted:
+        for k in w["kept"]:
+            e = kept_pairs.setdefault((k["vs"], k["ps"], k["name"]), {"windows": 0, "max": 0.0, "draws": 0, "first": w["ts"], "legacy": 0})
+            e["windows"] += 1
+            e["max"] = max(e["max"], k["rate"])
+            e["draws"] += k["n"]
+            e["legacy"] += 1 if k.get("legacy") else 0
+    for (vs, ps, name), e in sorted(kept_pairs.items(), key=lambda kv: -kv[1]["max"]):
+        add("KEPT", "PASS", "vs %s ps %s (%s): kept in the scene by design in %d of %d counted window(s), up to %.2f draws a frame (%d draws in all), first at %s; %s%s" % (
+            vs, ps, name, e["windows"], len(counted), e["max"], e["draws"], e["first"],
+            UICOMP_KEPT_WHY.get(name, "the census names it as not interface, with a pair of its own"),
+            "; %d of those window(s) are from a build whose census counted it as a composite left with no family (13c62cd6 to 069ebee4), read here as kept" % e["legacy"]
+            if e["legacy"] else ""))
     leftover = [w for w in counted if w["left"]]
     if counted and not leftover:
-        total = sum(w["seen"] for w in counted)
-        if total:
-            add("TAKEN", "PASS", "every interface composite drawn into an eye went into the layer: %d composite draws in %d window(s), none left in the scene" % (total, len(counted)))
+        kept_draws = sum(k["n"] for w in counted for k in w["kept"])
+        total = sum(w["seen"] for w in counted) - kept_draws
+        if total > 0:
+            add("TAKEN", "PASS", "every interface composite drawn into an eye went into the layer: %d composite draws in %d window(s), none left in the scene%s" % (
+                total, len(counted), " (%d more draws are the kept pair's, above, and are not interface)" % kept_draws if kept_draws else ""))
         else:
-            add("TAKEN", "WARN", "no composite was drawn into an eye in any counted window (a loading screen, or a log without a cockpit or a menu): nothing here shows the pair taken")
+            add("TAKEN", "WARN", "no composite was drawn into an eye in any counted window%s (a loading screen, or a log without a cockpit or a menu): nothing here shows the pair taken" % (
+                " but the kept pair's (%d draws, above)" % kept_draws if kept_draws else ""))
     return out
 
 
@@ -5068,9 +5121,15 @@ def print_ui_composites(text):
         if w["kind"] == "off":
             print("%s  NOT COUNTED in %d frames" % (w["ts"], w["frames"]))
             continue
-        what = "none" if w["state"] == "none" else "no composite drawn" if w["state"] == "idle" else "; ".join(
-            "%s/%s (%s) %.2f" % (pr["vs"], pr["ps"], pr["family"], pr["rate"]) for pr in w["pairs"]) + (
-            "; %d past the table (%.2f)" % (w["past"]["n"], w["past"]["rate"]) if w["past"] else "")
+        if w["state"] == "idle":
+            what = "no composite drawn"
+        else:
+            parts = ["none"] if w["state"] == "none" else []
+            parts += ["%s/%s (%s) %.2f" % (pr["vs"], pr["ps"], pr["family"], pr["rate"]) for pr in w["pairs"]]
+            if w["past"]:
+                parts.append("%d past the table (%.2f)" % (w["past"]["n"], w["past"]["rate"]))
+            parts += ["%s/%s (%s, kept by design) %d draws, %.2f" % (k["vs"], k["ps"], k["name"], k["n"], k["rate"]) for k in w["kept"]]
+            what = "; ".join(parts)
         print("%s  %d of %d composite draws (%.2f a frame) in %d frames (%d live)  %s" % (w["ts"], w["left"], w["seen"], w["rate"], w["frames"], w["live"], what))
     for tag, status, text_ in verdict:
         print("%s (%s) %s" % (status, tag, text_))
@@ -8529,7 +8588,7 @@ def self_test_ui_composites():
     lines = base.splitlines()
     p = parse_ui_composites(base)
     ws = p["windows"]
-    if [w["state"] for w in ws] != ["none", "idle", "none", "left", "left", "left", "left", "off", "none"] or p["unparsed"] or p["layer_windows"] != 2:
+    if [w["state"] for w in ws] != ["none", "idle", "none", "left", "left", "left", "left", "off", "none", "none", "left"] or p["unparsed"] or p["layer_windows"] != 2:
         fail("the fixture's windows read as %s (%d unparsed, %d layer lines)" % ([w["state"] for w in ws], len(p["unparsed"]), p["layer_windows"]))
         return False
     d = ws[3]
@@ -8544,6 +8603,26 @@ def self_test_ui_composites():
         fail("the overflow window reads as %r / %r" % (len(o["pairs"]), o["past"]))
     if (ws[7]["kind"], ws[7]["frames"]) != ("off", 2560) or ws[8]["live"] != 1280 or ws[1]["seen"] != 0:
         fail("the NOT COUNTED, half-live or idle windows read as %r / %r / %r" % (ws[7], ws[8]["live"], ws[1]["seen"]))
+    # The kept pair: a loading screen with only the null-output quad (0 left of 16182, the quad in its own clause), and a defect with the quad beside it.
+    k = ws[9]
+    if (k["ts"], k["left"], k["seen"], k["rate"], k["state"], k["pairs"], k["past"]) != ("16:05:00.001", 0, 16182, 0.0, "none", [], None) or k["kept"] != [
+            {"vs": "B018D143700AB803", "ps": "258B95AC99520C1F", "name": "null-output quad", "n": 5394, "rate": 2.0}]:
+        fail("the kept-only window reads as %r" % k)
+    b = ws[10]
+    if (b["left"], b["seen"], b["state"], b["past"]) != (56320, 66560, "left", None) or b["pairs"] != [
+            {"vs": "1989E6D3B405FDE0", "ps": "EAB8A1C95A13FFBE", "family": "no family", "rate": 22.0}] or b["kept"] != [
+            {"vs": "B018D143700AB803", "ps": "258B95AC99520C1F", "name": "null-output quad", "n": 5120, "rate": 2.0}]:
+        fail("the window with a pair left and the kept pair beside it reads as %r / %r" % (b["pairs"], b["kept"]))
+    # The table of kept pairs here is the DLL's (src/d3d11/ui_scene_composites.h kUiSceneKeptPairs): the same pairs, the same names.
+    try:
+        header = read_text(os.path.join(repo_root(), "src", "d3d11", "ui_scene_composites.h"))
+        entries = re.findall(r'\{0x([0-9A-F]{16})ull,\s*0x([0-9A-F]{16})ull,\s*"([^"]+)"\}', header)
+        if {(a, b_): n for a, b_, n in entries} != UICOMP_KEPT_PAIRS or len(entries) != len(UICOMP_KEPT_PAIRS):
+            fail("UICOMP_KEPT_PAIRS %r is not the DLL's kUiSceneKeptPairs %r" % (UICOMP_KEPT_PAIRS, entries))
+        if set(UICOMP_KEPT_WHY) != set(UICOMP_KEPT_PAIRS.values()):
+            fail("UICOMP_KEPT_WHY names %r, the kept pairs are named %r" % (sorted(UICOMP_KEPT_WHY), sorted(UICOMP_KEPT_PAIRS.values())))
+    except OSError:
+        fail("src\\d3d11\\ui_scene_composites.h is not readable from the repo root")
 
     def run(text):
         buf = io.StringIO()
@@ -8593,6 +8672,37 @@ def self_test_ui_composites():
     verdict("an idle window", pick(layer1, idle), 0, "WARN", "WARN (TAKEN) no composite was drawn into an eye in any counted window")
     # The layer live for half the window: said in the table, no verdict of its own.
     out = verdict("half live", pick(layer1, half), 0, "PASS", "0 of 30720 composite draws (0.00 a frame) in 2560 frames (1280 live)")
+    # The null-output quad kept: a loading screen with only that pair is a PASS that says the pair, why it is no defect, and that its draws are not interface; never a
+    # STOP and never a NAMED/UNCLAIMED finding. The 15:09 flight as the DLL now writes it.
+    loading, mixed = "16:05:00.001", "16:05:30.001"
+    out = verdict("a loading screen with the kept pair", pick(layer1, cockpit, loading), 0, "PASS",
+                  "PASS (KEPT) vs B018D143700AB803 ps 258B95AC99520C1F (null-output quad): kept in the scene by design in 1 of 2 counted window(s), up to 2.00 draws a frame (5394 draws in all)",
+                  "writes zero and reads nothing", "so the layer never takes it",
+                  "PASS (TAKEN) every interface composite drawn into an eye went into the layer: 72228 composite draws in 2 window(s), none left in the scene (5394 more draws are the kept pair's, above, and are not interface)",
+                  "0 of 16182 composite draws (0.00 a frame) in 2697 frames (2697 live)  none; B018D143700AB803/258B95AC99520C1F (null-output quad, kept by design) 5394 draws, 2.00")
+    if "UNCLAIMED" in out or "NAMED" in out:
+        fail("the kept pair is read as a finding:\n%s" % out)
+    # ...and a real defect beside it is still a STOP: the kept pair hides nothing.
+    verdict("the defect with the kept pair beside it", pick(layer1, mixed), 1, "STOP", "STOP (UNCLAIMED) vs 1989E6D3B405FDE0 ps EAB8A1C95A13FFBE: left in the scene in 1 of 1 counted window(s), up to 22.00 draws a frame",
+            "PASS (KEPT) vs B018D143700AB803 ps 258B95AC99520C1F (null-output quad)")
+    # Nothing but the kept pair drawn: the zero does not show a composite taken (a WARN, as an idle window is).
+    only_kept_text = pick(layer1, loading).replace("0 of 16182 composite draws", "0 of 5394 composite draws")
+    verdict("only the kept pair drawn", only_kept_text, 0, "WARN", "WARN (TAKEN) no composite was drawn into an eye in any counted window but the kept pair's (5394 draws, above)")
+    # A build between 13c62cd6 and 069ebee4 has no kept clause: it counted the quad as a composite left with no family (the 15:10:50 window of the 15:09 flight, verbatim).
+    legacy_line = "[15:10:50.165] ui quality: composites left in the scene: 5394 of 16182 composite draws (2.00 a frame) in 2697 frames (2697 live) -- vs B018D143700AB803 ps 258B95AC99520C1F (no family) 2.00 a frame."
+    legacy = version + "\n" + legacy_line + "\n"
+    out = verdict("an older build's line", legacy, 0, "PASS", "PASS (KEPT) vs B018D143700AB803 ps 258B95AC99520C1F (null-output quad): kept in the scene by design in 1 of 1 counted window(s)",
+                  "(5394 draws in all)", "read here as kept", "PASS (TAKEN) every interface composite drawn into an eye went into the layer: 10788 composite draws in 1 window(s)")
+    if "UNCLAIMED" in out:
+        fail("an older build's null-output quad is still read as unclaimed:\n%s" % out)
+    # ...but only that exact pair: one bit off, or with a family named, it is what it always was.
+    verdict("an older line, one bit off", version + "\n" + legacy_line.replace("B018D143700AB803", "B018D143700AB802") + "\n", 1, "STOP", "STOP (UNCLAIMED) vs B018D143700AB802 ps 258B95AC99520C1F")
+    verdict("an older line, ps one bit off", version + "\n" + legacy_line.replace("258B95AC99520C1F", "258B95AC99520C1E") + "\n", 1, "STOP", "STOP (UNCLAIMED) vs B018D143700AB803 ps 258B95AC99520C1E")
+    verdict("an older line, a family named", version + "\n" + legacy_line.replace("(no family)", "(interface composite, not taken)") + "\n", 0, "WARN", "WARN (NAMED) vs B018D143700AB803 ps 258B95AC99520C1F (interface composite)")
+    # Beside another pair an older line's kept draws are the rate over the frames, and the other pair is still said.
+    mixed_legacy = version + "\n" + ("[15:10:50.165] ui quality: composites left in the scene: 61440 of 66560 composite draws (24.00 a frame) in 2560 frames (2560 live) -- "
+                                     "vs 1989E6D3B405FDE0 ps EAB8A1C95A13FFBE (no family) 22.00 a frame; vs B018D143700AB803 ps 258B95AC99520C1F (no family) 2.00 a frame.") + "\n"
+    verdict("an older line beside a defect", mixed_legacy, 1, "STOP", "STOP (UNCLAIMED) vs 1989E6D3B405FDE0 ps EAB8A1C95A13FFBE", "PASS (KEPT) vs B018D143700AB803 ps 258B95AC99520C1F (null-output quad)", "(5120 draws in all)")
     # The layer's own 30 s lines and no census line: a build before it, or a census that never ran. Exit 3 and a STOP line that says so.
     verdict("no census line", pick(layer1, layer2), 3, "STOP", "STOP (INSTRUMENT) the layer printed 2 30 s line(s) and not one `composites left in the scene` line")
     # No ui quality line at all: the key was off.
