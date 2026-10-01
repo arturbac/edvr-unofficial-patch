@@ -1227,6 +1227,38 @@ int main(int argc, char** argv) {
         }
     }
 
+    // fix.vscreen_res_width = auto reads the route's key too (src\d3d11\vscreen_res.cpp: the on-foot screen is fitted to the eye only
+    // when the route will run, vscreen_fit.h). Its fallback is a second reader of the same key, and the day the route's default
+    // flips to auto the width has to follow it in the same commit: the same pair of checks, against the shipped file.
+    {
+        const std::string shippedWorld = Config::get().getString("experimental.temporal_aa_on_foot_world", "<unset>");
+        const std::string resSource = readRepoFile(dir, L"src\\d3d11\\vscreen_res.cpp");
+        if (resSource.empty()) {
+            fail("vscreen_res.cpp is readable from the repo root", "could not read it");
+        } else {
+            const std::string fallback = codeFallbackOf(resSource, "experimental.temporal_aa_on_foot_world");
+            if (fallback == shippedWorld) {
+                ok("the vscreen resolver's fallback for experimental.temporal_aa_on_foot_world is the shipped default");
+            } else {
+                fail("the vscreen resolver's fallback for experimental.temporal_aa_on_foot_world is the shipped default",
+                     "vscreen_res.cpp falls back to \"" + fallback + "\", the ini ships \"" + shippedWorld + "\"");
+            }
+            // CONTROL: the same source with the fallback turned the other way (the width fitted for a route no install has switched on).
+            std::string flipped = resSource;
+            const std::string from = "getString(\"experimental.temporal_aa_on_foot_world\", \"" + fallback + "\")";
+            const size_t at = flipped.find(from);
+            const char* other = shippedWorld == "auto" ? "off" : "auto";
+            if (at != std::string::npos)
+                flipped.replace(at, from.size(), std::string("getString(\"experimental.temporal_aa_on_foot_world\", \"") + other + "\")");
+            if (at != std::string::npos && codeFallbackOf(flipped, "experimental.temporal_aa_on_foot_world") != shippedWorld) {
+                ok("control: the vscreen resolver's fallback turned the other way is caught");
+            } else {
+                fail("control: the vscreen resolver's fallback turned the other way is caught",
+                     at == std::string::npos ? "the call was not found to alter" : "the flipped source still matched the ini");
+            }
+        }
+    }
+
     // The world jitter's key (design doc section 82, stage 2: experimental.temporal_aa_on_foot_world_jitter) is ON by default
     // and that is safe: it acts only while the route above, which is off by default, owns the world, and with the route key
     // off the route never reads it (vr_world_route_test pins that). The shipped file and the code's fallback for an ini that

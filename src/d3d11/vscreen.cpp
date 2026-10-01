@@ -67,6 +67,7 @@
 #include "engine_velocity.h"
 #include "vr_world_route.h"
 #include "vr_camera_census.h"
+#include "vscreen_footprint.h"   // fix.vscreen_res_width = auto's footprint instrument (the on-foot screen's width in the eye)
 #include "map_wait.h"         // the game's time inside Map, for the native timing line
 #include "flat_runtime.h"
 #include "flat_temporal.h"   // bounded, flat-profile-only scene discovery
@@ -1690,7 +1691,8 @@ bool drawGateSubscribed(State* s) {
         scrimWantsDraws() || quadProbeWants() || loaderPanelWants() ||
         introProbeWants() || introPanelWants() ||
         wakePulseWantsDraws() || nightVisionWantsDraws() ||
-        witchspaceStarsHidden() || depthProbeWanted();
+        witchspaceStarsHidden() || depthProbeWanted() ||
+        vscreenFootprintWanted();   // the footprint instrument (vscreen_footprint.h): it reads the 2D screen's composite
 }
 
 // The bound target's resolve, for the wake pulse, memoised on Rtv0's binding
@@ -3708,6 +3710,16 @@ __declspec(noinline) void cameraCensusEyeDraw(ID3D11DeviceContext* self) {
     vrCameraCensusEyeDraw(self, static_cast<uint32_t>(eye));
 }
 
+// The footprint instrument (vscreen_footprint.h; fix.vscreen_res_width = auto): at the 2D screen's composite, after the game's
+// own issue, tell it the draw's arguments and the panel distance its constants carry. Observes only: its copies and Map run
+// under the flat compute scope and never write a binding. NOINLINE and reached only while the instrument is armed (the
+// caller tests the flag, and only for an eye-target draw); the instrument itself spends one tick count and a compare on every
+// composite it does not sample.
+__declspec(noinline) void footprintEyeDraw(ID3D11DeviceContext* self, float applied, INT baseVertex, UINT startInstance) {
+    if (bindingShaderHash(BindSlot::Vs) != 0x5C36AF051B98B9F1ull || bindingShaderHash(BindSlot::Ps) != 0xCFE84157BC76E921ull) return;
+    vscreenFootprintCompositeDraw(self, applied, static_cast<int>(baseVertex), static_cast<unsigned>(startInstance));
+}
+
 __declspec(noinline) void worldScreenReissue(ID3D11DeviceContext* self, char kind, UINT count,
                                              UINT instances, const DrawArgs& args) {
     if (uiLayerIssueBlocked()) return;
@@ -4735,6 +4747,10 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
             // The VR camera census (vr_camera_census.h): at the 2D screen's composite, once an eye. g_vrWorldWants is true
             // whenever the census is wanted, so with the key off this is one load of a false bool.
             if (g_vrWorldWants && vrCameraCensusWanted()) cameraCensusEyeDraw(self);
+            // fix.vscreen_res_width = auto's footprint instrument: the same composite, the same moment. Armed only in the VR
+            // profile with the key auto; with the distance override applied to THIS draw its constants carry the scaled distance.
+            if (eyeGeometry && vscreenFootprintWanted())
+                footprintEyeDraw(self, v == DrawVerdict::kPanel ? g_state->distanceScale : 1.0f, baseVertex, startInstance);
             // The VR world route re-issues this 2D screen composite into the eye's layer right after the game's
             // own issue (ui_layer.h), and the door runs layer-only for the eye: the per-eye motion reissues below
             // are unused while the route owns it (0.24 ms), so they are skipped -- but the RECOGNITION still runs.
@@ -5531,6 +5547,7 @@ EDVR_BOUNDARY_TICK(tkUiDepth, "ui_depth");
 EDVR_BOUNDARY_TICK(tkUiLayer, "ui_layer");
 EDVR_BOUNDARY_TICK(tkVrWorldRoute, "vr_world_route");
 EDVR_BOUNDARY_TICK(tkVrCameraCensus, "vr_camera_census");
+EDVR_BOUNDARY_TICK(tkVScreenFootprint, "vscreen_footprint");
 EDVR_BOUNDARY_TICK(tkScreenMotion, "screen_motion");
 EDVR_BOUNDARY_TICK(tkCelestialMotion, "celestial_motion");
 EDVR_BOUNDARY_TICK(tkEngineVelocity, "engine_velocity");
@@ -5576,6 +5593,15 @@ void vScreenFrameBoundary() {
         // experimental.temporal_aa_on_foot_world off and the census off each returns at its first test.
         tkVrWorldRoute.run([&] { vrWorldRouteFrameBoundary(); });
         tkVrCameraCensus.run([&] { vrCameraCensusFrameBoundary(); });
+        // fix.vscreen_res_width = auto's footprint instrument (vscreen_footprint.h): maps a sample whose copy has had time to
+        // run, and every 30 s prints its line and stores the on-foot median for the next launch's width. The gate it is
+        // handed is the one the route reads: the layer's world-screen gate while the layer is live, else the journal's word.
+        // Unarmed (the flat profile, an explicit width) it is one config read a second and returns.
+        tkVScreenFootprint.run([&] {
+            const bool onFoot = uiLayerLiveForWorldRoute() ? uiLayerWorldScreenHeld()
+                                                           : (journalOnFootKnown() && journalOnFoot());
+            vscreenFootprintFrameBoundary(g_state->ownerCtx, onFoot);
+        });
         tkScreenMotion.run([&] { screenMotionFrameBoundary(g_state->ownerCtx); });
         tkCelestialMotion.run([&] { celestialMotionFrameBoundary(g_state->ownerCtx); });
         tkEngineVelocity.run([&] { engineVelocityFrameBoundary(g_state->ownerCtx); });
@@ -6890,6 +6916,7 @@ void shutdownVScreenFixes() {
 
     g_state->distanceEnabled = false;
     panelCurveShutdown();
+    vscreenFootprintShutdown();
     particleShutdown();
     objectProbeShutdown();
     pixelProbeShutdown();
