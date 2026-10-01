@@ -2,7 +2,7 @@
 //
 // tools\vscreen_fit_test runs the pure half (the rule, the corner arithmetic, the text) and scans the source. What it cannot run is
 // the glue itself: the D3D11 readback (four sources copied into one staging buffer at the composite draw, mapped later without
-// waiting), the arming condition, the 30 s window, the stored median, the fault guard. This rig compiles the REAL
+// waiting), the arming condition, the 30 s window, the stored head-on floor (p10), the fault guard. This rig compiles the REAL
 // vscreen_footprint.cpp with the real Config and Log, replaces what it calls (the runtime's published eye size, the hooks' bypass
 // flag) with stubs, puts a WARP device behind it with the four sources a composite draw binds (the model rows in cb0, the clip rows
 // in cb1 at their real offsets, the quad's four vertices, the per-instance SIZE), and finally runs the REAL reader
@@ -15,9 +15,11 @@
 //                     source is read from the right offset (the model rows at float 36, the clip rows at byte 4320 of a 5376 byte
 //                     buffer, the vertices at the draw's base vertex, SIZE at the draw's start instance), the sample waits its three
 //                     frames, nothing is mapped before the copy ran, and the 30 s line says exactly what it saw: samples on foot
-//                     and elsewhere, the footprint in eye pixels, at distance 1, the session median.
-//   WHAT IS STORED    the on-foot median is stored beside the eye width, at distance 1.0, and only from twelve on-foot samples up; the
-//                     line says what the file holds and the width the next launch would fit.
+//                     and elsewhere, the footprint in eye pixels, at distance 1, the session's value.
+//   WHAT IS STORED    the on-foot HEAD-ON FLOOR, the session's 10th percentile (tagged est=p10 in the file), is stored beside the eye
+//                     width, at distance 1.0, and only from twelve on-foot samples up; the line says what the file holds and the width
+//                     the next launch would fit. A session whose samples are NOT all alike (fractions at distance 1 from several applied
+//                     distances) stores 0.67 of the drawn width, where its median would be 0.85: the p10, not the median.
 //   SOURCES THAT ARE NOT WHAT IT ASSUMES   a vertex stride that is not 20, a constant buffer too small for the rows, no SIZE slot and
 //                     a negative base vertex each skip the sample and are counted by reason on the line; nothing is guessed.
 //   THE GUARD         a context that faults on every call (a bogus pointer) is absorbed by the fault budget five times, leaves the hooks'
@@ -378,7 +380,7 @@ int run() {
             const double at1 = std::atof(tokenOf(w1, "frac1").c_str());
             check(std::fabs(at1 - wantWidthFraction() * 0.7) < 1.0e-4, "WHAT IS STORED: the fraction at distance 1 is the drawn one times the applied distance");
             check(tokenOf(w1, "session-n") == "20" && std::fabs(std::atof(tokenOf(w1, "session-frac1").c_str()) - wantWidthFraction() * 0.7) < 1.0e-4,
-                  "WHAT IS STORED: the session median is over the 20 on-foot samples only");
+                  "WHAT IS STORED: the session's value is over the 20 on-foot samples only (all alike here, so their p10 is their value; the skewed session below tells p10 from median)");
             check(std::atof(tokenOf(w1, "other-fp").c_str()) > 3000.0, "THE PLUMBING: the menu samples are kept apart (other-fp)");
             check(tokenOf(w1, "persisted") != "no" && std::fabs(std::atof(tokenOf(w1, "persisted").c_str()) - wantWidthFraction() * 0.7) < 1.0e-4,
                   "WHAT IS STORED: twelve or more on-foot samples are stored, and the line says what the file holds");
@@ -389,7 +391,7 @@ int run() {
             in.fractionAtUnit = wantWidthFraction() * 0.7;
             in.route.keyAuto = true;
             check(tokenOf(w1, "fit") == std::to_string(fit::decide(in).width) && tokenOf(w1, "legacy") == "5040",
-                  "WHAT IS STORED: the line says the width the next launch would fit (the pure rule's, from the stored median) and the legacy one");
+                  "WHAT IS STORED: the line says the width the next launch would fit (the pure rule's, from the stored p10) and the legacy one");
             const std::string& w2 = windows[1];
             check(tokenOf(w2, "samples") == "0" && tokenOf(w2, "skipped") == "5" && has(w2, "why=") && tokenOf(w2, "fp") == "-",
                   "SOURCES THAT ARE NOT WHAT IT ASSUMES: five defective sources, five skipped samples, no measurement");
@@ -405,7 +407,7 @@ int run() {
         edvr::vscreenfit::Record r;
         check(edvr::lastKnownPanelFootprint(Config::get().logDir(), &r) && std::fabs(r.fractionAtUnit - wantWidthFraction() * 0.7) < 1.0e-4 && r.eyeWidth == 4032 &&
                   r.samples == 20 && std::fabs(r.distance - 0.7) < 1.0e-3,
-              "WHAT IS STORED: the file holds the on-foot median at distance 1, the eye width, the distance it was drawn at and the sample count");
+              "WHAT IS STORED: the file holds the on-foot p10 at distance 1, the eye width, the distance it was drawn at and the sample count");
     }
 
     // ---- the real reader ----------------------------------------------------------------------------------------------------------------
@@ -415,11 +417,58 @@ int run() {
         check(rc == 0, "THE READER: --vscreen-fit exits 0 on the glue's log");
         check(has(report, "PASS (INSTRUMENT)") && has(report, "PASS (ON FOOT)") && has(report, "PASS (SHAPE)") && has(report, "PASS (STORED)") &&
                   !has(report, "STOP ("),
-              "THE READER: its verdict on the glue's own log: the instrument ran, on foot was measured, the shape is 16:9, the median is stored, no STOP");
+              "THE READER: its verdict on the glue's own log: the instrument ran, on foot was measured, the shape is 16:9, the p10 is stored, no STOP");
         if (g_failure.size()) std::printf("%s\n", report.c_str());
     }
 
-    // ---- 5. the fault guard: a context that faults on every call -------------------------------------------------------------------------
+    // ---- 5. what is stored is the head-on floor (the session's p10), not its median ------------------------------------------------------
+    // Until here every on-foot sample was alike, so a p10 and a median are the same number. This session now takes samples whose fraction at
+    // distance 1 differs: the drawn constants stay, and the distance the draw says it carried does not (the instrument stores the drawn
+    // fraction x that distance). The store holds the 20 samples of 0.7 f above, then 5 of 0.4 f and 25 of 1.0 f (f = the drawn fraction):
+    //   sorted, n = 50: 5 x 0.4 f, 20 x 0.7 f, 25 x 1.0 f.   p10 = position 0.10 x 49 = 4.9 -> 0.4 f + 0.9 x (0.7 f - 0.4 f) = 0.67 f
+    //                                                         median = position 24.5 -> (0.7 f + 1.0 f) / 2 = 0.85 f
+    std::printf("the stored value is the p10\n");
+    const std::wstring tagFloor = L"fpfloor";
+    check(Log::get().open(g_dir, tagFloor.c_str()), "a log for the skewed session opens");
+    bindComposite(gpu, 20, true, false);
+    for (int i = 0; i < 5; ++i) sampleOnce(gpu, true, 0.4f, 4, 1);
+    for (int i = 0; i < 25; ++i) sampleOnce(gpu, true, 1.0f, 4, 1);
+    edvr::detail::g_footprintWindowMs = 1;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    edvr::vscreenFootprintFrameBoundary(gpu.ctx.Get(), true);
+    edvr::detail::g_footprintWindowMs = 600000;
+    Log::get().close();
+    {
+        const std::vector<std::string> fw = linesWith(slurp(newestLog(tagFloor.c_str())), "vscreen footprint 30s: ");
+        check(fw.size() == 1, "THE STORED FLOOR: the skewed session's window closed once and printed its line");
+        if (fw.size() == 1) {
+            const std::string& w = fw[0];
+            const double f = wantWidthFraction();
+            const double sess = std::atof(tokenOf(w, "session-frac1").c_str());
+            check(tokenOf(w, "samples") == "30" && tokenOf(w, "on-foot") == "30" && tokenOf(w, "session-n") == "50",
+                  "THE STORED FLOOR: 30 more on-foot samples, and the session now holds 50");
+            check(std::fabs(sess - 0.67 * f) < 1.0e-4 && std::fabs(sess - 0.85 * f) > 0.05,
+                  "THE STORED FLOOR: session-frac1 is the session's p10 (0.67 x the drawn fraction), not its median (0.85 x it)");
+            check(std::fabs(std::atof(tokenOf(w, "persisted").c_str()) - sess) < 1.0e-4, "THE STORED FLOOR: and persisted= says the file now holds that p10");
+            check(std::fabs(std::atof(tokenOf(w, "frac").c_str()) - f) < 1.0e-4 && tokenOf(w, "applied") == "1.000" && std::fabs(std::atof(tokenOf(w, "frac1").c_str()) - f) < 1.0e-4,
+                  "THE STORED FLOOR: while the window's own frac and frac1 stay medians of the window (the drawn fraction f, at distance 1.000)");
+            fit::Inputs in;
+            in.eyeWidth = 4032;
+            in.distance = 0.7;
+            in.haveFootprint = true;
+            in.fractionAtUnit = 0.67 * f;
+            in.route.keyAuto = true;
+            check(tokenOf(w, "fit") == std::to_string(fit::decide(in).width) && tokenOf(w, "fit") == "2880",
+                  "THE STORED FLOOR: and fit= is the pure rule's width from that p10 (2880: the floor, the screen is smaller than the calibration's)");
+        }
+        edvr::vscreenfit::Record r;
+        const std::string raw = slurp(Config::get().logDir() + L"\\vscreen_auto_footprint.txt");
+        check(edvr::lastKnownPanelFootprint(Config::get().logDir(), &r) && std::fabs(r.fractionAtUnit - 0.67 * wantWidthFraction()) < 1.0e-4 && r.samples == 50 && r.eyeWidth == 4032 &&
+                  has(raw, " est=p10 ") && !has(raw, "est=median"),
+              "THE STORED FLOOR: the file holds the p10 (0.67 x the drawn fraction) over 50 samples, tagged est=p10");
+    }
+
+    // ---- 6. the fault guard: a context that faults on every call -------------------------------------------------------------------------
     std::printf("the fault guard\n");
     const std::wstring tagDown = L"fpdown";
     check(Log::get().open(g_dir, tagDown.c_str()), "a log for the guard's session opens");

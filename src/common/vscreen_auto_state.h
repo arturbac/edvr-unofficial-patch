@@ -35,11 +35,12 @@ void noteResolvedEyeWidthForVScreenAuto(const std::wstring& logDir, uint32_t eye
 // and stored beside the eye width as a FRACTION of the eye width at panel distance
 // 1.0, so a changed panel_distance or eye width rescales it with no new measurement
 // (vscreen_fit.h says why). False when none is on record, or the file does not hold a
-// plausible fraction.
+// plausible p10 fraction (an older build's median record, with no est=p10, is no record).
 bool lastKnownPanelFootprint(const std::wstring& logDir, vscreenfit::Record* out);
 
-// Remembers a session's on-foot median. Called from the footprint instrument's 30 s
-// line, only with enough samples to be a median (vscreen_footprint.cpp).
+// Remembers a session's on-foot head-on floor (its 10th percentile, tagged est=p10 in the
+// file: a record written when the median was stored has no tag and reads as none). Called
+// from the footprint instrument's 30 s line, only with enough samples (vscreen_footprint.cpp).
 void noteMeasuredPanelFootprint(const std::wstring& logDir, const vscreenfit::Record& record);
 
 }  // namespace edvr

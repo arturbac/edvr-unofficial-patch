@@ -5700,7 +5700,7 @@ void vScreenFrameBoundary() {
         tkVrWorldRoute.run([&] { vrWorldRouteFrameBoundary(); });
         tkVrCameraCensus.run([&] { vrCameraCensusFrameBoundary(); });
         // fix.vscreen_res_width = auto's footprint instrument (vscreen_footprint.h): maps a sample whose copy has had time to
-        // run, and every 30 s prints its line and stores the on-foot median for the next launch's width. The gate it is
+        // run, and every 30 s prints its line and stores the on-foot head-on floor (p10) for the next launch's width. The gate it is
         // handed is the one the route reads: the layer's world-screen gate while the layer is live, else the journal's word.
         // Unarmed (the flat profile, an explicit width) it is one config read a second and returns.
         tkVScreenFootprint.run([&] {

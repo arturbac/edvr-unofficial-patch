@@ -42,8 +42,8 @@ using Microsoft::WRL::ComPtr;
 
 constexpr uint32_t kReadLagFrames = 3;       // a copy has run by then; mapping it sooner is what stalls
 constexpr uint32_t kGiveUpFrames = 90;       // a copy still not ready after about a second is abandoned and counted late
-constexpr uint32_t kMinPersistSamples = 12;  // an on-foot median needs at least this many samples (six seconds of them)
-constexpr double kPersistDelta = 0.002;      // a relative change in the median that rewrites the file (7 px of 3504)
+constexpr uint32_t kMinPersistSamples = 12;  // a stored p10 needs at least this many on-foot samples (six seconds of them): the 2nd and 3rd smallest of twelve
+constexpr double kPersistDelta = 0.002;      // a relative change in the stored p10 that rewrites the file (10 px of a 5006 px footprint: 7 px of the 3504 it fits)
 
 // The staging buffer's layout: the four sources, packed.
 constexpr uint32_t kOffModel = 0, kBytesModel = 48;     // cb0 rows 9..11: three float4
@@ -95,7 +95,7 @@ struct State {
     uint64_t windowStartMs = 0;
     uint32_t windowNo = 0;
     Window win;
-    vscreenfit::FractionStore session;       // the session's on-foot fractions, each normalised to panel distance 1.0
+    vscreenfit::FractionStore session;       // the session's on-foot fractions, each normalised to panel distance 1.0 (its p10 is what is stored)
     bool wroteOnce = false;
     double lastWrittenFrac1 = 0.0;
 };
@@ -257,7 +257,9 @@ void refreshWanted() {
     }
 }
 
-// The window's line, and the on-foot median stored for the next launch.
+// The window's line, and the on-foot head-on floor (the session's p10, vscreenfit::kFootprintQuantile) stored for the next launch.
+// The window's own fp / range / height / applied stay a median and a min..max: they describe the window; the session's p10 is the
+// number that is kept, because a head that is not square on to the screen only ever widens it (the median runs about 6% high).
 void closeWindow(uint64_t now) {
     State& s = g;
     Config& cfg = Config::get();
@@ -300,8 +302,8 @@ void closeWindow(uint64_t now) {
         w.haveOther = true;
         w.otherFrac = v;
     }
-    double frac1 = 0.0;
-    if (s.session.median(&frac1)) {
+    double frac1 = 0.0;   // the session's p10 at distance 1.0: the session-frac1= and persisted= tokens carry it
+    if (s.session.percentile(vscreenfit::kFootprintQuantile, &frac1)) {
         w.haveSession = true;
         w.sessionFrac1 = frac1;
         w.sessionN = static_cast<uint32_t>(s.session.total());
@@ -324,7 +326,7 @@ void closeWindow(uint64_t now) {
     }
     {
         // What the next launch would fit if the world route runs then: the same arithmetic the resolver uses
-        // (vscreen_fit.h), from this session's median when there is one, else the calibration seed.
+        // (vscreen_fit.h), from this session's p10 when there is one, else the calibration seed.
         uint32_t eyeForFit = w.eyeKnown ? w.eyeW : 0u;
         if (!eyeForFit) lastKnownEyeWidth(cfg.logDir(), &eyeForFit);
         if (eyeForFit) {

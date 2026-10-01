@@ -134,14 +134,18 @@ auto = N wide: rule=fitted|legacy ...`: the rule that chose the width and why, f
 which footprint, and which world-route condition failed when it is legacy), the
 width the panel patch applied, the footprint instrument's arming line and every
 `vscreen footprint 30s:` window (samples on foot and elsewhere, the screen's width in
-eye pixels, its range and shape, the footprint at panel distance 1, the session
-median, what is stored for the next launch and the width it would fit), then the
-verdict lines, PASS / WARN / STOP / n/a: RULE (the width follows the rule's own
-tokens and is what was applied), INSTRUMENT (it ran, saw the composite and read its
-sources), ON FOOT, STABLE, SHAPE (the footprint's pixel aspect is 16:9), DISTANCE LAW
-(the footprint at distance 1 agrees across panel distances), CALIBRATION (Sean's
-3504 at distance 0.7 on a 4032 px eye) and STORED. A log with none of these lines
-exits 1; the verdict never changes the exit code (read its lines).
+eye pixels, its range and shape, the footprint at panel distance 1, the session's
+head-on floor (its p10), what is stored for the next launch and the width it would
+fit), then the verdict lines, PASS / WARN / STOP / n/a: RULE (the width follows the
+rule's own tokens, to a step of 16, and is what was applied), INSTRUMENT (it ran, saw
+the composite and read its sources), ON FOOT, STABLE (the windows' widths at distance
+1 agree to 8%) and SHAPE (the median window's shape is 16:9 in the eye's own pixels,
+from the log's game FOV when it carries one), which judge only the windows with 12 or
+more on-foot samples, DISTANCE LAW (the footprint at distance 1 agrees across panel
+distances), CALIBRATION (the session's stored p10 against the 5006 px head-on
+footprint behind Sean's 3504 at distance 0.7 on a 4032 px eye, within 5%) and STORED.
+A log with none of these lines exits 1; the verdict never changes the exit code (read
+its lines).
 
 --flat-upscale reads a flat-profile flight (design doc section 83): the game's final copy admitted by
 its structure, so DLSS, FSR and TAA resolve below the output (Elite's supersampling under 1.0) whatever bloom,
@@ -4062,24 +4066,34 @@ def resolve_target(spec):
 # src/common/vscreen_fit.h writes the `vScreen resolution: auto = ...` rule line and the `vscreen footprint 30s:` line; the armed line
 # is src/d3d11/vscreen_footprint.cpp's. tools\vscreen_fit_test holds the formatters to tools\vscreen_fit_fixture.log, the file this
 # reader's own self-test reads. The constants below are that header's (kMultiplier, kFloorWidth, kLegacyMultiplier, the calibration
-# point); the rig pins the header, and self_test_vscreen_fit pins this copy of it to the header's text.
+# point, the stored quantile); the rig pins the header, and self_test_vscreen_fit pins this copy of it to the header's text.
+# What the log's session-frac1= and persisted= tokens carry is the session's p10 (the head-on floor), not a median: a window's own
+# fp / range / h / shape stay a median and a min..max.
 # ---------------------------------------------------------------------------------------------------------------------------------------
-VSCREEN_M = 1.0                 # kMultiplier
+VSCREEN_M = 0.70                # kMultiplier: the fitted width is this share of the screen's head-on footprint
 VSCREEN_FLOOR = 2880            # kFloorWidth
 VSCREEN_LEGACY_M = 1.25         # kLegacyMultiplier
-VSCREEN_SEED = (3504.0, 0.7, 4032.0)   # kSeedWidthPx, kSeedDistance, kSeedEyeWidthPx: Sean's calibration point
+VSCREEN_CHOSEN = 3504.0         # kChosenWidthPx: the width Sean chose for his rig (4032 px eye, panel distance 0.7)
+VSCREEN_SEED = (5006.0, 0.7, 4032.0)   # kSeedFootprintPx, kSeedDistance, kSeedEyeWidthPx: the calibration point (the screen's head-on px there)
+VSCREEN_QUANTILE = 0.10         # kFootprintQuantile: the stored estimator, p10
 VSCREEN_SHAPE = 16.0 / 9.0
-VSCREEN_STABLE = 0.02           # the screen's width may move this much (relative) between windows, and inside one
-VSCREEN_SHAPE_WARN = 0.03
-VSCREEN_SHAPE_STOP = 0.15
+VSCREEN_MIN_FOOT = 12           # a window with fewer on-foot samples than this is a transition (a menu, a map), not a measurement of the screen
+VSCREEN_STABLE = 0.08           # the windows' widths at distance 1 may differ this much, (max - min) / median (head turning moves a window by a few %)
+VSCREEN_SHAPE_PASS = (-0.09, 0.03)   # the median window shape may sit this far below / above its reference and pass: a turned head stretches the height
+VSCREEN_SHAPE_STOP = 0.15       # beyond this far either way the corner arithmetic or the eye size is wrong; between is a WARN
 VSCREEN_LAW = 0.02              # footprint at distance 1 may differ this much between windows at different distances
-VSCREEN_CALIBRATION = 0.03      # the measured footprint may differ this much from the calibration point before m is re-derived
+VSCREEN_CALIBRATION = 0.05      # the session's stored p10 may differ this much from the calibration point before m is re-derived
+VSCREEN_RULE_TOL = 16           # the width a rule line prints may differ this much from the one its own tokens give (the footprint prints rounded)
 
 VSCREEN_RULE_RE = re.compile(r"^(?:\[(?P<ts>[0-9:.]+)\] )?vScreen resolution: auto = (?P<w>\d+) wide: (?P<rest>.*)$")
 VSCREEN_APPLY_RE = re.compile(r"^(?:\[(?P<ts>[0-9:.]+)\] )?vScreen resolution: (?P<sw>\d+)x(?P<sh>\d+) -> (?P<w>\d+)x(?P<h>\d+) at (?P<sites>\d+) site")
 VSCREEN_EXPLICIT_RE = re.compile(r"^(?:\[(?P<ts>[0-9:.]+)\] )?vScreen resolution: explicit (?P<w>\d+) wide")
 VSCREEN_FOOT_RE = re.compile(r"^(?:\[(?P<ts>[0-9:.]+)\] )?vscreen footprint 30s: (?P<rest>.*)$")
 VSCREEN_ARMED_RE = re.compile(r"^(?:\[(?P<ts>[0-9:.]+)\] )?vscreen footprint: (?P<what>armed|not armed|STOOD DOWN)")
+# The graphics log's one line that carries the eyes' FOV (src/d3d11/perf_monitor.cpp, logNativeBenchmark, once a benchmark window):
+# `native benchmark workload: window N, ... game FOV radians L l/r/u/d R l/r/u/d; order left/right/up/down; ...`. Angles, not
+# tangents; the left eye's are the eye the footprint instrument's eye size comes from.
+VSCREEN_FOV_RE = re.compile(r"native benchmark workload: .*?game FOV radians L (?P<l>-?\d+\.\d+)/(?P<r>-?\d+\.\d+)/(?P<u>-?\d+\.\d+)/(?P<d>-?\d+\.\d+) R ")
 
 
 def _vround16(value):
@@ -4095,10 +4109,18 @@ def _vnum(text):
 def parse_vscreen_fit(text):
     """The log's vscreen auto-fit lines: {rule: {ts, width, kv, prose} (the launch's first auto line) or None, explicit: width or None,
     no_eye: bool (auto with no eye width on record), off: bool, applied: {ts, src, w, h, sites} or None, armed: [(ts, what)],
-    windows: [{ts, kv}]}. A line cut short or garbled is skipped, never fatal."""
-    f = {"rule": None, "explicit": None, "no_eye": False, "off": False, "applied": None, "armed": [], "windows": []}
+    windows: [{ts, kv}], fov: (left, right, up, down) in radians of the left eye from the log's first `native benchmark workload:`
+    line, or None}. A line cut short or garbled is skipped, never fatal."""
+    f = {"rule": None, "explicit": None, "no_eye": False, "off": False, "applied": None, "armed": [], "windows": [], "fov": None}
     for raw in text.splitlines():
         try:
+            if f["fov"] is None and "game FOV radians" in raw:
+                m = VSCREEN_FOV_RE.search(raw)
+                if m:
+                    l, r, u, d = (float(m.group(k)) for k in "lrud")
+                    if l < 0.0 < r and d < 0.0 < u and max(abs(l), r, u, abs(d)) < 1.5:   # a real FOV: a flat log's zeros are none
+                        f["fov"] = (l, r, u, d)
+                continue
             m = VSCREEN_RULE_RE.match(raw)
             if m:
                 head, _, prose = m.group("rest").partition(" -- ")
@@ -4135,7 +4157,8 @@ def parse_vscreen_fit(text):
 
 def vscreen_fit_windows(f):
     """Each window's tokens as numbers: [{window, samples, on_foot, other, skipped, late, draws, why, distance, applied, eye (w, h) or None,
-    fp, frac, lo, hi, h, shape, other_fp, at1, frac1, session_n, session_frac1, persisted, fit, legacy}]."""
+    fp, frac, lo, hi, h, shape, other_fp, at1, frac1, session_n, session_frac1, persisted, fit, legacy, m (the m of the fit= token: a build
+    that stored the session's median, before the p10, printed 1.00 here)}]."""
     out = []
     for w in f["windows"]:
         kv = w["kv"]
@@ -4149,16 +4172,32 @@ def vscreen_fit_windows(f):
             "lo": float(rng.group(1)) if rng else None, "hi": float(rng.group(2)) if rng else None, "h": _vnum(kv.get("h")),
             "shape": _vnum(kv.get("shape")), "other_fp": _vnum(kv.get("other-fp")), "at1": _vnum(kv.get("at1")), "frac1": _vnum(kv.get("frac1")),
             "session_n": _cint(kv.get("session-n")) or 0, "session_frac1": _vnum(kv.get("session-frac1")), "persisted": _vnum(kv.get("persisted")),
-            "fit": _vnum(kv.get("fit")), "legacy": _vnum(kv.get("legacy"))})
+            "fit": _vnum(kv.get("fit")), "legacy": _vnum(kv.get("legacy")), "m": _vnum(kv.get("m"))})
     return out
+
+
+def _vscreen_shape_ref(f, eye):
+    """(reference shape, how it was got) for the SHAPE check: 16:9 for square eye pixels, and 16/9 x fx/fy when the log carries the
+    eye's FOV (the `native benchmark workload:` line, f["fov"]) and the eye's size: fx and fy are the pixels per unit tangent across and
+    down, so a screen that is 16:9 on the page reads 16/9 x fx/fy in an eye whose pixels are not square. Without a FOV the reference is
+    16:9 and says so."""
+    fov = f.get("fov")
+    if fov and eye:
+        l, r, u, d = (math.tan(a) for a in fov)
+        if r - l > 0.0 and u - d > 0.0 and eye[0] and eye[1]:
+            ratio = (eye[0] / (r - l)) / (eye[1] / (u - d))
+            return VSCREEN_SHAPE * ratio, "16:9 in this eye's pixels = %.3f (16:9 x fx/fy %.4f, from the log's game FOV)" % (VSCREEN_SHAPE * ratio, ratio)
+    return VSCREEN_SHAPE, "16:9 = %.3f (square eye pixels assumed: this log carries no per-eye FOV line)" % VSCREEN_SHAPE
 
 
 def vscreen_fit_verdict(f):
     """The verdict on one flight: [(tag, status, text)], status PASS, WARN, STOP or n/a (what the log cannot say). The tags are the
     questions the flight plan asks: RULE (did auto choose by the rule it names, and was that what was applied), INSTRUMENT (did the
-    footprint instrument run, see the composite and read its sources), ON FOOT (was the screen measured on foot), STABLE, SHAPE (the
-    corner arithmetic and the eye size agree that the screen is 16:9), DISTANCE LAW (A varies as 1/d), CALIBRATION (does m = 1.0 give
-    Sean's 3504), STORED (what the next launch will fit)."""
+    footprint instrument run, see the composite and read its sources), ON FOOT (was the screen measured on foot), STABLE (the windows'
+    widths at distance 1 agree), SHAPE (the median window's shape is 16:9 in the eye's own pixels), DISTANCE LAW (A varies as 1/d),
+    CALIBRATION (is the session's stored head-on floor, p10, the 5006 px behind Sean's 3504), STORED (what the next launch will fit).
+    ON FOOT, STABLE and SHAPE judge only the windows with VSCREEN_MIN_FOOT or more on-foot samples (a window of one or six samples is a
+    transition: it is what made a flight read 102% unstable and 1.43 shaped). DISTANCE LAW is unchanged: it keeps every on-foot window."""
     out = []
 
     def add(tag, status, text):
@@ -4190,13 +4229,15 @@ def vscreen_fit_verdict(f):
                 lo = min(floor, cap)
                 want = _vround16(min(max(m * fp, lo), cap))
                 nudged = kv.get("nudged") == "yes"
-                if width == want or (nudged and 0 < abs(width - want) <= 16 * 8):
-                    text = ("FITTED to %d wide from a %s footprint of %.0f px at fix.panel_distance %s on a %d px eye (m=%.2f, floor %d, cap %d, clamp %s%s); "
+                # The footprint prints rounded to a whole pixel, so m x footprint can sit a hair either side of a rounding edge: one step (16)
+                # of difference is that, not a wrong width. A nudge off another target's size moves the width by several steps.
+                if abs(width - want) <= VSCREEN_RULE_TOL or (nudged and abs(width - want) <= 16 * 8):
+                    text = ("FITTED to %d wide from a %s footprint of %.0f px at fix.panel_distance %s on a %d px eye (m=%.3f, floor %d, cap %d, clamp %s%s); "
                             "legacy would have been %s"
                             % (width, kv.get("source", "?"), fp, kv.get("distance", "?"), eye or 0, m, floor, cap, kv.get("clamp", "?"),
                                ", nudged off another target's size" if nudged else "", kv.get("legacy", "?")))
                 else:
-                    status, text = "STOP", ("the line says %d wide but its own tokens (footprint %.0f, m %.2f, floor %d, cap %d) give %d" % (width, fp, m, floor, cap, want))
+                    status, text = "STOP", ("the line says %d wide but its own tokens (footprint %.0f, m %.3f, floor %d, cap %d) give %d" % (width, fp, m, floor, cap, want))
         elif name == "legacy":
             want = _vround16((eye or 0) * VSCREEN_LEGACY_M) if eye else None
             why = rule["prose"].partition("because the world route will not run:")[2].partition(". Without the route")[0].strip()
@@ -4255,38 +4296,59 @@ def vscreen_fit_verdict(f):
             add("INSTRUMENT", "PASS", base)
 
     # ---- ON FOOT ----
-    foot_wins = [w for w in wins if w["on_foot"] and w["fp"] is not None]
+    # foot_any: every window that saw the screen on foot. foot_wins: those with enough samples to judge. A window of one or six on-foot
+    # samples is a transition (a menu or a map came up, the commander got off the ship): its median is the head's pose, not the screen.
+    foot_any = [w for w in wins if w["on_foot"] and w["fp"] is not None]
+    foot_wins = [w for w in foot_any if w["on_foot"] >= VSCREEN_MIN_FOOT]
     if wins:
-        if not foot_wins:
+        if not foot_any:
             others = [w["other_fp"] for w in wins if w["other_fp"] is not None]
             add("ON FOOT", "WARN", "no on-foot sample: the screen was measured at the menu only%s, and nothing on foot was stored for the next launch"
                 % (" (%.0f px)" % statistics.median(others) if others else ""))
+        elif not foot_wins:
+            add("ON FOOT", "WARN", "on-foot samples in %d window(s), but no window has %d: %d sample(s) in all is too thin to judge the screen's width, stability or shape"
+                % (len(foot_any), VSCREEN_MIN_FOOT, sum(w["on_foot"] for w in foot_any)))
         else:
             fps = [w["fp"] for w in foot_wins]
-            add("ON FOOT", "PASS", "%d on-foot window(s), %d sample(s); the screen spans %.0f px (median of the windows' medians %.0f..%.0f) of the eye"
-                % (len(foot_wins), sum(w["on_foot"] for w in foot_wins), statistics.median(fps), min(fps), max(fps)))
+            thin = len(foot_any) - len(foot_wins)
+            add("ON FOOT", "PASS", "%d on-foot window(s), %d sample(s); the screen spans %.0f px (median of the windows' medians %.0f..%.0f) of the eye%s"
+                % (len(foot_wins), sum(w["on_foot"] for w in foot_wins), statistics.median(fps), min(fps), max(fps),
+                   "; %d thinner window(s) (under %d on-foot samples) left out" % (thin, VSCREEN_MIN_FOOT) if thin else ""))
             # ---- STABLE ----
-            med = statistics.median(fps)
-            spread = (max(fps) - min(fps)) / med if med else 0.0
-            inside = max(((w["hi"] - w["lo"]) / w["fp"] for w in foot_wins if w["lo"] is not None and w["hi"] is not None and w["fp"]), default=0.0)
-            if spread > VSCREEN_STABLE or inside > VSCREEN_STABLE:
-                add("STABLE", "WARN", "the screen's width moved: %.1f%% between windows, up to %.1f%% inside one (over %.0f%%): the head, a menu, or the panel distance "
-                    "changed during the flight" % (spread * 100.0, inside * 100.0, VSCREEN_STABLE * 100.0))
+            # Each window's median in eye pixels at distance 1 (fp x the distance its constants carried), so a window flown at another panel
+            # distance compares with the rest; the spread of those, (max - min) / median. What is inside a window (its lo..hi) is the head
+            # moving, which is what a floor estimator is for: it is not judged.
+            at1 = [w["fp"] * w["applied"] for w in foot_wins if w["applied"]]
+            if len(at1) < 2:
+                add("STABLE", "n/a", "one window with %d or more on-foot samples: nothing to compare it with" % VSCREEN_MIN_FOOT)
             else:
-                add("STABLE", "PASS", "the screen's width held: %.1f%% between windows, up to %.1f%% inside one (under %.0f%%)" % (spread * 100.0, inside * 100.0, VSCREEN_STABLE * 100.0))
+                spread = (max(at1) - min(at1)) / statistics.median(at1)
+                if spread > VSCREEN_STABLE:
+                    add("STABLE", "WARN", "the screen's width moved: %.1f%% between %d windows (%.0f..%.0f px at distance 1; over %.0f%%): the head turned, a menu was up, "
+                        "or the screen itself changed during the flight" % (spread * 100.0, len(at1), min(at1), max(at1), VSCREEN_STABLE * 100.0))
+                else:
+                    add("STABLE", "PASS", "the screen's width held: %.1f%% between %d windows (%.0f..%.0f px at distance 1; under %.0f%%)"
+                        % (spread * 100.0, len(at1), min(at1), max(at1), VSCREEN_STABLE * 100.0))
             # ---- SHAPE ----
+            # The MEDIAN of the windows' shapes against 16:9 (in the eye's own pixels: _vscreen_shape_ref). A head that is not square on to
+            # the screen stretches its height at first order and its width at second, so the shape reads under 16:9 and the pass band is
+            # lopsided; a window's own lowest sample is the closest to head-on and is not what is judged.
             shapes = [w["shape"] for w in foot_wins if w["shape"] is not None]
             if not shapes:
                 add("SHAPE", "n/a", "no shape= token: the eye's height was not known (the runtime had not published its sizing)")
             else:
-                worst = max(abs(s / VSCREEN_SHAPE - 1.0) for s in shapes)
-                status = "STOP" if worst > VSCREEN_SHAPE_STOP else ("WARN" if worst > VSCREEN_SHAPE_WARN else "PASS")
-                add("SHAPE", status, "the footprint's pixel aspect reads %.3f..%.3f against 16:9 = %.3f (worst %.1f%% off)%s"
-                    % (min(shapes), max(shapes), VSCREEN_SHAPE, worst * 100.0,
+                ref, ref_how = _vscreen_shape_ref(f, foot_wins[0]["eye"])
+                med_shape = statistics.median(shapes)
+                dev = med_shape / ref - 1.0
+                lo_ok, hi_ok = VSCREEN_SHAPE_PASS
+                status = "STOP" if abs(dev) > VSCREEN_SHAPE_STOP else ("PASS" if lo_ok <= dev <= hi_ok else "WARN")
+                add("SHAPE", status, "the median of the windows' footprint shapes reads %.3f against %s: %+.1f%% (the windows run %.3f..%.3f; pass %+.0f%% to %+.0f%%, "
+                    "stop past %.0f%% either way)%s"
+                    % (med_shape, ref_how, dev * 100.0, min(shapes), max(shapes), lo_ok * 100.0, hi_ok * 100.0, VSCREEN_SHAPE_STOP * 100.0,
                        "" if status == "PASS" else ": the corner arithmetic, the eye size or the screen's stretch is not what the instrument assumes"))
             # ---- DISTANCE LAW ----
             by_d = {}
-            for w in foot_wins:
+            for w in foot_any:
                 if w["applied"] and w["frac1"] is not None:
                     by_d.setdefault(round(w["applied"], 2), []).append(w["frac1"])
             if len(by_d) < 2:
@@ -4300,21 +4362,37 @@ def vscreen_fit_verdict(f):
                     "the footprint at distance 1 over %d distances (%s): %.1f%% apart (%s %.0f%%): A %s 1/d"
                     % (len(meds), ", ".join("%.2f -> %.4f" % (d, meds[d]) for d in sorted(meds)), spread * 100.0,
                        "under" if spread <= VSCREEN_LAW else "over", VSCREEN_LAW * 100.0, "varies as" if spread <= VSCREEN_LAW else "does NOT vary as"))
-            # ---- CALIBRATION ----
-            seed_w, seed_d, seed_e = VSCREEN_SEED
-            at_seed = [w for w in foot_wins if w["eye"] and w["eye"][0] == int(seed_e) and w["applied"] and abs(w["applied"] - seed_d) < 0.011]
-            if at_seed:
-                got = statistics.median([w["fp"] for w in at_seed])
-                ratio = got / seed_w
-                if abs(ratio - 1.0) <= VSCREEN_CALIBRATION:
-                    add("CALIBRATION", "PASS", "at Sean's calibration point (a %d px eye at distance %.1f) the screen spans %.0f px against the 3504 he flew (%.1f%%): m = 1.0 "
-                        "reproduces his width" % (int(seed_e), seed_d, got, ratio * 100.0))
-                else:
-                    add("CALIBRATION", "WARN", "at Sean's calibration point the screen spans %.0f px, not the 3504 he flew (%.1f%%): m = 1.0 would fit %d wide there; "
-                        "m = %.3f reproduces 3504 -- his call whether 3504 or the measurement is right (vscreen_fit.h kMultiplier, kSeed*)"
-                        % (got, ratio * 100.0, _vround16(got), seed_w / got))
+    # ---- CALIBRATION ----
+    # Not the window medians: the session's STORED value, the p10 the next launch will fit from (session-frac1 of the last window with
+    # 12 or more samples in the session), at the calibration point's eye (a 4032 px one). session-frac1 is a fraction of the eye at distance
+    # 1, so x eye / the calibration distance is the screen's head-on footprint at that distance whatever distance was flown (the 1/d law).
+    if wins and foot_any:
+        seed_fp, seed_d, seed_e = VSCREEN_SEED
+        stored = [w for w in wins if w["session_frac1"] is not None and w["session_n"] >= VSCREEN_MIN_FOOT and w["eye"] and w["eye"][0] == int(seed_e)]
+        # A build from before the p10 calibration stored the session's MEDIAN and printed m=1.00 on its window lines: its session-frac1 is about 6%
+        # above the head-on floor, so it is not held against the calibration point (a window with no m token, an eye not yet known, passes).
+        current = [w for w in stored if w["m"] is None or abs(w["m"] - VSCREEN_M) < 1e-6]
+        if stored and not current:
+            add("CALIBRATION", "n/a", "this log's windows fit at m=%.3f, not %.3f: a build from before the p10 calibration, whose session value is a median, not the head-on "
+                "floor the %.0f px calibration point is held against" % (stored[-1]["m"], VSCREEN_M, VSCREEN_SEED[0]))
+        elif current:
+            s = current[-1]
+            got = s["session_frac1"] * int(seed_e) / seed_d
+            ratio = got / seed_fp
+            if abs(ratio - 1.0) <= VSCREEN_CALIBRATION:
+                add("CALIBRATION", "PASS", "at Sean's calibration point (a %d px eye) the session's stored head-on floor (p10) is %.0f px at distance %.1f against the %.0f px "
+                    "his %.0f is fitted from (%.1f%%, within %.0f%%): m = %.2f fits %d wide there"
+                    % (int(seed_e), got, seed_d, seed_fp, VSCREEN_CHOSEN, ratio * 100.0, VSCREEN_CALIBRATION * 100.0, VSCREEN_M, _vround16(VSCREEN_M * got)))
             else:
-                add("CALIBRATION", "n/a", "not at the calibration point (a %d px eye at panel distance %.1f)" % (int(seed_e), seed_d))
+                add("CALIBRATION", "WARN", "at Sean's calibration point (a %d px eye) the session's stored head-on floor (p10) is %.0f px at distance %.1f, not the %.0f px his %.0f "
+                    "is fitted from (%.1f%%, over %.0f%% apart): m = %.2f would fit %d wide there; m = %.3f reproduces %.0f -- his call whether the seed or the "
+                    "measurement is right (vscreen_fit.h kMultiplier, kSeedFootprintPx)"
+                    % (int(seed_e), got, seed_d, seed_fp, VSCREEN_CHOSEN, ratio * 100.0, VSCREEN_CALIBRATION * 100.0, VSCREEN_M, _vround16(VSCREEN_M * got),
+                       VSCREEN_CHOSEN / got, VSCREEN_CHOSEN))
+        elif any(w["eye"] and w["eye"][0] == int(seed_e) for w in wins):
+            add("CALIBRATION", "n/a", "the session has fewer than %d on-foot samples: no stored head-on floor to hold against the calibration point yet" % VSCREEN_MIN_FOOT)
+        else:
+            add("CALIBRATION", "n/a", "not at the calibration point (a %d px eye)" % int(seed_e))
 
     # ---- STORED ----
     if wins:
@@ -4329,10 +4407,14 @@ def vscreen_fit_verdict(f):
                     "; the next launch fits %d wide, the width this launch ran at (%d)" % (fit, applied["w"])
             if rule is not None and rule["kv"].get("route") == "no":
                 note += " -- this launch's route=no (legacy), so a launch fits only once the world route will run"
-            add("STORED", "PASS", "the on-foot median is stored: %.4f of the eye at panel distance 1 (%d sample(s))%s" % (p["persisted"], p["session_n"], note))
-        elif foot_wins:
+            # The window lines of a build from before the p10 calibration print m=1.00, and what that build stored is the session's median.
+            old_m = next((w["m"] for w in wins if w["m"] is not None and abs(w["m"] - VSCREEN_M) > 1e-6), None)
+            what = "the on-foot head-on floor (p10)" if old_m is None else \
+                "the on-foot MEDIAN (this log is from a build before the p10 calibration: m=%.3f on its window lines)" % old_m
+            add("STORED", "PASS", "%s is stored: %.4f of the eye at panel distance 1 (%d sample(s))%s" % (what, p["persisted"], p["session_n"], note))
+        elif foot_any:
             add("STORED", "WARN", "on-foot samples were taken (%d) but nothing was stored: the file needs at least 12 on-foot samples in the session"
-                % sum(w["on_foot"] for w in foot_wins))
+                % sum(w["on_foot"] for w in foot_any))
         else:
             add("STORED", "n/a", "nothing was stored: no on-foot samples")
     return out
@@ -4366,7 +4448,7 @@ def print_vscreen_fit(text):
                  "; applied %dx%d" % (f["applied"]["w"], f["applied"]["h"]) if f["applied"] else ""))
     for w in wins:
         print("window %s: samples %d (on foot %d, other %d), draws %d, skipped %d, late %d; eye %s distance %s applied %s; on foot fp=%s frac=%s range=%s..%s "
-              "shape=%s; at distance 1 %s px (%s); session n=%d median %s persisted %s; next launch fits %s (legacy %s)"
+              "shape=%s; at distance 1 %s px (%s); session n=%d session-frac1 %s persisted %s; next launch fits %s (legacy %s)"
               % (w["window"], w["samples"], w["on_foot"], w["other"], w["draws"], w["skipped"], w["late"],
                  "%dx%d" % w["eye"] if w["eye"] else "-", w["distance"], w["applied"], "%.0f" % w["fp"] if w["fp"] is not None else "-",
                  w["frac"], "%.0f" % w["lo"] if w["lo"] is not None else "-", "%.0f" % w["hi"] if w["hi"] is not None else "-", w["shape"],
@@ -7124,9 +7206,9 @@ def main(argv=None):
                          "resolution:` rule line (fitted or legacy, and why) and the "
                          "width applied, the footprint instrument's arming line and "
                          "its 30 s lines (the on-foot screen's width in eye pixels, "
-                         "its stability, shape and 1/d law, against Sean's 3504 "
-                         "calibration point) and what is stored for the next launch; "
-                         "PASS / WARN / STOP lines")
+                         "its stability, shape and 1/d law, and the session's stored "
+                         "head-on floor against the 5006 px behind Sean's 3504) and what "
+                         "is stored for the next launch; PASS / WARN / STOP lines")
     ap.add_argument("--flat-upscale", action="store_true",
                     help="report a flat-profile flight (design doc section 83): the final copy admitted by "
                          "structure, so DLSS, FSR and TAA resolve below the output whatever the post chain; the "
@@ -8174,51 +8256,67 @@ def self_test_vscreen_fit():
     if os.path.isfile(header):
         h = read_text(header)
         for name, value in (("kMultiplier", VSCREEN_M), ("kFloorWidth", VSCREEN_FLOOR), ("kLegacyMultiplier", VSCREEN_LEGACY_M),
-                            ("kSeedWidthPx", VSCREEN_SEED[0]), ("kSeedDistance", VSCREEN_SEED[1]), ("kSeedEyeWidthPx", VSCREEN_SEED[2])):
+                            ("kChosenWidthPx", VSCREEN_CHOSEN), ("kSeedFootprintPx", VSCREEN_SEED[0]), ("kSeedDistance", VSCREEN_SEED[1]),
+                            ("kSeedEyeWidthPx", VSCREEN_SEED[2]), ("kFootprintQuantile", VSCREEN_QUANTILE)):
             m = re.search(r"constexpr (?:double|uint32_t) %s = ([0-9.]+);" % name, h)
             if not m or abs(float(m.group(1)) - value) > 1e-9:
                 fail("this reader's constant for %s (%r) is not src\\common\\vscreen_fit.h's (%r)" % (name, value, m.group(1) if m else None))
     else:
         fail("src\\common\\vscreen_fit.h is not where the self-test looks for it (%s)" % header)
+    if abs(VSCREEN_M * VSCREEN_SEED[0] - VSCREEN_CHOSEN) > 1.0 or _vround16(VSCREEN_M * VSCREEN_SEED[0]) != int(VSCREEN_CHOSEN):
+        fail("this reader's m (%r) x seed footprint (%r) is not the chosen width (%r): the three move together" % (VSCREEN_M, VSCREEN_SEED[0], VSCREEN_CHOSEN))
 
     # ---- the parser ----
     f = parse_vscreen_fit(text)
     kv = f["rule"]["kv"] if f["rule"] else {}
     if not f["rule"] or f["rule"]["width"] != 3504 or kv.get("rule") != "fitted" or kv.get("source") != "seed" or kv.get("route") != "run" or \
-            kv.get("eye") != "4032" or kv.get("distance") != "0.700" or kv.get("legacy") != "5040" or kv.get("footprint") != "3504" or \
-            kv.get("m") != "1.00" or kv.get("floor") != "2880" or kv.get("cap") != "5040" or kv.get("clamp") != "none":
+            kv.get("eye") != "4032" or kv.get("distance") != "0.700" or kv.get("legacy") != "5040" or kv.get("footprint") != "5006" or \
+            kv.get("m") != "0.700" or kv.get("floor") != "2880" or kv.get("cap") != "5040" or kv.get("clamp") != "none":
         fail("the fixture's rule line parsed as %r" % (f["rule"],))
     if not f["applied"] or (f["applied"]["w"], f["applied"]["h"], f["applied"]["sites"]) != (3504, 1971, 6) or len(f["armed"]) != 1 or \
             f["armed"][0][1] != "armed" or len(f["windows"]) != 4:
         fail("the fixture parsed as applied %r, %d arming line(s), %d window(s)" % (f["applied"], len(f["armed"]), len(f["windows"])))
     w = vscreen_fit_windows(f)
-    if len(w) != 4 or (w[0]["samples"], w[0]["on_foot"], w[0]["other"], w[0]["draws"], w[0]["fp"], w[0]["other_fp"], w[0]["applied"]) != (44, 0, 44, 5280, None, 3503.0, None) or \
-            (w[1]["fp"], w[1]["lo"], w[1]["hi"], w[1]["shape"], w[1]["at1"], w[1]["persisted"], w[1]["fit"], w[1]["legacy"], w[1]["eye"]) != \
-            (3497.0, 3489.0, 3505.0, 1.778, 2448.0, 0.6071, 3504.0, 5040.0, (4032, 3898)) or w[3]["session_n"] != 177:
+    if len(w) != 4 or (w[0]["samples"], w[0]["on_foot"], w[0]["other"], w[0]["draws"], w[0]["fp"], w[0]["other_fp"], w[0]["applied"]) != (44, 0, 44, 5280, None, 5640.0, None) or \
+            (w[1]["fp"], w[1]["lo"], w[1]["hi"], w[1]["shape"], w[1]["at1"], w[1]["session_frac1"], w[1]["persisted"], w[1]["fit"], w[1]["legacy"], w[1]["eye"]) != \
+            (5262.0, 5011.0, 5890.0, 1.71, 3683.0, 0.8694, 0.8694, 3504.0, 5040.0, (4032, 3898)) or w[3]["session_n"] != 177 or w[3]["session_frac1"] != 0.8691 or \
+            w[3]["persisted"] != 0.8694:
         fail("the fixture's windows parsed as %r" % (w,))
+    if f["fov"] is not None:
+        fail("the fixture carries no FOV line, but the parser read one: %r" % (f["fov"],))
     # A line cut short or garbled is skipped, never fatal.
     g = parse_vscreen_fit("vscreen footprint 30s: window=x samples=y on-foot=\nvScreen resolution: auto = 12 wide\n"
                           "vScreen resolution: 1920x1080 -> 3504x1971 at\nnothing at all\nvscreen footprint: armed -- x\n")
     if g["rule"] is not None or g["applied"] is not None or len(g["armed"]) != 1 or len(g["windows"]) != 1:
         fail("a cut-short line was mis-parsed: %r" % (g,))
+    # The eyes' FOV is read from the graphics log's benchmark line (angles in radians, order left/right/up/down): the first real one.
+    fov_line = ("[06:07:04.100] native benchmark workload: window 1, feature epoch 0, treatments 14/14, game FOV radians L -0.89775/0.71858/0.79986/-0.79986 "
+                "R -0.71858/0.89775/0.79986/-0.79986; order left/right/up/down; input is submitted ROI, output is active XR target.")
+    flat_zero = ("[06:07:04.000] native benchmark workload: window 1, feature epoch 0, treatments 0/0, game FOV radians L 0.00000/0.00000/0.00000/0.00000 "
+                 "R 0.00000/0.00000/0.00000/0.00000; order left/right/up/down; input is submitted ROI, output is active XR target.")
+    want_fov = (-0.89775, 0.71858, 0.79986, -0.79986)
+    if parse_vscreen_fit(fov_line)["fov"] != want_fov or parse_vscreen_fit(flat_zero + "\n" + fov_line)["fov"] != want_fov or \
+            parse_vscreen_fit(flat_zero)["fov"] is not None:
+        fail("the FOV was not read from the benchmark line (or a flat log's zeros were taken for one): %r" % (parse_vscreen_fit(fov_line)["fov"],))
 
     # ---- the report on the fixture: every question PASSes, the one the log cannot answer says so ----
     rc, out = report(text)
     flat = re.sub(r"[ ]+", " ", out)
     for want in (
             "vscreen fit: the rule line, an apply line, 1 arming line(s), 4 footprint window(s)",
-            "launch: auto = 3504 wide, rule=fitted source=seed route=run eye=4032 distance=0.700 footprint=3504 clamp=none legacy=5040; applied 3504x1971",
+            "launch: auto = 3504 wide, rule=fitted source=seed route=run eye=4032 distance=0.700 footprint=5006 clamp=none legacy=5040; applied 3504x1971",
             "window 1: samples 44 (on foot 0, other 44), draws 5280, skipped 0, late 0; eye 4032x3898",
-            "window 4: samples 59 (on foot 59, other 0), draws 5400, skipped 0, late 0; eye 4032x3898 distance 0.7 applied 0.7; on foot fp=3499",
-            "PASS (RULE) FITTED to 3504 wide from a seed footprint of 3504 px at fix.panel_distance 0.700 on a 4032 px eye (m=1.00, floor 2880, cap 5040, "
+            "window 4: samples 59 (on foot 59, other 0), draws 5400, skipped 0, late 0; eye 4032x3898 distance 0.7 applied 0.7; on foot fp=5270",
+            "PASS (RULE) FITTED to 3504 wide from a seed footprint of 5006 px at fix.panel_distance 0.700 on a 4032 px eye (m=0.700, floor 2880, cap 5040, "
             "clamp none); legacy would have been 5040; applied 3504x1971 at 6 site(s)",
             "PASS (INSTRUMENT) 4 window(s): 221 sample(s) (177 on foot, 44 other), 21480 composite draw(s) seen, 0 skipped, 0 late",
-            "PASS (ON FOOT) 3 on-foot window(s), 177 sample(s); the screen spans 3499 px",
-            "PASS (STABLE) the screen's width held",
-            "PASS (SHAPE) the footprint's pixel aspect reads 1.778..1.778 against 16:9 = 1.778",
+            "PASS (ON FOOT) 3 on-foot window(s), 177 sample(s); the screen spans 5270 px (median of the windows' medians 5262..5281) of the eye",
+            "PASS (STABLE) the screen's width held: 0.4% between 3 windows (3683..3697 px at distance 1; under 8%)",
+            "PASS (SHAPE) the median of the windows' footprint shapes reads 1.700 against 16:9 = 1.778 (square eye pixels assumed: this log carries no per-eye FOV line): -4.4%",
             "n/a (DISTANCE LAW) one panel distance in this log (0.70)",
-            "PASS (CALIBRATION) at Sean's calibration point (a 4032 px eye at distance 0.7) the screen spans 3499 px against the 3504 he flew (99.9%): m = 1.0 reproduces his width",
-            "PASS (STORED) the on-foot median is stored: 0.6075 of the eye at panel distance 1 (177 sample(s)); the next launch fits 3504 wide, the width this launch ran at (3504)",
+            "PASS (CALIBRATION) at Sean's calibration point (a 4032 px eye) the session's stored head-on floor (p10) is 5006 px at distance 0.7 against the 5006 px his 3504 is "
+            "fitted from (100.0%, within 5%): m = 0.70 fits 3504 wide there",
+            "PASS (STORED) the on-foot head-on floor (p10) is stored: 0.8694 of the eye at panel distance 1 (177 sample(s)); the next launch fits 3504 wide, the width this launch ran at (3504)",
             "vscreen fit verdict: PASS (7 PASS, 0 WARN, 0 STOP, 1 n/a)"):
         if want not in flat:
             fail("the fixture's report lacks %r:\n%s" % (want, out))
@@ -8246,12 +8344,28 @@ def self_test_vscreen_fit():
     st, out = statuses(sub(text, "auto = 3504 wide", "auto = 3600 wide"))
     if st.get("RULE") != "STOP" or "its own tokens" not in out:
         fail("a width that is not what its own tokens give did not STOP: %r\n%s" % (st, out))
-    st, out = statuses(sub(text, "footprint=3504 m=1.00", "footprint=3504 m=0.95"))
-    if st.get("RULE") != "STOP":
-        fail("a different m in the tokens did not change the recomputed width: %r" % (st,))
-    st, out = statuses(sub(sub(text, "clamp=none", "clamp=floor nudged=yes"), "auto = 3504 wide", "auto = 3520 wide").replace("-> 3504x1971", "-> 3520x1980"))
+    st, out = statuses(sub(text, "footprint=5006 m=0.700", "footprint=5006 m=0.650"))
+    if st.get("RULE") != "STOP" or "m 0.650" not in out:
+        fail("a different m in the tokens did not change the recomputed width (and print at three decimals): %r\n%s" % (st, out))
+    # The footprint prints rounded to a pixel, so a printed width one step (16) from the recomputed one is rounding, and two are not.
+    one_step = lambda t: sub(sub(t, "auto = 3504 wide", "auto = 3520 wide"), "-> 3504x1971", "-> 3520x1980")
+    st, out = statuses(one_step(text))
+    if st.get("RULE") != "PASS":
+        fail("a width one step (16) from the one its own tokens give was refused: that is the rounding of the printed footprint: %r\n%s" % (st, out))
+    st, out = statuses(sub(sub(text, "auto = 3504 wide", "auto = 3536 wide"), "-> 3504x1971", "-> 3536x1989"))
+    if st.get("RULE") != "STOP" or "its own tokens" not in out:
+        fail("a width two steps (32) from the one its own tokens give was accepted: %r\n%s" % (st, out))
+    # A nudge off another target's size moves a width by several steps: allowed only when the line says nudged=yes, and only up to eight.
+    nudged = lambda t, w, h: sub(sub(sub(t, "clamp=none", "clamp=none nudged=yes"), "auto = 3504 wide", "auto = %d wide" % w), "-> 3504x1971", "-> %dx%d" % (w, h))
+    st, out = statuses(nudged(text, 3584, 2016))
     if st.get("RULE") != "PASS":
         fail("a nudged width within a few steps of the recomputed one was refused: %r\n%s" % (st, out))
+    st, out = statuses(sub(sub(text, "auto = 3504 wide", "auto = 3584 wide"), "-> 3504x1971", "-> 3584x2016"))
+    if st.get("RULE") != "STOP":
+        fail("a width five steps from the recomputed one passed without the nudged=yes that would explain it: %r" % (st,))
+    st, out = statuses(nudged(text, 3664, 2061))
+    if st.get("RULE") != "STOP":
+        fail("a nudged width ten steps from the recomputed one passed: %r" % (st,))
     st, out = statuses("\n".join(l for l in text.splitlines() if "-> 3504x1971" not in l))
     if st.get("RULE") != "PASS" or "no `vScreen resolution: ... ->` apply line" not in out:
         fail("a log with no apply line did not say so: %r" % (st,))
@@ -8292,47 +8406,100 @@ def self_test_vscreen_fit():
     # ---- on foot, stable, shape, the distance law, the calibration point, what is stored ----
     menu_only = "\n".join(l for l in text.splitlines() if "window=2 " not in l and "window=3 " not in l and "window=4 " not in l)
     st, out = statuses(menu_only)
-    if st.get("ON FOOT") != "WARN" or st.get("STORED") != "n/a" or "menu only (3503 px)" not in out:
+    if st.get("ON FOOT") != "WARN" or st.get("STORED") != "n/a" or "menu only (5640 px)" not in out:
         fail("a menu-only session did not WARN on foot and store nothing: %r\n%s" % (st, out))
-    st, out = statuses(sub(text, "fp=3501 frac=0.8683 range=3493..3509", "fp=3700 frac=0.9177 range=3693..3709"))
-    if st.get("STABLE") != "WARN" or "the screen's width moved" not in out:
-        fail("a window that moved by 5%% did not WARN stable: %r" % (st,))
-    st, out = statuses(sub(text, "fp=3501 frac=0.8683 range=3493..3509", "fp=3501 frac=0.8683 range=3300..3709"))
-    if st.get("STABLE") != "WARN":
-        fail("a wide range inside a window did not WARN stable: %r" % (st,))
-    st, out = statuses(text.replace("shape=1.778", "shape=1.700"))
-    if st.get("SHAPE") != "WARN":
-        fail("a shape 4%% off 16:9 did not WARN: %r" % (st,))
-    st, out = statuses(text.replace("shape=1.778", "shape=1.200"))
-    if st.get("SHAPE") != "STOP" or "not what the instrument assumes" not in out:
-        fail("a shape 32%% off 16:9 did not STOP: %r\n%s" % (st, out))
-    st, out = statuses(text.replace(" shape=1.778", ""))
+    # STABLE: the windows' widths at distance 1 (fp x applied), (max - min) / median, against 8%. What is inside a window is not judged.
+    st, out = statuses(sub(text, "fp=5281 frac=1.3098 range=5004..6044", "fp=5800 frac=1.4385 range=5004..6044"))
+    if st.get("STABLE") != "WARN" or "the screen's width moved" not in out or "10.2% between 3 windows" not in out:
+        fail("a window 10%% wider than the others did not WARN stable: %r\n%s" % (st, out))
+    st, out = statuses(sub(text, "fp=5281 frac=1.3098 range=5004..6044", "fp=5500 frac=1.3641 range=5004..6044"))
+    if st.get("STABLE") != "PASS" or "4.5% between 3 windows" not in out:
+        fail("a window 4%% wider than the others (a head turning) did not hold: %r\n%s" % (st, out))
+    st, out = statuses(sub(text, "fp=5281 frac=1.3098 range=5004..6044", "fp=5281 frac=1.3098 range=3300..9000"))
+    if st.get("STABLE") != "PASS":
+        fail("a wide range inside one window was judged unstable (it is the head moving, not the screen): %r" % (st,))
+    # Thin windows (a transition: one on-foot sample, or six) are left out of ON FOOT, STABLE and SHAPE, and ON FOOT says how many.
+    thin3 = sub(sub(text, "window=3 samples=58 on-foot=58 other=0", "window=3 samples=58 on-foot=1 other=57"),
+                "fp=5281 frac=1.3098 range=5004..6044 h=0.8017 shape=1.690", "fp=10746 frac=2.6652 range=10746..10746 h=1.9283 shape=1.430")
+    st, out = statuses(thin3)
+    if st.get("ON FOOT") != "PASS" or st.get("STABLE") != "PASS" or st.get("SHAPE") != "PASS" or "2 on-foot window(s), 119 sample(s)" not in out or \
+            "1 thinner window(s) (under 12 on-foot samples) left out" not in out:
+        fail("a window of one on-foot sample (fp 10746, shape 1.43) was not left out of ON FOOT, STABLE and SHAPE: %r\n%s" % (st, out))
+    all_thin = re.sub(r"on-foot=(60|58|59) other=0", r"on-foot=6 other=\1", text)
+    st, out = statuses(all_thin)
+    if st.get("ON FOOT") != "WARN" or "no window has 12" not in out or "STABLE" in st or "SHAPE" in st or st.get("STORED") != "PASS":
+        fail("windows that all have fewer than 12 on-foot samples were judged: %r\n%s" % (st, out))
+    # SHAPE: the MEDIAN of the windows' shapes against 16:9: -9% to +3% passes, to +-15% WARNs, beyond STOPs.
+    for shape, want, why in (("1.650", "PASS", "-7.2%"), ("1.800", "PASS", "+1.3%"), ("1.600", "WARN", "-10.0%"), ("1.850", "WARN", "+4.1%"),
+                             ("1.500", "STOP", "-15.6%"), ("2.100", "STOP", "+18.1%")):
+        st, out = statuses(re.sub(r"shape=\d\.\d{3}", "shape=" + shape, text))
+        if st.get("SHAPE") != want or (why not in out):
+            fail("every window's shape %s (%s off 16:9) did not read %s: %r\n%s" % (shape, why, want, st, out))
+        if want != "PASS" and "not what the instrument assumes" not in out:
+            fail("a shape that did not pass did not say what is wrong: %r\n%s" % (st, out))
+    st, out = statuses(sub(text, "range=5004..6044 h=0.8017 shape=1.690", "range=5004..6044 h=1.0000 shape=1.200"))
+    if st.get("SHAPE") != "PASS" or "reads 1.700 against" not in out:
+        fail("one window of an odd shape (1.2) beside two good ones moved the median verdict: %r\n%s" % (st, out))
+    st, out = statuses(re.sub(r" shape=\d\.\d{3}", "", text))
     if st.get("SHAPE") != "n/a":
         fail("windows with no shape token did not read n/a: %r" % (st,))
+    # SHAPE in the eye's own pixels: the log's game FOV, when it carries one, gives fx/fy and the reference 16/9 x fx/fy.
+    st, out = statuses(text + "\n" + fov_line)
+    if st.get("SHAPE") != "PASS" or "16:9 in this eye's pixels = 1.778 (16:9 x fx/fy 1.0003, from the log's game FOV)" not in re.sub(r"[ ]+", " ", out):
+        fail("a square-pixel FOV did not give the reference 1.778 from the log: %r\n%s" % (st, out))
+    wide_pixels = fov_line.replace("L -0.89775/0.71858/0.79986/-0.79986 R -0.71858/0.89775/0.79986/-0.79986",
+                                   "L -0.74692/0.74692/0.79986/-0.79986 R -0.74692/0.74692/0.79986/-0.79986")
+    st, out = statuses(text + "\n" + wide_pixels)
+    if st.get("SHAPE") != "STOP" or "16:9 x fx/fy 1.1500" not in re.sub(r"[ ]+", " ", out) or "-16.8%" not in out:
+        fail("an eye whose pixels are 15%% wider than tall did not move the reference to 2.044 (shape 1.700 reads -16.8%% off it): %r\n%s" % (st, out))
+    tall_pixels = fov_line.replace("L -0.89775/0.71858/0.79986/-0.79986 R -0.71858/0.89775/0.79986/-0.79986",
+                                   "L -0.89708/0.89708/0.79986/-0.79986 R -0.89708/0.89708/0.79986/-0.79986")
+    st, out = statuses(text + "\n" + tall_pixels)
+    if st.get("SHAPE") != "WARN" or "16:9 x fx/fy 0.8500" not in re.sub(r"[ ]+", " ", out) or "+12.5%" not in out:
+        fail("an eye whose pixels are 15%% taller than wide did not move the reference to 1.511 (shape 1.700 reads +12.5%% off it): %r\n%s" % (st, out))
     # Two distances: the last window flown at 1.0 with the footprint scaled by 1/d (A at distance 1 unchanged): the law holds; if it did not
     # scale (the screen the same width at another distance) it does not.
     w4 = next(l for l in text.splitlines() if "window=4 " in l)
-    w4d = (w4.replace("distance=0.700 applied=0.700", "distance=1.000 applied=1.000").replace("fp=3499 frac=0.8678 range=3491..3507 h=0.5049",
-                                                                                             "fp=2449 frac=0.6074 range=2441..2457 h=0.3533"))
+    w4d = (w4.replace("distance=0.700 applied=0.700", "distance=1.000 applied=1.000").replace("fp=5270 frac=1.3070 range=5009..5961 h=0.7953",
+                                                                                             "fp=3689 frac=0.9149 range=3506..4173 h=0.5567"))
     st, out = statuses(text.replace(w4, w4d))
-    if st.get("DISTANCE LAW") != "PASS" or "varies as 1/d" not in out:
-        fail("a window flown at another panel distance with the footprint scaled by 1/d did not PASS the law: %r\n%s" % (st, out))
-    w4bad = w4d.replace("at1=2449 frac1=0.6075", "at1=3499 frac1=0.8678")
+    if st.get("DISTANCE LAW") != "PASS" or "varies as 1/d" not in out or st.get("STABLE") != "PASS":
+        fail("a window flown at another panel distance with the footprint scaled by 1/d did not PASS the law (and hold): %r\n%s" % (st, out))
+    w4bad = w4d.replace("at1=3689 frac1=0.9149", "at1=5270 frac1=1.3070")
     st, out = statuses(text.replace(w4, w4bad))
     if st.get("DISTANCE LAW") != "STOP" or "does NOT vary as 1/d" not in out:
         fail("a footprint that did not scale with the distance did not STOP the law: %r\n%s" % (st, out))
-    off = text.replace("fp=3497", "fp=3200").replace("fp=3501", "fp=3200").replace("fp=3499", "fp=3200")
-    st, out = statuses(off)
-    if st.get("CALIBRATION") != "WARN" or "m = 1.095" not in out:
-        fail("a measurement 9%% under Sean's 3504 did not WARN and name the m that reproduces it: %r\n%s" % (st, out))
+    # CALIBRATION is the session's STORED value (the last window's session-frac1, the p10) at a 4032 px eye: x 4032 / 0.7 is the screen's
+    # head-on footprint at the calibration distance, whatever distance was flown; within 5% of 5006 passes.
+    st, out = statuses(sub(text, "session-frac1=0.8691", "session-frac1=0.7909"))
+    if st.get("CALIBRATION") != "WARN" or "m = 0.769 reproduces 3504" not in out or "4556 px" not in out or "91.0%" not in out:
+        fail("a stored floor 9%% under the calibration point did not WARN and name the m that reproduces 3504 (0.769): %r\n%s" % (st, out))
+    st, out = statuses(sub(text, "session-frac1=0.8691", "session-frac1=0.8300"))
+    if st.get("CALIBRATION") != "PASS" or "95.5%" not in out:
+        fail("a stored floor 4.5%% under the calibration point did not PASS: %r\n%s" % (st, out))
+    st, out = statuses(sub(text, "session-frac1=0.8691", "session-frac1=0.8170"))
+    if st.get("CALIBRATION") != "WARN" or "94.0%" not in out:
+        fail("a stored floor 6%% under the calibration point did not WARN: %r\n%s" % (st, out))
+    st, out = statuses(re.sub(r"(?<![-\w])fp=\d+", "fp=3200", text))
+    if st.get("CALIBRATION") != "PASS":
+        fail("the calibration read the windows' medians (all 3200 here) instead of the session's stored value: %r\n%s" % (st, out))
     st, out = statuses(text.replace("eye=4032x3898", "eye=3296x3186"))
-    if st.get("CALIBRATION") != "n/a":
-        fail("another eye did not read n/a at the calibration point: %r" % (st,))
+    if st.get("CALIBRATION") != "n/a" or "not at the calibration point (a 4032 px eye)" not in out:
+        fail("another eye did not read n/a at the calibration point: %r\n%s" % (st, out))
+    st, out = statuses(re.sub(r"session-n=\d+", "session-n=6", text))
+    if st.get("CALIBRATION") != "n/a" or "fewer than 12 on-foot samples" not in out:
+        fail("a session of fewer than 12 on-foot samples did not read n/a at the calibration point: %r\n%s" % (st, out))
+    # A log from a build before the p10 calibration (its window lines print m=1.00; it stored the session's median) is not held against the
+    # p10 calibration point, and says what it stored.
+    st, out = statuses(text.replace("legacy=5040 m=0.700", "legacy=5040 m=1.00"))
+    if st.get("CALIBRATION") != "n/a" or "from before the p10 calibration" not in out or st.get("STORED") != "PASS" or \
+            "the on-foot MEDIAN (this log is from a build before the p10 calibration: m=1.000 on its window lines) is stored" not in out:
+        fail("a log whose window lines print m=1.00 was held against the p10 calibration point as if it stored a p10: %r\n%s" % (st, out))
     st, out = statuses(re.sub(r"persisted=[0-9.]+", "persisted=no", text))
     if st.get("STORED") != "WARN" or "needs at least 12 on-foot samples" not in out:
         fail("on-foot samples with nothing stored did not WARN: %r" % (st,))
-    st, out = statuses(sub(text, "persisted=0.6075 fit=3504", "persisted=0.6075 fit=3856"))
-    if st.get("STORED") != "PASS" or "the next launch fits 3856 wide (this launch: 3504)" not in out:
+    st, out = statuses(sub(text, "persisted=0.8694 fit=3504", "persisted=0.8694 fit=3856"))
+    if st.get("STORED") != "PASS" or "the next launch fits 3856 wide (this launch: 3504)" not in out or "head-on floor (p10) is stored: 0.8694" not in out:
         fail("a next launch that would change the width did not say so: %r\n%s" % (st, out))
     rc, out = report("nothing of the kind\nvr camera census: x\n")
     if rc != 1 or "no vscreen auto-fit line" not in out:

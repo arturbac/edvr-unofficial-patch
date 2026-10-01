@@ -320,9 +320,10 @@ void revertVScreenModeResolution() {
 //
 // TWO RULES, one reason to choose (src/common/vscreen_fit.h says all of it; docs/design-
 // flat-temporal-aa-2026-09-23.md, section 82, the "vscreen auto-fit" entry): when the VR
-// world route will run, auto is the on-foot screen's own footprint in eye pixels (the
-// instrument in vscreen_footprint.cpp measures it, the state file keeps it, the pure
-// half does the arithmetic); otherwise it is today's 125% of the eye width, unchanged.
+// world route will run, auto is 70% (vscreenfit::kMultiplier) of the on-foot screen's
+// head-on footprint in eye pixels (the instrument in vscreen_footprint.cpp measures it,
+// the state file keeps its 10th percentile, the pure half does the arithmetic); otherwise
+// it is today's 125% of the eye width, unchanged.
 // The decision is made from the configuration this launch runs with plus two files of
 // the last session's, and every caller (the panel patch, the intro movie's target, the
 // menu's hint) asks this one function.
