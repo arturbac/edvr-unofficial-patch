@@ -619,8 +619,10 @@ void driveInjector(bool wantsInjection) {
     g_frameCoverageOk = true;
     g_frameWorldApplied = VrWorldAppliedPhase{};
     if (want == VrWorldJitter::On) {
-        // The phase machine yields a zero phase for its first two frames (warm-up), then the flat profile's Halton sequence.
-        g_phase.beginFrame(true, g_prev.valid && g_f.treated, w, h);
+        // The phase machine yields a zero phase for its first two frames (warm-up), then the flat profile's Halton sequence. The
+        // route resolves at the game's render size (render == output: extentOk), so the ratio rule (temporal_math.h) gives the fixed
+        // eight with or without experimental.temporal_aa_jitter_follows_upscale: the route does not read the key.
+        g_phase.beginFrame(true, g_prev.valid && g_f.treated, w, h, temporalJitterPhaseCount(w, h, w, h));
         g_framePhaseX = g_phase.currentX;
         g_framePhaseY = g_phase.currentY;
         FlatCameraVrFrame vf;
@@ -773,6 +775,7 @@ void vrWorldRouteFrameBoundary() {
         }
         g_namedLast = g_frameNamed;
         g_win.phaseX = g_framePhaseX; g_win.phaseY = g_framePhaseY;
+        g_win.phases = g_phase.phaseCount;
         g_win.rowsX = g_f.treated ? g_frameWorldApplied.x : 0.0f;
         g_win.rowsY = g_f.treated ? g_frameWorldApplied.y : 0.0f;
         if (g_jitter == VrWorldJitter::On) g_phase.finish(g_f.treated, g_frameCoverageOk);

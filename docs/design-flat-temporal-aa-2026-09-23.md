@@ -50,6 +50,23 @@
 - **Field reports (79-82):** users 1-2 refused every frame, 3 at 7-13 fps, 4
   lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED; fix FLOWN, DEFAULT ON;
   vscreen auto-fit (fitted width) and the curved route BUILT 10-01, unflown.
+- **Jitter phases (section 84, 2026-10-01):** suspect (g) of section 82 as a
+  switch, `experimental.temporal_aa_jitter_follows_upscale` (off by default,
+  byte-identical): ceil(8 x ratio^2) phases for the VR eye pass and the flat
+  upstream route, eight for the world route. BUILT on
+  claude/jitter-phases-terrain-retire, NOT FLOWN; section 84 has the flight.
+- **Compatibility decision, environment:** moved to Status detail 2026-10-01.
+
+## Status detail (moved out of Status 2026-09-29)
+
+*Note: the section 75 sentence below ("awaiting the confirming flight") is
+superseded by section 75's own same-day addendum (the 13:00 flight ran
+storm-free; the canopy flicker is the separate scintillation family, CLOSED
+live 2026-09-27 evening); the Status summary above reflects that. The Next
+text repeats a typo ("qualify it then)." twice) kept as originally written.*
+
+### Compatibility decision and environment (moved out of Status 2026-10-01)
+
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -59,14 +76,6 @@
   window mode, installed mods and backend DLL versions. Headset/runtime are N/A
   for flat. VR regression records the actual runtime/headset/per-eye size.
   Other colour spaces and rendering routes require separate qualification.
-
-## Status detail (moved out of Status 2026-09-29)
-
-*Note: the section 75 sentence below ("awaiting the confirming flight") is
-superseded by section 75's own same-day addendum (the 13:00 flight ran
-storm-free; the canopy flicker is the separate scintillation family, CLOSED
-live 2026-09-27 evening); the Status summary above reflects that. The Next
-text repeats a typo ("qualify it then)." twice) kept as originally written.*
 
 ### State (as of section 77)
 
@@ -7956,3 +7965,120 @@ pin, `panel_curve_test` C2); the one addition is the footprint call, armed only
 when the fit is. NOT COVERED by a rig: the draw in the game (no flight yet), and
 the strip's index order against the game's culling (flown at 0.3 in August on
 the on-foot composite, not re-proved here).
+
+## 84. Jitter phases follow the upscale ratio: a switch to fly (build, 2026-10-01)
+
+Suspect (g) of section 82. Sean's VR cockpit, landed: an eye render of
+2016x1949 into an output of 4032x3898 (2x), and distant hills keep
+shimmering after DLSS. History is kept and motion is correct; HMD Image
+Quality 0.65 helped but did not fix it. Every path here jitters through the
+same eight Halton (2,3) phases (src\common\temporal_math.h,
+`kTemporalJitterCount` 8), which repeat at 11.25 Hz at 90 Hz. NVIDIA's DLSS
+guidance and AMD's FSR (`ffxFsr3UpscalerGetJitterPhaseCount`, which casts
+8 x (display / render)^2 to an integer; docs/fsr-upscaler-design-2026-09-16.md)
+both ask for 8 x (display / render)^2 phases, 32 at 2x, so that the upscaler
+sees enough sub-pixel samples of fine detail. Eight is that rule at 1x only. A hypothesis,
+not a finding: (g) also names NGX's integration of fine HDR content, and the
+same shimmer in all three backends would put it upstream of the count.
+
+What was built, commit 2 of claude/jitter-phases-terrain-retire (commit 1 is
+the terrain retirement, docs/terrain-motion-dispatch-cost-2026-09-17.md):
+
+- The rule. `temporalJitterPhaseCount(renderW, renderH, outW, outH)` is
+  ceil(8 x output area / render area): the ratio's square taken as the ratio
+  of the two areas, which is the square of the per-axis ratio whenever the
+  axes scale alike (every size EDVR has met), as an exact integer ceiling
+  with no float rounding; never below eight; capped at 128 (NVIDIA's own
+  3x figure is 72). `temporalJitterPhase(n, count)` is the same Halton (2,3)
+  walk with the index (n % count) + 1, so its first eight are the fixed
+  eight's; `temporalJitter(n)` is exactly count 8, bit for bit.
+- The switch. `experimental.temporal_aa_jitter_follows_upscale`, off | on,
+  default OFF: every path then runs today's eight, byte for byte (pinned).
+  Live: the VR pass reads it at each treat, the flat route at each Present.
+  A change resets nothing (the key is no part of any history). TEMPORARY:
+  Sean drops it after the flight if it wins. The in-headset menu's developer
+  mode lists it on the Experimental page (a getBool read is a toggle).
+- The VR eye pass (native_temporal.cpp). Each eye's last treated input and
+  the output the pass was asked for, the served floor's cut included; the
+  larger of the two eyes' counts, so both eyes keep sharing one phase
+  (docs/fss-scanner.md relies on it). begin() runs before the treat that
+  sizes the frame, so a change takes one frame, two after a mode change, and a
+  first treat must have named a size (eight until then).
+- The flat route (flat_runtime.cpp, `flatCameraPhaseCount`): R is the plan's
+  render size and E the size the upscaler resolves to (the vendor's negotiated
+  size where one was answered for the contract, else the route's default: D
+  for DLSS, FSR and TAA below the output, R at or above it), on the UPSTREAM
+  camera route only. The Legacy route's lighting patch
+  (flat_lighting_contract.h) refuses a jitter past 7/16 of a pixel; the first
+  eight phases stay inside it, the ninth (y -0.463) and the sixteenth (x
+  -0.469) do not (pinned in flat_lighting_tests.h), so a Legacy or Off frame at
+  a longer count would lose its jitter to a refusal. Only the injector's rows
+  carry a phase to the game with no such bound.
+- The VR world route (vr_world_route.cpp) resolves at the game's render size
+  (render == output), so the rule gives eight with the key on or off: it
+  reads no key, hands its phase machine the rule's count for its own sizes
+  and prints what the machine ran.
+- Untouched on purpose: the FSR3 port's own count (int(8 x ratio^2), ramped
+  1 a frame, used for lock lifetime only, ffx_fsr3upscaler.cpp:1004; EDVR
+  never asks it for jitter) and NGX (jitter per frame, no count).
+
+The log. VR: `native temporal: jitter phases=N (eye 0 WxH -> WxH, eye 1 ...;
+experimental.temporal_aa_jitter_follows_upscale=on|off: ...)` at the first
+jittered frame and at every change of the count or the key (a mode change
+shows its settling frame too), and `jitter_phases=N` in the close totals.
+Flat: `phases=N` on the 5 s `flat jitter:` line. World route: `phases=N` just
+before `jitter=` on its 5 s line. One read for all three:
+`python tools\edvr_log.py --target frontier --expect-build HEAD --grep "phases="`.
+
+Rigs and mutants. `temporal_test` (the rule's table: 32 at 2x, 18 at 1.5x, 72
+at 3x, 19 for the Pimax pair; the ceiling exact; the floor of eight and the
+cap; the fixed eight bit for bit), `flat_temporal_test` (the phase machine's
+count, a change of count between frames, `flatCameraPhaseCount`, and the
+Legacy bound that is the reason), `vr_world_route_test` (the window's token and
+a source pin on the route), `native_temporal_test --phase-count-self-test`
+(the real channel code flown on WARP through eight segments of mode, size and
+live key flips: the sequence frame by frame, both eyes' phase, no reset on a
+flip, the logged sequence), `config_test` (the shipped default and both code
+fallbacks, each with a control), the VR camera census fixture
+(`tools\camera_census_fixture.log`, regenerated: the route's 5 s line gained
+`phases=8`), and `tools\temporal_test\jitter_phase_mutants.py`:
+20 one-token breaks, each caught by a check that names it (`--run` on demand,
+about 30 s; `--self-test` is in the build). All 20 caught.
+
+ruled out: a longer count on the flat Legacy route, because its lighting
+patch refuses phases past 7/16 of a pixel (above); a count for the world
+route, because it resolves at R = D. Not ruled out: that more phases is not
+the lever; the flight below measures the count alone.
+
+The flight (one session with the terrain retirement's regression flight;
+verify the build with `python tools\edvr_log.py --target <t> --expect-build
+HEAD`):
+
+1. VR, cockpit, landed at a hills spot, HMD Image Quality 0.5, DLSS. Key OFF:
+   the log reads `native temporal: jitter phases=8 ...=off`. Take an eye dump
+   (the `dump_eyes` hotkey or the menu's Instruments row; with
+   `advanced.eye_run_treated` on for the treated crops). Flip the key ON live
+   (the menu's developer mode, Experimental page; or the ini): the log gets
+   `jitter phases=32 (eye 0 2016x1949 -> 4032x3898 ...=on` at once if the pair
+   is Sean's, and the real sizes otherwise. Take a second dump from the same
+   pose. Compare the treated crops' per-pixel variance over the run on a hills
+   region: `python tools\eye_run_shimmer.py <crops> --centre X Y --region hills
+   X0 Y0 X1 Y1`, its last line. PASS: the on run's amplitude is lower than the
+   off run's, with no flash in the `whole` column and no blur or ghosting
+   added. FAIL: no change (the count is not the lever: open (g)'s other legs)
+   or a worse picture (a longer sequence settles slower after any reset).
+2. One low flight over terrain with the key on: the terrain retirement's
+   regression check (docs/terrain-motion-dispatch-cost-2026-09-17.md).
+3. Flat (Epic), DLSS or TAA, the key on, at SS 1.0 and then below it. The
+   `flat jitter:` line reads `phases=8` at SS 1.0 (render at the output) and
+   ceil(8 x (D/R)^2) below: 12 at 0.85, 15 at 0.75, 32 at 0.5, with
+   `state=live` and `refusals` not rising, and `flat route:` naming the same R
+   and E. PASS: that, and the picture at least as stable as with the key off.
+   FAIL: refusals rising or the state leaving `live` with the key on; phases
+   stuck at 8 below 1.0 (the route is not upstream: the
+   `flat camera inject owner:` line says which route owns the frame); and
+   watch the lighting for seams on the game's 120-pixel light-grid tiles:
+   the upstream route has flown only the eight phases inside 7/16 of a pixel
+   (section 13 shows a lookup of p - j stays in its pixel, hence its tile,
+   for any |j| < 1/2 less a float margin, which 128 phases leave at 1/256),
+   and this is the first time it carries a phase out to 0.496.

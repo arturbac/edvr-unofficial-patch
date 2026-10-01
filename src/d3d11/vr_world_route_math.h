@@ -21,6 +21,7 @@
 // leaves Off, owned() is false, the eye shift is never suppressed, the layer is never told the world is the route's,
 // and the door never runs layer-only. The rig pins each answer.
 #pragma once
+#include "../common/temporal_math.h"   // kTemporalJitterCount: the window's default phase count
 #include "flat_hdr_route.h"
 #include "flat_mono_refusal.h"   // the stage 2 experiment build's pixel classes and the census's counters (pure)
 #include <cstdint>
@@ -276,6 +277,10 @@ struct VrWorldWindow {
     // phase its rows carried (render pixels, positive right/down), and the fold-in's mode counts.
     const char* jitter = "idle";
     float phaseX = 0.0f, phaseY = 0.0f, rowsX = 0.0f, rowsY = 0.0f;
+    // How many phases the route's sequence ran through (temporal_math.h): the route resolves at the game's render size, render ==
+    // output, so the ratio rule gives the fixed eight whatever experimental.temporal_aa_jitter_follows_upscale says. A default-
+    // constructed window says eight, the count every path has always run.
+    uint32_t phases = kTemporalJitterCount;
     uint64_t foldMode[3] = {};    // frames whose resolve ran the weapon fold-in with mode 0, 1, 2 (FlatMonoResolveFrame::firstPersonPhaseMode)
     // The stage 2 experiment build: the state of experimental.temporal_aa_on_foot_world_steady_detail at the boundary that printed the
     // line (vrWorldSteadyKeyName: "on" or "off"; the key defaults to on, and off is the route as flight 2 flew it). A window nothing has
@@ -310,7 +315,7 @@ inline int vrWorldFormatWindow(char* out, size_t size, VrWorldKey key, VrWorldSt
         "vr world route 5s: key=%s state=%s layer=%s gate=%s frames=%llu gate-frames=%llu gate-flips=%llu hdr-frames=%llu trigger=%llu "
         "none=%llu ambiguous=%llu treated=%llu declined=%llu owned-frames=%llu eye-takes=%llu door-layer-only=%llu "
         "enters=%llu releases=%llu (last=%s) scene-resets=%llu late-hdr-writes=%llu (in %llu frames) last=%s "
-        "jitter=%s phase=%.4f,%.4f rows=%.4f,%.4f fp-mode=%llu/%llu/%llu steady-detail=%s curve=%s curve-reissues=%llu "
+        "phases=%u jitter=%s phase=%.4f,%.4f rows=%.4f,%.4f fp-mode=%llu/%llu/%llu steady-detail=%s curve=%s curve-reissues=%llu "
         "last-trigger=VS=%016llX PS=%016llX target=%ux%u hdr=%ux%u selection=",
         vrWorldKeyName(key), vrWorldStateName(state), layerLive ? "live" : "not-live", gate ? "held" : "no",
         static_cast<unsigned long long>(w.hdr.frames), static_cast<unsigned long long>(w.gateFrames),
@@ -322,7 +327,7 @@ inline int vrWorldFormatWindow(char* out, size_t size, VrWorldKey key, VrWorldSt
         static_cast<unsigned long long>(w.layerOnly), static_cast<unsigned long long>(w.enters),
         static_cast<unsigned long long>(w.releases), w.lastRelease, static_cast<unsigned long long>(w.resets),
         static_cast<unsigned long long>(w.hdr.lateWrites), static_cast<unsigned long long>(w.hdr.lateWriteFrames),
-        w.hdr.lastVerdict, w.jitter, static_cast<double>(w.phaseX), static_cast<double>(w.phaseY),
+        w.hdr.lastVerdict, w.phases, w.jitter, static_cast<double>(w.phaseX), static_cast<double>(w.phaseY),
         static_cast<double>(w.rowsX), static_cast<double>(w.rowsY), static_cast<unsigned long long>(w.foldMode[0]),
         static_cast<unsigned long long>(w.foldMode[1]), static_cast<unsigned long long>(w.foldMode[2]), w.steady,
         w.curve, static_cast<unsigned long long>(w.curveReissues),

@@ -953,6 +953,9 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
 if errorlevel 1 ( echo [edvr] ERROR: native temporal test build failed & exit /b 1 )
 "%BUILD%\native_temporal_test.exe" --dry-run || exit /b 1
 "%BUILD%\native_temporal_test.exe" --self-test || exit /b 1
+REM The jitter phase count (experimental.temporal_aa_jitter_follows_upscale): the same channel code flown through a script of modes, sizes
+REM and live key flips in a process of its own, because the provider's channel pool holds sixteen and --self-test uses them all.
+"%BUILD%\native_temporal_test.exe" --phase-count-self-test || exit /b 1
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /I"third_party\openxr\include" ^
     /Fo"%OBJ%\native_temporal\\" /Fe"%BUILD%\native_temporal_gpu_test.exe" ^
@@ -1414,6 +1417,12 @@ if errorlevel 1 ( echo [edvr] ERROR: temporal_test build failed & exit /b 1 )
     echo [edvr] ERROR: the temporal pass's arithmetic is wrong
     exit /b 1
 )
+REM The jitter phase count (experimental.temporal_aa_jitter_follows_upscale, 2026-10-01) is pinned by this rig (the rule's table and
+REM the fixed eight's bit-for-bit sameness), flat_temporal_test (the phase machine and the route decision), vr_world_route_test (the
+REM window token) and native_temporal_test --phase-count-self-test (the VR eye pass flown on WARP). The self-test below holds the
+REM mutation list that proves those rigs fail on a broken source to the sources as they are and to the way build.bat compiles each
+REM rig; its --run (on demand) builds each against one edited production file. Drop it with the key.
+python "tools\temporal_test\jitter_phase_mutants.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_ui_depth
