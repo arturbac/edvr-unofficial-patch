@@ -691,6 +691,143 @@ static void testShippedIni(const std::wstring& root) {
                   "a rig that left the lever commented carries nothing: the new file stands as shipped");
         }
     }
+
+    // 2026-10-01: three experimental switches retired, each fixed at the behaviour it chose. The VR world route always jitters the
+    // world it owns (only the global experimental.temporal_aa_jitter off stops it): experimental.temporal_aa_on_foot_world_jitter.
+    // The depth-checked steady detail is always on, in the VR world route and in flat: experimental.temporal_aa_on_foot_world_steady_detail.
+    // The jitter phases always follow the upscale ratio: experimental.temporal_aa_jitter_follows_upscale. All three shipped as LIVE
+    // lines under [experimental], so every install of the previous version has them written out, and a rig that flew an A/B has one
+    // of them on the other value. Each line is carried with its value (a line somebody put there is how a support thread starts),
+    // reported as retired and not as a key this version never shipped, and not adopted (the shipped file documents none of the three);
+    // the setting beside each keeps its tuned value; no documentation block is resurrected; a second merge adds no copy.
+    check(shipped.find("temporal_aa_on_foot_world_jitter") == std::string::npos &&
+              shipped.find("temporal_aa_on_foot_world_steady_detail") == std::string::npos &&
+              shipped.find("temporal_aa_jitter_follows_upscale") == std::string::npos,
+          "the shipped ini documents none of the three retired experimental switches");
+    {
+        // The previous version's file: the shipped one with the three blocks put back where each sat, right after its neighbour.
+        const std::string afterJitter = "\ntemporal_aa_jitter = on" + eol;          // the jitter-phase switch followed it
+        const std::string afterRoute = "\ntemporal_aa_on_foot_world = off" + eol;   // the world jitter followed the route's key
+        const std::string afterMaps = "\non_foot_maps_sharp = off" + eol;           // the steady detail followed the maps gate
+        const size_t atJitter = shipped.find(afterJitter);
+        const size_t atRoute = shipped.find(afterRoute);
+        const size_t atMaps = shipped.find(afterMaps);
+        const bool anchored = atJitter != std::string::npos && atRoute != std::string::npos && atMaps != std::string::npos &&
+                              atJitter < atRoute && atRoute < atMaps;
+        check(anchored, "the shipped ini still has the three lines the retired-switch fixture anchors on, in this order");
+        if (anchored) {
+            std::string previous = shipped;
+            // Back to front, so the earlier offsets stay valid.
+            previous.insert(atMaps + afterMaps.size(),
+                eol + "# On foot: steadier fine detail on objects the game draws over (design doc" + eol +
+                "# section 82, the depth-validated steady detail). on, the default, gives those" + eol +
+                "# pixels the camera's motion instead, but only where last frame's depth confirms it." + eol +
+                "# dev: choices on, off" + eol +
+                "temporal_aa_on_foot_world_steady_detail = on" + eol);
+            previous.insert(atRoute + afterRoute.size(),
+                eol + "# VR on foot: jitter the world's own cameras while the world route owns the" + eol +
+                "# world (design doc section 82, stage 2). on, the default, jitters the world" + eol +
+                "# while the route owns it; off keeps the route and resolves an unjittered world." + eol +
+                "# dev: choices on, off" + eol +
+                "temporal_aa_on_foot_world_jitter = on" + eol);
+            previous.insert(atJitter + afterJitter.size(),
+                eol + "# TEMPORARY A/B SWITCH (2026-10-01): how many sub-pixel jitter phases the" + eol +
+                "# jitter runs through before it repeats. off, the default, is the fixed eight." + eol +
+                "temporal_aa_jitter_follows_upscale = off" + eol);
+
+            // A user's file: the previous version's, with the setting beside each switch tuned and the switches at the given values.
+            const auto setLine = [&](std::string text, const std::string& oldLine, const std::string& newLine) {
+                const size_t p = text.find("\n" + oldLine + eol);
+                if (p != std::string::npos) text.replace(p + 1, oldLine.size(), newLine);
+                return text;
+            };
+            const auto userFile = [&](const char* jitter, const char* steady, const char* follows) {
+                std::string text = setLine(previous, "temporal_aa_jitter = on", "temporal_aa_jitter = off");
+                text = setLine(text, "temporal_aa_on_foot_world = off", "temporal_aa_on_foot_world = auto");
+                text = setLine(text, "on_foot_maps_sharp = off", "on_foot_maps_sharp = on");
+                text = setLine(text, "temporal_aa_on_foot_world_jitter = on",
+                               std::string("temporal_aa_on_foot_world_jitter = ") + jitter);
+                text = setLine(text, "temporal_aa_on_foot_world_steady_detail = on",
+                               std::string("temporal_aa_on_foot_world_steady_detail = ") + steady);
+                text = setLine(text, "temporal_aa_jitter_follows_upscale = off",
+                               std::string("temporal_aa_jitter_follows_upscale = ") + follows);
+                return text;
+            };
+            const auto copies = [](const std::string& text, const std::string& needle) {
+                size_t n = 0, from = 0;
+                while ((from = text.find(needle, from)) != std::string::npos) {
+                    ++n;
+                    from += 1;
+                }
+                return n;
+            };
+            const std::string carriedNote = "# carried over from your edvr.ini; this version no longer uses it";
+            const auto carriedAs = [&](const std::string& merged, const std::string& line) {
+                return merged.find(carriedNote + "\n" + line) != std::string::npos ||
+                       merged.find(carriedNote + "\r\n" + line) != std::string::npos;
+            };
+
+            struct Variant { const char* what; const char* jitter; const char* steady; const char* follows; };
+            const Variant variants[] = {
+                {"the previous version's own values", "on", "on", "off"},
+                {"a rig that flew the world jitter A/B and the jitter phases", "off", "on", "on"},
+                {"a rig that flew the steady-detail A/B", "on", "off", "off"},
+            };
+            for (const Variant& v : variants) {
+                const std::string tag = std::string(v.what) + ": ";
+                const std::string jitterLine = std::string("temporal_aa_on_foot_world_jitter = ") + v.jitter;
+                const std::string steadyLine = std::string("temporal_aa_on_foot_world_steady_detail = ") + v.steady;
+                const std::string followsLine = std::string("temporal_aa_jitter_follows_upscale = ") + v.follows;
+                MergeReport rep;
+                const std::string switchMerged = mergeIni(shipped, userFile(v.jitter, v.steady, v.follows), &previous, {}, &rep);
+                expectEq(iniValue(switchMerged, "experimental.temporal_aa_on_foot_world_jitter"), v.jitter,
+                         (tag + "the retired world jitter switch is carried with its value, not eaten").c_str());
+                expectEq(iniValue(switchMerged, "experimental.temporal_aa_on_foot_world_steady_detail"), v.steady,
+                         (tag + "...and so is the steady-detail switch").c_str());
+                expectEq(iniValue(switchMerged, "experimental.temporal_aa_jitter_follows_upscale"), v.follows,
+                         (tag + "...and the jitter-phase switch").c_str());
+                check(rep.retired.size() == 3 && rep.carried.empty(),
+                      (tag + "all three are reported as retired settings, none as a key this version never shipped").c_str(),
+                      std::to_string(rep.retired.size()) + " retired, " + std::to_string(rep.carried.size()) + " carried");
+                check(carriedAs(switchMerged, jitterLine) && carriedAs(switchMerged, steadyLine) && carriedAs(switchMerged, followsLine),
+                      (tag + "each carried line follows a note saying this version no longer uses it").c_str());
+                expectEq(iniValue(switchMerged, "experimental.temporal_aa_on_foot_world"), "auto",
+                         (tag + "the route key beside the world jitter keeps its tuned value").c_str());
+                expectEq(iniValue(switchMerged, "experimental.on_foot_maps_sharp"), "on",
+                         (tag + "the maps gate beside the steady detail keeps its tuned value").c_str());
+                expectEq(iniValue(switchMerged, "experimental.temporal_aa_jitter"), "off",
+                         (tag + "the global jitter key beside the jitter-phase switch keeps its tuned value").c_str());
+                check(switchMerged.find("steadier fine detail on objects") == std::string::npos &&
+                          switchMerged.find("jitter the world's own cameras while the world route owns") == std::string::npos &&
+                          switchMerged.find("TEMPORARY A/B SWITCH") == std::string::npos,
+                      (tag + "the retired switches' documentation blocks are not resurrected").c_str());
+
+                // The merge is idempotent on the carried lines: merging again with the result as the user's file must not duplicate them.
+                MergeReport again;
+                const std::string twice = mergeIni(shipped, switchMerged, &shipped, {}, &again);
+                check(copies(twice, jitterLine) == 1 && copies(twice, steadyLine) == 1 && copies(twice, followsLine) == 1,
+                      (tag + "a second merge does not duplicate a carried line").c_str(),
+                      std::to_string(copies(twice, jitterLine)) + "/" + std::to_string(copies(twice, steadyLine)) + "/" +
+                          std::to_string(copies(twice, followsLine)) + " copies");
+            }
+
+            // Hand-installed, no base copy: the same three lines are still carried and still inert, only the note differs.
+            MergeReport bareRep;
+            const std::string bare = mergeIni(shipped, userFile("off", "off", "on"), nullptr, {}, &bareRep);
+            check(iniValue(bare, "experimental.temporal_aa_on_foot_world_jitter") == "off" &&
+                      iniValue(bare, "experimental.temporal_aa_on_foot_world_steady_detail") == "off" &&
+                      iniValue(bare, "experimental.temporal_aa_jitter_follows_upscale") == "on",
+                  "with no base copy the three retired switches are still carried with their values");
+            check(bareRep.carried.size() == 3 && bareRep.retired.empty(),
+                  "and reported as keys this version never shipped (the merge cannot know they once did)");
+
+            // A file that has none of the lines (installed from this version, or the lines deleted) carries nothing: the new file stands.
+            MergeReport freshRep;
+            const std::string fresh = mergeIni(shipped, shipped, &previous, {}, &freshRep);
+            check(fresh == shipped && freshRep.retired.empty() && freshRep.carried.empty(),
+                  "a file without the three lines carries nothing: the new file stands as shipped");
+        }
+    }
 }
 
 // A shipped default that CHANGED, against the real edvr.ini: fix.ui_quality went

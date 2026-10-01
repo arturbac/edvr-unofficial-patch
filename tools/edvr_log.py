@@ -1351,8 +1351,9 @@ def print_refusal_census(windows, events=None):
           "of the resolves that ask; shares are of the pixels the samples examined) ==" % (every or "?"))
     if not windows:
         print("none: no `vr world route refusal 5s:` line in this log (the route never engaged, or this build predates the census; with the "
-              "route on the line is printed while advanced.vr_camera_census is on, and while "
-              "experimental.temporal_aa_on_foot_world_steady_detail is on, which is its default)")
+              "route on the line is printed while advanced.vr_camera_census is on, and in every window where the steady-detail depth check "
+              "counted frames, which a current build always does: its steady detail is always on, and only a log from a build that had the "
+              "setting may say off)")
         return []
     states = [refusal_state(w) for w in windows]
     off_windows = [w for w, s in zip(windows, states) if s == "census-off"]
@@ -7589,7 +7590,7 @@ def self_test_camera_census():
     _, out = report(text + refusal_line(view="on", steady="on", stale=0, kept=1, ran=1))
     if "the refusal view was painting: the headset showed the prep's classification, not the world" not in out:
         fail("a window with the refusal view on was not noted:\n%s" % out)
-    _, out = report(text + "[00:00:10.000] vr world route: steady-detail is ON from frame=100 (experimental.temporal_aa_on_foot_world_steady_detail): x\n"
+    _, out = report(text + "[00:00:10.000] vr world route: steady-detail is ON from frame=100 (the line an older build printed when it read its key): x\n"
                     "[00:00:11.000] vr world route: the refusal view is ON from frame=200 (advanced.temporal_aa_debug = motion_source): y\n")
     if "route log: [00:00:10.000] vr world route: steady-detail is ON from frame=100" not in out or "route log: [00:00:11.000] vr world route: the refusal view is ON" not in out:
         fail("the route's state lines were not quoted in the refusal section:\n%s" % out)
