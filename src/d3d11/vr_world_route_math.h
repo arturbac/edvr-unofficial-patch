@@ -565,13 +565,15 @@ inline int vrWorldFormatRowsMismatch(char* out, size_t size, uint64_t frame, flo
 }
 
 // ---- the stage 2 experiment build (design doc section 82) ------------------------------------------------------------------
-// experimental.temporal_aa_on_foot_world_steady_detail: off (the default) or on. Flight 2's shimmer on fine patterns fits the prep
+// experimental.temporal_aa_on_foot_world_steady_detail: off (the default) or on. Flight 2's shimmer on fine patterns is the prep
 // refusing the history of a pixel whose engine slot a LATER draw overdrew (the slot's depth is no longer the pixel's) and the finish
-// then showing the raw jittered input there. "on" sends exactly those pixels to the camera term instead, the rule the flat profile's
-// 3D menu has run since 2026-09-29, so one session can compare the two at the same spot. Only the stale-slot refusal is relaxed: a
-// masked record, a corrupt slot, the sky and the weapon's pixels stay refused. A moving object drawn by a shader the engine table
-// does not name can ghost while it is on. Read only while the route key is auto. A value that is present and is not "on" reads as
-// off, so a typo never relaxes anything. The in-headset menu's developer mode flips it live, like the jitter key.
+// then showing the raw jittered input there (flight 3 confirmed it at the main menu: 5.674% of the pixels, all stale, calm with the key
+// on). "on" gives those pixels the camera term instead, but only where last frame's depth confirms it (the depth at the position the
+// camera term sends the pixel to matches the depth this surface would have had there had it not moved, within 1%: the depth-validated
+// steady detail; the blanket form was flight 3's experiment); where it does not the pixel is refused as before. Only the stale-slot
+// refusal is relaxed: a masked record, a corrupt slot, the sky and the weapon's pixels stay refused. A lateral mover's interior can
+// still pass the depth test and ghost while it is on. Read only while the route key is auto. A value that is present and is not "on"
+// reads as off, so a typo never relaxes anything. The in-headset menu's developer mode flips it live, like the jitter key.
 enum class VrWorldSteadyKey : uint8_t { Off, On };
 inline VrWorldSteadyKey vrWorldSteadyKeyFromText(const char* text) {
     if (!text) return VrWorldSteadyKey::Off;
@@ -589,8 +591,9 @@ inline int vrWorldFormatSteadyChanged(char* out, size_t size, uint64_t frame, Vr
     if (key == VrWorldSteadyKey::On)
         return std::snprintf(out, size,
             "vr world route: steady-detail is ON from frame=%llu (experimental.temporal_aa_on_foot_world_steady_detail): a pixel whose "
-            "engine slot a later draw overdrew takes the camera term instead of refusing its history, as the 3D menu's does; masked "
-            "records and corrupt slots stay refused; a moving object drawn by a shader the engine table does not name can ghost",
+            "engine slot a later draw overdrew takes the camera term instead of refusing its history where last frame's depth confirms "
+            "it, and is refused where it does not; masked records and corrupt slots stay refused; a lateral mover's interior can still "
+            "pass the depth test and ghost",
             static_cast<unsigned long long>(frame));
     return std::snprintf(out, size,
         "vr world route: steady-detail is OFF from frame=%llu (experimental.temporal_aa_on_foot_world_steady_detail): a pixel whose "
@@ -607,11 +610,15 @@ inline int vrWorldFormatViewChanged(char* out, size_t size, uint64_t frame, bool
             static_cast<unsigned long long>(frame), flatMonoViewLegend());
     return std::snprintf(out, size, "vr world route: the refusal view is OFF from frame=%llu", static_cast<unsigned long long>(frame));
 }
-// The third line of a 5 s window, printed only while the refusal census is wanted (advanced.vr_camera_census on): an absent line is
-// "the census was off", and a line with sampled=0 is "on, and no sample was read back" -- the two are never the same text, and a
-// census that ran and found nothing says so with pixels > 0 and refused=0. `treated` is the route's own count of treated frames in
-// the window; asked, sampled, dropped and read are the resolver's (flat_mono_refusal.h FlatMonoRefusalCensus). The reader
-// (edvr_log.py --camera-census) parses this text.
+// The third line of a 5 s window, printed while the refusal census is wanted (advanced.vr_camera_census on), while samples of a census
+// that has just gone off are still draining, and while the steady-detail key is on (its depth check's own frames are counted
+// whatever the census asks): an absent line is "the census and the key were off", and a line with sampled=0 is "on, and no sample was
+// read back" -- the two are never the same text, and a census that ran and found nothing says so with pixels > 0 and refused=0.
+// `treated` is the route's own count of treated frames in the window; asked, sampled, dropped and read are the resolver's
+// (flat_mono_refusal.h FlatMonoRefusalCensus). The stale pixels are two numbers: `stale-refused` (refused: with the key off all of
+// them, with it on the ones last frame's depth did not confirm) and `stale-kept` (not refused: the camera term, confirmed). `depth-check`
+// is ran/skipped: the resolves with the key on whose prep ran the depth check, and those that could not (no last-frame depth). The
+// reader (edvr_log.py --camera-census) parses this text; it still reads the flight-3 spellings `stale=` and `forgiven=`.
 struct VrWorldRefusalWindow {
     bool census = false;                  // the census key is on at the boundary that printed the line
     uint64_t treated = 0;
@@ -620,12 +627,13 @@ struct VrWorldRefusalWindow {
     uint32_t width = 0, height = 0;       // the render size of the last sample read back
     uint64_t pixels = 0;                  // what the read-back samples examined
     uint64_t counts[kFlatMonoRefusalSlots] = {};
+    uint64_t checked = 0, skipped = 0;    // the resolver's depth-check frames this window (FlatMonoRefusalCensus::checked, skipped)
     const char* steady = "off";           // vrWorldSteadyKeyName at the boundary
     const char* view = "off";             // "on" while the refusal view is painting
 };
 inline uint64_t vrWorldRefusalTotal(const VrWorldRefusalWindow& w) {
     uint64_t n = 0;
-    for (uint32_t i = 0; i < kFlatMonoRefusalForgiven; ++i) n += w.counts[i];
+    for (uint32_t i = 0; i < kFlatMonoRefusalStaleKept; ++i) n += w.counts[i];
     return n;
 }
 inline int vrWorldFormatRefusalWindow(char* out, size_t size, const VrWorldRefusalWindow& w) {
@@ -636,8 +644,8 @@ inline int vrWorldFormatRefusalWindow(char* out, size_t size, const VrWorldRefus
     const double pct = w.pixels ? 100.0 * static_cast<double>(refused) / static_cast<double>(w.pixels) : 0.0;
     return std::snprintf(out, size,
         "vr world route refusal 5s: census=%s every=%u treated=%llu asked=%llu sampled=%llu read=%llu dropped=%llu size=%ux%u "
-        "pixels=%llu refused=%llu refused-pct=%.3f stale=%llu masked=%llu corrupt=%llu sentinel=%llu unreprojectable=%llu camera=%llu "
-        "range=%llu depth=%llu weapon=%llu other=%llu forgiven=%llu steady-detail=%s view=%s",
+        "pixels=%llu refused=%llu refused-pct=%.3f stale-refused=%llu masked=%llu corrupt=%llu sentinel=%llu unreprojectable=%llu camera=%llu "
+        "range=%llu depth=%llu weapon=%llu other=%llu stale-kept=%llu depth-check=%llu/%llu steady-detail=%s view=%s",
         w.census ? "on" : "off", w.every, static_cast<unsigned long long>(w.treated), static_cast<unsigned long long>(w.asked),
         static_cast<unsigned long long>(w.sampled), static_cast<unsigned long long>(w.read), static_cast<unsigned long long>(w.dropped),
         w.width, w.height, static_cast<unsigned long long>(w.pixels), static_cast<unsigned long long>(refused), pct,
@@ -646,7 +654,8 @@ inline int vrWorldFormatRefusalWindow(char* out, size_t size, const VrWorldRefus
         static_cast<unsigned long long>(w.counts[kFlatMonoClassUnreprojectable]), static_cast<unsigned long long>(w.counts[kFlatMonoClassCamera]),
         static_cast<unsigned long long>(w.counts[kFlatMonoClassRange]), static_cast<unsigned long long>(w.counts[kFlatMonoClassDepth]),
         static_cast<unsigned long long>(w.counts[kFlatMonoClassWeaponRefused]), static_cast<unsigned long long>(refused - named),
-        static_cast<unsigned long long>(w.counts[kFlatMonoRefusalForgiven]), w.steady, w.view);
+        static_cast<unsigned long long>(w.counts[kFlatMonoRefusalStaleKept]), static_cast<unsigned long long>(w.checked),
+        static_cast<unsigned long long>(w.skipped), w.steady, w.view);
 }
 
 // The decline log. Flight 1 capped it per SESSION (twelve lines) and spent all twelve on the entry and the first seconds of one

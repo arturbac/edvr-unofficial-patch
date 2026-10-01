@@ -48,12 +48,12 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-82):** users 1-2 refused every frame, 3 at 7-13 fps, 4
-  lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED 10-01 (fix next);
-  vscreen auto-fit (route on: width fitted to the eye) BUILT 10-01, NOT FLOWN.
-- **Compatibility decision:** an absent profile descriptor is accepted as
-  legacy VR (manual installs keep working); an existing invalid one disables
-  fixes, preserving forwarding/chaining. New installers and developer
-  verification require `edvr_profile.ini`.
+  lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED; fix BUILT, unflown;
+  vscreen auto-fit (width fitted to the eye, route on) BUILT 10-01, unflown.
+- **Compatibility decision:** the prototype accepts an absent profile
+  descriptor as legacy VR so manual installations keep working. An existing
+  invalid descriptor disables fixes, preserving forwarding/chaining. New
+  installers and developer verification require `edvr_profile.ini`.
 - **Environment:** initial qualification is Windows, Elite's D3D11 renderer,
   mono SDR output. Record game/patch builds, GPU/driver, display/render sizes,
   window mode, installed mods and backend DLL versions. Headset/runtime are N/A
@@ -7375,6 +7375,187 @@ camera term for stale slots in the shared resolver (keep history where last
 frame's depth at the camera-reprojected spot matches, refuse otherwise), so
 flat on foot gets it too; then a settlement check with movers and a desk
 check in flat before any default changes.
+
+SETTLEMENT FLIGHT, 2026-10-01 (log 060011): the blanket form of the key
+(02c1c456: every stale slot takes the camera term) works on foot at the
+settlement. Sean: "it looks beautiful". He reported no mover ghosting, but he
+did not look for it (people walking, a ship landing, doors), so the caveat is
+unchecked, not cleared.
+
+HMD CINEMA ON FOOT (reported with it; recorded only, not in scope here): the
+route declined every frame (about 450 a 5 s window, gate=no; reasons
+`depth-not-screen-motion-source` and `engine-views-unavailable`), so it never
+owned the world, and the whole panel ghosted and flickered. That is a separate,
+pre-existing cinema-mode problem, not the steady-detail key's, and nothing in
+the entry below widens to it.
+
+2026-10-01, THE DEPTH-VALIDATED STEADY DETAIL, VR AND FLAT (built and
+rig-proven; NOT FLOWN). The proposal at the end of FLIGHT 3, built
+as one rule in the shared resolver, one key, two readers.
+
+THE CHECK (flat_mono_shader_source.h, the prep). A pixel whose engine slot
+holds another depth than the pixel (a later draw overdrew it: "stale") takes
+the camera term, as every pixel without a slot does, and then has to pass one
+test: last frame's depth, in the best of the four texels around the position
+the camera term sends the pixel to in last frame's raster, must be within
+max(1e-6, 1% of expected) of `expected`, the depth the camera term says this
+surface had there. The position is the camera term's true previous uv times
+the render size, plus the previous raster phase (jitter.zw), minus half a
+texel; the four texels are the bilinear footprint, clamped to the image. Pass:
+the camera term stands (not refused; class stale, counted `stale-kept`). Fail:
+refused exactly as with the key off (counted `stale-refused`). Masked,
+corrupt, sentinel and sky pixels and the weapon's never reach the test, and
+the 3D menu's blanket policy (staticScene) wins and does not run it.
+
+THE TOLERANCE AND WHY (a throwaway simulation, numbers below; no flight).
+- Depth is reversed-Z float32, infinite far: d = near / z, sky 0. The float32
+  spacing is 0.7e-7 to 1.2e-7 of d at every range from 0.025 m to 1e8 m, so a
+  relative error in d is the same relative error in z at any distance: the
+  tolerance is relative. The floor 1e-6 equals 1% at d = 1e-4 (z = 250 m with
+  near 0.025 m); farther than that the floor is the tolerance (4% of d at
+  1 km, 40% at 10 km). The resolver's own TAA applies the same 1% and 1e-6 to
+  its history depth in taa() today, so the two cannot disagree.
+- Edges and thin lines, the shimmer's own geometry (a static line, the jitter
+  phases of consecutive frames): the nearest texel keeps a 1 px line 62.5%
+  (0 deg) to 74% (45 deg) of the time and a 2 px line 81-87%, so it would
+  refuse the very pixels this exists for; the four texels keep every line of
+  1 px or more 100%, a 0.5 px line at 30 deg 100% (the nearest: 44.5%) and at
+  45 deg 80.5% (53%). A 0.5 px line at 0 deg keeps 25% in every footprint.
+  3x3 is no better on lines and leaks farther at edges.
+- Slanted planes (a static plane, relative depth change per pixel g): with
+  four texels at 1%, g = 1% keeps 100%, 2% 99.9%, 3% 91%, 5% 67%. g is 2% per
+  pixel at a 1 deg grazing angle at VR 5040x2835 (2.6% flat 3840x2160), 0.2%
+  at 10 deg. At 0.3% a 1% plane keeps 99.8% and a 2% one 58%; so 1% is the
+  loosest that does not start refusing ordinary floors.
+- Movers: a face moving in depth by 0.5-1% a frame is kept, 2% a frame is
+  refused: at 5 m and 90 fps that is 9 m/s, so only fast depth movers are
+  seen. A flat-faced lateral mover 40 px wide at 1 px a frame keeps 98.75% of
+  its stale pixels (3x3: 99.2%): its two edge columns are refused and its
+  interior passes, as under the blanket form, carrying a history that is
+  misregistered by the step. HONEST LIMIT: the check refuses edges,
+  disocclusions and surfaces that changed depth; it cannot see a surface
+  that slides sideways at constant depth. Also at an edge the best of four
+  keeps the trailing 1 px of a surface that moved away (the background beside
+  it was there a texel over): the rig pins it (9 of 16 refused, 7 kept).
+- ruled out: the nearest texel alone, because it refuses 25-93% of static
+  thin lines; 3x3, because it is no better on lines and leaks farther; 0.3%,
+  because a plane at 2% a pixel (a 1 deg grazing floor) keeps only 58% there;
+  3%, because a face moving 2% a frame in depth is then kept.
+
+THE KEY OFF CONTRACT. `experimental.temporal_aa_on_foot_world_steady_detail`
+keeps its name and values; off is the default and refuses a stale slot as
+before, byte for byte: the prep's arithmetic and every output are what they
+were (the resolver rig's recorded key-off hashes still pass, unchanged), no
+second depth image is made, the backend is handed the same image as always,
+and the depth-check frames count zero. "on" now means the depth-checked form.
+The blanket form is gone from the VR route (the route rig pins that it never
+sets staticScene); it survives for the flat 3D main menu alone, untouched.
+
+PREVIOUS DEPTH AND ITS COST. EDVR's TAA already keeps last frame's depth. DLSS
+and FSR keep none, so the first frame with the key on makes a second R32_FLOAT
+image at the render size (57 MB at 5040x2835, 33 MB at 3840x2160) and from
+then the depth the backend is handed alternates between the two images: the
+prep writes this frame's depth into the one that is not last frame's and reads
+last frame's as t8. No copy and no extra write: memory only. A frame with the
+key off writes the first image as before, so the key can flip live. If the
+image cannot be made the log says so once and the frames run as with the key
+off (`depth-check` counts them as skipped). GPU: only a stale pixel pays, four
+4-byte loads and a few dozen ALU ops; with 5.7% of a VR frame stale (flight 3)
+that is 0.8 M pixels, 13 MB of reads, about 0.03-0.05 ms at 5040x2835; the
+flat Krait menu's 22.5% at 4K would be about 0.06 ms. An estimate: WARP cannot
+time it. The flight reads `world resolve` ms on the route line key off against
+key on.
+
+FLAT USES THE SAME KEY. runtime_profile.h: one allowlist line. flat_runtime.cpp:
+steadyReadKey once a Present (off unless the file says "on", any case), the
+state handed to the resolver at both treatment sites (the copy route and the
+HDR route) right after the menu's `f.staticScene` lines, which are unchanged
+(four mentions, none from the key; the flat temporal rig pins it). The log says
+`flat runtime: steady-detail is ON|OFF from frame=N (...)` when the key
+changes (and at startup when it is on; nothing while it is off) and, every
+5 s while a temporal mode runs, `flat steady detail 5s: steady-detail=on|off
+depth-check=RAN/SKIPPED`. No flat census or view (the stale share on foot in
+flat stays unmeasured). Backends: DLSS, DLAA, FSR and EDVR's TAA all take the
+check.
+A flat-specific key is not needed. Flat's ini is edvr-flat.ini:
+  [experimental]
+  temporal_aa_on_foot_world_steady_detail = on
+VR's is edvr.ini, the same two lines (the line is already there, off).
+
+THE VR CENSUS (`advanced.vr_camera_census`). The refusal line's `stale=` is
+now `stale-refused=` (refused: with the key off every stale pixel, on the
+ones the check refused) and `forgiven=` is `stale-kept=` (not refused: the
+camera term, confirmed by last frame's depth); new `depth-check=RAN/SKIPPED`
+(resolves with the key on whose prep ran the check, and those that could not;
+a reset frame is neither). The line now also prints while only the key is on.
+`edvr_log.py --camera-census` reads both spellings, totals each key state
+alone, prints stale-kept as a share of all pixels and, with the key on, of
+the stale pixels, and WARNs on: key on and no depth-check frame at all, key on
+and the check never ran, key off with stale-kept or checked frames; one note:
+key on, the check ran and kept nothing.
+
+EVIDENCE FROM THE RIGS (no flight). Resolver rig (WARP, the new
+flat_steady_depth_gpu_tests.h), through DLSS's stub, FSR's and EDVR's TAA: key
+off refuses a stale block and makes no second image; key on keeps it in a
+still scene and the backend is handed THIS frame's depth through eight frames
+with the key flipped on and off; a surface that arrived is refused and kept
+once it has been there a frame; 0.9% and 1.1% each way and the floor (1e-5
+deep, 5% inside it, 20% outside); a 1 px line one texel over is found in both
+axes and both signs of the previous phase, two texels over is not; a camera
+three pixels over reads the depth where it sends the pixel; a camera moved
+along its view axis compares with `expected`, not the pixel's depth; the
+menu's blanket policy keeps a stale pixel whatever the depth says and the
+check neither runs nor counts; a reset frame refuses all and counts nothing
+and the next frame has its depth; corrupt, sentinel, sky and masked stay
+refused with the key on; the census splits 16 stale pixels into kept or
+refused; through the TAA a kept pixel reaches its history (122 and 134) and a
+refused one takes the current colour (64 and 192). 22 mutants of the shader
+are each caught (the tolerance at 0, 0.5% and 5%, the floor at 0 and 1e-3, min
+for max, no check, inverted, the wrong position, the pixel's own depth for
+`expected`, no previous phase, the wrong sign, the current phase, no half
+texel, one and sixteen texels, this frame's depth, the blanket form, key
+refuses, sky and corrupt kept, a refused pixel counted as range). The route
+rig, the census rig and its fixture, the glue rig (real formatter into the
+real reader, a key-on window), the reader's self-test (both spellings),
+config_test (the key off in the shipped ini, both readers' fallbacks, the flat
+allowlist) and flat_temporal_test pin the rest. NOT measured: the GPU cost;
+the real DLSS and FSR SDKs given alternating depth images (the rig's backends
+are stubs that read the same textures); anything in a headset or at the desk.
+
+UNSURE. (1) The SDKs take the depth resource per evaluate call, so alternating
+should be inert, but the stubs cannot show it; a quality change at the key
+flip with `depth-check` ran > 0 would be the sign, and the key is the revert.
+(2) Lateral movers: the check cannot see them; flight 2 below tests it.
+(3) Flat's stale share on foot is unknown, so "kept" there has no number
+until a flat census exists.
+
+FLIGHT PLAN (install by tools\install_edvr.py; `edvr_log.py --target <t>
+--expect-build HEAD --version` first; VR legs `--camera-census` with
+`advanced.vr_camera_census = on`, flat legs `--grep "steady"`).
+1. VR, the main menu, HMD Cinema (fix.vscreen_res_width 4032), key on: calm as
+   with the blanket key (flight 3); the census `stale-kept` about 5.7% of the
+   pixels (flight 3's stale share) and `stale-refused` near 0; `depth-check`
+   ran in about every frame of a window (450) and skipped 0.
+2. VR at the settlement, standing still, then with movers (people walking,
+   a ship landing, doors), key off then on, twice: static detail calm with
+   the key on; no ghost trailing a mover (Sean looks at one mover on purpose,
+   twice); the stale-refused share rises where something moves; `world
+   resolve` ms key off against on.
+3. Flat, Epic, at the desk (edvr-flat.ini above, temporal_aa on, any
+   backend, on foot): hose spools and hull plating calm with the key on,
+   shimmering off; the 5 s line says on with `depth-check` ran about every
+   frame; the menu is unchanged (key on or off).
+Pass: 1 calm and nearly all stale kept; 2 calm with no ghost; 3 calm. If 2
+ghosts, the check is too loose for movers and the answer is a motion
+signal, not a tighter depth tolerance (ruled out above).
+
+PROPOSED, NOT BUILT. (a) A near-miss counter: stale pixels refused by less
+than twice the tolerance, so the tolerance's edge has a number from a flight.
+(b) The flicker census of FLIGHT 2's plan, if the shimmer outlasts the key.
+(c) A flat census and view, if the flat stale share is wanted: the VR formatter
+moved into flat_mono_refusal.h and a gate that is not
+advanced.temporal_aa_debug (its readers across the tree make that key unsafe
+to allowlist in flat). (d) A flat-specific key name: not needed.
 
 **The vscreen auto-fit (2026-10-01; BUILT, NOT FLOWN).** Sean: "we're rapidly
 approaching making route on the default for everyone". With the route running,

@@ -107,11 +107,20 @@ struct FlatMonoResolveFrame {
     // The 3D main menu (2026-09-29): the frame's contract came through the verified menu HDR copy, so
     // the scene is a ship on its pedestal and nothing moves but the camera. Only then does a pixel whose
     // engine slot was overdrawn by a draw that never wrote it (an unkeyed hull) take the camera term
-    // instead of refusing history. The VR world route sets it too, from the dev key
-    // experimental.temporal_aa_on_foot_world_steady_detail (off by default): the same rule, applied on foot, for the
-    // flight that tells whether those refusals are what shimmers. False (the default, and every frame outside that menu
-    // and that key) leaves the shader's arithmetic bit-identical to before the field.
+    // instead of refusing history, whatever last frame's depth says (the blanket form). Only the flat runtime sets it, from
+    // the verified menu copy; the VR world route never does. False (the default, and every frame outside that menu)
+    // leaves the shader's arithmetic bit-identical to before the field.
     bool staticScene = false;
+    // The steady-detail rule (experimental.temporal_aa_on_foot_world_steady_detail; the VR world route and the flat profile on foot,
+    // design doc section 82, the depth-validated steady detail): a pixel whose engine slot a later draw overdrew takes the camera term
+    // instead of refusing its history ONLY where last frame's depth confirms the camera term -- the depth, in the best of the four
+    // texels around the previous raster position, is within 1% (floor 1e-6, kFlatMonoStaleDepthRelative) of the depth this surface would
+    // have had there had it not moved -- and is refused exactly as before wherever it does not. The check needs last frame's depth: TAA
+    // keeps it already; the other backends get a second depth image, made on the first frame that asks, and from then on the depth the
+    // backend is handed alternates between the two (never while this is false: those frames write the one image they always did). Masked
+    // records, corrupt slots, the sky and the first-person pixels are untouched. staticScene (the menu's blanket form) wins when both are
+    // set. False (the default) leaves every pixel, every resource and the prep's arithmetic exactly as before the field.
+    bool steadyDetail = false;
     // The VR world route's refusal census and view (design doc section 82, stage 2 experiment build; flat_mono_refusal.h).
     // Both default to off, the flat profile never sets either, and a frame that asks for neither runs the prep and the finish
     // exactly as before (no class texture is made, bound or written, no census pass is dispatched).

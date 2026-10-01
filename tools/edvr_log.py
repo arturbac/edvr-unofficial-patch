@@ -504,15 +504,18 @@ def print_vh_tally(text, frame):
 # counts frames whose window was open and that named nothing: one per world-to-map change is expected.) The route's own log
 # lines the verdict quotes are listed in ROUTE_EVENT_MARKERS (`STOP at frame=`, `RELEASED the world at frame=`, ...).
 # The inject line ends with `fov=<narrowest>..<widest>` (radians: the struct's field of view over the screen views of the window,
-# two values when the first-person camera's tighter one is in it) or `fov=-` (no frustum was read), and, with the census key on,
-# a third line follows the two (src/d3d11/vr_world_route_math.h vrWorldFormatRefusalWindow):
+# two values when the first-person camera's tighter one is in it) or `fov=-` (no frustum was read), and, with the census key on or
+# the steady-detail key on, a third line follows the two (src/d3d11/vr_world_route_math.h vrWorldFormatRefusalWindow):
 #   vr world route refusal 5s: census=on|off every=N treated=N asked=N sampled=N read=N dropped=N size=WxH pixels=N refused=N
-#       refused-pct=X stale=N masked=N corrupt=N sentinel=N unreprojectable=N camera=N range=N depth=N weapon=N other=N
-#       forgiven=N steady-detail=on|off view=on|off
-# (`pixels` is what the read-back samples examined, `refused` the pixels whose history the prep refused, by cause; `forgiven` the stale
-# pixels the steady-detail key sent to the camera term instead; "ran, 0 refused" is pixels > 0 and refused=0, "never ran" is
-# treated=0, asked=0 or read=0.) The route also logs a line when the steady-detail key or the refusal view changes
-# (`steady-detail is ON|OFF from frame=`, `the refusal view is ON|OFF from frame=`), see ROUTE_EVENT_MARKERS.
+#       refused-pct=X stale-refused=N masked=N corrupt=N sentinel=N unreprojectable=N camera=N range=N depth=N weapon=N other=N
+#       stale-kept=N depth-check=RAN/SKIPPED steady-detail=on|off view=on|off
+# (`pixels` is what the read-back samples examined, `refused` the pixels whose history the prep refused, by cause. The stale pixels are
+# two numbers: `stale-refused`, refused (with the steady-detail key off every stale pixel, with it on the ones last frame's depth did
+# not confirm), and `stale-kept`, not refused (the camera term, confirmed by last frame's depth). `depth-check` is the resolves with
+# the key on whose prep ran the depth check and those that could not (a reset frame is neither). The flight-3 build's `stale=` and
+# `forgiven=` (its blanket form of the rule) still parse, as stale-refused and stale-kept, with no depth-check. "Ran, 0 refused" is
+# pixels > 0 and refused=0, "never ran" is treated=0, asked=0 or read=0.) The route also logs a line when the steady-detail key or
+# the refusal view changes (`steady-detail is ON|OFF from frame=`, `the refusal view is ON|OFF from frame=`), see ROUTE_EVENT_MARKERS.
 #
 # WHAT A CAMERA IS. The camera OBJECT is no identity: one object was the left eye camera in
 # the cockpit (kind 5) and the world's kind-3 camera on foot (flight 1, 4.63 million calls),
@@ -550,7 +553,7 @@ REFUSAL_LINE_RE = re.compile(
 # The causes the refusal line counts, in the line's own order (src/d3d11/flat_mono_refusal.h), and what each one is. `other` is
 # what the census cannot name: a refused pixel of a class the line has no token for.
 REFUSAL_CAUSES = (
-    ("stale", "the engine slot's depth was not the pixel's: a later draw overdrew it"),
+    ("stale-refused", "the engine slot's depth was not the pixel's (a later draw overdrew it) and the steady-detail depth check, if it is on, did not confirm the camera term"),
     ("masked", "a rig record with no usable history this frame (first seen, or after a gap)"),
     ("corrupt", "a slot code or a record number that did not survive intact"),
     ("sentinel", "no depth under the slot (the sky) or the out-of-range marker"),
@@ -914,7 +917,9 @@ def parse_refusal_windows(text):
     of the same window (the route prints route, inject, refusal, in that order; a missing one is None). A list of dicts: ts, kv (every
     token), census (census=on), steady and view (the tokens' text), w and h (size=), pct (refused-pct), route and inject (the other
     two lines' tokens), the counters as ints (None when a token is absent or not a number: treated, asked, sampled, read, dropped,
-    every, pixels, refused, forgiven) and causes {name: int or None} for every name of REFUSAL_CAUSES."""
+    every, pixels, refused), kept (`stale-kept=`, or the flight-3 build's `forgiven=`), check_ran and check_skipped (`depth-check=RAN/SKIPPED`:
+    None for a build without the depth check) and causes {name: int or None} for every name of REFUSAL_CAUSES (`stale-refused`
+    reads the flight-3 build's `stale=` when the new token is absent)."""
     out = []
     route = inject = None
     for raw in text.splitlines():
@@ -933,9 +938,14 @@ def parse_refusal_windows(text):
         w = {"ts": m.group("ts") or "", "kv": kv, "census": kv.get("census") == "on", "steady": kv.get("steady-detail"),
              "view": kv.get("view"), "w": int(size.group(1)) if size else None, "h": int(size.group(2)) if size else None,
              "pct": _cf(kv.get("refused-pct")), "route": route, "inject": inject}
-        for key in ("every", "treated", "asked", "sampled", "read", "dropped", "pixels", "refused", "forgiven"):
+        for key in ("every", "treated", "asked", "sampled", "read", "dropped", "pixels", "refused"):
             w[key] = _cint(kv.get(key))
+        w["kept"] = _cint(kv.get("stale-kept", kv.get("forgiven")))
+        check = re.match(r"^(\d+)/(\d+)$", kv.get("depth-check", ""))
+        w["check_ran"], w["check_skipped"] = (int(check.group(1)), int(check.group(2))) if check else (None, None)
         w["causes"] = {name: _cint(kv.get(name)) for name, _ in REFUSAL_CAUSES}
+        if w["causes"]["stale-refused"] is None:
+            w["causes"]["stale-refused"] = _cint(kv.get("stale"))
         out.append(w)
         route = inject = None
     return out
@@ -963,6 +973,18 @@ def _pct(n, pixels):
     return "%.3f%%" % (100.0 * n / pixels) if pixels else "-"
 
 
+def _stale_tail(steady, kept, stale_refused, ran, skipped):
+    """The tail of a measured line's stale part: with the key on, how much of the stale pixels the depth check kept, and, when the line
+    carries it (and the key is on, or the check counted frames), the depth check's own frames."""
+    out = ""
+    stale = (kept or 0) + (stale_refused or 0)
+    if steady == "on" and stale:
+        out += " (%.1f%% of the stale pixels)" % (100.0 * (kept or 0) / stale)
+    if ran is not None and (steady == "on" or ran or skipped):
+        out += "; depth-check %d ran, %d skipped" % (ran, skipped or 0)
+    return out
+
+
 def refusal_findings(windows):
     """[(level, text)] about what the refusal lines do not support believing (WARN: a number that contradicts another, a key that did not
     take effect, a census that never measured) and what is worth knowing (note)."""
@@ -984,12 +1006,29 @@ def refusal_findings(windows):
             if w["refused"] > w["pixels"]:
                 out.append(("WARN", "%s: refused %d exceeds the pixels examined, %d: the census counts a pixel once, so one of the two is wrong"
                             % (stamp, w["refused"], w["pixels"])))
-            if w["steady"] == "on" and (causes["stale"] or 0) > 0:
+            ran, skipped = w["check_ran"], w["check_skipped"]
+            if w["steady"] == "on" and ran is None and (causes["stale-refused"] or 0) > 0:
+                # A build without the depth check (the flight-3 build): its key was the blanket form, which refused no stale pixel.
                 out.append(("WARN", "%s: steady-detail=on and %d stale pixel(s) were still refused: the key's rule did not reach the resolver "
-                            "(with it on, a stale slot takes the camera term and is counted as forgiven)" % (stamp, causes["stale"])))
-            if w["steady"] == "off" and (w["forgiven"] or 0) > 0:
-                out.append(("WARN", "%s: %d stale pixel(s) were forgiven while steady-detail=off: the line's key state and the resolver's disagree"
-                            % (stamp, w["forgiven"])))
+                            "(a build without the depth check: with it on, a stale slot takes the camera term and is counted as kept)"
+                            % (stamp, causes["stale-refused"])))
+            if w["steady"] == "on" and ran is not None:
+                if not ran and not skipped:
+                    out.append(("WARN", "%s: steady-detail=on and the resolver counted no depth-check frame in a window that treated %d frame(s): "
+                                "the key reached the route and not the resolver" % (stamp, w["treated"])))
+                elif not ran:
+                    out.append(("WARN", "%s: steady-detail=on and the depth check never ran (0 ran, %d skipped): the resolver could not make "
+                                "last frame's depth, so every stale pixel was refused as with the key off" % (stamp, skipped)))
+                elif not (w["kept"] or 0) and (causes["stale-refused"] or 0) > 0:
+                    out.append(("note", "%s: steady-detail=on, the depth check ran in %d frame(s) and kept no stale pixel (%d refused): "
+                                "everything stale moved, or last frame's depth never matched" % (stamp, ran, causes["stale-refused"])))
+            if w["steady"] == "off":
+                if (w["kept"] or 0) > 0:
+                    out.append(("WARN", "%s: %d stale pixel(s) were kept while steady-detail=off: the line's key state and the resolver's disagree"
+                                % (stamp, w["kept"])))
+                if (ran or 0) or (skipped or 0):
+                    out.append(("WARN", "%s: the depth check counted frames (%d ran, %d skipped) while steady-detail=off: the line's key state and "
+                                "the resolver's disagree" % (stamp, ran or 0, skipped or 0)))
             if (w["dropped"] or 0) > 0:
                 out.append(("note", "%s: %d sample(s) were skipped because the read-back ring was full (the shares are unaffected, the sample "
                             "count is lower)" % (stamp, w["dropped"])))
@@ -1032,9 +1071,10 @@ def print_refusal_census(windows, events=None):
             named = [(name, w["causes"][name]) for name, _ in REFUSAL_CAUSES if w["causes"][name]]
             mix = ", ".join("%s %s" % (name, _pct(n, w["pixels"])) for name, n in named) if named else "none refused"
             print("%s: MEASURED %d sample(s) of %dx%d (%d asked, %d dispatched, %d dropped), treated %d; pixels %d; refused %s (%d): %s; "
-                  "forgiven %s | %s"
+                  "stale-kept %s%s | %s"
                   % (head, w["read"], w["w"] or 0, w["h"] or 0, w["asked"], w["sampled"], w["dropped"] or 0, w["treated"], w["pixels"],
-                     _pct(w["refused"], w["pixels"]), w["refused"], mix, _pct(w["forgiven"] or 0, w["pixels"]), context))
+                     _pct(w["refused"], w["pixels"]), w["refused"], mix, _pct(w["kept"] or 0, w["pixels"]),
+                     _stale_tail(w["steady"], w["kept"], w["causes"]["stale-refused"], w["check_ran"], w["check_skipped"]), context))
         else:
             reason = {
                 "idle": "the route treated no frame in this window (nothing was measured)",
@@ -1053,13 +1093,17 @@ def print_refusal_census(windows, events=None):
         group = [w for w, _ in measured if w["steady"] == key]
         pixels = sum(w["pixels"] for w in group)
         refused = sum(w["refused"] for w in group)
-        forgiven = sum(w["forgiven"] or 0 for w in group)
+        kept = sum(w["kept"] or 0 for w in group)
+        with_check = [w for w in group if w["check_ran"] is not None]
+        ran = sum(w["check_ran"] for w in with_check) if with_check else None
+        skipped = sum(w["check_skipped"] for w in with_check) if with_check else None
         totals = {name: sum(w["causes"][name] or 0 for w in group) for name, _ in REFUSAL_CAUSES}
         mix = ", ".join("%s %s" % (name, _pct(n, pixels)) for name, n in totals.items() if n)
         of_refused = ", ".join("%s %.1f%%" % (name, 100.0 * n / refused) for name, n in totals.items() if n) if refused else ""
-        print("totals, steady-detail=%s: %d measured window(s), %d sample(s), pixels %d, refused %s (%d)%s; forgiven %s%s"
+        print("totals, steady-detail=%s: %d measured window(s), %d sample(s), pixels %d, refused %s (%d)%s; stale-kept %s%s%s"
               % (key, len(group), sum(w["read"] for w in group), pixels, _pct(refused, pixels), refused,
-                 ": %s" % mix if mix else " (none refused)", _pct(forgiven, pixels),
+                 ": %s" % mix if mix else " (none refused)", _pct(kept, pixels),
+                 _stale_tail(key, kept, totals["stale-refused"], ran, skipped),
                  "; of the refused: %s" % of_refused if of_refused else ""))
         if len(group) > 1:
             shares = [100.0 * w["refused"] / w["pixels"] for w in group]
@@ -4704,8 +4748,9 @@ def self_test_camera_census():
     # The parser: the fixture's two refusal windows, each joined to the route and inject lines of its own window.
     rw = parse_refusal_windows(text)
     if len(rw) != 2 or [refusal_state(w) for w in rw] != ["idle", "measured"] or rw[1]["pixels"] != 1600300800 or rw[1]["refused"] != 58410978 or \
-            rw[1]["causes"]["stale"] != 40007520 or rw[1]["causes"]["masked"] != 800150 or rw[1]["causes"]["sentinel"] != 16003008 or \
-            rw[1]["causes"]["range"] != 1600300 or rw[1]["forgiven"] != 0 or rw[1]["steady"] != "off" or rw[1]["view"] != "off" or \
+            rw[1]["causes"]["stale-refused"] != 40007520 or rw[1]["causes"]["masked"] != 800150 or rw[1]["causes"]["sentinel"] != 16003008 or \
+            rw[1]["causes"]["range"] != 1600300 or rw[1]["kept"] != 0 or (rw[1]["check_ran"], rw[1]["check_skipped"]) != (0, 0) or \
+            rw[1]["steady"] != "off" or rw[1]["view"] != "off" or \
             (rw[1]["w"], rw[1]["h"]) != (5040, 2835) or abs(rw[1]["pct"] - 3.650) > 1e-9 or rw[1]["every"] != 4 or rw[1]["dropped"] != 0 or \
             rw[1]["route"]["fp-mode"] != "0/450/0" or rw[1]["inject"]["fov"] != "0.8203..0.9831" or rw[0]["route"]["jitter"] != "idle" or \
             rw[0]["inject"]["fov"] != "-" or not rw[0]["census"]:
@@ -4731,11 +4776,12 @@ def self_test_camera_census():
         "census=on: NOT MEASURED: the route treated no frame in this window (nothing was measured) | route state=observing jitter=idle "
         "fp-mode 0/0/0, inj-fp 0, struct fov -",
         "census=on: MEASURED 112 sample(s) of 5040x2835 (450 asked, 113 dispatched, 0 dropped), treated 450; pixels 1600300800; refused "
-        "3.650% (58410978): stale 2.500%, masked 0.050%, sentinel 1.000%, range 0.100%; forgiven 0.000% | route state=owned jitter=on "
+        "3.650% (58410978): stale-refused 2.500%, masked 0.050%, sentinel 1.000%, range 0.100%; stale-kept 0.000% | route state=owned jitter=on "
         "fp-mode 0/450/0, inj-fp 1350, struct fov 0.8203..0.9831",
-        "totals, steady-detail=off: 1 measured window(s), 112 sample(s), pixels 1600300800, refused 3.650% (58410978): stale 2.500%, masked "
-        "0.050%, sentinel 1.000%, range 0.100%; forgiven 0.000%; of the refused: stale 68.5%, masked 1.4%, sentinel 27.4%, range 2.7%",
-        "causes seen: stale = the engine slot's depth was not the pixel's: a later draw overdrew it; masked = a rig record with no usable history",
+        "totals, steady-detail=off: 1 measured window(s), 112 sample(s), pixels 1600300800, refused 3.650% (58410978): stale-refused 2.500%, masked "
+        "0.050%, sentinel 1.000%, range 0.100%; stale-kept 0.000%; of the refused: stale-refused 68.5%, masked 1.4%, sentinel 27.4%, range 2.7%",
+        "causes seen: stale-refused = the engine slot's depth was not the pixel's (a later draw overdrew it) and the steady-detail depth check, if it is on, "
+        "did not confirm the camera term; masked = a rig record with no usable history",
         "refusal census: consistent (1 of 2 window(s) measured)",
         "; struct field of view 0.8203..0.9831 rad over 1 window(s); the weapon's fold-in ran in 450 frame(s) (mode 1: 450, mode 2: 0), about "
         "3.0 first-person call(s) credited a frame",
@@ -4750,18 +4796,18 @@ def self_test_camera_census():
         """One refusal line of the fixture's measured window, with some tokens changed."""
         v = dict(census="on", every=4, treated=450, asked=450, sampled=113, read=112, dropped=0, size="5040x2835", pixels=1600300800,
                  refused=58410978, pct="3.650", stale=40007520, masked=800150, corrupt=0, sentinel=16003008, unreprojectable=0, camera=0,
-                 range=1600300, depth=0, weapon=0, other=0, forgiven=0, steady="off", view="off")
+                 range=1600300, depth=0, weapon=0, other=0, kept=0, ran=0, skipped=0, steady="off", view="off")
         v.update(kw)
         return ("[12:00:09.000] vr world route refusal 5s: census=%(census)s every=%(every)d treated=%(treated)d asked=%(asked)d "
                 "sampled=%(sampled)d read=%(read)d dropped=%(dropped)d size=%(size)s pixels=%(pixels)d refused=%(refused)d "
-                "refused-pct=%(pct)s stale=%(stale)d masked=%(masked)d corrupt=%(corrupt)d sentinel=%(sentinel)d "
+                "refused-pct=%(pct)s stale-refused=%(stale)d masked=%(masked)d corrupt=%(corrupt)d sentinel=%(sentinel)d "
                 "unreprojectable=%(unreprojectable)d camera=%(camera)d range=%(range)d depth=%(depth)d weapon=%(weapon)d other=%(other)d "
-                "forgiven=%(forgiven)d steady-detail=%(steady)s view=%(view)s\n") % v
+                "stale-kept=%(kept)d depth-check=%(ran)d/%(skipped)d steady-detail=%(steady)s view=%(view)s\n") % v
 
     nothing = dict(refused=0, pct="0.000", stale=0, masked=0, sentinel=0, range=0)
     # "Ran, 0 refused" (pixels > 0, refused=0) is never the same text as "never ran" (treated=0, asked=0, read=0).
     _, out = report(text + refusal_line(**nothing))
-    if "refused 0.000% (0): none refused; forgiven 0.000%" not in squash(out) or "!! " in out or \
+    if "refused 0.000% (0): none refused; stale-kept 0.000%" not in squash(out) or "!! " in out or \
             "totals, steady-detail=off: 2 measured window(s), 224 sample(s), pixels 3200601600, refused 1.825% (58410978)" not in squash(out):
         fail("a window that measured and found nothing refused was not reported as measured, or the totals did not add the two:\n%s" % out)
     _, out = report(text + refusal_line(treated=450, asked=0, sampled=0, read=0, pixels=0, **nothing))
@@ -4782,18 +4828,43 @@ def self_test_camera_census():
     _, out = report("\n".join(l for l in text.split("\n") if "vr world route refusal" not in l))
     if "none: no `vr world route refusal 5s:` line in this log" not in out or "!! " in out or "stage 2 verdict: PASS (6 PASS" not in out:
         fail("a log without refusal lines (the census key off, or an older build) did not say so, or its verdict moved:\n%s" % out)
-    # The key's state: each state is totalled on its own; with it on a stale slot is "forgiven", never refused.
-    on = refusal_line(steady="on", stale=0, forgiven=40007520, refused=18403458, pct="1.150", read=112)
+    # The key's state: each state is totalled on its own; with it on a stale slot is kept (last frame's depth confirmed the camera term) or
+    # refused (it did not), and the depth check's own frames are counted. 38007520 + 2000000 = the fixture's 40007520 stale pixels.
+    on = refusal_line(steady="on", stale=2000000, kept=38007520, refused=20403458, pct="1.275", read=112, ran=448, skipped=2)
     _, out = report(text + on)
-    if "!! " in out or "totals, steady-detail=on: 1 measured window(s), 112 sample(s), pixels 1600300800, refused 1.150% (18403458)" not in squash(out) or \
-            "forgiven 2.500%" not in squash(out) or "totals, steady-detail=off: 1 measured window(s)" not in squash(out):
-        fail("a window with the steady-detail key on was not totalled on its own, with its forgiven share:\n%s" % out)
-    _, out = report(text + refusal_line(steady="on", stale=5, forgiven=40007515))
+    if "!! " in out or "totals, steady-detail=on: 1 measured window(s), 112 sample(s), pixels 1600300800, refused 1.275% (20403458)" not in squash(out) or \
+            "stale-kept 2.375% (95.0% of the stale pixels); depth-check 448 ran, 2 skipped" not in squash(out) or \
+            "stale-refused 0.125%" not in squash(out) or "totals, steady-detail=off: 1 measured window(s)" not in squash(out):
+        fail("a window with the steady-detail key on was not totalled on its own, with its stale-kept share and the depth check's frames:\n%s" % out)
+    _, out = report(text + refusal_line(steady="on", stale=40007520, kept=0, ran=0, skipped=450))
+    if "steady-detail=on and the depth check never ran (0 ran, 450 skipped)" not in out or "refusal census: WARN" not in out:
+        fail("the key on with a depth check that never ran (every frame skipped) was not a WARN:\n%s" % out)
+    _, out = report(text + refusal_line(steady="on", stale=40007520, kept=0, ran=0, skipped=0))
+    if "the resolver counted no depth-check frame in a window that treated 450 frame(s)" not in out or "refusal census: WARN" not in out:
+        fail("the key on with no depth-check frame counted at all was not a WARN:\n%s" % out)
+    _, out = report(text + refusal_line(steady="on", stale=40007520, kept=0, ran=448, skipped=2))
+    if "the depth check ran in 448 frame(s) and kept no stale pixel (40007520 refused)" not in out or "!! " in out:
+        fail("the depth check that ran and kept nothing was not a note (and only a note):\n%s" % out)
+    _, out = report(text + refusal_line(steady="off", kept=9))
+    if "9 stale pixel(s) were kept while steady-detail=off" not in out:
+        fail("pixels kept with the key off were not a WARN:\n%s" % out)
+    _, out = report(text + refusal_line(steady="off", ran=3, skipped=1))
+    if "the depth check counted frames (3 ran, 1 skipped) while steady-detail=off" not in out:
+        fail("depth-check frames with the key off were not a WARN:\n%s" % out)
+    # The flight-3 build's spellings (`stale=`, `forgiven=`, no depth-check) still parse, as stale-refused and stale-kept, and its blanket rule is judged as it was.
+    old_spelling = lambda line: line.replace("stale-refused=", "stale=").replace(" stale-kept=", " forgiven=").replace(" depth-check=0/0", "")
+    flight3 = old_spelling(refusal_line(steady="on", stale=0, kept=40007520, refused=18403458, pct="1.150", read=112))
+    if " depth-check=" in flight3 or " forgiven=40007520 " not in flight3 or " stale=0 " not in flight3:
+        fail("the flight-3 line was not built")
+    w3 = parse_refusal_windows(flight3)[0]
+    if w3["kept"] != 40007520 or w3["causes"]["stale-refused"] != 0 or w3["check_ran"] is not None or w3["check_skipped"] is not None:
+        fail("the flight-3 spellings did not parse as stale-kept and stale-refused with no depth-check: %r" % ((w3["kept"], w3["causes"]["stale-refused"], w3["check_ran"]),))
+    _, out = report(text + flight3)
+    if "!! " in out or "stale-kept 2.500%" not in squash(out) or "depth-check" in out.split("totals, steady-detail=on")[1].split("\n")[0]:
+        fail("a flight-3 window with its key on was not read as stale-kept 2.500% with no depth-check, and no finding:\n%s" % out)
+    _, out = report(text + old_spelling(refusal_line(steady="on", stale=5, kept=40007515)))
     if "steady-detail=on and 5 stale pixel(s) were still refused" not in out or "refusal census: WARN" not in out:
-        fail("stale pixels still refused with the key on were not a WARN:\n%s" % out)
-    _, out = report(text + refusal_line(steady="off", forgiven=9))
-    if "9 stale pixel(s) were forgiven while steady-detail=off" not in out:
-        fail("pixels forgiven with the key off were not a WARN:\n%s" % out)
+        fail("stale pixels still refused with the flight-3 build's key on were not a WARN:\n%s" % out)
     _, out = report(text + refusal_line(refused=1600300801))
     if "refused 1600300801 exceeds the pixels examined, 1600300800" not in out:
         fail("more pixels refused than examined was not a WARN:\n%s" % out)
@@ -4801,7 +4872,7 @@ def self_test_camera_census():
     if "3 sample(s) were skipped because the read-back ring was full" not in out or "7 refused pixel(s) are of a class the census cannot name" not in out or \
             "refusal census: consistent" not in out:
         fail("dropped samples and unnamed causes were not notes (consistent, not WARN):\n%s" % out)
-    _, out = report(text + refusal_line(view="on", steady="on", stale=0, forgiven=1))
+    _, out = report(text + refusal_line(view="on", steady="on", stale=0, kept=1, ran=1))
     if "the refusal view was painting: the headset showed the prep's classification, not the world" not in out:
         fail("a window with the refusal view on was not noted:\n%s" % out)
     _, out = report(text + "[00:00:10.000] vr world route: steady-detail is ON from frame=100 (experimental.temporal_aa_on_foot_world_steady_detail): x\n"

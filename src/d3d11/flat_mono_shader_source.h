@@ -6,7 +6,8 @@ inline constexpr char kFlatMonoShaderSource[] = R"HLSL(
 cbuffer Mono : register(b0) {
     float4 now[6]; float4 old[6];
     uint4 size; // render width/height, output width/height
-    uint4 flags; // reset, complete engine views, TAA, static scene (w: only ever nonzero in the 3D main menu)
+    uint4 flags; // reset, complete engine views, TAA, stale-slot policy (w: 0 refuse, 1 camera term for every stale slot, only ever set in the
+                 // 3D main menu, 2 camera term for a stale slot where last frame's depth (t8) confirms it, the steady-detail key)
     float4 jitter; // current xy, previous zw; actual raster phase in render pixels
     float4 rowsJitter; // NDC shift the camera rows themselves carry: current xy, previous zw; all zero = unjittered rows
     uint4 route; // x: the HDR route (section 81): Color is R11G11B10F scene radiance and OutColor is fp16; y: with x, the
@@ -28,7 +29,7 @@ Texture2D<float2> Motion : register(t4);
 Texture2D<float> Rejection : register(t5);
 Texture2D<float> ExpectedDepth : register(t6);
 Texture2D<float4> History : register(t7);
-Texture2D<float> HistoryDepth : register(t8);
+Texture2D<float> HistoryDepth : register(t8);         // taa's: last frame's depth; and the prep's, bound only when flags.w==2 (the steady-detail depth check)
 Texture2D<float4> FirstPersonMotion : register(t9);   // prep only, bound when route.z != 0: the VR weapon map, render size,
                                                       // xy previous minus current in render pixels, z depth, w 1 valid / 2 new / 0 none
 Texture2D<uint2> FirstPersonStencil : register(t10);  // prep only, bound when route.z != 0: the depth texture's stencil plane (.y)
@@ -74,8 +75,30 @@ bool cameraBefore(float2 uv, float depth, out float4 before) {
     before=position.x*o0+position.y*o1+position.z*o2+iz*o3;
     return before.w>0 && all(isfinite(before));
 }
-// 0 = camera term, 1 = exact engine motion, 2 = explicitly reject history. `cls` is what the pixel is (kClass*): the refusal
-// census and view read it, nothing else does, and no return below depends on it.
+// THE STEADY-DETAIL DEPTH CHECK (flags.w==2; design doc section 82, the depth-validated steady detail). A stale slot's pixel is an
+// overdrawn one: its record says nothing about it, so the camera term is the only motion it has, and the camera term is right only
+// when the surface did not move. Last frame's depth says whether it did not: the surface that was at the position the camera term sends
+// this pixel to, in last frame's own raster (that position plus the previous phase), must be this surface, i.e. its depth must be the
+// one this surface would have had there had it not moved (`expected`, the camera term's own). Depth is reversed-Z, float32, d = near/z,
+// so a relative error in d is the same relative error in z at any range and a relative tolerance is the right form; the tolerance is the
+// 1% (floor 1e-6) the resolver's own TAA applies before it trusts history (taa(), below), against the best of the four texels around the
+// previous raster position: a thin line the jitter put on the neighbouring texel last frame still finds itself, and a static slanted
+// surface is within half a texel's gradient of one of them (tools\flat_mono_resolve_test holds the numbers; the simulation is in the
+// design doc). True = confirmed; false = refused, as a stale slot always was. Called for a stale pixel whose camera term was already
+// formed and in range, and only then.
+static const float kStaleDepthRel=.01, kStaleDepthFloor=1e-6;
+bool stalePreviousDepthMatches(float2 prev,float expected) {
+    const int2 hi=int2(size.xy)-1;
+    const float2 raster=prev*float2(size.xy)+jitter.zw-.5;   // the previous raster position in texel-centre coordinates: the 2x2 below surrounds it
+    const int2 base=int2(floor(raster));
+    const float tol=max(kStaleDepthFloor,expected*kStaleDepthRel);
+    float best=3.402823e38;
+    [unroll]for(int y=0;y<2;++y)[unroll]for(int x=0;x<2;++x)best=min(best,abs(HistoryDepth.Load(int3(clamp(base+int2(x,y),0,hi),0))-expected));
+    return best<=tol;
+}
+// 0 = camera term, 1 = exact engine motion, 2 = explicitly reject history, 3 = the camera term if the depth check confirms it (a stale
+// slot with flags.w==2). `cls` is what the pixel is (kClass*): the refusal census and view read it, nothing else does, and no return
+// below depends on it.
 uint engineBefore(int2 q,float2 uv,float depth,out float4 before,out uint cls) {
     before=0; cls=kClassNone;
     if(flags.y==0)return 0;
@@ -83,13 +106,15 @@ uint engineBefore(int2 q,float2 uv,float depth,out float4 before,out uint cls) {
     if(!(es.x>=1))return 0;
     if(!(depth>0) || es.x>=4294967296.0){cls=kClassSentinel;return 2;}
     // A slot written by a keyed draw that something has since drawn over: the pixel's owner is not the
-    // one that wrote the slot, so its record says nothing about it. Everywhere but the 3D main menu that
-    // is not knowable and history is refused. In the menu (flags.w, set by the runtime only for a frame
+    // one that wrote the slot, so its record says nothing about it. By default (flags.w==0) that is not
+    // knowable and history is refused. In the 3D main menu (flags.w==1, set by the runtime only for a frame
     // whose contract came through the verified menu copy) nothing on screen moves but the camera, so the
-    // pixel takes the camera term -- an unkeyed hull that overdraws a keyed one no longer aliases. The VR
-    // world route sets the same flag from experimental.temporal_aa_on_foot_world_steady_detail (off by
-    // default), and only this refusal is relaxed: a masked record stays refused.
-    if(asuint(depth)!=asuint(es.y)){cls=kClassStale;return flags.w!=0?0:2;}
+    // pixel takes the camera term -- an unkeyed hull that overdraws a keyed one no longer aliases. With
+    // experimental.temporal_aa_on_foot_world_steady_detail on (flags.w==2: the VR world route and the flat
+    // profile on foot) the pixel takes the camera term only where last frame's depth confirms it (return 3: the
+    // caller asks stalePreviousDepthMatches) and is refused everywhere else, as by default. Only this refusal is
+    // relaxed, either way: a masked record stays refused.
+    if(asuint(depth)!=asuint(es.y)){cls=kClassStale;return flags.w==1?0:(flags.w==2?3:2);}
     uint code=uint(es.x);
     if(float(code)!=es.x || (code&1)==0){cls=kClassCorrupt;return 2;}
     uint count,stride; Pool.GetDimensions(count,stride);
@@ -161,7 +186,7 @@ void prep(uint3 id:SV_DispatchThreadID) {
         // HLSL logical operators do not short-circuit: putting cameraBefore's
         // out parameter in || would overwrite the exact engine result.
         bool valid=kind==1;
-        if(kind==0)valid=cameraBefore(rawUv,depth,before);
+        if(kind==0||kind==3)valid=cameraBefore(rawUv,depth,before);
         if(valid) {
             float2 prev=before.xy/before.w*float2(.5,-.5)+.5;
             // SDK vectors exclude both raster phases; the backend receives
@@ -170,8 +195,11 @@ void prep(uint3 id:SV_DispatchThreadID) {
             expected=before.z/before.w;
             valid=all(isfinite(motion)) && all(abs(motion)<=65504) &&
                   all(prev>=0) && all(prev<=1) && isfinite(expected) && expected>=0 && expected<=1;
-            reject=valid?0:1;
             if(!valid)cls=kClassRange;
+            // A stale slot under the steady-detail rule (kind 3): the camera term stands only if last frame's depth confirms it. A pixel
+            // the check refuses stays a stale-slot pixel (cls kClassStale, refused): the census counts it as stale-refused.
+            if(valid && kind==3)valid=stalePreviousDepthMatches(prev,expected);
+            reject=valid?0:1;
         } else if(kind!=2)cls=kClassCamera;
     }
     if(reject!=0)motion=0;
@@ -181,10 +209,13 @@ void prep(uint3 id:SV_DispatchThreadID) {
     // The refusal census and view: one byte, the class and (bit 7) whether this pixel's history was refused.
     if(debug.x!=0 || debug.y!=0)OutClass[q]=cls|(reject!=0?0x80u:0u);
 }
+)HLSL"
+R"HLSL(
 // The refusal census (flat_mono_refusal.h): one pass over the class texture the prep wrote, on a frame that sampled. Per group the
 // refused classes are counted in shared memory, and each non-zero count is added to one of 16 stripes of the global buffer (spread by
 // group column, so the atomics of 220 000 groups do not queue on sixteen addresses). Slot 15 counts a stale pixel the prep did NOT
-// refuse (the steady-detail key sent it to the camera term). Accepted pixels are not counted. No early return: every thread reaches both barriers.
+// refuse (the steady-detail rule kept it: the camera term, confirmed by last frame's depth); a stale pixel it did refuse stays in the
+// stale slot. Accepted pixels are not counted. No early return: every thread reaches both barriers.
 groupshared uint gRefusal[16];
 [numthreads(8,8,1)]
 void census(uint3 id:SV_DispatchThreadID,uint3 gid:SV_GroupID,uint gi:SV_GroupIndex) {
@@ -199,8 +230,7 @@ void census(uint3 id:SV_DispatchThreadID,uint3 gid:SV_GroupID,uint gi:SV_GroupIn
     GroupMemoryBarrierWithGroupSync();
     if(gi<16 && gRefusal[gi]!=0)RefusalCounts.InterlockedAdd(((gid.x&15u)*16u+gi)*4u,gRefusal[gi]);
 }
-)HLSL"
-R"HLSL(
+
 // The HDR route accumulates in a bounded space, c / (1 + max3(c)), and inverts it on output: a sun disc or a hot
 // particle in a linear 3x3 clamp would set the box and the blend alone and ring around every highlight. The history
 // stays linear fp16, so a route flip needs no conversion and the tone pass sees linear radiance again.
