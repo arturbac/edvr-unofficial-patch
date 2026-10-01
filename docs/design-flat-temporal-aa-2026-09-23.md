@@ -53,8 +53,9 @@
 - **Jitter phases (section 84, 2026-10-01):** suspect (g) of section 82 as a
   switch, `experimental.temporal_aa_jitter_follows_upscale` (off by default,
   byte-identical): ceil(8 x ratio^2) phases for the VR eye pass and the flat
-  upstream route, eight for the world route. BUILT on
-  claude/jitter-phases-terrain-retire, NOT FLOWN; section 84 has the flight.
+  upstream route, eight for the world route. ON MAIN 08b48036; FLOWN 10-01:
+  no visible change on the distant hills (section 84's end), so suspect (g)
+  is ruled out for the hills.
 - **Compatibility decision, environment:** moved to Status detail 2026-10-01.
 
 ## Status detail (moved out of Status 2026-09-29)
@@ -8385,3 +8386,18 @@ HEAD`):
    (section 13 shows a lookup of p - j stays in its pixel, hence its tile,
    for any |j| < 1/2 less a float margin, which 128 phases leave at 1/256),
    and this is the first time it carries a phase out to 0.496.
+
+FLIGHT, 2026-10-01 11:18 (Frontier 08b48036, log 111827; VR cockpit,
+landed, at the distant hills, eye 2016x1949 -> 4032x3898). The switch went
+live at 11:20:57.680. The log shows `jitter phases=8 ... =off: the fixed 8`
+at engagement, then `jitter phases=32 ... =on` at 11:20:58. Sean flipped it
+while looking at the hills: "didn't see any change to shimmering on the
+hills". He took an eye dump with it on, where the shimmer was strongest
+(stamp 112137); there is no same-spot key-off dump to compare it with.
+ruled out: too few jitter phases (suspect (g)) as the cause of the hills'
+shimmer, because 32 phases at the same spot made no visible difference.
+What remains is the hills investigation's (d): sub-pixel streaks at the 0.5
+input resolution, about 21.6 input px per degree. HMD Image Quality 0.65
+helped, and the flat game at about 32 px per degree does not shimmer. Proposed: the
+switch goes in the cleanup build and the fixed 8 stays, since there is no
+visible benefit and the flat light-grid risk above is unflown.
