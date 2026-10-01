@@ -66,6 +66,11 @@ static void fail(const char* what, const std::string& detail) {
     ++g_fails;
 }
 
+static void check(bool condition, const char* what, const std::string& detail = std::string()) {
+    if (condition) ok(what);
+    else fail(what, detail.empty() ? std::string("the condition did not hold") : detail);
+}
+
 static void expectStr(const char* key, const char* want, const char* what) {
     const std::string got = Config::get().getString(key, "<unset>");
     if (got == want) ok(what);
@@ -1822,6 +1827,121 @@ int main(int argc, char** argv) {
                 }
             }
         }
+    }
+
+    // --- log.max_mb: the default is 16 (2026-10-01; it was 4), and the cap does what it says --------------------------------------
+    //
+    // The shipped edvr.ini documents the default commented out ("#max_mb = 16"), so for every install that has not written the line the
+    // CODE's fallback is the cap; tools\check_config_contract.py holds a commented default to the code's in the build. This pins the
+    // number itself and then what the log does with it, at sizes that keep the test fast: the default must not stop a 1.3 MB session
+    // (past a 1 MB cap), an explicit max_mb = 1 must stop it with the one line that says so, and an explicit max_mb = 4 keeps 4 and
+    // 0 is no cap (those two by the cap in force, with no writing). The writer has no rotation: a log that reaches its cap says so
+    // once and stops, and the next session opens a new file; the flat profile reads this key the same way (the "log." keys are
+    // allowed in both profiles, and the fallback is one line of one class).
+    {
+        const std::string iniText = readRepoFile(dir, L"edvr.ini");
+        const std::string logSource = readRepoFile(dir, L"src\\common\\log.cpp");
+        if (iniText.empty() || logSource.empty()) {
+            fail("log.max_mb pins", "could not read edvr.ini or src\\common\\log.cpp from the repo root");
+        } else {
+            check(iniText.find("\n#max_mb = 16") != std::string::npos && iniText.find("\n#max_mb = 4") == std::string::npos,
+                  "the shipped edvr.ini documents log.max_mb at 16, commented out (the code's fallback is the default)");
+            check(logSource.find("getInt(\"log.max_mb\", 16)") != std::string::npos &&
+                      logSource.find("getInt(\"log.max_mb\", 4)") == std::string::npos,
+                  "the log's fallback for log.max_mb is 16");
+        }
+    }
+    if (argc >= 3) {
+        const std::wstring scratch = widen(argv[2]);
+        struct CapRun {
+            bool opened = false;
+            uint64_t maxBytes = ~0ull;
+            std::string body;
+        };
+        // One session in the scratch directory: the given [log] lines (a max_mb line or none), one 1.3 MB burst (the flusher's first pass
+        // writes all of it), then a marker line a second pass can only write if the cap has not been reached. `write` false opens and
+        // closes without writing, to read the cap in force.
+        const auto session = [&](const char* maxMbLine, const wchar_t* tag, bool write) {
+            CapRun run;
+            std::string ini = "[log]\r\nenabled = 1\r\nbuffer_mb = 16\r\n";
+            ini += maxMbLine;
+            if (!writeIni(scratch, ini.c_str())) return run;
+            Config::get().init(scratch);
+            Log::get().close();
+            const std::wstring pattern = std::wstring(L"edvr_") + tag + L"_*.log";
+            {
+                WIN32_FIND_DATAW old{};
+                HANDLE oh = FindFirstFileW((scratch + L"\\" + pattern).c_str(), &old);
+                if (oh != INVALID_HANDLE_VALUE) {
+                    do {
+                        DeleteFileW((scratch + L"\\" + old.cFileName).c_str());
+                    } while (FindNextFileW(oh, &old));
+                    FindClose(oh);
+                }
+            }
+            if (!Log::get().open(scratch, tag)) return run;
+            run.opened = true;
+            run.maxBytes = Log::get().maxBytes();
+            if (write) {
+                const std::string filler(1000, 'y');
+                for (int i = 0; i < 1300; ++i) Log::get().note("capfill %d %s", i, filler.c_str());
+                Sleep(700);   // the flusher passes every 250 ms: one writes the burst, the next has to decide about the marker
+                Log::get().note("capmarker after the first burst");
+                Sleep(700);
+            }
+            Log::get().close();
+            WIN32_FIND_DATAW fd{};
+            HANDLE h = FindFirstFileW((scratch + L"\\" + pattern).c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                const std::wstring name = fd.cFileName;
+                FindClose(h);
+                HANDLE f = CreateFileW((scratch + L"\\" + name).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (f != INVALID_HANDLE_VALUE) {
+                    char chunk[65536];
+                    DWORD got = 0;
+                    while (ReadFile(f, chunk, sizeof(chunk), &got, nullptr) && got) run.body.append(chunk, got);
+                    CloseHandle(f);
+                }
+            }
+            return run;
+        };
+        const auto count = [](const std::string& text, const char* needle) {
+            size_t n = 0, from = 0;
+            while ((from = text.find(needle, from)) != std::string::npos) {
+                ++n;
+                from += 1;
+            }
+            return n;
+        };
+        const char* const kCapLine = "log size cap reached; nothing further will be written";
+        const uint64_t kMiB = 1024ull * 1024ull;
+
+        const CapRun byDefault = session("", L"capdefault", true);
+        if (!byDefault.opened) {
+            fail("log.max_mb default", "the log would not open in the scratch dir");
+        } else {
+            check(byDefault.maxBytes == 16 * kMiB, "with no max_mb line the cap in force is 16 MB",
+                  std::to_string(byDefault.maxBytes) + " bytes");
+            check(count(byDefault.body, "capmarker after the first burst") == 1 && count(byDefault.body, kCapLine) == 0,
+                  "...and a 1.3 MB session is not stopped by it (the old 4 MB default would not have stopped it either; a 1 MB cap does)");
+        }
+        const CapRun small = session("max_mb = 1\r\n", L"capsmall", true);
+        if (!small.opened) {
+            fail("log.max_mb = 1", "the log would not open in the scratch dir");
+        } else {
+            check(small.maxBytes == 1 * kMiB, "an explicit max_mb = 1 is a 1 MB cap", std::to_string(small.maxBytes) + " bytes");
+            check(count(small.body, kCapLine) == 1 && count(small.body, "capmarker after the first burst") == 0,
+                  "a session past its cap says so exactly once and writes nothing after it (the cap is the truncation: there is no rotation)");
+            check(small.body.size() > 1 * kMiB && small.body.size() < 2 * kMiB,
+                  "...and the file ends at the burst that crossed the cap (past 1 MB, under 2 MB), not at the default's 16 MB",
+                  std::to_string(small.body.size()) + " bytes");
+        }
+        const CapRun four = session("max_mb = 4\r\n", L"capfour", false);
+        check(four.opened && four.maxBytes == 4 * kMiB, "an ini that says max_mb = 4 keeps 4 MB", std::to_string(four.maxBytes) + " bytes");
+        const CapRun none = session("max_mb = 0\r\n", L"capnone", false);
+        check(none.opened && none.maxBytes == 0, "max_mb = 0 is no cap", std::to_string(none.maxBytes) + " bytes");
+        Log::get().close();
     }
 
     // --- floats, notes and threads (2026-09-29) ----------------------------
