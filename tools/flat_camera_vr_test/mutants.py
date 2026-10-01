@@ -137,7 +137,7 @@ LIVE_COMMENT = "    // A hook that is not live (never installed, failed, stood d
 LIVE_RETURN = "    if (!live) return false;\n"
 REPORT_LINE = "    const bool report = flatCameraVrObserves(bits);\n"
 NOINJECT_SET = "    if (inject) g_inject.injected.noteInjected(camera);\n    return inject;"
-EFFECTIVE = "in.gate = flatCameraVrEffectiveGate(gate, g_vr.stepAtMs(), GetTickCount64());"
+EFFECTIVE = "in.gate = flatCameraVrEffectiveGate(in.mode, gate, g_vr.stepAtMs(), GetTickCount64());"
 WANTS = "    if (g_vr.wantsFrustum(in)) frustum = readFrustum(camera);\n"
 STAND = "        standDown(why);\n    }\n    // This step is"
 QUIET_FN = "bool flatCameraVrQuiet() { return flatCameraVrQuietFor(g_vrBits.load(std::memory_order_acquire), g_inject.injected.empty()); }"
@@ -229,6 +229,9 @@ MUTANTS = [
     M("phase-not-finite-checked", "vr", "R9", [(PHASE_FINITE, "renderW != 0 && renderH != 0 && ")], "a NaN phase is a phase"),
     M("frame-window-never-lapses", "vr", "R9", [(LAPSE, "if (stepAtMs == 0) return FlatCameraGateVerdict::Expired;")], "the route's last frame injects for ever"),
     M("failure-window-500-ms", "vr", "R9", [("static constexpr uint64_t kWindowMs = 5000;", "static constexpr uint64_t kWindowMs = 500;")], "the stand-down window is half a second"),
+    M("frame-window-lapses-in-every-mode", "vr", "R9",
+      [("    if (mode != FlatCameraVrMode::Inject || gate != FlatCameraGateVerdict::Admit) return gate;", "    if (gate != FlatCameraGateVerdict::Admit) return gate;")],
+      "the route's step ages the census's window field in observe-only frames"),
     # ---- R11: the detour ------------------------------------------------------------------------------------------------------------------
     M("commit-guard-removed", "cpp", "R11", [(COMMIT_GUARD, "    float entryX = 0, entryY = 0;\n")], "a pass-through call writes the return slot"),
     M("commit-always-injects", "cpp", "R11", [(COMMIT_CALL, "vrCommit(r0, ctx, camera, callNo, true, wantPost)")], "every call writes a phase"),
@@ -248,6 +251,8 @@ MUTANTS = [
     M("flat-runtime-told-of-a-vr-call", "cpp", "R11", [(RESTORE_END, RESTORE_END.replace("    }\n", "        flatRuntimeNoteCameraApplied();\n    }\n"))], "the VR post half tells the flat runtime"),
     M("every-redirect-joins-the-flush-set", "cpp", "R11", [(NOINJECT_SET, "    g_inject.injected.noteInjected(camera);\n    return inject;")], "a census-only redirect makes the camera a flush candidate"),
     M("frame-window-lapse-not-applied", "cpp", "R11", [(EFFECTIVE, "in.gate = gate;")], "the route's step does not bound the window"),
+    M("frame-window-lapse-for-the-wrong-mode", "cpp", "R11",
+      [(EFFECTIVE, "in.gate = flatCameraVrEffectiveGate(FlatCameraVrMode::PassThrough, gate, g_vr.stepAtMs(), GetTickCount64());")], "an injecting frame's window never lapses"),
     M("frustum-always-read", "cpp", "R11", [(WANTS, "    frustum = readFrustum(camera);\n")], "every call reads the camera's aspect and near plane"),
     M("stand-down-dropped", "cpp", "R11", [(STAND, "    }\n    // This step is")], "failed writes never stand the hook down"),
     M("quiet-always-true", "cpp", "R11", [(QUIET_FN, "bool flatCameraVrQuiet() { return flatCameraVrQuietFor(g_vrBits.load(std::memory_order_acquire), true); }")], "quiet ignores the injected set"),
