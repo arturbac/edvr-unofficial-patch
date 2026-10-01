@@ -78,7 +78,6 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "pose_reader_watch.h"
 #include "transition_flash_eye_base.h"
 #include "vscreen_res.h"
-#include "celestial_motion.h"
 
 namespace edvr {
 namespace {
@@ -1018,11 +1017,6 @@ HRESULT STDMETHODCALLTYPE hookedDevCreate(ID3D11Device* self, const void* first,
                 g_createBufferBytes.fetch_add(static_cast<const D3D11_BUFFER_DESC*>(first)->ByteWidth,
                                               std::memory_order_relaxed);
             }
-            // A destroyed buffer's address can be reused by a fresh one; a
-            // watched slot would otherwise inherit that buffer's stale shadow.
-            // Guarded the same way as the Map/Unmap tees (celestial_motion.h):
-            // with no slot watched, no new buffer's address can match one.
-            if (out && *out && celestialMotionAnyWatched()) celestialMotionConstantsUnknownWrite(static_cast<ID3D11Buffer*>(*out));
         }
     }
     return hr;

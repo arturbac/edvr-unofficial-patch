@@ -2133,8 +2133,23 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // identity between the two routes resets history once, here.
     flatCameraInjectFrame(frame + 1,enabled);
     if(flatCameraInjectTakeHistoryReset()) {s.phase.resetHistory();reset();}
+    // How many phases the sequence runs (experimental.temporal_aa_jitter_follows_upscale, temporal_math.h): the fixed eight unless
+    // the key is on, the injector owns the frame (flatCameraPhaseCount says why only Upstream) and the upscaler resolves to more
+    // pixels than the game renders. E is the plan's, as the resolver takes it: the vendor's negotiated size where one was
+    // answered for this contract, else the route's default (flat_mono_resolve.cpp, evalW). Read live, once a Present; the key is
+    // not part of any history, so a change resets nothing and the next frame simply draws its phase from the new count.
+    uint32_t phaseEvalW=0,phaseEvalH=0;
+    if(s.haveResolvePlan) {
+        const FlatResolveRoute planRoute=flatResolveRoute(s.plannedResolve.mode,s.plannedResolve.renderWidth,s.plannedResolve.renderHeight,
+            s.plannedResolve.outputWidth,s.plannedResolve.outputHeight);
+        const bool negotiatedEval=s.plannedResolve.evalWidth && s.plannedResolve.evalHeight;
+        phaseEvalW=negotiatedEval?s.plannedResolve.evalWidth:planRoute.evalWidth;
+        phaseEvalH=negotiatedEval?s.plannedResolve.evalHeight:planRoute.evalHeight;
+    }
+    const uint32_t phaseCount=flatCameraPhaseCount(flatCameraInjectRoute(),
+        Config::get().getBool("experimental.temporal_aa_jitter_follows_upscale",false),s.phaseWidth,s.phaseHeight,phaseEvalW,phaseEvalH);
     s.phase.beginFrame(flatCameraPhaseEnabled(flatCameraInjectRoute(),wanted,s.observing,s.projection!=nullptr),
-        compatible,s.phaseWidth,s.phaseHeight);
+        compatible,s.phaseWidth,s.phaseHeight,phaseCount);
     s.frameHadPhase=nonzeroPhase(s);
     flatCameraInjectArm(); // the phase is chosen: the injector's frame window opens
     s.frameCoverage=true;s.temporalAccepted=false;
@@ -2198,9 +2213,11 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             char unkeyed[560]; engineVelocityFormatUnkeyed(unkeyed,sizeof(unkeyed));
             Log::get().note("%s",unkeyed);
         }
-        Log::get().note("flat jitter: enabled=%u wanted=%u phase=(%.5g,%.5g) previous=(%.5g,%.5g) warm=%u frames=%llu draws=%llu dispatches=%llu refusals=%llu state=%s history-valid=%u",
+        // phases= is the count the sequence ran through this frame (temporal_math.h): 8 unless
+        // experimental.temporal_aa_jitter_follows_upscale is on, the route is upstream and the render is below the output.
+        Log::get().note("flat jitter: enabled=%u wanted=%u phase=(%.5g,%.5g) previous=(%.5g,%.5g) phases=%u warm=%u frames=%llu draws=%llu dispatches=%llu refusals=%llu state=%s history-valid=%u",
             enabled?1u:0u,s.jitterWanted?1u:0u,
-            s.phase.currentX,s.phase.currentY,s.phase.previousX,s.phase.previousY,s.phase.warmFrames,
+            s.phase.currentX,s.phase.currentY,s.phase.previousX,s.phase.previousY,s.phase.phaseCount,s.phase.warmFrames,
             (unsigned long long)s.jitteredFrames,(unsigned long long)s.jitterDraws,(unsigned long long)s.jitterDispatches,
             (unsigned long long)s.jitterRefusals,s.jitterReason,s.phase.previousAcceptedValid?1u:0u);
         // The camera injector's row bookkeeping, every window while a temporal mode runs

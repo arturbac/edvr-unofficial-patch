@@ -32,7 +32,7 @@ enum class GpuCensusSection : uint8_t {
     DoorTemporalWhole = 0,    // the whole temporalInner call, both eyes (edvrTemporalAa)
     DoorUpscaler,             // fsr/dlaa, and the fovea crops (periphery + centre) -- nested inside DoorTemporalWhole
     DoorMotionPrep,           // the motion-vector dispatch (mvCs) -- nested inside DoorTemporalWhole
-    DoorHologramResolve,      // uiDepthHologramResolve + celestialMotionViews -- nested inside DoorTemporalWhole
+    DoorHologramResolve,      // uiDepthHologramResolve + uiDepthTemporalDepth -- nested inside DoorTemporalWhole
     DoorUiResolve,            // applyUiResolve -- nested inside DoorTemporalWhole
     DoorSharpen,              // sharpen_pass.cpp's dispatch
     DoorMenu,                 // menu_panel.cpp's dispatch
@@ -42,7 +42,6 @@ enum class GpuCensusSection : uint8_t {
     FrameHologramPasses,      // the two hologram/icon depth reissues
     FrameUiDepthCoverage,     // the UI-depth family reissue (UiContent::prepare, stellar coverage nest inside)
     FramePlanet,              // the planet/solar terrain reissue
-    FrameTerrain,             // the terrain/celestial motion reissue
     FrameScreenMotion,        // screen_motion.cpp's own GPU work: the UI mask clear+reissue,
                               // the eye's buffer/size copies, clear and projection draw, the
                               // panel-count readback -- not screenMotionUiDraw/screenMotionDraw's
@@ -69,7 +68,6 @@ enum class GpuCensusSection : uint8_t {
     // and never part of "EDVR ~X". Per draw like the sections above (K = 8, the
     // same stride and rotation); they own the line after the main one.
     AlteredPoolFamily,        // a pool-family draw with EDVR's MRT6 slot target bound and its shaders substituted
-    AlteredTerrain,           // a null-pixel-shader terrain prepass with EDVR's motion target bound and a pixel shader added
     AlteredUiLayer,           // a UI draw redirected into EDVR's UI layer target (fix.ui_quality)
     // A draw wrapped in another fix's state change (RemLok, the loading hologram, scrim,
     // particles, the panel ...): ONE SECTION PER FIX, kAlteredFixCount of them, in AlteredFix's
@@ -82,15 +80,16 @@ enum class GpuCensusSection : uint8_t {
 
 // Which of the classes above a draw of Elite's is, decided where forwardWithVerdict
 // issues the game's own draw. One class per draw, in this priority: a pool-family
-// draw (only when no verdict claimed it, as engineVelocityBeforeDraw is), a terrain
-// original, a UI-layer redirect, then any other verdict's wrapper. None for a draw
-// EDVR leaves as the game issued it, for a foreign context, and for every reissue.
-enum class AlteredDrawClass : uint8_t { None = 0, PoolFamily, TerrainOriginal, UiLayer, Verdict };
+// draw (only when no verdict claimed it, as engineVelocityBeforeDraw is), a UI-layer
+// redirect, then any other verdict's wrapper. None for a draw EDVR leaves as the game
+// issued it, for a foreign context, and for every reissue. (A "terrain original", the
+// null-pixel-shader prepass advanced.terrain_motion captured in its own draw, was a
+// class here until that hook retired on 2026-10-01.)
+enum class AlteredDrawClass : uint8_t { None = 0, PoolFamily, UiLayer, Verdict };
 inline AlteredDrawClass classifyAlteredDraw(bool owner, bool verdictNone, bool poolSubstituted,
-                                            bool terrainOriginal, bool uiLayered) noexcept {
+                                            bool uiLayered) noexcept {
     if (!owner) return AlteredDrawClass::None;
     if (verdictNone && poolSubstituted) return AlteredDrawClass::PoolFamily;
-    if (terrainOriginal) return AlteredDrawClass::TerrainOriginal;
     if (uiLayered) return AlteredDrawClass::UiLayer;
     if (!verdictNone) return AlteredDrawClass::Verdict;
     return AlteredDrawClass::None;
@@ -126,7 +125,7 @@ struct AlteredDraw {
     AlteredDrawClass cls = AlteredDrawClass::None;
     AlteredFix fix = AlteredFix::Unnamed;
     constexpr AlteredDraw() noexcept = default;
-    // Implicit, so a class that names no fix (None, the pool family, terrain, the UI layer) is written as itself.
+    // Implicit, so a class that names no fix (None, the pool family, the UI layer) is written as itself.
     constexpr AlteredDraw(AlteredDrawClass c) noexcept : cls(c) {}
     constexpr AlteredDraw(AlteredDrawClass c, AlteredFix f) noexcept : cls(c), fix(f) {}
 };
@@ -135,11 +134,10 @@ inline GpuCensusSection alteredFixSectionOf(AlteredFix f) noexcept {
 }
 inline GpuCensusSection alteredSectionOf(AlteredDraw d) noexcept {
     switch (d.cls) {
-    case AlteredDrawClass::PoolFamily:      return GpuCensusSection::AlteredPoolFamily;
-    case AlteredDrawClass::TerrainOriginal: return GpuCensusSection::AlteredTerrain;
-    case AlteredDrawClass::UiLayer:         return GpuCensusSection::AlteredUiLayer;
-    case AlteredDrawClass::Verdict:         return alteredFixSectionOf(d.fix);
-    case AlteredDrawClass::None:            break;
+    case AlteredDrawClass::PoolFamily: return GpuCensusSection::AlteredPoolFamily;
+    case AlteredDrawClass::UiLayer:    return GpuCensusSection::AlteredUiLayer;
+    case AlteredDrawClass::Verdict:    return alteredFixSectionOf(d.fix);
+    case AlteredDrawClass::None:       break;
     }
     return GpuCensusSection::Count;
 }

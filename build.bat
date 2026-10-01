@@ -551,7 +551,6 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\intro_skip.cpp" ^
     "src\d3d11\intro_upscale.cpp" ^
     "src\d3d11\temporal_pass.cpp" ^
-    "src\d3d11\celestial_motion.cpp" ^
     "src\d3d11\depth_probe.cpp" ^
     "src\d3d11\luma_probe.cpp" ^
     "src\d3d11\dlaa.cpp" ^
@@ -955,6 +954,9 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
 if errorlevel 1 ( echo [edvr] ERROR: native temporal test build failed & exit /b 1 )
 "%BUILD%\native_temporal_test.exe" --dry-run || exit /b 1
 "%BUILD%\native_temporal_test.exe" --self-test || exit /b 1
+REM The jitter phase count (experimental.temporal_aa_jitter_follows_upscale): the same channel code flown through a script of modes, sizes
+REM and live key flips in a process of its own, because the provider's channel pool holds sixteen and --self-test uses them all.
+"%BUILD%\native_temporal_test.exe" --phase-count-self-test || exit /b 1
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /I"third_party\openxr\include" ^
     /Fo"%OBJ%\native_temporal\\" /Fe"%BUILD%\native_temporal_gpu_test.exe" ^
@@ -1501,6 +1503,12 @@ if errorlevel 1 ( echo [edvr] ERROR: temporal_test build failed & exit /b 1 )
     echo [edvr] ERROR: the temporal pass's arithmetic is wrong
     exit /b 1
 )
+REM The jitter phase count (experimental.temporal_aa_jitter_follows_upscale, 2026-10-01) is pinned by this rig (the rule's table and
+REM the fixed eight's bit-for-bit sameness), flat_temporal_test (the phase machine and the route decision), vr_world_route_test (the
+REM window token) and native_temporal_test --phase-count-self-test (the VR eye pass flown on WARP). The self-test below holds the
+REM mutation list that proves those rigs fail on a broken source to the sources as they are and to the way build.bat compiles each
+REM rig; its --run (on demand) builds each against one edited production file. Drop it with the key.
+python "tools\temporal_test\jitter_phase_mutants.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_ui_depth
@@ -1636,19 +1644,23 @@ if errorlevel 1 ( echo [edvr] ERROR: stellar motion test build failed & exit /b 
 "%OBJ%\stellarmotion\stellar_motion_test.exe" || exit /b 1
 exit /b 0
 
-:rig_terrain_motion
-echo [edvr] === terrain motion regression ===
-if not exist "%OBJ%\terrainmotion" mkdir "%OBJ%\terrainmotion"
-cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
-    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
-    /Fo"%OBJ%\terrainmotion\\" /Fe"%OBJ%\terrainmotion\celestial_motion_test.exe" ^
-    "tools\celestial_motion_test\celestial_motion_test.cpp" ^
-    "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
-    /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib
-if errorlevel 1 ( echo [edvr] ERROR: terrain motion test build failed & exit /b 1 )
-"%OBJ%\terrainmotion\celestial_motion_test.exe" || exit /b 1
-python "tools\terrain_motion.py" --self-test || exit /b 1
-python "tools\terrain_motion.py" "%OBJ%\terrainmotion\eye_fixture_Terrain.bin" --verify-fixture || exit /b 1
+:rig_terrain_retired_test
+echo [edvr] === terrain retirement A/B ===
+REM The proof of the 2026-10-01 retirement of advanced.terrain_motion (docs\terrain-motion-dispatch-cost-2026-09-17.md): the
+REM temporal compute shader before the cut, rebuilt from the current text and the removed fragments, and after it, run on WARP over
+REM scenes that carry terrain-like pixels, give byte-identical outputs for both entries with probe.w bit 8 clear -- every player
+REM without the key. It compiles the shader twelve ways on twelve threads (the `main` entry alone is about 20 s in fxc) and runs
+REM about 20 s. It exists for that one edit and goes when its anchors move (the rig says so); --verify-old, run once by hand with the
+REM pre-retirement file, ties the rebuilt reference to the real old text.
+if not exist "%OBJ%\terrainretired" mkdir "%OBJ%\terrainretired"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /utf-8 ^
+    /Fo"%OBJ%\terrainretired\\" /Fe"%OBJ%\terrainretired\terrain_retired_test.exe" ^
+    "tools\terrain_retired_test\terrain_retired_test.cpp" ^
+    /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib dxguid.lib
+if errorlevel 1 ( echo [edvr] ERROR: terrain retirement test build failed & exit /b 1 )
+"%OBJ%\terrainretired\terrain_retired_test.exe" --dry-run || exit /b 1
+"%OBJ%\terrainretired\terrain_retired_test.exe" || exit /b 1
 exit /b 0
 
 :rig_depth_scene_pick_test

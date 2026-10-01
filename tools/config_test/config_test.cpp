@@ -1081,6 +1081,8 @@ int main(int argc, char** argv) {
     expectStr("advanced.mesh_motion", "<unset>", "the retired mesh record pairing's key is absent");
     expectStr("advanced.temporal_aa_objects_reach", "<unset>", "the retired station path's reach is absent");
     expectStr("advanced.temporal_aa_objects_ships_metres", "<unset>", "the retired ship path's range is absent");
+    // The terrain patches' own recorded transforms (2026-10-01): terrain takes the camera's motion, with no key.
+    expectStr("advanced.terrain_motion", "<unset>", "the retired terrain motion key is absent");
     // The particle facing measurement (dead since 2026-08-23) retired 2026-09-23.
     expectStr("advanced.particle_face_emitter", "<unset>", "the retired particle facing key is absent");
     // The foveation's eye-tracked centre went with its gaze source (2026-09-23)
@@ -1291,6 +1293,44 @@ int main(int argc, char** argv) {
                                              : "the flipped source still matched the ini");
             }
         }
+    }
+
+    // The jitter phase count's switch (2026-10-01: experimental.temporal_aa_jitter_follows_upscale) is OFF by default: with it off
+    // every path keeps the fixed eight phases, byte for byte. The shipped file, and the code's fallback at both of its reads (the
+    // VR eye pass in native_temporal.cpp and the flat runtime), must say the same; the control turns each fallback to true (a
+    // longer sequence on every install, with nobody having asked) and must be caught.
+    expectBool("experimental.temporal_aa_jitter_follows_upscale", false, "the shipped edvr.ini ships the jitter phase count switch off");
+    for (const char* source : {"native_temporal.cpp", "flat_runtime.cpp"}) {
+        const std::string key = "experimental.temporal_aa_jitter_follows_upscale";
+        const std::string text = readRepoFile(dir, widen((std::string("src\\d3d11\\") + source).c_str()).c_str());
+        const std::string label = std::string(source) + " reads the jitter phase count switch with a false fallback";
+        if (text.empty()) {
+            const std::string readable = std::string(source) + " is readable from the repo root (jitter phase count switch)";
+            fail(readable.c_str(), "could not read it");
+            continue;
+        }
+        const std::string needle = "getBool(\"" + key + "\",";
+        const size_t at = text.find(needle);
+        // The literal after the comma, up to the closing parenthesis.
+        auto fallbackOf = [&](const std::string& s) {
+            const size_t pos = s.find(needle);
+            if (pos == std::string::npos) return std::string("<no such read>");
+            size_t begin = pos + needle.size();
+            while (begin < s.size() && s[begin] == ' ') ++begin;
+            size_t end = begin;
+            while (end < s.size() && s[end] != ')') ++end;
+            return s.substr(begin, end - begin);
+        };
+        if (at != std::string::npos && fallbackOf(text) == "false") ok(label.c_str());
+        else fail(label.c_str(), std::string(source) + " reads it with the fallback \"" + fallbackOf(text) + "\"");
+        std::string flipped = text;
+        if (at != std::string::npos) {
+            const size_t begin = flipped.find("false", at + needle.size());
+            flipped.replace(begin, 5, "true");
+        }
+        const std::string control = std::string("control: the jitter phase count switch's fallback turned to true in ") + source + " is caught";
+        if (at != std::string::npos && fallbackOf(flipped) != "false") ok(control.c_str());
+        else fail(control.c_str(), at == std::string::npos ? "the read was not found to alter" : "the flipped source still matched the ini");
     }
 
     // The on-foot maps gate (design-world-camera-motion-2026-09-30.md, Phase 1: experimental.on_foot_maps_sharp) is OFF by

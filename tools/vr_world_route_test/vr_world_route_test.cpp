@@ -484,10 +484,19 @@ void lineCases() {
     n = vrWorldFormatWindow(line, sizeof(line), VrWorldKey::Auto, VrWorldState::Owned, true, true, w);
     check(n > 0 && n < 1100 && std::strstr(line, "jitter=on phase=0.4375,-0.3125 rows=0.4375,-0.3125 fp-mode=4/300/2"),
           "line: the 5 s line carries the jitter decision, the world phase in use, the rows' phase and the fold-in's modes");
+    // The phase count (2026-10-01; temporal_math.h): the route resolves at the game's render size, so it runs the fixed eight, and its
+    // 5 s line says so before the jitter decision -- a window nothing has set prints eight, one handed another count prints that one.
+    check(n > 0 && std::strstr(line, " phases=8 jitter=on phase=0.4375,-0.3125 "),
+          "line: the 5 s line carries the phase count the route ran, eight by default, just before the jitter decision");
+    w.phases = 32;
+    n = vrWorldFormatWindow(line, sizeof(line), VrWorldKey::Auto, VrWorldState::Owned, true, true, w);
+    check(n > 0 && n < 1100 && std::strstr(line, " phases=32 jitter=on phase=0.4375,-0.3125 "),
+          "line: ...and prints the window's own count, not a constant");
     VrWorldWindow idle;
     n = vrWorldFormatWindow(line, sizeof(line), VrWorldKey::Auto, VrWorldState::Observing, true, true, idle);
     check(n > 0 && std::strstr(line, "jitter=idle phase=0.0000,0.0000 rows=0.0000,0.0000 fp-mode=0/0/0"),
           "line: a route that does not jitter prints jitter=idle and a zero phase (an absent token would read as 'never built')");
+    check(n > 0 && std::strstr(line, " phases=8 jitter=idle "), "line: ...and the fixed eight (a default window says what every path has always run)");
     char buf[512];
     n = vrWorldFormatEntered(buf, sizeof(buf), 1234, kVrWorldWarmFrames);
     check(n > 0 && std::strstr(buf, "OWNS the world from frame=1234") && std::strstr(buf, "8 treated frames"), "line: the ownership line names the frame and the warm-up");
@@ -1346,6 +1355,15 @@ void sourcePins() {
           "door: the layer's predicate answers the route's question first and the maps gate's only when the key is on");
     check(nt.find("&&!edvr::vrWorldRouteOwnsNextFrame()") != std::string::npos,
           "eye shift: native_temporal advertises the shift only while the route does not own the next frame");
+    // The phase count (2026-10-01; temporal_math.h): the route resolves at the game's render size (render == output), so it hands its
+    // phase machine the count the ratio rule gives for that -- the fixed eight, with experimental.temporal_aa_jitter_follows_upscale
+    // on or off, and the route reads no such key -- and its 5 s window carries what the machine ran.
+    const std::string routeCpp = readFile("src\\d3d11\\vr_world_route.cpp");
+    check(!routeCpp.empty() &&
+              count(routeCpp, "g_phase.beginFrame(true, g_prev.valid && g_f.treated, w, h, temporalJitterPhaseCount(w, h, w, h));") == 1 &&
+              count(routeCpp, "g_win.phases = g_phase.phaseCount;") == 1 &&
+              routeCpp.find("temporal_aa_jitter_follows_upscale\"") == std::string::npos,
+          "phase count: the route's phase machine is given the ratio rule's count for render == output, its window prints what the machine ran, and the route reads no key for it");
     const std::string skip = functionBody(nt, "HRESULT WINAPI skipEye(");
     check(!skip.empty() && before(skip, "edvr::vrWorldRouteNoteSceneReset();", "s->history[eye]={}"),
           "scene reset: a withheld eye frame tells the route before it touches the eye's history");
