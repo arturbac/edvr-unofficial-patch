@@ -239,6 +239,25 @@ inline bool vrWorldFillObservation(FlatContractObservation& k, const VrWorldView
 
 // ---- the census -----------------------------------------------------------------------------------------------
 // One 5 s window, reset when it prints. The HDR route's window is the detector's half; the rest is the route's.
+// The camera injector's per-frame counters summed over one 5 s window (stage 2; flat_camera_inject.h FlatCameraVrCounters),
+// and the evidence the world's rows carried the phase the injector was given. Printed on its own line
+// (vrWorldFormatInjectWindow): the route line is near the log's 1200-character limit already.
+struct VrWorldInjectWindow {
+    uint64_t scene = 0, firstPerson = 0;     // calls injected with the Scene and the FirstPerson role
+    uint64_t refused = 0;                    // screen-view calls the detour admitted and could not write
+    uint64_t warming = 0;                    // screen-view calls admitted with a zero phase (nothing written)
+    uint64_t auxiliary = 0;                  // kind-3 calls excluded by role
+    uint64_t afterTrigger = 0;               // screen-view calls after the trigger
+    uint64_t unsupported = 0, otherKind = 0; // kinds 4 and 5, and kinds 0, 1, 2 ...
+    uint64_t unreadable = 0, offThread = 0, writeFail = 0;
+    uint64_t injectedKind[8] = {};           // injected calls by kind (0..5, 6 other, 7 unreadable): only kind 3 may be non-zero
+    uint64_t pairChecked = 0, pairBad = 0;   // consecutive resolved frames whose rows differed by the phases they were claimed to carry
+    // The naming rule (the window opens only after a frame that named the screen's source): frames whose window was open and that
+    // turned out to name nothing (a map, a menu or a transition cannot be told from a world before its cameras refresh, so the
+    // first such frame after a named one is expected, at most one per change), and injections on a frame whose window the route
+    // had SHUT (a STOP: a shut window is never written through).
+    uint64_t unnamedFrames = 0, shutInjected = 0;
+};
 struct VrWorldWindow {
     FlatHdrWindow hdr;            // frames, hdr-frames, trigger, none, ambiguous, treated, declined, late writes, selection tally
     uint64_t gateFrames = 0;      // frames the route watched with the gate held
@@ -248,6 +267,12 @@ struct VrWorldWindow {
     uint64_t layerOnly = 0;       // eyes whose door ran layer-only
     uint64_t enters = 0, releases = 0, resets = 0;
     const char* lastRelease = "none";
+    // Stage 2. The last boundary's jitter decision (vrWorldJitterName), the phase the frame that ended was given and the
+    // phase its rows carried (render pixels, positive right/down), and the fold-in's mode counts.
+    const char* jitter = "idle";
+    float phaseX = 0.0f, phaseY = 0.0f, rowsX = 0.0f, rowsY = 0.0f;
+    uint64_t foldMode[3] = {};    // frames whose resolve ran the weapon fold-in with mode 0, 1, 2 (FlatMonoResolveFrame::firstPersonPhaseMode)
+    VrWorldInjectWindow inject;
     void reset() { *this = VrWorldWindow{}; }
 };
 // The 5 s line, printed every window while the key is auto, zeros included: an absent line is what "the route never
@@ -258,6 +283,7 @@ inline int vrWorldFormatWindow(char* out, size_t size, VrWorldKey key, VrWorldSt
         "vr world route 5s: key=%s state=%s layer=%s gate=%s frames=%llu gate-frames=%llu gate-flips=%llu hdr-frames=%llu trigger=%llu "
         "none=%llu ambiguous=%llu treated=%llu declined=%llu owned-frames=%llu eye-takes=%llu door-layer-only=%llu "
         "enters=%llu releases=%llu (last=%s) scene-resets=%llu late-hdr-writes=%llu (in %llu frames) last=%s "
+        "jitter=%s phase=%.4f,%.4f rows=%.4f,%.4f fp-mode=%llu/%llu/%llu "
         "last-trigger=VS=%016llX PS=%016llX target=%ux%u hdr=%ux%u selection=",
         vrWorldKeyName(key), vrWorldStateName(state), layerLive ? "live" : "not-live", gate ? "held" : "no",
         static_cast<unsigned long long>(w.hdr.frames), static_cast<unsigned long long>(w.gateFrames),
@@ -269,7 +295,10 @@ inline int vrWorldFormatWindow(char* out, size_t size, VrWorldKey key, VrWorldSt
         static_cast<unsigned long long>(w.layerOnly), static_cast<unsigned long long>(w.enters),
         static_cast<unsigned long long>(w.releases), w.lastRelease, static_cast<unsigned long long>(w.resets),
         static_cast<unsigned long long>(w.hdr.lateWrites), static_cast<unsigned long long>(w.hdr.lateWriteFrames),
-        w.hdr.lastVerdict, static_cast<unsigned long long>(w.hdr.lastTriggerVs),
+        w.hdr.lastVerdict, w.jitter, static_cast<double>(w.phaseX), static_cast<double>(w.phaseY),
+        static_cast<double>(w.rowsX), static_cast<double>(w.rowsY), static_cast<unsigned long long>(w.foldMode[0]),
+        static_cast<unsigned long long>(w.foldMode[1]), static_cast<unsigned long long>(w.foldMode[2]),
+        static_cast<unsigned long long>(w.hdr.lastTriggerVs),
         static_cast<unsigned long long>(w.hdr.lastTriggerPs), w.hdr.lastTargetWidth, w.hdr.lastTargetHeight,
         w.hdr.lastHdrWidth, w.hdr.lastHdrHeight);
     const auto append = [&](const char* first, const char* name, unsigned long long count) {
@@ -295,11 +324,17 @@ inline int vrWorldFormatEntered(char* out, size_t size, uint64_t frame, uint32_t
         static_cast<unsigned long long>(frame), warmFrames);
 }
 // The route let go: why, and what it had done.
-inline int vrWorldFormatReleased(char* out, size_t size, uint64_t frame, VrWorldRelease why, uint64_t ownedFrames) {
+// lastDecline: the selector's reason for the frames the route declined just before it let go (null or empty when it
+// declined none: a gate lost, a key turned off), declineRun how many frames in a row.
+inline int vrWorldFormatReleased(char* out, size_t size, uint64_t frame, VrWorldRelease why, uint64_t ownedFrames,
+                                 const char* lastDecline = nullptr, uint32_t declineRun = 0) {
+    char tail[160] = "";
+    if (lastDecline && lastDecline[0] && declineRun)
+        std::snprintf(tail, sizeof(tail), "; last decline: %s x%u", lastDecline, declineRun);
     return std::snprintf(out, size,
-        "vr world route: RELEASED the world at frame=%llu (%s) after %llu owned frame(s); the eye shift is back on and "
+        "vr world route: RELEASED the world at frame=%llu (%s%s) after %llu owned frame(s); the eye shift is back on and "
         "the eye route serves the eyes",
-        static_cast<unsigned long long>(frame), vrWorldReleaseName(why), static_cast<unsigned long long>(ownedFrames));
+        static_cast<unsigned long long>(frame), vrWorldReleaseName(why), tail, static_cast<unsigned long long>(ownedFrames));
 }
 // The first trigger of a session, once.
 inline int vrWorldFormatFirstTrigger(char* out, size_t size, uint64_t frame, const FlatHdrFrame& f) {
@@ -312,6 +347,215 @@ inline int vrWorldFormatFirstTrigger(char* out, size_t size, uint64_t frame, con
         static_cast<unsigned long long>(t.ps), t.targetWidth, t.targetHeight, t.targetFormat, t.hdrWidth, t.hdrHeight,
         t.srvKnown ? static_cast<int>(t.srvSlot) : -1, h ? h->draws : 0u, h ? h->firstSeq : 0u, h ? h->lastSeq : 0u,
         t.ambiguous ? "; MORE THAN ONE HDR candidate matched, so the route declines" : "");
+}
+
+// ---- stage 2: the world jitter (design doc section 82, stage 2) ---------------------------------------------------------
+// experimental.temporal_aa_on_foot_world_jitter: on (the default) or off. While the route owns the world, "on" puts the
+// sub-pixel phase into the world's cameras through the camera injector (flat_camera_inject.h), and the resolver gets that
+// phase for its jitter input and for the rows; "off" keeps the route and zeroes the phase, which is flight 1's unjittered
+// world, so one session can compare the two at the same spot. A value that is present and is not "on" reads as off: a typo
+// can never start writing the game's cameras. (experimental.temporal_aa_jitter, the global jitter key, off also means off.)
+enum class VrWorldJitterKey : uint8_t { Off, On };
+inline VrWorldJitterKey vrWorldJitterKeyFromText(const char* text) {
+    if (!text) return VrWorldJitterKey::Off;
+    const char* on = "on";
+    for (; *on; ++on, ++text) {
+        char c = *text;
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (c != *on) return VrWorldJitterKey::Off;
+    }
+    return *text == 0 ? VrWorldJitterKey::On : VrWorldJitterKey::Off;
+}
+inline const char* vrWorldJitterKeyName(VrWorldJitterKey key) { return key == VrWorldJitterKey::On ? "on" : "off"; }
+
+// What the route decides about the world phase for the frame that starts. Only On asks the injector to write a camera.
+enum class VrWorldJitter : uint8_t {
+    On,         // inject kind-3 screen-view calls before the trigger with this frame's phase
+    KeyOff,     // experimental.temporal_aa_on_foot_world_jitter is off: the route runs unjittered (nothing is installed for it)
+    GlobalOff,  // experimental.temporal_aa_jitter is off
+    Idle,       // the route is not Warming or Owned (or its key is off): nothing to jitter
+    Unnamed,    // the route is Warming or Owned but the last frame named no source for the screen (a map, a menu, a transition):
+                // the window stays shut, through the route's grace frames, until a frame names one again
+    NoHook,     // wanted, but the camera hook is not live (not installed, failed, stood down): the world stays unjittered
+    Fault,      // the injector was switched off for the session after a STOP line (an injected kind other than 3)
+};
+// namedLast: the frame that just ended named the screen's source (the engine's pool-family draw into the screen-sized depth,
+// the selector's depthNamed fact). The frame's kind-3 refreshes come before the draws that name the source (the scene camera is
+// refreshed before the pass that draws with it), so the frame that starts cannot be asked;
+// a map frame refreshes about thirty kind-3 cameras and must never pick up the world's phase, so the window opens only after
+// a frame that named its source and stays shut after one that did not (design-world-camera-motion-2026-09-30.md section 5).
+inline VrWorldJitter vrWorldJitterDecide(bool routeKeyAuto, VrWorldJitterKey jitterKey, bool globalJitter,
+                                         bool routeWantsInjection, bool namedLast, bool hookLive, bool fault) {
+    if (!routeKeyAuto) return VrWorldJitter::Idle;
+    if (fault) return VrWorldJitter::Fault;
+    if (jitterKey != VrWorldJitterKey::On) return VrWorldJitter::KeyOff;
+    if (!globalJitter) return VrWorldJitter::GlobalOff;
+    if (!routeWantsInjection) return VrWorldJitter::Idle;
+    if (!namedLast) return VrWorldJitter::Unnamed;
+    if (!hookLive) return VrWorldJitter::NoHook;
+    return VrWorldJitter::On;
+}
+// The token of the 5 s line (jitter=): on, off (either key), idle, unnamed, no-hook, fault.
+inline const char* vrWorldJitterName(VrWorldJitter j) {
+    switch (j) {
+        case VrWorldJitter::On: return "on";
+        case VrWorldJitter::KeyOff:
+        case VrWorldJitter::GlobalOff: return "off";
+        case VrWorldJitter::Idle: return "idle";
+        case VrWorldJitter::Unnamed: return "unnamed";
+        case VrWorldJitter::NoHook: return "no-hook";
+        case VrWorldJitter::Fault: return "fault";
+    }
+    return "?";
+}
+
+// A phase as the frame APPLIED it to one group of cameras (render pixels, positive right/down). Equality is exact: both
+// sides of every comparison come from the same float the route handed the injector.
+struct VrWorldAppliedPhase {
+    float x = 0.0f, y = 0.0f;
+    bool zero() const { return x == 0.0f && y == 0.0f; }
+    bool operator==(const VrWorldAppliedPhase& o) const { return x == o.x && y == o.y; }
+};
+// The weapon fold-in's mode for the resolver (FlatMonoResolveFrame::firstPersonPhaseMode): the map's vector is previous
+// minus current at the two frames' OWN raster phases, so the fold-in needs to know whether the first-person camera carried
+// the world's phase in BOTH frames.
+//   0  no phase anywhere in either frame (the world is unjittered): the map is used as it is given;
+//   1  the first-person camera carried exactly the world's phase in both frames: the map's vector gets the phase term;
+//   2  it did not (a first-person call was not injected in one of the frames, or was refused): attached pixels reject.
+// fpNow / fpPrev are what the first-person camera carried this frame and last frame: the phase when its calls were all
+// injected, zero when one was excluded or refused. A frame with no first-person call at all (no weapon drawn) has no
+// attached pixels, so the caller passes the world's phase for it (vacuously the same).
+inline uint32_t vrWorldFirstPersonMode(const VrWorldAppliedPhase& worldNow, const VrWorldAppliedPhase& worldPrev,
+                                       const VrWorldAppliedPhase& fpNow, const VrWorldAppliedPhase& fpPrev) {
+    if (worldNow.zero() && worldPrev.zero() && fpNow.zero() && fpPrev.zero()) return 0;
+    return (fpNow == worldNow && fpPrev == worldPrev) ? 1u : 2u;
+}
+
+// The injector's per-frame counters as the route sees them (the fields of FlatCameraVrCounters it reads; a plain struct so
+// the pure rig and the formatters need no injector header).
+struct VrWorldInjectFrame {
+    uint32_t sceneInjected = 0, sceneRefused = 0, firstPersonInjected = 0, firstPersonRefused = 0;
+    uint32_t warming = 0, auxiliary = 0, afterTrigger = 0, unsupported = 0, otherKind = 0, unreadable = 0;
+    uint32_t writeFailures = 0, offThread = 0;
+    uint32_t injectedKind[8] = {};
+};
+inline void vrWorldAddInjectFrame(VrWorldInjectWindow& w, const VrWorldInjectFrame& f) {
+    w.scene += f.sceneInjected; w.firstPerson += f.firstPersonInjected;
+    w.refused += static_cast<uint64_t>(f.sceneRefused) + f.firstPersonRefused;
+    w.warming += f.warming; w.auxiliary += f.auxiliary; w.afterTrigger += f.afterTrigger;
+    w.unsupported += f.unsupported; w.otherKind += f.otherKind; w.unreadable += f.unreadable;
+    w.offThread += f.offThread; w.writeFail += f.writeFailures;
+    for (int i = 0; i < 8; ++i) w.injectedKind[i] += f.injectedKind[i];
+}
+// Any injected call of a kind other than 3: the one thing the admission table must make impossible.
+inline bool vrWorldInjectedWrongKind(const VrWorldInjectFrame& f) {
+    for (int i = 0; i < 8; ++i) if (i != 3 && f.injectedKind[i]) return true;
+    return false;
+}
+
+// The second line of a 5 s window (the route line is near the log's 1200-character limit): the injector's counters and the
+// rows-pair evidence. inj-kinds lists the INJECTED calls by kind: "3:<n>" for kind 3, "other:<n>" for everything else, or
+// "none". The reader (edvr_log.py --camera-census) parses this text.
+inline int vrWorldFormatInjectWindow(char* out, size_t size, const VrWorldInjectWindow& w) {
+    char kinds[96] = "none";
+    uint64_t other = 0;
+    for (int i = 0; i < 8; ++i) if (i != 3) other += w.injectedKind[i];
+    if (w.injectedKind[3] || other) {
+        int n = 0;
+        if (w.injectedKind[3]) n = std::snprintf(kinds, sizeof(kinds), "3:%llu", static_cast<unsigned long long>(w.injectedKind[3]));
+        else kinds[0] = 0;
+        if (other) std::snprintf(kinds + n, sizeof(kinds) - static_cast<size_t>(n), "%sother:%llu", n ? "," : "",
+                                 static_cast<unsigned long long>(other));
+    }
+    return std::snprintf(out, size,
+        "vr world route inject 5s: inj-scene=%llu inj-fp=%llu inj-refused=%llu warming=%llu aux=%llu after=%llu "
+        "unsupported=%llu other-kind=%llu unreadable=%llu off-thread=%llu write-fail=%llu inj-kinds=%s "
+        "pair-checked=%llu pair-bad=%llu inj-unnamed=%llu inj-shut=%llu",
+        static_cast<unsigned long long>(w.scene), static_cast<unsigned long long>(w.firstPerson),
+        static_cast<unsigned long long>(w.refused), static_cast<unsigned long long>(w.warming),
+        static_cast<unsigned long long>(w.auxiliary), static_cast<unsigned long long>(w.afterTrigger),
+        static_cast<unsigned long long>(w.unsupported), static_cast<unsigned long long>(w.otherKind),
+        static_cast<unsigned long long>(w.unreadable), static_cast<unsigned long long>(w.offThread),
+        static_cast<unsigned long long>(w.writeFail), kinds, static_cast<unsigned long long>(w.pairChecked),
+        static_cast<unsigned long long>(w.pairBad), static_cast<unsigned long long>(w.unnamedFrames),
+        static_cast<unsigned long long>(w.shutInjected));
+}
+// The first frame the world carries a non-zero phase in an ownership episode, once per episode.
+inline int vrWorldFormatJitterLive(char* out, size_t size, uint64_t frame, float phaseX, float phaseY, uint32_t renderW,
+                                   uint32_t renderH, const VrWorldInjectFrame& f) {
+    return std::snprintf(out, size,
+        "vr world route: the world is JITTERED from frame=%llu: phase (%.4f,%.4f) px in %ux%u, %u scene and %u first-person "
+        "camera call(s) injected this frame (kind 3 only; the eye cameras, kind 5, are never written); the eye shift stays off "
+        "while the route owns the world",
+        static_cast<unsigned long long>(frame), static_cast<double>(phaseX), static_cast<double>(phaseY), renderW, renderH,
+        f.sceneInjected, f.firstPersonInjected);
+}
+// A kind-3 call the role test excluded, once per distinct signature (the first eight): the roles are never guessed.
+inline int vrWorldFormatExcluded(char* out, size_t size, float aspect, float fov, float nearZ, float farZ,
+                                 unsigned long long callerRva, float screenAspect, unsigned long long calls) {
+    return std::snprintf(out, size,
+        "vr world route: camera call EXCLUDED, not a screen view: kind 3 aspect=%.4f fov=%.4f near=%.4f far=%.1f caller=+0x%llX "
+        "(the screen's aspect is %.4f; a screen view is within 4%%): %llu call(s) so far, never injected",
+        static_cast<double>(aspect), static_cast<double>(fov), static_cast<double>(nearZ), static_cast<double>(farZ),
+        callerRva, static_cast<double>(screenAspect), calls);
+}
+// The route asked for jitter and no scene camera call was injected: the world is unjittered this frame, and says why.
+inline int vrWorldFormatNoSceneInjection(char* out, size_t size, uint64_t frame, const VrWorldInjectFrame& f) {
+    return std::snprintf(out, size,
+        "vr world route: jitter is wanted but no scene camera call was injected at frame=%llu (warming %u, auxiliary %u, after "
+        "the trigger %u, refused %u, unsupported %u, other kinds %u, unreadable %u): the frame resolves unjittered",
+        static_cast<unsigned long long>(frame), f.warming, f.auxiliary, f.afterTrigger, f.sceneRefused + f.firstPersonRefused,
+        f.unsupported, f.otherKind, f.unreadable);
+}
+// STOP: an injected kind other than 3. The route switches the injector off for the session (the key flipping off and on
+// again clears it).
+inline int vrWorldFormatStopWrongKind(char* out, size_t size, uint64_t frame, const VrWorldInjectFrame& f) {
+    return std::snprintf(out, size,
+        "vr world route: STOP at frame=%llu: camera calls of a kind other than 3 were INJECTED (kind 0: %u, 1: %u, 2: %u, 4: %u, "
+        "5: %u, other: %u, unreadable: %u): only kind 3 may be; the injector is switched off for this session (set "
+        "experimental.temporal_aa_on_foot_world off and auto again to clear it)",
+        static_cast<unsigned long long>(frame), f.injectedKind[0], f.injectedKind[1], f.injectedKind[2], f.injectedKind[4],
+        f.injectedKind[5], f.injectedKind[6], f.injectedKind[7]);
+}
+// A frame whose window was open named no source for the screen: the first frame of a map, a menu or a transition, which cannot
+// be told from a world frame before its cameras refresh (the naming draw follows the first scene refresh). Expected, once per change; the window is
+// shut from the next frame on, until a frame names one again, and the map or menu is left as it was.
+inline int vrWorldFormatUnnamedOpen(char* out, size_t size, uint64_t frame, const VrWorldInjectFrame& f) {
+    return std::snprintf(out, size,
+        "vr world route: frame=%llu named no source for the screen but its camera window was open (it follows a frame that did: a "
+        "map, a menu or a transition cannot be told before its cameras refresh): %u scene and %u first-person call(s) carried "
+        "the phase this once; the window stays shut until a frame names its source again",
+        static_cast<unsigned long long>(frame), f.sceneInjected, f.firstPersonInjected);
+}
+// STOP: camera calls were injected on a frame whose window the route had shut (an unnamed frame before it, a route that was not
+// Warming or Owned, a jitter key off). The route switches the injector off for the session.
+inline int vrWorldFormatStopShut(char* out, size_t size, uint64_t frame, const char* decision, const VrWorldInjectFrame& f) {
+    return std::snprintf(out, size,
+        "vr world route: STOP at frame=%llu: %u scene and %u first-person camera call(s) were INJECTED on a frame whose window the "
+        "route had shut (decision: %s); a shut window is never written through, and the map or menu would pick up the world's "
+        "phase; the injector is switched off for this session (set experimental.temporal_aa_on_foot_world off and auto again "
+        "to clear it)",
+        static_cast<unsigned long long>(frame), f.sceneInjected, f.firstPersonInjected, decision ? decision : "?");
+}
+// The rows of two consecutive resolved frames did not differ by the phases they were claimed to carry (flat_camera_phase.h
+// flatCameraCheckRowPair): the injection missed the camera the scene reads, or the game jitters too. Counted; the first few named.
+inline int vrWorldFormatRowsMismatch(char* out, size_t size, uint64_t frame, float rx, float ry, float prx, float pry,
+                                     float maxError) {
+    return std::snprintf(out, size,
+        "vr world route: camera rows disagree with the phase at frame=%llu: claimed now (%.4f,%.4f) previous (%.4f,%.4f) px, the "
+        "rows' measured difference is off by %.3g NDC (tolerance 2e-6); the frame is still resolved, this is the evidence",
+        static_cast<unsigned long long>(frame), static_cast<double>(rx), static_cast<double>(ry), static_cast<double>(prx),
+        static_cast<double>(pry), static_cast<double>(maxError));
+}
+
+// The decline log. Flight 1 capped it per SESSION (twelve lines) and spent all twelve on the entry and the first seconds of one
+// gap, so later declines said nothing. It now caps per RUN of declines (consecutive frames the route did not treat; a treated
+// frame ends the run and re-arms the cap) and, as a backstop against a flapping selector, per session. The 5 s line's counters
+// and the RELEASED line's "last decline" carry what the cap drops.
+constexpr uint32_t kVrWorldDeclineLinesPerRun = 3;
+constexpr uint32_t kVrWorldDeclineLinesPerSession = 64;
+inline bool vrWorldDeclineLogAllowed(uint32_t runLines, uint32_t sessionLines) {
+    return runLines < kVrWorldDeclineLinesPerRun && sessionLines < kVrWorldDeclineLinesPerSession;
 }
 
 }  // namespace edvr
