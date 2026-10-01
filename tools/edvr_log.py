@@ -13,6 +13,8 @@
     python tools/edvr_log.py --target frontier --camera-census --expect-build HEAD
     python tools/edvr_log.py --target frontier --maps-sharp --expect-build HEAD
     python tools/edvr_log.py --target frontier --vscreen-fit --expect-build HEAD
+    python tools/edvr_log.py --target epic --flat-upscale --expect-build HEAD
+    python tools/edvr_log.py --target frontier --vr-supersampling --expect-build HEAD
     python tools/edvr_log.py --target frontier --route-curve --expect-build HEAD
     python tools/edvr_log.py --list
 
@@ -140,6 +142,22 @@ sources), ON FOOT, STABLE, SHAPE (the footprint's pixel aspect is 16:9), DISTANC
 3504 at distance 0.7 on a 4032 px eye) and STORED. A log with none of these lines
 exits 1; the verdict never changes the exit code (read its lines).
 
+--flat-upscale reads a flat-profile flight (design doc section 83): the game's final copy admitted by
+its structure, so DLSS, FSR and TAA resolve below the output (Elite's supersampling under 1.0) whatever bloom,
+depth of field and the tone variant do. It prints the key line, each `flat route:` (R, E, D), the first
+admission and every decline (`flat copy structure:`), each `flat copy structure 5s:` window (the game's copies
+split into the whitelist's, the structure's admissions, its declines by cause, no scene, a render size that does
+not fit, the HDR route's, and the key off's; the scene, output and source sizes; the longest chain of R-sized image
+passes between the scene and the copy), the stand-down and F8 warning lines with the render size's words, and the
+refusals summed, then PASS / WARN / STOP / n/a lines: KEY, ADMISSION (did the instrument run), TREATED, UPSCALE
+(below the output, admitted or selected, treated), TONE REFUSALS, STAND-DOWN (no-3d-scene is a silent startup; a
+render size is the user's resolution; a tone refusal with declines is a game anti-aliasing chain), F8 WARNING (the
+false startup warning is a STOP), CHAIN (a game anti-aliasing filter the structure declines) and ADVICE (the old
+supersampling paragraph must be gone). --vr-supersampling reads a VR flight: the `vr supersampling:` line (Elite's
+Supersampling below 1, from the measured render size against the eye texture), vScreen's own adoption line it
+follows and the menu's note that the headset notice was queued, with NOTICE / CONSISTENT / HEADSET / FLAT lines
+(a flat log carrying the notice is a STOP). Neither verdict changes the exit code (read its lines).
+
 --route-curve reads a flight with the curved VR world route (design doc section 82,
 "The curved route": fix.panel_curvature above 0, experimental.temporal_aa_on_foot_world
 = auto). It reads the route's `vr world route 5s:` lines by token (`curve=`: off,
@@ -156,10 +174,10 @@ the log has no route line. A log from before the curved route has no curve token
 that is a WARN which says so, never a PASS.
 
 Exit 0 when a log was read, 1 when none was found (or --camera-census found no
-census line, or --vscreen-fit no auto-fit line), 2 when --expect-build did not
-match (--tally periodic checks the runtime log against it too). --maps-sharp's and
---route-curve's codes for a log they read are their own (above): 0, 1 and 3 mean a
-verdict, not "no log".
+census line, or --vscreen-fit no auto-fit line, or --flat-upscale no flat line, or
+--vr-supersampling no VR line), 2 when --expect-build did not match (--tally periodic
+checks the runtime log against it too). --maps-sharp's and --route-curve's codes for a
+log they read are their own (above): 0, 1 and 3 mean a verdict, not "no log".
 """
 
 import argparse
@@ -4310,6 +4328,425 @@ def print_vscreen_fit(text):
     return 0
 
 
+# ---------------------------------------------------------------------------------------------------------------------------------------
+# --flat-upscale: the flat profile's final copy admitted by structure (design doc section 83), and what follows from it. Below the output
+# (Elite's supersampling under 1.0) the game's own copy upscales; the structure admission is what lets DLSS and FSR resolve there whatever
+# bloom, depth of field and the tone variant do. The lines are written by src/d3d11/flat_copy_structure.h (`flat copy structure 5s:`, the
+# first admission and the declines), flat_standdown.h, flat_elite_settings.h and flat_runtime.cpp; tools\flat_temporal_test holds the
+# formatters to tools\flat_upscale_fixture.log (a good flight and three episodes), the file this reader's self-test reads.
+# ---------------------------------------------------------------------------------------------------------------------------------------
+FLATU_TS = r"^(?:\[(?P<ts>[0-9:.]+)\] )?"
+FLATU_KEY_RE = re.compile(FLATU_TS + r"flat hdr route: experimental\.temporal_aa_before_post=(?P<key>\w+) \((?P<when>read at startup|changed)\) at frame=(?P<frame>\d+)")
+FLATU_TRIGGER_RE = re.compile(FLATU_TS + r"flat hdr route: first trigger at frame=(?P<frame>\d+)")
+FLATU_WINDOW_RE = re.compile(FLATU_TS + r"flat copy structure 5s: (?P<rest>.*)$")
+FLATU_FIRST_RE = re.compile(
+    FLATU_TS + r"flat copy structure: first admission at frame=(?P<frame>\d+) \(experimental\.temporal_aa_before_post=auto\): the game's final copy reads a "
+    r"(?P<w>\d+)x(?P<h>\d+) R8G8B8A8 image written by one pass, VS=(?P<vs>[0-9A-F]+) PS=(?P<ps>[0-9A-F]+), after the scene HDR's first consumer "
+    r"\(VS=(?P<tvs>[0-9A-F]+) PS=(?P<tps>[0-9A-F]+)\), .*?\(the whitelist said (?P<wl>[\w-]+)\); the scene is (?P<sw>\d+)x(?P<sh>\d+) on a "
+    r"(?P<ow>\d+)x(?P<oh>\d+) output(?P<menu> \(the 3D menu\))?, route=(?P<route>[\w-]+);")
+FLATU_DECLINED_RE = re.compile(
+    FLATU_TS + r"flat copy structure: declined at frame=(?P<frame>\d+): (?P<why>[\w-]+) \(the whitelist said (?P<wl>[\w-]+)\); the final copy reads a "
+    r"(?P<w>\d+)x(?P<h>\d+) fmt (?P<fmt>\d+) image with (?P<writers>\d+) writer\(s\) .*?, (?P<passes>\d+) R-sized image pass\(es\) between")
+FLATU_ROUTE_RE = re.compile(FLATU_TS + r"flat route: (?P<name>[\w-]+) R=(?P<rw>\d+)x(?P<rh>\d+) E=(?P<ew>\d+)x(?P<eh>\d+) D=(?P<dw>\d+)x(?P<dh>\d+)(?P<rest>.*)$")
+FLATU_STAND_RE = re.compile(FLATU_TS + r"flat stand-down: (?P<what>entered|resumed|ended|still stood down) (?P<rest>.*)$")
+FLATU_STAND_ENTERED_RE = re.compile(r"^at frame=(?P<frame>\d+): every frame for (?P<secs>[\d.]+) s \((?P<frames>\d+) frames\) was refused for (?P<reason>[\w-]+)(?: \((?P<words>[^)]*)\))?, none treated")
+FLATU_STAND_STILL_RE = re.compile(r"^at frame=(?P<frame>\d+) after (?P<secs>\d+) s: refused for (?P<reason>[\w-]+)(?: \((?P<words>[^)]*)\))?, (?P<probes>\d+) probes so far")
+FLATU_WARN_RE = re.compile(FLATU_TS + r"flat settings warning: (?P<what>shown|changed|hidden)(?: \(mode=(?P<mode>\w+), frames refused for (?P<reason>[\w-]+)(?P<flags>.*?)\): (?P<words>.*))?$")
+FLATU_REFUSAL_RE = re.compile(FLATU_TS + r"flat runtime refusal 5s: reason=(?P<reason>[\w-]+) count=(?P<count>\d+)")
+FLATU_RUNTIME_RE = re.compile(FLATU_TS + r"flat runtime: treated=(?P<treated>\d+) refused=(?P<refused>\d+) last=(?P<last>[\w-]+)")
+FLATU_TONE_REASONS = ("no-known-tone-pass", "invalid-tone-pass")
+FLATU_SILENT_REASONS = ("no-3d-scene", "no-known-output-copy")
+FLATU_OLD_ADVICE = ("Supersampling is below 1.0", ", supersampling below 1.0 (render ")
+
+
+def parse_flat_upscale(text):
+    """The log's flat-upscale lines: {keys: [{ts, key, when}], triggers: [index of the first-trigger line], windows: [{ts, kv, index}], first: {...} or None,
+    declines: [{ts, why, wl, passes}], routes: [{ts, name, r, e, d}], stand: [{ts, what, reason, words, index}], warns: [{ts, what, reason, mode,
+    flags, words, index}], refusals: {reason: count}, runtime: [{ts, treated, refused, last}], old_advice: bool, flat: bool}. A line cut short or
+    garbled is skipped, never fatal."""
+    f = {"keys": [], "triggers": [], "windows": [], "first": None, "declines": [], "routes": [], "stand": [], "warns": [], "refusals": {}, "runtime": [],
+         "old_advice": False, "flat": False}
+    for index, raw in enumerate(text.splitlines()):
+        try:
+            if any(token in raw for token in FLATU_OLD_ADVICE):
+                f["old_advice"] = True
+            m = FLATU_KEY_RE.match(raw)
+            if m:
+                f["flat"] = True
+                f["keys"].append({"ts": m.group("ts") or "", "key": m.group("key"), "when": m.group("when")})
+                continue
+            m = FLATU_TRIGGER_RE.match(raw)
+            if m:
+                f["triggers"].append(index)
+                continue
+            m = FLATU_WINDOW_RE.match(raw)
+            if m:
+                f["windows"].append({"ts": m.group("ts") or "", "kv": _ckv(m.group("rest")), "index": index})
+                continue
+            m = FLATU_FIRST_RE.match(raw)
+            if m:
+                if f["first"] is None:
+                    f["first"] = {"ts": m.group("ts") or "", "frame": int(m.group("frame")), "src": (int(m.group("w")), int(m.group("h"))),
+                                  "scene": (int(m.group("sw")), int(m.group("sh"))), "output": (int(m.group("ow")), int(m.group("oh"))),
+                                  "whitelist": m.group("wl"), "route": m.group("route"), "menu": bool(m.group("menu")), "index": index}
+                continue
+            m = FLATU_DECLINED_RE.match(raw)
+            if m:
+                f["declines"].append({"ts": m.group("ts") or "", "why": m.group("why"), "wl": m.group("wl"), "passes": int(m.group("passes")),
+                                      "src": (int(m.group("w")), int(m.group("h")))})
+                continue
+            m = FLATU_ROUTE_RE.match(raw)
+            if m:
+                f["routes"].append({"ts": m.group("ts") or "", "name": m.group("name"), "r": (int(m.group("rw")), int(m.group("rh"))),
+                                    "e": (int(m.group("ew")), int(m.group("eh"))), "d": (int(m.group("dw")), int(m.group("dh")))})
+                continue
+            m = FLATU_STAND_RE.match(raw)
+            if m:
+                what, rest = m.group("what"), m.group("rest")
+                entry = {"ts": m.group("ts") or "", "what": what, "reason": None, "words": None, "index": index}
+                sub = (FLATU_STAND_ENTERED_RE if what == "entered" else FLATU_STAND_STILL_RE if what == "still stood down" else None)
+                sm = sub.match(rest) if sub else None
+                if sm:
+                    entry["reason"], entry["words"] = sm.group("reason"), sm.group("words")
+                f["stand"].append(entry)
+                continue
+            m = FLATU_WARN_RE.match(raw)
+            if m:
+                f["warns"].append({"ts": m.group("ts") or "", "what": m.group("what"), "reason": m.group("reason"), "mode": m.group("mode"),
+                                   "flags": m.group("flags") or "", "words": m.group("words") or "", "index": index})
+                continue
+            m = FLATU_REFUSAL_RE.match(raw)
+            if m:
+                f["refusals"][m.group("reason")] = f["refusals"].get(m.group("reason"), 0) + int(m.group("count"))
+                continue
+            m = FLATU_RUNTIME_RE.match(raw)
+            if m:
+                f["flat"] = True
+                f["runtime"].append({"ts": m.group("ts") or "", "treated": int(m.group("treated")), "refused": int(m.group("refused")), "last": m.group("last")})
+        except (ValueError, TypeError):
+            continue
+    return f
+
+
+def flat_upscale_windows(f):
+    """Each `flat copy structure 5s:` window's tokens as numbers: [{ts, key, copies, whitelist, admitted, declined, selector_refused, no_scene,
+    render_size, route_serves, key_off, last, scene (w, h) or None, output (w, h) or None, source (w, h) or None, ldr_before_max, declines {why: n}}]."""
+    out = []
+    for w in f["windows"]:
+        kv = w["kv"]
+
+        def size(token):
+            m = re.match(r"^(\d+)x(\d+)$", kv.get(token, ""))
+            return (int(m.group(1)), int(m.group(2))) if m and int(m.group(1)) else None
+        declines = {}
+        text = kv.get("declines", "none")
+        if text != "none":
+            for part in text.split(","):
+                key, sep, value = part.rpartition(":")
+                if sep and value.isdigit():
+                    declines[key] = int(value)
+        out.append({"ts": w["ts"], "key": kv.get("key", "?"), "copies": _cint(kv.get("copies")) or 0, "whitelist": _cint(kv.get("whitelist")) or 0,
+                    "admitted": _cint(kv.get("admitted")) or 0, "declined": _cint(kv.get("declined")) or 0,
+                    "selector_refused": _cint(kv.get("selector-refused")) or 0, "no_scene": _cint(kv.get("no-scene")) or 0,
+                    "render_size": _cint(kv.get("render-size")) or 0, "route_serves": _cint(kv.get("route-serves")) or 0,
+                    "key_off": _cint(kv.get("key-off")) or 0, "last": kv.get("last", "?"), "scene": size("scene"), "output": size("output"),
+                    "source": size("source"), "ldr_before_max": _cint(kv.get("ldr-passes-before-max")) or 0, "declines": declines})
+    return out
+
+
+def flat_upscale_verdict(f):
+    """The verdict on one flight: [(tag, status, text)], status PASS, WARN, STOP or n/a (what the log cannot say). The tags are the questions the
+    flight plan asks: KEY (is the admission on), ADMISSION (did it run, and what did it see), TREATED (did frames get treated), UPSCALE (below the
+    output, by structure or by the whitelist), TONE REFUSALS (frames the whitelist refused for a tone pass and nothing admitted), STAND-DOWN (which
+    reasons stood the work down), F8 WARNING (what the panel said, and the startup false warning), CHAIN (a game anti-aliasing chain the structure
+    declined), ADVICE (the old supersampling advice must be gone)."""
+    out = []
+
+    def add(tag, status, text):
+        out.append((tag, status, text))
+
+    wins = flat_upscale_windows(f)
+    total = {k: sum(w[k] for w in wins) for k in ("copies", "whitelist", "admitted", "declined", "selector_refused", "no_scene", "render_size", "route_serves", "key_off")}
+    runtime = f["runtime"]
+    treated = (runtime[-1]["treated"] - runtime[0]["treated"]) if len(runtime) > 1 else (runtime[-1]["treated"] if runtime else 0)
+    # The AA rule's declines: the frames the windows counted (each cause is logged as a line once a session, so the lines are not a count of frames),
+    # or, with no window that counted them, the decline lines.
+    chain_lines = sum(1 for d in f["declines"] if "r-sized-image-passes" in d["why"])
+    chain_frames = sum(n for w in wins for why, n in w["declines"].items() if "r-sized-image-passes" in why)
+    passes_declines = chain_frames or chain_lines
+
+    # KEY
+    if f["keys"]:
+        last = f["keys"][-1]
+        if last["key"] == "auto":
+            add("KEY", "PASS", "experimental.temporal_aa_before_post=auto (%s): the game's final copy is admitted by structure where the HDR route does not serve the frame" % last["when"])
+        else:
+            add("KEY", "WARN", "experimental.temporal_aa_before_post=%s (%s): the copy route is the whitelist alone; nothing is admitted by structure" % (last["key"], last["when"]))
+    else:
+        add("KEY", "n/a", "no `flat hdr route:` key line (a build that predates the route, or a session that never reached a Present)")
+
+    # ADMISSION
+    if not wins:
+        add("ADMISSION", "STOP", "no `flat copy structure 5s:` window: the admission never ran (a build that predates section 83, or no temporal mode was selected)")
+    else:
+        add("ADMISSION", "PASS" if total["copies"] else "WARN", "%d window(s): copies %d, whitelist %d, admitted %d, declined %d, selector-refused %d, no-3d-scene %d, render-size %d, route-serves %d, key-off %d%s%s"
+            % (len(wins), total["copies"], total["whitelist"], total["admitted"], total["declined"], total["selector_refused"], total["no_scene"], total["render_size"],
+               total["route_serves"], total["key_off"],
+               "" if total["copies"] else "; NO final copy was ruled on in any window: the admission ran and had nothing to say (a session that never drew a 3D frame, or a copy the reducer never reached)",
+               "; first admission at frame %d (%dx%d image, scene %dx%d on %dx%d, route %s%s)" % (
+                   f["first"]["frame"], f["first"]["src"][0], f["first"]["src"][1], f["first"]["scene"][0], f["first"]["scene"][1], f["first"]["output"][0],
+                   f["first"]["output"][1], f["first"]["route"], ", the 3D menu" if f["first"]["menu"] else "") if f["first"] else "; no frame was admitted by structure"))
+
+    # TREATED
+    if not runtime:
+        add("TREATED", "n/a", "no `flat runtime:` line")
+    elif treated > 0:
+        add("TREATED", "PASS", "%d frame(s) treated over the log (the counter went %d -> %d)" % (treated, runtime[0]["treated"], runtime[-1]["treated"]))
+    else:
+        add("TREATED", "STOP", "no frame was treated (the counter stayed at %d; last verdict %s)" % (runtime[-1]["treated"], runtime[-1]["last"]))
+
+    # UPSCALE
+    below = [r for r in f["routes"] if r["r"][0] < r["d"][0] or r["r"][1] < r["d"][1]]
+    if not below:
+        add("UPSCALE", "n/a", "no frame rendered below the output in this log (no `flat route:` line with R under D)")
+    else:
+        names = sorted({"%s R=%dx%d D=%dx%d" % (r["name"], r["r"][0], r["r"][1], r["d"][0], r["d"][1]) for r in below})
+        if total["admitted"] > 0 and treated > 0:
+            add("UPSCALE", "PASS", "below the output (%s): %d frame(s) admitted by structure, treated" % ("; ".join(names), total["admitted"]))
+        elif total["whitelist"] > 0 and treated > 0:
+            add("UPSCALE", "PASS", "below the output (%s): the whitelist selected %d frame(s), treated; the structure had nothing to do (every frame had a known tone pass)" % ("; ".join(names), total["whitelist"]))
+        else:
+            add("UPSCALE", "STOP", "below the output (%s) and nothing was admitted or selected, or nothing treated" % "; ".join(names))
+
+    # TONE REFUSALS
+    tone = {r: n for r, n in f["refusals"].items() if r in FLATU_TONE_REASONS}
+    if not tone:
+        add("TONE REFUSALS", "PASS", "no frame was refused for a tone pass")
+    else:
+        text = ", ".join("%s %d" % (r, n) for r, n in sorted(tone.items()))
+        add("TONE REFUSALS", "WARN" if treated > 0 else "STOP", "%s frame(s) refused for a tone pass: %s" % (sum(tone.values()), text))
+
+    # STAND-DOWN
+    entered = [s for s in f["stand"] if s["what"] == "entered"]
+    if not entered:
+        add("STAND-DOWN", "PASS", "the work never stood down")
+    else:
+        worst, notes = "PASS", []
+        for s in entered:
+            reason = s["reason"] or "?"
+            if reason in FLATU_SILENT_REASONS:
+                status = "PASS"
+            elif reason == "render-size-does-not-fit-output":
+                status = "WARN"
+            elif reason in FLATU_TONE_REASONS and passes_declines:
+                status = "WARN"
+            else:
+                status = "STOP"
+            notes.append("%s%s: %s%s" % (s["ts"] or "?", "", reason, " (%s)" % s["words"] if s["words"] else ""))
+            worst = "STOP" if status == "STOP" or worst == "STOP" else ("WARN" if status == "WARN" or worst == "WARN" else "PASS")
+        add("STAND-DOWN", worst, "%d stand-down(s): %s%s" % (len(entered), "; ".join(notes),
+            "" if worst == "PASS" else " (no-3d-scene is a startup or a loading screen, silent; render-size-does-not-fit-output is Elite's resolution not being the screen's shape; a tone refusal "
+                                            "with declines for R-sized passes is a game anti-aliasing chain; anything else is a chain nothing recognised)"))
+
+    # F8 WARNING
+    shown = [w for w in f["warns"] if w["what"] in ("shown", "changed")]
+    if not shown:
+        add("F8 WARNING", "PASS", "the panel showed no warning")
+    else:
+        first_scene = min([i for i in f["triggers"]] + ([f["first"]["index"]] if f["first"] else []) or [10 ** 9])
+        worst, notes = "PASS", []
+        for w in shown:
+            reason = w["reason"] or "?"
+            if w["index"] < first_scene and reason != "render-size-does-not-fit-output":
+                status, why = "STOP", "BEFORE ANY SCENE: the false startup warning"
+            elif reason == "render-size-does-not-fit-output":
+                status, why = "WARN", "the render size"
+            elif reason in FLATU_TONE_REASONS and passes_declines:
+                status, why = "WARN", "a game anti-aliasing chain, Anti-aliasing advised"
+            else:
+                status, why = "STOP", "an unrecognised chain"
+            notes.append("%s %s (%s): %s" % (w["ts"] or "?", reason, why, w["words"][:110]))
+            worst = "STOP" if status == "STOP" or worst == "STOP" else ("WARN" if status == "WARN" or worst == "WARN" else "PASS")
+        add("F8 WARNING", worst, "%d warning(s): %s" % (len(shown), " | ".join(notes)))
+
+    # CHAIN
+    if not wins:
+        add("CHAIN", "n/a", "no window")
+    elif passes_declines:
+        longest = max([d["passes"] for d in f["declines"]] + [w["ldr_before_max"] for w in wins])
+        add("CHAIN", "WARN", "the structure declined %s with R-sized image passes between the scene HDR's first consumer and the copy (the longest chain: %d): "
+            "the game's anti-aliasing filter, which the structure leaves refused; turn Anti-aliasing off in Elite"
+            % ("%d frame(s)" % chain_frames if chain_frames else "frames (%d decline line(s); no window counted them)" % chain_lines, longest))
+    else:
+        add("CHAIN", "PASS", "no R-sized image pass between the scene HDR's first consumer and the copy (the longest chain seen: %d)" % max([w["ldr_before_max"] for w in wins] + [0]))
+
+    # ADVICE
+    if f["old_advice"]:
+        add("ADVICE", "STOP", "the old supersampling advice is in this log (\"Supersampling is below 1.0\"): a build from before section 83, or the advice is back")
+    else:
+        add("ADVICE", "PASS", "the supersampling advice is gone (below 1.0 is supported)")
+    return out
+
+
+def flat_upscale_summary(verdict):
+    counts = {"PASS": 0, "WARN": 0, "STOP": 0, "n/a": 0}
+    for _, status, _ in verdict:
+        counts[status] = counts.get(status, 0) + 1
+    worst = "STOP" if counts["STOP"] else ("WARN" if counts["WARN"] else ("PASS" if counts["PASS"] else "n/a"))
+    return "flat upscale verdict: %s (%d PASS, %d WARN, %d STOP, %d n/a)" % (worst, counts["PASS"], counts["WARN"], counts["STOP"], counts["n/a"])
+
+
+def print_flat_upscale(text):
+    """The --flat-upscale report. Returns the process exit code: 0 when the log has any flat line, 1 when it has none (a VR log, or no flat session);
+    the verdict never changes the exit code (read its lines)."""
+    f = parse_flat_upscale(text)
+    wins = flat_upscale_windows(f)
+    if not (f["keys"] or wins or f["runtime"] or f["stand"] or f["warns"]):
+        print("[edvr] no flat-profile line in this log (a VR session, or a build that predates the flat runtime).")
+        return 1
+    print("[edvr] flat upscale: %d key line(s), %d copy-structure window(s), %d route line(s), %d stand-down line(s), %d warning line(s), %d decline line(s)"
+          % (len(f["keys"]), len(wins), len(f["routes"]), len(f["stand"]), len(f["warns"]), len(f["declines"])))
+    for k in f["keys"]:
+        print("key %s: experimental.temporal_aa_before_post=%s (%s)" % (k["ts"] or "?", k["key"], k["when"]))
+    for r in f["routes"]:
+        print("route %s: %s R=%dx%d E=%dx%d D=%dx%d" % (r["ts"] or "?", r["name"], r["r"][0], r["r"][1], r["e"][0], r["e"][1], r["d"][0], r["d"][1]))
+    if f["first"]:
+        fi = f["first"]
+        print("first admission %s at frame %d: a %dx%d image, scene %dx%d on a %dx%d output, route %s%s; the whitelist said %s"
+              % (fi["ts"] or "?", fi["frame"], fi["src"][0], fi["src"][1], fi["scene"][0], fi["scene"][1], fi["output"][0], fi["output"][1], fi["route"],
+                 " (the 3D menu)" if fi["menu"] else "", fi["whitelist"]))
+    for d in f["declines"]:
+        print("declined %s: %s (the whitelist said %s; a %dx%d image, %d R-sized pass(es) between)" % (d["ts"] or "?", d["why"], d["wl"], d["src"][0], d["src"][1], d["passes"]))
+    for w in wins:
+        print("window %s: key=%s copies %d (whitelist %d, admitted %d, declined %d, selector-refused %d, no-3d-scene %d, render-size %d, route-serves %d, key-off %d); last %s; "
+              "scene %s output %s source %s; longest chain %d%s"
+              % (w["ts"] or "?", w["key"], w["copies"], w["whitelist"], w["admitted"], w["declined"], w["selector_refused"], w["no_scene"], w["render_size"], w["route_serves"],
+                 w["key_off"], w["last"], "%dx%d" % w["scene"] if w["scene"] else "-", "%dx%d" % w["output"] if w["output"] else "-", "%dx%d" % w["source"] if w["source"] else "-",
+                 w["ldr_before_max"], "; declines " + ", ".join("%s:%d" % kv for kv in sorted(w["declines"].items())) if w["declines"] else ""))
+    for s in f["stand"]:
+        print("stand-down %s: %s%s%s" % (s["ts"] or "?", s["what"], " for %s" % s["reason"] if s["reason"] else "", " (%s)" % s["words"] if s["words"] else ""))
+    for w in f["warns"]:
+        print("F8 warning %s: %s%s%s" % (w["ts"] or "?", w["what"], " for %s" % w["reason"] if w["reason"] else "", ": %s" % w["words"][:200] if w["words"] else ""))
+    if f["refusals"]:
+        print("refusals (summed from `flat runtime refusal 5s:`): " + ", ".join("%s %d" % kv for kv in sorted(f["refusals"].items(), key=lambda kv: -kv[1])))
+    verdict = flat_upscale_verdict(f)
+    for tag, status, text_ in verdict:
+        print("%s (%s) %s" % (status, tag, text_))
+    print(flat_upscale_summary(verdict))
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------
+# --vr-supersampling: Elite's Supersampling below 1.0 in VR, read from the render sizes (design doc section 83, the VR warning). The lines are
+# src/common/vr_supersample_notice.h's log line (once a session), vscreen.cpp's own adoption line it follows, and menu.cpp's note that the
+# headset notice was queued. tools\vscreen_fit_test (R13) holds the formatter and the wiring; this reader's self-test builds the lines from
+# the header's own text.
+# ---------------------------------------------------------------------------------------------------------------------------------------
+VRSS_RE = re.compile(FLATU_TS + r"vr supersampling: Elite draws the 3D world at (?P<rw>\d+)x(?P<rh>\d+), (?P<pct>\d+)% of the (?P<ew>\d+)x(?P<eh>\d+) eye texture, and scales it up before EDVR sees it: ")
+VRSS_ADOPT_RE = re.compile(FLATU_TS + r"vScreen: the world on this rig is rendered at (?P<rw>\d+)x(?P<rh>\d+) and scaled into the (?P<ew>\d+)x(?P<eh>\d+) the headset is handed -- (?P<pct>\d+)% of the width")
+VRSS_QUEUED_RE = re.compile(FLATU_TS + r"vr supersampling: (?:the headset notice is queued as a toast|menu\.toasts is off, so no toast)")
+VRSS_BELOW_PERCENT = 98    # kBelowPercent in src/common/vr_supersample_notice.h
+
+
+def vrss_below(r, e):
+    """vrss::below: the render size under kBelowPercent of the eye's width AND height, an exact compare (the percent in the log is rounded,
+    so 97.6% reads 98 there and is still below)."""
+    return bool(r[0] and r[1] and e[0] and e[1] and r[0] * 100 < e[0] * VRSS_BELOW_PERCENT and r[1] * 100 < e[1] * VRSS_BELOW_PERCENT)
+
+
+def parse_vr_supersampling(text):
+    """{notice: {ts, r, pct, e} or None, adopt: {ts, r, e, pct} or None, queued: ts or None, toast: bool, flat: bool}."""
+    f = {"notice": None, "adopt": None, "queued": None, "toast": False, "flat": False}
+    for raw in text.splitlines():
+        try:
+            m = VRSS_RE.match(raw)
+            if m:
+                if f["notice"] is None:
+                    f["notice"] = {"ts": m.group("ts") or "", "r": (int(m.group("rw")), int(m.group("rh"))), "pct": int(m.group("pct")), "e": (int(m.group("ew")), int(m.group("eh")))}
+                continue
+            m = VRSS_ADOPT_RE.match(raw)
+            if m:
+                if f["adopt"] is None:
+                    f["adopt"] = {"ts": m.group("ts") or "", "r": (int(m.group("rw")), int(m.group("rh"))), "e": (int(m.group("ew")), int(m.group("eh"))), "pct": int(m.group("pct"))}
+                continue
+            m = VRSS_QUEUED_RE.match(raw)
+            if m:
+                if f["queued"] is None:
+                    f["queued"] = m.group("ts") or "?"
+                    f["toast"] = "queued as a toast" in raw
+                continue
+            if FLATU_RUNTIME_RE.match(raw) or FLATU_KEY_RE.match(raw):
+                f["flat"] = True
+        except (ValueError, TypeError):
+            continue
+    return f
+
+
+def vr_supersampling_verdict(f):
+    """[(tag, status, text)]: NOTICE (the log line, from the measured sizes), CONSISTENT (it agrees with vScreen's own adoption line), HEADSET (the
+    toast was queued, and the Status page's hint has it while the menu is open), FLAT (a flat log never carries it)."""
+    out = []
+
+    def add(tag, status, text):
+        out.append((tag, status, text))
+
+    n, a = f["notice"], f["adopt"]
+    if f["flat"] and (n or a or f["queued"]):
+        add("FLAT", "STOP", "a flat-profile log carries the VR notice: it must never")
+    elif f["flat"]:
+        add("FLAT", "PASS", "a flat-profile log, and no VR notice in it")
+    if n:
+        if vrss_below(n["r"], n["e"]):
+            add("NOTICE", "PASS", "the world is drawn at %dx%d, %d%% of the %dx%d eye texture: Elite's Supersampling is below 1 (or an upscaler sits in the chain)"
+                % (n["r"][0], n["r"][1], n["pct"], n["e"][0], n["e"][1]))
+        else:
+            add("NOTICE", "STOP", "the notice names %dx%d against a %dx%d eye (%d%%), which is not below %d%% on both axes" % (n["r"][0], n["r"][1], n["e"][0], n["e"][1], n["pct"], VRSS_BELOW_PERCENT))
+    elif a and vrss_below(a["r"], a["e"]):
+        add("NOTICE", "STOP", "vScreen measured the world at %d%% of the eye (%dx%d in %dx%d) and no `vr supersampling:` line followed: the detection did not run" % (a["pct"], a["r"][0], a["r"][1], a["e"][0], a["e"][1]))
+    elif a:
+        add("NOTICE", "n/a", "vScreen measured the world at %d%% of the eye: not below %d%% on both axes, so no notice is right" % (a["pct"], VRSS_BELOW_PERCENT))
+    else:
+        add("NOTICE", "n/a", "vScreen adopted no render size: the world may be drawn at the eye's own size, or vScreen's guards held the adoption back (read its `vScreen:` lines), "
+                             "or no scene was drawn yet. Elite's Supersampling below 1 cannot be ruled out from this log")
+    if n and a:
+        if n["r"] == a["r"] and n["e"] == a["e"]:
+            add("CONSISTENT", "PASS", "the notice's sizes are vScreen's own adoption line's")
+        else:
+            add("CONSISTENT", "STOP", "the notice says %dx%d in %dx%d, vScreen's adoption line %dx%d in %dx%d" % (n["r"] + n["e"] + a["r"] + a["e"]))
+    elif n:
+        add("CONSISTENT", "WARN", "no vScreen adoption line to check the notice against")
+    if n:
+        if f["queued"]:
+            add("HEADSET", "PASS", "%s (%s)" % ("the headset notice was queued as a toast" if f["toast"] else "menu.toasts is off: no toast", f["queued"]) + "; the Status page shows the advice as its hint while the menu is open")
+        else:
+            add("HEADSET", "WARN", "no `vr supersampling:` menu line: the headset notice was not queued (the menu may not have ticked yet)")
+    return out
+
+
+def print_vr_supersampling(text):
+    """The --vr-supersampling report. Returns 0 when the log has any of the lines, 1 when it has none; the verdict never changes the exit code."""
+    f = parse_vr_supersampling(text)
+    if not (f["notice"] or f["adopt"] or f["queued"]):
+        print("[edvr] no `vr supersampling:` or vScreen render-size line in this log (the world may be drawn at the eye's own size, or vScreen's guards held the "
+              "adoption back, or this is a build that predates section 83: Supersampling below 1 cannot be ruled out from it).")
+        return 1
+    if f["adopt"]:
+        a = f["adopt"]
+        print("adoption %s: the world is drawn at %dx%d and scaled into the %dx%d the headset is handed (%d%% of the width)" % (a["ts"] or "?", a["r"][0], a["r"][1], a["e"][0], a["e"][1], a["pct"]))
+    if f["notice"]:
+        n = f["notice"]
+        print("notice %s: %dx%d, %d%% of the %dx%d eye texture" % (n["ts"] or "?", n["r"][0], n["r"][1], n["pct"], n["e"][0], n["e"][1]))
+    verdict = vr_supersampling_verdict(f)
+    for tag, status, text_ in verdict:
+        print("%s (%s) %s" % (status, tag, text_))
+    counts = {"PASS": 0, "WARN": 0, "STOP": 0, "n/a": 0}
+    for _, status, _ in verdict:
+        counts[status] = counts.get(status, 0) + 1
+    worst = "STOP" if counts["STOP"] else ("WARN" if counts["WARN"] else ("PASS" if counts["PASS"] else "n/a"))
+    print("vr supersampling verdict: %s (%d PASS, %d WARN, %d STOP, %d n/a)" % (worst, counts["PASS"], counts["WARN"], counts["STOP"], counts["n/a"]))
+    return 0
+
+
 # --route-curve: the curved VR world route (docs/design-flat-temporal-aa-2026-09-23.md, section 82, "The curved route").
 # With fix.panel_curvature above 0 the route's layer re-issues the screen through the very strip the game's own draw is substituted with
 # (src/d3d11/panel_curve.cpp panelCurveReissue), and the route's log says so: its 5 s line (src/d3d11/vr_world_route_math.h
@@ -5155,6 +5592,16 @@ def main(argv=None):
                          "its stability, shape and 1/d law, against Sean's 3504 "
                          "calibration point) and what is stored for the next launch; "
                          "PASS / WARN / STOP lines")
+    ap.add_argument("--flat-upscale", action="store_true",
+                    help="report a flat-profile flight (design doc section 83): the final copy admitted by "
+                         "structure, so DLSS, FSR and TAA resolve below the output whatever the post chain; the "
+                         "key, routes, first admission, declines, 5 s windows, stand-down and F8 warning lines, "
+                         "and KEY / ADMISSION / TREATED / UPSCALE / TONE REFUSALS / STAND-DOWN / F8 WARNING / "
+                         "CHAIN / ADVICE PASS / WARN / STOP lines")
+    ap.add_argument("--vr-supersampling", action="store_true",
+                    help="report a VR flight's Elite-supersampling-below-1 notice (design doc section 83): "
+                         "the `vr supersampling:` line from the measured render size, vScreen's adoption line "
+                         "and the headset notice; NOTICE / CONSISTENT / HEADSET / FLAT lines")
     ap.add_argument("--route-curve", action="store_true",
                     help="report a curved VR world route flight (fix.panel_curvature above 0 "
                          "with experimental.temporal_aa_on_foot_world = auto): the route's 5 s "
@@ -5266,6 +5713,10 @@ def main(argv=None):
 
     if args.vscreen_fit:
         return print_vscreen_fit(text)
+    if args.flat_upscale:
+        return print_flat_upscale(text)
+    if args.vr_supersampling:
+        return print_vr_supersampling(text)
     if args.camera_census:
         return print_camera_census(text)
     if args.maps_sharp:
@@ -5617,11 +6068,260 @@ def self_test():
         ok = False
     if not self_test_vscreen_fit():
         ok = False
+    if not self_test_flat_upscale():
+        ok = False
     if not self_test_route_curve():
         ok = False
 
     print("self-test: %s" % ("ok" if ok else "FAILED"))
     return 0 if ok else 1
+
+
+FLATU_FIXTURE = "flat_upscale_fixture.log"
+
+
+def self_test_flat_upscale():
+    """--flat-upscale on the checked-in synthetic flight (tools\\flat_upscale_fixture.log, which tools\\flat_temporal_test holds to exactly what the DLL's
+    formatters write): a good flight below the output, then each episode appended to it, then logs altered to take away each thing the report
+    depends on and to break each thing the verdict judges; and --vr-supersampling on lines built from the header's own text. Returns ok."""
+    import contextlib
+    import io
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("flat upscale: %s" % msg)
+        ok = False
+
+    def report(text, fn=None):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = (fn or print_flat_upscale)(text)
+        return rc, buf.getvalue()
+
+    def statuses(text, fn=None):
+        """{tag: status} of the verdict lines of a log, and the whole report."""
+        _, out = report(text, fn)
+        found = {}
+        for line in out.splitlines():
+            m = re.match(r"^(PASS|WARN|STOP|n/a) \(([A-Z0-9 -]+)\) ", line)
+            if m:
+                found[m.group(2)] = m.group(1)
+        return found, out
+
+    def sub(text, old, new, count=-1):
+        """text with `old` replaced by `new`; fails the test (and returns text) when `old` is not there: a mutation that changes nothing would pass
+        every check for the wrong reason."""
+        if old not in text:
+            fail("the mutation %r -> %r found nothing to change" % (old, new))
+            return text
+        return text.replace(old, new, count)
+
+    def want_statuses(text, want, label):
+        got, out = statuses(text)
+        for tag, status in want.items():
+            if got.get(tag) != status:
+                fail("%s: %s is %r, wanted %r:\n%s" % (label, tag, got.get(tag), status, out))
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    fixture = os.path.join(here, FLATU_FIXTURE)
+    if not os.path.isfile(fixture):
+        fail("the fixture %s is missing beside this script" % FLATU_FIXTURE)
+        return False
+    whole = read_text(fixture)
+    segments, current = {"base": []}, "base"
+    for line in whole.splitlines():
+        m = re.match(r"^# episode: (.+)$", line)
+        if m:
+            current = m.group(1)
+            segments[current] = []
+        else:
+            segments[current].append(line)
+    base = "\n".join(segments["base"]) + "\n"
+    if sorted(segments) != ["base", "game-aa", "old-advice", "render-size"]:
+        fail("the fixture's segments are %r" % sorted(segments))
+        return False
+
+    def with_episode(name):
+        return base + "\n".join(segments[name]) + "\n"
+
+    # ---- the parser, on the good flight ----
+    f = parse_flat_upscale(base)
+    if len(f["keys"]) != 1 or f["keys"][0]["key"] != "auto" or f["keys"][0]["when"] != "read at startup" or len(f["windows"]) != 5 or len(f["routes"]) != 1 or \
+            f["routes"][0]["r"] != (2880, 1620) or f["routes"][0]["d"] != (3840, 2160) or f["routes"][0]["name"] != "trained-upscale" or len(f["runtime"]) != 5:
+        fail("the fixture's key, windows, route and runtime lines parsed as %r" % ({k: (v if k in ("keys", "routes") else len(v) if isinstance(v, list) else v) for k, v in f.items()},))
+    fi = f["first"]
+    if not fi or (fi["frame"], fi["src"], fi["scene"], fi["output"], fi["whitelist"], fi["route"], fi["menu"]) != \
+            (1919, (2880, 1620), (2880, 1620), (3840, 2160), "no-known-tone-pass", "trained-upscale", False):
+        fail("the first admission parsed as %r" % (fi,))
+    stand = [(s["what"], s["reason"]) for s in f["stand"]]
+    if stand != [("entered", "no-3d-scene"), ("resumed", None)] or f["warns"] or f["refusals"] != {"no-3d-scene": 1482} or f["old_advice"]:
+        fail("the stand-down, warning and refusal lines parsed as %r %r %r" % (stand, f["warns"], f["refusals"]))
+    w = flat_upscale_windows(f)
+    if len(w) != 5 or (w[0]["copies"], w[0]["no_scene"], w[0]["admitted"], w[0]["last"], w[0]["scene"], w[0]["output"]) != (741, 741, 0, "no-scene", None, (3840, 2160)) or \
+            (w[2]["admitted"], w[2]["copies"], w[2]["scene"], w[2]["source"], w[2]["ldr_before_max"], w[2]["last"]) != (331, 331, (2880, 1620), (2880, 1620), 0, "admitted"):
+        fail("the fixture's windows parsed as %r" % (w,))
+    # A line cut short or garbled is skipped, never fatal.
+    g = parse_flat_upscale("flat copy structure 5s: key=auto copies=x\nflat stand-down: entered at frame=zz\nflat route: trained-upscale R=\n"
+                           "flat settings warning: shown (mode=\nflat runtime: treated=\nnothing at all\n")
+    if g["first"] is not None or g["routes"] or g["runtime"] or len(g["windows"]) != 1:
+        fail("a cut-short line was mis-parsed: %r" % (g,))
+
+    # ---- the report on the good flight: every question PASSes ----
+    rc, out = report(base)
+    flat = re.sub(r"[ ]+", " ", out)
+    for want in (
+            "[edvr] flat upscale: 1 key line(s), 5 copy-structure window(s), 1 route line(s), 2 stand-down line(s), 0 warning line(s), 0 decline line(s)",
+            "key 15:12:02.151: experimental.temporal_aa_before_post=auto (read at startup)",
+            "route 15:12:18.913: trained-upscale R=2880x1620 E=3840x2160 D=3840x2160",
+            "first admission 15:12:18.914 at frame 1919: a 2880x1620 image, scene 2880x1620 on a 3840x2160 output, route trained-upscale; the whitelist said no-known-tone-pass",
+            "window 15:12:21.149: key=auto copies 331 (whitelist 0, admitted 331, declined 0, selector-refused 0, no-3d-scene 0, render-size 0, route-serves 0, key-off 0); last admitted; "
+            "scene 2880x1620 output 3840x2160 source 2880x1620; longest chain 0",
+            "stand-down 15:12:08.368: entered for no-3d-scene",
+            "stand-down 15:12:18.903: resumed",
+            "PASS (KEY) experimental.temporal_aa_before_post=auto (read at startup)",
+            "PASS (ADMISSION) 5 window(s): copies 1753, whitelist 0, admitted 1009, declined 0, selector-refused 0, no-3d-scene 744, render-size 0, route-serves 0, key-off 0; first admission at frame 1919",
+            "PASS (TREATED) 1009 frame(s) treated over the log (the counter went 0 -> 1009)",
+            "PASS (UPSCALE) below the output (trained-upscale R=2880x1620 D=3840x2160): 1009 frame(s) admitted by structure, treated",
+            "PASS (TONE REFUSALS) no frame was refused for a tone pass",
+            "PASS (STAND-DOWN) 1 stand-down(s): 15:12:08.368: no-3d-scene",
+            "PASS (F8 WARNING) the panel showed no warning",
+            "PASS (CHAIN) no R-sized image pass between the scene HDR's first consumer and the copy (the longest chain seen: 0)",
+            "PASS (ADVICE) the supersampling advice is gone (below 1.0 is supported)",
+            "flat upscale verdict: PASS (9 PASS, 0 WARN, 0 STOP, 0 n/a)"):
+        if want not in flat:
+            fail("the good flight's report lacks %r:\n%s" % (want, out))
+    if rc != 0:
+        fail("the good flight reported exit %d" % rc)
+
+    # ---- the episodes ----
+    want_statuses(with_episode("render-size"), {"KEY": "PASS", "ADMISSION": "PASS", "TREATED": "PASS", "STAND-DOWN": "WARN", "F8 WARNING": "WARN", "CHAIN": "PASS", "ADVICE": "PASS"},
+                  "a render size that does not fit")
+    _, out = statuses(with_episode("render-size"))
+    flat = re.sub(r"[ ]+", " ", out)
+    for want in ("stand-down 15:14:28.335: entered for render-size-does-not-fit-output (Elite renders 2176x1224 on a 2560x1600 screen)",
+                 "F8 warning 15:14:28.335: shown for render-size-does-not-fit-output: DLSS is not active: Elite renders 2176x1224 on a 2560x1600 screen. | Set Elite's resolution to your screen's",
+                 "WARN (F8 WARNING) 1 warning(s): 15:14:28.335 render-size-does-not-fit-output (the render size)",
+                 "flat upscale verdict: WARN"):
+        if want not in flat:
+            fail("the render-size episode's report lacks %r:\n%s" % (want, out))
+    want_statuses(with_episode("game-aa"), {"TONE REFUSALS": "WARN", "STAND-DOWN": "WARN", "F8 WARNING": "WARN", "CHAIN": "WARN", "ADMISSION": "PASS", "ADVICE": "PASS"}, "a game AA chain")
+    _, out = statuses(with_episode("game-aa"))
+    flat = re.sub(r"[ ]+", " ", out)
+    for want in ("declined 15:16:40.100: r-sized-image-passes-follow-the-first-consumer-of-the-scene-hdr (the whitelist said no-known-tone-pass; a 2880x1620 image, 2 R-sized pass(es) between)",
+                 "WARN (CHAIN) the structure declined 600 frame(s) with R-sized image passes", "(the longest chain: 2)"):
+        if want not in flat:
+            fail("the game-AA episode's report lacks %r:\n%s" % (want, out))
+    # The CHAIN count is the windows' frames, not the decline lines (one line a cause a session); with no window that counted them it says lines.
+    no_counts = re.sub(r"(declines=)r-sized-image-passes-follow-the-first-consumer-of-the-scene-hdr:\d+", r"\1none", with_episode("game-aa"))
+    _, out = statuses(no_counts)
+    if "frames (1 decline line(s); no window counted them)" not in re.sub(r"[ ]+", " ", out):
+        fail("a game-AA log whose windows counted no declines should name the decline lines, not call them frames:\n%s" % out)
+    want_statuses(with_episode("old-advice"), {"ADVICE": "STOP", "F8 WARNING": "STOP"}, "a build from before section 83")
+
+    # ---- take away what the report depends on, and break what the verdict judges ----
+    no_windows = "\n".join(l for l in base.splitlines() if "flat copy structure 5s:" not in l) + "\n"
+    rc, out = report(no_windows)
+    got, _ = statuses(no_windows)
+    if got.get("ADMISSION") != "STOP" or rc != 0 or got.get("UPSCALE") != "STOP":
+        fail("a flight with no admission window should say ADMISSION STOP and (nothing admitted below the output) UPSCALE STOP, exit 0: %r rc=%d" % (got, rc))
+    want_statuses(sub(base, "temporal_aa_before_post=auto (read at startup)", "temporal_aa_before_post=off (read at startup)"), {"KEY": "WARN"}, "the key off")
+    no_key = "\n".join(l for l in base.splitlines() if "flat hdr route:" not in l) + "\n"
+    want_statuses(no_key, {"KEY": "n/a", "ADMISSION": "PASS"}, "no key line")
+    # Windows that never ruled on a final copy: the admission ran and had nothing to say, which is not a PASS.
+    no_copies = "\n".join(re.sub(r"(copies|whitelist|admitted|no-scene)=\d+", r"\1=0", l) if "flat copy structure 5s:" in l else l for l in base.splitlines()) + "\n"
+    want_statuses(no_copies, {"ADMISSION": "WARN"}, "windows with no final copy")
+    _, out = statuses(no_copies)
+    if "NO final copy was ruled on in any window" not in out:
+        fail("windows with copies=0 should say no final copy was ruled on:\n%s" % out)
+    untreated = re.sub(r"flat runtime: treated=\d+", "flat runtime: treated=0", base)
+    want_statuses(untreated, {"TREATED": "STOP", "UPSCALE": "STOP"}, "nothing treated")
+    no_runtime = "\n".join(l for l in base.splitlines() if "flat runtime:" not in l) + "\n"
+    want_statuses(no_runtime, {"TREATED": "n/a", "UPSCALE": "STOP"}, "no runtime lines")
+    no_route = "\n".join(l for l in base.splitlines() if "flat route:" not in l) + "\n"
+    want_statuses(no_route, {"UPSCALE": "n/a"}, "no route line")
+    # The startup false warning: a warning shown before any scene is a STOP, whatever it says.
+    startup = sub(base, "[15:12:08.368] flat stand-down: entered", "[15:12:08.360] flat settings warning: shown (mode=DLSS, frames refused for no-known-tone-pass, work stood down): DLSS is not "
+                  "active: Elite's post-processing is not recognised. Turn off in Elite's graphics options: Anti-aliasing, Bloom, Depth of field\n[15:12:08.368] flat stand-down: entered", 1)
+    want_statuses(startup, {"F8 WARNING": "STOP"}, "the false startup warning")
+    _, out = statuses(startup)
+    if "BEFORE ANY SCENE" not in out:
+        fail("the false startup warning is not named:\n%s" % out)
+    # A stand-down for a chain nothing recognised (no declines to explain it) is a STOP.
+    chain = base + "\n".join(l for l in segments["game-aa"] if "flat stand-down:" in l or "flat runtime refusal" in l) + "\n"
+    want_statuses(chain, {"STAND-DOWN": "STOP", "TONE REFUSALS": "WARN"}, "an unrecognised chain")
+    hdr = base + "[15:20:00.000] flat stand-down: entered at frame=9: every frame for 5.0 s (400 frames) was refused for no-hdr-consumer, none treated; paused: x\n"
+    want_statuses(hdr, {"STAND-DOWN": "STOP"}, "a missing HDR consumer")
+    # Tone refusals with nothing treated are a STOP rather than a WARN.
+    want_statuses(untreated + "[15:20:00.000] flat runtime refusal 5s: reason=no-known-tone-pass count=500\n", {"TONE REFUSALS": "STOP"}, "refusals with nothing treated")
+    # A VR log has no flat lines: exit 1.
+    rc, out = report("[10:00:00.000] version v0.18.0 (build 1)\n[10:00:01.000] vScreen: something\n")
+    if rc != 1 or "no flat-profile line" not in out:
+        fail("a log with no flat line should exit 1 and say so: rc=%d %r" % (rc, out))
+    # This reader's copy of the header's key text: the fixture's key line is the runtime's.
+    runtime_cpp = os.path.join(os.path.dirname(here), "src", "d3d11", "flat_runtime.cpp")
+    if os.path.isfile(runtime_cpp):
+        r = read_text(runtime_cpp)
+        if "flat hdr route: experimental.temporal_aa_before_post=%s%s at frame=%llu: %s" not in r:
+            fail("src\\d3d11\\flat_runtime.cpp no longer writes the key line this reader parses")
+    else:
+        fail("src\\d3d11\\flat_runtime.cpp is not where the self-test looks for it (%s)" % runtime_cpp)
+
+    # ---- --vr-supersampling, from the header's own text ----
+    header = os.path.join(os.path.dirname(here), "src", "common", "vr_supersample_notice.h")
+    vscreen = os.path.join(os.path.dirname(here), "src", "d3d11", "vscreen.cpp")
+    notice_prefix = "vr supersampling: Elite draws the 3D world at %ux%u, %u%% of the %ux%u eye texture, and scales it up before EDVR sees it: "
+    adopt_prefix = "vScreen: the world on this rig is rendered at %ux%u and scaled into the %ux%u the headset is handed -- %u%% of the width"
+    if os.path.isfile(header):
+        if notice_prefix.replace("\\", "") not in read_text(header).replace("\"\n        \"", ""):
+            fail("src\\common\\vr_supersample_notice.h's log line is not the text this reader parses")
+        if kBelow := re.search(r"constexpr uint32_t kBelowPercent = (\d+);", read_text(header)):
+            if int(kBelow.group(1)) != VRSS_BELOW_PERCENT:
+                fail("this reader's VRSS_BELOW_PERCENT (%d) is not the header's kBelowPercent (%s)" % (VRSS_BELOW_PERCENT, kBelow.group(1)))
+        else:
+            fail("kBelowPercent was not found in the header")
+    else:
+        fail("src\\common\\vr_supersample_notice.h is not where the self-test looks for it (%s)" % header)
+    if os.path.isfile(vscreen):
+        if adopt_prefix.replace("%ux%u", "%ux%u") not in read_text(vscreen).replace("\"\n                \"", ""):
+            fail("src\\d3d11\\vscreen.cpp's adoption line is not the text this reader parses")
+    notice = ("[09:30:12.100] " + (notice_prefix % (2112, 2304, 75, 2816, 3072)) + "Elite's Supersampling is below 1 (an upscaler in the chain reads the same). EDVR's DLSS then upscales an "
+              "image that is already upscaled, which softens the world and the holograms. Set Elite's Supersampling to 1 and raise HMD Image Quality instead: EDVR's DLSS upscales from that. "
+              "Measured from the render sizes, not read from Elite's settings file.\n")
+    adopt = ("[09:30:12.098] " + (adopt_prefix % (2112, 2304, 2816, 3072, 75)) + ", which is what supersampling away from 1.0 and every upscaler in the chain do (FSR and NIS at their \"ultra quality\" are exactly this).\n")
+    queued = "[09:30:12.300] vr supersampling: the headset notice is queued as a toast (\"Elite Supersampling is below 1: use HMD Image Quality\"); the Status page shows the advice as its hint while the menu is open.\n"
+    vr = "[09:29:00.000] version v0.18.0-rc.5-26-g5ec0de01 (build 5EC0DE01) -- this DLL was linked 2026-10-01 20:05:44 UTC\n" + adopt + notice + queued
+    p = parse_vr_supersampling(vr)
+    if not p["notice"] or p["notice"]["r"] != (2112, 2304) or p["notice"]["pct"] != 75 or p["notice"]["e"] != (2816, 3072) or not p["adopt"] or p["adopt"]["pct"] != 75 or not p["queued"] or not p["toast"] or p["flat"]:
+        fail("the VR lines parsed as %r" % (p,))
+    want_statuses_vr = lambda text, want, label: [fail("%s: %s is %r, wanted %r" % (label, t, statuses(text, print_vr_supersampling)[0].get(t), s))
+                                                  for t, s in want.items() if statuses(text, print_vr_supersampling)[0].get(t) != s]
+    want_statuses_vr(vr, {"NOTICE": "PASS", "CONSISTENT": "PASS", "HEADSET": "PASS"}, "the good VR flight")
+    _, out = statuses(vr, print_vr_supersampling)
+    flat = re.sub(r"[ ]+", " ", out)
+    for want in ("adoption 09:30:12.098: the world is drawn at 2112x2304 and scaled into the 2816x3072 the headset is handed (75% of the width)",
+                 "notice 09:30:12.100: 2112x2304, 75% of the 2816x3072 eye texture",
+                 "PASS (NOTICE) the world is drawn at 2112x2304, 75% of the 2816x3072 eye texture: Elite's Supersampling is below 1",
+                 "PASS (CONSISTENT) the notice's sizes are vScreen's own adoption line's",
+                 "PASS (HEADSET) the headset notice was queued as a toast (09:30:12.300)",
+                 "vr supersampling verdict: PASS (3 PASS, 0 WARN, 0 STOP, 0 n/a)"):
+        if want not in flat:
+            fail("the VR report lacks %r:\n%s" % (want, out))
+    want_statuses_vr(adopt + queued, {"NOTICE": "STOP"}, "the adoption line and no notice (the detection did not run)")
+    want_statuses_vr(sub(sub(vr, "rendered at 2112x2304", "rendered at 2816x3072"), "75% of the width", "100% of the width").replace(notice, ""), {"NOTICE": "n/a"}, "a world at the eye's own size")
+    # The DLL's compare is exact on both axes; the percent in the log is rounded. 2751x3000 in 2816x3072 is 97.7% (logged as 98) and 97.7%: below.
+    near = vr.replace("2112x2304", "2751x3000").replace("75% of", "98% of")
+    want_statuses_vr(near, {"NOTICE": "PASS", "CONSISTENT": "PASS"}, "97.7 percent, logged as 98: below, since the DLL's compare is exact")
+    # One axis under the threshold and the other not is no notice (the DLL needs both).
+    one_axis = vr.replace("2112x2304", "2112x3070")
+    want_statuses_vr(one_axis, {"NOTICE": "STOP"}, "a notice for a world under the eye on one axis only")
+    want_statuses_vr(sub(vr, "scaled into the 2816x3072", "scaled into the 2800x3072"), {"CONSISTENT": "STOP"}, "sizes that disagree")
+    want_statuses_vr(vr.replace(queued, ""), {"HEADSET": "WARN"}, "no menu line")
+    want_statuses_vr(vr + "[09:31:00.000] flat runtime: treated=1 refused=0 last=treated-jittered\n", {"FLAT": "STOP"}, "a flat log with the notice")
+    rc, out = report("[09:00:00.000] version v0.18.0 (build 1)\n", print_vr_supersampling)
+    if rc != 1 or "no `vr supersampling:`" not in out:
+        fail("a log with no VR line should exit 1 and say so: rc=%d %r" % (rc, out))
+    return ok
 
 
 def self_test_maps_sharp():

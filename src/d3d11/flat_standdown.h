@@ -63,6 +63,11 @@ inline bool flatMonoReasonStructural(FlatMonoReason reason) {
     // the route recognises as its first consumer followed. Like the others it does not clear by
     // itself inside a scene. HdrExtent (render smaller than output) is not: the copy route serves it.
     case FlatMonoReason::NoHdrConsumer:
+    // The copy structure's (flat_copy_structure.h, section 83): the scene's render size does not fit the output (it
+    // changes only when the user changes Elite's resolution or supersampling), and a final copy with no scene in the
+    // frame (startup, a loading screen, a 2D menu), which stands the work down silently like no-known-output-copy.
+    case FlatMonoReason::RenderSize:
+    case FlatMonoReason::NoScene:
         return true;
     default:
         return false;
@@ -74,9 +79,13 @@ inline bool flatMonoReasonStructural(FlatMonoReason reason) {
 // pass, broken lineage, wrong order, and a copy that was found but is not unique or not valid.
 // Not NoOutputCopy: a frame with no final copy at all is a startup or loading frame, there is
 // nothing in Elite's settings to turn off, and the flight of 2026-09-30 (flight 052916) showed
-// the warning on every such start. It is still structural: the work stands down for it, silently.
+// the warning on every such start. It is still structural: the work stands down for it, silently. The same holds
+// for NoScene (section 83): a final copy found in a frame with no scene is a startup, a loading screen or a 2D menu
+// (the rc.5 user's startup showed the warning for ten seconds of pre-scene frames), so it stands the work down and says
+// nothing.
 inline bool flatMonoReasonWarrantsWarning(FlatMonoReason reason) {
-    return flatMonoReasonStructural(reason) && reason != FlatMonoReason::NoOutputCopy;
+    return flatMonoReasonStructural(reason) && reason != FlatMonoReason::NoOutputCopy &&
+           reason != FlatMonoReason::NoScene;
 }
 
 // What the runtime does in the frame that starts now.
@@ -265,13 +274,26 @@ private:
 // Three lines, each with a prefix a reader can search for. "flat stand-down:" never
 // appears in a session that never stood down; the periodic line repeats every 30 s
 // for as long as it lasts, so "never ran" and "stood down" cannot be confused.
-inline int flatStandDownFormatEntered(char* out, size_t size, uint64_t frame, const FlatStandDown& s) {
+// `renderSize` (section 83) is the render-size refusal's own measurement, in words ("Elite renders 2176x1224 on a
+// 2560x1600 screen"): it follows the reason's name, in brackets, wherever that reason is named, and only there. Null
+// (or empty) for a session that has none, and every line is then what it always was.
+inline const char* flatStandDownReasonText(char* buf, size_t cap, FlatMonoReason reason, const char* renderSize) {
+    if (reason == FlatMonoReason::RenderSize && renderSize && *renderSize) {
+        std::snprintf(buf, cap, "%s (%s)", flatMonoReasonName(reason), renderSize);
+        return buf;
+    }
+    return flatMonoReasonName(reason);
+}
+inline int flatStandDownFormatEntered(char* out, size_t size, uint64_t frame, const FlatStandDown& s,
+                                      const char* renderSize = nullptr) {
+    char reason[256];
     return std::snprintf(out, size,
         "flat stand-down: entered at frame=%llu: every frame for %.1f s (%llu frames) was refused for %s, "
         "none treated; paused: %s; re-probing one whole frame every %.1f s, resuming when a frame is "
         "treatable (a settings change in the game, or a loading screen ending)",
         static_cast<unsigned long long>(frame), static_cast<double>(s.enteredAfterMs) / 1000.0,
-        static_cast<unsigned long long>(s.enteredAfterFrames), flatMonoReasonName(s.enteredReason),
+        static_cast<unsigned long long>(s.enteredAfterFrames),
+        flatStandDownReasonText(reason, sizeof(reason), s.enteredReason, renderSize),
         kFlatStandDownPausedWork, static_cast<double>(kFlatStandDownProbeMs) / 1000.0);
 }
 // `why` is null for the ordinary resume (a probe frame was treatable); a wake names its cause.
@@ -289,16 +311,18 @@ inline int flatStandDownFormatResumed(char* out, size_t size, uint64_t frame, co
         static_cast<unsigned long long>(s.lastProbes));
 }
 inline int flatStandDownFormatStill(char* out, size_t size, uint64_t frame, const FlatStandDown& s,
-                                    uint64_t nowMs) {
+                                    uint64_t nowMs, const char* renderSize = nullptr) {
+    char entered[256], probe[256];
     return std::snprintf(out, size,
         "flat stand-down: still stood down at frame=%llu after %.0f s: refused for %s, %llu probes so far "
         "(last probe: %s), %llu frames skipped",
         static_cast<unsigned long long>(frame),
         static_cast<double>(nowMs > s.standSinceMs ? nowMs - s.standSinceMs : 0) / 1000.0,
-        flatMonoReasonName(s.enteredReason), static_cast<unsigned long long>(s.probes),
+        flatStandDownReasonText(entered, sizeof(entered), s.enteredReason, renderSize),
+        static_cast<unsigned long long>(s.probes),
         s.probeSeen == FlatFrameSeen::None ? "none yet"
         : s.probeSeen == FlatFrameSeen::Treatable ? "treatable"
-        : flatMonoReasonName(s.probeReason),
+        : flatStandDownReasonText(probe, sizeof(probe), s.probeReason, renderSize),
         static_cast<unsigned long long>(s.pausedFrames));
 }
 
