@@ -6,8 +6,8 @@ passes proves little until it is seen to FAIL on a header that breaks the rule i
 below it copies the production header into a temp directory OUTSIDE the repo, applies one textual edit (or a few that belong
 together), compiles the rig against that copy, runs it on the rule's cases, and requires the rig to fail on the check that
 belongs to the rule (the first line it prints after FAIL: starts with the label prefix the mutation names). Nothing is written
-inside the repo; the temp directory is removed at the end. The source pins (P1..P6) read the runtime's sources and are not
-mutated here.
+inside the repo; the temp directory is removed at the end. The source pins (P1..P8) read the runtime's sources and are not
+mutated here (P4a and P8 carry controls of their own: the same predicate over copies with one edit each must fail).
 
   python tools\\on_foot_maps_test\\mutants.py --self-test        text only: every anchor is found exactly once in the header as it
                                                                 is now, every label named is in the rig, and build.bat compiles
@@ -76,8 +76,8 @@ ON_COUNTS = "        static_cast<unsigned long long>(frame), kUiMapsHoldFrames, 
 TAKE_WORDS = '"on foot maps sharp: the layer TAKES the 2D screen at frame=%llu: no world camera named its source for %u frames in a row "'
 HAND_ARGS = ("        static_cast<unsigned long long>(eyesLayerOnly), static_cast<unsigned long long>(eyesNotEmpty), why ? why : \"?\");\n")
 WINDOW_GATE = 'world ? "world" : "panel"'
-WINDOW_RELEASES = '"releases=%u screen-takes=%u recognised=%u door-layer-only=%u door-not-empty=%u not-live-frames=%u",'
-WINDOW_ARGS = "w.releases, w.screenTakes, w.recognised, w.doorLayerOnly, w.doorNotEmpty, w.notLive);\n"
+WINDOW_RELEASES = '"releases=%u screen-takes=%u recognised=%u door-layer-only=%u door-not-empty=%u not-live-frames=%u screen-draws=%u",'
+WINDOW_ARGS = "w.releases, w.screenTakes, w.recognised, w.doorLayerOnly, w.doorNotEmpty, w.notLive, w.screenDraws);\n"
 WINDOW_RESET = "    void reset() { *this = UiMapsWindow{}; }\n"
 OFF_PANEL = '        wasPanel ? "; the layer held a panel at that moment and the gate now decides it again" : "");\n'
 
@@ -149,10 +149,21 @@ MUTANTS = [
     M("off-line-always-says-panel", "R8d", [(OFF_PANEL, '        "; the layer held a panel at that moment and the gate now decides it again");\n')], "the OFF line always says the layer held a panel"),
     # ---- R9: the 5 s window ----------------------------------------------------------------------------------------------------
     M("window-gate-inverted", "R9a", [(WINDOW_GATE, 'world ? "panel" : "world"')], "the window says panel for the world"),
-    M("window-counter-missing", "R9a", [(WINDOW_RELEASES, '"screen-takes=%u recognised=%u door-layer-only=%u door-not-empty=%u not-live-frames=%u",'),
-                                        (WINDOW_ARGS, "w.screenTakes, w.recognised, w.doorLayerOnly, w.doorNotEmpty, w.notLive);\n")],
+    M("window-counter-missing", "R9a", [(WINDOW_RELEASES, '"screen-takes=%u recognised=%u door-layer-only=%u door-not-empty=%u not-live-frames=%u screen-draws=%u",'),
+                                        (WINDOW_ARGS, "w.screenTakes, w.recognised, w.doorLayerOnly, w.doorNotEmpty, w.notLive, w.screenDraws);\n")],
       "the window leaves the releases out"),
     M("window-reset-incomplete", "R9c", [(WINDOW_RESET, "    void reset() { frames = 0; }\n")], "a window's reset zeroes one counter"),
+    # The composites the decision saw (design doc 8.10): the reader sets screen-draws against screen-takes, so it must be there, last, and its own.
+    M("window-draws-missing", "R9a", [(WINDOW_RELEASES, '"releases=%u screen-takes=%u recognised=%u door-layer-only=%u door-not-empty=%u not-live-frames=%u",'),
+                                      (WINDOW_ARGS, "w.releases, w.screenTakes, w.recognised, w.doorLayerOnly, w.doorNotEmpty, w.notLive);\n")],
+      "the window leaves screen-draws out, so the reader cannot tell a cockpit from composites drawn and not taken"),
+    M("window-draws-before-not-live", "R9a", [(WINDOW_RELEASES, '"releases=%u screen-takes=%u recognised=%u door-layer-only=%u door-not-empty=%u screen-draws=%u not-live-frames=%u",'),
+                                              (WINDOW_ARGS, "w.releases, w.screenTakes, w.recognised, w.doorLayerOnly, w.doorNotEmpty, w.screenDraws, w.notLive);\n")],
+      "screen-draws moves in front of not-live-frames, which the reader's pattern ends with"),
+    M("window-draws-prints-takes", "R9b", [(WINDOW_ARGS, "w.releases, w.screenTakes, w.recognised, w.doorLayerOnly, w.doorNotEmpty, w.notLive, w.screenTakes);\n")],
+      "screen-draws prints the takes, so a window never shows a composite that was not taken"),
+    M("window-reset-keeps-draws", "R9c", [(WINDOW_RESET, "    void reset() { const uint32_t keep = screenDraws; *this = UiMapsWindow{}; screenDraws = keep; }\n")],
+      "a window's reset keeps the composites it counted, so every window after the first overstates them"),
 ]
 
 

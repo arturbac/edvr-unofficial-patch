@@ -1311,6 +1311,168 @@ void testMapsGate(Rig& r) {
     }
 }
 
+// ================================================================ what the 5 s window says across the transitions of the first flight
+// The first flight of the maps gate (docs/design-world-camera-motion-2026-09-30.md, 8.10; Frontier, 2026-10-01 08:32:55.975) ended its
+// second panel period in a boarding: on foot with the route owning the world, then the ship's cockpit. The naming stopped with the last
+// 2D screen composite, three unnamed frames released the gate, the route let go on the same boundary (RELEASED on-foot-gate-lost), and
+// from then on every window read panel frames, no screen taken, no eye through the layer-only door -- because a cockpit draws no 2D
+// screen composite, which nothing in the line could say. The window line now carries screen-draws=: every 2D screen composite the
+// layer's decision SAW while the gate was on, taken or not. This replays the flight's transition and the one it did not take, against the
+// production layer, and reads the window lines back from its real log:
+//   a map opened with the route owning the world (composites re-issued, then taken, both eyes layer-only), closed again (taken until the
+//   second named frame holds the world), the route owning again; then the boarding: three unnamed frames, the gate and the route let go,
+//   and no composite follows. The first window is every one of those frames and its numbers are checked against the rig's own count of
+//   what it drew and what the layer did with it; the second is the cockpit alone -- the flight's windows: panel frames, nothing drawn,
+//   nothing taken, no door.
+// Two real 5 s windows, so the rig sleeps twice (the window's length is the layer's own constant).
+static unsigned windowNumber(const std::string& line, const char* key) {
+    const std::string needle = std::string(" ") + key + "=";
+    const size_t at = line.find(needle);
+    return at == std::string::npos ? ~0u : static_cast<unsigned>(std::strtoul(line.c_str() + at + needle.size(), nullptr, 10));
+}
+
+void testMapsTransitions(Rig& r) {
+    auto& cfg = Config::get();
+    wchar_t temp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, temp);
+    const std::wstring dir = std::wstring(temp) + L"edvr_ui_layer_world_maps_windows_" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    check(Log::get().open(dir, L"uilwwin"), "windows: the rig's log opens in a temp directory (its window lines are read back at the end)");
+
+    // On foot by the journal, the key on: the first boundary carries the world, held.
+    g_stubs.journalKnown = g_stubs.journalOnFoot = true;
+    g_stubs.depthKnown = false;
+    g_stubs.depthDraws = 0;
+    g_stubs.routeDoor = false;
+    g_stubs.mayTake = false;
+    cfg.set("experimental.on_foot_maps_sharp", "on");
+    uiLayerConfigure(cfg);
+    check(boundaryFrame(r, true) && uiLayerMapsOn(), "windows: (setup) the key on, on foot: the naming decides, carried from today's gate (the world)");
+
+    // What the rig drew and what the layer did with it, window by window (zeroed after each window line). The setup boundary above was the
+    // window's first frame, a world frame: the layer counts it, so the frame counts start at one.
+    unsigned reissued = 0, taken = 0, wrong = 0, doorMissed = 0, doorWrong = 0, worldFrames = 1, panelFrames = 0;
+    // A frame while the route owns the world: both eyes' composites are drawn and re-issued into the layer, never taken.
+    auto worldFrame = [&](bool named) {
+        nextArmed(r);
+        g_stubs.eyeDraws = 2;
+        for (int e = 0; e < 2; ++e) {
+            bindGame(r, e);
+            const Drawn d = drawScreen(r);
+            if (d.reissued && !d.taken) ++reissued; else ++wrong;
+        }
+        const bool held = boundaryFrame(r, named);
+        ++(held ? worldFrames : panelFrames);
+        return held;
+    };
+    // A frame while the layer holds the panel (a map, a menu): both eyes' composites are taken and the door runs layer-only for both.
+    auto mapFrame = [&](bool named) {
+        const uint64_t seq = nextArmed(r);
+        g_stubs.eyeDraws = 2;
+        for (int e = 0; e < 2; ++e) {
+            if (takeScreen(r, e)) ++taken; else ++wrong;
+        }
+        if (!(uiLayerDoorLayerOnly(0, seq) && uiLayerDoorLayerOnly(1, seq))) ++doorMissed;
+        const bool held = boundaryFrame(r, named);
+        ++(held ? worldFrames : panelFrames);
+        return held;
+    };
+    // A frame in a cockpit: no 2D screen composite is drawn at all; the door is asked and has nothing to run for.
+    auto cockpitFrame = [&]() {
+        const uint64_t seq = nextArmed(r);
+        g_stubs.eyeDraws = 0;
+        if (uiLayerDoorLayerOnly(0, seq) || uiLayerDoorLayerOnly(1, seq)) ++doorWrong;
+        const bool held = boundaryFrame(r, false);
+        ++(held ? worldFrames : panelFrames);
+        return held;
+    };
+
+    // The world, the route owning it; then a map opens (the naming stops, the third unnamed frame releases the gate and the route
+    // lets go with it) and the layer takes every composite; then the map closes (two named frames hold the world; the composites
+    // drawn in them are still the panel's and are taken) and the route owns the world again.
+    g_stubs.mayTake = true;
+    for (int i = 0; i < 10; ++i) worldFrame(true);
+    bool held = true;
+    for (int i = 0; i < 3; ++i) held = worldFrame(false);
+    check(!held, "windows: (setup) three unnamed frames release the gate, as a map's opening does");
+    g_stubs.mayTake = false;
+    for (int i = 0; i < 12; ++i) mapFrame(false);
+    mapFrame(true);
+    held = mapFrame(true);
+    check(held, "windows: (setup) two named frames hold the world again");
+    g_stubs.mayTake = true;
+    for (int i = 0; i < 3; ++i) worldFrame(true);
+    // The boarding: the composites stop, three unnamed frames release the gate, the route lets go on the same boundary; the cockpit follows.
+    for (int i = 0; i < 3; ++i) held = cockpitFrame();
+    check(!held, "windows: (setup) the boarding: three frames with no composite and no naming release the gate");
+    g_stubs.mayTake = false;
+    for (int i = 0; i < 5; ++i) cockpitFrame();
+    Sleep(5100);                                     // the window is 5 s of the wall clock
+    cockpitFrame();                                  // this boundary writes the first window's line
+    const unsigned w1Reissued = reissued, w1Taken = taken, w1Frames = worldFrames + panelFrames, w1World = worldFrames, w1Panel = panelFrames;
+    const unsigned w1Wrong = wrong, w1DoorMissed = doorMissed, w1DoorWrong = doorWrong;
+    reissued = taken = wrong = doorMissed = doorWrong = worldFrames = panelFrames = 0;
+
+    // The cockpit alone, a whole window of it: the flight's windows after the boarding.
+    for (int i = 0; i < 30; ++i) cockpitFrame();
+    Sleep(5100);
+    cockpitFrame();                                  // the second window's line
+    const unsigned w2Frames = worldFrames + panelFrames, w2World = worldFrames, w2Panel = panelFrames, w2Wrong = wrong, w2DoorWrong = doorWrong;
+
+    cfg.set("experimental.on_foot_maps_sharp", "off");
+    uiLayerConfigure(cfg);
+    boundaryFrame(r, false);
+    check(!uiLayerMapsOn(), "windows: (cleanup) key off");
+    g_stubs.mayTake = false;
+    g_stubs.eyeDraws = 0;
+
+    check(w1Wrong == 0 && w1DoorMissed == 0 && w1DoorWrong == 0 && w2Wrong == 0 && w2DoorWrong == 0,
+          "windows: (setup) every composite the rig drew went the way the scenario says (re-issued while the route owns, taken while the layer holds the panel), the door ran layer-only for every taken eye and for none in a cockpit");
+    check(w1Reissued > 0 && w1Taken > 0 && w1World > 0 && w1Panel > 0,
+          "windows: (setup) the first window holds both kinds of composite and both gates");
+
+    Log::get().close();
+    const std::vector<std::string> lines = mapsLines(dir);
+    std::vector<std::string> win;
+    for (const auto& l : lines)
+        if (l.rfind("on foot maps sharp 5s:", 0) == 0) win.push_back(l);
+    check(win.size() == 2, "windows: the real layer wrote one line for each of the two 5 s windows");
+    if (win.size() == 2) {
+        const std::string& a = win[0];
+        const std::string& b = win[1];
+        // The first window: every composite counted once, taken or not; only the layer's own takes are takes; the door only for those.
+        check(windowNumber(a, "screen-draws") == w1Reissued + w1Taken,
+              "windows: the first window's screen-draws is every composite the decision saw (re-issued ones and taken ones): the layer counts what it was asked, not what it took");
+        check(windowNumber(a, "screen-takes") == w1Taken, "windows: ... its screen-takes is only the taken ones (a re-issue is not a take)");
+        check(windowNumber(a, "door-layer-only") == w1Taken, "windows: ... its door-layer-only is the eyes of the taken ones");
+        check(windowNumber(a, "door-not-empty") == 0, "windows: ... no eye kept the upscaler");
+        check(windowNumber(a, "frames") == w1Frames && windowNumber(a, "world-frames") == w1World && windowNumber(a, "panel-frames") == w1Panel,
+              "windows: ... it counts the frames of the run and which gate each ended in");
+        check(windowNumber(a, "holds") == 1 && windowNumber(a, "releases") == 2, "windows: ... one hold (the map closing) and two releases (the map opening, the boarding)");
+        // The second window: the flight's own shape.
+        check(windowNumber(b, "world-frames") == 0 && windowNumber(b, "panel-frames") == w2Panel && w2World == 0 && w2Frames == w2Panel,
+              "windows: the cockpit window is whole-panel: panel frames and no world frame");
+        check(windowNumber(b, "screen-takes") == 0 && windowNumber(b, "door-layer-only") == 0 && windowNumber(b, "door-not-empty") == 0,
+              "windows: ... nothing taken, no eye through the layer-only door (what the first flight's windows said)");
+        check(windowNumber(b, "screen-draws") == 0,
+              "windows: ... and screen-draws says why: no 2D screen composite was drawn, so there was nothing to take");
+        check(b.size() > 15 && b.compare(b.size() - 15, 15, " screen-draws=0") == 0 && a.find(" screen-draws=") != std::string::npos &&
+                  a.find(" screen-draws=") > a.find(" not-live-frames="),
+              "windows: screen-draws is the line's last token, after not-live-frames (the reader's pattern ends with it)");
+    } else {
+        for (const auto& l : lines) std::printf("      | %s\n", l.c_str());
+    }
+    {   // Remove the rig's temp log.
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((dir + L"\\*.log").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do { DeleteFileW((dir + L"\\" + fd.cFileName).c_str()); } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        RemoveDirectoryW(dir.c_str());
+    }
+}
+
 // --bench (not part of the gate): what the on-foot maps gate costs the CPU, measured against the real boundary and the real door
 // predicate. The boundary's own work (the journal and depth steps, the layer's warm compile, the window bookkeeping) is the same in
 // every column, so the difference between the columns is the feature's.
@@ -1425,6 +1587,7 @@ int main(int argc, char** argv) {
     test125(r);
     testAccessors(r);
     testMapsGate(r);
+    testMapsTransitions(r);
     uiLayerShutdown();
     std::printf("ui_layer_world_test: %u checks, %u failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

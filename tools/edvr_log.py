@@ -2779,7 +2779,10 @@ MAPS_STAMP_RE = re.compile(r"^\[(?P<ts>\d\d:\d\d:\d\d\.\d{3})\] (?P<msg>.*)$")
 # everything up to the fixed words after them, never up to the first ")".
 MAPS_ON_RE = re.compile(r"^on foot maps sharp: ON at frame=(?P<frame>\d+) .*gate starts as .*: (?P<start>the world|not the world) "
                         r"\(the journal: (?P<journal>.*)\)\.$")
-MAPS_OFF_RE = re.compile(r"^on foot maps sharp: OFF at frame=(?P<frame>\d+) \((?P<why>[^)]*)\): ")
+# The OFF line's reason is "(why)", and three of the DLL's reasons have parentheses of their own ("no temporal mode is on (fix.temporal_aa is
+# off)", "the eye jitter is not as shipped (...)", "screen motion is not live (...)"), so it takes one level of nesting: a pattern that stopped
+# at the first ")" lost the OFF line of a real flight (edvr_gfx_20261001_085519.log, fix.temporal_aa off) as a line it did not know.
+MAPS_OFF_RE = re.compile(r"^on foot maps sharp: OFF at frame=(?P<frame>\d+) \((?P<why>(?:[^()]|\([^()]*\))*)\): ")
 MAPS_TAKE_RE = re.compile(r"^on foot maps sharp: the layer TAKES the 2D screen at frame=(?P<frame>\d+): no world camera named its source "
                           r"for (?P<run>\d+) frames in a row \(after (?P<world>\d+) world frames, (?P<secs>[0-9.]+) s; the journal: "
                           r"(?P<journal>.*)\)\. A map or a menu is sharp from the layer")
@@ -2793,7 +2796,10 @@ MAPS_WINDOW_RE = re.compile(r"^on foot maps sharp 5s: key=on (?P<secs>[0-9.]+) s
                             r"frames=(?P<frames>\d+) named=(?P<named>\d+) unnamed=(?P<unnamed>\d+) world-frames=(?P<world>\d+) "
                             r"panel-frames=(?P<panel>\d+) holds=(?P<holds>\d+) releases=(?P<releases>\d+) "
                             r"screen-takes=(?P<takes>\d+) recognised=(?P<recognised>\d+) door-layer-only=(?P<only>\d+) "
-                            r"door-not-empty=(?P<notempty>\d+) not-live-frames=(?P<notlive>\d+)")
+                            r"door-not-empty=(?P<notempty>\d+) not-live-frames=(?P<notlive>\d+)(?: screen-draws=(?P<draws>\d+))?")
+# `draws` is the 2D screen composites the layer's decision SAW in the window (taken or not); a log from a build before the Phase 1 fix
+# (design doc 8.10) has no such token and reads None: the reader then judges by takes alone and says it cannot tell "nothing drawn"
+# from "drawn and refused".
 MAPS_ROUTE_RELEASED_RE = re.compile(r"vr world route: RELEASED the world at frame=(?P<frame>\d+) \((?P<why>[^)]*)\)")
 MAPS_ROUTE_OWNS_RE = re.compile(r"vr world route: OWNS the world from frame=(?P<frame>\d+) ")
 # A black eye is the sharpen door's own failure line ("... got NO composite from the UI layer -- the eye is BLACK", printed only on the
@@ -2831,8 +2837,9 @@ def parse_maps_sharp(text):
             if not w:
                 out["unparsed"].append(raw)
                 continue
-            d = {k: int(v) for k, v in w.groupdict().items() if k not in ("secs", "mode", "gate")}
-            d.update(ts=ts, t=t, secs=float(w.group("secs")), mode=w.group("mode"), gate=w.group("gate"))
+            d = {k: int(v) for k, v in w.groupdict().items() if k not in ("secs", "mode", "gate", "draws")}
+            d.update(ts=ts, t=t, secs=float(w.group("secs")), mode=w.group("mode"), gate=w.group("gate"),
+                     draws=int(w.group("draws")) if w.group("draws") is not None else None)
             out["windows"].append(d)
         elif msg.startswith("on foot maps sharp:"):
             for kind, rx in (("on", MAPS_ON_RE), ("off", MAPS_OFF_RE), ("take", MAPS_TAKE_RE), ("back", MAPS_BACK_RE),
@@ -2913,6 +2920,18 @@ def maps_sharp_episodes(p):
         samples = [l for l in p["luma"] if t0 <= l["t"] <= end_t and l["final_black"] is not None]
         e["luma_samples"] = len(samples)
         e["luma_black"] = sum(1 for l in samples if l["final_black"] >= 99)
+        # What the 2D screen did in the period, from the 5 s windows that overlap it (a window is stamped when it closes). Composites are
+        # only ever TAKEN in panel frames, so the taken count needs no trimming. A window with world frames in it cannot say how many of
+        # the composites it saw were drawn in its panel frames, so the drawn count uses only the whole-panel windows (gate=panel at its
+        # close and no world frame in it): there, 0 drawn means nothing was on the 2D screen (the cockpit after boarding, a loading
+        # black) and a drawn count above the taken count means the layer left composites in the game's frame.
+        wins = [w for w in p["windows"] if w["t"] > t0 and w["t"] - w["secs"] < end_t]
+        e["takes"] = sum(w["takes"] for w in wins)
+        pure = [w for w in wins if w["gate"] == "panel" and w["world"] == 0 and w["panel"] > 0]
+        e["pure_windows"] = len(pure)
+        e["pure_frames"] = sum(w["panel"] for w in pure)
+        e["pure_takes"] = sum(w["takes"] for w in pure)
+        e["pure_draws"] = sum(w["draws"] for w in pure) if pure and all(w["draws"] is not None for w in pure) else None
         if e["end"] is not None and e["end"]["kind"] == "back":
             owns = [r for r in p["route"] if r["kind"] == "owns" and 0 <= r["t"] - e["end"]["t"] <= 2.0]
             e["route_owns"] = min(owns, key=lambda r: r["t"]) if owns else None
@@ -2938,16 +2957,38 @@ def maps_sharp_judge(p, eps):
         if w["notempty"]:
             warns.append("%s: %d eye(s) had the screen taken but the game drew something else into an eye-sized target, so the upscaler ran for "
                          "them (door-not-empty)" % (w["ts"], w["notempty"]))
-        if w["panel"] and w["only"] < MAPS_DOOR_SHARE * 2 * w["panel"] and not w["notempty"]:
-            warns.append("%s: %d panel frames but only %d eyes through the layer-only door (expected about %d): the upscaler ran for the rest "
-                         "without a counted reason" % (w["ts"], w["panel"], w["only"], 2 * w["panel"]))
+        # The door should have run for every composite the layer TOOK (an eye whose 2D screen was taken with nothing else drawn into it): the
+        # expectation is the taken composites, not the panel frames. A panel frame with nothing on the 2D screen (the cockpit after boarding,
+        # a loading black) has nothing taken and nothing for the door to skip; the first flight read as a failed door because this rule
+        # counted panel frames (design doc 8.10).
+        if w["takes"] and w["only"] < MAPS_DOOR_SHARE * w["takes"] and not w["notempty"]:
+            warns.append("%s: %d taken composites but only %d eyes through the layer-only door (expected about %d): the upscaler ran for the rest "
+                         "without a counted reason" % (w["ts"], w["takes"], w["only"], w["takes"]))
+        # A window that was panel from start to end, in which the decision saw more 2D screen composites than the layer took: composites
+        # the gate gave the layer and the layer left in the game's frame. (Only the new 5 s line counts what the decision saw.)
+        if w["draws"] is not None and w["gate"] == "panel" and w["world"] == 0 and w["panel"] and w["draws"] > w["takes"]:
+            warns.append("%s: the gate gave the layer the panel for the whole window and the decision saw %d 2D screen composites, but only %d were "
+                         "taken: the layer left %d in the game's frame" % (w["ts"], w["draws"], w["takes"], w["draws"] - w["takes"]))
     for e in eps:
         t0 = e["take"]["ts"]
+        if e["takes"] == 0 and e["pure_windows"]:
+            if e["pure_draws"] == 0:
+                notes.append("%s: no 2D screen composite was drawn in this panel period's %d whole-panel window(s) (%d frames): the cockpit after "
+                             "boarding, a load, anything that draws no screen. Nothing for the layer to take and nothing for the door to skip"
+                             % (t0, e["pure_windows"], e["pure_frames"]))
+            elif e["pure_draws"] is None:
+                notes.append("%s: the layer took no 2D screen composite in this panel period's %d whole-panel window(s) (%d frames). This log's 5 s "
+                             "line has no screen-draws, so \"nothing was drawn\" cannot be told from \"drawn and not taken\" here; the journal, the "
+                             "on-foot source lines and the layer's own 30 s `2D screen draws asked` can" % (t0, e["pure_windows"], e["pure_frames"]))
         if e["luma_black"]:
-            if e["take"].get("journal") == "on foot":
+            if e["take"].get("journal") == "on foot" and e["takes"] > 0:
                 warns.append("%s: the luma probe read the final stage black in %d of %d sample(s) of a panel period the journal calls on foot: a "
                              "map or a menu should be on screen, so look at the headset's picture for this stretch"
                              % (t0, e["luma_black"], e["luma_samples"]))
+            elif e["takes"] == 0:
+                notes.append("%s: the luma probe read the final stage black in %d of %d sample(s) of this panel period, in which the layer held no "
+                             "2D screen: not the layer's picture. A load's black, a fade, the game closing (the first flight's four samples were "
+                             "its exit fade, seconds before the shutdown totals)" % (t0, e["luma_black"], e["luma_samples"]))
             else:
                 notes.append("%s: the luma probe read the final stage black in %d of %d sample(s) of this panel period (the journal: %s): black "
                              "by content when nothing is drawn after a load, so this is the arrival and not a black eye"
@@ -2970,11 +3011,24 @@ def maps_sharp_judge(p, eps):
     if not ws:
         warns.append("no 5 s window line: the feature printed nothing while the key was on, so it never ran")
     if p["unparsed"]:
-        warns.append("%d 'on foot maps sharp' line(s) the reader does not know (the formatters changed?)" % len(p["unparsed"]))
+        warns.append("%d 'on foot maps sharp' line(s) the reader does not know (the formatters changed?); the first: %s"
+                     % (len(p["unparsed"]), p["unparsed"][0].strip()[:200]))
     if not any(e["end"] is not None and not e["open"] and e["end"]["kind"] == "back" for e in eps):
         warns.append("no panel period closed in this log: nothing was taken and handed back (a map or a menu opened and closed is what "
                      "the flight is for)")
     return stops, warns, notes
+
+
+def _maps_period_screens(e):
+    """One line on what the 2D screen did in a panel period's whole-panel windows (no world frame in them), or None when it had none."""
+    if not e["pure_windows"]:
+        return None
+    if e["pure_draws"] is None:
+        return ("      in the period's %d whole-panel window(s) (%d frames) the layer took %d 2D screen composite(s); this log's 5 s line does not "
+                "count the composites the decision saw" % (e["pure_windows"], e["pure_frames"], e["pure_takes"]))
+    return ("      2D screen composites in the period's %d whole-panel window(s) (%d frames): drawn %d, taken %d%s"
+            % (e["pure_windows"], e["pure_frames"], e["pure_draws"], e["pure_takes"],
+               " -- none was drawn: nothing for the layer to take or the door to skip (a cockpit, a load)" if e["pure_draws"] == 0 else ""))
 
 
 def print_maps_sharp(text):
@@ -3010,6 +3064,9 @@ def print_maps_sharp(text):
             lead_closed = "%s  TAKES frame %d after %d world frames (%.1f s of world)" % (t["ts"], t["frame"], t["world"], t["secs"])
         if e["end"] is None or e["open"]:
             print("  %s -> still open at the end of the log" % lead_open)
+            screens = _maps_period_screens(e)
+            if screens:
+                print(screens)
             continue
         if e["frames"] is not None:
             tail = "%d frames (%.1f s), %d eyes layer-only, %d kept the upscaler -> %s" % (e["frames"], e["secs"], e["only"], e["kept"], e["why"])
@@ -3025,13 +3082,25 @@ def print_maps_sharp(text):
         if e["luma_samples"]:
             print("      luma probe: %d sample(s) in this period, the final stage black in %d (black by content for a loading stretch, a "
                   "defect under a map or a menu)" % (e["luma_samples"], e["luma_black"]))
+        screens = _maps_period_screens(e)
+        if screens:
+            print(screens)
     if ws:
         print("5 s windows, summed (%d): %d frames, named %d / unnamed %d, world %d / panel %d, %d hold(s), %d release(s); %d screen takes, %d "
               "recognised; %d eyes through the layer-only door, %d kept the upscaler; %d frame(s) not decided by naming"
               % (len(ws), tot["frames"], tot["named"], tot["unnamed"], tot["world"], tot["panel"], tot["holds"], tot["releases"], tot["takes"],
                  tot["recognised"], tot["only"], tot["notempty"], tot["notlive"]))
         if tot["panel"]:
-            print("  panel frames: %d; the layer-only door ran for %.1f%% of their %d eyes" % (tot["panel"], 100.0 * tot["only"] / (2 * tot["panel"]), 2 * tot["panel"]))
+            # Against the composites the layer TOOK, not 2 x the panel frames: a panel frame with nothing on the 2D screen (the cockpit after
+            # boarding) takes nothing and has nothing for the door to skip (the first flight's "46.1%" counted those frames as failures).
+            if tot["takes"]:
+                print("  panel frames: %d; composites taken: %d, and the layer-only door ran for %.1f%% of them"
+                      % (tot["panel"], tot["takes"], 100.0 * tot["only"] / tot["takes"]))
+            else:
+                print("  panel frames: %d; the layer took no 2D screen composite" % tot["panel"])
+            if all(w["draws"] is not None for w in ws):
+                print("  the decision saw %d 2D screen composites in these windows, %d of them taken"
+                      % (sum(w["draws"] for w in ws), tot["takes"]))
     stops, warns, notes = maps_sharp_judge(p, eps)
     for n in notes:
         print("  note: %s" % n)
@@ -4898,8 +4967,89 @@ def self_test_maps_sharp():
     rc, out = run("[16:20:00.000] version v0.0.0 (build 1) -- this DLL was linked x\n[16:20:01.000] something else\n")
     if rc != 3 or "no 'on foot maps sharp' line" not in out:
         fail("a log with no feature line (rc=%d):\n%s" % (rc, out))
-    # A line of the feature the reader does not know is reported, not dropped.
-    altered("an unknown line", clean + "[16:23:41.000] on foot maps sharp: something the formatters never wrote\n", 0, "WARN", "the reader does not know")
+    # A line of the feature the reader does not know is reported, not dropped, and the first one is quoted so the next defect is not a hunt.
+    altered("an unknown line", clean + "[16:23:41.000] on foot maps sharp: something the formatters never wrote\n", 0, "WARN",
+            "the first: [16:23:41.000] on foot maps sharp: something the formatters never wrote")
+
+    # Every reason the DLL can give for the gate stopping or standing aside (src\\d3d11\\ui_layer_math.h uiLayerNotLiveReasonFor; ui_layer.cpp mapsGate and
+    # mapsLayerNotLive), in the OFF line's "(why)" and the not-live line's last words. Three carry parentheses of their own, and the OFF pattern stopped
+    # at the first ")": a real flight (edvr_gfx_20261001_085519.log, fix.temporal_aa off) lost its OFF line as "unknown". The list is held to the DLL's
+    # sources, so a reason that is reworded fails here and not in the ten minutes after a flight.
+    reasons = ["the key went off", "screen motion is not live", "fix.ui_quality is off", "no temporal mode is on (fix.temporal_aa is off)",
+               "the eye jitter is not as shipped (advanced.temporal_aa_jitter_sign or _lag is set)", "the layer stood down for the session",
+               "screen motion is not live (fix.temporal_aa is off, or it stood down)", "the UI layer is not live"]
+    reason_src = ""
+    for rel in ("src/d3d11/ui_layer_math.h", "src/d3d11/ui_layer.cpp"):
+        try:
+            reason_src += read_text(os.path.join(repo_root(), *rel.split("/")))
+        except OSError:
+            fail("%s is missing: the reasons below cannot be held to the DLL's sources" % rel)
+    for why in reasons:
+        if reason_src and '"%s"' % why not in reason_src:
+            fail("the reason %r is not in the DLL's sources any more: reword it here too" % why)
+        pr = parse_maps_sharp(
+            "[16:23:45.000] on foot maps sharp: OFF at frame=32500 (%s): the 2D screen is the world by the journal's reading or the screen's own "
+            "depth again, as without the key.\n"
+            "[16:23:46.000] on foot maps sharp: experimental.on_foot_maps_sharp is on but the 2D screen's gate stays the journal's and the screen's "
+            "own depth, as without the key: %s.\n" % (why, why))
+        got = [(e["kind"], e.get("why")) for e in pr["events"]]
+        if got != [("off", why), ("notlive", why)] or pr["unparsed"]:
+            fail("a gate-stopped line with the reason %r reads as %r (%d unparsed)" % (why, got, len(pr["unparsed"])))
+
+    # The first flight (design doc 8.10: edvr_gfx_20261001_082459.log, Frontier, df9172db). A map was handed back with the route owning again;
+    # later the player BOARDED his ship: the gate released and the route let go on one boundary (TAKES and RELEASED at one stamp), the game
+    # stopped drawing the 2D screen (a cockpit has no screen composite), and every window after the take read gate=panel with screen-takes=0.
+    # The reader of that build judged the door against PANEL FRAMES and called the cockpit six failed doors, and the journal's reading at the
+    # take (stale by 1.6 s: still "on foot") turned the game's exit fade into a luma WARN. These are that log's lines; the TAKES, RELEASED and
+    # ON lines are the fixture's (formatter) text restamped. The old format has no screen-draws; the new one does.
+    def restamp(line, ts):
+        return "[%s]%s\n" % (ts, line[line.index("]") + 1:])
+
+    def win(ts, gate, frames, named, world, panel, takes, rel, draws=None):
+        return ("[%s] on foot maps sharp 5s: key=on 5 s mode=naming gate=%s frames=%d named=%d unnamed=%d world-frames=%d panel-frames=%d holds=0 "
+                "releases=%d screen-takes=%d recognised=%d door-layer-only=%d door-not-empty=0 not-live-frames=0%s\n"
+                % (ts, gate, frames, named, frames - named, world, panel, rel, takes, takes, takes,
+                   "" if draws is None else " screen-draws=%d" % draws))
+
+    def flight(new_format, cockpit_draws=0):
+        d = (lambda n: n) if new_format else (lambda n: None)
+        cockpit = [("08:33:03.156", 428), ("08:33:08.155", 450), ("08:33:13.156", 428), ("08:33:18.159", 429), ("08:33:23.160", 364)]
+        return "".join([
+            "[08:24:59.501] version v0.18.0-rc.5-37-gdf9172db (build 6ABE6A99) -- this DLL was linked 2026-10-01 14:13:45 UTC\n",
+            restamp(first_line(lambda l: "ON at frame=" in l), "08:31:23.144"),
+            # period 1: a map, handed back clean, the route owning the world again 163 ms later
+            restamp(first_line(lambda l: "the layer TAKES" in l), "08:31:23.166"),
+            win("08:31:28.150", "panel", 450, 0, 0, 450, 900, 0, d(900)),
+            win("08:31:33.150", "panel", 450, 0, 0, 450, 900, 0, d(900)),
+            win("08:31:38.150", "panel", 450, 0, 0, 450, 900, 0, d(900)),
+            restamp(first_line(lambda l: "HANDS BACK" in l).replace("2 kept the upscaler", "0 kept the upscaler"), "08:31:44.796"),
+            restamp(first_line(lambda l: "vr world route: OWNS" in l), "08:31:44.959"),
+            win("08:32:48.156", "world", 448, 448, 448, 0, 0, 0, d(896)),
+            win("08:32:53.159", "world", 451, 451, 451, 0, 0, 0, d(902)),
+            restamp(first_line(lambda l: "the layer TAKES" in l), "08:32:55.975"),
+            restamp(first_line(lambda l: "vr world route: RELEASED" in l), "08:32:55.975"),
+            win("08:32:58.157", "panel", 375, 211, 213, 162, 0, 1, d(426)),
+            "".join(win(ts, "panel", n, 0, 0, n, 0, 0, d(cockpit_draws)) for ts, n in cockpit),
+            "[08:33:22.312] luma probe: eye=0 game=0.000/0.000/100% dlss_out=0.000/0.000/100% final=0.000/0.000/100%\n",
+            "[08:33:22.312] luma probe: eye=0 first black stage is game (game 0.000 dlss_out 0.000 final 0.000).\n",
+            "[08:33:25.110] native sharpen totals: treated=79454, off=0, refusals=0, invalidations=8, stood_down=0, layer_only=14114, layer_only_black=0.\n",
+        ])
+
+    rc, out = run(flight(False))
+    if rc != 0 or "(0 STOP, 0 WARN)" not in out or "layer-only door (expected" in out or \
+            "the layer took no 2D screen composite in this panel period's 5 whole-panel window(s)" not in out or "not the layer's picture" not in out:
+        fail("the boarding flight, 5 s line without screen-draws (rc=%d): a cockpit with nothing taken must not read as a failed door or a black eye:\n%s"
+             % (rc, out))
+    rc, out = run(flight(True))
+    if rc != 0 or "(0 STOP, 0 WARN)" not in out or "layer-only door (expected" in out or \
+            "no 2D screen composite was drawn in this panel period's 5 whole-panel window(s)" not in out or \
+            "drawn 0, taken 0 -- none was drawn" not in out or "the decision saw" not in out:
+        fail("the boarding flight, 5 s line with screen-draws (rc=%d): the cockpit's windows say none was drawn:\n%s" % (rc, out))
+    # Composites that WERE drawn while the gate gave the layer the whole window and that the layer did not take: that is the failure the old
+    # reading imagined, and the new line can tell it from the cockpit.
+    rc, out = run(flight(True, cockpit_draws=40))
+    if rc != 0 or "maps-sharp verdict: WARN" not in out or "the layer left 40 in the game's frame" not in out:
+        fail("composites drawn but not taken in a whole-panel window (rc=%d) must WARN, naming the count:\n%s" % (rc, out))
     return ok
 
 

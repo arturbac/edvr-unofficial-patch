@@ -2993,6 +2993,11 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
     }
     if (!ctx || familyInt <= 0 || familyInt >= static_cast<int>(UiLayerFamily::kCount)) return false;
     const UiLayerFamily family = static_cast<UiLayerFamily>(familyInt);
+    // The on-foot maps gate's count of the 2D screen composites this decision SEES (ui_maps_math.h UiMapsWindow::screenDraws): every
+    // one while the gate is on, whatever the decision comes to (taken, re-issued, left in the game's frame, refused). Counted here and
+    // nowhere else, so the reader can tell a window in which nothing was drawn (a cockpit, a load) from one whose composites were not
+    // taken. With the key off it is one load of a bool that is false.
+    if (family == UiLayerFamily::kScreen && detail::g_uiLayerMapsOn) ++g_maps.win.screenDraws;
     UiLayerDrawFacts f;
     f.family = family;
     f.verdictForwards = verdictForwards;
