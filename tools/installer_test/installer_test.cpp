@@ -624,6 +624,73 @@ static void testShippedIni(const std::wstring& root) {
         check(seen == 1, "a second merge does not duplicate a carried line",
               std::to_string(seen) + " copies");
     }
+
+    // 2026-10-01: advanced.terrain_motion retired (terrain takes the camera's motion; the per-patch hook is gone). A rig that
+    // flew the lever's A/B has `terrain_motion = off` live under [advanced]. It is carried with its value, not eaten and
+    // not adopted; it is reported as retired; the setting beside it keeps its tuned value; the lever's documentation block
+    // is not resurrected. A rig that never touched it (the line still commented) carries nothing at all. At run time the
+    // config audit names a carried line in the log (config.cpp: "name settings this build does not read ... a retired setting").
+    check(shipped.find("terrain_motion") == std::string::npos,
+          "the shipped ini no longer documents the terrain motion lever");
+    {
+        const std::string terrainAnchor = "#temporal_aa_diagnostics = 0" + eol;
+        const size_t terrainAt = shipped.find(terrainAnchor);
+        check(terrainAt != std::string::npos, "the shipped ini still has the line the terrain-motion fixture anchors on");
+        if (terrainAt != std::string::npos) {
+            const size_t terrainAfter = terrainAt + terrainAnchor.size();
+            // The previous version's file: the shipped one with the lever's block put back where it sat.
+            const std::string previous = shipped.substr(0, terrainAfter) + eol +
+                "# The motion DLSS, TAA and FSR are given for planetary terrain (every terrain" + eol +
+                "# patch's own transform, recorded at its draw). Off hands those pixels the" + eol +
+                "# camera's motion instead, which ghosts and smears on terrain that moves" + eol +
+                "# against the camera -- a lever for pricing the hook against the frame time" + eol +
+                "# over terrain, not a setting to fly with. Live." + eol +
+                "#terrain_motion = on" + eol +
+                shipped.substr(terrainAfter);
+            std::string flown = previous;
+            flown.replace(flown.find("#terrain_motion = on"), strlen("#terrain_motion = on"), "terrain_motion = off");
+            flown.replace(flown.find("#temporal_aa_diagnostics = 0"), strlen("#temporal_aa_diagnostics = 0"),
+                          "temporal_aa_diagnostics = 1");
+
+            MergeReport terrainRep;
+            const std::string terrainMerged = mergeIni(shipped, flown, &previous, {}, &terrainRep);
+            expectEq(iniValue(terrainMerged, "advanced.temporal_aa_diagnostics"), "1",
+                     "the setting next to the retired lever keeps its tuned value");
+            expectEq(iniValue(terrainMerged, "advanced.terrain_motion"), "off",
+                     "a retired terrain motion lever is carried with its value, not eaten");
+            check(terrainRep.retired.size() == 1 && terrainRep.carried.empty(),
+                  "it is reported as a retired setting, not as a key this version never shipped");
+            check(terrainMerged.find("# carried over from your edvr.ini; this version no longer uses it\n" +
+                                     std::string("terrain_motion = off")) != std::string::npos ||
+                      terrainMerged.find("# carried over from your edvr.ini; this version no longer uses it\r\n" +
+                                         std::string("terrain_motion = off")) != std::string::npos,
+                  "the carried line follows a note saying this version no longer uses it");
+            check(terrainMerged.find("planetary terrain (every terrain") == std::string::npos,
+                  "the retired lever's documentation block is not resurrected");
+
+            // Hand-installed, no base copy: still carried, still inert; only the note differs.
+            MergeReport bareTerrain;
+            const std::string bareMerged = mergeIni(shipped, flown, nullptr, {}, &bareTerrain);
+            expectEq(iniValue(bareMerged, "advanced.terrain_motion"), "off", "with no base copy the lever is still carried");
+            check(bareTerrain.carried.size() == 1, "and reported as a key this version never shipped");
+
+            // The merge is idempotent on the carried line.
+            MergeReport againTerrain;
+            const std::string twiceTerrain = mergeIni(shipped, terrainMerged, &shipped, {}, &againTerrain);
+            size_t copies = 0, from = 0;
+            while ((from = twiceTerrain.find("terrain_motion = off", from)) != std::string::npos) {
+                ++copies;
+                from += 1;
+            }
+            check(copies == 1, "a second merge does not duplicate the carried lever", std::to_string(copies) + " copies");
+
+            // A rig that never touched the lever has its line commented: nothing is carried and the new file stands.
+            MergeReport untouchedTerrain;
+            const std::string untouchedMerged = mergeIni(shipped, previous, &previous, {}, &untouchedTerrain);
+            check(untouchedMerged.find("terrain_motion") == std::string::npos && untouchedTerrain.retired.empty(),
+                  "a rig that left the lever commented carries nothing: the new file stands as shipped");
+        }
+    }
 }
 
 // A shipped default that CHANGED, against the real edvr.ini: fix.ui_quality went

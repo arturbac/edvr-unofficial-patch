@@ -63,7 +63,6 @@
 #include "ui_layer_math.h"
 #include "vr_world_route.h"  // VrWorldInternalScope: the world route's own D3D calls step past these hooks
 #include "ui_surfaces.h"  // uiAtlasNoteWrite: the glyph atlas instrument's write count
-#include "celestial_motion.h"
 #include "engine_velocity.h"
 #include "vr_world_route.h"
 #include "vr_camera_census.h"
@@ -3164,7 +3163,6 @@ void STDMETHODCALLTYPE hookedExecuteCommandList(ID3D11DeviceContext* self,
     if (!privateExecution) {
         graphicsBridgeNoteUnknownExecution();
         motionResourceWritten(nullptr);
-        celestialMotionConstantsUnknownWrite(nullptr);
         glitchFrameInvalidatePool(nullptr);
     }
     s->realExecuteCommandList(self, list, restoreContextState);
@@ -3251,13 +3249,6 @@ HRESULT STDMETHODCALLTYPE hookedMap(ID3D11DeviceContext* self, ID3D11Resource* r
     // The reveal sync's shadow of the scene block, same tee, its own gate.
     if (mapData && fssRevealWantsDraws()) {
         fssRevealNoteMap(res, mapped->pData);
-    }
-    // Terrain-constants CPU shadow: capture the mapped pointer so the Unmap
-    // tee can memcpy the game's write without a GPU copy at draw time.
-    // Guarded by celestialMotionAnyWatched() (celestial_motion.h): with no
-    // slot watched, the callee's own loop cannot match this resource either.
-    if (mapData0 && type != D3D11_MAP_READ && celestialMotionAnyWatched()) {
-        celestialMotionConstantsMapped(res, mapped->pData);
     }
     // Only the one buffer we care about, so this is a pointer compare on a very
     // hot path and nothing more.
@@ -3379,9 +3370,6 @@ void STDMETHODCALLTYPE hookedUnmap(ID3D11DeviceContext* self, ID3D11Resource* re
         return;
     }
     motionResourceWritten(res);
-    // Guarded the same way as hookedMap's Map-time tee: with no slot
-    // watched, the callee's own loop cannot match this resource either.
-    if (celestialMotionAnyWatched()) celestialMotionConstantsUnmapped(res);
     // glitchFrameInvalidatePool's own and only test is "installed at all"
     // (glitch_frame.h) -- unlike glitchFrameWantsPool, it does not also ask
     // State::observing, so glitchFrameObserving() would be the wrong,
@@ -4000,7 +3988,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         // Altered only when the layer redirected it: a declined substitution issues the
         // game's own draw untouched, which is not an altered draw.
         const bool issued = !swallowed &&
-            observedDraw(classifyAlteredDraw(owner, true, false, false, layered));
+            observedDraw(classifyAlteredDraw(owner, true, false, layered));
         if (layered) {
             uiLayerEnd(self);
             if (issued) uiLayerSecondIssues(self, kind, count, instances, args);
@@ -4043,12 +4031,6 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // One compare for the ordinary draw; the switch for the one with a
     // verdict (forwardVerdictBegin says why this is the same ladder).
     if (v != DrawVerdict::kNone) forwardVerdictBegin(self, v);
-    // celestialMotionLive() first: with fix.temporal_aa off the terrain
-    // history is configured off, and this Begin is a cross-TU call that only
-    // ever returns false -- once per eye-pass draw. The inline predicate is a
-    // NECESSARY condition Begin re-tests, so the verdict cannot change.
-    const bool terrainOriginal=owner && celestialMotionLive() &&
-        celestialMotionBeginOriginal(self,bindingShaderHash(BindSlot::Vs));
     if (effectCaptureScope.ctx) objectProbePanelDrawBegin(self);
     // The layer's bracket goes innermost: after the verdict's own Begin (a
     // RemLok scissor, a slot swap) so the layer maps the state the draw is
@@ -4057,12 +4039,12 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     if (seedOutcome.on && layered) seedOutcome.redirected = true;
     // Which kind of altered draw the game's own draw is now (gpu_census.h): a pool-family
     // draw runs with EDVR's slot target and shaders bound (engineVelocityBeforeDraw ran
-    // for this verdict-free draw just before), a terrain original with its motion target
-    // and pixel shader, a layered UI draw into EDVR's layer, any other verdict inside its
-    // fix's state change. A handful of loads and compares on a draw that is none of them.
+    // for this verdict-free draw just before), a layered UI draw into EDVR's layer, any
+    // other verdict inside its fix's state change. A handful of loads and compares on a
+    // draw that is none of them.
     // A Verdict-class draw also carries the fix that wraps it (alteredFixOf): the census names each.
     const AlteredDrawClass alteredClass = classifyAlteredDraw(owner, v == DrawVerdict::kNone,
-                                                              engineVelocityDrawSubstituted(), terrainOriginal, layered);
+                                                              engineVelocityDrawSubstituted(), layered);
     const bool originalIssued=observedDraw(alteredClass == AlteredDrawClass::Verdict
                                                ? AlteredDraw(alteredClass, alteredFixOf(v)) : AlteredDraw(alteredClass));
     if (layered) {
@@ -4089,7 +4071,6 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // reactive mask exist to tell the upscaler about pixels the upscaler no
     // longer sees.
     if (effectCaptureScope.ctx) objectProbePanelDrawEnd(self);
-    if(terrainOriginal)celestialMotionEnd(self);
     if (owner && uiLayerIssueBlocked()) {
         // Begin failed with untrusted shader state: close existing brackets,
         // but issue neither the stock fallback nor any depth/motion replay.
@@ -4147,12 +4128,6 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         GpuCensusScope census(self, GpuCensusSection::FramePlanet);
         pureDrawReissue(self,kind,count,instances,args);uiDepthPlanetEnd(self);
     }
-    if (!terrainOriginal && owner && celestialMotionLive() &&
-        celestialMotionBegin(self, bindingShaderHash(BindSlot::Vs))) {
-        GpuCensusScope census(self, GpuCensusSection::FrameTerrain);
-        draw(AlteredDrawClass::None);   // a reissue into EDVR's own target: timed as FrameTerrain, not as an altered draw
-        celestialMotionEnd(self);
-    }
     if (v != DrawVerdict::kNone) {
         if (v == DrawVerdict::kBackdrop) backdropEnd(self);
         // The splash screen's dim under the loader's dialogs (splash_dim.h):
@@ -4190,7 +4165,7 @@ void STDMETHODCALLTYPE hookedCopyResource(ID3D11DeviceContext* self,
     uiAtlasNoteWrite(dst, 2);
     if (g_vrWorldWatchWrites && !foreignContext(self)) vrWorldRouteNoteWrite(dst);   // a write into H after the resolve is the latch's
     if(foreignContext(self))engineVelocityResourceUnknown(dst);
-    if (!foreignContext(self)) {motionResourceWritten(dst);celestialMotionConstantsUnknownWrite(dst);glitchFrameInvalidatePool(dst);if(fssResActive())fssResNoteCopyMaybeMismatched(dst,src);if(uiLayerWatching())uiLayerNoteCopy(dst,src);}
+    if (!foreignContext(self)) {motionResourceWritten(dst);glitchFrameInvalidatePool(dst);if(fssResActive())fssResNoteCopyMaybeMismatched(dst,src);if(uiLayerWatching())uiLayerNoteCopy(dst,src);}
     if (!foreignContext(self) && flatRuntimeActive()) { flatRuntimeSubstitution(self, FlatSubstEvent::kCopy); flatRuntimeWritten(dst); }
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalTransfer(dst, src, 'R');
     if (drawCensusArmed()) {
@@ -4338,7 +4313,6 @@ void STDMETHODCALLTYPE hookedCopySubresourceRegion(
         if(box && box->right>=box->left)
             motionResourceWritten(dst,dstX,uint64_t(dstX)+box->right-box->left);
         else motionResourceWritten(dst);
-        celestialMotionConstantsUnknownWrite(dst);
         glitchFrameInvalidatePool(dst);
         if (fssResActive()) fssResNoteCopyMaybeMismatched(dst, src);
         if (uiLayerWatching()) uiLayerNoteCopy(dst, src);
@@ -4374,7 +4348,6 @@ void STDMETHODCALLTYPE hookedUpdateSubresource(ID3D11DeviceContext* self,
     if (!foreignContext(self)) {
         if(box && box->right>=box->left)motionResourceWritten(dst,box->left,box->right);
         else motionResourceWritten(dst);
-        celestialMotionConstantsWritten(dst, data, box);
         glitchFrameInvalidatePool(dst);
     }
     if (drawCensusArmed()) {
@@ -5589,7 +5562,6 @@ EDVR_BOUNDARY_TICK(tkVrWorldRoute, "vr_world_route");
 EDVR_BOUNDARY_TICK(tkVrCameraCensus, "vr_camera_census");
 EDVR_BOUNDARY_TICK(tkVScreenFootprint, "vscreen_footprint");
 EDVR_BOUNDARY_TICK(tkScreenMotion, "screen_motion");
-EDVR_BOUNDARY_TICK(tkCelestialMotion, "celestial_motion");
 EDVR_BOUNDARY_TICK(tkEngineVelocity, "engine_velocity");
 EDVR_BOUNDARY_TICK(tkSharpenTick, "sharpen_tick");
 EDVR_BOUNDARY_TICK(tkTemporalTick, "temporal_tick");
@@ -5643,7 +5615,6 @@ void vScreenFrameBoundary() {
             vscreenFootprintFrameBoundary(g_state->ownerCtx, onFoot);
         });
         tkScreenMotion.run([&] { screenMotionFrameBoundary(g_state->ownerCtx); });
-        tkCelestialMotion.run([&] { celestialMotionFrameBoundary(g_state->ownerCtx); });
         tkEngineVelocity.run([&] { engineVelocityFrameBoundary(g_state->ownerCtx); });
         // The sharpening's warm compile and missing-hook note, once a frame,
         // unconditionally -- not nested under any other feature's gate.
@@ -6973,7 +6944,6 @@ void shutdownVScreenFixes() {
     uiLayerShutdown();
     screenMotionShutdown();
     nightVisionShutdown();
-    celestialMotionShutdown();
     scrimShutdown();
     quadProbeShutdown();
     wakePulseShutdown();

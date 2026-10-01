@@ -1081,6 +1081,8 @@ int main(int argc, char** argv) {
     expectStr("advanced.mesh_motion", "<unset>", "the retired mesh record pairing's key is absent");
     expectStr("advanced.temporal_aa_objects_reach", "<unset>", "the retired station path's reach is absent");
     expectStr("advanced.temporal_aa_objects_ships_metres", "<unset>", "the retired ship path's range is absent");
+    // The terrain patches' own recorded transforms (2026-10-01): terrain takes the camera's motion, with no key.
+    expectStr("advanced.terrain_motion", "<unset>", "the retired terrain motion key is absent");
     // The particle facing measurement (dead since 2026-08-23) retired 2026-09-23.
     expectStr("advanced.particle_face_emitter", "<unset>", "the retired particle facing key is absent");
     // The foveation's eye-tracked centre went with its gaze source (2026-09-23)
