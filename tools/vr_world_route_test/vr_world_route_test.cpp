@@ -1225,9 +1225,11 @@ void sourcePins() {
     // THE KEY-OFF CONTRACT. With the key off, from the start, the boundary's first test returns and nothing below it runs: no
     // camera detour, no phase, no extra counter. Stage 2 adds exactly one thing to that test, the flag that says the injector
     // still has to be wound down after the key went off live; it is false from the start and set only by driveInjector.
-    check(boundary.find("getString(\"experimental.temporal_aa_on_foot_world\", \"off\")") != std::string::npos &&
+    // The key's default is auto since 2026-10-01 (tools\config_test holds the fallback to the shipped file); a key set off, or any word
+    // that is not auto, is still this early return.
+    check(boundary.find("getString(\"experimental.temporal_aa_on_foot_world\", \"auto\")") != std::string::npos &&
               before(boundary, "if (key == VrWorldKey::Off && g_machine.state == VrWorldState::Off && !g_census && !g_injectorEngaged)", "++g_frameNo"),
-          "key off: the boundary reads the key with the default off and returns before doing anything when nothing is to be accounted");
+          "key off: the boundary reads the key with the default auto and, with the key set off, returns before doing anything when nothing is to be accounted");
     check(rt.find("bool g_injectorEngaged = false;") != std::string::npos && count(rt, "g_injectorEngaged = true;") == 1 &&
               before(rt, "void driveInjector(", "g_injectorEngaged = true;") && before(rt, "g_injectorEngaged = true;", "void windDownInjector("),
           "key off: the flag that keeps the boundary running starts false and is set in exactly one place, inside driveInjector");

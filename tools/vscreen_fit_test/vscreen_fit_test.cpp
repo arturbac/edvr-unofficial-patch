@@ -856,8 +856,11 @@ void caseR12() {
     if (g_failure.size()) return;
 
     // The resolver reads each of the route's conditions the way its owner does.
-    check(has(res, "getString(\"experimental.temporal_aa_on_foot_world\", \"off\")") && has(route, "getString(\"experimental.temporal_aa_on_foot_world\", \"off\")"),
-          "R12b: the resolver and the route read experimental.temporal_aa_on_foot_world with the same default");
+    // Auto since 2026-10-01: the route's default and the width's fitting rule flip together, in the same commit, or the width is fitted
+    // for a route that does not run (or the other way round); the shipped file says the same.
+    check(has(res, "getString(\"experimental.temporal_aa_on_foot_world\", \"auto\")") && has(route, "getString(\"experimental.temporal_aa_on_foot_world\", \"auto\")") &&
+              has(ini, "\ntemporal_aa_on_foot_world = auto"),
+          "R12b: the resolver and the route read experimental.temporal_aa_on_foot_world with the same default, auto, and the shipped edvr.ini ships it");
     for (const char* read : {"getString(\"fix.ui_quality\", \"100\")", "getString(\"fix.temporal_aa\", \"off\")", "getString(\"advanced.temporal_aa_jitter_sign\", \"as_is\")",
                              "getFloat(\"advanced.temporal_aa_jitter_lag\", 0.0f)"}) {
         checkf(has(res, read) && has(layer, read), "R12c: the resolver and uiLayerConfigure read the layer's key the same way: %s", read);

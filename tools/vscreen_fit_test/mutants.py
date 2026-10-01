@@ -202,7 +202,7 @@ MUTANTS = [
     M("pin-resolver-includes-curve", "R12e", [('#include "ui_layer_math.h"\n', '#include "panel_curve.h"\n#include "ui_layer_math.h"\n')],
       "the resolver includes panel_curve.h again", "src/d3d11/vscreen_res.cpp"),
     M("pin-quality-default-drifts", "R12c", [('cfg.getString("fix.ui_quality", "100")', 'cfg.getString("fix.ui_quality", "125")')], "the resolver's fix.ui_quality default is not the layer's", "src/d3d11/vscreen_res.cpp"),
-    M("pin-route-default-drifts", "R12b", [('cfg.getString("experimental.temporal_aa_on_foot_world", "off")', 'cfg.getString("experimental.temporal_aa_on_foot_world", "auto")')], "the resolver's route key default is not the route's", "src/d3d11/vscreen_res.cpp"),
+    M("pin-route-default-drifts", "R12b", [('cfg.getString("experimental.temporal_aa_on_foot_world", "auto")', 'cfg.getString("experimental.temporal_aa_on_foot_world", "off")')], "the resolver's route key default is not the route's (auto since 2026-10-01)", "src/d3d11/vscreen_res.cpp"),
     M("pin-layer-reason-dropped", "R12c", [("uiLayerNotLiveReasonFor(target, temporal, jitterAsShipped, /*stoodDown=*/false)", "nullptr")], "the resolver does not ask why the layer is not live", "src/d3d11/vscreen_res.cpp"),
     M("pin-ini-forgets-the-rule", "R12o", [("#   fitted   when the VR on-foot world route will run (it needs", "#   fitted   when the VR on-foot route will run (it needs")], "the ini's text no longer names the world route", "edvr.ini"),
     M("pin-ini-forgets-the-restart", "R12o", [("# while it runs (never any file on disk). Needs a game restart; typing the", "# while it runs (never any file on disk). Takes effect later; typing the")], "the ini's text no longer says a restart is needed", "edvr.ini"),

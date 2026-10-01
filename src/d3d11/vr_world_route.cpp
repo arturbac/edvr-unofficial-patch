@@ -692,8 +692,9 @@ void windDownInjector() {
 
 // ---- the frame boundary ------------------------------------------------------------------------------------------------------------
 void vrWorldRouteFrameBoundary() {
-    // The key, live: read here, so the frame that starts now is the first to see a change. Off unless "auto".
-    const VrWorldKey key = vrWorldKeyFromText(Config::get().getString("experimental.temporal_aa_on_foot_world", "off").c_str());
+    // The key, live: read here, so the frame that starts now is the first to see a change. Auto for an ini with no line (the shipped
+    // edvr.ini says auto too, and tools\config_test holds the two to one answer); any other word reads as off.
+    const VrWorldKey key = vrWorldKeyFromText(Config::get().getString("experimental.temporal_aa_on_foot_world", "auto").c_str());
     g_key = key;
     g_census = vrCameraCensusWanted();
     if (key == VrWorldKey::Off && g_machine.state == VrWorldState::Off && !g_census && !g_injectorEngaged) {

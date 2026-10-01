@@ -37,8 +37,8 @@ second — so tune by eye from there.
   untouched — the same texels, on bent geometry.
 
 **With the VR on-foot world route** (`experimental.temporal_aa_on_foot_world =
-auto`; design-flat-temporal-aa-2026-09-23.md, section 82, "The curved route",
-2026-10-01) the curve stays on. The route hands each eye its own resolved copy of
+auto`, its default since 2026-10-01; design-flat-temporal-aa-2026-09-23.md,
+section 82, "The curved route") the curve stays on. The route hands each eye its own resolved copy of
 the screen through the UI layer, and for a curved screen the layer draws that
 copy through the very same bent strip the game's own draw uses, by the same code,
 so the bend and the placement are identical with the route on or off. The route's

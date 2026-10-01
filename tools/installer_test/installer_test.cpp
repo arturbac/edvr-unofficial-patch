@@ -707,8 +707,8 @@ static void testShippedIni(const std::wstring& root) {
     {
         // The previous version's file: the shipped one with the three blocks put back where each sat, right after its neighbour.
         const std::string afterJitter = "\ntemporal_aa_jitter = on" + eol;          // the jitter-phase switch followed it
-        const std::string afterRoute = "\ntemporal_aa_on_foot_world = off" + eol;   // the world jitter followed the route's key
-        const std::string afterMaps = "\non_foot_maps_sharp = off" + eol;           // the steady detail followed the maps gate
+        const std::string afterRoute = "\ntemporal_aa_on_foot_world = auto" + eol;  // the world jitter followed the route's key
+        const std::string afterMaps = "\non_foot_maps_sharp = on" + eol;             // the steady detail followed the maps gate
         const size_t atJitter = shipped.find(afterJitter);
         const size_t atRoute = shipped.find(afterRoute);
         const size_t atMaps = shipped.find(afterMaps);
@@ -743,8 +743,9 @@ static void testShippedIni(const std::wstring& root) {
             };
             const auto userFile = [&](const char* jitter, const char* steady, const char* follows) {
                 std::string text = setLine(previous, "temporal_aa_jitter = on", "temporal_aa_jitter = off");
-                text = setLine(text, "temporal_aa_on_foot_world = off", "temporal_aa_on_foot_world = auto");
-                text = setLine(text, "on_foot_maps_sharp = off", "on_foot_maps_sharp = on");
+                // Both keys ship on now (2026-10-01): the user who opted out of the route and the maps gate has them off.
+                text = setLine(text, "temporal_aa_on_foot_world = auto", "temporal_aa_on_foot_world = off");
+                text = setLine(text, "on_foot_maps_sharp = on", "on_foot_maps_sharp = off");
                 text = setLine(text, "temporal_aa_on_foot_world_jitter = on",
                                std::string("temporal_aa_on_foot_world_jitter = ") + jitter);
                 text = setLine(text, "temporal_aa_on_foot_world_steady_detail = on",
@@ -791,10 +792,10 @@ static void testShippedIni(const std::wstring& root) {
                       std::to_string(rep.retired.size()) + " retired, " + std::to_string(rep.carried.size()) + " carried");
                 check(carriedAs(switchMerged, jitterLine) && carriedAs(switchMerged, steadyLine) && carriedAs(switchMerged, followsLine),
                       (tag + "each carried line follows a note saying this version no longer uses it").c_str());
-                expectEq(iniValue(switchMerged, "experimental.temporal_aa_on_foot_world"), "auto",
-                         (tag + "the route key beside the world jitter keeps its tuned value").c_str());
-                expectEq(iniValue(switchMerged, "experimental.on_foot_maps_sharp"), "on",
-                         (tag + "the maps gate beside the steady detail keeps its tuned value").c_str());
+                expectEq(iniValue(switchMerged, "experimental.temporal_aa_on_foot_world"), "off",
+                         (tag + "the route key beside the world jitter keeps its tuned value (off: opted out of the new default)").c_str());
+                expectEq(iniValue(switchMerged, "experimental.on_foot_maps_sharp"), "off",
+                         (tag + "the maps gate beside the steady detail keeps its tuned value (off: opted out of the new default)").c_str());
                 expectEq(iniValue(switchMerged, "experimental.temporal_aa_jitter"), "off",
                          (tag + "the global jitter key beside the jitter-phase switch keeps its tuned value").c_str());
                 check(switchMerged.find("steadier fine detail on objects") == std::string::npos &&
@@ -883,6 +884,76 @@ static void testChangedDefault(const std::wstring& root) {
     MergeReport removed;
     expectEq(iniValue(mergeIni(shipped, deleted, &previous, {}, &removed), "fix.ui_quality", "<absent>"),
              "<absent>", "a line they commented out stays commented out");
+}
+
+// 2026-10-01: two experimental defaults flipped on, the VR world route (experimental.temporal_aa_on_foot_world: off -> auto) and the
+// on-foot maps gate (experimental.on_foot_maps_sharp: off -> on), the keys kept for one release candidate as the way back. What an
+// existing install does with them is the merge's property, as for fix.ui_quality above, and it is pinned for both keys so that what an
+// upgrading user sees is on record: a line that still says what the previous version shipped (the installer's base copy kept) moves to
+// the new default and the report says so; a value somebody chose, a line they deleted and a hand-installed file with no base copy keep
+// what they have. The previous version's file is the shipped one with the two old defaults written back.
+static void testChangedDefaultsOn(const std::wstring& root) {
+    printf("\nshipped defaults that flipped on (the VR world route off -> auto, the on-foot maps gate off -> on), against the real edvr.ini\n");
+    const std::string shipped = readAll(joinPath(root, L"edvr.ini"));
+    if (shipped.empty()) {
+        fail("read the repository's edvr.ini", "not found next to the repo root");
+        return;
+    }
+    struct Flip {
+        const char* line;      // the key's line in the ini, as the previous version spelled its value
+        const char* dotted;    // the key as the merge names it
+        const char* newValue;  // what this version ships
+    };
+    const Flip flips[] = {
+        {"temporal_aa_on_foot_world", "experimental.temporal_aa_on_foot_world", "auto"},
+        {"on_foot_maps_sharp", "experimental.on_foot_maps_sharp", "on"},
+    };
+    std::string previous = shipped;
+    bool anchored = true;
+    for (const Flip& f : flips) {
+        expectEq(iniValue(shipped, f.dotted, "<absent>"), f.newValue,
+                 (std::string("the shipped default of ") + f.dotted + " is " + f.newValue).c_str());
+        const std::string now = std::string("\n") + f.line + " = " + f.newValue;
+        const size_t at = previous.find(now);
+        if (at == std::string::npos) { anchored = false; continue; }
+        previous.replace(at, now.size(), std::string("\n") + f.line + " = off");
+    }
+    check(anchored, "the shipped ini has the two lines this case reverts");
+    if (!anchored) return;
+
+    // An install that never touched them, with the base copy the installer keeps: the new defaults are adopted, and the report
+    // says so. Somebody who typed `off` on purpose is the same bytes and gets the same answer: the merge cannot tell.
+    MergeReport untouched;
+    const std::string adopted = mergeIni(shipped, previous, &previous, {}, &untouched);
+    for (const Flip& f : flips) {
+        expectEq(iniValue(adopted, f.dotted, "<absent>"), f.newValue,
+                 (std::string("an install that never touched ") + f.dotted + " (base copy kept) is moved to the new default").c_str());
+        bool reported = false;
+        for (const std::string& line : untouched.adopted)
+            reported |= line.find(std::string(f.dotted) + " = " + f.newValue) == 0;
+        check(reported, (std::string("and the report says the default of ") + f.dotted + " moved").c_str());
+    }
+
+    // With no base copy (a hand-installed rig): compared against the NEW defaults, so the old default reads as a choice and is
+    // kept. The merge over-preserves; the key is the way back, and this is a rig that had written the old default out.
+    MergeReport handInstalled;
+    const std::string kept = mergeIni(shipped, previous, nullptr, {}, &handInstalled);
+    for (const Flip& f : flips)
+        expectEq(iniValue(kept, f.dotted, "<absent>"), "off",
+                 (std::string("with no base copy the same file keeps its off for ") + f.dotted).c_str());
+    check(handInstalled.twoWay, "and the report says it compared against the new defaults");
+
+    // A line they deleted stays deleted (commented out), and the runtime then uses the code's fallback, which is the shipped
+    // default (tools/config_test checks it); the other key, left alone, still moves.
+    std::string deletedRoute = previous;
+    deletedRoute.replace(deletedRoute.find("\ntemporal_aa_on_foot_world = off"), strlen("\ntemporal_aa_on_foot_world = off"),
+                         "\n#temporal_aa_on_foot_world = off");
+    MergeReport partial;
+    const std::string mixed = mergeIni(shipped, deletedRoute, &previous, {}, &partial);
+    expectEq(iniValue(mixed, "experimental.temporal_aa_on_foot_world", "<absent>"), "<absent>",
+             "a route line they commented out stays commented out (the runtime then uses the code's fallback, auto)");
+    expectEq(iniValue(mixed, "experimental.on_foot_maps_sharp", "<absent>"), "on",
+             "...and the maps gate they left alone still moves to the new default");
 }
 
 // ---------------------------------------------------------------------------
@@ -4448,6 +4519,7 @@ int wmain(int argc, wchar_t** argv) {
     testMerge();
     testShippedIni(root);
     testChangedDefault(root);
+    testChangedDefaultsOn(root);
     testPlanner();
     testNativePlanner();
     testFlatPlanner();

@@ -29,7 +29,9 @@
 // the width he flew.
 //
 // THE ROUTE'S CONDITIONS at launch (all three, plus what the layer itself needs):
-//   * experimental.temporal_aa_on_foot_world is auto
+//   * experimental.temporal_aa_on_foot_world is auto (its default since 2026-10-01; the resolver's fallback in
+//     vscreen_res.cpp, the route's in vr_world_route.cpp and the shipped edvr.ini say the same, and tools\config_test and
+//     tools\vscreen_fit_test hold them to one answer)
 //   * the UI layer is live: fix.ui_quality is not off, and a temporal mode is on (the layer composites at that pass's door)
 //   * the runtime is EDVR's own OpenXR (not Elite's native Oculus back end, not a foreign openvr_api.dll)
 // and the flat profile never fits (the world route is a VR route).

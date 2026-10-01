@@ -1275,10 +1275,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    // The VR on-foot world route (design doc section 82, experimental.temporal_aa_on_foot_world) is OFF by default: it is
-    // unflown. The shipped file says off, and so must the code's fallback for an ini with no such line, which is every
-    // install that predates the key: the same pair of checks as above, because nothing else holds the two to one answer.
-    expectStr("experimental.temporal_aa_on_foot_world", "off", "the shipped edvr.ini ships the VR world route off");
+    // The VR on-foot world route (design doc section 82, experimental.temporal_aa_on_foot_world) is AUTO by default since
+    // 2026-10-01: it has flown, and Sean made it the default (the key stays for one release candidate as the way back). The shipped
+    // file says auto, and so must the code's fallback for an ini with no such line, which is every install that predates the
+    // key: the same pair of checks as above, because nothing else holds the two to one answer. The vscreen resolver's fallback
+    // (below) is held to the same answer in the same commit: a width fitted for a route that does not run would be wrong.
+    expectStr("experimental.temporal_aa_on_foot_world", "auto", "the shipped edvr.ini ships the VR world route auto");
     {
         const std::string shippedWorld = Config::get().getString("experimental.temporal_aa_on_foot_world", "<unset>");
         const std::string worldSource = readRepoFile(dir, L"src\\d3d11\\vr_world_route.cpp");
@@ -1292,16 +1294,17 @@ int main(int argc, char** argv) {
                 fail("the code's fallback for experimental.temporal_aa_on_foot_world is the shipped default",
                      "vr_world_route.cpp falls back to \"" + fallback + "\", the ini ships \"" + shippedWorld + "\"");
             }
-            // CONTROL: the same source with the fallback turned to auto (a route that switched itself on for every install).
+            // CONTROL: the same source with the fallback turned the other way (a route that switched itself off for every install).
             std::string flipped = worldSource;
             const std::string from = "getString(\"experimental.temporal_aa_on_foot_world\", \"" + fallback + "\")";
             const size_t at = flipped.find(from);
+            const char* other = shippedWorld == "auto" ? "off" : "auto";
             if (at != std::string::npos)
-                flipped.replace(at, from.size(), "getString(\"experimental.temporal_aa_on_foot_world\", \"auto\")");
+                flipped.replace(at, from.size(), std::string("getString(\"experimental.temporal_aa_on_foot_world\", \"") + other + "\")");
             if (at != std::string::npos && codeFallbackOf(flipped, "experimental.temporal_aa_on_foot_world") != shippedWorld) {
-                ok("control: the VR world route's fallback turned to auto is caught");
+                ok("control: the VR world route's fallback turned the other way is caught");
             } else {
-                fail("control: the VR world route's fallback turned to auto is caught",
+                fail("control: the VR world route's fallback turned the other way is caught",
                      at == std::string::npos ? "the call was not found to alter"
                                              : "the flipped source still matched the ini");
             }
@@ -1309,8 +1312,8 @@ int main(int argc, char** argv) {
     }
 
     // fix.vscreen_res_width = auto reads the route's key too (src\d3d11\vscreen_res.cpp: the on-foot screen is fitted to the eye only
-    // when the route will run, vscreen_fit.h). Its fallback is a second reader of the same key, and the day the route's default
-    // flips to auto the width has to follow it in the same commit: the same pair of checks, against the shipped file.
+    // when the route will run, vscreen_fit.h). Its fallback is a second reader of the same key, and it flipped to auto with the
+    // route's default in the same commit (2026-10-01), as it must every time: the same pair of checks, against the shipped file.
     {
         const std::string shippedWorld = Config::get().getString("experimental.temporal_aa_on_foot_world", "<unset>");
         const std::string resSource = readRepoFile(dir, L"src\\d3d11\\vscreen_res.cpp");
@@ -1324,7 +1327,8 @@ int main(int argc, char** argv) {
                 fail("the vscreen resolver's fallback for experimental.temporal_aa_on_foot_world is the shipped default",
                      "vscreen_res.cpp falls back to \"" + fallback + "\", the ini ships \"" + shippedWorld + "\"");
             }
-            // CONTROL: the same source with the fallback turned the other way (the width fitted for a route no install has switched on).
+            // CONTROL: the same source with the fallback turned the other way (a width fitted for a route that does not run, or the
+            // legacy width for a route that does).
             std::string flipped = resSource;
             const std::string from = "getString(\"experimental.temporal_aa_on_foot_world\", \"" + fallback + "\")";
             const size_t at = flipped.find(from);
@@ -1344,11 +1348,11 @@ int main(int argc, char** argv) {
     // shipped file and the sources): while the route owns the world it always jitters, and the global jitter key off is
     // the one thing that stops it (vr_world_route_test and vr_world_route_gpu_test pin both).
 
-    // The on-foot maps gate (design-world-camera-motion-2026-09-30.md, Phase 1: experimental.on_foot_maps_sharp) is OFF by
-    // default: it is unflown, and with it on the layer takes a map's or a menu's 2D screen on foot. The shipped file and the
-    // code's fallback for an ini that predates the key must say the same thing; the control turns the fallback to on (a gate
-    // that switched itself on for every install) and must be caught.
-    expectStr("experimental.on_foot_maps_sharp", "off", "the shipped edvr.ini ships the on-foot maps gate off");
+    // The on-foot maps gate (design-world-camera-motion-2026-09-30.md, Phase 1: experimental.on_foot_maps_sharp) is ON by
+    // default since 2026-10-01 (the key stays for one release candidate as the way back): the layer takes a map's or a menu's 2D
+    // screen on foot. The shipped file and the code's fallback for an ini that predates the key must say the same thing; the
+    // control turns the fallback the other way (a gate that switched itself off for every install) and must be caught.
+    expectStr("experimental.on_foot_maps_sharp", "on", "the shipped edvr.ini ships the on-foot maps gate on");
     {
         const std::string shippedMaps = Config::get().getString("experimental.on_foot_maps_sharp", "<unset>");
         const std::string layerSource = readRepoFile(dir, L"src\\d3d11\\ui_layer.cpp");
@@ -1365,12 +1369,13 @@ int main(int argc, char** argv) {
             std::string flipped = layerSource;
             const std::string from = "getString(\"experimental.on_foot_maps_sharp\", \"" + fallback + "\")";
             const size_t at = flipped.find(from);
+            const char* other = shippedMaps == "on" ? "off" : "on";
             if (at != std::string::npos)
-                flipped.replace(at, from.size(), "getString(\"experimental.on_foot_maps_sharp\", \"on\")");
+                flipped.replace(at, from.size(), std::string("getString(\"experimental.on_foot_maps_sharp\", \"") + other + "\")");
             if (at != std::string::npos && codeFallbackOf(flipped, "experimental.on_foot_maps_sharp") != shippedMaps) {
-                ok("control: the on-foot maps gate's fallback turned to on is caught");
+                ok("control: the on-foot maps gate's fallback turned the other way is caught");
             } else {
-                fail("control: the on-foot maps gate's fallback turned to on is caught",
+                fail("control: the on-foot maps gate's fallback turned the other way is caught",
                      at == std::string::npos ? "the call was not found to alter"
                                              : "the flipped source still matched the ini");
             }

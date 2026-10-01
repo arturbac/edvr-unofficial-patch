@@ -349,7 +349,7 @@ namespace {
 // The route's conditions as the configuration states them -- the same three the world
 // route needs at run time, read from the ini the way each owner reads it, because at
 // launch (and in the menu, for the next one) no owner has run yet:
-//   * experimental.temporal_aa_on_foot_world: vr_world_route.cpp's boundary, default off
+//   * experimental.temporal_aa_on_foot_world: vr_world_route.cpp's boundary, default auto
 //   * (the curved screen is not a condition: the route re-issues a curved screen through
 //     the same strip the game's draw is substituted with, panel_curve.h panelCurveReissue)
 //   * the UI layer: ui_layer.cpp's uiLayerConfigure -- fix.ui_quality (default 100), a
@@ -367,7 +367,7 @@ vscreenfit::RouteFacts routeFactsFromConfig(Config& cfg) {
     vscreenfit::RouteFacts f;
     f.flatProfile = runtimeFlatProfile();
     f.keyAuto = vscreenfit::keyTextIsAuto(
-        cfg.getString("experimental.temporal_aa_on_foot_world", "off").c_str());
+        cfg.getString("experimental.temporal_aa_on_foot_world", "auto").c_str());
 
     const std::string quality = cfg.getString("fix.ui_quality", "100");
     bool recognized = true;

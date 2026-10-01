@@ -8,7 +8,7 @@
 //
 // WHAT IS HERE, all pure (tools\vr_world_route_test drives every function, and the runtime calls the very same
 // code):
-//   - the key: experimental.temporal_aa_on_foot_world, off (the default) or auto;
+//   - the key: experimental.temporal_aa_on_foot_world, auto (the default since 2026-10-01) or off;
 //   - the ownership machine: the route treats frames, is WARM after kVrWorldWarmFrames treated frames in a row,
 //     OWNS the world from then on, and is released by the gate, the layer, a scene reset, a run of frames it did not
 //     treat, or the late-write latch. Only an owned route moves the eye shift and the screen draws;
@@ -31,9 +31,9 @@
 namespace edvr {
 
 // ---- the key ---------------------------------------------------------------------------------------------
-// experimental.temporal_aa_on_foot_world: auto (the route where it applies) or off. Off by default: the route has
-// not flown. A key that is absent reads as the default; a value that is present and is not "auto" reads as off, so a
-// typo leaves on-foot VR exactly as it was and never switches the route on by accident.
+// experimental.temporal_aa_on_foot_world: auto (the route where it applies) or off. Auto by default since 2026-10-01 (the
+// route has flown; off is kept for one release candidate as the way back). A key that is absent reads as the default; a
+// value that is present and is not "auto" reads as off, so a typo leaves on-foot VR exactly as it was before the route.
 enum class VrWorldKey : uint8_t { Off, Auto };
 inline VrWorldKey vrWorldKeyFromText(const char* text) {
     if (!text) return VrWorldKey::Off;
