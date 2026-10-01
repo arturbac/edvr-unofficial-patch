@@ -7712,9 +7712,15 @@ flat and VR (85119ce9; Epic log 071356, Frontier log 074129).
   ruled out: "the route declines every frame in Cinema on foot", because
   074129 owned in Cinema on foot after the arrival spell.
   Open: what ends the spell (the arrival camera? the first on-foot source
-  frame?). During it the eye route serves the panel without screen motion,
-  which is the ghost Sean saw while moving. That is pre-existing for the eye
-  route.
+  frame?).
+  CORRECTED 10-01 by the Phase 1 build's log reading
+  (design-world-camera-motion-2026-09-30.md, 8.6). In the spell the layer took
+  every screen draw: 060011 reads "5174 2D screen draws asked, 0 left in the
+  picture" and "5396 ... 0 left". The luma probe's final stage is black at
+  every sample of both spells; the world arrives at once afterwards.
+  ruled out: "the ghost Sean saw was the eye route serving the panel during
+  the spell", because no eye-route panel was shown in it.
+  What the ghost was is unknown. Cinema on foot looked good in 074129.
 - Next: steady detail default ON for VR and flat (the key-off pins move with
   it), shipped with Phase 1 and the auto-fit.
 
