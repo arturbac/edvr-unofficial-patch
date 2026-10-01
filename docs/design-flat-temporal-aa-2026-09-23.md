@@ -49,7 +49,7 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-82):** users 1-2 refused every frame, 3 treated at 7-13
-  fps, 4 lost ~23 ms (ReShade). 80-81 flown. 82 (VR): flown once, analysed.
+  fps, 4 lost ~23 ms (ReShade). 80-81 flown. 82 (VR): flown once; stage 2 built.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -6343,7 +6343,11 @@ the route resolves at DLAA 5040x2835 on slot 2.
    first release. So the game showed a full-screen non-world view. The 3D map
    the plan asked for fits (the second gap is 10.7 s, the first 18.1 s a first
    look, the 98-frame world between them the map closed and reopened), but the
-   log cannot tell map from menu: Sean's account is wanted. The named source
+   log cannot tell map from menu. SEAN'S ACCOUNT (afterwards): "I opened the
+   system and galaxy maps". The two paused-world gaps (18.1 s and 10.7 s) were
+   those two maps, in the log's order 16:22:42, 16:23:01, then the exit at
+   16:23:24 (which gap was which map is not recorded), so the releases around
+   the maps are correct behaviour, now confirmed. The named source
    depth was 0x2636FFC0AA0, then 0x2636FFBD0E0 in the 98-frame episode, then
    0x2636FFC0AA0 again. The third release (16:23:24.8) is the exit: 2016x1949
    eye-sized depth targets and a loading composite into an eye appear in the
@@ -6440,10 +6444,13 @@ the route resolves at DLAA 5040x2835 on slot 2.
    1e-6 with a world phase of 1e-4 to 2e-4) while the kind-3 calls' rows carry
    it, kind-5 calls stay 6.0 a frame and injected calls run 54-68 a frame. STOP
    on any |leak| > 1e-5, an injected kind other than 3, or off-thread or
-   unreadable calls. Open: the weapon map's phase term, and the ~6 other kind-3
-   calls a frame (two cameras in the table, a 90-degree square-aspect one from
-   caller +0x58DE73 and a 0.236 rad zoom-like one) which need a role before
-   they get a phase.
+   unreadable calls. Open at the time: the weapon map's phase term, and a role
+   for "the ~6 other kind-3 calls a frame". CORRECTED by the stage 2 note
+   below: those six are not two other cameras. They are the weapon's own
+   refreshes inside the 54 (two per call site, three sites): the old table's
+   two other kind-3 cameras (a 90-degree square-aspect one at caller +0x58DE73
+   and a 0.236 rad one) were first seen in the cockpit's first frames and do
+   not appear in any logged on-foot call sequence.
 4. STOP LIST. Late writes 0; no latch line. No `layer did not take` line; the
    layer's refused and lost-draw counts are 0 in every 30 s line. native
    temporal totals `layer_only=28422, layer_only_declined=0`; native sharpen
@@ -6477,3 +6484,288 @@ line names its last decline reason and the decline log caps per episode, not
 per session; a route CPU clock; the fold-in's counters in the 30 s window; the
 first treat's duration as its own line; the census reader classifies a camera
 by each call's kind.
+
+**Stage 2 implementation note: the world jitter (2026-09-30).** Sean: "Build
+stage 2." Built on main 246070a7 from flight 1's census (above): the route now
+puts the flat profile's sub-pixel phase into the on-foot world's own kind-3
+cameras and resolves the jittered world. BUILT, NOT FLOWN. Environment the fix
+depends on: EDVR's native OpenXR runtime on the game process (the camera hook
+is the flat profile's detour at EliteDangerous64.exe+0x592200 of flight 1's
+build; the RVA is build-specific, a moved hook reads `failed`, the route says
+so once and resolves unjittered; under the Oculus native SDK the route never
+ran, so this is inert there), Pimax Crystal Super at HMD 0.65 (eye 2620x2533,
+output 4032x3898), the 2D screen and H 5040x2835 R11G11B10F, the route at DLAA
+on slot 2 (DLSS preset K), fix.ui_quality on, fix.panel_curvature 0, the eye
+shift off while the route owns the world (unchanged).
+
+BUILT. (1) The injector in VR (flat_camera_inject.cpp; the pure half is
+flat_camera_vr.h, header-only: the role, the admission, the flush, the
+counters, the mode word). One detour serves the flat profile, the census and
+the route. A per-frame mode word, which the route sets (flatCameraVrFrame,
+once a frame on the Present thread from vrWorldRouteFrameBoundary, ahead of
+the census's step; flatCameraVrCloseWindow at the trigger), is zero for the
+flat profile's whole life and for a process the route never drives, and the
+detour then runs the code it always ran (eleven regions of the flat path are
+hashed in the rig). Admission is by KIND on every call, never cached per camera
+object: it builds on flatCameraAdmit and never spells a kind. Only kind 3 is
+ever injected; kinds 4 and 5 (the eyes) are Unsupported, counted and never
+mutated; kinds 0, 1, 2 are other kinds. Per call, in order: the off-thread
+exit, the kind, the frame window, the role (aspect, near, fov and far are read
+only for a kind-3 call the frame could inject), the census hears the call
+before any write (told willInject and the role), the flush, the writes (the
+flat injector's own: the bound pair, then the flag word's bits 4 and 8, rolled
+back if any write fails, the return redirect last), and the call's one outcome
+(calls = the sum of the outcomes, in every mode). The entry values come back
+after the body (restore-after-call). A camera the route injected and now does
+not (a release, a role exclusion, a call after the trigger, a warm-up, a kind
+change on a reused object) keeps the phase in its derived blocks, so its first
+un-injected call raises the two dirty bits once: the flush, in every mode, the
+only write a pass-through or observe-only frame can make. The relay gate closes
+only when the detour is quiet (the last frame asked for neither injection nor
+observation and no camera waits for its flush; flatCameraVrQuiet), an
+injecting frame's window lapses with the flat frame window, and the flat
+stand-down rule (eight failed writes in one 5 s window) applies. Rigs:
+tools\flat_camera_vr_test, 121 checks (the admission over 2,880 input
+combinations against a table written from the brief, the injected-kind
+invariant exhaustively, the camera-object reuse scenario as a scripted call
+sequence, the one-outcome rule over 227k random calls, the flush for every
+reason, the arithmetic bit-equal to the flat injector's) and 102 one-rule
+mutants, all caught. The VR path's memory operations on a real camera struct
+have never run in the game: they are the flat injector's own statements, pinned
+equal, in a new combination (census report, injection, one return redirect and
+the restore).
+(2) The route (vr_world_route.cpp, vr_world_route_math.h). The window opens at
+the frame boundary only when all hold: the key is auto, the route is Warming
+or Owned, the gate holds, the layer is live, the A/B key is on, and the frame
+that just ended NAMED the screen's source (the naming rule, below). The phase
+is the flat profile's own FlatLivePhase: two zero-phase frames (the injector
+admits and writes nothing), then the Halton (2,3) sequence, within half a
+pixel of the 5040x2835 grid, in render pixels positive right/down, written as a
+bound-pair shift of +phase/W and -phase/H (an NDC shift: the same pixel shift
+on any field of view). What the resolver gets is the phase a SCENE call
+CONFIRMED (jitter and rows, this frame and last), never the chosen one: a frame
+whose window was open and whose scene cameras never took the phase resolves
+unjittered and says why; a frame part of whose cameras took it (a refused
+write) is declined (camera-injection-incomplete) and the phase machine starts
+its two zero frames again. The flat runtime's row-pair evidence
+(flatCameraCheckRowPair) runs on consecutive resolved frames: two frames' rows
+must differ by the phases they claim. vrWorldRouteWorldPhase() answers with the
+frame's phase; the eye shift stays off while owned.
+(3) The resolver's weapon seam (FlatMonoResolveFrame::firstPersonPhaseMode, one
+shader line, three source lines): the map's vector is previous minus current at
+the two frames' OWN raster phases, m = (P_prev - P_cur) + (p - c); mode 1 adds
+(c - p), mode 0 leaves the vector as given (byte-identical to the build before
+the field existed), any other mode rejects attached pixels' history. Proven on
+WARP against maps built from explicit positions: error 0 px on nine dyadic
+phase pairs, at most 0.002 px on a Halton pair (fp16 rounding), 18 of 18
+mutations caught (tools\flat_mono_resolve_test, flat_first_person_phase_gpu_
+tests.h); the sign of zero on a real driver is untested.
+(4) The instruments and the reader, below.
+
+THE TWO OPEN POINTS, settled from the census call lines (frame 13804, every
+kind-3 call's composed rows read as a projection; `edvr_log.py --camera-census`
+now prints the same split for flight 1):
+(a) THE WEAPON'S PHASE TERM: the weapon takes THE SAME PHASE. The weapon is not
+another camera: its calls are six of the 54 kind-3 calls, the same camera
+object with a tighter field of view (47.03 against 56.36 degrees vertical) and
+a larger near plane (0.0675 against 0.025), the same screen aspect (1.788 from
+the matrix, 1.7778 from the rows once the shift is out), two calls a site over
+three sites (the draws 4166-4170 and 5922-5923 of the census numbering), and
+they refresh whether or not a weapon is drawn. The bound pair is an NDC shift,
+so one bound is one pixel shift on any field of view: a first-person camera
+given the world's phase rasterises its pixels on the world's jittered grid, the
+attached pixels and the world under them share one sample position, and the
+map's vector needs exactly (c - p). Left unjittered, every attached pixel would
+sit a constant sub-pixel off the one jitter the backend is told, which no
+vector can absorb, and excluding the weapon (mode 2 every frame) would throw
+its history away every frame. The fold-in stays correct either way: the route
+computes the mode from what each frame's cameras actually carried
+(vrWorldFirstPersonMode): 1 when the first-person camera carried the world's
+phase in both frames (a frame with no weapon map has no attached pixels and
+counts the world's phase as the weapon's), 2 when a first-person call was
+excluded or refused in either frame, 0 when nothing carried a phase. The 5 s
+line's `fp-mode=a/b/c` and the resolver's firstPersonPhaseFrames count the
+three. UNFLOWN in substance: flight 1 was in a station with the weapon not
+drawn; the settlement leg flies it.
+(b) THE "~6 OTHER KIND-3 CALLS": they are the weapon's six (above), inside the
+54, not two other cameras (the flight 1 entry is corrected). In frame 13804 all
+54 kind-3 calls are one camera object through five view objects, 48 scene
+calls and 6 first-person, every one of screen aspect. The table's two other
+kind-3 cameras (a 90-degree square-aspect one at caller +0x58DE73, a 0.236 rad
+one) were first seen in the cockpit's first frames and appear in no logged
+on-foot call sequence (the +0x58DE73 site runs at about 0.2 calls a frame).
+The roles, decided on every call (flat_camera_vr.h): a kind-3 call is a
+SCREEN VIEW when its aspect is within 4% of H's aspect; of the screen views,
+the first-person one has a near plane at least 1.5 times the smallest near a
+screen view has shown; both get the frame's phase. Everything else is
+AUXILIARY (a probe, a spot light's square camera, a zoom camera): excluded,
+counted (`aux=`), its signature (aspect, fov, near, far, caller) logged once
+(the first eight), never injected. An unknown role is excluded, never guessed.
+The role is aspect-only: any kind-3 camera of the screen's aspect gets the
+phase, which the census's per-call role= and inj= will show in flight.
+Settlement frames carry about 73-79 kind-3 calls (the world-camera design doc's
+estimate): their extra calls are unknown until flown; one with the screen's
+aspect is injected as a scene call, one without is excluded and named.
+
+THE NAMING RULE (design-world-camera-motion-2026-09-30.md section 5). A map or
+menu frame refreshes about thirty kind-3 cameras and must never pick up the
+world's phase. The window therefore opens only after a frame that named the
+screen's source (the selector's depthNamed: a pool-family draw into the
+screen-sized depth), and stays shut after one that did not, through the
+route's three grace frames, until a frame names one again. The frame that
+starts cannot be asked: its scene camera refreshes before the draws that name
+the source, so the last frame's naming is the only one there is. The cost is
+one frame: the FIRST map or menu frame after a world frame has its window open
+and its cameras take the phase once (counted `inj-unnamed`, said once per
+change in the log, eight lines a session); every later one is shut. Checked
+against flight 1: the declines of both paused-world gaps were
+`depth-not-screen-motion-source` (2,396 of the 2,399). After a shut frame the
+phase machine starts its two zero frames again, so each map costs three
+unjittered (still DLAA-resolved) world frames on return. The window also closes
+at the route's trigger, and a write on a frame the route had shut is a STOP
+(`inj-shut`): the route switches the injector off until its key is flipped.
+Warming frames are resolved by the route (the eye route still serves the eyes,
+with its own shift on): the resolved H goes back into the game's chain, so the
+jitter is not seen; what the eye route does see is the phase in the named
+draw's rows for those frames, under half a source pixel.
+
+THE A/B. `experimental.temporal_aa_on_foot_world_jitter` = on (default), dev:
+choices on, off, live from the in-headset menu like the route key. off keeps
+the route and zeroes the phase: the injector is never stepped, the world
+resolves unjittered, flight 1's behaviour; any value but on reads as off (a
+typo never writes the game's cameras); `experimental.temporal_aa_jitter` off
+stops it too. KEY OFF (`experimental.temporal_aa_on_foot_world` off) is today's
+behaviour, pinned: the boundary's one early-return test only gains a flag that
+is false until the route first drives the injector, nothing of stage 2 runs
+before it, and the injector is never stepped (vr_world_route_test source pins,
+the GPU rig's key-off scenario, config_test). Turning the route key off live
+passes the injector through until what it wrote is restored, then leaves it
+alone; with the census on the detour stays stepped (it is observing).
+
+INSTRUMENTS AND READER. The 5 s route line carries `jitter=` (on, off, idle,
+unnamed, no-hook, fault), `phase=` (the world phase in use, render pixels),
+`rows=` (what the resolved frame's rows carried) and `fp-mode=a/b/c`; a second
+line, `vr world route inject 5s:`, carries the injector's counters
+(`inj-scene inj-fp inj-refused warming aux after unsupported other-kind
+unreadable off-thread write-fail inj-kinds pair-checked pair-bad inj-unnamed
+inj-shut`). The RELEASED line names its last decline and its run
+(`(frames-not-treated; last decline: depth-not-screen-motion-source x3)`). The
+decline log caps per RUN of declines (three lines, re-armed by a treated frame)
+with a session backstop of 64. Route events are one line each: `the world is
+JITTERED from frame=` (once per ownership episode), `camera window was open`
+(the first map frame, above), `EXCLUDED, not a screen view` (a signature),
+`jitter is wanted but no scene camera call was injected`, `camera rows
+disagree with the phase`, `the camera hook is not available`, and the STOP
+lines. The census (vr_camera_census*.h/.cpp) hears each call before any write,
+told `inj=` and `role=` (scene, fp, aux), its 5 s line gains `inj-calls=`, a
+sequence header and each eye line gain `phase=X,Y` (render pixels; `-` while
+the route is not jittering) and, while the route jitters, only a frame whose
+phase is non-zero is sampled (flight 1 spent its whole sample on warm-up
+frames). Its key-off path leaves the relay to the route
+(flatCameraInjectPause(flatCameraVrQuiet())) and its notes say the census
+itself never writes a camera. `python tools\edvr_log.py --camera-census` labels
+a camera by the KIND OF EACH LOGGED CALL (the first-seen kind of an object is no
+identity), splits one object's projections (flight 1: world camera
+0x25FEFC53770, 54.0 calls a frame, 48 at near 0.025 and 6 at near 0.0675, "the
+first-person weapon camera's signature"; no "not enough calls" any more), and
+ends with the STAGE 2 VERDICT: six lines, PASS, WARN, STOP or n/a each, then
+`stage 2 verdict: <word>`: (i) LEAK (the eye rows must not move: |leak| below
+1e-6 NDC with a world phase of 1e-4 to 2e-4; STOP above 1e-5), (ii) KIND-3
+ROWS CARRY THE PHASE (each injected call's measured shift within 1e-6 of
+x = 2 px/W, y = -2 py/H), (iii) INJECTED KINDS (kind 3 only), (iv) OFF-THREAD /
+UNREADABLE, (v) ROLES, (vi) INJECTION WINDOW (`inj-shut`, `inj-unnamed`). The
+verdict never changes the reader's exit code. Flight 1's log reads (iv) PASS
+and the rest n/a (it predates stage 2). The census rigs print the route's two
+lines through the route's own formatters, so a format drift fails the build.
+
+FLIGHT PLAN. Frontier, the flight-1 environment; the installed build is the
+one `python tools\edvr_log.py --target frontier --expect-build HEAD --version`
+names (the coordinator installs). Keys (live `edvr.ini` by the Edit tool, or
+the in-headset menu, developer mode, Experimental page):
+`experimental.temporal_aa_on_foot_world = auto`,
+`experimental.temporal_aa_on_foot_world_jitter = on`, `fix.panel_curvature = 0`,
+`fix.ui_quality` on. Turn `advanced.vr_camera_census` ON LIVE only after the
+route owns the world and its 5 s line reads `jitter=on` (the census samples the
+first frames after it starts; they must be jittered ones), and leave it on.
+Read with `python tools\edvr_log.py --target frontier --expect-build HEAD
+--grep "vr world route"` (the route lines) and `--camera-census` (the verdict);
+note the clock at every change.
+1. SAME SPOT, standing still, no menu, weapon not drawn, the same scene in view,
+   90 s each, toggled live: (1a) route auto, jitter on; (1b) jitter off (the
+   route stays: flight 1's behaviour); (1c) route off (the eye route, the
+   baseline); (1d) route auto, jitter on again. Read the 30 s windows that fall
+   wholly inside a leg.
+   PASS: 1a and 1d: `state=owned jitter=on`, `phase=` non-zero and changing,
+   `rows=` equal to `phase=`, `treated` = `frames`; the inject line has
+   `inj-kinds=3:N` only, `inj-scene` about 48 and `inj-fp` about 6 a frame,
+   `unsupported` about 6 a frame (the eyes, kind 5), and `inj-refused=0
+   write-fail=0 off-thread=0 unreadable=0 inj-shut=0 inj-unnamed=0 pair-bad=0`,
+   `pair-checked` about the treated frames (`after=` is what is left after the
+   trigger: record it); `OWNS the world` and `the world is JITTERED from
+   frame=` once per episode; no `declined`, `STOP`, `camera rows disagree` or
+   `RELEASED` line; the census verdict reads (i)-(vi) PASS. 1b: `jitter=off
+   phase=0.0000,0.0000 rows=0.0000,0.0000`, `inj-scene=0 inj-fp=0
+   inj-kinds=none`, owned and treated as in flight 1 (EDVR ~3.5 ms). 1c: no
+   route line at all, the eye route's cost (about 5 ms). Cost: EDVR ~ in 1a
+   within 0.2 ms of 1b's, application render p50 not worse by more than
+   0.3 ms. Sean: 1a against 1b, the world's edges calmer under DLAA with
+   nothing swimming; the HUD and the menus unchanged.
+   STOP: any `STOP at frame=` line; a census verdict STOP (an eye's |leak|
+   above 1e-5, an injected kind other than 3, off-thread or unreadable calls);
+   `pair-bad` above 0 (the rows do not carry the phase the route claims: the
+   resolver's jitter input is wrong, expect blur; the reader calls it WARN, the
+   plan calls it STOP); `inj-refused` or `write-fail` above 0; `jitter=no-hook`
+   or `jitter=fault`; a `declined` or `RELEASED` line in a world that did not
+   change; 1a's EDVR ~ more than 0.3 ms above 1b's.
+2. A SETTLEMENT, weapon drawn and holstered: 60 s holstered, 60 s drawn
+   (moving slowly, turning the head), 60 s holstered, then 60 s drawn with the
+   jitter key off for Sean's comparison. PASS: as leg 1, and `inj-fp` about 6 a
+   frame whether the weapon is drawn or not; with the weapon drawn `fp-mode`
+   is mostly mode 1 (the middle number), mode 0 only for the zero-phase frames
+   after a restart; `late-hdr-writes=0` (the latch's chain is new here); every
+   `EXCLUDED` line names a signature whose aspect is not the screen's. STOP:
+   `fp-mode` mostly 2 with the weapon drawn (the first-person camera is not
+   carrying the phase: read `inj-fp`, the EXCLUDED lines and the census roles);
+   `state=latched`; the weapon shimmering or swimming against the world with
+   the jitter on and not with it off (Sean).
+3. THE MAPS, on foot: open and close the system map and then the galaxy map,
+   30 s each, jitter on, watching the first frames after each open and each
+   close. PASS, per opening: one `camera window was open` line and `inj-unnamed`
+   up by at most one, at most three `declined` lines, one `RELEASED ...
+   (frames-not-treated; last decline: <reason> x3)` (depth-not-screen-motion-
+   source, or no-trigger when the map draws no H), the windows `jitter=unnamed`
+   or `idle` with `inj-scene=0` and `inj-shut=0` in every window that is all
+   map; per closing: `OWNS the world` after 8 treated
+   frames and `the world is JITTERED from frame=` once more. The maps look
+   exactly as in flight 1: no new shimmer, crawl or doubled lines (the drag
+   smear is the world-camera design doc's arc and is expected unchanged).
+   STOP: `inj-shut` above 0 or a `STOP at frame=` line (a window opened on a
+   frame after an unnamed one, which includes a map frame jittered past the
+   first); `jitter=on` in a window that is all map frames; `inj-unnamed` rising
+   by more than one an opening.
+
+KNOWN LIMITS. One frame per world-to-map change carries the phase (above). Each
+restart (a map, a decline) costs three unjittered DLAA frames. The weapon
+fold-in's jittered path is proven on WARP only and unflown. The census must be
+turned on after the route owns the world, or its eye budget is spent on frames
+with no phase and (i) STOPs with that reason. A settlement's extra kind-3
+calls are unknown. The sceneNear anchor never resets, so a context with a
+larger scene near would count its scene cameras as first-person (counters
+only). edvr_log.py is now about 250 KB: the census reader could be its own
+module (not done).
+
+- ruled out: opening the window on the CURRENT frame's naming, because the
+  scene camera refreshes before the draws that name the source: nothing exists
+  to read when the window must open. The previous frame's naming is what there
+  is, and its one-frame cost is counted.
+- ruled out: a draw-count or call-count test inside the frame to tell a map
+  from a world before the first camera call (the map's fewer draws), because it
+  is a guess about scenes: roles and scenes are never guessed here.
+- ruled out: excluding the weapon's camera from the phase, because the
+  attached pixels would be rejected every frame or sit a constant sub-pixel
+  off the backend's one jitter.
+- ruled out: an injected phase on Observing frames, because nothing resolves
+  them (a frame the route may not resolve is never jittered at the source).
+- ruled out: reading "the ~6 other kind-3 calls" as two other cameras, because
+  frame 13804 shows them as the weapon's refreshes inside the 54 and the table's
+  two other kind-3 cameras never appear on foot.
