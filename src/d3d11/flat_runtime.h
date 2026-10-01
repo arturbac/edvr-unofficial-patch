@@ -20,17 +20,20 @@ bool flatRuntimeNativeScale();
 // warning). Any thread; false with a treated, transiently refused or merely slow-to-start
 // session, and with the mode off. The caller checks that a temporal mode is selected.
 bool flatRuntimeStructuralRefusal(const char** reasonName, bool* standingDown);
-// Whether the HDR route (experimental.temporal_aa_before_post = auto, flat_hdr_route.h) is what treats frames now:
-// published with the refusal state, so it is meaningful only while flatRuntimeStructuralRefusal is true. The F8
-// warning drops the Bloom and Depth of field advice while it holds.
-bool flatRuntimeHdrRouteActive();
-// Whether the route's key is auto and its last selection found the game rendering below the output on both axes
-// (Elite's supersampling under 1.0), so the route leaves the frames to the copy route: then true, with the measured
-// render and output sizes (the route's own, taken at its trigger, not Elite's settings file). False with the key off,
-// with a selection at R >= D and after a resize. Any thread. The F8 warning adds its supersampling line from it, and
-// only while frames are refused and the route is not treating them (flatWarningFlags).
-bool flatRuntimeHdrRouteBelowOutput(uint32_t* renderWidth, uint32_t* renderHeight, uint32_t* outputWidth,
-                                    uint32_t* outputHeight);
+// Whether the route's key (experimental.temporal_aa_before_post) is auto, so the game's final copy is admitted by its
+// structure and Bloom and Depth of field never cause a refusal (flat_copy_structure.h, design section 83): published with the
+// refusal state, so it is meaningful only while flatRuntimeStructuralRefusal is true. The F8 warning drops the Bloom and Depth
+// of field advice while it holds.
+bool flatRuntimeStructureAdmission();
+// Whether EDVR's own TAA is selected and the scene renders above the output on both axes: with the refusal state, so meaningful
+// only while flatRuntimeStructuralRefusal is true. Neither route resolves a chain the whitelist does not know there (the HDR
+// route evaluates at the render size, the display-grid TAA at the output's), and the F8 warning says what to do about it.
+bool flatRuntimeTaaAboveOutput();
+// The scene's and the output's sizes as the final copy's admission last measured them (the R11G11B10F target the scene is drawn
+// into, and the swap chain's), true once a frame has shown a scene since the key, the mode or a resize last cleared it. The
+// runtime's own measurement, never Elite's settings file. Any thread. The F8 warning and the stand-down line name the render
+// size from it when the refusal is render-size-does-not-fit-output.
+bool flatRuntimeSceneSizes(uint32_t* renderWidth, uint32_t* renderHeight, uint32_t* outputWidth, uint32_t* outputHeight);
 // The upstream camera injector's read points into the phase machine: the
 // current phase in render pixels and the validated resolve plan's render
 // extent (w/h); applied is the machine's own applied count this frame.

@@ -11,6 +11,7 @@
 
 #include <d3d11.h>
 
+#include <atomic>   // g_renderBelowEye
 #include <cctype>   // toupper, in the census-skip spec parser
 #include <cmath>
 #include <cstdio>   // _snprintf_s, for the sizes list in the starvation line
@@ -24,6 +25,7 @@
 #include "../common/log.h"
 #include "../common/proxy.h"  // breadcrumbHeartbeat, the steady-state trail
 #include "../common/timing.h"
+#include "../common/vr_supersample_notice.h"   // Elite's Supersampling below 1, read from the measured render size
 #include "../common/vtable_hook.h"
 #include "backdrop_fix.h"
 #include "billboard_fix.h"
@@ -5303,6 +5305,14 @@ bool vScreenIsEyeSized(uint32_t w, uint32_t h) {
     return false;
 }
 
+// Elite's Supersampling below 1.0 as the sizes measure it (vr_supersample_notice.h): the measured render size and the eye's
+// in one word, 0 until the world is found rendered under kBelowPercent of the eye's width and height. Written once a
+// session on the frame thread where the render size is adopted, read by the menu on its own tick.
+static std::atomic<uint64_t> g_renderBelowEye{0};
+bool vScreenRenderBelowEye(uint32_t* renderW, uint32_t* renderH, uint32_t* eyeW, uint32_t* eyeH) {
+    return vrss::unpack(g_renderBelowEye.load(std::memory_order_acquire), renderW, renderH, eyeW, eyeH);
+}
+
 uint32_t vScreenEyeDrawsThisFrame() {
     const State* s = g_state;
     return s ? s->eyeDrawsThisFrame : 0;
@@ -6040,6 +6050,17 @@ void vScreenFrameBoundary() {
                 "report this log.",
                 s->renderW, s->renderH, s->eyeW, s->eyeH, pct, best, s->eyeDrawsMax,
                 Config::get().iniName());
+            // ELITE'S SUPERSAMPLING BELOW 1.0 (design section 83, the VR warning): the measurement above IS the detection, from
+            // the render sizes and never from Elite's settings file. A world drawn under the eye's width and height is scaled
+            // up by the game before EDVR sees it, so EDVR's DLSS upscales an upscaled image and the holograms suffer with it.
+            // Said once here, in the log; the menu reads it for the headset (vScreenRenderBelowEye). Never in a flat session:
+            // it has no eye texture, so this branch is not reached with one.
+            if (vrss::below(s->renderW, s->renderH, s->eyeW, s->eyeH)) {
+                g_renderBelowEye.store(vrss::pack(s->renderW, s->renderH, s->eyeW, s->eyeH), std::memory_order_release);
+                char notice[1000];
+                vrss::formatLog(notice, sizeof(notice), s->renderW, s->renderH, s->eyeW, s->eyeH);
+                Log::get().note("%s", notice);
+            }
         } else if (best > kSceneEyeDraws) {
             // THE SAME EVIDENCE, WITHOUT THE CORROBORATION, so it buys less.
             //

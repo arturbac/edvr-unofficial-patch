@@ -25,6 +25,10 @@
 //   R11 the state files on disk (vscreen_auto_state.cpp): the footprint's round trip beside the eye width's, in a temp directory
 //   R12 the wiring, as source pins: the resolver's reads match their owners', the instrument's hook sits where the pins say and
 //       stays off the flat profile, its D3D calls never wait and always step past the hooks, the named place for the curve
+//   R13 Elite's Supersampling below 1.0 in VR (src/common/vr_supersample_notice.h; design section 83, the VR warning): the pure
+//       judgement over the measured render size and the eye's, the published word, the words, and the wiring as source pins
+//       (the detection is vscreen's own measurement, never Elite's settings file; the toast, the Status line and the settings
+//       pages' note are the menu's; a flat session never reaches any of it)
 //
 // Usage: --self-test [<repo root>] [--only R1,R3,...] [--root <dir>] | --dry-run (does nothing) | --write-fixture <path> [--dry-run]
 // (regenerates tools\vscreen_fit_fixture.log from the formatters; with --dry-run it says what it would write and writes nothing).
@@ -52,7 +56,15 @@
 #include "../../src/common/vscreen_auto_state.h"
 #endif
 
+// R13: Elite's Supersampling below 1, from the measured render size. The mutation tool builds the rig against an edited copy of this
+// header through -DVR_SUPERSAMPLE_HEADER, as it does for the fit's.
+#ifndef VR_SUPERSAMPLE_HEADER
+#define VR_SUPERSAMPLE_HEADER "../../src/common/vr_supersample_notice.h"
+#endif
+#include VR_SUPERSAMPLE_HEADER
+
 namespace fit = edvr::vscreenfit;
+namespace vrss = edvr::vrss;
 
 namespace {
 
@@ -920,9 +932,100 @@ void caseR12() {
     }
 }
 
+// ---- R13: Elite's Supersampling below 1.0 in VR ---------------------------------------------------------------------------
+void caseR13() {
+    // The judgement: the world rendered under 98% of the eye's width AND height. The eye is 2816x3072 here (a Pimax-like eye).
+    check(vrss::kBelowPercent == 98, "R13a: the threshold is 98 percent (Elite's Supersampling steps by 0.05; two percent absorb a rounded size)");
+    check(vrss::below(2112, 2304, 2816, 3072) && vrss::below(2675, 2918, 2816, 3072) && vrss::below(1408, 1536, 2816, 3072),
+          "R13a: 75%, 95% and 50% of the eye are below 1");
+    check(!vrss::below(2816, 3072, 2816, 3072) && !vrss::below(2760, 3011, 2816, 3072) && !vrss::below(3520, 3840, 2816, 3072),
+          "R13a: the eye's own size, 98% of it and a larger render (Supersampling above 1) are not");
+    check(!vrss::below(2112, 3072, 2816, 3072) && !vrss::below(2816, 2304, 2816, 3072),
+          "R13a: one axis under and the other not is no uniform Supersampling: not below 1");
+    check(!vrss::below(0, 0, 0, 0) && !vrss::below(2112, 2304, 0, 0) && !vrss::below(0, 0, 2816, 3072) && !vrss::below(2112, 2304, 2816, 0),
+          "R13a: an unknown size is never below 1 -- a flat session has no eye texture, so none of this can say yes to it");
+    check(vrss::percentOfEye(2112, 2816) == 75 && vrss::percentOfEye(2675, 2816) == 95 && vrss::percentOfEye(2816, 2816) == 100 &&
+              vrss::percentOfEye(1409, 2816) == 50 && vrss::percentOfEye(0, 2816) == 0 && vrss::percentOfEye(2112, 0) == 0,
+          "R13a: the world's share of the eye's width, rounded to a percent, 0 when unknown");
+    // The published word: the four sizes, or nothing.
+    {
+        uint32_t a = 0, b = 0, c = 0, d = 0;
+        const uint64_t word = vrss::pack(2112, 2304, 2816, 3072);
+        check(word != 0 && vrss::unpack(word, &a, &b, &c, &d) && a == 2112 && b == 2304 && c == 2816 && d == 3072,
+              "R13b: the four sizes pack into one word and read back");
+        check(vrss::pack(2816, 3072, 2816, 3072) == 0 && vrss::pack(0, 0, 0, 0) == 0 && vrss::pack(70000, 1, 140000, 2) == 0 &&
+                  !vrss::unpack(0, &a, &b, &c, &d),
+              "R13b: a size that is not below 1, an unknown one or one past 65535 publishes nothing, and nothing unpacks to no");
+    }
+    // The words.
+    {
+        char log[1200], toast[96], status[64], note[400];
+        vrss::formatLog(log, sizeof(log), 2112, 2304, 2816, 3072);
+        vrss::formatToast(toast, sizeof(toast));
+        vrss::formatStatus(status, sizeof(status), 2112, 2816);
+        vrss::formatNote(note, sizeof(note), 2112, 2304, 2816, 3072);
+        const std::string l = log;
+        check(std::strncmp(log, "vr supersampling: Elite draws the 3D world at 2112x2304, 75% of the 2816x3072 eye texture, and scales it up before EDVR sees it:", 128) == 0 &&
+                  has(l, "Elite's Supersampling is below 1") && has(l, "HMD Image Quality") && has(l, "EDVR's DLSS upscales from that") &&
+                  has(l, "Measured from the render sizes, not read from Elite's settings file") && l.size() < 1000,
+              "R13c: the log line names the measurement, the cause, what it does to DLSS and the holograms, what to set, and that it is measured");
+        check(has(l, "holograms") && has(l, "already upscaled") && has(l, "Supersampling to 1"), "R13c: ...and says why it hurts and what Supersampling should be");
+        check(std::string(toast) == "Elite Supersampling is below 1: use HMD Image Quality" && std::strlen(toast) <= 60,
+              "R13c: the headset toast is one short line that names both settings");
+        check(std::string(status) == "below 1: world at 75% of the eye" && std::strlen(status) < 63, "R13c: the Status page's value fits MenuLine::right (63 bytes)");
+        check(has(note, "2112x2304") && has(note, "75%") && has(note, "2816x3072") && has(note, "HMD Image Quality") && has(note, "Supersampling to 1") &&
+                  std::strlen(note) < 399,
+              "R13c: the settings pages' note names the sizes and the advice and fits its buffer");
+    }
+    // The wiring, as source pins.
+    {
+        const std::string vs = readFile("src\\d3d11\\vscreen.cpp");
+        const std::string menu = readFile("src\\d3d11\\menu.cpp");
+        const std::string flat = readFile("src\\d3d11\\flat_runtime.cpp");
+        const std::string header = readFile("src\\common\\vr_supersample_notice.h");
+        const std::string vsh = readFile("src\\d3d11\\vscreen.h");
+        check(!vs.empty() && !menu.empty() && !flat.empty() && !header.empty() && !vsh.empty(), "R13d: the sources the pins read are readable from the repo root");
+        if (g_failure.size()) return;
+        // Detection: vScreen's own measurement, at the render-size adoption, once; never Elite's settings file.
+        const size_t adopt = vs.find("vScreen: the world on this rig is rendered at %ux%u and scaled into");
+        const size_t pub = vs.find("g_renderBelowEye.store(vrss::pack(s->renderW, s->renderH, s->eyeW, s->eyeH), std::memory_order_release);");
+        const size_t logAt = vs.find("vrss::formatLog(notice, sizeof(notice), s->renderW, s->renderH, s->eyeW, s->eyeH);");
+        check(adopt != std::string::npos && pub != std::string::npos && logAt != std::string::npos && adopt < pub && pub < logAt &&
+                  count(vs, "g_renderBelowEye.store(") == 1 && count(vs, "if (vrss::below(s->renderW, s->renderH, s->eyeW, s->eyeH)) {") == 1,
+              "R13d: vScreen publishes and logs the notice once, from the measured render size against the eye's, right after it adopts the size");
+        check(!has(vs, "SSAAMultiplier") && !has(vs, "fxcfg") && !has(header, "fxcfg") && !has(header, "Settings.xml") && !has(header, "SSAAMultiplier"),
+              "R13d: nothing here reads Elite's settings file: the sizes are the whole evidence");
+        check(has(vsh, "bool vScreenRenderBelowEye(uint32_t* renderW, uint32_t* renderH, uint32_t* eyeW, uint32_t* eyeH);") &&
+                  has(vs, "bool vScreenRenderBelowEye(uint32_t* renderW, uint32_t* renderH, uint32_t* eyeW, uint32_t* eyeH) {"),
+              "R13d: the accessor the menu reads is declared and defined once");
+        // The menu: a toast once, the Status line, the settings pages' note; the VR branch only.
+        const std::string tick = functionBody(menu, "void menuTick(ID3D11Device* dev) {");
+        const size_t flatReturn = tick.find("if (runtimeFlatProfile()) {");
+        const size_t toast = tick.find("if (!s.vrSupersamplingToasted && s.toasts) {");
+        const size_t vrBranch = tick.find("guardedBudget(g_budget, [&] {\n        static uint64_t lastNativeRevision = 0;");
+        check(flatReturn != std::string::npos && toast != std::string::npos && vrBranch != std::string::npos && flatReturn < vrBranch && vrBranch < toast &&
+                  count(menu, "vrss::formatToast(") == 1 && count(menu, "s.toastQueue.push_back(toast);") == 1 &&
+                  has(tick, "s.vrSupersamplingToasted = true;"),
+              "R13e: the toast is queued once a session, gated on menu.toasts, after the flat profile's branch returned: flat never reaches it");
+        check(count(menu, "statusLine(c, \"Elite supersampling\", buf);") == 1 && count(menu, "vrss::formatStatus(buf, sizeof(buf), rw, ew2);") == 1,
+              "R13e: the Status page has the line, only when vScreen measured it");
+        const std::string note = functionBody(menu, "void buildContent(MenuContent& c) {");
+        const size_t noteAt = note.find("if (!runtimeFlatProfile()) {\n            uint32_t rw = 0, rh = 0, ew = 0, eh = 0;\n            if (vScreenRenderBelowEye(");
+        check(noteAt != std::string::npos && count(menu, "vrss::formatNote(paragraph, sizeof(paragraph), rw, rh, ew, eh);") == 1,
+              "R13e: the settings pages' note is under the not-flat test, built from the measured sizes");
+        check(!has(flat, "vrss::") && !has(flat, "vScreenRenderBelowEye") && !has(flat, "vr_supersample_notice") && !has(flat, "Supersampling is below 1"),
+              "R13f: the flat runtime never touches the notice");
+        // The F8 panel's words: the flat warning no longer carries a supersampling paragraph at all (section 83).
+        const std::string settings = readFile("src\\d3d11\\flat_elite_settings.h");
+        check(!settings.empty() && !has(settings, "Supersampling is below 1.0") && !has(settings, "kFlatSupersamplingWords"),
+              "R13f: the flat warning's own supersampling advice is gone (below 1.0 is supported now), and nothing flat says the VR words");
+    }
+}
+
 struct Case { const char* id; void (*run)(); };
 const Case kCases[] = {{"R1", caseR1}, {"R2", caseR2}, {"R3", caseR3}, {"R4", caseR4}, {"R5", caseR5},  {"R6", caseR6},
-                       {"R7", caseR7}, {"R8", caseR8}, {"R9", caseR9}, {"R10", caseR10}, {"R11", caseR11}, {"R12", caseR12}};
+                       {"R7", caseR7}, {"R8", caseR8}, {"R9", caseR9}, {"R10", caseR10}, {"R11", caseR11}, {"R12", caseR12},
+                       {"R13", caseR13}};
 
 bool selected(const std::string& only, const char* id) {
     if (only.empty()) return true;

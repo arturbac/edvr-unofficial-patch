@@ -39,6 +39,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 HEADER = "src/common/vscreen_fit.h"
+HEADER2 = "src/common/vr_supersample_notice.h"   # R13: Elite's Supersampling below 1 (the rig takes it through -DVR_SUPERSAMPLE_HEADER)
+HEADERS = {HEADER: "VSCREEN_FIT_HEADER", HEADER2: "VR_SUPERSAMPLE_HEADER"}
 RIG = HERE / "vscreen_fit_test.cpp"
 BUILD_BAT = ROOT / "build.bat"
 RIG_LABEL = ":rig_vscreen_fit_test"
@@ -51,6 +53,10 @@ RUN_TIMEOUT = 60.0
 # Every file the rig's source pins read, relative to the repo root (a pin mutation edits a copy of one of these in a temp root).
 PIN_FILES = [
     "src/common/vscreen_fit.h",
+    "src/common/vr_supersample_notice.h",
+    "src/d3d11/vscreen.h",
+    "src/d3d11/menu.cpp",
+    "src/d3d11/flat_elite_settings.h",
     "src/d3d11/vscreen_res.cpp",
     "src/d3d11/vr_world_route.cpp",
     "src/d3d11/vr_world_route_math.h",
@@ -71,7 +77,7 @@ class Mutant:
         self.why = why
         self.target = target                                                    # the file edited; the header means a code mutant
         self.rule = re.match(r"R\d+", self.caught[0]).group(0)                  # the rig's case to run
-        self.kind = "code" if target == HEADER and not name.startswith("pin-") else "pin"
+        self.kind = "code" if target in HEADERS and not name.startswith("pin-") else "pin"
 
 
 def M(name, caught, edits, why, target=HEADER):
@@ -176,6 +182,25 @@ MUTANTS = [
     M("pin-curve-named-twice", "R2f", [("    if (routeStandsAsideForCurve(f))\n", "    if (routeStandsAsideForCurve(f) || f.curved)\n")], "the curve is consulted in a second place", HEADER),
     M("pin-ini-forgets-the-rule", "R12o", [("#   fitted   when the VR on-foot world route will run (it needs", "#   fitted   when the VR on-foot route will run (it needs")], "the ini's text no longer names the world route", "edvr.ini"),
     M("pin-ini-forgets-the-restart", "R12o", [("# while it runs (never any file on disk). Needs a game restart; typing the", "# while it runs (never any file on disk). Takes effect later; typing the")], "the ini's text no longer says a restart is needed", "edvr.ini"),
+    # ---- R13: Elite's Supersampling below 1.0 in VR (the second header, and the wiring the pins read) -----------------------------
+    M("ss-threshold-90", "R13a", [("constexpr uint32_t kBelowPercent = 98;", "constexpr uint32_t kBelowPercent = 90;")], "the world must render under 90% of the eye, not 98%", HEADER2),
+    M("ss-one-axis-is-enough", "R13a", [("kBelowPercent &&\n           static_cast<uint64_t>(renderH)", "kBelowPercent ||\n           static_cast<uint64_t>(renderH)")], "one axis under the eye's is a Supersampling below 1", HEADER2),
+    M("ss-percent-truncates", "R13a", [("(static_cast<uint64_t>(renderW) * 100u + eyeW / 2u) / eyeW", "(static_cast<uint64_t>(renderW) * 100u) / eyeW")], "the percentage is cut, not rounded", HEADER2),
+    M("ss-pack-ignores-the-judgement", "R13b", [("    if (!below(renderW, renderH, eyeW, eyeH) || renderW > 0xFFFFu", "    if (renderW > 0xFFFFu")], "a size that is not below 1 is published as a notice", HEADER2),
+    M("ss-unpack-shift", "R13b", [("*eyeW = static_cast<uint32_t>(packed >> 32 & 0xFFFFu);", "*eyeW = static_cast<uint32_t>(packed >> 16 & 0xFFFFu);")], "the eye's width is read from the render height's bits", HEADER2),
+    M("ss-log-forgets-hmd-quality", "R13c", [("\"raise HMD Image Quality instead: EDVR's DLSS upscales from that. Measured from the render sizes, not read from \"", "\"raise the quality elsewhere: EDVR's DLSS upscales from that. Measured from the render sizes, not read from \"")],
+      "the log line does not name HMD Image Quality", HEADER2),
+    M("ss-toast-reworded", "R13c", [('"Elite Supersampling is below 1: use HMD Image Quality"', '"Elite Supersampling is low"')], "the toast no longer says what to use instead", HEADER2),
+    M("ss-status-reworded", "R13c", [('"below 1: world at %u%% of the eye"', '"world at %u%%"')], "the Status value no longer says below 1", HEADER2),
+    M("pin-ss-toast-not-gated", "R13e", [("        if (!s.vrSupersamplingToasted && s.toasts) {", "        if (!s.vrSupersamplingToasted) {")], "the toast ignores menu.toasts", "src/d3d11/menu.cpp"),
+    M("pin-ss-status-renamed", "R13e", [('statusLine(c, "Elite supersampling", buf);', 'statusLine(c, "Elite SS", buf);')], "the Status line is not the one the pin knows", "src/d3d11/menu.cpp"),
+    M("pin-ss-note-on-flat", "R13e", [("        if (!runtimeFlatProfile()) {\n            uint32_t rw = 0, rh = 0, ew = 0, eh = 0;\n            if (vScreenRenderBelowEye(", "        if (true) {\n            uint32_t rw = 0, rh = 0, ew = 0, eh = 0;\n            if (vScreenRenderBelowEye(")],
+      "the settings pages' note is built in a flat session too", "src/d3d11/menu.cpp"),
+    M("pin-ss-reads-elite-settings", "R13d", [("g_renderBelowEye.store(vrss::pack(s->renderW, s->renderH, s->eyeW, s->eyeH), std::memory_order_release);", "g_renderBelowEye.store(vrss::pack(s->renderW, s->renderH, s->eyeW, s->eyeH), std::memory_order_release); (void)\"SSAAMultiplier\";")],
+      "the detection reads Elite's settings file instead of only the sizes", "src/d3d11/vscreen.cpp"),
+    M("pin-ss-flat-runtime-touches-it", "R13f", [('#include "flat_copy_structure.h"', '#include "flat_copy_structure.h"\n#include "vscreen.h"   // vScreenRenderBelowEye')], "the flat runtime includes the VR notice's accessor", "src/d3d11/flat_runtime.cpp"),
+    M("pin-ss-flat-warning-says-it", "R13f", [("inline constexpr char kFlatTaaAboveWords[] =", 'inline constexpr char kFlatSupersamplingWords[] = "Supersampling is below 1.0";\ninline constexpr char kFlatTaaAboveWords[] =')],
+      "the flat warning has a supersampling paragraph again", "src/d3d11/flat_elite_settings.h"),
 ]
 
 
@@ -326,7 +351,6 @@ def run_all(only=None, jobs=None, keep=False, dry_run=False, out=sys.stdout):
         return 0
     tc = Toolchain()
     work = Path(tempfile.mkdtemp(prefix="vscreen_fit_mutants_"))
-    header = read_source(HEADER)
     try:
         # The control: the rig built from the real header, run on every case against the real tree. Pin mutations reuse this exe.
         cdir = work / "control"
@@ -344,14 +368,14 @@ def run_all(only=None, jobs=None, keep=False, dry_run=False, out=sys.stdout):
 
         def code_mutant(m):
             try:
-                text = apply_edits(header, m.edits, m.name)
+                text = apply_edits(read_source(m.target), m.edits, m.name)
             except ValueError as error:
                 return m, "badedit", str(error)
             d = work / ("code_" + m.name)
             d.mkdir()
-            mutated = d / "vscreen_fit.h"
+            mutated = d / Path(m.target).name
             mutated.write_text(text, encoding="utf-8", newline="\n")
-            define = '/DVSCREEN_FIT_HEADER="%s"' % str(mutated).replace("\\", "/")
+            define = '/D%s="%s"' % (HEADERS[m.target], str(mutated).replace("\\", "/"))
             code, output, exe = build_rig(tc, d, extra=["/DVSCREEN_FIT_MUTANT", define])
             if code != 0:
                 return m, "nocompile", (output.strip().splitlines()[-1] if output.strip() else "")

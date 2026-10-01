@@ -29,6 +29,7 @@
 #include "flat_query_cut_tests.h"
 #include "flat_wrapper_note_tests.h"
 #include "flat_hdr_route_tests.h"
+#include "flat_copy_structure_tests.h"
 #include "flat_hdr_crumbs_tests.h"
 
 #include <cstdio>
@@ -2372,8 +2373,9 @@ void testFlatWarningWiring() {
         // The gate itself: the stand-down, for a reason that found an output copy, and no clock.
         {&standdownH, "bool warningActive() const { return standing && flatMonoReasonWarrantsWarning(standReason); }", 1,
          "the warning is on while stood down for a reason that found an output copy"},
-        {&standdownH, "return flatMonoReasonStructural(reason) && reason != FlatMonoReason::NoOutputCopy;", 1,
-         "and never for no-known-output-copy: a startup or loading frame has no final copy"},
+        {&standdownH, "return flatMonoReasonStructural(reason) && reason != FlatMonoReason::NoOutputCopy &&\n"
+                      "           reason != FlatMonoReason::NoScene;", 1,
+         "and never for no-known-output-copy or no-3d-scene: a startup or loading frame has no final copy, or no scene"},
         {&standdownH, "standReason = runReason;", 1, "a stand-down starts with the reason that entered it"},
         {&standdownH, "standReason = reason;", 1, "and follows each probe frame's own finding"},
     };
@@ -2432,7 +2434,7 @@ void testFlatCpuWiring() {
     const Pin pins[] = {
         // Every family the census names has its scope at the entry points that family stands for.
         {&runtimeCpp, "flatcpu::Scope shell(flatcpu::kOther);", 3, "the draw scope (both halves) and the dispatch scope time their own shells"},
-        {&runtimeCpp, "flatcpu::kReduce", 1, "contract reduction times the reducer"},
+        {&runtimeCpp, "flatcpu::kReduce", 2, "contract reduction times the reducer and the final copy's admission by structure"},
         {&runtimeCpp, "flatcpu::kCopyChecks", 2, "the exact-shader verifications and the F10 captures are timed"},
         {&runtimeCpp, "flatcpu::kCameraRows", 2, "the camera lookup and hash, and capture()"},
         {&runtimeCpp, "flatcpu::kTrace", 5, "every trace-ring copy is timed: capture, dispatch, write, record and the HDR route's resolve marker"},
@@ -2906,9 +2908,13 @@ int main(int argc, char** argv) {
         return hdr_route_test::traceChain(argv[2]);
     if (argc == 5 && std::strcmp(argv[1], "--trace-trim") == 0)
         return hdr_route_test::traceTrim(argv[2], argv[3], argv[4]);
+    // The final copy's admission by structure (flat_copy_structure_tests.h): what it makes of each frame of a trace.
+    if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--trace-structure") == 0)
+        return copy_structure_test::traceStructure(argv[2], argc == 4 && std::strcmp(argv[3], "pretend") == 0);
     if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) {
         std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir> | --trace-check <file> | --trace-migrate <dir> | "
-                  "--trace-rekey <file|dir> | --trace-chain <file> | --trace-trim <in> <out> <frame[,frame...]>");
+                  "--trace-rekey <file|dir> | --trace-chain <file> | --trace-structure <file> | "
+                  "--trace-trim <in> <out> <frame[,frame...]>");
         return 2;
     }
     failures += flatProjectionViewportTests();
@@ -2963,6 +2969,7 @@ int main(int argc, char** argv) {
     failures += flatQueryCutTests();
     testFlatQueryCutWiring();
     failures += flatHdrRouteTests();
+    failures += flatCopyStructureTests();
     failures += flatHdrCrumbTests();
     failures += flatHdrCrumbWiringTests();
     if (failures) return 1;
