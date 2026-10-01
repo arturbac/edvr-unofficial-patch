@@ -146,7 +146,8 @@ struct State {
     uint64_t staticSceneFrames=0;
     // The steady-detail key (experimental.temporal_aa_on_foot_world_steady_detail), read once a Present (steadyReadKey): on, the resolver gives a
     // stale-slot pixel the camera term where last frame's depth confirms it (FlatMonoResolveFrame::steadyDetail, set at the two treatment
-    // call sites). Off by default; the 3D menu's blanket policy (staticSceneFrames above) wins where it applies and is not this key's.
+    // call sites). ON by default (a file with no line reads on; any other word than on reads off); the field starts false only until the first
+    // Present has read the key. The 3D menu's blanket policy (staticSceneFrames above) wins where it applies and is not this key's.
     bool steadyDetail=false, steadyKeyRead=false;
     FlatMonoResolvePreflight plannedResolve{};
     FlatMonoResolvePreflightResult resolvePreflight{};
@@ -1713,16 +1714,18 @@ static void hdrReadKey(State& s, uint64_t frame) {
     }
 }
 // experimental.temporal_aa_on_foot_world_steady_detail (design doc section 82, the depth-validated steady detail), read at every Present:
-// off unless the file says "on" (any case; a typo never relaxes anything). It is the same key the VR world route reads, and the same rule:
-// a pixel whose engine slot a later draw overdrew takes the camera term instead of refusing its history only where last frame's depth
-// confirms it (the resolver keeps that depth when it is asked), and is refused where it does not. It starts no history and resets nothing:
-// a change is said once, and the next frame that reaches the resolver carries it.
+// ON when the file has no line (the default since flight 4; the shipped edvr.ini says the same: config_test holds the two to one answer),
+// and on when it says "on" (any case); any other word, "off" and a typo included, reads off, which is the refusal exactly as before the key
+// existed. It is the same key the VR world route reads, and the same rule: a pixel whose engine slot a later draw overdrew takes the
+// camera term instead of refusing its history only where last frame's depth confirms it (the resolver keeps that depth when it is asked),
+// and is refused where it does not. It starts no history and resets nothing: a change is said once, and the next frame that reaches the
+// resolver carries it.
 static void steadyReadKey(State& s, uint64_t frame) {
-    const bool on = _stricmp(Config::get().getString("experimental.temporal_aa_on_foot_world_steady_detail", "off").c_str(), "on") == 0;
+    const bool on = _stricmp(Config::get().getString("experimental.temporal_aa_on_foot_world_steady_detail", "on").c_str(), "on") == 0;
     if (s.steadyKeyRead && on == s.steadyDetail) return;
     const bool first = !s.steadyKeyRead;
     s.steadyDetail = on; s.steadyKeyRead = true;
-    if (first && !on) return;   // the default says nothing: only a session that turns it on, or turns it off again, has a line
+    if (first && !on) return;   // a session that starts off says nothing here (the 5 s line carries steady-detail=off); on, whether by default or by the file, is said once at startup
     Log::get().note("flat runtime: steady-detail is %s from frame=%llu (experimental.temporal_aa_on_foot_world_steady_detail%s): %s",
         on ? "ON" : "OFF", static_cast<unsigned long long>(frame), first ? ", read at startup" : ", changed",
         on ? "a pixel whose engine slot a later draw overdrew takes the camera term instead of refusing its history where last frame's depth "
@@ -2767,7 +2770,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     // other frame, and the shader is then bit-identical to what it was before the field.
     f.staticScene=flatFrameThroughMenuCopy(s.prefix,selected.hdr);
     if(f.staticScene)++s.staticSceneFrames;
-    f.steadyDetail=s.steadyDetail;   // experimental.temporal_aa_on_foot_world_steady_detail: the depth-validated rule, off unless the key says on
+    f.steadyDetail=s.steadyDetail;   // experimental.temporal_aa_on_foot_world_steady_detail: the depth-validated rule, on by default, off when the file says anything but on
     // Metadata is frozen from the qualified handoff for a future frame's
     // preflight. It cannot authorize jitter in this already rendered frame.
     Ptr<ID3D11Texture2D> colorTexture;
@@ -3057,7 +3060,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
     f.configuredDlssPreset = s.preset;
     f.staticScene = flatFrameThroughMenuCopy(s.prefix, selected.hdr);
     if (f.staticScene) ++s.staticSceneFrames;
-    f.steadyDetail = s.steadyDetail;   // experimental.temporal_aa_on_foot_world_steady_detail: the depth-validated rule, off unless the key says on
+    f.steadyDetail = s.steadyDetail;   // experimental.temporal_aa_on_foot_world_steady_detail: the depth-validated rule, on by default, off when the file says anything but on
     // The plan, frozen from the qualified trigger for the next frame's preflight, as the copy route freezes its own.
     Ptr<ID3D11Texture2D> colorTexture;
     if (s.projection && SUCCEEDED(hdrResource.As(&colorTexture))) {

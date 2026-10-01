@@ -1293,11 +1293,13 @@ int main(int argc, char** argv) {
         }
     }
 
-    // The steady-detail key (design doc section 82: experimental.temporal_aa_on_foot_world_steady_detail) relaxes a refusal the
-    // resolver makes, so it is OFF by default in every place that can say so: the shipped file and the code's fallback, in BOTH of
-    // its readers (the VR world route and the flat runtime, whose key it is on foot too), which must agree. The control turns a
-    // fallback to on (a relaxation nobody asked for) and must be caught.
-    expectStr("experimental.temporal_aa_on_foot_world_steady_detail", "off", "the shipped edvr.ini ships the steady-detail key off");
+    // The steady-detail key (design doc section 82: experimental.temporal_aa_on_foot_world_steady_detail) is ON by default since flight 4,
+    // the depth-validated form having passed in flat and VR, in every place that can say so: the shipped file and the code's fallback, in
+    // BOTH of its readers (the VR world route and the flat runtime, whose key it is on foot too), which must agree: an ini that predates
+    // the key must behave as one that carries it. An explicit off is the refusal as before the key existed, and stays pinned below (the
+    // flat scope, the VR profile, the route rig's parse of the word, the flat rig's scan of the reader). The control turns a fallback to
+    // off (a reader that silently refuses where the other relaxes) and must be caught.
+    expectStr("experimental.temporal_aa_on_foot_world_steady_detail", "on", "the shipped edvr.ini ships the steady-detail key on");
     {
         const std::string shippedSteady = Config::get().getString("experimental.temporal_aa_on_foot_world_steady_detail", "<unset>");
         const struct { const wchar_t* file; const char* name; } readers[] = {
@@ -1320,8 +1322,8 @@ int main(int argc, char** argv) {
             const std::string from = "getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"" + fallback + "\")";
             const size_t at = flipped.find(from);
             if (at != std::string::npos)
-                flipped.replace(at, from.size(), "getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"on\")");
-            const std::string control = std::string("control: the steady-detail key's fallback in ") + reader.name + " turned to on is caught";
+                flipped.replace(at, from.size(), "getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"off\")");
+            const std::string control = std::string("control: the steady-detail key's fallback in ") + reader.name + " turned to off is caught";
             if (at != std::string::npos && codeFallbackOf(flipped, "experimental.temporal_aa_on_foot_world_steady_detail") != shippedSteady) {
                 ok(control.c_str());
             } else {
@@ -1839,7 +1841,8 @@ int main(int argc, char** argv) {
     expectStr("experimental.temporal_aa_on_foot_world_jitter", "off", "flat scope refuses the VR world jitter's key");
     // ... but the steady-detail key is the one VR world key the flat runtime reads too (flat_runtime.cpp steadyReadKey: the depth-validated
     // camera term for a stale slot, on foot): listed in runtimeProfileAllowsKey, so a flat profile reads what the file says. Unlisted it would
-    // read off here whatever the file said, with nothing in the log to say the key was refused.
+    // read off here whatever the file said (and the default, on, would never reach the runtime), with nothing in the log to say the key was
+    // refused. The explicit off below is the refusal as before the key existed.
     Config::get().set("experimental.temporal_aa_on_foot_world_steady_detail", "on");
     expectStr("experimental.temporal_aa_on_foot_world_steady_detail", "on", "flat scope permits the steady-detail key's explicit on");
     Config::get().set("experimental.temporal_aa_on_foot_world_steady_detail", "off");

@@ -1193,12 +1193,13 @@ inline int flatHdrRouteTests() {
         expect(count(menu, "static_assert(static_cast<int>(kFlatPageRowCount) + 1 + FlatSettingsWarning::kMaxLines <= kMenuMaxLines,") == 1,
                "the flat page's rows, a blank line and a full warning are held to the card's lines at compile time");
         // THE DEPTH-VALIDATED STEADY DETAIL on foot (design doc section 82): the flat runtime reads the VR world route's key
-        // experimental.temporal_aa_on_foot_world_steady_detail once a Present (default off) and hands it to the resolver at the two treatment
-        // call sites. The 3D menu's own blanket policy (FlatMonoResolveFrame::staticScene, from the verified menu copy) is not the key's and
+        // experimental.temporal_aa_on_foot_world_steady_detail once a Present (default ON since flight 4: a file with no line reads on; "off" and
+        // any other word read off, the refusal as before the key existed) and hands it to the resolver at the two treatment call sites. The 3D menu's own blanket policy (FlatMonoResolveFrame::staticScene, from the verified menu copy) is not the key's and
         // its lines are exactly what they were: four mentions of f.staticScene in the file, none of them an assignment from the key.
-        expect(count(runtime, "Config::get().getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"off\")") == 1 &&
+        expect(count(runtime, "_stricmp(Config::get().getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"on\").c_str(), \"on\") == 0") == 1 &&
+                   count(runtime, "getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"off\")") == 0 &&
                    count(runtime, "steadyReadKey(s, frame);") == 1 && count(runtime, "bool steadyDetail=false, steadyKeyRead=false;") == 1,
-               "the steady-detail key is read once a Present, by steadyReadKey, and its state starts off");
+               "the steady-detail key is read once a Present, by steadyReadKey: on when the file has no line, off for an explicit off or any other word (the comparison is with on); its state is false only until the first read");
         expect(count(runtime, "f.staticScene=flatFrameThroughMenuCopy(s.prefix,selected.hdr);\n    if(f.staticScene)++s.staticSceneFrames;\n"
                               "    f.steadyDetail=s.steadyDetail;") == 1 &&
                    count(runtime, "f.staticScene = flatFrameThroughMenuCopy(s.prefix, selected.hdr);\n    if (f.staticScene) ++s.staticSceneFrames;\n"
