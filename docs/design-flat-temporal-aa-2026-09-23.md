@@ -49,7 +49,7 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-82):** users 1-2 refused every frame, 3 at 7-13 fps, 4
-  lost ~23 ms (ReShade). 80-81 flown. 82: experiment build ready; (f') leads.
+  lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED 10-01; fix next.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -7353,3 +7353,25 @@ first weapon group of a frame is counted scene. Mode 1 is unflown. GPU cost is
 unmeasured. A screen-aspect camera wider than 1.087 times the scene's fov would
 turn the scene's calls into first-person: the `fov=` range and the reader's
 check (b) show it.
+
+FLIGHT 3, 2026-10-01 05:49: (f') CONFIRMED. Frontier, 02c1c456, log 054902;
+the game's 3D mode HMD Cinema, the main menu with the ship in view,
+`fix.vscreen_res_width = 4032`, the route owned at 4032x2268, census on.
+Steady-detail went ON at 05:50:05, OFF at 05:50:22, ON at 05:50:28; the view
+went ON at 05:50:40. The one whole key-off window (05:50:28) refused 5.674% of
+the pixels, all but `range=` of it `stale=` (58,105,650 of 58,111,623). Every
+whole key-on window refused 0.001-0.003% (`range=` only, `stale=0`) and
+forgave about 58 M pixels, the same ~5.7%. Sean: the shimmer on the ship's
+lines stops with the key on ("That fixed it!"). With the view on he took an
+eye dump: the fine YELLOW (stale-slot) lines are the ones that shimmered, so
+the deciding test (the view paints exactly the shimmering lines) passed as
+well as the A/B. So the shimmer is the prep's
+stale-slot refusal (a later draw overdrew the pixel's engine slot) showing
+the jittered raw input. Flat on foot runs the same rule (staticScene false),
+which explains the hoses there. Not yet checked: movers (the key gives an
+overdrawn slot the camera term, so a moving object drawn that way can ghost),
+the settlement leg, flat. Proposed next (Sean's call): a depth-validated
+camera term for stale slots in the shared resolver (keep history where last
+frame's depth at the camera-reprojected spot matches, refuse otherwise), so
+flat on foot gets it too; then a settlement check with movers and a desk
+check in flat before any default changes.
