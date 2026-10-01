@@ -1001,12 +1001,13 @@ void caseR13() {
         // The menu: a toast once, the Status line, the settings pages' note; the VR branch only.
         const std::string tick = functionBody(menu, "void menuTick(ID3D11Device* dev) {");
         const size_t flatReturn = tick.find("if (runtimeFlatProfile()) {");
-        const size_t toast = tick.find("if (!s.vrSupersamplingToasted && s.toasts) {");
+        const size_t toast = tick.find("if (!s.vrSupersamplingToasted) {");
         const size_t vrBranch = tick.find("guardedBudget(g_budget, [&] {\n        static uint64_t lastNativeRevision = 0;");
         check(flatReturn != std::string::npos && toast != std::string::npos && vrBranch != std::string::npos && flatReturn < vrBranch && vrBranch < toast &&
                   count(menu, "vrss::formatToast(") == 1 && count(menu, "s.toastQueue.push_back(toast);") == 1 &&
-                  has(tick, "s.vrSupersamplingToasted = true;"),
-              "R13e: the toast is queued once a session, gated on menu.toasts, after the flat profile's branch returned: flat never reaches it");
+                  has(tick, "s.vrSupersamplingToasted = true;\n                if (s.toasts) {\n                    char toast[96];") &&
+                  has(tick, "vr supersampling: the headset notice is queued as a toast") && has(tick, "vr supersampling: menu.toasts is off, so no toast"),
+              "R13e: the toast is queued once a session, gated on menu.toasts and logged either way, after the flat profile's branch returned: flat never reaches it");
         check(count(menu, "statusLine(c, \"Elite supersampling\", buf);") == 1 && count(menu, "vrss::formatStatus(buf, sizeof(buf), rw, ew2);") == 1,
               "R13e: the Status page has the line, only when vScreen measured it");
         const std::string note = functionBody(menu, "void buildContent(MenuContent& c) {");

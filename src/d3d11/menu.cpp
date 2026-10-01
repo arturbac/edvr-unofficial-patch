@@ -3737,13 +3737,20 @@ void menuTick(ID3D11Device* dev) {
         // rendered under the eye texture, the headset says so once a session as a toast (the menu's own notice, with the log
         // line vScreen wrote; the open menu keeps the Status line and the note). Gated on menu.toasts like every toast, and
         // this is the VR branch: the flat profile returned above and never reaches it.
-        if (!s.vrSupersamplingToasted && s.toasts) {
+        if (!s.vrSupersamplingToasted) {
             uint32_t rw = 0, rh = 0, ew = 0, eh = 0;
             if (vScreenRenderBelowEye(&rw, &rh, &ew, &eh)) {
                 s.vrSupersamplingToasted = true;
-                char toast[96];
-                vrss::formatToast(toast, sizeof(toast));
-                s.toastQueue.push_back(toast);
+                if (s.toasts) {
+                    char toast[96];
+                    vrss::formatToast(toast, sizeof(toast));
+                    s.toastQueue.push_back(toast);
+                    Log::get().note("vr supersampling: the headset notice is queued as a toast (\"%s\"); the Status page has the line "
+                                    "\"Elite supersampling\" and every settings page the note, while the menu is open.", toast);
+                } else {
+                    Log::get().note("vr supersampling: menu.toasts is off, so no toast; the Status page has the line \"Elite "
+                                    "supersampling\" and every settings page the note, while the menu is open.");
+                }
                 s.contentDirty = true;
             }
         }

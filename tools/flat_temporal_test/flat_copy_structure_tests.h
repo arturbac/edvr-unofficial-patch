@@ -4,8 +4,10 @@
 // admission makes of each frame of a trace, the dump behind the pins in this file and in section 83.
 #pragma once
 #include "../../src/d3d11/flat_copy_structure.h"
+#include "../../src/d3d11/flat_elite_settings.h"
 #include "flat_hdr_route_tests.h"
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -200,6 +202,142 @@ inline void renameTone(edvr::FlatTraceEvent& e, void* context) {
     if (e.kind == edvr::kFlatTraceEventDraw && edvr::flat_mono_detail::toneHdrSlot(e.key.vs, e.key.ps) != ~0u) {
         e.key.ps = r->ps; ++r->renamed;
     }
+}
+
+}  // namespace copy_structure_test
+
+// ---- the fixture: tools\flat_upscale_fixture.log, a good flight below the output and three episodes, held to what the formatters write --
+// edvr_log.py --flat-upscale's own self-test reads the checked-in file. Regenerate it with `flat_temporal_test.exe --write-fixture <path>`
+// after a deliberate change to a line's text; the check in flatCopyStructureTests fails the build until the file says what the formatters
+// say. The lines the DLL writes inline (the key's, the route's, the runtime's counters) are copied from real logs (the rc.5 user's of
+// 2026-10-01 and Sean's of 2026-09-30) and held to the runtime's source by the pins there. The base is a good flight: a startup of
+// pre-scene frames (stood down for no-3d-scene, silent), then a scene rendered at 2880x1620 on a 3840x2160 output, admitted by
+// structure, treated. After it, marker lines (`# episode: <name>`) open episodes the reader's self-test appends to the base one at a
+// time: a render size that does not fit, a game AA chain the structure declines, and a pre-section-83 build's supersampling advice.
+namespace copy_structure_test {
+
+inline std::string flatUpscaleFixtureText() {
+    using namespace edvr;
+    std::string out;
+    char line[1300], words[160];
+    // Each segment (the base flight, then each episode) is written in time order, however the code below builds it.
+    std::vector<std::pair<std::string, std::string>> segment;
+    auto flush = [&] {
+        std::stable_sort(segment.begin(), segment.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (const auto& entry : segment) { out += "["; out += entry.first; out += "] "; out += entry.second; out += "\n"; }
+        segment.clear();
+    };
+    auto push = [&](const char* ts, const char* text) { segment.emplace_back(ts, text); };
+    auto marker = [&](const char* name) { flush(); out += "# episode: "; out += name; out += "\n"; };
+    push("15:12:00.100", "version v0.18.0-rc.5-26-g5ec0de01 (build 5EC0DE01) -- this DLL was linked 2026-10-01 20:05:44 UTC");
+    push("15:12:02.151", "flat hdr route: experimental.temporal_aa_before_post=auto (read at startup) at frame=1: the route resolves the game's HDR scene "
+                         "target before its bloom, depth of field and tone where the render size is at least the output's and the target is R11G11B10F; "
+                         "every other frame keeps the copy route, which admits the game's final copy by its structure (an R-sized R8G8B8A8 image made after "
+                         "the scene HDR's first consumer, uniformly scaled to the output) when no whitelisted tone pass wrote it, so bloom, depth of field and "
+                         "the tone variant do not matter below the output either");
+
+    // The startup: frames with a final copy and no scene.
+    FlatStandDown down;
+    down.enteredReason = FlatMonoReason::NoScene; down.standReason = FlatMonoReason::NoScene;
+    down.enteredAfterMs = 5000; down.enteredAfterFrames = 740; down.standing = true;
+    flatStandDownFormatEntered(line, sizeof(line), 742, down);
+    push("15:12:08.368", line);
+    down.lastStoodDownMs = 10500; down.lastProbes = 7;
+    flatStandDownFormatResumed(line, sizeof(line), 1918, down, nullptr);
+    push("15:12:18.903", line);
+
+    // The scene: the game renders at 2880x1620 on a 3840x2160 output (supersampling 0.75).
+    push("15:12:18.913", "flat route: trained-upscale R=2880x1620 E=3840x2160 D=3840x2160");
+    FlatCopyDiag diag;
+    diag.outcome = FlatCopyOutcome::Admitted; diag.whitelist = FlatMonoReason::NoTonePass;
+    diag.srcWidth = 2880; diag.srcHeight = 1620; diag.srcFormat = 27; diag.srcDraws = 1;
+    diag.srcVs = 0xF9CFC798F21E9AEAull; diag.srcPs = 0xE8948389387DA083ull;
+    diag.triggerVs = 0xDFED8E1C9E191BECull; diag.triggerPs = 0x143AAE0597E2F7BFull;
+    diag.sceneWidth = 2880; diag.sceneHeight = 1620; diag.outputWidth = 3840; diag.outputHeight = 2160;
+    flatCopyFormatFirstAdmission(line, sizeof(line), 1919, diag, "trained-upscale");
+    push("15:12:18.914", line);
+    struct Win { const char* ts; uint64_t copies, whitelist, admitted, noScene; uint64_t treated; };
+    const Win wins[] = {{"15:12:11.150", 741, 0, 0, 741, 0}, {"15:12:16.147", 3, 0, 0, 3, 0},
+                        {"15:12:21.149", 331, 0, 331, 0, 0}, {"15:12:26.148", 340, 0, 340, 0, 0}, {"15:12:31.150", 338, 0, 338, 0, 0}};
+    uint64_t treated = 0;
+    for (const Win& w : wins) {
+        FlatCopyWindow window;
+        window.copies = w.copies; window.whitelist = w.whitelist; window.admitted = w.admitted; window.noScene = w.noScene;
+        window.last = w.admitted ? "admitted" : "no-scene";
+        if (w.admitted) {
+            window.lastSceneW = 2880; window.lastSceneH = 1620; window.lastOutW = 3840; window.lastOutH = 2160;
+            window.lastSrcW = 2880; window.lastSrcH = 1620; window.lastSrcVs = diag.srcVs; window.lastSrcPs = diag.srcPs;
+        } else {
+            window.lastOutW = 3840; window.lastOutH = 2160;
+        }
+        flatCopyFormatWindow(line, sizeof(line), true, window);
+        push(w.ts, line);
+        treated += w.admitted;
+        char runtime[400];
+        std::snprintf(runtime, sizeof(runtime),
+            "flat runtime: treated=%llu refused=%llu last=%s render-source=game-SS jitter=(0.125,-0.1667) accepted-reset-5s=%u "
+            "accepted-history-5s=%llu treated-streak=%llu longest-treated-streak=%llu",
+            static_cast<unsigned long long>(treated), 744ull,
+            w.admitted ? "treated-jittered" : "no-3d-scene", w.admitted ? 1u : 0u,
+            static_cast<unsigned long long>(w.admitted ? w.admitted - 1 : 0), static_cast<unsigned long long>(treated),
+            static_cast<unsigned long long>(treated));
+        push(w.ts, runtime);
+        if (w.noScene) push(w.ts, "flat runtime refusal 5s: reason=no-3d-scene count=741");
+    }
+    // Episode: the render size does not fit (Elite's resolution 2560x1440 on a 2560x1600 screen, supersampling 0.85).
+    marker("render-size");
+    FlatStandDown size;
+    size.enteredReason = FlatMonoReason::RenderSize; size.standReason = FlatMonoReason::RenderSize;
+    size.enteredAfterMs = 5000; size.enteredAfterFrames = 598; size.standing = true;
+    flatRenderSizeWords(words, sizeof(words), 2176, 1224, 2560, 1600);
+    flatStandDownFormatEntered(line, sizeof(line), 14827, size, words);
+    push("15:14:28.335", line);
+    EliteGraphics rc5;
+    rc5.folderFound = rc5.presetKnown = rc5.custom = rc5.fileRead = true;
+    std::strcpy(rc5.preset, "Custom"); std::strcpy(rc5.file, "Custom.4.4.fxcfg");
+    rc5.aaMode = 0; rc5.bloomQuality = 3; rc5.dofEnabled = 2;
+    const FlatWarningCause shape = flatWarningCause(true, true, false, true, true, 2176, 1224, 2560, 1600);
+    FlatSettingsWarning w;
+    flatComposeSettingsWarning("DLSS", rc5, 0, nullptr, nullptr, &w, shape);
+    flatFormatSettingsWarningLog(line, sizeof(line), false, "DLSS", "render-size-does-not-fit-output", true, shape, w);
+    push("15:14:28.335", line);
+    size.probes = 19; size.pausedFrames = 3523; size.probeSeen = FlatFrameSeen::Structural; size.probeReason = FlatMonoReason::RenderSize;
+    size.standSinceMs = 1000;
+    flatStandDownFormatStill(line, sizeof(line), 22623, size, 31000, words);
+    push("15:14:58.340", line);
+    push("15:15:07.021", "flat settings warning: hidden (the work is not stood down for the shape of a post chain now, or the mode is off)");
+    // Episode: a game AA chain between the tone pass and the copy, which the structure declines (the Anti-aliasing advice stays).
+    marker("game-aa");
+    FlatCopyDiag aa;
+    aa.outcome = FlatCopyOutcome::Declined; aa.why = "r-sized-image-passes-follow-the-first-consumer-of-the-scene-hdr";
+    aa.whitelist = FlatMonoReason::NoTonePass; aa.srcWidth = 2880; aa.srcHeight = 1620; aa.srcFormat = 27; aa.srcDraws = 1;
+    aa.srcVs = 0x98E6F9986FDC9A53ull; aa.srcPs = 0x4168985B52C5D7C4ull; aa.ldrTargetsBefore = 2; aa.ldrDrawsBefore = 2;
+    aa.sceneWidth = 2880; aa.sceneHeight = 1620; aa.outputWidth = 3840; aa.outputHeight = 2160;
+    flatCopyFormatDeclined(line, sizeof(line), 20010, aa);
+    push("15:16:40.100", line);
+    FlatCopyWindow aaWindow;
+    for (int i = 0; i < 600; ++i) aaWindow.note(aa);
+    flatCopyFormatWindow(line, sizeof(line), true, aaWindow);
+    push("15:16:45.149", line);
+    FlatStandDown chain;
+    chain.enteredReason = FlatMonoReason::NoTonePass; chain.standReason = FlatMonoReason::NoTonePass;
+    chain.enteredAfterMs = 5000; chain.enteredAfterFrames = 591; chain.standing = true;
+    flatStandDownFormatEntered(line, sizeof(line), 20400, chain);
+    push("15:16:50.039", line);
+    EliteGraphics aaOn = rc5; aaOn.aaMode = 4; aaOn.bloomQuality = 0; aaOn.dofEnabled = 0;
+    const FlatWarningCause admission = flatWarningCause(true, true, false, false, true, 2880, 1620, 3840, 2160);
+    flatComposeSettingsWarning("DLSS", aaOn, 0, nullptr, nullptr, &w, admission);
+    flatFormatSettingsWarningLog(line, sizeof(line), false, "DLSS", "no-known-tone-pass", true, admission, w);
+    push("15:16:50.039", line);
+    push("15:16:50.040", "flat runtime refusal 5s: reason=no-known-tone-pass count=591");
+    // Episode: the old advice (a build from before section 83): the supersampling paragraph and its bracket.
+    marker("old-advice");
+    push("15:18:00.100", "flat settings warning: shown (mode=DLAA, frames refused for no-known-tone-pass, work stood down, supersampling below 1.0 "
+                         "(render 2880x1620, output 3840x2160)): DLAA is not active: Elite's post-processing is not recognised. Turn off in Elite's "
+                         "graphics options: Bloom, Depth of field Supersampling is below 1.0. At 1.0 or above, EDVR anti-aliases before bloom and depth "
+                         "of field, so they no longer block it. Raising it costs GPU time.");
+    flush();
+    return out;
 }
 
 }  // namespace copy_structure_test
@@ -461,6 +599,40 @@ inline int flatCopyStructureTests() {
         expect(invalid.selected(), "invalid-tone-pass (a known tone pass that fails its checks) is rescued by the structure too");
     }
 
+    // ---- the selector's own extent gates: the route's (R >= D) and the copy structure's (a uniform scale, half to twice) --------------------
+    // flatCopyAdmit classifies the scene's size first, so the selector's own gate is a second line of defence. It is held here directly, on the
+    // very function both callers use, with the gate named and a detector state made by hand (an off-shape scene has no trigger of its own).
+    {
+        struct Row { uint32_t w, h; FlatHdrExtentGate gate; FlatMonoReason want; const char* what; };
+        const Row rows[] = {
+            {3840, 2160, FlatHdrExtentGate::RenderAtLeastOutput, FlatMonoReason::Selected, "the route takes R = D"},
+            {5760, 3240, FlatHdrExtentGate::RenderAtLeastOutput, FlatMonoReason::Selected, "the route takes R = 1.5 D"},
+            {1920, 1080, FlatHdrExtentGate::RenderAtLeastOutput, FlatMonoReason::HdrExtent, "the route refuses R = 0.5 D"},
+            {1920, 1080, FlatHdrExtentGate::UniformHalfToDouble, FlatMonoReason::Selected, "the structure takes R = 0.5 D (exactly half)"},
+            {7680, 4320, FlatHdrExtentGate::UniformHalfToDouble, FlatMonoReason::Selected, "the structure takes R = 2 D (exactly twice)"},
+            {1900, 1069, FlatHdrExtentGate::UniformHalfToDouble, FlatMonoReason::RenderSize, "the structure refuses a pixel under half"},
+            {7700, 4332, FlatHdrExtentGate::UniformHalfToDouble, FlatMonoReason::RenderSize, "the structure refuses over twice"},
+            {3840, 2000, FlatHdrExtentGate::UniformHalfToDouble, FlatMonoReason::RenderSize, "the structure refuses a shape that is not the output's"},
+            {3840, 2000, FlatHdrExtentGate::RenderAtLeastOutput, FlatMonoReason::HdrExtent, "the route refuses a shape that is not the output's"},
+        };
+        bool all = true;
+        for (const Row& r : rows) {
+            Build b; b.sc.hW = r.w; b.sc.hH = r.h;
+            Built built = build(b);
+            FlatHdrFrame fake;
+            flatHdrBeginFrame(fake, b.sc.outW, b.sc.outH);
+            fake.triggered = true; fake.trigger.hdr = built.stream->sc.h; fake.trigger.sequence = built.stream->prefix->sequence;
+            const FlatMonoFrame sel = flatSelectHdrRouteAt(*built.stream->prefix, fake, [](uint64_t, uint64_t) { return true; },
+                                                          fake.trigger.sequence, r.gate);
+            const bool ok = sel.reason == r.want &&
+                            (r.want != FlatMonoReason::RenderSize && r.want != FlatMonoReason::HdrExtent
+                                 ? sel.selected() && sel.renderWidth == r.w
+                                 : sel.renderWidth == r.w && sel.renderHeight == r.h && sel.outputWidth == b.sc.outW && sel.outputHeight == b.sc.outH);
+            if (!ok) { all = false; std::printf("  (gate row \"%s\": got %s)\n", r.what, flatMonoReasonName(sel.reason)); }
+        }
+        expect(all, "the selector's extent gates, row by row (the refusals carry the measured sizes)");
+    }
+
     // ---- the scene's size: no scene, a size that does not fit, the key --------------------------------------------------
     {
         // No scene at all: a startup, a loading screen or a 2D menu (here: the draws into H are too few to be a scene).
@@ -713,8 +885,8 @@ inline int flatCopyStructureTests() {
                "the policy is the route's key, the mode and the latch; the admission reads the prefix and the detector as they stand");
         expect(count(runtime, "if (whitelist.selected()) s.copyWindow.noteWhitelist(); else s.copyWindow.note(diag);") == 1,
                "every ruling is counted, the whitelist's frames apart");
-        expect(count(runtime, "flatCopyFormatWindow(copyText, sizeof(copyText), s.hdrKey == FlatHdrKey::Auto, s.copyWindow);") == 1 &&
-                   count(runtime, "s.copyWindow.reset();") == 1,
+        expect(count(runtime, "flatCopyFormatWindow(copyText, sizeof(copyText), s.hdrKey == FlatHdrKey::Auto, s.copyWindow);\n"
+                              "            Log::get().note(\"%s\", copyText);\n            s.copyWindow.reset();") == 1,
                "the census line prints every window while a temporal mode runs, and the window resets with it");
         expect(count(runtime, "flatCopyFormatFirstAdmission(") == 1 && count(runtime, "flatCopyFormatDeclined(") == 1 &&
                    count(runtime, "s.copyDeclineLines < 12") == 1,
@@ -731,8 +903,29 @@ inline int flatCopyStructureTests() {
                    count(runtime, "bool flatRuntimeSceneSizes(") == 1,
                "the three accessors the panel reads");
         // The key's own words say what auto does now.
-        expect(count(runtime, "which admits the game's final copy by its structure") == 1,
+        expect(count(runtime, "which admits the game's final copy by its structure") == 1 &&
+                   count(runtime, "Log::get().note(\"flat hdr route: experimental.temporal_aa_before_post=%s%s at frame=%llu: %s\",") == 1,
                "the key's log line says the copy route admits by structure below the output");
+        // The lines the fixture copies from the runtime's own format strings (the reader parses exactly these prefixes).
+        expect(count(runtime, "\"flat runtime: treated=%llu refused=%llu last=%s render-source=game-SS jitter=(%.5g,%.5g) accepted-reset-5s=%llu ") == 1 &&
+                   count(runtime, "\"flat runtime refusal 5s: reason=%s count=%llu\"") == 1 &&
+                   count(runtime, "\"flat route: %s R=%ux%u E=%ux%u D=%ux%u%s\"") == 1,
+               "the runtime's counter, refusal and route lines are the formats the fixture and the reader read");
+        const std::string menu = slurp("src/d3d11/menu.cpp");
+        expect(count(menu, "\"flat settings warning: hidden (the work is not stood down for the shape of \"\n"
+                           "                        \"a post chain now, or the mode is off)\"") == 1,
+               "the panel's hidden line is the one the fixture copies");
+    }
+
+    // ---- the fixture: what a good flight below the output writes, and three episodes ---------------------------------------
+    {
+        std::vector<unsigned char> bytes;
+        std::string have;
+        if (hdr_route_test::readFile(fs::path("tools/flat_upscale_fixture.log"), &bytes)) have.assign(bytes.begin(), bytes.end());
+        for (size_t at; (at = have.find('\r')) != std::string::npos;) have.erase(at, 1);
+        expect(!have.empty() && have == flatUpscaleFixtureText(),
+               "tools\\flat_upscale_fixture.log is exactly what the formatters write (regenerate it: flat_temporal_test.exe --write-fixture "
+               "tools\\flat_upscale_fixture.log)");
     }
 
     return failures;

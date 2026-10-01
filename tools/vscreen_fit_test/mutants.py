@@ -192,7 +192,7 @@ MUTANTS = [
       "the log line does not name HMD Image Quality", HEADER2),
     M("ss-toast-reworded", "R13c", [('"Elite Supersampling is below 1: use HMD Image Quality"', '"Elite Supersampling is low"')], "the toast no longer says what to use instead", HEADER2),
     M("ss-status-reworded", "R13c", [('"below 1: world at %u%% of the eye"', '"world at %u%%"')], "the Status value no longer says below 1", HEADER2),
-    M("pin-ss-toast-not-gated", "R13e", [("        if (!s.vrSupersamplingToasted && s.toasts) {", "        if (!s.vrSupersamplingToasted) {")], "the toast ignores menu.toasts", "src/d3d11/menu.cpp"),
+    M("pin-ss-toast-not-gated", "R13e", [("                if (s.toasts) {\n                    char toast[96];", "                {\n                    char toast[96];")], "the toast ignores menu.toasts", "src/d3d11/menu.cpp"),
     M("pin-ss-status-renamed", "R13e", [('statusLine(c, "Elite supersampling", buf);', 'statusLine(c, "Elite SS", buf);')], "the Status line is not the one the pin knows", "src/d3d11/menu.cpp"),
     M("pin-ss-note-on-flat", "R13e", [("        if (!runtimeFlatProfile()) {\n            uint32_t rw = 0, rh = 0, ew = 0, eh = 0;\n            if (vScreenRenderBelowEye(", "        if (true) {\n            uint32_t rw = 0, rh = 0, ew = 0, eh = 0;\n            if (vScreenRenderBelowEye(")],
       "the settings pages' note is built in a flat session too", "src/d3d11/menu.cpp"),

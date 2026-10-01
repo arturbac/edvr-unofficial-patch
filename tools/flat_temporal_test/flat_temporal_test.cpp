@@ -2358,7 +2358,8 @@ void testFlatWarningWiring() {
         {&menuCpp, "if (runtimeFlatProfile() && s.flatWarnActive) {", 1, "the panel draws the warning only while it is active"},
         {&menuCpp, "if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;", 2,
          "the warning, and the wrapper note after it, are note lines below the rows"},
-        {&menuCpp, "FlatWarnRuler ruler{c.capPx * 8 / 7};", 2, "wrapped with the panel's own ruler at the note face's em (both)"},
+        {&menuCpp, "FlatWarnRuler ruler{c.capPx * 8 / 7};", 3,
+         "wrapped with the panel's own ruler at the note face's em (the flat warning, the wrapper note, and the VR supersampling note)"},
         {&menuCpp, "flatWarningTick(now);", 1, "the flat tick runs the warning"},
         {&menuCpp, "s.flatSettingsForce = true;", 1, "Elite's files are looked at when the panel opens"},
         {&menuCpp, "s.flatSettings.setFolder(flatEliteGraphicsFolder());", 1, "from %LOCALAPPDATA%, resolved once"},
@@ -2911,6 +2912,19 @@ int main(int argc, char** argv) {
     // The final copy's admission by structure (flat_copy_structure_tests.h): what it makes of each frame of a trace.
     if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--trace-structure") == 0)
         return copy_structure_test::traceStructure(argv[2], argc == 4 && std::strcmp(argv[3], "pretend") == 0);
+    // --write-fixture <path> [--dry-run]: regenerate tools\flat_upscale_fixture.log from the formatters. Anything that writes a file
+    // takes --dry-run, and --dry-run writes nothing at all.
+    if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--write-fixture") == 0) {
+        const std::string text = copy_structure_test::flatUpscaleFixtureText();
+        if (argc == 4 && std::strcmp(argv[3], "--dry-run") == 0) {
+            std::printf("flat_temporal_test: --dry-run: would write %zu bytes to %s; wrote nothing\n", text.size(), argv[2]);
+            return 0;
+        }
+        std::ofstream out(argv[2], std::ios::binary | std::ios::trunc);
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        std::printf("flat_temporal_test: wrote %zu bytes to %s\n", text.size(), argv[2]);
+        return out ? 0 : 1;
+    }
     if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) {
         std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir> | --trace-check <file> | --trace-migrate <dir> | "
                   "--trace-rekey <file|dir> | --trace-chain <file> | --trace-structure <file> | "

@@ -1105,6 +1105,10 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     "third_party\dxbc_hash\DxilHash.cpp" ^
     /link /INCREMENTAL:NO kernel32.lib
 if errorlevel 1 ( echo [edvr] ERROR: flat temporal test build failed & exit /b 1 )
+REM --write-fixture regenerates tools\flat_upscale_fixture.log (design doc section 83); anything that writes a file takes --dry-run,
+REM and --dry-run writes nothing at all.
+"%BUILD%\flat_temporal_test.exe" --write-fixture "%OBJ%\flattemporaltest\never_written.log" --dry-run || exit /b 1
+if exist "%OBJ%\flattemporaltest\never_written.log" ( echo [edvr] ERROR: flat_temporal_test --write-fixture --dry-run wrote a file & exit /b 1 )
 "%BUILD%\flat_temporal_test.exe" --self-test || exit /b 1
 exit /b 0
 
