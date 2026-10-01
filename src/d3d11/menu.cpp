@@ -189,6 +189,10 @@ struct State {
     // output, with the measured sizes): set with the key, which carries all of it, so the panel and the log say what the key says.
     FlatWarningCause flatWarnCause;
     int         flatWarnLogged = 0;
+    // A cause that differs from the one on show waits kFlatWarnHoldMs before it replaces it (flat_elite_settings.h, FlatWarnHold);
+    // each hold that starts is logged, at most kFlatWarnHeldLogMax times a session.
+    FlatWarnHold flatWarnHold;
+    int         flatWarnHeldLogged = 0;
     // The graphics-wrapper note (flat_wrapper_note.h): said once in the log when it is first drawn.
     bool        flatWrapperNoteLogged = false;
     // Elite's Supersampling below 1.0 in VR (vr_supersample_notice.h, design section 83): the headset toast is said once a
@@ -1003,6 +1007,9 @@ constexpr int kFlatWarnLogMax = 24;
 // The flat page is the rows of menu_flat_rows.h and nothing else; a blank line and a full warning make up the rest of
 // the card. (The wrapper note, when there is one, takes what is left.)
 static_assert(static_cast<int>(kFlatPageRowCount) + 1 + FlatSettingsWarning::kMaxLines <= kMenuMaxLines,
+// The held-change lines (a cause that waits out kFlatWarnHoldMs before it replaces the one on show) are bounded on their own: a
+// run of transients must not use up the budget that says what the panel showed, and the other way round.
+constexpr int kFlatWarnHeldLogMax = 8;
               "the flat page's rows, a blank line and a full settings warning fit the card's lines");
 
 // The selected mode as the panel names it on its Anti-aliasing row.
@@ -1056,6 +1063,22 @@ void flatWarningTick(uint64_t now) {
     const bool was = s.flatWarnActive;
     s.flatWarnActive = refusing;
     s.flatWarnKey = key;
+    // A cause that differs from the one on show waits kFlatWarnHoldMs before it replaces it (flat_elite_settings.h, FlatWarnHold).
+    // The scene's size moves only when a final copy is evaluated, at the stand-down's probe frames while stood down, so a loading
+    // screen's size stood as the computed cause for one probe interval and the words flipped back and forth; a show and a hide
+    // stay immediate. Asked every tick and before the comparison below, so a cause that returns to the one on show drops the
+    // change that was waiting.
+    if (!s.flatWarnHold.admit(refusing, s.flatWarnActive, s.flatWarnKey, key, now)) {
+        if (s.flatWarnHold.began() && s.flatWarnHeldLogged < kFlatWarnHeldLogMax) {
+            ++s.flatWarnHeldLogged;
+            char held[360];
+            flatFormatWarnHeldLog(held, sizeof(held), s.flatWarnCause, cause);
+            Log::get().note("%s", held);
+            if (s.flatWarnHeldLogged == kFlatWarnHeldLogMax)
+                Log::get().note("flat settings warning: further held changes are not logged this session");
+        }
+        return;
+    }
     s.flatWarnCause = cause;
     s.contentDirty = true;
     if (s.flatWarnLogged >= kFlatWarnLogMax) return;
