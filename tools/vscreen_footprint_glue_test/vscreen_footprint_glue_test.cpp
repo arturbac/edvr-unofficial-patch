@@ -20,6 +20,11 @@
 //                     width, at distance 1.0, and only from twelve on-foot samples up; the line says what the file holds and the width
 //                     the next launch would fit. A session whose samples are NOT all alike (fractions at distance 1 from several applied
 //                     distances) stores 0.67 of the drawn width, where its median would be 0.85: the p10, not the median.
+//   THE SAVE FAILS    the first window that has a record to save finds the destination held open with no sharing (an older session's
+//                     record is on disk): the save fails, the line says persisted=no save-failed=1 and the log says SAVE FAILED once, the
+//                     file is exactly what it was and no temp file is left; with the lock gone the NEXT window (its p10 unchanged,
+//                     nothing new on foot) saves: persisted= is the value, save-failed does not grow, and the next launch's read
+//                     (lastKnownPanelFootprint over the same directory) returns it. The run is read by the real reader: STORED WARNs.
 //   SOURCES THAT ARE NOT WHAT IT ASSUMES   a vertex stride that is not 20, a constant buffer too small for the rows, no SIZE slot and
 //                     a negative base vertex each skip the sample and are counted by reason on the line; nothing is guessed.
 //   THE GUARD         a context that faults on every call (a bogus pointer) is absorbed by the fault budget five times, leaves the hooks'
@@ -330,10 +335,29 @@ int run() {
     for (int i = 0; i < 20; ++i) sampleOnce(gpu, true, 0.7f, 4, 1);
     check(!edvr::g_flatComputeInternal, "the hooks' bypass flag is clear after the instrument's own D3D calls");
 
-    edvr::detail::g_footprintWindowMs = 1;   // the next boundary closes the window
+    // THE SAVE FAILS. This is the first window with a record to save, and the file cannot be replaced: an older session's record is on disk and
+    // something holds it open with no sharing. (The older record goes in through the writer itself; the checks below read it back.)
+    const std::wstring stateFile = Config::get().logDir() + L"\\vscreen_auto_footprint.txt";
+    edvr::vscreenfit::Record olderRecord;
+    olderRecord.fractionAtUnit = 0.5;
+    olderRecord.eyeWidth = 4032;
+    olderRecord.distance = 0.7;
+    olderRecord.samples = 31;
+    edvr::noteMeasuredPanelFootprint(Config::get().logDir(), olderRecord);
+    HANDLE held = CreateFileW(stateFile.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(held != INVALID_HANDLE_VALUE, "THE SAVE FAILS: an older session's record is on disk, held open with no sharing");
+
+    edvr::detail::g_footprintWindowMs = 1;   // the next boundary closes the window: its save meets the lock
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
     edvr::vscreenFootprintFrameBoundary(gpu.ctx.Get(), true);
     edvr::detail::g_footprintWindowMs = 600000;
+    if (held != INVALID_HANDLE_VALUE) CloseHandle(held);   // unlocked: the next window's save can reach the file
+    {
+        edvr::vscreenfit::Record kept;
+        check(edvr::lastKnownPanelFootprint(Config::get().logDir(), &kept) && std::fabs(kept.fractionAtUnit - 0.5) < 1.0e-6 && kept.samples == 31 && kept.eyeWidth == 4032,
+              "THE SAVE FAILS: after the failed save the file is exactly the older session's record (a failed save changes nothing)");
+        check(GetFileAttributesW((stateFile + L".tmp").c_str()) == INVALID_FILE_ATTRIBUTES, "THE SAVE FAILS: and no temp file is left beside it");
+    }
 
     // ---- 4. sources that are not what the measurement assumes ---------------------------------------------------------------------------
     std::printf("sources that are not what it assumes\n");
@@ -382,8 +406,8 @@ int run() {
             check(tokenOf(w1, "session-n") == "20" && std::fabs(std::atof(tokenOf(w1, "session-frac1").c_str()) - wantWidthFraction() * 0.7) < 1.0e-4,
                   "WHAT IS STORED: the session's value is over the 20 on-foot samples only (all alike here, so their p10 is their value; the skewed session below tells p10 from median)");
             check(std::atof(tokenOf(w1, "other-fp").c_str()) > 3000.0, "THE PLUMBING: the menu samples are kept apart (other-fp)");
-            check(tokenOf(w1, "persisted") != "no" && std::fabs(std::atof(tokenOf(w1, "persisted").c_str()) - wantWidthFraction() * 0.7) < 1.0e-4,
-                  "WHAT IS STORED: twelve or more on-foot samples are stored, and the line says what the file holds");
+            check(tokenOf(w1, "persisted") == "no" && tokenOf(w1, "save-failed") == "1",
+                  "THE SAVE FAILS: the line of the window whose save failed says persisted=no (nothing from this session has reached the file) and save-failed=1");
             fit::Inputs in;
             in.eyeWidth = 4032;
             in.distance = 0.7;
@@ -399,15 +423,35 @@ int run() {
             check(has(why, "vb0-stride:2") && has(why, "cb-small:1") && has(why, "no-size:1") && has(why, "vb-small:1"),
                   "SOURCES THAT ARE NOT WHAT IT ASSUMES: counted by reason (vb0-stride x2 for the stride and the negative base vertex, cb-small, no-size, vb-small)");
             check(tokenOf(w1, "draws") == "25" && tokenOf(w2, "draws") == "5", "the composite draws the hook saw are counted per window (25, then the 5 defective ones)");
+            // The next window: the lock is gone, nothing new was seen on foot, so the p10 is exactly what it was. It saves anyway, because the
+            // last save failed; persisted= is then what the file holds, and the failure count does not grow.
+            check(tokenOf(w2, "session-n") == "20" && std::fabs(std::atof(tokenOf(w2, "session-frac1").c_str()) - wantWidthFraction() * 0.7) < 1.0e-4 &&
+                      tokenOf(w2, "session-frac1") == tokenOf(w1, "session-frac1"),
+                  "THE SAVE FAILS: the next window's p10 is unchanged (the same 20 samples, nothing new on foot)");
+            check(tokenOf(w2, "persisted") != "no" && std::fabs(std::atof(tokenOf(w2, "persisted").c_str()) - wantWidthFraction() * 0.7) < 1.0e-4 && tokenOf(w2, "save-failed") == "1",
+                  "THE SAVE FAILS: and that window saves anyway: persisted= is the value now in the file, and save-failed stays 1 (no further failures)");
         }
         check(count(log, "vscreen footprint 30s: ") == 2 && !has(log, "STOOD DOWN"), "no fault so far: no STOOD DOWN line");
+        {   // The log says it once, with the Win32 error, what happens to the file and that the next window tries again.
+            const std::vector<std::string> failedLines = linesWith(log, "vscreen footprint: SAVE FAILED");
+            check(failedLines.size() == 1, "THE SAVE FAILS: the log says so once (the save that failed, not the retry that worked)");
+            if (failedLines.size() == 1) {
+                const size_t at = failedLines[0].find("(Win32 error ");
+                const unsigned long code = at == std::string::npos ? 0ul : std::strtoul(failedLines[0].c_str() + at + 13, nullptr, 10);
+                check(code != 0 && has(failedLines[0], "the file keeps its previous value") && has(failedLines[0], "the next 30 s window tries again") &&
+                          has(failedLines[0], "Failed saves this session: 1;"),
+                      "THE SAVE FAILS: the line names a Win32 error, says the file keeps its previous value and that the next 30 s window tries again");
+            }
+        }
     }
     {
         // The stored file: the footprint beside the eye width, at distance 1.
         edvr::vscreenfit::Record r;
         check(edvr::lastKnownPanelFootprint(Config::get().logDir(), &r) && std::fabs(r.fractionAtUnit - wantWidthFraction() * 0.7) < 1.0e-4 && r.eyeWidth == 4032 &&
                   r.samples == 20 && std::fabs(r.distance - 0.7) < 1.0e-3,
-              "WHAT IS STORED: the file holds the on-foot p10 at distance 1, the eye width, the distance it was drawn at and the sample count");
+              "WHAT IS STORED: after the retry the file holds the on-foot p10 at distance 1 (what the next launch's read returns), the eye width, the distance it was drawn at (the "
+              "session's, though the retry window saw nothing on foot) and the sample count");
+        check(GetFileAttributesW((stateFile + L".tmp").c_str()) == INVALID_FILE_ATTRIBUTES, "WHAT IS STORED: and no temp file is left beside it");
     }
 
     // ---- the real reader ----------------------------------------------------------------------------------------------------------------
@@ -415,9 +459,10 @@ int run() {
         int rc = 0;
         const std::string report = runReader(logPath, &rc);
         check(rc == 0, "THE READER: --vscreen-fit exits 0 on the glue's log");
-        check(has(report, "PASS (INSTRUMENT)") && has(report, "PASS (ON FOOT)") && has(report, "PASS (SHAPE)") && has(report, "PASS (STORED)") &&
-                  !has(report, "STOP ("),
-              "THE READER: its verdict on the glue's own log: the instrument ran, on foot was measured, the shape is 16:9, the p10 is stored, no STOP");
+        check(has(report, "PASS (INSTRUMENT)") && has(report, "PASS (ON FOOT)") && has(report, "PASS (SHAPE)") && !has(report, "STOP ("),
+              "THE READER: its verdict on the glue's own log: the instrument ran, on foot was measured, the shape is 16:9, no STOP");
+        check(has(report, "WARN (STORED)") && has(report, "save(s) of the on-foot footprint FAILED") && has(report, "first in window 1"),
+              "THE READER: and it WARNs on STORED, saying a save failed (the save-failed token of the instrument's own line, read by key) and in which window");
         if (g_failure.size()) std::printf("%s\n", report.c_str());
     }
 
@@ -449,7 +494,8 @@ int run() {
                   "THE STORED FLOOR: 30 more on-foot samples, and the session now holds 50");
             check(std::fabs(sess - 0.67 * f) < 1.0e-4 && std::fabs(sess - 0.85 * f) > 0.05,
                   "THE STORED FLOOR: session-frac1 is the session's p10 (0.67 x the drawn fraction), not its median (0.85 x it)");
-            check(std::fabs(std::atof(tokenOf(w, "persisted").c_str()) - sess) < 1.0e-4, "THE STORED FLOOR: and persisted= says the file now holds that p10");
+            check(std::fabs(std::atof(tokenOf(w, "persisted").c_str()) - sess) < 1.0e-4 && tokenOf(w, "save-failed") == "1",
+                  "THE STORED FLOOR: and persisted= says the file now holds that p10 (saved with the lock gone: save-failed is still the 1 from before)");
             check(std::fabs(std::atof(tokenOf(w, "frac").c_str()) - f) < 1.0e-4 && tokenOf(w, "applied") == "1.000" && std::fabs(std::atof(tokenOf(w, "frac1").c_str()) - f) < 1.0e-4,
                   "THE STORED FLOOR: while the window's own frac and frac1 stay medians of the window (the drawn fraction f, at distance 1.000)");
             fit::Inputs in;

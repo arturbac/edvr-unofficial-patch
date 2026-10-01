@@ -144,9 +144,11 @@ the composite and read its sources), ON FOOT, STABLE (the windows' widths at dis
 from the log's game FOV when it carries one), which judge only the windows with 12 or
 more on-foot samples, DISTANCE LAW (the footprint at distance 1 agrees across panel
 distances), CALIBRATION (the session's stored p10 against the 5006 px head-on
-footprint behind Sean's 3504 at distance 0.7 on a 4032 px eye, within 5%) and STORED.
-A log with none of these lines exits 1; the verdict never changes the exit code (read
-its lines).
+footprint behind Sean's 3504 at distance 0.7 on a 4032 px eye, within 5%) and STORED
+(a WARN when any window carries save-failed=N: a save of the footprint that did not
+reach the file; the log's `vscreen footprint: SAVE FAILED (Win32 error N)` line, the
+first three of a session, names the error). A log with none of these lines exits 1; the
+verdict never changes the exit code (read its lines).
 
 --flat-upscale reads a flat-profile flight (design doc section 83): the game's final copy admitted by
 its structure, so DLSS, FSR and TAA resolve below the output (Elite's supersampling under 1.0) whatever bloom,
@@ -4166,7 +4168,8 @@ def parse_vscreen_fit(text):
 def vscreen_fit_windows(f):
     """Each window's tokens as numbers: [{window, samples, on_foot, other, skipped, late, draws, why, distance, applied, eye (w, h) or None,
     fp, frac, lo, hi, h, shape, other_fp, at1, frac1, session_n, session_frac1, persisted, fit, legacy, m (the m of the fit= token: a build
-    that stored the session's median, before the p10, printed 1.00 here)}]."""
+    that stored the session's median, before the p10, printed 1.00 here), save_failed (the save-failed= token, read by key: the saves that
+    failed so far this session, 0 when the token is absent, as in every log from a build without it and every window before the first failure)}]."""
     out = []
     for w in f["windows"]:
         kv = w["kv"]
@@ -4180,7 +4183,7 @@ def vscreen_fit_windows(f):
             "lo": float(rng.group(1)) if rng else None, "hi": float(rng.group(2)) if rng else None, "h": _vnum(kv.get("h")),
             "shape": _vnum(kv.get("shape")), "other_fp": _vnum(kv.get("other-fp")), "at1": _vnum(kv.get("at1")), "frac1": _vnum(kv.get("frac1")),
             "session_n": _cint(kv.get("session-n")) or 0, "session_frac1": _vnum(kv.get("session-frac1")), "persisted": _vnum(kv.get("persisted")),
-            "fit": _vnum(kv.get("fit")), "legacy": _vnum(kv.get("legacy")), "m": _vnum(kv.get("m"))})
+            "fit": _vnum(kv.get("fit")), "legacy": _vnum(kv.get("legacy")), "m": _vnum(kv.get("m")), "save_failed": _cint(kv.get("save-failed")) or 0})
     return out
 
 
@@ -4203,7 +4206,8 @@ def vscreen_fit_verdict(f):
     questions the flight plan asks: RULE (did auto choose by the rule it names, and was that what was applied), INSTRUMENT (did the
     footprint instrument run, see the composite and read its sources), ON FOOT (was the screen measured on foot), STABLE (the windows'
     widths at distance 1 agree), SHAPE (the median window's shape is 16:9 in the eye's own pixels), DISTANCE LAW (A varies as 1/d),
-    CALIBRATION (is the session's stored head-on floor, p10, the 5006 px behind Sean's 3504), STORED (what the next launch will fit).
+    CALIBRATION (is the session's stored head-on floor, p10, the 5006 px behind Sean's 3504), STORED (what the next launch will fit; a WARN
+    when any window carries save-failed=N, a save that did not reach the file).
     ON FOOT, STABLE and SHAPE judge only the windows with VSCREEN_MIN_FOOT or more on-foot samples (a window of one or six samples is a
     transition: it is what made a flight read 102% unstable and 1.43 shaped). DISTANCE LAW is unchanged: it keeps every on-foot window."""
     out = []
@@ -4406,7 +4410,16 @@ def vscreen_fit_verdict(f):
     if wins:
         last = wins[-1]
         persisted = [w for w in wins if w["persisted"] is not None]
-        if persisted:
+        # A save that failed: the 30 s line carries save-failed=N (read by key; the count so far this session, absent before the first failure and in
+        # every log from a build without it) and the log has a `vscreen footprint: SAVE FAILED (Win32 error N)` line for the first three. The file kept
+        # what it held, so nothing below may claim the session's value is what the next launch will read.
+        failed = [w for w in wins if w["save_failed"] > 0]
+        if failed:
+            reached = ("the last value that did reach it is %.4f of the eye at panel distance 1 (window %s)" % (persisted[-1]["persisted"], persisted[-1]["window"])
+                       if persisted else "nothing from this session has reached it (persisted=no on every window)")
+            add("STORED", "WARN", "%d save(s) of the on-foot footprint FAILED (first in window %s; the log's `vscreen footprint: SAVE FAILED` line names the Win32 error): "
+                "the file keeps its previous value and a later window tries again; %s" % (max(w["save_failed"] for w in wins), failed[0]["window"], reached))
+        elif persisted:
             p = persisted[-1]
             fit = p["fit"]
             note = ""
@@ -4456,11 +4469,12 @@ def print_vscreen_fit(text):
                  "; applied %dx%d" % (f["applied"]["w"], f["applied"]["h"]) if f["applied"] else ""))
     for w in wins:
         print("window %s: samples %d (on foot %d, other %d), draws %d, skipped %d, late %d; eye %s distance %s applied %s; on foot fp=%s frac=%s range=%s..%s "
-              "shape=%s; at distance 1 %s px (%s); session n=%d session-frac1 %s persisted %s; next launch fits %s (legacy %s)"
+              "shape=%s; at distance 1 %s px (%s); session n=%d session-frac1 %s persisted %s%s; next launch fits %s (legacy %s)"
               % (w["window"], w["samples"], w["on_foot"], w["other"], w["draws"], w["skipped"], w["late"],
                  "%dx%d" % w["eye"] if w["eye"] else "-", w["distance"], w["applied"], "%.0f" % w["fp"] if w["fp"] is not None else "-",
                  w["frac"], "%.0f" % w["lo"] if w["lo"] is not None else "-", "%.0f" % w["hi"] if w["hi"] is not None else "-", w["shape"],
                  "%.0f" % w["at1"] if w["at1"] is not None else "-", w["frac1"], w["session_n"], w["session_frac1"], w["persisted"],
+                 " save-failed %d" % w["save_failed"] if w["save_failed"] else "",
                  "%.0f" % w["fit"] if w["fit"] is not None else "-", "%.0f" % w["legacy"] if w["legacy"] is not None else "-"))
     verdict = vscreen_fit_verdict(f)
     for tag, status, text_ in verdict:
@@ -8835,6 +8849,42 @@ def self_test_vscreen_fit():
     st, out = statuses(sub(text, "persisted=0.8694 fit=3504", "persisted=0.8694 fit=3856"))
     if st.get("STORED") != "PASS" or "the next launch fits 3856 wide (this launch: 3504)" not in out or "head-on floor (p10) is stored: 0.8694" not in out:
         fail("a next launch that would change the width did not say so: %r\n%s" % (st, out))
+    # A save that failed: the window lines carry save-failed=N (the count so far this session; read by key, absent in every log before the first
+    # failure and from a build without it), and STORED WARNs, whichever window it was and whatever the later windows managed to save.
+    def with_line(t, window, old, new):
+        return "\n".join(l.replace(old, new) if (" window=%d " % window) in l else l for l in t.splitlines())
+    if any(x["save_failed"] for x in vscreen_fit_windows(parse_vscreen_fit(text))):
+        fail("the fixture has no save-failed token, but a window reads one")
+    failed_first = with_line(with_line(with_line(text, 2, "persisted=0.8694 fit=", "persisted=no save-failed=1 fit="),
+                                       3, "persisted=0.8694 fit=", "persisted=0.8694 save-failed=1 fit="), 4, "persisted=0.8694 fit=", "persisted=0.8694 save-failed=1 fit=")
+    wf = vscreen_fit_windows(parse_vscreen_fit(failed_first))
+    if [x["save_failed"] for x in wf] != [0, 1, 1, 1] or [x["persisted"] for x in wf] != [None, None, 0.8694, 0.8694]:
+        fail("save-failed was not read by key from the window lines (or persisted=no read as a number): %r" % ([(x["save_failed"], x["persisted"]) for x in wf],))
+    st, out = statuses(failed_first)
+    flat_out = re.sub(r"[ ]+", " ", out)
+    if st.get("STORED") != "WARN" or "1 save(s) of the on-foot footprint FAILED (first in window 2;" not in flat_out or \
+            "`vscreen footprint: SAVE FAILED` line names the Win32 error" not in flat_out or \
+            "the last value that did reach it is 0.8694 of the eye at panel distance 1 (window 4)" not in flat_out or "persisted None save-failed 1;" not in flat_out or \
+            "persisted 0.8694 save-failed 1;" not in flat_out:
+        fail("a first save that failed and was retried did not WARN STORED, naming the window, the log line and the last value that reached the file: %r\n%s" % (st, out))
+    never = text
+    for win, n in ((2, 1), (3, 2), (4, 3)):
+        never = with_line(never, win, "persisted=0.8694 fit=", "persisted=no save-failed=%d fit=" % n)
+    st, out = statuses(never)
+    if st.get("STORED") != "WARN" or "3 save(s) of the on-foot footprint FAILED (first in window 2;" not in out or \
+            "nothing from this session has reached it (persisted=no on every window)" not in out:
+        fail("saves that failed in every window did not WARN STORED, saying nothing reached the file: %r\n%s" % (st, out))
+    # The failure line of the log is no arming line (the reader tells those apart by their first words), and changes no other verdict.
+    failure_line = ("[06:08:05.500] vscreen footprint: SAVE FAILED (Win32 error 5) -- the on-foot footprint did not reach vscreen_auto_footprint.txt: the file keeps its "
+                    "previous value, and the next 30 s window tries again. Failed saves this session: 1; the 30 s lines carry save-failed=N from now on, and persisted=no "
+                    "(or the last value that did reach the file) until a save succeeds.")
+    pf = parse_vscreen_fit(failed_first + "\n" + failure_line)
+    if len(pf["armed"]) != 1 or pf["armed"][0][1] != "armed" or len(pf["windows"]) != 4:
+        fail("the SAVE FAILED line was read as an arming or a window line: %r" % (pf["armed"],))
+    st_with, _ = statuses(failed_first + "\n" + failure_line)
+    st_without, _ = statuses(failed_first)
+    if st_with != st_without or st_with.get("INSTRUMENT") != "PASS":
+        fail("the SAVE FAILED line changed a verdict: %r vs %r" % (st_with, st_without))
     rc, out = report("nothing of the kind\nvr camera census: x\n")
     if rc != 1 or "no vscreen auto-fit line" not in out:
         fail("a log with none of the lines did not exit 1 and say so:\n%s" % out)

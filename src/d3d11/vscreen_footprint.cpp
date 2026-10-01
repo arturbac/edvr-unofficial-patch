@@ -8,6 +8,11 @@
 // that is armed but sees no composite (the screen is not on show, the shader pair changed) prints the 30 s line with
 // draws=0; one that sees it and cannot read a source prints skipped= with the reasons in why=. tools\edvr_log.py
 // --vscreen-fit says which of those it is.
+//
+// WHAT THE LOG SHOWS WHEN A SAVE FAILS (the stored footprint could not be written): a `vscreen footprint: SAVE FAILED (Win32 error N)` line
+// (the first three of a session) and, on every 30 s line from then on, `save-failed=N` (the count so far; absent until the first
+// failure) beside `persisted=` -- which says `no`, or the last value that DID reach the file, never a value that did not. The next window
+// tries again whether or not the p10 has moved. A build without this prints persisted=<value> whether or not the write happened.
 #include "vscreen_footprint.h"
 
 #include <windows.h>
@@ -96,8 +101,11 @@ struct State {
     uint32_t windowNo = 0;
     Window win;
     vscreenfit::FractionStore session;       // the session's on-foot fractions, each normalised to panel distance 1.0 (its p10 is what is stored)
+    // What the FILE holds, as far as this session knows: advanced only by a save that succeeded (closeWindow), never by an attempt.
     bool wroteOnce = false;
     double lastWrittenFrac1 = 0.0;
+    uint32_t saveFailed = 0;                 // saves that failed so far this session (the 30 s lines carry it once it is above 0)
+    double sessionApplied = 0.0;             // the panel distance the session's on-foot draws carried (the last window that had any)
 };
 State g;
 FaultBudget g_budget("vscreenFootprint", 5);
@@ -302,28 +310,42 @@ void closeWindow(uint64_t now) {
         w.haveOther = true;
         w.otherFrac = v;
     }
+    if (w.applied > 0.0) s.sessionApplied = w.applied;   // a retry window with no on-foot samples of its own still records the distance they carried
     double frac1 = 0.0;   // the session's p10 at distance 1.0: the session-frac1= and persisted= tokens carry it
     if (s.session.percentile(vscreenfit::kFootprintQuantile, &frac1)) {
         w.haveSession = true;
         w.sessionFrac1 = frac1;
         w.sessionN = static_cast<uint32_t>(s.session.total());
         if (s.session.total() >= kMinPersistSamples) {
+            // A save is tried when nothing has reached the file this session, or when the p10 has moved from the last value that did. What the
+            // instrument claims is what the FILE holds: wroteOnce and lastWrittenFrac1 advance only when the save succeeded, so a save that
+            // failed is tried again at the next window even though the p10 has not changed since, and persisted= never says more than is true.
             const bool changed =
                 !s.wroteOnce || std::fabs(frac1 - s.lastWrittenFrac1) > kPersistDelta * s.lastWrittenFrac1;
             if (changed) {
                 vscreenfit::Record r;
                 r.fractionAtUnit = frac1;
                 r.eyeWidth = w.eyeKnown ? w.eyeW : 0u;
-                r.distance = w.applied > 0.0 ? w.applied : 1.0;
+                r.distance = s.sessionApplied > 0.0 ? s.sessionApplied : 1.0;
                 r.samples = static_cast<uint32_t>(s.session.total());
-                noteMeasuredPanelFootprint(cfg.logDir(), r);
-                s.wroteOnce = true;
-                s.lastWrittenFrac1 = frac1;
+                uint32_t saveError = 0;
+                if (noteMeasuredPanelFootprint(cfg.logDir(), r, &saveError)) {
+                    s.wroteOnce = true;
+                    s.lastWrittenFrac1 = frac1;
+                } else {
+                    ++s.saveFailed;
+                    if (s.saveFailed <= vscreenfit::kSaveFailedLineCap) {
+                        char failedLine[520];
+                        vscreenfit::formatSaveFailedLine(failedLine, sizeof(failedLine), saveError, s.saveFailed);
+                        Log::get().note("%s", failedLine);
+                    }
+                }
             }
-            w.persisted = true;
+            w.persisted = s.wroteOnce;
             w.persistedFrac1 = s.lastWrittenFrac1;
         }
     }
+    w.saveFailed = s.saveFailed;
     {
         // What the next launch would fit if the world route runs then: the same arithmetic the resolver uses
         // (vscreen_fit.h), from this session's p10 when there is one, else the calibration seed.

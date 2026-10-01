@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """The mutation proof for tools\\vscreen_fit_test: the rig fails when a rule of the fit, or a wiring pin, is flipped.
 
-The rig (vscreen_fit_test.cpp) pins the rules of src\\common\\vscreen_fit.h (R1..R10) and the wiring of the resolver, the footprint
-instrument and its hooks (R12; R11 is the state files on disk and is not mutated here). A rig that passes proves little until it
-is seen to FAIL on a source that breaks the rule it pins. This tool does that, for two kinds of mutation:
+The rig (vscreen_fit_test.cpp) pins the rules of src\\common\\vscreen_fit.h (R1..R10), the state files on disk (R11) and the wiring of
+the resolver, the footprint instrument and its hooks (R12). A rig that passes proves little until it is seen to FAIL on a source
+that breaks the rule it pins. This tool does that, for three kinds of mutation:
 
   code   one textual edit of the header, compiled into the rig in a temp directory OUTSIDE the repo (the rig takes the header
          through -DVSCREEN_FIT_HEADER and is built with -DVSCREEN_FIT_MUTANT, which leaves out the one case that needs another
          source linked), and the rig run on the rule's case;
+  state  one textual edit of a COPY of src\\common\\vscreen_auto_state.cpp (the state-file writer and reader), the rig built WITH its
+         state-file case against the copy (the real headers are found through /I), and the rig run on the rule's case: R11 runs
+         the writer against a destination held open, a reader's handle, a directory in the way, and so on, on disk;
   pin    one textual edit of a COPY of a source file the rig's source pins read, in a temp root, and the rig (built once, from
          the real header) run with --root on the rule's case.
 
@@ -41,6 +44,7 @@ ROOT = HERE.parents[1]
 HEADER = "src/common/vscreen_fit.h"
 HEADER2 = "src/common/vr_supersample_notice.h"   # R13: Elite's Supersampling below 1 (the rig takes it through -DVR_SUPERSAMPLE_HEADER)
 HEADERS = {HEADER: "VSCREEN_FIT_HEADER", HEADER2: "VR_SUPERSAMPLE_HEADER"}
+STATE_SRC = "src/common/vscreen_auto_state.cpp"   # R11: the state files on disk (the rig links the real one; a state mutation links an edited copy)
 RIG = HERE / "vscreen_fit_test.cpp"
 BUILD_BAT = ROOT / "build.bat"
 RIG_LABEL = ":rig_vscreen_fit_test"
@@ -64,6 +68,7 @@ PIN_FILES = [
     "src/d3d11/vscreen.cpp",
     "src/d3d11/vscreen_footprint.cpp",
     "src/d3d11/flat_runtime.cpp",
+    "src/common/vscreen_auto_state.cpp",
     "edvr.ini",
 ]
 
@@ -76,7 +81,12 @@ class Mutant:
         self.why = why
         self.target = target                                                    # the file edited; the header means a code mutant
         self.rule = re.match(r"R\d+", self.caught[0]).group(0)                  # the rig's case to run
-        self.kind = "code" if target in HEADERS and not name.startswith("pin-") else "pin"
+        if target in HEADERS and not name.startswith("pin-"):
+            self.kind = "code"
+        elif target == STATE_SRC and name.startswith("state-"):
+            self.kind = "state"    # the state-file source, edited and LINKED into the rig (a pin- name edits it as text the pins read instead)
+        else:
+            self.kind = "pin"
 
 
 def M(name, caught, edits, why, target=HEADER):
@@ -250,6 +260,42 @@ MUTANTS = [
     M("pin-ini-forgets-the-floor", "R12o", [("remembers its head-on floor", "remembers its median")], "the ini's text says a median is remembered, not the head-on floor", "edvr.ini"),
     M("pin-ini-calibration-forgotten", "R12o", [("# starts from a calibration (3504 wide at panel_distance 0.7 on a 4032 wide\n# eye, where", "# starts from a calibration (3200 wide at panel_distance 0.7 on a 4032 wide\n# eye, where")],
       "the ini's text quotes another calibration width", "edvr.ini"),
+    # ---- a save that fails (R11 runs the writer on disk against obstacles: a state mutation links an edited copy of vscreen_auto_state.cpp) ----------
+    M("state-failure-reported-as-success", "R11g", [("        return refused(error);\n    }\n    return true;\n}", "        refused(error);\n        return true;\n    }\n    return true;\n}")],
+      "the writer says true although the record did not reach the file", STATE_SRC),
+    M("state-error-not-reported", "R11g", [("        if (win32Error) *win32Error = static_cast<uint32_t>(error);\n", "")],
+      "the writer fails but gives no Win32 error for the log", STATE_SRC),
+    M("state-write-straight-to-destination", ("R11i", "R11j"), [("CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS", "CreateFileW(dest.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS"),
+                                                                ("!MoveFileExW(tmp.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))", "false)")],
+      "the record is written into the destination itself (as before): a reader holding the file, or a temp name in the way, no longer stops the save", STATE_SRC),
+    M("state-no-temp-cleanup", "R11g", [("        DeleteFileW(tmp.c_str());   // nothing of a failed save is left behind\n", "")],
+      "a failed save leaves its temp file behind", STATE_SRC),
+    M("state-implausible-accepted", "R11l", [("    if (!vscreenfit::plausibleFraction(record.fractionAtUnit)) return refused(ERROR_INVALID_DATA);\n", "")],
+      "the writer stores a fraction the record cannot hold", STATE_SRC),
+    M("pin-save-bytecount-unchecked", "R12s", [("    else if (written != static_cast<DWORD>(n)) error = ERROR_WRITE_FAULT;   // a short write is a failed save, not a shorter record\n", "")],
+      "the writer does not compare the bytes written with the record's length", STATE_SRC),
+    M("pin-save-no-flush", "R12s", [("    else if (!FlushFileBuffers(f)) error = lastError();\n", "")], "the writer does not flush the temp file before it replaces the destination", STATE_SRC),
+    M("pin-save-no-write-through", "R12s", [("MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))", "MOVEFILE_REPLACE_EXISTING))")],
+      "the replace does not wait for the disk", STATE_SRC),
+    M("pin-save-result-ignored", "R12r", [("                if (noteMeasuredPanelFootprint(cfg.logDir(), r, &saveError)) {\n                    s.wroteOnce = true;\n                    s.lastWrittenFrac1 = frac1;\n                } else {\n",
+                                           "                noteMeasuredPanelFootprint(cfg.logDir(), r, &saveError);\n                s.wroteOnce = true;\n                s.lastWrittenFrac1 = frac1;\n                if (false) {\n")],
+      "the instrument does not look at what the save returned: what it has written advances either way (the old behaviour)", "src/d3d11/vscreen_footprint.cpp"),
+    M("pin-state-advanced-before-save", "R12r", [("                if (noteMeasuredPanelFootprint(cfg.logDir(), r, &saveError)) {\n                    s.wroteOnce = true;\n                    s.lastWrittenFrac1 = frac1;\n                } else {\n",
+                                                  "                s.wroteOnce = true;\n                s.lastWrittenFrac1 = frac1;\n                if (noteMeasuredPanelFootprint(cfg.logDir(), r, &saveError)) {\n                } else {\n")],
+      "what has been written advances before the save says whether it happened", "src/d3d11/vscreen_footprint.cpp"),
+    M("pin-persisted-always-true", "R12r", [("            w.persisted = s.wroteOnce;\n", "            w.persisted = true;\n")], "the 30 s line says persisted whether or not anything reached the file", "src/d3d11/vscreen_footprint.cpp"),
+    M("pin-failed-save-not-retried", "R12r", [("!s.wroteOnce || std::fabs(frac1 - s.lastWrittenFrac1) > kPersistDelta * s.lastWrittenFrac1;", "std::fabs(frac1 - s.lastWrittenFrac1) > kPersistDelta * s.lastWrittenFrac1;")],
+      "a first save that failed is not tried again until the p10 moves", "src/d3d11/vscreen_footprint.cpp"),
+    M("pin-failed-save-not-counted", "R12r", [("                    ++s.saveFailed;\n", "")], "a failed save is not counted", "src/d3d11/vscreen_footprint.cpp"),
+    M("pin-failed-save-line-unbounded", "R12r", [("if (s.saveFailed <= vscreenfit::kSaveFailedLineCap) {", "if (true) {")], "a save that fails every window logs a line every window", "src/d3d11/vscreen_footprint.cpp"),
+    M("pin-failed-save-not-on-the-line", "R12r", [("    w.saveFailed = s.saveFailed;\n", "")], "the 30 s line never carries save-failed", "src/d3d11/vscreen_footprint.cpp"),
+    M("save-failed-token-always-printed", "R9j", [("    if (w.saveFailed) {   // only after a failure: a line with none is byte for byte what it was", "    if (true) {   // only after a failure: a line with none is byte for byte what it was")],
+      "every 30 s line carries save-failed (a line with no failure is no longer what it was)"),
+    M("save-failed-token-renamed", "R9j", [('" save-failed=%u"', '" save_failed=%u"')], "the token the reader parses by key is renamed"),
+    M("save-failed-line-forgets-the-retry", "R9k", [("and the next 30 s window tries again.", "and that is the end of it.")], "the failure line does not say the next window tries again"),
+    M("save-failed-cap-raised", "R9k", [("constexpr uint32_t kSaveFailedLineCap = 3;", "constexpr uint32_t kSaveFailedLineCap = 30;")], "a failing save may log thirty lines a session, not three"),
+    M("save-failed-line-reads-as-arming", "R9k", [('"vscreen footprint: SAVE FAILED (Win32 error %u) -- the on-foot footprint did not reach', '"vscreen footprint: armed (Win32 error %u) -- the on-foot footprint did not reach')],
+      "the failure line starts with the reader's arming word"),
     # ---- R13: Elite's Supersampling below 1.0 in VR (the second header, and the wiring the pins read) -----------------------------
     M("ss-threshold-90", "R13a", [("constexpr uint32_t kBelowPercent = 98;", "constexpr uint32_t kBelowPercent = 90;")], "the world must render under 90% of the eye, not 98%", HEADER2),
     M("ss-one-axis-is-enough", "R13a", [("kBelowPercent &&\n           static_cast<uint64_t>(renderH)", "kBelowPercent ||\n           static_cast<uint64_t>(renderH)")], "one axis under the eye's is a Supersampling below 1", HEADER2),
@@ -465,8 +511,27 @@ def run_all(only=None, jobs=None, keep=False, dry_run=False, out=sys.stdout):
             outcome, detail = run_rig(control_exe, m.rule, tc, root=root)
             return m, outcome, detail
 
+        def state_mutant(m):
+            try:
+                text = apply_edits(read_source(m.target), m.edits, m.name)
+            except ValueError as error:
+                return m, "badedit", str(error)
+            d = work / ("state_" + m.name)
+            d.mkdir()
+            mutated = d / Path(m.target).name
+            mutated.write_text(text, encoding="utf-8", newline="\n")
+            # The rig is built WITH its state-file case (no -DVSCREEN_FIT_MUTANT) and the real header, linked against the edited copy of the
+            # state-file source, which finds the real vscreen_auto_state.h (and through it vscreen_fit.h) along /I.
+            code, output, exe = build_rig(tc, d, extra=["/I" + str(ROOT / "src" / "common")], sources=[RIG, mutated])
+            if code != 0:
+                return m, "nocompile", (output.strip().splitlines()[-1] if output.strip() else "")
+            outcome, detail = run_rig(exe, m.rule, tc)
+            return m, outcome, detail
+
         def one(m):
-            return code_mutant(m) if m.kind == "code" else pin_mutant(m)
+            if m.kind == "code":
+                return code_mutant(m)
+            return state_mutant(m) if m.kind == "state" else pin_mutant(m)
 
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=jobs or min(8, os.cpu_count() or 2)) as pool:
@@ -536,9 +601,11 @@ def self_test():
         check(m.rule in cases, "%s: the rig has no case %s" % (m.name, m.rule))
         if m.kind == "pin":
             check(m.target in PIN_FILES, "%s: %s is not a file the pins' temp root copies" % (m.name, m.target))
+        if m.kind == "state":
+            check(m.target == STATE_SRC and m.rule == "R11", "%s: a state mutation edits %s and is caught by the rig's R11" % (m.name, STATE_SRC))
     rules = {m.rule for m in MUTANTS}
-    check(rules == cases - {"R11"}, "every rule of the rig has a mutation (R11, the state files on disk, is not mutated), and only rules of the rig: %s vs %s"
-          % (sorted(rules), sorted(cases - {"R11"})))
+    check(rules == cases, "every rule of the rig has a mutation (R11, the state files on disk, through the linked copy of the state-file source), and only "
+          "rules of the rig: %s vs %s" % (sorted(rules), sorted(cases)))
 
     # build.bat compiles the rig the way this tool does, and runs this tool's self-test
     bat = BUILD_BAT.read_bytes().decode("utf-8", errors="replace")

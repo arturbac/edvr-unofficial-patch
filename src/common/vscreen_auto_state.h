@@ -41,6 +41,14 @@ bool lastKnownPanelFootprint(const std::wstring& logDir, vscreenfit::Record* out
 // Remembers a session's on-foot head-on floor (its 10th percentile, tagged est=p10 in the
 // file: a record written when the median was stored has no tag and reads as none). Called
 // from the footprint instrument's 30 s line, only with enough samples (vscreen_footprint.cpp).
-void noteMeasuredPanelFootprint(const std::wstring& logDir, const vscreenfit::Record& record);
+//
+// Returns true ONLY when the whole record reached the file: it is written to a temp file
+// beside the destination (vscreen_auto_footprint.txt.tmp), the byte count and the flush are
+// checked, and the temp then REPLACES the destination in one move (write-through), so a
+// failed save leaves the destination exactly as it was and no temp behind. False, and the
+// Win32 error of the step that failed in *win32Error when it is given (0 on success;
+// ERROR_INVALID_DATA for a fraction the record refuses to hold, ERROR_INVALID_PARAMETER for
+// no directory), for anything else: the caller must not claim a record it did not save.
+bool noteMeasuredPanelFootprint(const std::wstring& logDir, const vscreenfit::Record& record, uint32_t* win32Error = nullptr);
 
 }  // namespace edvr

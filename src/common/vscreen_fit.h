@@ -505,6 +505,19 @@ inline int formatStoodDownLine(char* out, size_t size) {
                          "stands.");
 }
 
+// A save of the stored record that did not reach the file (vscreen_footprint.cpp prints this for the first kSaveFailedLineCap failures of a
+// session and then stays quiet; every 30 s line from the first failure on carries save-failed=N, the count so far). Its first words are not
+// the reader's arming words (armed / not armed / STOOD DOWN), so it never reads as an arming line. win32Error is what the writer reported
+// (vscreen_auto_state.cpp: the Win32 error of the step that failed; ERROR_INVALID_DATA for a fraction it refuses to store).
+constexpr uint32_t kSaveFailedLineCap = 3;
+inline int formatSaveFailedLine(char* out, size_t size, uint32_t win32Error, uint32_t failedSoFar) {
+    return std::snprintf(out, size,
+                         "vscreen footprint: SAVE FAILED (Win32 error %u) -- the on-foot footprint did not reach vscreen_auto_footprint.txt: the file keeps its "
+                         "previous value, and the next 30 s window tries again. Failed saves this session: %u; the 30 s lines carry save-failed=N from now on, "
+                         "and persisted=no (or the last value that did reach the file) until a save succeeds.%s",
+                         win32Error, failedSoFar, failedSoFar >= kSaveFailedLineCap ? " No more of these lines this session." : "");
+}
+
 struct WindowLine {
     uint32_t window = 0;
     bool eyeKnown = false;
@@ -523,8 +536,9 @@ struct WindowLine {
     bool haveSession = false;
     double sessionFrac1 = 0;
     uint32_t sessionN = 0;
-    bool persisted = false;
+    bool persisted = false;          // something has reached the file this session (persistedFrac1 is the last value that did)
     double persistedFrac1 = 0;
+    uint32_t saveFailed = 0;         // saves that failed so far this session; the token is printed only when this is above 0
     uint32_t fitWidth = 0, legacyWidth = 0;
 };
 
@@ -550,8 +564,12 @@ inline int formatWindowLine(char* out, size_t size, const WindowLine& w) {
         else std::snprintf(other, sizeof(other), " other-frac=%.4f", w.otherFrac);
     }
     if (w.haveSession) std::snprintf(sess, sizeof(sess), "session-n=%u session-frac1=%.4f", w.sessionN, w.sessionFrac1);
-    char persisted[40] = "persisted=no";
+    char persisted[72] = "persisted=no";
     if (w.persisted) std::snprintf(persisted, sizeof(persisted), "persisted=%.4f", w.persistedFrac1);
+    if (w.saveFailed) {   // only after a failure: a line with none is byte for byte what it was
+        const size_t used = std::strlen(persisted);
+        std::snprintf(persisted + used, sizeof(persisted) - used, " save-failed=%u", w.saveFailed);
+    }
     char fit[96] = "fit=-";
     if (w.fitWidth) std::snprintf(fit, sizeof(fit), "fit=%u legacy=%u m=%.3f floor=%u", w.fitWidth, w.legacyWidth, kMultiplier, kFloorWidth);
     char why[110] = "";

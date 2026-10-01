@@ -21,12 +21,16 @@
 //       interpolation, an even thinning that keeps the median and the p10 across a long session)
 //   R8  the stored record: the codec round trip, the est=p10 tag, and what it refuses (an older build's median record, which has no tag)
 //   R9  the log's text: the `vScreen resolution:` line names the rule and why, the menu hint fits its buffer, the 30 s line's
-//       tokens (the reader, tools\edvr_log.py --vscreen-fit, parses exactly these)
+//       tokens (the reader, tools\edvr_log.py --vscreen-fit, parses exactly these), the save-failed token (only after a failed save)
+//       and the SAVE FAILED line
 //   R10 the route's key parse, pinned against the route's own (the resolver does not include the route's header chain)
-//   R11 the state files on disk (vscreen_auto_state.cpp): the footprint's round trip beside the eye width's, in a temp directory, and
-//       Sean's own older median file read as no record
+//   R11 the state files on disk (vscreen_auto_state.cpp): the footprint's round trip beside the eye width's, in a temp directory,
+//       Sean's own older median file read as no record, and a save that cannot reach the file (held open with no sharing, held by a
+//       reader, the temp name or the destination taken by a directory, a record it refuses): false with the Win32 error, the file
+//       exactly as it was, no temp left; the same record saved once the obstacle is gone
 //   R12 the wiring, as source pins: the resolver's reads match their owners', the instrument's hook sits where the pins say and
-//       stays off the flat profile, its D3D calls never wait and always step past the hooks, the resolver reads no curve fact
+//       stays off the flat profile, its D3D calls never wait and always step past the hooks, the resolver reads no curve fact, the
+//       instrument claims only what the save reported (and retries a failed one), the writer's temp file / byte count / flush / replace
 //   R13 Elite's Supersampling below 1.0 in VR (src/common/vr_supersample_notice.h; design section 83, the VR warning): the pure
 //       judgement over the measured render size and the eye's, the published word, the words, and the wiring as source pins
 //       (the detection is vscreen's own measurement, never Elite's settings file; the toast and the Status page's hint are the
@@ -854,6 +858,38 @@ void caseR9() {
         const auto u = tokensOf(line, "vscreen footprint 30s: ");
         check(tok(u, "samples") == "0" && tok(u, "draws") == "0" && tok(u, "fp") == "-" && tok(u, "persisted") == "no" && tok(u, "fit") == "-" && tok(u, "eye") == "-",
               "R9g: an armed instrument that saw nothing still prints its line, with draws=0 and a dash for every measurement");
+        // A save that failed: save-failed=N (the count so far this session) right after persisted=, and only then, so the line of a window
+        // with none is byte for byte what it always was (R9h holds the fixture, every line of a good flight, to the formatters).
+        check(!has(s, "save-failed") && !has(line, "save-failed"), "R9j: a window with no failed save carries no save-failed token at all");
+        fit::WindowLine failedFirst = w;
+        failedFirst.persisted = false;
+        failedFirst.saveFailed = 1;
+        fit::formatWindowLine(line, sizeof(line), failedFirst);
+        const auto ff = tokensOf(line, "vscreen footprint 30s: ");
+        check(tok(ff, "persisted") == "no" && tok(ff, "save-failed") == "1" && has(line, "persisted=no save-failed=1 fit=3504 legacy=5040"),
+              "R9j: a first save that failed: persisted=no and save-failed=1, right after persisted= and before fit=");
+        fit::WindowLine failedLater = w;
+        failedLater.saveFailed = 3;
+        fit::formatWindowLine(line, sizeof(line), failedLater);
+        const auto fl = tokensOf(line, "vscreen footprint 30s: ");
+        check(tok(fl, "persisted") == "0.8691" && tok(fl, "save-failed") == "3" && std::strlen(line) < 700,
+              "R9j: a later save that failed: persisted= keeps the value that did reach the file, and save-failed=3 is the count so far");
+    }
+    {   // the line that says a save failed
+        char sf[640];
+        const int n = fit::formatSaveFailedLine(sf, sizeof(sf), 32, 1);
+        check(n > 0 && n < 500 && std::strncmp(sf, "vscreen footprint: SAVE FAILED (Win32 error 32) -- ", 51) == 0,
+              "R9k: the save-failed line starts `vscreen footprint: SAVE FAILED (Win32 error N) -- ` and fits the instrument's 520 byte buffer");
+        check(has(sf, "did not reach vscreen_auto_footprint.txt") && has(sf, "the file keeps its previous value") && has(sf, "the next 30 s window tries again") &&
+                  has(sf, "Failed saves this session: 1;") && has(sf, "save-failed=N") && has(sf, "persisted=no") && !has(sf, "No more of these lines"),
+              "R9k: it says what did not happen, that the file keeps its previous value, that the next window retries, and what the 30 s lines will say");
+        check(std::strncmp(sf, "vscreen footprint: armed", 24) != 0 && std::strncmp(sf, "vscreen footprint: not armed", 28) != 0 && std::strncmp(sf, "vscreen footprint: STOOD DOWN", 29) != 0 &&
+                  !has(sf, "vscreen footprint 30s:"),
+              "R9k: and it is none of the lines the reader tells apart by their first words (armed, not armed, STOOD DOWN) nor a 30 s line");
+        char last[640];
+        fit::formatSaveFailedLine(last, sizeof(last), 5, fit::kSaveFailedLineCap);
+        check(fit::kSaveFailedLineCap == 3 && has(last, "Failed saves this session: 3;") && has(last, "No more of these lines this session."),
+              "R9k: only three of these lines are printed a session, and the third says there will be no more");
     }
     {   // the once-per-change lines
         char armed[800], notArmed[400], down[400];
@@ -911,8 +947,13 @@ std::wstring tempDir() {
     return dir;
 }
 void removeDir(const std::wstring& dir) {
-    for (const wchar_t* f : {L"vscreen_auto_eye_width.txt", L"vscreen_auto_footprint.txt"}) DeleteFileW((dir + L"\\" + f).c_str());
+    for (const wchar_t* f : {L"vscreen_auto_eye_width.txt", L"vscreen_auto_footprint.txt", L"vscreen_auto_footprint.txt.tmp"}) DeleteFileW((dir + L"\\" + f).c_str());
     RemoveDirectoryW(dir.c_str());
+}
+bool pathExists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+bool isDirectory(const std::wstring& path) {
+    const DWORD a = GetFileAttributesW(path.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 void writeRaw(const std::wstring& path, const char* text) {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -948,6 +989,60 @@ void caseR11() {
     edvr::noteResolvedEyeWidthForVScreenAuto(dir, 4032);
     check(edvr::lastKnownEyeWidth(dir, &eye) && eye == 4032 && edvr::lastKnownPanelFootprint(dir, &r) && closeTo(r.fractionAtUnit, 0.58, 1e-5),
           "R11b: nor does storing the eye width disturb the footprint");
+    {   // A save returns whether the record reached the file, and a save that fails leaves the file exactly as it was.
+        const std::wstring dest = dir + L"\\vscreen_auto_footprint.txt";
+        const std::wstring tmp = dest + L".tmp";
+        uint32_t err = 99;
+        check(edvr::noteMeasuredPanelFootprint(dir, w, &err) && err == 0 && !pathExists(tmp) && slurpFile(dest) == "fraction=0.617100 est=p10 eye=4032 distance=0.700 samples=77\n",
+              "R11f: a save that reaches the file returns true with Win32 error 0, writes the record whole, and leaves no temp file");
+        const std::string good = slurpFile(dest);
+        // Held open with no sharing: a replace cannot happen. (What the instrument meets when something has the file.)
+        HANDLE lock = CreateFileW(dest.c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        check(lock != INVALID_HANDLE_VALUE, "R11g: the destination can be held open with no sharing for the test");
+        err = 0;
+        const bool lockedSave = edvr::noteMeasuredPanelFootprint(dir, w2, &err);
+        if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
+        check(!lockedSave && err != 0, "R11g: a destination held open with no sharing: the save returns false and gives the Win32 error");
+        check(slurpFile(dest) == good && !pathExists(tmp), "R11g: and the file holds exactly what it held, with no temp file left behind");
+        // The lock gone, the same record again: it saves (a window whose p10 has not moved, retried after a failed save).
+        err = 99;
+        check(edvr::noteMeasuredPanelFootprint(dir, w2, &err) && err == 0 && edvr::lastKnownPanelFootprint(dir, &r) && closeTo(r.fractionAtUnit, 0.58, 1e-5) && !pathExists(tmp),
+              "R11h: the same record again with the lock gone: true, and it reads back");
+        const std::string good2 = slurpFile(dest);
+        // A reader holding the file open (read and write sharing, but not delete) stops a replace too; a write straight into the file would
+        // get through it, so this is what tells a temp file moved over the destination from the destination written in place.
+        lock = CreateFileW(dest.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        err = 0;
+        const bool readerSave = edvr::noteMeasuredPanelFootprint(dir, w, &err);
+        if (lock != INVALID_HANDLE_VALUE) CloseHandle(lock);
+        check(lock != INVALID_HANDLE_VALUE && !readerSave && err != 0 && slurpFile(dest) == good2 && !pathExists(tmp),
+              "R11i: a reader holding the file open (no delete sharing): false with the error, the file as it was, no temp (the record is moved over the file, never written into it)");
+        // The temp file's name taken by a directory: the save cannot start, and the file is untouched.
+        CreateDirectoryW(tmp.c_str(), nullptr);
+        err = 0;
+        const bool tmpSave = edvr::noteMeasuredPanelFootprint(dir, w, &err);
+        check(!tmpSave && err != 0 && slurpFile(dest) == good2 && isDirectory(tmp), "R11j: the temp file's name taken by a directory: false with the error, the file as it was");
+        RemoveDirectoryW(tmp.c_str());
+        // A directory where the file should be (a first save that can never succeed): false, nothing readable, no temp left.
+        const std::wstring blocked = dir + L"\\blocked";
+        CreateDirectoryW(blocked.c_str(), nullptr);
+        CreateDirectoryW((blocked + L"\\vscreen_auto_footprint.txt").c_str(), nullptr);
+        err = 0;
+        const bool dirSave = edvr::noteMeasuredPanelFootprint(blocked, w, &err);
+        check(!dirSave && err != 0 && isDirectory(blocked + L"\\vscreen_auto_footprint.txt") && !pathExists(blocked + L"\\vscreen_auto_footprint.txt.tmp") &&
+                  !edvr::lastKnownPanelFootprint(blocked, &r),
+              "R11k: a directory where the file should be: the save returns false with the error, the directory stays, no temp is left, and nothing reads as a record");
+        DeleteFileW((blocked + L"\\vscreen_auto_footprint.txt.tmp").c_str());   // (a writer that leaves its temp behind must not leave this directory behind too)
+        RemoveDirectoryW((blocked + L"\\vscreen_auto_footprint.txt").c_str());
+        RemoveDirectoryW(blocked.c_str());
+        // Refusals are failures too: a fraction the record cannot hold, and no directory at all. Neither touches the file.
+        err = 0;
+        const bool junkSave = edvr::noteMeasuredPanelFootprint(dir, fit::Record{0.001, 4032, 1.0, 3}, &err);
+        check(!junkSave && err != 0 && slurpFile(dest) == good2, "R11l: an implausible fraction is refused: false with an error, the file as it was");
+        err = 0;
+        check(!edvr::noteMeasuredPanelFootprint(L"", w, &err) && err != 0, "R11l: and so is no directory at all");
+        check(edvr::noteMeasuredPanelFootprint(dir, w2) && slurpFile(dest) == good2, "R11l: the error out parameter is optional (an ordinary save, asking for none, still returns true)");
+    }
     // The file an older build wrote, when it stored the session's MEDIAN (Sean's own, 2026-10-01): no est tag, so it is no record.
     writeRaw(dir + L"\\vscreen_auto_footprint.txt", "fraction=0.889105 eye=4032 distance=0.650 samples=188\n");
     check(!edvr::lastKnownPanelFootprint(dir, &r), "R11e: an older build's median file (Sean's: fraction=0.889105 eye=4032 distance=0.650 samples=188) reads as no record");
@@ -984,7 +1079,9 @@ void caseR12() {
     const std::string fp = readFile("src\\d3d11\\vscreen_footprint.cpp");
     const std::string ini = readFile("edvr.ini");
     const std::string flatRuntime = readFile("src\\d3d11\\flat_runtime.cpp");
-    check(!res.empty() && !route.empty() && !layer.empty() && !vs.empty() && !fp.empty() && !ini.empty(), "R12a: the sources the pins read are readable from the repo root");
+    const std::string authState = readFile("src\\common\\vscreen_auto_state.cpp");
+    check(!res.empty() && !route.empty() && !layer.empty() && !vs.empty() && !fp.empty() && !ini.empty() && !authState.empty(),
+          "R12a: the sources the pins read are readable from the repo root");
     if (g_failure.size()) return;
 
     // The resolver reads each of the route's conditions the way its owner does.
@@ -1063,6 +1160,31 @@ void caseR12() {
         check(count(fp, "noteMeasuredPanelFootprint(") == 1 && has(fp, "kMinPersistSamples"), "R12n: the on-foot p10 is stored in one place, behind a minimum sample count");
         check(has(fp, "s.session.percentile(vscreenfit::kFootprintQuantile, &frac1)") && !has(fp, "s.session.median("),
               "R12n: and what is stored is the session's p10 (vscreenfit::kFootprintQuantile), never its median");
+        {   // What a window says it saved is what reached the file (the glue rig runs the same instrument against a destination it cannot replace).
+            const std::string close = functionBody(fp, "void closeWindow(");
+            check(has(close, "if (noteMeasuredPanelFootprint(cfg.logDir(), r, &saveError)) {") && before(close, "if (noteMeasuredPanelFootprint(", "s.wroteOnce = true;") &&
+                      before(close, "s.wroteOnce = true;", "} else {") && before(close, "} else {", "++s.saveFailed;"),
+                  "R12r: the instrument asks the save whether it succeeded, and what it has written advances only inside the success branch");
+            check(count(close, "s.wroteOnce = true;") == 1 && count(close, "s.lastWrittenFrac1 = frac1;") == 1 && !has(close, "w.persisted = true;") &&
+                      has(close, "w.persisted = s.wroteOnce;") && has(close, "w.persistedFrac1 = s.lastWrittenFrac1;"),
+                  "R12r: the state advances in that one place, and persisted= is only what has reached the file (never true by default)");
+            check(has(close, "!s.wroteOnce || std::fabs(frac1 - s.lastWrittenFrac1) > kPersistDelta * s.lastWrittenFrac1"),
+                  "R12r: a save is tried while nothing has reached the file and whenever the p10 has moved from what did, so a failed one is tried again at the next window");
+            check(has(close, "++s.saveFailed;") && has(close, "if (s.saveFailed <= vscreenfit::kSaveFailedLineCap) {") &&
+                      has(close, "vscreenfit::formatSaveFailedLine(failedLine, sizeof(failedLine), saveError, s.saveFailed);") && has(close, "w.saveFailed = s.saveFailed;"),
+                  "R12r: a failed save is counted, said in the log (the first kSaveFailedLineCap of a session) and carried on the window line");
+        }
+        {   // The writer: a temp file beside the file, checked, flushed, then moved over it; a failure leaves nothing behind.
+            const std::string writer = functionBody(authState, "bool noteMeasuredPanelFootprint(");
+            check(!writer.empty() && has(writer, "CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS") && !has(writer, "CreateFileW(dest.c_str()") &&
+                      has(writer, "const std::wstring tmp = dest + kAutoFootprintTempSuffix;") && has(authState, "kAutoFootprintTempSuffix[] = L\".tmp\";"),
+                  "R12s: the writer writes a temp file beside the destination (its name plus .tmp), never the destination itself");
+            check(before(writer, "WriteFile(f, text, static_cast<DWORD>(n), &written, nullptr)", "FlushFileBuffers(f)") &&
+                      before(writer, "FlushFileBuffers(f)", "MoveFileExW(tmp.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)"),
+                  "R12s: it writes, flushes, then replaces the destination write-through, in that order");
+            check(has(writer, "written != static_cast<DWORD>(n)"), "R12s: the byte count is checked against the formatted length (a short write is a failed save)");
+            check(has(writer, "DeleteFileW(tmp.c_str());") && before(writer, "MoveFileExW(", "DeleteFileW(tmp.c_str());"), "R12s: a failed save deletes its temp file");
+        }
         const std::string state = functionBody(fp, "struct State {");
         check(!state.empty() && state.find("ComPtr<") == std::string::npos && has(state, "ID3D11Buffer* staging = nullptr;") && has(fp, "g.staging->Release();"),
               "R12p: the static state holds the staging buffer as a raw pointer released by hand (a COM smart pointer in a static would Release at DLL detach)");
