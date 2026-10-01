@@ -1119,6 +1119,23 @@ void testSourcePins(const std::string& injectCpp) {
     check(count(censusCpp, "flatCameraInjectSetObserver(&g_observer)") == 1 && count(censusCpp, "flatCameraInjectObserveFrame()") == 1 &&
           count(censusCpp, "flatCameraInjectPause(") == 2,
           "the hook is asked for from one place (the boundary, after the key is on), and paused and unpaused from the two edges of it");
+    // The key-off edge hands the relay's gate back to the route when the detour is not quiet (the world route injects, or a camera it injected
+    // still waits for its flush): the pause is asked as flatCameraVrQuiet(), after the observer is detached, never a bare true. The unpause stays false.
+    const std::string deactivateBody = functionBody(censusCpp, "void deactivate() {");
+    const std::string activateBody = functionBody(censusCpp, "void activate(State* s) {");
+    check(!deactivateBody.empty() && !activateBody.empty() &&
+              deactivateBody.find("flatCameraInjectSetObserver(nullptr);") != std::string::npos &&
+              deactivateBody.find("flatCameraInjectPause(flatCameraVrQuiet());") != std::string::npos &&
+              deactivateBody.find("flatCameraInjectSetObserver(nullptr);") < deactivateBody.find("flatCameraInjectPause(flatCameraVrQuiet());") &&
+              deactivateBody.find("flatCameraInjectPause(true)") == std::string::npos &&
+              activateBody.find("flatCameraInjectPause(false);") != std::string::npos,
+          "the key-off edge pauses the relay only when the detour is quiet (flatCameraInjectPause(flatCameraVrQuiet()), after the observer is detached): a census "
+          "key-off never closes the gate on the route's injection; the key-on edge reopens it");
+    // The announcement says what is true while the route injects: the CENSUS never writes a camera; the detour does, for the route.
+    check(censusCpp.find("the census itself never writes a camera (the route's injection, when it runs, is its own)") != std::string::npos &&
+              censusCpp.find("nothing is written to any camera") == std::string::npos && censusH.find("the CENSUS never writes a") != std::string::npos &&
+              censusH.find("only ever OBSERVES") == std::string::npos,
+          "the announcement and the header say the census itself never writes a camera (the route's injection is its own), not that nothing is written to any camera");
     check(censusCpp.find("flatRuntime") == std::string::npos && injectCpp.find("flatRuntimePhaseState(&jx, &jy, &rw, &rh, &applied);") != std::string::npos,
           "the census never calls the flat runtime (no phase source is needed: observe mode asks for no phase)");
     // A second place that reads the key would need its own off path.
@@ -1224,10 +1241,9 @@ std::string fixtureLog() {
     };
     char line[kVrCensusLineBytes + 1];
     put("version 0.18.0-rc.4-31-g0a1b2c3d (build 68C0A1F2) -- synthetic fixture for edvr_log.py --camera-census");
-    put("vr camera census: on (advanced.vr_camera_census); observe-only, nothing is written to any camera; owner thread 4321; "
-        "5 s line per window for 36 windows, then one per 12; cameras first 64, call sequences first 3 and eye draws first 4 "
-        "on-foot frames (the tone drawn while the journal, read=yes, says on foot; while the world route jitters, only a frame "
-        "whose phase is non-zero); line budget 724");
+    put("vr camera census: on (advanced.vr_camera_census); the census itself never writes a camera (the route's injection, when it runs, is its own); owner thread 4321; "
+        "5 s lines: 36 windows, then one per 12; cameras first 64, call sequences first 3 and eye draws first 4 on-foot frames "
+        "(tone drawn, journal read=yes says on foot; while the route jitters, only a non-zero phase); line budget 724");
 
     const float renderW = 5040.0f, renderH = 2835.0f;
     const FixtureCam world{0x241dc2e2960, 3, 1.0122f, renderW / renderH, 0.025f, 0x594E13, renderW, renderH, 0x241dd00a000};

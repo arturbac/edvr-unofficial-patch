@@ -21,7 +21,8 @@
 //                       same hashing does see the model's derive change the camera.
 //   THE PROTOCOL        the observer is registered before the hook can exist, the owner is named, then the hook is asked
 //                       for: S P D F at the first boundary, D F at every later one; the key going off detaches the observer
-//                       and closes the gate, going on again reopens it.
+//                       and closes the gate -- asked as flatCameraVrQuiet(), so while the world route injects (the detour is not
+//                       quiet) the gate is left to the route -- and going on again reopens it.
 //   SAMPLING            the ship frames (the journal says not on foot) print no sequence and spend no eye readback; the
 //                       frame the journal flips at prints no empty sequence; and, STAGE 2, the route's zero-phase warm-up
 //                       (vrWorldRouteWorldPhase true with a phase of 0, 0 for four frames, the commander on foot, the tone
@@ -111,6 +112,9 @@ uint64_t geometrySequence = 4700;
 bool phaseJittering = false;
 float phaseX = 0.0f, phaseY = 0.0f;
 int phaseCalls = 0;
+// flatCameraVrQuiet: the detour is quiet when this frame asked for neither injection nor observation and no injected camera still waits for its
+// flush. True for a census-only process; false while the world route injects.
+bool vrQuiet = true;
 // The order the injector was asked things in, one letter each: S set-observer, P pause, D disarm, F observe-frame.
 char order[64] = {};
 size_t orderN = 0;
@@ -128,6 +132,7 @@ void flatCameraInjectPause(bool p) { stub::paused = p; ++stub::pauseCalls; stub:
 void flatCameraInjectDisarm() { ++stub::disarmCalls; stub::mark('D'); }
 bool flatCameraInjectObserveFrame() { ++stub::observeFrameCalls; stub::mark('F'); return true; }
 const char* flatCameraInjectObserveStatus() { return "installed"; }
+bool flatCameraVrQuiet() { return stub::vrQuiet; }
 
 bool vrWorldRouteDrawProgress(uint32_t* drawOrdinal, bool* toneSeen, uint64_t* frame) {
     if (!stub::progressHave) return false;
@@ -690,6 +695,21 @@ int run() {
     vrCameraCensusFrameBoundary();
     check(vrCameraCensusWanted() && stub::observer != nullptr && !stub::paused && stub::setObserverCalls == 3 && std::strcmp(stub::order, "SPDF") == 0,
           "...and turning it on again re-registers the observer and reopens the gate (S P D F)");
+    {   // The detour is NOT quiet -- the world route injects, or a camera it injected still waits for its flush: a census key-off detaches the observer
+        // and leaves the relay's gate to the route (the pause is asked as flatCameraVrQuiet(), here false, so the gate stays open).
+        stub::vrQuiet = false;
+        Config::get().set("advanced.vr_camera_census", "off");
+        stub::clearOrder();
+        vrCameraCensusFrameBoundary();
+        check(!vrCameraCensusWanted() && stub::observer == nullptr && !stub::paused && std::strcmp(stub::order, "SP") == 0,
+              "a census key-off while the detour is not quiet (the route injects) detaches the observer and leaves the gate open: the pause is asked as flatCameraVrQuiet()");
+        stub::vrQuiet = true;
+        Config::get().set("advanced.vr_camera_census", "on");
+        stub::clearOrder();
+        vrCameraCensusFrameBoundary();
+        check(vrCameraCensusWanted() && stub::observer != nullptr && !stub::paused && std::strcmp(stub::order, "SPDF") == 0,
+              "...and the census comes back as before (S P D F)");
+    }
     Log::get().close();
 
     // ---- 5. the log the glue wrote ---------------------------------------------------------------------------------------------------
@@ -697,9 +717,13 @@ int run() {
     const std::wstring logPath = newestLog(tagOn.c_str());
     const std::string log = slurp(logPath);
     check(!log.empty(), "the glue wrote a log");
-    check(occurrences(log, "vr camera census: on (advanced.vr_camera_census)") == 1 && occurrences(log, "vr camera census: off (advanced.vr_camera_census)") == 1,
-          "it says once that the census is on and once that it went off (a second activation does not announce itself again)");
-    check(has(lineWith(log, "vr camera census: on (advanced.vr_camera_census)"), "while the world route jitters, only a frame whose phase is non-zero"),
+    check(occurrences(log, "vr camera census: on (advanced.vr_camera_census)") == 1 && occurrences(log, "vr camera census: off (advanced.vr_camera_census)") == 2,
+          "it says once that the census is on and once for each of the two key-offs that it went off (a second activation does not announce itself again)");
+    check(has(lineWith(log, "vr camera census: on (advanced.vr_camera_census)"), "the census itself never writes a camera (the route's injection, when it runs, is its own)") &&
+              !has(lineWith(log, "vr camera census: on (advanced.vr_camera_census)"), "nothing is written to any camera") &&
+              has(lineWith(log, "vr camera census: off (advanced.vr_camera_census)"), "the census observer is detached and the refresh hook stays in place"),
+          "the announcement says the census itself never writes a camera (the route's injection is its own), and the key-off line says the observer is detached");
+    check(has(lineWith(log, "vr camera census: on (advanced.vr_camera_census)"), "while the route jitters, only a non-zero phase"),
           "the announcement says that while the route jitters only a frame with a non-zero phase is sampled");
     check(occurrences(log, "vr camera census: camera=0x") == 5, "one line for each of the five cameras, printed once");
     {

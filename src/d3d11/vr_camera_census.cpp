@@ -221,11 +221,10 @@ void activate(State* s) {
     flatCameraInjectPause(false);               // a hook that was paused by a key-off reopens its gate
     if (!s->announced && s->budget.take(VrCensusLines::Info)) {
         s->announced = true;
-        Log::get().note("vr camera census: on (advanced.vr_camera_census); observe-only, nothing is written to any camera; "
-                        "owner thread %lu; 5 s line per window for %u windows, then one per %u; cameras first %u, "
-                        "call sequences first %u and eye draws first %u on-foot frames (the tone drawn while the journal, "
-                        "read=%s, says on foot; while the world route jitters, only a frame whose phase is non-zero); "
-                        "line budget %u",
+        Log::get().note("vr camera census: on (advanced.vr_camera_census); the census itself never writes a camera (the route's injection, when it runs, is its own); "
+                        "owner thread %lu; 5 s lines: %u windows, then one per %u; cameras first %u, call sequences first %u and "
+                        "eye draws first %u on-foot frames (tone drawn, journal read=%s says on foot; while the route jitters, "
+                        "only a non-zero phase); line budget %u",
                         static_cast<unsigned long>(GetCurrentThreadId()), kVrCensusEveryWindow, kVrCensusThinTo,
                         static_cast<unsigned>(VrCensusCameraTable::kCapacity), kVrCensusMaxSequences, kVrCensusMaxEyeFrames,
                         journalWatchActive() ? "yes" : "no: the tone alone decides", VrCensusBudget::capTotal());
@@ -235,7 +234,10 @@ void activate(State* s) {
 void deactivate() {
     g_wanted = false;
     flatCameraInjectSetObserver(nullptr);
-    flatCameraInjectPause(true);                // the relay's gate closes: the game's refresh runs straight through
+    // The relay's gate closes, so the game's refresh runs straight through, only when the detour is quiet: while the world route
+    // injects (or a camera it injected still waits for its flush) it is the route's to keep open, and a census key-off must not close it
+    // for a frame (flatCameraVrQuiet is true for a census-only process, where nothing else needs the gate).
+    flatCameraInjectPause(flatCameraVrQuiet());
     State* s = g_state;
     if (!s) return;
     s->active = false;
@@ -243,8 +245,8 @@ void deactivate() {
     s->current.reset();
     s->staging.Reset();
     if (s->budget.take(VrCensusLines::Info))
-        Log::get().note("vr camera census: off (advanced.vr_camera_census); the refresh hook stays in place, inert, until the "
-                        "game exits");
+        Log::get().note("vr camera census: off (advanced.vr_camera_census); the census observer is detached and the refresh hook stays "
+                        "in place (the route's, if it injects) until the game exits");
 }
 
 void printCameraLines(State* s) {

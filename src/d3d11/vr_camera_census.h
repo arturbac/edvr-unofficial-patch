@@ -1,9 +1,11 @@
 // The VR camera census (design doc section 82, "Pre-build findings and the stop"): a ZERO-MUTATION observation of the
 // game's view-constant refresh (the camera injector's detour) in the VR profile, to answer the one question the world
 // route's jitter waits on: how to tell the eye views' cameras from the world's. Key: advanced.vr_camera_census = off|on,
-// default off. With it on in the VR profile the detour is installed and only ever OBSERVES (it never writes a bound
-// pair, a flag or a row); with it off, nothing is installed and nothing changes: every entry point below returns at
-// once, nothing is allocated and no line is logged (tools\vr_camera_census_test pins each).
+// default off. With it on in the VR profile the census registers an observer with the detour and the CENSUS never writes a
+// camera, a bound pair, a flag or a row (when the world route injects its phase it is the DETOUR that writes the world's
+// cameras, for the route; the census hears of each call and of what the detour decided for it); with it off, nothing is
+// installed and nothing changes: every entry point below returns at once, nothing is allocated and no line is logged
+// (tools\vr_camera_census_test pins each).
 //
 // What it records, bounded (vr_camera_census_core.h has the tables, the budget and the text of every line):
 //   - a 5 s line every window (zeros included): calls, calls on other threads, kinds, callers, distinct cameras, where in
