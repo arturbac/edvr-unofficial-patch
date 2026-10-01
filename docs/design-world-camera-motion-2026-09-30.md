@@ -37,14 +37,17 @@
   path (code reading).
 - **Ruled out:** end of section 1.
 - **Next flight:** the plan in section 9: census on, Phase 1's key toggled
-  live in its own on-foot leg, route off and then auto, plus a Cinema-on-foot
-  leg. Read with `python tools\edvr_log.py --target frontier --expect-build
-  HEAD --maps-sharp` and `--camera-census`.
-- **Open (new, 2026-10-01):** HMD Cinema on foot. `edvr_gfx_20261001_060011.log`
-  06:01:02-06:01:57: the route declined every frame
-  (`depth-not-screen-motion-source`), the gate was open (journal: no Flags2;
-  screen depth 4 draws a frame) and the layer took the 2D screen at 1.99 a
-  frame. Section 8.6 says what the build does there with the key off and on.
+  live in its own on-foot leg, route off and then auto, plus the arrival leg
+  (load into on-foot play with the key off, then on). Read with `python
+  tools\edvr_log.py --target frontier --expect-build HEAD --maps-sharp` and
+  `--camera-census`.
+- **Open (2026-10-01, corrected):** the arrival spell, not Cinema mode. After
+  a load into on-foot play every frame is declined for 27 s
+  (`edvr_gfx_20261001_074129.log`, 07:42:53-07:43:20) to 62 s
+  (`..._060011.log`, 06:00:58-06:02:00): the gate open (journal: no Flags2;
+  screen depth 4 draws a frame), the screen black at every luma stage; then the
+  world appears and the route owns 0.30 s later. Section 8.6 says what the
+  build does there with the key off and on. No fix for the spell is built.
 - **Environment:** EDVR's OpenXR runtime; Pimax Crystal Super, 90 Hz, HMD
   quality 0.65 (eye 2620x2533, output 4032x3898); 2D screen 5040x2835 in
   flight 1 (`fix.vscreen_res_width` auto, the legacy rule; main's auto-fit,
@@ -339,10 +342,18 @@ held to the formatters by on_foot_maps_test P7):
   door-not-empty= not-live-frames=`. If the code never ran there is no such
   line; if the trap were alive the line shows `screen-takes>0 recognised=0`.
 - The reader's verdict. STOP: a panel period under 10 frames (a flap in the
-  world), a black eye (`native sharpen: LAYER-ONLY eye ... NO composite`, a
-  luma probe black stage), taken composites never recognised. WARN: an eye kept
-  the upscaler, the door short of its eyes, the route and the gate letting go
-  more than 50 ms apart, a layer-only decline, frames not decided by naming.
+  world), a black eye (the sharpen door's own failure line, `native sharpen:
+  LAYER-ONLY eye ... NO composite`, and only that), taken composites never
+  recognised. WARN: an eye kept the upscaler, the door short of its eyes, the
+  route and the gate letting go more than 50 ms apart, a layer-only decline,
+  frames not decided by naming, a black luma `final` stage inside a panel period
+  the journal calls on foot. A panel period also opens at an ON line whose gate
+  starts as a panel (the arrival). The luma probe's `first black stage is ...`
+  lines are not black-eye evidence (it prints one at every change, `none` when a
+  black arrival gives way to a world); the first reader counted them and every
+  real flight would have STOPPED, found when 8.6 was written against real logs,
+  with the journal's `(a menu, or no file yet)` parentheses that also lost the
+  arrival's ON and TAKES lines.
 
 **8.3 Key-off contract.** The gate equals a frozen copy of today's expression
 for every input: `uiMapsGateHeld` exhaustive in on_foot_maps_test R5, and the
@@ -387,31 +398,75 @@ route's call is). The world frames stay the eye route's and the route stays
 off with its own line. Code reading only; the flight keeps 0 (the census join
 reads the eye composite, which a curved screen replaces).
 
-**8.6 HMD Cinema on foot** (`edvr_gfx_20261001_060011.log`,
-v0.18.0-rc.5-19-g02c1c456, 06:01:02-06:01:57). In those 55 s the journal
-reported no Flags2, the screen's depth saw 4 draws a frame, the gate was
-open, the route declined 100% (`depth-not-screen-motion-source`), and the
-layer's own 30 s lines say it took the 2D screen at 1.99 and 2.00 a frame:
-the panel was the layer's, not the eye route's, and the upscaler's `full`
-price reads 0.00. At 06:02:00.107 the screen's depth jumped to 12,049 draws a
-frame at 4032x2268, the gate held and the route owned 2 s later, so naming
-works in the Cinema world once the world is drawn into a screen-sized depth;
-the 55 s before it are the naming failure, not diagnosed here.
-- Key off: byte for byte today's: the gate open, the layer takes the screen.
-- Key on: the same gate (nothing names, so the panel is not the world), the
-  same take, the same sharp unfiltered picture, plus the door skipping the
-  upscaler (the log shows 2 eye draws a frame, so the eye is empty and the
-  skip is allowed), plus the recognition keeping naming alive. When the world
-  starts naming (06:02:00 here) two named frames hold it and the eye route and
-  the route take over as today.
-- Risk, stated: if a Cinema WORLD were drawn into a depth that never names, the
-  key on would hand a world the journal or the depth count holds today to the
-  layer (sharp, no temporal AA) after three frames. The log above does not show
-  that; the Cinema leg of the flight is there to see it.
-Ghost and flicker with movement is therefore not the eye route filtering the
-panel in that stretch (the layer composites the raw screen); if it persists
-with the key on it is in the game's own image or the layer, and the census
-episodes name the depth sizes (join lines) that explain the naming failure.
+**8.6 The arrival spell** (coordinator's correction, 2026-10-01: the declines
+in `edvr_gfx_20261001_060011.log`, v0.18.0-rc.5-19-g02c1c456, are not a Cinema
+property but the first seconds of on-foot play after a load; `..._074129.log`,
+v0.18.0-rc.5-22-g85119ce9, shows them again). Neither build has Phase 1, so
+both show today's gate.
+- *What the logs show.* After the load the route declines every frame
+  (`depth-not-screen-motion-source`, the tone pass running on all of them), the
+  layer's world-screen gate is open (the journal: no Flags2 in Status.json; the
+  screen's depth 4 draws a frame; held 0 of 2,587 and 2,698 frames in 060011's
+  30 s windows ending 06:01:12 and 06:01:42), the eyes hold only the two
+  composites (2 eye draws a
+  frame) and the luma probe reads 100% black at the game, dlss_out and final
+  stages at every 2 s sample (060011 to 06:01:59, 074129 07:42:51-07:43:19):
+  the screen is empty, not an unnamed world. 074129: first decline 07:42:53.317,
+  `journal: LoadGame` 07:42:53.643, the world at 07:43:19.853 (26.5 s). 060011:
+  06:00:58-06:02:00.107 (62 s). The pass ran on every eye throughout (the 30 s
+  `gates` lines: "the pass treated 5,174 and 5,396 eyes" in the same two 060011
+  windows): 074129's lean shader priced the upscaler at 2.69-2.95 ms a pair,
+  prep 0.12 and UI resolve 0.20; 060011's diagnostic shader read `full` 0.00
+  and prep 0.21.
+- *The arrival.* The world's draws come at once: 12,049 draws a frame into a
+  4032x2268 depth (060011), 10,261 into 3504x1971 (074129). Today's depth gate
+  holds the screen as the world after two frames over 64 (06:02:00.107,
+  07:43:19.853). The first naming (the on-foot source slot target is made)
+  follows 126 ms and 152 ms later, the route jitters at +234 and +237 ms and
+  owns at +304 and +301 ms (eight treated frames). That wait for the first
+  naming fits the trap (8.1): a taken screen swallows the recognition, naming
+  needs one within 2 frames, so it restarts only once the depth gate has put
+  the composite back in the eye route.
+- *Key off:* today's, byte for byte (8.3): the journal-or-depth gate, the layer
+  takes the empty screen, the pass runs on empty eyes, the depth gate hands
+  back, the route owns 0.30 s later.
+- *Key on, in the spell:* the gate is the naming. Nothing names, so the screen
+  is a panel three unnamed frames after the world goes (today's gate lets go
+  after 90 frames under 32 draws, about a second later) and stays one, the
+  state today's gate is in for the rest of the spell. The layer composites the
+  same empty screen, so what Sean sees does not change. The eyes hold nothing
+  else (the door's emptiness test, 8.1), so the layer-only door skips the pass
+  for every eye for the whole spell: upscaler, prep and UI resolve (about 3.1
+  ms a pair in 074129) are not run and the composite costs 0.24-0.39, about
+  2.8 ms a frame saved, of nothing visible. The recognition runs on every taken
+  composite, so naming is armed. The 5 s lines read `gate=panel named=0
+  unnamed=N recognised=screen-takes door-layer-only=2 x panel-frames`.
+- *Key on, at the arrival:* the world's first frame names the screen at once
+  (no wait for the eye route) and two named frames hand it back: expected
+  within a few frames of the world, no later than today's depth hold
+  (unmeasured: the trap hid the timing). The route then warms eight frames and
+  owns, about 0.3 s as today. The door left the upscaler's history alone, so
+  the first eye-route frame resets it, as the first treated frame does today.
+- *The lines with the key on.* From launch the gate usually starts as a panel
+  (the main menu), so there is no TAKES line: the ON line (`... starts as ...
+  not the world (the journal: no Flags2 in Status.json (a menu, or no file
+  yet))`) opens the period and the HANDS BACK line closes it. With the key
+  turned on in a world, the load gives a TAKES line. `--maps-sharp` reports both
+  as panel periods; its luma note is information there (black by content) and
+  a WARN only when the journal called the period on foot.
+- *Risks, stated.* (1) The hand-back waits for naming where today's waits for a
+  draw count: a world whose draws arrive and are never named is the layer's
+  (sharp, unfiltered) until something names it. Both logs name it 0.13-0.15 s
+  after the hold even with the trap's delay, so with the key on it names no
+  later. (2) Three unnamed frames after a hand-back release the screen again:
+  074129's owned world had one two-frame gap (frames 12495-12496,
+  `engine-views-unavailable`, after the source was re-made), one frame short of
+  a release. (3) Today's spell runs the pass, so a DLSS feature first made
+  then is made unseen; with the key on, a session whose first eye-route frame
+  is the arrival makes it (58-105 ms an eye in 074129 at 07:43:39) at the
+  hand-back. A session that has shown a menu or a cockpit has run the pass.
+  The leg looks for it: LONG FRAME lines in the second after the hand-back.
+No fix for the spell is built: there is nothing in it to name.
 
 **8.7 Phase 0 as built** (vr_camera_census_core.h, vr_camera_census.cpp; no
 new key, it rides `advanced.vr_camera_census`). An episode is ONE frame
@@ -457,7 +512,8 @@ ordinary taken-UI path leaves text unsharpened); watch for ringing, and if it
 shows the cure is RCAS off for a non-world panel eye. (b) The key name: it
 covers menus and any non-world panel, so `experimental.on_foot_panels_sharp`
 says what the user gets; changing it is one edit in ui_layer.cpp, edvr.ini and
-the config rig. (c) The unnamed Cinema world above. (d) A frame where the
+the config rig. (c) The arrival (8.6): the hand-back waits for naming where
+today's gate waits for a draw count. (d) A frame where the
 layer is not armed (after a withheld eye) leaves the game's composite in the
 eye and the upscaler runs: one frame, as today.
 
@@ -494,23 +550,39 @@ Note the clock at every open and close. Frontier, the environment above.
 4. *On foot, route auto, key on:* world 30 s (the route owns); galaxy map 15 s,
    close, 10 s world, system map 15 s, close; the menu 10 s; world 30 s. Then
    one map with the key off as the reference for the hand-off.
-5. *HMD Cinema on foot* (set it in the game, then): world 30 s, key off then
-   on; a map 15 s; the menu 10 s; the main menu. This leg is for 8.6.
+5. *Arrival, key off then on* (in the mode he flies; both modes if there is
+   time): key off, to the main menu, Continue, 30 s of world; to the main menu
+   again, key on in the ini, Continue, 60 s of world. If the session's first
+   load goes straight to on-foot play, that load is the key-off half (leg 1's
+   state): note its clock and skip it here. Note the clock at the load, at the
+   world's first frame and when the route owns. This leg is for 8.6.
 6. Board; a cockpit map (the stereo maps, a regression check); census off.
 Read, each with `--target frontier --expect-build HEAD`: `--version`,
 `--maps-sharp`, `--camera-census`, `--grep "world screen|screen motion:|vr
-world route:|luma probe"`.
+world route:|luma probe|journal: LoadGame|engine motion: on-foot source|temporal
+aa price|LONG FRAME"`.
 - PASS: a TAKES line within 3 frames of each map and menu opening, a HANDS
   BACK within 2 named frames of closing, no TAKES in a stretch of world, the map
   sharp under a drag (look), the HUD intact, `recognised` about `screen-takes`,
   `door-layer-only` about twice the panel frames, route and gate released on
   one boundary and the route owning again 8 frames after a hand-back, no luma
-  black stage at an edge, the reader's verdict PASS. The census answers H1 (maps
-  and menus unnamed), H2 (the longest unnamed run in the world under 3), H3 and
-  the detour's CPU.
+  black stage after a hand-back, the reader's verdict PASS. The census answers
+  H1 (maps and menus unnamed), H2 (the longest unnamed run in the world under
+  3), H3 and the detour's CPU.
+- PASS (arrival, key on): the screen black through the spell as with the key
+  off, no flash; the period (the ON line's, or a TAKES line's) closed by a
+  HANDS BACK within 0.2 s of the world's first frame (the `engine motion:
+  on-foot source slot target created` line; key off: 0.13-0.15 s after the
+  depth hold) and the route owning within 0.3 s of it (key off: 0.15-0.18 s
+  after that line); no TAKES in the 10 s after; `door-layer-only` about twice
+  the panel frames through the spell, and the `temporal aa price` lines in it
+  showing no upscaler (key off: `full` 2.7-2.95 ms a pair); no LONG FRAME in
+  the second after the hand-back that the key-off arrival lacks.
 - STOP: a TAKES in the world, a panel period under 10 frames, a black eye, a
-  lasting dark fade after a hand-back, taken composites with `recognised=0`.
+  lasting dark fade after a hand-back, taken composites with `recognised=0`;
+  at the arrival, a TAKES within 10 s of the hand-back, a hand-back more than
+  1 s after the world's first frame, a flash or a dark frame at the hand-back.
 - WATCH: map lines shimmering (the layer samples the screen at mip 0, 5040 wide
   in leg 1's launch state: the cure is the route's mipped screen), ringing on
-  menu text (8.9a),
-  `door-not-empty` above 0, Cinema world TAKES.
+  menu text (8.9a), `door-not-empty` above 0, a TAKES in a stretch of world in
+  any mode (a world that does not name).

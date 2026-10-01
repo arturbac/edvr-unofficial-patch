@@ -2732,12 +2732,15 @@ def print_camera_census(text):
 # tools/on_foot_maps_test compares tools/maps_sharp_fixture.log to those formatters byte for byte, and this reader's self-test
 # parses the same file, so a formatter that drifts fails in the build rather than in the ten minutes after a flight.
 MAPS_STAMP_RE = re.compile(r"^\[(?P<ts>\d\d:\d\d:\d\d\.\d{3})\] (?P<msg>.*)$")
+# The journal's reading is text the DLL substitutes into "(the journal: %s)", and one of its readings has parentheses of its own ("no
+# Flags2 in Status.json (a menu, or no file yet)": every arrival, before the game writes Status.json), so the groups below take
+# everything up to the fixed words after them, never up to the first ")".
 MAPS_ON_RE = re.compile(r"^on foot maps sharp: ON at frame=(?P<frame>\d+) .*gate starts as .*: (?P<start>the world|not the world) "
-                        r"\(the journal: (?P<journal>[^)]*)\)\.$")
+                        r"\(the journal: (?P<journal>.*)\)\.$")
 MAPS_OFF_RE = re.compile(r"^on foot maps sharp: OFF at frame=(?P<frame>\d+) \((?P<why>[^)]*)\): ")
 MAPS_TAKE_RE = re.compile(r"^on foot maps sharp: the layer TAKES the 2D screen at frame=(?P<frame>\d+): no world camera named its source "
                           r"for (?P<run>\d+) frames in a row \(after (?P<world>\d+) world frames, (?P<secs>[0-9.]+) s; the journal: "
-                          r"(?P<journal>[^)]*)\)\.")
+                          r"(?P<journal>.*)\)\. A map or a menu is sharp from the layer")
 MAPS_BACK_RE = re.compile(r"^on foot maps sharp: the layer HANDS BACK the 2D screen at frame=(?P<frame>\d+) after (?P<frames>\d+) panel "
                           r"frames \((?P<secs>[0-9.]+) s; (?P<only>\d+) eyes through the layer-only door, (?P<kept>\d+) kept the "
                           r"upscaler because the game drew something else into them\): (?P<why>.*)\.$")
@@ -2751,7 +2754,14 @@ MAPS_WINDOW_RE = re.compile(r"^on foot maps sharp 5s: key=on (?P<secs>[0-9.]+) s
                             r"door-not-empty=(?P<notempty>\d+) not-live-frames=(?P<notlive>\d+)")
 MAPS_ROUTE_RELEASED_RE = re.compile(r"vr world route: RELEASED the world at frame=(?P<frame>\d+) \((?P<why>[^)]*)\)")
 MAPS_ROUTE_OWNS_RE = re.compile(r"vr world route: OWNS the world from frame=(?P<frame>\d+) ")
-MAPS_BLACK_NEEDLES = ("native sharpen: LAYER-ONLY eye", "first black stage is")
+# A black eye is the sharpen door's own failure line ("... got NO composite from the UI layer -- the eye is BLACK", printed only on the
+# failure path). The luma probe's "first black stage is X" lines are NOT black-eye evidence: the probe prints one whenever the first
+# black stage CHANGES, including "is none" the moment a black arrival gives way to a world, and "is game" for as long as the layer
+# holds the screen (the game's own eye image is empty by construction). Four real flights each carry 8 to 20 of them; reading them as
+# black eyes made every real flight STOP. The probe's sample lines are kept per panel period instead (MAPS_LUMA_RE), as a note.
+MAPS_BLACK_NEEDLES = ("native sharpen: LAYER-ONLY eye",)
+MAPS_LUMA_RE = re.compile(r"^luma probe: eye=(?P<eye>\d) game=(?P<game>\S+) dlss_out=(?P<dlss>\S+) final=(?P<final>\S+)$")
+MAPS_LUMA_STAGE_RE = re.compile(r"^(?P<mean>[0-9.]+)/(?P<max>[0-9.]+)/(?P<black>\d+)%$")
 MAPS_SHORT_PANEL_FRAMES = 10     # a panel period shorter than this (0.11 s at 90 Hz) is a flap in the world, not a map or a menu a person opened
 MAPS_DOOR_SHARE = 0.9            # eyes through the layer-only door, of the 2 x panel-frames a panel period should have had
 MAPS_SAME_BOUNDARY_S = 0.05      # the route lets go on the gate's boundary: its RELEASED line is within this of the TAKES line
@@ -2764,8 +2774,10 @@ def _clock_s(ts):
 
 def parse_maps_sharp(text):
     """The feature's lines, in log order: {events: [{kind, ts, t, ...}], windows: [{ts, t, ...ints}], route: [{kind, ts, t, ...}],
-    black: [{ts, t, line}], declined: [...]}. A line that starts "on foot maps sharp" but is none of the kinds goes in `unparsed`."""
-    out = {"events": [], "windows": [], "route": [], "black": [], "declined": [], "unparsed": []}
+    black: [{ts, t, line}], declined: [...], luma: [{ts, t, eye, final_black, final_mean}]}. A line that starts "on foot maps sharp"
+    but is none of the kinds goes in `unparsed`. `luma` holds the probe's sample lines (the final stage's black share), which
+    maps_sharp_episodes lays against the panel periods."""
+    out = {"events": [], "windows": [], "route": [], "black": [], "declined": [], "unparsed": [], "luma": []}
     for raw in text.splitlines():
         m = MAPS_STAMP_RE.match(raw.rstrip("\r"))
         if not m:
@@ -2800,6 +2812,13 @@ def parse_maps_sharp(text):
             e = MAPS_ROUTE_OWNS_RE.search(msg)
             if e:
                 out["route"].append({"kind": "owns", "ts": ts, "t": t, "frame": int(e.group("frame"))})
+        elif msg.startswith("luma probe: eye=") and " game=" in msg:
+            lm = MAPS_LUMA_RE.match(msg)
+            if lm:
+                fm = MAPS_LUMA_STAGE_RE.match(lm.group("final"))
+                out["luma"].append({"ts": ts, "t": t, "eye": int(lm.group("eye")),
+                                    "final_black": int(fm.group("black")) if fm else None,
+                                    "final_mean": float(fm.group("mean")) if fm else None})
         elif any(n in msg for n in MAPS_BLACK_NEEDLES):
             out["black"].append({"ts": ts, "t": t, "line": msg[:160]})
         elif "native temporal: layer-only declined" in msg:
@@ -2809,11 +2828,22 @@ def parse_maps_sharp(text):
 
 def maps_sharp_episodes(p):
     """Panel periods: each TAKES line paired with the next HANDS BACK or OFF line. {take, end, frames, secs, only, kept, why, route_released,
-    route_owns, open}. `open` is a TAKES still unanswered at the end of the log."""
+    route_owns, luma_samples, luma_black, open}. `open` is a TAKES still unanswered at the end of the log.
+
+    A period also starts at an ON line whose gate starts as a panel (the key on, or the layer live, while the screen already shows
+    nothing the world camera names: the main menu, a load, the arrival after it). Its `take` is that ON line, marked from_on, with
+    no world frames behind it. Without it the arrival with the key on from launch had no TAKES line, and its HANDS BACK closed
+    nothing the report could show."""
     eps = []
     cur = None
     for ev in p["events"]:
-        if ev["kind"] == "take":
+        if ev["kind"] == "on" and ev.get("start") == "not the world":
+            if cur is not None:
+                cur["open"] = True
+                eps.append(cur)
+            cur = {"take": {"kind": "take", "ts": ev["ts"], "t": ev["t"], "frame": ev["frame"], "run": 0, "world": 0, "secs": 0.0,
+                            "journal": ev["journal"], "from_on": True}, "end": None, "open": False}
+        elif ev["kind"] == "take":
             if cur is not None:   # a second take with no hand-back between (a switch in and out): the earlier one ended unseen
                 cur["open"] = True
                 eps.append(cur)
@@ -2831,8 +2861,16 @@ def maps_sharp_episodes(p):
         eps.append(cur)
     for e in eps:
         t0 = e["take"]["t"]
-        rel = [r for r in p["route"] if r["kind"] == "released" and abs(r["t"] - t0) <= 1.0]
+        # A period that began at the ON line had no world to let go of: no route release belongs to it.
+        rel = [] if e["take"].get("from_on") else [r for r in p["route"] if r["kind"] == "released" and abs(r["t"] - t0) <= 1.0]
         e["route_released"] = min(rel, key=lambda r: abs(r["t"] - t0)) if rel else None
+        # The luma probe's samples inside the period: the final stage is the texture handed to the VR half, the layer's composite
+        # included. Black by content after a load (nothing is drawn); black under a map is a defect. The judge tells them apart by
+        # what the journal said when the period began.
+        end_t = e["end"]["t"] if e["end"] is not None else float("inf")
+        samples = [l for l in p["luma"] if t0 <= l["t"] <= end_t and l["final_black"] is not None]
+        e["luma_samples"] = len(samples)
+        e["luma_black"] = sum(1 for l in samples if l["final_black"] >= 99)
         if e["end"] is not None and e["end"]["kind"] == "back":
             owns = [r for r in p["route"] if r["kind"] == "owns" and 0 <= r["t"] - e["end"]["t"] <= 2.0]
             e["route_owns"] = min(owns, key=lambda r: r["t"]) if owns else None
@@ -2863,6 +2901,15 @@ def maps_sharp_judge(p, eps):
                          "without a counted reason" % (w["ts"], w["panel"], w["only"], 2 * w["panel"]))
     for e in eps:
         t0 = e["take"]["ts"]
+        if e["luma_black"]:
+            if e["take"].get("journal") == "on foot":
+                warns.append("%s: the luma probe read the final stage black in %d of %d sample(s) of a panel period the journal calls on foot: a "
+                             "map or a menu should be on screen, so look at the headset's picture for this stretch"
+                             % (t0, e["luma_black"], e["luma_samples"]))
+            else:
+                notes.append("%s: the luma probe read the final stage black in %d of %d sample(s) of this panel period (the journal: %s): black "
+                             "by content when nothing is drawn after a load, so this is the arrival and not a black eye"
+                             % (t0, e["luma_black"], e["luma_samples"], e["take"].get("journal", "?")))
         if e["end"] is None or e["open"]:
             notes.append("%s: the panel period starting here was still open at the end of the log" % t0)
             continue
@@ -2910,24 +2957,32 @@ def print_maps_sharp(text):
             print("  %s  NOT LIVE: %s" % (ev["ts"], ev["why"]))
         elif ev["kind"] == "notempty":
             print("  %s  eye %d sequence %d: %d eye draws, the layer took %d" % (ev["ts"], ev["eye"], ev["seq"], ev["draws"], ev["taken"]))
-    print("panel periods (a map or a menu the layer held):")
+    print("panel periods (a map or a menu the layer held, or a stretch with nothing for a world camera to name: a load, the arrival after it):")
     for e in eps:
         t = e["take"]
+        if t.get("from_on"):
+            lead = "%s  ON frame %d, the screen already a panel (the journal: %s)" % (t["ts"], t["frame"], t["journal"])
+            lead_open = lead_closed = lead
+        else:
+            lead_open = "%s  TAKES frame %d after %d world frames (%.1f s)" % (t["ts"], t["frame"], t["world"], t["secs"])
+            lead_closed = "%s  TAKES frame %d after %d world frames (%.1f s of world)" % (t["ts"], t["frame"], t["world"], t["secs"])
         if e["end"] is None or e["open"]:
-            print("  %s  TAKES frame %d after %d world frames (%.1f s) -> still open at the end of the log" % (t["ts"], t["frame"], t["world"], t["secs"]))
+            print("  %s -> still open at the end of the log" % lead_open)
             continue
         if e["frames"] is not None:
             tail = "%d frames (%.1f s), %d eyes layer-only, %d kept the upscaler -> %s" % (e["frames"], e["secs"], e["only"], e["kept"], e["why"])
         else:
             tail = "%.1f s, then %s" % (e["secs"], e["why"])
-        print("  %s  TAKES frame %d after %d world frames (%.1f s of world)  ->  %s  %s"
-              % (t["ts"], t["frame"], t["world"], t["secs"], e["end"]["ts"], tail))
+        print("  %s  ->  %s  %s" % (lead_closed, e["end"]["ts"], tail))
         if e["route_released"] is not None:
             print("      the VR world route let go at %s (%+.0f ms from the take: %s)"
                   % (e["route_released"]["ts"], 1000 * (e["route_released"]["t"] - t["t"]), e["route_released"]["why"]))
         if e["route_owns"] is not None:
             print("      the route owned the world again at %s (%.0f ms after the hand-back)"
                   % (e["route_owns"]["ts"], 1000 * (e["route_owns"]["t"] - e["end"]["t"])))
+        if e["luma_samples"]:
+            print("      luma probe: %d sample(s) in this period, the final stage black in %d (black by content for a loading stretch, a "
+                  "defect under a map or a menu)" % (e["luma_samples"], e["luma_black"]))
     if ws:
         print("5 s windows, summed (%d): %d frames, named %d / unnamed %d, world %d / panel %d, %d hold(s), %d release(s); %d screen takes, %d "
               "recognised; %d eyes through the layer-only door, %d kept the upscaler; %d frame(s) not decided by naming"
@@ -4730,11 +4785,58 @@ def self_test_maps_sharp():
     # The trap: taken composites that were never recognised.
     altered("recognised=0 with screen-takes>0", clean.replace("screen-takes=810 recognised=810", "screen-takes=810 recognised=0"), 1, "STOP",
             "none recognised")
-    # A black eye reported by the sharpen door or the luma probe.
+    # A black eye is the sharpen door's own failure line, and only that.
     altered("a black eye", clean + "[16:23:41.000] native sharpen: LAYER-ONLY eye 0 (sequence 5) got NO composite from the UI layer -- the eye "
                                    "is BLACK for this frame (1 so far); the layer stands down\n", 1, "STOP", "a black eye was reported")
-    altered("a luma black stage", clean + "[16:23:41.000] luma probe: eye=0 first black stage is game (game 0.000 dlss_out 0.000 final 0.000).\n",
-            1, "STOP", "a black eye was reported")
+    # The luma probe's lines are not black-eye evidence. Real flights carry them by the dozen: a sample line every 2 s, and a
+    # "first black stage is X" line at every CHANGE of the first black stage ("is none" when a black arrival gives way to a world, "is
+    # game" for as long as the layer holds the screen). This test once demanded a STOP for "is game", and every real flight stopped.
+    luma_real = ("[16:23:41.000] luma probe: eye=0 game=0.000/0.000/100% dlss_out=0.000/0.000/100% final=0.000/0.000/100%\n"
+                 "[16:23:41.001] luma probe: eye=0 first black stage is game (game 0.000 dlss_out 0.000 final 0.000).\n"
+                 "[16:23:43.000] luma probe: eye=0 game=0.226/0.824/0% dlss_out=0.226/0.820/0% final=0.226/0.820/0%\n"
+                 "[16:23:43.001] luma probe: eye=0 first black stage is none (game 0.226 dlss_out 0.226 final 0.226).\n")
+    altered("the luma probe's lines outside any panel period", clean + luma_real, 0, "PASS", "(0 STOP, 0 WARN)")
+    if parse_maps_sharp(clean + luma_real)["black"]:
+        fail("the luma probe's transition lines were read as black eyes")
+    # The same black sample inside a panel period the journal calls on foot: a map or a menu was on screen, so look.
+    altered("a black final stage under an on-foot map",
+            clean.replace("[16:22:50.100]", "[16:22:50.000] luma probe: eye=0 game=0.000/0.000/100% dlss_out=0.000/0.000/100% final=0.000/0.000/100%\n"
+                          "[16:22:50.100]", 1), 0, "WARN", "calls on foot")
+    # The journal's reading with parentheses of its own (every arrival, before Status.json exists): the ON and TAKES lines must still
+    # parse, with the whole reading as the journal (a regex that stopped at the first ")" lost both lines as "unknown").
+    nested = base.replace("the journal: on foot)", "the journal: no Flags2 in Status.json (a menu, or no file yet))")
+    pn = parse_maps_sharp(nested)
+    jn = "no Flags2 in Status.json (a menu, or no file yet)"
+    if [e["kind"] for e in pn["events"]] != kinds or pn["unparsed"] or len(pn["events"]) < 2 or \
+            (pn["events"][0].get("journal"), pn["events"][1].get("journal"), pn["events"][1].get("world")) != (jn, jn, 26944):
+        fail("with parentheses inside the journal's reading the events read as %s (%d unparsed), journals %r" % (
+            [e["kind"] for e in pn["events"]], len(pn["unparsed"]), [e.get("journal") for e in pn["events"][:2]]))
+    # The arrival with the key on from launch: the gate starts as a panel (the main menu, the load), so there is no TAKES line and the
+    # period begins at the ON line. It must be a period, paired with its HANDS BACK and the route owning again, with the black luma
+    # sample a note (the journal had no Flags2) and not a WARN or a STOP.
+    base_lines = base.splitlines()
+
+    def first_line(pred):
+        return next(l for l in base_lines if pred(l))
+
+    arrival = "\n".join([
+        first_line(lambda l: "version v0.0.0-fixture" in l),
+        first_line(lambda l: "ON at frame=" in l).replace("left it: the world (the journal: on foot).",
+                                                         "left it: not the world (the journal: no Flags2 in Status.json (a menu, or no file yet))."),
+        first_line(lambda l: "5s:" in l and "gate=panel" in l),
+        "[16:22:50.000] luma probe: eye=0 game=0.000/0.000/100% dlss_out=0.000/0.000/100% final=0.000/0.000/100%",
+        first_line(lambda l: "HANDS BACK" in l).replace("2 kept the upscaler", "0 kept the upscaler"),
+        first_line(lambda l: "vr world route: OWNS" in l),
+    ]) + "\n"
+    ea = maps_sharp_episodes(parse_maps_sharp(arrival))
+    if len(ea) != 1 or not ea[0]["take"].get("from_on") or ea[0]["frames"] != 1599 or ea[0]["route_released"] is not None or \
+            ea[0]["route_owns"] is None or (ea[0]["luma_samples"], ea[0]["luma_black"]) != (1, 1):
+        fail("the arrival period (a gate that starts as a panel) reads as %r" % (ea,))
+    rc, out = run(arrival)
+    if rc != 0 or "maps-sharp verdict: PASS" not in out or "(0 STOP, 0 WARN)" not in out or \
+            "ON frame 900, the screen already a panel (the journal: no Flags2 in Status.json (a menu, or no file yet))" not in out or \
+            "black by content" not in out or "the route owned the world again" not in out:
+        fail("the arrival report (rc=%d):\n%s" % (rc, out))
     # The route letting go apart from the gate.
     altered("the route apart", clean.replace("[16:22:41.915] vr world route: RELEASED", "[16:22:42.300] vr world route: RELEASED"), 0, "WARN",
             "not the same boundary")
