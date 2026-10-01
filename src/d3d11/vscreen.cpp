@@ -3733,6 +3733,38 @@ __declspec(noinline) void worldScreenReissue(ID3D11DeviceContext* self, char kin
     }
 }
 
+// The same re-issue for a CURVED screen (fix.panel_curvature above 0). The game's draw was swallowed by the curve substitution
+// (panelCurveSubstitute drew the strip into the eye), so what is repeated into the eye's layer is that strip, by the very helper that
+// bound it for the game's draw (panel_curve.h panelCurveReissue): the layer's bend and placement are the game's by construction, at any
+// curvature and any panel distance (the distance override's constants are still bound: the caller is inside beginPanelOverride's
+// bracket). Ready is asked BEFORE the layer's bracket is opened, so a draw that cannot be made never opens one; a draw that faults
+// after it closes the bracket without taking the eye (uiLayerWorldReissueEnd(.., false)) and the eye route serves it.
+__declspec(noinline) void worldScreenReissueCurved(ID3D11DeviceContext* self) {
+    if (uiLayerIssueBlocked()) return;
+    VrWorldInternalScope internal;
+    if (!panelCurveReissueReady()) return;
+    if (uiLayerWorldReissueBegin(self)) {
+        GpuCensusScope census(self, GpuCensusSection::FrameWorldLayer);
+        const bool drawn = panelCurveReissue(self, g_state->realDrawIndexedInstanced);
+        uiLayerWorldReissueEnd(self, drawn);
+    }
+}
+
+// What the tail of the game's own issue does for a FLAT screen composite and a swallowed (curved) draw never reached, done for the
+// curved one right after the substitution: (1) the footprint instrument (vscreen_footprint.h; fix.vscreen_res_width = auto) reads the
+// quad the game bound -- the substitution has put the game's vertex buffer back -- so the screen's footprint is measured flat, which is
+// what the fit's m is defined at (the middle of the panel; vscreen_fit.h); (2) while the route owns the frame, screen motion's
+// recognition (its per-eye motion pass was skipped for the frame, as the flat tail skips it) and the route's re-issue of the strip.
+__declspec(noinline) void curvedScreenSwallowed(ID3D11DeviceContext* self, DrawVerdict v, UINT count, UINT instances,
+                                                const DrawArgs& args, bool routeOwns) {
+    if (self != g_state->ownerCtx) return;
+    if (g_state->rtv0Eye && count && instances && vscreenFootprintWanted())
+        footprintEyeDraw(self, v == DrawVerdict::kPanel ? g_state->distanceScale : 1.0f, args.base, args.startInstance);
+    if (!routeOwns) return;
+    if (screenMotionLive()) screenMotionRecognize();
+    worldScreenReissueCurved(self);
+}
+
 // fix.ui_quality (ui_layer.h): which piece of the interface an owner draw is.
 // Asked only while the layer is live. A draw into anything that is not an
 // eye target is none -- the GUI's own draws into its surfaces are the
@@ -3992,7 +4024,9 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         g_state->curveThisDraw = false;
         const bool layered = uiLayer && uiLayerBegin(self);
         if (seedOutcome.on && layered) seedOutcome.redirected = true;
-        const bool swallowed = panelCurveSubstitute(self, g_state->realDrawIndexedInstanced);
+        // The strip's own motion pass is the per-eye one the game's tail ends with, which the flat screen skips while the VR
+        // world route owns the frame (worldReissue.on: the route's re-issue below makes the eye layer-only); so does this.
+        const bool swallowed = panelCurveSubstitute(self, g_state->realDrawIndexedInstanced, !worldReissue.on);
         if (seedOutcome.on) {
             seedOutcome.substituted = swallowed;
             // A successful substitute issues its mesh and can issue the
@@ -4000,7 +4034,13 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
             seedOutcome.known = !swallowed;
         }
         if (layered) uiLayerEnd(self);
-        if (swallowed) return;
+        if (swallowed) {
+            // The route's frame (worldReissue.on) re-issues the strip into the layer here, before the verdict's state is undone by
+            // the caller (endPanelOverride): the placement the second issue needs is still bound. Not a taken draw: taken and
+            // re-issued are exclusive (uiLayerDecide's plan is never made for a take).
+            curvedScreenSwallowed(self, v, count, instances, args, worldReissue.on);
+            return;
+        }
     }
     // One compare for the ordinary draw; the switch for the one with a
     // verdict (forwardVerdictBegin says why this is the same ladder).

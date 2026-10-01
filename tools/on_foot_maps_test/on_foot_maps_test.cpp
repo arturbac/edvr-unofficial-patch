@@ -7,8 +7,9 @@
 //            logs. tools\on_foot_maps_test\mutants.py compiles this rig against a copy of the header with ONE rule flipped and
 //            requires the rig to fail on the case that belongs to the rule (the label of its first FAIL starts with the mutation's
 //            label prefix); that is why every check below carries a label "R<n><letter>: ...".
-//   P1..P6   the pins, by source scan from the repo root: the places that call the pure half stay where the design put them, and
-//            the key-off contract stays true -- with the key off nothing new is read, counted, logged or issued
+//   P1..P8   the pins, by source scan from the repo root: the places that call the pure half stay where the design put them, and
+//            the key-off contract stays true -- with the key off nothing new is read, counted, logged or issued; the 5 s line's
+//            screen-draws= is counted in the one place (P8, with controls that make it fail)
 //            (--self-test <repo root>; skipped when no root is given, and never run by the mutation tool).
 //
 // Usage: --self-test [<repo root>] [--only R1,R5,...]   |   --dry-run (no checks run)
@@ -248,17 +249,17 @@ void caseR9() {
     char line[1000];
     int n = uiMapsFormatWindow(line, sizeof(line), 5.0, "naming", true, w);
     check(n > 0 && contains(line, "on foot maps sharp 5s: key=on 5 s mode=naming gate=world frames=0 named=0 unnamed=0 world-frames=0 panel-frames=0 holds=0 releases=0 "
-                                   "screen-takes=0 recognised=0 door-layer-only=0 door-not-empty=0 not-live-frames=0"),
-          "R9a: a window of zeros is still a line, with every counter in it, so an absent line means the code never ran");
+                                   "screen-takes=0 recognised=0 door-layer-only=0 door-not-empty=0 not-live-frames=0 screen-draws=0"),
+          "R9a: a window of zeros is still a line, with every counter in it (screen-draws last), so an absent line means the code never ran");
     w.frames = 450; w.named = 12; w.unnamed = 438; w.worldFrames = 14; w.panelFrames = 436; w.holds = 1; w.releases = 2; w.screenTakes = 872;
-    w.recognised = 871; w.doorLayerOnly = 870; w.doorNotEmpty = 3; w.notLive = 4;
+    w.recognised = 871; w.doorLayerOnly = 870; w.doorNotEmpty = 3; w.notLive = 4; w.screenDraws = 900;
     n = uiMapsFormatWindow(line, sizeof(line), 5.0, "fallback", false, w);
     check(n > 0 && n < 600 && contains(line, "mode=fallback gate=panel frames=450 named=12 unnamed=438 world-frames=14 panel-frames=436 holds=1 releases=2 screen-takes=872 "
-                                             "recognised=871 door-layer-only=870 door-not-empty=3 not-live-frames=4"),
+                                             "recognised=871 door-layer-only=870 door-not-empty=3 not-live-frames=4 screen-draws=900"),
           "R9b: every counter is printed under its name, and the gate and the mode with them");
     w.reset();
     check(w.frames == 0 && w.named == 0 && w.unnamed == 0 && w.worldFrames == 0 && w.panelFrames == 0 && w.holds == 0 && w.releases == 0 && w.screenTakes == 0 &&
-              w.recognised == 0 && w.doorLayerOnly == 0 && w.doorNotEmpty == 0 && w.notLive == 0,
+              w.recognised == 0 && w.doorLayerOnly == 0 && w.doorNotEmpty == 0 && w.notLive == 0 && w.screenDraws == 0,
           "R9c: a window's reset zeroes every counter");
 }
 
@@ -285,7 +286,9 @@ std::string fixtureText() {
     uiMapsFormatOn(line, sizeof(line), 900, true, "on foot");
     add("16:20:10.100", line);
     UiMapsWindow w;
-    w.frames = 450; w.named = 450; w.worldFrames = 450;
+    // screen-draws is two composites a frame (one per eye) in every window of a flight on foot, whoever drew them: the world's are
+    // re-issued or left in the game's frame, a map's are taken. A cockpit window would say 0 (see the reader's boarding case).
+    w.frames = 450; w.named = 450; w.worldFrames = 450; w.screenDraws = 900;
     uiMapsFormatWindow(line, sizeof(line), 5.0, "naming", true, w);
     add("16:20:15.101", line);
     add("16:22:40.100", line);
@@ -294,12 +297,14 @@ std::string fixtureText() {
     add("16:22:41.915", "vr world route: RELEASED the world at frame=26844 (on-foot-gate-lost) after 13044 owned frame(s); the eye shift is back on and the eye route serves the eyes");
     w = UiMapsWindow{};
     w.frames = 450; w.named = 43; w.unnamed = 407; w.worldFrames = 45; w.panelFrames = 405; w.releases = 1; w.screenTakes = 810; w.recognised = 810; w.doorLayerOnly = 810;
+    w.screenDraws = 900;
     uiMapsFormatWindow(line, sizeof(line), 5.0, "naming", false, w);
     add("16:22:45.100", line);
     uiMapsFormatNotEmpty(line, sizeof(line), 0, 31200, 3, 2);
     add("16:22:47.300", line);
     w = UiMapsWindow{};
     w.frames = 450; w.unnamed = 450; w.panelFrames = 450; w.screenTakes = 900; w.recognised = 900; w.doorLayerOnly = 898; w.doorNotEmpty = 2;
+    w.screenDraws = 900;
     uiMapsFormatWindow(line, sizeof(line), 5.0, "naming", false, w);
     add("16:22:50.100", line);
     add("16:22:55.100", line);
@@ -307,11 +312,12 @@ std::string fixtureText() {
     add("16:22:59.982", line);
     w = UiMapsWindow{};
     w.frames = 450; w.named = 9; w.unnamed = 441; w.worldFrames = 6; w.panelFrames = 444; w.holds = 1; w.screenTakes = 888; w.recognised = 888; w.doorLayerOnly = 888;
+    w.screenDraws = 900;
     uiMapsFormatWindow(line, sizeof(line), 5.0, "naming", true, w);
     add("16:23:00.100", line);
     add("16:23:00.126", "vr world route: OWNS the world from frame=29452 after 8 treated frames in a row; the eye shift is off and the layer takes the screen draw on every frame the route treats (the eye route serves the rest)");
     w = UiMapsWindow{};
-    w.frames = 450; w.named = 450; w.worldFrames = 450;
+    w.frames = 450; w.named = 450; w.worldFrames = 450; w.screenDraws = 900;
     uiMapsFormatWindow(line, sizeof(line), 5.0, "naming", true, w);
     add("16:23:05.100", line);
     uiMapsFormatTake(line, sizeof(line), 30000, kUiMapsReleaseFrames, 800, 8.9, "on foot");
@@ -418,11 +424,30 @@ void pins() {
               nt.find("vrWorldRouteDoorLayerOnly(") == std::string::npos && ns.find("vrWorldRouteDoorLayerOnly(") == std::string::npos,
           "P3b: the temporal door and the sharpen door each ask the layer's one predicate once, and neither asks the route's directly any more");
 
-    // P4: the recognition. The existing call site is untouched; the new one is behind the gate and only for a taken 2D screen.
-    check(countOf(squeeze(vs), "screenMotionRecognize()") == 2 &&
-              has(squeeze(vs), "if(uiLayer&&uiFamily==UiLayerFamily::kScreen&&uiLayerMapsOn()&&screenMotionLive()&&screenMotionRecognize())uiLayerMapsNoteRecognised();") &&
-              has(squeeze(vs), "if(screenMotionLive()&&uiLayerWorldReissuePending())screenMotionRecognize();"),
-          "P4a: the recognition is called in exactly two places in vscreen.cpp: the route's (unchanged) and a taken 2D screen's, behind uiLayerMapsOn()");
+    // P4: the recognition. The existing call site is untouched; the new one is behind the gate and only for a taken 2D screen; and the curved
+    // screen's (curvedScreenSwallowed: the curve substitution returns before the flat tail, so for a frame the route owns it runs the
+    // recognition itself, behind the route's gate) is the third and last.
+    const auto recognitionPlaces = [](const std::string& squeezed) {
+        return countOf(squeezed, "screenMotionRecognize()") == 3 &&
+               has(squeezed, "if(uiLayer&&uiFamily==UiLayerFamily::kScreen&&uiLayerMapsOn()&&screenMotionLive()&&screenMotionRecognize())uiLayerMapsNoteRecognised();") &&
+               has(squeezed, "if(screenMotionLive()&&uiLayerWorldReissuePending())screenMotionRecognize();") &&
+               has(squeezed, "if(!routeOwns)return;if(screenMotionLive())screenMotionRecognize();worldScreenReissueCurved(self);");
+    };
+    check(recognitionPlaces(squeeze(vs)),
+          "P4a: the recognition is called in exactly three places in vscreen.cpp: the route's (unchanged), a taken 2D screen's behind uiLayerMapsOn(), and the curved screen's after the substitution (behind routeOwns)");
+    {   // controls: the same predicate over copies with one edit each must fail, so P4a can fail
+        const std::string sq = squeeze(vs);
+        const std::string third = "if(!routeOwns)return;if(screenMotionLive())screenMotionRecognize();worldScreenReissueCurved(self);";
+        const size_t at = sq.find(third);
+        std::string without = sq, extra = sq, ungated = sq;
+        if (at != std::string::npos) {
+            without.replace(at, third.size(), "if(!routeOwns)return;worldScreenReissueCurved(self);");
+            extra.replace(at, third.size(), third + "screenMotionRecognize();");
+            ungated.replace(at, third.size(), "if(screenMotionLive())screenMotionRecognize();worldScreenReissueCurved(self);");
+        }
+        check(at != std::string::npos && !recognitionPlaces(without) && !recognitionPlaces(extra) && !recognitionPlaces(ungated),
+              "P4a control: without the curved screen's recognition, with a fourth, or with the curved screen's ungated by routeOwns, the pin fails");
+    }
     const std::string fwd = functionBody(vs, "void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,");
     check(inOrder(fwd, {"uiLayer = uiLayerDecide(self, static_cast<int>(uiFamily)", "worldReissue.on = uiLayerWorldReissuePending();",
                         "screenMotionRecognize()", "uiLayer = uiLayerNoteOther(", "if (g_state->curveThisDraw) {", "const bool layered = uiLayer && uiLayerBegin(self);"}),
@@ -443,6 +468,36 @@ void pins() {
     fixture.erase(std::remove(fixture.begin(), fixture.end(), '\r'), fixture.end());
     check(!fixture.empty() && fixture == fixtureText(),
           "P7: tools\\maps_sharp_fixture.log is exactly what the formatters write for its numbers (regenerate: on_foot_maps_test --emit-fixture > tools\\maps_sharp_fixture.log)");
+
+    // P8: the composites the decision SEES. The window line's screen-draws= (which the reader sets against screen-takes to tell a cockpit that
+    // drew no 2D screen composite from composites drawn and not taken) is counted in exactly one place: uiLayerDecide, in the statement right
+    // after the family is set, for the screen family alone and only while the maps gate is on -- whatever the decision comes to. Counted in the
+    // take instead it would equal screen-takes and say nothing; counted ungated it would run with the key off.
+    const auto drawsPlaces = [](const std::string& sq) {
+        return countOf(sq, "++g_maps.win.screenDraws;") == 1 &&
+               has(sq, "if (family == UiLayerFamily::kScreen && detail::g_uiLayerMapsOn) ++g_maps.win.screenDraws; UiLayerDrawFacts f;") &&
+               inOrder(sq, {"const UiLayerFamily family = static_cast<UiLayerFamily>(familyInt);",
+                            "if (family == UiLayerFamily::kScreen && detail::g_uiLayerMapsOn) ++g_maps.win.screenDraws;"});
+    };
+    check(drawsPlaces(all),
+          "P8: screen-draws is counted once, in uiLayerDecide right after the family is set, for the screen family and only with the maps gate on");
+    {   // controls: the same predicate over copies with one edit each must fail, so P8 can fail
+        const std::string counter = squeeze("if (family == UiLayerFamily::kScreen && detail::g_uiLayerMapsOn) ++g_maps.win.screenDraws;");
+        const std::string taken = squeeze("++g_maps.win.screenTakes;");
+        const size_t at = all.find(counter), tk = all.find(taken);
+        std::string removed = all, ungated = all, anyFamily = all, inTake = all, twice = all;
+        if (at != std::string::npos && tk != std::string::npos) {
+            removed.replace(at, counter.size(), "");
+            ungated.replace(at, counter.size(), squeeze("if (family == UiLayerFamily::kScreen) ++g_maps.win.screenDraws;"));
+            anyFamily.replace(at, counter.size(), squeeze("if (detail::g_uiLayerMapsOn) ++g_maps.win.screenDraws;"));
+            inTake = removed;
+            inTake.insert(inTake.find(taken) + taken.size(), "++g_maps.win.screenDraws;");
+            twice.insert(tk + taken.size(), "++g_maps.win.screenDraws;");
+        }
+        check(at != std::string::npos && tk != std::string::npos && !drawsPlaces(removed) && !drawsPlaces(ungated) && !drawsPlaces(anyFamily) &&
+                  !drawsPlaces(inTake) && !drawsPlaces(twice),
+              "P8 control: without the counter, ungated by the maps gate, for every family, counted in the take instead, or counted twice, the pin fails");
+    }
 }
 
 // ---- the cost of the naming check ------------------------------------------------------------------------------------------

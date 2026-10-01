@@ -13,7 +13,6 @@
 #include "../common/temporal_mode.h"
 #include "../common/vscreen_auto_state.h"
 #include "../common/vscreen_fit.h"
-#include "panel_curve.h"
 #include "ui_layer_math.h"
 #include "vr_runtime.h"
 
@@ -347,12 +346,12 @@ void revertVScreenModeResolution() {
 // as before) until one session with VR running has completed.
 namespace {
 
-// The route's conditions as the configuration states them -- the same four the world
+// The route's conditions as the configuration states them -- the same three the world
 // route needs at run time, read from the ini the way each owner reads it, because at
 // launch (and in the menu, for the next one) no owner has run yet:
 //   * experimental.temporal_aa_on_foot_world: vr_world_route.cpp's boundary, default off
-//   * the curved screen: panel_curve.cpp (panelCurveWantedByConfig, the very predicate
-//     the route's boundary asks as panelCurveWants())
+//   * (the curved screen is not a condition: the route re-issues a curved screen through
+//     the same strip the game's draw is substituted with, panel_curve.h panelCurveReissue)
 //   * the UI layer: ui_layer.cpp's uiLayerConfigure -- fix.ui_quality (default 100), a
 //     temporal mode on (fix.temporal_aa, default off) and the jitter switches as shipped;
 //     ui_layer_math.h's uiLayerNotLiveReasonFor words the failure ("stood down" is a fact
@@ -369,7 +368,6 @@ vscreenfit::RouteFacts routeFactsFromConfig(Config& cfg) {
     f.flatProfile = runtimeFlatProfile();
     f.keyAuto = vscreenfit::keyTextIsAuto(
         cfg.getString("experimental.temporal_aa_on_foot_world", "off").c_str());
-    f.curved = panelCurveWantedByConfig(cfg);
 
     const std::string quality = cfg.getString("fix.ui_quality", "100");
     bool recognized = true;

@@ -25,6 +25,9 @@ namespace detail {
 bool  g_panelCurveStoodDown = false;
 float g_panelCurveCurvature = 0.0f;
 int   g_panelCurveSegments = kDefaultSegments;
+float    g_panelCurveGain = 0.0f;
+bool     g_panelCurveReady = false;
+uint64_t g_panelCurveReissues = 0;
 }  // namespace detail
 
 namespace {
@@ -192,6 +195,60 @@ void restoreSaved(ID3D11DeviceContext* ctx) {
     ctx->IASetPrimitiveTopology(g_savedTopo);
     if (g_savedVb) { g_savedVb->Release(); g_savedVb = nullptr; }
     if (g_savedIb) { g_savedIb->Release(); g_savedIb = nullptr; }
+}
+
+// THE STRIP'S DRAW, shared by the substitution and the VR world route's re-issue so that the two draws of one strip cannot differ:
+// the game's input assembler saved, ours bound, the one draw issued through the ORIGINAL pointer, and it returns with the game's state
+// STILL HELD (g_saveHeld) -- the substitution then issues its motion pass with the strip bound, and both end in restoreSaved. The
+// calls and their order are what panelCurveSubstitute has always made.
+void drawStripHeld(ID3D11DeviceContext* ctx, PanelCurveDrawFn draw) {
+    // Save exactly what is about to be changed and nothing else. None of
+    // these slots goes through an EDVR hook, so there is no shadow to
+    // consult and none to confuse: the context is the only authority on
+    // them, and IAGet* is how it is asked.
+    ctx->IAGetVertexBuffers(0, 1, &g_savedVb, &g_savedStride, &g_savedOffset);
+    ctx->IAGetIndexBuffer(&g_savedIb, &g_savedFmt, &g_savedIbOffset);
+    ctx->IAGetPrimitiveTopology(&g_savedTopo);
+    g_saveHeld = true;
+
+    ID3D11Buffer* ours = g_vb;
+    UINT stride = sizeof(Vertex);
+    UINT offset = 0;
+    ctx->IASetVertexBuffers(0, 1, &ours, &stride, &offset);
+    ctx->IASetIndexBuffer(g_ib, DXGI_FORMAT_R16_UINT, 0);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    // Through the ORIGINAL function pointer. The context's vtable entry is
+    // our own thunk, and calling it here would recognise this composite
+    // again and substitute again, without end.
+    draw(ctx, g_indexCount, 1, 0, 0, 0);
+}
+
+// The strip in hand is the one the current configuration and the learned gain ask for.
+bool stripCurrent() {
+    return g_vb && g_ib && g_builtCurvature == detail::g_panelCurveCurvature &&
+           g_builtSegments == detail::g_panelCurveSegments && g_builtSign == g_sign && g_builtGain == activeGain();
+}
+
+// Stand down permanently on the FIRST fault, rather than spending a
+// budget of five. The other users of guardedBudget in this tree are
+// observers, where retrying costs a log line; this one has the
+// player's view riding on it, and a substitution that faulted once has
+// no business being attempted again mid-flight.
+void standDownAfterFault(ID3D11DeviceContext* ctx, const char* what) {
+    detail::g_panelCurveStoodDown = true;
+    detail::g_panelCurveReady = false;
+    // And put the game's state back, which is the whole reason the saved
+    // state is not a set of locals. Under its own guard: if the context is
+    // far enough gone that restoring faults too, there is nothing further
+    // to be done and the process should survive to say so.
+    guarded("panelCurve.restore", [&] { restoreSaved(ctx); });
+    Log::get().note(
+        "panel curvature: %s faulted, so it is off for the rest "
+        "of this session and the game's own quad is drawn again. The input "
+        "assembler was put back, so the screen should look exactly as it did "
+        "before -- if it does not, restart the game and report the log.",
+        what);
 }
 
 // Which way +z points in the panel's local space. MEASURED 2026-08-23, and
@@ -509,6 +566,7 @@ bool build(ID3D11DeviceContext* ctx) {
     g_builtSegments = detail::g_panelCurveSegments;
     g_builtSign = g_sign;
     g_builtGain = activeGain();
+    detail::g_panelCurveGain = g_builtGain;
     Log::get().note(
         "panel curvature: built a %d-column strip -- %u vertices, %u indices -- at "
         "curvature %.3f, depth sign %+d. At curvature 0 and 1 column this is the "
@@ -583,50 +641,22 @@ void panelCurveConfigure(Config& cfg) {
     }
 }
 
-bool panelCurveWantedByConfig(Config& cfg) {
-    // Keep in step with panelCurveConfigure above: the same keys, the same bounds, the same "out of range is off".
-    float c = cfg.getFloat("fix.panel_curvature", 0.0f);
-    if (c < 0.0f || c > kMaxCurvature) c = 0.0f;
-    const int segments = cfg.getIntInRange("advanced.panel_curvature_segments",
-                                           kDefaultSegments, kMinSegments, kMaxSegments);
-    return c > 0.0f || segments != kDefaultSegments;
-}
-
-bool panelCurveSubstitute(ID3D11DeviceContext* ctx, PanelCurveDrawFn draw) {
-    if (!ctx || !draw || detail::g_panelCurveStoodDown) return false;
+bool panelCurveSubstitute(ID3D11DeviceContext* ctx, PanelCurveDrawFn draw, bool withMotion) {
+    if (!ctx || !draw || detail::g_panelCurveStoodDown) { detail::g_panelCurveReady = false; return false; }
 
     bool substituted = false;
     const bool ok = guardedBudget(g_budget, [&] {
         if (!learnSize(ctx)) return;
-        if (!g_vb || !g_ib || g_builtCurvature != detail::g_panelCurveCurvature ||
-            g_builtSegments != detail::g_panelCurveSegments || g_builtSign != g_sign ||
-            g_builtGain != activeGain()) {
+        if (!stripCurrent()) {
             if (!build(ctx)) return;
         }
 
-        // Save exactly what is about to be changed and nothing else. None of
-        // these slots goes through an EDVR hook, so there is no shadow to
-        // consult and none to confuse: the context is the only authority on
-        // them, and IAGet* is how it is asked.
-        ctx->IAGetVertexBuffers(0, 1, &g_savedVb, &g_savedStride, &g_savedOffset);
-        ctx->IAGetIndexBuffer(&g_savedIb, &g_savedFmt, &g_savedIbOffset);
-        ctx->IAGetPrimitiveTopology(&g_savedTopo);
-        g_saveHeld = true;
-
-        ID3D11Buffer* ours = g_vb;
-        UINT stride = sizeof(Vertex);
-        UINT offset = 0;
-        ctx->IASetVertexBuffers(0, 1, &ours, &stride, &offset);
-        ctx->IASetIndexBuffer(g_ib, DXGI_FORMAT_R16_UINT, 0);
-        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-        // Through the ORIGINAL function pointer. The context's vtable entry is
-        // our own thunk, and calling it here would recognise this composite
-        // again and substitute again, without end.
-        draw(ctx, g_indexCount, 1, 0, 0, 0);
-        const float shape[4]={kPi*g_builtCurvature,float(g_builtSegments),
-            kTowardViewer*float(g_builtSign)*g_builtGain,0.0f};
-        screenMotionDraw(ctx,draw,g_indexCount,1,0,0,0,shape);
+        drawStripHeld(ctx, draw);
+        if (withMotion) {
+            const float shape[4]={kPi*g_builtCurvature,float(g_builtSegments),
+                kTowardViewer*float(g_builtSign)*g_builtGain,0.0f};
+            screenMotionDraw(ctx,draw,g_indexCount,1,0,0,0,shape);
+        }
 
         restoreSaved(ctx);
 
@@ -644,25 +674,38 @@ bool panelCurveSubstitute(ID3D11DeviceContext* ctx, PanelCurveDrawFn draw) {
     });
 
     if (!ok) {
-        // Stand down permanently on the FIRST fault, rather than spending a
-        // budget of five. The other users of guardedBudget in this tree are
-        // observers, where retrying costs a log line; this one has the
-        // player's view riding on it, and a substitution that faulted once has
-        // no business being attempted again mid-flight.
-        detail::g_panelCurveStoodDown = true;
-        // And put the game's state back, which is the whole reason the saved
-        // state is not a set of locals. Under its own guard: if the context is
-        // far enough gone that restoring faults too, there is nothing further
-        // to be done and the process should survive to say so.
-        guarded("panelCurve.restore", [&] { restoreSaved(ctx); });
-        Log::get().note(
-            "panel curvature: the substitution faulted, so it is off for the rest "
-            "of this session and the game's own quad is drawn again. The input "
-            "assembler was put back, so the screen should look exactly as it did "
-            "before -- if it does not, restart the game and report the log.");
+        standDownAfterFault(ctx, "the substitution");
         return false;
     }
+    detail::g_panelCurveReady = substituted;
     return substituted;
+}
+
+bool panelCurveReissueReady() {
+    return panelCurveWants() && stripCurrent();
+}
+
+bool panelCurveReissue(ID3D11DeviceContext* ctx, PanelCurveDrawFn draw) {
+    if (!ctx || !draw || !panelCurveReissueReady()) return false;
+
+    bool drawn = false;
+    const bool ok = guardedBudget(g_budget, [&] {
+        drawStripHeld(ctx, draw);
+        restoreSaved(ctx);
+        drawn = true;
+    });
+    if (!ok) {
+        standDownAfterFault(ctx, "the VR world route's re-issue of the strip");
+        return false;
+    }
+    if (++detail::g_panelCurveReissues == 1) {
+        Log::get().note(
+            "panel curvature: the VR world route's layer drew the same %d-column strip at curvature %.3f that the game's own draw is "
+            "substituted with, from the mipped resolved screen: the layer's bend and placement are the game's by construction (one "
+            "helper binds the strip for both). From here the route owns a curved screen.",
+            detail::g_panelCurveSegments, detail::g_panelCurveCurvature);
+    }
+    return drawn;
 }
 
 void panelCurveShutdown() {
@@ -689,6 +732,8 @@ void panelCurveShutdown() {
     g_builtCurvature = -1.0f;
     g_builtSegments = -1;
     g_builtSign = 0;
+    detail::g_panelCurveReady = false;
+    detail::g_panelCurveGain = 0.0f;
 }
 
 }  // namespace edvr

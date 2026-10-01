@@ -46,9 +46,10 @@
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-83):** users 1-2 refused every frame, 3 at 7-13 fps, 4
   lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED; fix FLOWN, DEFAULT ON;
-  vscreen auto-fit BUILT 10-01, unflown. 83 (an rc.5 user, SS 0.85 on a 16:10
-  screen): flat R < D by structure, the real cause in the messages, a VR
-  Supersampling warning: BUILT 10-01 (claude/flat-upscale), NOT FLOWN.
+  vscreen auto-fit (fitted width) and the curved route BUILT 10-01, unflown.
+  83 (an rc.5 user, SS 0.85 on a 16:10 screen): flat R < D by structure, the
+  real cause in the messages, a VR Supersampling warning: BUILT 10-01
+  (claude/flat-upscale), NOT FLOWN.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -7757,6 +7758,198 @@ edvr_log.py reads such a window as `census-off` (summarised on one line, no
 WARN) instead of a census that never measured. A flat session that starts on
 says so once at startup; one that starts off says nothing (its 5 s line has
 steady-detail=off).
+
+THE CURVED ROUTE (2026-10-01; BUILT, NOT FLOWN). Sean flies
+`fix.panel_curvature` 0.3 with `panel_distance` 0.7 ("the only thing missing is
+panel curve"). The route stood aside for any curvature above 0 (item 7 of its
+first entry above): the curve substitution swallows the game's screen draw and
+the layer's re-issue repeated the game's draw. Now the re-issue repeats the
+STRIP.
+
+THE MECHANISM (`src\d3d11\vscreen.cpp`, `panel_curve.cpp`). After
+`panelCurveSubstitute` has drawn the strip into the eye, and when the route owns
+the frame (the layer planned a re-issue: `worldReissue.on`),
+`curvedScreenSwallowed` runs screen motion's recognition (the flat tail does, so
+the naming stays alive) and `worldScreenReissueCurved` opens the layer's own
+Begin, issues `panelCurveReissue` and closes it with End. ONE helper,
+`drawStripHeld`, saves the game's vertex buffer, index buffer and topology,
+binds the strip and issues the draw through the original pointer; the
+substitution and the re-issue both call it, so they cannot differ. What the
+layer's draw shares with the game's: the strip's buffers (the same objects), the
+draw's arguments, the game's vertex shader, its placement constants (the
+re-issue sits inside `beginPanelOverride`'s bracket, so the panel-distance
+override's constants are still bound), its pixel shader, its SIZE slot and its
+rasterizer state. What differs is what the flat re-issue also differs in: the
+layer's target, the viewport and scissor through the layer's map with the jitter
+cancelled, the opaque blend, and the route's mipped resolved screen with a
+trilinear sampler at PS slot 0. RCAS stays after the composite (the layer-only
+door's order, unchanged). So the bend and the placement are the game's at any
+curvature and any panel distance by construction; `tools\panel_curve_test`
+proves the shared input-assembler state, arguments and bytes over a table of
+curvatures, columns, signs and gains, and that a live curvature change rebuilds
+before the next re-issue. The strip's own screen-motion pass is skipped for a
+frame the route owns, as the flat tail skips it; a re-issue the layer refuses
+leaves that eye to the eye route without that frame's screen motion, as for a
+flat screen.
+
+THE STATES. `pending`: the first composites after the key or the curvature comes
+on, while the substitution reads the panel's SIZE (about 50 ms, then it builds
+the strip): the game draws its flat quad and the layer re-issues the flat quad
+to match (the plan accepts a substituted draw, the draw path falls through to
+the flat tail), so both are flat and consistent. `stood-down`: a fault in the
+substitution or in the strip's re-issue stands the feature down for the session
+(the first fault, as it always did): the game's quad is drawn again and the
+route keeps owning with the flat re-issue. A fault in the strip's draw after the
+layer's Begin closes the bracket without taking the eye
+(`uiLayerWorldReissueEnd(.., false)`, counted as a fault refusal): the eye route
+serves it.
+
+THE LOG. The route's 5 s line gains, right after `steady-detail=`, `curve=` and
+`curve-reissues=`. `curve=off` while the game's own quad is drawn, `pending` and
+`stood-down` as above, else `C/S/G`: the curvature (a fraction of a circle), the
+strip's columns and the depth gain in the panel's model units, the numbers of the
+strip in hand, which the layer's draw uses too. `curve-reissues` is the strips
+the layer drew in the window and equals `eye-takes` on a healthy curved owned
+window; `eye-takes` above 0 with `curve-reissues=0` under a `C/S/G` curve would
+be the layer drawing a FLAT screen under a curved game draw. The OWNS line ends,
+by state: `off`, nothing (byte-identical to before); `C/S/G`, `; the screen is
+curved (curve=C/S/G): the layer draws the same strip the game's own draw is
+substituted with, so the bend and the placement are the game's`; `pending`, `;
+the screen is set to curve (curve=pending): the strip is not built yet, so the
+game and the layer both draw the flat quad until it is`; `stood-down`, `; the
+screen is set to curve but the curve stood down (curve=stood-down): the game
+draws its own flat quad and the layer re-issues it flat`. (The first build of
+this entry gave pending and stood-down the C/S/G sentence, which was false for
+both; found by the rig's author and fixed before any flight.) `panel curvature:
+the VR world route's layer drew the same N-column strip ...` prints once, at the
+first re-issue. The stays-off line no longer names curvature and the layer's
+`curved-screen` refusal is gone (a stale build is the only way to read one).
+
+THE AUTO-FIT. Its curvature condition is dropped: `routeStandsAsideForCurve` and
+`RouteFacts.curved` are deleted from `src\common\vscreen_fit.h` (its header said
+to, when this landed) and `vscreen_res.cpp` no longer reads the curve. The
+route's conditions at launch are three: the key auto, the UI layer live, EDVR's
+runtime (and the flat profile never fits). With curvature on, auto gives what it
+gives flat: `rule=fitted`, from the stored footprint or the seed (3504 at
+`panel_distance` 0.7 on a 4032 eye), `route=run`. Before this build it gave
+`rule=legacy route=no`, 5040 (leg C of the auto-fit's own flight plan above,
+now superseded).
+
+THE FOOTPRINT, from the code and arithmetic. (a) The instrument could not see a
+curved composite at all: its call sat in the tail of the game's own issue, which
+the substitution swallows, so with curvature on it would have printed `draws=0`
+(its own flight plan reads that as "composite not recognised") and stored
+nothing. (b) It is now called from `curvedScreenSwallowed`, after the
+substitution has put the game's vertex buffer back, so it reads the quad the game
+bound: the screen's footprint as if it were flat. (c) That is the quantity the
+rule's m is defined at, texels per eye pixel at the MIDDLE of the panel, and the
+bend keeps the middle: x' = sin(theta)/k has slope 1 and z' = (1 - cos(theta))/k
+has slope 0 at x = 0 (`bend()`; checked numerically), so the middle's density is
+the flat one at any curvature. (d) What the rule does not cover is the EDGES,
+which the bend moves nearer. Edge density over middle density, from `bend()`
+under a pinhole at the origin, the panel's middle d half-widths away and the
+gain equal to the half-width (the model's d is not any number the instrument
+reads):
+
+  curvature   d=1.1   1.5    2.0    3.0    4.0    6.0
+  0.1         1.48    1.31   1.21   1.12   1.07   1.03
+  0.3         2.72    1.75   1.32   1.01   0.88   0.77
+  0.5         3.26    1.28   0.69   0.34   0.23   0.13
+
+So a NEAR bent panel enlarges its edges' texels more than its middle's: at the
+fitted width (one texel per eye pixel at the middle) the edges look softer than
+the middle, by up to the table's factor; beyond about 3 half-widths they show
+less. That is geometry, not a measurement on Sean's rig (his d is unknown), and
+it is not corrected: doing so needs d and the bend inside the instrument, which
+would be a guess. The flight looks at it (fitted against an explicit 5040).
+
+NOT DONE, said and not hidden. (1) `advanced.vr_camera_census`'s eye-draw hook
+still sits in the flat tail, so the census sees no composite while the screen is
+curved. (2) Phase 1's take with curvature is unflown: the decision for a
+substituted screen is pinned (`ui_layer_world_test`) and the take draws the strip
+into the layer as it always did; this build does not change that path. (3) The
+intro movie, the splash and the loader's own screens have their own geometry and
+are not on this path. (4) The edge softness above.
+
+FLIGHT PLAN (Frontier, HMD Cinema, Sean's pairing: the main menu first, then one
+on-foot spot, 60 s a leg, so two 30 s windows). Every leg, `edvr.ini`: `[fix]`
+`temporal_aa = dlss`, `ui_quality = 100`, `panel_distance = 0.7`,
+`vscreen_res_width = auto`; `[experimental]` `temporal_aa_on_foot_world = auto`,
+`on_foot_maps_sharp = off` (one change at a time; leg E turns it on). Install by
+`tools\install_edvr.py`; the first line of every read is
+`edvr_log.py --expect-build HEAD --route-curve` (and `--vscreen-fit` for the width).
+A. `panel_curvature = 0.3`; delete `edvr_logs\vscreen_auto_footprint.txt`. Expect
+   `rule=fitted source=seed route=run ... auto = 3504 wide` on a 4032 eye (the
+   width flat gives; before this build `rule=legacy route=no`, 5040), the OWNS
+   line with the curve sentence, `curve=pending` for at most the first window
+   and then `curve=0.300/64/<gain>` in every owned window with `curve-reissues`
+   equal to `eye-takes` and above 0, one `panel curvature: the VR world route's
+   layer drew the same 64-column strip` line, no `fault=` in the `vr world route
+   layer:` line's own refusals, and a `vscreen footprint` line with `draws`
+   above 0 (before this build `draws=0`: the curved composite was never seen)
+   and its `fp=`. Sean's eye, at the menu and on foot: the bend and the
+   placement are the route-off screen's, and nothing jumps when the route
+   engages (the arrival spell's end) or releases.
+B. Same spot, same view, `panel_curvature = 0` (a live edit is enough: the
+   curvature is live and `curve=` goes `off`). Expect `curve=off`,
+   `curve-reissues=0`, `eye-takes` above 0, a flat screen, and A's `fp=` within
+   2% of this leg's (the bend keeps the middle, so the middle's footprint is the
+   flat one).
+C. A against B in the headset with the same text on the screen: the middle, then
+   the edges. The edges softer at 0.3 than at 0 is the table's geometry, not a
+   defect; then an explicit `vscreen_res_width = 5040` at 0.3: if the edges
+   sharpen and the middle does not change, the fit wants an edge term (record
+   both widths and Sean's words). Frame time: the `EDVR GPU census:` and
+   `native benchmark:` windows of A against B (a 130-vertex strip for 4:
+   expected equal within the windows' own spread; a gap beyond the spread is a
+   finding, not a number fixed in advance).
+D. Restart with A's ini and the stored footprint kept: `source=measured`, the
+   width the footprint gives (roundTo16 of A's measurement; 3504 when it is
+   3504 +-8). That is the auto-fit's CALIBRATION with curvature on.
+E. (the Phase 1 take with curvature, unflown) `on_foot_maps_sharp = on`,
+   `panel_curvature = 0.3`, the route off: open the galaxy map on foot and drag
+   it. Expect `screen-takes` above 0 and `screen-draws` equal to it
+   (`--maps-sharp`), the map sharp, the screen as curved as before it opened.
+PASS: in A every owned window has `curve-reissues` equal to `eye-takes` and
+above 0, no `stood-down`, a footprint with `draws` above 0, and Sean sees the
+route's screen bent like the route-off screen; B has `curve=off` and the same
+`fp=`. FAIL, each with what it means: `eye-takes` above 0 and `curve-reissues=0`
+under a `C/S/G` curve (the layer drew a FLAT screen under a curved game draw:
+STOP); `curve=stood-down` (a fault; the line before it names it); `curve=pending`
+for many windows (the SIZE was never read: the game draws flat and the layer
+re-issues flat, consistent but flat at 0.3 with the route on); a bend that
+changes shape or place when the route engages or releases (the layer's strip is
+not the substitution's: compare `curve=`'s C/S/G with the `panel curvature:`
+line); `draws=0` at 0.3 (the instrument's new call never ran); A's `fp=` off B's
+by more than a few percent (it read something other than the flat quad).
+
+GATES (all in `build.bat`; the full build is green and the stamp is in the
+hand-off). New: `tools\panel_curve_test`, the real `panel_curve.cpp` on WARP:
+2271 checks in 11 cases and 85 mutants of the module, every one caught. The
+substitution and the layer's re-issue draw one strip, in state, arguments and
+bytes, over curvature x columns x sign x gain; a live change rebuilds before
+the next re-issue; the game's input assembler comes back whatever it held (a
+canonical, an odd and an empty state); a faulting draw stands the feature down.
+`tools\vr_world_route_test\mutants.py`: 38 mutants of the route's pure, GPU and
+layer rigs, `--self-test` in the build and `--run` on demand. Changed:
+`vr_world_route_test` and `vr_world_route_gpu_test` (`curve=`, `curve-reissues=`,
+the per-state OWNS suffix, the route running with curvature above 0; in-rig
+controls on each pin), `ui_layer_world_test` (`testCurvedScreen`: a substituted draw is
+planned and taken like a flat one; a re-issue that did not land closes its
+bracket and takes no eye), the `ui_quality_test` wiring pins (the curve branch,
+`worldScreenReissueCurved`, `curvedScreenSwallowed`'s gates, the flat re-issue's
+exact text, the recognition at three places; 23 in-rig controls),
+`vscreen_fit_test` (the rule no longer consults the curve; the footprint's
+second call site; 87 of 87 mutants), `on_foot_maps_test` P4a (three places).
+CURVATURE 0 is held by `panel_curve_test` C1 (nothing wanted; the re-issue is not
+ready and draws nothing), the wiring pin on the flat re-issue's text and the
+route's 5 s line being the old line with ` curve=off curve-reissues=0` after
+`steady-detail=`. CURVATURE ABOVE 0 WITH THE ROUTE OFF is the substitution as it
+was: `panelCurveSubstitute(.., !worldReissue.on)` keeps its motion pass (wiring
+pin, `panel_curve_test` C2); the one addition is the footprint call, armed only
+when the fit is. NOT COVERED by a rig: the draw in the game (no flight yet), and
+the strip's index order against the game's culling (flown at 0.3 in August on
+the on-foot composite, not re-proved here).
 
 ## 83. Flat upscaling: the final copy admitted by structure (build, 2026-10-01)
 

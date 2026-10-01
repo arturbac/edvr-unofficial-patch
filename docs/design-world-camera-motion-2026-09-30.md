@@ -3,16 +3,19 @@
 ## Status
 
 - **State (2026-10-01):** Phase 0 (census episodes) and Phase 1 (the
-  on-foot panel gate, with the layer-only door under it) are BUILT together on
-  branch `claude/on-foot-maps-sharp`, riding one build and one flight, NOT
-  FLOWN. Sean approved the design 2026-10-01: (i) for Phase 1; Phase 0 and 1
-  on one build; any non-world panel to the layer, not just the maps; the eyes
-  skip the upscaler under a held panel. Implementation note and flight plan:
-  sections 8 and 9. Phases 2 and 3 untouched. Origin: flight 1 of the VR world
-  route (design-flat-temporal-aa-2026-09-23.md section 82;
-  `edvr_gfx_20260930_161545.log`, v0.18.0-rc.4-104-gbde47f81). Sean's
-  direction: every view's temporal-AA motion comes from the game camera that
-  renders it, not head heuristics.
+  on-foot panel gate, with the layer-only door under it) are on main
+  (df9172db) and FLOWN ONCE (Frontier, `edvr_gfx_20261001_082459.log`, route
+  off): Sean, "it all looks perfect to my eye". The reader said WARN; section
+  8.10 says why: a boarding it could not tell from a defect. No Phase 1
+  defect; the 5 s line gains `screen-draws=` and the reader judges by it (a
+  Phase 1 fix on branch `claude/vr-route-curvature`, NOT FLOWN). Sean approved
+  the design 2026-10-01: (i) for Phase 1; any non-world panel to the layer, not
+  just the maps; the eyes skip the upscaler under a held panel. Implementation
+  note and flight plan: sections 8 and 9. Phases 2 and 3 untouched. Origin:
+  flight 1 of the VR world route (design-flat-temporal-aa-2026-09-23.md
+  section 82; `edvr_gfx_20260930_161545.log`, v0.18.0-rc.4-104-gbde47f81).
+  Sean's direction: every view's temporal-AA motion comes from the game camera
+  that renders it, not head heuristics.
 - **Keys:** `experimental.on_foot_maps_sharp = off|on` (default off, live;
   covers menus too, a better name is `on_foot_panels_sharp`) and the existing
   `advanced.vr_camera_census` (episodes, naming runs and the detour's CPU ride
@@ -405,6 +408,12 @@ keeps the naming alive (the curved branch returns before the tail where the
 route's call is). The world frames stay the eye route's and the route stays
 off with its own line. Code reading only; the flight keeps 0 (the census join
 reads the eye composite, which a curved screen replaces).
+SUPERSEDED for the route, 2026-10-01 (branch `claude/vr-route-curvature`):
+the route no longer needs 0. Its re-issue repeats the curve substitution's
+strip, so a curved screen is re-issued, not refused; the take is as written
+here (design-flat-temporal-aa-2026-09-23.md section 82, "The curved route",
+BUILT, NOT FLOWN; the flight plan there has the Phase 1 take with curvature as
+its leg E).
 
 **8.6 The arrival spell** (coordinator's correction, 2026-10-01: the declines
 in `edvr_gfx_20261001_060011.log`, v0.18.0-rc.5-19-g02c1c456, are not a Cinema
@@ -530,6 +539,68 @@ today's gate waits for a draw count. (d) A frame where the
 layer is not armed (after a withheld eye) leaves the game's composite in the
 eye and the upscaler runs: one frame, as today.
 
+**8.10 The first flight (2026-10-01).** `edvr_gfx_20261001_082459.log`, Frontier,
+v0.18.0-rc.5-37-gdf9172db. Sean: "it all looks perfect to my eye". Launched with
+the route off (vScreen took the legacy 5040), the maps key on, the route auto
+live. The reader of that build read WARN (0 STOP, 7 WARN). The log says:
+- *Period 1* (ON 08:31:23.144, TAKES 08:31:23.166): a map. 1,930 frames, all 3,860
+  eyes through the layer-only door, none kept the upscaler, HANDS BACK
+  08:31:44.796, and the route owned the world 163 ms later (the eight warming
+  frames of 8.4). The door worked for a screen the route had owned before the key.
+- *Between* (08:32:35): the route declined three frames (`engine-views-unavailable`),
+  released by `frames-not-treated` and owned again 207 ms later, while the gate held
+  the world throughout: the route's declines and the gate are independent, as 8.4 says.
+- *Period 2* (TAKES and the route's RELEASED `on-foot-gate-lost`, both 08:32:55.975):
+  not a map. Sean boarded his ship. The 30 s line at 08:33:00 says `the journal:
+  aboard` and lists the cockpit's families (holo panels, flight HUD);
+  `settlement detail: no longer on foot (Status.json)` at 08:32:57.615 (1.6 s after the
+  take: the journal lags the camera); `engine motion: on-foot source slot target
+  released ... no on-foot source for 120 frames` at 08:32:57.645; the transition-flash
+  lines name a change of reference frame. A cockpit draws no 2D screen composite, so
+  every window after the take reads `screen-takes=0` and there was nothing for the
+  door to skip. The route and the gate let go on one boundary, as designed.
+- *The four black luma samples* (08:33:22.3-08:33:24.4, every stage, both eyes) are the
+  game's exit fade: the first black stage is `game` (the game submitted black) and the
+  shutdown totals follow at 08:33:25.110. The sharpen door's own totals for the whole
+  session: `layer_only=14114, layer_only_black=0`.
+- *The six flights after it* (same build; Frontier logs 084752, 085519, 085923, 090246,
+  090933, 092026): stretches of the main menu (the journal: no Flags2) and of the ship
+  (aboard) with the key on, and the layer took no 2D screen composite in any of them
+  (`screen-takes=0` in every window: nothing for the gate to do). The reader reads each as
+  WARN for "no panel period closed" and nothing else, except 085519: fix.temporal_aa was
+  off for a stretch of it, and the OFF line's reason (`no temporal mode is on
+  (fix.temporal_aa is off)`) has parentheses of its own, which the reader's pattern
+  stopped at, so it lost the line as one it did not know. Three of the DLL's eight
+  reasons are like that. Fixed: one level of nesting, all eight reasons through the OFF
+  and not-live patterns in the self-test, held to the DLL's sources, and the
+  unknown-line WARN quotes the line.
+The door was right and the instruments were not, three ways. (1) The reader judged the
+door against PANEL FRAMES (the gate's state) and not against taken composites, so a
+cockpit read as six failed doors (the "46.1%"). (2) A window with panel frames and
+`screen-takes=0` was ambiguous: nothing counted the composites the decision SAW, so
+"nothing was drawn" and "drawn and refused" read alike. (3) The luma WARN took the
+journal's reading at the TAKES (stale by 1.6 s) for a stretch that was a cockpit.
+THE FIX (its own commit, `claude/vr-route-curvature`; no behaviour change):
+the 5 s line gains `screen-draws=` (every 2D screen composite the layer's decision saw
+while the key was on, taken or not); the reader judges the door against composites
+taken, adds a WARN for composites drawn in a whole-panel window and not taken, notes a
+period with no composite (`none was drawn: a cockpit, a load`) and no longer lets a
+period the layer held no screen in raise the luma WARN; a log without the token (this
+one) is read by takes alone and says it cannot tell the two apart. The real layer rig
+(`ui_layer_world_test`, `testMapsTransitions`, two real 5 s windows) replays both
+transitions: a map opened with the route owning (the composites go on, the layer takes
+them, the door runs layer-only for both eyes) and closed, then the boarding (route
+owning, naming stops, both let go on one boundary, no composite follows). The first
+window is the whole run, checked token by token against what the rig drew and what the
+layer did with it (draws = re-issued + taken, takes = taken, door = taken); the second
+is the cockpit alone, the flight's shape: panel frames, draws 0, takes 0, door 0.
+`on_foot_maps_test` holds the token (R9, four new mutants) and its one counting place
+(P8, with controls); the reader's self-test has the boarding flight in both formats.
+The reader now reads this flight as PASS (0 STOP, 0 WARN).
+ruled out: "the layer-only door failed after the route's release on the gate", because
+no composite was taken in those windows (nothing was drawn: a cockpit) and the sharpen
+door counted 14,114 layer-only eyes and 0 black.
+
 ## 9. Flight plan (one build, one flight)
 
 Live `edvr.ini` edited with the Edit tool (never a regex); all keys live. Set
@@ -577,8 +648,10 @@ aa price|LONG FRAME"`.
 - PASS: a TAKES line within 3 frames of each map and menu opening, a HANDS
   BACK within 2 named frames of closing, no TAKES in a stretch of world, the map
   sharp under a drag (look), the HUD intact, `recognised` about `screen-takes`,
-  `door-layer-only` about twice the panel frames, route and gate released on
-  one boundary and the route owning again 8 frames after a hand-back, no luma
+  `door-layer-only` about `screen-takes` and `screen-draws` equal to it in a
+  whole-panel window (a cockpit period has neither: `screen-draws=0`), route and
+  gate released on one boundary and the route owning again 8 frames after a
+  hand-back, no luma
   black stage after a hand-back, the reader's verdict PASS. The census answers
   H1 (maps and menus unnamed), H2 (the longest unnamed run in the world under
   3), H3 and the detour's CPU.
@@ -587,8 +660,8 @@ aa price|LONG FRAME"`.
   HANDS BACK within 0.2 s of the world's first frame (the `engine motion:
   on-foot source slot target created` line; key off: 0.13-0.15 s after the
   depth hold) and the route owning within 0.3 s of it (key off: 0.15-0.18 s
-  after that line); no TAKES in the 10 s after; `door-layer-only` about twice
-  the panel frames through the spell, and the `temporal aa price` lines in it
+  after that line); no TAKES in the 10 s after; `door-layer-only` about
+  `screen-takes` through the spell (8.10), and the `temporal aa price` lines in it
   showing no upscaler (key off: `full` 2.7-2.95 ms a pair); no LONG FRAME in
   the second after the hand-back that the key-off arrival lacks.
 - STOP: a TAKES in the world, a panel period under 10 frames, a black eye, a

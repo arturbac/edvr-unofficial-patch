@@ -28,12 +28,21 @@
 // Sean's calibration point (3504 px at distance 0.7 on a 4032 px eye), which makes the first launch on his rig exactly
 // the width he flew.
 //
-// THE ROUTE'S CONDITIONS at launch (all four, plus what the layer itself needs):
+// THE ROUTE'S CONDITIONS at launch (all three, plus what the layer itself needs):
 //   * experimental.temporal_aa_on_foot_world is auto
-//   * fix.panel_curvature is 0 (the route stands aside for a curved screen -- one named function below, easy to drop)
 //   * the UI layer is live: fix.ui_quality is not off, and a temporal mode is on (the layer composites at that pass's door)
 //   * the runtime is EDVR's own OpenXR (not Elite's native Oculus back end, not a foreign openvr_api.dll)
 // and the flat profile never fits (the world route is a VR route).
+//
+// A CURVED SCREEN (fix.panel_curvature above 0) IS NOT A CONDITION. The route re-issues a curved screen through the very strip the
+// game's draw is substituted with (panel_curve.h panelCurveReissue), so it runs with the curve on and the fit applies to it. The
+// footprint the rule uses is the game's own flat quad, which the instrument reads before the strip replaces it (vscreen.cpp): the
+// width of the screen as if it were flat. That is exactly what m is defined at -- texels per eye pixel at the MIDDLE of the panel --
+// because the bend keeps the middle point and the arc length (panel_curve.cpp bend(): x' = sin(theta)/k has unit slope at x = 0, and
+// z' = (1 - cos(theta))/k, toward the viewer, is zero there with zero slope), so the middle density is the flat one at any curvature.
+// What the rule does NOT address is the
+// edges of a bent panel, which are denser than the middle when the panel is near (computed in the design doc, section 82, the curved
+// route entry): they are magnified by the nearness the bend gives them.
 #pragma once
 
 #include <algorithm>
@@ -147,16 +156,9 @@ enum class RuntimeKind : uint8_t {
 struct RouteFacts {
     bool flatProfile = false;
     bool keyAuto = false;            // experimental.temporal_aa_on_foot_world reads "auto"
-    bool curved = false;             // the curved screen is wanted (panel_curve.h panelCurveWants: curvature above 0)
     const char* layerWhy = nullptr;  // nullptr: the UI layer would be live; else uiLayerNotLiveReasonFor's line
     RuntimeKind runtime = RuntimeKind::NotLoadedYet;
 };
-
-// THE NAMED PLACE. The world route stands aside for a curved screen: the layer re-issues the game's OWN screen draw, and a
-// curved screen is not that draw (vr_world_route.cpp, vrWorldRouteFrameBoundary: `layerLive = ... && !curved`). When the
-// curve-aware re-issue lands (design doc section 82, queued) delete this function and its one call in routeVerdict; nothing
-// else in the rule mentions the curve.
-inline bool routeStandsAsideForCurve(const RouteFacts& f) { return f.curved; }
 
 struct RouteVerdict {
     bool runs = false;
@@ -176,8 +178,6 @@ inline RouteVerdict routeVerdict(const RouteFacts& f) {
     RouteVerdict v;
     if (f.flatProfile) addWhy(v, "this is the flat profile (the world route is a VR route)");
     if (!f.keyAuto) addWhy(v, "experimental.temporal_aa_on_foot_world is not auto");
-    if (routeStandsAsideForCurve(f))
-        addWhy(v, "fix.panel_curvature is above 0 (the route stands aside for a curved screen)");
     if (f.layerWhy && f.layerWhy[0]) addWhy(v, f.layerWhy);
     if (f.runtime == RuntimeKind::OculusNative)
         addWhy(v, "this session is on Elite's native Oculus back end (EDVR's OpenXR runtime is not driving it)");

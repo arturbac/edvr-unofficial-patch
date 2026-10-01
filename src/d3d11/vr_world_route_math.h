@@ -281,9 +281,27 @@ struct VrWorldWindow {
     // line (vrWorldSteadyKeyName: "on" or "off"; the key defaults to on, and off is the route as flight 2 flew it). A window nothing has
     // set (a default-constructed one) says off: the boundary sets it from the key before every line.
     const char* steady = "off";
+    // The screen's curve at the boundary that printed the line (vrWorldFormatCurve: "off", "pending", "stood-down" or "C/S/G") and
+    // how many strips the route's layer re-issued in the window (panel_curve.h panelCurveReissue). A default-constructed window says
+    // off and 0: the boundary sets both before every line.
+    char curve[48] = "off";
+    uint64_t curveReissues = 0;
     VrWorldInjectWindow inject;
     void reset() { *this = VrWorldWindow{}; }
 };
+// The screen's curve as the route's lines say it (the curved route, design doc section 82): "off" when the game's own quad is
+// drawn (fix.panel_curvature 0 and the default segment count: `configured` false), "stood-down" when the substitution turned
+// itself off for the session (a fault, or a panel SIZE that cannot be one), "pending" while it is asked for and has not drawn its
+// strip yet (it learns the panel's SIZE for a few frames after the first composite and draws the game's flat quad meanwhile, and
+// the layer re-issues that flat quad to match), else "C/S/G": the curvature (a fraction of a full circle), the strip's columns and
+// the depth gain in the panel's model units -- the numbers the strip in hand was built from, which the layer's re-issue draws too.
+inline int vrWorldFormatCurve(char* out, size_t size, bool configured, bool standDown, bool ready, float curvature, int segments,
+                              float gain) {
+    if (!configured) return std::snprintf(out, size, "off");
+    if (standDown) return std::snprintf(out, size, "stood-down");
+    if (!ready) return std::snprintf(out, size, "pending");
+    return std::snprintf(out, size, "%.3f/%d/%.3f", static_cast<double>(curvature), segments, static_cast<double>(gain));
+}
 // The 5 s line, printed every window while the key is auto, zeros included: an absent line is what "the route never
 // ran" looks like, and the stop signals in the flight plan read it.
 inline int vrWorldFormatWindow(char* out, size_t size, VrWorldKey key, VrWorldState state, bool layerLive, bool gate,
@@ -292,7 +310,7 @@ inline int vrWorldFormatWindow(char* out, size_t size, VrWorldKey key, VrWorldSt
         "vr world route 5s: key=%s state=%s layer=%s gate=%s frames=%llu gate-frames=%llu gate-flips=%llu hdr-frames=%llu trigger=%llu "
         "none=%llu ambiguous=%llu treated=%llu declined=%llu owned-frames=%llu eye-takes=%llu door-layer-only=%llu "
         "enters=%llu releases=%llu (last=%s) scene-resets=%llu late-hdr-writes=%llu (in %llu frames) last=%s "
-        "jitter=%s phase=%.4f,%.4f rows=%.4f,%.4f fp-mode=%llu/%llu/%llu steady-detail=%s "
+        "jitter=%s phase=%.4f,%.4f rows=%.4f,%.4f fp-mode=%llu/%llu/%llu steady-detail=%s curve=%s curve-reissues=%llu "
         "last-trigger=VS=%016llX PS=%016llX target=%ux%u hdr=%ux%u selection=",
         vrWorldKeyName(key), vrWorldStateName(state), layerLive ? "live" : "not-live", gate ? "held" : "no",
         static_cast<unsigned long long>(w.hdr.frames), static_cast<unsigned long long>(w.gateFrames),
@@ -307,6 +325,7 @@ inline int vrWorldFormatWindow(char* out, size_t size, VrWorldKey key, VrWorldSt
         w.hdr.lastVerdict, w.jitter, static_cast<double>(w.phaseX), static_cast<double>(w.phaseY),
         static_cast<double>(w.rowsX), static_cast<double>(w.rowsY), static_cast<unsigned long long>(w.foldMode[0]),
         static_cast<unsigned long long>(w.foldMode[1]), static_cast<unsigned long long>(w.foldMode[2]), w.steady,
+        w.curve, static_cast<unsigned long long>(w.curveReissues),
         static_cast<unsigned long long>(w.hdr.lastTriggerVs),
         static_cast<unsigned long long>(w.hdr.lastTriggerPs), w.hdr.lastTargetWidth, w.hdr.lastTargetHeight,
         w.hdr.lastHdrWidth, w.hdr.lastHdrHeight);
@@ -326,11 +345,37 @@ inline int vrWorldFormatWindow(char* out, size_t size, VrWorldKey key, VrWorldSt
     return n;
 }
 // The route took the world: the first frame its layer took a screen draw after being warm.
-inline int vrWorldFormatEntered(char* out, size_t size, uint64_t frame, uint32_t warmFrames) {
+// `curve` is vrWorldFormatCurve's text at that boundary, and the line adds ONE sentence that says what is true of the screen in that state
+// (each keeps "(curve=<text>)", the part a reader keys on):
+//   off, or null    nothing: a flat screen's line is what it always was;
+//   "C/S/G"         a strip is in hand: the layer draws the very strip the game's own draw is substituted with;
+//   "pending"       asked for and no strip built yet: the game and the layer both draw the flat quad until it is;
+//   "stood-down"    the substitution turned itself off for the session: the game draws its own flat quad and the layer re-issues it flat.
+constexpr char kVrWorldEnteredStripHead[] = "; the screen is curved (curve=";
+constexpr char kVrWorldEnteredStripTail[] =
+    "): the layer draws the same strip the game's own draw is substituted with, so the bend and the placement are the game's";
+constexpr char kVrWorldEnteredPending[] =
+    "; the screen is set to curve (curve=pending): the strip is not built yet, so the game and the layer both draw the flat quad until it is";
+constexpr char kVrWorldEnteredStoodDown[] =
+    "; the screen is set to curve but the curve stood down (curve=stood-down): the game draws its own flat quad and the layer re-issues it flat";
+constexpr size_t kVrWorldEnteredTailBytes = 224;
+// The longest sentence of each state fits the suffix buffer (the strip's with the widest curve text a window holds): a longer one fails the
+// build, not the log line.
+static_assert(sizeof(kVrWorldEnteredStripHead) + sizeof(kVrWorldEnteredStripTail) - 1 + (sizeof(VrWorldWindow::curve) - 1) <= kVrWorldEnteredTailBytes,
+              "the OWNS line's strip sentence (with the widest curve text) must fit the suffix buffer");
+static_assert(sizeof(kVrWorldEnteredPending) <= kVrWorldEnteredTailBytes, "the OWNS line's pending sentence must fit the suffix buffer");
+static_assert(sizeof(kVrWorldEnteredStoodDown) <= kVrWorldEnteredTailBytes, "the OWNS line's stood-down sentence must fit the suffix buffer");
+inline int vrWorldFormatEntered(char* out, size_t size, uint64_t frame, uint32_t warmFrames, const char* curve = nullptr) {
+    char tail[kVrWorldEnteredTailBytes] = "";
+    if (curve && std::strcmp(curve, "off") != 0) {
+        if (std::strcmp(curve, "pending") == 0) std::snprintf(tail, sizeof(tail), "%s", kVrWorldEnteredPending);
+        else if (std::strcmp(curve, "stood-down") == 0) std::snprintf(tail, sizeof(tail), "%s", kVrWorldEnteredStoodDown);
+        else std::snprintf(tail, sizeof(tail), "%s%s%s", kVrWorldEnteredStripHead, curve, kVrWorldEnteredStripTail);
+    }
     return std::snprintf(out, size,
         "vr world route: OWNS the world from frame=%llu after %u treated frames in a row; the eye shift is off and the "
-        "layer takes the screen draw on every frame the route treats (the eye route serves the rest)",
-        static_cast<unsigned long long>(frame), warmFrames);
+        "layer takes the screen draw on every frame the route treats (the eye route serves the rest)%s",
+        static_cast<unsigned long long>(frame), warmFrames, tail);
 }
 // The route let go: why, and what it had done.
 // lastDecline: the selector's reason for the frames the route declined just before it let go (null or empty when it

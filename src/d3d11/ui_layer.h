@@ -204,6 +204,9 @@ void uiLayerCrispToneEnd(ID3D11DeviceContext* ctx);
 // SECOND time, after the game's draw, into the eye's layer -- the game's own shader, opaque, from the route's mipped
 // copy of the resolved screen through a trilinear sampler like the game's -- and the door then runs layer-only for
 // that eye (native_temporal.cpp, native_sharpen.cpp): the layer's opaque screen over a black frame IS the eye.
+// With fix.panel_curvature above 0 the game's draw is the curve substitution's strip (panel_curve.h) and the second draw is that
+// strip too: vscreen.cpp issues panelCurveReissue between Begin and End, the same helper that bound the strip for the game's draw,
+// so the layer's bend and placement are the game's (the plan accepts a substituted draw as it does a flat one).
 // With experimental.temporal_aa_on_foot_world off none of this ever happens (the route never owns a frame): the
 // decision, the draws, the jitter and the door are what they were.
 //
@@ -231,8 +234,10 @@ inline bool uiLayerWorldReissuePending() { return detail::g_uiLayerWorldReissue;
 // VrWorldInternalScope, so vscreen's hooks step aside.
 bool uiLayerWorldReissueBegin(ID3D11DeviceContext* ctx);
 // Puts every binding Begin changed back and, when the re-issue landed, tells the route which eye it took
-// (vrWorldRouteNoteEyeTaken). Safe without a Begin.
-void uiLayerWorldReissueEnd(ID3D11DeviceContext* ctx);
+// (vrWorldRouteNoteEyeTaken). Safe without a Begin. landed false (the curved screen's strip draw faulted after Begin: panel_curve.h
+// panelCurveReissue returned false): the bindings go back, the eye is NOT taken, and the refusal is counted as a fault -- the eye
+// route serves the eye. Every other caller issues a draw that cannot fail this way and passes nothing.
+void uiLayerWorldReissueEnd(ID3D11DeviceContext* ctx, bool landed = true);
 // The decided draw went no further (the game's draw was swallowed or never issued): forget the pending re-issue.
 void uiLayerWorldReissueAbandon();
 // The door's preflight, from treat() before it commits an eye to layer-only: would the composite certainly run

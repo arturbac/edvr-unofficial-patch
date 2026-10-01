@@ -8,6 +8,10 @@
 //   - the happy path: the resolver is called once at the tone, on slot 2, on H, with the route's flags; warm-up, ownership,
 //     and the published state the eye shift and the layer read;
 //   - every refusal the selector names: no resolver call, the eye route serves the frame, the reason in the log;
+//   - a CURVED screen (fix.panel_curvature above 0) does not hold the route off: it resolves, owns and may take frames as a flat screen
+//     does, its 5 s line names the curve (pending, stood-down, or curvature/columns/gain) and each window's strips (a delta of
+//     panel_curve's cumulative count), and its OWNS line says so; with the key off the curve changes nothing; with curvature 0 the
+//     lines are what they were (curve=off);
 //   - the route's own calls pass the hooks' internal flags, and leave the game's pipeline state as they found it;
 //   - late writes into H latch the route off; a scene reset releases and resets; a frame gap resets the history;
 //   - the key going off while owned lets go of everything;
@@ -170,11 +174,15 @@ bool flatCameraVrQuiet() { return !g_inj.gateOpen; }
 }  // namespace edvr
 
 namespace edvr {
-// panel_curve.h's state (panelCurveWants is inline over these): a scenario sets the curvature the way the config would.
+// panel_curve.h's state (panelCurveWants and panelCurveInfo are inline over these): a scenario sets the curvature the way the config
+// would, and the strip's readiness, gain and re-issue count the way panel_curve.cpp would. panel_curve.cpp is not linked.
 namespace detail {
 bool g_panelCurveStoodDown = false;
 float g_panelCurveCurvature = 0.0f;
 int g_panelCurveSegments = kDefaultSegments;
+float g_panelCurveGain = 0.0f;
+bool g_panelCurveReady = false;
+uint64_t g_panelCurveReissues = 0;   // cumulative, as in the DLL: it only grows, and the route prints each window's delta of it
 }  // namespace detail
 thread_local bool g_flatComputeInternal = false;
 Log& Log::get() { static Log instance; return instance; }
@@ -344,6 +352,7 @@ struct FrameOpts {
     bool secondDepth = false;     // H is drawn with two different depth targets
     bool noTone = false;          // the frame has H but no consumer
     int gbufferDraws = 4;         // draws into one target pair before H: the run the route skips at two compares
+    bool holdBoundary = false;    // stop after the eye refreshes: the frame's flags are still up and the boundary is the caller's
 };
 // The retake chain at tiny scale (design doc section 82): the world into the G-buffer, H's draws (with the screen depth), the
 // exposure reduction on a COPY of H, late draws, the 630x354-style tiny draws reading H, the tone, then what follows it.
@@ -360,6 +369,7 @@ void frame(World& w, const FrameOpts& o = {}) {
     if (o.lateWrite && g_vrWorldWatchWrites) vrWorldRouteNoteWrite(w.h.Get());   // the hooks' own guard
     draw(w, w.rtone.Get(), nullptr, {w.sother.Get()});   // the game copy, the HUD, the eye composites: writes elsewhere
     gameEyeRefreshes();   // the eye cameras (kind 5) refresh after the tone, at the eye composites
+    if (o.holdBoundary) return;
     vrWorldRouteFrameBoundary();
     bindingFrameBoundary();
 }
@@ -368,6 +378,19 @@ size_t countLines(const char* needle) {
     size_t n = 0;
     for (const auto& l : g_log) if (l.find(needle) != std::string::npos) ++n;
     return n;
+}
+// The last 5 s line the route logged ("" when it has logged none).
+std::string lastWindowLine() {
+    std::string out;
+    for (const auto& l : g_log) if (l.find("vr world route 5s:") != std::string::npos) out = l;
+    return out;
+}
+// The one line that says the route took the world (the OWNS line), "" when there is none or more than one.
+std::string ownsLine() {
+    std::string out;
+    size_t n = 0;
+    for (const auto& l : g_log) if (l.find("OWNS the world") != std::string::npos) { out = l; ++n; }
+    return n == 1 ? out : std::string();
 }
 void configure(bool routeOn) {
     Config::get().set("experimental.temporal_aa_on_foot_world", routeOn ? "auto" : "off");
@@ -388,6 +411,9 @@ void reset(World& w) {
     g_namedDepth = w.depth.Get();
     edvr::detail::g_panelCurveStoodDown = false; edvr::detail::g_panelCurveCurvature = 0.0f;
     edvr::detail::g_panelCurveSegments = edvr::detail::kDefaultSegments;
+    edvr::detail::g_panelCurveReady = false; edvr::detail::g_panelCurveGain = 0.0f;
+    // g_panelCurveReissues is NOT zeroed: the route prints each window's delta against the last count it saw (it keeps that across the key
+    // going off, as in the DLL), and a cumulative count that went backwards would print a wrapped number. A scenario adds to it instead.
 }
 
 void stage2(World& w);
@@ -403,6 +429,16 @@ void scenarios(World& w) {
     check(g_log.empty() && g_mipsResets == 0, "key off: not one log line and nothing released");
     check(g_inj.frameCalls == 0 && g_inj.closeCalls == 0 && g_inj.frames.empty() && g_inj.c.calls > 0,
           "key off: the camera injector is never touched (no frame step, no window close), although the game's cameras refreshed every frame");
+
+    // 1b. KEY OFF with a curved screen: the curve does not wake a route that is off (its state is read only inside the key-auto branch).
+    reset(w);
+    edvr::detail::g_panelCurveCurvature = 0.3f; edvr::detail::g_panelCurveReady = true; edvr::detail::g_panelCurveGain = 35.556f;
+    for (int i = 0; i < 30; ++i) frame(w);
+    check(g_backendCalls == 0 && !g_vrWorldWants && !vrWorldRouteOwnsNextFrame() && !vrWorldRouteTreatedThisFrame() &&
+              vrWorldRouteState() == VrWorldState::Off && !vrWorldRouteLayerMayTake() && !vrWorldRouteEnabled() && g_log.empty() && g_mipsResets == 0,
+          "key off with a curved screen: 30 frames: no resolve, no draw watched, nothing owned, not one log line");
+    check(g_inj.frameCalls == 0 && g_inj.closeCalls == 0 && g_inj.frames.empty(),
+          "key off with a curved screen: the camera injector is never touched either");
 
     // 2. THE HAPPY PATH.
     reset(w);
@@ -461,6 +497,10 @@ void scenarios(World& w) {
         }
         check(lineOk, "owned: the 5 s line counts the eye's take once and the layer-only door once (asked twice)");
         check(stateOk, "owned: the 5 s line names the state (owned) and the selection (selected)");
+        // With fix.panel_curvature 0 nothing about the flat route changes: the line says curve=off and no strips, the OWNS line has no word about a curve.
+        check(lastWindowLine().find(" curve=off curve-reissues=0 ") != std::string::npos && !ownsLine().empty() &&
+                  ownsLine().find("curved") == std::string::npos && countLines("fix.panel_curvature") == 0,
+              "owned: a flat screen: the 5 s line says curve=off curve-reissues=0, and the OWNS line and the log say nothing about a curve");
     }
     check(!vrWorldRouteDoorLayerOnly(0, 77), "owned: the per-frame tags are cleared at the boundary");
     const auto stats = flatMonoResolveStats();
@@ -562,26 +602,101 @@ void scenarios(World& w) {
         frame(w); frame(w);
         check(g_backendCalls >= 1, "layer not live: live again, the route treats");
     }
-    {   // the curved screen: the layer cannot re-issue it, so the route owns no frame while the substitution is wanted
+    {   // the layer not live with a curved screen: the layer is the only thing that holds the route off, and the line names ITS reason
         reset(w);
         configure(true);
         edvr::detail::g_panelCurveCurvature = 0.3f;
+        g_layerLive = false;
         for (int i = 0; i < 5; ++i) frame(w);
-        check(g_backendCalls == 0 && !g_vrWorldWants && countLines("the route stays off") == 1 && countLines("fix.panel_curvature bends") == 1,
-              "curved screen: five frames, no resolve, draws not watched, ONE line saying the route stays off and why (fix.panel_curvature)");
-        edvr::detail::g_panelCurveCurvature = 0.0f;
+        check(g_backendCalls == 0 && !g_vrWorldWants && countLines("the route stays off") == 1 && countLines("fix.ui_quality") >= 1 &&
+                  countLines("fix.panel_curvature") == 0,
+              "curved screen, layer not live: five frames, no resolve, ONE line saying the route stays off, and it names the layer's reason, not the curve");
+        g_layerLive = true;
         frame(w); frame(w);
-        check(g_backendCalls >= 1, "curved screen: curvature back to 0, the route treats");
+        check(g_backendCalls >= 1, "curved screen, layer live again: the route treats");
+    }
+    {   // THE CURVED SCREEN (fix.panel_curvature above 0) no longer holds the route off. The layer re-issues the game's own strip, so the route
+        // resolves, owns and takes frames as it does for a flat screen, and says which curve (the OWNS line, the 5 s line's curve= and curve-reissues=).
         reset(w);
         configure(true);
-        edvr::detail::g_panelCurveSegments = edvr::detail::kDefaultSegments + 8;   // the identity test wants the substitution too
-        for (int i = 0; i < 3; ++i) frame(w);
-        check(g_backendCalls == 0 && countLines("fix.panel_curvature bends") == 1, "curved screen: a non-default segment count (the identity test) is the same substitution");
+        edvr::detail::g_panelCurveCurvature = 0.3f;   // asked for, no strip drawn yet: the substitution is still learning the panel's SIZE
+        vrWorldRouteFrameBoundary();
+        check(vrWorldRouteState() == VrWorldState::Observing && g_vrWorldWants && vrWorldRouteEnabled(),
+              "curved screen: the first boundary with the key auto leaves the route Observing and wanting draws (a curve does not hold it off)");
+        for (int i = 0; i < int(kVrWorldWarmFrames); ++i) frame(w);
+        check(g_backendCalls == int(kVrWorldWarmFrames) && g_vrWorldWants && vrWorldRouteState() == VrWorldState::Owned && vrWorldRouteOwnsNextFrame(),
+              "curved screen: the resolver is called on every frame, the route owns after the warm-up and the eye shift is off, as for a flat screen");
+        check(countLines("the route stays off") == 0 && countLines("fix.panel_curvature") == 0,
+              "curved screen: not one line says the route stays off or names fix.panel_curvature");
+        check(!ownsLine().empty() &&
+                  ownsLine().find("; the screen is set to curve (curve=pending): the strip is not built yet, so the game and the layer both draw the flat quad until it is") !=
+                      std::string::npos &&
+                  ownsLine().find("the layer draws the same strip") == std::string::npos,
+              "curved screen: the OWNS line is printed once and says what is true while no strip is built: curve=pending, the flat quad is drawn");
+        FrameOpts held;
+        held.holdBoundary = true;
+        frame(w, held);   // an owned frame, the boundary not yet run: once the route treated it (at the tone) the layer may take the screen draw
+        check(vrWorldRouteLayerMayTake() && vrWorldRouteTreatedThisFrame(), "curved screen: once the route treated the frame the layer may take the (curved) screen draw");
+        vrWorldRouteFrameBoundary();
+        bindingFrameBoundary();
+        // The 5 s line: three windows of real time. Pending and no strips; then the strip's numbers and the window's strips; then the next
+        // window's own count (a delta of panel_curve's cumulative count, not the count itself).
+        Sleep(5100);
+        frame(w);
+        std::string window = lastWindowLine();
+        check(window.find(" curve=pending curve-reissues=0 ") != std::string::npos && window.find("state=owned") != std::string::npos,
+              "curved screen: the 5 s line names the curve before its strip is drawn: curve=pending curve-reissues=0");
+        edvr::detail::g_panelCurveReady = true;
+        edvr::detail::g_panelCurveGain = 35.556f;
+        edvr::detail::g_panelCurveReissues += 12;
+        Sleep(5100);
+        frame(w);
+        window = lastWindowLine();
+        check(window.find(" curve=0.300/64/35.556 curve-reissues=12 ") != std::string::npos,
+              "curved screen: once the strip is ready the 5 s line names curvature/columns/gain (curve=0.300/64/35.556) and the strips the window re-issued (12)");
+        edvr::detail::g_panelCurveReissues += 18;
+        Sleep(5100);
+        frame(w);
+        window = lastWindowLine();
+        check(window.find(" curve=0.300/64/35.556 curve-reissues=18 ") != std::string::npos && window.find("curve-reissues=30") == std::string::npos,
+              "curved screen: curve-reissues is each window's own count (30 strips in all, 18 of them in this window)");
+        check(vrWorldRouteState() == VrWorldState::Owned && g_backendCalls >= int(kVrWorldWarmFrames) + 3,
+              "curved screen: and the route stayed Owned and kept resolving through the three windows");
+    }
+    {   // the OWNS line names the numbers when the strip is already in hand at ownership (the usual case: the substitution drew it frames ago)
         reset(w);
         configure(true);
-        edvr::detail::g_panelCurveCurvature = 0.3f; edvr::detail::g_panelCurveStoodDown = true;   // the feature stood itself down
-        for (int i = 0; i < 3; ++i) frame(w);
-        check(g_backendCalls >= 1 && countLines("fix.panel_curvature bends") == 0, "curved screen: a substitution that stood itself down does not hold the route off");
+        edvr::detail::g_panelCurveCurvature = 0.3f; edvr::detail::g_panelCurveReady = true; edvr::detail::g_panelCurveGain = 35.556f;
+        vrWorldRouteFrameBoundary();
+        for (int i = 0; i < int(kVrWorldWarmFrames); ++i) frame(w);
+        check(g_backendCalls == int(kVrWorldWarmFrames) && vrWorldRouteState() == VrWorldState::Owned &&
+                  ownsLine().find("; the screen is curved (curve=0.300/64/35.556): the layer draws the same strip the game's own draw is substituted with, "
+                                  "so the bend and the placement are the game's") != std::string::npos &&
+                  ownsLine().find("flat quad") == std::string::npos,
+              "curved screen: with the strip in hand the OWNS line names its numbers (curve=0.300/64/35.556) and says the layer draws the game's own strip");
+    }
+    {   // the identity test's column count alone (curvature 0, advanced.panel_curvature_segments off its default) asks for the substitution too: a curve like any other
+        reset(w);
+        configure(true);
+        edvr::detail::g_panelCurveSegments = edvr::detail::kDefaultSegments + 8;
+        edvr::detail::g_panelCurveReady = true; edvr::detail::g_panelCurveGain = 20.0f;
+        vrWorldRouteFrameBoundary();
+        for (int i = 0; i < int(kVrWorldWarmFrames); ++i) frame(w);
+        check(g_backendCalls == int(kVrWorldWarmFrames) && vrWorldRouteState() == VrWorldState::Owned && countLines("the route stays off") == 0 &&
+                  ownsLine().find("the screen is curved (curve=0.000/72/20.000)") != std::string::npos,
+              "curved screen: a non-default segment count (the identity test) is a curve the route runs with, and the OWNS line names it (curve=0.000/72/20.000)");
+    }
+    {   // a substitution that stood itself down (a fault, or a SIZE that is no panel's) draws the game's own quad again: the route still runs
+        reset(w);
+        configure(true);
+        edvr::detail::g_panelCurveCurvature = 0.3f; edvr::detail::g_panelCurveStoodDown = true;
+        vrWorldRouteFrameBoundary();
+        for (int i = 0; i < int(kVrWorldWarmFrames); ++i) frame(w);
+        check(g_backendCalls == int(kVrWorldWarmFrames) && vrWorldRouteState() == VrWorldState::Owned && countLines("the route stays off") == 0 &&
+                  ownsLine().find("; the screen is set to curve but the curve stood down (curve=stood-down): the game draws its own flat quad and the layer re-issues it flat") !=
+                      std::string::npos &&
+                  ownsLine().find("the layer draws the same strip") == std::string::npos,
+              "curved screen: a substitution that stood itself down does not hold the route off, and the OWNS line says the curve stood down and the flat quad is drawn");
     }
     {   // the gate lost while owned, then regained
         reset(w);

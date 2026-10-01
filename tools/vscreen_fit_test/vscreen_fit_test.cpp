@@ -9,8 +9,8 @@
 // WHAT IS PINNED, by rule (a check's label starts with its rule's id: the mutation tool names the rule each edit must trip):
 //   R1  the constants of the rule (m, floor, cap multiplier, step, Sean's calibration point) and today's rule, unchanged: the
 //       legacy width and its 16:9 height, rounding half up
-//   R2  the route's conditions: each one alone sends the width back to the legacy rule and says why; the curve is consulted in
-//       exactly one named place; a route that will not run gives EXACTLY the old answer for every distance and footprint
+//   R2  the route's conditions: each one alone sends the width back to the legacy rule and says why; the rule does not consult the
+//       curve (a curved screen is not a condition); a route that will not run gives EXACTLY the old answer for every distance and footprint
 //   R3  the fit: the first launch on Sean's rig is the width he flew (3504x1971), a measurement replaces the seed, the footprint
 //       rescales as 1/d, the floor and the cap, a small eye, never above the legacy width, always a multiple of 16 and 16:9
 //   R4  sizes another target already has: never produced by a fit (nudged up, else down), the legacy rule untouched
@@ -24,7 +24,7 @@
 //   R10 the route's key parse, pinned against the route's own (the resolver does not include the route's header chain)
 //   R11 the state files on disk (vscreen_auto_state.cpp): the footprint's round trip beside the eye width's, in a temp directory
 //   R12 the wiring, as source pins: the resolver's reads match their owners', the instrument's hook sits where the pins say and
-//       stays off the flat profile, its D3D calls never wait and always step past the hooks, the named place for the curve
+//       stays off the flat profile, its D3D calls never wait and always step past the hooks, the resolver reads no curve fact
 //   R13 Elite's Supersampling below 1.0 in VR (src/common/vr_supersample_notice.h; design section 83, the VR warning): the pure
 //       judgement over the measured render size and the eye's, the published word, the words, and the wiring as source pins
 //       (the detection is vscreen's own measurement, never Elite's settings file; the toast, the Status line and the settings
@@ -138,7 +138,6 @@ fit::RouteFacts goodRoute() {
     fit::RouteFacts f;
     f.flatProfile = false;
     f.keyAuto = true;
-    f.curved = false;
     f.layerWhy = nullptr;
     f.runtime = fit::RuntimeKind::NotLoadedYet;
     return f;
@@ -195,7 +194,7 @@ void caseR1() {
 // ---- R2: the route's conditions ------------------------------------------------------------------------------------------
 void caseR2() {
     const fit::RouteVerdict good = fit::routeVerdict(goodRoute());
-    check(good.runs && good.why[0] == 0, "R2a: all four conditions hold: the route will run and nothing is named");
+    check(good.runs && good.why[0] == 0, "R2a: every condition holds: the route will run and nothing is named");
     {
         fit::RouteFacts f = goodRoute();
         f.runtime = fit::RuntimeKind::EdvrOpenXr;
@@ -207,7 +206,6 @@ void caseR2() {
     const One singles[] = {
         {"R2b: the flat profile never fits", [](fit::RouteFacts& f) { f.flatProfile = true; }, "flat profile"},
         {"R2b: the key not auto: no route", [](fit::RouteFacts& f) { f.keyAuto = false; }, "experimental.temporal_aa_on_foot_world is not auto"},
-        {"R2b: a curved screen: the route stands aside", [](fit::RouteFacts& f) { f.curved = true; }, "fix.panel_curvature is above 0"},
         {"R2b: the UI layer not live: no route", [](fit::RouteFacts& f) { f.layerWhy = "fix.ui_quality is off"; }, "fix.ui_quality is off"},
         {"R2b: Elite's native Oculus back end: no route", [](fit::RouteFacts& f) { f.runtime = fit::RuntimeKind::OculusNative; }, "native Oculus"},
         {"R2b: a foreign openvr_api.dll: no route", [](fit::RouteFacts& f) { f.runtime = fit::RuntimeKind::ForeignOpenvr; }, "not EDVR's"},
@@ -223,13 +221,15 @@ void caseR2() {
         checkf(d.rule == fit::Rule::Legacy && d.width == 5040 && !d.route.runs && has(d.route.why, one.phrase),
                "R2e: with the condition failing (%s) the width is the legacy 5040 and the decision names it", one.phrase);
     }
-    {
+    {   // every condition at once: the flat profile, the key, the layer and the runtime (four reasons, three separators)
         fit::RouteFacts f = goodRoute();
+        f.flatProfile = true;
         f.keyAuto = false;
-        f.curved = true;
         f.layerWhy = "fix.ui_quality is off";
+        f.runtime = fit::RuntimeKind::OculusNative;
         const fit::RouteVerdict v = fit::routeVerdict(f);
-        check(!v.runs && has(v.why, "not auto") && has(v.why, "panel_curvature") && has(v.why, "ui_quality is off") && count(v.why, "; ") == 2,
+        check(!v.runs && has(v.why, "flat profile") && has(v.why, "not auto") && has(v.why, "ui_quality is off") && has(v.why, "native Oculus") &&
+                  count(v.why, "; ") == 3,
               "R2d: every failing condition is named, joined with \"; \"");
     }
     // A route that will not run gives EXACTLY the old answer, for every distance and every stored footprint.
@@ -239,18 +239,23 @@ void caseR2() {
             for (double d : {0.25, 0.5, 0.7, 1.0, 2.0, 4.0, 9.0})
                 for (double frac : {0.0, 0.1, 0.6083, 1.5}) {
                     fit::Inputs in = measuredInputs(eye, d, frac);
-                    in.route.curved = true;
+                    in.route.keyAuto = false;   // a condition that fails: the route will not run
                     const fit::Decision r = fit::decide(in);
                     same = same && r.rule == fit::Rule::Legacy && r.width == refLegacy(eye) && r.height == refHeight(refLegacy(eye)) && r.footprintPx == 0.0 &&
                            r.source == fit::Source::None;
                 }
         check(same, "R2e: a route that will not run is the legacy rule exactly, whatever the distance or the stored footprint");
     }
-    // The curve is consulted in one named place: the header names the function once and calls it once.
+    // The rule does not consult the curve: the route re-issues a curved screen through the game's own strip, so a curved screen is
+    // not a condition. The header has no function that asks, no `curved` fact, and says so in the paragraph that names it.
     const std::string header = readFile("src\\common\\vscreen_fit.h");
     if (!header.empty()) {
-        check(count(header, "routeStandsAsideForCurve(") == 2 && count(header, ".curved") == 1 && count(header, "THE NAMED PLACE") == 1,
-              "R2f: the curve is consulted in exactly one named place (routeStandsAsideForCurve: defined once, called once)");
+        check(!has(header, "routeStandsAsideForCurve") && !has(header, "THE NAMED PLACE"),
+              "R2f: the rule does not consult the curve (no routeStandsAsideForCurve, no named place for it)");
+        check(!has(header, "bool curved") && !has(header, ".curved") && !has(header, "f.curved"),
+              "R2f: and RouteFacts carries no `curved` fact");
+        check(count(header, "A CURVED SCREEN (fix.panel_curvature above 0) IS NOT A CONDITION.") == 1,
+              "R2f: and the header says in one paragraph that a curved screen is not a condition");
     }
 }
 
@@ -658,7 +663,7 @@ void caseR9() {
     }
     {   // legacy: names the failed condition
         fit::Inputs in = seedInputs(4032, 0.7);
-        in.route.curved = true;
+        in.route.keyAuto = false;
         in.route.layerWhy = "fix.ui_quality is off";
         const fit::Decision d = fit::decide(in);
         const int n = fit::formatRuleLine(line, sizeof(line), d, 4032);
@@ -667,8 +672,8 @@ void caseR9() {
         const auto t = tokensOf(s, "vScreen resolution: auto = 5040 wide: ");
         check(tok(t, "rule") == "legacy" && tok(t, "source") == "none" && tok(t, "route") == "no" && tok(t, "m") == "1.25" && tok(t, "legacy") == "5040",
               "R9d: rule=legacy source=none route=no m=1.25");
-        check(has(s, "LEGACY") && has(s, "fix.panel_curvature is above 0") && has(s, "fix.ui_quality is off"),
-              "R9d: and the prose names EVERY route condition that failed");
+        check(has(s, "LEGACY") && has(s, "experimental.temporal_aa_on_foot_world is not auto") && has(s, "fix.ui_quality is off") && !has(s, "panel_curvature"),
+              "R9d: and the prose names EVERY route condition that failed (the curve is not one of them)");
     }
     {   // the hint
         char hint[200];
@@ -842,12 +847,11 @@ void caseR12() {
     const std::string res = readFile("src\\d3d11\\vscreen_res.cpp");
     const std::string route = readFile("src\\d3d11\\vr_world_route.cpp");
     const std::string layer = readFile("src\\d3d11\\ui_layer.cpp");
-    const std::string curve = readFile("src\\d3d11\\panel_curve.cpp");
     const std::string vs = readFile("src\\d3d11\\vscreen.cpp");
     const std::string fp = readFile("src\\d3d11\\vscreen_footprint.cpp");
     const std::string ini = readFile("edvr.ini");
     const std::string flatRuntime = readFile("src\\d3d11\\flat_runtime.cpp");
-    check(!res.empty() && !route.empty() && !layer.empty() && !curve.empty() && !vs.empty() && !fp.empty() && !ini.empty(), "R12a: the sources the pins read are readable from the repo root");
+    check(!res.empty() && !route.empty() && !layer.empty() && !vs.empty() && !fp.empty() && !ini.empty(), "R12a: the sources the pins read are readable from the repo root");
     if (g_failure.size()) return;
 
     // The resolver reads each of the route's conditions the way its owner does.
@@ -860,17 +864,14 @@ void caseR12() {
     check(has(res, "temporalModeEnabled(") && has(layer, "temporalModeEnabled(") && has(res, "uiQualityParse(") && has(layer, "uiQualityParse(") &&
               has(res, "uiLayerNotLiveReasonFor(target, temporal, jitterAsShipped, /*stoodDown=*/false)"),
           "R12c: through the same parsers, and the layer's own words for why it is not live");
-    {
-        const std::string want = functionBody(curve, "bool panelCurveWantedByConfig(Config& cfg) {");
-        const std::string conf = functionBody(curve, "void panelCurveConfigure(Config& cfg) {");
-        check(!want.empty() && has(want, "cfg.getFloat(\"fix.panel_curvature\", 0.0f)") && has(conf, "cfg.getFloat(\"fix.panel_curvature\", 0.0f)") &&
-                  has(want, "c < 0.0f || c > kMaxCurvature") && has(conf, "c < 0.0f || c > kMaxCurvature") &&
-                  has(want, "cfg.getIntInRange(\"advanced.panel_curvature_segments\"") && has(conf, "cfg.getIntInRange(\"advanced.panel_curvature_segments\"") &&
-                  has(want, "return c > 0.0f || segments != kDefaultSegments;"),
-              "R12d: panelCurveWantedByConfig reads the curvature and the segment count as panelCurveConfigure does, with the predicate panelCurveWants() has");
+    check(has(res, "f.flatProfile = runtimeFlatProfile();") && has(res, "vscreenfit::decide(in)"),
+          "R12e: the resolver asks the pure rule, with the flat profile as a fact");
+    {   // A curved screen is not a condition of the route (it re-issues the game's own strip), so the resolver reads no curve fact.
+        const std::string facts = functionBody(res, "vscreenfit::RouteFacts routeFactsFromConfig(Config& cfg) {");
+        check(!facts.empty() && !has(facts, "panel_curvature") && !has(facts, "panelCurve") && !has(facts, ".curved") &&
+                  !has(res, "#include \"panel_curve.h\""),
+              "R12e: the resolver reads no curve fact: routeFactsFromConfig does not read the curvature and vscreen_res.cpp does not include panel_curve.h");
     }
-    check(has(res, "f.flatProfile = runtimeFlatProfile();") && has(res, "f.curved = panelCurveWantedByConfig(cfg);") && has(res, "vscreenfit::decide(in)"),
-          "R12e: the resolver asks the pure rule, with the flat profile and the curve as facts");
     {
         const std::string resolve = functionBody(res, "void resolveVScreenTargetResolution(");
         check(has(resolve, "if (announce) {") && has(resolve, "formatRuleLine(") && before(resolve, "vscreenfit::decide(in)", "formatRuleLine("),
@@ -882,10 +883,20 @@ void caseR12() {
     // The instrument's hook in the draw path, and what arms it.
     {
         const std::string thunk = functionBody(vs, "void STDMETHODCALLTYPE hookedDrawIndexedInstanced(");
-        check(count(vs, "footprintEyeDraw(") == 2 && has(thunk, "if (eyeGeometry && vscreenFootprintWanted())") && before(thunk, "cameraCensusEyeDraw(self);", "footprintEyeDraw(self,"),
-              "R12f: the instrument's call is made in the DrawIndexedInstanced thunk only, for an eye draw, behind its one flag, after the game's own issue");
+        check(count(vs, "footprintEyeDraw(") == 3 && count(thunk, "footprintEyeDraw(") == 1 &&
+                  has(thunk, "if (eyeGeometry && vscreenFootprintWanted())") && before(thunk, "cameraCensusEyeDraw(self);", "footprintEyeDraw(self,"),
+              "R12f: the instrument is called from the DrawIndexedInstanced thunk (for an eye draw, behind its one flag, after the game's own issue) and from the curved screen's swallowed draw (below), and nowhere else");
         check(has(thunk, "v == DrawVerdict::kPanel ? g_state->distanceScale : 1.0f"),
               "R12f: it is told the panel distance the draw's constants carry (the scaled one only when the override replaced the draw's cb0)");
+        // The curved screen: the substitution swallows the game's draw (the tail above is never reached), so the instrument is called
+        // from the swallowed path, on the owner context, for an eye draw, behind the same flag, and before the route's return.
+        const std::string swallowed = functionBody(vs, "void curvedScreenSwallowed(");
+        check(count(swallowed, "footprintEyeDraw(") == 1 && has(swallowed, "if (self != g_state->ownerCtx) return;") &&
+                  has(swallowed, "if (g_state->rtv0Eye && count && instances && vscreenFootprintWanted())") &&
+                  before(swallowed, "if (self != g_state->ownerCtx) return;", "footprintEyeDraw(self,") && before(swallowed, "footprintEyeDraw(self,", "if (!routeOwns) return;"),
+              "R12f: the curved screen's swallowed draw calls the instrument once: owner context only, an eye draw, behind the same flag, whether or not the route owns the frame");
+        check(has(swallowed, "v == DrawVerdict::kPanel ? g_state->distanceScale : 1.0f, args.base, args.startInstance"),
+              "R12f: and tells it the panel distance the draw's constants carry, with the draw's own base vertex and start instance");
         const std::string gate = functionBody(vs, "bool drawGateSubscribed(State* s) {");
         check(has(gate, "vscreenFootprintWanted()"), "R12g: the draw gate lists the instrument (a subscriber that is not listed starves when nothing else is on)");
         check(count(vs, "tkVScreenFootprint.run(") == 1 && before(vs, "tkVrCameraCensus.run(", "tkVScreenFootprint.run(") && before(vs, "tkVScreenFootprint.run(", "tkScreenMotion.run(") &&
@@ -927,8 +938,9 @@ void caseR12() {
         const size_t at = ini.find("\nvscreen_res_width = auto");
         const size_t from = at == std::string::npos ? at : ini.rfind("\n\n", at);
         const std::string block = (at == std::string::npos || from == std::string::npos) ? std::string() : ini.substr(from, at - from);
-        check(!block.empty() && has(block, "world route") && has(block, "fitted") && has(block, "125%") && has(block, "Needs a game restart") && has(block, "fix.panel_curvature"),
-              "R12o: edvr.ini's text for the key names both rules, the route's conditions that matter to a user, and the restart");
+        check(!block.empty() && has(block, "world route") && has(block, "fitted") && has(block, "125%") && has(block, "Needs a game restart") &&
+                  has(block, "fix.panel_curvature, does not stop it") && !has(block, "fix.panel_curvature at 0"),
+              "R12o: edvr.ini's text for the key names both rules, the route's conditions that matter to a user (a curved screen does not stop it), and the restart");
     }
 }
 

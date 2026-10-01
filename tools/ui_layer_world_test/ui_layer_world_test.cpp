@@ -20,8 +20,11 @@
 //      state, PS slots 0 and 1 (textures and samplers), shaders -- exactly the game's objects, after a landed
 //      re-issue and after every refusal.
 //   4. EVERY REFUSAL: a named counter, the game's state untouched, nothing taken, the route never told (no mips, no
-//      sampler, no sampler bound, no source texture, a curved screen, a blending draw, depth state, not armed, the
-//      draw's bindings changed before the re-issue, abandoned).
+//      sampler, no sampler bound, no source texture, a blending draw (a substituted one too), depth state, not armed,
+//      the draw's bindings changed before the re-issue, abandoned).
+//   4b. A CURVED SCREEN is no refusal: the game's draw is the curve substitution's strip (uiLayerDecide's `substituted`), the plan
+//      accepts it like a flat one, the re-issue lands in the layer exactly as a flat draw's does and takes the eye; and a strip
+//      draw that did not happen (End told landed = false) closes the bracket without taking the eye, counted as a fault.
 //   5. THE HOOKS STEP ASIDE: every raw entry the re-issue calls runs with VrWorldInternalScope up, without an outer one.
 //   6. THE DOOR'S PREFLIGHT and the accessors, the lost-draw counter, the stats.
 //   7. THE ON-FOOT MAPS GATE (experimental.on_foot_maps_sharp, docs/design-world-camera-motion-2026-09-30.md, Phase 1), the layer's
@@ -811,10 +814,14 @@ void testRefusals(Rig& r) {
         ID3D11ShaderResourceView* none = nullptr;
         r.ctx->PSSetShaderResources(0, 1, &none);
     });
-    refusal(r, "a curved screen", UiWorldRefuse::kCurved, UiLayerDecision::kRedirect, [] {}, /*substituted=*/true);
+    // (A curved screen is no refusal: its draw is the curve substitution's strip and the plan accepts it like a flat draw, testCurvedScreen below.
+    // It is refused for the same other reasons a flat draw is: here, a blend.)
     refusal(r, "a blending draw", UiWorldRefuse::kNotOpaque, UiLayerDecision::kRedirect, [&] {
         bindGame(r, 0, r.premul.Get());
     });
+    refusal(r, "a substituted (curved) draw that blends", UiWorldRefuse::kNotOpaque, UiLayerDecision::kRedirect, [&] {
+        bindGame(r, 0, r.premul.Get());
+    }, /*substituted=*/true);
     refusal(r, "a blend the layer cannot convert", UiWorldRefuse::kNone, UiLayerDecision::kBlendRefused, [&] {
         bindGame(r, 0, r.maxBlend.Get());
     });
@@ -925,6 +932,117 @@ void testRefusals(Rig& r) {
             check(!uiLayerWorldReissueBegin(r.ctx.Get()), "...and the plan with it: a Begin after that decision finds nothing to re-issue");
         }
         uiLayerWorldReissueAbandon();
+    }
+}
+
+// A CURVED screen (fix.panel_curvature above 0). The game's draw is the curve substitution's strip, which uiLayerDecide is told as `substituted`;
+// the route's re-issue repeats that strip (vscreen.cpp worldScreenReissueCurved, between Begin and End), and End is told whether the strip's draw
+// happened. This rig draws the quad for both issues, as for a flat screen: what is proven here is the layer's half -- the plan accepts a substituted
+// draw like a flat one, Begin and End land it and take the eye, and a draw that did not happen takes nothing.
+void testCurvedScreen(Rig& r) {
+    g_stubs.mayTake = true;
+    g_stubs.mipsAnswer = r.mipsSrv.Get();
+    g_stubs.samplerAnswer = r.mipSampler.Get();
+    const uint32_t whole[4] = {0, 0, kDoorW, kDoorH};
+    const float uv[4] = {0, 0, 1, 1};
+    const auto layerOf = [&](uint64_t seq) {
+        std::vector<uint32_t> px;
+        if (ID3D11Texture2D* out = uiLayerComposite(seq, 0, r.frame[0].tex.Get(), whole, uv)) {
+            px = readPixels(r, out);
+            out->Release();
+        }
+        return px;
+    };
+    // The flat draw first, as the control: what its layer holds.
+    uint64_t seq = nextArmed(r);
+    bindGame(r, 0);
+    const Drawn flat = drawScreen(r, false);
+    const std::vector<uint32_t> flatLayer = layerOf(seq);
+    check(flat.reissued && !flat.taken && !flatLayer.empty() && region(flatLayer, kDoorW, 12, 12, 84, 60, kGreen),
+          "a flat draw (the control): re-issued, and its layer holds the screen where the quad is");
+
+    // A substituted draw: planned and re-issued exactly like it.
+    seq = nextArmed(r);
+    bindGame(r, 0);
+    const Snap before = take(r.ctx.Get());
+    const auto s0 = statsNow();
+    const unsigned took0 = g_stubs.tookCalls;
+    const Drawn d = drawScreen(r, /*substituted=*/true);
+    check(!d.taken && d.pendingAfterDecide && d.reissued,
+          "a substituted (curved) screen draw: the decision is the route's (never a take), the draw is held for the re-issue and the re-issue lands -- as for a flat one");
+    const auto s1 = statsNow();
+    bool refusedAny = false;
+    for (size_t i = 0; i < static_cast<size_t>(UiWorldRefuse::kCount); ++i) refusedAny = refusedAny || s1.refused[i] != s0.refused[i];
+    check(!refusedAny && s1.reissued == s0.reissued + 1 &&
+              s1.screenDecided[static_cast<size_t>(UiLayerDecision::kRedirect)] == s0.screenDecided[static_cast<size_t>(UiLayerDecision::kRedirect)],
+          "...no refusal of any kind is counted (a curved screen is not one), and the draw is counted as a re-issue, not as a screen draw redirected into the layer");
+    check(g_stubs.tookCalls == took0 + 1 && g_stubs.tookEye == 0 && g_stubs.tookSeq == seq, "...the route is told eye 0 was taken, for this sequence, once");
+    check(same(before, take(r.ctx.Get())) && !uiLayerWorldReissuePending() && !uiLayerRedirecting(),
+          "...every changed state is back, and nothing is pending or redirecting afterwards");
+    {   // The eye is the route's for this frame, as a flat screen's is: a post pass the game leaves in its eye image is counted as lost.
+        ID3D11ShaderResourceView* post = r.eye[1].srv.Get();
+        r.ctx->PSSetShaderResources(0, 1, &post);
+        detail::g_bindingSlots[static_cast<size_t>(BindSlot::PsSrv0)].ptr = post;
+        uiLayerNoteOther(r.ctx.Get(), 3, true, false, false, false, 1, 0, 'D');
+        detail::g_bindingSlots[static_cast<size_t>(BindSlot::PsSrv0)].ptr = nullptr;
+        check(statsNow().lostDraws == s1.lostDraws + 1, "...the eye is the route's, as a flat screen's is: a post pass the game leaves in its eye image is counted as a lost draw");
+    }
+    const std::vector<uint32_t> curvedLayer = layerOf(seq);
+    check(!curvedLayer.empty() && curvedLayer == flatLayer,
+          "...and the layer holds exactly what a flat draw's layer holds (the substitution changes nothing about how the layer takes the draw)");
+
+    // The strip's draw did not happen (panel_curve.h panelCurveReissue returned false after Begin): End(landed = false) closes the bracket
+    // and takes nothing -- the eye route serves the eye -- and the refusal is counted as a fault.
+    seq = nextArmed(r);
+    bindGame(r, 0);
+    const Snap beforeFault = take(r.ctx.Get());
+    const auto f0 = statsNow();
+    const unsigned tookF0 = g_stubs.tookCalls;
+    const bool taken = uiLayerDecide(r.ctx.Get(), static_cast<int>(UiLayerFamily::kScreen), true, /*substituted=*/true);
+    r.ctx->Draw(4, 0);   // the game's own issue
+    check(!taken && uiLayerWorldReissuePending(), "a re-issue whose strip draw faults: the decision held the draw");
+    {
+        VrWorldInternalScope internal;   // worldScreenReissueCurved's scope, around Begin and End
+        const bool began = uiLayerWorldReissueBegin(r.ctx.Get());
+        check(began && uiLayerRedirecting(), "...Begin lands: the layer is bound, with the mipped screen and the sampler at PS slot 0");
+        // (the draw between Begin and End did not happen)
+        uiLayerWorldReissueEnd(r.ctx.Get(), /*landed=*/false);
+    }
+    const auto f1 = statsNow();
+    check(same(beforeFault, take(r.ctx.Get())) && !uiLayerRedirecting() && !uiLayerWorldReissuePending(),
+          "...End(landed = false) puts every changed state back and closes the bracket");
+    check(g_stubs.tookCalls == tookF0 && f1.reissued == f0.reissued &&
+              f1.refused[static_cast<size_t>(UiWorldRefuse::kFault)] == f0.refused[static_cast<size_t>(UiWorldRefuse::kFault)] + 1,
+          "...the eye is NOT taken (the route is not told, nothing is counted as a re-issue) and the refusal is counted as a fault");
+    {   // The eye is not the route's: a draw the game then leaves in its own eye image (a post pass over it) is not counted as lost, as it is
+        // for a re-issued eye (above and testLostDraws) -- the eye route serves this eye.
+        ID3D11ShaderResourceView* post = r.eye[1].srv.Get();
+        r.ctx->PSSetShaderResources(0, 1, &post);
+        detail::g_bindingSlots[static_cast<size_t>(BindSlot::PsSrv0)].ptr = post;
+        uiLayerNoteOther(r.ctx.Get(), 3, true, false, false, false, 1, 0, 'D');
+        detail::g_bindingSlots[static_cast<size_t>(BindSlot::PsSrv0)].ptr = nullptr;
+        check(statsNow().lostDraws == f1.lostDraws, "...the eye is not the route's: a post pass the game leaves in its eye image is not counted as a lost draw");
+    }
+    uiLayerWorldReissueEnd(r.ctx.Get(), false);   // a second End without a Begin changes nothing
+    check(statsNow().refused[static_cast<size_t>(UiWorldRefuse::kFault)] == f1.refused[static_cast<size_t>(UiWorldRefuse::kFault)] && g_stubs.tookCalls == tookF0,
+          "...and a stray End(landed = false) counts nothing more");
+    // Nothing is left stuck: the next frame's draw lands and takes the eye as usual.
+    const uint64_t next = nextArmed(r);
+    bindGame(r, 0);
+    const Drawn again = drawScreen(r, true);
+    check(again.reissued && g_stubs.tookCalls == tookF0 + 1 && g_stubs.tookSeq == next, "...and the next frame's substituted draw lands and takes the eye (nothing is stuck)");
+    // A draw that landed, told so by default, is what it always was: End(ctx) and End(ctx, true) are one thing (every flat caller passes nothing).
+    const uint64_t last = nextArmed(r);
+    bindGame(r, 0);
+    uiLayerDecide(r.ctx.Get(), static_cast<int>(UiLayerFamily::kScreen), true, false);
+    r.ctx->Draw(4, 0);
+    const unsigned tookL0 = g_stubs.tookCalls;
+    {
+        VrWorldInternalScope internal;
+        const bool began = uiLayerWorldReissueBegin(r.ctx.Get());
+        r.ctx->Draw(4, 0);
+        uiLayerWorldReissueEnd(r.ctx.Get(), /*landed=*/true);
+        check(began && g_stubs.tookCalls == tookL0 + 1 && g_stubs.tookSeq == last, "End(landed = true) takes the eye, exactly as End(ctx) with no second argument does");
     }
 }
 
@@ -1311,6 +1429,168 @@ void testMapsGate(Rig& r) {
     }
 }
 
+// ================================================================ what the 5 s window says across the transitions of the first flight
+// The first flight of the maps gate (docs/design-world-camera-motion-2026-09-30.md, 8.10; Frontier, 2026-10-01 08:32:55.975) ended its
+// second panel period in a boarding: on foot with the route owning the world, then the ship's cockpit. The naming stopped with the last
+// 2D screen composite, three unnamed frames released the gate, the route let go on the same boundary (RELEASED on-foot-gate-lost), and
+// from then on every window read panel frames, no screen taken, no eye through the layer-only door -- because a cockpit draws no 2D
+// screen composite, which nothing in the line could say. The window line now carries screen-draws=: every 2D screen composite the
+// layer's decision SAW while the gate was on, taken or not. This replays the flight's transition and the one it did not take, against the
+// production layer, and reads the window lines back from its real log:
+//   a map opened with the route owning the world (composites re-issued, then taken, both eyes layer-only), closed again (taken until the
+//   second named frame holds the world), the route owning again; then the boarding: three unnamed frames, the gate and the route let go,
+//   and no composite follows. The first window is every one of those frames and its numbers are checked against the rig's own count of
+//   what it drew and what the layer did with it; the second is the cockpit alone -- the flight's windows: panel frames, nothing drawn,
+//   nothing taken, no door.
+// Two real 5 s windows, so the rig sleeps twice (the window's length is the layer's own constant).
+static unsigned windowNumber(const std::string& line, const char* key) {
+    const std::string needle = std::string(" ") + key + "=";
+    const size_t at = line.find(needle);
+    return at == std::string::npos ? ~0u : static_cast<unsigned>(std::strtoul(line.c_str() + at + needle.size(), nullptr, 10));
+}
+
+void testMapsTransitions(Rig& r) {
+    auto& cfg = Config::get();
+    wchar_t temp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, temp);
+    const std::wstring dir = std::wstring(temp) + L"edvr_ui_layer_world_maps_windows_" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    check(Log::get().open(dir, L"uilwwin"), "windows: the rig's log opens in a temp directory (its window lines are read back at the end)");
+
+    // On foot by the journal, the key on: the first boundary carries the world, held.
+    g_stubs.journalKnown = g_stubs.journalOnFoot = true;
+    g_stubs.depthKnown = false;
+    g_stubs.depthDraws = 0;
+    g_stubs.routeDoor = false;
+    g_stubs.mayTake = false;
+    cfg.set("experimental.on_foot_maps_sharp", "on");
+    uiLayerConfigure(cfg);
+    check(boundaryFrame(r, true) && uiLayerMapsOn(), "windows: (setup) the key on, on foot: the naming decides, carried from today's gate (the world)");
+
+    // What the rig drew and what the layer did with it, window by window (zeroed after each window line). The setup boundary above was the
+    // window's first frame, a world frame: the layer counts it, so the frame counts start at one.
+    unsigned reissued = 0, taken = 0, wrong = 0, doorMissed = 0, doorWrong = 0, worldFrames = 1, panelFrames = 0;
+    // A frame while the route owns the world: both eyes' composites are drawn and re-issued into the layer, never taken.
+    auto worldFrame = [&](bool named) {
+        nextArmed(r);
+        g_stubs.eyeDraws = 2;
+        for (int e = 0; e < 2; ++e) {
+            bindGame(r, e);
+            const Drawn d = drawScreen(r);
+            if (d.reissued && !d.taken) ++reissued; else ++wrong;
+        }
+        const bool held = boundaryFrame(r, named);
+        ++(held ? worldFrames : panelFrames);
+        return held;
+    };
+    // A frame while the layer holds the panel (a map, a menu): both eyes' composites are taken and the door runs layer-only for both.
+    auto mapFrame = [&](bool named) {
+        const uint64_t seq = nextArmed(r);
+        g_stubs.eyeDraws = 2;
+        for (int e = 0; e < 2; ++e) {
+            if (takeScreen(r, e)) ++taken; else ++wrong;
+        }
+        if (!(uiLayerDoorLayerOnly(0, seq) && uiLayerDoorLayerOnly(1, seq))) ++doorMissed;
+        const bool held = boundaryFrame(r, named);
+        ++(held ? worldFrames : panelFrames);
+        return held;
+    };
+    // A frame in a cockpit: no 2D screen composite is drawn at all; the door is asked and has nothing to run for.
+    auto cockpitFrame = [&]() {
+        const uint64_t seq = nextArmed(r);
+        g_stubs.eyeDraws = 0;
+        if (uiLayerDoorLayerOnly(0, seq) || uiLayerDoorLayerOnly(1, seq)) ++doorWrong;
+        const bool held = boundaryFrame(r, false);
+        ++(held ? worldFrames : panelFrames);
+        return held;
+    };
+
+    // The world, the route owning it; then a map opens (the naming stops, the third unnamed frame releases the gate and the route
+    // lets go with it) and the layer takes every composite; then the map closes (two named frames hold the world; the composites
+    // drawn in them are still the panel's and are taken) and the route owns the world again.
+    g_stubs.mayTake = true;
+    for (int i = 0; i < 10; ++i) worldFrame(true);
+    bool held = true;
+    for (int i = 0; i < 3; ++i) held = worldFrame(false);
+    check(!held, "windows: (setup) three unnamed frames release the gate, as a map's opening does");
+    g_stubs.mayTake = false;
+    for (int i = 0; i < 12; ++i) mapFrame(false);
+    mapFrame(true);
+    held = mapFrame(true);
+    check(held, "windows: (setup) two named frames hold the world again");
+    g_stubs.mayTake = true;
+    for (int i = 0; i < 3; ++i) worldFrame(true);
+    // The boarding: the composites stop, three unnamed frames release the gate, the route lets go on the same boundary; the cockpit follows.
+    for (int i = 0; i < 3; ++i) held = cockpitFrame();
+    check(!held, "windows: (setup) the boarding: three frames with no composite and no naming release the gate");
+    g_stubs.mayTake = false;
+    for (int i = 0; i < 5; ++i) cockpitFrame();
+    Sleep(5100);                                     // the window is 5 s of the wall clock
+    cockpitFrame();                                  // this boundary writes the first window's line
+    const unsigned w1Reissued = reissued, w1Taken = taken, w1Frames = worldFrames + panelFrames, w1World = worldFrames, w1Panel = panelFrames;
+    const unsigned w1Wrong = wrong, w1DoorMissed = doorMissed, w1DoorWrong = doorWrong;
+    reissued = taken = wrong = doorMissed = doorWrong = worldFrames = panelFrames = 0;
+
+    // The cockpit alone, a whole window of it: the flight's windows after the boarding.
+    for (int i = 0; i < 30; ++i) cockpitFrame();
+    Sleep(5100);
+    cockpitFrame();                                  // the second window's line
+    const unsigned w2Frames = worldFrames + panelFrames, w2World = worldFrames, w2Panel = panelFrames, w2Wrong = wrong, w2DoorWrong = doorWrong;
+
+    cfg.set("experimental.on_foot_maps_sharp", "off");
+    uiLayerConfigure(cfg);
+    boundaryFrame(r, false);
+    check(!uiLayerMapsOn(), "windows: (cleanup) key off");
+    g_stubs.mayTake = false;
+    g_stubs.eyeDraws = 0;
+
+    check(w1Wrong == 0 && w1DoorMissed == 0 && w1DoorWrong == 0 && w2Wrong == 0 && w2DoorWrong == 0,
+          "windows: (setup) every composite the rig drew went the way the scenario says (re-issued while the route owns, taken while the layer holds the panel), the door ran layer-only for every taken eye and for none in a cockpit");
+    check(w1Reissued > 0 && w1Taken > 0 && w1World > 0 && w1Panel > 0,
+          "windows: (setup) the first window holds both kinds of composite and both gates");
+
+    Log::get().close();
+    const std::vector<std::string> lines = mapsLines(dir);
+    std::vector<std::string> win;
+    for (const auto& l : lines)
+        if (l.rfind("on foot maps sharp 5s:", 0) == 0) win.push_back(l);
+    check(win.size() == 2, "windows: the real layer wrote one line for each of the two 5 s windows");
+    if (win.size() == 2) {
+        const std::string& a = win[0];
+        const std::string& b = win[1];
+        // The first window: every composite counted once, taken or not; only the layer's own takes are takes; the door only for those.
+        check(windowNumber(a, "screen-draws") == w1Reissued + w1Taken,
+              "windows: the first window's screen-draws is every composite the decision saw (re-issued ones and taken ones): the layer counts what it was asked, not what it took");
+        check(windowNumber(a, "screen-takes") == w1Taken, "windows: ... its screen-takes is only the taken ones (a re-issue is not a take)");
+        check(windowNumber(a, "door-layer-only") == w1Taken, "windows: ... its door-layer-only is the eyes of the taken ones");
+        check(windowNumber(a, "door-not-empty") == 0, "windows: ... no eye kept the upscaler");
+        check(windowNumber(a, "frames") == w1Frames && windowNumber(a, "world-frames") == w1World && windowNumber(a, "panel-frames") == w1Panel,
+              "windows: ... it counts the frames of the run and which gate each ended in");
+        check(windowNumber(a, "holds") == 1 && windowNumber(a, "releases") == 2, "windows: ... one hold (the map closing) and two releases (the map opening, the boarding)");
+        // The second window: the flight's own shape.
+        check(windowNumber(b, "world-frames") == 0 && windowNumber(b, "panel-frames") == w2Panel && w2World == 0 && w2Frames == w2Panel,
+              "windows: the cockpit window is whole-panel: panel frames and no world frame");
+        check(windowNumber(b, "screen-takes") == 0 && windowNumber(b, "door-layer-only") == 0 && windowNumber(b, "door-not-empty") == 0,
+              "windows: ... nothing taken, no eye through the layer-only door (what the first flight's windows said)");
+        check(windowNumber(b, "screen-draws") == 0,
+              "windows: ... and screen-draws says why: no 2D screen composite was drawn, so there was nothing to take");
+        check(b.size() > 15 && b.compare(b.size() - 15, 15, " screen-draws=0") == 0 && a.find(" screen-draws=") != std::string::npos &&
+                  a.find(" screen-draws=") > a.find(" not-live-frames="),
+              "windows: screen-draws is the line's last token, after not-live-frames (the reader's pattern ends with it)");
+    } else {
+        for (const auto& l : lines) std::printf("      | %s\n", l.c_str());
+    }
+    {   // Remove the rig's temp log.
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((dir + L"\\*.log").c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do { DeleteFileW((dir + L"\\" + fd.cFileName).c_str()); } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        RemoveDirectoryW(dir.c_str());
+    }
+}
+
 // --bench (not part of the gate): what the on-foot maps gate costs the CPU, measured against the real boundary and the real door
 // predicate. The boundary's own work (the journal and depth steps, the layer's warm compile, the window bookkeeping) is the same in
 // every column, so the difference between the columns is the feature's.
@@ -1419,12 +1699,14 @@ int main(int argc, char** argv) {
     testReissue(r);
     testJitterCancel(r);
     testRefusals(r);
+    testCurvedScreen(r);
     testBeginWithoutOuterScope(r);
     testLostDraws(r);
     testDoorGaps(r);
     test125(r);
     testAccessors(r);
     testMapsGate(r);
+    testMapsTransitions(r);
     uiLayerShutdown();
     std::printf("ui_layer_world_test: %u checks, %u failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

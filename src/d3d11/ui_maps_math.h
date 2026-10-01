@@ -126,6 +126,11 @@ struct UiMapsWindow {
     uint32_t doorLayerOnly = 0; // eyes whose door ran layer-only for a taken panel (once per eye and sequence)
     uint32_t doorNotEmpty = 0;  // eyes the layer took the screen for but the game drew something else into: the upscaler ran
     uint32_t notLive = 0;       // frames the key was on and the gate could not be decided by naming
+    // Every 2D screen composite the layer's decision SAW while the gate was on, taken or not (the route's re-issue, a composite left in
+    // the game's frame and a take all count). Next to screenTakes it tells "nothing was drawn" (a cockpit, a load: draws 0) from "drawn
+    // and refused" (draws above takes): a window with panel frames and no takes was ambiguous without it. The first flight's boarding is
+    // the case (docs\design-world-camera-motion-2026-09-30.md, 8.10).
+    uint32_t screenDraws = 0;
     void reset() { *this = UiMapsWindow{}; }
 };
 
@@ -182,9 +187,9 @@ inline int uiMapsFormatNotEmpty(char* out, size_t size, uint32_t eye, uint64_t s
 inline int uiMapsFormatWindow(char* out, size_t size, double seconds, const char* mode, bool world, const UiMapsWindow& w) {
     return std::snprintf(out, size,
         "on foot maps sharp 5s: key=on %.0f s mode=%s gate=%s frames=%u named=%u unnamed=%u world-frames=%u panel-frames=%u holds=%u "
-        "releases=%u screen-takes=%u recognised=%u door-layer-only=%u door-not-empty=%u not-live-frames=%u",
+        "releases=%u screen-takes=%u recognised=%u door-layer-only=%u door-not-empty=%u not-live-frames=%u screen-draws=%u",
         seconds, mode ? mode : "?", world ? "world" : "panel", w.frames, w.named, w.unnamed, w.worldFrames, w.panelFrames, w.holds,
-        w.releases, w.screenTakes, w.recognised, w.doorLayerOnly, w.doorNotEmpty, w.notLive);
+        w.releases, w.screenTakes, w.recognised, w.doorLayerOnly, w.doorNotEmpty, w.notLive, w.screenDraws);
 }
 
 }  // namespace edvr

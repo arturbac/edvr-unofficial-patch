@@ -14,11 +14,13 @@
 //      (edvr_gfx_20260930_104653.log). It runs the real flatHdrObserveDraw through the route's own glue
 //      (vrWorldFillObservation) and asserts the trigger is q 8203, the tone, with H at t1, and only there, with each of the
 //      rules (i)-(iv) and the mid-frame copy of H and the late writes mutated in turn.
-//   5. THE 5 s LINE and the take/release lines, bounded.
+//   5. THE 5 s LINE and the take/release lines, bounded; and the curved screen in them (curve=, curve-reissues=, the OWNS line's sentence).
 //   6. SOURCE PINS for the hooks (the internal-call early returns on the nine thunks, the detector's call sites, the write
 //      observers, the boundary tick), for what the route may do with the camera detour (stage 2: drive it only while the key
 //      is auto and only through the two helpers, close its window at the trigger, take the phase it confirms) and for the
-//      key-off contract (the boundary's early return keeps today's single test; nothing of stage 2 runs before it).
+//      key-off contract (the boundary's early return keeps today's single test; nothing of stage 2 runs before it), and for the
+//      curved route (a curved screen does not hold the route off; its curve is named in two lines), each held by controls: copies of
+//      the source with one edit that must trip the pin named.
 //   7. STAGE 2, THE PURE HALF (design doc section 82, stage 2): the A/B key and the decision table that turns it, the
 //      weapon fold-in's mode, the injector counters' window and its line, the STOP on an injected kind other than 3, the
 //      excluded-call, no-scene and rows-mismatch lines, the decline log's cap per run of declines, and the RELEASED line's
@@ -465,6 +467,7 @@ void lineCases() {
     big.lastRelease = "late-writes-latched"; big.hdr.lastVerdict = "actual-hdr-binding-or-depth-view-refused";
     big.jitter = "no-hook"; big.phaseX = big.rowsX = -0.4999f; big.phaseY = big.rowsY = -0.4999f;
     big.foldMode[0] = big.foldMode[1] = big.foldMode[2] = 99999;
+    std::snprintf(big.curve, sizeof(big.curve), "1.000/256/99999.999"); big.curveReissues = 99999;   // the curve's tokens at their widest
     big.hdr.lastTriggerVs = big.hdr.lastTriggerPs = ~0ull;
     big.hdr.lastHdrWidth = big.hdr.lastHdrHeight = big.hdr.lastTargetWidth = big.hdr.lastTargetHeight = ~0u;
     const char* names[] = {"selected", "hdr-depth-not-single", "depth-not-screen-motion-source", "engine-views-unavailable",
@@ -496,6 +499,132 @@ void lineCases() {
     n = vrWorldFormatFirstTrigger(buf, sizeof(buf), 5, r.f);
     check(n > 0 && std::strstr(buf, "first trigger at frame=5 seq=8203") && std::strstr(buf, "target=5040x2835 fmt=27") && std::strstr(buf, "at t1"),
           "line: the first trigger line names the tone draw, its target and the slot it reads H at");
+}
+
+// ---- 5b. the curved screen in the route's lines ---------------------------------------------------------------------------
+// With fix.panel_curvature above 0 the route re-issues the screen through the game's own strip (panel_curve.h), and its lines say which
+// curve: the 5 s line's curve= and curve-reissues= (the window's strips), and a sentence on the OWNS line. The reader parses the 5 s
+// tokens, so these texts are the contract; with the curve off every line is what it was.
+void curveCases() {
+    char t[64];
+    // vrWorldFormatCurve: off, pending, stood-down, or curvature/columns/gain.
+    int n = vrWorldFormatCurve(t, sizeof(t), false, false, false, 0.0f, 64, 0.0f);
+    check(n == 3 && std::strcmp(t, "off") == 0, "curve: a screen nothing curves (curvature 0, the default column count) reads off");
+    n = vrWorldFormatCurve(t, sizeof(t), true, false, false, 0.3f, 64, 0.0f);
+    check(n == 7 && std::strcmp(t, "pending") == 0, "curve: asked for and no strip drawn yet (the substitution is still learning the panel's SIZE) reads pending");
+    n = vrWorldFormatCurve(t, sizeof(t), true, true, false, 0.3f, 64, 0.0f);
+    check(n == 10 && std::strcmp(t, "stood-down") == 0, "curve: a substitution that stood itself down for the session reads stood-down");
+    n = vrWorldFormatCurve(t, sizeof(t), true, false, true, 0.3f, 64, 35.556f);
+    check(n == 15 && std::strcmp(t, "0.300/64/35.556") == 0, "curve: a strip in hand reads curvature/columns/gain, three decimals each (0.300/64/35.556)");
+    n = vrWorldFormatCurve(t, sizeof(t), true, false, true, 0.05f, 256, 1234.5678f);
+    check(n > 0 && std::strcmp(t, "0.050/256/1234.568") == 0, "curve: the columns print as an integer and the gain rounds to three decimals (0.050/256/1234.568)");
+    // The states have an order: not asked for beats everything, a stand-down beats ready and pending.
+    vrWorldFormatCurve(t, sizeof(t), false, true, true, 0.3f, 64, 35.556f);
+    check(std::strcmp(t, "off") == 0, "curve: not asked for reads off whatever else is set (a stood-down flag left over from nothing says nothing)");
+    vrWorldFormatCurve(t, sizeof(t), true, true, true, 0.3f, 64, 35.556f);
+    check(std::strcmp(t, "stood-down") == 0, "curve: a stood-down substitution reads stood-down even with a strip in hand");
+    // The identity test's column count alone (curvature 0, 64 columns changed) is a curve that is asked for.
+    vrWorldFormatCurve(t, sizeof(t), true, false, true, 0.0f, 1, 20.0f);
+    check(std::strcmp(t, "0.000/1/20.000") == 0, "curve: asked for by the column count alone, curvature 0, still prints its numbers");
+    vrWorldFormatCurve(t, sizeof(t), true, false, true, 1.0f, 256, 999999.999f);
+    check(std::strlen(t) < sizeof(VrWorldWindow::curve), "curve: the widest text fits the window's field");
+
+    // The window: a default window says off and 0; reset() goes back to it; the 5 s line carries both tokens right after steady-detail.
+    VrWorldWindow w;
+    check(std::strcmp(w.curve, "off") == 0 && w.curveReissues == 0, "curve: a default window says curve off and 0 strips (the boundary sets both before every line)");
+    char line[1200];
+    w.steady = "on";
+    std::snprintf(w.curve, sizeof(w.curve), "0.300/64/35.556");
+    w.curveReissues = 1234;
+    n = vrWorldFormatWindow(line, sizeof(line), VrWorldKey::Auto, VrWorldState::Owned, true, true, w);
+    check(n > 0 && std::strstr(line, " fp-mode=0/0/0 steady-detail=on curve=0.300/64/35.556 curve-reissues=1234 last-trigger=VS="),
+          "curve: the 5 s line carries curve=<text> curve-reissues=<n> immediately after steady-detail=<on|off> and before last-trigger");
+    w.steady = "off";
+    std::snprintf(w.curve, sizeof(w.curve), "pending");
+    w.curveReissues = 0;
+    n = vrWorldFormatWindow(line, sizeof(line), VrWorldKey::Auto, VrWorldState::Owned, true, true, w);
+    check(n > 0 && std::strstr(line, " steady-detail=off curve=pending curve-reissues=0 last-trigger="), "curve: pending and zero strips read as such");
+    std::snprintf(w.curve, sizeof(w.curve), "stood-down");
+    n = vrWorldFormatWindow(line, sizeof(line), VrWorldKey::Auto, VrWorldState::Owned, true, true, w);
+    check(n > 0 && std::strstr(line, " steady-detail=off curve=stood-down curve-reissues=0 last-trigger="), "curve: stood-down reads as such");
+    w.curveReissues = 77;
+    w.reset();
+    check(std::strcmp(w.curve, "off") == 0 && w.curveReissues == 0, "curve: reset() takes a window back to curve off and 0 strips (each 5 s window counts its own)");
+
+    // The OWNS line: with no curve (null, or off) it is what it was, byte for byte; with one, it adds ONE sentence that says what is true of the
+    // screen in that state. A strip in hand: the layer draws the very strip the game's own draw is substituted with. Pending (no strip built
+    // yet) and stood-down (the substitution is off for the session): the flat quad, drawn by the game and re-issued flat by the layer.
+    const std::string flat = "vr world route: OWNS the world from frame=1234 after 8 treated frames in a row; the eye shift is off and the layer takes "
+                             "the screen draw on every frame the route treats (the eye route serves the rest)";
+    char buf[512];
+    n = vrWorldFormatEntered(buf, sizeof(buf), 1234, 8);
+    check(flat == buf && n == static_cast<int>(flat.size()), "curve: the OWNS line without a curve argument is the old text, byte for byte");
+    n = vrWorldFormatEntered(buf, sizeof(buf), 1234, 8, nullptr);
+    check(flat == buf && n == static_cast<int>(flat.size()), "curve: ... and with a null curve");
+    n = vrWorldFormatEntered(buf, sizeof(buf), 1234, 8, "off");
+    check(flat == buf && n == static_cast<int>(flat.size()), "curve: ... and with curve=off (a flat screen's line is unchanged)");
+    const std::string stripHead = "; the screen is curved (curve=";
+    const std::string stripTail = "): the layer draws the same strip the game's own draw is substituted with, so the bend and the placement are the game's";
+    const std::string stripSentence = stripHead + "0.300/64/35.556" + stripTail;
+    const std::string pendingSentence = "; the screen is set to curve (curve=pending): the strip is not built yet, so the game and the layer both draw the flat quad until it is";
+    const std::string stoodDownSentence = "; the screen is set to curve but the curve stood down (curve=stood-down): the game draws its own flat quad and the layer re-issues it flat";
+    // One pin per state: the line is the flat line plus exactly that state's sentence, byte for byte.
+    const auto ownsIs = [&](const char* curveText, const std::string& sentence) {
+        char b[512];
+        const int len = vrWorldFormatEntered(b, sizeof(b), 1234, 8, curveText);
+        return flat + sentence == b && len == static_cast<int>(flat.size() + sentence.size());
+    };
+    check(ownsIs("0.300/64/35.556", stripSentence),
+          "curve: a strip in hand (0.300/64/35.556): the OWNS line is the flat line plus the sentence that the layer draws the game's own strip, byte for byte");
+    check(ownsIs("pending", pendingSentence),
+          "curve: pending: the OWNS line is the flat line plus the sentence that the strip is not built yet and the game and the layer both draw the flat quad, byte for byte");
+    check(ownsIs("stood-down", stoodDownSentence),
+          "curve: stood-down: the OWNS line is the flat line plus the sentence that the curve stood down, the game draws its own flat quad and the layer re-issues it flat, byte for byte");
+    {   // Controls: each pin rejects the other two states' sentences, so a formatter that gave pending the strip sentence, or stood-down the pending
+        // one, would fail it.
+        const char* texts[3] = {"0.300/64/35.556", "pending", "stood-down"};
+        const std::string* sentences[3] = {&stripSentence, &pendingSentence, &stoodDownSentence};
+        const char* names[3] = {"strip", "pending", "stood-down"};
+        for (int s = 0; s < 3; ++s) {
+            bool rejects = true;
+            for (int o = 0; o < 3; ++o)
+                if (o != s) rejects = rejects && !ownsIs(texts[s], *sentences[o]);
+            char label[200];
+            std::snprintf(label, sizeof(label), "control: the %s pin rejects the other two states' sentences (a formatter that swapped them would fail it)", names[s]);
+            check(rejects, label);
+        }
+    }
+    {   // Every state keeps "(curve=<text>)" once: the part a reader keys on.
+        bool keyed = true;
+        const char* texts[3] = {"0.300/64/35.556", "pending", "stood-down"};
+        for (const char* text : texts) {
+            vrWorldFormatEntered(buf, sizeof(buf), 1234, 8, text);
+            const std::string owns(buf);
+            const size_t first = owns.find("(curve=");
+            const size_t second = first == std::string::npos ? first : owns.find("(curve=", first + 1);
+            keyed = keyed && first != std::string::npos && second == std::string::npos &&
+                    owns.find(std::string("(curve=") + text + ")") != std::string::npos;
+        }
+        check(keyed, "curve: every state's sentence carries (curve=<text>) exactly once, the part a reader keys on");
+    }
+    {   // The strip sentence with the widest curve text a window holds is whole: the suffix buffer does not cut it.
+        const std::string wide(sizeof(VrWorldWindow::curve) - 1, '7');
+        const int len = vrWorldFormatEntered(buf, sizeof(buf), 1234, 8, wide.c_str());
+        const std::string want = flat + stripHead + wide + stripTail;
+        check(want == buf && len == static_cast<int>(want.size()),
+              "curve: the strip sentence with the widest curve text a window holds (47 characters) is whole: the suffix buffer does not cut it");
+    }
+    // The route's buffer for this line is 384 bytes (vr_world_route.cpp): the widest realistic line of each state, a ten-digit frame number (over
+    // a year at 90 Hz) and a wide curve text, fits with room to spare, and the end of its sentence is not cut.
+    {
+        char route[384];
+        bool fits = true;
+        for (const char* text : {"1.000/256/1234.567", "pending", "stood-down"}) {
+            n = vrWorldFormatEntered(route, sizeof(route), 4294967295ull, kVrWorldWarmFrames, text);
+            fits = fits && n > 0 && n < static_cast<int>(sizeof(route)) - 8 && static_cast<size_t>(n) == std::strlen(route);
+        }
+        check(fits, "curve: the OWNS line of every state, with a ten-digit frame and a wide curve, fits the route's 384-byte buffer (8 bytes to spare) uncut");
+    }
 }
 
 
@@ -836,11 +965,11 @@ void experimentCases() {
     char line[1200];
     VrWorldWindow w;
     int n = vrWorldFormatWindow(line, sizeof(line), VrWorldKey::Auto, VrWorldState::Owned, true, true, w);
-    check(n > 0 && std::strstr(line, " fp-mode=0/0/0 steady-detail=off last-trigger="),
-          "route line: steady-detail=off sits after fp-mode in a window that never turned it on (a default window is flight 2's route)");
+    check(n > 0 && std::strstr(line, " fp-mode=0/0/0 steady-detail=off curve=off curve-reissues=0 last-trigger="),
+          "route line: steady-detail=off sits after fp-mode in a window that never turned it on (a default window is flight 2's route), with curve=off curve-reissues=0 after it");
     w.steady = vrWorldSteadyKeyName(VrWorldSteadyKey::On);
     n = vrWorldFormatWindow(line, sizeof(line), VrWorldKey::Auto, VrWorldState::Owned, true, true, w);
-    check(n > 0 && std::strstr(line, " steady-detail=on last-trigger="), "route line: steady-detail=on when the key is on");
+    check(n > 0 && std::strstr(line, " steady-detail=on curve=off curve-reissues=0 last-trigger="), "route line: steady-detail=on when the key is on");
 
     // The refusal line: "ran, nothing refused" and "never ran" are different texts.
     VrWorldRefusalWindow r;
@@ -954,6 +1083,96 @@ size_t count(const std::string& s, const std::string& needle) {
     size_t n = 0;
     for (size_t at = s.find(needle); at != std::string::npos; at = s.find(needle, at + needle.size())) ++n;
     return n;
+}
+// `text` with the one occurrence of `from` replaced; empty when `from` is not there exactly once (a control with a stale anchor must fail).
+std::string replaceOnce(const std::string& text, const std::string& from, const std::string& to) {
+    if (count(text, from) != 1) return {};
+    std::string out = text;
+    out.replace(out.find(from), from.size(), to);
+    return out;
+}
+
+// ---- the curved route's pins on the route's own source ------------------------------------------------------------------------------
+// A curved screen (fix.panel_curvature above 0) no longer holds the route off: the layer re-issues it through the strip the game's own draw
+// is substituted with. What the route's source must say about that is a function of its text, so curveBoundaryControls runs the very same
+// function on copies with one edit each that put the old behaviour (or a likely slip) back, and requires the pin named to fail.
+struct CurvePin { const char* id; bool ok; const char* what; };
+std::vector<CurvePin> curveBoundaryPins(const std::string& rt) {
+    std::vector<CurvePin> pins;
+    const std::string boundary = functionBody(rt, "void vrWorldRouteFrameBoundary(");
+    const std::string curveText = functionBody(rt, "void curveTextNow(");
+    // The statement that says the route stays off: from the layer test to the line that clears the note.
+    const size_t offAt = boundary.find("if (!layerLive) {");
+    const size_t offEnd = offAt == std::string::npos ? offAt : boundary.find("g_notLiveNoted = nullptr;", offAt);
+    const std::string staysOff = (offAt == std::string::npos || offEnd == std::string::npos) ? std::string() : boundary.substr(offAt, offEnd - offAt);
+    const size_t npos = std::string::npos;
+    pins.push_back({"layer-live",
+                    !boundary.empty() && boundary.find("    const bool layerLive = uiLayerLiveForWorldRoute();\n") != npos &&
+                        boundary.find("const bool curved") == npos && boundary.find("!curved") == npos && rt.find("panelCurveWants") == npos,
+                    "curvature: layerLive is the layer's own predicate and nothing else, and the route never asks panel_curve whether a substitution is wanted (a curved screen does not hold the route off)"});
+    pins.push_back({"stays-off-text",
+                    !staysOff.empty() && staysOff.find("the UI layer, so keep fix.ui_quality on)\", why);") != npos && staysOff.find("panel_curvature") == npos &&
+                        staysOff.find("uiLayerNotLiveReason()") != npos,
+                    "curvature: the route's stays-off line gives the layer's reason and names fix.ui_quality alone (no fix.panel_curvature)"});
+    pins.push_back({"curve-text",
+                    !curveText.empty() && curveText.find("const PanelCurveInfo pc = panelCurveInfo();") != npos &&
+                        curveText.find("const bool configured = pc.curvature > 0.0f || pc.segments != detail::kDefaultSegments;") != npos &&
+                        curveText.find("vrWorldFormatCurve(out, size, configured, pc.standDown, pc.ready, pc.curvature, pc.segments, pc.gain);") != npos &&
+                        curveText.find("if (reissues) *reissues = pc.reissues;") != npos,
+                    "curvature: curveTextNow reads panelCurveInfo once and words it with vrWorldFormatCurve: asked for by the curvature or the column count, stood down, ready, and the strip's numbers; it hands back the cumulative strip count"});
+    pins.push_back({"owns-line",
+                    before(boundary, "curveTextNow(curveText, sizeof(curveText), nullptr);",
+                           "vrWorldFormatEntered(line, sizeof(line), g_frameNo, kVrWorldWarmFrames, curveText);") &&
+                        boundary.find("char curveText[sizeof(g_win.curve)];") != npos,
+                    "curvature: the OWNS line is told the curve in use (curveTextNow, then vrWorldFormatEntered with its text)"});
+    pins.push_back({"window-line",
+                    before(boundary, "curveTextNow(g_win.curve, sizeof(g_win.curve), &curveReissues);", "g_win.curveReissues = curveReissues - g_curveReissuesSeen;") &&
+                        before(boundary, "g_win.curveReissues = curveReissues - g_curveReissuesSeen;", "g_curveReissuesSeen = curveReissues;") &&
+                        before(boundary, "g_curveReissuesSeen = curveReissues;", "vrWorldFormatWindow(line, sizeof(line), key,"),
+                    "curvature: the 5 s line's curve= comes from curveTextNow and its curve-reissues= is the window's delta of panel_curve's cumulative count, kept for the next window, all before the line is printed"});
+    pins.push_back({"one-reader",
+                    count(rt, "panelCurveInfo()") == 1 && count(rt, "curveTextNow(") == 3 && count(rt, "uint64_t g_curveReissuesSeen = 0;") == 1 &&
+                        count(rt, "g_curveReissuesSeen") == 3,
+                    "curvature: the route reads panel_curve's state in one place (curveTextNow: defined once, called for the OWNS line and the 5 s line), and keeps one running count"});
+    return pins;
+}
+// Each control: one edit of the route's text that must be caught by the pin it names.
+void curveBoundaryControls(const std::string& rt) {
+    struct Flip { const char* name; const char* from; const char* to; const char* caughtBy; };
+    const Flip flips[] = {
+        {"the old stand-aside returns", "    const bool layerLive = uiLayerLiveForWorldRoute();\n",
+         "    const bool curved = panelCurveWants();\n    const bool layerLive = uiLayerLiveForWorldRoute() && !curved;\n", "layer-live"},
+        {"another term joins layerLive", "    const bool layerLive = uiLayerLiveForWorldRoute();\n",
+         "    const bool layerLive = uiLayerLiveForWorldRoute() && panelCurveInfo().ready;\n", "layer-live"},
+        {"the stays-off line names fix.panel_curvature again", "so keep fix.ui_quality on)\", why);",
+         "so keep fix.ui_quality on and fix.panel_curvature at 0)\", why);", "stays-off-text"},
+        {"the stays-off line forgets the key to set", "so keep fix.ui_quality on)\", why);", "so keep the layer on)\", why);", "stays-off-text"},
+        {"the OWNS line is not told the curve", "vrWorldFormatEntered(line, sizeof(line), g_frameNo, kVrWorldWarmFrames, curveText);",
+         "vrWorldFormatEntered(line, sizeof(line), g_frameNo, kVrWorldWarmFrames);", "owns-line"},
+        {"the OWNS line's curve text is never filled", "            curveTextNow(curveText, sizeof(curveText), nullptr);\n", "            curveText[0] = 0;\n", "owns-line"},
+        {"the 5 s line's strip count is cumulative", "g_win.curveReissues = curveReissues - g_curveReissuesSeen;", "g_win.curveReissues = curveReissues;", "window-line"},
+        {"the window forgets the count it reported", "            g_curveReissuesSeen = curveReissues;\n", "", "window-line"},
+        {"the 5 s line's curve text is never filled", "curveTextNow(g_win.curve, sizeof(g_win.curve), &curveReissues);", "curveReissues = 0;", "window-line"},
+        {"the curve text ignores a stood-down substitution", "configured, pc.standDown, pc.ready,", "configured, false, pc.ready,", "curve-text"},
+        {"the curve text ignores the column count", "pc.curvature > 0.0f || pc.segments != detail::kDefaultSegments;", "pc.curvature > 0.0f;", "curve-text"},
+        {"the curve text drops the strip count", "    if (reissues) *reissues = pc.reissues;\n", "", "curve-text"},
+        {"a second reader of panel_curve's state", "    const bool layerLive = uiLayerLiveForWorldRoute();\n",
+         "    const bool layerLive = uiLayerLiveForWorldRoute();\n    (void)panelCurveInfo();\n", "one-reader"},
+    };
+    for (const Flip& f : flips) {
+        char label[320];
+        const std::string mutated = replaceOnce(rt, f.from, f.to);
+        std::snprintf(label, sizeof(label), "control: \"%s\" has its anchor in the route's source exactly once", f.name);
+        check(!mutated.empty(), label);
+        bool caught = false;
+        if (!mutated.empty())
+            for (const CurvePin& p : curveBoundaryPins(mutated)) caught = caught || (!p.ok && std::strcmp(p.id, f.caughtBy) == 0);
+        std::snprintf(label, sizeof(label), "control: \"%s\" is caught by the %s pin", f.name, f.caughtBy);
+        check(caught, label);
+    }
+    bool pristine = true;
+    for (const CurvePin& p : curveBoundaryPins(rt)) pristine = pristine && p.ok;
+    check(pristine, "control: with no edit every curved-route pin of the route's source holds (the controls above are the only way one fails)");
 }
 
 void sourcePins() {
@@ -1094,12 +1313,10 @@ void sourcePins() {
               rt.find("kVrWorldFeatureSlot") != std::string::npos,
           "resolve: the resolver runs inside the internal scope, on the world's own upscaler slot");
     check(rt.find("GpuCensusSection::FrameWorldResolve") != std::string::npos, "census: the resolve is timed on its own GPU census section");
-    // A curved screen is not the game's own draw, which is all the layer re-issues: the route owns no frame while the
-    // substitution is wanted (panel_curve.h), and the reason it gives names the key to set.
-    check(boundary.find("const bool curved = panelCurveWants();") != std::string::npos &&
-              boundary.find("const bool layerLive = uiLayerLiveForWorldRoute() && !curved;") != std::string::npos &&
-              boundary.find("fix.panel_curvature bends the on-foot screen") != std::string::npos,
-          "curvature: the route stays off while fix.panel_curvature's substitution is wanted, and says so");
+    // A curved screen no longer holds the route off: the layer re-issues it through the game's own strip (panel_curve.h panelCurveReissue,
+    // vscreen.cpp). The boundary's pins are a function of the route's text, held by flipped copies (curveBoundaryControls).
+    for (const CurvePin& p : curveBoundaryPins(rt)) check(p.ok, p.what);
+    curveBoundaryControls(rt);
     // The census's eye draw: the screen composite's own shader pair, read only with the census key on.
     const std::string census = functionBody(vs, "__declspec(noinline) void cameraCensusEyeDraw(");
     check(!census.empty() && census.find("0x5C36AF051B98B9F1ull") != std::string::npos && census.find("0xCFE84157BC76E921ull") != std::string::npos &&
@@ -1196,6 +1413,7 @@ int runSelfTest() {
     glueCases();
     triggerCases();
     lineCases();
+    curveCases();
     stage2Cases();
     mapsGateCases();
     experimentCases();
