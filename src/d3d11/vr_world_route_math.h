@@ -22,9 +22,11 @@
 // and the door never runs layer-only. The rig pins each answer.
 #pragma once
 #include "flat_hdr_route.h"
+#include "flat_mono_refusal.h"   // the stage 2 experiment build's pixel classes and the census's counters (pure)
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 namespace edvr {
 
@@ -257,6 +259,9 @@ struct VrWorldInjectWindow {
     // first such frame after a named one is expected, at most one per change), and injections on a frame whose window the route
     // had SHUT (a STOP: a shut window is never written through).
     uint64_t unnamedFrames = 0, shutInjected = 0;
+    // The narrowest and widest struct field of view (rad) any screen view showed in the window (the injector's fovNarrowest/fovWidest):
+    // 0 and 0 when none did. Two values say the struct carries a tighter weapon camera for the role's field-of-view test to find.
+    float fovNarrowest = 0.0f, fovWidest = 0.0f;
 };
 struct VrWorldWindow {
     FlatHdrWindow hdr;            // frames, hdr-frames, trigger, none, ambiguous, treated, declined, late writes, selection tally
@@ -272,6 +277,9 @@ struct VrWorldWindow {
     const char* jitter = "idle";
     float phaseX = 0.0f, phaseY = 0.0f, rowsX = 0.0f, rowsY = 0.0f;
     uint64_t foldMode[3] = {};    // frames whose resolve ran the weapon fold-in with mode 0, 1, 2 (FlatMonoResolveFrame::firstPersonPhaseMode)
+    // The stage 2 experiment build: the state of experimental.temporal_aa_on_foot_world_steady_detail at the boundary that printed the
+    // line (vrWorldSteadyKeyName: "on" or "off"; off, the default, is the route as flight 2 flew it).
+    const char* steady = "off";
     VrWorldInjectWindow inject;
     void reset() { *this = VrWorldWindow{}; }
 };
@@ -283,7 +291,7 @@ inline int vrWorldFormatWindow(char* out, size_t size, VrWorldKey key, VrWorldSt
         "vr world route 5s: key=%s state=%s layer=%s gate=%s frames=%llu gate-frames=%llu gate-flips=%llu hdr-frames=%llu trigger=%llu "
         "none=%llu ambiguous=%llu treated=%llu declined=%llu owned-frames=%llu eye-takes=%llu door-layer-only=%llu "
         "enters=%llu releases=%llu (last=%s) scene-resets=%llu late-hdr-writes=%llu (in %llu frames) last=%s "
-        "jitter=%s phase=%.4f,%.4f rows=%.4f,%.4f fp-mode=%llu/%llu/%llu "
+        "jitter=%s phase=%.4f,%.4f rows=%.4f,%.4f fp-mode=%llu/%llu/%llu steady-detail=%s "
         "last-trigger=VS=%016llX PS=%016llX target=%ux%u hdr=%ux%u selection=",
         vrWorldKeyName(key), vrWorldStateName(state), layerLive ? "live" : "not-live", gate ? "held" : "no",
         static_cast<unsigned long long>(w.hdr.frames), static_cast<unsigned long long>(w.gateFrames),
@@ -297,7 +305,7 @@ inline int vrWorldFormatWindow(char* out, size_t size, VrWorldKey key, VrWorldSt
         static_cast<unsigned long long>(w.hdr.lateWrites), static_cast<unsigned long long>(w.hdr.lateWriteFrames),
         w.hdr.lastVerdict, w.jitter, static_cast<double>(w.phaseX), static_cast<double>(w.phaseY),
         static_cast<double>(w.rowsX), static_cast<double>(w.rowsY), static_cast<unsigned long long>(w.foldMode[0]),
-        static_cast<unsigned long long>(w.foldMode[1]), static_cast<unsigned long long>(w.foldMode[2]),
+        static_cast<unsigned long long>(w.foldMode[1]), static_cast<unsigned long long>(w.foldMode[2]), w.steady,
         static_cast<unsigned long long>(w.hdr.lastTriggerVs),
         static_cast<unsigned long long>(w.hdr.lastTriggerPs), w.hdr.lastTargetWidth, w.hdr.lastTargetHeight,
         w.hdr.lastHdrWidth, w.hdr.lastHdrHeight);
@@ -438,8 +446,13 @@ struct VrWorldInjectFrame {
     uint32_t warming = 0, auxiliary = 0, afterTrigger = 0, unsupported = 0, otherKind = 0, unreadable = 0;
     uint32_t writeFailures = 0, offThread = 0;
     uint32_t injectedKind[8] = {};
+    float fovNarrowest = std::numeric_limits<float>::quiet_NaN(), fovWidest = std::numeric_limits<float>::quiet_NaN();   // NaN: no frustum read
 };
 inline void vrWorldAddInjectFrame(VrWorldInjectWindow& w, const VrWorldInjectFrame& f) {
+    if (f.fovNarrowest > 0.0f && f.fovWidest > 0.0f) {   // a NaN is neither
+        if (w.fovWidest == 0.0f || f.fovNarrowest < w.fovNarrowest) w.fovNarrowest = f.fovNarrowest;
+        if (f.fovWidest > w.fovWidest) w.fovWidest = f.fovWidest;
+    }
     w.scene += f.sceneInjected; w.firstPerson += f.firstPersonInjected;
     w.refused += static_cast<uint64_t>(f.sceneRefused) + f.firstPersonRefused;
     w.warming += f.warming; w.auxiliary += f.auxiliary; w.afterTrigger += f.afterTrigger;
@@ -467,10 +480,13 @@ inline int vrWorldFormatInjectWindow(char* out, size_t size, const VrWorldInject
         if (other) std::snprintf(kinds + n, sizeof(kinds) - static_cast<size_t>(n), "%sother:%llu", n ? "," : "",
                                  static_cast<unsigned long long>(other));
     }
+    char fov[40] = "-";   // "fov=-": no screen view's frustum was read in the window
+    if (w.fovWidest > 0.0f && w.fovNarrowest > 0.0f)
+        std::snprintf(fov, sizeof(fov), "%.4f..%.4f", static_cast<double>(w.fovNarrowest), static_cast<double>(w.fovWidest));
     return std::snprintf(out, size,
         "vr world route inject 5s: inj-scene=%llu inj-fp=%llu inj-refused=%llu warming=%llu aux=%llu after=%llu "
         "unsupported=%llu other-kind=%llu unreadable=%llu off-thread=%llu write-fail=%llu inj-kinds=%s "
-        "pair-checked=%llu pair-bad=%llu inj-unnamed=%llu inj-shut=%llu",
+        "pair-checked=%llu pair-bad=%llu inj-unnamed=%llu inj-shut=%llu fov=%s",
         static_cast<unsigned long long>(w.scene), static_cast<unsigned long long>(w.firstPerson),
         static_cast<unsigned long long>(w.refused), static_cast<unsigned long long>(w.warming),
         static_cast<unsigned long long>(w.auxiliary), static_cast<unsigned long long>(w.afterTrigger),
@@ -478,7 +494,7 @@ inline int vrWorldFormatInjectWindow(char* out, size_t size, const VrWorldInject
         static_cast<unsigned long long>(w.unreadable), static_cast<unsigned long long>(w.offThread),
         static_cast<unsigned long long>(w.writeFail), kinds, static_cast<unsigned long long>(w.pairChecked),
         static_cast<unsigned long long>(w.pairBad), static_cast<unsigned long long>(w.unnamedFrames),
-        static_cast<unsigned long long>(w.shutInjected));
+        static_cast<unsigned long long>(w.shutInjected), fov);
 }
 // The first frame the world carries a non-zero phase in an ownership episode, once per episode.
 inline int vrWorldFormatJitterLive(char* out, size_t size, uint64_t frame, float phaseX, float phaseY, uint32_t renderW,
@@ -546,6 +562,91 @@ inline int vrWorldFormatRowsMismatch(char* out, size_t size, uint64_t frame, flo
         "rows' measured difference is off by %.3g NDC (tolerance 2e-6); the frame is still resolved, this is the evidence",
         static_cast<unsigned long long>(frame), static_cast<double>(rx), static_cast<double>(ry), static_cast<double>(prx),
         static_cast<double>(pry), static_cast<double>(maxError));
+}
+
+// ---- the stage 2 experiment build (design doc section 82) ------------------------------------------------------------------
+// experimental.temporal_aa_on_foot_world_steady_detail: off (the default) or on. Flight 2's shimmer on fine patterns fits the prep
+// refusing the history of a pixel whose engine slot a LATER draw overdrew (the slot's depth is no longer the pixel's) and the finish
+// then showing the raw jittered input there. "on" sends exactly those pixels to the camera term instead, the rule the flat profile's
+// 3D menu has run since 2026-09-29, so one session can compare the two at the same spot. Only the stale-slot refusal is relaxed: a
+// masked record, a corrupt slot, the sky and the weapon's pixels stay refused. A moving object drawn by a shader the engine table
+// does not name can ghost while it is on. Read only while the route key is auto. A value that is present and is not "on" reads as
+// off, so a typo never relaxes anything. The in-headset menu's developer mode flips it live, like the jitter key.
+enum class VrWorldSteadyKey : uint8_t { Off, On };
+inline VrWorldSteadyKey vrWorldSteadyKeyFromText(const char* text) {
+    if (!text) return VrWorldSteadyKey::Off;
+    const char* on = "on";
+    for (; *on; ++on, ++text) {
+        char c = *text;
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (c != *on) return VrWorldSteadyKey::Off;
+    }
+    return *text == 0 ? VrWorldSteadyKey::On : VrWorldSteadyKey::Off;
+}
+inline const char* vrWorldSteadyKeyName(VrWorldSteadyKey key) { return key == VrWorldSteadyKey::On ? "on" : "off"; }
+// The key's state at the boundary that first read it with the route on, and each change after: one line, saying what the state does.
+inline int vrWorldFormatSteadyChanged(char* out, size_t size, uint64_t frame, VrWorldSteadyKey key) {
+    if (key == VrWorldSteadyKey::On)
+        return std::snprintf(out, size,
+            "vr world route: steady-detail is ON from frame=%llu (experimental.temporal_aa_on_foot_world_steady_detail): a pixel whose "
+            "engine slot a later draw overdrew takes the camera term instead of refusing its history, as the 3D menu's does; masked "
+            "records and corrupt slots stay refused; a moving object drawn by a shader the engine table does not name can ghost",
+            static_cast<unsigned long long>(frame));
+    return std::snprintf(out, size,
+        "vr world route: steady-detail is OFF from frame=%llu (experimental.temporal_aa_on_foot_world_steady_detail): a pixel whose "
+        "engine slot a later draw overdrew refuses its history, as in flight 2",
+        static_cast<unsigned long long>(frame));
+}
+// The refusal view (advanced.temporal_aa_debug = motion_source while the route resolves): said when it comes on and when it goes off.
+inline int vrWorldFormatViewChanged(char* out, size_t size, uint64_t frame, bool on) {
+    if (on)
+        return std::snprintf(out, size,
+            "vr world route: the refusal view is ON from frame=%llu (advanced.temporal_aa_debug = motion_source): the world's picture is "
+            "painted by the prep's own classification before the game's tone pass (%s); the hue survives the tone pass, the absolute "
+            "colour does not",
+            static_cast<unsigned long long>(frame), flatMonoViewLegend());
+    return std::snprintf(out, size, "vr world route: the refusal view is OFF from frame=%llu", static_cast<unsigned long long>(frame));
+}
+// The third line of a 5 s window, printed only while the refusal census is wanted (advanced.vr_camera_census on): an absent line is
+// "the census was off", and a line with sampled=0 is "on, and no sample was read back" -- the two are never the same text, and a
+// census that ran and found nothing says so with pixels > 0 and refused=0. `treated` is the route's own count of treated frames in
+// the window; asked, sampled, dropped and read are the resolver's (flat_mono_refusal.h FlatMonoRefusalCensus). The reader
+// (edvr_log.py --camera-census) parses this text.
+struct VrWorldRefusalWindow {
+    bool census = false;                  // the census key is on at the boundary that printed the line
+    uint64_t treated = 0;
+    uint64_t asked = 0, sampled = 0, dropped = 0, read = 0;
+    uint32_t every = 0;
+    uint32_t width = 0, height = 0;       // the render size of the last sample read back
+    uint64_t pixels = 0;                  // what the read-back samples examined
+    uint64_t counts[kFlatMonoRefusalSlots] = {};
+    const char* steady = "off";           // vrWorldSteadyKeyName at the boundary
+    const char* view = "off";             // "on" while the refusal view is painting
+};
+inline uint64_t vrWorldRefusalTotal(const VrWorldRefusalWindow& w) {
+    uint64_t n = 0;
+    for (uint32_t i = 0; i < kFlatMonoRefusalForgiven; ++i) n += w.counts[i];
+    return n;
+}
+inline int vrWorldFormatRefusalWindow(char* out, size_t size, const VrWorldRefusalWindow& w) {
+    const uint64_t refused = vrWorldRefusalTotal(w);
+    const uint64_t named = w.counts[kFlatMonoClassStale] + w.counts[kFlatMonoClassMasked] + w.counts[kFlatMonoClassCorrupt] +
+                           w.counts[kFlatMonoClassSentinel] + w.counts[kFlatMonoClassUnreprojectable] + w.counts[kFlatMonoClassCamera] +
+                           w.counts[kFlatMonoClassRange] + w.counts[kFlatMonoClassDepth] + w.counts[kFlatMonoClassWeaponRefused];
+    const double pct = w.pixels ? 100.0 * static_cast<double>(refused) / static_cast<double>(w.pixels) : 0.0;
+    return std::snprintf(out, size,
+        "vr world route refusal 5s: census=%s every=%u treated=%llu asked=%llu sampled=%llu read=%llu dropped=%llu size=%ux%u "
+        "pixels=%llu refused=%llu refused-pct=%.3f stale=%llu masked=%llu corrupt=%llu sentinel=%llu unreprojectable=%llu camera=%llu "
+        "range=%llu depth=%llu weapon=%llu other=%llu forgiven=%llu steady-detail=%s view=%s",
+        w.census ? "on" : "off", w.every, static_cast<unsigned long long>(w.treated), static_cast<unsigned long long>(w.asked),
+        static_cast<unsigned long long>(w.sampled), static_cast<unsigned long long>(w.read), static_cast<unsigned long long>(w.dropped),
+        w.width, w.height, static_cast<unsigned long long>(w.pixels), static_cast<unsigned long long>(refused), pct,
+        static_cast<unsigned long long>(w.counts[kFlatMonoClassStale]), static_cast<unsigned long long>(w.counts[kFlatMonoClassMasked]),
+        static_cast<unsigned long long>(w.counts[kFlatMonoClassCorrupt]), static_cast<unsigned long long>(w.counts[kFlatMonoClassSentinel]),
+        static_cast<unsigned long long>(w.counts[kFlatMonoClassUnreprojectable]), static_cast<unsigned long long>(w.counts[kFlatMonoClassCamera]),
+        static_cast<unsigned long long>(w.counts[kFlatMonoClassRange]), static_cast<unsigned long long>(w.counts[kFlatMonoClassDepth]),
+        static_cast<unsigned long long>(w.counts[kFlatMonoClassWeaponRefused]), static_cast<unsigned long long>(refused - named),
+        static_cast<unsigned long long>(w.counts[kFlatMonoRefusalForgiven]), w.steady, w.view);
 }
 
 // The decline log. Flight 1 capped it per SESSION (twelve lines) and spent all twelve on the entry and the first seconds of one

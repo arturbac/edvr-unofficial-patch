@@ -1,5 +1,6 @@
 #pragma once
 #include "engine_velocity.h"
+#include "flat_mono_refusal.h"
 #include <dxgiformat.h>
 #include <cstdint>
 
@@ -106,9 +107,21 @@ struct FlatMonoResolveFrame {
     // The 3D main menu (2026-09-29): the frame's contract came through the verified menu HDR copy, so
     // the scene is a ship on its pedestal and nothing moves but the camera. Only then does a pixel whose
     // engine slot was overdrawn by a draw that never wrote it (an unkeyed hull) take the camera term
-    // instead of refusing history. False (the default, and every frame outside that menu) leaves the
-    // shader's arithmetic bit-identical to before the field.
+    // instead of refusing history. The VR world route sets it too, from the dev key
+    // experimental.temporal_aa_on_foot_world_steady_detail (off by default): the same rule, applied on foot, for the
+    // flight that tells whether those refusals are what shimmers. False (the default, and every frame outside that menu
+    // and that key) leaves the shader's arithmetic bit-identical to before the field.
     bool staticScene = false;
+    // The VR world route's refusal census and view (design doc section 82, stage 2 experiment build; flat_mono_refusal.h).
+    // Both default to off, the flat profile never sets either, and a frame that asks for neither runs the prep and the finish
+    // exactly as before (no class texture is made, bound or written, no census pass is dispatched).
+    //   refusalCensus: count this frame's refused pixels by class. One resolve in kFlatMonoRefusalEvery that asks is sampled: the
+    //     prep writes its class texture, a counting pass reduces it into a small buffer, the buffer is copied to a staging
+    //     ring and read back a few frames later without waiting. flatMonoResolveTakeRefusalCensus() hands the sums over.
+    //   refusalView: paint the prep's classes into the resolved image (the HDR route only, in the eye path's colours), so the
+    //     refused pixels can be SEEN. Painted every frame it is set. A reset frame does neither.
+    bool refusalCensus = false;
+    uint32_t refusalView = 0;
     EngineVelocityViews engine{};
     uint64_t frame = 0;
     float deltaMs = 0;
@@ -239,6 +252,10 @@ struct FlatMonoResolveStats {
 FlatMonoResolveStats flatMonoResolveStats();
 // Whether the last resolve reset (flatCaptureFrameLive, flat_pixel_capture_policy.h).
 bool flatMonoResolveLastReset();
+// The refusal census's samples read back since the last take, and starts over (FlatMonoResolveFrame::refusalCensus). Owner thread:
+// it also polls the readback ring, with the resolver's own immediate context, before it hands the sums over. A census nobody asked
+// for hands back zeros.
+FlatMonoRefusalCensus flatMonoResolveTakeRefusalCensus();
 // Owner thread, before rasterization. Validates planned dimensions/mode/source
 // metadata, allocates renderer resources including the spatial fallback output,
 // then checks external backend availability. A Ready result proves fallback

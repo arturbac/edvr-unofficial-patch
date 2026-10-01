@@ -73,6 +73,18 @@ struct State {
     ComPtr<ID3D11RasterizerState> noCull;
     ComPtr<ID3D11RenderTargetView> hdrRtv;
     ID3D11Texture2D* hdrRtvTexture=nullptr;
+    // The refusal census and view (FlatMonoResolveFrame::refusalCensus, refusalView; flat_mono_refusal.h), all made on first use by
+    // a frame that asks, so a profile that never asks never pays: the counting pass, the prep's class texture (R8_UINT, render
+    // size), the counter buffer the pass adds into, and the staging ring its sums are read back from a few frames later.
+    ComPtr<ID3D11ComputeShader> census;
+    Image klass;
+    uint32_t classWidth=0, classHeight=0;
+    ComPtr<ID3D11Buffer> refusalCounts;
+    ComPtr<ID3D11UnorderedAccessView> refusalCountsUav;
+    ComPtr<ID3D11Buffer> refusalStaging[4];
+    bool refusalPending[4]={false,false,false,false};
+    uint32_t refusalWidth[4]={0,0,0,0}, refusalHeight[4]={0,0,0,0};
+    uint32_t refusalWrite=0;
     Image color, depth[2], motion, rejection, expected, output[2];
     uint32_t width=0, height=0, outWidth=0, outHeight=0, evalWidth=0, evalHeight=0, current=0;
     uint64_t lastFrame=0;
@@ -105,14 +117,21 @@ constexpr uint32_t kIsolationLogCap=4;
 // purpose, like the renderer state: a process that dies inside an isolation must not release the game's objects from static
 // destruction under the loader lock.
 FlatContextState& g_contextBlock=*new FlatContextState;
+// The refusal census's totals since the last take (flatMonoResolveTakeRefusalCensus) and the cadence's own counter, which is not
+// reset by a take. Leaked on purpose, like the renderer state.
+FlatMonoRefusalCensus& g_refusal=*new FlatMonoRefusalCensus;
+uint64_t g_refusalCadence=0;
+bool g_refusalFailureLogged=false;
 // rowsJitter: the NDC shift the camera rows themselves carry (current xy, previous zw), the shader removes it; all zero
 // when the rows are unjittered, which is every path that does not go through the upstream camera injector.
 // route: x = the HDR route (the input is R11G11B10F radiance, the outputs fp16), y = with x, EDVR's TAA output is final
 // and the pixel-shader finish only copies it into H, z = the first-person map (t9) and stencil (t10) are bound and valid
 // (FlatMonoResolveFrame::firstPersonMotion), w = the phase mode (firstPersonPhaseMode; 0 without z). All zero on the copy route without them, whose shader arithmetic is
 // unchanged.
-struct Constants { float camera[6][4], previous[6][4]; uint32_t size[4], flags[4]; float jitter[4], rowsJitter[4]; uint32_t route[4]; };
-static_assert(sizeof(Constants)==272, "HLSL cbuffer layout");
+// debug: x = this frame samples the refusal census, y = this frame paints the refusal view (FlatMonoResolveFrame::refusalCensus and
+// refusalView; the prep writes its class texture for either). Zero for every frame that asks for neither.
+struct Constants { float camera[6][4], previous[6][4]; uint32_t size[4], flags[4]; float jitter[4], rowsJitter[4]; uint32_t route[4], debug[4]; };
+static_assert(sizeof(Constants)==288, "HLSL cbuffer layout");
 // The game's pipeline state out of the way for the resolver's own work and its backends', and back on every exit. Two ways
 // (flat_context_isolation.h says which a device gets): the context state swap, which every device but DXMT's has always had and
 // which is unchanged, or the explicit capture (flat_context_state.h) for DXMT, whose SwapDeviceContextState aborts the process.
@@ -347,6 +366,7 @@ bool resources(const FlatMonoResolveFrame& f,const char** reason) {
        g.evalWidth==evalW && g.evalHeight==evalH)return true;
     ++stats.allocations;
     g.color={};g.depth[0]={};g.depth[1]={};g.motion={};g.rejection={};g.expected={};g.output[0]={};g.output[1]={};
+    g.klass={};g.classWidth=g.classHeight=0;   // the refusal census's class texture is the render size: made again by a frame that asks
     g.width=g.height=g.outWidth=g.outHeight=0;g.evalWidth=g.evalHeight=0;g.current=0;g.history=false;g.hdr=false;
     const bool taa=f.mode==FlatMonoResolveMode::Taa;
     // The images' names for the HDR route's crumbs: which of the private textures each creation is.
@@ -400,6 +420,66 @@ bool inputTexture(ID3D11ShaderResourceView* view,uint32_t width,uint32_t height,
     return device.Get()==g.device.Get() && desc.Width==width && desc.Height==height && desc.MipLevels==1 &&
         desc.ArraySize==1 && desc.SampleDesc.Count==1 && (desc.BindFlags&D3D11_BIND_SHADER_RESOURCE)!=0;
 }
+// ---- the refusal census and view (FlatMonoResolveFrame::refusalCensus, refusalView; flat_mono_refusal.h) -------------------------------
+// Everything here is made on first use by a frame that asks, never by initialize() or resources(): a frame that asks for neither
+// (every flat frame, and a VR frame with the census key and the view off) touches none of it.
+// The prep's class texture: one byte per render pixel (the class, and bit 7 for a refused history).
+bool ensureClassTexture(uint32_t width,uint32_t height) {
+    if(g.klass.texture && g.klass.srv && g.klass.uav && g.classWidth==width && g.classHeight==height)return true;
+    g.klass={};g.classWidth=g.classHeight=0;
+    if(!image(g.device.Get(),width,height,DXGI_FORMAT_R8_UINT,g.klass,true,"class")) {g.klass={};return false;}
+    g.classWidth=width;g.classHeight=height;
+    return true;
+}
+// The counting pass, its counter buffer (16 stripes of 16 counters, raw, UAV) and the four-slot staging ring the sums are read
+// back from.
+bool ensureRefusalCensus() {
+    if(g.census && g.refusalCounts && g.refusalCountsUav && g.refusalStaging[0] && g.refusalStaging[1] && g.refusalStaging[2] && g.refusalStaging[3])
+        return true;
+    ID3D11Device* device=g.device.Get();
+    if(!device)return false;
+    if(!g.census && FAILED(device->CreateComputeShader(kFlatMonoCensusBytecode,sizeof(kFlatMonoCensusBytecode),nullptr,g.census.GetAddressOf())))
+        return false;
+    const UINT bytes=kFlatMonoRefusalStripes*kFlatMonoRefusalSlots*4u;
+    if(!g.refusalCounts) {
+        D3D11_BUFFER_DESC bd{};bd.ByteWidth=bytes;bd.Usage=D3D11_USAGE_DEFAULT;bd.BindFlags=D3D11_BIND_UNORDERED_ACCESS;
+        bd.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        if(FAILED(device->CreateBuffer(&bd,nullptr,g.refusalCounts.GetAddressOf())))return false;
+    }
+    if(!g.refusalCountsUav) {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};ud.Format=DXGI_FORMAT_R32_TYPELESS;ud.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements=bytes/4u;ud.Buffer.Flags=D3D11_BUFFER_UAV_FLAG_RAW;
+        if(FAILED(device->CreateUnorderedAccessView(g.refusalCounts.Get(),&ud,g.refusalCountsUav.GetAddressOf())))return false;
+    }
+    for(auto& staging:g.refusalStaging) {
+        if(staging)continue;
+        D3D11_BUFFER_DESC bd{};bd.ByteWidth=bytes;bd.Usage=D3D11_USAGE_STAGING;bd.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+        if(FAILED(device->CreateBuffer(&bd,nullptr,staging.GetAddressOf())))return false;
+    }
+    return true;
+}
+// Reads back the samples the GPU has finished, oldest first, without waiting; a slot still in flight ends the pass (the ring is
+// read in order, so a later sample is never counted before an earlier one).
+void pollRefusalCensus(ID3D11DeviceContext* context) {
+    if(!context)return;
+    for(uint32_t k=0;k<4;++k) {
+        const uint32_t i=(g.refusalWrite+k)%4;
+        if(!g.refusalPending[i])continue;
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if(context->Map(g.refusalStaging[i].Get(),0,D3D11_MAP_READ,D3D11_MAP_FLAG_DO_NOT_WAIT,&mapped)!=S_OK)break;
+        const uint32_t* sums=static_cast<const uint32_t*>(mapped.pData);
+        for(uint32_t stripe=0;stripe<kFlatMonoRefusalStripes;++stripe)
+            for(uint32_t slot=0;slot<kFlatMonoRefusalSlots;++slot)
+                g_refusal.counts[slot]+=sums[stripe*kFlatMonoRefusalSlots+slot];
+        context->Unmap(g.refusalStaging[i].Get(),0);
+        ++g_refusal.frames;
+        g_refusal.pixels+=static_cast<uint64_t>(g.refusalWidth[i])*g.refusalHeight[i];
+        g_refusal.width=g.refusalWidth[i];g_refusal.height=g.refusalHeight[i];
+        g.refusalPending[i]=false;
+    }
+}
+// The ring is consumed in order, so the next sample may be taken only if the slot it would write is not still waiting to be read.
+bool refusalSlotFree() { return !g.refusalPending[g.refusalWrite]; }
 // The first-person inputs (FlatMonoResolveFrame::firstPersonMotion and firstPersonStencil, section 82), checked the way
 // inputTexture checks the colour and depth views, and answered by name: null when the view is fit to bind, else a static
 // reason. The reason goes to stats.firstPersonRefusal and the log; a refusal never refuses the frame, it only drops the pair.
@@ -487,7 +567,7 @@ void drawHdrTarget(ID3D11DeviceContext* context,ID3D11PixelShader* ps,uint32_t w
     }
     // Nothing of ours stays bound: the isolation guard's destructor clears the state once more before the game's returns.
     context->OMSetRenderTargets(0,nullptr,nullptr);
-    ID3D11ShaderResourceView* none[8]={};context->PSSetShaderResources(0,viewCount,none);
+    ID3D11ShaderResourceView* none[12]={};context->PSSetShaderResources(0,viewCount,none);   // twelve: the refusal view binds t11
 }
 // The backend's availability ask, where the asker is the HDR route: the first such ask of a session is the SDK's own
 // initialisation (NGX's, or AMD's), the first call into code that has never run on a DXMT device, so the crumbs bracket it.
@@ -506,6 +586,12 @@ bool backendAvailable(FlatMonoResolveMode mode,ID3D11Device* device,const char**
 
 FlatMonoResolveStats flatMonoResolveStats() { return stats; }
 bool flatMonoResolveLastReset() { return stats.lastReset; }
+FlatMonoRefusalCensus flatMonoResolveTakeRefusalCensus() {
+    if(g.context)pollRefusalCensus(g.context.Get());
+    FlatMonoRefusalCensus out=g_refusal;
+    g_refusal=FlatMonoRefusalCensus{};
+    return out;
+}
 // The preflight proper; the public entry below puts the route's crumbs around it.
 static FlatMonoResolvePreflightResult preflightBody(ID3D11Device* device,
     ID3D11DeviceContext* context,const FlatMonoResolvePreflight& planned) {
@@ -647,6 +733,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         return fail(reason,"flat-resolve-hdr-requires-render-size-evaluation");
     if(!initialize(device,context,reason))return false;
     if(hdr && !initializeHdr(device,reason))return false;
+    pollRefusalCensus(context);   // the samples the GPU finished since the last call (nothing pending: one flag test per slot)
     ComPtr<ID3D11Texture2D> color,depth;
     if(!inputTexture(f.color,f.renderWidth,f.renderHeight,true,color,hdr) ||
        !inputTexture(f.depth,f.renderWidth,f.renderHeight,false,depth))return fail(reason,"flat-resolve-input-view-mismatch");
@@ -691,6 +778,30 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
             }
         }
     } else if(f.firstPersonMotion || f.firstPersonStencil) ++stats.firstPersonPartial;
+    // The refusal census and view. Neither runs on a reset frame (every pixel is refused there, which says nothing) and the view is the
+    // HDR route's alone. A frame that asks for neither reaches the end of this block having touched nothing: no resource is made.
+    const bool paintView=hdr && f.refusalView!=0 && !reset;
+    bool sampleNow=false;
+    if(f.refusalCensus && !reset) {
+        ++g_refusal.asked;
+        if(g_refusalCadence++%kFlatMonoRefusalEvery==0) {
+            if(refusalSlotFree())sampleNow=true;
+            else ++g_refusal.dropped;
+        }
+    }
+    bool paintNow=paintView;
+    if(sampleNow || paintNow) {
+        if(!ensureClassTexture(f.renderWidth,f.renderHeight) || (sampleNow && !ensureRefusalCensus())) {
+            // A diagnostic never refuses the frame: it says so once and the frame runs as if nothing had asked.
+            sampleNow=false;paintNow=false;
+            if(!g_refusalFailureLogged) {
+                g_refusalFailureLogged=true;
+                Log::get().note("flat resolve: the refusal census/view could not make its resources (class texture, counting pass or "
+                                "counter buffer); it stays off and the frame resolves as usual");
+            }
+        }
+    }
+    const bool needClass=sampleNow || paintNow;
     const uint32_t index=taa?g.current:0;
     Constants constants{};std::memcpy(constants.camera,f.camera,sizeof(f.camera));
     std::memcpy(constants.previous,reset?f.camera:f.previousCamera,sizeof(f.previousCamera));
@@ -698,6 +809,7 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     constants.flags[0]=reset;constants.flags[1]=engine;constants.flags[2]=taa;constants.flags[3]=f.staticScene?1u:0u;
     constants.route[0]=hdr?1u:0u;constants.route[1]=(hdr&&taa)?1u:0u;
     constants.route[2]=firstPersonMap?1u:0u;constants.route[3]=firstPersonMap?f.firstPersonPhaseMode:0u;
+    constants.debug[0]=sampleNow?1u:0u;constants.debug[1]=paintNow?1u:0u;
     constants.jitter[0]=f.jitterX;constants.jitter[1]=f.jitterY;
     constants.jitter[2]=f.previousJitterX;constants.jitter[3]=f.previousJitterY;
     // On a reset the previous rows ARE the current rows (above), so they carry the current phase.
@@ -719,14 +831,34 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     ID3D11ShaderResourceView* prepViews[]={g.color.srv.Get(),f.depth,f.engine.slots,f.engine.pool,
         nullptr,nullptr,nullptr,nullptr,nullptr,firstPersonMap,firstPersonStencil};
     context->CSSetShaderResources(0,11,prepViews);
-    ID3D11UnorderedAccessView* prepOutputs[]={g.depth[index].uav.Get(),g.motion.uav.Get(),g.rejection.uav.Get(),g.expected.uav.Get()};
-    context->CSSetUnorderedAccessViews(0,4,prepOutputs,nullptr);
+    // u5 is the refusal census's class texture, bound only on a frame that samples or paints (u4 is the later kernels' OutColor).
+    ID3D11UnorderedAccessView* prepOutputs[]={g.depth[index].uav.Get(),g.motion.uav.Get(),g.rejection.uav.Get(),g.expected.uav.Get(),
+        nullptr,needClass?g.klass.uav.Get():nullptr};
+    context->CSSetUnorderedAccessViews(0,needClass?6:4,prepOutputs,nullptr);
     context->CSSetShader(g.prep.Get(),nullptr,0);
     context->Dispatch((f.renderWidth+7)/8,(f.renderHeight+7)/8,1);
-    ID3D11UnorderedAccessView* nullUavs[5]={};ID3D11ShaderResourceView* nullViews[11]={};
-    context->CSSetUnorderedAccessViews(0,5,nullUavs,nullptr);context->CSSetShaderResources(0,11,nullViews);
+    ID3D11UnorderedAccessView* nullUavs[6]={};ID3D11ShaderResourceView* nullViews[11]={};
+    context->CSSetUnorderedAccessViews(0,6,nullUavs,nullptr);context->CSSetShaderResources(0,11,nullViews);
     if(hdr)++stats.hdrPrepped;
     prepStep.close();
+    if(sampleNow) {
+        // The census sample: clear the counters, reduce the class texture the prep just wrote into them, copy them to the next
+        // staging slot (read back by pollRefusalCensus a few frames from now). b0 (the constants) is still bound from the prep.
+        const UINT groupsX=(f.renderWidth+7)/8,groupsY=(f.renderHeight+7)/8;
+        const UINT zeros[4]={0,0,0,0};
+        context->ClearUnorderedAccessViewUint(g.refusalCountsUav.Get(),zeros);
+        ID3D11ShaderResourceView* classView=g.klass.srv.Get();context->CSSetShaderResources(11,1,&classView);
+        ID3D11UnorderedAccessView* counts=g.refusalCountsUav.Get();context->CSSetUnorderedAccessViews(6,1,&counts,nullptr);
+        context->CSSetShader(g.census.Get(),nullptr,0);
+        context->Dispatch(groupsX,groupsY,1);
+        ID3D11UnorderedAccessView* noCounts=nullptr;context->CSSetUnorderedAccessViews(6,1,&noCounts,nullptr);
+        ID3D11ShaderResourceView* noClass=nullptr;context->CSSetShaderResources(11,1,&noClass);
+        const uint32_t slot=g.refusalWrite;
+        context->CopyResource(g.refusalStaging[slot].Get(),g.refusalCounts.Get());
+        g.refusalPending[slot]=true;g.refusalWidth[slot]=f.renderWidth;g.refusalHeight[slot]=f.renderHeight;
+        g.refusalWrite=(slot+1)%4;
+        ++g_refusal.sampled;
+    }
     HdrCrumbSpan backendStep(g_crumbOn,"backend","mode=%s in=%ux%u out=%ux%u reset=%u",flatMonoResolveModeName(f.mode),
         f.renderWidth,f.renderHeight,evalW,evalH,reset?1u:0u);
     bool ok=true;
@@ -757,9 +889,16 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         // The result goes back into the game's HDR target through a pixel-shader draw: per pixel the backend's output,
         // or the raw input where the rejection mask says the history is not to be trusted; for EDVR's TAA (route y) its
         // output, which has already made that choice. The state is our own, cleared at the top of the draw.
-        ID3D11ShaderResourceView* views[8]={g.color.srv.Get(),nullptr,nullptr,nullptr,nullptr,
-            g.rejection.srv.Get(),nullptr,g.output[taa?index:0].srv.Get()};
-        drawHdrTarget(context,g.finishHdr.Get(),f.renderWidth,f.renderHeight,views,8);
+        if(paintNow) {
+            // The refusal view: the same draw with the prep's class texture at t11, which the finish paints from.
+            ID3D11ShaderResourceView* paintViews[12]={g.color.srv.Get(),nullptr,nullptr,nullptr,nullptr,
+                g.rejection.srv.Get(),nullptr,g.output[taa?index:0].srv.Get(),nullptr,nullptr,nullptr,g.klass.srv.Get()};
+            drawHdrTarget(context,g.finishHdr.Get(),f.renderWidth,f.renderHeight,paintViews,12);
+        } else {
+            ID3D11ShaderResourceView* views[8]={g.color.srv.Get(),nullptr,nullptr,nullptr,nullptr,
+                g.rejection.srv.Get(),nullptr,g.output[taa?index:0].srv.Get()};
+            drawHdrTarget(context,g.finishHdr.Get(),f.renderWidth,f.renderHeight,views,8);
+        }
     } else if(!taa) {
         // SDKs may alter every stage. Start our final composite from the isolated
         // empty state; the outer guard still owns the untouched game's state.
@@ -899,4 +1038,10 @@ void flatMonoResolveTestPrepBytecode(const void* bytes,size_t size) {
 // Test-only, likewise: the session's budget of isolation log lines (kIsolationLogCap) starts over, so a rig that has initialised the
 // renderer many times can still read the line an initialisation says.
 void flatMonoResolveTestResetIsolationLog() { isolationLogged=0; }
+// Test-only, likewise: whether any of the refusal census's or the view's resources (the class texture, the counting pass, the counter
+// buffer and its staging ring) exists, so a rig can show that a frame which asked for neither made none of them.
+bool flatMonoResolveTestRefusalResources() {
+    return g.klass.texture || g.census || g.refusalCounts || g.refusalCountsUav || g.refusalStaging[0] || g.refusalStaging[1] ||
+           g.refusalStaging[2] || g.refusalStaging[3];
+}
 } // namespace edvr

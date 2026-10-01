@@ -1274,14 +1274,16 @@ std::string fixtureLog() {
     // The injector's own rule: the frame's phase goes into the bound pair as (jx / W, -jy / H); the rows then measure 2x that.
     auto phaseBound = [&](const VrCensusPhase& p, float* bx, float* by) { *bx = p.x / renderW; *by = -p.y / renderH; };
 
-    // Two lines of the world route's 5 s window, written by the route's OWN formatters (vr_world_route_math.h: vrWorldFormatWindow and
-    // vrWorldFormatInjectWindow), so the fixture the reader's self-test parses is what the route prints and a change to either line
-    // fails this rig's fixture pin until the fixture is regenerated and the reader parses it.
-    auto routeWindow = [&](VrWorldState state, bool gate, const VrWorldWindow& win) {
+    // Three lines of the world route's 5 s window, written by the route's OWN formatters (vr_world_route_math.h: vrWorldFormatWindow,
+    // vrWorldFormatInjectWindow and, while the census is on, vrWorldFormatRefusalWindow), so the fixture the reader's self-test parses is
+    // what the route prints and a change to any line fails this rig's fixture pin until the fixture is regenerated and the reader parses it.
+    auto routeWindow = [&](VrWorldState state, bool gate, const VrWorldWindow& win, const VrWorldRefusalWindow& refusal) {
         char text[1400];
         vrWorldFormatWindow(text, sizeof(text), VrWorldKey::Auto, state, true, gate, win);
         put(text);
         vrWorldFormatInjectWindow(text, sizeof(text), win.inject);
+        put(text);
+        vrWorldFormatRefusalWindow(text, sizeof(text), refusal);
         put(text);
     };
 
@@ -1290,7 +1292,9 @@ std::string fixtureLog() {
     {
         VrWorldWindow rw;
         rw.hdr.frames = 448; rw.gateFrames = 448; rw.hdr.lastVerdict = "none"; rw.jitter = "idle";
-        routeWindow(VrWorldState::Observing, false, rw);
+        VrWorldRefusalWindow rf;   // the census is on and the route treats nothing: "on, and nothing asked" (treated=0 asked=0 sampled=0 pixels=0)
+        rf.census = true; rf.every = kFlatMonoRefusalEvery;
+        routeWindow(VrWorldState::Observing, false, rw, rf);
     }
     {
         VrCensusWindow w;
@@ -1460,7 +1464,16 @@ std::string fixtureLog() {
         for (int i = 1; i < 450; ++i) rw.hdr.noteSelection("selected");
         rw.inject.scene = 5400; rw.inject.firstPerson = 1350; rw.inject.auxiliary = 450; rw.inject.unsupported = 2700;
         rw.inject.otherKind = 900; rw.inject.injectedKind[3] = 6750; rw.inject.pairChecked = 448;
-        routeWindow(VrWorldState::Owned, true, rw);
+        rw.inject.fovNarrowest = 0.8203f; rw.inject.fovWidest = 0.9831f;   // the struct's two fields of view: the weapon's and the scene's
+        // The refusal census over the window: one sample in four of 450 asking resolves (113 dispatched, 112 read back, none dropped), each
+        // sample the whole 5040x2835 render. 3.65% of the pixels refused: the sky (sentinel), stale slots, a few masked records and
+        // out-of-range reprojections; the first-person pixels are credited (mode 1), so almost none are refused for the weapon.
+        VrWorldRefusalWindow rf;
+        rf.census = true; rf.every = kFlatMonoRefusalEvery; rf.treated = 450; rf.asked = 450; rf.sampled = 113; rf.read = 112; rf.dropped = 0;
+        rf.width = 5040; rf.height = 2835; rf.pixels = 112ull * 5040ull * 2835ull;
+        rf.counts[kFlatMonoClassStale] = 40007520; rf.counts[kFlatMonoClassMasked] = 800150; rf.counts[kFlatMonoClassSentinel] = 16003008;
+        rf.counts[kFlatMonoClassRange] = 1600300; rf.counts[kFlatMonoClassWeaponRefused] = 0;
+        routeWindow(VrWorldState::Owned, true, rw, rf);
     }
     {
         VrCensusWindow w;
@@ -1556,10 +1569,13 @@ void testReaderFixture() {
     const char* classes[] = {"vr camera census 5s: frames=", "vr camera census: camera=0x", "vr camera census: changed: camera=0x",
                              "vr camera census: sequence frame=", "vr camera census: call frame=", "vr camera census: eye=",
                              "vr camera census: eye-geometry eye=",
-                             "vr world route 5s: key=auto state=owned", "vr world route inject 5s: inj-scene=5400"};
+                             "vr world route 5s: key=auto state=owned", "vr world route inject 5s: inj-scene=5400",
+                             "vr world route refusal 5s: census=on every=4 treated=450 asked=450 sampled=113 read=112 dropped=0 size=5040x2835 pixels=1600300800 refused=58410978 refused-pct=3.650"};
     unsigned found = 0;
     for (const char* cls : classes) if (built.find(cls) != std::string::npos) ++found;
-    check(found == 9, "the fixture holds a line of every class the rig pins: 5 s, camera, changed, sequence, call, eye, eye-geometry, and the route's two lines");
+    check(found == 10, "the fixture holds a line of every class the rig pins: 5 s, camera, changed, sequence, call, eye, eye-geometry, and the route's three lines");
+    check(built.find(" fov=0.8203..0.9831") != std::string::npos && built.find("vr world route refusal 5s: census=on every=4 treated=0 asked=0 sampled=0 read=0 dropped=0 size=0x0 pixels=0 refused=0 refused-pct=0.000") != std::string::npos,
+          "the fixture carries the experiment build's tokens: the injector's field-of-view range, and a refusal line for a window in which the census was on and nothing was treated (never the same text as a census that ran)");
     // The stage 2 tokens are in the fixture's census lines, from the formatters: a sampled frame's phase, what the detour decided for a call.
     check(built.find(" phase=0.2520,-0.1260 calls=24 recorded=24 truncated=0") != std::string::npos &&
               built.find(" inj=1 role=scene ") != std::string::npos && built.find(" inj=1 role=fp ") != std::string::npos &&

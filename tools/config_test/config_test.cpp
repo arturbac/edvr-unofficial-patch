@@ -1261,6 +1261,39 @@ int main(int argc, char** argv) {
         }
     }
 
+    // The stage 2 experiment build's key (design doc section 82: experimental.temporal_aa_on_foot_world_steady_detail) relaxes a
+    // refusal the resolver makes, so it is OFF by default in both places that can say so: the shipped file and the code's fallback
+    // for an ini that predates it, which must agree. The control turns the fallback to on (a relaxation nobody asked for) and
+    // must be caught.
+    expectStr("experimental.temporal_aa_on_foot_world_steady_detail", "off", "the shipped edvr.ini ships the VR world steady-detail key off");
+    {
+        const std::string shippedSteady = Config::get().getString("experimental.temporal_aa_on_foot_world_steady_detail", "<unset>");
+        const std::string worldSource = readRepoFile(dir, L"src\\d3d11\\vr_world_route.cpp");
+        if (worldSource.empty()) {
+            fail("vr_world_route.cpp is readable from the repo root (steady-detail key)", "could not read it");
+        } else {
+            const std::string fallback = codeFallbackOf(worldSource, "experimental.temporal_aa_on_foot_world_steady_detail");
+            if (fallback == shippedSteady) {
+                ok("the code's fallback for experimental.temporal_aa_on_foot_world_steady_detail is the shipped default");
+            } else {
+                fail("the code's fallback for experimental.temporal_aa_on_foot_world_steady_detail is the shipped default",
+                     "vr_world_route.cpp falls back to \"" + fallback + "\", the ini ships \"" + shippedSteady + "\"");
+            }
+            std::string flipped = worldSource;
+            const std::string from = "getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"" + fallback + "\")";
+            const size_t at = flipped.find(from);
+            if (at != std::string::npos)
+                flipped.replace(at, from.size(), "getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"on\")");
+            if (at != std::string::npos && codeFallbackOf(flipped, "experimental.temporal_aa_on_foot_world_steady_detail") != shippedSteady) {
+                ok("control: the VR world steady-detail key's fallback turned to on is caught");
+            } else {
+                fail("control: the VR world steady-detail key's fallback turned to on is caught",
+                     at == std::string::npos ? "the call was not found to alter"
+                                             : "the flipped source still matched the ini");
+            }
+        }
+    }
+
     // The VR camera census (design doc section 82, advanced.vr_camera_census) installs a game hook when it is on, so it
     // is OFF by default in both places that can say so: the shipped file and the code's fallback for an ini that predates
     // the key. The same pair of checks as the world route's, with the same control.
@@ -1768,6 +1801,9 @@ int main(int argc, char** argv) {
     // ... and so is its jitter key: a flat profile reads it off whatever the file says (it never asks).
     Config::get().set("experimental.temporal_aa_on_foot_world_jitter", "on");
     expectStr("experimental.temporal_aa_on_foot_world_jitter", "off", "flat scope refuses the VR world jitter's key");
+    // ... and the stage 2 experiment build's steady-detail key: a flat profile never relaxes the resolver's stale-slot refusal for it.
+    Config::get().set("experimental.temporal_aa_on_foot_world_steady_detail", "on");
+    expectStr("experimental.temporal_aa_on_foot_world_steady_detail", "off", "flat scope refuses the VR world steady-detail key");
     // The VR camera census's key is a VR-profile key too: a flat profile must never install its hook.
     Config::get().set("advanced.vr_camera_census", "on");
     expectStr("advanced.vr_camera_census", "off", "flat scope refuses the VR camera census's key");
@@ -1855,6 +1891,10 @@ int main(int argc, char** argv) {
     expectStr("experimental.temporal_aa_on_foot_world_jitter", "off", "VR profile reads the VR world jitter's explicit off");
     Config::get().set("experimental.temporal_aa_on_foot_world_jitter", "on");
     expectStr("experimental.temporal_aa_on_foot_world_jitter", "on", "VR profile reads the VR world jitter's explicit on");
+    Config::get().set("experimental.temporal_aa_on_foot_world_steady_detail", "on");
+    expectStr("experimental.temporal_aa_on_foot_world_steady_detail", "on", "VR profile reads the VR world steady-detail key's explicit on");
+    Config::get().set("experimental.temporal_aa_on_foot_world_steady_detail", "off");
+    expectStr("experimental.temporal_aa_on_foot_world_steady_detail", "off", "VR profile reads the VR world steady-detail key's explicit off");
     Config::get().set("advanced.vr_camera_census", "on");
     expectStr("advanced.vr_camera_census", "on", "VR profile reads the VR camera census's explicit on");
     g_runtimeProfile = RuntimeProfile::LegacyVr;

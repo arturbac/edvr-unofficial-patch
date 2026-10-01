@@ -91,6 +91,12 @@ kind 3 is injected, (iv) nothing ran off-thread or unreadable, (v) the roles, (v
 nothing was injected on a frame whose window the route had shut. The verdict reads
 the route's `vr world route 5s:` and `vr world route inject 5s:` lines and a few of
 its own log lines too; a log that predates stage 2 gets n/a lines, never a crash.
+With the census key on, the route also prints a refusal-census line a window
+(`vr world route refusal 5s:`, the stage 2 experiment build): the report gets a section
+with the share of the treated pixels whose history the resolver's prep refused, per
+window and by cause (stale slot, masked record, ...), the state of the steady-detail
+key and of the refusal view in each window, and totals by key state; (v) also checks
+the weapon's role (inj-fp against the fold-in's mode counts and the struct's fov range).
 A log with no census lines exits 1; the verdict never changes the exit code (read
 its lines).
 
@@ -481,6 +487,16 @@ def print_vh_tally(text, frame):
 # window was shut; not a fault. `inj-shut` counts calls injected on a frame whose window was shut and must be 0; `inj-unnamed`
 # counts frames whose window was open and that named nothing: one per world-to-map change is expected.) The route's own log
 # lines the verdict quotes are listed in ROUTE_EVENT_MARKERS (`STOP at frame=`, `RELEASED the world at frame=`, ...).
+# The inject line ends with `fov=<narrowest>..<widest>` (radians: the struct's field of view over the screen views of the window,
+# two values when the first-person camera's tighter one is in it) or `fov=-` (no frustum was read), and, with the census key on,
+# a third line follows the two (src/d3d11/vr_world_route_math.h vrWorldFormatRefusalWindow):
+#   vr world route refusal 5s: census=on|off every=N treated=N asked=N sampled=N read=N dropped=N size=WxH pixels=N refused=N
+#       refused-pct=X stale=N masked=N corrupt=N sentinel=N unreprojectable=N camera=N range=N depth=N weapon=N other=N
+#       forgiven=N steady-detail=on|off view=on|off
+# (`pixels` is what the read-back samples examined, `refused` the pixels whose history the prep refused, by cause; `forgiven` the stale
+# pixels the steady-detail key sent to the camera term instead; "ran, 0 refused" is pixels > 0 and refused=0, "never ran" is
+# treated=0, asked=0 or read=0.) The route also logs a line when the steady-detail key or the refusal view changes
+# (`steady-detail is ON|OFF from frame=`, `the refusal view is ON|OFF from frame=`), see ROUTE_EVENT_MARKERS.
 #
 # WHAT A CAMERA IS. The camera OBJECT is no identity: one object was the left eye camera in
 # the cockpit (kind 5) and the world's kind-3 camera on foot (flight 1, 4.63 million calls),
@@ -513,6 +529,22 @@ CENSUS_LINE_RE = re.compile(
     r"^(?P<ts>\[[\d:.]+\])?\s*vr camera census(?P<five> 5s)?: (?P<rest>.*?)\s*$")
 ROUTE_LINE_RE = re.compile(
     r"^(?P<ts>\[[\d:.]+\])?\s*vr world route (?P<inject>inject )?5s: (?P<rest>.*?)\s*$")
+REFUSAL_LINE_RE = re.compile(
+    r"^(?P<ts>\[[\d:.]+\])?\s*vr world route refusal 5s: (?P<rest>.*?)\s*$")
+# The causes the refusal line counts, in the line's own order (src/d3d11/flat_mono_refusal.h), and what each one is. `other` is
+# what the census cannot name: a refused pixel of a class the line has no token for.
+REFUSAL_CAUSES = (
+    ("stale", "the engine slot's depth was not the pixel's: a later draw overdrew it"),
+    ("masked", "a rig record with no usable history this frame (first seen, or after a gap)"),
+    ("corrupt", "a slot code or a record number that did not survive intact"),
+    ("sentinel", "no depth under the slot (the sky) or the out-of-range marker"),
+    ("unreprojectable", "a moved record whose reprojection failed"),
+    ("camera", "the camera term could not be formed"),
+    ("range", "the reprojection left the screen or was not finite"),
+    ("depth", "the pixel's own depth was not usable"),
+    ("weapon", "an attached first-person pixel the weapon's map could not place"),
+    ("other", "a refusal the census cannot name"),
+)
 CENSUS_JOIN_TOL = 1e-5
 # Two shift-sign candidates whose residuals differ by less than this are a tie: rows are floats, so rounding alone moves a
 # measure by about 1e-7, and with a shift of nothing (the jitter off) every candidate is the same number.
@@ -534,6 +566,9 @@ CENSUS_PROJ_SHOWN = 6
 # The kinds the design puts on the screen: the world is 3, the eyes 5 (design doc section 82, flight 1).
 CENSUS_KIND5_PER_FRAME = 6.0       # two eyes x the three call sites +0x594E13, +0x594EAB, +0x594FE1
 CENSUS_INJECTED_PER_FRAME = (54, 68)
+# The role test's field-of-view ratio (kFlatCameraVrFirstPersonFovRatio in src/d3d11/flat_camera_vr.h): a screen view whose fov is at
+# most this fraction of the frame's widest is the first-person camera. Flight 2's struct: 0.8203 against 0.9831 rad (ratio 0.834).
+CENSUS_FP_FOV_RATIO = 0.92
 
 
 def _cf(text):
@@ -778,6 +813,8 @@ ROUTE_EVENT_MARKERS = (
     ("window-open", "camera window was open"),
     ("released", "vr world route: RELEASED the world at frame="),
     ("excluded", "camera call EXCLUDED, not a screen view"),
+    ("steady-detail", "vr world route: steady-detail is "),
+    ("refusal-view", "vr world route: the refusal view is "),
 )
 
 
@@ -818,6 +855,207 @@ def route_hdr(windows, events=None):
         if m and int(m.group(1)) and int(m.group(2)):
             return int(m.group(1)), int(m.group(2)), "the route's `the world is JITTERED` line"
     return None
+
+
+def _cmodes(text):
+    """The route line's `fp-mode=a/b/c` (frames whose weapon fold-in ran in mode 0, 1, 2) as three ints, else None."""
+    m = re.match(r"^(\d+)/(\d+)/(\d+)$", text or "")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def _cfov(text):
+    """The inject line's `fov=` token: `lo..hi` -> (lo, hi) floats; `-` (no frustum was read) or anything else -> None."""
+    m = re.match(r"^(\d+(?:\.\d+)?)\.\.(\d+(?:\.\d+)?)$", text or "")
+    return (float(m.group(1)), float(m.group(2))) if m else None
+
+
+def route_fov(routes):
+    """(narrowest, widest, windows): the struct's field of view (radians) over the inject lines' `fov=` tokens, and how many windows
+    had a range; (None, None, 0) when none did (an older build, or no frustum was read)."""
+    lo = hi = None
+    n = 0
+    for w in routes:
+        r = _cfov(route_tok(w, "fov"))
+        if r:
+            lo = r[0] if lo is None or r[0] < lo else lo
+            hi = r[1] if hi is None or r[1] > hi else hi
+            n += 1
+    return lo, hi, n
+
+
+def parse_refusal_windows(text):
+    """The refusal census's 5 s lines (`vr world route refusal 5s:`: one a window while advanced.vr_camera_census is on and the route is
+    engaged, and while samples of a window that has just ended are still draining), each joined to the route's own line and inject line
+    of the same window (the route prints route, inject, refusal, in that order; a missing one is None). A list of dicts: ts, kv (every
+    token), census (census=on), steady and view (the tokens' text), w and h (size=), pct (refused-pct), route and inject (the other
+    two lines' tokens), the counters as ints (None when a token is absent or not a number: treated, asked, sampled, read, dropped,
+    every, pixels, refused, forgiven) and causes {name: int or None} for every name of REFUSAL_CAUSES."""
+    out = []
+    route = inject = None
+    for raw in text.splitlines():
+        m = ROUTE_LINE_RE.match(raw)
+        if m:
+            if m.group("inject"):
+                inject = _ckv(m.group("rest"))
+            else:
+                route, inject = _ckv(m.group("rest")), None
+            continue
+        m = REFUSAL_LINE_RE.match(raw)
+        if not m:
+            continue
+        kv = _ckv(m.group("rest"))
+        size = re.match(r"^(\d+)x(\d+)$", kv.get("size", ""))
+        w = {"ts": m.group("ts") or "", "kv": kv, "census": kv.get("census") == "on", "steady": kv.get("steady-detail"),
+             "view": kv.get("view"), "w": int(size.group(1)) if size else None, "h": int(size.group(2)) if size else None,
+             "pct": _cf(kv.get("refused-pct")), "route": route, "inject": inject}
+        for key in ("every", "treated", "asked", "sampled", "read", "dropped", "pixels", "refused", "forgiven"):
+            w[key] = _cint(kv.get(key))
+        w["causes"] = {name: _cint(kv.get(name)) for name, _ in REFUSAL_CAUSES}
+        out.append(w)
+        route = inject = None
+    return out
+
+
+def refusal_state(w):
+    """What one refusal line says happened in its window. `measured`: samples were read back and the shares are real (including a window
+    that measured and found nothing refused: pixels > 0, refused=0). The rest are windows that measured nothing, each for its own
+    reason: `idle` (the route treated no frame), `no-ask` (it treated frames and none asked for the census), `no-sample` (fewer asks than
+    one sample takes), `no-read` (samples were dispatched and none came back), `unreadable` (a counter did not parse)."""
+    if any(w[k] is None for k in ("treated", "asked", "sampled", "read", "pixels", "refused")):
+        return "unreadable"
+    if w["read"] and w["pixels"]:
+        return "measured"
+    if not w["treated"]:
+        return "idle"
+    if not w["asked"]:
+        return "no-ask"
+    if not w["sampled"]:
+        return "no-sample"
+    return "no-read"
+
+
+def _pct(n, pixels):
+    return "%.3f%%" % (100.0 * n / pixels) if pixels else "-"
+
+
+def refusal_findings(windows):
+    """[(level, text)] about what the refusal lines do not support believing (WARN: a number that contradicts another, a key that did not
+    take effect, a census that never measured) and what is worth knowing (note)."""
+    out = []
+    states = [refusal_state(w) for w in windows]
+    for w, s in zip(windows, states):
+        stamp = w["ts"] or "(no stamp)"
+        if s == "unreadable":
+            out.append(("WARN", "%s: a refusal line has a counter that is missing or not a number (an older or garbled line): its window is not counted"
+                        % stamp))
+        elif s == "no-ask":
+            out.append(("WARN", "%s: the route treated %d frame(s) and none asked the resolver for the census: the key reached the route "
+                        "(census=on) and not the resolver" % (stamp, w["treated"])))
+        elif s == "no-read":
+            out.append(("WARN", "%s: %d sample(s) were dispatched and none was read back: the read-back is stalled (or this is the window "
+                        "the key went on in)" % (stamp, w["sampled"])))
+        elif s == "measured":
+            causes = w["causes"]
+            if w["refused"] > w["pixels"]:
+                out.append(("WARN", "%s: refused %d exceeds the pixels examined, %d: the census counts a pixel once, so one of the two is wrong"
+                            % (stamp, w["refused"], w["pixels"])))
+            if w["steady"] == "on" and (causes["stale"] or 0) > 0:
+                out.append(("WARN", "%s: steady-detail=on and %d stale pixel(s) were still refused: the key's rule did not reach the resolver "
+                            "(with it on, a stale slot takes the camera term and is counted as forgiven)" % (stamp, causes["stale"])))
+            if w["steady"] == "off" and (w["forgiven"] or 0) > 0:
+                out.append(("WARN", "%s: %d stale pixel(s) were forgiven while steady-detail=off: the line's key state and the resolver's disagree"
+                            % (stamp, w["forgiven"])))
+            if (w["dropped"] or 0) > 0:
+                out.append(("note", "%s: %d sample(s) were skipped because the read-back ring was full (the shares are unaffected, the sample "
+                            "count is lower)" % (stamp, w["dropped"])))
+            if (causes["other"] or 0) > 0:
+                out.append(("note", "%s: %d refused pixel(s) are of a class the census cannot name (`other`)" % (stamp, causes["other"])))
+        if w["view"] == "on":
+            out.append(("note", "%s: the refusal view was painting: the headset showed the prep's classification, not the world" % stamp))
+    measured = [w for w, s in zip(windows, states) if s == "measured"]
+    treated = sum(w["treated"] or 0 for w in windows)
+    if windows and not measured:
+        if treated:
+            out.append(("WARN", "the census never measured: the route treated %d frame(s) over %d window(s) and no sample was read back"
+                        % (treated, len(windows))))
+        else:
+            out.append(("note", "the census was on for %d window(s) and the route treated no frame in any of them: nothing was measured "
+                        "(not owning the world: a ship, a menu, or the route key off)" % len(windows)))
+    return out
+
+
+def print_refusal_census(windows, events=None):
+    """The refusal-census section of --camera-census: the share of the treated pixels whose history the resolver's prep refused, per 5 s
+    window and by cause, with the steady-detail key's state and the refusal view's in each window, then totals by key state and the
+    findings. Returns the findings."""
+    events = events or {}
+    every = next((w["every"] for w in windows if w["every"]), None)
+    print("\n== refusal census (advanced.vr_camera_census: the route's own resolve, the prep's per-pixel classification, one sample in %s "
+          "of the resolves that ask; shares are of the pixels the samples examined) ==" % (every or "?"))
+    if not windows:
+        print("none: no `vr world route refusal 5s:` line in this log (advanced.vr_camera_census was off, the route never engaged, or this "
+              "build predates the census)")
+        return []
+    states = [refusal_state(w) for w in windows]
+    for w, s in zip(windows, states):
+        route = w["route"] or {}
+        inject = w["inject"] or {}
+        context = "route state=%s jitter=%s fp-mode %s, inj-fp %s, struct fov %s" % (
+            route.get("state", "?"), route.get("jitter", "?"), route.get("fp-mode", "?"), inject.get("inj-fp", "?"), inject.get("fov", "?"))
+        head = "%s steady-detail=%s view=%s census=%s" % (w["ts"] or "(no stamp)", w["steady"], w["view"], "on" if w["census"] else "off")
+        if s == "measured":
+            named = [(name, w["causes"][name]) for name, _ in REFUSAL_CAUSES if w["causes"][name]]
+            mix = ", ".join("%s %s" % (name, _pct(n, w["pixels"])) for name, n in named) if named else "none refused"
+            print("%s: MEASURED %d sample(s) of %dx%d (%d asked, %d dispatched, %d dropped), treated %d; pixels %d; refused %s (%d): %s; "
+                  "forgiven %s | %s"
+                  % (head, w["read"], w["w"] or 0, w["h"] or 0, w["asked"], w["sampled"], w["dropped"] or 0, w["treated"], w["pixels"],
+                     _pct(w["refused"], w["pixels"]), w["refused"], mix, _pct(w["forgiven"] or 0, w["pixels"]), context))
+        else:
+            reason = {
+                "idle": "the route treated no frame in this window (nothing was measured)",
+                "no-ask": "the route treated %s frame(s) and none asked for the census" % w["treated"],
+                "no-sample": "%s ask(s), fewer than one sample's worth (every %s)" % (w["asked"], w["every"]),
+                "no-read": "%s sample(s) dispatched, none read back" % w["sampled"],
+                "unreadable": "a counter did not parse",
+            }[s]
+            print("%s: NOT MEASURED: %s | %s" % (head, reason, context))
+    measured = [(w, s) for w, s in zip(windows, states) if s == "measured"]
+    keys = []
+    for w, _ in measured:
+        if w["steady"] not in keys:
+            keys.append(w["steady"])
+    for key in keys:
+        group = [w for w, _ in measured if w["steady"] == key]
+        pixels = sum(w["pixels"] for w in group)
+        refused = sum(w["refused"] for w in group)
+        forgiven = sum(w["forgiven"] or 0 for w in group)
+        totals = {name: sum(w["causes"][name] or 0 for w in group) for name, _ in REFUSAL_CAUSES}
+        mix = ", ".join("%s %s" % (name, _pct(n, pixels)) for name, n in totals.items() if n)
+        of_refused = ", ".join("%s %.1f%%" % (name, 100.0 * n / refused) for name, n in totals.items() if n) if refused else ""
+        print("totals, steady-detail=%s: %d measured window(s), %d sample(s), pixels %d, refused %s (%d)%s; forgiven %s%s"
+              % (key, len(group), sum(w["read"] for w in group), pixels, _pct(refused, pixels), refused,
+                 ": %s" % mix if mix else " (none refused)", _pct(forgiven, pixels),
+                 "; of the refused: %s" % of_refused if of_refused else ""))
+        if len(group) > 1:
+            shares = [100.0 * w["refused"] / w["pixels"] for w in group]
+            print("    per-window refused share: min %.3f%%, max %.3f%% over %d window(s)" % (min(shares), max(shares), len(group)))
+    seen = [(name, text) for name, text in REFUSAL_CAUSES if any((w["causes"][name] or 0) for w, _ in measured)]
+    if seen:
+        print("causes seen: %s" % "; ".join("%s = %s" % (name, text) for name, text in seen))
+    for key in ("steady-detail", "refusal-view"):
+        for line in events.get(key, [])[:6]:
+            print("route log: %s" % line[:240])
+    findings = refusal_findings(windows)
+    for level, text in findings:
+        print("%s %s" % ("!!" if level == "WARN" else "refusal note:", text))
+    warns = sum(1 for level, _ in findings if level == "WARN")
+    if warns:
+        print("refusal census: WARN (%d finding(s) above)" % warns)
+    elif measured:
+        print("refusal census: consistent (%d of %d window(s) measured)" % (len(measured), len(windows)))
+    else:
+        print("refusal census: nothing measured (%d window(s))" % len(windows))
+    return findings
 
 
 def census_join(c, tol=CENSUS_JOIN_TOL):
@@ -1344,6 +1582,20 @@ def census_verdict(c, routes, roles=None, events=None):
                                                       role_calls[k][0], role_calls[k][1])
                               for k in ("scene", "fp", "aux") if k in role_calls) or "none in a non-zero-phase sequence"
         body = "ROLES: the route counted %s; logged calls in non-zero-phase sequences: %s" % (route_text, call_text)
+        # The weapon (the stage 2 experiment build): the fold-in's mode counts say how many frames drew a weapon (mode 1 or 2), inj-fp how
+        # many of its calls the role test credited, and the inject line's fov= range whether the struct carries a second, tighter field of
+        # view for the test to find. Flight 2: inj-fp 0 with the fold-in in mode 2 on every weapon frame, and no fov= token.
+        modes = [_cmodes(route_tok(w, "fp-mode")) for w in routes]
+        m1 = sum(m[1] for m in modes if m)
+        m2 = sum(m[2] for m in modes if m)
+        folded = m1 + m2
+        fov_lo, fov_hi, fov_n = route_fov(routes)
+        fp_calls, scene_calls = sums["inj-fp"][0], sums["inj-scene"][0]
+        if fov_n:
+            body += "; struct field of view %.4f..%.4f rad over %d window(s)" % (fov_lo, fov_hi, fov_n)
+        if sums["inj-fp"][1] and fp_calls and folded:
+            body += "; the weapon's fold-in ran in %d frame(s) (mode 1: %d, mode 2: %d), about %.1f first-person call(s) credited a frame" % (
+                folded, m1, m2, fp_calls / float(folded))
         refused = sums["inj-refused"][0]
         write_fail, _ = total(routes, "write-fail")
         if aux_injected:
@@ -1355,6 +1607,24 @@ def census_verdict(c, routes, roles=None, events=None):
             add("v", "WARN", "%s: no scene call was injected" % body)
         elif events.get("no-scene-call"):
             add("v", "WARN", "%s; the route logged: %s" % (body, events["no-scene-call"][0][:200]))
+        elif sums["inj-fp"][1] and not fp_calls and folded:
+            if fov_n and fov_lo < CENSUS_FP_FOV_RATIO * fov_hi:
+                why = ("the struct carries two fields of view (%.4f and %.4f rad), so the role test should have told the weapon's calls "
+                       "from the scene's: a fault in the field-of-view test" % (fov_lo, fov_hi))
+            elif fov_n:
+                why = ("the struct carries one field of view (%.4f rad) in every window, so the weapon's calls cannot be told from the "
+                       "scene's by it" % fov_hi)
+            else:
+                why = "no inject line carries a fov= range (a build that predates the field-of-view test: flight 2's picture)"
+            add("v", "WARN", "%s: no first-person call was credited (inj-fp 0) although the weapon's fold-in ran in %d frame(s) (mode 1: %d, "
+                "mode 2: %d), so the weapon's pixels refuse their history; %s" % (body, folded, m1, m2, why))
+        elif fp_calls and m2 and not m1:
+            add("v", "WARN", "%s: first-person calls were credited (inj-fp %d) and yet the fold-in ran only in mode 2 (%d frame(s), mode 1 in "
+                "none): the frames that credited the weapon are not the frames its map was made in" % (body, fp_calls, m2))
+        elif fp_calls and scene_calls and fp_calls >= scene_calls:
+            add("v", "WARN", "%s: as many first-person calls as scene calls (%d against %d; flight 2's weapon was 15 of the world's 78): the "
+                "role test's scene anchor is probably a wider screen-aspect camera, read the struct field of view range" % (
+                    body, fp_calls, scene_calls))
         else:
             add("v", "PASS", body)
 
@@ -1436,8 +1706,12 @@ def census_verdict(c, routes, roles=None, events=None):
     return out
 
 
-def print_stage2_verdict(c, routes, roles=None, events=None):
-    """Prints the verdict section and returns its overall word: STOP, WARN, PASS or n/a."""
+def print_stage2_verdict(c, routes, roles=None, events=None, refusals=None):
+    """Prints the refusal-census section (when `refusals`, the parsed refusal windows, is given: an empty list says there were none) and
+    then the verdict section, and returns the verdict's overall word: STOP, WARN, PASS or n/a. The refusal census has its own closing
+    line and never changes the verdict's word."""
+    if refusals is not None:
+        print_refusal_census(refusals, events)
     print("\n== stage 2 verdict (PASS leak < %.0e NDC, STOP leak > %.0e; kind-3 rows within %.0e NDC of the phase) =="
           % (CENSUS_LEAK_PASS, CENSUS_LEAK_STOP, CENSUS_PHASE_TOL))
     verdict = census_verdict(c, routes, roles, events)
@@ -1491,6 +1765,7 @@ def print_camera_census(text):
         return 1
     routes = parse_world_route(text)
     events = route_events(text)
+    refusals = parse_refusal_windows(text)
     print("[edvr] camera census: %d census line(s): %d 5 s line(s), %d camera(s), "
           "%d call sequence(s), %d eye draw(s), %d other-thread entr%s"
           % (c["lines"], len(c["windows"]), len(c["order"]), len(c["sequences"]),
@@ -1748,7 +2023,7 @@ def print_camera_census(text):
               "%s%s" % ("(The join found no matching call in a logged frame: see above.)" if join else "(No eye draw was read back.)",
                         " Cameras with kind-5 calls in the logged sequences (candidates, not joined): %s"
                         % ", ".join("0x%X" % p for p in candidates) if candidates else ""))
-        print_stage2_verdict(c, routes, roles, events)
+        print_stage2_verdict(c, routes, roles, events, refusals)
         return 0
     print("eye camera(s): %s; world camera: %s; other world-side kind-3 camera(s): %s"
           % (", ".join("0x%X" % p for p in c["order"] if p in roles["eye"]),
@@ -1844,7 +2119,7 @@ def print_camera_census(text):
     else:
         print("(E) tangents: no eye draw fell in the frame an eye camera's line was printed, so the camera's tangents "
               "and the advertised frustum were not compared (their difference is the eye shift, about 1e-4, per frame)")
-    print_stage2_verdict(c, routes, roles, events)
+    print_stage2_verdict(c, routes, roles, events, refusals)
     return 0
 
 
@@ -3814,6 +4089,142 @@ def self_test_camera_census():
     _, out = report(with_leak("2.0e-06"))
     if "stage 2 verdict: WARN (" not in out:
         fail("one WARN and no STOP did not make the verdict WARN")
+
+    # ---- the stage 2 experiment build: the refusal census, the key's state, the view, the weapon's role ----
+    # The parser: the fixture's two refusal windows, each joined to the route and inject lines of its own window.
+    rw = parse_refusal_windows(text)
+    if len(rw) != 2 or [refusal_state(w) for w in rw] != ["idle", "measured"] or rw[1]["pixels"] != 1600300800 or rw[1]["refused"] != 58410978 or \
+            rw[1]["causes"]["stale"] != 40007520 or rw[1]["causes"]["masked"] != 800150 or rw[1]["causes"]["sentinel"] != 16003008 or \
+            rw[1]["causes"]["range"] != 1600300 or rw[1]["forgiven"] != 0 or rw[1]["steady"] != "off" or rw[1]["view"] != "off" or \
+            (rw[1]["w"], rw[1]["h"]) != (5040, 2835) or abs(rw[1]["pct"] - 3.650) > 1e-9 or rw[1]["every"] != 4 or rw[1]["dropped"] != 0 or \
+            rw[1]["route"]["fp-mode"] != "0/450/0" or rw[1]["inject"]["fov"] != "0.8203..0.9831" or rw[0]["route"]["jitter"] != "idle" or \
+            rw[0]["inject"]["fov"] != "-" or not rw[0]["census"]:
+        fail("the fixture's refusal lines parsed as %r" % ([(w["ts"], refusal_state(w), w["pixels"], w["refused"]) for w in rw],))
+    if len(parse_world_route(text)) != 2:
+        fail("the refusal lines joined the route's own windows (they are a third line and a list of their own)")
+    if (_cmodes("0/450/0"), _cmodes("0/0/12"), _cmodes("0/450"), _cmodes(None), _cmodes("a/b/c")) != ((0, 450, 0), (0, 0, 12), None, None, None):
+        fail("_cmodes")
+    if (_cfov("0.8203..0.9831"), _cfov("-"), _cfov(None), _cfov("1..2"), _cfov("0.8203.0.9831")) != ((0.8203, 0.9831), None, None, (1.0, 2.0), None):
+        fail("_cfov")
+    garbled = parse_refusal_windows("vr world route refusal 5s: census=on treated=x asked=0\n")
+    if len(garbled) != 1 or garbled[0]["treated"] is not None or refusal_state(garbled[0]) != "unreadable":
+        fail("a refusal counter that is not a number parsed as one, or its window was not 'unreadable'")
+    if [e for e in route_events("[00:00:01.000] vr world route: steady-detail is ON from frame=100 (x)\n"
+                                "[00:00:02.000] vr world route: the refusal view is ON from frame=200 (y)\n").keys()] != ["steady-detail", "refusal-view"]:
+        fail("the route's steady-detail and refusal-view lines are not among its event markers")
+    # The report on the fixture: the section, and the weapon's numbers in (v), whose old PASS text is unchanged.
+    rc, out = report(text)
+    flat = squash(out)
+    for w in (
+        "== refusal census (advanced.vr_camera_census: the route's own resolve, the prep's per-pixel classification, one sample in 4 of the "
+        "resolves that ask; shares are of the pixels the samples examined) ==",
+        "census=on: NOT MEASURED: the route treated no frame in this window (nothing was measured) | route state=observing jitter=idle "
+        "fp-mode 0/0/0, inj-fp 0, struct fov -",
+        "census=on: MEASURED 112 sample(s) of 5040x2835 (450 asked, 113 dispatched, 0 dropped), treated 450; pixels 1600300800; refused "
+        "3.650% (58410978): stale 2.500%, masked 0.050%, sentinel 1.000%, range 0.100%; forgiven 0.000% | route state=owned jitter=on "
+        "fp-mode 0/450/0, inj-fp 1350, struct fov 0.8203..0.9831",
+        "totals, steady-detail=off: 1 measured window(s), 112 sample(s), pixels 1600300800, refused 3.650% (58410978): stale 2.500%, masked "
+        "0.050%, sentinel 1.000%, range 0.100%; forgiven 0.000%; of the refused: stale 68.5%, masked 1.4%, sentinel 27.4%, range 2.7%",
+        "causes seen: stale = the engine slot's depth was not the pixel's: a later draw overdrew it; masked = a rig record with no usable history",
+        "refusal census: consistent (1 of 2 window(s) measured)",
+        "; struct field of view 0.8203..0.9831 rad over 1 window(s); the weapon's fold-in ran in 450 frame(s) (mode 1: 450, mode 2: 0), about "
+        "3.0 first-person call(s) credited a frame",
+    ):
+        if w not in flat:
+            fail("the report on the fixture lacks %r:\n%s" % (w, out))
+            break
+    if "!! " in out or "refusal note:" in out:
+        fail("the fixture's refusal census raised a finding:\n%s" % out)
+
+    def refusal_line(**kw):
+        """One refusal line of the fixture's measured window, with some tokens changed."""
+        v = dict(census="on", every=4, treated=450, asked=450, sampled=113, read=112, dropped=0, size="5040x2835", pixels=1600300800,
+                 refused=58410978, pct="3.650", stale=40007520, masked=800150, corrupt=0, sentinel=16003008, unreprojectable=0, camera=0,
+                 range=1600300, depth=0, weapon=0, other=0, forgiven=0, steady="off", view="off")
+        v.update(kw)
+        return ("[12:00:09.000] vr world route refusal 5s: census=%(census)s every=%(every)d treated=%(treated)d asked=%(asked)d "
+                "sampled=%(sampled)d read=%(read)d dropped=%(dropped)d size=%(size)s pixels=%(pixels)d refused=%(refused)d "
+                "refused-pct=%(pct)s stale=%(stale)d masked=%(masked)d corrupt=%(corrupt)d sentinel=%(sentinel)d "
+                "unreprojectable=%(unreprojectable)d camera=%(camera)d range=%(range)d depth=%(depth)d weapon=%(weapon)d other=%(other)d "
+                "forgiven=%(forgiven)d steady-detail=%(steady)s view=%(view)s\n") % v
+
+    nothing = dict(refused=0, pct="0.000", stale=0, masked=0, sentinel=0, range=0)
+    # "Ran, 0 refused" (pixels > 0, refused=0) is never the same text as "never ran" (treated=0, asked=0, read=0).
+    _, out = report(text + refusal_line(**nothing))
+    if "refused 0.000% (0): none refused; forgiven 0.000%" not in squash(out) or "!! " in out or \
+            "totals, steady-detail=off: 2 measured window(s), 224 sample(s), pixels 3200601600, refused 1.825% (58410978)" not in squash(out):
+        fail("a window that measured and found nothing refused was not reported as measured, or the totals did not add the two:\n%s" % out)
+    _, out = report(text + refusal_line(treated=450, asked=0, sampled=0, read=0, pixels=0, **nothing))
+    if "NOT MEASURED: the route treated 450 frame(s) and none asked for the census" not in out or \
+            "!! [12:00:09.000]: the route treated 450 frame(s) and none asked the resolver for the census" not in out or \
+            "refusal census: WARN (1 finding(s) above)" not in out or "0.000% (0): none refused" in out.split("NOT MEASURED")[1].split("\n")[0]:
+        fail("a route that treated frames and asked for no census was not called out as never having measured:\n%s" % out)
+    _, out = report(text + refusal_line(treated=3, asked=3, sampled=0, read=0, pixels=0, **nothing))
+    if "NOT MEASURED: 3 ask(s), fewer than one sample's worth (every 4)" not in out or "!! " in out:
+        fail("fewer asks than one sample took was a WARN (it is a short window), or was not said:\n%s" % out)
+    _, out = report(text + refusal_line(treated=450, asked=450, sampled=5, read=0, pixels=0, **nothing))
+    if "NOT MEASURED: 5 sample(s) dispatched, none read back" not in out or "5 sample(s) were dispatched and none was read back" not in out:
+        fail("samples dispatched and never read back were not a WARN:\n%s" % out)
+    _, out = report(text.replace("treated=0 asked=0 sampled=0 read=0", "treated=450 asked=450 sampled=0 read=0").replace(
+        "treated=450 asked=450 sampled=113 read=112 dropped=0 size=5040x2835 pixels=1600300800", "treated=450 asked=450 sampled=113 read=0 dropped=0 size=5040x2835 pixels=0"))
+    if "the census never measured: the route treated 900 frame(s) over 2 window(s) and no sample was read back" not in out:
+        fail("a census that never read a sample back was not a WARN:\n%s" % out)
+    _, out = report("\n".join(l for l in text.split("\n") if "vr world route refusal" not in l))
+    if "none: no `vr world route refusal 5s:` line in this log" not in out or "!! " in out or "stage 2 verdict: PASS (6 PASS" not in out:
+        fail("a log without refusal lines (the census key off, or an older build) did not say so, or its verdict moved:\n%s" % out)
+    # The key's state: each state is totalled on its own; with it on a stale slot is "forgiven", never refused.
+    on = refusal_line(steady="on", stale=0, forgiven=40007520, refused=18403458, pct="1.150", read=112)
+    _, out = report(text + on)
+    if "!! " in out or "totals, steady-detail=on: 1 measured window(s), 112 sample(s), pixels 1600300800, refused 1.150% (18403458)" not in squash(out) or \
+            "forgiven 2.500%" not in squash(out) or "totals, steady-detail=off: 1 measured window(s)" not in squash(out):
+        fail("a window with the steady-detail key on was not totalled on its own, with its forgiven share:\n%s" % out)
+    _, out = report(text + refusal_line(steady="on", stale=5, forgiven=40007515))
+    if "steady-detail=on and 5 stale pixel(s) were still refused" not in out or "refusal census: WARN" not in out:
+        fail("stale pixels still refused with the key on were not a WARN:\n%s" % out)
+    _, out = report(text + refusal_line(steady="off", forgiven=9))
+    if "9 stale pixel(s) were forgiven while steady-detail=off" not in out:
+        fail("pixels forgiven with the key off were not a WARN:\n%s" % out)
+    _, out = report(text + refusal_line(refused=1600300801))
+    if "refused 1600300801 exceeds the pixels examined, 1600300800" not in out:
+        fail("more pixels refused than examined was not a WARN:\n%s" % out)
+    _, out = report(text + refusal_line(dropped=3, other=7))
+    if "3 sample(s) were skipped because the read-back ring was full" not in out or "7 refused pixel(s) are of a class the census cannot name" not in out or \
+            "refusal census: consistent" not in out:
+        fail("dropped samples and unnamed causes were not notes (consistent, not WARN):\n%s" % out)
+    _, out = report(text + refusal_line(view="on", steady="on", stale=0, forgiven=1))
+    if "the refusal view was painting: the headset showed the prep's classification, not the world" not in out:
+        fail("a window with the refusal view on was not noted:\n%s" % out)
+    _, out = report(text + "[00:00:10.000] vr world route: steady-detail is ON from frame=100 (experimental.temporal_aa_on_foot_world_steady_detail): x\n"
+                    "[00:00:11.000] vr world route: the refusal view is ON from frame=200 (advanced.temporal_aa_debug = motion_source): y\n")
+    if "route log: [00:00:10.000] vr world route: steady-detail is ON from frame=100" not in out or "route log: [00:00:11.000] vr world route: the refusal view is ON" not in out:
+        fail("the route's state lines were not quoted in the refusal section:\n%s" % out)
+    # The weapon's role in (v): flight 2's picture (inj-fp 0 with the fold-in in mode 2 on every weapon frame) is a WARN and says what the
+    # field-of-view range makes of it; a credited weapon with a mode-1 fold-in is the fixture's PASS.
+    fl2 = text.replace("inj-fp=1350", "inj-fp=0").replace("fp-mode=0/450/0", "fp-mode=0/0/450")
+    _, out = report(fl2.replace("fov=0.8203..0.9831", "fov=-"))
+    line = verdict_line(out, "v")
+    if status(out, "v") != "WARN" or "no first-person call was credited (inj-fp 0) although the weapon's fold-in ran in 450 frame(s) (mode 1: 0, mode 2: 450)" not in line or \
+            "no inject line carries a fov= range" not in line:
+        fail("flight 2's weapon (inj-fp 0, mode 2, no fov=) was not a WARN naming the missing field-of-view range:\n%s" % line)
+    _, out = report(fl2)
+    if status(out, "v") != "WARN" or "the struct carries two fields of view (0.8203 and 0.9831 rad)" not in verdict_line(out, "v") or \
+            "a fault in the field-of-view test" not in verdict_line(out, "v"):
+        fail("inj-fp 0 with two fields of view in the struct was not a WARN naming a fault in the role test:\n%s" % verdict_line(out, "v"))
+    _, out = report(fl2.replace("fov=0.8203..0.9831", "fov=0.9831..0.9831"))
+    if status(out, "v") != "WARN" or "the struct carries one field of view (0.9831 rad)" not in verdict_line(out, "v"):
+        fail("inj-fp 0 with one field of view was not a WARN saying the weapon cannot be told by it:\n%s" % verdict_line(out, "v"))
+    _, out = report(text.replace("fp-mode=0/450/0", "fp-mode=0/0/450"))
+    if status(out, "v") != "WARN" or "yet the fold-in ran only in mode 2 (450 frame(s), mode 1 in none)" not in verdict_line(out, "v"):
+        fail("a credited weapon whose fold-in never ran in mode 1 was not a WARN:\n%s" % verdict_line(out, "v"))
+    _, out = report(text.replace("inj-scene=5400", "inj-scene=1000"))
+    if status(out, "v") != "WARN" or "as many first-person calls as scene calls (1350 against 1000" not in verdict_line(out, "v"):
+        fail("more first-person calls than scene calls was not a WARN:\n%s" % verdict_line(out, "v"))
+    _, out = report(text.replace("inj-fp=1350", "inj-fp=0").replace("fp-mode=0/450/0", "fp-mode=450/0/0"))
+    if status(out, "v") != "PASS":
+        fail("no weapon drawn (the fold-in never ran) with inj-fp 0 is not a fault:\n%s" % verdict_line(out, "v"))
+    _, out = report(fl2 + "[12:00:10.000] vr world route: jitter is wanted but no scene camera call was injected at frame=4 (warming 4)\n")
+    if status(out, "v") != "WARN" or "the route logged: " not in verdict_line(out, "v"):
+        fail("the route's no-scene line did not keep its place ahead of the weapon's checks:\n%s" % verdict_line(out, "v"))
 
     # ---- older logs: missing tokens are said, not crashed on ----
     older = re.sub(r" inj=\d role=\S+", "", text)

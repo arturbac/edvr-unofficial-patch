@@ -14,6 +14,9 @@ cbuffer Mono : register(b0) {
                  // stencil (t10) are bound and valid (section 82, prep only); w: with z, the first-person phase mode (0 the map's
                  // vector as given, 1 the two phases' difference is added to it, any other value rejects attached pixels' history).
                  // All zero on the copy route without them.
+    uint4 debug; // x: this frame samples the refusal census (prep writes the class texture, the census kernel counts it), y: this frame
+                 // paints the refusal view (prep writes the class texture, the HDR finish paints from it). Both zero on every frame that
+                 // asks for neither, and the flat profile never asks: the prep's arithmetic and its outputs are then what they were.
 };
 cbuffer EngineNow : register(b1) { float4 EN[277]; };   // EN[276].x: the frame stamp
 cbuffer EngineBefore : register(b2) { float4 EB[276]; };
@@ -29,12 +32,21 @@ Texture2D<float> HistoryDepth : register(t8);
 Texture2D<float4> FirstPersonMotion : register(t9);   // prep only, bound when route.z != 0: the VR weapon map, render size,
                                                       // xy previous minus current in render pixels, z depth, w 1 valid / 2 new / 0 none
 Texture2D<uint2> FirstPersonStencil : register(t10);  // prep only, bound when route.z != 0: the depth texture's stencil plane (.y)
+Texture2D<uint> ClassMap : register(t11);             // the census kernel's and the HDR finish's, bound only when debug.x or debug.y: the prep's class per pixel
 SamplerState LinearClamp : register(s0);
 RWTexture2D<float> OutDepth : register(u0);
 RWTexture2D<float2> OutMotion : register(u1);
 RWTexture2D<float> OutRejection : register(u2);
 RWTexture2D<float> OutExpected : register(u3);
 RWTexture2D<float4> OutColor : register(u4);
+RWTexture2D<uint> OutClass : register(u5);            // prep only, bound when debug.x or debug.y: what the pixel is and whether its history was refused
+RWByteAddressBuffer RefusalCounts : register(u6);     // the census kernel's: 16 stripes of 16 counters (flat_mono_refusal.h)
+
+// The pixel classes (flat_mono_refusal.h kFlatMonoClass*, which tools\flat_mono_resolve_test holds these to). Bit 7 of the byte the prep
+// writes says its history was refused.
+static const uint kClassNone=0, kClassJoined=1, kClassMasked=2, kClassNotRig=3, kClassStale=4, kClassCorrupt=5, kClassStaleStamp=6,
+    kClassSentinel=7, kClassUnreprojectable=8, kClassCamera=9, kClassRange=10, kClassDepth=11, kClassWeapon=12,
+    kClassWeaponRefused=13, kClassReset=14;
 
 // Under the upstream camera injector the game derives the b1 rows from a jittered
 // frustum, so rows 0..3 carry the raster phase (x += ndc.x*w, y += ndc.y*w, w =
@@ -62,40 +74,46 @@ bool cameraBefore(float2 uv, float depth, out float4 before) {
     before=position.x*o0+position.y*o1+position.z*o2+iz*o3;
     return before.w>0 && all(isfinite(before));
 }
-// 0 = camera term, 1 = exact engine motion, 2 = explicitly reject history.
-uint engineBefore(int2 q,float2 uv,float depth,out float4 before) {
-    before=0;
+// 0 = camera term, 1 = exact engine motion, 2 = explicitly reject history. `cls` is what the pixel is (kClass*): the refusal
+// census and view read it, nothing else does, and no return below depends on it.
+uint engineBefore(int2 q,float2 uv,float depth,out float4 before,out uint cls) {
+    before=0; cls=kClassNone;
     if(flags.y==0)return 0;
     float2 es=Slots.Load(int3(q,0));
     if(!(es.x>=1))return 0;
-    if(!(depth>0) || es.x>=4294967296.0)return 2;
+    if(!(depth>0) || es.x>=4294967296.0){cls=kClassSentinel;return 2;}
     // A slot written by a keyed draw that something has since drawn over: the pixel's owner is not the
     // one that wrote the slot, so its record says nothing about it. Everywhere but the 3D main menu that
     // is not knowable and history is refused. In the menu (flags.w, set by the runtime only for a frame
     // whose contract came through the verified menu copy) nothing on screen moves but the camera, so the
-    // pixel takes the camera term -- an unkeyed hull that overdraws a keyed one no longer aliases.
-    if(asuint(depth)!=asuint(es.y))return flags.w!=0?0:2;
+    // pixel takes the camera term -- an unkeyed hull that overdraws a keyed one no longer aliases. The VR
+    // world route sets the same flag from experimental.temporal_aa_on_foot_world_steady_detail (off by
+    // default), and only this refusal is relaxed: a masked record stays refused.
+    if(asuint(depth)!=asuint(es.y)){cls=kClassStale;return flags.w!=0?0:2;}
     uint code=uint(es.x);
-    if(float(code)!=es.x || (code&1)==0)return 2;
+    if(float(code)!=es.x || (code&1)==0){cls=kClassCorrupt;return 2;}
     uint count,stride; Pool.GetDimensions(count,stride);
     uint slot=code>>1;
-    if(slot>=count || stride!=336)return 2;
+    if(slot>=count || stride!=336){cls=kClassCorrupt;return 2;}
     EnginePoolRecord r=Pool[slot];
     uint kind=engineRecordKind(r,asuint(EN[276].x));
-    if(kind==2)return 2;
+    if(kind==2){cls=kClassMasked;return 2;}
     if(kind==3)kind=engineStaleStampKind(r,asuint(EN[276].x));
-    if(kind==2)return 2;   // an older masked marker keeps no history, as masked always did
-    if(kind!=1)return 0;   // not a rig record, or an older joined marker: the camera term
+    if(kind==2){cls=kClassMasked;return 2;}   // an older masked marker keeps no history, as masked always did
+    if(kind!=1){cls=kind==6?kClassStaleStamp:kClassNotRig;return 0;}   // not a rig record, or an older joined marker: the camera term
     // Freshness: a joined marker certifies only at the frame it was written.
-    if(r.data[18].x!=(0x7FC0ED01u^engineMarkerHash(r,asuint(EN[276].x))))return 0;
+    if(r.data[18].x!=(0x7FC0ED01u^engineMarkerHash(r,asuint(EN[276].x)))){cls=kClassStaleStamp;return 0;}
+    cls=kClassJoined;
     // The engine's own scene snapshots are the game's b1 upload too: same phase as the rows above, the
     // before-snapshot's being the previous frame's.
     if(!engineReprojectRows(r,uv*float2(2,-2)+float2(-1,1),depth,
         unjitterRow(EN[270],rowsJitter.xy),unjitterRow(EN[271],rowsJitter.xy),
         unjitterRow(EN[272],rowsJitter.xy),unjitterRow(EN[273],rowsJitter.xy),EN[275].xyz,
         unjitterRow(EB[270],rowsJitter.zw),unjitterRow(EB[271],rowsJitter.zw),
-        unjitterRow(EB[272],rowsJitter.zw),unjitterRow(EB[273],rowsJitter.zw),EB[275].xyz,before))
-        return engineRecordMoved(r)?2:0;
+        unjitterRow(EB[272],rowsJitter.zw),unjitterRow(EB[273],rowsJitter.zw),EB[275].xyz,before)) {
+        if(engineRecordMoved(r)){cls=kClassUnreprojectable;return 2;}
+        return 0;
+    }
     return 1;
 }
 [numthreads(8,8,1)]
@@ -107,6 +125,9 @@ void prep(uint3 id:SV_DispatchThreadID) {
     float2 rawUv=uv-jitter.xy/float2(size.xy);
     float depth=SceneDepth.Load(int3(q,0));
     float2 motion=0; float reject=1, expected=0;
+    // What the pixel is (kClass*), for the refusal census and view alone: nothing below reads it back. Until a check says
+    // otherwise a pixel the checks below do not reach is a reset frame's, or one whose own depth is no depth.
+    uint cls=flags.x!=0?kClassReset:kClassDepth;
     // First-person pixels (section 82). The depth texture's stencil bit 0x10 marks what the first-person draws wrote, and the
     // VR weapon map says, per texel, where that surface was a frame ago. Such a pixel takes the map's motion or rejects its
     // history, and NEVER the engine or camera term below: the weapon is not world geometry, and the camera term at its depth
@@ -133,9 +154,10 @@ void prep(uint3 id:SV_DispatchThreadID) {
         // positions (tools\flat_mono_resolve_test, flat_first_person_phase_gpu_tests.h).
         if(route.w==1)m.xy+=jitter.xy-jitter.zw; else if(route.w!=0)valid=false;
         motion=valid?m.xy:0; reject=valid?0:1; expected=valid?depth:0;
+        cls=valid?kClassWeapon:kClassWeaponRefused;
     } else if(flags.x==0 && isfinite(depth) && depth>=0 && depth<=1) {
         float4 before;
-        uint kind=engineBefore(q,rawUv,depth,before);
+        uint kind=engineBefore(q,rawUv,depth,before,cls);
         // HLSL logical operators do not short-circuit: putting cameraBefore's
         // out parameter in || would overwrite the exact engine result.
         bool valid=kind==1;
@@ -149,13 +171,36 @@ void prep(uint3 id:SV_DispatchThreadID) {
             valid=all(isfinite(motion)) && all(abs(motion)<=65504) &&
                   all(prev>=0) && all(prev<=1) && isfinite(expected) && expected>=0 && expected<=1;
             reject=valid?0:1;
-        }
+            if(!valid)cls=kClassRange;
+        } else if(kind!=2)cls=kClassCamera;
     }
     if(reject!=0)motion=0;
     OutDepth[q]=isfinite(depth)?saturate(depth):0;
     OutMotion[q]=motion; OutRejection[q]=reject;
     if(flags.z!=0)OutExpected[q]=expected;
+    // The refusal census and view: one byte, the class and (bit 7) whether this pixel's history was refused.
+    if(debug.x!=0 || debug.y!=0)OutClass[q]=cls|(reject!=0?0x80u:0u);
 }
+// The refusal census (flat_mono_refusal.h): one pass over the class texture the prep wrote, on a frame that sampled. Per group the
+// refused classes are counted in shared memory, and each non-zero count is added to one of 16 stripes of the global buffer (spread by
+// group column, so the atomics of 220 000 groups do not queue on sixteen addresses). Slot 15 counts a stale pixel the prep did NOT
+// refuse (the steady-detail key sent it to the camera term). Accepted pixels are not counted. No early return: every thread reaches both barriers.
+groupshared uint gRefusal[16];
+[numthreads(8,8,1)]
+void census(uint3 id:SV_DispatchThreadID,uint3 gid:SV_GroupID,uint gi:SV_GroupIndex) {
+    if(gi<16)gRefusal[gi]=0;
+    GroupMemoryBarrierWithGroupSync();
+    if(all(id.xy<size.xy)) {
+        const uint v=ClassMap.Load(int3(id.xy,0));
+        const uint kind=v&0x7Fu;
+        if((v&0x80u)!=0)InterlockedAdd(gRefusal[min(kind,14u)],1u);
+        else if(kind==kClassStale)InterlockedAdd(gRefusal[15],1u);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if(gi<16 && gRefusal[gi]!=0)RefusalCounts.InterlockedAdd(((gid.x&15u)*16u+gi)*4u,gRefusal[gi]);
+}
+)HLSL"
+R"HLSL(
 // The HDR route accumulates in a bounded space, c / (1 + max3(c)), and inverts it on output: a sun disc or a hot
 // particle in a linear 3x3 clamp would set the box and the blend alone and ring around every highlight. The history
 // stays linear fp16, so a route flip needs no conversion and the tone pass sees linear radiance again.
@@ -221,17 +266,47 @@ float4 hdrVs(uint id:SV_VertexID):SV_Position {
     float2 p=float2((id<<1)&2,id&2);
     return float4(p*float2(2,-2)+float2(-1,1),0,1);
 }
+// The refusal view (advanced.temporal_aa_debug = motion_source on the VR world route; debug.y): the prep's class, painted in the eye
+// path's colours (temporal_shader_source.h, the motion_source view). The picture is H, which the game's tone pass reads next, so each
+// colour is scaled by the pixel's own level (twice its luma, never below .04): the hue survives the tone pass, the absolute value
+// does not. green 1 joined, red 2 masked, blue 3 not a rig record, yellow 4 stale slot, magenta 5 corrupt, orange 6 stale stamp,
+// cyan 12 first-person, white any other refusal, and a pixel with no engine slot is dimmed to a quarter.
+float3 refusalPaint(float3 c,uint v) {
+    const uint kind=v&0x7Fu;
+    const float y=max(dot(c,float3(.2126,.7152,.0722)),.02)*2;
+    return kind==kClassJoined?float3(0,y,0):kind==kClassMasked?float3(y,0,0)
+         :kind==kClassNotRig?float3(0,.3*y,y):kind==kClassStale?float3(y,y,0)
+         :kind==kClassCorrupt?float3(y,0,y):kind==kClassStaleStamp?float3(y,.5*y,0)
+         :kind==kClassWeapon?float3(0,y,y):(kind>=kClassSentinel && kind<=kClassWeaponRefused)?float3(y,y,y):c*.25;
+}
+// The class an output pixel is painted by: a refused one among the four raster texels under its +jitter sample (those are the pixels
+// the finish shows raw, so the colour says why), else the nearest texel's.
+uint refusalClassAt(float2 rasterUv) {
+    const int2 hi=int2(size.xy)-1;
+    const int2 q=int2(floor(rasterUv*float2(size.xy)-.5));
+    uint best=0;
+    [unroll]for(int y=0;y<2;++y)[unroll]for(int x=0;x<2;++x) {
+        const uint v=ClassMap.Load(int3(clamp(q+int2(x,y),0,hi),0));
+        if((v&0x80u)!=0)best=max(best,v);
+    }
+    return best!=0?best:ClassMap.Load(int3(clamp(int2(floor(rasterUv*float2(size.xy))),0,hi),0));
+}
 float4 finishHdr(float4 pos:SV_Position):SV_Target {
     int2 p=int2(pos.xy);
-    // EDVR's TAA output is final (its own rejection ran inside it): a plain copy.
-    if(route.y!=0)return float4(hdrRepresentable(History.Load(int3(p,0)).rgb),1);
     float2 uv=pos.xy/float2(size.zw);
     float2 rasterUv=uv+jitter.xy/float2(size.xy);
-    int2 q=int2(floor(rasterUv*float2(size.xy)-.5));
-    float reject=0;
-    [unroll]for(int y=0;y<2;++y)[unroll]for(int x=0;x<2;++x)
-        reject=max(reject,Rejection.Load(int3(clamp(q+int2(x,y),0,int2(size.xy)-1),0)));
-    float3 c=reject>0?Color.SampleLevel(LinearClamp,rasterUv,0).rgb:History.Load(int3(p,0)).rgb;
+    float3 c;
+    if(route.y!=0) {
+        // EDVR's TAA output is final (its own rejection ran inside it): a plain copy.
+        c=History.Load(int3(p,0)).rgb;
+    } else {
+        int2 q=int2(floor(rasterUv*float2(size.xy)-.5));
+        float reject=0;
+        [unroll]for(int y=0;y<2;++y)[unroll]for(int x=0;x<2;++x)
+            reject=max(reject,Rejection.Load(int3(clamp(q+int2(x,y),0,int2(size.xy)-1),0)));
+        c=reject>0?Color.SampleLevel(LinearClamp,rasterUv,0).rgb:History.Load(int3(p,0)).rgb;
+    }
+    if(debug.y!=0)c=refusalPaint(c,refusalClassAt(rasterUv));
     return float4(hdrRepresentable(c),1);
 }
 float4 spatialHdr(float4 pos:SV_Position):SV_Target {
