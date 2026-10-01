@@ -2,10 +2,13 @@
 
 ## Status
 
-- **State:** design only, for the release after v0.18.0. Nothing is built.
-  It extends draft PR #46 (Devin Nemec, "generic OpenXR addon and plugin
-  architecture"), which this document reuses as its add-on tier (section 6).
-  The runtime-dependency check is done (section 4.1).
+- **State (2026-10-01):** implementation in progress on
+  `codex/plugin-architecture`; do not merge to main until Sean is ready to ship.
+  Three Luna 6 agents own the catalog/config ownership, night-vision pilot,
+  and build/boundary gates. This is the first Phase 1 slice, not completion
+  of all five phases. The review and remaining gates are in section 11.
+  This design extends draft PR #46 (Devin Nemec, "generic OpenXR addon and
+  plugin architecture") as its add-on tier (section 6).
 - **Goal (Sean):** every fix and performance item belongs to one plugin,
   plugins group features logically, and the user picks which to install in
   the installer. A plugin that is not installed costs nothing.
@@ -37,11 +40,19 @@
   4.1), the installer skips it and Elite stays on its stock VR path. Four
   changes first (section 10); no F8, AA, flash fix or Explorer Cam without
   the runtime; the first build needs a flight on a stock runtime.
-- **Next:** Phase 1 (section 8), after v0.18.0: the registry and dispatch
-  tables in the core and night vision moved behind them, gated by a
-  byte-identical verdict replay and a lower render-thread census. The
-  registry also owns the draw-gate subscriptions and takes static props and
-  the scheduler probe off temporalPassConfigure.
+- **Next:** build and review the Phase 1 pilot, then Steam baseline/candidate
+  flights before moving further groups. Baseline is unchanged `14a7ff70`.
+  Its full build passed; Steam install and payload verification passed.
+  Baseline refly is complete: Pimax Crystal Super / Pimax OpenXR, 90 Hz,
+  4032x3898 per eye. Earlier 4508x4358 samples are excluded. Carrier then
+  on-foot hangar, AA off then DLSS; night vision was not toggled. Log and
+  installed payload identity match the baseline. The pilot's full build passes
+  all gates, including 427 dispatch checks and the updated subscription and
+  transport-only fixtures. Commit/push and clean-version promotion precede
+  Steam candidate installation; then repeat the four samples and night vision.
+  Cached dispatch means shader-pair candidates, not final verdicts; shape
+  and state remain draw-time predicates. A scoped night-vision reference
+  replay cannot substitute for whole-ladder recorded replay (section 11).
 - **Ruled out while designing:** loading every DLL found in a folder (DLL
   planting; the installer's receipts already know what it installed), a
   stable ABI for first-party plugins (they ship with the core; freezing
@@ -405,3 +416,132 @@ when ReShade was removed). The rules:
   revisions (DllMain returns FALSE); `temporal_aa` or FSS `on` without the
   runtime costs with no output; the vr_runtime "Reinstall" advice
   (vr_runtime.cpp:106-113) and the README's second-log guidance turn wrong.
+
+## 11. Implementation review, 2026-10-01
+
+Sean requested review and implementation on a separate branch, with Luna 6
+agents working in parallel, and authorized the Steam install for testing.
+The branch is `codex/plugin-architecture`, based on `14a7ff70`. Main stays
+unchanged until explicit shipping authorization.
+
+The review found these constraints before implementation:
+
+- Cache the candidate claims at shader bind/configuration changes. Final
+  verdicts still depend on draw shape, resources, failure state and earlier
+  claims. Preserve the night-vision claim's existing ladder position.
+- The current census lacks enough state to replay every classifier. The
+  pilot may compare a frozen legacy night-vision classifier with the new
+  dispatch, including earlier-claim outcomes, but that proves only the
+  pilot. Whole-ladder migration needs recorded resource/state fixtures and
+  comparison of composed actions as well as verdict IDs.
+- Canonical, versioned manifest data must generate the compiled catalog.
+  Validate unique IDs, dependencies, profiles and explicit ownership of
+  each current config key. Shared section names cannot determine ownership.
+- Keep the installer's existing payload `components` field intact. Plugin
+  selections need their own versioned record in the later installer phase.
+  Soft dependencies do not auto-select plugins.
+- Registry subscription publication must cover configure and reload;
+  dynamic probe arming still needs its current refresh path. Static props
+  and the scheduler probe must be independently configured without losing
+  refresh behavior on engine changes.
+- Keep the default feature behavior throughout this first slice. Catalog
+  defaults describe the final architecture; they do not imply that legacy
+  diagnostics or any unmigrated feature is already suppressed.
+
+Implementation boundaries: one agent owns the manifest, generated catalog
+and config ownership checks; one owns the registry, night-vision pilot and
+scoped replay; one owns the include-boundary gate, static-library build and
+rig wiring. The coordinator owns integration review, the full build, Git
+and Steam installation. No group migration or add-on loading bypasses the
+flight gates in section 8.
+
+Next flight: compare unchanged `14a7ff70` and the reviewed pilot at the same
+carrier and on-foot spots, AA off and on, with identical settings, headset,
+per-eye size, VR runtime and DLSS version recorded. Flat comparison uses the
+same hangar spot. Verify log build identity first. Require repeatable CPU
+improvement beyond observed noise for Phase 1; unchanged or inconclusive
+measurements do not satisfy the Phase 1 improvement gate. GPU cost must not
+regress. No performance improvement is claimed before these flights.
+
+Baseline preparation: the unchanged full build passed all gates and wrote
+its receipt. The build-runner process-tree termination self-test failed
+inside the sandbox and passed unchanged outside it, so full validation ran
+outside the sandbox. The sanctioned installer installed and verified Steam
+with backups and without overwriting `edvr.ini`. Sean reports Pimax with
+Pimax OpenXR. The requested comparison includes game night vision on and off;
+the completed refly omitted that toggle, so no baseline claim draw was tested.
+
+Integration review caught and repaired a missing core dispatch include and
+a rig counter that confused shape evaluation with resolver invocation. It
+also moved new bind/draw activity breadcrumbs to frame-boundary reporting:
+the dispatch rig now checks that neither hot path calls the logger and that
+reports drain once, including at shutdown (424 checks passed). An unchanged
+heartbeat stress assertion failed under the first full runner load; H5 passed
+five focused runs and the next full run with four jobs. No heartbeat code or
+test was changed. That full run then stopped at the footprint rig's old
+source-layout assertion for draw-gate membership. Its subscription contract
+must follow the new registry before the full build can pass. The baseline
+flight began during compilation; only samples after compilation stops can
+support the performance comparison. No candidate has been installed.
+
+Cache-coherence audit found shader-shadow repairs outside the binding hooks
+(engine velocity and scanner resolve), plus exposure's independent reset.
+An old per-draw hash read saw those changes; hook-only cached candidates can
+miss them. Publish from the canonical shadow write/reset points, with an
+observer only for active plugin interest and a current-shadow seed when
+configuration enables interest. Preserve profile bypass and add repair,
+reset and off-bind-on checks before the next full build. Sean reduced OpenXR
+resolution to 4032 per eye and will refly; the earlier 4508x4358 samples are
+not the comparison baseline. Verify dimensions and build in the new log.
+
+Next replay slice, from the source inventory: the 19 verdicts include `None`;
+`Skip` and `Backdrop` each have multiple distinct claim sites. Preserve the
+early/offscreen route as well as the eye ladder. A normalized capture needs
+profile/config and frame latches, derived resource/CB facts, ordered rung
+outcomes (`not visited`, decline, pass), claim identity and final verdict.
+Record composed actions after forwarding too: begin/end, original issue,
+swallow, curve/dim and UI-layer reissues. The existing DC census precedes
+later claims and has no final verdict or complete classifier state. Keep it
+intact; add an explicitly armed sidecar using already-read facts, without
+extra D3D queries or a draw-path logger while unarmed. Recorded predicate
+outcomes alone prove ordering, not classifier equivalence; synthetic
+conflicting-claim cases and module-specific resource/state rigs remain
+necessary. Whole-ladder replay and performance gates are still outstanding.
+
+Baseline refly evidence: `edvr_gfx_20261001_171838.log`, v0.18.0 /
+`6ABED2A4`, unchanged `14a7ff70` payload verified. Pimax Crystal Super with
+Pimax OpenXR at 90 Hz; output 4032x3898, submitted ROI 2016x1949. Preset K
+is logged; the loaded DLSS DLL version is not read by this build. Sean
+confirms carrier first, then an on-foot hangar, AA off then DLSS in each.
+
+Direct EDVR draw-hook CPU estimates (window ends; approximately 20 seconds
+at 90 Hz; 1/16 frames, every 64th draw scaled by 64):
+
+| Scene / AA | Window end | Mean / max ms |
+|---|---|---|
+| Carrier, off (last pure pre-toggle window) | 17:20:58.196 | 0.411 / 1.984 |
+| Carrier, DLSS | 17:21:38.357 | 1.310 / 4.608 |
+| Carrier, DLSS | 17:21:58.446 | 1.465 / 4.282 |
+| Carrier, DLSS | 17:22:18.671 | 1.207 / 3.085 |
+| On foot, off (after Disembark) | 17:23:19.864 | 0.226 / 0.627 |
+| On foot, DLSS | 17:23:59.907 | 0.422 / 5.485 |
+
+These exclude forwarded game draw time and include EDVR reissues; they are
+means/maxima, not percentiles or all EDVR CPU. Early off windows vary from
+0.007 to 0.411 ms, so scene/workload matching matters. Exclude windows that
+straddle AA or disembark transitions. Native benchmark CPU measures the
+broader application render path (game plus EDVR); GPU samples likewise
+include game work. On-foot off window 14 completed 30 s: CPU/GPU p50
+1.861/5.173 ms. On-foot DLSS window 16 closed at exit after 29.641 s with
+`scope-changed`: CPU/GPU p50 2.335/8.183 ms, not a completed window. Keep
+this status when comparing; no improvement or no-regression claim yet.
+
+The remaining full-run failure was the transport-only fixture leaving
+night-vision stability at its true default. Module-owned startup demand
+correctly keeps optional hooks installed in that case. Make the fixture
+explicitly switch both night-vision settings off, and retain its real WARP
+transport matrix; do not weaken the hook assertions or production demand.
+The candidate's four timed cases must keep game night vision off to match
+this baseline; exercise ship-cockpit night vision afterward as a separate
+pilot check. Full-ladder replay, the rest of the phases and shipping remain
+outstanding.

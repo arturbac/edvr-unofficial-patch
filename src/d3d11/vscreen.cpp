@@ -33,7 +33,8 @@
 #include "panel_curve.h"
 #include "screen_motion.h"
 #include "weapon_motion.h"
-#include "night_vision.h"
+#include "plugin_registry.h"
+#include "plugin_dispatch.h"
 #include "device_hook.h"  // contextHookModeFor
 #include "draw_census.h"
 #include "draw_gate.h"    // the sampled subscriber gate the draw path reads
@@ -60,6 +61,7 @@
 #include "target_sharp.h"
 #include "wake_pulse.h"
 #include "scheduler_stack_probe.h"  // schedulerStackProbeShutdown
+#include "static_prop_gate.h"
 #include "ui_depth.h"
 #include "ui_layer.h"
 #include "ui_layer_math.h"
@@ -355,6 +357,9 @@ struct State {
     // on those would attribute another context's draws to the panel and
     // corrupt state nobody can see is wrong. See vtable_hook.h.
     ID3D11DeviceContext* ownerCtx = nullptr;
+    // Profile-scoped module dispatch is absent entirely on flat/invalid
+    // installs, so their draw ladder avoids even reading the candidate mask.
+    bool pluginDispatchEnabled = false;
 
     PFN_SetConstantBuffers   realVSSetConstantBuffers = nullptr;
     PFN_SetConstantBuffers   realPSSetConstantBuffers = nullptr;  // flat diagnostic observer only
@@ -1658,59 +1663,116 @@ __declspec(noinline) bool ensureOurCompositeCb(ID3D11DeviceContext* self, State*
     return true;
 }
 
-// Does any feature still want to see draws?
-//
-// The forty-term subscriber condition that used to sit inline at the top of
-// beginPanelOverride, moved out whole and unchanged. It is called once per
-// frame from vScreenFrameBoundary and its answer is cached in
-// State::drawGateWanted; the long comment at the use site says why that is
-// safe and what one frame of lateness costs.
-//
-// Kept as one expression, in the original order, so that a future subscriber
-// is added HERE and nowhere else -- which is the mistake the use site's
-// comment records three times over. The wake pulse, night vision, the
-// witchspace starfield switch and the depth probe repeated it: each acts below
-// the gate (wakePulseSkips in the offscreen branch, nightVisionMatches on the
-// eye draw, witchspaceStarsSkip ahead of the eye gate, the depth probe's two
-// notes) and none was listed, so with every other subscriber off the gate
-// closed and they never ran. They are the last four terms.
-//
-// The depth probe's two rungs share ONE term. depthProbeWanted() is the first
-// rung's own test; the second rung's pre-check, depthProbeEyeDrawNeedsNote(),
-// is that same flag AND a per-view test, so it cannot pass while the flag is
-// false. depthProbeConfigure arms it for any fix.temporal_aa value but off, or
-// for advanced.eye_depth_capture alone. objectProbeWantsDraws() below covers a
-// recognised temporal mode, which is why this went unnoticed; it does not cover
-// an unrecognised value or the capture on its own.
-//
-// Two rungs below the gate are deliberately NOT listed: screenMotionLive() and
-// uiLayerCrispOn(). Each implies temporalModeEnabled(fix.temporal_aa), the same
-// expression objectProbeConfigure sets g_objectProbeOn from, which is
-// objectProbeWantsDraws() below, so neither can be true while the gate is shut.
-// Narrow that probe's on-condition and both belong here.
-bool drawGateSubscribed(State* s) {
-    return s->distanceEnabled || s->countForFlashFix ||
-        headOffsetGateWantsPanel() || s->censusSkipCount != 0 ||
-        s->censusSkipRangeCount != 0 || s->censusSkipOffCount != 0 ||
-        s->quadSkipArmed ||
-        s->censusAutoW != 0 || fssResActive() ||
-        fssPanelWantsDraws() || fssRevealWantsDraws() ||
-        fssDumpWantsDraws() ||
-        resolveBindWants() ||
-        remlokWantsDraws() || holoWantsDraws() || targetSharpWantsDraws() ||
-        uiDepthWantsDraws() ||
-        sunglareWantsDraws() ||
-        drawCensusArmed() ||
-        objectProbeWantsDraws() ||
-        panelCurveWants() || particleWantsDraws() || backdropWantsDraws() ||
-        scrimWantsDraws() || quadProbeWants() || loaderPanelWants() ||
-        introProbeWants() || introPanelWants() ||
-        wakePulseWantsDraws() || nightVisionWantsDraws() ||
-        witchspaceStarsHidden() || depthProbeWanted() ||
-        vscreenFootprintWanted() ||   // the footprint instrument (vscreen_footprint.h): it reads the 2D screen's composite
-        introCurveWants();            // the splash's surface strip (intro_curve.h): it acts in the eye branch, below this gate -- and panelCurveWants()
-                                      // above is the ON-FOOT strip's flag, which stands down on its own while this one does not
+// Each remaining legacy subscriber is registered by stable name with the
+// core registry. Night vision registers through its plugin ops independently.
+// Keep each adapter beside this table so no consumer is hidden in an unrelated
+// feature's aggregate predicate.
+#define EDVR_GATE_STATE(name, expression)                                      \
+    uint32_t drawGate_##name(void* opaque) {                                   \
+        State* s = static_cast<State*>(opaque);                               \
+        return (expression) ? 1u : 0u;                                        \
+    }
+#define EDVR_GATE_GLOBAL(name, expression)                                    \
+    uint32_t drawGate_##name(void* opaque) {                                  \
+        (void)opaque;                                                         \
+        return (expression) ? 1u : 0u;                                        \
+    }
+
+EDVR_GATE_STATE(panel_distance, s->distanceEnabled)
+EDVR_GATE_STATE(transition_flash_eye_count, s->countForFlashFix)
+EDVR_GATE_GLOBAL(head_offset, headOffsetGateWantsPanel())
+EDVR_GATE_STATE(census_skip_count, s->censusSkipCount != 0)
+EDVR_GATE_STATE(census_skip_ranges, s->censusSkipRangeCount != 0)
+EDVR_GATE_STATE(census_skip_off, s->censusSkipOffCount != 0)
+EDVR_GATE_STATE(census_quad_skip_armed, s->quadSkipArmed)
+EDVR_GATE_STATE(census_auto, s->censusAutoW != 0)
+EDVR_GATE_GLOBAL(fss_resolution, fssResActive())
+EDVR_GATE_GLOBAL(fss_panel, fssPanelWantsDraws())
+EDVR_GATE_GLOBAL(fss_reveal, fssRevealWantsDraws())
+EDVR_GATE_GLOBAL(fss_dump, fssDumpWantsDraws())
+EDVR_GATE_GLOBAL(resolve_bind, resolveBindWants())
+EDVR_GATE_GLOBAL(remlok, remlokWantsDraws())
+EDVR_GATE_GLOBAL(hologram_depth, holoWantsDraws())
+EDVR_GATE_GLOBAL(target_indicator, targetSharpWantsDraws())
+EDVR_GATE_GLOBAL(ui_depth, uiDepthWantsDraws())
+EDVR_GATE_GLOBAL(sun_glare, sunglareWantsDraws())
+EDVR_GATE_GLOBAL(draw_census, drawCensusArmed())
+EDVR_GATE_GLOBAL(object_probe, objectProbeWantsDraws())
+EDVR_GATE_GLOBAL(panel_curve, panelCurveWants())
+EDVR_GATE_GLOBAL(particles, particleWantsDraws())
+EDVR_GATE_GLOBAL(backdrop, backdropWantsDraws())
+EDVR_GATE_GLOBAL(scrim, scrimWantsDraws())
+EDVR_GATE_GLOBAL(quad_probe, quadProbeWants())
+EDVR_GATE_GLOBAL(loader_panel, loaderPanelWants())
+EDVR_GATE_GLOBAL(intro_probe, introProbeWants())
+EDVR_GATE_GLOBAL(intro_panel, introPanelWants())
+EDVR_GATE_GLOBAL(wake_pulse, wakePulseWantsDraws())
+EDVR_GATE_GLOBAL(witchspace_stars, witchspaceStarsHidden())
+EDVR_GATE_GLOBAL(depth_probe, depthProbeWanted())
+EDVR_GATE_GLOBAL(vscreen_footprint, vscreenFootprintWanted())
+EDVR_GATE_GLOBAL(intro_curve, introCurveWants())
+
+#undef EDVR_GATE_STATE
+#undef EDVR_GATE_GLOBAL
+
+struct LegacyDrawGateRegistration {
+    const char* name;
+    EdvrLegacyDrawGateFn predicate;
+    bool needsState;
+};
+constexpr LegacyDrawGateRegistration kLegacyDrawGateRegistrations[] = {
+    {"legacy.panel-distance", &drawGate_panel_distance, true},
+    {"legacy.transition-flash-eye-count", &drawGate_transition_flash_eye_count, true},
+    {"legacy.head-offset", &drawGate_head_offset, false},
+    {"legacy.census-skip-count", &drawGate_census_skip_count, true},
+    {"legacy.census-skip-ranges", &drawGate_census_skip_ranges, true},
+    {"legacy.census-skip-off", &drawGate_census_skip_off, true},
+    {"legacy.census-quad-skip-armed", &drawGate_census_quad_skip_armed, true},
+    {"legacy.census-auto", &drawGate_census_auto, true},
+    {"legacy.fss-resolution", &drawGate_fss_resolution, false},
+    {"legacy.fss-panel", &drawGate_fss_panel, false},
+    {"legacy.fss-reveal", &drawGate_fss_reveal, false},
+    {"legacy.fss-dump", &drawGate_fss_dump, false},
+    {"legacy.resolve-bind", &drawGate_resolve_bind, false},
+    {"legacy.remlok", &drawGate_remlok, false},
+    {"legacy.hologram-depth", &drawGate_hologram_depth, false},
+    {"legacy.target-indicator", &drawGate_target_indicator, false},
+    {"legacy.ui-depth", &drawGate_ui_depth, false},
+    {"legacy.sun-glare", &drawGate_sun_glare, false},
+    {"legacy.draw-census", &drawGate_draw_census, false},
+    {"legacy.object-probe", &drawGate_object_probe, false},
+    {"legacy.panel-curve", &drawGate_panel_curve, false},
+    {"legacy.particles", &drawGate_particles, false},
+    {"legacy.backdrop", &drawGate_backdrop, false},
+    {"legacy.scrim", &drawGate_scrim, false},
+    {"legacy.quad-probe", &drawGate_quad_probe, false},
+    {"legacy.loader-panel", &drawGate_loader_panel, false},
+    {"legacy.intro-probe", &drawGate_intro_probe, false},
+    {"legacy.intro-panel", &drawGate_intro_panel, false},
+    {"legacy.wake-pulse", &drawGate_wake_pulse, false},
+    {"legacy.witchspace-stars", &drawGate_witchspace_stars, false},
+    {"legacy.depth-probe", &drawGate_depth_probe, false},
+    {"legacy.vscreen-footprint", &drawGate_vscreen_footprint, false},
+    {"legacy.intro-curve", &drawGate_intro_curve, false},
+};
+
+bool registerLegacyDrawGates(State* state) {
+    bool ok = true;
+    for (const auto& registration : kLegacyDrawGateRegistrations) {
+        void* context = registration.needsState ? state : nullptr;
+        if (!pluginRegistryRegisterLegacyDrawGate(registration.name,
+                                                   registration.predicate,
+                                                   context)) {
+            Log::get().note("plugin registry: draw-gate subscription '%s' failed; gate forced open",
+                            registration.name);
+            pluginRegistrySetDrawGateFailOpen();
+            ok = false;
+        }
+    }
+    return ok;
 }
+
+bool drawGateSubscribed(State* s) { return pluginRegistryWantsDraws(s); }
 
 // The bound target's resolve, for the wake pulse, memoised on Rtv0's binding
 // generation -- the rtv0Eye pattern. The wake pulse needs the target's size
@@ -2505,9 +2567,25 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
         }
     }
 
-    // Shape first, inline (night_vision.h): the match is pure, and the call
-    // per eye draw failed on this very test.
-    if(nightVisionShape(kind,count,instances) && nightVisionMatches(kind,count,instances))
+    // The canonical manifest carries this claim's shape and shader pair. The
+    // shape comparison is inline; shader interest was cached by the binding
+    // hooks. Only a shaped draw with that cached candidate crosses into the
+    // registry resolver, which then checks the module's live variant/failure.
+    uint32_t pluginClaim = kPluginClaimNone;
+    if (s->pluginDispatchEnabled) {
+        const uint64_t pluginCandidates = pluginRegistryShaderCandidates();
+        pluginClaim = plugins::dispatch::resolveCandidate(
+            pluginCandidates, plugins::kPluginCockpitVisuals, [&] {
+                const auto& claim = plugins::kManifest[plugins::kPluginCockpitVisuals]
+                    .claims[plugins::kClaimCockpitVisualsNightVision];
+                return plugins::dispatch::matchesShape(claim.drawShape,
+                    static_cast<uint8_t>(kind), count, instances);
+            }, [&] {
+                return pluginRegistryResolveDraw(pluginCandidates,
+                    static_cast<uint8_t>(kind), count, instances);
+            });
+    }
+    if (pluginClaim == kPluginClaimNightVision)
         return DrawVerdict::kNightVision;
 
     // The RemLok overlay fix, after the probes so a census taken while it
@@ -3612,7 +3690,7 @@ __declspec(noinline) void forwardVerdictBegin(ID3D11DeviceContext* self, DrawVer
     case DrawVerdict::kResolveBind:  resolveBindBegin(self); break;
     case DrawVerdict::kHolo:         holoBegin(self); break;
     case DrawVerdict::kTargetSharp:  targetSharpBegin(self); break;
-    case DrawVerdict::kNightVision:  nightVisionBegin(self); break;
+    case DrawVerdict::kNightVision:  pluginRegistryBegin(kPluginClaimNightVision,self); break;
     case DrawVerdict::kScrim:        scrimBegin(self); break;
     case DrawVerdict::kGlareSteady:  sunglareBegin(self); break;
     case DrawVerdict::kParticle:     particleBegin(self); break;
@@ -3627,7 +3705,7 @@ __declspec(noinline) void forwardVerdictEnd(ID3D11DeviceContext* self, DrawVerdi
     case DrawVerdict::kGlareSteady:  sunglareEnd(self); break;
     case DrawVerdict::kScrim:        scrimEnd(self); break;
     case DrawVerdict::kTargetSharp:  targetSharpEnd(self); break;
-    case DrawVerdict::kNightVision:  nightVisionEnd(self); break;
+    case DrawVerdict::kNightVision:  pluginRegistryEnd(kPluginClaimNightVision,self); break;
     case DrawVerdict::kHolo:         holoEnd(self); break;
     case DrawVerdict::kFssReveal:    fssRevealEnd(self); break;
     case DrawVerdict::kResolveBind:  resolveBindEnd(self); break;
@@ -5491,8 +5569,10 @@ void vScreenRefreshConfig() {
     introUpscaleConfigure(cfg);
     sharpenPassConfigure(cfg);
     temporalPassConfigure(cfg);
+    schedulerStackProbeConfigure(cfg.getBool("advanced.scheduler_probe", false));
+    staticPropGateConfigure(cfg.getBool("fix.static_prop_updates", false));
     screenMotionConfigure(cfg);
-    nightVisionConfigure(cfg);
+    pluginRegistryConfigure(&cfg);
     depthProbeConfigure(cfg);
     backdropConfigure(cfg);
     fssPanelConfigure(cfg);
@@ -5718,6 +5798,9 @@ void introCurveNoteRetired() {
 }  // namespace
 
 void vScreenFrameBoundary() {
+    // Drain plugin breadcrumbs away from shader-bind and draw callbacks; the
+    // queued events remain visible without taking the logger lock on draws.
+    pluginRegistryReportActivity();
     // The quad probe's readback: a capture taken a few frames ago is decoded
     // here, where the copy has certainly executed and mapping cannot stall
     // the render thread mid-frame.
@@ -6684,6 +6767,20 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     headOffsetGateConfigure();
     const bool wantVoid = cfg.getBool("fix.black_void", true);
     const float scale = cfg.getFloat("fix.panel_distance", 1.0f);
+    // Register profile-supported modules before the dormant-hook check so
+    // their own config contract can request hooks without core duplicating
+    // plugin-owned setting names or defaults.
+    bool cockpitVisualsRegistered = false;
+    if (pluginRegistryProfileSupports(plugins::kPluginCockpitVisuals)) {
+        cockpitVisualsRegistered = pluginRegistryRegister(cockpitVisualsPluginOps());
+        if (!cockpitVisualsRegistered) {
+            Log::get().note("plugin registry: cockpit-visuals registration failed; module dispatch is unavailable");
+            pluginRegistrySetDrawGateFailOpen();
+        }
+    } else {
+        Log::get().note("plugin registry: cockpit-visuals skipped for installation profile %s",
+                        runtimeProfileName());
+    }
     // Install the hooks whenever EITHER fix could be wanted now or later. Both
     // are documented as changeable while the game runs, and a hook that was
     // never installed cannot be switched on by editing a file -- so returning
@@ -6699,6 +6796,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     // because the frame counter it waits on also lives in here.
     if (!wantVoid && scale == 1.0f && !glitchFrameNeedsEyeDraws() &&
         !headOffsetGateWantsPanel() &&
+        !pluginRegistryWantsStartupHooks(&cfg) &&
         !cfg.getBool("advanced.app_gpu_timing", true) &&
         !cfg.getBool("advanced.panel_hooks_always", true)) {
         // The optional fixes are deliberately dormant, but native discovery
@@ -6706,6 +6804,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
         // one-shot install and does not create State, configure a fix, or bind
         // GPU timing. A failed vScreen install never reaches this branch, so
         // it cannot acquire a second ExecuteCommandList hook.
+        pluginRegistryShutdown();
         if (!g_vScreenInstallAttempted) {
             g_transportSelected = true;
             (void)graphicsBridgeInstallTransport(device, mode);
@@ -6718,7 +6817,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
 
     ID3D11DeviceContext* ctx = nullptr;
     device->GetImmediateContext(&ctx);
-    if (!ctx) return;
+    if (!ctx) { pluginRegistryShutdown(); return; }
 
     // The measured owner path supplies the canonical context and actual OS
     // thread. Timing failure never prevents installing the rendering fixes.
@@ -6726,6 +6825,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     gpuFrameBind(device, ctx, cfg.getBool("advanced.app_gpu_timing", true));
 
     g_state = new State();
+    g_state->pluginDispatchEnabled = cockpitVisualsRegistered;
     g_state->installMs = stampMs();
     g_state->windowStartMs = g_state->installMs;
     g_state->blackVoid = wantVoid;
@@ -6750,8 +6850,10 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     introUpscaleConfigure(cfg);
     sharpenPassConfigure(cfg);
     temporalPassConfigure(cfg);
+    schedulerStackProbeConfigure(cfg.getBool("advanced.scheduler_probe", false));
+    staticPropGateConfigure(cfg.getBool("fix.static_prop_updates", false));
     screenMotionConfigure(cfg);
-    nightVisionConfigure(cfg);
+    pluginRegistryConfigure(&cfg);
     depthProbeConfigure(cfg);
     backdropConfigure(cfg);
     fssPanelConfigure(cfg);
@@ -6806,10 +6908,12 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
         // g_state back to null, not merely leaked. Leaving it set makes the
         // guard at the top of this function refuse a later attempt, and leaves
         // the periodic totals reporting on a fix that was never installed.
+        pluginRegistryShutdown();
         delete g_state;
         g_state = nullptr;
         return;
     }
+    (void)registerLegacyDrawGates(g_state);
 
     // The mechanism, decided once per device by the caller and shared with the
     // exposure hooks so the two agree about this one object. Between attach
@@ -6919,6 +7023,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
         Log::get().note("vScreen: vtable commit failed; not installing");
         s.hook.uninstall();
         ctx->Release();
+        pluginRegistryShutdown();
         delete g_state;
         g_state = nullptr;
         return;
@@ -7098,7 +7203,7 @@ void shutdownVScreenFixes() {
     uiDepthShutdown();
     uiLayerShutdown();
     screenMotionShutdown();
-    nightVisionShutdown();
+    pluginRegistryShutdown();
     scrimShutdown();
     quadProbeShutdown();
     wakePulseShutdown();

@@ -1,15 +1,17 @@
 #include "night_vision.h"
 #include "night_vision_shader.h"
+#include "../../d3d11/plugin_registry.h"
 #include "temporal_shader_bytecode.h"
 #include <d3d11.h>
 #include <wrl/client.h>
 #include <algorithm>
 #include <cmath>
-#include "binding_shadow.h"
-#include "shader_swap.h"
-#include "vscreen.h"
-#include "../common/config.h"
-#include "../common/log.h"
+#include <cstring>
+#include "../../d3d11/binding_shadow.h"
+#include "../../d3d11/shader_swap.h"
+#include "../../d3d11/vscreen.h"
+#include "../../common/config.h"
+#include "../../common/log.h"
 namespace edvr { namespace {
 template<class T>using Ptr=Microsoft::WRL::ComPtr<T>;
 bool enabled=false,pulseEnabled=true,configured=false;
@@ -98,9 +100,18 @@ void nightVisionConfigure(Config& cfg){
     detail::g_nightVisionOn=variant()!=0;
 }
 bool nightVisionMatches(char kind,uint32_t count,uint32_t instances){
+    constexpr const auto& claim = plugins::kManifest[plugins::kPluginCockpitVisuals]
+        .claims[plugins::kClaimCockpitVisualsNightVision];
+    const auto& pair = claim.shaderPairs[0];
     return variant()!=0 && !state.failed[variant()] && nightVisionShape(kind,count,instances) &&
-        bindingShaderHash(BindSlot::Vs)==0xFCF7BD2896751D96ull &&
-        bindingShaderHash(BindSlot::Ps)==0xF786D34B5E118D5Eull;
+        bindingShaderHash(BindSlot::Vs)==pair.vertexShaderHash &&
+        bindingShaderHash(BindSlot::Ps)==pair.pixelShaderHash;
+}
+bool nightVisionClaimEligible(char kind,uint32_t count,uint32_t instances){
+    (void)kind;
+    (void)count;
+    (void)instances;
+    return variant()!=0 && !state.failed[variant()];
 }
 void nightVisionBegin(ID3D11DeviceContext* ctx){
     const unsigned mode=variant();
@@ -204,5 +215,50 @@ void nightVisionEnd(ID3D11DeviceContext* ctx){
     for(UINT i=0;i<state.count;++i){state.classes[i]->Release();state.classes[i]=nullptr;}
     state.count=0;state.engaged=false;
 }
-void nightVisionShutdown(){state=State{};}
+void nightVisionShutdown(){state=State{};detail::g_nightVisionOn=false;}
+
+namespace {
+void pluginConfigure(void* config) {
+    if (config) nightVisionConfigure(*static_cast<Config*>(config));
+}
+uint32_t pluginWantsDraws(void*) { return nightVisionWantsDraws() ? 1u : 0u; }
+uint32_t pluginStartupHooksWanted(void* config) {
+    if (!config) return 0;
+    const auto& cfg = *static_cast<Config*>(config);
+    return cfg.getBool("fix.night_vision_stability", true) ||
+        cfg.getBool("experimental.night_vision_realistic", false) ? 1u : 0u;
+}
+uint32_t pluginClaimDraw(void*,const char* claimId,uint8_t kind,uint32_t count,uint32_t instances) {
+    if (!claimId || std::strcmp(claimId,"night-vision") != 0) return kPluginClaimNone;
+    return nightVisionClaimEligible(static_cast<char>(kind),count,instances)
+        ? kPluginClaimNightVision : kPluginClaimNone;
+}
+void pluginBegin(void*,const char* claimId,ID3D11DeviceContext* context) {
+    if (claimId && std::strcmp(claimId,"night-vision") == 0) nightVisionBegin(context);
+}
+void pluginEnd(void*,const char* claimId,ID3D11DeviceContext* context) {
+    if (claimId && std::strcmp(claimId,"night-vision") == 0) nightVisionEnd(context);
+}
+void pluginShutdown(void*) { nightVisionShutdown(); }
+
+const char* const kCockpitVisualsClaimIds[] = {"night-vision"};
+const EdvrPluginOps kCockpitVisualsOps = {
+    sizeof(EdvrPluginOps),
+    plugins::kPluginCockpitVisuals,
+    "cockpit-visuals",
+    "cockpit-visuals.night-vision",
+    kCockpitVisualsClaimIds,
+    1u,
+    nullptr,
+    &pluginConfigure,
+    &pluginWantsDraws,
+    &pluginStartupHooksWanted,
+    &pluginClaimDraw,
+    &pluginBegin,
+    &pluginEnd,
+    &pluginShutdown,
+};
+}
+
+const EdvrPluginOps* cockpitVisualsPluginOps() { return &kCockpitVisualsOps; }
 }

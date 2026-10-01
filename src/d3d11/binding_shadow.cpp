@@ -18,6 +18,7 @@ BindingSlot g_bindingSlots[static_cast<size_t>(BindSlot::Count)];
 namespace {
 
 using Slot = detail::BindingSlot;
+BindingShaderObserverFn g_shaderObserver = nullptr;
 
 // This module's own budget, not shared with any fix.
 //
@@ -97,6 +98,12 @@ void bindingSetShader(BindSlot slot, void* ptr, uint64_t hash) {
     s.ptr = ptr;
     s.hash = hash;
     ++s.gen;
+    if (g_shaderObserver && (slot == BindSlot::Vs || slot == BindSlot::Ps))
+        g_shaderObserver();
+}
+
+void bindingShadowSetShaderObserver(BindingShaderObserverFn observer) {
+    g_shaderObserver = observer;
 }
 
 void bindingForgetAll() {
@@ -105,6 +112,7 @@ void bindingForgetAll() {
         s.hash = 0;
         ++s.gen;
     }
+    if (g_shaderObserver) g_shaderObserver();
 }
 
 void bindingFrameBoundary() {

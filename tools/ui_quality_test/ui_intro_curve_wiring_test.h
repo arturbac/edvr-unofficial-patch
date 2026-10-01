@@ -77,6 +77,7 @@ std::vector<WirePin> wiringPins(const std::string& text) {
     const std::string fwd = quietBody(text, "void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,");
     const std::string thunk = quietBody(text, "void STDMETHODCALLTYPE hookedDrawIndexedInstanced(");
     const std::string gate = quietBody(text, "bool drawGateSubscribed(State* s) {");
+    const std::string gateRegistration = quietBody(text, "bool registerLegacyDrawGates(State* state) {");
     const std::string frame = quietBody(text, "void vScreenFrameBoundary() {");
     const std::string shut = quietBody(text, "void shutdownVScreenFixes() {");
     const std::string note = quietBody(text, "void introCurveNoteRetired() {");
@@ -107,10 +108,14 @@ std::vector<WirePin> wiringPins(const std::string& text) {
                     has(bpo, kGuard) && countOf(bpo, "s->curveThisDraw=true;") == 1 && countOf(all, "kIntroCompositeVsHash") == 1,
                     "intro curve wiring [guard]: the on-foot curve's recognition (panelCurveWants() && srv0IsPanelSized) does not claim a six-index X draw whose VS is the intro "
                     "composite's, and the new term sits behind panelCurveWants()"});
-    // The draw gate lists the recogniser.
+    // The arming predicate is adapted to a named subscription, published to the registry, and consumed through its aggregate at the frame gate.
     pins.push_back({"gate",
-                    has(gate, "||vscreenFootprintWanted()||introCurveWants();}") && countOf(all, "introCurveWants()") == 2,
-                    "intro curve wiring [gate]: drawGateSubscribed lists introCurveWants() (the recogniser acts below the gate; the on-foot strip's panelCurveWants() stands down "
+                    has(all, "EDVR_GATE_GLOBAL(intro_curve,introCurveWants())") &&
+                        has(all, "{\"legacy.intro-curve\",&drawGate_intro_curve,false}") &&
+                        has(gateRegistration, "pluginRegistryRegisterLegacyDrawGate(registration.name") &&
+                        has(gate, "pluginRegistryWantsDraws(s)") &&
+                        has(all, "drawGateSet(drawGateSubscribed(s));") && countOf(all, "introCurveWants()") == 2,
+                    "intro curve wiring [gate]: the named adapter follows introCurveWants(), its entry is published to the registry, and the frame gate consumes the registry aggregate (the on-foot strip's panelCurveWants() stands down "
                     "on its own)"});
     // The strip's site: after the verdict's Begin and the layer's Begin, before the game's own issue, the layer's End and the dim; the dim follows.
     pins.push_back({"strip-site",
@@ -249,10 +254,9 @@ void testIntroCurveControls(const std::string& text) {
          "guard"},
         // ---- gate
         {"the draw gate does not list the recogniser",
-         {{"vscreenFootprintWanted() ||   // the footprint instrument (vscreen_footprint.h): it reads the 2D screen's composite\n        introCurveWants();",
-           "vscreenFootprintWanted();   // the footprint instrument (vscreen_footprint.h): it reads the 2D screen's composite\n        ("}},
+         {{"    {\"legacy.intro-curve\", &drawGate_intro_curve, false},\n", ""}},
          "gate"},
-        {"the draw gate lists the strip's own flag instead", {{"        introCurveWants();            // the splash's", "        panelCurveSurfaceWanted();    // the splash's"}}, "gate"},
+        {"the draw gate lists the strip's own flag instead", {{"EDVR_GATE_GLOBAL(intro_curve, introCurveWants())", "EDVR_GATE_GLOBAL(intro_curve, panelCurveSurfaceWanted())"}}, "gate"},
         // ---- strip-site
         {"the verdict's Begin runs after the strip", {{kRawBegin, ""}, {kRawObserved, std::string(kRawBegin) + kRawObserved}}, "strip-site"},
         {"the strip is drawn after the game's own issue", {{kRawObserved, ""}, {kRawStripStart, std::string(kRawObserved) + kRawStripStart}}, "strip-site"},

@@ -251,6 +251,10 @@ REM generated from the same sources the late contract check verifies.
 python "tools\check_config_contract.py" --self-test || exit /b 1
 python "tools\check_config_contract.py" --quiet --emit "%GEN%\config_contract_gen.h"
 if errorlevel 1 ( echo [edvr] ERROR: contract header generation failed & exit /b 1 )
+python "tools\plugin_catalog.py" --self-test || exit /b 1
+python "tools\plugin_catalog.py" --emit-cpp "%GEN%\plugin_manifest.inc" --dry-run || exit /b 1
+python "tools\plugin_catalog.py" --emit-cpp "%GEN%\plugin_manifest.inc"
+if errorlevel 1 ( echo [edvr] ERROR: plugin catalog validation or generation failed & exit /b 1 )
 
 echo [edvr] === precompiled temporal shaders ===
 REM Fixed HLSL belongs in the build: compiling it in the first Present delayed
@@ -275,6 +279,19 @@ if errorlevel 1 ( echo [edvr] ERROR: temporal shader compiler build failed & exi
 "%OBJ%\temporalshader\temporal_shader_build.exe" --self-test || exit /b 1
 "%OBJ%\temporalshader\temporal_shader_build.exe" --output "%GEN%\temporal_shader_bytecode.h" --dry-run || exit /b 1
 "%OBJ%\temporalshader\temporal_shader_build.exe" --output "%GEN%\temporal_shader_bytecode.h" || exit /b 1
+
+python "tools\check_plugin_boundaries.py" --self-test || exit /b 1
+python "tools\check_plugin_boundaries.py" --quiet --require-plugin cockpit_visuals ^
+    --require-source src\plugins\cockpit_visuals\night_vision.cpp --include-dir "%GEN%" || exit /b 1
+
+if not exist "%OBJ%\plugins\cockpit_visuals" mkdir "%OBJ%\plugins\cockpit_visuals"
+del /q "%OBJ%\plugins\cockpit_visuals\*.obj" 2>nul
+cl.exe %CFLAGS% /Fo"%OBJ%\plugins\cockpit_visuals\\" ^
+    "src\plugins\cockpit_visuals\night_vision.cpp"
+if errorlevel 1 ( echo [edvr] ERROR: cockpit visuals plugin compile failed & exit /b 1 )
+lib.exe /nologo /OUT:"%OBJ%\plugins\cockpit_visuals\plugin_cockpit_visuals.lib" ^
+    "%OBJ%\plugins\cockpit_visuals\night_vision.obj"
+if errorlevel 1 ( echo [edvr] ERROR: cockpit visuals plugin library failed & exit /b 1 )
 
 echo [edvr] === d3d11.dll ===
 REM The settings schema -- the installer's window AND the in-headset menu's
@@ -513,7 +530,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\format_support_log.cpp" ^
     "src\d3d11\graphics_bridge.cpp" ^
     "src\d3d11\render_boundary.cpp" ^
-    "src\d3d11\exposure_fix.cpp" "src\d3d11\vscreen.cpp" ^
+    "src\d3d11\exposure_fix.cpp" "src\d3d11\vscreen.cpp" "src\d3d11\plugin_registry.cpp" ^
     "src\d3d11\glitch_frame.cpp" ^
     "src\d3d11\pose_reader_watch.cpp" "src\d3d11\transition_flash_eye_base.cpp" ^
     "src\d3d11\vscreen_res.cpp" "src\common\vscreen_auto_state.cpp" "src\d3d11\vscreen_footprint.cpp" ^
@@ -538,7 +555,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\fss_panel_rect.cpp" ^
     "src\d3d11\panel_curve.cpp" "src\d3d11\screen_motion.cpp" "src\d3d11\weapon_motion.cpp" ^
     "src\d3d11\remlok_fix.cpp" "src\d3d11\holo_fix.cpp" ^
-    "src\d3d11\target_sharp.cpp" "src\d3d11\night_vision.cpp" ^
+    "src\d3d11\target_sharp.cpp" ^
     "src\d3d11\wake_pulse.cpp" ^
     "src\d3d11\ui_depth.cpp" ^
     "src\d3d11\ui_layer.cpp" "src\d3d11\ui_surfaces.cpp" "src\d3d11\ui_panel_scale.cpp" ^
@@ -588,7 +605,8 @@ if errorlevel 1 ( echo [edvr] ERROR: rc.exe failed on the runtime version resour
 
 link.exe /nologo /DLL /MACHINE:X64 /INCREMENTAL:NO %EDVR_CPU_LINK% /PDB:"%BUILD%\d3d11.pdb" ^
     /DEF:"%GEN%\edvr_d3d11.def" /OUT:"%BUILD%\d3d11.dll" ^
-    "%OBJ%\d3d11\*.obj" "%OBJ%\d3d11\dxbc_notice.res" "%OBJ%\d3d11\version.res" kernel32.lib user32.lib gdi32.lib version.lib d3dcompiler.lib %NGXLIB% %FSRLIB%
+    "%OBJ%\d3d11\*.obj" "%OBJ%\plugins\cockpit_visuals\plugin_cockpit_visuals.lib" ^
+    "%OBJ%\d3d11\dxbc_notice.res" "%OBJ%\d3d11\version.res" kernel32.lib user32.lib gdi32.lib version.lib d3dcompiler.lib %NGXLIB% %FSRLIB%
 if errorlevel 1 ( echo [edvr] ERROR: link failed & exit /b 1 )
 
 echo [edvr] built %BUILD%\d3d11.dll
@@ -1399,6 +1417,21 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
 if errorlevel 1 ( echo [edvr] ERROR: gate_test build failed & exit /b 1 )
 "%BUILD%\gate_test.exe" "%ROOT%" || (
     echo [edvr] ERROR: the head-offset gate arms where it should not
+    exit /b 1
+)
+exit /b 0
+
+:rig_plugin_dispatch_test
+echo [edvr] === plugin_dispatch_test.exe ===
+if not exist "%OBJ%\plugindispatch" mkdir "%OBJ%\plugindispatch"
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\plugindispatch\\" ^
+    /Fe"%BUILD%\plugin_dispatch_test.exe" "tools\plugin_dispatch_test\plugin_dispatch_test.cpp" ^
+    "src\d3d11\plugin_registry.cpp" "src\d3d11\binding_shadow.cpp" "src\common\guard.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: plugin dispatch rig build failed & exit /b 1 )
+"%BUILD%\plugin_dispatch_test.exe" --self-test || (
+    echo [edvr] ERROR: plugin dispatch verdict replay failed
     exit /b 1
 )
 exit /b 0

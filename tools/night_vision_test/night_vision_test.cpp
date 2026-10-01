@@ -3,7 +3,7 @@
 // This rig supplies its own binding shadow readers (below), so it asks the
 // header for declarations rather than the inline production ones.
 #define EDVR_BINDING_SHADOW_EXTERNAL 1
-#include "../../src/d3d11/night_vision.cpp"
+#include "../../src/plugins/cockpit_visuals/night_vision.cpp"
 #include <d3dcompiler.h>
 #include <d3d11sdklayers.h>
 #include <cstdio>
