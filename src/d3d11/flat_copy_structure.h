@@ -10,9 +10,10 @@
 //
 // WHAT IT ADMITS. At the final copy (the exact copy pair into the output, unchanged: the reducer's own checks) a frame is
 // admitted when the copy's source S is
-//   - an R8G8B8A8 image rendered this frame by one full-viewport pass with no depth,
+//   - an R8G8B8A8 image rendered this frame by one full-viewport pass with no depth, and not written outside a draw after it
+//     (no Clear, Copy, Update or Map: the prefix model marks such a target bad),
 //   - the scene's own size R (the size of the R11G11B10F target the scene was drawn into), a uniform scale of the output
-//     D between half and twice,
+//     D between half and twice, for a mode that has a route at that size (EDVR's `dlaa` has none below the output),
 //   - written after the first pass that read the scene HDR (the HDR detector's trigger, seen this frame), with every
 //     draw into H before it,
 //   - with no other R-sized R8G8B8A8 image written between that first consumer and S,
@@ -184,6 +185,11 @@ inline FlatMonoFrame flatCopyAdmit(FlatRuntimePrefix& p, const FlatHdrFrame& f, 
         g.outcome = FlatCopyOutcome::Declined; g.why = why;
         return whitelist;
     };
+    // A mode whose route is refused at this size resolves nothing here whatever the frame is (EDVR's `dlaa` below the output:
+    // flatResolveRoute says dlaa-requires-native). Admitting the frame would make it Treatable and the resolver would then refuse
+    // every one in silence, with no stand-down and no warning; declining keeps the whitelist's answer, and so the old stand-down.
+    if (flatResolveRoute(policy.mode, scene.width, scene.height, p.width, p.height).refused)
+        return decline("the-mode-has-no-route-at-this-render-size");
     const FlatContractObservation& k = d.key;
     const FlatContractRecord current = flatRuntimeRecord(d, p.sequence, p.frame);
     if (!flat_copy_detail::plainCopy(p, k, current)) return decline("the-copy-is-not-a-plain-full-screen-copy");
@@ -194,6 +200,11 @@ inline FlatMonoFrame flatCopyAdmit(FlatRuntimePrefix& p, const FlatHdrFrame& f, 
     g.srcVs = sk.vs; g.srcPs = sk.ps;
     if (!oneDraw(src->writes)) return decline("the-copy-source-is-not-written-by-one-pass");
     if (sk.format != 27) return decline("the-copy-source-is-not-r8g8b8a8");
+    // An explicit write into S after its pass (a Clear, a Copy, an Update or a Map: the prefix model marks the target bad) is what
+    // the whitelist's tone count refuses (flatRuntimeWritten zeroes it); the unknown tone pass has no count to lose, so it is
+    // said here. For an R8G8B8A8 target the mark means nothing else (the model's other conflicts are for HDR and image-source
+    // targets), and writes before S's pass, the game clearing the target for its own use, are not marked.
+    if (src->hdrBad) return decline("the-copy-source-was-written-outside-a-draw");
     if (!sk.rtv || sk.depth || sk.dsv) return decline("the-copy-source-was-drawn-with-a-depth-buffer");
     if (!fullViewport(sk, sk.width, sk.height)) return decline("the-copy-source-pass-is-not-full-viewport");
     if (sk.width != scene.width || sk.height != scene.height) return decline("the-copy-source-is-not-the-scene-size");

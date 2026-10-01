@@ -1553,16 +1553,6 @@ void buildStatus(MenuContent& c) {
     }
     statusLine(c, "Eye texture", buf);
     {
-        // Elite's Supersampling below 1.0, from the render sizes the vScreen module measures (vr_supersample_notice.h, design
-        // section 83): present only when the world is drawn under the eye texture's width and height. The settings pages carry
-        // the whole advice as a note; this is the line a support thread reads.
-        uint32_t rw = 0, rh = 0, ew2 = 0, eh2 = 0;
-        if (vScreenRenderBelowEye(&rw, &rh, &ew2, &eh2)) {
-            vrss::formatStatus(buf, sizeof(buf), rw, ew2);
-            statusLine(c, "Elite supersampling", buf);
-        }
-    }
-    {
         const CullGuardState g = decodeCullGuardState(cullGuardStatePacked());
         if (g.stage == 0) {
             snprintf(buf, sizeof(buf), "off");
@@ -1950,6 +1940,13 @@ void buildContent(MenuContent& c) {
         c.compact = true;
         snprintf(c.hint, sizeof(c.hint), "%s",
                  "The page a support thread will ask to see. Tab or PageDown for the next page.");
+        {
+            // Elite's Supersampling below 1.0 (VR; vr_supersample_notice.h, design section 83), when vScreen has measured the
+            // world rendered under the eye texture: the open menu says it HERE, in the hint this page has anyway. A line of its
+            // own, or a note on a settings page, would take the bitmap past the 2048-px guard on the Pimax (see the header).
+            uint32_t rw = 0, rh = 0, ew = 0, eh = 0;
+            if (vScreenRenderBelowEye(&rw, &rh, &ew, &eh)) vrss::formatStatusHint(c.hint, sizeof(c.hint));
+        }
     } else {
         // The tooltip waits for the look or the hand to settle on one row:
         // it is an explanation for someone who has stopped, not something
@@ -2192,25 +2189,6 @@ void buildContent(MenuContent& c) {
                     s.flatWrapperNoteLogged = true;
                     Log::get().note("flat wrapper note: shown in the panel (mode=%s): %s handles every graphics call, so every "
                                     "call EDVR makes goes through it first.", flatModeLabel().c_str(), wrapper);
-                }
-            }
-        }
-        // Elite's Supersampling below 1.0 (VR only; vr_supersample_notice.h, design section 83): after the rows, a blank line
-        // and the advice wrapped to the note face's width, whenever the vScreen module has measured the world rendered under
-        // the eye texture. The headset toast and the log line say it once; this is what the open menu shows. Never flat.
-        if (!runtimeFlatProfile()) {
-            uint32_t rw = 0, rh = 0, ew = 0, eh = 0;
-            if (vScreenRenderBelowEye(&rw, &rh, &ew, &eh)) {
-                char paragraph[400];
-                vrss::formatNote(paragraph, sizeof(paragraph), rw, rh, ew, eh);
-                FlatWarnRuler ruler{c.capPx * 8 / 7};
-                FlatSettingsWarning note;
-                flatWrapWarning(paragraph, c.cardPx - 2 * (c.capPx * 8 / 10), &flatWarnMeasure, &ruler, &note);
-                if (note.count > 0 && c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;
-                for (int i = 0; i < note.count && c.lineCount < kMenuMaxLines; ++i) {
-                    MenuLine& l = c.lines[c.lineCount++];
-                    strncpy(l.left, note.line[i], sizeof(l.left) - 1);
-                    l.style = kMenuNote;
                 }
             }
         }
@@ -3735,7 +3713,7 @@ void menuTick(ID3D11Device* dev) {
 
         // Elite's Supersampling below 1.0 (vr_supersample_notice.h, design section 83): once vScreen has measured the world
         // rendered under the eye texture, the headset says so once a session as a toast (the menu's own notice, with the log
-        // line vScreen wrote; the open menu keeps the Status line and the note). Gated on menu.toasts like every toast, and
+        // line vScreen wrote; the open menu keeps it as the Status page's hint). Gated on menu.toasts like every toast, and
         // this is the VR branch: the flat profile returned above and never reaches it.
         if (!s.vrSupersamplingToasted) {
             uint32_t rw = 0, rh = 0, ew = 0, eh = 0;
@@ -3745,11 +3723,11 @@ void menuTick(ID3D11Device* dev) {
                     char toast[96];
                     vrss::formatToast(toast, sizeof(toast));
                     s.toastQueue.push_back(toast);
-                    Log::get().note("vr supersampling: the headset notice is queued as a toast (\"%s\"); the Status page has the line "
-                                    "\"Elite supersampling\" and every settings page the note, while the menu is open.", toast);
+                    Log::get().note("vr supersampling: the headset notice is queued as a toast (\"%s\"); the Status page shows the "
+                                    "advice as its hint while the menu is open.", toast);
                 } else {
-                    Log::get().note("vr supersampling: menu.toasts is off, so no toast; the Status page has the line \"Elite "
-                                    "supersampling\" and every settings page the note, while the menu is open.");
+                    Log::get().note("vr supersampling: menu.toasts is off, so no toast; the Status page shows the advice as its "
+                                    "hint while the menu is open.");
                 }
                 s.contentDirty = true;
             }

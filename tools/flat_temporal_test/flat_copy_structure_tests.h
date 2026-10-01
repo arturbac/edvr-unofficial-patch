@@ -141,6 +141,8 @@ struct Build {
     uint64_t sPs = 0xFE;                 // S's writer's pixel shader (0xFE is no whitelisted pair)
     uint32_t sInstances = 1;
     bool poolSources = true;
+    bool sExplicitWrite = false;         // a Clear, Copy, Update or Map into S after its pass (the prefix model marks S bad)
+    bool sClearedBefore = false;         // ...and the game clearing S for its own use BEFORE its pass: not marked
 };
 struct Built {
     std::unique_ptr<hdr_route_test::Stream> stream;
@@ -165,6 +167,7 @@ inline Built build(const Build& b) {
         if (!b.sFullViewport) d.key.viewport[2] = float(w) - 8.0f;
         s.draw(d, nullptr, t1);
     };
+    if (b.sClearedBefore) flatRuntimeWritten(*s.prefix, S);   // S has no draw yet: nothing to mark
     if (b.sBeforeConsumer) writeS();
     s.write(s.sc.h);
     s.sceneDraws(b.poolSources ? 4 : 0, b.sceneDraws - (b.poolSources ? 4 : 0));
@@ -177,6 +180,7 @@ inline Built build(const Build& b) {
     }
     if (!b.sBeforeConsumer)
         for (uint32_t i = 0; i < b.sWriters; ++i) writeS(b.consumer && b.consumerWritesS && i == 0 ? s.sc.h : nullptr);
+    if (b.sExplicitWrite) flatRuntimeWritten(*s.prefix, S);   // the prefix model's own call for a Clear/Copy/Update/Map into a drawn target
     FlatRuntimeDraw c = s.make(s.sc.output, nullptr, b.sc.outW, b.sc.outH, 28, flat_mono_detail::kCopyVs,
                                flat_mono_detail::kCopyPs, false, false);
     out.copy = withSrv(c, b.copyReads ? b.copyReads : S);
@@ -527,6 +531,8 @@ inline int flatCopyStructureTests() {
             [](Build& b) { b.llmBefore = 1; b.consumerWritesS = false; });
         add("two game AA filters follow it", "r-sized-image-passes-follow-the-first-consumer-of-the-scene-hdr",
             [](Build& b) { b.llmBefore = 2; b.consumerWritesS = false; });
+        add("S is cleared, copied into or mapped after its pass", "the-copy-source-was-written-outside-a-draw",
+            [](Build& b) { b.sExplicitWrite = true; });
         bool all = true;
         for (const Row& r : rows) {
             Built built = build(r.b);
@@ -573,6 +579,34 @@ inline int flatCopyStructureTests() {
         admit(cb, policy(true, FlatMonoResolveMode::Dlss, true), &cbDiag);
         expect(cbDiag.outcome == FlatCopyOutcome::Declined && std::strcmp(cbDiag.why, "the-copy-is-not-a-plain-full-screen-copy") == 0,
                "the copy draw's own checks are made here (the reducer made none: no tone pass was found): a partial viewport is declined");
+        // The explicit write is the one the prefix model marks: a Clear before S's pass (the game readying the target) leaves no mark.
+        Build clearedBefore; clearedBefore.sClearedBefore = true;
+        Built cbf = build(clearedBefore);
+        FlatCopyDiag cbfDiag;
+        admit(cbf, policy(true, FlatMonoResolveMode::Dlss, true), &cbfDiag);
+        expect(cbfDiag.outcome == FlatCopyOutcome::Admitted,
+               "a write into S before its pass is not marked and does not stop the admission (only one after the pass does)");
+        // EDVR's `dlaa` has no route below the output (flatResolveRoute: dlaa-requires-native). Admitting such a frame would make it
+        // Treatable and the resolver would then refuse every one in silence, with no stand-down and no warning; the structure declines it
+        // by name and the whitelist's refusal (and with it the stand-down and the F8 warning) stands, as before this existed.
+        {
+            Build below; below.sc.hW = 1920; below.sc.hH = 1080;
+            Built bb = build(below);
+            FlatCopyDiag bd;
+            const FlatMonoFrame out = admit(bb, policy(true, FlatMonoResolveMode::Dlaa), &bd);
+            expect(bd.outcome == FlatCopyOutcome::Declined && std::strcmp(bd.why, "the-mode-has-no-route-at-this-render-size") == 0 &&
+                       !out.selected() && out.reason == FlatMonoReason::NoTonePass,
+                   "DLAA below the output has no route: declined by name, the whitelist's refusal stands");
+            Build native;
+            Built nb = build(native);
+            FlatCopyDiag nd;
+            admit(nb, policy(true, FlatMonoResolveMode::Dlaa), &nd);
+            Built nl = build(native);
+            FlatCopyDiag ld;
+            admit(nl, policy(true, FlatMonoResolveMode::Dlaa, true), &ld);
+            expect(nd.outcome == FlatCopyOutcome::RouteServes && ld.outcome == FlatCopyOutcome::Admitted,
+                   "DLAA at R = D is the HDR route's, and the copy's when the route is latched off: the route check is below the output only");
+        }
 
         // Only a tone refusal is touched: every other answer of the reducer is the same answer.
         for (const FlatMonoReason reason : {FlatMonoReason::Truncated, FlatMonoReason::NoHdrCamera, FlatMonoReason::ConflictingHdr,
@@ -902,10 +936,16 @@ inline int flatCopyStructureTests() {
         expect(count(runtime, "bool flatRuntimeStructureAdmission() {") == 1 && count(runtime, "bool flatRuntimeTaaAboveOutput() {") == 1 &&
                    count(runtime, "bool flatRuntimeSceneSizes(") == 1,
                "the three accessors the panel reads");
-        // The key's own words say what auto does now.
+        // The key's own words say what auto does now, and what off still names.
         expect(count(runtime, "which admits the game's final copy by its structure") == 1 &&
                    count(runtime, "Log::get().note(\"flat hdr route: experimental.temporal_aa_before_post=%s%s at frame=%llu: %s\",") == 1,
                "the key's log line says the copy route admits by structure below the output");
+        expect(count(runtime, "by the whitelist alone (a frame with no scene, or a render size that does not fit the output, is still named ") == 1,
+               "the key off's log line says the whitelist decides, and that no-3d-scene and the render size are still named");
+        // The startup spell is silent even when a handful of draws into an HDR-shaped target is a candidate: the route's no-consumer
+        // verdict does not overwrite a frame the copy stage found no scene in.
+        expect(count(runtime, "s.frameSeen <= FlatFrameSeen::Structural && s.frameReason != FlatMonoReason::NoScene) {") == 1,
+               "hdrFrameEnd leaves a no-3d-scene frame as it is (the route's no-hdr-consumer would warn)");
         // The lines the fixture copies from the runtime's own format strings (the reader parses exactly these prefixes).
         expect(count(runtime, "\"flat runtime: treated=%llu refused=%llu last=%s render-source=game-SS jitter=(%.5g,%.5g) accepted-reset-5s=%llu ") == 1 &&
                    count(runtime, "\"flat runtime refusal 5s: reason=%s count=%llu\"") == 1 &&

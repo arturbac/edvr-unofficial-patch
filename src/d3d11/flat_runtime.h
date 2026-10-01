@@ -30,9 +30,9 @@ bool flatRuntimeStructureAdmission();
 // route evaluates at the render size, the display-grid TAA at the output's), and the F8 warning says what to do about it.
 bool flatRuntimeTaaAboveOutput();
 // The scene's and the output's sizes as the final copy's admission last measured them (the R11G11B10F target the scene is drawn
-// into, and the swap chain's), true once a frame has shown a scene since the key, the mode or a resize last cleared it. The
-// runtime's own measurement, never Elite's settings file. Any thread. The F8 warning and the stand-down line name the render
-// size from it when the refusal is render-size-does-not-fit-output.
+// into, and the swap chain's), refreshed at every final copy that has a scene and true once one has since a resize last cleared
+// it. The runtime's own measurement, never Elite's settings file. Any thread. The F8 warning and the stand-down line name the
+// render size from it when the refusal is render-size-does-not-fit-output.
 bool flatRuntimeSceneSizes(uint32_t* renderWidth, uint32_t* renderHeight, uint32_t* outputWidth, uint32_t* outputHeight);
 // The upstream camera injector's read points into the phase machine: the
 // current phase in render pixels and the validated resolve plan's render

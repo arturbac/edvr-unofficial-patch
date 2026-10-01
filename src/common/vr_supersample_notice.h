@@ -73,17 +73,14 @@ inline int formatLog(char* out, size_t size, uint32_t renderW, uint32_t renderH,
 inline int formatToast(char* out, size_t size) {
     return std::snprintf(out, size, "Elite Supersampling is below 1: use HMD Image Quality");
 }
-// The Status page's value (MenuLine::right holds 63 bytes and a terminator).
-inline int formatStatus(char* out, size_t size, uint32_t renderW, uint32_t eyeW) {
-    return std::snprintf(out, size, "below 1: world at %u%% of the eye", percentOfEye(renderW, eyeW));
-}
-// The settings pages' note, wrapped by the caller to the card's width (one paragraph).
-inline int formatNote(char* out, size_t size, uint32_t renderW, uint32_t renderH, uint32_t eyeW, uint32_t eyeH) {
-    return std::snprintf(out, size,
-        "Elite draws the world at %ux%u, %u%% of the %ux%u eye, and scales it up before EDVR sees it (Supersampling below "
-        "1). EDVR's DLSS then upscales an upscaled image. Set Elite's Supersampling to 1 and raise HMD Image Quality "
-        "instead: EDVR's DLSS upscales from that.",
-        renderW, renderH, percentOfEye(renderW, eyeW), eyeW, eyeH);
+// The Status page's hint: the two-line area under its lines, which the page has whatever it says, so this replaces the text and
+// adds no line. That is the point of it being the one place the open menu says this. The menu bitmap is refused above 2048 px
+// (menu_panel.cpp, rasterise) and the panel then keeps its old bitmap: a settings page with a note under its nine rows
+// (sixteen lines and a hint, 42.6 caps) trips it from a 48-px cap, the Status page with one more line (sixteen at 1.7 caps)
+// from 54, and the Pimax at the default 1.1 deg (~46-50 ppd) has a 51-55 px cap, so a note or a line would freeze the panel on
+// exactly the headsets that run Supersampling below 1. At most 78 characters, the length of the hint it replaces.
+inline int formatStatusHint(char* out, size_t size) {
+    return std::snprintf(out, size, "Elite Supersampling is below 1: set it to 1 and use HMD Image Quality.");
 }
 
 }  // namespace vrss

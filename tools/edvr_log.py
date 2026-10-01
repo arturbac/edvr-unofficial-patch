@@ -4452,8 +4452,11 @@ def flat_upscale_verdict(f):
     total = {k: sum(w[k] for w in wins) for k in ("copies", "whitelist", "admitted", "declined", "selector_refused", "no_scene", "render_size", "route_serves", "key_off")}
     runtime = f["runtime"]
     treated = (runtime[-1]["treated"] - runtime[0]["treated"]) if len(runtime) > 1 else (runtime[-1]["treated"] if runtime else 0)
-    passes_declines = sum(1 for d in f["declines"] if "r-sized-image-passes" in d["why"]) or sum(
-        n for w in wins for why, n in w["declines"].items() if "r-sized-image-passes" in why)
+    # The AA rule's declines: the frames the windows counted (each cause is logged as a line once a session, so the lines are not a count of frames),
+    # or, with no window that counted them, the decline lines.
+    chain_lines = sum(1 for d in f["declines"] if "r-sized-image-passes" in d["why"])
+    chain_frames = sum(n for w in wins for why, n in w["declines"].items() if "r-sized-image-passes" in why)
+    passes_declines = chain_frames or chain_lines
 
     # KEY
     if f["keys"]:
@@ -4469,9 +4472,10 @@ def flat_upscale_verdict(f):
     if not wins:
         add("ADMISSION", "STOP", "no `flat copy structure 5s:` window: the admission never ran (a build that predates section 83, or no temporal mode was selected)")
     else:
-        add("ADMISSION", "PASS", "%d window(s): copies %d, whitelist %d, admitted %d, declined %d, selector-refused %d, no-3d-scene %d, render-size %d, route-serves %d, key-off %d%s"
+        add("ADMISSION", "PASS" if total["copies"] else "WARN", "%d window(s): copies %d, whitelist %d, admitted %d, declined %d, selector-refused %d, no-3d-scene %d, render-size %d, route-serves %d, key-off %d%s%s"
             % (len(wins), total["copies"], total["whitelist"], total["admitted"], total["declined"], total["selector_refused"], total["no_scene"], total["render_size"],
                total["route_serves"], total["key_off"],
+               "" if total["copies"] else "; NO final copy was ruled on in any window: the admission ran and had nothing to say (a session that never drew a 3D frame, or a copy the reducer never reached)",
                "; first admission at frame %d (%dx%d image, scene %dx%d on %dx%d, route %s%s)" % (
                    f["first"]["frame"], f["first"]["src"][0], f["first"]["src"][1], f["first"]["scene"][0], f["first"]["scene"][1], f["first"]["output"][0],
                    f["first"]["output"][1], f["first"]["route"], ", the 3D menu" if f["first"]["menu"] else "") if f["first"] else "; no frame was admitted by structure"))
@@ -4553,8 +4557,9 @@ def flat_upscale_verdict(f):
         add("CHAIN", "n/a", "no window")
     elif passes_declines:
         longest = max([d["passes"] for d in f["declines"]] + [w["ldr_before_max"] for w in wins])
-        add("CHAIN", "WARN", "the structure declined %d frame(s) with R-sized image passes between the scene HDR's first consumer and the copy (the longest chain: %d): "
-            "the game's anti-aliasing filter, which the structure leaves refused; turn Anti-aliasing off in Elite" % (passes_declines, longest))
+        add("CHAIN", "WARN", "the structure declined %s with R-sized image passes between the scene HDR's first consumer and the copy (the longest chain: %d): "
+            "the game's anti-aliasing filter, which the structure leaves refused; turn Anti-aliasing off in Elite"
+            % ("%d frame(s)" % chain_frames if chain_frames else "frames (%d decline line(s); no window counted them)" % chain_lines, longest))
     else:
         add("CHAIN", "PASS", "no R-sized image pass between the scene HDR's first consumer and the copy (the longest chain seen: %d)" % max([w["ldr_before_max"] for w in wins] + [0]))
 
@@ -4626,6 +4631,12 @@ VRSS_QUEUED_RE = re.compile(FLATU_TS + r"vr supersampling: (?:the headset notice
 VRSS_BELOW_PERCENT = 98    # kBelowPercent in src/common/vr_supersample_notice.h
 
 
+def vrss_below(r, e):
+    """vrss::below: the render size under kBelowPercent of the eye's width AND height, an exact compare (the percent in the log is rounded,
+    so 97.6% reads 98 there and is still below)."""
+    return bool(r[0] and r[1] and e[0] and e[1] and r[0] * 100 < e[0] * VRSS_BELOW_PERCENT and r[1] * 100 < e[1] * VRSS_BELOW_PERCENT)
+
+
 def parse_vr_supersampling(text):
     """{notice: {ts, r, pct, e} or None, adopt: {ts, r, e, pct} or None, queued: ts or None, toast: bool, flat: bool}."""
     f = {"notice": None, "adopt": None, "queued": None, "toast": False, "flat": False}
@@ -4656,7 +4667,7 @@ def parse_vr_supersampling(text):
 
 def vr_supersampling_verdict(f):
     """[(tag, status, text)]: NOTICE (the log line, from the measured sizes), CONSISTENT (it agrees with vScreen's own adoption line), HEADSET (the
-    toast, the Status line and the note were queued), FLAT (a flat log never carries it)."""
+    toast was queued, and the Status page's hint has it while the menu is open), FLAT (a flat log never carries it)."""
     out = []
 
     def add(tag, status, text):
@@ -4668,17 +4679,18 @@ def vr_supersampling_verdict(f):
     elif f["flat"]:
         add("FLAT", "PASS", "a flat-profile log, and no VR notice in it")
     if n:
-        if n["pct"] < VRSS_BELOW_PERCENT and n["r"][0] * 100 < n["e"][0] * VRSS_BELOW_PERCENT:
+        if vrss_below(n["r"], n["e"]):
             add("NOTICE", "PASS", "the world is drawn at %dx%d, %d%% of the %dx%d eye texture: Elite's Supersampling is below 1 (or an upscaler sits in the chain)"
                 % (n["r"][0], n["r"][1], n["pct"], n["e"][0], n["e"][1]))
         else:
-            add("NOTICE", "STOP", "the notice names %dx%d against a %dx%d eye (%d%%), which is not below %d%%" % (n["r"][0], n["r"][1], n["e"][0], n["e"][1], n["pct"], VRSS_BELOW_PERCENT))
-    elif a and a["pct"] < VRSS_BELOW_PERCENT:
+            add("NOTICE", "STOP", "the notice names %dx%d against a %dx%d eye (%d%%), which is not below %d%% on both axes" % (n["r"][0], n["r"][1], n["e"][0], n["e"][1], n["pct"], VRSS_BELOW_PERCENT))
+    elif a and vrss_below(a["r"], a["e"]):
         add("NOTICE", "STOP", "vScreen measured the world at %d%% of the eye (%dx%d in %dx%d) and no `vr supersampling:` line followed: the detection did not run" % (a["pct"], a["r"][0], a["r"][1], a["e"][0], a["e"][1]))
     elif a:
-        add("NOTICE", "n/a", "vScreen measured the world at %d%% of the eye: not below %d%%, so no notice is right" % (a["pct"], VRSS_BELOW_PERCENT))
+        add("NOTICE", "n/a", "vScreen measured the world at %d%% of the eye: not below %d%% on both axes, so no notice is right" % (a["pct"], VRSS_BELOW_PERCENT))
     else:
-        add("NOTICE", "n/a", "vScreen adopted no render size (the world is drawn at the eye's own size, or no scene was drawn yet)")
+        add("NOTICE", "n/a", "vScreen adopted no render size: the world may be drawn at the eye's own size, or vScreen's guards held the adoption back (read its `vScreen:` lines), "
+                             "or no scene was drawn yet. Elite's Supersampling below 1 cannot be ruled out from this log")
     if n and a:
         if n["r"] == a["r"] and n["e"] == a["e"]:
             add("CONSISTENT", "PASS", "the notice's sizes are vScreen's own adoption line's")
@@ -4688,7 +4700,7 @@ def vr_supersampling_verdict(f):
         add("CONSISTENT", "WARN", "no vScreen adoption line to check the notice against")
     if n:
         if f["queued"]:
-            add("HEADSET", "PASS", "%s (%s)" % ("the headset notice was queued as a toast" if f["toast"] else "menu.toasts is off: no toast", f["queued"]) + "; the Status page and the settings pages carry it while the menu is open")
+            add("HEADSET", "PASS", "%s (%s)" % ("the headset notice was queued as a toast" if f["toast"] else "menu.toasts is off: no toast", f["queued"]) + "; the Status page shows the advice as its hint while the menu is open")
         else:
             add("HEADSET", "WARN", "no `vr supersampling:` menu line: the headset notice was not queued (the menu may not have ticked yet)")
     return out
@@ -4698,7 +4710,8 @@ def print_vr_supersampling(text):
     """The --vr-supersampling report. Returns 0 when the log has any of the lines, 1 when it has none; the verdict never changes the exit code."""
     f = parse_vr_supersampling(text)
     if not (f["notice"] or f["adopt"] or f["queued"]):
-        print("[edvr] no `vr supersampling:` or vScreen render-size line in this log (the world is drawn at the eye's own size, or a build that predates section 83).")
+        print("[edvr] no `vr supersampling:` or vScreen render-size line in this log (the world may be drawn at the eye's own size, or vScreen's guards held the "
+              "adoption back, or this is a build that predates section 83: Supersampling below 1 cannot be ruled out from it).")
         return 1
     if f["adopt"]:
         a = f["adopt"]
@@ -5384,9 +5397,14 @@ def self_test_flat_upscale():
     _, out = statuses(with_episode("game-aa"))
     flat = re.sub(r"[ ]+", " ", out)
     for want in ("declined 15:16:40.100: r-sized-image-passes-follow-the-first-consumer-of-the-scene-hdr (the whitelist said no-known-tone-pass; a 2880x1620 image, 2 R-sized pass(es) between)",
-                 "WARN (CHAIN) the structure declined 1 frame(s) with R-sized image passes", "(the longest chain: 2)"):
+                 "WARN (CHAIN) the structure declined 600 frame(s) with R-sized image passes", "(the longest chain: 2)"):
         if want not in flat:
             fail("the game-AA episode's report lacks %r:\n%s" % (want, out))
+    # The CHAIN count is the windows' frames, not the decline lines (one line a cause a session); with no window that counted them it says lines.
+    no_counts = re.sub(r"(declines=)r-sized-image-passes-follow-the-first-consumer-of-the-scene-hdr:\d+", r"\1none", with_episode("game-aa"))
+    _, out = statuses(no_counts)
+    if "frames (1 decline line(s); no window counted them)" not in re.sub(r"[ ]+", " ", out):
+        fail("a game-AA log whose windows counted no declines should name the decline lines, not call them frames:\n%s" % out)
     want_statuses(with_episode("old-advice"), {"ADVICE": "STOP", "F8 WARNING": "STOP"}, "a build from before section 83")
 
     # ---- take away what the report depends on, and break what the verdict judges ----
@@ -5398,6 +5416,12 @@ def self_test_flat_upscale():
     want_statuses(sub(base, "temporal_aa_before_post=auto (read at startup)", "temporal_aa_before_post=off (read at startup)"), {"KEY": "WARN"}, "the key off")
     no_key = "\n".join(l for l in base.splitlines() if "flat hdr route:" not in l) + "\n"
     want_statuses(no_key, {"KEY": "n/a", "ADMISSION": "PASS"}, "no key line")
+    # Windows that never ruled on a final copy: the admission ran and had nothing to say, which is not a PASS.
+    no_copies = "\n".join(re.sub(r"(copies|whitelist|admitted|no-scene)=\d+", r"\1=0", l) if "flat copy structure 5s:" in l else l for l in base.splitlines()) + "\n"
+    want_statuses(no_copies, {"ADMISSION": "WARN"}, "windows with no final copy")
+    _, out = statuses(no_copies)
+    if "NO final copy was ruled on in any window" not in out:
+        fail("windows with copies=0 should say no final copy was ruled on:\n%s" % out)
     untreated = re.sub(r"flat runtime: treated=\d+", "flat runtime: treated=0", base)
     want_statuses(untreated, {"TREATED": "STOP", "UPSCALE": "STOP"}, "nothing treated")
     no_runtime = "\n".join(l for l in base.splitlines() if "flat runtime:" not in l) + "\n"
@@ -5453,7 +5477,7 @@ def self_test_flat_upscale():
               "image that is already upscaled, which softens the world and the holograms. Set Elite's Supersampling to 1 and raise HMD Image Quality instead: EDVR's DLSS upscales from that. "
               "Measured from the render sizes, not read from Elite's settings file.\n")
     adopt = ("[09:30:12.098] " + (adopt_prefix % (2112, 2304, 2816, 3072, 75)) + ", which is what supersampling away from 1.0 and every upscaler in the chain do (FSR and NIS at their \"ultra quality\" are exactly this).\n")
-    queued = "[09:30:12.300] vr supersampling: the headset notice is queued as a toast (\"Elite Supersampling is below 1: use HMD Image Quality\"); the Status page has the line \"Elite supersampling\" and every settings page the note, while the menu is open.\n"
+    queued = "[09:30:12.300] vr supersampling: the headset notice is queued as a toast (\"Elite Supersampling is below 1: use HMD Image Quality\"); the Status page shows the advice as its hint while the menu is open.\n"
     vr = "[09:29:00.000] version v0.18.0-rc.5-26-g5ec0de01 (build 5EC0DE01) -- this DLL was linked 2026-10-01 20:05:44 UTC\n" + adopt + notice + queued
     p = parse_vr_supersampling(vr)
     if not p["notice"] or p["notice"]["r"] != (2112, 2304) or p["notice"]["pct"] != 75 or p["notice"]["e"] != (2816, 3072) or not p["adopt"] or p["adopt"]["pct"] != 75 or not p["queued"] or not p["toast"] or p["flat"]:
@@ -5472,7 +5496,13 @@ def self_test_flat_upscale():
         if want not in flat:
             fail("the VR report lacks %r:\n%s" % (want, out))
     want_statuses_vr(adopt + queued, {"NOTICE": "STOP"}, "the adoption line and no notice (the detection did not run)")
-    want_statuses_vr(sub(vr, "75% of the width", "100% of the width").replace(notice, ""), {"NOTICE": "n/a"}, "a world at the eye's own size")
+    want_statuses_vr(sub(sub(vr, "rendered at 2112x2304", "rendered at 2816x3072"), "75% of the width", "100% of the width").replace(notice, ""), {"NOTICE": "n/a"}, "a world at the eye's own size")
+    # The DLL's compare is exact on both axes; the percent in the log is rounded. 2751x3000 in 2816x3072 is 97.7% (logged as 98) and 97.7%: below.
+    near = vr.replace("2112x2304", "2751x3000").replace("75% of", "98% of")
+    want_statuses_vr(near, {"NOTICE": "PASS", "CONSISTENT": "PASS"}, "97.7 percent, logged as 98: below, since the DLL's compare is exact")
+    # One axis under the threshold and the other not is no notice (the DLL needs both).
+    one_axis = vr.replace("2112x2304", "2112x3070")
+    want_statuses_vr(one_axis, {"NOTICE": "STOP"}, "a notice for a world under the eye on one axis only")
     want_statuses_vr(sub(vr, "scaled into the 2816x3072", "scaled into the 2800x3072"), {"CONSISTENT": "STOP"}, "sizes that disagree")
     want_statuses_vr(vr.replace(queued, ""), {"HEADSET": "WARN"}, "no menu line")
     want_statuses_vr(vr + "[09:31:00.000] flat runtime: treated=1 refused=0 last=treated-jittered\n", {"FLAT": "STOP"}, "a flat log with the notice")

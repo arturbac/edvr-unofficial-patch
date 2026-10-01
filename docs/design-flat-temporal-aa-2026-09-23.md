@@ -8002,10 +8002,16 @@ A frame is admitted when:
    reducer stops at the tone pass before it checks the copy, so it is checked
    again);
 2. the copy's source S was written this frame by exactly one pass: R8G8B8A8,
-   full viewport, no depth, the scene's size;
+   full viewport, no depth, the scene's size, and not written outside a draw
+   after it (no Clear, Copy, Update or Map: the prefix model marks the target,
+   which is what the whitelist's tone count loses and an unknown tone pass has
+   no count to lose);
 3. the scene is the R11G11B10F target with a depth of its own size that took
    the most draws (at least 8), and its size is a uniform scale of the output
-   from half to twice (`flatRenderFitsOutput`);
+   from half to twice (`flatRenderFitsOutput`), for a mode that has a route
+   there (EDVR's `dlaa` has none below the output: admitting the frame would
+   make it Treatable and the resolver would refuse every one in silence, so it
+   stays refused as before);
 4. the HDR trigger was seen this frame, is unambiguous, reads that target and
    comes before S's first write;
 5. no other R-sized R8G8B8A8 pass was written between the trigger and S (the AA
@@ -8040,8 +8046,10 @@ contract hash or published word moves): `render-size-does-not-fit-output` (the
 scene is not a uniform scale of the output from half to twice; the measured
 sizes ride it) and `no-3d-scene` (a final copy and no scene). Both stand the
 work down after 5 s; the first warns, the second never does, so the startup
-spell is silent. The sizes are the prefix model's measurement and the swap
-chain's, never Elite's settings file.
+spell is silent (`hdrFrameEnd` leaves it alone too: the route's no-hdr-consumer
+verdict, for a frame with an HDR-shaped target of a few draws, would warn). The
+sizes are the prefix model's measurement at every final copy that has a scene,
+and the swap chain's, never Elite's settings file.
 
 - Stand-down: `flat stand-down: entered ...: every frame for 5.0 s (598 frames)
   was refused for render-size-does-not-fit-output (Elite renders 2176x1224 on a
@@ -8076,10 +8084,16 @@ reached scene levels. It never reads Elite's settings file, never fires in flat
 the 3D world at 1998x1931, 75% of the 2665x2575 eye texture, ... Set Elite's
 Supersampling to 1 and raise HMD Image Quality instead ...`, a headset toast
 ("Elite Supersampling is below 1: use HMD Image Quality") through the menu's
-own toast queue (`menu.toasts`), a Status page line `Elite supersampling`, a
-note on every settings page, and the menu's log line saying which were queued.
-An upscaler in the chain (FSR, NIS) reads the same, and the log line says so. A
+own toast queue (`menu.toasts`), the Status page's hint while the menu is open,
+and the menu's log line saying which were queued. No page gains a line for it
+(a review finding): the menu bitmap is refused above 2048 px and the panel then
+keeps its old bitmap, which a note under a settings page's rows (16 lines and a
+hint) reaches from a 48-px cap and one more Status line from 54, and the Pimax
+has 51-55; the hint is the two-line area the Status page has anyway. An
+upscaler in the chain (FSR, NIS) reads the same, and the log line says so. A
 pinned `advanced.eye_render_size` is not a measurement and does not trigger it.
+It is vScreen's once-a-session measurement: after Supersampling is fixed in
+session the hint stays until a restart.
 
 **Contracts: what works today is unchanged.** Pinned in `flat_temporal_test`
 (the corpus replay is the test) and `vscreen_fit_test`:
@@ -8102,7 +8116,9 @@ pinned `advanced.eye_render_size` is not a measurement and does not trigger it.
 - no new key, no ini value moved, `config_test` unchanged.
   `experimental.temporal_aa_before_post` is the switch: auto is the route plus
   the structure, off the whitelist alone (the A/B); its `edvr.ini` comment says
-  so.
+  so. With it off the whitelist still decides; only the naming changes (a frame
+  with no scene says `no-3d-scene`, a render size that does not fit says so),
+  and the key's log line says that.
 
 **What the log shows.** If the new code never ran, there is no `flat copy
 structure 5s:` line at all.
@@ -8180,19 +8196,32 @@ temporal_aa_before_post = auto` (the default).
    advice. The A/B for leg 1.
 8. VR at Elite Supersampling 0.85, HMD Image Quality 1.0, `[menu] toasts = on`.
    Pass: `--vr-supersampling` NOTICE with about 85% of the eye, CONSISTENT,
-   HEADSET; in the headset one toast, the Status line and the page note.
-   Control: Supersampling 1.0 gives no `vr supersampling:` line, and a flat log
-   never has one.
+   HEADSET; in the headset one toast and, with the menu on the Status page, the
+   hint (open every page too: none may stop drawing). Control: Supersampling
+   1.0 gives no `vr supersampling:` line, and a flat log never has one.
 
-**Mutations** (scratch runs, restored after): `flat_temporal_test` 44 edits, 43
-applied, 42 caught by the rigs and 1 equivalent (the `selected()` term of the
-entry test is redundant with the reason test); `vscreen_fit_test` case R13, 14
+**Mutations** (scratch runs, restored after): `flat_temporal_test` 51 edits, 50
+applied, 49 caught by the rigs and 1 equivalent (the `selected()` term of the
+entry test is redundant with the reason test); `vscreen_fit_test` case R13, 16
 mutations in `mutants.py`.
+
+**Review.** A read-only review of the diff by a second agent found one defect
+that no rig could see (the VR note's layout, above) and these, all fixed: the
+admission now declines an S that was written outside a draw and a mode with no
+route at the size; `hdrFrameEnd` no longer turns no-3d-scene into a warning;
+the scene's sizes are refreshed at every final copy; the key-off log line names
+what it still names; and the readers (an exact two-axis compare for the 98%,
+frames counted from the windows and not the decline lines, ADMISSION a WARN
+when no window ruled on a copy, no claim from silence about Elite's
+Supersampling).
 
 **Not built.** The relaxed rule for a game FXAA chain (waits for leg 6); a
 trace marker for the structure's verdict (a live F10 trace replays as the
 whitelist's refusal, and the rig runs the admission over it); a VR notice for a
-pinned `advanced.eye_render_size`.
+pinned `advanced.eye_render_size`; a guard for a compute write into S or H of
+an unknown chain (the whitelist's tone count guards them for a known one; the
+prefix model records no compute write for other targets); a stand-down message
+for `dlaa` below the output (it stays refused with the old words).
 
 - ruled out: the final copy or the HDR detector as the cause of the refusals,
   because in every refusal the copy was valid and the detector fired on every
@@ -8217,3 +8246,8 @@ pinned `advanced.eye_render_size`.
 - ruled out: Elite's settings file for the VR Supersampling warning or the
   render size in the F8 words, because the measured sizes are the evidence and
   the file says only what was asked for.
+- ruled out: a note on every settings page and a Status line for the VR notice,
+  because the menu bitmap's 2048-px height guard trips from a 48-px cap with
+  the note and a 54-px cap with one more Status line, and the Pimax runs 51-55:
+  the panel would keep a stale bitmap on the headsets that run Supersampling
+  below 1. The toast, the log line and the Status hint add no line.

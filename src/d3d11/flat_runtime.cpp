@@ -1469,9 +1469,9 @@ void resolveSpanEnd(ID3D11DeviceContext* ctx) noexcept {
 // now), bits 8..15 the stand-down's current reason.
 std::atomic<uint32_t> g_refusalPublished{0};
 // The scene's and the output's sizes as the copy stage last saw them (the admission's scene facts, section 83), in one
-// word, 16 bits each (flatHdrPackSizes); 0 when no frame has shown a scene since the key, the mode or a resize last
-// cleared it. Written on the draw thread, read by the panel thread (flatRuntimeSceneSizes): the F8 words name the render
-// size when it does not fit the output, and EDVR's TAA above the output.
+// word, 16 bits each (flatHdrPackSizes), refreshed at every final copy that has a scene; 0 when no frame has shown one
+// since a resize (the swap chain or device went) last cleared it. Written on the draw thread, read by the panel thread
+// (flatRuntimeSceneSizes): the F8 words name the render size when it does not fit the output, and EDVR's TAA above it.
 std::atomic<uint64_t> g_sceneSizes{0};
 void publishRefusal(const State& s, bool warn) {
     uint32_t v = 0;
@@ -1737,7 +1737,8 @@ static void hdrReadKey(State& s, uint64_t frame) {
               "first consumer, uniformly scaled to the output) when no whitelisted tone pass wrote it, so bloom, depth of "
               "field and the tone variant do not matter below the output either"
             : "the trigger detector only observes (a census line every 5 s); the copy route treats every frame as before, "
-              "by the whitelist alone");
+              "by the whitelist alone (a frame with no scene, or a render size that does not fit the output, is still named "
+              "as such)");
     if (!first) {
         endStandDown(s, frame, "experimental.temporal_aa_before_post changed");
         s.phase.resetHistory(); reset();
@@ -1787,9 +1788,11 @@ static void hdrFrameEnd(State& s, uint64_t frame) {
     } else if (verdict == FlatHdrFrameVerdict::NoTrigger) {
         s.hdrWindow.lastVerdict = flatMonoReasonName(FlatMonoReason::NoHdrConsumer);
         // A frame that reached the game's output copy, had an HDR target and gave the route no consumer is refused for
-        // the shape of its chain. A frame that never reached a copy stays "no final copy" (a loading screen).
+        // the shape of its chain. A frame that never reached a copy stays "no final copy" (a loading screen), and a frame
+        // the copy stage found no scene in (no-3d-scene: startup, a loading screen, an HDR target with a handful of draws)
+        // stays that, which never warns (section 83).
         if (s.hdrKey == FlatHdrKey::Auto && !s.hdrLatch.tripped && s.frameSeen != FlatFrameSeen::None &&
-            s.frameSeen <= FlatFrameSeen::Structural) {
+            s.frameSeen <= FlatFrameSeen::Structural && s.frameReason != FlatMonoReason::NoScene) {
             s.frameSeen = FlatFrameSeen::Structural; s.frameReason = FlatMonoReason::NoHdrConsumer;
         }
     }
@@ -1834,9 +1837,16 @@ static FlatMonoFrame copyAdmit(State& s, const FlatRuntimeDraw& d, const FlatMon
     FlatCopyDiag diag;
     const FlatMonoFrame out = flatCopyAdmit(s.prefix, s.hdr, d, whitelist, policy, &diag);
     if (whitelist.selected()) s.copyWindow.noteWhitelist(); else s.copyWindow.note(diag);
-    if (diag.sceneWidth)
-        g_sceneSizes.store(flatHdrPackSizes(diag.sceneWidth, diag.sceneHeight, s.prefix.width, s.prefix.height),
-                           std::memory_order_release);
+    // The scene's size for the panel, from every final copy that has a scene: the admission's own facts where it looked, the
+    // prefix model's where it did not (a frame the whitelist selected, or refused for another reason), so the F8 words never
+    // read sizes older than the refusal they name.
+    uint32_t sceneW = diag.sceneWidth, sceneH = diag.sceneHeight;
+    if (!sceneW) {
+        const FlatSceneFacts facts = flatSceneFacts(s.prefix, s.prefix.width, s.prefix.height);
+        sceneW = facts.width; sceneH = facts.height;
+    }
+    if (sceneW)
+        g_sceneSizes.store(flatHdrPackSizes(sceneW, sceneH, s.prefix.width, s.prefix.height), std::memory_order_release);
     char text[1000];
     if (diag.outcome == FlatCopyOutcome::Admitted && !s.copyFirstLogged) {
         s.copyFirstLogged = true;

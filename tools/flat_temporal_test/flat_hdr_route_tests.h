@@ -1174,11 +1174,15 @@ inline int flatHdrRouteTests() {
                    count(runtime, "flatHdrSupersamplingAdvice") == 0 && count(menu, "flatRuntimeHdrRouteBelowOutput") == 0 &&
                    count(menu, "flatRuntimeHdrRouteActive") == 0 && count(menu, "supersamplingBelowOne") == 0,
                "the supersampling advice, its published sizes and the route's eligibility word are gone from the runtime and the panel");
-        // The scene's and the output's sizes the copy stage measures are published for the panel (the admission's scene facts), written
-        // where the copy is ruled on and cleared by a resize; the panel reads them only while frames are refused.
+        // The scene's and the output's sizes the copy stage measures are published for the panel (the admission's scene facts, or the
+        // prefix model's where the admission did not look), written at every final copy that has a scene and cleared by a resize; the
+        // panel reads them only while frames are refused.
         expect(count(runtime, "g_sceneSizes.store(") == 2 && count(runtime, "g_sceneSizes.store(0, std::memory_order_release);") == 1 &&
-                   count(runtime, "flatHdrPackSizes(diag.sceneWidth, diag.sceneHeight, s.prefix.width, s.prefix.height)") == 1,
-               "the scene's measured sizes are published from the copy's admission and cleared by a resize");
+                   count(runtime, "flatHdrPackSizes(sceneW, sceneH, s.prefix.width, s.prefix.height)") == 1 &&
+                   count(runtime, "uint32_t sceneW = diag.sceneWidth, sceneH = diag.sceneHeight;\n    if (!sceneW) {\n"
+                                  "        const FlatSceneFacts facts = flatSceneFacts(s.prefix, s.prefix.width, s.prefix.height);\n"
+                                  "        sceneW = facts.width; sceneH = facts.height;\n    }\n    if (sceneW)\n") == 1,
+               "the scene's measured sizes are published at every final copy that has a scene (the admission's facts, else the prefix model's) and cleared by a resize");
         expect(count(menu, "const bool sizesKnown = refusing && flatRuntimeSceneSizes(&renderW, &renderH, &outputW, &outputH);") == 1 &&
                    count(menu, "const FlatWarningCause cause = flatWarningCause(refusing, refusing && flatRuntimeStructureAdmission(),") == 1 &&
                    count(menu, "refusing && flatRuntimeTaaAboveOutput(), renderSizeReason, sizesKnown,") == 1,

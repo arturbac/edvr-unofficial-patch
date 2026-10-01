@@ -27,8 +27,9 @@
 //       stays off the flat profile, its D3D calls never wait and always step past the hooks, the resolver reads no curve fact
 //   R13 Elite's Supersampling below 1.0 in VR (src/common/vr_supersample_notice.h; design section 83, the VR warning): the pure
 //       judgement over the measured render size and the eye's, the published word, the words, and the wiring as source pins
-//       (the detection is vscreen's own measurement, never Elite's settings file; the toast, the Status line and the settings
-//       pages' note are the menu's; a flat session never reaches any of it)
+//       (the detection is vscreen's own measurement, never Elite's settings file; the toast and the Status page's hint are the
+//       menu's and no page gains a line, because the menu bitmap's 2048-px height guard trips on the Pimax; a flat session never
+//       reaches any of it)
 //
 // Usage: --self-test [<repo root>] [--only R1,R3,...] [--root <dir>] | --dry-run (does nothing) | --write-fixture <path> [--dry-run]
 // (regenerates tools\vscreen_fit_fixture.log from the formatters; with --dry-run it says what it would write and writes nothing).
@@ -971,11 +972,10 @@ void caseR13() {
     }
     // The words.
     {
-        char log[1200], toast[96], status[64], note[400];
+        char log[1200], toast[96], hint[200];
         vrss::formatLog(log, sizeof(log), 2112, 2304, 2816, 3072);
         vrss::formatToast(toast, sizeof(toast));
-        vrss::formatStatus(status, sizeof(status), 2112, 2816);
-        vrss::formatNote(note, sizeof(note), 2112, 2304, 2816, 3072);
+        vrss::formatStatusHint(hint, sizeof(hint));
         const std::string l = log;
         check(std::strncmp(log, "vr supersampling: Elite draws the 3D world at 2112x2304, 75% of the 2816x3072 eye texture, and scales it up before EDVR sees it:", 128) == 0 &&
                   has(l, "Elite's Supersampling is below 1") && has(l, "HMD Image Quality") && has(l, "EDVR's DLSS upscales from that") &&
@@ -984,10 +984,10 @@ void caseR13() {
         check(has(l, "holograms") && has(l, "already upscaled") && has(l, "Supersampling to 1"), "R13c: ...and says why it hurts and what Supersampling should be");
         check(std::string(toast) == "Elite Supersampling is below 1: use HMD Image Quality" && std::strlen(toast) <= 60,
               "R13c: the headset toast is one short line that names both settings");
-        check(std::string(status) == "below 1: world at 75% of the eye" && std::strlen(status) < 63, "R13c: the Status page's value fits MenuLine::right (63 bytes)");
-        check(has(note, "2112x2304") && has(note, "75%") && has(note, "2816x3072") && has(note, "HMD Image Quality") && has(note, "Supersampling to 1") &&
-                  std::strlen(note) < 399,
-              "R13c: the settings pages' note names the sizes and the advice and fits its buffer");
+        // The Status page's hint replaces the 78-character hint the page has (two lines, whatever it says): never longer, so the
+        // page never wraps to a third line, and it names both settings.
+        check(std::string(hint) == "Elite Supersampling is below 1: set it to 1 and use HMD Image Quality." && std::strlen(hint) <= 78,
+              "R13c: the Status page's hint is one sentence, no longer than the hint it replaces (78 characters)");
     }
     // The wiring, as source pins.
     {
@@ -1020,12 +1020,19 @@ void caseR13() {
                   has(tick, "s.vrSupersamplingToasted = true;\n                if (s.toasts) {\n                    char toast[96];") &&
                   has(tick, "vr supersampling: the headset notice is queued as a toast") && has(tick, "vr supersampling: menu.toasts is off, so no toast"),
               "R13e: the toast is queued once a session, gated on menu.toasts and logged either way, after the flat profile's branch returned: flat never reaches it");
-        check(count(menu, "statusLine(c, \"Elite supersampling\", buf);") == 1 && count(menu, "vrss::formatStatus(buf, sizeof(buf), rw, ew2);") == 1,
-              "R13e: the Status page has the line, only when vScreen measured it");
-        const std::string note = functionBody(menu, "void buildContent(MenuContent& c) {");
-        const size_t noteAt = note.find("if (!runtimeFlatProfile()) {\n            uint32_t rw = 0, rh = 0, ew = 0, eh = 0;\n            if (vScreenRenderBelowEye(");
-        check(noteAt != std::string::npos && count(menu, "vrss::formatNote(paragraph, sizeof(paragraph), rw, rh, ew, eh);") == 1,
-              "R13e: the settings pages' note is under the not-flat test, built from the measured sizes");
+        // The open menu says it in the Status page's hint, and nowhere else: no line is added to any page (the bitmap is refused above
+        // 2048 px, which a 48-px cap reaches with a note under a settings page's rows and a 54-px cap with one more Status line; the
+        // Pimax has 51-55). The accessor is read exactly twice in menu.cpp, the hint and the toast.
+        const std::string build = functionBody(menu, "void buildContent(MenuContent& c) {");
+        const size_t statusAt = build.find("buildStatus(c);");
+        const size_t compactAt = build.find("c.compact = true;", statusAt == std::string::npos ? 0 : statusAt);
+        const size_t hintAt = build.find("if (vScreenRenderBelowEye(&rw, &rh, &ew, &eh)) vrss::formatStatusHint(c.hint, sizeof(c.hint));");
+        check(statusAt != std::string::npos && compactAt != std::string::npos && hintAt != std::string::npos && compactAt < hintAt &&
+                  count(menu, "vrss::formatStatusHint(c.hint, sizeof(c.hint));") == 1,
+              "R13e: the Status page's hint says it, after the page's own hint is set, only when vScreen measured it");
+        check(count(menu, "vScreenRenderBelowEye(") == 2 && !has(menu, "formatNote") && !has(menu, "vrss::formatStatus(") &&
+                  !has(menu, "statusLine(c, \"Elite supersampling\""),
+              "R13e: nothing adds a line to a page for the notice: the accessor is read twice (the hint and the toast), no note, no Status line");
         check(!has(flat, "vrss::") && !has(flat, "vScreenRenderBelowEye") && !has(flat, "vr_supersample_notice") && !has(flat, "Supersampling is below 1"),
               "R13f: the flat runtime never touches the notice");
         // The F8 panel's words: the flat warning no longer carries a supersampling paragraph at all (section 83).
