@@ -1695,6 +1695,11 @@ int main(int argc, char** argv) {
     cfg.set("fix.temporal_aa", "dlss");
     cfg.set("advanced.temporal_aa_jitter_sign", "as_is");
     cfg.set("advanced.temporal_aa_jitter_lag", "0");
+    // The on-foot maps gate ships ON since 2026-10-01 (an ini with no line reads on: tools\config_test and tools\on_foot_maps_test
+    // hold the fallback). The cases before the maps section pin the world-screen gate as the journal and the screen's own depth
+    // give it, which is the maps key off, and the maps section sets the key itself, so the rig starts with it off: the new default
+    // must not leak in and make the first maps case start from a gate that is already on.
+    cfg.set("experimental.on_foot_maps_sharp", "off");
     uiLayerConfigure(cfg);
     check(uiLayerLive(), "the layer is live for the rig (fix.ui_quality 100, dlss, jitter as shipped)");
     // The first boundary computes the world-screen gate (the journal: on foot) and warms the layer's shaders.

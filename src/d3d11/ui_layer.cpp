@@ -2732,8 +2732,9 @@ bool crispTakeReady(ID3D11DeviceContext* ctx, int eye);
 // --------------------------------------------------------------- the API
 
 void uiLayerConfigure(Config& cfg) {
-    // The on-foot maps gate's key, live: the boundary latches it. A value that is not "on" reads as off.
-    g_maps.keyCfg = uiMapsKeyFromText(cfg.getString("experimental.on_foot_maps_sharp", "off").c_str());
+    // The on-foot maps gate's key, live: the boundary latches it. On for an ini with no line (the shipped default since 2026-10-01,
+    // which tools\config_test holds the fallback to); a value that is not "on" reads as off.
+    g_maps.keyCfg = uiMapsKeyFromText(cfg.getString("experimental.on_foot_maps_sharp", "on").c_str());
     g_hdrDrawTimingOn = cfg.getBool("advanced.temporal_aa_diagnostics", false);
     detail::g_uiSeedDiagnostics = g_hdrDrawTimingOn;
     g_seedCensus.configure(g_hdrDrawTimingOn);
