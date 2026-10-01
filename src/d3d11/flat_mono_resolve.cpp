@@ -87,6 +87,10 @@ struct State {
     uint32_t refusalWrite=0;
     Image color, depth[2], motion, rejection, expected, output[2];
     uint32_t width=0, height=0, outWidth=0, outHeight=0, evalWidth=0, evalHeight=0, current=0;
+    // The steady-detail depth check's previous depth (FlatMonoResolveFrame::steadyDetail). TAA keeps last frame's depth in depth[current^1]
+    // already; the other backends keep none, so depth[1] is made on the first frame that asks, and while frames ask, the depth the
+    // backend is handed alternates between the two images: depthLast is the one the previous frame wrote (0 for every frame that did not ask).
+    uint32_t depthLast=0;
     uint64_t lastFrame=0;
     FlatMonoResolveMode mode=FlatMonoResolveMode::Taa;
     bool hdr=false;   // the resources below are the HDR route's (an HDR input copy, fp16 outputs)
@@ -122,6 +126,8 @@ FlatContextState& g_contextBlock=*new FlatContextState;
 FlatMonoRefusalCensus& g_refusal=*new FlatMonoRefusalCensus;
 uint64_t g_refusalCadence=0;
 bool g_refusalFailureLogged=false;
+// The steady-detail rule's second depth image could not be made: said once, and the frames that ask run as if they had not (refused as before).
+bool g_steadyFailureLogged=false;
 // rowsJitter: the NDC shift the camera rows themselves carry (current xy, previous zw), the shader removes it; all zero
 // when the rows are unjittered, which is every path that does not go through the upstream camera injector.
 // route: x = the HDR route (the input is R11G11B10F radiance, the outputs fp16), y = with x, EDVR's TAA output is final
@@ -367,7 +373,7 @@ bool resources(const FlatMonoResolveFrame& f,const char** reason) {
     ++stats.allocations;
     g.color={};g.depth[0]={};g.depth[1]={};g.motion={};g.rejection={};g.expected={};g.output[0]={};g.output[1]={};
     g.klass={};g.classWidth=g.classHeight=0;   // the refusal census's class texture is the render size: made again by a frame that asks
-    g.width=g.height=g.outWidth=g.outHeight=0;g.evalWidth=g.evalHeight=0;g.current=0;g.history=false;g.hdr=false;
+    g.width=g.height=g.outWidth=g.outHeight=0;g.evalWidth=g.evalHeight=0;g.current=0;g.depthLast=0;g.history=false;g.hdr=false;
     const bool taa=f.mode==FlatMonoResolveMode::Taa;
     // The images' names for the HDR route's crumbs: which of the private textures each creation is.
     const auto role=[&](const Image& i)->const char* {
@@ -429,6 +435,15 @@ bool ensureClassTexture(uint32_t width,uint32_t height) {
     g.klass={};g.classWidth=g.classHeight=0;
     if(!image(g.device.Get(),width,height,DXGI_FORMAT_R8_UINT,g.klass,true,"class")) {g.klass={};return false;}
     g.classWidth=width;g.classHeight=height;
+    return true;
+}
+// The steady-detail depth check's second depth image for the backends that keep none (everything but EDVR's own TAA, whose depth[1]
+// resources() makes): made on the first frame that asks, at the render size, like depth[0] (R32_FLOAT, shader and unordered access).
+// A reallocation by resources() drops it with the rest and the next asking frame makes it again.
+bool ensureSecondDepth(uint32_t width,uint32_t height) {
+    if(g.depth[1].texture && g.depth[1].srv && g.depth[1].uav)return true;
+    g.depth[1]={};
+    if(!image(g.device.Get(),width,height,DXGI_FORMAT_R32_FLOAT,g.depth[1],true,"depth1")) {g.depth[1]={};return false;}
     return true;
 }
 // The counting pass, its counter buffer (16 stripes of 16 counters, raw, UAV) and the four-slot staging ring the sums are read
@@ -803,10 +818,30 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     }
     const bool needClass=sampleNow || paintNow;
     const uint32_t index=taa?g.current:0;
+    // THE STEADY-DETAIL DEPTH CHECK (FlatMonoResolveFrame::steadyDetail). The menu's blanket policy wins, so a frame with staticScene has nothing
+    // for the check to do. Otherwise the frame needs last frame's depth beside the one it writes: EDVR's TAA has it (depth[index^1]); the
+    // other backends get depth[1] here, on the first frame that asks, and the depth they are handed alternates between the two images from then
+    // on. A frame that does not ask never touches depth[1]: it writes depth[0], the backend reads depth[0], as always. A reset frame refuses
+    // every pixel anyway (the prep never reaches a stale slot), so it only keeps the alternation going.
+    const bool steady=f.steadyDetail && !f.staticScene;
+    uint32_t depthIndex=index,prevDepthIndex=taa?(index^1u):0u;
+    bool steadyAvailable=false;
+    if(steady) {
+        if(taa)steadyAvailable=true;
+        else if(ensureSecondDepth(f.renderWidth,f.renderHeight)) {
+            steadyAvailable=true;depthIndex=g.depthLast^1u;prevDepthIndex=g.depthLast;
+        } else if(!g_steadyFailureLogged) {
+            g_steadyFailureLogged=true;
+            Log::get().note("flat resolve: the steady-detail depth check could not make its second depth image (%ux%u R32_FLOAT); the frames that ask "
+                            "refuse a stale slot as before",f.renderWidth,f.renderHeight);
+        }
+    }
+    const bool depthCheck=steadyAvailable && !reset;
+    if(steady && !reset) {if(depthCheck)++g_refusal.checked;else ++g_refusal.skipped;}
     Constants constants{};std::memcpy(constants.camera,f.camera,sizeof(f.camera));
     std::memcpy(constants.previous,reset?f.camera:f.previousCamera,sizeof(f.previousCamera));
     constants.size[0]=f.renderWidth;constants.size[1]=f.renderHeight;constants.size[2]=evalW;constants.size[3]=evalH;
-    constants.flags[0]=reset;constants.flags[1]=engine;constants.flags[2]=taa;constants.flags[3]=f.staticScene?1u:0u;
+    constants.flags[0]=reset;constants.flags[1]=engine;constants.flags[2]=taa;constants.flags[3]=f.staticScene?1u:(depthCheck?2u:0u);
     constants.route[0]=hdr?1u:0u;constants.route[1]=(hdr&&taa)?1u:0u;
     constants.route[2]=firstPersonMap?1u:0u;constants.route[3]=firstPersonMap?f.firstPersonPhaseMode:0u;
     constants.debug[0]=sampleNow?1u:0u;constants.debug[1]=paintNow?1u:0u;
@@ -826,13 +861,14 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
     HdrCrumbSpan prepStep(g_crumbOn,"prep","groups=%ux%u",(f.renderWidth+7)/8,(f.renderHeight+7)/8);
     ID3D11Buffer* cb[]={g.constants.Get(),f.engine.sceneNow,f.engine.scenePrev};
     context->CSSetConstantBuffers(0,3,cb);
-    // t4..t8 are the later kernels' (motion, rejection, expected depth, history): null for prep. t9 and t10 are the
-    // first-person map and stencil, null unless the pair was accepted above.
+    // t4..t7 are the later kernels' (motion, rejection, expected depth, history): null for prep. t8 is the later kernels' history depth
+    // and the prep's too, but only on a frame whose steady-detail check runs (last frame's depth). t9 and t10 are the first-person map and
+    // stencil, null unless the pair was accepted above.
     ID3D11ShaderResourceView* prepViews[]={g.color.srv.Get(),f.depth,f.engine.slots,f.engine.pool,
-        nullptr,nullptr,nullptr,nullptr,nullptr,firstPersonMap,firstPersonStencil};
+        nullptr,nullptr,nullptr,nullptr,depthCheck?g.depth[prevDepthIndex].srv.Get():nullptr,firstPersonMap,firstPersonStencil};
     context->CSSetShaderResources(0,11,prepViews);
     // u5 is the refusal census's class texture, bound only on a frame that samples or paints (u4 is the later kernels' OutColor).
-    ID3D11UnorderedAccessView* prepOutputs[]={g.depth[index].uav.Get(),g.motion.uav.Get(),g.rejection.uav.Get(),g.expected.uav.Get(),
+    ID3D11UnorderedAccessView* prepOutputs[]={g.depth[depthIndex].uav.Get(),g.motion.uav.Get(),g.rejection.uav.Get(),g.expected.uav.Get(),
         nullptr,needClass?g.klass.uav.Get():nullptr};
     context->CSSetUnorderedAccessViews(0,needClass?6:4,prepOutputs,nullptr);
     context->CSSetShader(g.prep.Get(),nullptr,0);
@@ -873,11 +909,11 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         context->CSSetShader(g.taa.Get(),nullptr,0);context->Dispatch((f.outputWidth+7)/8,(f.outputHeight+7)/8,1);
     } else if(f.mode==FlatMonoResolveMode::Fsr) {
         const float sy=std::sqrt(f.camera[0][1]*f.camera[0][1]+f.camera[1][1]*f.camera[1][1]+f.camera[2][1]*f.camera[2][1]);
-        ok=fsr3Evaluate(context,f.slot,g.color.texture.Get(),g.depth[0].texture.Get(),g.motion.texture.Get(),g.rejection.texture.Get(),
+        ok=fsr3Evaluate(context,f.slot,g.color.texture.Get(),g.depth[depthIndex].texture.Get(),g.motion.texture.Get(),g.rejection.texture.Get(),
             g.output[0].texture.Get(),f.renderWidth,f.renderHeight,evalW,evalH,f.jitterX,f.jitterY,reset,f.deltaMs,
             f.camera[3][2],(std::numeric_limits<float>::max)(),2*std::atan(1/sy),reason,true,hdr);
     } else {
-        ok=dlaaEvaluate(context,static_cast<int>(f.slot),g.color.texture.Get(),g.depth[0].texture.Get(),g.motion.texture.Get(),g.output[0].texture.Get(),
+        ok=dlaaEvaluate(context,static_cast<int>(f.slot),g.color.texture.Get(),g.depth[depthIndex].texture.Get(),g.motion.texture.Get(),g.output[0].texture.Get(),
             g.rejection.texture.Get(),f.renderWidth,f.renderHeight,evalW,evalH,f.jitterX,f.jitterY,reset,f.deltaMs,reason,hdr);
     }
     }
@@ -912,11 +948,12 @@ bool flatMonoResolve(ID3D11Device* device,ID3D11DeviceContext* context,const Fla
         context->CSSetShader(g.finish.Get(),nullptr,0);context->Dispatch((evalW+7)/8,(evalH+7)/8,1);
     }
     if(!hdr && pixels.active() && (f.mode==FlatMonoResolveMode::Dlss || f.mode==FlatMonoResolveMode::Dlaa)) {
-        ID3D11Texture2D* textures[]={g.color.texture.Get(),g.depth[0].texture.Get(),g.motion.texture.Get(),
+        ID3D11Texture2D* textures[]={g.color.texture.Get(),g.depth[depthIndex].texture.Get(),g.motion.texture.Get(),
             g.rejection.texture.Get(),g.output[0].texture.Get(),g.output[1].texture.Get()};
         try { pixels.capture(device,context,f,reset,textures); } catch(...) { pixels.cancel(); }
     }
     g.history=true;g.lastFrame=f.frame;g.current=index^1;g.inputFormat=colorDesc.Format;
+    if(!taa)g.depthLast=depthIndex;   // the image the next asking frame reads as last frame's depth (0 while no frame asks)
     if(reset) {
         ++stats.acceptedResets;stats.currentContinueRun=0;
         if(requestedReset)++stats.requestedResets;
@@ -1043,5 +1080,10 @@ void flatMonoResolveTestResetIsolationLog() { isolationLogged=0; }
 bool flatMonoResolveTestRefusalResources() {
     return g.klass.texture || g.census || g.refusalCounts || g.refusalCountsUav || g.refusalStaging[0] || g.refusalStaging[1] ||
            g.refusalStaging[2] || g.refusalStaging[3];
+}
+// Test-only, likewise: whether the resolver holds a second depth image for a backend that keeps none, which only a frame that asked for the
+// steady-detail depth check makes (EDVR's TAA has its own depth[1], made with the rest by resources(); it does not count here).
+bool flatMonoResolveTestSecondDepth() {
+    return g.mode!=FlatMonoResolveMode::Taa && g.depth[1].texture;
 }
 } // namespace edvr

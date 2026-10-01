@@ -1,5 +1,5 @@
 // The VR world route's refusal census and view (design doc section 82, stage 2 experiment build) on WARP: the prep's class byte, the counting
-// pass and its read-back, what the steady-detail rule (staticScene) does to the counts, the HDR finish's paint, and that a frame which
+// pass and its read-back, what the steady-detail rule (steadyDetail, the depth-validated form) does to the counts, the HDR finish's paint, and that a frame which
 // asks for neither makes and touches none of it.
 //
 // One fixture throughout (flat_resolve_fixture.h: 16 x 16, a still camera, no engine slot anywhere unless a case writes one, one pool
@@ -25,13 +25,14 @@ inline int hlslConstant(const std::string& source, const char* name) {
     return std::atoi(source.c_str() + at + needle.size());
 }
 struct Taken {
-    uint64_t asked = 0, sampled = 0, dropped = 0, frames = 0, pixels = 0;
+    uint64_t asked = 0, sampled = 0, dropped = 0, frames = 0, pixels = 0, checked = 0, skipped = 0;
     uint64_t counts[edvr::kFlatMonoRefusalSlots] = {};
     void add(const edvr::FlatMonoRefusalCensus& c) {
         asked += c.asked; sampled += c.sampled; dropped += c.dropped; frames += c.frames; pixels += c.pixels;
+        checked += c.checked; skipped += c.skipped;
         for (uint32_t i = 0; i < edvr::kFlatMonoRefusalSlots; ++i) counts[i] += c.counts[i];
     }
-    uint64_t refused() const { uint64_t n = 0; for (uint32_t i = 0; i < edvr::kFlatMonoRefusalForgiven; ++i) n += counts[i]; return n; }
+    uint64_t refused() const { uint64_t n = 0; for (uint32_t i = 0; i < edvr::kFlatMonoRefusalStaleKept; ++i) n += counts[i]; return n; }
 };
 }  // namespace refusalgpu
 
@@ -150,8 +151,8 @@ inline void refusalGpuTests(ID3D11Device* device, ID3D11DeviceContext* context) 
     check(a.asked == 4 && a.sampled == 1 && a.frames == 1 && a.dropped == 0 && a.pixels == uint64_t(w) * h,
           "refusal: four asking frames take one sample (one in kFlatMonoRefusalEvery), read it back, and count its pixels");
     check(a.counts[kFlatMonoClassStale] == 16 && a.counts[kFlatMonoClassMasked] == 1 && a.counts[kFlatMonoClassCorrupt] == 1 &&
-              a.counts[kFlatMonoClassSentinel] == 2 && a.counts[kFlatMonoRefusalForgiven] == 0,
-          "refusal: the stale block is 16 pixels, the masked record 1, the corrupt code 1, the sentinel and the sky 2; none forgiven");
+              a.counts[kFlatMonoClassSentinel] == 2 && a.counts[kFlatMonoRefusalStaleKept] == 0,
+          "refusal: the stale block is 16 pixels, the masked record 1, the corrupt code 1, the sentinel and the sky 2; none kept");
     check(a.refused() == 20 && a.refused() == maskPopA,
           "refusal: the census's refused total is exactly the number of texels the backend was handed a rejection of 255 for");
     check(a.refused() == a.counts[kFlatMonoClassStale] + a.counts[kFlatMonoClassMasked] + a.counts[kFlatMonoClassCorrupt] +
@@ -162,19 +163,22 @@ inline void refusalGpuTests(ID3D11Device* device, ID3D11DeviceContext* context) 
                 static_cast<unsigned long long>(a.counts[kFlatMonoClassStale]), static_cast<unsigned long long>(a.counts[kFlatMonoClassMasked]),
                 static_cast<unsigned long long>(a.counts[kFlatMonoClassCorrupt]), static_cast<unsigned long long>(a.counts[kFlatMonoClassSentinel]));
 
-    // Key on (FlatMonoResolveFrame::staticScene, which the steady-detail key sets): the stale block takes the camera term, so it is no longer
-    // refused and is counted as forgiven; the masked record, the corrupt code and the sentinel stay refused.
-    f.staticScene = true;
+    // Key on (FlatMonoResolveFrame::steadyDetail, which the steady-detail key sets): the scene is still (last frame's depth is this frame's), so
+    // the stale block takes the camera term where last frame's depth confirms it, is no longer refused and is counted as kept; the masked
+    // record, the corrupt code and the sentinel stay refused. The depth-check cases themselves are flat_steady_depth_gpu_tests.h's.
+    f.steadyDetail = true;
     for (unsigned i = 0; i < 4; ++i) run("refusal: census step B (steady detail on): the stale block takes the camera term");
     const unsigned maskPopB = popcountMask();
     const auto b = takeAll(1);
-    check(b.counts[kFlatMonoClassStale] == 0 && b.counts[kFlatMonoRefusalForgiven] == 16 && b.counts[kFlatMonoClassMasked] == 1 &&
+    check(b.counts[kFlatMonoClassStale] == 0 && b.counts[kFlatMonoRefusalStaleKept] == 16 && b.counts[kFlatMonoClassMasked] == 1 &&
               b.counts[kFlatMonoClassCorrupt] == 1 && b.counts[kFlatMonoClassSentinel] == 2,
-          "refusal: with the stale-slot rule relaxed the 16 stale pixels move from refused to forgiven and the masked record, corrupt code and sentinel stay refused");
+          "refusal: with the steady-detail rule on, in a still scene, the 16 stale pixels move from stale-refused to stale-kept and the masked record, corrupt code and sentinel stay refused");
+    check(b.checked == 4 && b.skipped == 0 && a.checked == 0 && a.skipped == 0,
+          "refusal: the depth check's frames are counted with the key on (four) and never with it off");
     check(b.refused() == 4 && b.refused() == maskPopB && maskPopA - maskPopB == 16,
           "refusal: the refused total falls by exactly the stale block, and still equals the rejection mask's count");
     check(observedMotionHash != hashA, "refusal: the key changes what the backend is handed (the stale block's motion and mask), so the counts are not a fiction");
-    f.staticScene = false;
+    f.steadyDetail = false;
 
     // Counts accumulate across samples: eight asking frames are two samples.
     for (unsigned i = 0; i < 8; ++i) run("refusal: census step C: eight asking frames, two samples");
@@ -248,12 +252,13 @@ inline void refusalGpuTests(ID3D11Device* device, ID3D11DeviceContext* context) 
     setRecord(1);
     run("refusal: the view on, a joined record");
     check(readH(px) && isColour(px, 8, 8, 0.0, y1, 0.0), "refusal view: a joined record is green (accepted: the backend's result scaled by its own level)");
-    // With the steady-detail rule on, a stale pixel is accepted but still painted yellow (the view says what the pixel IS, the census how it was treated).
-    f.staticScene = true;
+    // With the steady-detail rule on, a stale pixel the depth check keeps is accepted but still painted yellow (the view says what the pixel IS,
+    // the census how it was treated).
+    f.steadyDetail = true;
     run("refusal: the view on, steady detail on");
     check(readH(px) && isColour(px, 5, 5, y1, y1, 0.0),
           "refusal view: a stale pixel the steady-detail rule accepted is painted yellow from the backend's result, not from the raw input");
-    f.staticScene = false;
+    f.steadyDetail = false;
     f.refusalView = 0;
     run("refusal: the view off again");
     check(readH(px) && isColour(px, 5, 5, 1.0, 1.0, 1.0), "refusal: the view off again paints nothing");

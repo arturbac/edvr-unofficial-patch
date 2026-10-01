@@ -764,24 +764,31 @@ void experimentCases() {
     char rl[1024];
     n = vrWorldFormatRefusalWindow(rl, sizeof(rl), r);
     check(n > 0 && std::strstr(rl, "vr world route refusal 5s: census=off every=0 treated=0 asked=0 sampled=0 read=0 dropped=0 size=0x0 pixels=0 refused=0 "
-                                   "refused-pct=0.000 stale=0 masked=0 corrupt=0 sentinel=0 unreprojectable=0 camera=0 range=0 depth=0 weapon=0 other=0 "
-                                   "forgiven=0 steady-detail=off view=off"),
+                                   "refused-pct=0.000 stale-refused=0 masked=0 corrupt=0 sentinel=0 unreprojectable=0 camera=0 range=0 depth=0 weapon=0 other=0 "
+                                   "stale-kept=0 depth-check=0/0 steady-detail=off view=off"),
           "refusal line: every counter is printed, zero included, and an empty window reads census=off pixels=0");
     r.census = true; r.every = kFlatMonoRefusalEvery; r.treated = 450; r.asked = 450; r.sampled = 113; r.read = 112; r.dropped = 1;
     r.width = 5040; r.height = 2835; r.pixels = 112ull * 5040 * 2835;
     r.counts[kFlatMonoClassStale] = 1200000; r.counts[kFlatMonoClassMasked] = 3000; r.counts[kFlatMonoClassSentinel] = 11;
     r.counts[kFlatMonoClassRange] = 1200; r.counts[kFlatMonoClassWeaponRefused] = 2000; r.counts[kFlatMonoClassReset] = 7;
-    r.counts[kFlatMonoRefusalForgiven] = 0; r.steady = "off"; r.view = "on";
+    r.counts[kFlatMonoRefusalStaleKept] = 0; r.steady = "off"; r.view = "on";
     n = vrWorldFormatRefusalWindow(rl, sizeof(rl), r);
     check(n > 0 && n < 700 && std::strstr(rl, "census=on every=4 treated=450 asked=450 sampled=113 read=112 dropped=1 size=5040x2835 pixels=1600300800 ") &&
-              std::strstr(rl, "refused=1206218 refused-pct=0.075 stale=1200000 masked=3000 corrupt=0 sentinel=11 unreprojectable=0 camera=0 range=1200 depth=0 "
-                              "weapon=2000 other=7 forgiven=0 steady-detail=off view=on"),
+              std::strstr(rl, "refused=1206218 refused-pct=0.075 stale-refused=1200000 masked=3000 corrupt=0 sentinel=11 unreprojectable=0 camera=0 range=1200 depth=0 "
+                              "weapon=2000 other=7 stale-kept=0 depth-check=0/0 steady-detail=off view=on"),
           "refusal line: a sampled window prints its size, the pixels examined, the refused total and its share, each cause, the unnamed remainder as other, "
           "the key's state and the view");
-    r.steady = "on"; r.counts[kFlatMonoClassStale] = 0; r.counts[kFlatMonoRefusalForgiven] = 1190000;
+    // The key on (the depth-validated form): the stale pixels are two numbers, the ones last frame's depth confirmed (stale-kept: not refused,
+    // not in the refused total) and the ones it did not (stale-refused: refused, in the total), and the line says how many frames ran the check.
+    r.steady = "on"; r.counts[kFlatMonoClassStale] = 10000; r.counts[kFlatMonoRefusalStaleKept] = 1190000; r.checked = 448; r.skipped = 2;
     n = vrWorldFormatRefusalWindow(rl, sizeof(rl), r);
-    check(n > 0 && std::strstr(rl, "stale=0 ") && std::strstr(rl, "forgiven=1190000 steady-detail=on") && std::strstr(rl, "refused=6218 "),
-          "refusal line: with the key on the stale pixels move to forgiven and no longer count as refused");
+    check(n > 0 && std::strstr(rl, "stale-refused=10000 ") && std::strstr(rl, "stale-kept=1190000 depth-check=448/2 steady-detail=on") &&
+              std::strstr(rl, "refused=16218 refused-pct=0.001 "),
+          "refusal line: with the key on the stale pixels split in two: stale-kept (confirmed by last frame's depth, not refused) and stale-refused (refused, counted), and the depth check's ran/skipped frames");
+    {   // The old spellings are gone from the text: a reader that wants them reads the flight-3 logs by its own table.
+        const bool oldSpellings = std::strstr(rl, " stale=") || std::strstr(rl, "forgiven=");
+        check(!oldSpellings, "refusal line: the flight-3 tokens (stale=, forgiven=) are no longer printed: the new line has stale-refused= and stale-kept=");
+    }
     VrWorldRefusalWindow ran;
     ran.census = true; ran.every = 4; ran.treated = 450; ran.asked = 450; ran.sampled = 113; ran.read = 113; ran.width = 5040; ran.height = 2835;
     ran.pixels = 113ull * 5040 * 2835;
@@ -795,20 +802,25 @@ void experimentCases() {
           "refusal line: 'ran and refused nothing' (pixels > 0, refused=0) and 'on but never sampled' (sampled=0 pixels=0) are different texts");
     VrWorldRefusalWindow big;
     big.census = true; big.every = ~0u; big.treated = big.asked = big.sampled = big.read = big.dropped = ~0ull; big.width = big.height = ~0u; big.pixels = ~0ull;
+    big.checked = big.skipped = ~0ull;
     for (uint32_t i = 0; i < kFlatMonoRefusalSlots; ++i) big.counts[i] = ~0ull;
     big.steady = "off"; big.view = "off";
     n = vrWorldFormatRefusalWindow(rl, sizeof(rl), big);
     std::printf("        (the widest refusal line is %d characters; the route's buffer is 1024)\n", n);
     check(n > 0 && n < 1000, "refusal line: at its widest (every counter at 2^64-1) it fits its buffer and the log's line");
-    check(kFlatMonoRefusalForgiven == 15 && kFlatMonoRefusalSlots == 16 && kFlatMonoClassReset == 14 && kFlatMonoClassRefusedBit == 0x80u,
-          "refusal line: the census has sixteen slots, class 0..14 for refused pixels and slot 15 for the stale pixels the key forgave");
+    check(kFlatMonoRefusalStaleKept == 15 && kFlatMonoRefusalSlots == 16 && kFlatMonoClassReset == 14 && kFlatMonoClassRefusedBit == 0x80u,
+          "refusal line: the census has sixteen slots, class 0..14 for refused pixels and slot 15 for the stale pixels the steady-detail rule kept");
+    // The depth check's tolerance is one number, in one header (the HLSL and the resolver's rig are held to it there).
+    check(kFlatMonoStaleDepthRelative == 0.01 && kFlatMonoStaleDepthFloor == 1e-6,
+          "steady detail: the depth check's tolerance is 1% (floor 1e-6), the resolver's own TAA's");
 
     // The two change lines.
     char cl[768];
     n = vrWorldFormatSteadyChanged(cl, sizeof(cl), 4242, VrWorldSteadyKey::On);
-    check(n > 0 && std::strstr(cl, "vr world route: steady-detail is ON from frame=4242") && std::strstr(cl, "masked records and corrupt slots stay refused") &&
-              std::strstr(cl, "can ghost"),
-          "steady-detail line: coming on says what it does and what it costs, and that masked records stay refused");
+    check(n > 0 && std::strstr(cl, "vr world route: steady-detail is ON from frame=4242") && std::strstr(cl, "where last frame's depth confirms it") &&
+              std::strstr(cl, "is refused where it does not") && std::strstr(cl, "masked records and corrupt slots stay refused") &&
+              std::strstr(cl, "pass the depth test and ghost"),
+          "steady-detail line: coming on says what it does (only where last frame's depth confirms it) and what it costs (a lateral mover's interior can ghost), and that masked records stay refused");
     n = vrWorldFormatSteadyChanged(cl, sizeof(cl), 4300, VrWorldSteadyKey::Off);
     check(n > 0 && std::strstr(cl, "vr world route: steady-detail is OFF from frame=4300") && std::strstr(cl, "refuses its history, as in flight 2"),
           "steady-detail line: going off says the route is flight 2's again");
@@ -1041,16 +1053,19 @@ void sourcePins() {
                   before(boundary, "if (key == VrWorldKey::Off && g_machine.state == VrWorldState::Off && !g_census && !g_injectorEngaged)", "readExperimentKeys();") &&
                   before(boundary, "readExperimentKeys();", "g_vrWorldWants = g_census ||"),
               "key off: the experiment keys are read only inside the key-auto branch, after the boundary's early return, before the frame that starts is armed");
-        check(!treat.empty() && treat.find("f.staticScene = g_steadyKey == VrWorldSteadyKey::On;") != std::string::npos &&
+        check(!treat.empty() && treat.find("f.steadyDetail = g_steadyKey == VrWorldSteadyKey::On;") != std::string::npos &&
                   treat.find("f.refusalCensus = g_census;") != std::string::npos && treat.find("f.refusalView = g_viewOn ? 1u : 0u;") != std::string::npos &&
-                  count(rt, "f.staticScene") == 1 && count(rt, "f.refusalCensus") == 1 && count(rt, "f.refusalView") == 1 &&
-                  before(treat, "f.reset = resetMissing", "f.staticScene = g_steadyKey") && before(treat, "f.staticScene = g_steadyKey", "flatMonoResolve(device.Get()"),
-              "experiment: the resolver's stale-slot rule, census and view are set from the three keys in one place, before the resolve, and nowhere else (off is false, false, 0)");
+                  count(rt, "f.steadyDetail") == 1 && count(rt, "f.refusalCensus") == 1 && count(rt, "f.refusalView") == 1 &&
+                  before(treat, "f.reset = resetMissing", "f.steadyDetail = g_steadyKey") && before(treat, "f.steadyDetail = g_steadyKey", "flatMonoResolve(device.Get()"),
+              "experiment: the resolver's stale-slot rule (the depth-validated form), census and view are set from the three keys in one place, before the resolve, and nowhere else (off is false, false, 0)");
+        check(count(rt, "f.staticScene") == 0,
+              "experiment: the route never sets the resolver's blanket form (staticScene is the flat 3D menu's alone): the key is the depth-checked form");
         check(boundary.find("flatMonoResolveTakeRefusalCensus()") != std::string::npos && count(rt, "flatMonoResolveTakeRefusalCensus()") == 1 &&
                   before(boundary, "vrWorldFormatInjectWindow(", "flatMonoResolveTakeRefusalCensus()") &&
                   before(boundary, "flatMonoResolveTakeRefusalCensus()", "vrWorldFormatRefusalWindow(") &&
-                  before(boundary, "vrWorldFormatRefusalWindow(", "g_win.reset();") && boundary.find("if (g_census || rc.asked || rc.sampled || rc.frames) {") != std::string::npos,
-              "experiment: the census's sums are taken once, in the 5 s window, and its line is printed only while the census key is on (or samples are still in flight)");
+                  before(boundary, "vrWorldFormatRefusalWindow(", "g_win.reset();") && boundary.find("if (g_census || rc.asked || rc.sampled || rc.frames || rc.checked || rc.skipped) {") != std::string::npos &&
+                  boundary.find("rw.checked = rc.checked; rw.skipped = rc.skipped;") != std::string::npos,
+              "experiment: the census's sums are taken once, in the 5 s window, and its line is printed only while the census key is on, samples are still in flight, or the steady-detail key's depth check counted frames");
         check(boundary.find("g_win.steady = vrWorldSteadyKeyName(g_steadyKey);") != std::string::npos &&
                   before(boundary, "g_win.steady = vrWorldSteadyKeyName(g_steadyKey);", "vrWorldFormatWindow("),
               "experiment: the route line names the steady-detail key's state");
