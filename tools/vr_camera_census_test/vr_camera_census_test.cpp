@@ -29,6 +29,7 @@
 #include "../c2_derive_test/c2_derive_model.h"
 #include "../../src/d3d11/flat_camera_phase.h"
 #include "../../src/d3d11/vr_camera_census_core.h"
+#include "../../src/d3d11/vr_world_route_math.h"   // the route's REAL 5 s line formatters: the fixture's route lines are theirs, so a drift fails here
 
 namespace {
 
@@ -1273,29 +1274,24 @@ std::string fixtureLog() {
     // The injector's own rule: the frame's phase goes into the bound pair as (jx / W, -jy / H); the rows then measure 2x that.
     auto phaseBound = [&](const VrCensusPhase& p, float* bx, float* by) { *bx = p.x / renderW; *by = -p.y / renderH; };
 
-    // Two lines of the world route's 5 s window, as the route writes them (the route's side of the contract; the route's own formatter is
-    // not part of the census): the route line with the stage 2 tokens between last= and last-trigger=, then the inject line.
-    auto routeWindow = [&](const char* state, const char* gate, const char* counters, const char* last, const char* jitter, const char* phase,
-                           const char* rows, const char* fpMode, const char* vs, const char* ps, const char* target, const char* hdr,
-                           const char* selection, const char* inject) {
-        char text[1200];
-        std::snprintf(text, sizeof(text),
-                      "vr world route 5s: key=auto state=%s layer=live gate=%s %s (last=none) scene-resets=0 late-hdr-writes=0 (in 0 frames) "
-                      "last=%s jitter=%s phase=%s rows=%s fp-mode=%s last-trigger=VS=%s PS=%s target=%s hdr=%s selection=%s",
-                      state, gate, counters, last, jitter, phase, rows, fpMode, vs, ps, target, hdr, selection);
+    // Two lines of the world route's 5 s window, written by the route's OWN formatters (vr_world_route_math.h: vrWorldFormatWindow and
+    // vrWorldFormatInjectWindow), so the fixture the reader's self-test parses is what the route prints and a change to either line
+    // fails this rig's fixture pin until the fixture is regenerated and the reader parses it.
+    auto routeWindow = [&](VrWorldState state, bool gate, const VrWorldWindow& win) {
+        char text[1400];
+        vrWorldFormatWindow(text, sizeof(text), VrWorldKey::Auto, state, true, gate, win);
         put(text);
-        std::snprintf(text, sizeof(text), "vr world route inject 5s: %s", inject);
+        vrWorldFormatInjectWindow(text, sizeof(text), win.inject);
         put(text);
     };
 
     // The first window: a commander in a ship. The route is idle, the tone is drawn every frame, the journal says not on foot, so
     // nothing is sampled.
-    routeWindow("observing", "no",
-                "frames=448 gate-frames=448 gate-flips=0 hdr-frames=0 trigger=0 none=0 ambiguous=0 treated=0 declined=0 owned-frames=0 "
-                "eye-takes=0 door-layer-only=0 enters=0 releases=0",
-                "none", "idle", "0.0000,0.0000", "0.0000,0.0000", "0/0/0", "0000000000000000", "0000000000000000", "0x0", "0x0", "none",
-                "inj-scene=0 inj-fp=0 inj-refused=0 warming=0 aux=0 after=0 unsupported=0 other-kind=0 unreadable=0 off-thread=0 write-fail=0 "
-                "inj-kinds=none pair-checked=0 pair-bad=0 inj-unnamed=0 inj-shut=0");
+    {
+        VrWorldWindow rw;
+        rw.hdr.frames = 448; rw.gateFrames = 448; rw.hdr.lastVerdict = "none"; rw.jitter = "idle";
+        routeWindow(VrWorldState::Observing, false, rw);
+    }
     {
         VrCensusWindow w;
         w.frames = 448; w.calls = 41788; w.posts = 41788;
@@ -1452,13 +1448,20 @@ std::string fixtureLog() {
         }
     }
     // The on-foot window: the route's two lines, then the census's 5 s line, which says how many calls the detour injected.
-    routeWindow("owned", "held",
-                "frames=450 gate-frames=450 gate-flips=1 hdr-frames=450 trigger=450 none=0 ambiguous=0 treated=450 declined=0 owned-frames=450 "
-                "eye-takes=900 door-layer-only=900 enters=1 releases=0",
-                "treated", "on", "-0.2520,-0.0630", "0.1260,0.2520", "0/450/0", "DFED8E1C9E191BEC", "143AAE0597E2F7BF", "2520x1417", "5040x2835",
-                "selected:450",
-                "inj-scene=5400 inj-fp=1350 inj-refused=0 warming=0 aux=450 after=0 unsupported=2700 other-kind=900 unreadable=0 off-thread=0 write-fail=0 "
-                "inj-kinds=3:6750 pair-checked=448 pair-bad=0 inj-unnamed=0 inj-shut=0");
+    {
+        VrWorldWindow rw;
+        rw.hdr.frames = 450; rw.gateFrames = 450; rw.gateFlips = 1; rw.hdr.hdrFrames = 450; rw.hdr.triggerFrames = 450;
+        rw.hdr.treated = 450; rw.ownedFrames = 450; rw.takes = 900; rw.layerOnly = 900; rw.enters = 1;
+        rw.hdr.lastVerdict = "treated"; rw.jitter = "on"; rw.phaseX = -0.2520f; rw.phaseY = -0.0630f; rw.rowsX = 0.1260f; rw.rowsY = 0.2520f;
+        rw.foldMode[1] = 450;
+        rw.hdr.lastTriggerVs = 0xDFED8E1C9E191BECull; rw.hdr.lastTriggerPs = 0x143AAE0597E2F7BFull;
+        rw.hdr.lastTargetWidth = 2520; rw.hdr.lastTargetHeight = 1417; rw.hdr.lastHdrWidth = 5040; rw.hdr.lastHdrHeight = 2835;
+        rw.hdr.noteSelection("selected");
+        for (int i = 1; i < 450; ++i) rw.hdr.noteSelection("selected");
+        rw.inject.scene = 5400; rw.inject.firstPerson = 1350; rw.inject.auxiliary = 450; rw.inject.unsupported = 2700;
+        rw.inject.otherKind = 900; rw.inject.injectedKind[3] = 6750; rw.inject.pairChecked = 448;
+        routeWindow(VrWorldState::Owned, true, rw);
+    }
     {
         VrCensusWindow w;
         w.frames = 450; w.calls = 10800; w.posts = 10800; w.stale = 0; w.injCalls = 6750;

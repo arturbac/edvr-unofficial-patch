@@ -69,6 +69,7 @@
 #include "../../src/d3d11/vr_camera_census.h"
 #include "../../src/d3d11/vr_camera_census_core.h"
 #include "../../src/d3d11/vr_world_route.h"
+#include "../../src/d3d11/vr_world_route_math.h"   // the route's REAL 5 s line formatters: the log the reader reads carries the route's own text
 
 // ---------------------------------------------------------------------------------------------------------------------
 // An allocation counter: every global operator new is counted on the thread that made it, so a section of code can say
@@ -631,21 +632,24 @@ int run() {
     check(stub::phaseCalls == 1 + 12 + 24,
           "the census asked the route for its phase once at the activation boundary, once at each of the 12 frame boundaries, and at each of the 24 eye draws "
           "(before the sampling decision uses it, sampled or not)");
-    // The world route's two 5 s lines, as the route writes them (written here through the real Log, in the route's format, from what the
-    // script drove): the reader's verdict needs the render size (hdr=) and the route's own counts.
+    // The world route's two 5 s lines, written by the route's OWN formatters (vrWorldFormatWindow and vrWorldFormatInjectWindow, through
+    // the real Log, from what the script drove): the reader's verdict needs the render size (hdr=) and the route's own counts, and a
+    // change to either line breaks this rig until the reader parses the new text.
     {
-        char text[1200];
-        std::snprintf(text, sizeof(text),
-                      "vr world route 5s: key=auto state=owned layer=live gate=held frames=12 gate-frames=12 gate-flips=1 hdr-frames=12 trigger=12 none=0 "
-                      "ambiguous=0 treated=12 declined=0 owned-frames=5 eye-takes=10 door-layer-only=10 enters=1 releases=0 (last=none) scene-resets=0 "
-                      "late-hdr-writes=0 (in 0 frames) last=treated jitter=on phase=0.0630,0.1890 rows=-0.2520,-0.0630 fp-mode=0/12/0 "
-                      "last-trigger=VS=DFED8E1C9E191BEC PS=143AAE0597E2F7BF target=2520x1417 hdr=5040x2835 selection=selected:12");
+        VrWorldWindow rw;
+        rw.hdr.frames = 12; rw.gateFrames = 12; rw.gateFlips = 1; rw.hdr.hdrFrames = 12; rw.hdr.triggerFrames = 12;
+        rw.hdr.treated = 12; rw.ownedFrames = 5; rw.takes = 10; rw.layerOnly = 10; rw.enters = 1;
+        rw.hdr.lastVerdict = "treated"; rw.jitter = "on"; rw.phaseX = 0.0630f; rw.phaseY = 0.1890f; rw.rowsX = -0.2520f; rw.rowsY = -0.0630f;
+        rw.foldMode[1] = 12;
+        rw.hdr.lastTriggerVs = 0xDFED8E1C9E191BECull; rw.hdr.lastTriggerPs = 0x143AAE0597E2F7BFull;
+        rw.hdr.lastTargetWidth = 2520; rw.hdr.lastTargetHeight = 1417; rw.hdr.lastHdrWidth = 5040; rw.hdr.lastHdrHeight = 2835;
+        for (int i = 0; i < 12; ++i) rw.hdr.noteSelection("selected");
+        rw.inject.scene = g_injectedScene; rw.inject.firstPerson = g_injectedFirstPerson; rw.inject.warming = 4 * 42;
+        rw.inject.unsupported = 12 * 4; rw.inject.otherKind = 12 * 2; rw.inject.injectedKind[3] = g_injectedCalls; rw.inject.pairChecked = 5;
+        char text[1400];
+        vrWorldFormatWindow(text, sizeof(text), VrWorldKey::Auto, VrWorldState::Owned, true, true, rw);
         Log::get().note("%s", text);
-        std::snprintf(text, sizeof(text),
-                      "vr world route inject 5s: inj-scene=%llu inj-fp=%llu inj-refused=0 warming=%d aux=0 after=0 unsupported=%d other-kind=%d unreadable=0 "
-                      "off-thread=0 write-fail=0 inj-kinds=3:%llu pair-checked=5 pair-bad=0 inj-unnamed=0 inj-shut=0",
-                      static_cast<unsigned long long>(g_injectedScene), static_cast<unsigned long long>(g_injectedFirstPerson), 4 * 42, 12 * 4, 12 * 2,
-                      static_cast<unsigned long long>(g_injectedCalls));
+        vrWorldFormatInjectWindow(text, sizeof(text), rw.inject);
         Log::get().note("%s", text);
     }
     check(g_hot.posts == g_hot.calls && g_hot.preAsksPost == g_hot.calls, "every pre half asked for its post half, and every post half ran");
