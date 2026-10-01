@@ -1273,16 +1273,16 @@ int main(int argc, char** argv) {
         for (const auto& reader : readers) {
             const std::string source = readRepoFile(dir, reader.file);
             if (source.empty()) {
-                fail(std::string(reader.name) + " is readable from the repo root (steady-detail key)", "could not read it");
+                fail((std::string(reader.name) + " is readable from the repo root (steady-detail key)").c_str(), "could not read it");
                 continue;
             }
             const std::string fallback = codeFallbackOf(source, "experimental.temporal_aa_on_foot_world_steady_detail");
             const std::string label = std::string("the code's fallback for experimental.temporal_aa_on_foot_world_steady_detail in ") +
                                       reader.name + " is the shipped default";
             if (fallback == shippedSteady) {
-                ok(label);
+                ok(label.c_str());
             } else {
-                fail(label, std::string(reader.name) + " falls back to \"" + fallback + "\", the ini ships \"" + shippedSteady + "\"");
+                fail(label.c_str(), std::string(reader.name) + " falls back to \"" + fallback + "\", the ini ships \"" + shippedSteady + "\"");
             }
             std::string flipped = source;
             const std::string from = "getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"" + fallback + "\")";
@@ -1291,9 +1291,9 @@ int main(int argc, char** argv) {
                 flipped.replace(at, from.size(), "getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"on\")");
             const std::string control = std::string("control: the steady-detail key's fallback in ") + reader.name + " turned to on is caught";
             if (at != std::string::npos && codeFallbackOf(flipped, "experimental.temporal_aa_on_foot_world_steady_detail") != shippedSteady) {
-                ok(control);
+                ok(control.c_str());
             } else {
-                fail(control, at == std::string::npos ? "the call was not found to alter" : "the flipped source still matched the ini");
+                fail(control.c_str(), at == std::string::npos ? "the call was not found to alter" : "the flipped source still matched the ini");
             }
         }
     }
