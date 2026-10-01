@@ -2,11 +2,10 @@
 
 ## Status
 
-- **State:** merged to main at `dacb7a56` (2026-09-25, includes main
-  `a4cdb045`) after Sean's go-ahead; the caveats below remain the open
-  qualification record. Latest analyzed Epic build is `d0898e1b`. The
-  section-by-section chronology (sections 26-77) is verbatim in Status detail
-  below; the evidence is in sections 1-78.
+- **State:** merged to main at `dacb7a56` (2026-09-25) after Sean's go-ahead;
+  the caveats below remain the open qualification record. Latest analyzed Epic
+  build `d0898e1b`. The chronology (26-77) is verbatim in Status detail below;
+  the evidence is in sections 1-83.
 - Established or qualified: camera ownership/jitter (26-28); F8 and menu
   treatment (34-37); cockpit projection and smoother DLSS edges (40-43); PS91
   motion ownership and rigid BFE shell motion (49-51); on-foot weapon camera
@@ -15,14 +14,11 @@
   zero unknown-pair captures); gate 1 contract and reducer (70, 73; 6/6 traces
   replay byte-identical); gate 2 routing, retirement, negotiation (72, 74;
   04:58 and 09:55 2026-09-27 flights FLOWN); six review fixes (77, no flight).
-- Open in the journal: section 75's success-status Present fix (13:00 flight
-  storm-free, present-not-ok=0; the deliberate confirming flight is not
-  recorded; the 0.5x canopy flicker is a separate scintillation family,
-  CLOSED live 2026-09-27 evening, section 76 session 3); section 76's gate-2
-  matrix cells still open at its end; section 78 (2026-09-28): nine of ten
-  refusing ship pairs reciped and rig-pinned (census 46), the tenth
-  (vs_C7FA0C0F5DD49180) refused until its blob is captured; the upstream
-  camera hook proposed there is now design-flat-camera-integration.md.
+- Open in the journal: section 75's confirming flight (13:00 storm-free; the
+  0.5x canopy flicker is a separate family, CLOSED 2026-09-27); section 76's
+  gate-2 matrix cells; section 78: nine of ten refusing ship pairs reciped
+  (census 46), vs_C7FA0C0F5DD49180 refused until its blob is captured; the
+  upstream camera hook is now design-flat-camera-integration.md.
 - **Priority (Sean):** performance over code sharing. Share math/backends where
   cheap; keep separate frame scheduling/capture paths when that avoids copies,
   synchronization or additional per-draw work. Defer broad core extraction
@@ -37,9 +33,10 @@
 - **Ruled-out pointer:** the kinematic arc's Status records rejected motion
   estimates and the nonexistent engine velocity buffer. Reuse engine-record
   motion; do not revive estimation or the retired deferred UI replay.
-- **Next:** the HDR route flew (hangar, bright star; R < D at 0.75) and is
-  default auto (section 81); legs still to fly: FSR, EDVR TAA, game FXAA,
-  ReShade. Then the open items above (older: Status detail). Existing
+- **Next:** fly section 83's plan (SS 0.75 and 0.85 with bloom and DoF on and
+  off, a mismatched resolution, TAA at 1.25, game AA, VR at 0.85). The HDR route
+  flew (section 81; FSR, TAA at R = D, ReShade still to fly). Then the open
+  items above (older: Status detail). Existing
   evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
   PS91/BFE or stale-resize hypotheses. The menu hangar-floor P1 defect remains
@@ -47,9 +44,30 @@
   `d9f86b09` belongs to the main/openxr-perf-gaps line.
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
-- **Field reports (79-82):** users 1-2 refused every frame, 3 at 7-13 fps, 4
+- **Field reports (79-83):** users 1-2 refused every frame, 3 at 7-13 fps, 4
   lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED; fix FLOWN, DEFAULT ON;
   vscreen auto-fit (fitted width) and the curved route BUILT 10-01, unflown.
+  83 (an rc.5 user, SS 0.85 on a 16:10 screen): flat R < D by structure, the
+  real cause in the messages, a VR Supersampling warning: BUILT 10-01
+  (claude/flat-upscale), NOT FLOWN.
+- **Jitter phases (section 84, 2026-10-01):** suspect (g) of section 82 as a
+  switch, `experimental.temporal_aa_jitter_follows_upscale` (off by default,
+  byte-identical): ceil(8 x ratio^2) phases for the VR eye pass and the flat
+  upstream route, eight for the world route. ON MAIN 08b48036; FLOWN 10-01:
+  no visible change on the distant hills (section 84's end), so suspect (g)
+  is ruled out for the hills.
+- **Compatibility decision, environment:** moved to Status detail 2026-10-01.
+
+## Status detail (moved out of Status 2026-09-29)
+
+*Note: the section 75 sentence below ("awaiting the confirming flight") is
+superseded by section 75's own same-day addendum (the 13:00 flight ran
+storm-free; the canopy flicker is the separate scintillation family, CLOSED
+live 2026-09-27 evening); the Status summary above reflects that. The Next
+text repeats a typo ("qualify it then)." twice) kept as originally written.*
+
+### Compatibility decision and environment (moved out of Status 2026-10-01)
+
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
   invalid descriptor disables fixes, preserving forwarding/chaining. New
@@ -59,14 +77,6 @@
   window mode, installed mods and backend DLL versions. Headset/runtime are N/A
   for flat. VR regression records the actual runtime/headset/per-eye size.
   Other colour spaces and rendering routes require separate qualification.
-
-## Status detail (moved out of Status 2026-09-29)
-
-*Note: the section 75 sentence below ("awaiting the confirming flight") is
-superseded by section 75's own same-day addendum (the 13:00 flight ran
-storm-free; the canopy flicker is the separate scintillation family, CLOSED
-live 2026-09-27 evening); the Status summary above reflects that. The Next
-text repeats a typo ("qualify it then)." twice) kept as originally written.*
 
 ### State (as of section 77)
 
@@ -7956,3 +7966,438 @@ pin, `panel_curve_test` C2); the one addition is the footprint call, armed only
 when the fit is. NOT COVERED by a rig: the draw in the game (no flight yet), and
 the strip's index order against the game's culling (flown at 0.3 in August on
 the on-foot composite, not re-proved here).
+
+## 83. Flat upscaling: the final copy admitted by structure (build, 2026-10-01)
+
+Branch `claude/flat-upscale`, cut from main `e6cf26b3`. Built, rig- and
+mutation-tested; NOT FLOWN. Sean approved the build on 2026-10-01 ("Go ahead
+with all 3"; for flat below 1.0: "In flat, running less than 1.0 should be
+workable, that's our upscale"): (1) flat R < D upscales whatever bloom, depth
+of field and blur do; (2) the stand-down line and the F8 warning say the real
+cause, and flat's supersampling advice goes; (3) TAA above the output works or
+says why, and the startup false warning goes; (4) VR only: a warning when
+Elite's Supersampling is below 1. Readers: `python tools\edvr_log.py --target
+<game dir> --flat-upscale --expect-build HEAD` and `--vr-supersampling`.
+
+**Evidence.**
+
+- rc.5 user, build 6ABDAB8E, 2026-10-01 (`edvr_gfx_20261001_145335.log`,
+  `_145604.log`; Custom preset AAMode 4, Bloom 3, DoF 2; output 2560x1600).
+  Elite's resolution 2560x1440 at supersampling 0.85 renders 2176x1224.
+  `flatUniformScale` allows abs(w*oh - h*ow) <= ow+oh, here 348,160 against
+  4,160, so 1,574 frames read `invalid-tone-pass` and 4,500
+  `no-known-tone-pass` (summed from `flat runtime refusal 5s:`) and F8 said
+  only "Elite's post-processing is not recognised". At R > D the HDR route
+  treated every frame (367 of 367 in one window at 3264x2040). EDVR's TAA at R
+  = 3840x2400 (1.5 D), 14:54:10: the route declines TAA above D
+  (`route-does-not-evaluate-at-render-size`), the copy route refused all 308
+  frames for `no-known-tone-pass`, the work stood down and F8 asked for
+  Anti-aliasing, Bloom and Depth of field off.
+- The startup false warning, `_145604.log` 14:56:12.369: 740 frames with a
+  final copy and no scene were refused as `no-known-tone-pass`, the work stood
+  down after 5 s and F8 named the post chain for 10.5 s, until the first scene.
+- Sean 2026-09-30, SS 0.75 (R = 2880x1620 on 3840x2160, AAMode 0, Bloom 3, DoF
+  2; section 81): 299 and 149 frames refused, stand-down at 13:32:49, F8
+  advising supersampling 1.0, the opposite of an upscale. In every refusal the
+  copy was valid and the HDR detector fired on every frame at R >= D.
+- The corpus (17 captures, 46 frames; `flat_temporal_test --trace-structure
+  <file> [pretend]` prints the structure's verdict per frame): 42 frames have a
+  known tone pass, 3 (Bloom 3, DoF 2, R = D) the whitelist refuses, 1 is a 2D
+  menu. With the tone pass asked away the structure admits 45 scenes: the 42 to
+  exactly the whitelist's selection, and the 3. Of the 45, 24 frames in 8
+  captures are below the output (0.5, 0.65, 0.667 and 0.75 D), 12 at R = D, 9
+  at 1.5 D. Only the four section 81 captures say the game's AA was off.
+
+**Design.** `src\d3d11\flat_copy_structure.h` (pure; the runtime and the rig
+call the same code) holds `flatCopyAdmit`. It runs at the game's final copy,
+after the reducer and the HDR detector and before the stand-down merge, and
+replaces only a tone-pass refusal (`no-known-tone-pass`, `invalid-tone-pass`).
+A frame is admitted when:
+
+1. the copy is the exact copy pair, one draw, full viewport, no depth (the
+   reducer stops at the tone pass before it checks the copy, so it is checked
+   again);
+2. the copy's source S was written this frame by exactly one pass: R8G8B8A8,
+   full viewport, no depth, the scene's size, and not written outside a draw
+   after it (no Clear, Copy, Update or Map: the prefix model marks the target,
+   which is what the whitelist's tone count loses and an unknown tone pass has
+   no count to lose);
+3. the scene is the R11G11B10F target with a depth of its own size that took
+   the most draws (at least 8), and its size is a uniform scale of the output
+   from half to twice (`flatRenderFitsOutput`), for a mode that has a route
+   there (EDVR's `dlaa` has none below the output: admitting the frame would
+   make it Treatable and the resolver would refuse every one in silence, so it
+   stays refused as before);
+4. the HDR trigger was seen this frame, is unambiguous, reads that target and
+   comes before S's first write;
+5. no other R-sized R8G8B8A8 pass was written between the trigger and S (the AA
+   rule below);
+6. the HDR selector (`flatSelectHdrFrame`, new gate `UniformHalfToDouble`)
+   finds H's camera, depth and sources in order.
+
+Nothing is asked of the passes between H and S, so bloom, DoF, every tone
+variant and a mod's grade stop mattering. The selection is the whitelist's
+field for field (S as `color`, the trigger's H or the 3D menu copy's inherited
+HDR as `hdr`), so the copy stage, the resolver and the menu policy run
+unchanged. It applies only with `experimental.temporal_aa_before_post = auto`,
+never where the whitelist selected, never where the HDR route serves the frame
+(R >= D, the mode evaluates at R, route not latched). At R < D the game's own
+copy upscales S to D and DLSS or FSR resolve S at R to D at the copy (`flat
+route: trained-upscale R=2880x1620 E=3840x2160 D=3840x2160`). EDVR's TAA above
+D is the display-grid route, also the copy's, so the same rules admit it up to
+twice D.
+
+The risk is a game anti-aliasing filter between tone and copy: FXAA would give
+a softer double AA, the game's TAA jitters the camera itself and fights EDVR's
+phase. The structure cannot tell which, but any such filter adds an R-sized
+R8G8B8A8 pass between the scene's first consumer and S. Rule 5 declines that
+frame, so it stays refused and F8 keeps its Anti-aliasing advice; the chain
+length rides the decline and every window (`ldr-passes-before-max`). No corpus
+scene has such a pass, so the rule does not catch known stock, EDHM or bloom
+chains, and what AA writes is unobserved until leg 6. Relaxing the rule for
+FXAA is one line, after that flight.
+
+**What is named now.** Two reasons are appended to the selector's (23, 24; no
+contract hash or published word moves): `render-size-does-not-fit-output` (the
+scene is not a uniform scale of the output from half to twice; the measured
+sizes ride it) and `no-3d-scene` (a final copy and no scene). Both stand the
+work down after 5 s; the first warns, the second never does, so the startup
+spell is silent (`hdrFrameEnd` leaves it alone too: the route's no-hdr-consumer
+verdict, for a frame with an HDR-shaped target of a few draws, would warn). The
+sizes are the prefix model's measurement at every final copy that has a scene,
+and the swap chain's, never Elite's settings file.
+
+- Stand-down: `flat stand-down: entered ...: every frame for 5.0 s (598 frames)
+  was refused for render-size-does-not-fit-output (Elite renders 2176x1224 on a
+  2560x1600 screen), none treated; ...`, and the 30 s reminder.
+- F8, render size: "DLSS is not active: Elite renders 2176x1224 on a 2560x1600
+  screen." then "Set Elite's resolution to your screen's, 2560x1600, and change
+  the render size with its supersampling." (outside half to twice: "That is
+  under half the screen's size. Raise Elite's supersampling.", or "over twice
+  ... Lower ...").
+- F8, any other refusal: "Elite's post-processing is not recognised." and, with
+  the key auto, only the Anti-aliasing advice (Bloom and Depth of field no
+  longer cause a refusal); with the key off the old advice. EDVR's TAA with the
+  scene above the output adds "Above 1.0 supersampling, EDVR's TAA works only
+  on a post chain it knows. Set Elite's supersampling to 1.0 or lower, or
+  choose DLSS or FSR."
+- Gone: the supersampling paragraph and its code (`kFlatSupersamplingWords`,
+  `flatHdrSupersamplingAdvice`, `g_hdrBelowOutput`). The warning's log line
+  joins its paragraphs with a vertical bar (closing section 81's cosmetic item
+  1); the `DLAA` label at SS 0.75 (item 2) goes with the treatment.
+
+**VR only: Elite's Supersampling below 1.** Elite then draws the 3D world into
+a target smaller than the eye texture and scales it up before EDVR sees it, so
+DLSS upscales an upscaled image and the holograms miss their draw (the
+2026-09-24 entry of `docs\openxr-performance-review-2026-09-14.md`: 1998x1931,
+75% of a 2665x2575 eye). The detection is vScreen's existing measurement
+(`vScreen: the world on this rig is rendered at WxH and scaled into ...`)
+against the eye texture, under 98% of both axes
+(`src\common\vr_supersample_notice.h`), with vScreen's own guards: the eye's
+shape to within a percent, once a session, only while the submitted size never
+reached scene levels. It never reads Elite's settings file, never fires in flat
+(no eye texture) and speaks once: the log line `vr supersampling: Elite draws
+the 3D world at 1998x1931, 75% of the 2665x2575 eye texture, ... Set Elite's
+Supersampling to 1 and raise HMD Image Quality instead ...`, a headset toast
+("Elite Supersampling is below 1: use HMD Image Quality") through the menu's
+own toast queue (`menu.toasts`), the Status page's hint while the menu is open,
+and the menu's log line saying which were queued. No page gains a line for it
+(a review finding): the menu bitmap is refused above 2048 px and the panel then
+keeps its old bitmap, which a note under a settings page's rows (16 lines and a
+hint) reaches from a 48-px cap and one more Status line from 54, and the Pimax
+has 51-55; the hint is the two-line area the Status page has anyway. An
+upscaler in the chain (FSR, NIS) reads the same, and the log line says so. A
+pinned `advanced.eye_render_size` is not a measurement and does not trigger it.
+It is vScreen's once-a-session measurement: after Supersampling is fixed in
+session the hint stays until a restart.
+
+**Contracts: what works today is unchanged.** Pinned in `flat_temporal_test`
+(the corpus replay is the test) and `vscreen_fit_test`:
+
+- the reducer, frame contract and whitelist selector are untouched; the
+  corpus's 46 contract hashes replay identical;
+- all 42 whitelisted frames come back from the admission field for field (key
+  auto), and with the key off the structure leaves every frame with a scene
+  alone; the 3D menu's `staticScene` is the same through the structure, 42 of
+  42;
+- the HDR route: the admission answers `route-serves` for DLSS, FSR and TAA at
+  R = D and DLSS and FSR at 1.5 D; the 3 Bloom 3 / DoF 2 frames stay the
+  route's at R = D; the route's own pins pass except those that held the
+  supersampling advice;
+- `flatSelectHdrFrame`'s default gate is the route's `R >= D`, held row by row;
+  the structure's gate is a uniform scale from half to twice, both ends in;
+- with the tone pair renamed, all 24 corpus frames below the output are refused
+  by the whitelist and admitted by the structure to the same selection in DLSS,
+  FSR and TAA (72 of 72), and none with the key off;
+- no new key, no ini value moved, `config_test` unchanged.
+  `experimental.temporal_aa_before_post` is the switch: auto is the route plus
+  the structure, off the whitelist alone (the A/B); its `edvr.ini` comment says
+  so. With it off the whitelist still decides; only the naming changes (a frame
+  with no scene says `no-3d-scene`, a render size that does not fit says so),
+  and the key's log line says that.
+
+**What the log shows.** If the new code never ran, there is no `flat copy
+structure 5s:` line at all.
+
+- Every 5 s while a temporal mode runs, zeros included: `flat copy structure
+  5s: key=auto copies=N whitelist=N admitted=N declined=N selector-refused=N
+  no-scene=N render-size=N route-serves=N key-off=N last=<outcome> scene=WxH
+  output=WxH source=WxH VS=.. PS=.. ldr-passes-before-max=N
+  declines=<cause:count,...>` (or `none`). Pass at R < D, Bloom 3 and DoF 2:
+  `admitted` about `copies`, `whitelist=0`, `declines=none`. A known chain
+  (Bloom 0, DoF 0): `whitelist` about `copies`, `admitted=0`. Fail: `admitted=0
+  declined=N` with a cause, or `render-size=N`.
+- Once: `flat copy structure: first admission at frame=N ...: ... admitted by
+  structure`. At most 12 a session, each cause once: `flat copy structure:
+  declined at frame=N: <cause> (the whitelist said ...)`. The causes are the
+  decline strings in `flat_copy_structure.h`; the AA rule's is
+  `r-sized-image-passes-follow-the-first-consumer-of-the-scene-hdr`.
+- `flat stand-down: ... refused for no-3d-scene` at startup, silently, then
+  `resumed` at the first scene; `render-size-does-not-fit-output (Elite renders
+  WxH on a WxH screen)` for a mismatched resolution; `flat settings warning:
+  shown (mode=DLSS, frames refused for render-size-does-not-fit-output, work
+  stood down, structure admission on, render WxH on output WxH): ...`. No
+  `Supersampling is below 1.0` anywhere.
+- VR: `vr supersampling: Elite draws the 3D world at ...` after vScreen's
+  adoption line, then the menu's `... queued as a toast` line.
+- The reader's tags: KEY, ADMISSION, TREATED, UPSCALE, TONE REFUSALS,
+  STAND-DOWN, F8 WARNING, CHAIN, ADVICE (a STOP when the old advice is in the
+  log, i.e. the wrong build). `--vr-supersampling`: NOTICE, CONSISTENT,
+  HEADSET, FLAT. `tools\flat_upscale_fixture.log` (a good flight and three
+  episodes) is held to the formatters by the rig and read by the reader's
+  self-test.
+
+**Environment.** Flat profile, Windows, Elite's D3D11 renderer, no VR runtime
+(N/A), mono SDR output, DLSS through NGX (model k on Sean's rig), FSR3 or
+EDVR's TAA. R is the prefix model's R11G11B10F scene target; fixed tables: 128
+targets, the scene's 8-draw floor, 12 decline lines a session.
+
+**Flight plan** (Epic install, flat build, `edvr-flat.ini`; read each log with
+`--flat-upscale --expect-build HEAD` first, a log from another build is no
+evidence). Elite's resolution is the screen's own, borderless, AAMode 0 unless
+a leg says otherwise; the `flat settings:` line records AAMode, Bloom and DoF.
+Ini `[fix] temporal_aa = dlss` (`fsr`; `on` is EDVR's TAA) and `[experimental]
+temporal_aa_before_post = auto` (the default).
+
+1. SS 0.75, Bloom 3 and DoF 2, DLSS. Pass: the first-admission line, route
+   `trained-upscale R=0.75 D`, `admitted` about every frame, `whitelist=0`,
+   `declines=none`, nothing refused for a tone pass after startup, no
+   stand-down but the silent startup `no-3d-scene`, F8 hidden, reader PASS.
+   Look at: the picture against the game's own upscale at the same SS, bloom
+   and DoF edges, the HUD and holograms.
+2. SS 0.75, Bloom 0 and DoF 0 (a chain the whitelist knows). Pass: `whitelist`
+   about every frame, `admitted=0`, treated: the structure leaves known chains
+   alone.
+3. Legs 1 and 2 at SS 0.85.
+4. A mismatched resolution (an aspect other than the screen's, such as
+   2560x1440 on a 2560x1600 screen at SS 0.85, or 16:9 on a 16:10 screen),
+   DLSS. Pass: after 5 s the stand-down names `render-size-does-not-fit-output
+   (Elite renders ... on a ... screen)`, F8 shows the two sentences above and
+   nothing about the post chain; reader WARN (STAND-DOWN, F8 WARNING), no STOP.
+   Then set the resolution to the screen's: `resumed`, warning `hidden`.
+5. `temporal_aa = on` at SS 1.25, Bloom 3 and DoF 2, AAMode 0. Pass is either
+   outcome, named: treated through the structure (`taa-display-grid-down`,
+   `admitted` about every frame), or a decline cause in `declines=` with the F8
+   TAA paragraph (`the-copy-source-is-not-the-scene-size` would say Elite
+   downsamples before the copy above SS 1). Fail: a bare "not recognised" with
+   Bloom and DoF advice.
+6. Game AA on (AAMode 4 as the rc.5 user, also 1 to 3) at SS 0.75, Bloom 3,
+   DLSS, then `on` at SS 1.5 (the 308-frame case). Expected by design:
+   `r-sized-image-passes-follow-...` declines with the chain length, stand-down
+   for `no-known-tone-pass`, F8 "Turn off in Elite's graphics options:
+   Anti-aliasing" and nothing about Bloom, reader WARN (CHAIN). Read the chain
+   length and which filter it is, then decide whether the rule relaxes.
+7. `temporal_aa_before_post = off` (a live ini edit) at SS 0.75, Bloom 3 and
+   DoF 2. Pass: `key=off`, `key-off=N` in the windows, the old refusal and old
+   advice. The A/B for leg 1.
+8. VR at Elite Supersampling 0.85, HMD Image Quality 1.0, `[menu] toasts = on`.
+   Pass: `--vr-supersampling` NOTICE with about 85% of the eye, CONSISTENT,
+   HEADSET; in the headset one toast and, with the menu on the Status page, the
+   hint (open every page too: none may stop drawing). Control: Supersampling
+   1.0 gives no `vr supersampling:` line, and a flat log never has one.
+
+**Mutations** (scratch runs, restored after): `flat_temporal_test` 51 edits, 50
+applied, 49 caught by the rigs and 1 equivalent (the `selected()` term of the
+entry test is redundant with the reason test); `vscreen_fit_test` case R13, 16
+mutations in `mutants.py`.
+
+**Review.** A read-only review of the diff by a second agent found one defect
+that no rig could see (the VR note's layout, above) and these, all fixed: the
+admission now declines an S that was written outside a draw and a mode with no
+route at the size; `hdrFrameEnd` no longer turns no-3d-scene into a warning;
+the scene's sizes are refreshed at every final copy; the key-off log line names
+what it still names; and the readers (an exact two-axis compare for the 98%,
+frames counted from the windows and not the decline lines, ADMISSION a WARN
+when no window ruled on a copy, no claim from silence about Elite's
+Supersampling).
+
+**Not built.** The relaxed rule for a game FXAA chain (waits for leg 6); a
+trace marker for the structure's verdict (a live F10 trace replays as the
+whitelist's refusal, and the rig runs the admission over it); a VR notice for a
+pinned `advanced.eye_render_size`; a guard for a compute write into S or H of
+an unknown chain (the whitelist's tone count guards them for a known one; the
+prefix model records no compute write for other targets); a stand-down message
+for `dlaa` below the output (it stays refused with the old words).
+
+- ruled out: the final copy or the HDR detector as the cause of the refusals,
+  because in every refusal the copy was valid and the detector fired on every
+  frame at R >= D.
+- ruled out: growing the whitelist hash by hash, because the refused chains
+  differ by user and setting and the structure admits all 42 known frames and
+  the 3 unknown ones with no list.
+- ruled out: relaxing `flatUniformScale` for a mismatched resolution, because
+  2176x1224 on 2560x1600 is 348,160 off against 4,160 and the game's own copy
+  would stretch the image unevenly: the user must set the resolution, and F8
+  says so.
+- ruled out: the stopgap (the HDR route as DLAA at R, the game upscaling) as
+  the first answer, because structure admission proved feasible on the corpus;
+  nothing was switched silently.
+- ruled out: the flat supersampling advice as the answer below 1.0, because
+  below 1.0 is served now and the advice told the user to raise supersampling.
+- ruled out: admitting a chain with an R-sized image pass after the tone pass
+  before a flight reads one, because FXAA would be softer, the game's TAA
+  jitters the camera itself and the structure cannot tell them apart.
+- ruled out: a new ini key for the admission, because the route's key already
+  means off = whitelist alone, auto = route plus structure.
+- ruled out: Elite's settings file for the VR Supersampling warning or the
+  render size in the F8 words, because the measured sizes are the evidence and
+  the file says only what was asked for.
+- ruled out: a note on every settings page and a Status line for the VR notice,
+  because the menu bitmap's 2048-px height guard trips from a 48-px cap with
+  the note and a 54-px cap with one more Status line, and the Pimax runs 51-55:
+  the panel would keep a stale bitmap on the headsets that run Supersampling
+  below 1. The toast, the log line and the Status hint add no line.
+
+## 84. Jitter phases follow the upscale ratio: a switch to fly (build, 2026-10-01)
+
+Suspect (g) of section 82. Sean's VR cockpit, landed: an eye render of
+2016x1949 into an output of 4032x3898 (2x), and distant hills keep
+shimmering after DLSS. History is kept and motion is correct; HMD Image
+Quality 0.65 helped but did not fix it. Every path here jitters through the
+same eight Halton (2,3) phases (src\common\temporal_math.h,
+`kTemporalJitterCount` 8), which repeat at 11.25 Hz at 90 Hz. NVIDIA's DLSS
+guidance and AMD's FSR (`ffxFsr3UpscalerGetJitterPhaseCount`, which casts
+8 x (display / render)^2 to an integer; docs/fsr-upscaler-design-2026-09-16.md)
+both ask for 8 x (display / render)^2 phases, 32 at 2x, so that the upscaler
+sees enough sub-pixel samples of fine detail. Eight is that rule at 1x only. A hypothesis,
+not a finding: (g) also names NGX's integration of fine HDR content, and the
+same shimmer in all three backends would put it upstream of the count.
+
+What was built, commit 2 of claude/jitter-phases-terrain-retire (commit 1 is
+the terrain retirement, docs/terrain-motion-dispatch-cost-2026-09-17.md):
+
+- The rule. `temporalJitterPhaseCount(renderW, renderH, outW, outH)` is
+  ceil(8 x output area / render area): the ratio's square taken as the ratio
+  of the two areas, which is the square of the per-axis ratio whenever the
+  axes scale alike (every size EDVR has met), as an exact integer ceiling
+  with no float rounding; never below eight; capped at 128 (NVIDIA's own
+  3x figure is 72). `temporalJitterPhase(n, count)` is the same Halton (2,3)
+  walk with the index (n % count) + 1, so its first eight are the fixed
+  eight's; `temporalJitter(n)` is exactly count 8, bit for bit.
+- The switch. `experimental.temporal_aa_jitter_follows_upscale`, off | on,
+  default OFF: every path then runs today's eight, byte for byte (pinned).
+  Live: the VR pass reads it at each treat, the flat route at each Present.
+  A change resets nothing (the key is no part of any history). TEMPORARY:
+  Sean drops it after the flight if it wins. The in-headset menu's developer
+  mode lists it on the Experimental page (a getBool read is a toggle).
+- The VR eye pass (native_temporal.cpp). Each eye's last treated input and
+  the output the pass was asked for, the served floor's cut included; the
+  larger of the two eyes' counts, so both eyes keep sharing one phase
+  (docs/fss-scanner.md relies on it). begin() runs before the treat that
+  sizes the frame, so a change takes one frame, two after a mode change, and a
+  first treat must have named a size (eight until then).
+- The flat route (flat_runtime.cpp, `flatCameraPhaseCount`): R is the plan's
+  render size and E the size the upscaler resolves to (the vendor's negotiated
+  size where one was answered for the contract, else the route's default: D
+  for DLSS, FSR and TAA below the output, R at or above it), on the UPSTREAM
+  camera route only. The Legacy route's lighting patch
+  (flat_lighting_contract.h) refuses a jitter past 7/16 of a pixel; the first
+  eight phases stay inside it, the ninth (y -0.463) and the sixteenth (x
+  -0.469) do not (pinned in flat_lighting_tests.h), so a Legacy or Off frame at
+  a longer count would lose its jitter to a refusal. Only the injector's rows
+  carry a phase to the game with no such bound.
+- The VR world route (vr_world_route.cpp) resolves at the game's render size
+  (render == output), so the rule gives eight with the key on or off: it
+  reads no key, hands its phase machine the rule's count for its own sizes
+  and prints what the machine ran.
+- Untouched on purpose: the FSR3 port's own count (int(8 x ratio^2), ramped
+  1 a frame, used for lock lifetime only, ffx_fsr3upscaler.cpp:1004; EDVR
+  never asks it for jitter) and NGX (jitter per frame, no count).
+
+The log. VR: `native temporal: jitter phases=N (eye 0 WxH -> WxH, eye 1 ...;
+experimental.temporal_aa_jitter_follows_upscale=on|off: ...)` at the first
+jittered frame and at every change of the count or the key (a mode change
+shows its settling frame too), and `jitter_phases=N` in the close totals.
+Flat: `phases=N` on the 5 s `flat jitter:` line. World route: `phases=N` just
+before `jitter=` on its 5 s line. One read for all three:
+`python tools\edvr_log.py --target frontier --expect-build HEAD --grep "phases="`.
+
+Rigs and mutants. `temporal_test` (the rule's table: 32 at 2x, 18 at 1.5x, 72
+at 3x, 19 for the Pimax pair; the ceiling exact; the floor of eight and the
+cap; the fixed eight bit for bit), `flat_temporal_test` (the phase machine's
+count, a change of count between frames, `flatCameraPhaseCount`, and the
+Legacy bound that is the reason), `vr_world_route_test` (the window's token and
+a source pin on the route), `native_temporal_test --phase-count-self-test`
+(the real channel code flown on WARP through eight segments of mode, size and
+live key flips: the sequence frame by frame, both eyes' phase, no reset on a
+flip, the logged sequence), `config_test` (the shipped default and both code
+fallbacks, each with a control), the VR camera census fixture
+(`tools\camera_census_fixture.log`, regenerated: the route's 5 s line gained
+`phases=8`), and `tools\temporal_test\jitter_phase_mutants.py`:
+20 one-token breaks, each caught by a check that names it (`--run` on demand,
+about 30 s; `--self-test` is in the build). All 20 caught.
+
+ruled out: a longer count on the flat Legacy route, because its lighting
+patch refuses phases past 7/16 of a pixel (above); a count for the world
+route, because it resolves at R = D. Not ruled out: that more phases is not
+the lever; the flight below measures the count alone.
+
+The flight (one session with the terrain retirement's regression flight;
+verify the build with `python tools\edvr_log.py --target <t> --expect-build
+HEAD`):
+
+1. VR, cockpit, landed at a hills spot, HMD Image Quality 0.5, DLSS. Key OFF:
+   the log reads `native temporal: jitter phases=8 ...=off`. Take an eye dump
+   (the `dump_eyes` hotkey or the menu's Instruments row; with
+   `advanced.eye_run_treated` on for the treated crops). Flip the key ON live
+   (the menu's developer mode, Experimental page; or the ini): the log gets
+   `jitter phases=32 (eye 0 2016x1949 -> 4032x3898 ...=on` at once if the pair
+   is Sean's, and the real sizes otherwise. Take a second dump from the same
+   pose. Compare the treated crops' per-pixel variance over the run on a hills
+   region: `python tools\eye_run_shimmer.py <crops> --centre X Y --region hills
+   X0 Y0 X1 Y1`, its last line. PASS: the on run's amplitude is lower than the
+   off run's, with no flash in the `whole` column and no blur or ghosting
+   added. FAIL: no change (the count is not the lever: open (g)'s other legs)
+   or a worse picture (a longer sequence settles slower after any reset).
+2. One low flight over terrain with the key on: the terrain retirement's
+   regression check (docs/terrain-motion-dispatch-cost-2026-09-17.md).
+3. Flat (Epic), DLSS or TAA, the key on, at SS 1.0 and then below it (below
+   1.0 the frame reaches the resolver through section 83's admission of the
+   game's final copy by structure, which this build carries). The
+   `flat jitter:` line reads `phases=8` at SS 1.0 (render at the output) and
+   ceil(8 x (D/R)^2) below: 12 at 0.85, 15 at 0.75, 32 at 0.5, with
+   `state=live` and `refusals` not rising, and `flat route:` naming the same R
+   and E. PASS: that, and the picture at least as stable as with the key off.
+   FAIL: refusals rising or the state leaving `live` with the key on; phases
+   stuck at 8 below 1.0 (the route is not upstream: the
+   `flat camera inject owner:` line says which route owns the frame); and
+   watch the lighting for seams on the game's 120-pixel light-grid tiles:
+   the upstream route has flown only the eight phases inside 7/16 of a pixel
+   (section 13 shows a lookup of p - j stays in its pixel, hence its tile,
+   for any |j| < 1/2 less a float margin, which 128 phases leave at 1/256),
+   and this is the first time it carries a phase out to 0.496.
+
+FLIGHT, 2026-10-01 11:18 (Frontier 08b48036, log 111827; VR cockpit,
+landed, at the distant hills, eye 2016x1949 -> 4032x3898). The switch went
+live at 11:20:57.680. The log shows `jitter phases=8 ... =off: the fixed 8`
+at engagement, then `jitter phases=32 ... =on` at 11:20:58. Sean flipped it
+while looking at the hills: "didn't see any change to shimmering on the
+hills". He took an eye dump with it on, where the shimmer was strongest
+(stamp 112137); there is no same-spot key-off dump to compare it with.
+ruled out: too few jitter phases (suspect (g)) as the cause of the hills'
+shimmer, because 32 phases at the same spot made no visible difference.
+What remains is the hills investigation's (d): sub-pixel streaks at the 0.5
+input resolution, about 21.6 input px per degree. HMD Image Quality 0.65
+helped, and the flat game at about 32 px per degree does not shimmer. Proposed: the
+switch goes in the cleanup build and the fixed 8 stays, since there is no
+visible benefit and the flat light-grid risk above is unflown.

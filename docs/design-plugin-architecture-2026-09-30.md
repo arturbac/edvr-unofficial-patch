@@ -74,7 +74,7 @@ default first):
 
 | Area | Features | Profile |
 |---|---|---|
-| Temporal | temporal AA (TAA/DLSS/FSR) with engine motion, camera jitter, screen/weapon/celestial/terrain motion; sharpening (RCAS); UI, smoke and hologram depth; the flat adapter | VF |
+| Temporal | temporal AA (TAA/DLSS/FSR) with engine motion, camera jitter, screen/weapon motion (the celestial/terrain hook retired 2026-10-01); sharpening (RCAS); UI, smoke and hologram depth; the flat adapter | VF |
 | Interface | UI quality (layer, panel scale, hologram remaps) | V |
 | Cockpit visuals | sun glare, particle billboards and witchspace stars, RemLok lines, wake pulse, target indicator, night vision | V |
 | Light | exposure share and damping | V |
@@ -164,7 +164,7 @@ temporal pass's frame state never crosses a plugin boundary.
 
 | Plugin | Contents | Profiles | Needs | Default VR / flat |
 |---|---|---|---|---|
-| temporal-aa | TAA, DLSS, FSR, engine motion, camera jitter (VR frustum, flat camera path), screen, weapon, celestial and terrain motion, UI/smoke/hologram depth, UI quality (the layer, panel scale, hologram remaps; VR), sharpening, the flat adapter (stand-down, F8 warning) | VF | NGX DLL for DLSS | installed, mode off, UI quality 100 / installed |
+| temporal-aa | TAA, DLSS, FSR, engine motion, camera jitter (VR frustum, flat camera path), screen and weapon motion (the celestial/terrain hook retired 2026-10-01), UI/smoke/hologram depth, UI quality (the layer, panel scale, hologram remaps; VR), sharpening, the flat adapter (stand-down, F8 warning) | VF | NGX DLL for DLSS | installed, mode off, UI quality 100 / installed |
 | cockpit-visuals | sun glare, particles and witchspace stars, RemLok, wake pulse, target indicator, night vision | V | - | on / - |
 | exposure | exposure share and damping | V | - | on / - |
 | scanners | FSS eye sync family, scanner body | V | - | on / - |

@@ -211,10 +211,10 @@ inline int flatEliteSettingsTests() {
                "the warning key moves with the mode, the preset and the three fields");
     }
 
-    // ---- the HDR route is active (section 81): Bloom and Depth of field are not what a refusal is about -----------
-    // The route resolves before both, so their advice goes; the Anti-aliasing advice stays (the game's own AA after
-    // the tone double-filters, and a game TAA's jitter fights EDVR's). Every other word is unchanged, which the
-    // route-off rows above pin.
+    // ---- the route's key is auto (sections 81 and 83): Bloom and Depth of field are not what a refusal is about -----------
+    // The route resolves before both and the copy's admission by structure does not care about either, so their advice goes;
+    // the Anti-aliasing advice stays (a filter after the tone pass is what keeps a frame refused, and a game TAA's jitter
+    // fights EDVR's). Every other word is unchanged, which the key-off rows above pin.
     {
         EliteGraphics user1, user2, all, preset;
         for (EliteGraphics* g : {&user1, &user2, &all, &preset}) {
@@ -229,152 +229,152 @@ inline int flatEliteSettingsTests() {
         preset.custom = false; std::strcpy(preset.preset, "Ultra");
         const int wide = 100000;
         FlatSettingsWarning w;
-        auto hdrWords = [&](const char* mode, const EliteGraphics& g) {
-            flatComposeSettingsWarning(mode, g, wide, &elite_settings_test::ruler, nullptr, &w, true);
+        FlatWarningCause admission;
+        admission.structureAdmission = true;
+        auto admitWords = [&](const char* mode, const EliteGraphics& g) {
+            flatComposeSettingsWarning(mode, g, wide, &elite_settings_test::ruler, nullptr, &w, admission);
         };
-        hdrWords("DLSS", user1);
+        admitWords("DLSS", user1);
         expect(w.count == 2 && std::strcmp(w.line[1], "Turn off in Elite's graphics options: Anti-aliasing") == 0,
-               "HDR route active, user 1 (AA on): Anti-aliasing is still named");
-        hdrWords("DLAA", user2);
+               "key auto, user 1 (AA on): Anti-aliasing is still named");
+        admitWords("DLAA", user2);
         expect(w.count == 2 && std::strstr(w.line[1], "Bloom") == nullptr && std::strstr(w.line[1], "Depth of field") == nullptr &&
                std::strstr(w.line[1], "Please send your logs") != nullptr,
-               "HDR route active, user 2 (only bloom and DoF on): neither is named, the logs are asked for");
-        hdrWords("TAA", all);
+               "key auto, user 2 (only bloom and DoF on): neither is named, the logs are asked for");
+        admitWords("TAA", all);
         expect(w.count == 2 && std::strcmp(w.line[1], "Turn off in Elite's graphics options: Anti-aliasing") == 0,
-               "HDR route active, all three on: only Anti-aliasing is named");
-        hdrWords("DLSS", preset);
+               "key auto, all three on: only Anti-aliasing is named");
+        admitWords("DLSS", preset);
         expect(w.count == 2 && std::strstr(w.line[1], "Ultra graphics preset may turn on Anti-aliasing.") != nullptr &&
                std::strstr(w.line[1], "Bloom") == nullptr && std::strstr(w.line[1], "Depth of field") == nullptr,
-               "HDR route active, another preset: only Anti-aliasing is said to be turned on");
+               "key auto, another preset: only Anti-aliasing is said to be turned on");
         words("TAA", all, wide, &w);
         expect(w.count == 2 && std::strcmp(w.line[1], "Turn off in Elite's graphics options: Anti-aliasing, Bloom, Depth of field") == 0,
-               "HDR route not active: the words are exactly what they were (all three named)");
-        expect(flatSettingsWarningKey("DLSS", user1, false) != flatSettingsWarningKey("DLSS", user1, true) &&
-               flatSettingsWarningKey("DLSS", user1) == flatSettingsWarningKey("DLSS", user1, false),
-               "the warning key moves with the route, so the panel rebuilds when it flips");
+               "key off: the words are exactly what they were (all three named)");
+        FlatWarningCause none;
+        expect(flatSettingsWarningKey("DLSS", user1, none) != flatSettingsWarningKey("DLSS", user1, admission) &&
+               flatSettingsWarningKey("DLSS", user1) == flatSettingsWarningKey("DLSS", user1, none),
+               "the warning key moves with the key, so the panel rebuilds when it flips");
     }
 
-    // ---- supersampling below 1.0 (section 81): the warning's third paragraph ------------------------------------------
-    // Frames are refused, the route's key is auto, and the route leaves them to the copy route only because the game
-    // renders below the output (Elite's supersampling under 1.0): the warning says so after the advice it already gives,
-    // which stays. The measured render and output sizes decide it, never Elite's settings file, and every other
-    // combination leaves the words exactly as they were.
+    // ---- the render size (section 83): what the refusal is, in the user's terms ----------------------------------------
+    // The scene's size is not a uniform scale of the output between half and twice (Elite's resolution is not the screen's
+    // shape): the warning says "Elite renders 2176x1224 on a 2560x1600 screen" and what to set, and nothing about the post
+    // chain. EDVR's TAA above the output is the post-chain refusal's third paragraph. The runtime's measured sizes decide
+    // both, never Elite's settings file.
     {
-        EliteGraphics user1, user2, sean, all, preset;
-        for (EliteGraphics* g : {&user1, &user2, &sean, &all, &preset}) {
+        EliteGraphics rc5, sean, preset;
+        for (EliteGraphics* g : {&rc5, &sean, &preset}) {
             g->folderFound = g->presetKnown = g->custom = g->fileRead = true;
             std::strcpy(g->preset, "Custom");
             std::strcpy(g->file, "Custom.4.4.fxcfg");
         }
-        user1.aaMode = 4; user1.bloomQuality = 0; user1.dofEnabled = 0;
-        user2.aaMode = 0; user2.bloomQuality = 3; user2.dofEnabled = 2;
+        rc5.aaMode = 0; rc5.bloomQuality = 3; rc5.dofEnabled = 2;
         sean.aaMode = 0; sean.bloomQuality = 0; sean.dofEnabled = 0;
-        all.aaMode = 4; all.bloomQuality = 1; all.dofEnabled = 1;
         preset.aaMode = preset.bloomQuality = preset.dofEnabled = 0;
         preset.custom = false; std::strcpy(preset.preset, "Ultra");
         const int wide = 100000;
-        FlatSettingsWarning plain, with;
-        const std::string ssWords = kFlatSupersamplingWords;
-        expect(ssWords == "Supersampling is below 1.0. At 1.0 or above, EDVR anti-aliases before bloom and depth of field, so they "
-                        "no longer block it. Raising it costs GPU time.",
-               "the extra paragraph's words: supersampling, what 1.0 or above gives, what it costs");
+        FlatSettingsWarning w;
+        const EliteGraphics* users[] = {&rc5, &sean, &preset};
 
-        // The words: one paragraph after the advice, for every advice the warning gives.
-        bool after = true, unchanged = true;
-        const EliteGraphics* users[] = {&user1, &user2, &sean, &all, &preset};
+        // The rc.5 user's rig: Elite's resolution 2560x1440 on a 2560x1600 screen at supersampling 0.85, so R = 2176x1224.
+        FlatWarningCause shape = flatWarningCause(true, true, false, true, true, 2176, 1224, 2560, 1600);
+        expect(shape.renderSize && shape.structureAdmission && !shape.taaAbove && shape.renderW == 2176 && shape.outputH == 1600,
+               "a render-size refusal with measured sizes is a render-size cause");
         for (const EliteGraphics* g : users) {
-            flatComposeSettingsWarning("DLSS", *g, wide, &elite_settings_test::ruler, nullptr, &plain, false, false);
-            flatComposeSettingsWarning("DLSS", *g, wide, &elite_settings_test::ruler, nullptr, &with, false, true);
-            after = after && plain.count == 2 && with.count == 3 && ssWords == with.line[2];
-            unchanged = unchanged && std::strcmp(plain.line[0], with.line[0]) == 0 && std::strcmp(plain.line[1], with.line[1]) == 0;
+            flatComposeSettingsWarning("DLSS", *g, wide, &elite_settings_test::ruler, nullptr, &w, shape);
+            expect(w.count == 2 &&
+                   std::strcmp(w.line[0], "DLSS is not active: Elite renders 2176x1224 on a 2560x1600 screen.") == 0 &&
+                   std::strcmp(w.line[1], "Set Elite's resolution to your screen's, 2560x1600, and change the render size with its "
+                                          "supersampling.") == 0,
+                   "the shape is off: the render size, the screen's, and what to set; the same for every Elite setting");
         }
-        expect(after, "the supersampling paragraph is the third line after the two the warning always has");
-        expect(unchanged, "and the bloom, depth-of-field and game-AA advice before it is not touched by it");
-        flatComposeSettingsWarning("DLAA", user2, wide, &elite_settings_test::ruler, nullptr, &with, false, true);
-        expect(with.count == 3 && std::strcmp(with.line[1], "Turn off in Elite's graphics options: Bloom, Depth of field") == 0,
-               "user 2 (bloom and DoF on): both still named, then the supersampling words");
-        // The route being active is nothing for it to say: the route is treating the frames, so supersampling is not in the way.
-        flatComposeSettingsWarning("DLAA", user2, wide, &elite_settings_test::ruler, nullptr, &with, true, true);
-        expect(with.count == 2 && std::strstr(with.line[1], "Supersampling") == nullptr,
-               "with the route active the paragraph never appears, whatever the flag says");
-        // At the panel's width it wraps onto the card: every variant fits the lines (ten at worst, twelve allowed), each line fits the width, and
+        // The size is out of the half-to-twice band but the shape is right: say which way.
+        flatComposeSettingsWarning("DLSS", sean, wide, &elite_settings_test::ruler, nullptr, &w,
+                                   flatWarningCause(true, true, false, true, true, 1200, 750, 2560, 1600));
+        expect(w.count == 2 && std::strcmp(w.line[0], "DLSS is not active: Elite renders 1200x750 on a 2560x1600 screen.") == 0 &&
+               std::strcmp(w.line[1], "That is under half the screen's size. Raise Elite's supersampling.") == 0,
+               "uniform but under half the screen's size: raise the supersampling");
+        flatComposeSettingsWarning("TAA", sean, wide, &elite_settings_test::ruler, nullptr, &w,
+                                   flatWarningCause(true, true, false, true, true, 5760, 3600, 2560, 1600));
+        expect(w.count == 2 && std::strcmp(w.line[0], "TAA is not active: Elite renders 5760x3600 on a 2560x1600 screen.") == 0 &&
+               std::strcmp(w.line[1], "That is over twice the screen's size. Lower Elite's supersampling.") == 0,
+               "uniform but over twice the screen's size: lower the supersampling");
+        // Sizes unknown (nothing measured yet): the refusal is not called a render-size one, the words are the post chain's.
+        const FlatWarningCause unknownSizes = flatWarningCause(true, true, false, true, false, 0, 0, 0, 0);
+        expect(!unknownSizes.renderSize, "a render-size reason without measured sizes says nothing about sizes");
+
+        // EDVR's TAA above the output: a third paragraph after the two the post-chain warning always has.
+        const FlatWarningCause taa = flatWarningCause(true, true, true, false, true, 3840, 2160, 2560, 1440);
+        expect(taa.taaAbove && !taa.renderSize && taa.structureAdmission, "TAA above the output with the key auto is a TAA cause");
+        flatComposeSettingsWarning("TAA", sean, wide, &elite_settings_test::ruler, nullptr, &w, taa);
+        expect(w.count == 3 && std::strcmp(w.line[2], kFlatTaaAboveWords) == 0 &&
+               std::strcmp(w.line[0], "TAA is not active: Elite's post-processing is not recognised.") == 0,
+               "the TAA paragraph is the third line, after the post chain's two");
+        expect(std::string(kFlatTaaAboveWords) == "Above 1.0 supersampling, EDVR's TAA works only on a post chain it knows. Set "
+                                                  "Elite's supersampling to 1.0 or lower, or choose DLSS or FSR.",
+               "the TAA paragraph's words");
+        // Only with the key auto (the structure is what DLSS and FSR do not depend on), never alongside a render-size refusal, never
+        // for another mode's label (the runtime publishes the mode), never when frames are not refused.
+        expect(!flatWarningCause(true, false, true, false, true, 3840, 2160, 2560, 1440).taaAbove &&
+               !flatWarningCause(true, true, true, true, true, 3840, 2160, 2560, 1440).taaAbove &&
+               !flatWarningCause(false, true, true, false, true, 3840, 2160, 2560, 1440).taaAbove &&
+               !flatWarningCause(true, true, false, false, true, 3840, 2160, 2560, 1440).taaAbove,
+               "the TAA paragraph needs key auto, a post-chain refusal, TAA above the output and measured sizes");
+        expect(!flatWarningCause(false, true, true, true, true, 2176, 1224, 2560, 1600).renderSize &&
+               !flatWarningCause(false, true, true, true, true, 2176, 1224, 2560, 1600).structureAdmission,
+               "frames not refused: no condition holds, whatever the runtime published");
+
+        // At the panel's width it wraps onto the card: every variant fits the lines it has (twelve allowed), each line fits the width, and
         // the flat page's three rows and a blank line still leave the card room (menu.cpp static_asserts the same sum).
         bool fits = true;
-        for (const EliteGraphics* g : users) {
-            flatComposeSettingsWarning("TAA", *g, elite_settings_test::kPanelWidthPx, &elite_settings_test::ruler, nullptr, &with, false, true);
-            fits = fits && with.count >= 4 && with.count <= 10 && with.count <= FlatSettingsWarning::kMaxLines;
-            for (int i = 0; i < with.count; ++i)
-                if (elite_settings_test::ruler(with.line[i], nullptr) > elite_settings_test::kPanelWidthPx) fits = false;
-            std::string joined;
-            for (int i = 0; i < with.count; ++i) joined += (i ? " " : "") + std::string(with.line[i]);
-            fits = fits && joined.find(ssWords) != std::string::npos;   // the wrapped lines read as the words, none dropped
-        }
-        expect(fits, "wrapped to the panel's width every variant fits the lines it has, and the paragraph is whole");
+        const FlatWarningCause causes[] = {shape, taa, flatWarningCause(true, true, false, true, true, 1200, 750, 2560, 1600),
+                                           flatWarningCause(true, false, false, false, true, 0, 0, 0, 0)};
+        for (const EliteGraphics* g : users)
+            for (const FlatWarningCause& c : causes) {
+                flatComposeSettingsWarning("TAA", *g, elite_settings_test::kPanelWidthPx, &elite_settings_test::ruler, nullptr, &w, c);
+                fits = fits && w.count >= 2 && w.count <= FlatSettingsWarning::kMaxLines;
+                for (int i = 0; i < w.count; ++i)
+                    if (elite_settings_test::ruler(w.line[i], nullptr) > elite_settings_test::kPanelWidthPx) fits = false;
+            }
+        expect(fits, "wrapped to the panel's width every variant fits the lines it has");
         expect(3 + 1 + FlatSettingsWarning::kMaxLines <= 16, "the flat page's rows, a blank line and a full warning fit the card's 16 lines");
 
-        // The key moves with the paragraph, so the panel and the log update live when supersampling crosses 1.0; with the
-        // route active the flag changes nothing (there is no paragraph to add).
-        expect(flatSettingsWarningKey("DLSS", user2, false, true) != flatSettingsWarningKey("DLSS", user2, false, false) &&
-               flatSettingsWarningKey("DLSS", user2, true, true) == flatSettingsWarningKey("DLSS", user2, true, false) &&
-               flatSettingsWarningKey("DLSS", user2, false, false) == flatSettingsWarningKey("DLSS", user2) &&
-               flatSettingsWarningKey("DLSS", user2, false, true) != flatSettingsWarningKey("DLSS", user2, true, false),
-               "the warning key moves with the supersampling paragraph and with nothing else it does not show");
+        // The key moves with every condition and with the sizes the words name, so the panel and the log update live as Elite's
+        // resolution or supersampling changes; with no cause it is what it was.
+        expect(flatSettingsWarningKey("DLSS", sean, shape) != flatSettingsWarningKey("DLSS", sean, FlatWarningCause{}) &&
+               flatSettingsWarningKey("DLSS", sean, shape) !=
+                   flatSettingsWarningKey("DLSS", sean, flatWarningCause(true, true, false, true, true, 2176, 1224, 2560, 1440)) &&
+               flatSettingsWarningKey("DLSS", sean, taa) != flatSettingsWarningKey("DLSS", sean, FlatWarningCause{true, false, false}) &&
+               flatSettingsWarningKey("DLSS", sean, FlatWarningCause{true, false, false, 3840, 2160, 2560, 1440}) ==
+                   flatSettingsWarningKey("DLSS", sean, FlatWarningCause{true, false, false}),
+               "the warning key moves with the sizes the words name and with nothing else it does not show");
 
-        // The whole truth table, from what the runtime measures and publishes to the words: key x sizes x refusing x route.
-        // The paragraph appears for exactly one row family: refused, key auto, route not treating, R below D.
-        struct Size { uint32_t rw, rh; const char* name; };
-        const Size sizes[] = {{3072, 1728, "R < D"}, {3840, 2160, "R = D"}, {4800, 2700, "R > D"}};
-        bool table = true;
-        int shown = 0;
-        for (const FlatHdrKey key : {FlatHdrKey::Off, FlatHdrKey::Auto})
-            for (const Size& size : sizes)
-                for (int refusing = 0; refusing < 2; ++refusing)
-                    for (int route = 0; route < 2; ++route) {
-                        const bool published = flatHdrSupersamplingAdvice(key, route != 0, size.rw, size.rh, 3840, 2160);
-                        const FlatWarningFlags f = flatWarningFlags(refusing != 0, route != 0, published);
-                        bool present = false;
-                        if (f.refusing) {   // the panel composes nothing when frames are not refused
-                            flatComposeSettingsWarning("DLSS", user2, wide, &elite_settings_test::ruler, nullptr, &with,
-                                                       f.hdrRoute, f.supersamplingBelowOne);
-                            present = with.count == 3 && ssWords == with.line[2];
-                        }
-                        const bool want = refusing != 0 && key == FlatHdrKey::Auto && route == 0 && size.rw < 3840;
-                        if (present != want || f.supersamplingBelowOne != (want && f.refusing)) table = false;
-                        if (present) ++shown;
-                    }
-        expect(table && shown == 1,
-               "present for refused + R < D + key auto and nowhere else: not with the key off, at R = D or above, with the "
-               "route treating, or when frames are not refused");
-
-        // The log line carries every paragraph the panel does, names the measured sizes with the extra one, and is
-        // otherwise exactly what it was.
+        // The log line carries every paragraph the panel does (joined, so a list with no final period does not run into the next),
+        // names the measured sizes where the words do, and is otherwise exactly what it was.
         char line[900];
         FlatSettingsWarning logged;
-        const FlatWarningFlags on = flatWarningFlags(true, false, true);
-        flatComposeSettingsWarning("DLSS", user2, 0, nullptr, nullptr, &logged, on.hdrRoute, on.supersamplingBelowOne);
-        flatFormatSettingsWarningLog(line, sizeof(line), false, "DLSS", "no-known-tone-pass", true, on, 3072, 1728, 3840, 2160, logged);
-        const std::string onText = line;
-        expect(onText == "flat settings warning: shown (mode=DLSS, frames refused for no-known-tone-pass, work stood down, "
-                         "supersampling below 1.0 (render 3072x1728, output 3840x2160)): DLSS is not active: Elite's "
-                         "post-processing is not recognised. Turn off in Elite's graphics options: Bloom, Depth of field " +
-                             ssWords,
-               "the log line for a refused frame below the output: the conditions, the sizes, all three paragraphs");
-        const FlatWarningFlags off = flatWarningFlags(true, false, false);
-        flatComposeSettingsWarning("DLSS", user2, 0, nullptr, nullptr, &logged, off.hdrRoute, off.supersamplingBelowOne);
-        flatFormatSettingsWarningLog(line, sizeof(line), true, "DLSS", "no-known-tone-pass", true, off, 0, 0, 0, 0, logged);
+        flatComposeSettingsWarning("DLSS", rc5, 0, nullptr, nullptr, &logged, shape);
+        flatFormatSettingsWarningLog(line, sizeof(line), false, "DLSS", "render-size-does-not-fit-output", true, shape, logged);
+        expect(std::string(line) == "flat settings warning: shown (mode=DLSS, frames refused for render-size-does-not-fit-output, work "
+                                    "stood down, structure admission on, render 2176x1224 on output 2560x1600): DLSS is not active: "
+                                    "Elite renders 2176x1224 on a 2560x1600 screen. | Set Elite's resolution to your screen's, "
+                                    "2560x1600, and change the render size with its supersampling.",
+               "the log line for a render-size refusal: the conditions, the sizes, both paragraphs");
+        flatComposeSettingsWarning("TAA", rc5, 0, nullptr, nullptr, &logged, taa);
+        flatFormatSettingsWarningLog(line, sizeof(line), true, "TAA", "no-known-tone-pass", true, taa, logged);
+        expect(std::string(line) == "flat settings warning: changed (mode=TAA, frames refused for no-known-tone-pass, work stood down, "
+                                    "structure admission on, TAA above the output (render 3840x2160, output 2560x1440)): TAA is not "
+                                    "active: Elite's post-processing is not recognised. | Please send your logs (F10 in the cockpit, "
+                                    "then the installer's log bundle). | " + std::string(kFlatTaaAboveWords),
+               "the log line for TAA above the output: the conditions, the sizes, all three paragraphs");
+        FlatWarningCause off;
+        flatComposeSettingsWarning("DLSS", rc5, 0, nullptr, nullptr, &logged, off);
+        flatFormatSettingsWarningLog(line, sizeof(line), true, "DLSS", "no-known-tone-pass", true, off, logged);
         expect(std::string(line) == "flat settings warning: changed (mode=DLSS, frames refused for no-known-tone-pass, work stood "
-                                    "down): DLSS is not active: Elite's post-processing is not recognised. Turn off in Elite's "
+                                    "down): DLSS is not active: Elite's post-processing is not recognised. | Turn off in Elite's "
                                     "graphics options: Bloom, Depth of field",
-               "without the paragraph the log line is what it always was");
-        const FlatWarningFlags routeOn = flatWarningFlags(true, true, true);
-        flatComposeSettingsWarning("DLSS", user1, 0, nullptr, nullptr, &logged, routeOn.hdrRoute, routeOn.supersamplingBelowOne);
-        flatFormatSettingsWarningLog(line, sizeof(line), false, "DLSS", "no-hdr-consumer", false, routeOn, 3072, 1728, 3840, 2160, logged);
-        expect(std::string(line).find("HDR route active") != std::string::npos &&
-                   std::string(line).find("supersampling") == std::string::npos &&
-                   std::string(line).find("Supersampling") == std::string::npos,
-               "with the route active the log line says so and names no supersampling");
-        expect(!flatWarningFlags(false, false, true).supersamplingBelowOne && !flatWarningFlags(false, true, true).hdrRoute,
-               "frames not refused: no condition holds, whatever the runtime published");
+               "with the key off the log line is what it always was, but for the separator between paragraphs");
     }
 
     // ---- real files ------------------------------------------------------------------------

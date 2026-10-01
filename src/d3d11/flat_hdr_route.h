@@ -197,11 +197,18 @@ inline FlatHdrFrameVerdict flatHdrFrameVerdict(const FlatHdrFrame& f) {
 }
 
 // ---- the selector ----------------------------------------------------------------------------
+// How the selector bounds the scene's render size R against the output D. The HDR route resolves at R, so it needs R >= D
+// (HdrExtent otherwise: the copy route and its whitelist serve a smaller R, decision (c) of section 81). The copy's
+// admission by structure (flat_copy_structure.h, section 83) is the one that serves it: the game's own final copy scales R
+// to D, so any uniform R from half to twice D works there (RenderSize otherwise, with the measured sizes).
+enum class FlatHdrExtentGate : uint8_t { RenderAtLeastOutput, UniformHalfToDouble };
 // flatSelectMonoFrame's sibling, run at the trigger over the records so far: H and its camera, the
 // supported pool sources, one depth, one camera hash, in order, without the tone and copy requirements
 // and with the extent gate R >= D. A refusal keeps the selector's own reason; the copy route is then
-// the frame's only route, as before.
-inline FlatMonoFrame flatSelectHdrFrame(const FlatMonoFrameInput& in, const void* hdrResource, uint32_t consumerSeq) {
+// the frame's only route, as before. `consumerSeq` is the place every H draw and every source must precede: the trigger
+// draw's, for the route; the first draw into the copy's source, for the copy structure.
+inline FlatMonoFrame flatSelectHdrFrame(const FlatMonoFrameInput& in, const void* hdrResource, uint32_t consumerSeq,
+                                        FlatHdrExtentGate gate = FlatHdrExtentGate::RenderAtLeastOutput) {
     using namespace flat_mono_detail;
     FlatMonoFrame out{};
     out.frame = in.frame; out.epoch = in.epoch;
@@ -248,11 +255,20 @@ inline FlatMonoFrame flatSelectHdrFrame(const FlatMonoFrameInput& in, const void
     // A target past twice the output or off the output's aspect is no scene extent either. The refusal carries the
     // measured sizes (H's and the output's): the F8 warning names supersampling below 1.0 from them, not from
     // Elite's settings file.
-    if (w < in.outputWidth || h < in.outputHeight || w > in.outputWidth * 2 || h > in.outputHeight * 2 ||
-        !flatUniformScale(w, h, in.outputWidth, in.outputHeight)) {
+    if (gate == FlatHdrExtentGate::RenderAtLeastOutput) {
+        if (w < in.outputWidth || h < in.outputHeight || w > in.outputWidth * 2 || h > in.outputHeight * 2 ||
+            !flatUniformScale(w, h, in.outputWidth, in.outputHeight)) {
+            out.renderWidth = w; out.renderHeight = h;
+            out.outputWidth = in.outputWidth; out.outputHeight = in.outputHeight;
+            return refuse(FlatMonoReason::HdrExtent);
+        }
+    } else if (!flatUniformScale(w, h, in.outputWidth, in.outputHeight) || w * 2 < in.outputWidth ||
+               h * 2 < in.outputHeight || w > in.outputWidth * 2 || h > in.outputHeight * 2) {
+        // The whitelist's own bound on the tone target (flatSelectMonoFrame): a uniform scale of the output between half
+        // and twice, per axis.
         out.renderWidth = w; out.renderHeight = h;
         out.outputWidth = in.outputWidth; out.outputHeight = in.outputHeight;
-        return refuse(FlatMonoReason::HdrExtent);
+        return refuse(FlatMonoReason::RenderSize);
     }
     if (!hdrCameraDraws) return refuse(FlatMonoReason::NoHdrCamera);
     float camera[6][4];
@@ -300,11 +316,13 @@ inline FlatMonoFrame flatSelectHdrFrame(const FlatMonoFrameInput& in, const void
     return out;
 }
 
-// The prefix model's records at the trigger, assembled the way the copy branch assembles them for the copy
-// route (flatRuntimeObserve) and run through flatSelectHdrFrame. `consumer` is the trigger draw's record.
+// The prefix model's records at a draw, assembled the way the copy branch assembles them for the copy
+// route (flatRuntimeObserve) and run through flatSelectHdrFrame. `consumerSeq` is the place every H draw and every
+// source must precede and `gate` the extent bound (flatSelectHdrRoute below is the trigger's, the route's own).
 // A conflict the model recorded on H is kept as the witness, as the copy route keeps it.
-inline FlatMonoFrame flatSelectHdrRoute(FlatRuntimePrefix& p, const FlatHdrFrame& f,
-                                        bool (*supportedPair)(uint64_t, uint64_t)) {
+inline FlatMonoFrame flatSelectHdrRouteAt(FlatRuntimePrefix& p, const FlatHdrFrame& f,
+                                          bool (*supportedPair)(uint64_t, uint64_t), uint32_t consumerSeq,
+                                          FlatHdrExtentGate gate) {
     using namespace flat_mono_detail;
     FlatMonoFrame out{}; out.frame = out.epoch = p.frame;
     if (!f.triggered) { out.reason = FlatMonoReason::NoHdrConsumer; return out; }
@@ -324,7 +342,7 @@ inline FlatMonoFrame flatSelectHdrRoute(FlatRuntimePrefix& p, const FlatHdrFrame
     FlatMonoFrameInput in{}; in.world = records; in.worldCount = n;
     in.output = p.output; in.outputWidth = p.width; in.outputHeight = p.height; in.outputFormat = p.format;
     in.frame = in.epoch = p.frame; in.supportedPair = supportedPair;
-    out = flatSelectHdrFrame(in, f.trigger.hdr, f.trigger.sequence);
+    out = flatSelectHdrFrame(in, f.trigger.hdr, consumerSeq, gate);
     if (out.reason == FlatMonoReason::ConflictingHdr) {
         auto& wit = p.selectedConflict;
         wit.hdr = target->resource; wit.sequence = target->hdrCamera ? target->tone.first : target->writes.first;
@@ -336,6 +354,11 @@ inline FlatMonoFrame flatSelectHdrRoute(FlatRuntimePrefix& p, const FlatHdrFrame
             ? FlatRuntimeConflict::SelectorCamera : FlatRuntimeConflict::SelectorLayout;
     }
     return out;
+}
+// The route's own selection, at its trigger: every H draw and source before the trigger draw, R >= D.
+inline FlatMonoFrame flatSelectHdrRoute(FlatRuntimePrefix& p, const FlatHdrFrame& f,
+                                        bool (*supportedPair)(uint64_t, uint64_t)) {
+    return flatSelectHdrRouteAt(p, f, supportedPair, f.trigger.sequence, FlatHdrExtentGate::RenderAtLeastOutput);
 }
 
 // ---- the route's gate ----------------------------------------------------------------------------
@@ -360,17 +383,9 @@ inline FlatFrameSeen flatHdrTriggerSeen(const FlatMonoFrame& selection, FlatMono
         ? FlatFrameSeen::Treatable : FlatFrameSeen::None;
 }
 
-// ---- supersampling below 1.0 (the F8 warning's extra line) --------------------------------------------------
-// With the key auto, the route leaves a frame to the copy route for one reason a user can change: the game renders
-// below the output (R < D, Elite's supersampling under 1.0), and at 1.0 or above the route would resolve before
-// bloom and depth of field. Whether the warning says so: the key is auto, the route is not treating frames, and the
-// MEASURED render size (H's extent at the trigger) is below the output's (the swap chain's) on both axes. The sizes
-// are the route's own measurements, not Elite's settings file. The caller adds "frames are being refused".
-inline bool flatHdrSupersamplingAdvice(FlatHdrKey key, bool routeActive, uint32_t renderW, uint32_t renderH,
-                                       uint32_t outputW, uint32_t outputH) {
-    return key == FlatHdrKey::Auto && !routeActive && renderW && renderH && outputW && outputH &&
-           renderW < outputW && renderH < outputH;
-}
+// ---- the scene's and the output's sizes, for the panel ------------------------------------------------------
+// (The F8 warning once advised raising Elite's supersampling to 1.0 when the game rendered below the output. Below 1.0
+// is served now, by the copy's admission by structure, flat_copy_structure.h; the advice and its predicate are gone.)
 // The four sizes in one 64-bit word, 16 bits each (a size past 65535 cannot be a screen), 0 meaning "not the case":
 // what the runtime publishes for the panel thread to read without a lock.
 inline uint64_t flatHdrPackSizes(uint32_t renderW, uint32_t renderH, uint32_t outputW, uint32_t outputH) {

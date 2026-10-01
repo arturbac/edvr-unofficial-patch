@@ -495,6 +495,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\oculus_route.cpp" ^
     "src\d3d11\menu_keys.cpp" ^
     "src\d3d11\menu_panel.cpp" "src\d3d11\perf_monitor.cpp" "src\d3d11\native_perf_history.cpp" "src\d3d11\native_benchmark_collector.cpp" ^
+    "src\d3d11\stall_watch.cpp" ^
     "src\d3d11\native_menu.cpp" ^
     "src\d3d11\native_temporal.cpp" "src\d3d11\flat_temporal.cpp" "src\d3d11\flat_compute_capture.cpp" "src\d3d11\flat_compute_readback.cpp" ^
     "src\d3d11\flat_runtime.cpp" "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
@@ -551,7 +552,6 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\intro_skip.cpp" ^
     "src\d3d11\intro_upscale.cpp" ^
     "src\d3d11\temporal_pass.cpp" ^
-    "src\d3d11\celestial_motion.cpp" ^
     "src\d3d11\depth_probe.cpp" ^
     "src\d3d11\luma_probe.cpp" ^
     "src\d3d11\dlaa.cpp" ^
@@ -683,7 +683,7 @@ set "RUN_JOBS_ARGS="
 if defined EDVR_JOBS set "RUN_JOBS_ARGS=--jobs %EDVR_JOBS%"
 python tools\run_jobs.py --self-test || exit /b 1
 python tools\run_jobs.py --script "%ROOT%\build.bat" --times "%BUILD%\rig_times.json" ^
-    --exe-dir "%BUILD%" --quiet native_timing_test,gpu_timing_test,gpu_census_test,vtable_test ^
+    --exe-dir "%BUILD%" --quiet native_timing_test,gpu_timing_test,gpu_census_test,vtable_test,stall_sampler_test ^
     --after openxr_module_test=openxr_exports_test ^
     %RUN_JOBS_ARGS% || exit /b 1
 
@@ -955,6 +955,9 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
 if errorlevel 1 ( echo [edvr] ERROR: native temporal test build failed & exit /b 1 )
 "%BUILD%\native_temporal_test.exe" --dry-run || exit /b 1
 "%BUILD%\native_temporal_test.exe" --self-test || exit /b 1
+REM The jitter phase count (experimental.temporal_aa_jitter_follows_upscale): the same channel code flown through a script of modes, sizes
+REM and live key flips in a process of its own, because the provider's channel pool holds sixteen and --self-test uses them all.
+"%BUILD%\native_temporal_test.exe" --phase-count-self-test || exit /b 1
 cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /I"third_party\openxr\include" ^
     /Fo"%OBJ%\native_temporal\\" /Fe"%BUILD%\native_temporal_gpu_test.exe" ^
@@ -1097,6 +1100,87 @@ if errorlevel 1 ( echo [edvr] ERROR: crash_context_test build failed & exit /b 1
 "%BUILD%\crash_context_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_freeze_log_test
+echo [edvr] === freeze_log_test.exe ===
+REM Build gate for the freeze logging (src\common\freeze_book.h, src\openxr\long_cycle_line.h,
+REM docs\freeze-diagnostics-2026-10-01.md, issue 63): the size buckets, the judge that tells a one-frame
+REM Present-gap blip from a stall by the runtime's cycle, the write rule (a frame of 250 ms or more always
+REM has its line), the book's counts and worst list, the runtime's rate limit and its three new lines, and by
+REM source text that the glue in perf_monitor.cpp, native_runtime_host.h and native_timing.cpp still calls them.
+REM It links nothing of the DLLs. tools\freeze_log_test\mutants.py --self-test holds the mutation list to the
+REM sources as they are; --run builds the rig against each edit and needs the MSVC toolchain.
+if not exist "%OBJ%\freezelog" mkdir "%OBJ%\freezelog"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\common" /I"src\openxr" ^
+    /Fo"%OBJ%\freezelog"\ /Fe"%OBJ%\freezelog\freeze_log_test.exe" ^
+    "tools\freeze_log_test\freeze_log_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: freeze_log_test build failed & exit /b 1 )
+"%OBJ%\freezelog\freeze_log_test.exe" --dry-run || exit /b 1
+"%OBJ%\freezelog\freeze_log_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\freeze_log_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
+:rig_heartbeat_writer_test
+echo [edvr] === heartbeat_writer_test.exe ===
+REM Build gate for the breadcrumb heartbeat's writer thread (src\common\heartbeat_writer.h, src\common\proxy.cpp,
+REM docs\freeze-diagnostics-2026-10-01.md, issue 63): the heartbeat's file write is off the render thread, and the
+REM file still MEANS what it meant. The sink never runs on the posting thread and a sink stuck for 600 ms does not
+REM slow post(); a writer held up writes the newest post and never an older one after a newer; it writes nothing of
+REM its own (a hung render thread stops the heartbeat); a record is whole; close and closeAndDrain drop what is
+REM pending and wait, for a bounded time, for what has begun; through the real breadcrumbHeartbeat and the real
+REM breadcrumb file; a child that crashes (the file's last line is the crash filter's, never a heartbeat) and one
+REM that is killed (the last line is a whole heartbeat); and by source text that the render thread's function
+REM writes no file and DllMain and the crash filter close the heartbeat before their closing lines. The rig's
+REM exe lives in its own obj directory so edvr_breadcrumbs.txt, which is written beside the exe, is its own.
+REM tools\heartbeat_writer_test\mutants.py --self-test holds the mutation list to the sources as they are.
+if not exist "%OBJ%\heartbeat" mkdir "%OBJ%\heartbeat"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\common" ^
+    /Fo"%OBJ%\heartbeat"\ /Fe"%OBJ%\heartbeat\heartbeat_writer_test.exe" ^
+    "tools\heartbeat_writer_test\heartbeat_writer_test.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" "src\common\proxy.cpp" ^
+    /link /INCREMENTAL:NO user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: heartbeat_writer_test build failed & exit /b 1 )
+"%OBJ%\heartbeat\heartbeat_writer_test.exe" --dry-run || exit /b 1
+"%OBJ%\heartbeat\heartbeat_writer_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\heartbeat_writer_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
+:rig_stall_sampler_test
+if "%EDVR_RIG_STEP%"=="run" goto stall_sampler_test_run
+echo [edvr] === stall_sampler_test.exe ===
+REM Build gate for the stall sampler (src\common\stall_sampler.h, src\d3d11\stall_watch.cpp,
+REM docs\freeze-diagnostics-2026-10-01.md, issue 63): the REAL capture, walk and naming code against threads the rig
+REM blocks in places it knows -- a Sleep, a wait, a busy loop in this exe, a busy loop in stall_target.dll (so a
+REM module that is not the exe is named), a stack 21 KB deep that uses RBP as its frame register -- and that the
+REM thread it stopped is ALWAYS running again (a failed context read, a stack pointer outside the stack, an exited
+REM thread, three hundred stops in a row); that the walk reads the COPY (the thread has run on and overwritten the
+REM stack, and the sample still names its frames); the watchdog end to end on a real clock (1.3 s of stall, three
+REM samples at 150/500/1000 ms); the policy on a fake one (thresholds, rate limit, session cap); and by source text
+REM that no injection-shaped API appears and the window between the stop and the resume is straight-line. It holds
+REM wall-clock intervals against a real thread, so it is a --quiet rig: its compiles run in the pool and its run
+REM alone, after the others. tools\stall_sampler_test\mutants.py --self-test holds the mutation list to the sources
+REM as they are; --run builds the rig against each edit (about four minutes, serial: it is judged by the clock).
+if not exist "%OBJ%\stallsampler" mkdir "%OBJ%\stallsampler"
+cl.exe /nologo /O2 /MT /LD /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\stallsampler"\ /Fe"%OBJ%\stallsampler\stall_target.dll" ^
+    "tools\stall_sampler_test\stall_target_dll.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: stall_target.dll build failed & exit /b 1 )
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\common" ^
+    /Fo"%OBJ%\stallsampler"\ /Fe"%OBJ%\stallsampler\stall_sampler_test.exe" ^
+    "tools\stall_sampler_test\stall_sampler_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: stall_sampler_test build failed & exit /b 1 )
+if "%EDVR_RIG_STEP%"=="build" exit /b 0
+:stall_sampler_test_run
+"%OBJ%\stallsampler\stall_sampler_test.exe" --dry-run || exit /b 1
+"%OBJ%\stallsampler\stall_sampler_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\stall_sampler_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
 :rig_flat_temporal_test
 echo [edvr] === flat_temporal_test.exe ===
 if not exist "%OBJ%\flattemporaltest" mkdir "%OBJ%\flattemporaltest"
@@ -1106,6 +1190,10 @@ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     "third_party\dxbc_hash\DxilHash.cpp" ^
     /link /INCREMENTAL:NO kernel32.lib
 if errorlevel 1 ( echo [edvr] ERROR: flat temporal test build failed & exit /b 1 )
+REM --write-fixture regenerates tools\flat_upscale_fixture.log (design doc section 83); anything that writes a file takes --dry-run,
+REM and --dry-run writes nothing at all.
+"%BUILD%\flat_temporal_test.exe" --write-fixture "%OBJ%\flattemporaltest\never_written.log" --dry-run || exit /b 1
+if exist "%OBJ%\flattemporaltest\never_written.log" ( echo [edvr] ERROR: flat_temporal_test --write-fixture --dry-run wrote a file & exit /b 1 )
 "%BUILD%\flat_temporal_test.exe" --self-test || exit /b 1
 exit /b 0
 
@@ -1417,6 +1505,12 @@ if errorlevel 1 ( echo [edvr] ERROR: temporal_test build failed & exit /b 1 )
     echo [edvr] ERROR: the temporal pass's arithmetic is wrong
     exit /b 1
 )
+REM The jitter phase count (experimental.temporal_aa_jitter_follows_upscale, 2026-10-01) is pinned by this rig (the rule's table and
+REM the fixed eight's bit-for-bit sameness), flat_temporal_test (the phase machine and the route decision), vr_world_route_test (the
+REM window token) and native_temporal_test --phase-count-self-test (the VR eye pass flown on WARP). The self-test below holds the
+REM mutation list that proves those rigs fail on a broken source to the sources as they are and to the way build.bat compiles each
+REM rig; its --run (on demand) builds each against one edited production file. Drop it with the key.
+python "tools\temporal_test\jitter_phase_mutants.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_ui_depth
@@ -1552,19 +1646,23 @@ if errorlevel 1 ( echo [edvr] ERROR: stellar motion test build failed & exit /b 
 "%OBJ%\stellarmotion\stellar_motion_test.exe" || exit /b 1
 exit /b 0
 
-:rig_terrain_motion
-echo [edvr] === terrain motion regression ===
-if not exist "%OBJ%\terrainmotion" mkdir "%OBJ%\terrainmotion"
-cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 ^
-    /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
-    /Fo"%OBJ%\terrainmotion\\" /Fe"%OBJ%\terrainmotion\celestial_motion_test.exe" ^
-    "tools\celestial_motion_test\celestial_motion_test.cpp" ^
-    "src\d3d11\gpu_timing.cpp" "src\d3d11\gpu_span_d3d11.cpp" ^
-    /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib
-if errorlevel 1 ( echo [edvr] ERROR: terrain motion test build failed & exit /b 1 )
-"%OBJ%\terrainmotion\celestial_motion_test.exe" || exit /b 1
-python "tools\terrain_motion.py" --self-test || exit /b 1
-python "tools\terrain_motion.py" "%OBJ%\terrainmotion\eye_fixture_Terrain.bin" --verify-fixture || exit /b 1
+:rig_terrain_retired_test
+echo [edvr] === terrain retirement A/B ===
+REM The proof of the 2026-10-01 retirement of advanced.terrain_motion (docs\terrain-motion-dispatch-cost-2026-09-17.md): the
+REM temporal compute shader before the cut, rebuilt from the current text and the removed fragments, and after it, run on WARP over
+REM scenes that carry terrain-like pixels, give byte-identical outputs for both entries with probe.w bit 8 clear -- every player
+REM without the key. It compiles the shader twelve ways on twelve threads (the `main` entry alone is about 20 s in fxc) and runs
+REM about 20 s. It exists for that one edit and goes when its anchors move (the rig says so); --verify-old, run once by hand with the
+REM pre-retirement file, ties the rebuilt reference to the real old text.
+if not exist "%OBJ%\terrainretired" mkdir "%OBJ%\terrainretired"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /DUNICODE /D_UNICODE /utf-8 ^
+    /Fo"%OBJ%\terrainretired\\" /Fe"%OBJ%\terrainretired\terrain_retired_test.exe" ^
+    "tools\terrain_retired_test\terrain_retired_test.cpp" ^
+    /link /INCREMENTAL:NO d3d11.lib d3dcompiler.lib dxguid.lib
+if errorlevel 1 ( echo [edvr] ERROR: terrain retirement test build failed & exit /b 1 )
+"%OBJ%\terrainretired\terrain_retired_test.exe" --dry-run || exit /b 1
+"%OBJ%\terrainretired\terrain_retired_test.exe" || exit /b 1
 exit /b 0
 
 :rig_depth_scene_pick_test

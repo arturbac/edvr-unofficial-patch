@@ -26,6 +26,7 @@
 #include "../common/proxy.h"
 #include "../common/timing.h"
 #include "../common/temporal_mode.h"
+#include "../common/vr_supersample_notice.h"
 #include "../common/vscreen_fit.h"
 #include "device_hook.h"
 #include "elite_binds.h"
@@ -43,6 +44,7 @@
 #include "perf_monitor.h"
 #include "sharpen_pass.h"
 #include "temporal_pass.h"
+#include "vscreen.h"        // vScreenRenderBelowEye: Elite's Supersampling below 1, from the sizes
 #include "vscreen_res.h"
 // fsr3_engine.h is deliberately NOT included: the Temporal AA status line
 // reaches AMD's price and its name through temporal_pass.h's
@@ -183,12 +185,15 @@ struct State {
     bool        flatSettingsForce = false;
     bool        flatWarnActive = false;
     std::string flatWarnKey;
-    // The conditions the words were built from (route treating, supersampling below 1.0): set with the key, which
-    // carries both, so the panel and the log say what the key says.
-    FlatWarningFlags flatWarnFlags;
+    // The conditions the words were built from (structure admission, a render size that does not fit, EDVR's TAA above the
+    // output, with the measured sizes): set with the key, which carries all of it, so the panel and the log say what the key says.
+    FlatWarningCause flatWarnCause;
     int         flatWarnLogged = 0;
     // The graphics-wrapper note (flat_wrapper_note.h): said once in the log when it is first drawn.
     bool        flatWrapperNoteLogged = false;
+    // Elite's Supersampling below 1.0 in VR (vr_supersample_notice.h, design section 83): the headset toast is said once a
+    // session, the Status line and the settings pages' note whenever vScreen has measured it. Never in a flat session.
+    bool        vrSupersamplingToasted = false;
     float alpha = 0.0f;
     uint64_t openedMs = 0;
     uint64_t lastInputMs = 0;
@@ -988,9 +993,10 @@ std::string displayValue(const MenuRowDef& d, const std::string& v) {
 // ---------------------------------------------------------------------------
 // The flat panel's settings warning (flat_elite_settings.h). Shown only while a
 // temporal mode is selected and the runtime has stood its work down for the shape
-// of a post chain whose output copy it found (flatRuntimeStructuralRefusal, which
-// follows the stand-down and nothing else): a treated session, a session that is
-// merely starting, and a loading screen see nothing.
+// of a post chain whose output copy it found, or for a render size that does not fit
+// the output (flatRuntimeStructuralRefusal, which follows the stand-down and nothing
+// else): a treated session, a session that is merely starting (no scene yet), and a
+// loading screen see nothing.
 
 constexpr int kFlatWarnLogMax = 24;
 
@@ -1034,31 +1040,31 @@ void flatWarningTick(uint64_t now) {
         }
     }
     const std::string label = refusing ? flatModeLabel() : std::string();
-    // Which of the warning's conditions hold (flat_elite_settings.h, flatWarningFlags). The HDR route treating this
-    // session's frames means the refusal is not about bloom or depth of field, so those are not named. The game
-    // rendering below the output with the route's key auto adds the supersampling paragraph; both come from the runtime's
-    // own measurements (the render and output sizes it saw at its trigger), never from Elite's settings file.
+    // Which of the warning's conditions hold (flat_elite_settings.h, flatWarningCause). The route's key being auto means the
+    // game's final copy is admitted by its structure, so a refusal is not about bloom or depth of field and those are not
+    // named. A refusal for the render size says the sizes; EDVR's TAA above the output says what to set. All of it comes from
+    // the runtime's own measurements (the scene's and the output's sizes at the final copy), never from Elite's settings file.
     uint32_t renderW = 0, renderH = 0, outputW = 0, outputH = 0;
-    const bool belowOutput = refusing && flatRuntimeHdrRouteBelowOutput(&renderW, &renderH, &outputW, &outputH);
-    const FlatWarningFlags flags = flatWarningFlags(refusing, refusing && flatRuntimeHdrRouteActive(), belowOutput);
-    const std::string key = refusing ? flatSettingsWarningKey(label.c_str(), s.flatSettings.settings(), flags.hdrRoute,
-                                                              flags.supersamplingBelowOne)
+    const bool sizesKnown = refusing && flatRuntimeSceneSizes(&renderW, &renderH, &outputW, &outputH);
+    const bool renderSizeReason = refusing && std::strcmp(reason, flatMonoReasonName(FlatMonoReason::RenderSize)) == 0;
+    const FlatWarningCause cause = flatWarningCause(refusing, refusing && flatRuntimeStructureAdmission(),
+                                                    refusing && flatRuntimeTaaAboveOutput(), renderSizeReason, sizesKnown,
+                                                    renderW, renderH, outputW, outputH);
+    const std::string key = refusing ? flatSettingsWarningKey(label.c_str(), s.flatSettings.settings(), cause)
                                      : std::string();
     if (refusing == s.flatWarnActive && key == s.flatWarnKey) return;
     const bool was = s.flatWarnActive;
     s.flatWarnActive = refusing;
     s.flatWarnKey = key;
-    s.flatWarnFlags = flags;
+    s.flatWarnCause = cause;
     s.contentDirty = true;
     if (s.flatWarnLogged >= kFlatWarnLogMax) return;
     ++s.flatWarnLogged;
     if (refusing) {
         FlatSettingsWarning w;
-        flatComposeSettingsWarning(label.c_str(), s.flatSettings.settings(), 0, nullptr, nullptr, &w, flags.hdrRoute,
-                                   flags.supersamplingBelowOne);
+        flatComposeSettingsWarning(label.c_str(), s.flatSettings.settings(), 0, nullptr, nullptr, &w, cause);
         char line[900];
-        flatFormatSettingsWarningLog(line, sizeof(line), was, label.c_str(), reason, standing, flags, renderW, renderH,
-                                     outputW, outputH, w);
+        flatFormatSettingsWarningLog(line, sizeof(line), was, label.c_str(), reason, standing, cause, w);
         Log::get().note("%s", line);
     } else {
         Log::get().note("flat settings warning: hidden (the work is not stood down for the shape of "
@@ -1934,6 +1940,13 @@ void buildContent(MenuContent& c) {
         c.compact = true;
         snprintf(c.hint, sizeof(c.hint), "%s",
                  "The page a support thread will ask to see. Tab or PageDown for the next page.");
+        {
+            // Elite's Supersampling below 1.0 (VR; vr_supersample_notice.h, design section 83), when vScreen has measured the
+            // world rendered under the eye texture: the open menu says it HERE, in the hint this page has anyway. A line of its
+            // own, or a note on a settings page, would take the bitmap past the 2048-px guard on the Pimax (see the header).
+            uint32_t rw = 0, rh = 0, ew = 0, eh = 0;
+            if (vScreenRenderBelowEye(&rw, &rh, &ew, &eh)) vrss::formatStatusHint(c.hint, sizeof(c.hint));
+        }
     } else {
         // The tooltip waits for the look or the hand to settle on one row:
         // it is an explanation for someone who has stopped, not something
@@ -2148,8 +2161,7 @@ void buildContent(MenuContent& c) {
             const int width = c.cardPx - 2 * (c.capPx * 8 / 10);
             FlatSettingsWarning warning;
             flatComposeSettingsWarning(flatModeLabel().c_str(), s.flatSettings.settings(), width,
-                                       &flatWarnMeasure, &ruler, &warning, s.flatWarnFlags.hdrRoute,
-                                       s.flatWarnFlags.supersamplingBelowOne);
+                                       &flatWarnMeasure, &ruler, &warning, s.flatWarnCause);
             if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;
             for (int i = 0; i < warning.count && c.lineCount < kMenuMaxLines; ++i) {
                 MenuLine& l = c.lines[c.lineCount++];
@@ -3698,6 +3710,28 @@ void menuTick(ID3D11Device* dev) {
         perfMonitorSetActive(s.open && s.pages[s.page].monitor);
         // Writes the worker finished since last frame.
         drainWrites();
+
+        // Elite's Supersampling below 1.0 (vr_supersample_notice.h, design section 83): once vScreen has measured the world
+        // rendered under the eye texture, the headset says so once a session as a toast (the menu's own notice, with the log
+        // line vScreen wrote; the open menu keeps it as the Status page's hint). Gated on menu.toasts like every toast, and
+        // this is the VR branch: the flat profile returned above and never reaches it.
+        if (!s.vrSupersamplingToasted) {
+            uint32_t rw = 0, rh = 0, ew = 0, eh = 0;
+            if (vScreenRenderBelowEye(&rw, &rh, &ew, &eh)) {
+                s.vrSupersamplingToasted = true;
+                if (s.toasts) {
+                    char toast[96];
+                    vrss::formatToast(toast, sizeof(toast));
+                    s.toastQueue.push_back(toast);
+                    Log::get().note("vr supersampling: the headset notice is queued as a toast (\"%s\"); the Status page shows the "
+                                    "advice as its hint while the menu is open.", toast);
+                } else {
+                    Log::get().note("vr supersampling: menu.toasts is off, so no toast; the Status page shows the advice as its "
+                                    "hint while the menu is open.");
+                }
+                s.contentDirty = true;
+            }
+        }
 
         // The summon key: EDVR's own, focus-gated. With Shift, recentre.
         if (s.summon.pressed()) {

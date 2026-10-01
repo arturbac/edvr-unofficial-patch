@@ -32,30 +32,29 @@ unsigned occurrenceCapFor(GpuCensusSection section) noexcept {
 // 1..8) -- DoorTemporalWhole (index 0) has no slot of its own; it is the
 // "whole" that four of these nest inside (see gpuCensusLogLine).
 constexpr const char* kDoorBreakdownNames[8] = {
-    "upscaler", "motion prep", "hologram resolve+celestial", "UI resolve",
+    "upscaler", "motion prep", "hologram resolve", "UI resolve",
     "sharpen", "menu", "UI layer composite", "FSS heal"
 };
-// The in-frame breakdown, FrameHologramPasses..FrameUiLayerHdrSeed (indices 9..17): the item names, in the
+// The in-frame breakdown, FrameHologramPasses..FrameUiLayerHdrSeed (indices 9..16): the item names, in the
 // sections' order. "HDR HUD depth-stencil seed" is the name the UI layer's own 30 s line gives the same stage.
 constexpr const char* kFrameBreakdownNames[] = {
-    "hologram passes", "UI depth coverage", "planet", "terrain",
+    "hologram passes", "UI depth coverage", "planet",
     "screen motion", "weapon motion", "engine velocity",
     "UI layer reissues", "HDR HUD depth-stencil seed",
     "world resolve", "world mips", "world layer"
 };
 constexpr size_t kFrameSections = sizeof(kFrameBreakdownNames) / sizeof(kFrameBreakdownNames[0]);
 // Elite's own draws that EDVR alters (gpu_census.h): the game's draws timed whole, so they are
-// reported on their own lines and never summed into EDVR's total. AlteredPoolFamily,
-// AlteredTerrain and AlteredUiLayer are one class each (indices 18..20); the draws another fix
-// wraps are one section per fix from AlteredFixFirst on (indices 21..36), reported as one item
-// on the classes' line (their sum) and one by one on the line after it.
+// reported on their own lines and never summed into EDVR's total. AlteredPoolFamily and
+// AlteredUiLayer are one class each (indices 20..21); the draws another fix wraps are one
+// section per fix from AlteredFixFirst on (indices 22..37), reported as one item on the
+// classes' line (their sum) and one by one on the line after it.
 constexpr size_t kAlteredFirst = static_cast<size_t>(GpuCensusSection::AlteredPoolFamily);
 constexpr size_t kSeedSection = static_cast<size_t>(GpuCensusSection::FrameUiLayerHdrSeed);
 constexpr size_t kAlteredClassSections = static_cast<size_t>(GpuCensusSection::AlteredFixFirst) - kAlteredFirst;
 constexpr size_t kAlteredFixFirst = static_cast<size_t>(GpuCensusSection::AlteredFixFirst);
-constexpr const char* kAlteredNames[3] = {
-    "pool-family draws (EDVR's slot target and shaders)", "terrain prepasses (EDVR's motion target and shader)",
-    "UI draws (redirected to EDVR's layer)"
+constexpr const char* kAlteredNames[2] = {
+    "pool-family draws (EDVR's slot target and shaders)", "UI draws (redirected to EDVR's layer)"
 };
 constexpr const char* kAlteredFixSumName = "other fix-wrapped draws";
 // The fix names, in AlteredFix's order: fixed strings, never built from a draw.
@@ -64,7 +63,7 @@ constexpr const char* kAlteredFixNames[kAlteredFixCount] = {
     "sun glare clamp", "sun glare steady", "particles", "FSS panel", "FSS reveal", "FSS dump",
     "scanner-body resolve", "loading scrim", "menu backdrop", "unnamed fix"
 };
-static_assert(kAlteredClassSections == 3, "one name for each altered-draw class");
+static_assert(kAlteredClassSections == 2, "one name for each altered-draw class");
 // The VR world route's three sections (gpu_census.h) come right after the seed and are the last in-frame ones. The
 // rotation gives none of them a turn until it has been called this window, so a session with the key off samples as it did
 // before they existed.
@@ -418,7 +417,7 @@ void logAndResetWindow(uint64_t now) {
         "EDVR GPU census, the other fix-wrapped draws above by the fix that wraps each (the same draws, the game's own "
         "work in each figure as above): %s; \"-\" means no draw of that fix ran this window.",
         fixItems.c_str());
-    char gapDetail[900];
+    char gapDetail[1100];   // the stalls clause (gpu_frame_gap.h) made 900 too small by about a hundred characters
     formatGapDetail(gapDetail, sizeof(gapDetail), gap);
     Log::get().note("%s", gapDetail);
 

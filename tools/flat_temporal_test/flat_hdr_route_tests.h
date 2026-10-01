@@ -593,22 +593,10 @@ inline int flatHdrRouteTests() {
                "R < D: hdr-route-needs-render-at-least-output, transient");
         expect(lowSel.renderWidth == 2496 && lowSel.renderHeight == 1404 && lowSel.outputWidth == 3840 &&
                lowSel.outputHeight == 2160,
-               "the extent refusal carries the measured render and output sizes (the F8 supersampling line reads them)");
-        // What the runtime publishes from it (flatHdrSupersamplingAdvice): the key, the route, the sizes.
+               "the extent refusal carries the measured render and output sizes (the census line's last-trigger fields read them)");
+        // The sizes the runtime publishes for the panel (the copy admission's scene facts, section 83) pack into one word.
         {
             const uint32_t rW = lowSel.renderWidth, rH = lowSel.renderHeight, dW = lowSel.outputWidth, dH = lowSel.outputHeight;
-            expect(flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, rW, rH, dW, dH) &&
-                       !flatHdrSupersamplingAdvice(FlatHdrKey::Off, false, rW, rH, dW, dH) &&
-                       !flatHdrSupersamplingAdvice(FlatHdrKey::Auto, true, rW, rH, dW, dH),
-                   "supersampling advice: the key auto and the route not treating, with the render below the output; never with the key off");
-            expect(!flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, dW, dH, dW, dH) &&
-                       !flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, dW + 960, dH + 540, dW, dH) &&
-                       !flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, rW, dH, dW, dH) &&
-                       !flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, dW, rH, dW, dH),
-                   "...not at R = D, above it, or with only one axis below (no uniform supersampling)");
-            expect(!flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, 0, 0, dW, dH) &&
-                       !flatHdrSupersamplingAdvice(FlatHdrKey::Auto, false, rW, rH, 0, 0),
-                   "...and not from sizes nobody measured");
             uint32_t a = 0, b = 0, c = 0, d = 0;
             expect(flatHdrUnpackSizes(flatHdrPackSizes(rW, rH, dW, dH), &a, &b, &c, &d) && a == rW && b == rH && c == dW && d == dH &&
                        !flatHdrUnpackSizes(0, &a, &b, &c, &d) && flatHdrPackSizes(0, rH, dW, dH) == 0 &&
@@ -1180,16 +1168,29 @@ inline int flatHdrRouteTests() {
         expect(count(runtime, "flatHdrTriggerSeen(sel, s.engine)") == 1 && count(runtime, "flatFrameSeenFor(") == 1 &&
                    count(runtime, "if (routeSeen == FlatFrameSeen::Treatable) { s.frameSeen = FlatFrameSeen::Treatable;") == 1,
                "the route adds to a frame's stand-down verdict through flatHdrTriggerSeen only; the copy stage is the one other caller of flatFrameSeenFor");
-        expect(count(runtime, "g_hdrBelowOutput.store(") == 4 && count(runtime, "g_hdrBelowOutput.store(0, std::memory_order_release);") == 3 &&
-                   count(runtime, "flatHdrSupersamplingAdvice(s.hdrKey, s.hdrEligible, sel.renderWidth, sel.renderHeight,") == 1,
-               "the measured sizes are published from the selection and cleared by a key change, a resize and a selection at R >= D");
-        expect(count(menu, "const bool belowOutput = refusing && flatRuntimeHdrRouteBelowOutput(&renderW, &renderH, &outputW, &outputH);") == 1 &&
-                   count(menu, "const FlatWarningFlags flags = flatWarningFlags(refusing, refusing && flatRuntimeHdrRouteActive(), belowOutput);") == 1,
-               "the panel reads the published sizes only while frames are refused, through flatWarningFlags");
-        expect(count(menu, "flatSettingsWarningKey(label.c_str(), s.flatSettings.settings(), flags.hdrRoute,") == 1 &&
-                   count(menu, "flatFormatSettingsWarningLog(line, sizeof(line), was, label.c_str(), reason, standing, flags, renderW, renderH,") == 1 &&
-                   count(menu, "s.flatWarnFlags.hdrRoute,") == 1 && count(menu, "s.flatWarnFlags.supersamplingBelowOne);") == 1,
-               "the key, the log line and the panel's words all take the same two conditions");
+        // The F8 supersampling advice (the game rendering below the output) is gone (section 83: below 1.0 is served by the
+        // copy's admission by structure), with its published sizes and the route's eligibility word: nothing of either is left.
+        expect(count(runtime, "g_hdrBelowOutput") == 0 && count(runtime, "hdrEligible") == 0 &&
+                   count(runtime, "flatHdrSupersamplingAdvice") == 0 && count(menu, "flatRuntimeHdrRouteBelowOutput") == 0 &&
+                   count(menu, "flatRuntimeHdrRouteActive") == 0 && count(menu, "supersamplingBelowOne") == 0,
+               "the supersampling advice, its published sizes and the route's eligibility word are gone from the runtime and the panel");
+        // The scene's and the output's sizes the copy stage measures are published for the panel (the admission's scene facts, or the
+        // prefix model's where the admission did not look), written at every final copy that has a scene and cleared by a resize; the
+        // panel reads them only while frames are refused.
+        expect(count(runtime, "g_sceneSizes.store(") == 2 && count(runtime, "g_sceneSizes.store(0, std::memory_order_release);") == 1 &&
+                   count(runtime, "flatHdrPackSizes(sceneW, sceneH, s.prefix.width, s.prefix.height)") == 1 &&
+                   count(runtime, "uint32_t sceneW = diag.sceneWidth, sceneH = diag.sceneHeight;\n    if (!sceneW) {\n"
+                                  "        const FlatSceneFacts facts = flatSceneFacts(s.prefix, s.prefix.width, s.prefix.height);\n"
+                                  "        sceneW = facts.width; sceneH = facts.height;\n    }\n    if (sceneW)\n") == 1,
+               "the scene's measured sizes are published at every final copy that has a scene (the admission's facts, else the prefix model's) and cleared by a resize");
+        expect(count(menu, "const bool sizesKnown = refusing && flatRuntimeSceneSizes(&renderW, &renderH, &outputW, &outputH);") == 1 &&
+                   count(menu, "const FlatWarningCause cause = flatWarningCause(refusing, refusing && flatRuntimeStructureAdmission(),") == 1 &&
+                   count(menu, "refusing && flatRuntimeTaaAboveOutput(), renderSizeReason, sizesKnown,") == 1,
+               "the panel reads the published sizes and the two bits only while frames are refused, through flatWarningCause");
+        expect(count(menu, "flatSettingsWarningKey(label.c_str(), s.flatSettings.settings(), cause)") == 1 &&
+                   count(menu, "flatFormatSettingsWarningLog(line, sizeof(line), was, label.c_str(), reason, standing, cause, w);") == 1 &&
+                   count(menu, "&flatWarnMeasure, &ruler, &warning, s.flatWarnCause);") == 1,
+               "the key, the log line and the panel's words all take the same cause");
         expect(count(menu, "static_assert(static_cast<int>(kFlatPageRowCount) + 1 + FlatSettingsWarning::kMaxLines <= kMenuMaxLines,") == 1,
                "the flat page's rows, a blank line and a full warning are held to the card's lines at compile time");
         // THE DEPTH-VALIDATED STEADY DETAIL on foot (design doc section 82): the flat runtime reads the VR world route's key

@@ -29,6 +29,7 @@
 #include "flat_query_cut_tests.h"
 #include "flat_wrapper_note_tests.h"
 #include "flat_hdr_route_tests.h"
+#include "flat_copy_structure_tests.h"
 #include "flat_hdr_crumbs_tests.h"
 
 #include <cstdio>
@@ -2357,7 +2358,8 @@ void testFlatWarningWiring() {
         {&menuCpp, "if (runtimeFlatProfile() && s.flatWarnActive) {", 1, "the panel draws the warning only while it is active"},
         {&menuCpp, "if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;", 2,
          "the warning, and the wrapper note after it, are note lines below the rows"},
-        {&menuCpp, "FlatWarnRuler ruler{c.capPx * 8 / 7};", 2, "wrapped with the panel's own ruler at the note face's em (both)"},
+        {&menuCpp, "FlatWarnRuler ruler{c.capPx * 8 / 7};", 2,
+         "wrapped with the panel's own ruler at the note face's em (the flat warning and the wrapper note: no VR note takes a line)"},
         {&menuCpp, "flatWarningTick(now);", 1, "the flat tick runs the warning"},
         {&menuCpp, "s.flatSettingsForce = true;", 1, "Elite's files are looked at when the panel opens"},
         {&menuCpp, "s.flatSettings.setFolder(flatEliteGraphicsFolder());", 1, "from %LOCALAPPDATA%, resolved once"},
@@ -2372,8 +2374,9 @@ void testFlatWarningWiring() {
         // The gate itself: the stand-down, for a reason that found an output copy, and no clock.
         {&standdownH, "bool warningActive() const { return standing && flatMonoReasonWarrantsWarning(standReason); }", 1,
          "the warning is on while stood down for a reason that found an output copy"},
-        {&standdownH, "return flatMonoReasonStructural(reason) && reason != FlatMonoReason::NoOutputCopy;", 1,
-         "and never for no-known-output-copy: a startup or loading frame has no final copy"},
+        {&standdownH, "return flatMonoReasonStructural(reason) && reason != FlatMonoReason::NoOutputCopy &&\n"
+                      "           reason != FlatMonoReason::NoScene;", 1,
+         "and never for no-known-output-copy or no-3d-scene: a startup or loading frame has no final copy, or no scene"},
         {&standdownH, "standReason = runReason;", 1, "a stand-down starts with the reason that entered it"},
         {&standdownH, "standReason = reason;", 1, "and follows each probe frame's own finding"},
     };
@@ -2432,7 +2435,7 @@ void testFlatCpuWiring() {
     const Pin pins[] = {
         // Every family the census names has its scope at the entry points that family stands for.
         {&runtimeCpp, "flatcpu::Scope shell(flatcpu::kOther);", 3, "the draw scope (both halves) and the dispatch scope time their own shells"},
-        {&runtimeCpp, "flatcpu::kReduce", 1, "contract reduction times the reducer"},
+        {&runtimeCpp, "flatcpu::kReduce", 2, "contract reduction times the reducer and the final copy's admission by structure"},
         {&runtimeCpp, "flatcpu::kCopyChecks", 2, "the exact-shader verifications and the F10 captures are timed"},
         {&runtimeCpp, "flatcpu::kCameraRows", 2, "the camera lookup and hash, and capture()"},
         {&runtimeCpp, "flatcpu::kTrace", 5, "every trace-ring copy is timed: capture, dispatch, write, record and the HDR route's resolve marker"},
@@ -2906,9 +2909,26 @@ int main(int argc, char** argv) {
         return hdr_route_test::traceChain(argv[2]);
     if (argc == 5 && std::strcmp(argv[1], "--trace-trim") == 0)
         return hdr_route_test::traceTrim(argv[2], argv[3], argv[4]);
+    // The final copy's admission by structure (flat_copy_structure_tests.h): what it makes of each frame of a trace.
+    if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--trace-structure") == 0)
+        return copy_structure_test::traceStructure(argv[2], argc == 4 && std::strcmp(argv[3], "pretend") == 0);
+    // --write-fixture <path> [--dry-run]: regenerate tools\flat_upscale_fixture.log from the formatters. Anything that writes a file
+    // takes --dry-run, and --dry-run writes nothing at all.
+    if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--write-fixture") == 0) {
+        const std::string text = copy_structure_test::flatUpscaleFixtureText();
+        if (argc == 4 && std::strcmp(argv[3], "--dry-run") == 0) {
+            std::printf("flat_temporal_test: --dry-run: would write %zu bytes to %s; wrote nothing\n", text.size(), argv[2]);
+            return 0;
+        }
+        std::ofstream out(argv[2], std::ios::binary | std::ios::trunc);
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        std::printf("flat_temporal_test: wrote %zu bytes to %s\n", text.size(), argv[2]);
+        return out ? 0 : 1;
+    }
     if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) {
         std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir> | --trace-check <file> | --trace-migrate <dir> | "
-                  "--trace-rekey <file|dir> | --trace-chain <file> | --trace-trim <in> <out> <frame[,frame...]>");
+                  "--trace-rekey <file|dir> | --trace-chain <file> | --trace-structure <file> | "
+                  "--trace-trim <in> <out> <frame[,frame...]>");
         return 2;
     }
     failures += flatProjectionViewportTests();
@@ -2963,6 +2983,7 @@ int main(int argc, char** argv) {
     failures += flatQueryCutTests();
     testFlatQueryCutWiring();
     failures += flatHdrRouteTests();
+    failures += flatCopyStructureTests();
     failures += flatHdrCrumbTests();
     failures += flatHdrCrumbWiringTests();
     if (failures) return 1;

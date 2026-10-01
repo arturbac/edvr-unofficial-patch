@@ -677,6 +677,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
             // already dead and may have been holding our spinlock or the heap
             // lock. Do the minimum and leak the rest.
             if (reserved != nullptr) {
+                // First: nothing may be written behind the closing crumb (the heartbeat's writer thread is dead
+                // by now, but a post it never wrote is dropped, not left pending).
+                edvr::breadcrumbHeartbeatClose();
                 edvr::breadcrumb("gfx: process exit");
                 // Getting here at all means the game exited rather than
                 // died, so the sentinel comes down. One DeleteFileW, which
@@ -691,6 +694,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
                 // stays for a host that loads the DLL and lets go of it before
                 // that -- a tool, a rig -- where nothing detached is running yet
                 // and this is the right teardown.
+                edvr::breadcrumbHeartbeatClose();
                 edvr::breadcrumb("gfx: FreeLibrary unload");
                 shutdown();
             }
