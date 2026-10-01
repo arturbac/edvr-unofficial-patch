@@ -131,12 +131,16 @@ W_GUARD = ("    if (panelCurveWants() && srv0IsPanelSized(s, kind, count) &&\n"
            "        !(kind == 'X' && count == 6 && bindingShaderHash(BindSlot::Vs) == kIntroCompositeVsHash)) {\n")
 W_GATE = ("        vscreenFootprintWanted() ||   // the footprint instrument (vscreen_footprint.h): it reads the 2D screen's composite\n"
           "        introCurveWants();")
-W_DIM = ("            if (!(stripIssued && panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced))) {\n"
+W_DIM = ("            if (!(stripIssued && panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced))) {\n"
          "                draw(AlteredDrawClass::None);\n            }\n")
+W_DIM_CALL = "panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced))) {"
+W_REVERSE_DECL = "    bool stripReverseU = false;\n"
+W_MOVIE_ARMED = "            if (introPanelStripArmed()) {\n"
+W_MOVIE_REVERSE = "                stripReverseU = introPanelStripReverseU();\n"
 W_REFUSAL = ("        if (owner && uiLayerIssueBlocked()) return false;\n"
              "        if (stripIssued) return true;   // the strip was issued in its place: nothing more, and something was\n")
 W_CANDIDATE = "if ((v == DrawVerdict::kIntroPanel || g_state->introCurveThisDraw) && owner && panelCurveSurfaceWanted()) {"
-W_STRIP_CALL = "stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced);"
+W_STRIP_CALL = "stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced);"
 W_TICK = ("        tkIntroCurve.run([&] {\n            const bool sceneFrame = g_state->eyeDrawsLastFrame >= kSceneEyeDraws;\n"
           "            introCurveTick(g_state->ownerCtx, sceneFrame);\n            if (sceneFrame) introCurveNoteRetired();\n        });\n")
 W_RETIRE_TEXT = "in all (the movie's, the splash's and the splash dim's re-issues of either)"
@@ -283,8 +287,13 @@ MUTANTS = [
     wiring("iw-site-after-the-game-draw", "strip-site", [(W_OBSERVED, ""), (W_STRIP_START, W_OBSERVED + W_STRIP_START)],
            "the strip is drawn after the game's own issue"),
     wiring("iw-site-dim-is-flat", "strip-site", [(W_DIM, "            draw(AlteredDrawClass::None);\n")], "the splash dim does not follow the strip"),
-    wiring("iw-site-third-call", "strip-site", [(W_END, W_END + "    panelCurveSurfaceDraw(self, 1.0f, 1, g_state->realDrawIndexedInstanced);\n")],
+    wiring("iw-site-third-call", "strip-site", [(W_END, W_END + "    panelCurveSurfaceDraw(self, 1.0f, 1, false, g_state->realDrawIndexedInstanced);\n")],
            "a third place draws the strip"),
+    wiring("iw-site-dim-drops-reverse", "strip-site", [(W_DIM_CALL, "panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced))) {")],
+           "the splash dim's re-issue of the strip drops the u direction"),
+    wiring("iw-site-dim-hardcodes-reverse", "strip-site", [(W_DIM_CALL, "panelCurveSurfaceDraw(self, stripGain, stripToward, false, g_state->realDrawIndexedInstanced))) {")],
+           "the splash dim's re-issue of the strip passes a constant u direction"),
+    wiring("iw-site-reverse-starts-true", "strip-site", [(W_REVERSE_DECL, "    bool stripReverseU = true;\n")], "an unarmed draw's u direction starts as against x"),
     wiring("iw-unarmed-early-return-first", "unarmed-text",
            [(W_REFUSAL, "        if (stripIssued) return true;   // the strip was issued in its place: nothing more, and something was\n"
                         "        if (owner && uiLayerIssueBlocked()) return false;\n")],
@@ -295,8 +304,8 @@ MUTANTS = [
            [("const bool originalIssued=observedDraw(alteredClass", "const bool originalIssued = stripIssued || observedDraw(alteredClass")],
            "originalIssued is no longer observedDraw's answer"),
     wiring("iw-unarmed-dim-ungated", "unarmed-text",
-           [("if (!(stripIssued && panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced))) {",
-             "if (!(panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced))) {")],
+           [("if (!(stripIssued && panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced))) {",
+             "if (!(panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced))) {")],
            "the dim draws the strip even when the main draw's strip did not draw"),
     wiring("iw-candidate-asks-first", "candidate",
            [(W_CANDIDATE, "if (panelCurveSurfaceWanted() && (v == DrawVerdict::kIntroPanel || g_state->introCurveThisDraw) && owner) {")],
@@ -305,12 +314,27 @@ MUTANTS = [
     wiring("iw-args-movie-gain", "strip-args", [("stripGain = introPanelStripGain();", "stripGain = introCurveGain();")], "the movie is drawn at the splash's gain"),
     wiring("iw-args-movie-direction", "strip-args", [("                stripToward = 1;\n", "                stripToward = -1;\n")], "the movie bends the other way"),
     wiring("iw-args-splash-direction", "strip-args", [("stripToward = introCurveToward();", "stripToward = 1;")], "the splash's direction is a constant"),
-    wiring("iw-args-no-draw-function", "strip-args", [(W_STRIP_CALL, "stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward, nullptr);")],
+    wiring("iw-args-movie-reverse-constant", "strip-args", [("stripReverseU = introPanelStripReverseU();", "stripReverseU = true;")],
+           "the movie passes a constant u direction, whatever its placement says"),
+    wiring("iw-args-splash-reverse-constant", "strip-args", [("stripReverseU = introCurveReverseU();", "stripReverseU = true;")],
+           "the splash passes a constant u direction, whatever its constants say"),
+    wiring("iw-args-splash-reverse-is-the-movies", "strip-args", [("stripReverseU = introCurveReverseU();", "stripReverseU = introPanelStripReverseU();")],
+           "the splash passes the movie's u direction"),
+    wiring("iw-args-movie-reverse-is-the-splashs", "strip-args", [(W_MOVIE_REVERSE, "                stripReverseU = introCurveReverseU();\n")],
+           "the movie passes the splash's u direction"),
+    wiring("iw-args-movie-reverse-before-the-arm-test", "strip-args", [(W_MOVIE_REVERSE, ""), (W_MOVIE_ARMED, "            stripReverseU = introPanelStripReverseU();\n" + W_MOVIE_ARMED)],
+           "the movie's u direction is read before its strip is armed (it is valid only while armed)"),
+    wiring("iw-args-call-drops-reverse", "strip-args", [(W_STRIP_CALL, "stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced);")],
+           "the strip's main call passes no u direction"),
+    wiring("iw-args-call-hardcodes-reverse", "strip-args",
+           [(W_STRIP_CALL, "stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward, false, g_state->realDrawIndexedInstanced);")],
+           "the strip's main call passes a constant u direction"),
+    wiring("iw-args-no-draw-function", "strip-args", [(W_STRIP_CALL, "stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, nullptr);")],
            "the strip is drawn through no draw function"),
     wiring("iw-args-past-the-refusal", "strip-args", [("if (stripToward != 0 && !uiLayerIssueBlocked()) {", "if (stripToward != 0) {")],
            "the strip is asked past observedDraw's own refusal"),
     wiring("iw-fallback-always-issued", "fallback",
-           [(W_STRIP_CALL, "panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced);\n            stripIssued = true;")],
+           [(W_STRIP_CALL, "panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced);\n            stripIssued = true;")],
            "the strip counts as issued whatever it returned: the game's quad is never drawn"),
     wiring("iw-fallback-starts-true", "fallback", [("bool stripIssued = false;", "bool stripIssued = true;")], "every draw starts as the strip's"),
     wiring("iw-onfoot-flag-rides", "not-on-foot-flag",

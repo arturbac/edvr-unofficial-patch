@@ -4084,22 +4084,28 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     // dim below follows the strip. The candidate test is two cheap tests, so an ordinary draw pays nothing and at curvature 0 nothing runs; the
     // same refusal observedDraw makes comes first; and a strip that cannot be drawn leaves stripIssued false, so the game's own draw is issued
     // below exactly as it always was -- flat, never missing.
+    // THE THIRD NUMBER is which way the strip's u runs (docs\intro-video.md, the mirror fix): the intro composite's placement runs its +x to the viewer's
+    // LEFT, and the strip, built by the on-foot generator, ran u with x and came out mirrored, so each caller says it from its own placement -- the movie's
+    // from the matrix EDVR built (introPanelStripReverseU), the splash's from the game's constants (introCurveReverseU) -- and never from the other's.
     float stripGain = 0.0f;
     int stripToward = 0;
+    bool stripReverseU = false;
     if ((v == DrawVerdict::kIntroPanel || g_state->introCurveThisDraw) && owner && panelCurveSurfaceWanted()) {
         if (v == DrawVerdict::kIntroPanel) {
             // The movie: its quad is EDVR's, at the splash's half-width, with +z' toward the viewer.
             if (introPanelStripArmed()) {
                 stripGain = introPanelStripGain();
                 stripToward = 1;
+                stripReverseU = introPanelStripReverseU();
             }
         } else {
-            // The splash: the half-width and the direction the game's own constants gave.
+            // The splash: the half-width, the direction and the u direction the game's own constants gave.
             stripGain = introCurveGain();
             stripToward = introCurveToward();
+            stripReverseU = introCurveReverseU();
         }
         if (stripToward != 0 && !uiLayerIssueBlocked()) {
-            stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced);
+            stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced);
             if (seedOutcome.on && stripIssued) {
                 seedOutcome.substituted = true;
                 seedOutcome.known = false;   // the strip's mesh is not the game's draw: its original count is not the strip's
@@ -4201,7 +4207,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
             splashDimBegin(self)) {
             // The dim is the same draw through the dark shader, so it follows the strip when the strip drew this one: the game's flat quad
             // would dim a rectangle over a screen whose edges have come nearer. A strip that fails here leaves the game's own draw.
-            if (!(stripIssued && panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced))) {
+            if (!(stripIssued && panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced))) {
                 draw(AlteredDrawClass::None);
             }
             splashDimEnd(self);
