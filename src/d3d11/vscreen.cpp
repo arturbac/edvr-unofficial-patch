@@ -1508,6 +1508,13 @@ thread_local bool t_uiDepthThisDraw = false;
 // it composes independently of whether the family reissue above also
 // claims this draw.
 thread_local bool t_holoDepthThisDraw = false;
+// This eye draw samples a learned interface surface -- a composite (ui_depth's
+// test, published by uiDepthOnEyeDraw) -- for the layer's census of the
+// composites it leaves in the scene (ui_scene_composites.h). Set by
+// beginPanelOverride, consumed and cleared by forwardWithVerdict's scope, the
+// same take-and-clear the two flags above have, so it is only ever the draw's
+// own.
+thread_local bool t_compositeThisDraw = false;
 
 enum class DrawVerdict {
     kNone, kPanel, kSkip, kRemlok, kHolo,
@@ -1926,6 +1933,7 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     s->curveThisDraw = false;
     s->introCurveThisDraw = false;
     t_uiDepthThisDraw = false;
+    t_compositeThisDraw = false;
     // Counting eye draws is not part of the panel distance fix, even though it
     // happens here.
     //
@@ -2344,8 +2352,11 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // or a named family drawn straight into the eye, writes its depth. A
     // flag and not a verdict, so it composes with whatever claims the draw
     // below; forwardWithVerdict's scope consumes it.
-    if (uiDepthWantsDraws()) t_uiDepthThisDraw = uiDepthOnEyeDraw(self,
-        {kind,count,instances,args.start,args.base,args.startInstance});
+    if (uiDepthWantsDraws()) {
+        t_uiDepthThisDraw = uiDepthOnEyeDraw(self,
+            {kind,count,instances,args.start,args.base,args.startInstance});
+        t_compositeThisDraw = uiDepthDrawSampledSurface();
+    }
     // The generic hologram/icon depth pass (ui_depth.h): its own family
     // list, checked independently of the classification above.
     if (uiDepthHologramWantsDraws()) t_holoDepthThisDraw = uiDepthHologramOnEyeDraw(self);
@@ -3786,7 +3797,9 @@ __declspec(noinline) void curvedScreenSwallowed(ID3D11DeviceContext* self, DrawV
 // surfaces' content, not the eye's UI. Into an eye target that is not 8-bit
 // UNORM (the lit HDR target -- thousands of scene draws a frame) only the
 // hash compares run, to name the cockpit families the crisp take takes (the
-// three named shaders and the take's eight holograms, one family); the
+// holo panels' two vertex shaders -- the stock one and the one Disable GUI
+// effects switches in -- the flight HUD, the target sprite and the take's
+// eight holograms, one family); the
 // full rules run for the post-tonemap target alone, where a frame has a few
 // dozen draws. The 2D screen's composite is recognised exactly as the panel
 // distance and the curved screen recognise it (srv0IsPanelSized); the rest
@@ -3891,11 +3904,13 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     struct UiDepthScope {
         ID3D11DeviceContext* ctx;
         bool                 on;
-        bool                 holoOn;   // the generic hologram/icon pass's own classification
+        bool                 holoOn;      // the generic hologram/icon pass's own classification
+        bool                 composite;   // this eye draw samples a learned interface surface (the layer's census)
         explicit UiDepthScope(ID3D11DeviceContext* c)
-            : ctx(c), on(t_uiDepthThisDraw), holoOn(t_holoDepthThisDraw) {
+            : ctx(c), on(t_uiDepthThisDraw), holoOn(t_holoDepthThisDraw), composite(t_compositeThisDraw) {
             t_uiDepthThisDraw = false;
             t_holoDepthThisDraw = false;
+            t_compositeThisDraw = false;
         }
         ~UiDepthScope() {
             if (on) uiDepthEnd(ctx);
@@ -3948,8 +3963,16 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         if (seedOutcome.on) seedOutcome.original = seedOutcome.original || issued;
         return issued;
     };
+    // The layer's census of the interface composites it leaves in the scene
+    // (ui_scene_composites.h): set where the family rule has run for an eye
+    // draw that samples a learned interface surface, settled below once the
+    // after-UI retry has had its say.
+    bool compositeCounted = false;
+    UiLayerFamily compositeFamily = UiLayerFamily::kNone;
     if (owner && uiLayerLive() && g_state->rtv0Eye && v != DrawVerdict::kQuadSkip) {
         const UiLayerFamily uiFamily = uiLayerFamilyOf(g_state, kind, count);
+        compositeCounted = uiDepthScope.composite;
+        compositeFamily = uiFamily;
         if (uiFamily != UiLayerFamily::kNone) {
             uiLayer = uiLayerDecide(self, static_cast<int>(uiFamily), uiLayerVerdictForwards(v),
                                     g_state->curveThisDraw);
@@ -4000,6 +4023,19 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         if (uiLayer && worldReissue.on) {
             worldReissue.on = false;
             uiLayerWorldReissueAbandon();
+        }
+    }
+    // The census of composites left in the scene, settled after BOTH takes (the
+    // family's and the after-UI retry's): a composite is counted once, taken
+    // into the layer or left in the game's frame, and a left one is named by its
+    // shaders and the family the rule gave it (none when it named nothing -- the
+    // case this exists for). The shaders' hashes are read for the left ones only.
+    if (compositeCounted) {
+        if (uiLayer) {
+            uiLayerNoteCompositeTaken();
+        } else {
+            uiLayerNoteCompositeLeft(bindingShaderHash(BindSlot::Vs), bindingShaderHash(BindSlot::Ps),
+                                     static_cast<int>(compositeFamily));
         }
     }
     // The sub-draw probe, which also SWALLOWS the game's draw -- it re-issues

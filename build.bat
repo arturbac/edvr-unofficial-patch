@@ -2905,6 +2905,27 @@ if errorlevel 1 ( echo [edvr] ERROR: on foot maps test build failed & exit /b 1 
 python "tools\on_foot_maps_test\mutants.py" --self-test || exit /b 1
 exit /b 0
 
+:rig_ui_composite_census_test
+echo [edvr] === ui_composite_census_test.exe ===
+REM The cockpit holo panels' second shader pair and the census of the interface composites the layer leaves in the scene (docs\ui-layer-2026-09-23.md,
+REM "2026-10-01: Disable GUI effects"): the pure halves, src\d3d11\ui_layer_math.h's family rule (the vertex shader Elite switches in with Disable GUI
+REM effects on names the cockpit holo panels, on the lit HDR target and on the post-tonemap one, exactly as the stock one does) and
+REM src\d3d11\ui_scene_composites.h's window, zero line, line with pairs, cap and detector-off wording, compiled alone -- plus the source pins from the repo
+REM root (where ui_depth publishes the composite flag, the scope that consumes it, the count after both takes, the line once a window with its zeros, depth
+REM left out for the new pair on purpose, the eye-run diagnostic's watch list, and the reader's fixture byte for byte; each pin carries a control).
+REM tools\ui_composite_census_test\mutants.py --self-test holds the mutation list to the headers as they are; the list itself (--run, on demand, about a
+REM minute) proves the rig fails when each rule is flipped. Pure C++ and source scans: no D3D.
+if not exist "%OBJ%\uicompositecensus" mkdir "%OBJ%\uicompositecensus"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\d3d11" /Fo"%OBJ%\uicompositecensus"\ ^
+    /Fe"%BUILD%\ui_composite_census_test.exe" "tools\ui_composite_census_test\ui_composite_census_test.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: ui composite census test build failed & exit /b 1 )
+"%BUILD%\ui_composite_census_test.exe" --dry-run || exit /b 1
+"%BUILD%\ui_composite_census_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\ui_composite_census_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
 :rig_panel_curve_test
 echo [edvr] === panel_curve_test.exe ===
 REM The curved screen's strip (src\d3d11\panel_curve.cpp; fix.panel_curvature) compiled for real with the real Config, Log and fault

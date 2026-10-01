@@ -131,6 +131,13 @@ namespace detail {
 bool g_screenMotionEnabled = true;
 bool g_screenMotionFailed = false;
 }  // namespace detail
+
+// ui_depth.h's two flags (uiDepthWantsDraws is inline over them): the layer's 30 s composite line says NOT COUNTED when the interface depth
+// pass is off or stood down (ui_scene_composites.h). The pass is on here, as fix.temporal_aa = dlss would have it.
+namespace detail {
+bool g_uiDepthOn = true;
+bool g_uiDepthStoodDown = false;
+}  // namespace detail
 bool vrWorldRouteEnabled() { return g_stubs.enabled; }
 bool vrWorldRouteLayerMayTake() { return g_stubs.mayTake; }
 bool vrWorldRouteDoorLayerOnly(uint32_t, uint64_t) { return g_stubs.routeDoor; }

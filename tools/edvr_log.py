@@ -15,6 +15,7 @@
     python tools/edvr_log.py --target frontier --vscreen-fit --expect-build HEAD
     python tools/edvr_log.py --target epic --flat-upscale --expect-build HEAD
     python tools/edvr_log.py --target frontier --vr-supersampling --expect-build HEAD
+    python tools/edvr_log.py --target frontier --ui-composites --expect-build HEAD
     python tools/edvr_log.py --target frontier --route-curve --expect-build HEAD
     python tools/edvr_log.py --target steam --freezes --expect-build HEAD
     python tools/edvr_log.py --list
@@ -159,6 +160,21 @@ Supersampling below 1, from the measured render size against the eye texture), v
 follows and the menu's note that the headset notice was queued, with NOTICE / CONSISTENT / HEADSET / FLAT lines
 (a flat log carrying the notice is a STOP). Neither verdict changes the exit code (read its lines).
 
+--ui-composites reads one flight's census of the interface composites the UI layer left in the scene
+(docs/ui-layer-2026-09-23.md, "2026-10-01: Disable GUI effects"). The layer names an interface draw by its
+vertex shader, and a draw into the lit HDR eye that samples an interface surface under a vertex shader no
+family names reached no decision and no refusal line: user 5's cockpit panels, with Elite's Disable GUI
+effects on, stayed in the scene upscaled with it. Every 30 s the layer now prints one `composites left in
+the scene` line, zeros included: how many composite draws of how many were left, a frame's worth, and each
+pair left by vertex shader, pixel shader and family (`no family` = nothing named it), or NOT COUNTED when the
+interface depth pass was off. The report lays the windows out and judges INSTRUMENT (the census ran: a log
+with the layer's 30 s lines and none of these is a build before it or a census that never ran), DETECTOR (a
+NOT COUNTED window), UNCLAIMED (a composite no family names, left in the scene: 0.5 draws a frame or more is a
+STOP, less a WARN), NAMED (a family named it and the layer did not take it: a WARN, the layer's `left in the
+game's frame` line says why), OVERFLOW (more different pairs than the table names) and TAKEN (every composite
+went into the layer). Its exit code carries the verdict: 0 for PASS or WARN, 1 for STOP, 3 when the log has
+no census line (main() answers 2 for a wrong build before this runs).
+
 --route-curve reads a flight with the curved VR world route (design doc section 82,
 "The curved route": fix.panel_curvature above 0, experimental.temporal_aa_on_foot_world
 = auto). It reads the route's `vr world route 5s:` lines by token (`curve=`: off,
@@ -198,9 +214,9 @@ log holds none of the freeze lines (a build from before the freeze logging).
 Exit 0 when a log was read, 1 when none was found (or --camera-census found no
 census line, or --vscreen-fit no auto-fit line, or --flat-upscale no flat line, or
 --vr-supersampling no VR line), 2 when --expect-build did not match (--tally periodic
-and --freezes check the runtime log against it too). --maps-sharp's, --route-curve's and
---freezes's codes for a log they read are their own (above): 0, 1 and 3 mean a verdict,
-not "no log".
+and --freezes check the runtime log against it too). --maps-sharp's, --route-curve's,
+--ui-composites's and --freezes's codes for a log they read are their own (above): 0, 1 and
+3 mean a verdict, not "no log".
 """
 
 import argparse
@@ -4797,6 +4813,172 @@ def print_vr_supersampling(text):
     return 0
 
 
+# --ui-composites: the interface composites the UI layer left in the scene (docs/ui-layer-2026-09-23.md, "2026-10-01: Disable GUI effects").
+# The layer names an interface draw by its vertex shader; a draw into the lit HDR eye that samples an interface surface and has a vertex shader
+# no family names gets no decision and no refusal line, so it stays in the scene, upscaled with it, and the log said nothing: user 5's cockpit
+# panels (Elite's Disable GUI effects switches the holo panels to vs 1989E6D3B405FDE0 / ps EAB8A1C95A13FFBE) for a month. Every 30 s the layer
+# prints ONE line, zeros included (src/d3d11/ui_scene_composites.h uiSceneCompositeText; tools\ui_composite_census_test holds the formatter and
+# tools\ui_composites_fixture.log to each other byte for byte):
+#   ui quality: composites left in the scene: <left> of <seen> composite draws (<rate> a frame) in <frames> frames (<live> live) -- <detail>.
+# <detail> is `none: every interface composite drawn into an eye went into the layer`, `no draw into an eye sampled an interface surface in
+# this window`, or the pairs left -- `vs <16 hex> ps <16 hex> (<family, not taken | no family>) <rate> a frame`, `;`-separated, then `<n> draws
+# of pairs past the table's <cap> (<rate> a frame)`; or the line says NOT COUNTED when the interface depth pass was not running (no surface is
+# learned, so no draw is a composite and a zero would mean nothing). A composite NO FAMILY names is the defect this reads for; one a family
+# named and the layer did not take (the layer not armed for a frame, the world-screen gate holding the 2D screen) is also left in the scene and
+# shows with its family, beside the reasons the layer's `left in the game's frame` line already gives. A log with the layer's 30 s lines and no
+# composites line is a build from before this census, or a census that never ran: that is what the zeros are for.
+UICOMP_STAMP_RE = re.compile(r"^\[(?P<ts>\d\d:\d\d:\d\d\.\d{3})\]\s*(?P<msg>.*)$")
+UICOMP_PREFIX = "ui quality: composites left in the scene: "
+UICOMP_RE = re.compile(r"^ui quality: composites left in the scene: (?P<left>\d+) of (?P<seen>\d+) composite draws \((?P<rate>[0-9.]+) a frame\) "
+                       r"in (?P<frames>\d+) frames \((?P<live>\d+) live\) -- (?P<detail>.*)\.$")
+UICOMP_OFF_RE = re.compile(r"^ui quality: composites left in the scene: NOT COUNTED \((?P<why>.*)\) in (?P<frames>\d+) frames\.$")
+UICOMP_PAIR_RE = re.compile(r"vs (?P<vs>[0-9A-F]{16}) ps (?P<ps>[0-9A-F]{16}) \((?P<family>[^)]*)\) (?P<rate>[0-9.]+) a frame")
+UICOMP_PAST_RE = re.compile(r"(?P<n>\d+) draws of pairs past the table's (?P<cap>\d+) \((?P<rate>[0-9.]+) a frame\)")
+UICOMP_NONE = "none: every interface composite drawn into an eye went into the layer"
+UICOMP_IDLE = "no draw into an eye sampled an interface surface in this window"
+UICOMP_NO_FAMILY = "no family"
+UICOMP_LAYER_RE = re.compile(r"^ui quality: layer: \d+ s, \d+ frames, ")
+# Draws a frame at or above which a composite left in the scene is the finding (one draw every other frame); below it a stray at a transition.
+UICOMP_SUSTAINED = 0.5
+
+
+def parse_ui_composites(text):
+    """{windows: [{ts, t, kind: 'count' | 'off', left, seen, rate, frames, live, state: 'none' | 'idle' | 'left', pairs: [{vs, ps, family, rate}], past: {n, cap,
+    rate} or None}], layer_windows: the layer's own 30 s lines, unparsed: [raw lines that start with the prefix and are none of the shapes]}."""
+    out = {"windows": [], "layer_windows": 0, "unparsed": []}
+    for raw in text.splitlines():
+        m = UICOMP_STAMP_RE.match(raw.rstrip("\r"))
+        if not m:
+            continue
+        ts, msg = m.group("ts"), m.group("msg")
+        t = _clock_s(ts)
+        if UICOMP_LAYER_RE.match(msg):
+            out["layer_windows"] += 1
+            continue
+        if not msg.startswith(UICOMP_PREFIX):
+            continue
+        off = UICOMP_OFF_RE.match(msg)
+        if off:
+            out["windows"].append({"ts": ts, "t": t, "kind": "off", "left": 0, "seen": 0, "rate": 0.0, "frames": int(off.group("frames")), "live": 0,
+                                   "state": "off", "pairs": [], "past": None, "why": off.group("why")})
+            continue
+        c = UICOMP_RE.match(msg)
+        if not c:
+            out["unparsed"].append(raw)
+            continue
+        detail = c.group("detail")
+        w = {"ts": ts, "t": t, "kind": "count", "left": int(c.group("left")), "seen": int(c.group("seen")), "rate": float(c.group("rate")),
+             "frames": int(c.group("frames")), "live": int(c.group("live")), "state": "left", "pairs": [], "past": None}
+        if detail == UICOMP_NONE:
+            w["state"] = "none"
+        elif detail == UICOMP_IDLE:
+            w["state"] = "idle"
+        else:
+            for item in detail.split("; "):
+                p = UICOMP_PAIR_RE.fullmatch(item)
+                if p:
+                    family = p.group("family")
+                    w["pairs"].append({"vs": p.group("vs"), "ps": p.group("ps"), "family": UICOMP_NO_FAMILY if family == UICOMP_NO_FAMILY else family.replace(", not taken", ""),
+                                       "rate": float(p.group("rate"))})
+                    continue
+                q = UICOMP_PAST_RE.fullmatch(item)
+                if q:
+                    w["past"] = {"n": int(q.group("n")), "cap": int(q.group("cap")), "rate": float(q.group("rate"))}
+                    continue
+                w["state"] = "unreadable"
+        if w["state"] == "unreadable" or (w["state"] == "left" and not w["pairs"] and not w["past"]):
+            out["unparsed"].append(raw)
+            continue
+        out["windows"].append(w)
+    return out
+
+
+def ui_composites_verdict(p):
+    """[(tag, status, text)]: INSTRUMENT (the census ran: the line is there; zero lines beside the layer's own is a build before it or a census that never ran),
+    DETECTOR (a window the interface depth pass was off), UNCLAIMED (a composite no family names, left in the scene: sustained is a STOP, a stray a WARN),
+    NAMED (a family named it and it was not taken: a WARN, the layer's `left in the game's frame` line says why), OVERFLOW (more different pairs left than the
+    table names), TAKEN (every composite drawn into an eye went into the layer) and SHAPE (a line the reader could not parse)."""
+    out = []
+
+    def add(tag, status, text):
+        out.append((tag, status, text))
+
+    ws = p["windows"]
+    if p["unparsed"]:
+        add("SHAPE", "WARN", "%d line(s) start with the census prefix and are none of its shapes (the formatter changed? read them): %s" % (len(p["unparsed"]), p["unparsed"][0][:160]))
+    if not ws:
+        if p["layer_windows"]:
+            add("INSTRUMENT", "STOP", "the layer printed %d 30 s line(s) and not one `composites left in the scene` line: a build from before this census, or a census that never ran "
+                                      "(check --expect-build; a current build prints it every window, zeros included)" % p["layer_windows"])
+        else:
+            add("INSTRUMENT", "n/a", "no `ui quality:` 30 s line at all: fix.ui_quality was off in this log (the census prints only while the layer does)")
+        return out
+    counted = [w for w in ws if w["kind"] == "count"]
+    off = [w for w in ws if w["kind"] == "off"]
+    add("INSTRUMENT", "PASS", "%d window(s) of the census line: %d counted, %d NOT COUNTED (zeros are printed, so a line saying 0 is the count having run)" % (len(ws), len(counted), len(off)))
+    if off:
+        add("DETECTOR", "WARN", "%d window(s) say NOT COUNTED (the interface depth pass was not running -- fix.temporal_aa off or stood down -- so no draw there could be "
+                                "recognised as a composite); read the others" % len(off))
+    # The pairs left, by (vs, ps, family) across the windows.
+    seen_pairs = {}
+    for w in counted:
+        for pr in w["pairs"]:
+            key = (pr["vs"], pr["ps"], pr["family"])
+            e = seen_pairs.setdefault(key, {"windows": 0, "max": 0.0, "sum": 0.0, "first": w["ts"]})
+            e["windows"] += 1
+            e["max"] = max(e["max"], pr["rate"])
+            e["sum"] += pr["rate"]
+    unclaimed = {k: v for k, v in seen_pairs.items() if k[2] == UICOMP_NO_FAMILY}
+    named = {k: v for k, v in seen_pairs.items() if k[2] != UICOMP_NO_FAMILY}
+    if unclaimed:
+        for (vs, ps, _), e in sorted(unclaimed.items(), key=lambda kv: -kv[1]["max"]):
+            text_ = ("vs %s ps %s: left in the scene in %d of %d counted window(s), up to %.2f draws a frame (mean %.2f), first at %s; no family names it, so the layer "
+                     "never decides it and the scene upscales it with everything else" % (vs, ps, e["windows"], len(counted), e["max"], e["sum"] / e["windows"], e["first"]))
+            add("UNCLAIMED", "STOP" if e["max"] >= UICOMP_SUSTAINED else "WARN", text_)
+    if named:
+        for (vs, ps, family), e in sorted(named.items(), key=lambda kv: -kv[1]["max"]):
+            add("NAMED", "WARN", "vs %s ps %s (%s): named and not taken in %d window(s), up to %.2f draws a frame; the layer's `left in the game's frame` line gives the reason "
+                                 "(not armed, a world-screen gate, another fix swallowing it)" % (vs, ps, family, e["windows"], e["max"]))
+    past = [w for w in counted if w["past"]]
+    if past:
+        worst = max(w["past"]["rate"] for w in past)
+        add("OVERFLOW", "STOP" if worst >= UICOMP_SUSTAINED else "WARN",
+            "%d window(s) left draws of more different pairs than the table names (%d), up to %.2f draws a frame unnamed" % (len(past), past[0]["past"]["cap"], worst))
+    leftover = [w for w in counted if w["left"]]
+    if counted and not leftover:
+        total = sum(w["seen"] for w in counted)
+        if total:
+            add("TAKEN", "PASS", "every interface composite drawn into an eye went into the layer: %d composite draws in %d window(s), none left in the scene" % (total, len(counted)))
+        else:
+            add("TAKEN", "WARN", "no composite was drawn into an eye in any counted window (a loading screen, or a log without a cockpit or a menu): nothing here shows the pair taken")
+    return out
+
+
+def print_ui_composites(text):
+    """The --ui-composites report. Exit 0 for PASS or WARN, 1 for STOP, 3 when the log has no census line (a build before it, the layer off, or a census that never ran)."""
+    p = parse_ui_composites(text)
+    verdict = ui_composites_verdict(p)
+    ws = p["windows"]
+    for w in ws:
+        if w["kind"] == "off":
+            print("%s  NOT COUNTED in %d frames" % (w["ts"], w["frames"]))
+            continue
+        what = "none" if w["state"] == "none" else "no composite drawn" if w["state"] == "idle" else "; ".join(
+            "%s/%s (%s) %.2f" % (pr["vs"], pr["ps"], pr["family"], pr["rate"]) for pr in w["pairs"]) + (
+            "; %d past the table (%.2f)" % (w["past"]["n"], w["past"]["rate"]) if w["past"] else "")
+        print("%s  %d of %d composite draws (%.2f a frame) in %d frames (%d live)  %s" % (w["ts"], w["left"], w["seen"], w["rate"], w["frames"], w["live"], what))
+    for tag, status, text_ in verdict:
+        print("%s (%s) %s" % (status, tag, text_))
+    counts = {"PASS": 0, "WARN": 0, "STOP": 0, "n/a": 0}
+    for _, status, _ in verdict:
+        counts[status] = counts.get(status, 0) + 1
+    worst = "STOP" if counts["STOP"] else ("WARN" if counts["WARN"] else ("PASS" if counts["PASS"] else "n/a"))
+    print("ui-composites verdict: %s (%d PASS, %d WARN, %d STOP, %d n/a)" % (worst, counts["PASS"], counts["WARN"], counts["STOP"], counts["n/a"]))
+    if not ws:
+        return 3
+    return 1 if counts["STOP"] else 0
+
+
 # --route-curve: the curved VR world route (docs/design-flat-temporal-aa-2026-09-23.md, section 82, "The curved route").
 # With fix.panel_curvature above 0 the route's layer re-issues the screen through the very strip the game's own draw is substituted with
 # (src/d3d11/panel_curve.cpp panelCurveReissue), and the route's log says so: its 5 s line (src/d3d11/vr_world_route_math.h
@@ -7136,6 +7318,13 @@ def main(argv=None):
                     help="report a VR flight's Elite-supersampling-below-1 notice (design doc section 83): "
                          "the `vr supersampling:` line from the measured render size, vScreen's adoption line "
                          "and the headset notice; NOTICE / CONSISTENT / HEADSET / FLAT lines")
+    ap.add_argument("--ui-composites", action="store_true",
+                    help="report the interface composites the UI layer left in the scene (fix.ui_quality on; "
+                         "docs/ui-layer-2026-09-23.md, 2026-10-01): the layer's 30 s `composites left in the "
+                         "scene` lines (zeros printed, so a 0 is the count having run), the pairs left by vertex "
+                         "and pixel shader and family, and INSTRUMENT / DETECTOR / UNCLAIMED / NAMED / OVERFLOW / "
+                         "TAKEN lines (a composite no family names, left in the scene, is a STOP); exit 0 for "
+                         "PASS or WARN, 1 for STOP, 3 when the log has no such line")
     ap.add_argument("--route-curve", action="store_true",
                     help="report a curved VR world route flight (fix.panel_curvature above 0 "
                          "with experimental.temporal_aa_on_foot_world = auto): the route's 5 s "
@@ -7269,6 +7458,8 @@ def main(argv=None):
         return print_flat_upscale(text)
     if args.vr_supersampling:
         return print_vr_supersampling(text)
+    if args.ui_composites:
+        return print_ui_composites(text)
     if args.camera_census:
         return print_camera_census(text)
     if args.maps_sharp:
@@ -7620,6 +7811,8 @@ def self_test():
         ok = False
     if not self_test_maps_sharp():
         ok = False
+    if not self_test_ui_composites():
+        ok = False
     if not self_test_vscreen_fit():
         ok = False
     if not self_test_flat_upscale():
@@ -7877,6 +8070,111 @@ def self_test_flat_upscale():
     rc, out = report("[09:00:00.000] version v0.18.0 (build 1)\n", print_vr_supersampling)
     if rc != 1 or "no `vr supersampling:`" not in out:
         fail("a log with no VR line should exit 1 and say so: rc=%d %r" % (rc, out))
+    return ok
+
+
+UICOMP_FIXTURE = "ui_composites_fixture.log"
+
+
+def self_test_ui_composites():
+    """--ui-composites on the checked-in synthetic catalogue (tools\\ui_composites_fixture.log, which tools\\ui_composite_census_test holds to exactly what the
+    DLL's formatter writes): every shape of the census line parsed, then logs picked from it by clock time to make each verdict, and logs altered to break the
+    things the reader keys on. Returns ok."""
+    import contextlib
+    import io
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("ui-composites: %s" % msg)
+        ok = False
+
+    path = os.path.join(repo_root(), "tools", UICOMP_FIXTURE)
+    try:
+        base = read_text(path)
+    except OSError:
+        fail("the fixture %s is missing" % path)
+        return False
+    lines = base.splitlines()
+    p = parse_ui_composites(base)
+    ws = p["windows"]
+    if [w["state"] for w in ws] != ["none", "idle", "none", "left", "left", "left", "left", "off", "none"] or p["unparsed"] or p["layer_windows"] != 2:
+        fail("the fixture's windows read as %s (%d unparsed, %d layer lines)" % ([w["state"] for w in ws], len(p["unparsed"]), p["layer_windows"]))
+        return False
+    d = ws[3]
+    if (d["ts"], d["left"], d["seen"], d["rate"], d["frames"], d["live"]) != ("16:02:00.001", 56320, 61440, 22.0, 2560, 2560) or d["pairs"] != [
+            {"vs": "1989E6D3B405FDE0", "ps": "EAB8A1C95A13FFBE", "family": "no family", "rate": 22.0}] or d["past"] is not None:
+        fail("the defect window reads as %r" % d)
+    n = ws[5]
+    if n["pairs"] != [{"vs": "81216C77F90DEDD6", "ps": "A2965EC2931A39C8", "family": "cockpit holo panels", "rate": 0.01}]:
+        fail("the named-family window reads as %r" % n["pairs"])
+    o = ws[6]
+    if len(o["pairs"]) != 8 or o["past"] != {"n": 4000, "cap": 8, "rate": 1.56} or o["left"] != 4160 or o["pairs"][0]["vs"] != "0000000000005000":
+        fail("the overflow window reads as %r / %r" % (len(o["pairs"]), o["past"]))
+    if (ws[7]["kind"], ws[7]["frames"]) != ("off", 2560) or ws[8]["live"] != 1280 or ws[1]["seen"] != 0:
+        fail("the NOT COUNTED, half-live or idle windows read as %r / %r / %r" % (ws[7], ws[8]["live"], ws[1]["seen"]))
+
+    def run(text):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = print_ui_composites(text)
+        return rc, buf.getvalue()
+
+    version = next(l for l in lines if "version v0.0.0-fixture" in l)
+
+    def pick(*stamps):
+        """The version line and the lines at these clock times (exactly 'hh:mm:ss.mmm')."""
+        chosen = [l for l in lines if any(l.startswith("[" + s + "]") for s in stamps)]
+        if len(chosen) != len(stamps):
+            fail("pick %s found %d line(s)" % (stamps, len(chosen)))
+        return "\n".join([version] + chosen) + "\n"
+
+    def verdict(what, text, want_rc, want_verdict, *want_in):
+        rc, out = run(text)
+        if rc != want_rc or ("ui-composites verdict: " + want_verdict) not in out or any(w not in out for w in want_in):
+            fail("%s: rc=%d, wanted %d %s mentioning %r:\n%s" % (what, rc, want_rc, want_verdict, want_in, out))
+        return out
+
+    layer1, layer2 = "16:00:30.000", "16:01:30.000"
+    menu, idle, cockpit, defect1, defect2, named, overflow, off, half = ("16:00:30.001", "16:01:00.001", "16:01:30.001", "16:02:00.001", "16:02:30.001",
+                                                                       "16:03:00.001", "16:03:30.001", "16:04:00.001", "16:04:30.001")
+    # A healthy flight: a menu, nothing drawn, a cockpit with the pair taken -- every window a zero, and the zeros are said.
+    healthy = pick(layer1, menu, idle, layer2, cockpit)
+    verdict("a healthy flight", healthy, 0, "PASS", "PASS (INSTRUMENT) 3 window(s) of the census line: 3 counted, 0 NOT COUNTED",
+            "PASS (TAKEN) every interface composite drawn into an eye went into the layer: 66840 composite draws in 3 window(s)", "0 of 61440 composite draws (0.00 a frame)")
+    # The defect: the Disable-GUI-effects panels left in the scene, nothing names them (the field's 22 draws a frame) -- twice a window apart.
+    out = verdict("the defect", healthy + pick(defect1, defect2).split("\n", 1)[1], 1, "STOP",
+                  "STOP (UNCLAIMED) vs 1989E6D3B405FDE0 ps EAB8A1C95A13FFBE: left in the scene in 2 of 5 counted window(s), up to 22.00 draws a frame (mean 22.00), first at 16:02:00.001",
+                  "no family names it")
+    if "(TAKEN)" in out:
+        fail("a flight with composites left says every composite went into the layer:\n%s" % out)
+    # The same pair below the line a sustained composite is: a stray at a transition, a WARN.
+    stray = pick(layer1, cockpit, defect1).replace("22.00 a frame", "0.40 a frame").replace("(22.00 a frame)", "(0.40 a frame)")
+    verdict("a stray", stray, 0, "WARN", "WARN (UNCLAIMED)", "up to 0.40 draws a frame")
+    # A named family left: a WARN that says where the reason is, never a STOP.
+    verdict("a named family left", pick(layer2, cockpit, named), 0, "WARN", "WARN (NAMED) vs 81216C77F90DEDD6 ps A2965EC2931A39C8 (cockpit holo panels): named and not taken in 1 window(s)",
+            "left in the game's frame")
+    # More pairs than the table names: the overflow is a STOP at a sustained rate, and the eight named pairs are strays.
+    verdict("overflow", pick(layer2, overflow), 1, "STOP", "STOP (OVERFLOW)", "WARN (UNCLAIMED) vs 0000000000005000 ps 0000000000006000", "up to 1.56 draws a frame unnamed")
+    # The interface depth pass off: a window that says NOT COUNTED is not a zero.
+    verdict("NOT COUNTED", pick(layer2, off), 0, "WARN", "WARN (DETECTOR) 1 window(s) say NOT COUNTED", "NOT COUNTED in 2560 frames")
+    # No composite drawn into an eye at all: the zero does not show the pair taken.
+    verdict("an idle window", pick(layer1, idle), 0, "WARN", "WARN (TAKEN) no composite was drawn into an eye in any counted window")
+    # The layer live for half the window: said in the table, no verdict of its own.
+    out = verdict("half live", pick(layer1, half), 0, "PASS", "0 of 30720 composite draws (0.00 a frame) in 2560 frames (1280 live)")
+    # The layer's own 30 s lines and no census line: a build before it, or a census that never ran. Exit 3 and a STOP line that says so.
+    verdict("no census line", pick(layer1, layer2), 3, "STOP", "STOP (INSTRUMENT) the layer printed 2 30 s line(s) and not one `composites left in the scene` line")
+    # No ui quality line at all: the key was off.
+    verdict("the key off", version + "\n", 3, "n/a", "n/a (INSTRUMENT) no `ui quality:` 30 s line at all")
+    # A line that starts with the prefix and is none of its shapes is said, and no window is made of it.
+    drift = pick(layer1, defect1).replace("composite draws", "composite draw")
+    out = verdict("a drifted line", drift, 3, "STOP", "WARN (SHAPE) 1 line(s) start with the census prefix and are none of its shapes")
+    if parse_ui_composites(drift)["windows"]:
+        fail("a drifted line made a window")
+    # The reader's own shapes: the pair regex wants sixteen upper-case hex digits, and a hash that is not is not a pair.
+    short = pick(layer1, defect1).replace("vs 1989E6D3B405FDE0", "vs 1989E6D3B405FDE")
+    if parse_ui_composites(short)["windows"]:
+        fail("a pair with a fifteen-digit hash made a window")
     return ok
 
 
