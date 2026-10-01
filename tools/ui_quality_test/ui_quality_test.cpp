@@ -54,6 +54,10 @@
 //     dark background, the translucent-over-bright cost nonzero and under
 //     its measured 113-step ceiling, and failing with the take removed.
 //
+//   * the surface strip's wiring in vscreen.cpp (ui_intro_curve_wiring_test.h; docs/intro-video.md, job 3): source scans of the intro movie's
+//     and the splash's strip, each with controls that edit a copy and must trip the pin; --wiring runs the source scans alone, which is how
+//     tools\vr_world_route_test\mutants.py proves them on edited copies of the real file.
+//
 // Exit codes: 0 pass, 1 a check failed, 2 usage. --dry-run touches nothing.
 #include <windows.h>
 
@@ -2408,6 +2412,7 @@ void testWriteBack(Gpu& g) {
 #include "ui_after_ui_test.h"
 #include "ui_world_route_test.h"
 #include "ui_world_route_wiring_test.h"
+#include "ui_intro_curve_wiring_test.h"
 
 }  // namespace
 
@@ -2416,11 +2421,20 @@ int main(int argc, char** argv) {
         std::puts("ui_quality_test: dry-run (no device, no files)");
         return 0;
     }
+    // --wiring: the source scans of src\d3d11 alone, with their controls (no device). tools\vr_world_route_test\mutants.py runs this on edited
+    // copies of vscreen.cpp in a temp tree (the rig reads its sources from the working directory), so every pin is seen to fail on the real file.
+    if (argc == 2 && std::strcmp(argv[1], "--wiring") == 0) {
+        afterui::testWiring();
+        worldroute::testWiring();
+        introcurve::testWiring();
+        std::printf("ui_quality_test --wiring: %u checks, %u failures\n", g_checks, g_fails);
+        return g_fails ? 1 : 0;
+    }
     // --hardware: the same checks on the default hardware adapter instead of
     // WARP, by hand (the gate runs --self-test; a build machine may have no GPU).
     const bool hardware = argc == 2 && std::strcmp(argv[1], "--hardware") == 0;
     if (argc != 2 || (std::strcmp(argv[1], "--self-test") != 0 && !hardware)) {
-        std::puts("usage: ui_quality_test --self-test | --hardware | --dry-run");
+        std::puts("usage: ui_quality_test --self-test | --hardware | --wiring | --dry-run");
         return 2;
     }
     testRenderState();
@@ -2442,6 +2456,7 @@ int main(int argc, char** argv) {
     afterui::testWiring();
     worldroute::testAll();
     worldroute::testWiring();
+    introcurve::testWiring();
     testHudParity();
     testChains();
     testPanelScale();
