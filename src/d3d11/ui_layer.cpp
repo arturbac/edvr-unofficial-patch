@@ -2929,13 +2929,14 @@ UiWorldRefuse worldReissueSources(ID3D11DeviceContext* ctx, uint64_t seq, WorldR
 
 // The route's screen draw passed every test of the decision: check what the re-issue needs from the draw's own
 // bindings and, when it has them, hold the draw for the re-issue that follows the game's own issue. Never a take.
-void worldReissuePlan(ID3D11DeviceContext* ctx, const UiLayerDrawFacts& f, bool substituted, uint64_t seq,
+// A curved screen (fix.panel_curvature: the game's draw is substituted with the strip, vscreen.cpp) is planned like a flat one:
+// the re-issue repeats whatever the game's draw became (a quad, or the strip through panel_curve.h panelCurveReissue), and the
+// plan's checks are about bindings the two share (the depth state, the blend, the texture and the sampler at PS slot 0).
+void worldReissuePlan(ID3D11DeviceContext* ctx, const UiLayerDrawFacts& f, uint64_t seq,
                       float jx, float jy) {
     UiWorldRefuse why = UiWorldRefuse::kNone;
     WorldReissue plan;
-    if (substituted) {
-        why = UiWorldRefuse::kCurved;
-    } else if (f.ds.tests() || f.ds.writes()) {
+    if (f.ds.tests() || f.ds.writes()) {
         why = UiWorldRefuse::kDepthState;
     } else if (f.blend != UiBlendShape::kOpaque) {
         why = UiWorldRefuse::kNotOpaque;
@@ -3164,7 +3165,7 @@ bool uiLayerDecide(ID3D11DeviceContext* ctx, int familyInt, bool verdictForwards
         // own issue (counted when it lands, as a re-issue -- not as "redirected": the layer took nothing from the
         // game's frame); one the tests refused is counted and named as any refusal, and the eye route serves it.
         if (uiLayerWorldCount(d, true) == UiWorldCount::kReissue) {
-            worldReissuePlan(ctx, f, substituted, seq, jx, jy);
+            worldReissuePlan(ctx, f, seq, jx, jy);
         } else {
             ++g_win.decided[static_cast<size_t>(family)][static_cast<size_t>(d)];
             noteFamily(family, d, detail);
@@ -3983,7 +3984,7 @@ bool uiLayerWorldReissueBegin(ID3D11DeviceContext* ctx) {
 
 // The game's draw has been issued once more: every binding Begin changed goes back, and the route is told which
 // eye the layer took. Safe without a Begin.
-void uiLayerWorldReissueEnd(ID3D11DeviceContext* ctx) {
+void uiLayerWorldReissueEnd(ID3D11DeviceContext* ctx, bool landed) {
     if (!g_reissue.active || !ctx) return;
     WorldReissue plan = g_reissue;
     g_reissue = WorldReissue{};
@@ -4004,6 +4005,12 @@ void uiLayerWorldReissueEnd(ID3D11DeviceContext* ctx) {
     if (!putBack || (g_stoodDown && !wasDown)) {
         // The state could not be trusted back: the eye is not the layer's (the eye route serves it, or the layer
         // stood down and the route lets go at the boundary).
+        worldRefuse(plan.eye, uiWorldReasonId(UiWorldRefuse::kFault));
+        return;
+    }
+    if (!landed) {
+        // The draw between Begin and End did not happen (a fault in the curved screen's strip): nothing is in the layer for this
+        // eye, so it is not the route's.
         worldRefuse(plan.eye, uiWorldReasonId(UiWorldRefuse::kFault));
         return;
     }

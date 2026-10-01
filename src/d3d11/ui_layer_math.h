@@ -1134,8 +1134,8 @@ inline UiWorldCount uiLayerWorldCount(UiLayerDecision d, bool routeMode) {
 // Why the route's re-issue did not happen, beyond the decision's own tests (those are UiLayerDecision values).
 enum class UiWorldRefuse : uint8_t {
     kNone = 0,
-    kCurved,         // panel_curvature is on: the game draws the screen through its own curved mesh, which a repeat
-                     // of the game's draw would not reproduce
+    // (There is no "curved" reason: a curved screen is re-issued through the strip the game's draw is substituted with,
+    // panel_curve.h panelCurveReissue, so the plan accepts it as it does a flat one.)
     kDepthState,     // the screen draw tests or writes depth or stencil (the re-issue binds no depth target)
     kNotOpaque,      // the screen draw blends: the layer-only eye is the layer over black, and only an opaque draw is
                      // the eye that way
@@ -1150,9 +1150,6 @@ enum class UiWorldRefuse : uint8_t {
 };
 inline const char* uiWorldRefuseName(UiWorldRefuse r) {
     switch (r) {
-        case UiWorldRefuse::kCurved:
-            return "the screen is curved (panel_curvature): the game draws its own mesh, which a repeat of its draw "
-                   "would not reproduce";
         case UiWorldRefuse::kDepthState: return "the screen draw tests or writes depth or stencil (the re-issue binds none)";
         case UiWorldRefuse::kNotOpaque:
             return "the screen draw blends (only an opaque draw is the whole eye over a black frame)";
@@ -1171,7 +1168,6 @@ inline const char* uiWorldRefuseName(UiWorldRefuse r) {
 // holds 1200 characters, and ten long reasons beside fourteen decisions would not fit).
 inline const char* uiWorldRefuseKey(UiWorldRefuse r) {
     switch (r) {
-        case UiWorldRefuse::kCurved: return "curved-screen";
         case UiWorldRefuse::kDepthState: return "depth-state";
         case UiWorldRefuse::kNotOpaque: return "blending-draw";
         case UiWorldRefuse::kNoSource: return "no-source-texture";

@@ -24,7 +24,7 @@
 #include "dlaa.h"
 #include "flat_mono_resolve.h"
 #include "gpu_census.h"
-#include "panel_curve.h"    // panelCurveWants: the curved screen's substitution, which the layer cannot re-issue
+#include "panel_curve.h"    // panelCurveInfo: the curve in use, named in the route's 5 s line and its OWNS line
 #include "ui_layer.h"
 #include "vr_camera_census.h"
 #include "vr_world_mips.h"
@@ -656,6 +656,18 @@ void driveInjector(bool wantsInjection) {
     if (want != VrWorldJitter::On) g_jitterLiveLogged = false;
     g_jitter = want;
 }
+// The screen's curve as the route's lines say it (vr_world_route_math.h vrWorldFormatCurve), from panel_curve.h's state at this
+// boundary: "off" while the game's own quad is drawn, "pending" while the substitution is still learning the panel's SIZE, "stood-down",
+// else curvature/columns/gain -- the numbers of the strip the layer's re-issue draws. `reissues` (when asked) is panel_curve's
+// cumulative count of strips the route's layer drew; the window line prints its delta.
+uint64_t g_curveReissuesSeen = 0;
+void curveTextNow(char* out, size_t size, uint64_t* reissues) {
+    const PanelCurveInfo pc = panelCurveInfo();
+    const bool configured = pc.curvature > 0.0f || pc.segments != detail::kDefaultSegments;
+    vrWorldFormatCurve(out, size, configured, pc.standDown, pc.ready, pc.curvature, pc.segments, pc.gain);
+    if (reissues) *reissues = pc.reissues;
+}
+
 // The stage 2 experiment build's three keys, read at the boundary while the route key is auto (design doc section 82): the
 // steady-detail key (default on since flight 4; any word but on reads off), the debug key's motion_source (the refusal view), and what the
 // census key said at the top of the boundary (g_census). A change is said once, in the log, with what the state does.
@@ -707,13 +719,11 @@ void vrWorldRouteFrameBoundary() {
     }
     ++g_frameNo;
 
-    // The frame that ended. The layer re-issues the game's OWN screen draw, and a curved screen is not that draw (the geometry
-    // substitution swallows it), so with fix.panel_curvature on the layer would refuse every frame (curved-screen) and an owned
-    // route would pay for the world resolve while the eye route still served the eyes. The route does not own such a frame: the
-    // same predicate that decides the substitution (panel_curve.h) holds it off, with the reason in its one line. (Follow-up: a
-    // curve-aware re-issue through panelCurveSubstitute.)
-    const bool curved = panelCurveWants();
-    const bool layerLive = uiLayerLiveForWorldRoute() && !curved;
+    // The frame that ended. A curved screen (fix.panel_curvature above 0) does not hold the route off: the layer re-issues it through
+    // the very strip the game's own draw is substituted with (panel_curve.h panelCurveReissue, vscreen.cpp curvedScreenSwallowed), so
+    // the route needs the layer live and nothing of the screen's geometry. The curve in use is named in the 5 s line (curve=) and the
+    // OWNS line.
+    const bool layerLive = uiLayerLiveForWorldRoute();
     const bool gate = uiLayerWorldScreenHeld();
     if (key == VrWorldKey::Auto) {
         readExperimentKeys();
@@ -795,7 +805,9 @@ void vrWorldRouteFrameBoundary() {
             g_tookNoted = false;
             g_ownedFramesEpisode = 0;
             char line[384];
-            vrWorldFormatEntered(line, sizeof(line), g_frameNo, kVrWorldWarmFrames);
+            char curveText[sizeof(g_win.curve)];
+            curveTextNow(curveText, sizeof(curveText), nullptr);
+            vrWorldFormatEntered(line, sizeof(line), g_frameNo, kVrWorldWarmFrames, curveText);
             Log::get().note("%s", line);
         }
         if (step.released != VrWorldRelease::None) {
@@ -818,14 +830,13 @@ void vrWorldRouteFrameBoundary() {
         if (g_machine.state != VrWorldState::Latched) g_latchLogged = false;
         // The key is auto but the layer is not live: one line per reason, saying the route stays off and why.
         if (!layerLive) {
-            const char* why = curved ? "fix.panel_curvature bends the on-foot screen and the layer cannot re-issue a curved screen yet"
-                                     : uiLayerNotLiveReason();
+            const char* why = uiLayerNotLiveReason();
             if (!why) why = "the UI layer is not live";
             if (g_notLiveNoted != why && (!g_notLiveNoted || std::strcmp(g_notLiveNoted, why) != 0)) {
                 g_notLiveNoted = why;
                 Log::get().note("vr world route: experimental.temporal_aa_on_foot_world is auto but the route stays off, and "
                                 "on-foot VR keeps today's two-eye route: %s (the route hands the eyes the resolved screen through "
-                                "the UI layer, so keep fix.ui_quality on and fix.panel_curvature at 0)", why);
+                                "the UI layer, so keep fix.ui_quality on)", why);
             }
         } else {
             g_notLiveNoted = nullptr;
@@ -836,6 +847,10 @@ void vrWorldRouteFrameBoundary() {
             char line[1200];
             g_win.jitter = vrWorldJitterName(g_jitter);
             g_win.steady = vrWorldSteadyKeyName(g_steadyKey);
+            uint64_t curveReissues = 0;
+            curveTextNow(g_win.curve, sizeof(g_win.curve), &curveReissues);
+            g_win.curveReissues = curveReissues - g_curveReissuesSeen;
+            g_curveReissuesSeen = curveReissues;
             vrWorldFormatWindow(line, sizeof(line), key, g_machine.state, layerLive, gate, g_win);
             Log::get().note("%s", line);
             char injectLine[512];
