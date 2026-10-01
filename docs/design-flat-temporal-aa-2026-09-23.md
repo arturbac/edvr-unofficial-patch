@@ -7881,8 +7881,8 @@ on-foot spot, 60 s a leg, so two 30 s windows). Every leg, `edvr.ini`: `[fix]`
 A. `panel_curvature = 0.3`; delete `edvr_logs\vscreen_auto_footprint.txt`. Expect
    `rule=fitted source=seed route=run ... auto = 3504 wide` on a 4032 eye (the
    width flat gives; before this build `rule=legacy route=no`, 5040), the OWNS
-   line with the curve sentence, `curve=pending` for at most the first window
-   and then `curve=0.300/64/<gain>` in every owned window with `curve-reissues`
+   line with the curve sentence, `curve=pending` for at most the first two
+   windows and then `curve=0.300/64/<gain>` in every owned window with `curve-reissues`
    equal to `eye-takes` and above 0, one `panel curvature: the VR world route's
    layer drew the same 64-column strip` line, no `fault=` in the `vr world route
    layer:` line's own refusals, and a `vscreen footprint` line with `draws`
@@ -7916,12 +7916,15 @@ route's screen bent like the route-off screen; B has `curve=off` and the same
 `fp=`. FAIL, each with what it means: `eye-takes` above 0 and `curve-reissues=0`
 under a `C/S/G` curve (the layer drew a FLAT screen under a curved game draw:
 STOP); `curve=stood-down` (a fault; the line before it names it); `curve=pending`
-for many windows (the SIZE was never read: the game draws flat and the layer
+for more than two windows (the SIZE was never read: the game draws flat and the layer
 re-issues flat, consistent but flat at 0.3 with the route on); a bend that
 changes shape or place when the route engages or releases (the layer's strip is
 not the substitution's: compare `curve=`'s C/S/G with the `panel curvature:`
 line); `draws=0` at 0.3 (the instrument's new call never ran); A's `fp=` off B's
 by more than a few percent (it read something other than the flat quad).
+`edvr_log.py --route-curve` says the route's half of this in seven verdicts: CURVE,
+RE-ISSUE, READY, STOOD DOWN, STALE BUILD, OWNS and FAULT (exit 1 on a STOP, 3 when
+the log has no route line); `--vscreen-fit` reads the footprint and the width.
 
 GATES (all in `build.bat`; the full build is green and the stamp is in the
 hand-off). New: `tools\panel_curve_test`, the real `panel_curve.cpp` on WARP:
@@ -7940,7 +7943,10 @@ bracket and takes no eye), the `ui_quality_test` wiring pins (the curve branch,
 `worldScreenReissueCurved`, `curvedScreenSwallowed`'s gates, the flat re-issue's
 exact text, the recognition at three places; 23 in-rig controls),
 `vscreen_fit_test` (the rule no longer consults the curve; the footprint's
-second call site; 87 of 87 mutants), `on_foot_maps_test` P4a (three places).
+second call site; 87 of 87 mutants), `on_foot_maps_test` P4a (three places),
+and the reader (`edvr_log.py --self-test` builds its logs from the formatter-held
+lines of `camera_census_fixture.log`, pins every token it swaps, and every verdict
+has a mutant that must fail it).
 CURVATURE 0 is held by `panel_curve_test` C1 (nothing wanted; the re-issue is not
 ready and draws nothing), the wiring pin on the flat re-issue's text and the
 route's 5 s line being the old line with ` curve=off curve-reissues=0` after

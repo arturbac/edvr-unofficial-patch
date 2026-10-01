@@ -15,6 +15,7 @@
     python tools/edvr_log.py --target frontier --vscreen-fit --expect-build HEAD
     python tools/edvr_log.py --target epic --flat-upscale --expect-build HEAD
     python tools/edvr_log.py --target frontier --vr-supersampling --expect-build HEAD
+    python tools/edvr_log.py --target frontier --route-curve --expect-build HEAD
     python tools/edvr_log.py --list
 
 This is the sanctioned replacement for `Get-Content <some path> -Tail 200 |
@@ -157,10 +158,26 @@ Supersampling below 1, from the measured render size against the eye texture), v
 follows and the menu's note that the headset notice was queued, with NOTICE / CONSISTENT / HEADSET / FLAT lines
 (a flat log carrying the notice is a STOP). Neither verdict changes the exit code (read its lines).
 
+--route-curve reads a flight with the curved VR world route (design doc section 82,
+"The curved route": fix.panel_curvature above 0, experimental.temporal_aa_on_foot_world
+= auto). It reads the route's `vr world route 5s:` lines by token (`curve=`: off,
+pending, stood-down or curvature/columns/gain; `curve-reissues=`: the strips the layer
+drew), the OWNS lines, the `panel curvature:` notes and the layer's `vr world route
+layer:` refusals, prints the windows by ownership and curve, and judges CURVE (what
+the owned windows said, and any change), RE-ISSUE (strips drawn equal eye takes; takes
+with no strip under a curve are a flat screen under a curved game draw: STOP), READY
+(pending past two windows), STOOD DOWN (with the note that names the cause), STALE
+BUILD (a `curved-screen` refusal, which only the build before the curved route writes:
+STOP), OWNS (its sentence names the curve the next window shows) and FAULT. Like
+--maps-sharp its exit code carries the verdict: 0 for PASS or WARN, 1 for STOP, 3 when
+the log has no route line. A log from before the curved route has no curve tokens:
+that is a WARN which says so, never a PASS.
+
 Exit 0 when a log was read, 1 when none was found (or --camera-census found no
-census line, or --vscreen-fit no auto-fit line, or --flat-upscale no flat line, or --vr-supersampling no VR line), 2 when --expect-build did not
-match (--tally periodic checks the runtime log against it too). --maps-sharp's codes
-for a log it read are its own (above): 0, 1 and 3 mean a verdict, not "no log".
+census line, or --vscreen-fit no auto-fit line, or --flat-upscale no flat line, or
+--vr-supersampling no VR line), 2 when --expect-build did not match (--tally periodic
+checks the runtime log against it too). --maps-sharp's and --route-curve's codes for a
+log they read are their own (above): 0, 1 and 3 mean a verdict, not "no log".
 """
 
 import argparse
@@ -4730,6 +4747,789 @@ def print_vr_supersampling(text):
     return 0
 
 
+# --route-curve: the curved VR world route (docs/design-flat-temporal-aa-2026-09-23.md, section 82, "The curved route").
+# With fix.panel_curvature above 0 the route's layer re-issues the screen through the very strip the game's own draw is substituted with
+# (src/d3d11/panel_curve.cpp panelCurveReissue), and the route's log says so: its 5 s line (src/d3d11/vr_world_route_math.h
+# vrWorldFormatWindow) carries `curve=` (off, pending, stood-down, or curvature/columns/gain) and `curve-reissues=` (the strips the layer
+# drew in the window), its OWNS line (vrWorldFormatEntered) ends with a sentence holding `(curve=<text>)` when the screen is set to curve,
+# panel_curve.cpp writes its own `panel curvature:` notes, and the layer's `vr world route layer:` line (ui_layer.cpp logWorldRoute) counts
+# the route's refusals by reason. One flight log in, one answer out: did the curve and the route work together.
+#
+# The 5 s line is read by key=value TOKENS (_ckv), never by position: a later build drops the steady-detail and jitter keys and the tokens
+# around them. Both counters are the window's own and are read at the same boundary, which is why a healthy window has them equal. The exit
+# code carries the verdict, as --maps-sharp's does: 0 for PASS or WARN, 1 for STOP, 3 when the log has no route line at all (main() answers
+# 2 for a wrong build before this runs). self_test_route_curve builds its logs from the formatter-held lines of tools\camera_census_fixture.log
+# and pins every token it swaps, so a formatter that moves a token fails the self-test, not a flight.
+
+ROUTE_CURVE_STAMP_RE = re.compile(r"^\[(?P<ts>\d\d:\d\d:\d\d\.\d{3})\]\s*(?P<msg>.*)$")
+# What `curve=` says: off (the game's own quad is drawn), pending (asked for, strip not built yet), stood-down (a fault turned it off for the
+# session), else the strip in hand as curvature/columns/gain (vrWorldFormatCurve: "%.3f/%d/%.3f").
+ROUTE_CURVE_WORDS = ("off", "pending", "stood-down")
+ROUTE_CURVE_STRIP_RE = re.compile(r"^-?\d+(?:\.\d+)?/\d+/-?\d+(?:\.\d+)?$")
+ROUTE_CURVE_OWNS_RE = re.compile(r"vr world route: OWNS the world from frame=(?P<frame>\d+) ")
+# The OWNS line keeps `(curve=<text>)` in whichever sentence it adds for a screen set to curve; a reader keys on that, never on the words.
+ROUTE_CURVE_NAMED_RE = re.compile(r"\(curve=(?P<curve>[^)]*)\)")
+ROUTE_CURVE_LAYER_RE = re.compile(r"^vr world route layer: (?P<secs>[0-9.]+) s; \d+ screen draws re-issued into the layer .*?"
+                                  r"refused by the route's own checks: (?P<checks>.*?); refused by the decision's tests")
+ROUTE_CURVE_CHECK_RE = re.compile(r"(?P<why>[a-z][a-z0-9-]*)=(?P<n>\d+)")
+ROUTE_CURVE_NOT_TAKEN = "vr world route: layer did not take the screen draw for "
+# The refusal the build BEFORE the curved route wrote when the screen was curved (ui_layer_math.h kCurved, deleted since): its short key in
+# the layer's 30 s line, and its long text in the first-eight `layer did not take the screen draw` lines. Only a stale build writes either.
+ROUTE_CURVE_STALE_KEY = "curved-screen"
+ROUTE_CURVE_STALE_TEXT = "the screen is curved (panel_curvature)"
+# `panel curvature:` notes the verdicts use, by a phrase each (each sits on one line of panel_curve.cpp, which the self-test pins). fault, size
+# and unbound are the three ways the curve stands itself down; reissue prints once, at the layer's first strip.
+ROUTE_CURVE_NOTES = (
+    ("fault", "faulted, so it is off for the rest"),
+    ("size", "the SIZE buffer read back"),
+    ("unbound", "nothing is bound to vertex slots 1..3"),
+    ("reissue", "the VR world route's layer drew the same"),
+)
+ROUTE_CURVE_STANDDOWN_KINDS = ("fault", "size", "unbound")
+# A healthy window has curve-reissues equal to eye-takes: the layer's take and the strip's draw are one call chain, and the route reads both at the
+# boundary it prints on. This many eyes of slack (two frames, at two eyes a frame) is for a boundary that falls inside a frame; it is small on
+# purpose, so that a steady flat share (even 1% of a window's 900 eyes) is a WARN and not rounding.
+ROUTE_CURVE_EDGE_EYES = 4
+# The strip is built about 50 ms after the first composite, while the substitution reads the panel's SIZE: `pending` in more owned windows in a
+# row than this is a SIZE that was never read.
+ROUTE_CURVE_PENDING_WINDOWS = 2
+
+
+def _route_curve_kind(text):
+    """A window's curve text as a kind: off, pending, stood-down, strip (curvature/columns/gain), unknown (anything else), or None (no token)."""
+    if text is None:
+        return None
+    if text in ROUTE_CURVE_WORDS:
+        return text
+    return "strip" if ROUTE_CURVE_STRIP_RE.match(text) else "unknown"
+
+
+def parse_route_curve(text):
+    """What --route-curve reads, each item with its 0-based line number (`line`) so a verdict can say what came before what. windows: the
+    route's 5 s lines by token (curve and reissues are None for a build before the curved route; `owned` is owned-frames above 0). owns: the
+    OWNS lines and the curve each names (None when its line has no `(curve=...)`). notes: the `panel curvature:` lines, `kind` one of
+    ROUTE_CURVE_NOTES or other. layer: the layer's `vr world route layer:` lines with the route's refusals by reason; layer_unknown: those it
+    could not read. stale: what only a build before the curved route writes (the `curved-screen` refusal)."""
+    p = {"windows": [], "owns": [], "notes": [], "layer": [], "layer_unknown": [], "stale": []}
+    for n, raw in enumerate(text.splitlines()):
+        if "vr world route" not in raw and "panel curvature:" not in raw:
+            continue
+        m = ROUTE_LINE_RE.match(raw)
+        if m:
+            if not m.group("inject"):
+                kv = _ckv(m.group("rest"))
+                frames = _cint(kv.get("owned-frames"))
+                p["windows"].append({
+                    "line": n, "ts": (m.group("ts") or "").strip("[]"), "state": kv.get("state"), "owned_frames": frames,
+                    "owned": frames > 0 if frames is not None else kv.get("state") == "owned",
+                    "takes": _cint(kv.get("eye-takes")), "curve": kv.get("curve"), "reissues": _cint(kv.get("curve-reissues"))})
+            continue
+        s = ROUTE_CURVE_STAMP_RE.match(raw.rstrip())
+        ts, msg = (s.group("ts"), s.group("msg")) if s else ("", raw.strip())
+        at = {"line": n, "ts": ts}
+        if msg.startswith("vr world route: OWNS the world"):
+            om = ROUTE_CURVE_OWNS_RE.match(msg)
+            if om:
+                named = ROUTE_CURVE_NAMED_RE.search(msg, om.end())
+                p["owns"].append(dict(at, frame=int(om.group("frame")), named=named.group("curve") if named else None))
+        elif msg.startswith("vr world route layer: ") or msg.startswith(ROUTE_CURVE_NOT_TAKEN):
+            # The layer's two kinds of line are where a build before the curved route wrote its refusal of a curved screen: the short key in the
+            # 30 s line, the long text in either (the first-eight lines carry it alone, and a flight under 30 s has no other).
+            if ROUTE_CURVE_STALE_TEXT in msg:
+                p["stale"].append(dict(at, what="the layer's refusal reason `%s ...`" % ROUTE_CURVE_STALE_TEXT))
+            if not msg.startswith("vr world route layer: "):
+                continue
+            lm = ROUTE_CURVE_LAYER_RE.match(msg)
+            if not lm:
+                p["layer_unknown"].append(dict(at, text=msg))
+                sm = re.search(r"%s=([1-9]\d*)" % re.escape(ROUTE_CURVE_STALE_KEY), msg)
+                if sm:
+                    p["stale"].append(dict(at, what="`%s=%s` in a layer line this reader could not otherwise read" % (ROUTE_CURVE_STALE_KEY, sm.group(1))))
+                continue
+            checks = {k: int(v) for k, v in ROUTE_CURVE_CHECK_RE.findall(lm.group("checks"))}
+            p["layer"].append(dict(at, secs=float(lm.group("secs")), checks=checks))
+            if checks.get(ROUTE_CURVE_STALE_KEY, 0) > 0:
+                p["stale"].append(dict(at, what="`%s=%d` in the layer's refusal line" % (ROUTE_CURVE_STALE_KEY, checks[ROUTE_CURVE_STALE_KEY])))
+        elif msg.startswith("panel curvature: "):
+            body = msg[len("panel curvature: "):]
+            kind = next((k for k, needle in ROUTE_CURVE_NOTES if needle in body), "other")
+            p["notes"].append(dict(at, kind=kind, text=body))
+    return p
+
+
+def _rc_when(items, shown=3):
+    """The times of some parsed lines for a message: `10:00:15.100, 10:00:20.100, 10:00:25.100 and 4 more`."""
+    names = [i["ts"] or "line %d" % (i["line"] + 1) for i in items]
+    return ", ".join(names[:shown]) + (" and %d more" % (len(names) - shown) if len(names) > shown else "")
+
+
+def _rc_curve(p, add):
+    """CURVE: what the owned windows said the screen's curve was, and whether it changed. A log with nothing to read it from is a WARN, never a
+    PASS: no window, no curve token (a build before the curved route), or a route that never owned the world."""
+    ws = p["windows"]
+    owned = [w for w in ws if w["owned"]]
+    if not ws:
+        add("CURVE", "WARN", "no `vr world route 5s:` window in this log (it has other route lines): there is no window to read a curve from")
+        return
+    if all(w["curve"] is None for w in ws):
+        add("CURVE", "WARN", "no curve tokens: this log is from a build before the curved route (its %d route 5 s line(s) carry no curve= or "
+            "curve-reissues=), so it says nothing about the curve and the route working together; install the current build and fly again" % len(ws))
+        return
+    if not owned:
+        add("CURVE", "WARN", "the route never owned the world in this log (no owned-frames above 0 in its %d window(s)), so there is nothing to "
+            "judge about the curve: the flight did not reach an on-foot world the route could own, or the route stood aside (state= and the OWNS "
+            "lines say which)" % len(ws))
+        return
+    runs = []
+    for w in owned:
+        text = w["curve"] if w["curve"] is not None else "(no token)"
+        if runs and runs[-1][0] == text:
+            runs[-1][1] += 1
+        else:
+            runs.append([text, 1])
+    counts = {}
+    for text, n in runs:
+        counts[text] = counts.get(text, 0) + n
+    kinds = {_route_curve_kind(w["curve"]) for w in owned}
+    msg = ", ".join("curve=%s in %d of %d owned windows" % (t, n, len(owned)) for t, n in counts.items())
+    if len(runs) > 1:
+        msg += "; it changed between windows: %s (a live edit of fix.panel_curvature, or the strip finishing its build: not a failure)" \
+               % " -> ".join(t for t, _ in runs)
+    if None in kinds or "unknown" in kinds:
+        add("CURVE", "WARN", msg + ". A curve text this reader does not know (the formatter changed?): it is left out of the other verdicts")
+    elif kinds & {"pending", "stood-down"}:
+        add("CURVE", "note", msg + " (READY and STOOD DOWN judge the pending and stood-down windows)")
+    else:
+        add("CURVE", "PASS", msg)
+    if kinds == {"off"}:
+        add("CURVE", "note", "no curve was configured (fix.panel_curvature 0 at the default column count): the game's own flat quad was drawn and re-issued, "
+            "so this log says nothing about the curved route; set fix.panel_curvature above 0 and fly again to test it")
+
+
+def _rc_reissue(p, add):
+    """RE-ISSUE: with the strip in hand for a whole owned window (the same curvature/columns/gain as the window before, so no build or edit fell
+    inside it) every eye the layer took was drawn through the strip: curve-reissues equals eye-takes to within ROUTE_CURVE_EDGE_EYES. Takes with no
+    strip are the layer's FLAT screen under a curved game draw (STOP); a strip count well off the takes is a WARN; a strip drawn while the curve
+    was off in two windows running cannot happen (WARN: the instrument or the build is wrong)."""
+    ws = p["windows"]
+    strips_owned = [w for w in ws if w["owned"] and _route_curve_kind(w["curve"]) == "strip"]
+    stop, low, high, idle, leak = [], [], [], [], []
+    compared = eyes = struck = off_held = 0
+    for i in range(1, len(ws)):
+        w, before = ws[i], ws[i - 1]
+        if w["takes"] is None or w["reissues"] is None:
+            continue
+        if w["curve"] == "off" and before["curve"] == "off":
+            off_held += 1
+            if w["reissues"] > 0:
+                leak.append(w)
+        if not (w["owned"] and _route_curve_kind(w["curve"]) == "strip" and before["curve"] == w["curve"]):
+            continue
+        if w["takes"] == 0 and w["reissues"] == 0:
+            idle.append(w)
+            continue
+        compared += 1
+        eyes += w["takes"]
+        struck += w["reissues"]
+        if w["takes"] > 0 and w["reissues"] == 0:
+            stop.append(w)
+        elif w["reissues"] < w["takes"] - ROUTE_CURVE_EDGE_EYES:
+            low.append(w)
+        elif w["reissues"] > w["takes"] + ROUTE_CURVE_EDGE_EYES:
+            high.append(w)
+    if stop:
+        add("RE-ISSUE", "STOP", "%d owned window(s) (%s) took eyes with the strip in hand and drew no strip (the first: eye-takes=%d curve-reissues=0 under "
+            "curve=%s): the layer drew a FLAT screen under a curved game draw, so while the route owns the world the headset shows a flat screen and "
+            "the curve is lost" % (len(stop), _rc_when(stop), stop[0]["takes"], stop[0]["curve"]))
+    if low:
+        add("RE-ISSUE", "WARN", "curve-reissues is well below eye-takes in %d owned window(s) (%s; the first: %d strips for %d eyes, more than %d apart): "
+            "the layer took the other eyes through the flat re-issue while the strip was in hand, so for those eyes the screen is flat while the "
+            "curve is on" % (len(low), _rc_when(low), low[0]["reissues"], low[0]["takes"], ROUTE_CURVE_EDGE_EYES))
+    if high:
+        add("RE-ISSUE", "WARN", "curve-reissues is above eye-takes in %d owned window(s) (%s; the first: %d strips for %d eyes, more than %d apart): the "
+            "layer drew a strip for eyes it then did not take, so the eye route served them (a fault, or a state that would not go back: see FAULT "
+            "and the layer's refusal line)" % (len(high), _rc_when(high), high[0]["reissues"], high[0]["takes"], ROUTE_CURVE_EDGE_EYES))
+    if leak:
+        add("RE-ISSUE", "WARN", "curve-reissues is above 0 while curve=off in %d window(s) (%s; the first: %d) and the window before said off too: impossible "
+            "by construction, since the layer only draws a strip the curve built, so this instrument is wrong or the log is from a stale build"
+            % (len(leak), _rc_when(leak), leak[0]["reissues"]))
+    if compared and not (stop or low or high):
+        add("RE-ISSUE", "PASS", "curve-reissues equals eye-takes (to within %d eyes) in all %d owned window(s) that had the strip in hand for the whole "
+            "window (%d eye takes, %d strips)" % (ROUTE_CURVE_EDGE_EYES, compared, eyes, struck))
+    if strips_owned and not compared:
+        add("RE-ISSUE", "WARN", "the strip's re-issue was not compared in any window: it needs an owned window with the same curve= as the window before "
+            "it and eye-takes above 0, and this log has none; nothing here shows the layer drawing the strip")
+    if idle:
+        add("RE-ISSUE", "note", "%d owned window(s) (%s) had the strip in hand and took no eye (eye-takes=0): nothing to compare in them"
+            % (len(idle), _rc_when(idle)))
+    if off_held and not leak:
+        add("RE-ISSUE", "PASS", "no strip was drawn while the curve was off (curve-reissues=0 in the %d window(s) that said curve=off right after a window "
+            "that said it too)" % off_held)
+    total = sum(w["reissues"] or 0 for w in ws)
+    firsts = [n for n in p["notes"] if n["kind"] == "reissue"]
+    if total and not firsts:
+        add("RE-ISSUE", "note", "%d strip(s) were re-issued but the log has no `panel curvature: the VR world route's layer drew the same ...` line (it "
+            "prints once, at the first one): the log is cut, or that note's text changed" % total)
+    elif len(firsts) > 1:
+        add("RE-ISSUE", "note", "the first-re-issue note appears %d times (%s); it prints once a session" % (len(firsts), _rc_when(firsts)))
+
+
+def _rc_ready(p, add):
+    """READY: `pending` is the strip not built yet, while the substitution reads the panel's SIZE (about 50 ms); the game and the layer both draw the
+    flat quad meanwhile, consistent but flat. More than ROUTE_CURVE_PENDING_WINDOWS owned windows of it in a row is a SIZE that was never read."""
+    owned = [w for w in p["windows"] if w["owned"]]
+    best = cur = 0
+    first = last = start = None
+    for w in owned:
+        if w["curve"] == "pending":
+            if cur == 0:
+                start = w
+            cur += 1
+            if cur > best:
+                best, first, last = cur, start, w
+        else:
+            cur = 0
+    if best > ROUTE_CURVE_PENDING_WINDOWS:
+        add("READY", "WARN", "curve=pending in %d owned windows in a row (%s to %s): the panel's SIZE was never read, so the game and the layer both draw "
+            "the flat quad: consistent with each other, but flat at a curvature above 0. The strip builds within about 50 ms of the first composite, "
+            "so %d windows is the most a healthy start shows" % (best, first["ts"], last["ts"], ROUTE_CURVE_PENDING_WINDOWS))
+    elif best:
+        add("READY", "note", "curve=pending in %d owned window(s) (%s%s): the strip was still being built, which a healthy start shows for up to %d%s"
+            % (best, first["ts"], " to " + last["ts"] if last is not first else "", ROUTE_CURVE_PENDING_WINDOWS,
+               "; the log ends with it still pending" if owned and owned[-1]["curve"] == "pending" else ""))
+    elif any(_route_curve_kind(w["curve"]) == "strip" for w in owned):
+        add("READY", "PASS", "no owned window said pending: the strip was in hand when the route first owned the world")
+
+
+def _rc_standdown(p, add):
+    """STOOD DOWN: a fault, or a panel SIZE that cannot be one, turns the curve off for the session; the game then draws its own flat quad and the
+    layer re-issues it flat, as before the curved route. Any window saying so is a WARN carrying the nearest `panel curvature:` note before it."""
+    down = [w for w in p["windows"] if w["curve"] == "stood-down"]
+    if not down:
+        add("STOOD DOWN", "PASS", "no window said curve=stood-down")
+        return
+    cause = [n for n in p["notes"] if n["kind"] in ROUTE_CURVE_STANDDOWN_KINDS and n["line"] < down[0]["line"]]
+    why = ("The nearest note before it (%s): panel curvature: %s" % (cause[-1]["ts"], cause[-1]["text"][:320] + ("..." if len(cause[-1]["text"]) > 320 else ""))
+           if cause else "No `panel curvature:` note before it names the cause (this log may start after it).")
+    add("STOOD DOWN", "WARN", "curve=stood-down in %d window(s) (%s): the curve turned itself off for the rest of the session, so the game draws its own flat "
+        "quad and the layer re-issues it flat, as before the curved route. %s" % (len(down), _rc_when(down), why))
+
+
+def _rc_stale(p, add, say_pass):
+    """STALE BUILD: the layer's `curved-screen` refusal was deleted with the build that made the route re-issue a curved screen; a log that carries
+    it flew the build before, and its numbers say nothing about this one. say_pass is False for a log with no curve token (CURVE has already said
+    it is from a build before the curved route): a PASS there would read as if that build were fine."""
+    if p["stale"]:
+        add("STALE BUILD", "STOP", "%d line(s) carry the refusal that only the build before the curved route writes (the first at %s: %s): that build's route "
+            "stood aside for any curved screen, so what this log says about the route and the curve is that build's, not this one's; install the "
+            "current build and fly again" % (len(p["stale"]), p["stale"][0]["ts"], p["stale"][0]["what"]))
+    elif not say_pass:
+        return
+    elif p["layer"]:
+        add("STALE BUILD", "PASS", "no curved-screen refusal in the layer's %d refusal line(s)" % len(p["layer"]))
+    else:
+        add("STALE BUILD", "note", "no `vr world route layer:` line in this log (the layer prints one every 30 s while the route key is auto), so a stale build "
+            "could not be ruled out from it")
+
+
+def _rc_owns(p, add):
+    """OWNS: the OWNS line names a curve (`(curve=<text>)` in the sentence it adds) exactly when the 5 s window after it shows a curve other than off.
+    `pending` and `stood-down` are curves here (the strip was still being built; the sentence says so). A mismatch is a note, never a verdict."""
+    ws, owns = p["windows"], p["owns"]
+    if not owns:
+        add("OWNS", "note", "no OWNS line in this log (the route never entered ownership, or this log starts after it)")
+        return
+    bad, agree, named, wi = [], 0, 0, 0
+    for o in owns:
+        while wi < len(ws) and ws[wi]["line"] < o["line"]:
+            wi += 1
+        if wi >= len(ws) or ws[wi]["curve"] is None:
+            continue
+        w = ws[wi]
+        says = o["named"] not in (None, "off")
+        shows = w["curve"] != "off"
+        named += says
+        if says == shows:
+            agree += 1
+        else:
+            bad.append((o, w))
+    for o, w in bad[:3]:
+        if o["named"] in (None, "off"):
+            add("OWNS", "note", "%s: the OWNS line names no curve but the 5 s window after it (%s) says curve=%s: the curve was set or finished building "
+                "after the route took the world (a live edit, or the strip's build)" % (o["ts"], w["ts"], w["curve"]))
+        else:
+            add("OWNS", "note", "%s: the OWNS line says (curve=%s) but the 5 s window after it (%s) says curve=off: the curve was turned off in between "
+                "(a live edit)" % (o["ts"], o["named"], w["ts"]))
+    if len(bad) > 3:
+        add("OWNS", "note", "and %d more OWNS line(s) that disagree with the window after them" % (len(bad) - 3))
+    if agree and not bad:
+        add("OWNS", "PASS", "%d OWNS line(s): each names a curve exactly when the 5 s window after it shows one (%d named; pending counts as a curve: the "
+            "strip was still being built)" % (agree, named))
+    elif not agree and not bad:
+        add("OWNS", "note", "no 5 s window after the OWNS line(s) to compare them with")
+
+
+def _rc_fault(p, add):
+    """FAULT: a `fault` refusal in the layer's refusal line while strips were re-issued in the same span (the route windows printed since the
+    layer's last line: its window is 30 s, the route's 5 s) is a strip draw that faulted after the layer's bracket opened; the eye route served
+    those eyes, and one fault stands the curve down for the session."""
+    ws = p["windows"]
+    if not p["layer"]:
+        return
+    hits, flat, prev = [], 0, -1
+    for l in p["layer"]:
+        faults = l["checks"].get("fault", 0)
+        if faults:
+            strips = sum(w["reissues"] or 0 for w in ws if prev < w["line"] < l["line"])
+            if strips:
+                hits.append((l, faults, strips))
+            else:
+                flat += faults
+        prev = l["line"]
+    if hits:
+        l, faults, strips = hits[0]
+        add("FAULT", "WARN", "fault refusals beside re-issued strips in %d layer line(s) (%s; the first: fault=%d with %d strips in its span): a strip draw "
+            "faulted after the layer's bracket opened, so the eye route served those eyes; one fault stands the curve down for the session (see "
+            "STOOD DOWN and the `panel curvature:` note)" % (len(hits), _rc_when([h[0] for h in hits]), faults, strips))
+    else:
+        add("FAULT", "PASS", "no fault refusal beside re-issued strips in the layer's %d refusal line(s)" % len(p["layer"]))
+    if flat:
+        add("FAULT", "note", "%d fault refusal(s) in spans with no strip re-issued: the flat re-issue's own bind, not the curve's" % flat)
+
+
+def _rc_layer_unknown(p, add):
+    if p["layer_unknown"]:
+        add("LAYER", "WARN", "%d `vr world route layer:` line(s) this reader does not know (the formatter changed?), so STALE BUILD and FAULT did not see them; "
+            "the first: %s" % (len(p["layer_unknown"]), p["layer_unknown"][0]["text"][:200]))
+
+
+def route_curve_judge(p):
+    """[(tag, status, text)] in the order of the rules: CURVE, RE-ISSUE, READY, STOOD DOWN, STALE BUILD, OWNS, FAULT (and LAYER, a layer line this
+    reader cannot read). status is PASS, WARN, STOP or note; notes are facts and never change the verdict. A log with no curve token (a build
+    before the curved route) is judged by what it can still say (STALE BUILD), and its CURVE line is a WARN that says so."""
+    out = []
+
+    def add(tag, status, text):
+        out.append((tag, status, text))
+
+    ws = p["windows"]
+    tokens = any(w["curve"] is not None for w in ws)
+    _rc_curve(p, add)
+    if tokens and any(w["owned"] for w in ws):
+        _rc_reissue(p, add)
+        _rc_ready(p, add)
+    if tokens:
+        _rc_standdown(p, add)
+    _rc_stale(p, add, tokens)
+    if tokens:
+        _rc_owns(p, add)
+        _rc_fault(p, add)
+    _rc_layer_unknown(p, add)
+    return out
+
+
+def _rc_runs(ws):
+    """The route's windows as runs of the same ownership and curve: [{owned, curve, n, first, last, takes, strips}]."""
+    runs = []
+    for w in ws:
+        if runs and runs[-1]["owned"] == w["owned"] and runs[-1]["curve"] == w["curve"]:
+            r = runs[-1]
+            r["n"] += 1
+            r["last"] = w["ts"]
+            r["takes"] += w["takes"] or 0
+            r["strips"] += w["reissues"] or 0
+        else:
+            runs.append({"owned": w["owned"], "curve": w["curve"], "n": 1, "first": w["ts"], "last": w["ts"],
+                         "takes": w["takes"] or 0, "strips": w["reissues"] or 0})
+    return runs
+
+
+def print_route_curve(text, path=None):
+    """--route-curve: the curved VR world route's flight in one report; exit 0 (PASS or WARN), 1 (STOP), 3 (no route line in the log). `path` is the log's
+    file, named in the header beside the build (main() has already printed its full path and the version line)."""
+    p = parse_route_curve(text)
+    ws = p["windows"]
+    if not (ws or p["owns"] or p["layer"] or p["layer_unknown"]):
+        print("[edvr] route-curve: no `vr world route` line in this log. The key experimental.temporal_aa_on_foot_world was not auto, the UI layer was not "
+              "live (the route stays off then), or this is not a VR flight; with the key auto the route prints a 5 s line every window, zeros included.")
+        return 3
+    ver = version_line(text)[1]
+    print("[edvr] route-curve: %sbuild %s; %d route window(s), %d owned; %d OWNS line(s), %d `panel curvature:` note(s), %d layer refusal line(s)"
+          % (os.path.basename(path) + ", " if path else "", ver or "(no version line)", len(ws), sum(1 for w in ws if w["owned"]), len(p["owns"]),
+             len(p["notes"]), len(p["layer"])))
+    runs = _rc_runs(ws)
+    if runs:
+        print("route windows, by ownership and curve (%d run(s)):" % len(runs))
+        shown = runs if len(runs) <= 12 else runs[:6] + [None] + runs[-5:]
+        for r in shown:
+            if r is None:
+                print("  ... %d run(s) left out ..." % (len(runs) - 11))
+                continue
+            print("  %s .. %s  %3d window(s)  %-9s  curve=%s  eye-takes %d, curve-reissues %d"
+                  % (r["first"], r["last"], r["n"], "owned" if r["owned"] else "not owned", r["curve"] if r["curve"] is not None else "(no token)",
+                     r["takes"], r["strips"]))
+    if p["owns"]:
+        print("OWNS lines (%d): %s%s" % (len(p["owns"]), "; ".join("%s frame %d%s" % (o["ts"], o["frame"], " (curve=%s)" % o["named"] if o["named"] is not None else "")
+                                                                 for o in p["owns"][:6]), " ..." if len(p["owns"]) > 6 else ""))
+    if p["notes"]:
+        print("`panel curvature:` notes (%d):" % len(p["notes"]))
+        for n in p["notes"][:8]:
+            print("  %s  %s" % (n["ts"], n["text"][:110] + ("..." if len(n["text"]) > 110 else "")))
+        if len(p["notes"]) > 8:
+            print("  ... %d more" % (len(p["notes"]) - 8))
+    if p["layer"]:
+        listed = [l for l in p["layer"] if l["checks"]]
+        print("layer refusal lines (%d): %s" % (len(p["layer"]), "; ".join("%s %s" % (l["ts"], ", ".join("%s=%d" % kv for kv in l["checks"].items()))
+                                                                          for l in listed[:6]) + (" ..." if len(listed) > 6 else "")
+                                                if listed else "none lists a refusal by the route's own checks"))
+    findings = route_curve_judge(p)
+    for tag, status, msg in findings:
+        print("  %-4s  %s: %s" % (status, tag, msg))
+    stops = sum(1 for f in findings if f[1] == "STOP")
+    warns = sum(1 for f in findings if f[1] == "WARN")
+    verdict = "STOP" if stops else "WARN" if warns else "PASS"
+    print("route-curve verdict: %s (%d STOP, %d WARN). PASS: strips drawn equal eye takes wherever the strip was in hand, built within %d windows, nothing "
+          "stood down, no stale-build refusal, no fault beside strips. STOP: eyes taken and no strip drawn (a flat screen under a curved game draw), or a "
+          "`curved-screen` refusal (a stale build). WARN: a strip count off its eye takes, a strip still pending, a stood-down curve, a fault beside "
+          "strips, or nothing to judge (no curve token, no owned window)." % (verdict, stops, warns, ROUTE_CURVE_PENDING_WINDOWS))
+    return 1 if stops else 0
+
+
+def self_test_route_curve():
+    """--route-curve on logs built from the route's own formatter output: the 5 s lines of tools\\camera_census_fixture.log (which
+    tools\\vr_world_route_test holds to the formatter) with only their curve tokens, eye-takes, owned-frames and state swapped, the flat OWNS line of
+    tools\\maps_sharp_fixture.log with each state's sentence added, and the layer's line as a real flight wrote it. Every case asserts the verdict AND the
+    exit code; the pins at the top tie the reader's tokens and phrases to the sources that write them. Returns ok."""
+    import contextlib
+    import io
+    import shutil
+    import tempfile
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("route-curve: %s" % msg)
+        ok = False
+
+    root = repo_root()
+    tools = os.path.join(root, "tools")
+    try:
+        census = read_text(os.path.join(tools, CENSUS_FIXTURE))
+        maps = read_text(os.path.join(tools, "maps_sharp_fixture.log"))
+    except OSError as e:
+        fail("a fixture the self-test builds from is missing (%s)" % e)
+        return False
+
+    # The pins: each phrase the reader keys on must still be in the source that writes it (each sits on one line there, which is what makes it
+    # pinnable), and the one key that marks a stale build, `curved-screen`, must not be in the header that deleted it. A reworded note or a
+    # key brought back fails here, with the file named, instead of making a flight's verdict quietly wrong.
+    for rel, needles, absent in (
+            (("src", "d3d11", "vr_world_route_math.h"), ("(curve=",), ()),
+            (("src", "d3d11", "panel_curve.cpp"), tuple(n for _, n in ROUTE_CURVE_NOTES), ()),
+            (("src", "d3d11", "ui_layer.cpp"), ("vr world route layer: ", "route's own checks: %s; refused by the decision's tests"), ()),
+            (("src", "d3d11", "ui_layer_math.h"), ('return "fault";', ROUTE_CURVE_NOT_TAKEN + "eye %d: %s"), ('"%s"' % ROUTE_CURVE_STALE_KEY,))):
+        try:
+            body = read_text(os.path.join(root, *rel))
+        except OSError:
+            fail("%s is not where the self-test looks for it" % "\\".join(rel))
+            continue
+        for needle in needles:
+            if needle not in body:
+                fail("%s no longer has %r, which --route-curve reads; change this reader and its pin together" % ("\\".join(rel), needle))
+        for needle in absent:
+            if needle in body:
+                fail("%s has %s again: --route-curve reads it as the sign of a build before the curved route" % ("\\".join(rel), needle))
+
+    # The base route line: the fixture's owned window, whose curve tokens are the formatter's. Everything a case swaps is pinned to occur once.
+    owned_lines = [l for l in census.splitlines() if "vr world route 5s:" in l and " state=owned " in l]
+    base = owned_lines[0] if len(owned_lines) == 1 else ""
+    tok = " curve=off curve-reissues=0 "
+    counts = [base.count(tok), base.count(" state=owned "), len(re.findall(r" owned-frames=\d+ ", base)), len(re.findall(r" eye-takes=\d+ ", base))]
+    if not base or counts != [1, 1, 1, 1]:
+        fail("the census fixture's owned route line is not one line with ' curve=off curve-reissues=0 ', ' state=owned ', one owned-frames= and one "
+             "eye-takes= (found %d line(s), counts %s): the formatter moved a token, or the fixture was regenerated without it" % (len(owned_lines), counts))
+        return False
+    owned0 = int(re.search(r" owned-frames=(\d+) ", base).group(1))
+    takes0 = int(re.search(r" eye-takes=(\d+) ", base).group(1))
+    if takes0 < 100:
+        fail("the census fixture's owned window has eye-takes=%d: the tolerance cases need a window of at least 100 eyes" % takes0)
+        return False
+    owns_lines = [l for l in maps.splitlines() if "vr world route: OWNS the world" in l]
+    if len(owns_lines) != 1 or "(curve=" in owns_lines[0]:
+        fail("tools\\maps_sharp_fixture.log should hold one flat OWNS line, found %d (or it names a curve)" % len(owns_lines))
+        return False
+    owns_flat = re.sub(r"^\[[\d:.]+\] ", "", owns_lines[0])
+    owns_frame = int(re.search(r"OWNS the world from frame=(\d+) ", owns_flat).group(1))
+
+    # The sentences vrWorldFormatEntered adds for a screen set to curve, one per state (the reader keys on `(curve=<text>)` in them, not the words).
+    sent_strip = ("; the screen is curved (curve=%s): the layer draws the same strip the game's own draw is substituted with, so the bend and the "
+                  "placement are the game's")
+    sent_pending = "; the screen is set to curve (curve=pending): the strip is not built yet, so the game and the layer both draw the flat quad until it is"
+    sent_down = ("; the screen is set to curve but the curve stood down (curve=stood-down): the game draws its own flat quad and the layer "
+                 "re-issues it flat")
+    # The layer's line, verbatim from a real flight log (2026-10-01 09:21:27.190, Frontier): no rig holds this one, since it is a printf in ui_layer.cpp.
+    layer_real = ("vr world route layer: 30 s; 0 screen draws re-issued into the layer (0.00 a frame); refused by the route's own checks: none; refused by "
+                  "the decision's tests (every 2D screen draw this window, owned frames or not): none; 0 draws into a re-issued eye left in the game's "
+                  "frame (lost while the route owns that eye). The first eight distinct reasons are named in full, once each, in the lines "
+                  "\"vr world route: layer did not take the screen draw for eye N\".")
+    # A route line from a real flight of a build before the curved route (2026-10-01 09:23:52.317): no curve tokens.
+    route_old = ("[09:23:52.317] vr world route 5s: key=auto state=observing layer=live gate=no frames=432 gate-frames=432 gate-flips=0 hdr-frames=0 "
+                 "trigger=0 none=0 ambiguous=0 treated=0 declined=0 owned-frames=0 eye-takes=0 door-layer-only=0 enters=0 releases=0 (last=none) "
+                 "scene-resets=0 late-hdr-writes=0 (in 0 frames) last=none jitter=idle phase=0.0000,0.0000 rows=0.0000,0.0000 fp-mode=0/0/0 "
+                 "steady-detail=on last-trigger=VS=0000000000000000 PS=0000000000000000 target=0x0 hdr=0x0 selection=none")
+    if layer_real.count("route's own checks: none;") != 1:
+        fail("the self-test's own layer line lost its 'route's own checks: none;'")
+        return False
+
+    strip = "0.300/64/0.531"
+    eyes = takes0
+
+    def win(i, curve="off", reissues=0, takes=None, owned=True):
+        """Window i of a flight (5 s apart): the base line with its curve tokens, eye-takes, owned-frames and state swapped."""
+        takes = eyes if takes is None else takes
+        line = re.sub(r"^\[[\d:.]+\]", "[10:%02d:%02d.100]" % (5 * i // 60, 5 * i % 60), base)
+        line = line.replace(tok, " curve=%s curve-reissues=%d " % (curve, reissues))
+        line = re.sub(r" owned-frames=\d+ ", " owned-frames=%d " % (owned0 if owned else 0), line)
+        line = re.sub(r" eye-takes=\d+ ", " eye-takes=%d " % (takes if owned else 0), line)
+        return line.replace(" state=owned ", " state=%s " % ("owned" if owned else "observing"))
+
+    def many(n, curve, reissues=None, start=0, **kw):
+        """n windows of one curve; reissues defaults to the window's eye takes, the healthy count."""
+        return [win(start + i, curve, eyes if reissues is None else reissues, **kw) for i in range(n)]
+
+    def owns(sentence="", at="10:00:00.050"):
+        return "[%s] %s%s" % (at, owns_flat, sentence)
+
+    def note(text, at="10:00:14.000"):
+        return "[%s] panel curvature: %s" % (at, text)
+
+    def layer(checks="none", at="10:00:30.200"):
+        return "[%s] %s" % (at, layer_real.replace("route's own checks: none;", "route's own checks: %s;" % checks))
+
+    def lines(*parts):
+        flat = []
+        for part in parts:
+            flat.extend(part if isinstance(part, list) else [part])
+        return "\n".join(flat) + "\n"
+
+    def run(text, path=None):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = print_route_curve(text, path)
+        return rc, buf.getvalue()
+
+    def case(what, text, rc_want, verdict, *has, absent=()):
+        rc, out = run(text)
+        problems = []
+        if rc != rc_want:
+            problems.append("exit %d, wanted %d" % (rc, rc_want))
+        if verdict and ("route-curve verdict: %s (" % verdict) not in out:
+            problems.append("the verdict is not %s" % verdict)
+        problems += ["lacks %r" % h for h in has if h not in out]
+        problems += ["has %r" % a for a in absent if a in out]
+        if problems:
+            fail("%s: %s:\n%s" % (what, "; ".join(problems), out))
+
+    no_stop_warn = ("  STOP  ", "  WARN  ")
+    fault_note = note("the VR world route's re-issue of the strip faulted, so it is off for the rest of this session and the game's own quad is drawn "
+                      "again. The input assembler was put back, so the screen should look exactly as it did before -- if it does not, restart the game "
+                      "and report the log.")
+
+    # ---- what the parser reads out of a formatter-held line ----
+    pw = parse_route_curve(win(3, strip, eyes))["windows"]
+    if len(pw) != 1 or (pw[0]["state"], pw[0]["owned"], pw[0]["owned_frames"], pw[0]["takes"], pw[0]["curve"], pw[0]["reissues"]) != (
+            "owned", True, owned0, eyes, strip, eyes):
+        fail("the parser reads a swapped fixture line as %r" % pw)
+    if parse_route_curve(census)["windows"][-1]["curve"] != "off" or len(parse_route_curve(census)["windows"]) != 2:
+        fail("the census fixture's own route lines (two windows, the inject lines between skipped) read as %r" % parse_route_curve(census)["windows"])
+
+    # ---- the verdicts ----
+    healthy = lines(owns(sent_strip % strip), many(11, strip), layer())
+    case("a healthy curved run", healthy, 0, "PASS", "curve=0.300/64/0.531 in 11 of 11 owned windows",
+         "curve-reissues equals eye-takes (to within 4 eyes) in all 10 owned window(s)", "PASS  OWNS", "PASS  STALE BUILD", "PASS  STOOD DOWN",
+         "PASS  READY", "OWNS lines (1): 10:00:00.050 frame %d (curve=%s)" % (owns_frame, strip),
+         "layer refusal lines (1): none lists a refusal by the route's own checks", absent=no_stop_warn)
+    case("a log with no version line says so in the header", healthy, 0, "PASS", "[edvr] route-curve: build (no version line); 11 route window(s), 11 owned")
+    rc, out = run("[10:00:00.000] version 0.14.1-93-gf78eba4 (build 68C0A1F2)\n" + healthy, os.path.join("somewhere", "edvr_gfx_20260101_000000.log"))
+    if rc != 0 or "[edvr] route-curve: edvr_gfx_20260101_000000.log, build 0.14.1-93-gf78eba4; 11 route window(s), 11 owned" not in out:
+        fail("the header should name the log's file and the build:\n%s" % out)
+    case("the census fixture as it is (a curve of off and no OWNS line)", census, 0, "PASS", "curve=off in 1 of 1 owned windows", "no curve was configured")
+    case("the same run with CRLF line ends", healthy.replace("\n", "\r\n"), 0, "PASS", "in 11 of 11 owned windows")
+    case("the same run with no time stamps", re.sub(r"(?m)^\[[\d:.]+\] ", "", healthy), 0, "PASS", "in 11 of 11 owned windows")
+
+    case("the flat screen under a curved draw: eye takes and no strip", lines(many(11, strip, 0)), 1, "STOP",
+         "STOP  RE-ISSUE", "10 owned window(s)", "the layer drew a FLAT screen under a curved game draw", "eye-takes=%d curve-reissues=0 under curve=%s" % (eyes, strip))
+    case("curve off throughout", lines(many(6, "off", 0)), 0, "PASS", "PASS  CURVE: curve=off in 6 of 6 owned windows", "note  CURVE: no curve was configured",
+         "PASS  RE-ISSUE: no strip was drawn while the curve was off", absent=no_stop_warn)
+
+    case("pending in three owned windows in a row", lines(many(3, "pending", 0), many(3, strip, start=3)), 0, "WARN",
+         "WARN  READY: curve=pending in 3 owned windows in a row", "the panel's SIZE was never read", "10:00:00.100 to 10:00:10.100")
+    case("pending in two owned windows is the healthy start", lines(many(2, "pending", 0), many(4, strip, start=2)), 0, "PASS",
+         "note  READY: curve=pending in 2 owned window(s)", absent=no_stop_warn)
+    case("pending, then not, then pending: the run is the longest consecutive one", lines(many(2, "pending", 0), many(1, strip, start=2),
+         many(2, "pending", 0, start=3), many(2, strip, start=5)), 0, "PASS", "note  READY: curve=pending in 2 owned window(s)")
+    case("the strip built between two windows: the window it was built in is not judged", lines(win(0, "pending", 0), win(1, strip, eyes // 2), win(2, strip, eyes)),
+         0, "PASS", "all 1 owned window(s) that had the strip in hand", absent=("  STOP  ",))
+
+    case("stood down after a fault note", lines(many(3, strip), fault_note, many(3, "stood-down", 0, start=3)), 0, "WARN",
+         "WARN  STOOD DOWN: curve=stood-down in 3 window(s)", "the VR world route's re-issue of the strip faulted", "panel curvature: the VR world route's re-issue",
+         "`panel curvature:` notes (1):\n  10:00:14.000  the VR world route's re-issue of the strip faulted")
+    case("stood down with no note before it", lines(many(3, strip), many(2, "stood-down", 0, start=3)), 0, "WARN",
+         "WARN  STOOD DOWN: curve=stood-down in 2 window(s)", "No `panel curvature:` note before it names the cause")
+    size_note = note("the SIZE buffer read back 0.000 x 0.000, which cannot be a panel size. The bend needs a gain in model units and there is none to be "
+                     "had, so it stands down.", "10:00:01.000")
+    unbound_note = note("nothing is bound to vertex slots 1..3, so the panel's SIZE cannot be read and the bend has no gain to put it in model units. "
+                        "Standing down.", "10:00:00.500")
+    case("stood down after a SIZE note, the nearer of two causes", lines(unbound_note, size_note, many(3, "stood-down", 0)), 0, "WARN",
+         "The nearest note before it (10:00:01.000): panel curvature: the SIZE buffer read back 0.000 x 0.000",
+         absent=("The nearest note before it (10:00:00.500)",))
+    case("a fault note AFTER the first stood-down window is not its cause", lines(many(2, "stood-down", 0), fault_note), 0, "WARN",
+         "No `panel curvature:` note before it names the cause", absent=("The nearest note before it (",))
+    case("only fault, SIZE and unbound notes are causes (the build note is not)", lines(
+        note("built a 64-column strip -- 130 vertices, 384 indices -- at curvature 0.300, depth sign +1."), many(2, "stood-down", 0)), 0, "WARN",
+         "No `panel curvature:` note before it names the cause")
+
+    case("a live edit from the curve to off", lines(many(3, strip), many(3, "off", 0, start=3)), 0, "PASS",
+         "curve=0.300/64/0.531 in 3 of 6 owned windows, curve=off in 3 of 6 owned windows", "it changed between windows: 0.300/64/0.531 -> off",
+         absent=no_stop_warn)
+    case("off, pending, then the strip", lines(many(2, "off", 0), many(1, "pending", 0, start=2), many(4, strip, start=3)), 0, "PASS",
+         "it changed between windows: off -> pending -> 0.300/64/0.531")
+    case("a live edit of the curvature itself", lines(many(3, strip), many(3, "0.500/64/0.531", start=3)), 0, "PASS",
+         "0.300/64/0.531 -> 0.500/64/0.531")
+    case("a window of a live edit to off may still count strips from before it", lines(many(3, strip), win(3, "off", eyes // 2)), 0, "PASS",
+         absent=("while curve=off",))
+
+    case("a curved-screen refusal in the layer's line", lines(many(4, "off", 0), layer("curved-screen=1800")), 1, "STOP",
+         "STOP  STALE BUILD", "`curved-screen=1800` in the layer's refusal line", "the build before the curved route")
+    case("a curved-screen refusal beside other refusals", lines(many(4, strip), layer("depth-state=3, curved-screen=12, fault=1")), 1, "STOP", "STOP  STALE BUILD")
+    old_text = ("vr world route: layer did not take the screen draw for eye 0: the screen is curved (panel_curvature): the game draws its own mesh, which a "
+                "repeat of its draw would not reproduce")
+    case("the old build's long refusal text alone (a flight shorter than the layer's 30 s line)", lines(many(3, "off", 0), "[10:00:01.000] " + old_text),
+         1, "STOP", "STOP  STALE BUILD", "the layer's refusal reason `the screen is curved (panel_curvature) ...`")
+    case("the old long text inside the layer's own line", lines(many(3, strip), layer("the screen is curved (panel_curvature): the game draws its own mesh")), 1, "STOP",
+         "STOP  STALE BUILD", "the layer's refusal reason `the screen is curved (panel_curvature) ...`")
+    case("curved-screen in a layer line the reader cannot otherwise read", lines(many(3, strip),
+         "[10:00:20.000] vr world route layer: a format this reader never saw; curved-screen=7"), 1, "STOP", "STOP  STALE BUILD",
+         "`curved-screen=7` in a layer line this reader could not otherwise read", "WARN  LAYER")
+    case("curved-screen=0 in an unreadable layer line is no refusal", lines(many(3, strip),
+         "[10:00:20.000] vr world route layer: a format this reader never saw; curved-screen=0"), 0, "WARN", "WARN  LAYER", absent=("STOP  STALE BUILD",))
+    case("a stale log has no curve tokens and a curved-screen refusal: STOP wins over the WARN",
+         lines([w.replace(tok, " ") for w in many(4, "off", 0)], layer("curved-screen=900")), 1, "STOP", "WARN  CURVE: no curve tokens", "STOP  STALE BUILD")
+    case("no curved-screen in a log with a layer line", lines(many(3, "off", 0), layer("depth-state=3")), 0, "PASS", "PASS  STALE BUILD")
+    case("no layer line to rule a stale build out", lines(many(3, strip)), 0, "PASS", "note  STALE BUILD: no `vr world route layer:` line")
+
+    case("no route line at all", "[10:00:00.000] version 0.14.1-93-gf78eba4 (build 68C0A1F2)\n[10:00:01.000] nothing of the route's here\n", 3, None,
+         "no `vr world route` line in this log", absent=("route-curve verdict",))
+    case("a log with only the curve's own notes has no route line", lines(note("off; the game's own quad is drawn.")), 3, None, "no `vr world route` line")
+
+    case("OWNS names the curve and the window shows it", lines(owns(sent_strip % strip), many(3, strip)), 0, "PASS",
+         "PASS  OWNS: 1 OWNS line(s): each names a curve exactly when the 5 s window after it shows one (1 named")
+    case("OWNS names no curve and the window shows off", lines(owns(), many(3, "off", 0)), 0, "PASS", "PASS  OWNS: 1 OWNS line(s)", "(0 named")
+    case("OWNS names no curve but the window shows one: a note, not a verdict", lines(owns(), many(3, strip)), 0, "PASS",
+         "note  OWNS: 10:00:00.050: the OWNS line names no curve but the 5 s window after it (10:00:00.100) says curve=%s" % strip, absent=("PASS  OWNS",))
+    case("OWNS names a curve but the window shows off: a note", lines(owns(sent_strip % strip), many(3, "off", 0)), 0, "PASS",
+         "the OWNS line says (curve=%s) but the 5 s window after it (10:00:00.100) says curve=off" % strip, absent=("PASS  OWNS",))
+    case("OWNS pending, the window shows the strip: pending is a curve", lines(owns(sent_pending), many(3, strip)), 0, "PASS", "PASS  OWNS: 1 OWNS line(s)",
+         "(1 named", absent=("note  OWNS",))
+    case("OWNS stood-down, the window stood-down", lines(owns(sent_down), many(3, "stood-down", 0)), 0, "WARN", "PASS  OWNS: 1 OWNS line(s)", absent=("note  OWNS",))
+    case("OWNS keys on (curve=...), not on the sentence", lines(owns("; the screen now bends (curve=%s) for you" % strip), many(3, strip)), 0, "PASS",
+         "PASS  OWNS: 1 OWNS line(s)", "(1 named")
+    case("an OWNS line with no window after it", lines(many(3, strip), owns(sent_strip % strip, "10:00:20.000")), 0, "PASS",
+         "note  OWNS: no 5 s window after the OWNS line(s)")
+    case("each OWNS line is judged against the window after it", lines(owns(), many(2, "off", 0), owns(sent_strip % strip, "10:00:12.000"), many(2, strip, start=2),
+         owns("", "10:00:22.000"), many(1, strip, start=4)), 0, "PASS", "note  OWNS: 10:00:22.000: the OWNS line names no curve")
+
+    shuffled = [re.sub(r" curve=(\S+) curve-reissues=(\d+) ", " ", w).replace(" key=auto ", " curve-reissues=%s curve=%s key=auto " % (eyes, strip), 1)
+                for w in many(11, strip)]
+    case("the curve tokens moved to the front of the line, reversed", lines(owns(sent_strip % strip), shuffled, layer()), 0, "PASS",
+         "curve=0.300/64/0.531 in 11 of 11 owned windows", "in all 10 owned window(s)", absent=no_stop_warn)
+    slim = [re.sub(r" (?:jitter|phase|rows|fp-mode|steady-detail)=\S+", "", w) for w in many(11, strip)]
+    if any(" steady-detail=" in w or " jitter=" in w for w in slim):
+        fail("the self-test's own slimming left a steady-detail or jitter token in a window line")
+    case("the steady-detail, jitter, phase, rows and fp-mode tokens removed (a later build)", lines(owns(sent_strip % strip), slim, layer()), 0, "PASS",
+         "curve=0.300/64/0.531 in 11 of 11 owned windows", "in all 10 owned window(s)", absent=no_stop_warn)
+
+    case("a fault beside re-issued strips", lines(many(11, strip), layer("fault=3")), 0, "WARN", "WARN  FAULT: fault refusals beside re-issued strips in 1 layer line(s)",
+         "fault=3 with %d strips in its span" % (10 * eyes + eyes), "layer refusal lines (1): 10:00:30.200 fault=3")
+    case("a fault in a flat log is not the curve's", lines(many(6, "off", 0), layer("fault=3")), 0, "PASS", "PASS  FAULT", "3 fault refusal(s) in spans with no strip")
+    case("a fault line BEFORE the strips has no strips in its span", lines(layer("fault=2", "10:00:00.050"), many(6, strip)), 0, "PASS", "PASS  FAULT",
+         "2 fault refusal(s) in spans with no strip", absent=("WARN  FAULT",))
+    case("the second layer line's span starts after the first", lines(many(3, strip), layer("depth-state=1", "10:00:15.200"), many(3, "off", 0, start=3),
+         layer("fault=1", "10:00:30.200")), 0, "PASS", "PASS  FAULT", absent=("WARN  FAULT",))
+    case("an unknown layer line", lines(many(3, "off", 0), "[10:00:20.000] vr world route layer: something the formatter never wrote"), 0, "WARN",
+         "WARN  LAYER: 1 `vr world route layer:` line(s) this reader does not know", "something the formatter never wrote")
+
+    case("a build before the curved route (the fixture's lines without the two tokens)", lines([w.replace(tok, " ") for w in many(4, "off", 0)], layer()), 0, "WARN",
+         "WARN  CURVE: no curve tokens: this log is from a build before the curved route", "4 route 5 s line(s)",
+         absent=("PASS  CURVE", "PASS  RE-ISSUE", "PASS  STOOD DOWN", "PASS  OWNS", "PASS  STALE BUILD", "PASS  FAULT", "note  STALE BUILD"))
+    case("a real route line of a build before the curved route", lines(route_old, layer()), 0, "WARN",
+         "no curve tokens: this log is from a build before the curved route", absent=("PASS  CURVE", "PASS  STALE BUILD", "route-curve verdict: PASS"))
+    case("a route that never owned the world", lines(many(4, strip, 0, owned=False)), 0, "WARN",
+         "WARN  CURVE: the route never owned the world in this log", absent=("PASS  CURVE",))
+    just_entered = [re.sub(r" owned-frames=\d+ ", " owned-frames=0 ", w) for w in many(3, strip, 0, takes=0)]
+    case("state=owned with no owned frame in the window is not an owned window", lines(just_entered), 0, "WARN",
+         "WARN  CURVE: the route never owned the world in this log")
+    case("a route line stream with only the other route lines", lines(owns(), layer()), 0, "WARN", "WARN  CURVE: no `vr world route 5s:` window")
+
+    case("strips a few eyes under the takes: window-edge slack", lines(win(0, strip, eyes), win(1, strip, eyes - 4)), 0, "PASS", "to within 4 eyes")
+    case("strips five eyes under the takes: well below", lines(win(0, strip, eyes), win(1, strip, eyes - 5)), 0, "WARN",
+         "WARN  RE-ISSUE: curve-reissues is well below eye-takes in 1 owned window(s)", "%d strips for %d eyes, more than 4 apart" % (eyes - 5, eyes))
+    case("half the eyes through the strip", lines(many(1, strip), win(1, strip, eyes // 2), win(2, strip, eyes // 2)), 0, "WARN", "in 2 owned window(s)",
+         "the layer took the other eyes through the flat re-issue", absent=("STOP  RE-ISSUE",))
+    case("strips four eyes over the takes: slack", lines(win(0, strip, eyes), win(1, strip, eyes + 4)), 0, "PASS", "to within 4 eyes")
+    case("strips five eyes over the takes", lines(win(0, strip, eyes), win(1, strip, eyes + 5)), 0, "WARN",
+         "WARN  RE-ISSUE: curve-reissues is above eye-takes in 1 owned window(s)", "the layer drew a strip for eyes it then did not take")
+    case("one eye taken and no strip is still the flat screen", lines(win(0, strip, 2), win(1, strip, 0, takes=2)), 1, "STOP", "eye-takes=2 curve-reissues=0")
+    case("a strip window of one: nothing before it to hold it against", lines(win(0, strip, 0)), 0, "WARN", "the strip's re-issue was not compared in any window",
+         absent=("STOP  RE-ISSUE",))
+    case("windows that took no eye with the strip in hand", lines(many(3, strip, 0, takes=0)), 0, "WARN", "the strip's re-issue was not compared in any window",
+         "note  RE-ISSUE: 2 owned window(s)", "had the strip in hand and took no eye")
+    case("strips while the curve was off, twice running", lines(win(0, "off", 0), win(1, "off", 50)), 0, "WARN",
+         "WARN  RE-ISSUE: curve-reissues is above 0 while curve=off in 1 window(s)", "impossible by construction")
+    case("a first-reissue note is expected once strips were drawn", lines(many(4, strip)), 0, "PASS",
+         "note  RE-ISSUE: %d strip(s) were re-issued but the log has no `panel curvature: the VR world route's layer drew the same" % (4 * eyes))
+    first_note = note("the VR world route's layer drew the same 64-column strip at curvature 0.300 that the game's own draw is substituted with, from the mipped "
+                      "resolved screen.", "10:00:00.090")
+    case("with the first-reissue note there is no such note", lines(first_note, many(4, strip)), 0, "PASS", absent=("were re-issued but the log has no",))
+    case("an unknown curve text is a WARN, not a crash", lines(many(3, "weird/curve", 0)), 0, "WARN", "WARN  CURVE: curve=weird/curve in 3 of 3 owned windows",
+         "does not know")
+
+    # ---- the command line: the flag, the build check, the exit codes ----
+    tmp = tempfile.mkdtemp(prefix="edvr_route_curve_")
+    try:
+        version = "[09:59:59.000] version 0.14.1-93-gf78eba4 (build 68C0A1F2) -- this DLL was linked 2026-09-09 20:34:39 UTC\n"
+        logs = {"ok": version + healthy, "stop": version + lines(many(4, strip, 0)), "none": version + "[10:00:00.000] nothing\n"}
+        for name, body in logs.items():
+            with open(os.path.join(tmp, name + ".log"), "wb") as f:
+                f.write(body.encode("utf-8"))
+
+        def cli(name, *extra):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = main(["--file", os.path.join(tmp, name + ".log"), "--route-curve"] + list(extra))
+            return rc, buf.getvalue()
+
+        for name, extra, want_rc, want_in, want_not in (
+                ("ok", ["--expect-build", "0.14.1-93-gf78eba4"], 0, "route-curve verdict: PASS", ""),
+                ("ok", [], 0, "route-curve verdict: PASS", ""),
+                ("ok", ["--expect-build", "0.14.1-40-gc468661"], 2, "BUILD MISMATCH", "route-curve verdict"),
+                ("stop", ["--expect-build", "0.14.1-93-gf78eba4"], 1, "route-curve verdict: STOP", ""),
+                ("none", [], 3, "no `vr world route` line", "route-curve verdict")):
+            rc, out = cli(name, *extra)
+            if rc != want_rc or want_in not in out or (want_not and want_not in out):
+                fail("--route-curve through main() on the %s log with %s returned %d (wanted %d, with %r and without %r):\n%s"
+                     % (name, extra or "no --expect-build", rc, want_rc, want_in, want_not, out))
+        rc, out = cli("ok")
+        if "[edvr] route-curve: ok.log, build 0.14.1-93-gf78eba4; 11 route window(s), 11 owned" not in out:
+            fail("--route-curve through main() should name the log's file and the build in its header:\n%s" % out)
+        rc, out = cli("ok", "--version")
+        if rc != 0 or "route-curve verdict" in out:
+            fail("--version ahead of --route-curve should print the version and stop (exit %d):\n%s" % (rc, out))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return ok
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Locate and read EDVR flight logs.")
@@ -4802,6 +5602,14 @@ def main(argv=None):
                     help="report a VR flight's Elite-supersampling-below-1 notice (design doc section 83): "
                          "the `vr supersampling:` line from the measured render size, vScreen's adoption line "
                          "and the headset notice; NOTICE / CONSISTENT / HEADSET / FLAT lines")
+    ap.add_argument("--route-curve", action="store_true",
+                    help="report a curved VR world route flight (fix.panel_curvature above 0 "
+                         "with experimental.temporal_aa_on_foot_world = auto): the route's 5 s "
+                         "lines by token (curve=, curve-reissues=), its OWNS lines, the `panel "
+                         "curvature:` notes and the layer's refusals, and a PASS / WARN / STOP "
+                         "verdict (strips drawn against eye takes, pending, stood-down, a stale "
+                         "build, the OWNS sentence, a fault); exit 0 for PASS or WARN, 1 for "
+                         "STOP, 3 when the log has no route line")
     ap.add_argument("--window-ms", type=float, default=100.0,
                     help="with --tally periodic, a long frame coincides with a "
                          "periodic event when the event's end time is inside "
@@ -4913,6 +5721,8 @@ def main(argv=None):
         return print_camera_census(text)
     if args.maps_sharp:
         return print_maps_sharp(text)
+    if args.route_curve:
+        return print_route_curve(text, path)
     if args.tally == "periodic":
         return print_periodic_report(path, text, ver, want, args, native_dirs)
     if args.tally:
@@ -5259,6 +6069,8 @@ def self_test():
     if not self_test_vscreen_fit():
         ok = False
     if not self_test_flat_upscale():
+        ok = False
+    if not self_test_route_curve():
         ok = False
 
     print("self-test: %s" % ("ok" if ok else "FAILED"))
