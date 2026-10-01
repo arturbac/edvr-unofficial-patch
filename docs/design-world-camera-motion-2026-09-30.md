@@ -557,6 +557,17 @@ live. The reader of that build read WARN (0 STOP, 7 WARN). The log says:
   game's exit fade: the first black stage is `game` (the game submitted black) and the
   shutdown totals follow at 08:33:25.110. The sharpen door's own totals for the whole
   session: `layer_only=14114, layer_only_black=0`.
+- *The six flights after it* (same build; Frontier logs 084752, 085519, 085923, 090246,
+  090933, 092026): stretches of the main menu (the journal: no Flags2) and of the ship
+  (aboard) with the key on, and the layer took no 2D screen composite in any of them
+  (`screen-takes=0` in every window: nothing for the gate to do). The reader reads each as
+  WARN for "no panel period closed" and nothing else, except 085519: fix.temporal_aa was
+  off for a stretch of it, and the OFF line's reason (`no temporal mode is on
+  (fix.temporal_aa is off)`) has parentheses of its own, which the reader's pattern
+  stopped at, so it lost the line as one it did not know. Three of the DLL's eight
+  reasons are like that. Fixed: one level of nesting, all eight reasons through the OFF
+  and not-live patterns in the self-test, held to the DLL's sources, and the
+  unknown-line WARN quotes the line.
 The door was right and the instruments were not, three ways. (1) The reader judged the
 door against PANEL FRAMES (the gate's state) and not against taken composites, so a
 cockpit read as six failed doors (the "46.1%"). (2) A window with panel frames and
