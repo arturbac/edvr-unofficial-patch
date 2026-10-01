@@ -1096,6 +1096,27 @@ if errorlevel 1 ( echo [edvr] ERROR: crash_context_test build failed & exit /b 1
 "%BUILD%\crash_context_test.exe" --self-test || exit /b 1
 exit /b 0
 
+:rig_freeze_log_test
+echo [edvr] === freeze_log_test.exe ===
+REM Build gate for the freeze logging (src\common\freeze_book.h, src\openxr\long_cycle_line.h,
+REM docs\freeze-diagnostics-2026-10-01.md, issue 63): the size buckets, the judge that tells a one-frame
+REM Present-gap blip from a stall by the runtime's cycle, the write rule (a frame of 250 ms or more always
+REM has its line), the book's counts and worst list, the runtime's rate limit and its three new lines, and by
+REM source text that the glue in perf_monitor.cpp, native_runtime_host.h and native_timing.cpp still calls them.
+REM It links nothing of the DLLs. tools\freeze_log_test\mutants.py --self-test holds the mutation list to the
+REM sources as they are; --run builds the rig against each edit and needs the MSVC toolchain.
+if not exist "%OBJ%\freezelog" mkdir "%OBJ%\freezelog"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\common" /I"src\openxr" ^
+    /Fo"%OBJ%\freezelog"\ /Fe"%OBJ%\freezelog\freeze_log_test.exe" ^
+    "tools\freeze_log_test\freeze_log_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: freeze_log_test build failed & exit /b 1 )
+"%OBJ%\freezelog\freeze_log_test.exe" --dry-run || exit /b 1
+"%OBJ%\freezelog\freeze_log_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\freeze_log_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
 :rig_flat_temporal_test
 echo [edvr] === flat_temporal_test.exe ===
 if not exist "%OBJ%\flattemporaltest" mkdir "%OBJ%\flattemporaltest"
