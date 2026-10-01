@@ -15,6 +15,7 @@
     python tools/edvr_log.py --target frontier --vscreen-fit --expect-build HEAD
     python tools/edvr_log.py --target epic --flat-upscale --expect-build HEAD
     python tools/edvr_log.py --target frontier --vr-supersampling --expect-build HEAD
+    python tools/edvr_log.py --target frontier --terrain-checkerboard --expect-build HEAD
     python tools/edvr_log.py --target frontier --route-curve --expect-build HEAD
     python tools/edvr_log.py --target steam --freezes --expect-build HEAD
     python tools/edvr_log.py --list
@@ -163,6 +164,13 @@ Supersampling below 1, from the measured render size against the eye texture), v
 follows and the menu's note that the headset notice was queued, with NOTICE / CONSISTENT / HEADSET / FLAT lines
 (a flat log carrying the notice is a STOP). Neither verdict changes the exit code (read its lines).
 
+--terrain-checkerboard reads a VR flight's Elite terrain checkerboard rendering notice (design doc section 84): the
+worker's start line, one line for the first read and each change (ON, OFF or unknown with its reason, read from the
+game's active graphics preset on a worker thread), the log's bound line and the menu's note that the headset notice
+was queued as a toast, once per raise, with READER / NOTICE / CHANGES / LIMIT / HEADSET / FLAT lines (a flat log
+carrying them is a STOP). A log with none of the lines means the reader never started, which is not "read, off": an
+OFF or an unknown read writes a line too. Its verdict does not change the exit code either.
+
 --route-curve reads a flight with the curved VR world route (design doc section 82,
 "The curved route": fix.panel_curvature above 0, experimental.temporal_aa_on_foot_world
 = auto). It reads the route's `vr world route 5s:` lines by token (`curve=`: off,
@@ -201,7 +209,7 @@ log holds none of the freeze lines (a build from before the freeze logging).
 
 Exit 0 when a log was read, 1 when none was found (or --camera-census found no
 census line, or --vscreen-fit no auto-fit line, or --flat-upscale no flat line, or
---vr-supersampling no VR line), 2 when --expect-build did not match (--tally periodic
+--vr-supersampling no VR line, or --terrain-checkerboard no terrain checkerboard line), 2 when --expect-build did not match (--tally periodic
 and --freezes check the runtime log against it too). --maps-sharp's, --route-curve's and
 --freezes's codes for a log they read are their own (above): 0, 1 and 3 mean a verdict,
 not "no log".
@@ -4880,6 +4888,322 @@ def print_vr_supersampling(text):
     return 0
 
 
+# ---------------------------------------------------------------------------------------------------------------------------------------
+# --terrain-checkerboard: Elite's terrain checkerboard rendering in VR, read from the game's active graphics preset on a worker thread (design
+# doc section 84, the VR hint). The lines are src/common/terrain_checkerboard_notice.h's: the worker's start line, one line for the first read
+# and one for each change (ON, OFF or unknown with its reason), the bound's line, a failed start or a fault, and the menu's note that the
+# headset notice was queued as a toast, once per raise. tools\terrain_checkerboard_test holds the formatter, the reader and the wiring, and
+# runs this reader over the log the real worker wrote; this reader's self-test builds its lines from the header's own text.
+#
+# A log WITHOUT the lines means the reader never started: a flat session, a build from before section 84, or a VR frame boundary that never
+# reached the menu's tick. A read that found the option off, or found nothing, writes a line too (OFF, unknown), so no line is never "read, off".
+# ---------------------------------------------------------------------------------------------------------------------------------------
+TCB_START_RE = re.compile(FLATU_TS + r"vr terrain checkerboard: reading Elite's graphics settings on its own thread \((?P<tid>\d+)\), every (?P<secs>\d+) s, off the render thread\.")
+TCB_FAILED_RE = re.compile(FLATU_TS + r"vr terrain checkerboard: could not start the reader thread")
+TCB_READ_RE = re.compile(FLATU_TS + r"vr terrain checkerboard: (?P<state>ON|OFF|unknown) \((?P<detail>.*)\)(?:: (?P<tail>.*))?$")
+TCB_DETAIL_RE = re.compile(r"^preset (?P<preset>.*?), (?P<source>[^,]+?): TerrainCheckerboardRenderingEnabled=(?P<value>.*)$")
+TCB_LIMIT_RE = re.compile(FLATU_TS + r"vr terrain checkerboard: (?P<n>\d+) lines logged; further changes")
+TCB_FAULT_RE = re.compile(FLATU_TS + r"vr terrain checkerboard: the reader faulted repeatedly")
+TCB_QUEUED_RE = re.compile(FLATU_TS + r"vr terrain checkerboard: (?:the headset notice is queued as a toast|menu\.toasts is off, so no toast)")
+TCB_LOG_MAX = 16    # kLogMax in src/common/terrain_checkerboard_notice.h
+
+
+def parse_terrain_checkerboard(text):
+    """{start: {ts, tid, secs} or None, failed: ts or None, reads: [{ts, state, preset, source, value, reason, tail}], limit: ts or None, fault: ts or None,
+    queued: [{ts, toast}], flat: bool}: the lines in the order the log has them."""
+    f = {"start": None, "failed": None, "reads": [], "limit": None, "fault": None, "queued": [], "flat": False}
+    for raw in text.splitlines():
+        try:
+            m = TCB_READ_RE.match(raw)
+            if m:
+                state = m.group("state")
+                d = TCB_DETAIL_RE.match(m.group("detail")) if state != "unknown" else None
+                f["reads"].append({"ts": m.group("ts") or "", "state": state, "tail": m.group("tail") or "",
+                                   "preset": d.group("preset") if d else "", "source": d.group("source") if d else "", "value": d.group("value") if d else "",
+                                   "reason": m.group("detail") if state == "unknown" else ""})
+                continue
+            m = TCB_START_RE.match(raw)
+            if m:
+                if f["start"] is None:
+                    f["start"] = {"ts": m.group("ts") or "", "tid": int(m.group("tid")), "secs": int(m.group("secs"))}
+                continue
+            m = TCB_FAILED_RE.match(raw)
+            if m:
+                if f["failed"] is None:
+                    f["failed"] = m.group("ts") or "?"
+                continue
+            m = TCB_LIMIT_RE.match(raw)
+            if m:
+                if f["limit"] is None:
+                    f["limit"] = m.group("ts") or "?"
+                continue
+            m = TCB_FAULT_RE.match(raw)
+            if m:
+                if f["fault"] is None:
+                    f["fault"] = m.group("ts") or "?"
+                continue
+            m = TCB_QUEUED_RE.match(raw)
+            if m:
+                f["queued"].append({"ts": m.group("ts") or "?", "toast": "queued as a toast" in raw})
+                continue
+            if FLATU_RUNTIME_RE.match(raw) or FLATU_KEY_RE.match(raw):
+                f["flat"] = True
+        except (ValueError, TypeError):
+            continue
+    return f
+
+
+def terrain_checkerboard_raises(reads):
+    """How many times the option RAISED: an ON read whose predecessor was not ON (the first read counts). Each one is a new published version in the
+    state On, which is what queues one toast; an ON read after an ON read is a change of preset or file with the option still on, not a raise."""
+    return sum(1 for i, r in enumerate(reads) if r["state"] == "ON" and (i == 0 or reads[i - 1]["state"] != "ON"))
+
+
+def tcb_verdict_reader(f, add):
+    """FLAT (a flat log never carries the lines) and READER (the worker started, and read): the first two questions about any such log."""
+    reads = f["reads"]
+    anything = f["start"] or f["failed"] or reads or f["limit"] or f["fault"] or f["queued"]
+    if f["flat"] and anything:
+        add("FLAT", "STOP", "a flat-profile log carries the VR terrain checkerboard lines: it must never")
+    elif f["flat"]:
+        add("FLAT", "PASS", "a flat-profile log, and no terrain checkerboard line in it")
+    if f["failed"]:
+        add("READER", "STOP", "the reader thread could not be started (%s): the option was not read, so no notice can have been raised" % f["failed"])
+    elif f["fault"]:
+        add("READER", "STOP", "the reader faulted repeatedly and stopped (%s): the notice kept the last state it published" % f["fault"])
+    elif f["start"] and reads:
+        add("READER", "PASS", "the worker started (%s, thread %d, every %d s) and read %d time(s) logged, the first at %s"
+            % (f["start"]["ts"] or "?", f["start"]["tid"], f["start"]["secs"], len(reads), reads[0]["ts"] or "?"))
+    elif f["start"]:
+        add("READER", "STOP", "the worker started (%s) and no read line followed: it died, hung or was never given a pass" % (f["start"]["ts"] or "?"))
+    elif reads:
+        add("READER", "WARN", "read lines but no start line (a log cut at the front?)")
+
+
+def tcb_verdict_notice(f, add):
+    """NOTICE (what the last read says), CHANGES (the reads in order) and LIMIT (the log's bound was reached)."""
+    reads = f["reads"]
+    if reads:
+        last = reads[-1]
+        if last["state"] == "ON":
+            add("NOTICE", "PASS", "terrain checkerboard rendering is ON (preset %s, %s, =%s): distant terrain shimmers in VR with DLSS, and the notice is due"
+                % (last["preset"] or "?", last["source"] or "?", last["value"] or "?"))
+        elif last["state"] == "OFF":
+            add("NOTICE", "n/a", "terrain checkerboard rendering is OFF (preset %s, %s, =%s): not the cause of any distant terrain shimmer in this log, and no notice is right"
+                % (last["preset"] or "?", last["source"] or "?", last["value"] or "?"))
+        else:
+            add("NOTICE", "WARN", "terrain checkerboard rendering is unknown (%s): it cannot be ruled in or out from this log" % (last["reason"] or "no reason"))
+    if len(reads) > 1:
+        add("CHANGES", "PASS", "%d read line(s) in the order they were logged: %s" % (len(reads), ", ".join("%s %s" % (r["ts"] or "?", r["state"]) for r in reads)))
+    if f["limit"]:
+        add("LIMIT", "WARN", "the bound of %d logged reads was reached at %s: later changes are not in this log" % (TCB_LOG_MAX, f["limit"]))
+
+
+def tcb_verdict_headset(f, add):
+    """HEADSET: one queued line per RAISE of the option (a raise is an ON read after a read that was not ON)."""
+    raises = terrain_checkerboard_raises(f["reads"])
+    toasts = len(f["queued"])
+    if not (raises or toasts):
+        return
+    what = "the headset notice was queued as a toast" if all(q["toast"] for q in f["queued"]) else "queued (menu.toasts off for some: no toast)"
+    if f["limit"]:
+        add("HEADSET", "WARN", "%d queued line(s), but reads past the bound are not logged, so the raises cannot be counted" % toasts)
+    elif toasts == raises:
+        add("HEADSET", "PASS", "%d raise(s) of the option, %d queued line(s) (%s): once per raise; the Status page shows the advice as its hint while the menu is open" % (raises, toasts, what))
+    elif toasts == 0:
+        add("HEADSET", "WARN", "no `vr terrain checkerboard:` menu line: the headset notice was not queued (the menu may not have ticked yet)")
+    elif toasts < raises:
+        add("HEADSET", "WARN", "%d raise(s) of the option but %d queued line(s): a toast was not said" % (raises, toasts))
+    else:
+        add("HEADSET", "STOP", "%d queued line(s) for %d raise(s) of the option: a raise was said more than once" % (toasts, raises))
+
+
+def terrain_checkerboard_verdict(f):
+    """[(tag, status, text)]: FLAT, READER, NOTICE, CHANGES, LIMIT, HEADSET (see the three functions above)."""
+    out = []
+    add = lambda tag, status, text: out.append((tag, status, text))
+    tcb_verdict_reader(f, add)
+    tcb_verdict_notice(f, add)
+    tcb_verdict_headset(f, add)
+    return out
+
+
+def print_terrain_checkerboard(text):
+    """The --terrain-checkerboard report. Returns 0 when the log has any of the lines, 1 when it has none; the verdict never changes the exit code."""
+    f = parse_terrain_checkerboard(text)
+    if not (f["start"] or f["failed"] or f["reads"] or f["limit"] or f["fault"] or f["queued"]):
+        print("[edvr] no `vr terrain checkerboard:` line in this log: the reader never started (a flat session, a build from before section 84, or a VR frame "
+              "boundary that never reached the menu's tick), so Elite's terrain checkerboard rendering cannot be ruled in or out from it. A read that found the "
+              "option off, or found nothing, writes a line too: no line is not \"read, off\".")
+        return 1
+    if f["start"]:
+        print("worker %s: reading Elite's graphics settings on its own thread (%d), every %d s" % (f["start"]["ts"] or "?", f["start"]["tid"], f["start"]["secs"]))
+    for r in f["reads"]:
+        if r["state"] == "unknown":
+            print("read %s: unknown (%s)" % (r["ts"] or "?", r["reason"]))
+        else:
+            print("read %s: %s in preset %s (%s), TerrainCheckerboardRenderingEnabled=%s" % (r["ts"] or "?", r["state"], r["preset"] or "?", r["source"] or "?", r["value"] or "?"))
+    for q in f["queued"]:
+        print("queued %s: %s" % (q["ts"], "as a toast" if q["toast"] else "no toast (menu.toasts is off)"))
+    verdict = terrain_checkerboard_verdict(f)
+    for tag, status, text_ in verdict:
+        print("%s (%s) %s" % (status, tag, text_))
+    counts = {"PASS": 0, "WARN": 0, "STOP": 0, "n/a": 0}
+    for _, status, _ in verdict:
+        counts[status] = counts.get(status, 0) + 1
+    worst = "STOP" if counts["STOP"] else ("WARN" if counts["WARN"] else ("PASS" if counts["PASS"] else "n/a"))
+    print("vr terrain checkerboard verdict: %s (%d PASS, %d WARN, %d STOP, %d n/a)" % (worst, counts["PASS"], counts["WARN"], counts["STOP"], counts["n/a"]))
+    return 0
+
+
+def self_test_terrain_checkerboard():
+    """--terrain-checkerboard on lines built from src/common/terrain_checkerboard_notice.h's own text: every format the reader parses is checked against
+    the header's string literals, then a good flight (read ON, one toast, then OFF) and logs altered to break each thing the verdict judges. Returns ok."""
+    import contextlib
+    import io
+    ok = True
+
+    def fail(msg):
+        nonlocal ok
+        print("terrain checkerboard: %s" % msg)
+        ok = False
+
+    def report(text):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = print_terrain_checkerboard(text)
+        return rc, buf.getvalue()
+
+    def statuses(text):
+        _, out = report(text)
+        found = {}
+        for row in out.splitlines():
+            m = re.match(r"^(PASS|WARN|STOP|n/a) \(([A-Z0-9 -]+)\) ", row)
+            if m:
+                found[m.group(2)] = m.group(1)
+        return found, out
+
+    def want(text, wanted, label, absent=()):
+        got, out = statuses(text)
+        for tag, status in wanted.items():
+            if got.get(tag) != status:
+                fail("%s: %s is %r, wanted %r:\n%s" % (label, tag, got.get(tag), status, out))
+        for tag in absent:
+            if tag in got:
+                fail("%s: %s should not be judged, and is %r:\n%s" % (label, tag, got.get(tag), out))
+
+    def literals(source):
+        """The C string literals of a source text, adjacent ones joined the way the compiler does, with \\\" and \\\\ undone."""
+        out = []
+        for run in re.finditer(r'(?:"(?:[^"\\\n]|\\.)*"[ \t\r\n]*)+', source):
+            joined = "".join(re.findall(r'"((?:[^"\\\n]|\\.)*)"', run.group(0)))
+            out.append(re.sub(r"\\(.)", lambda m: {"n": "\n", "t": "\t"}.get(m.group(1), m.group(1)), joined))
+        return out
+
+    header = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "common", "terrain_checkerboard_notice.h")
+    if not os.path.isfile(header):
+        fail("src\\common\\terrain_checkerboard_notice.h is not where the self-test looks for it (%s)" % header)
+        return False
+    source = read_text(header)
+    have = set(literals(source))
+    fmt_on = "vr terrain checkerboard: ON (preset %s, %s: TerrainCheckerboardRenderingEnabled=%s): %s"
+    fmt_off = "vr terrain checkerboard: OFF (preset %s, %s: TerrainCheckerboardRenderingEnabled=%s): no notice."
+    fmt_unknown = "vr terrain checkerboard: unknown (%s): no notice."
+    fmt_start = "vr terrain checkerboard: reading Elite's graphics settings on its own thread (%lu), every %u s, off the render thread."
+    fmt_failed = "vr terrain checkerboard: could not start the reader thread, so Elite's terrain checkerboard rendering is not being read: no notice."
+    fmt_fault = "vr terrain checkerboard: the reader faulted repeatedly and has stopped; the notice keeps the last state it published."
+    fmt_limit = "vr terrain checkerboard: %d lines logged; further changes are followed by the notice but no longer logged."
+    fmt_queued = 'vr terrain checkerboard: the headset notice is queued as a toast ("%s"); the Status page shows the advice as its hint while the menu is open.'
+    fmt_notoast = "vr terrain checkerboard: menu.toasts is off, so no toast; the Status page shows the advice as its hint while the menu is open."
+    sentence = "Elite's terrain checkerboard rendering makes distant terrain shimmer with DLSS. Turn it off in Elite's graphics options."
+    toast = "Distant terrain shimmers: turn off terrain checkerboard"
+    for text in (fmt_on, fmt_off, fmt_unknown, fmt_start, fmt_failed, fmt_fault, fmt_limit, fmt_queued, fmt_notoast, sentence, toast):
+        if text not in have:
+            fail("src\\common\\terrain_checkerboard_notice.h has no string literal %r: this reader parses text the DLL no longer writes" % text)
+    if "(" in sentence or ")" in sentence:
+        fail("the sentence has a parenthesis, which the reader takes as the end of the detail")
+    k = re.search(r"constexpr int kLogMax = (\d+);", source)
+    if not k or int(k.group(1)) != TCB_LOG_MAX:
+        fail("this reader's TCB_LOG_MAX (%d) is not the header's kLogMax (%s)" % (TCB_LOG_MAX, k.group(1) if k else "missing"))
+
+    def row(ts, text):
+        return "[%s] %s\n" % (ts, text)
+
+    version = "[09:29:00.000] version v0.18.0-rc.5 (build 5EC0DE01) -- this DLL was linked 2026-10-01 20:05:44 UTC\n"
+    start = row("09:29:10.100", fmt_start % (4242, 3))
+    on = row("09:29:10.102", fmt_on % ("VRHigh", "OptionDefaults\\VRHigh.fxcfg", "true", sentence))
+    queued = row("09:29:10.300", fmt_queued % toast)
+    off = row("09:31:00.500", fmt_off % ("Custom", "Custom.4.4.fxcfg", "false"))
+    on2 = row("09:33:00.500", fmt_on % ("Custom", "Custom.4.4.fxcfg", "True", sentence))
+    queued2 = row("09:33:00.700", fmt_queued % toast)
+    unknown = row("09:35:00.000", fmt_unknown % "preset Custom but the folder has no Custom.<major>.<minor>.fxcfg")
+    good = version + start + on + queued
+
+    # ---- the parser, on a good flight ----
+    p = parse_terrain_checkerboard(good)
+    r0 = p["reads"][0] if p["reads"] else {}
+    if not p["start"] or (p["start"]["tid"], p["start"]["secs"]) != (4242, 3) or len(p["reads"]) != 1 or \
+            (r0.get("state"), r0.get("preset"), r0.get("source"), r0.get("value")) != ("ON", "VRHigh", "OptionDefaults\\VRHigh.fxcfg", "true") or \
+            len(p["queued"]) != 1 or not p["queued"][0]["toast"] or p["flat"] or p["limit"] or p["fault"] or p["failed"]:
+        fail("the good flight parsed as %r" % (p,))
+    g = parse_terrain_checkerboard("vr terrain checkerboard: ON (\nvr terrain checkerboard: reading Elite's graphics settings on its own thread (x)\nnothing\n")
+    if g["reads"] or g["start"]:
+        fail("a cut-short line was mis-parsed: %r" % (g,))
+
+    # ---- the report on a good flight ----
+    rc, out = report(good)
+    flat = re.sub(r"[ ]+", " ", out)
+    for needle in ("worker 09:29:10.100: reading Elite's graphics settings on its own thread (4242), every 3 s",
+                   "read 09:29:10.102: ON in preset VRHigh (OptionDefaults\\VRHigh.fxcfg), TerrainCheckerboardRenderingEnabled=true",
+                   "queued 09:29:10.300: as a toast",
+                   "PASS (READER) the worker started (09:29:10.100, thread 4242, every 3 s) and read 1 time(s) logged, the first at 09:29:10.102",
+                   "PASS (NOTICE) terrain checkerboard rendering is ON (preset VRHigh, OptionDefaults\\VRHigh.fxcfg, =true)",
+                   "PASS (HEADSET) 1 raise(s) of the option, 1 queued line(s) (the headset notice was queued as a toast): once per raise",
+                   "vr terrain checkerboard verdict: PASS (3 PASS, 0 WARN, 0 STOP, 0 n/a)"):
+        if needle not in flat:
+            fail("the good flight's report lacks %r:\n%s" % (needle, out))
+    if rc != 0:
+        fail("the good flight reported exit %d" % rc)
+    want(good, {"READER": "PASS", "NOTICE": "PASS", "HEADSET": "PASS"}, "the good flight", absent=("CHANGES", "LIMIT", "FLAT"))
+
+    # ---- what the last read says, and the changes ----
+    want(good + off, {"NOTICE": "n/a", "CHANGES": "PASS", "HEADSET": "PASS"}, "turned off after the toast")
+    want(good + off + on2 + queued2, {"NOTICE": "PASS", "CHANGES": "PASS", "HEADSET": "PASS"}, "off and on again: two raises, two toasts")
+    want(good + off + on2, {"HEADSET": "WARN"}, "a second raise with no second toast")
+    want(good + row("09:30:00.000", fmt_on % ("VRUltra", "OptionDefaults\\VRUltra.fxcfg", "true", sentence)), {"HEADSET": "PASS", "CHANGES": "PASS"}, "a preset change with the option still on is no raise")
+    want(good + off + unknown + on2 + queued2, {"HEADSET": "PASS", "NOTICE": "PASS"}, "unknown between two raises is also a re-arm")
+    want(version + start + unknown, {"READER": "PASS", "NOTICE": "WARN"}, "an unknown read", absent=("HEADSET",))
+    want(version + start + off, {"READER": "PASS", "NOTICE": "n/a"}, "a read that found it off", absent=("HEADSET",))
+    _, out = statuses(version + start + unknown)
+    if "unknown (preset Custom but the folder has no Custom.<major>.<minor>.fxcfg)" not in out:
+        fail("an unknown read's reason is not in the report:\n%s" % out)
+
+    # ---- the headset line ----
+    want(version + start + on, {"HEADSET": "WARN"}, "no menu line")
+    want(good + queued, {"HEADSET": "STOP"}, "one raise said twice")
+    want(version + start + off + queued, {"HEADSET": "STOP"}, "a toast with no raise")
+    want(version + start + on + row("09:29:10.300", fmt_notoast), {"HEADSET": "PASS"}, "menu.toasts off: no toast, still once")
+    _, out = statuses(version + start + on + row("09:29:10.300", fmt_notoast))
+    if "queued (menu.toasts off for some: no toast)" not in out:
+        fail("a log with menu.toasts off should say so:\n%s" % out)
+
+    # ---- the reader: started, read, failed, faulted, bounded ----
+    want(version + start, {"READER": "STOP"}, "started and never read")
+    want(version + on, {"READER": "WARN"}, "reads without the start line")
+    want(version + row("09:29:10.100", fmt_failed), {"READER": "STOP"}, "a thread that could not start")
+    want(good + row("09:40:00.000", fmt_fault), {"READER": "STOP"}, "a reader that faulted")
+    want(good + row("09:40:00.000", fmt_limit % TCB_LOG_MAX), {"LIMIT": "WARN", "HEADSET": "WARN"}, "the log's bound")
+
+    # ---- flat, and no lines at all ----
+    flat_run = "[09:31:00.000] flat runtime: treated=1 refused=0 last=treated-jittered\n"
+    want(good + flat_run, {"FLAT": "STOP"}, "a flat log carrying the VR lines")
+    for text, label in ((version, "an empty log"), (version + flat_run, "a flat log with no lines"), (version + "[09:29:10.100] vr supersampling: something\n", "another notice's lines")):
+        rc, out = report(text)
+        if rc != 1 or "no `vr terrain checkerboard:` line" not in out or "not \"read, off\"" not in out:
+            fail("%s should exit 1 and say that no line is not \"read, off\": rc=%d %r" % (label, rc, out))
+    return ok
+
+
 # --route-curve: the curved VR world route (docs/design-flat-temporal-aa-2026-09-23.md, section 82, "The curved route").
 # With fix.panel_curvature above 0 the route's layer re-issues the screen through the very strip the game's own draw is substituted with
 # (src/d3d11/panel_curve.cpp panelCurveReissue), and the route's log says so: its 5 s line (src/d3d11/vr_world_route_math.h
@@ -7219,6 +7543,12 @@ def main(argv=None):
                     help="report a VR flight's Elite-supersampling-below-1 notice (design doc section 83): "
                          "the `vr supersampling:` line from the measured render size, vScreen's adoption line "
                          "and the headset notice; NOTICE / CONSISTENT / HEADSET / FLAT lines")
+    ap.add_argument("--terrain-checkerboard", action="store_true",
+                    help="report a VR flight's Elite-terrain-checkerboard-rendering notice (design doc section 84): the worker's "
+                         "start line, one line for the first read and each change (ON, OFF or unknown with its reason, read from "
+                         "the game's active graphics preset on a worker thread) and the menu's queued-toast line; READER / NOTICE / "
+                         "CHANGES / LIMIT / HEADSET / FLAT lines. No line at all means the reader never started, which is not "
+                         "\"read, off\"")
     ap.add_argument("--route-curve", action="store_true",
                     help="report a curved VR world route flight (fix.panel_curvature above 0 "
                          "with experimental.temporal_aa_on_foot_world = auto): the route's 5 s "
@@ -7352,6 +7682,8 @@ def main(argv=None):
         return print_flat_upscale(text)
     if args.vr_supersampling:
         return print_vr_supersampling(text)
+    if args.terrain_checkerboard:
+        return print_terrain_checkerboard(text)
     if args.camera_census:
         return print_camera_census(text)
     if args.maps_sharp:
@@ -7710,6 +8042,8 @@ def self_test():
     if not self_test_route_curve():
         ok = False
     if not self_test_freezes():
+        ok = False
+    if not self_test_terrain_checkerboard():
         ok = False
 
     print("self-test: %s" % ("ok" if ok else "FAILED"))

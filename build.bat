@@ -519,7 +519,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\vscreen_res.cpp" "src\common\vscreen_auto_state.cpp" "src\d3d11\vscreen_footprint.cpp" ^
     "src\d3d11\binding_shadow.cpp" "src\d3d11\head_offset_gate.cpp" ^
     "src\d3d11\vr_runtime.cpp" ^
-    "src\d3d11\journal_watch.cpp" ^
+    "src\d3d11\journal_watch.cpp" "src\d3d11\terrain_checkerboard.cpp" ^
     "src\d3d11\elite_binds.cpp" "src\d3d11\draw_census.cpp" ^
     "src\d3d11\object_probe.cpp" ^
     "src\d3d11\pixel_probe.cpp" ^
@@ -1919,6 +1919,28 @@ if errorlevel 1 ( echo [edvr] ERROR: vscreen_fit_test build failed & exit /b 1 )
 if exist "%OBJ%\vscreenfit\never_written.log" ( echo [edvr] ERROR: vscreen_fit_test --dry-run --write-fixture wrote a file & exit /b 1 )
 "%OBJ%\vscreenfit\vscreen_fit_test.exe" --self-test "%ROOT%" || exit /b 1
 python "tools\vscreen_fit_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
+:rig_terrain_checkerboard_test
+echo [edvr] === terrain_checkerboard_test.exe ===
+REM Elite's terrain checkerboard rendering in VR, said in the headset (design doc section 84, the VR hint): the words and the pure picks
+REM (src\common\terrain_checkerboard_notice.h), the reader on fixture folders and the monitor's rule for a half-written file
+REM (src\d3d11\terrain_checkerboard_reader.h), the worker thread on a real log (src\d3d11\terrain_checkerboard.cpp, linked with the real
+REM Log, Config and fault guard, and then tools\edvr_log.py --terrain-checkerboard over the log it wrote: needs python on PATH) and the
+REM wiring in menu.cpp as source pins (they read src\ from the repo root, which the rig takes as its argument). The fixtures are written
+REM to a temp directory and removed. tools\terrain_checkerboard_test\mutants.py --self-test holds the rig's mutation list to the sources as
+REM they are; the list itself (--run, on demand, about a minute) proves the rig fails when each rule of the headers, the worker or the
+REM wiring is broken.
+if not exist "%OBJ%\terraincheckerboard" mkdir "%OBJ%\terraincheckerboard"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\terraincheckerboard\\" /Fe"%OBJ%\terraincheckerboard\terrain_checkerboard_test.exe" ^
+    "tools\terrain_checkerboard_test\terrain_checkerboard_test.cpp" "src\d3d11\terrain_checkerboard.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" "src\common\proxy.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: terrain_checkerboard_test build failed & exit /b 1 )
+"%OBJ%\terraincheckerboard\terrain_checkerboard_test.exe" --dry-run || exit /b 1
+"%OBJ%\terraincheckerboard\terrain_checkerboard_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\terrain_checkerboard_test\mutants.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_vscreen_footprint_glue_test
