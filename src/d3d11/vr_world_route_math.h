@@ -278,7 +278,8 @@ struct VrWorldWindow {
     float phaseX = 0.0f, phaseY = 0.0f, rowsX = 0.0f, rowsY = 0.0f;
     uint64_t foldMode[3] = {};    // frames whose resolve ran the weapon fold-in with mode 0, 1, 2 (FlatMonoResolveFrame::firstPersonPhaseMode)
     // The stage 2 experiment build: the state of experimental.temporal_aa_on_foot_world_steady_detail at the boundary that printed the
-    // line (vrWorldSteadyKeyName: "on" or "off"; off, the default, is the route as flight 2 flew it).
+    // line (vrWorldSteadyKeyName: "on" or "off"; the key defaults to on, and off is the route as flight 2 flew it). A window nothing has
+    // set (a default-constructed one) says off: the boundary sets it from the key before every line.
     const char* steady = "off";
     VrWorldInjectWindow inject;
     void reset() { *this = VrWorldWindow{}; }
@@ -565,15 +566,16 @@ inline int vrWorldFormatRowsMismatch(char* out, size_t size, uint64_t frame, flo
 }
 
 // ---- the stage 2 experiment build (design doc section 82) ------------------------------------------------------------------
-// experimental.temporal_aa_on_foot_world_steady_detail: off (the default) or on. Flight 2's shimmer on fine patterns is the prep
+// experimental.temporal_aa_on_foot_world_steady_detail: on (the default since flight 4) or off. Flight 2's shimmer on fine patterns is the prep
 // refusing the history of a pixel whose engine slot a LATER draw overdrew (the slot's depth is no longer the pixel's) and the finish
 // then showing the raw jittered input there (flight 3 confirmed it at the main menu: 5.674% of the pixels, all stale, calm with the key
 // on). "on" gives those pixels the camera term instead, but only where last frame's depth confirms it (the depth at the position the
 // camera term sends the pixel to matches the depth this surface would have had there had it not moved, within 1%: the depth-validated
 // steady detail; the blanket form was flight 3's experiment); where it does not the pixel is refused as before. Only the stale-slot
 // refusal is relaxed: a masked record, a corrupt slot, the sky and the weapon's pixels stay refused. A lateral mover's interior can
-// still pass the depth test and ghost while it is on. Read only while the route key is auto. A value that is present and is not "on"
-// reads as off, so a typo never relaxes anything. The in-headset menu's developer mode flips it live, like the jitter key.
+// still pass the depth test and ghost while it is on (flight 4: none seen). Read only while the route key is auto. A file with no line
+// reads on (the reader's fallback); a value that is present and is not "on" reads as off, a typo included, which is the refusal exactly
+// as before the key existed. The in-headset menu's developer mode flips it live, like the jitter key.
 enum class VrWorldSteadyKey : uint8_t { Off, On };
 inline VrWorldSteadyKey vrWorldSteadyKeyFromText(const char* text) {
     if (!text) return VrWorldSteadyKey::Off;

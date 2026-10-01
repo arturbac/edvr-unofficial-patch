@@ -48,7 +48,7 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-82):** users 1-2 refused every frame, 3 at 7-13 fps, 4
-  lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED; fix FLOWN OK 10-01;
+  lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED; fix FLOWN, DEFAULT ON;
   vscreen auto-fit (width fitted to the eye, route on) BUILT 10-01, unflown.
 - **Compatibility decision:** the prototype accepts an absent profile
   descriptor as legacy VR so manual installations keep working. An existing
@@ -7717,3 +7717,38 @@ flat and VR (85119ce9; Epic log 071356, Frontier log 074129).
   route.
 - Next: steady detail default ON for VR and flat (the key-off pins move with
   it), shipped with Phase 1 and the auto-fit.
+
+STEADY DETAIL DEFAULT ON, VR and flat (2026-10-01). Sean: "Please make it
+default". `experimental.temporal_aa_on_foot_world_steady_detail` now falls
+back to on in both readers (the VR route's readExperimentKeys and the flat
+runtime's steadyReadKey) and the shipped edvr.ini says on; the name, the
+section ([experimental]) and the values are unchanged (moving it to [fix]
+would be a rename, Sean's call). Why: flight 4 passed with it on (flat 071356:
+the check ran on every resolve, "looks great"; VR 074129: the menu kept 40-44
+M stale pixels a window against about 1 k refused, on foot and Cinema looked
+good), and Sean reports "I did not see any issues with ghosting or trails" in
+his flights since 85119ce9. That is informal: he did not run a movers leg, so
+it is the evidence behind the flip and not a measurement of ghosting.
+
+EXPLICIT OFF is today's refusal exactly. The readers compare the file's word
+with "on", so "off", a typo and an empty value all read off: the prep refuses
+every stale slot as before the key existed, no second depth image is made and
+the depth-check frames count zero. The pins are config_test (the ini and both
+fallbacks agree; the flat scope and the VR profile read an explicit off; the
+control now flips a fallback to off), the route rig (the parse of the word,
+the ini line), the flat temporal rig (the reader's comparison with on), and
+the resolver rig's recorded key-off hashes, unchanged. A mutation of each (a
+fallback back to off, any word but off reading on, the ini back to off) fails
+one of them.
+
+SCOPE. The route stays default off (the route's own key,
+`experimental.temporal_aa_on_foot_world`), so in VR the new default matters
+only while the route is auto; in flat every temporal mode on foot now gets the
+check unless edvr-flat.ini says off. The 3D menu's blanket policy is
+untouched. An existing ini with no line now reads on; one with an explicit off
+keeps it. The VR refusal line is now printed while only this key is on, i.e.
+in every route session, with census=off and the depth check's frame counts:
+edvr_log.py reads such a window as `census-off` (summarised on one line, no
+WARN) instead of a census that never measured. A flat session that starts on
+says so once at startup; one that starts off says nothing (its 5 s line has
+steady-detail=off).

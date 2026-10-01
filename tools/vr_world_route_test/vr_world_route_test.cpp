@@ -817,7 +817,8 @@ void mapsGateCases() {
 }
 
 // ---- 9. the stage 2 experiment build, the pure half ----------------------------------------------------------------------------
-// experimental.temporal_aa_on_foot_world_steady_detail (off by default: the stale-slot refusal relaxed on foot), the refusal census's
+// experimental.temporal_aa_on_foot_world_steady_detail (on by default since flight 4: the stale-slot refusal relaxed on foot where last
+// frame's depth confirms it; an explicit off, or any word but on, is the refusal as before), the refusal census's
 // line and the two lines that say a key or the view changed. The reader parses these texts, so the line pins here are the contract.
 void experimentCases() {
     check(vrWorldSteadyKeyFromText("on") == VrWorldSteadyKey::On && vrWorldSteadyKeyFromText("ON") == VrWorldSteadyKey::On &&
@@ -827,7 +828,7 @@ void experimentCases() {
     bool allOff = true;
     for (const char* t : notOn) allOff = allOff && vrWorldSteadyKeyFromText(t) == VrWorldSteadyKey::Off;
     check(allOff && vrWorldSteadyKeyFromText(nullptr) == VrWorldSteadyKey::Off,
-          "steady-detail key: anything that is not exactly on, a typo included, reads off: a typo can never relax the stale-slot refusal");
+          "steady-detail key: anything that is not exactly on, an explicit off and a typo included, reads off: the file's off is the refusal exactly as before the key existed");
     check(std::strcmp(vrWorldSteadyKeyName(VrWorldSteadyKey::On), "on") == 0 && std::strcmp(vrWorldSteadyKeyName(VrWorldSteadyKey::Off), "off") == 0,
           "steady-detail key: the names are the ini's words");
 
@@ -1132,14 +1133,16 @@ void sourcePins() {
     check(!skip.empty() && before(skip, "edvr::vrWorldRouteNoteSceneReset();", "s->history[eye]={}"),
           "scene reset: a withheld eye frame tells the route before it touches the eye's history");
 
-    // THE STAGE 2 EXPERIMENT BUILD (design doc section 82). Three keys, all off by default, read only while the route key is auto,
-    // and each handed to the resolver as the resolver's own contract: with all three off the frame is flight 2's frame.
+    // THE STAGE 2 EXPERIMENT BUILD (design doc section 82). Three keys, read only while the route key is auto, and each handed to the
+    // resolver as the resolver's own contract: the steady-detail key defaults to ON since flight 4, the debug view and the census to off;
+    // with all three off the frame is flight 2's frame.
     {
         const std::string keys = functionBody(rt, "void readExperimentKeys(");
-        check(!keys.empty() && keys.find("getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"off\")") != std::string::npos &&
+        check(!keys.empty() && keys.find("getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"on\")") != std::string::npos &&
+                  keys.find("getString(\"experimental.temporal_aa_on_foot_world_steady_detail\", \"off\")") == std::string::npos &&
                   keys.find("getString(\"advanced.temporal_aa_debug\", \"off\")") != std::string::npos &&
                   keys.find("\"motion_source\"") != std::string::npos && keys.find("vrWorldSteadyKeyFromText(") != std::string::npos,
-              "experiment: the steady-detail key (default off) and the view (the debug key's motion_source, default off) are read in one place");
+              "experiment: the steady-detail key (default on, parsed by vrWorldSteadyKeyFromText so an explicit off or a typo reads off) and the view (the debug key's motion_source, default off) are read in one place");
         check(count(rt, "getString(\"experimental.temporal_aa_on_foot_world_steady_detail\"") == 1 && count(rt, "readExperimentKeys();") == 1,
               "experiment: the steady-detail key is read once, by readExperimentKeys, which the boundary calls once");
         const size_t callAt = boundary.find("readExperimentKeys();");
@@ -1177,10 +1180,10 @@ void sourcePins() {
                   treat.find("((inj.firstPersonInjected > 0 && inj.firstPersonRefused == 0) ? worldApplied : VrWorldAppliedPhase{});") != std::string::npos,
               "weapon: a weapon drawn is credited the world's phase only when a first-person call was injected and none was refused (the injector's role, not a guess); otherwise mode 2 as before");
         const std::string cfgSource = readFile("edvr.ini");
-        const size_t keyAt = cfgSource.find("\ntemporal_aa_on_foot_world_steady_detail = off");
+        const size_t keyAt = cfgSource.find("\ntemporal_aa_on_foot_world_steady_detail = on");
         const size_t choicesAt = keyAt == std::string::npos ? keyAt : cfgSource.rfind("# dev: choices on, off", keyAt);
         check(keyAt != std::string::npos && choicesAt != std::string::npos && keyAt - choicesAt < 40,
-              "experiment: the shipped edvr.ini ships the key off, with the developer tier's choices (the in-headset menu's Experimental page flips it live)");
+              "experiment: the shipped edvr.ini ships the key on, with the developer tier's choices (the in-headset menu's Experimental page flips it live)");
     }
 }
 

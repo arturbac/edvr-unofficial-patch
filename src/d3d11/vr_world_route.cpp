@@ -95,9 +95,12 @@ uint32_t g_missRun = 0;                         // consecutive untreated frames 
 uint32_t g_declineRunLines = 0, g_declineLinesSession = 0;   // decline lines logged in this run of declines / this session
 
 // ---- the stage 2 experiment build (design doc section 82) -----------------------------------------------------------------------
-// Read at the frame boundary, only while the route key is auto (readExperimentKeys), and used by the resolve at the trigger. All three
-// default to off: with experimental.temporal_aa_on_foot_world_steady_detail off, advanced.temporal_aa_debug anything but motion_source and
+// Read at the frame boundary, only while the route key is auto (readExperimentKeys), and used by the resolve at the trigger. The steady-detail
+// key defaults to ON (design doc section 82, flight 4); the debug key's motion_source and advanced.vr_camera_census default to off. With
+// experimental.temporal_aa_on_foot_world_steady_detail set off, advanced.temporal_aa_debug anything but motion_source and
 // advanced.vr_camera_census off, treatWorld hands the resolver exactly what it handed it in flight 2.
+// The steady key starts Off here only as the state before a boundary has read the file: the first boundary with the route on reads it (on, by
+// default) and says so once.
 VrWorldSteadyKey g_steadyKey = VrWorldSteadyKey::Off;   // experimental.temporal_aa_on_foot_world_steady_detail: stale slots take the camera term where last frame's depth confirms it
 VrWorldSteadyKey g_steadyReported = VrWorldSteadyKey::Off;   // the state the log last said: a change logs once
 bool g_viewOn = false, g_viewReported = false;          // advanced.temporal_aa_debug = motion_source: the resolver paints the prep's classes into H
@@ -654,11 +657,11 @@ void driveInjector(bool wantsInjection) {
     g_jitter = want;
 }
 // The stage 2 experiment build's three keys, read at the boundary while the route key is auto (design doc section 82): the
-// steady-detail key (default off), the debug key's motion_source (the refusal view), and what the census key said at the top of the
-// boundary (g_census). A change is said once, in the log, with what the state does.
+// steady-detail key (default on since flight 4; any word but on reads off), the debug key's motion_source (the refusal view), and what the
+// census key said at the top of the boundary (g_census). A change is said once, in the log, with what the state does.
 void readExperimentKeys() {
     g_steadyKey = vrWorldSteadyKeyFromText(
-        Config::get().getString("experimental.temporal_aa_on_foot_world_steady_detail", "off").c_str());
+        Config::get().getString("experimental.temporal_aa_on_foot_world_steady_detail", "on").c_str());
     g_viewOn = _stricmp(Config::get().getString("advanced.temporal_aa_debug", "off").c_str(), "motion_source") == 0;
     if (g_steadyKey != g_steadyReported) {
         g_steadyReported = g_steadyKey;

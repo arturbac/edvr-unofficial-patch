@@ -94,7 +94,9 @@ nothing was injected on a frame whose window the route had shut. The verdict rea
 the route's `vr world route 5s:` and `vr world route inject 5s:` lines and a few of
 its own log lines too; a log that predates stage 2 gets n/a lines, never a crash.
 With the census key on, the route also prints a refusal-census line a window
-(`vr world route refusal 5s:`, the stage 2 experiment build): the report gets a section
+(`vr world route refusal 5s:`, the stage 2 experiment build; with the steady-detail key on, which
+is its default, the line is printed with the census off as well, carrying only the depth check's
+frame counts: such a window is `census-off`, never a census that failed): the report gets a section
 with the share of the treated pixels whose history the resolver's prep refused, per
 window and by cause (stale slot, masked record, ...), the state of the steady-detail
 key and of the refusal view in each window, and totals by key state; (v) also checks
@@ -1149,7 +1151,8 @@ def route_fov(routes):
 
 def parse_refusal_windows(text):
     """The refusal census's 5 s lines (`vr world route refusal 5s:`: one a window while advanced.vr_camera_census is on and the route is
-    engaged, and while samples of a window that has just ended are still draining), each joined to the route's own line and inject line
+    engaged, while the steady-detail key is on and the route is engaged (its default; census=off then), and while samples of a window
+    that has just ended are still draining), each joined to the route's own line and inject line
     of the same window (the route prints route, inject, refusal, in that order; a missing one is None). A list of dicts: ts, kv (every
     token), census (census=on), steady and view (the tokens' text), w and h (size=), pct (refused-pct), route and inject (the other
     two lines' tokens), the counters as ints (None when a token is absent or not a number: treated, asked, sampled, read, dropped,
@@ -1189,13 +1192,17 @@ def parse_refusal_windows(text):
 
 def refusal_state(w):
     """What one refusal line says happened in its window. `measured`: samples were read back and the shares are real (including a window
-    that measured and found nothing refused: pixels > 0, refused=0). The rest are windows that measured nothing, each for its own
-    reason: `idle` (the route treated no frame), `no-ask` (it treated frames and none asked for the census), `no-sample` (fewer asks than
-    one sample takes), `no-read` (samples were dispatched and none came back), `unreadable` (a counter did not parse)."""
+    that measured and found nothing refused: pixels > 0, refused=0). `census-off`: the census key was off and nothing asked for it; the
+    line is there for the steady-detail key (on by default) and carries its depth-check frame counts only, so there is nothing to
+    measure and nothing wrong. The rest are windows that measured nothing, each for its own reason: `idle` (the route treated no frame),
+    `no-ask` (the census was on, the route treated frames and none asked for it), `no-sample` (fewer asks than one sample takes),
+    `no-read` (samples were dispatched and none came back), `unreadable` (a counter did not parse)."""
     if any(w[k] is None for k in ("treated", "asked", "sampled", "read", "pixels", "refused")):
         return "unreadable"
     if w["read"] and w["pixels"]:
         return "measured"
+    if not w["census"] and not (w["asked"] or w["sampled"]):
+        return "census-off"
     if not w["treated"]:
         return "idle"
     if not w["asked"]:
@@ -1221,9 +1228,43 @@ def _stale_tail(steady, kept, stale_refused, ran, skipped):
     return out
 
 
+def _key_findings(w, stamp, measured):
+    """What the steady-detail key's state and the resolver's depth-check frames say to each other in one window. The frame counts are
+    the resolver's own host counters, so a window needs no samples for them (a `census-off` window has none); the stale pixels are
+    known only to a window that measured."""
+    out = []
+    causes = w["causes"]
+    ran, skipped = w["check_ran"], w["check_skipped"]
+    if measured and w["steady"] == "on" and ran is None and (causes["stale-refused"] or 0) > 0:
+        # A build without the depth check (the flight-3 build): its key was the blanket form, which refused no stale pixel.
+        out.append(("WARN", "%s: steady-detail=on and %d stale pixel(s) were still refused: the key's rule did not reach the resolver "
+                    "(a build without the depth check: with it on, a stale slot takes the camera term and is counted as kept)"
+                    % (stamp, causes["stale-refused"])))
+    if w["steady"] == "on" and ran is not None:
+        if not ran and not skipped:
+            if w["treated"]:   # a window that treated nothing had nothing to check
+                out.append(("WARN", "%s: steady-detail=on and the resolver counted no depth-check frame in a window that treated %d frame(s): "
+                            "the key reached the route and not the resolver" % (stamp, w["treated"])))
+        elif not ran:
+            out.append(("WARN", "%s: steady-detail=on and the depth check never ran (0 ran, %d skipped): the resolver could not make "
+                        "last frame's depth, so every stale pixel was refused as with the key off" % (stamp, skipped)))
+        elif measured and not (w["kept"] or 0) and (causes["stale-refused"] or 0) > 0:
+            out.append(("note", "%s: steady-detail=on, the depth check ran in %d frame(s) and kept no stale pixel (%d refused): "
+                        "everything stale moved, or last frame's depth never matched" % (stamp, ran, causes["stale-refused"])))
+    if w["steady"] == "off":
+        if (w["kept"] or 0) > 0:
+            out.append(("WARN", "%s: %d stale pixel(s) were kept while steady-detail=off: the line's key state and the resolver's disagree"
+                        % (stamp, w["kept"])))
+        if (ran or 0) or (skipped or 0):
+            out.append(("WARN", "%s: the depth check counted frames (%d ran, %d skipped) while steady-detail=off: the line's key state and "
+                        "the resolver's disagree" % (stamp, ran or 0, skipped or 0)))
+    return out
+
+
 def refusal_findings(windows):
     """[(level, text)] about what the refusal lines do not support believing (WARN: a number that contradicts another, a key that did not
-    take effect, a census that never measured) and what is worth knowing (note)."""
+    take effect, a census that never measured) and what is worth knowing (note). A `census-off` window is not a census that failed: only
+    the steady-detail key's own checks apply to it."""
     out = []
     states = [refusal_state(w) for w in windows]
     for w, s in zip(windows, states):
@@ -1237,34 +1278,14 @@ def refusal_findings(windows):
         elif s == "no-read":
             out.append(("WARN", "%s: %d sample(s) were dispatched and none was read back: the read-back is stalled (or this is the window "
                         "the key went on in)" % (stamp, w["sampled"])))
+        elif s == "census-off":
+            out.extend(_key_findings(w, stamp, False))
         elif s == "measured":
             causes = w["causes"]
             if w["refused"] > w["pixels"]:
                 out.append(("WARN", "%s: refused %d exceeds the pixels examined, %d: the census counts a pixel once, so one of the two is wrong"
                             % (stamp, w["refused"], w["pixels"])))
-            ran, skipped = w["check_ran"], w["check_skipped"]
-            if w["steady"] == "on" and ran is None and (causes["stale-refused"] or 0) > 0:
-                # A build without the depth check (the flight-3 build): its key was the blanket form, which refused no stale pixel.
-                out.append(("WARN", "%s: steady-detail=on and %d stale pixel(s) were still refused: the key's rule did not reach the resolver "
-                            "(a build without the depth check: with it on, a stale slot takes the camera term and is counted as kept)"
-                            % (stamp, causes["stale-refused"])))
-            if w["steady"] == "on" and ran is not None:
-                if not ran and not skipped:
-                    out.append(("WARN", "%s: steady-detail=on and the resolver counted no depth-check frame in a window that treated %d frame(s): "
-                                "the key reached the route and not the resolver" % (stamp, w["treated"])))
-                elif not ran:
-                    out.append(("WARN", "%s: steady-detail=on and the depth check never ran (0 ran, %d skipped): the resolver could not make "
-                                "last frame's depth, so every stale pixel was refused as with the key off" % (stamp, skipped)))
-                elif not (w["kept"] or 0) and (causes["stale-refused"] or 0) > 0:
-                    out.append(("note", "%s: steady-detail=on, the depth check ran in %d frame(s) and kept no stale pixel (%d refused): "
-                                "everything stale moved, or last frame's depth never matched" % (stamp, ran, causes["stale-refused"])))
-            if w["steady"] == "off":
-                if (w["kept"] or 0) > 0:
-                    out.append(("WARN", "%s: %d stale pixel(s) were kept while steady-detail=off: the line's key state and the resolver's disagree"
-                                % (stamp, w["kept"])))
-                if (ran or 0) or (skipped or 0):
-                    out.append(("WARN", "%s: the depth check counted frames (%d ran, %d skipped) while steady-detail=off: the line's key state and "
-                                "the resolver's disagree" % (stamp, ran or 0, skipped or 0)))
+            out.extend(_key_findings(w, stamp, True))
             if (w["dropped"] or 0) > 0:
                 out.append(("note", "%s: %d sample(s) were skipped because the read-back ring was full (the shares are unaffected, the sample "
                             "count is lower)" % (stamp, w["dropped"])))
@@ -1273,14 +1294,15 @@ def refusal_findings(windows):
         if w["view"] == "on":
             out.append(("note", "%s: the refusal view was painting: the headset showed the prep's classification, not the world" % stamp))
     measured = [w for w, s in zip(windows, states) if s == "measured"]
-    treated = sum(w["treated"] or 0 for w in windows)
-    if windows and not measured:
+    counted = [w for w, s in zip(windows, states) if s != "census-off"]
+    treated = sum(w["treated"] or 0 for w in counted)
+    if counted and not measured:
         if treated:
             out.append(("WARN", "the census never measured: the route treated %d frame(s) over %d window(s) and no sample was read back"
-                        % (treated, len(windows))))
+                        % (treated, len(counted))))
         else:
             out.append(("note", "the census was on for %d window(s) and the route treated no frame in any of them: nothing was measured "
-                        "(not owning the world: a ship, a menu, or the route key off)" % len(windows)))
+                        "(not owning the world: a ship, a menu, or the route key off)" % len(counted)))
     return out
 
 
@@ -1293,11 +1315,15 @@ def print_refusal_census(windows, events=None):
     print("\n== refusal census (advanced.vr_camera_census: the route's own resolve, the prep's per-pixel classification, one sample in %s "
           "of the resolves that ask; shares are of the pixels the samples examined) ==" % (every or "?"))
     if not windows:
-        print("none: no `vr world route refusal 5s:` line in this log (advanced.vr_camera_census was off, the route never engaged, or this "
-              "build predates the census)")
+        print("none: no `vr world route refusal 5s:` line in this log (the route never engaged, or this build predates the census; with the "
+              "route on the line is printed while advanced.vr_camera_census is on, and while "
+              "experimental.temporal_aa_on_foot_world_steady_detail is on, which is its default)")
         return []
     states = [refusal_state(w) for w in windows]
+    off_windows = [w for w, s in zip(windows, states) if s == "census-off"]
     for w, s in zip(windows, states):
+        if s == "census-off":
+            continue   # summarised below, one line a key state: a long flight has hundreds of them
         route = w["route"] or {}
         inject = w["inject"] or {}
         context = "route state=%s jitter=%s fp-mode %s, inj-fp %s, struct fov %s" % (
@@ -1320,6 +1346,17 @@ def print_refusal_census(windows, events=None):
                 "unreadable": "a counter did not parse",
             }[s]
             print("%s: NOT MEASURED: %s | %s" % (head, reason, context))
+    off_keys = []
+    for w in off_windows:
+        if w["steady"] not in off_keys:
+            off_keys.append(w["steady"])
+    for key in off_keys:
+        group = [w for w in off_windows if w["steady"] == key]
+        counted = [w for w in group if w["check_ran"] is not None]
+        print("census off in %d window(s), steady-detail=%s (the line is printed for the key): the route treated %d frame(s)%s"
+              % (len(group), key, sum(w["treated"] or 0 for w in group),
+                 "; depth-check %d ran, %d skipped" % (sum(w["check_ran"] for w in counted), sum(w["check_skipped"] for w in counted))
+                 if counted else ""))
     measured = [(w, s) for w, s in zip(windows, states) if s == "measured"]
     keys = []
     for w, _ in measured:
@@ -1354,12 +1391,17 @@ def print_refusal_census(windows, events=None):
     for level, text in findings:
         print("%s %s" % ("!!" if level == "WARN" else "refusal note:", text))
     warns = sum(1 for level, _ in findings if level == "WARN")
+    asked = len(windows) - len(off_windows)
     if warns:
         print("refusal census: WARN (%d finding(s) above)" % warns)
     elif measured:
-        print("refusal census: consistent (%d of %d window(s) measured)" % (len(measured), len(windows)))
+        print("refusal census: consistent (%d of %d window(s) measured)%s" % (
+            len(measured), asked, "; %d other window(s) had the census off" % len(off_windows) if off_windows else ""))
+    elif off_windows and not asked:
+        print("refusal census: the census key was off in all %d window(s): nothing to measure (the lines carry the steady-detail key's "
+              "depth-check frames)" % len(off_windows))
     else:
-        print("refusal census: nothing measured (%d window(s))" % len(windows))
+        print("refusal census: nothing measured (%d window(s))" % asked)
     return findings
 
 
@@ -5843,6 +5885,38 @@ def self_test_camera_census():
     _, out = report(text + old_spelling(refusal_line(steady="on", stale=5, kept=40007515)))
     if "steady-detail=on and 5 stale pixel(s) were still refused" not in out or "refusal census: WARN" not in out:
         fail("stale pixels still refused with the flight-3 build's key on were not a WARN:\n%s" % out)
+    # The census key OFF with the steady-detail key on (its default): the route prints the line for the depth check's frame counts, and
+    # such a window is `census-off`: not a census that failed to measure, nothing to WARN about unless the depth check's own counts are wrong.
+    off_kw = dict(census="off", every=4, treated=450, asked=0, sampled=0, read=0, size="0x0", pixels=0, refused=0, pct="0.000",
+                  stale=0, masked=0, sentinel=0, range=0, steady="on", kept=0, ran=448, skipped=2)
+    cw = parse_refusal_windows(refusal_line(**off_kw))[0]
+    if refusal_state(cw) != "census-off" or (cw["check_ran"], cw["check_skipped"]) != (448, 2) or cw["census"]:
+        fail("a census=off line with nothing asked was not the census-off state: %r" % (refusal_state(cw),))
+    _, out = report(text + refusal_line(**off_kw))
+    if "!! " in out or "census off in 1 window(s), steady-detail=on (the line is printed for the key): the route treated 450 frame(s); " \
+            "depth-check 448 ran, 2 skipped" not in squash(out) or \
+            "refusal census: consistent (1 of 2 window(s) measured); 1 other window(s) had the census off" not in squash(out) or \
+            "NOT MEASURED: the route treated 450" in out:
+        fail("a census-off window beside a measured one was not summarised on its own line, or was called a failed census:\n%s" % out)
+    _, out = report("\n".join(l for l in text.split("\n") if "vr world route refusal" not in l) + refusal_line(**off_kw) +
+                    refusal_line(**dict(off_kw, ran=450, skipped=0)))
+    if "!! " in out or "census off in 2 window(s), steady-detail=on" not in squash(out) or "depth-check 898 ran, 2 skipped" not in squash(out) or \
+            "refusal census: the census key was off in all 2 window(s): nothing to measure" not in squash(out) or \
+            "the census never measured" in out:
+        fail("a log whose every refusal line is census-off was not read as 'nothing to measure' without a WARN:\n%s" % out)
+    _, out = report(text + refusal_line(**dict(off_kw, ran=0, skipped=0)))
+    if "steady-detail=on and the resolver counted no depth-check frame in a window that treated 450 frame(s)" not in out or \
+            "refusal census: WARN" not in out:
+        fail("a census-off window with the key on and no depth-check frame was not a WARN:\n%s" % out)
+    _, out = report(text + refusal_line(**dict(off_kw, ran=0, skipped=450)))
+    if "steady-detail=on and the depth check never ran (0 ran, 450 skipped)" not in out:
+        fail("a census-off window whose depth check never ran was not a WARN:\n%s" % out)
+    _, out = report(text + refusal_line(**dict(off_kw, steady="off", ran=3, skipped=1)))
+    if "the depth check counted frames (3 ran, 1 skipped) while steady-detail=off" not in out:
+        fail("a census-off window with depth-check frames and the key off was not a WARN:\n%s" % out)
+    _, out = report(text + refusal_line(**dict(off_kw, treated=0, ran=0, skipped=0)))
+    if "!! " in out:
+        fail("a census-off window that treated no frame (nothing to check) was a finding:\n%s" % out)
     _, out = report(text + refusal_line(refused=1600300801))
     if "refused 1600300801 exceeds the pixels examined, 1600300800" not in out:
         fail("more pixels refused than examined was not a WARN:\n%s" % out)
