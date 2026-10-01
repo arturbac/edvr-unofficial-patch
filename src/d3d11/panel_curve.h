@@ -67,6 +67,15 @@ typedef void(__stdcall* PanelCurveDrawFn)(ID3D11DeviceContext*, unsigned int,
 // three cases without restarting the game.
 void panelCurveConfigure(Config& cfg);
 
+// The question panelCurveWants() answers, asked of the CONFIGURATION instead of the
+// running state: would the curved screen replace the game's own quad if the game
+// started with this ini? The same two keys, the same bounds as panelCurveConfigure
+// (an out-of-range curvature reads as off), no state touched, nothing logged. For
+// the callers that decide something at LAUNCH that depends on the answer -- the VR
+// world route stands aside for a curved screen, so the width fix.vscreen_res_width
+// = auto fits for it (vscreen_res.cpp) is only right while this is false.
+bool panelCurveWantedByConfig(Config& cfg);
+
 // Is a substitution wanted at all? False when curvature is 0 and the segment
 // count is the default, and false for the rest of the session once the fault
 // budget has stood the feature down.

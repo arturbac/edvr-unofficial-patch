@@ -515,7 +515,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\exposure_fix.cpp" "src\d3d11\vscreen.cpp" ^
     "src\d3d11\glitch_frame.cpp" ^
     "src\d3d11\pose_reader_watch.cpp" "src\d3d11\transition_flash_eye_base.cpp" ^
-    "src\d3d11\vscreen_res.cpp" "src\common\vscreen_auto_state.cpp" ^
+    "src\d3d11\vscreen_res.cpp" "src\common\vscreen_auto_state.cpp" "src\d3d11\vscreen_footprint.cpp" ^
     "src\d3d11\binding_shadow.cpp" "src\d3d11\head_offset_gate.cpp" ^
     "src\d3d11\vr_runtime.cpp" ^
     "src\d3d11\journal_watch.cpp" ^
@@ -1801,6 +1801,47 @@ if errorlevel 1 ( echo [edvr] ERROR: vr_world_mips_test build failed & exit /b 1
 "%OBJ%\vrworldmips\vr_world_mips_test.exe" --dry-run || exit /b 1
 "%OBJ%\vrworldmips\vr_world_mips_test.exe" --self-test || exit /b 1
 python "tools\vr_world_mips_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
+:rig_vscreen_fit_test
+echo [edvr] === vscreen_fit_test.exe ===
+REM fix.vscreen_res_width = auto, fitted to what each eye shows (design doc section 82, the "vscreen auto-fit" entry): the pure half
+REM (src\common\vscreen_fit.h) run by the very code the DLL runs -- the rule, the route's conditions, the footprint geometry, the stored
+REM record, the log's text -- plus the state files on disk (src\common\vscreen_auto_state.cpp) and the source pins that hold the resolver,
+REM the instrument's hook and its D3D calls to what the pure half assumes (they read src\ and edvr.ini from the repo root, which the rig
+REM takes as its argument). tools\vscreen_fit_test\mutants.py --self-test holds the rig's mutation list to the sources as they are; the
+REM list itself (--run, on demand, about a minute) proves the rig fails when each rule of the header or each wiring pin is flipped.
+if not exist "%OBJ%\vscreenfit" mkdir "%OBJ%\vscreenfit"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS ^
+    /Fo"%OBJ%\vscreenfit\\" /Fe"%OBJ%\vscreenfit\vscreen_fit_test.exe" ^
+    "tools\vscreen_fit_test\vscreen_fit_test.cpp" "src\common\vscreen_auto_state.cpp" ^
+    /link /INCREMENTAL:NO kernel32.lib
+if errorlevel 1 ( echo [edvr] ERROR: vscreen_fit_test build failed & exit /b 1 )
+"%OBJ%\vscreenfit\vscreen_fit_test.exe" --dry-run || exit /b 1
+"%OBJ%\vscreenfit\vscreen_fit_test.exe" --dry-run --write-fixture "%OBJ%\vscreenfit\never_written.log" || exit /b 1
+if exist "%OBJ%\vscreenfit\never_written.log" ( echo [edvr] ERROR: vscreen_fit_test --dry-run --write-fixture wrote a file & exit /b 1 )
+"%OBJ%\vscreenfit\vscreen_fit_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\vscreen_fit_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
+:rig_vscreen_footprint_glue_test
+echo [edvr] === vscreen_footprint_glue_test.exe ===
+REM The footprint instrument's glue (src\d3d11\vscreen_footprint.cpp; design doc section 82, the "vscreen auto-fit" entry) compiled for
+REM real with the real Config, Log and fault guard, and stubs for what it calls (the runtime's published eye size, the hooks' bypass
+REM flag): the four sources a composite draw binds (the model rows, the clip rows at their real offsets, the quad, the SIZE record) on a
+REM WARP device read back through the staging copy and the DO_NOT_WAIT map, the 30 s line, the stored median, the sources that are not
+REM what the measurement assumes, the fault budget -- and then tools\edvr_log.py --vscreen-fit over the log the glue wrote. Needs python
+REM on PATH; runs from the repo root; takes about a second. Its exe sits under obj\ and it takes System32's device through
+REM src\common\system_d3d11.h, so it links without d3d11.lib.
+if not exist "%OBJ%\vscreenfpglue" mkdir "%OBJ%\vscreenfpglue"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /D_CRT_SECURE_NO_WARNINGS /I"%GEN%" ^
+    /Fo"%OBJ%\vscreenfpglue\\" /Fe"%OBJ%\vscreenfpglue\vscreen_footprint_glue_test.exe" ^
+    "tools\vscreen_footprint_glue_test\vscreen_footprint_glue_test.cpp" "src\d3d11\vscreen_footprint.cpp" "src\common\vscreen_auto_state.cpp" ^
+    "src\common\config.cpp" "src\common\log.cpp" "src\common\guard.cpp" "src\common\proxy.cpp" ^
+    /link /INCREMENTAL:NO user32.lib version.lib
+if errorlevel 1 ( echo [edvr] ERROR: vscreen_footprint_glue_test build failed & exit /b 1 )
+"%OBJ%\vscreenfpglue\vscreen_footprint_glue_test.exe" --dry-run || exit /b 1
+"%OBJ%\vscreenfpglue\vscreen_footprint_glue_test.exe" --self-test || exit /b 1
 exit /b 0
 
 :rig_openvr_abi_test

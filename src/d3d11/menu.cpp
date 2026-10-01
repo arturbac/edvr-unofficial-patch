@@ -26,6 +26,7 @@
 #include "../common/proxy.h"
 #include "../common/timing.h"
 #include "../common/temporal_mode.h"
+#include "../common/vscreen_fit.h"
 #include "device_hook.h"
 #include "elite_binds.h"
 #include "flat_elite_settings.h"
@@ -2043,8 +2044,12 @@ void buildContent(MenuContent& c) {
                 // announce=false: this runs every frame the row is highlighted,
                 // not once at startup, so the resolver must stay silent here.
                 uint32_t vw = 0, vh = 0;
-                resolveVScreenTargetResolution(Config::get(), &vw, &vh, /*announce=*/false);
-                if (vw && vh) {
+                vscreenfit::Decision autoRule;
+                resolveVScreenTargetResolution(Config::get(), &vw, &vh, /*announce=*/false, &autoRule);
+                if (vw && vh && autoRule.width) {
+                    // "auto": which of its two rules chose it (vscreen_fit.h).
+                    vscreenfit::formatHint(c.hint, sizeof(c.hint), autoRule);
+                } else if (vw && vh) {
                     snprintf(c.hint, sizeof(c.hint), "Currently resolves to %ux%u.", vw, vh);
                 } else {
                     snprintf(c.hint, sizeof(c.hint),

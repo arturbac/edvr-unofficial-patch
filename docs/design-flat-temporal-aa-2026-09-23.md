@@ -39,9 +39,8 @@
   motion; do not revive estimation or the retired deferred UI replay.
 - **Next:** the HDR route flew (hangar, bright star; R < D at 0.75) and is
   default auto (section 81); legs still to fly: FSR, EDVR TAA, game FXAA,
-  ReShade. Then the open items above: section-75 confirming flight, section-76
-  matrix cells, section-77 fixes, section-78 recipes (older: Status detail).
-  Existing evidence does not justify ignoring the alternate projection.
+  ReShade. Then the open items above (older: Status detail). Existing
+  evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
   PS91/BFE or stale-resize hypotheses. The menu hangar-floor P1 defect remains
   open. VR still needs regression tests; the concourse NPC observation on
@@ -49,11 +48,12 @@
 - **Test target (Sean):** all in-game tests on the Epic install under
   `C:\Program Files\Epic Games\EliteDangerous\Products`; keep its INI.
 - **Field reports (79-82):** users 1-2 refused every frame, 3 at 7-13 fps, 4
-  lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED 10-01; fix next.
-- **Compatibility decision:** the prototype accepts an absent profile
-  descriptor as legacy VR so manual installations keep working. An existing
-  invalid descriptor disables fixes, preserving forwarding/chaining. New
-  installers and developer verification require `edvr_profile.ini`.
+  lost ~23 ms (ReShade). 80-81 flown. 82: (f') CONFIRMED 10-01 (fix next);
+  vscreen auto-fit (route on: width fitted to the eye) BUILT 10-01, NOT FLOWN.
+- **Compatibility decision:** an absent profile descriptor is accepted as
+  legacy VR (manual installs keep working); an existing invalid one disables
+  fixes, preserving forwarding/chaining. New installers and developer
+  verification require `edvr_profile.ini`.
 - **Environment:** initial qualification is Windows, Elite's D3D11 renderer,
   mono SDR output. Record game/patch builds, GPU/driver, display/render sizes,
   window mode, installed mods and backend DLL versions. Headset/runtime are N/A
@@ -7375,3 +7375,136 @@ camera term for stale slots in the shared resolver (keep history where last
 frame's depth at the camera-reprojected spot matches, refuse otherwise), so
 flat on foot gets it too; then a settlement check with movers and a desk
 check in flat before any default changes.
+
+**The vscreen auto-fit (2026-10-01; BUILT, NOT FLOWN).** Sean: "we're rapidly
+approaching making route on the default for everyone". With the route running,
+5040x2835 (auto's 125% of the 4032 eye) is render cost nothing needs: the game
+draws every on-foot pixel of it (G-buffer, depth, HDR, HUD), the route resolves
+and mips it, and the eye shows about 3500 of it. Flown with the route on: 4032
+wide "looked fine", 3504x1971 "looks great still" (Frontier, 02c1c456, log
+060703). `fix.vscreen_res_width = auto` now fits the screen to what the eye
+shows whenever the route will run and keeps today's rule otherwise. Explicit
+widths are exact; the flat profile never arms any of it.
+
+THE RULE (`src\common\vscreen_fit.h`, pure; `tools\vscreen_fit_test` runs the
+very code the DLL runs).
+- The route will run, at launch, when ALL hold: `experimental.
+  temporal_aa_on_foot_world` is auto; `fix.panel_curvature` is 0 (the route
+  stands aside for a curved screen; ONE named function, `routeStandsAsideFor
+  Curve`, delete it with the curve-aware re-issue); the UI layer is live
+  (`fix.ui_quality` on, a temporal mode on, the jitter switches as shipped:
+  the layer's own `uiLayerNotLiveReasonFor`); the runtime is EDVR's OpenXR.
+  That last one cannot be read at device creation (the module list is empty
+  until openvr_api.dll is called, 1.2 s later), so none-loaded-yet is
+  undecided, not a failure: the eye width on record is only ever written by
+  EDVR's runtime. Elite's native Oculus back end, or a foreign openvr_api.dll,
+  fails it. Else: today's rule, unchanged: roundTo16(1.25 x the eye).
+- Fitted width = roundTo16(clamp(m x A, 2880, cap)), 16:9, m = 1.0, cap = the
+  legacy width (a fit never asks for more than the old rule did), nudged off
+  1920x1080 and 3840x2160 (the only 16:9 sizes the game's own targets took in
+  four flights' logs; the world-screen gate and the panel recognition key on
+  the panel's size). A small eye whose cap is under 2880 gets the legacy width.
+- A = fraction x eye width / d. The fraction is the screen's width as a share of
+  the eye's at panel distance 1.0: the distance override scales one float of
+  the composite's placement (its z translation), so the footprint varies as
+  1/d, and the stored fraction rescales to a changed `fix.panel_distance` or
+  eye width with no new measurement.
+- Nothing measured yet: the fraction is Sean's calibration point (3504 px at
+  0.7 on a 4032 eye = 0.6083), so the FIRST launch on his rig is 3504x1971,
+  the width he flew. m = 1.0 is that by construction. His measured A is not
+  known until the flight: if it reads other than 3504 (3%), the reader prints
+  the m that reproduces 3504 (`kMultiplier`, one constant; his call).
+
+THE LINE. `vScreen resolution: auto = N wide: rule=fitted|legacy source=seed|
+measured|none route=run|no eye= distance= legacy= [footprint= m= floor= cap=
+clamp= nudged=] -- prose`. It names the rule, the numbers it was made from and,
+for legacy, EVERY route condition that failed. An explicit width prints
+`vScreen resolution: explicit N wide`. The in-headset menu's hint says the same.
+
+THE INSTRUMENT (`src\d3d11\vscreen_footprint.cpp`). At the 2D screen's
+composite (vs 5C36AF05, ps CFE84157; after the game's own issue) the quad's four
+corners go through the composite VS's own arithmetic
+(`docs\shaders\composite-vs.asm`): cb0 rows 9..11, cb1 rows 270..273 (the clip
+columns), the four vertices (stride 20, at the draw's base vertex) and the
+per-instance SIZE (a float2 slot, at the start instance). Horizontal NDC extent
+/ 2 = the share of the eye's width. Twice a second one draw's four sources are
+copied into one 256 byte staging buffer; the Map is at the frame boundary three
+frames later, DO_NOT_WAIT, so the render thread never waits. Its D3D calls step
+past EDVR's hooks (the scope is taken outside the fault guard), a budget of 5
+faults stands it down, and a source that is not what the measurement assumes
+(stride not 20, a buffer too small, no SIZE slot, a negative base vertex)
+skips the sample and is counted by reason. Armed: VR profile, key auto.
+ruled out: an occlusion query as the instrument, because it counts AREA (a
+width follows only by assuming the screen's shape), is clipped where the
+screen overflows the eye (d under about 0.6), and needs GPU-latency handling;
+the corners are exact, free on the GPU and clip nothing, and each source was
+already read in flight (panel_curve's SIZE and cb0, the census's cb1 rows).
+The 30 s line: `vscreen footprint 30s: window= samples= on-foot= other=
+skipped= late= [why=reason:n,..] draws= distance= applied= eye=WxH fp= frac=
+range=lo..hi h= shape= [other-fp=] at1= frac1= session-n= session-frac1=
+persisted= fit= legacy= m= floor=`. fp: the on-foot median in eye pixels;
+shape: its pixel aspect, 1.778 when the corner arithmetic and the eye size
+agree; at1/frac1: at panel distance 1; persisted: what the file holds; fit:
+what the next launch fits if the route runs. Menu and on-foot samples are kept
+apart (the layer's world-screen gate, else the journal's); only on foot is
+stored, from 12 samples up. If it never ran there is no `vscreen footprint`
+line at all, not even `vscreen footprint: armed --`; armed with no composite
+seen prints draws=0; seen but unreadable prints skipped= with why=.
+
+PERSISTENCE. `edvr_logs\vscreen_auto_footprint.txt`, beside
+`vscreen_auto_eye_width.txt`: `fraction=0.608333 eye=4032 distance=0.700
+samples=177`, the session's on-foot median at distance 1.0, rewritten when it
+moves 0.2%. A garbled or implausible (outside 0.05..3.0) file is no measurement.
+
+THE READER. `python tools\edvr_log.py --target frontier --vscreen-fit
+--expect-build HEAD`: RULE (the width recomputed from the line's own tokens, and
+what the panel patch applied), INSTRUMENT, ON FOOT, STABLE (under 2%), SHAPE
+(16:9 within 3%), DISTANCE LAW (frac1 within 2% across distances), CALIBRATION
+(3504 within 3% at the calibration point), STORED. The census verdict's NDC
+figure read a literal 5040x2835; it now takes the route lines' hdr=, else the
+JITTERED line, else the panel patch's size, else says it does not know.
+
+GATES. `tools\vscreen_fit_test` (201 checks; `mutants.py --run`: 76 mutants of
+the header and the wiring pins, all caught), `tools\vscreen_footprint_glue_test`
+(the real glue on WARP with the four sources at their real offsets, the stored
+file, the defective sources, the fault budget, then the real reader over its
+log), `config_test` pins the resolver's route-key fallback to the shipped
+default, the reader's self-test, `tools\vscreen_fit_fixture.log` held to the
+formatters.
+
+NOT KNOWN, and which line reads it. (1) The footprint's absolute value on
+Sean's rig: the seed is the width he flew, not a measurement (`fp=`,
+CALIBRATION). (2) That the on-foot and menu footprints agree (`other-fp=` against
+`fp=`). (3) The 1/d law (`frac1=` across a leg at another distance). (4) The
+quad's corners at +-1 with SIZE in a float2 slot, from panel_curve's flights
+(`shape=`). (5) What a narrower screen costs elsewhere: it sizes every
+screen-mode target, the intro movie's, HMD Cinema and the FSS chrome (213/320 of
+the width: 3408x1917 at 5120).
+
+FLIGHT PLAN (Frontier or Epic; one on-foot spot, standing still 60 s a leg, so
+two 30 s windows). Every leg, `edvr.ini`: `[fix]` `temporal_aa = dlss`,
+`ui_quality = 100`, `panel_curvature = 0`, `panel_distance = 0.7`; `[experimental]`
+`temporal_aa_on_foot_world = auto`. Install by `tools\install_edvr.py`; the
+first line of every read is `edvr_log.py --expect-build HEAD --vscreen-fit`.
+A. Delete `edvr_logs\vscreen_auto_footprint.txt`, `vscreen_res_width = auto`.
+   Expect `rule=fitted source=seed route=run ... auto = 3504 wide`, applied
+   3504x1971, the armed line, then windows with `on-foot` above 0, `skipped=0`,
+   `late=0`, `persisted=` a number. Exit.
+A2. Restart, same ini, no edits. Expect `source=measured` and the width the
+   measurement gives: roundTo16(A) (3504 when A is 3504 +-8; 3520 at 3512..3527).
+   CALIBRATION is the verdict on m. This is the leg that matters.
+B. Restart with `vscreen_res_width = 5040` (explicit; the cost leg): the same
+   spot and view. Compare the `EDVR GPU census:` lines (the world resolve, the
+   mips, the world layer, ms a frame) and the `native benchmark:` windows
+   (whole-frame GPU and CPU p50, which end at every settings change) with A2's,
+   and Sean's eye on the text: 3504 against 5040.
+C. Restart with `panel_curvature = 0.3`, auto: expect `rule=legacy route=no`,
+   5040x2835, the prose naming `fix.panel_curvature is above 0`, and no route.
+D. (cheap, same spot) Restart at `panel_distance = 1.0`: `footprint=` near 2450
+   under the 2880 floor (clamp=floor), DISTANCE LAW PASS: frac1 matches A2's.
+PASS: A shows the fitted seed line and a stored measurement; A2's CALIBRATION is
+PASS (else Sean picks 3504 or the measurement); STABLE and SHAPE PASS; C names
+the failed condition. FAIL: no `vscreen footprint` line (never ran), draws=0 (the
+composite not recognised), skipped= large (a source is not what it assumes,
+why= says which), SHAPE off 16:9 (the corner arithmetic or the eye size is
+wrong), a width in the rule line that its own tokens do not give.
