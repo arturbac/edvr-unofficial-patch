@@ -2,7 +2,7 @@
 
 ## Status
 
-- **State (2026-10-01):** implementation in progress on
+- **State (2026-10-02):** implementation in progress on
   `codex/plugin-architecture`; do not merge to main until Sean is ready to ship.
   Three Luna 6 agents now own cost attribution, production integration,
   and test gates. This is Phase 1 work, not completion
@@ -52,7 +52,8 @@
   Continue Phase 1 disabled-interest and cost work before group migration;
   shader-pair candidates stay cached, shape/state stay draw-time predicates.
   Ladder/replay and disabled-interest snapshots pass all 121 jobs; trace-only
-  counters are removed. CPU/D3D-call attribution remains open (section 11).
+  counters are removed. Sampled classifier CPU and direct NV call attribution
+  pass all 122 jobs; full module cost coverage remains open (section 11).
 - **Ruled out while designing:** loading every DLL found in a folder (DLL
   planting; the installer's receipts already know what it installed), a
   stable ABI for first-party plugins (they ship with the core; freezing
@@ -695,8 +696,8 @@ reset, configuration reseeding and flat bypass remain covered. The first
 optimized visitor retained eight loaded-flag guards; using the known first
 legacy-interest rung removes them. Independent optimized inspection finds
 one legacy mask load, 94 calls, a 288-byte stack frame and no selector,
-trace, or stack-cookie calls in the unarmed classifier. Its emitted extent
-is 7,052 bytes versus 6,885 for validated `d57600de` and 6,693 for baseline
+trace, or stack-cookie calls in the unarmed classifier. Its last instruction
+starts at offset 7,052 versus 6,885 for validated `d57600de` and 6,693 for baseline
 `14a7ff70`; baseline has 105 calls and a 272-byte stack frame. These are
 compiler checks, not a measured flight improvement. This changed source
 still needs full validation before commit or installation.
@@ -750,3 +751,88 @@ measurements need explicit timing boundaries and coverage. GPU-census scope
 occurrences cannot substitute for executed D3D-call counts. Per-owner CPU
 and actual issuance annotations are still required before the next Phase 1
 performance flight.
+
+### Sampled cost collector, 2026-10-02 (validated)
+
+The next slice times typed classifier handlers only after their cached
+interest gate admits them. A gated miss records Reached and NotEligible
+without reading the clock; an eligible handler records Invoked and a timed
+scope. Foreign/deferred contexts, flat/internal/indirect bypasses and replay
+captures do not use the sampled CPU policy. NoCpu removes its scopes and
+counter callbacks at compile time.
+
+CPU probes use ordinal 32 within the existing 64-draw sampled-frame stride;
+the comparable aggregate sample remains at ordinal 0. Sharing the aggregate
+draw would put extra probe clocks inside that sample and multiply their cost
+by 64. The existing aggregate's forwarding boundaries stay unchanged,
+including the indexed-instanced weapon-motion limitation recorded above.
+CPU estimates include probe overhead and cover classifier handlers, not all
+module work. They use actual completed, unsuppressed sampled frames, include
+owner-zero samples, and report frame-level spread with no confidence interval
+or calibrated budget claim.
+
+API notes count actual direct context invocations in the migrated NV module,
+including getters, state changes and restoration, with separate Work,
+Transfer, State, ReadQuery and Instrumentation classes. Loop iterations count
+separately. The immediate-context check remains one existing query; rejected
+deferred calls do not touch collection. An accepted NV begin reads sampling
+once and retains it through the matching end, so unsampled API sites do not
+call the collector. Helper internals, device/resource creation, IUnknown,
+SDK/runtime work, game forwards and other modules remain outside this slice.
+API counts are raw totals and per completed API sample frame, never CPU-stride
+scaled or inferred from GPU scope occurrences.
+
+The C-compatible fixed-memory collector drains closed sample flags before
+the frame monitor resets and publishes the next flags. Configure/reload drops
+mixed partial state and one subsequent close; shutdown discards partial data
+after unhooking. A replay latch excludes its CPU frame while retaining API
+sampling. Sparse rows name logical owners and observed source coverage; they
+do not imply module selection. Cold configure/window lines distinguish a
+running collector with no observations from a collector that never ran.
+The first optimized production compile passes without warnings and the NoCpu
+body has no new collector or clock callbacks. Its listing uses `/FAs`, so its
+machine-code extent cannot yet be compared to the saved `/FAcs` reference.
+Ruled out: relocation offsets of 587/618 represented classifier byte sizes,
+because they were PDATA references, not encoded instruction offsets. The
+saved `b1c6edf6` reference ends at instruction offset 0x1b8c followed by a
+five-byte jump: 7,057 bytes including that instruction. Earlier 7,052 was
+the last instruction's start offset.
+
+The final type-only CPU policy keeps the old trace/context/draw-argument ABI;
+an unused policy-reference parameter was removed before validation. Independent
+inspection of encoded `/FAcs` listings finds exactly the same 1,446 instruction
+records, 7,057-byte extent, 94 calls and 288-byte stack reservation as
+`b1c6edf6`; the encoded listing bytes match SHA-256
+`bee82ef5511ed48874d7d25b30bb345efb79a12213235dd8c5bdee44b6ebe2a0`.
+The NoCpu classifier has no collector, clock, selector-helper or stack-cookie
+calls. Direct draw thunks grow by 40-50 bytes while retaining their call counts
+and stack reservations. These are codegen checks, not a flight result.
+
+The serial guarded `run_jobs.py` set passes `plugin_cost_test`,
+`draw_ladder_test` and `native_motion_rigs`, without compiler warnings or
+foreground/window events. A real `/TC /std:c11` smoke pins the C record sizes,
+offsets and function signatures. Collector fixtures cover actual closed-frame
+denominators, stride scaling only for CPU, replay suppression, measured zero
+versus absent rows, configure/reload and shutdown. Fake-clock selector fixtures
+cover gated misses without clocks, exact eligible timing, NoCpu with trace,
+and a valid earlier claimant preventing later NV queries or scopes. NV WARP
+passes 264,393 checks, including no unsampled notes, exact pulse-path 11 calls
+(nine read/query, two state), the repeated SRV loop, three-query malformed
+settings return, state restoration and deferred rejection before collection.
+The first full validation attempt stopped after 56 of 122 jobs at the VR
+world-route mutation fixture. Its unchanged production checks pass 283 cases,
+but the `iw-flag-put-away-before-the-draw` mutant could not find its old
+`beginPanelOverride(trace, ...)` source anchor after the type-only CPU policy
+changed that call spelling. The mutation was not applied or run; this failure
+does not measure a rendering or cost regression. Preserve its original
+semantics and update scoped anchors before rerunning full validation.
+The anchor repair passes the guarded 283 route checks and all 96 mutation
+checks over four rigs. The unchanged production code and repaired fixtures
+then pass the full normal `build.bat --jobs 4`: 116 pooled jobs in 138.8 s
+and six quiet jobs in 25.5 s, both production profiles, self-contained
+installers and 232-key config/package contracts. Receipt created
+2026-10-02T06:40:42.483870Z, status `full-pass`, inputs fingerprint
+`bca56d8554df2336a3459036fb389812ffa63d7d42c5dc9028e951836d6c0372`.
+This validates the partial collector; it does not complete all-module CPU/API
+coverage or pass the Phase 1 performance flight gate. Steam remains on
+`14a7ff70`; repeatable baseline/candidate windows are still required.

@@ -16,6 +16,22 @@
 using Microsoft::WRL::ComPtr;
 unsigned checks=0;
 D3D_DRIVER_TYPE testDriver=D3D_DRIVER_TYPE_WARP;
+uint8_t nvApiSampleFlag=0;
+unsigned nvApiSampleReads=0;
+uint64_t nvApiCalls[10][39][5]{};
+extern "C" uint8_t edvrPluginCostApiSampleFrame(void) noexcept {
+    ++nvApiSampleReads;
+    return nvApiSampleFlag;
+}
+extern "C" void edvrPluginCostNoteD3dCall(uint8_t owner,uint16_t siteId,uint8_t apiClass) noexcept {
+    if(owner<10 && siteId<39 && apiClass<5) ++nvApiCalls[owner][siteId][apiClass];
+}
+void resetNvApiNotes(uint8_t sample){
+    nvApiSampleFlag=sample;nvApiSampleReads=0;std::memset(nvApiCalls,0,sizeof(nvApiCalls));
+}
+uint64_t nvApiSiteTotal(unsigned site){uint64_t n=0;for(unsigned c=0;c<5;++c)n+=nvApiCalls[1][site][c];return n;}
+uint64_t nvApiClassTotal(unsigned apiClass){uint64_t n=0;for(unsigned s=0;s<39;++s)n+=nvApiCalls[1][s][apiClass];return n;}
+uint64_t nvApiTotal(){uint64_t n=0;for(unsigned s=0;s<39;++s)n+=nvApiSiteTotal(s);return n;}
 void check(bool b,const char* why){++checks;if(!b){std::printf("FAIL: %s\n",why);std::exit(1);}}
 void hr(HRESULT h){check(SUCCEEDED(h),"D3D operation");}
 ComPtr<ID3DBlob> compile(const char* s,const char* entry,const char* profile,const D3D_SHADER_MACRO* macros=nullptr){
@@ -124,6 +140,29 @@ struct Rig {
 void test(bool realistic){
     testOn=realistic;testPulse=true;
     Rig r;check(nightVisionMatches('X',240,1),"exact night pair accepted");check(!nightVisionMatches('D',240,1)&&!nightVisionMatches('X',6,1)&&!nightVisionMatches('X',240,2),"unrelated draw shapes rejected");
+    // The profiler flag is read once only after GetType accepts the immediate
+    // context. Unsampled begin/end preserves the call path without collector
+    // writes; sampled notes count each actual call, including both SRV slots.
+    nightVisionShutdown();testOn=false;testPulse=true;nightVisionConfigure(Config::get());
+    resetNvApiNotes(0);nightVisionBegin(r.ctx.Get());nightVisionEnd(r.ctx.Get());
+    check(nvApiSampleReads==1&&nvApiTotal()==0,"unsampled immediate begin/end emits no API collector notes");
+    resetNvApiNotes(1);nightVisionBegin(r.ctx.Get());nightVisionEnd(r.ctx.Get());
+    check(nvApiSampleReads==1,"sampled immediate begin reads API sampling flag once");
+    check(nvApiSiteTotal(18)==1&&nvApiSiteTotal(19)==1&&nvApiSiteTotal(20)==1&&
+          nvApiSiteTotal(21)==2&&nvApiSiteTotal(22)==1&&nvApiSiteTotal(23)==1&&
+          nvApiSiteTotal(24)==1&&nvApiSiteTotal(33)==1&&nvApiSiteTotal(34)==1&&
+          nvApiSiteTotal(38)==1&&nvApiTotal()==11,"sampled pulse begin/end notes exact direct calls and two SRV iterations");
+    check(nvApiClassTotal(3)==9&&nvApiClassTotal(2)==2&&nvApiClassTotal(0)==0&&
+          nvApiClassTotal(1)==0&&nvApiClassTotal(4)==0,"sampled pulse API categories reflect read queries and state calls only");
+    // A bad settings buffer returns immediately after the three reached
+    // context queries; no later resource, shader, or restoration site exists.
+    r.ctx->PSSetConstantBuffers(2,1,r.camera.GetAddressOf());resetNvApiNotes(1);
+    nightVisionBegin(r.ctx.Get());
+    check(nvApiSampleReads==1&&nvApiTotal()==3&&nvApiSiteTotal(18)==1&&
+          nvApiSiteTotal(19)==1&&nvApiSiteTotal(20)==1&&nvApiSiteTotal(21)==0,
+          "malformed settings resource records only API calls reached before early return");
+    r.ctx->PSSetConstantBuffers(2,1,r.settings.GetAddressOf());
+    testOn=realistic;testPulse=true;nightVisionConfigure(Config::get());
     // The draw path asks nightVisionShape inline before the call: it must
     // accept the matched shape and nothing the match itself rejects on shape.
     check(nightVisionShape('X',240,1)&&!nightVisionShape('D',240,1)&&!nightVisionShape('X',6,1)&&!nightVisionShape('X',240,2),"inline shape pre-check agrees with the match");
@@ -158,8 +197,9 @@ void test(bool realistic){
     fixed=r.draw(true);stock=r.draw(false);
     for(size_t i=0;i<fixed.size();++i)check(std::isfinite(fixed[i])&&fabsf(fixed[i]-stock[i])<1e-5f,"singular camera retains original pulse");
     // A matched hash is insufficient when a future build changes resources.
-    r.ctx->PSSetConstantBuffers(2,1,r.camera.GetAddressOf());nightVisionBegin(r.ctx.Get());
+    r.ctx->PSSetConstantBuffers(2,1,r.camera.GetAddressOf());resetNvApiNotes(1);nightVisionBegin(r.ctx.Get());
     ComPtr<ID3D11PixelShader> ps;r.ctx->PSGetShader(&ps,nullptr,nullptr);check(ps.Get()==r.stock.Get(),"wrong settings size rejected");nightVisionEnd(r.ctx.Get());r.ctx->PSSetConstantBuffers(2,1,r.settings.GetAddressOf());
+    check(nvApiSampleReads==1&&nvApiTotal()==3,"malformed settings early return notes only its reached context calls");
     r.bind(2,r.depth);fixed=r.draw(true);stock=r.draw(false);check(fixed==stock,"wrong normal format draws stock");r.bind(2,r.normals);stock=r.draw(false);
     // The second shader output is a blend factor, not another render
     // target. A changed MRT/blend contract must retain the original draw.
@@ -170,10 +210,21 @@ void test(bool realistic){
     r.ctx->OMSetRenderTargets(2,mrt,nullptr);nightVisionBegin(r.ctx.Get());ps.Reset();r.ctx->PSGetShader(&ps,nullptr,nullptr);
     check(ps==r.stock,"MRT pass keeps original shader");nightVisionEnd(r.ctx.Get());r.ctx->OMSetRenderTargets(1,r.rt.GetAddressOf(),r.dsv.Get());
     // Nested Begin is harmless, including live disabling before End.
-    nightVisionBegin(r.ctx.Get());ps.Reset();r.ctx->PSGetShader(&ps,nullptr,nullptr);check(ps!=r.stock,"known single target engages");
+    nightVisionShutdown();testOn=realistic;testPulse=true;nightVisionConfigure(Config::get());
+    resetNvApiNotes(1);nightVisionBegin(r.ctx.Get());ps.Reset();r.ctx->PSGetShader(&ps,nullptr,nullptr);check(ps!=r.stock,"known single target engages");
     nightVisionBegin(r.ctx.Get());testOn=false;testPulse=false;nightVisionConfigure(Config::get());nightVisionEnd(r.ctx.Get());
+    check(nvApiSampleReads==1&&nvApiTotal()==(realistic?40u:11u)&&nvApiSiteTotal(38)==1&&
+          (!realistic || (nvApiSiteTotal(35)==1&&nvApiSiteTotal(36)==1&&nvApiSiteTotal(37)==1)),
+          "sampled end records each state restoration call used by its mode");
+    if(realistic){
+        bool exact=nvApiTotal()==40;
+        for(unsigned site=0;site<39;++site)
+            exact=exact&&nvApiSiteTotal(site)==(site==21?2u:1u);
+        check(exact,"first sampled realistic begin/end records all 39 direct sites and both SRV iterations exactly");
+    }
     ps.Reset();r.ctx->PSGetShader(&ps,nullptr,nullptr);check(ps==r.stock,"live disabling restores an engaged draw");testOn=realistic;testPulse=true;nightVisionConfigure(Config::get());
-    ComPtr<ID3D11DeviceContext> deferred;hr(r.dev->CreateDeferredContext(0,&deferred));nightVisionBegin(deferred.Get());ps.Reset();deferred->PSGetShader(&ps,nullptr,nullptr);check(!ps,"deferred context rejected");
+    ComPtr<ID3D11DeviceContext> deferred;hr(r.dev->CreateDeferredContext(0,&deferred));resetNvApiNotes(1);nightVisionBegin(deferred.Get());ps.Reset();deferred->PSGetShader(&ps,nullptr,nullptr);check(!ps,"deferred context rejected");
+    check(nvApiSampleReads==0&&nvApiTotal()==0,"deferred context rejects before collector accessor or owner API notes");
     testOn=false;testPulse=false;nightVisionConfigure(Config::get());check(!nightVisionMatches('X',240,1),"both live settings Off bypass replacement");fixed=r.draw(true);
     check(fixed==stock,"live Off draws original pixels");
     testOn=realistic;testPulse=true;nightVisionConfigure(Config::get());check(nightVisionMatches('X',240,1),"live On reengages");

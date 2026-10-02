@@ -4,6 +4,7 @@
 #include <tuple>
 #include <type_traits>
 #include "draw_interest.h"
+#include "../common/plugin_cost.h"
 
 // Stable identities for the ordered draw classifier. These are intentionally
 // independent of DrawVerdict: a verdict says what was selected, while a site
@@ -288,37 +289,114 @@ struct SiteResult final {
 #define EDVR_LADDER_FORCEINLINE inline
 #endif
 
-template <class Visitor, class SiteType, class InterestProvider, class TracePolicy>
+// CPU-cost rows describe only the time spent in the typed classifier handler.
+// Keep the attribution table here beside the ordered sites; ambiguous shared
+// state and always-kept census plumbing are Core until a narrower owner is
+// evidenced. This is reporting metadata, never plugin selection.
+template <SiteId Id>
+constexpr plugin_cost::Owner cpuOwnerForSite() noexcept {
+    if constexpr (Id == SiteId::kParticleProbe || Id == SiteId::kObjectProbe ||
+                  Id == SiteId::kUiCrispProbe ||
+                  Id == SiteId::kOffscreenCensusSkip || Id == SiteId::kOffscreenQuadSkip ||
+                  Id == SiteId::kEyeCensusSkip || Id == SiteId::kEyeRangeSkip) {
+        return plugin_cost::Owner::Diagnostics;
+    } else if constexpr (Id == SiteId::kParticleSubstitute ||
+                         Id == SiteId::kWitchspaceStarsSkip ||
+                         Id == SiteId::kOffscreenWakePulseSkip ||
+                         Id == SiteId::kSunglareNomination || Id == SiteId::kNightVisionClaim ||
+                         Id == SiteId::kRemlokHideSkip || Id == SiteId::kRemlokScissorClaim ||
+                         Id == SiteId::kTargetSharpClaim || Id == SiteId::kSunglareSkip ||
+                         Id == SiteId::kSunglareSteadyClaim || Id == SiteId::kGlareClampClaim) {
+        return plugin_cost::Owner::CockpitVisuals;
+    } else if constexpr (Id == SiteId::kOffscreenViewport ||
+                         Id == SiteId::kFssPanelClaim || Id == SiteId::kFssRevealClaim ||
+                         Id == SiteId::kFssDumpClaim || Id == SiteId::kResolveBindClaim) {
+        return plugin_cost::Owner::Scanners;
+    } else if constexpr (Id == SiteId::kOffscreenBackdropBlit ||
+                         Id == SiteId::kOffscreenLoaderPanel || Id == SiteId::kIntroPanelClaim ||
+                         Id == SiteId::kIntroCurveObserve || Id == SiteId::kHoloClaim ||
+                         Id == SiteId::kScrimClaim || Id == SiteId::kEyeBackdropComposite) {
+        return plugin_cost::Owner::Intro;
+    } else if constexpr (Id == SiteId::kPanelCurveObserve ||
+                         Id == SiteId::kEyeNoDistanceNone ||
+                         Id == SiteId::kPanelEligibilityNone ||
+                         Id == SiteId::kPanelDistanceClaim || Id == SiteId::kPanelTailNone) {
+        return plugin_cost::Owner::OnFootPanel;
+    } else if constexpr (Id == SiteId::kEyeUiDepthProbe ||
+                         Id == SiteId::kEyeHoloDepthProbe) {
+        return plugin_cost::Owner::TemporalAa;
+    } else if constexpr (Id == SiteId::kHeadOffsetObserve) {
+        return plugin_cost::Owner::Comfort;
+    } else {
+        // Core includes shared classifier state/route work, foreign/draw-gate
+        // exits, census observations, and any site not yet assigned narrowly.
+        return plugin_cost::Owner::Core;
+    }
+}
+
+template <class Visitor, class SiteType, class InterestProvider,
+          class TracePolicy, class CpuPolicy>
 EDVR_LADDER_FORCEINLINE void visitOne(Flow& flow, Visitor& visitor, InterestProvider& interest,
-                                      TracePolicy& trace) {
+                                      TracePolicy& trace, CpuPolicy& cpu) {
+    if constexpr (!CpuPolicy::enabled) (void)cpu;
     if (flow == Flow::Continue) {
+        constexpr plugin_cost::Owner owner = cpuOwnerForSite<SiteType::id>();
+        constexpr std::uint16_t siteId = static_cast<std::uint16_t>(SiteType::id);
+        if constexpr (CpuPolicy::enabled) {
+            CpuPolicy::template note<owner, siteId>(plugin_cost::SiteEvent::Reached);
+        }
         if constexpr (SiteType::interestGated) {
             if (!interest.template eligible<SiteType>()) {
                 if constexpr (TracePolicy::enabled) {
                     trace.template site<SiteType::id, SiteType::kind>(SiteResult::notEligible());
+                }
+                if constexpr (CpuPolicy::enabled) {
+                    CpuPolicy::template note<owner, siteId>(plugin_cost::SiteEvent::NotEligible);
                 }
                 return;
             }
         }
         static_assert(std::is_same_v<decltype(visitor.template visit<SiteType>()), SiteResult>,
                       "draw-ladder visitors return draw_ladder::SiteResult");
-        const SiteResult result = visitor.template visit<SiteType>();
-        if constexpr (TracePolicy::enabled) {
-            trace.template site<SiteType::id, SiteType::kind>(result);
+        if constexpr (CpuPolicy::enabled) {
+            CpuPolicy::template note<owner, siteId>(plugin_cost::SiteEvent::Invoked);
+            SiteResult result{};
+            {
+                typename CpuPolicy::template Scope<owner, siteId> timed;
+                result = visitor.template visit<SiteType>();
+            }
+            if constexpr (TracePolicy::enabled) {
+                trace.template site<SiteType::id, SiteType::kind>(result);
+            }
+            flow = result.flow;
+        } else {
+            const SiteResult result = visitor.template visit<SiteType>();
+            if constexpr (TracePolicy::enabled) {
+                trace.template site<SiteType::id, SiteType::kind>(result);
+            }
+            flow = result.flow;
         }
-        flow = result.flow;
     }
 }
 
 // A fold expression makes the source order explicit and generates direct,
 // typed calls. The Flow test prevents evaluation of every suffix after a
 // terminal claim or exit; no runtime array or function-pointer dispatch exists.
-template <class... Sites, class Visitor, class InterestProvider, class TracePolicy>
+template <class... Sites, class Visitor, class InterestProvider,
+          class TracePolicy, class CpuPolicy>
 EDVR_LADDER_FORCEINLINE Flow visitOrdered(Sequence<Sites...>, Visitor& visitor,
-                                          InterestProvider& interest, TracePolicy& trace) {
+                                          InterestProvider& interest, TracePolicy& trace,
+                                          CpuPolicy& cpu) {
     Flow flow = Flow::Continue;
-    (visitOne<Visitor, Sites>(flow, visitor, interest, trace), ...);
+    (visitOne<Visitor, Sites>(flow, visitor, interest, trace, cpu), ...);
     return flow;
+}
+
+template <class... Sites, class Visitor, class InterestProvider, class TracePolicy>
+EDVR_LADDER_FORCEINLINE Flow visitOrdered(Sequence<Sites...> sequence, Visitor& visitor,
+                                          InterestProvider& interest, TracePolicy& trace) {
+    plugin_cost::NoCpu cpu;
+    return visitOrdered(sequence, visitor, interest, trace, cpu);
 }
 
 #undef EDVR_LADDER_FORCEINLINE

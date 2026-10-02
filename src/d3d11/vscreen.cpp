@@ -2449,18 +2449,19 @@ struct VScreenDrawLadderVisitor {
     }
 };
 
-template <class TracePolicy>
+template <class TracePolicy, class CpuPolicy>
 LadderDecision beginPanelOverride(TracePolicy& trace, ID3D11DeviceContext* self,
                                   char kind, UINT count, UINT instances,
                                   const DrawArgs& args) {
+    CpuPolicy cpu;
     VScreenDrawLadderVisitor<TracePolicy> visitor{g_state, self, kind, count,
                                                   instances, args, trace};
-    if (draw_ladder::visitOrdered(draw_ladder::CommonSequence{}, visitor, visitor, trace) ==
+    if (draw_ladder::visitOrdered(draw_ladder::CommonSequence{}, visitor, visitor, trace, cpu) ==
         draw_ladder::Flow::Stop) return visitor.decision;
     if (!visitor.s->rtv0Eye) {
-        draw_ladder::visitOrdered(draw_ladder::OffscreenSequence{}, visitor, visitor, trace);
+        draw_ladder::visitOrdered(draw_ladder::OffscreenSequence{}, visitor, visitor, trace, cpu);
     } else {
-        draw_ladder::visitOrdered(draw_ladder::EyeSequence{}, visitor, visitor, trace);
+        draw_ladder::visitOrdered(draw_ladder::EyeSequence{}, visitor, visitor, trace, cpu);
     }
     return visitor.decision;
 }
@@ -2554,8 +2555,15 @@ void ladderTraceAction(TracePolicy& trace,
 template <class Work>
 LadderDecision withDrawLadderTrace(ID3D11DeviceContext* self, char kind,
                                    UINT count, UINT instances,
-                                   const DrawArgs& args, Work&& work) {
-    if (self == g_state->ownerCtx && draw_ladder_trace::drawLadderTraceCaptureActive()) {
+                                   const DrawArgs& args, bool cpuSample,
+                                   Work&& work) {
+    const bool isOwner = self == g_state->ownerCtx;
+    const bool replayActive = (isOwner || cpuSample) &&
+        draw_ladder_trace::drawLadderTraceCaptureActive();
+    const bool capturing = isOwner && replayActive;
+    const bool suppressCpu = cpuSample && replayActive;
+    if (suppressCpu) edvrPluginCostMarkTraceSuppressed();
+    if (capturing) {
         draw_ladder_trace::DrawFacts facts{};
         facts.eyeDrawIndex = g_state->eyeDrawsThisFrame;
         facts.kind = static_cast<uint8_t>(kind);
@@ -2587,7 +2595,8 @@ LadderDecision withDrawLadderTrace(ID3D11DeviceContext* self, char kind,
             kind, count, instances, args);
         const auto previousToken = t_activeDrawReplayToken;
         t_activeDrawReplayToken = token;
-        const LadderDecision result = work(trace);
+        plugin_cost::NoCpu noCpu;
+        const LadderDecision result = work(trace, noCpu);
         t_activeDrawReplayToken = previousToken;
         ladderTraceAction<decltype(trace), draw_ladder::ActionId::kDrawEnd>(
             trace, draw_ladder::ActionPhase::End, draw_ladder::ActionOutcome::Applied,
@@ -2597,7 +2606,12 @@ LadderDecision withDrawLadderTrace(ID3D11DeviceContext* self, char kind,
         return result;
     }
     draw_ladder::NoTrace noTrace;
-    return work(noTrace);
+    if (cpuSample && !suppressCpu) {
+        plugin_cost::SampledCpu<> sampledCpu;
+        return work(noTrace, sampledCpu);
+    }
+    plugin_cost::NoCpu noCpu;
+    return work(noTrace, noCpu);
 }
 
 template <class Work>
@@ -4960,13 +4974,21 @@ __declspec(noinline) void noteSceneInstancePool(ID3D11DeviceContext* self) {
 
 struct DrawClock {
     bool    on;
+    bool    cpuOn;
     int64_t t0;
     int64_t real = 0;
     bool forwarded = false;
-    DrawClock()
-        : on(perfMonitorSampleDraws() &&
-             (++t_drawClockOrdinal % kPerfMonitorDrawTimeStride) == 0),
-          t0(on ? qpcNow() : 0) {}
+    DrawClock() : on(false), cpuOn(false), t0(0) {
+        if (perfMonitorSampleDraws()) {
+            // One shared sampled-frame ordinal keeps the existing aggregate
+            // draw sample at offset 0 and places plugin-cost probes on the
+            // disjoint offset 32. Unsampled frames still do not advance it.
+            const uint32_t ordinal = ++t_drawClockOrdinal;
+            on = (ordinal % kPerfMonitorDrawTimeStride) == 0;
+            cpuOn = (ordinal % kPerfMonitorDrawTimeStride) == 32;
+        }
+        if (on) t0 = qpcNow();
+    }
     void realCall(int64_t start) {
         // Only the first call forwards the game's draw. Coverage reissues
         // are EDVR work; subtracting every call hid their CPU/driver cost.
@@ -5010,8 +5032,12 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
     if (quadProbeWants()) g_state->qsBaseVertex = static_cast<INT>(start);
     DrawArgs args;
     args.base = static_cast<int32_t>(start);
-    withDrawLadderTrace(self, 'D', count, 1, args, [&](auto& trace) {
-        const LadderDecision decision = beginPanelOverride(trace, self, 'D', count, 1, args);
+    withDrawLadderTrace(self, 'D', count, 1, args,
+                        clock.cpuOn && g_state && self == g_state->ownerCtx,
+                        [&](auto& trace, auto& cpu) {
+        const LadderDecision decision = beginPanelOverride<
+            std::remove_reference_t<decltype(trace)>,
+            std::remove_reference_t<decltype(cpu)>>(trace, self, 'D', count, 1, args);
         const DrawVerdict v = decision.verdict;
         if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
         if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
@@ -5103,8 +5129,12 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
     DrawArgs args;
     args.start = startIndex;
     args.base = baseVertex;
-    withDrawLadderTrace(self, 'I', count, 1, args, [&](auto& trace) {
-        const LadderDecision decision = beginPanelOverride(trace, self, 'I', count, 1, args);
+    withDrawLadderTrace(self, 'I', count, 1, args,
+                        clock.cpuOn && g_state && self == g_state->ownerCtx,
+                        [&](auto& trace, auto& cpu) {
+        const LadderDecision decision = beginPanelOverride<
+            std::remove_reference_t<decltype(trace)>,
+            std::remove_reference_t<decltype(cpu)>>(trace, self, 'I', count, 1, args);
         const DrawVerdict v = decision.verdict;
         if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
         if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
@@ -5162,8 +5192,12 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
     DrawArgs args;
     args.base = static_cast<int32_t>(startVertex);
     args.startInstance = startInstance;
-    withDrawLadderTrace(self, 'N', perInstance, instances, args, [&](auto& trace) {
-        const LadderDecision decision = beginPanelOverride(trace, self, 'N', perInstance, instances, args);
+    withDrawLadderTrace(self, 'N', perInstance, instances, args,
+                        clock.cpuOn && g_state && self == g_state->ownerCtx,
+                        [&](auto& trace, auto& cpu) {
+        const LadderDecision decision = beginPanelOverride<
+            std::remove_reference_t<decltype(trace)>,
+            std::remove_reference_t<decltype(cpu)>>(trace, self, 'N', perInstance, instances, args);
         const DrawVerdict v = decision.verdict;
         if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
         if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
@@ -5245,8 +5279,12 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     args.start = startIndex;
     args.base = baseVertex;
     args.startInstance = startInstance;
-    withDrawLadderTrace(self, 'X', perInstance, instances, args, [&](auto& trace) {
-      const LadderDecision decision = beginPanelOverride(trace, self, 'X', perInstance, instances, args);
+    withDrawLadderTrace(self, 'X', perInstance, instances, args,
+                        clock.cpuOn && g_state && self == g_state->ownerCtx,
+                        [&](auto& trace, auto& cpu) {
+      const LadderDecision decision = beginPanelOverride<
+          std::remove_reference_t<decltype(trace)>,
+          std::remove_reference_t<decltype(cpu)>>(trace, self, 'X', perInstance, instances, args);
       const DrawVerdict v = decision.verdict;
       // Engine-record velocity (with fix.temporal_aa): four generation
       // compares; the pool families' substituted shaders and MRT6 are bound
@@ -6060,6 +6098,8 @@ void vScreenRefreshConfig() {
     // session -- and it cost a flight when fix.head_offset_gate did exactly
     // that.
     headOffsetGateConfigure();
+    perfMonitorPluginCostConfigure(static_cast<uint8_t>(runtimeVrProfile()
+        ? plugins::kProfileVr : plugins::kProfileFlat));
 
     if (wasVoid != s->blackVoid || wasScale != s->distanceScale) {
         Log::get().note("vScreen config reloaded: black void %s, panel distance x%.3f "
@@ -7517,6 +7557,8 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     draw_ladder_trace::configure(s.replayTraceEnabled, Log::get().path().c_str());
     Log::get().note("draw replay: initial configure status=%s",
                     draw_ladder_trace::statusName(draw_ladder_trace::status()));
+    perfMonitorPluginCostConfigure(static_cast<uint8_t>(runtimeVrProfile()
+        ? plugins::kProfileVr : plugins::kProfileFlat));
 
     Log::get().note("vScreen fixes installed: black void %s, panel distance %s, eye-draw "
                     "counting %s, hooking %s",
@@ -7648,6 +7690,7 @@ namespace edvr {
 void shutdownVScreenFixes() {
     graphicsBridgeUninstallTransport();
     if (!g_state) {
+        perfMonitorPluginCostShutdown();
         const draw_ladder_trace::ShutdownResult replay = draw_ladder_trace::shutdown();
         if (replay.previousStatus != draw_ladder_trace::Status::Disabled ||
             replay.discardedPendingArm || replay.discardedCapture) {
@@ -7729,6 +7772,7 @@ void shutdownVScreenFixes() {
     depthProbeShutdown();
     sharpenPassShutdown();
     g_state->hook.uninstall();
+    perfMonitorPluginCostShutdown();
     const draw_ladder_trace::ShutdownResult replay = draw_ladder_trace::shutdown();
     Log::get().note("draw replay: shutdown prior=%s pending-arm-discarded=%u capture-discarded=%u",
                     draw_ladder_trace::statusName(replay.previousStatus),

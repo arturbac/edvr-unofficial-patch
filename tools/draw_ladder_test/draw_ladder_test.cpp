@@ -12,6 +12,7 @@
 
 namespace ladder = edvr::draw_ladder;
 namespace draw_interest = edvr::draw_interest;
+namespace plugin_cost = edvr::plugin_cost;
 
 struct SiteEvent final {
     ladder::SiteId id;
@@ -130,6 +131,46 @@ struct CandidateInterest final {
         }
     }
 };
+
+struct CpuSiteEvent final {
+    plugin_cost::Owner owner;
+    std::uint16_t site;
+    plugin_cost::SiteEvent event;
+};
+
+struct CpuTickEvent final {
+    plugin_cost::Owner owner;
+    std::uint16_t site;
+    std::uint64_t ticks;
+};
+
+struct LadderFakeClock final {
+    static inline std::int64_t next = 100;
+    static inline unsigned reads = 0;
+    static std::int64_t now() noexcept {
+        ++reads;
+        const std::int64_t result = next;
+        next += 10;
+        return result;
+    }
+    static void reset() noexcept { next = 100; reads = 0; }
+};
+
+struct LadderFakeSink final {
+    static inline std::vector<CpuSiteEvent> sites;
+    static inline std::vector<CpuTickEvent> tickEvents;
+    static void site(plugin_cost::Owner owner, std::uint16_t siteId,
+                     plugin_cost::SiteEvent event) noexcept {
+        sites.push_back({owner, siteId, event});
+    }
+    static void ticks(plugin_cost::Owner owner, std::uint16_t siteId,
+                      std::uint64_t value) noexcept {
+        tickEvents.push_back({owner, siteId, value});
+    }
+    static void reset() { sites.clear(); tickEvents.clear(); }
+};
+
+using LadderSampledCpu = plugin_cost::SampledCpu<LadderFakeClock, LadderFakeSink>;
 
 bool check(bool condition, const char* label);
 
@@ -327,6 +368,137 @@ bool typedInterestChecks() {
                         ladder::SiteId::kParticleSubstitute)] == 0,
                     "terminal common exits precede every interest and candidate query");
     }
+    return ok;
+}
+
+bool cpuPolicyChecks() {
+    static_assert(ladder::cpuOwnerForSite<ladder::SiteId::kNightVisionClaim>() ==
+                  plugin_cost::Owner::CockpitVisuals);
+    static_assert(ladder::cpuOwnerForSite<ladder::SiteId::kFssPanelClaim>() ==
+                  plugin_cost::Owner::Scanners);
+    static_assert(ladder::cpuOwnerForSite<ladder::SiteId::kIntroCurveObserve>() ==
+                  plugin_cost::Owner::Intro);
+    static_assert(ladder::cpuOwnerForSite<ladder::SiteId::kPanelCurveObserve>() ==
+                  plugin_cost::Owner::OnFootPanel);
+    static_assert(ladder::cpuOwnerForSite<ladder::SiteId::kEyeUiDepthProbe>() ==
+                  plugin_cost::Owner::TemporalAa);
+    static_assert(ladder::cpuOwnerForSite<ladder::SiteId::kRouteSelected>() ==
+                  plugin_cost::Owner::Core);
+
+    using NvOnly = ladder::Sequence<
+        ladder::ShaderCandidateGatedClaim<ladder::SiteId::kNightVisionClaim>>;
+    bool ok = true;
+    const auto hasSiteEvent = [](plugin_cost::Owner owner, ladder::SiteId site,
+                                 plugin_cost::SiteEvent event) {
+        for (const auto& row : LadderFakeSink::sites)
+            if (row.owner == owner && row.site == static_cast<uint16_t>(site) && row.event == event)
+                return true;
+        return false;
+    };
+    const auto hasTick = [](plugin_cost::Owner owner, ladder::SiteId site, uint64_t ticks) {
+        for (const auto& row : LadderFakeSink::tickEvents)
+            if (row.owner == owner && row.site == static_cast<uint16_t>(site) && row.ticks == ticks)
+                return true;
+        return false;
+    };
+
+    // A reached candidate with a known miss records the decision but never
+    // invokes/times its predicate handler.
+    LadderFakeClock::reset();
+    LadderFakeSink::reset();
+    Scenario missScenario;
+    missScenario.claimAt = ladder::SiteId::kNightVisionClaim;
+    ModelVisitor missVisitor{missScenario};
+    CandidateInterest missInterest;
+    missInterest.candidate = false;
+    ladder::NoTrace noTrace;
+    LadderSampledCpu missCpu;
+    const auto missFlow = ladder::visitOrdered(NvOnly{}, missVisitor, missInterest, noTrace, missCpu);
+    ok &= check(missFlow == ladder::Flow::Continue && missInterest.candidateQueries == 1 &&
+                missInterest.candidateLoads == 1 &&
+                missVisitor.handlerCalls[static_cast<uint16_t>(ladder::SiteId::kNightVisionClaim)] == 0,
+                "sampled known shader mismatch reaches the gate but skips its handler");
+    ok &= check(LadderFakeClock::reads == 0 && LadderFakeSink::tickEvents.empty() &&
+                hasSiteEvent(plugin_cost::Owner::CockpitVisuals,
+                             ladder::SiteId::kNightVisionClaim, plugin_cost::SiteEvent::Reached) &&
+                hasSiteEvent(plugin_cost::Owner::CockpitVisuals,
+                             ladder::SiteId::kNightVisionClaim, plugin_cost::SiteEvent::NotEligible) &&
+                !hasSiteEvent(plugin_cost::Owner::CockpitVisuals,
+                              ladder::SiteId::kNightVisionClaim, plugin_cost::SiteEvent::Invoked),
+                "eligibility miss has no handler clock, invocation, or owner ticks");
+
+    // An eligible claim times exactly the real shared-selector handler scope.
+    LadderFakeClock::reset();
+    LadderFakeSink::reset();
+    Scenario eligibleScenario;
+    eligibleScenario.claimAt = ladder::SiteId::kNightVisionClaim;
+    eligibleScenario.verdict = static_cast<int16_t>(ladder::VerdictOrdinal::kNightVision);
+    ModelVisitor eligibleVisitor{eligibleScenario};
+    CandidateInterest eligibleInterest;
+    LadderSampledCpu eligibleCpu;
+    const auto eligibleFlow = ladder::visitOrdered(NvOnly{}, eligibleVisitor, eligibleInterest,
+                                                   noTrace, eligibleCpu);
+    ok &= check(eligibleFlow == ladder::Flow::Stop && eligibleInterest.candidateQueries == 1 &&
+                eligibleVisitor.handlerCalls[static_cast<uint16_t>(ladder::SiteId::kNightVisionClaim)] == 1,
+                "eligible NV site uses the production typed claim and terminates");
+    ok &= check(LadderFakeClock::reads == 2 && LadderFakeSink::tickEvents.size() == 1 &&
+                hasSiteEvent(plugin_cost::Owner::CockpitVisuals,
+                             ladder::SiteId::kNightVisionClaim, plugin_cost::SiteEvent::Reached) &&
+                hasSiteEvent(plugin_cost::Owner::CockpitVisuals,
+                             ladder::SiteId::kNightVisionClaim, plugin_cost::SiteEvent::Invoked) &&
+                hasTick(plugin_cost::Owner::CockpitVisuals,
+                        ladder::SiteId::kNightVisionClaim, 10),
+                "eligible handler has exact fake-clock ticks under its logical owner");
+
+    // The same typed selector under NoCpu retains behavior but compiles away
+    // every clock/sink callback. Trace recording remains independent.
+    LadderFakeClock::reset();
+    LadderFakeSink::reset();
+    ModelVisitor noCpuVisitor{eligibleScenario};
+    CandidateInterest noCpuInterest;
+    plugin_cost::NoCpu noCpu;
+    TraceCapture capture;
+    const auto noCpuFlow = ladder::visitOrdered(NvOnly{}, noCpuVisitor, noCpuInterest,
+                                                capture, noCpu);
+    ok &= check(noCpuFlow == ladder::Flow::Stop && noCpuVisitor.handlerCalls[
+                    static_cast<uint16_t>(ladder::SiteId::kNightVisionClaim)] == 1 &&
+                LadderFakeClock::reads == 0 && LadderFakeSink::sites.empty() &&
+                LadderFakeSink::tickEvents.empty(),
+                "NoCpu preserves a traced selector claim with zero clock or collector calls");
+    ok &= check(capture.sites.size() == 1 &&
+                capture.sites[0].id == ladder::SiteId::kNightVisionClaim &&
+                capture.sites[0].result.outcome == ladder::SiteOutcome::Claimed,
+                "trace capture records the same claim while CPU sampling is suppressed");
+
+    // A real earlier terminal rung in the shared EyeSequence prevents all
+    // later candidate queries and CPU records, including Night Vision.
+    LadderFakeClock::reset();
+    LadderFakeSink::reset();
+    Scenario earlyScenario;
+    earlyScenario.route = ladder::RouteId::kVrEye;
+    earlyScenario.claimAt = ladder::SiteId::kEyeCensusSkip;
+    earlyScenario.verdict = static_cast<int16_t>(ladder::VerdictOrdinal::kSkip);
+    ModelVisitor earlyVisitor{earlyScenario};
+    CandidateInterest earlyInterest;
+    LadderSampledCpu earlyCpu;
+    const auto commonFlow = ladder::visitOrdered(ladder::CommonSequence{}, earlyVisitor,
+                                                 earlyInterest, noTrace, earlyCpu);
+    const auto eyeFlow = commonFlow == ladder::Flow::Continue
+        ? ladder::visitOrdered(ladder::VrEyeSequence{}, earlyVisitor, earlyInterest,
+                               noTrace, earlyCpu)
+        : commonFlow;
+    ok &= check(eyeFlow == ladder::Flow::Stop && !earlyVisitor.visited.empty() &&
+                earlyVisitor.visited.back() == ladder::SiteId::kEyeCensusSkip,
+                "prior eye claimant remains the terminal ladder rung");
+    ok &= check(earlyInterest.candidateQueries == 0 && earlyInterest.candidateLoads == 0,
+                "prior eye claimant skips later shader candidate queries");
+    ok &= check(!hasSiteEvent(plugin_cost::Owner::CockpitVisuals,
+                              ladder::SiteId::kNightVisionClaim, plugin_cost::SiteEvent::Reached) &&
+                !hasSiteEvent(plugin_cost::Owner::CockpitVisuals,
+                              ladder::SiteId::kNightVisionClaim, plugin_cost::SiteEvent::Invoked) &&
+                !hasTick(plugin_cost::Owner::CockpitVisuals,
+                         ladder::SiteId::kNightVisionClaim, 10),
+                "prior eye claimant records no later NV owner timing or site events");
     return ok;
 }
 
@@ -1321,6 +1493,7 @@ int selfTest(const char* traceDir) {
     bool ok = true;
     ok &= interestMaskChecks();
     ok &= typedInterestChecks();
+    ok &= cpuPolicyChecks();
     ok &= productionRouteOrderCheck();
     static_assert(ladder::CommonSequence::size == sizeof(kFrozenCommon) / sizeof(kFrozenCommon[0]));
     static_assert(ladder::OffscreenSequence::size == sizeof(kFrozenOffscreen) / sizeof(kFrozenOffscreen[0]));

@@ -531,7 +531,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\format_support_log.cpp" ^
     "src\d3d11\graphics_bridge.cpp" ^
     "src\d3d11\render_boundary.cpp" ^
-    "src\d3d11\exposure_fix.cpp" "src\d3d11\vscreen.cpp" "src\d3d11\plugin_registry.cpp" ^
+    "src\d3d11\exposure_fix.cpp" "src\d3d11\vscreen.cpp" "src\d3d11\plugin_registry.cpp" "src\d3d11\plugin_cost.cpp" ^
     "src\d3d11\glitch_frame.cpp" ^
     "src\d3d11\pose_reader_watch.cpp" "src\d3d11\transition_flash_eye_base.cpp" ^
     "src\d3d11\vscreen_res.cpp" "src\common\vscreen_auto_state.cpp" "src\d3d11\vscreen_footprint.cpp" ^
@@ -1437,6 +1437,22 @@ if errorlevel 1 ( echo [edvr] ERROR: plugin dispatch rig build failed & exit /b 
 )
 exit /b 0
 
+:rig_plugin_cost_test
+echo [edvr] === plugin_cost_test.exe ===
+if not exist "%OBJ%\plugincost" mkdir "%OBJ%\plugincost"
+cl.exe /nologo /TC /std:c11 /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /c ^
+    "tools\plugin_cost_test\plugin_cost_header_c_smoke.c" ^
+    /Fo"%OBJ%\plugincost\plugin_cost_header_c_smoke.obj"
+if errorlevel 1 ( echo [edvr] ERROR: plugin cost C header smoke failed & exit /b 1 )
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /Fo"%OBJ%\plugincost\\" ^
+    /Fe"%BUILD%\plugin_cost_test.exe" "tools\plugin_cost_test\plugin_cost_test.cpp" ^
+    "src\d3d11\plugin_cost.cpp" /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: plugin cost test build failed & exit /b 1 )
+"%BUILD%\plugin_cost_test.exe" --dry-run || exit /b 1
+"%BUILD%\plugin_cost_test.exe" --self-test || exit /b 1
+exit /b 0
+
 :rig_draw_ladder_test
 echo [edvr] === draw_ladder_test.exe ===
 if exist "%BUILD%\draw_ladder_trace_test" (
@@ -1444,7 +1460,7 @@ if exist "%BUILD%\draw_ladder_trace_test" (
     exit /b 1
 )
 if not exist "%OBJ%\drawladder" mkdir "%OBJ%\drawladder"
-cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+cl.exe /I"%GEN%" /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
     /D_CRT_SECURE_NO_WARNINGS /DEDVR_VERSION_STRING=\"%EDVR_VER%\" ^
     /Fo"%OBJ%\drawladder\\" ^
     /Fe"%BUILD%\draw_ladder_test.exe" "tools\draw_ladder_test\draw_ladder_test.cpp" ^
