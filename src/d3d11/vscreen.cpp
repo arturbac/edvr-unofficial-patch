@@ -1917,6 +1917,7 @@ struct VScreenDrawLadderVisitor {
     TracePolicy& trace;
     uint32_t rtvGen = 0;
     uint64_t pluginCandidates = 0;
+    draw_interest::InterestMask legacyInterestMask = 0;
     RemlokAction remlokAction = RemlokAction::kNone;
     SunglareAction glareAction = SunglareAction::kStock;
     bool chromeMatched = false;
@@ -1941,8 +1942,8 @@ struct VScreenDrawLadderVisitor {
     }
 
     template <class SiteType>
-    bool eligible() {
-        if constexpr (SiteType::id == draw_ladder::SiteId::kNightVisionClaim) {
+    __forceinline bool eligible() {
+        if constexpr (SiteType::shaderCandidateGated) {
             // Profile/config registration is cold and stable. Do not query the
             // published shader-pair candidate cache when the module is absent.
             if (!s->pluginDispatchEnabled) return false;
@@ -1950,8 +1951,22 @@ struct VScreenDrawLadderVisitor {
             if constexpr (TracePolicy::enabled) trace.candidates(pluginCandidates);
             return plugins::dispatch::hasCandidate(
                 pluginCandidates, plugins::kPluginCockpitVisuals);
+        } else if constexpr (SiteType::interestGated) {
+            // CommonSequence always precedes either branch sequence, and
+            // ParticleSubstitute is its first legacy-interest site. Read the
+            // published mask there only if the ordered ladder reaches it;
+            // later legacy sites use this local copy. The shared ladder pins
+            // that publication rung so new tags cannot silently move ahead
+            // of it. Night vision keeps its separate lazy candidate read.
+            if constexpr (std::is_same_v<SiteType,
+                                         draw_ladder::FirstLegacyInterestSite>) {
+                legacyInterestMask = pluginRegistryDrawInterestMask();
+            }
+            return draw_interest::contains(legacyInterestMask,
+                                           SiteType::interestId);
+        } else {
+            return true;
         }
-        return true;
     }
 
     template <class SiteType>
@@ -5875,6 +5890,54 @@ bool vScreenRenderBelowEye(uint32_t* renderW, uint32_t* renderH, uint32_t* eyeW,
     return vrss::unpack(g_renderBelowEye.load(std::memory_order_acquire), renderW, renderH, eyeW, eyeH);
 }
 
+static bool configureLegacyDrawInterests() {
+    using draw_interest::InterestId;
+    using draw_interest::ShaderFilter;
+    constexpr std::size_t kFilterCapacity = 16;
+    ShaderFilter filters[kFilterCapacity]{};
+    std::size_t filterCount = 0;
+    draw_interest::InterestMask configured = 0;
+    auto enable = [&](InterestId id, bool active) {
+        if (active) configured |= draw_interest::bit(id);
+    };
+    auto append = [&](auto getter) {
+        if (filterCount > kFilterCapacity) return false;
+        const std::size_t written = getter(filters + filterCount,
+                                           kFilterCapacity - filterCount);
+        if (written > kFilterCapacity - filterCount) {
+            filterCount = kFilterCapacity + 1;
+            return false;
+        }
+        filterCount += written;
+        return true;
+    };
+
+    enable(InterestId::TargetSharp, targetSharpDrawInterestConfigured());
+    enable(InterestId::WitchspaceStars, witchspaceStarsDrawInterestConfigured());
+    enable(InterestId::FssPanel, fssPanelDrawInterestConfigured());
+    enable(InterestId::FssReveal, fssRevealDrawInterestConfigured());
+    enable(InterestId::FssDump, fssDumpDrawInterestConfigured());
+    enable(InterestId::ParticleSubstitute, particleSubstituteDrawInterestConfigured());
+    enable(InterestId::IntroCurveObserve, introCurveDrawInterestConfigured());
+    enable(InterestId::PanelCurveObserve, panelCurveDrawInterestConfigured());
+
+    const bool filtersFit =
+        append(targetSharpDrawInterestFilters) &&
+        append(witchspaceStarsDrawInterestFilters) &&
+        append(fssPanelDrawInterestFilters) &&
+        append(fssRevealDrawInterestFilters) &&
+        append(fssDumpDrawInterestFilters) &&
+        append(particleSubstituteDrawInterestFilters);
+    const bool accepted = pluginRegistryConfigureDrawInterests(
+        configured, filtersFit ? filters : nullptr,
+        filtersFit ? filterCount : kFilterCapacity + 1);
+    if (!accepted) {
+        Log::get().note("vScreen: legacy draw-interest metadata rejected; "
+                        "configured predicates remain enabled without shader filtering.");
+    }
+    return accepted;
+}
+
 uint32_t vScreenEyeDrawsThisFrame() {
     const State* s = g_state;
     return s ? s->eyeDrawsThisFrame : 0;
@@ -5987,6 +6050,7 @@ void vScreenRefreshConfig() {
     exposureConfigure(cfg);
     panelCurveConfigure(cfg);
     particleConfigure(cfg);
+    configureLegacyDrawInterests();
     objectProbeConfigure(cfg);
     pixelProbeConfigure(cfg);
     lodGovernorConfigure(cfg);
@@ -7298,6 +7362,7 @@ void installVScreenFixes(ID3D11Device* device, HookMode mode) {
     exposureConfigure(cfg);
     panelCurveConfigure(cfg);
     particleConfigure(cfg);
+    configureLegacyDrawInterests();
     objectProbeConfigure(cfg);
     pixelProbeConfigure(cfg);
     lodGovernorConfigure(cfg);

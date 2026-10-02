@@ -4,8 +4,8 @@
 
 - **State (2026-10-01):** implementation in progress on
   `codex/plugin-architecture`; do not merge to main until Sean is ready to ship.
-  Three Luna 6 agents now own the ordered ladder/rigs, armed trace codec,
-  and production integration. This is Phase 1 work, not completion
+  Three Luna 6 agents now own cost attribution, production integration,
+  and test gates. This is Phase 1 work, not completion
   of all five phases. The review and remaining gates are in section 11.
   This design extends draft PR #46 (Devin Nemec, "generic OpenXR addon and
   plugin architecture") as its add-on tier (section 6).
@@ -40,8 +40,8 @@
   4.1), the installer skips it and Elite stays on its stock VR path. Four
   changes first (section 10); no F8, AA, flash fix or Explorer Cam without
   the runtime; the first build needs a flight on a stock runtime.
-- **Next:** the pilot `3f8dceec` is committed and pushed on its branch;
-  full validation and clean-version promotion passed. Steam candidate flight
+- **Next:** pilot `3f8dceec` and ladder/replay `d57600de` are pushed;
+  full validation passes both; pilot clean-version promotion passed. Candidate flight
   completed and payload identity passed: Pimax Crystal Super / Pimax OpenXR, 90 Hz,
   4032x3898 per eye. The carrier draw-hook mean is promising; on-foot DLSS
   is close to baseline. Single buckets and an unlogged scene boundary do
@@ -49,10 +49,10 @@
   identical settings; Sean confirms the slight blur is the same on baseline.
   Ruled out: migration introduced NV blur, because the verified baseline
   comparison reproduces it. Steam currently has baseline `14a7ff70`.
-  Complete the Phase 1 core ladder/replay before further group migration;
+  Continue Phase 1 disabled-interest and cost work before group migration;
   shader-pair candidates stay cached, shape/state stay draw-time predicates.
-  The selector/codec matrix and optimized classifier compile pass; trace-only
-  helper counters are removed. Full validation passes all 121 jobs (section 11).
+  Ladder/replay and disabled-interest snapshots pass all 121 jobs; trace-only
+  counters are removed. CPU/D3D-call attribution remains open (section 11).
 - **Ruled out while designing:** loading every DLL found in a folder (DLL
   planting; the installer's receipts already know what it installed), a
   stable ABI for first-party plugins (they ship with the core; freezing
@@ -673,3 +673,80 @@ configuration contract, and package checks. Log:
 This validates the mechanical ladder/replay slice. Disabled-feature
 interest, per-plugin cost attribution and the Phase 1 performance flight
 remain outstanding; Steam is unchanged on baseline `14a7ff70`.
+
+Next interest slice: module-owned cold metadata publishes conservative
+configuration interest for target sharpening, witchspace-star hiding, FSS
+panel/reveal/dump, particle substitution and the two curvature observers.
+The canonical binding observer caches known shader matches; unknown hashes
+retain the existing fallback. The typed ladder reads that legacy mask lazily
+and skips disabled predicates, while preserving all site IDs and trace
+`NotEligible` events. Night vision retains its separate mask at its current
+rung. Core/shared observers and dynamic readiness, faults, retirement,
+resources and body/frame state stay live. Flat never subscribes to this
+VR-classifier cache. The current settings enable curvature and several
+cockpit features, so config-off checks alone cannot establish a workload
+win; codegen checks and a matched performance flight remain required.
+
+The guarded interest checks pass: registry dispatch has 458 checks, and the
+production replay roundtrip covers 44 draws, 685 site records and 102 action
+records. Disabled optional claims and observers record `NotEligible` while
+mandatory/shared observers retain their order. Canonical bind repair,
+reset, configuration reseeding and flat bypass remain covered. The first
+optimized visitor retained eight loaded-flag guards; using the known first
+legacy-interest rung removes them. Independent optimized inspection finds
+one legacy mask load, 94 calls, a 288-byte stack frame and no selector,
+trace, or stack-cookie calls in the unarmed classifier. Its emitted extent
+is 7,052 bytes versus 6,885 for validated `d57600de` and 6,693 for baseline
+`14a7ff70`; baseline has 105 calls and a 272-byte stack frame. These are
+compiler checks, not a measured flight improvement. This changed source
+still needs full validation before commit or installation.
+
+Cost review: all nine manifest budgets remain explicitly unmeasured, with
+CPU, issued-D3D-call and direct-GPU metrics and fixed coverage descriptions.
+Future relative limits require a build/profile/scene/config reference and
+measured uncertainty; the permitted increase cannot exceed the reference
+interval's positive noise margin. Existing GPU samples are being grouped
+by logical owner without changing timestamp collection. Nested temporal
+breakdowns and wrapped game draws are excluded from owner direct-work
+subtotals. Quiet scopes do not imply missing samples, and a shared
+weapon-motion service is charged once to temporal-aa. These partial scope
+estimates do not establish full plugin costs or flight budgets.
+
+The guarded GPU rig passes 326 checks with warning-free compilation and a
+clean focus guard. Its semantic ownership table pins every existing census
+section, excludes nested/wrapped work from direct subtotals, keeps core
+separate, distinguishes quiet, omitted and untimed scopes, and emits no
+inactive-owner rows. The shared weapon-motion note requires that particular
+scope to have occurred. New owner rows follow the original detailed group,
+preserving the main-line/seed-detail adjacency. No timestamps, shaders or
+D3D behavior changed. Catalog self-tests and emitter dry-run pass; current
+source is frozen for full validation.
+
+The first full validation attempt stops at UI-quality source-order pins
+after 22 of 121 jobs. Ruled out: curvature recognition moved before the
+movie claim or after the backdrop, because the production sequence retains
+both positions and the same six-index-X/`introCurveWants()` predicate. The
+pins and mutation anchors still spell those rungs as ungated `Site` types;
+they must follow the new `InterestGated` declarations without relaxing the
+ordering contract. Related mutation fixtures are being audited together.
+
+The repaired pins pass 3,215 UI-quality checks and 385,610 WARP seed checks;
+the guarded world-route rig passes 283 checks and all 96 mutations. Both
+focus guards are clean. Full retry `build/plugin-architecture-interest-build-2.log`
+passes all 121 jobs (115 pooled, six quiet), both production profiles,
+self-contained installers and the 232-key configuration contract. Receipt
+input fingerprint:
+`86bddc5f26093cefe7938498f65d3c1b184e3c161bd108bf897cd98bce4ac253`.
+This validates disabled-interest, structured unmeasured cost metadata and
+existing GPU-scope attribution. It does not pass the Phase 1 flight gate or
+complete CPU/D3D-call attribution. Steam remains on baseline `14a7ff70`.
+
+The CPU/call inventory also found a limitation in the existing aggregate
+draw-hook estimate: indexed-instanced forwarding times its weapon-motion
+reissue inside the interval subtracted as the real call. Consequently that
+particular EDVR reissue is excluded despite the broader log description.
+Keep the existing aggregate comparable between builds; new per-owner
+measurements need explicit timing boundaries and coverage. GPU-census scope
+occurrences cannot substitute for executed D3D-call counts. Per-owner CPU
+and actual issuance annotations are still required before the next Phase 1
+performance flight.

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <atomic>
 #include "plugin_manifest.inc"
+#include "draw_interest.h"
 
 struct ID3D11DeviceContext;
 
@@ -45,10 +46,18 @@ namespace edvr {
 
 namespace detail {
 extern std::atomic<uint64_t> g_pluginShaderCandidates;
+extern std::atomic<draw_interest::InterestMask> g_legacyDrawInterestMask;
 }
 
 inline uint64_t pluginRegistryShaderCandidates() {
     return detail::g_pluginShaderCandidates.load(std::memory_order_relaxed);
+}
+
+// One lazily consumed snapshot for all ordered legacy interest-gated sites.
+// Keep this separate from the night-vision plugin candidate mask so a legacy
+// site cannot cause the plugin cache to be read before its original rung.
+inline draw_interest::InterestMask pluginRegistryDrawInterestMask() {
+    return detail::g_legacyDrawInterestMask.load(std::memory_order_relaxed);
 }
 
 inline bool pluginRegistryHasCandidate(uint32_t pluginIndex) {
@@ -76,6 +85,9 @@ void pluginRegistryConfigure(void* config);
 void pluginRegistryShutdown();
 void pluginRegistryOnShaderBind(uint64_t vsHash, uint64_t psHash);
 void pluginRegistryRefreshShaderCandidates();
+bool pluginRegistryConfigureDrawInterests(
+    draw_interest::InterestMask configuredMask,
+    const draw_interest::ShaderFilter* filters, size_t filterCount) noexcept;
 void pluginRegistryReportActivity();
 uint32_t pluginRegistryResolveDraw(uint64_t candidates, uint8_t kind,
                                    uint32_t count, uint32_t instances);

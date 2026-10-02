@@ -14,6 +14,8 @@ files or directories.
 
 import copy
 import json
+import math
+import re
 import os
 import sys
 import tempfile
@@ -25,6 +27,28 @@ EXPECTED_IDS = (
     'on-foot-panel', 'comfort', 'performance', 'diagnostics',
 )
 PROFILES = ('vr', 'flat')
+METRIC_SPECS = {
+    'cpu': {
+        'unit': 'milliseconds per frame',
+        'coverage': ('EDVR-owned CPU work attributable to this plugin. The existing draw-hook CPU census is aggregate and does not split module cost.'),
+    },
+    'issuedGpuWork': {
+        'unit': 'EDVR-issued D3D11 calls per frame',
+        'coverage': ('Calls issued by this plugin only; forwarded game calls and shared/core work are excluded unless explicitly attributed.'),
+    },
+    'directGpu': {
+        'unit': 'GPU milliseconds per frame',
+        'coverage': ('Direct GPU work attributable to this plugin. Whole-frame GPU samples are not plugin-level attribution.'),
+    },
+}
+METRIC_IDS = tuple(METRIC_SPECS)
+
+# Match values emitted by `git describe --tags --always --dirty`, the version
+# identity written into EDVR's version log line. A bare tag/hash may have the
+# standard distance/hash suffix and optional dirty marker.
+_BUILD_ID_RE = re.compile(
+    r'^(?:v?[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?|[0-9a-f]{7,40})'
+    r'(?:-[0-9]+-g[0-9a-f]{7,40})?(?:-dirty)?$')
 EXPECTED_PROFILES = {
     'temporal-aa': ('vr', 'flat'),
     'cockpit-visuals': ('vr',),
@@ -95,13 +119,152 @@ def _string_list(value, label, problems, unique=True):
     return value
 
 
+def _finite_number(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        converted = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+    return math.isfinite(converted)
+
+
+def _validate_cost_budget(budget, plugin_id, supported_profiles):
+    """Validate honest unmeasured declarations and provenance-bound relative budgets."""
+    problems = []
+    label = plugin_id + '.costBudget'
+    if not isinstance(budget, dict) or set(budget) != {'state', 'reference', 'metrics'}:
+        return [label + ' must define exactly state, reference, and metrics']
+
+    metrics = budget.get('metrics')
+    if not isinstance(metrics, dict) or set(metrics) != set(METRIC_IDS):
+        problems.append(label + '.metrics must define exactly %s' % ', '.join(METRIC_IDS))
+        metrics = {}
+
+    states = set()
+    for metric_id, spec in METRIC_SPECS.items():
+        metric = metrics.get(metric_id)
+        mlabel = '%s.metrics.%s' % (label, metric_id)
+        if not isinstance(metric, dict):
+            problems.append(mlabel + ' must be an object')
+            continue
+        state = metric.get('state')
+        if state not in ('unmeasured', 'relative'):
+            problems.append(mlabel + '.state must be unmeasured or relative')
+            continue
+        states.add(state)
+        if metric.get('unit') != spec['unit']:
+            problems.append(mlabel + '.unit must be %s' % spec['unit'])
+        if metric.get('coverage') != spec['coverage']:
+            problems.append(mlabel + '.coverage must preserve the documented attribution scope')
+        if state == 'unmeasured':
+            if set(metric) != {'state', 'unit', 'coverage'}:
+                problems.append(mlabel + ' unmeasured entries cannot carry values, limits, or uncertainty')
+        elif set(metric) != {'state', 'unit', 'coverage', 'referenceValue', 'maxRelativeIncrease'}:
+            problems.append(mlabel + ' relative entries require referenceValue and maxRelativeIncrease')
+        else:
+            reference_value = metric.get('referenceValue')
+            limit = metric.get('maxRelativeIncrease')
+            if not _finite_number(reference_value) or reference_value <= 0:
+                problems.append(mlabel + '.referenceValue must be a finite positive measured baseline')
+            if not _finite_number(limit) or limit < 0:
+                problems.append(mlabel + '.maxRelativeIncrease must be a finite non-negative relative limit')
+
+    state = budget.get('state')
+    expected_state = ('unmeasured' if states == {'unmeasured'} else
+                      'relative' if states == {'relative'} else
+                      'mixed' if states == {'unmeasured', 'relative'} else None)
+    if state not in ('unmeasured', 'relative', 'mixed') or state != expected_state:
+        problems.append(label + '.state must match the metric measurement states')
+
+    reference = budget.get('reference')
+    if expected_state == 'unmeasured':
+        if reference is not None:
+            problems.append(label + '.reference must be null while every metric is unmeasured')
+    elif expected_state in ('relative', 'mixed'):
+        required = {'measurementId', 'build', 'profile', 'scene', 'config', 'uncertainty'}
+        if not isinstance(reference, dict) or set(reference) != required:
+            problems.append(label + '.reference must define measurementId, build, profile, scene, config, uncertainty')
+        else:
+            for field in ('measurementId', 'build', 'scene'):
+                if not isinstance(reference[field], str) or not reference[field].strip():
+                    problems.append(label + '.reference.%s must be a non-empty string' % field)
+            build_id = reference.get('build')
+            if (not isinstance(build_id, str) or not _BUILD_ID_RE.fullmatch(build_id) or
+                    build_id.lower() in ('unknown', 'unversioned-test-build')):
+                problems.append(label + '.reference.build must match a logged git-describe version identity')
+            if reference['profile'] not in PROFILES:
+                problems.append(label + '.reference.profile must be a known runtime profile')
+            elif reference['profile'] not in supported_profiles:
+                problems.append(label + '.reference.profile is unsupported by this plugin')
+            config = reference['config']
+            if not isinstance(config, dict) or not config:
+                problems.append(label + '.reference.config must identify a non-empty measurement configuration')
+            elif any(not isinstance(key, str) or not key.strip() or
+                     not isinstance(value, (str, int, float, bool)) or
+                     (isinstance(value, float) and not _finite_number(value))
+                     for key, value in config.items()):
+                problems.append(label + '.reference.config must contain named scalar settings')
+
+            uncertainty = reference['uncertainty']
+            required_uncertainty = {'method', 'sampleCount', 'confidence', 'metrics'}
+            if not isinstance(uncertainty, dict) or set(uncertainty) != required_uncertainty:
+                problems.append(label + '.reference.uncertainty must define method, sampleCount, confidence, metrics')
+            else:
+                if not isinstance(uncertainty['method'], str) or not uncertainty['method'].strip():
+                    problems.append(label + '.reference.uncertainty.method must be non-empty')
+                sample_count = uncertainty['sampleCount']
+                if type(sample_count) is not int or not 2 <= sample_count <= 0xFFFFFFFF:
+                    problems.append(label + '.reference.uncertainty.sampleCount must fit uint32 and be >= 2')
+                confidence = uncertainty['confidence']
+                if not _finite_number(confidence) or not 0 < confidence < 1:
+                    problems.append(label + '.reference.uncertainty.confidence must be between 0 and 1')
+                intervals = uncertainty['metrics']
+                measured_ids = {metric_id for metric_id, metric in metrics.items()
+                                if isinstance(metric, dict) and metric.get('state') == 'relative'}
+                if not isinstance(intervals, dict) or set(intervals) != measured_ids:
+                    problems.append(label + '.reference.uncertainty.metrics must match relative metric IDs')
+                else:
+                    for metric_id in measured_ids:
+                        interval = intervals[metric_id]
+                        metric = metrics[metric_id]
+                        mlabel = '%s.metrics.%s' % (label, metric_id)
+                        ilabel = '%s.reference.uncertainty.metrics.%s' % (label, metric_id)
+                        if not isinstance(interval, dict) or set(interval) != {'low', 'high', 'unit'}:
+                            problems.append(ilabel + ' must define low, high, and unit')
+                            continue
+                        low, high = interval['low'], interval['high']
+                        if interval['unit'] != METRIC_SPECS[metric_id]['unit']:
+                            problems.append(ilabel + '.unit does not match the metric unit')
+                        if (not _finite_number(low) or not _finite_number(high) or low < 0 or
+                                low > high or not _finite_number(metric.get('referenceValue')) or
+                                not low <= metric['referenceValue'] <= high):
+                            problems.append(ilabel + ' must be a finite ordered interval containing the measured referenceValue')
+                        elif (_finite_number(metric.get('maxRelativeIncrease')) and
+                              _finite_number(metric.get('referenceValue')) and
+                              metric['referenceValue'] > 0):
+                            # The only supported allowance is the positive
+                            # one-sided margin already present in this metric's
+                            # measured reference interval: (high / baseline)-1.
+                            # This encodes "within measured noise" without an
+                            # arbitrary independent regression threshold.
+                            noise_margin = (high / metric['referenceValue']) - 1.0
+                            if not _finite_number(noise_margin):
+                                problems.append(ilabel + ' produces a non-finite relative uncertainty margin')
+                            elif metric['maxRelativeIncrease'] > noise_margin:
+                                problems.append(mlabel + '.maxRelativeIncrease exceeds the reference uncertainty upper margin')
+    elif reference is not None:
+        problems.append(label + '.reference must be null when no metrics are measured')
+    return problems
+
+
 def validate_manifest(data, documented_keys=None):
     """Return human-readable errors; validate refs, ownership, and defaults."""
     problems = []
     if not isinstance(data, dict):
         return ['manifest must be a JSON object']
-    if type(data.get('schemaVersion')) is not int or data.get('schemaVersion') != 1:
-        problems.append('unsupported schemaVersion (expected integer 1)')
+    if type(data.get('schemaVersion')) is not int or data.get('schemaVersion') != 2:
+        problems.append('unsupported schemaVersion (expected integer 2)')
     if not isinstance(data.get('description'), str) or not data.get('description'):
         problems.append('description must be a non-empty string')
     if not isinstance(data.get('selectionSemantics'), str) or not data.get('selectionSemantics'):
@@ -139,8 +302,8 @@ def validate_manifest(data, documented_keys=None):
         for field in ('name', 'description', 'costNote'):
             if not isinstance(plugin.get(field), str) or not plugin.get(field):
                 problems.append('%s.%s must be a non-empty string' % (pid, field))
-
         supported = _string_list(plugin.get('profiles'), pid + '.profiles', problems)
+        problems.extend(_validate_cost_budget(plugin.get('costBudget'), pid, supported))
         recommended = _string_list(plugin.get('recommendedProfiles'), pid + '.recommendedProfiles', problems)
         defaults = _string_list(plugin.get('defaultInstallProfiles'), pid + '.defaultInstallProfiles', problems)
         expected_profiles = EXPECTED_PROFILES.get(pid)
@@ -403,6 +566,12 @@ def render_cpp(data):
         '    kProfileFlat = 1u << 1,',
         '    kProfileLegacyVr = kProfileVr,',
         '};',
+        'enum CostBudgetState : std::uint32_t { kCostBudgetUnmeasured = 0, kCostBudgetRelative = 1, kCostBudgetMixed = 2 };',
+        'enum CostMetricState : std::uint32_t { kCostMetricUnmeasured = 0, kCostMetricRelative = 1 };',
+        'struct CostMetric { const char* id; std::uint32_t state; const char* unit; const char* coverage; const double* referenceValue; const double* maxRelativeIncrease; };',
+        'struct CostMetricUncertainty { const char* id; double low, high; const char* unit; };',
+        'struct CostReference { const char* measurementId; const char* build; std::uint32_t profileMask; const char* scene; const char* configJson; const char* uncertaintyMethod; std::uint32_t sampleCount; double confidence; const CostMetricUncertainty* metrics; std::uint32_t metricCount; };',
+        'struct CostBudget { std::uint32_t state; const CostReference* reference; const CostMetric* metrics; std::uint32_t metricCount; };',
         'struct Dependency { const char* id; std::uint32_t kind; const char* reason; };',
         'struct ShaderPair { std::uint64_t vertexShaderHash, pixelShaderHash; };',
         'struct DrawShape { std::uint8_t kind; std::uint32_t count, instances; };',
@@ -421,6 +590,7 @@ def render_cpp(data):
         '    const Dependency* dependencies; std::uint32_t dependencyCount;',
         '    const char* const* rigs; std::uint32_t rigCount;',
         '    const char* costNote;',
+        '    const CostBudget* costBudget;',
         '};',
     ]
     lines.append('inline constexpr const char* kCoreOwnedConfigKeys[] = {')
@@ -468,6 +638,46 @@ def render_cpp(data):
         if not plugin['dependencies']:
             lines.append('    {"", 0, ""},')
         lines.append('};')
+        budget = plugin['costBudget']
+        metrics = budget['metrics']
+        for metric_id in METRIC_IDS:
+            metric = metrics[metric_id]
+            if metric['state'] == 'relative':
+                lines.append('inline constexpr double k_%s_cost_%s_reference_value = %.17g;' % (
+                    pid, metric_id, metric['referenceValue']))
+                lines.append('inline constexpr double k_%s_cost_%s_relative_limit = %.17g;' % (
+                    pid, metric_id, metric['maxRelativeIncrease']))
+        lines.append('inline constexpr CostMetric k_%s_cost_metrics[] = {' % pid)
+        for metric_id in METRIC_IDS:
+            metric = metrics[metric_id]
+            metric_state = 'kCostMetricRelative' if metric['state'] == 'relative' else 'kCostMetricUnmeasured'
+            reference_ptr = '&k_%s_cost_%s_reference_value' % (pid, metric_id) if metric['state'] == 'relative' else 'nullptr'
+            limit_ptr = '&k_%s_cost_%s_relative_limit' % (pid, metric_id) if metric['state'] == 'relative' else 'nullptr'
+            lines.append('    {%s, %s, %s, %s, %s, %s},' % (
+                _cpp_string(metric_id), metric_state, _cpp_string(metric['unit']),
+                _cpp_string(metric['coverage']), reference_ptr, limit_ptr))
+        lines.append('};')
+        reference = budget['reference']
+        reference_ptr = 'nullptr'
+        if reference is not None:
+            uncertainty = reference['uncertainty']
+            lines.append('inline constexpr CostMetricUncertainty k_%s_cost_uncertainty[] = {' % pid)
+            for metric_id, interval in uncertainty['metrics'].items():
+                lines.append('    {%s, %.17g, %.17g, %s},' % (
+                    _cpp_string(metric_id), interval['low'], interval['high'], _cpp_string(interval['unit'])))
+            lines.append('};')
+            lines.append('inline constexpr CostReference k_%s_cost_reference = {%s, %s, 0x%xu, %s, %s, %s, %du, %.17g, k_%s_cost_uncertainty, %d};' % (
+                pid, _cpp_string(reference['measurementId']), _cpp_string(reference['build']),
+                profile_mask([reference['profile']]), _cpp_string(reference['scene']),
+                _cpp_string(json.dumps(reference['config'], sort_keys=True, separators=(',', ':'), ensure_ascii=True)),
+                _cpp_string(uncertainty['method']), uncertainty['sampleCount'], uncertainty['confidence'],
+                pid, len(uncertainty['metrics'])))
+            reference_ptr = '&k_%s_cost_reference' % pid
+        budget_state = {'unmeasured': 'kCostBudgetUnmeasured',
+                        'relative': 'kCostBudgetRelative',
+                        'mixed': 'kCostBudgetMixed'}[budget['state']]
+        lines.append('inline constexpr CostBudget k_%s_cost_budget = {%s, %s, k_%s_cost_metrics, %d};' % (
+            pid, budget_state, reference_ptr, pid, len(METRIC_IDS)))
     lines.append('inline constexpr PluginRecord kManifest[] = {')
     for plugin in data['plugins']:
         pid = plugin['id'].replace('-', '_')
@@ -484,7 +694,8 @@ def render_cpp(data):
                      (pid, len(plugin['ownedConfigKeys']), pid, len(plugin['hookPoints'])))
         lines.append('     k_%s_claims, %d, k_%s_dependencies, %d,' %
                      (pid, len(plugin['claims']), pid, len(plugin['dependencies'])))
-        lines.append('     k_%s_rigs, %d, %s},' % (pid, len(plugin['rigs']), _cpp_string(plugin['costNote'])))
+        lines.append('     k_%s_rigs, %d, %s, &k_%s_cost_budget},' % (
+            pid, len(plugin['rigs']), _cpp_string(plugin['costNote']), pid))
     index_names = [plugin['id'].replace('-', '_').title().replace('_', '') for plugin in data['plugins']]
     lines.append('};')
     lines.append('enum PluginIndex : std::uint32_t {')
@@ -555,6 +766,113 @@ def self_test():
         original = load_json()
         documented = ini_documented_keys()
         check('canonical manifest validates', not validate_manifest(original, documented))
+        check('all nine plugin cost budgets are explicitly unmeasured',
+              len(original['plugins']) == 9 and all(
+                  plugin['costBudget']['state'] == 'unmeasured' and
+                  plugin['costBudget']['reference'] is None and
+                  all(metric['state'] == 'unmeasured' and
+                      set(metric) == {'state', 'unit', 'coverage'}
+                      for metric in plugin['costBudget']['metrics'].values())
+                  for plugin in original['plugins']))
+
+        bad = copy.deepcopy(original)
+        bad['plugins'][0]['costBudget']['metrics']['cpu']['referenceValue'] = 0
+        check('unmeasured metric rejects fabricated numeric values',
+              any('unmeasured entries cannot carry values' in p
+                  for p in validate_manifest(bad, documented)))
+        bad = copy.deepcopy(original)
+        bad['plugins'][0]['costBudget']['state'] = 'relative'
+        bad['plugins'][0]['costBudget']['metrics']['cpu'].update(
+            {'state': 'relative', 'referenceValue': 1.0, 'maxRelativeIncrease': 0.1})
+        check('measured metric rejects an absent reference record',
+              any('reference must define measurementId' in p
+                  for p in validate_manifest(bad, documented)))
+
+        measured = copy.deepcopy(original)
+        budget = measured['plugins'][1]['costBudget']
+        budget['state'] = 'relative'
+        values = {'cpu': 1.25, 'issuedGpuWork': 3.0, 'directGpu': 0.75}
+        intervals = {}
+        for metric_id, value in values.items():
+            metric = budget['metrics'][metric_id]
+            metric.update({'state': 'relative', 'referenceValue': value,
+                           'maxRelativeIncrease': 0.1})
+            intervals[metric_id] = {'low': value * 0.9, 'high': value * 1.1,
+                                    'unit': metric['unit']}
+        budget['reference'] = {
+            'measurementId': 'self-test.synthetic.reference',
+            'build': 'v0.18.0-3-gd57600de-dirty',
+            'profile': 'vr',
+            'scene': 'synthetic validator fixture',
+            'config': {'advanced.synthetic_fixture': True},
+            'uncertainty': {'method': 'synthetic shape fixture', 'sampleCount': 3,
+                            'confidence': 0.95, 'metrics': intervals},
+        }
+        check('complete relative schema accepts internally consistent provenance fixture',
+              not validate_manifest(measured, documented))
+        log_build = copy.deepcopy(measured)
+        log_build['plugins'][1]['costBudget']['reference']['build'] = '0.14.1-93-gf78eba4'
+        check('relative reference accepts the version identity format used by flight logs',
+              not validate_manifest(log_build, documented))
+        prerelease_build = copy.deepcopy(measured)
+        prerelease_build['plugins'][1]['costBudget']['reference']['build'] = 'v0.18.0-rc.5-26-g5ec0de01'
+        check('relative reference accepts logged prerelease git-describe identity',
+              not validate_manifest(prerelease_build, documented))
+        hash_build = copy.deepcopy(measured)
+        hash_build['plugins'][1]['costBudget']['reference']['build'] = 'd57600de'
+        check('relative reference accepts git-describe hash-only identity',
+              not validate_manifest(hash_build, documented))
+        noisy = copy.deepcopy(measured)
+        noisy_budget = noisy['plugins'][1]['costBudget']
+        noisy_budget['metrics']['cpu']['referenceValue'] = 1.0
+        noisy_budget['metrics']['cpu']['maxRelativeIncrease'] = 0.50
+        noisy_budget['reference']['uncertainty']['metrics']['cpu'] = {
+            'low': 0.95, 'high': 1.05, 'unit': noisy_budget['metrics']['cpu']['unit']}
+        check('relative allowance cannot exceed measured one-sided uncertainty margin',
+              'cockpit-visuals.costBudget.metrics.cpu.maxRelativeIncrease exceeds the reference uncertainty upper margin'
+              in validate_manifest(noisy, documented))
+        overflow_margin = copy.deepcopy(measured)
+        overflow_metric = overflow_margin['plugins'][1]['costBudget']['metrics']['cpu']
+        overflow_metric.update({'referenceValue': 1e-308, 'maxRelativeIncrease': 0.1})
+        overflow_margin['plugins'][1]['costBudget']['reference']['uncertainty']['metrics']['cpu'] = {
+            'low': 1e-308, 'high': 1e308, 'unit': overflow_metric['unit']}
+        check('relative uncertainty arithmetic rejects a non-finite margin',
+              any('non-finite relative uncertainty margin' in p
+                  for p in validate_manifest(overflow_margin, documented)))
+        bad = copy.deepcopy(measured)
+        bad['plugins'][1]['costBudget']['reference']['build'] = 'measurement build alpha'
+        check('relative reference requires a logged git-describe build identity',
+              any('logged git-describe version identity' in p
+                  for p in validate_manifest(bad, documented)))
+        bad = copy.deepcopy(measured)
+        bad['plugins'][1]['costBudget']['reference']['build'] = '1-made-up'
+        check('relative reference rejects non-production tag prose',
+              any('logged git-describe version identity' in p
+                  for p in validate_manifest(bad, documented)))
+        bad = copy.deepcopy(measured)
+        bad['plugins'][1]['costBudget']['reference']['uncertainty']['sampleCount'] = 0x100000000
+        check('relative reference sample count must fit generated uint32',
+              any('sampleCount must fit uint32' in p for p in validate_manifest(bad, documented)))
+        bad = copy.deepcopy(measured)
+        bad['plugins'][1]['costBudget']['metrics']['cpu']['referenceValue'] = 10 ** 10000
+        check('oversized JSON integer is rejected without numeric conversion failure',
+              any('referenceValue must be a finite positive' in p
+                  for p in validate_manifest(bad, documented)))
+        bad = copy.deepcopy(measured)
+        bad['plugins'][1]['costBudget']['reference']['profile'] = 'flat'
+        check('relative reference rejects unsupported profile',
+              any('reference.profile is unsupported' in p
+                  for p in validate_manifest(bad, documented)))
+        bad = copy.deepcopy(measured)
+        del bad['plugins'][1]['costBudget']['reference']['uncertainty']
+        check('relative reference rejects missing uncertainty',
+              any('reference must define measurementId' in p
+                  for p in validate_manifest(bad, documented)))
+        bad = copy.deepcopy(measured)
+        bad['plugins'][1]['costBudget']['reference']['uncertainty']['metrics']['cpu']['low'] = 2.0
+        check('relative reference rejects an interval inconsistent with its baseline',
+              any('finite ordered interval containing' in p
+                  for p in validate_manifest(bad, documented)))
 
         bad = copy.deepcopy(original)
         bad['plugins'][1]['id'] = bad['plugins'][0]['id']
@@ -612,7 +930,11 @@ def self_test():
                   'kCoreOwnedConfigKeyCount' in content and
                   'kPluginTemporalAa = 0' in content and
                   'kClaimCockpitVisualsNightVision = 0' in content and
-                  '{0x58u, 240u, 1u}' in content)
+                  '{0x58u, 240u, 1u}' in content and
+                  'struct CostBudget' in content and
+                  'k_temporal_aa_cost_budget = {kCostBudgetUnmeasured, nullptr' in content and
+                  '"directGpu", kCostMetricUnmeasured' in content and
+                  'kCostMetricUnmeasured' in content)
     except Exception as exc:
         failures.append('unexpected exception: %s' % exc)
 

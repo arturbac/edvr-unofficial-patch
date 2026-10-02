@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "description": "Canonical first-party plugin catalog for EDVR. Array order and index define stable plugin mask bits.",
   "profiles": [
     "vr",
@@ -123,7 +123,28 @@
       "costNote": "Per-plugin cost not measured; see the design document census baseline.",
       "rigs": [],
       "implementationStatus": "catalog-only",
-      "selectionAvailableProfiles": []
+      "selectionAvailableProfiles": [],
+      "costBudget": {
+        "state": "unmeasured",
+        "reference": null,
+        "metrics": {
+          "cpu": {
+            "state": "unmeasured",
+            "unit": "milliseconds per frame",
+            "coverage": "EDVR-owned CPU work attributable to this plugin. The existing draw-hook CPU census is aggregate and does not split module cost."
+          },
+          "issuedGpuWork": {
+            "state": "unmeasured",
+            "unit": "EDVR-issued D3D11 calls per frame",
+            "coverage": "Calls issued by this plugin only; forwarded game calls and shared/core work are excluded unless explicitly attributed."
+          },
+          "directGpu": {
+            "state": "unmeasured",
+            "unit": "GPU milliseconds per frame",
+            "coverage": "Direct GPU work attributable to this plugin. Whole-frame GPU samples are not plugin-level attribution."
+          }
+        }
+      }
     },
     {
       "index": 1,
@@ -195,7 +216,28 @@
         "plugin_dispatch_test"
       ],
       "implementationStatus": "phase1-pilot",
-      "selectionAvailableProfiles": []
+      "selectionAvailableProfiles": [],
+      "costBudget": {
+        "state": "unmeasured",
+        "reference": null,
+        "metrics": {
+          "cpu": {
+            "state": "unmeasured",
+            "unit": "milliseconds per frame",
+            "coverage": "EDVR-owned CPU work attributable to this plugin. The existing draw-hook CPU census is aggregate and does not split module cost."
+          },
+          "issuedGpuWork": {
+            "state": "unmeasured",
+            "unit": "EDVR-issued D3D11 calls per frame",
+            "coverage": "Calls issued by this plugin only; forwarded game calls and shared/core work are excluded unless explicitly attributed."
+          },
+          "directGpu": {
+            "state": "unmeasured",
+            "unit": "GPU milliseconds per frame",
+            "coverage": "Direct GPU work attributable to this plugin. Whole-frame GPU samples are not plugin-level attribution."
+          }
+        }
+      }
     },
     {
       "index": 2,
@@ -231,7 +273,28 @@
       "costNote": "Per-plugin cost not measured; see the design document census baseline.",
       "rigs": [],
       "implementationStatus": "catalog-only",
-      "selectionAvailableProfiles": []
+      "selectionAvailableProfiles": [],
+      "costBudget": {
+        "state": "unmeasured",
+        "reference": null,
+        "metrics": {
+          "cpu": {
+            "state": "unmeasured",
+            "unit": "milliseconds per frame",
+            "coverage": "EDVR-owned CPU work attributable to this plugin. The existing draw-hook CPU census is aggregate and does not split module cost."
+          },
+          "issuedGpuWork": {
+            "state": "unmeasured",
+            "unit": "EDVR-issued D3D11 calls per frame",
+            "coverage": "Calls issued by this plugin only; forwarded game calls and shared/core work are excluded unless explicitly attributed."
+          },
+          "directGpu": {
+            "state": "unmeasured",
+            "unit": "GPU milliseconds per frame",
+            "coverage": "Direct GPU work attributable to this plugin. Whole-frame GPU samples are not plugin-level attribution."
+          }
+        }
+      }
     },
     {
       "index": 3,
@@ -264,7 +327,28 @@
       "costNote": "Per-plugin cost not measured; see the design document census baseline.",
       "rigs": [],
       "implementationStatus": "catalog-only",
-      "selectionAvailableProfiles": []
+      "selectionAvailableProfiles": [],
+      "costBudget": {
+        "state": "unmeasured",
+        "reference": null,
+        "metrics": {
+          "cpu": {
+            "state": "unmeasured",
+            "unit": "milliseconds per frame",
+            "coverage": "EDVR-owned CPU work attributable to this plugin. The existing draw-hook CPU census is aggregate and does not split module cost."
+          },
+          "issuedGpuWork": {
+            "state": "unmeasured",
+            "unit": "EDVR-issued D3D11 calls per frame",
+            "coverage": "Calls issued by this plugin only; forwarded game calls and shared/core work are excluded unless explicitly attributed."
+          },
+          "directGpu": {
+            "state": "unmeasured",
+            "unit": "GPU milliseconds per frame",
+            "coverage": "Direct GPU work attributable to this plugin. Whole-frame GPU samples are not plugin-level attribution."
+          }
+        }
+      }
     },
     {
       "index": 4,
@@ -305,7 +389,28 @@
       "costNote": "Per-plugin cost not measured; see the design document census baseline.",
       "rigs": [],
       "implementationStatus": "catalog-only",
-      "selectionAvailableProfiles": []
+      "selectionAvailableProfiles": [],
+      "costBudget": {
+        "state": "unmeasured",
+        "reference": null,
+        "metrics": {
+          "cpu": {
+            "state": "unmeasured",
+            "unit": "milliseconds per frame",
+            "coverage": "EDVR-owned CPU work attributable to this plugin. The existing draw-hook CPU census is aggregate and does not split module cost."
+          },
+          "issuedGpuWork": {
+            "state": "unmeasured",
+            "unit": "EDVR-issued D3D11 calls per frame",
+            "coverage": "Calls issued by this plugin only; forwarded game calls and shared/core work are excluded unless explicitly attributed."
+          },
+          "directGpu": {
+            "state": "unmeasured",
+            "unit": "GPU milliseconds per frame",
+            "coverage": "Direct GPU work attributable to this plugin. Whole-frame GPU samples are not plugin-level attribution."
+          }
+        }
+      }
     },
     {
       "index": 5,
@@ -350,7 +455,28 @@
       "costNote": "Per-plugin cost not measured; see the design document census baseline.",
       "rigs": [],
       "implementationStatus": "catalog-only",
-      "selectionAvailableProfiles": []
+      "selectionAvailableProfiles": [],
+      "costBudget": {
+        "state": "unmeasured",
+        "reference": null,
+        "metrics": {
+          "cpu": {
+            "state": "unmeasured",
+            "unit": "milliseconds per frame",
+            "coverage": "EDVR-owned CPU work attributable to this plugin. The existing draw-hook CPU census is aggregate and does not split module cost."
+          },
+          "issuedGpuWork": {
+            "state": "unmeasured",
+            "unit": "EDVR-issued D3D11 calls per frame",
+            "coverage": "Calls issued by this plugin only; forwarded game calls and shared/core work are excluded unless explicitly attributed."
+          },
+          "directGpu": {
+            "state": "unmeasured",
+            "unit": "GPU milliseconds per frame",
+            "coverage": "Direct GPU work attributable to this plugin. Whole-frame GPU samples are not plugin-level attribution."
+          }
+        }
+      }
     },
     {
       "index": 6,
@@ -409,7 +535,28 @@
       "costNote": "Per-plugin cost not measured; see the design document census baseline.",
       "rigs": [],
       "implementationStatus": "catalog-only",
-      "selectionAvailableProfiles": []
+      "selectionAvailableProfiles": [],
+      "costBudget": {
+        "state": "unmeasured",
+        "reference": null,
+        "metrics": {
+          "cpu": {
+            "state": "unmeasured",
+            "unit": "milliseconds per frame",
+            "coverage": "EDVR-owned CPU work attributable to this plugin. The existing draw-hook CPU census is aggregate and does not split module cost."
+          },
+          "issuedGpuWork": {
+            "state": "unmeasured",
+            "unit": "EDVR-issued D3D11 calls per frame",
+            "coverage": "Calls issued by this plugin only; forwarded game calls and shared/core work are excluded unless explicitly attributed."
+          },
+          "directGpu": {
+            "state": "unmeasured",
+            "unit": "GPU milliseconds per frame",
+            "coverage": "Direct GPU work attributable to this plugin. Whole-frame GPU samples are not plugin-level attribution."
+          }
+        }
+      }
     },
     {
       "index": 7,
@@ -454,7 +601,28 @@
       "costNote": "Per-plugin cost not measured; see the design document census baseline.",
       "rigs": [],
       "implementationStatus": "catalog-only",
-      "selectionAvailableProfiles": []
+      "selectionAvailableProfiles": [],
+      "costBudget": {
+        "state": "unmeasured",
+        "reference": null,
+        "metrics": {
+          "cpu": {
+            "state": "unmeasured",
+            "unit": "milliseconds per frame",
+            "coverage": "EDVR-owned CPU work attributable to this plugin. The existing draw-hook CPU census is aggregate and does not split module cost."
+          },
+          "issuedGpuWork": {
+            "state": "unmeasured",
+            "unit": "EDVR-issued D3D11 calls per frame",
+            "coverage": "Calls issued by this plugin only; forwarded game calls and shared/core work are excluded unless explicitly attributed."
+          },
+          "directGpu": {
+            "state": "unmeasured",
+            "unit": "GPU milliseconds per frame",
+            "coverage": "Direct GPU work attributable to this plugin. Whole-frame GPU samples are not plugin-level attribution."
+          }
+        }
+      }
     },
     {
       "index": 8,
@@ -530,7 +698,28 @@
       "costNote": "Per-plugin cost not measured; see the design document census baseline.",
       "rigs": [],
       "implementationStatus": "catalog-only",
-      "selectionAvailableProfiles": []
+      "selectionAvailableProfiles": [],
+      "costBudget": {
+        "state": "unmeasured",
+        "reference": null,
+        "metrics": {
+          "cpu": {
+            "state": "unmeasured",
+            "unit": "milliseconds per frame",
+            "coverage": "EDVR-owned CPU work attributable to this plugin. The existing draw-hook CPU census is aggregate and does not split module cost."
+          },
+          "issuedGpuWork": {
+            "state": "unmeasured",
+            "unit": "EDVR-issued D3D11 calls per frame",
+            "coverage": "Calls issued by this plugin only; forwarded game calls and shared/core work are excluded unless explicitly attributed."
+          },
+          "directGpu": {
+            "state": "unmeasured",
+            "unit": "GPU milliseconds per frame",
+            "coverage": "Direct GPU work attributable to this plugin. Whole-frame GPU samples are not plugin-level attribution."
+          }
+        }
+      }
     }
   ],
   "selectionSemantics": "defaultInstallProfiles records the design target defaults from the architecture decision. Phase 1 does not expose plugin selection; implementationStatus records what the registry currently implements."

@@ -18,6 +18,7 @@ constexpr uint32_t kEarlierClaim = 0x2001u;
 constexpr uint64_t kVs = 0xFCF7BD2896751D96ull;
 constexpr uint64_t kPs = 0xF786D34B5E118D5Eull;
 constexpr uint64_t kActive = uint64_t{1} << kPlugin;
+constexpr uint64_t kLegacyVs = 0x1122334455667788ull;
 constexpr auto kManifestNightVisionClaim = edvr::plugins::kManifest[kPlugin].claims[
     edvr::plugins::kClaimCockpitVisualsNightVision];
 constexpr edvr::plugins::dispatch::ShaderClaimKey kClaims[] = {
@@ -165,6 +166,32 @@ void replayMatrix() {
                         }
 }
 
+void costBudgetMetadata() {
+    check(edvr::plugins::kPluginCount == 9 &&
+              edvr::plugins::kPluginIndexCount == edvr::plugins::kPluginCount,
+          "budget metadata remains attached to the complete stable catalog");
+    for (uint32_t i = 0; i < edvr::plugins::kPluginCount; ++i) {
+        const auto& plugin = edvr::plugins::kManifest[i];
+        const auto* budget = plugin.costBudget;
+        check(plugin.costNote && *plugin.costNote && budget &&
+                  budget->state == edvr::plugins::kCostBudgetUnmeasured &&
+                  budget->reference == nullptr && budget->metrics && budget->metricCount == 3,
+              "all plugins retain costNote and an unmeasured, reference-free cost budget");
+        if (!budget || !budget->metrics || budget->metricCount != 3) continue;
+        constexpr const char* expectedMetrics[] = {"cpu", "issuedGpuWork", "directGpu"};
+        bool metricsHonest = true;
+        for (uint32_t j = 0; j < 3; ++j) {
+            const auto& metric = budget->metrics[j];
+            metricsHonest &= metric.id && std::strcmp(metric.id, expectedMetrics[j]) == 0 &&
+                metric.state == edvr::plugins::kCostMetricUnmeasured &&
+                metric.unit && *metric.unit && metric.coverage && *metric.coverage &&
+                metric.referenceValue == nullptr && metric.maxRelativeIncrease == nullptr;
+        }
+        check(metricsHonest,
+              "unmeasured CPU, issued-work, and direct-GPU metrics carry scope without numeric values");
+    }
+}
+
 void disabledAndCacheCases() {
     size_t pairChecks = 0;
     uint32_t callbacks = 0;
@@ -265,12 +292,75 @@ void registryLifecycle() {
     check(!edvr::pluginRegistryWantsDraws(&registryState),
           "named and plugin subscriptions both report off");
 
+    using edvr::draw_interest::InterestId;
+    using edvr::draw_interest::InterestMask;
+    using edvr::draw_interest::HashFilter;
+    constexpr InterestMask kTargetSharp = edvr::draw_interest::bit(InterestId::TargetSharp);
+    constexpr InterestMask kIntroCurve = edvr::draw_interest::bit(InterestId::IntroCurveObserve);
+    const edvr::draw_interest::ShaderFilter legacyFilters[] = {
+        {InterestId::TargetSharp, HashFilter::Vertex, kLegacyVs, 0},
+    };
+    check(edvr::pluginRegistryConfigureDrawInterests(
+              kTargetSharp | kIntroCurve, legacyFilters, 1),
+          "configured VR legacy interest accepts bounded module-owned shader metadata");
+    check(edvr::pluginRegistryShaderCandidates() == 0 &&
+              edvr::pluginRegistryDrawInterestMask() == kIntroCurve,
+          "legacy bind-interest is published separately and known shader mismatch is filtered");
+    edvr::bindingSetShader(edvr::BindSlot::Vs, reinterpret_cast<void*>(3), kLegacyVs);
+    check(edvr::pluginRegistryDrawInterestMask() == (kTargetSharp | kIntroCurve),
+          "legacy match refreshes on bind while config-only curve interest remains active");
+    edvr::bindingSetShader(edvr::BindSlot::Vs, reinterpret_cast<void*>(4), kLegacyVs + 1);
+    check(edvr::pluginRegistryDrawInterestMask() == kIntroCurve,
+          "known VS mismatch filters only its configured interest");
+    edvr::bindingSetShader(edvr::BindSlot::Vs, nullptr, 0);
+    check(edvr::pluginRegistryDrawInterestMask() == (kTargetSharp | kIntroCurve),
+          "unknown VS hash conservatively keeps legacy fallback reachable");
+
+    const auto vrProfile = edvr::g_runtimeProfile;
+    edvr::g_runtimeProfile = edvr::RuntimeProfile::Flat;
+    check(edvr::pluginRegistryConfigureDrawInterests(
+              kTargetSharp | kIntroCurve, legacyFilters, 1) &&
+              edvr::pluginRegistryDrawInterestMask() == 0,
+          "flat profile does not publish VR-only legacy shader interest");
+    edvr::g_runtimeProfile = vrProfile;
+    edvr::g_runtimeProfile = edvr::RuntimeProfile::Invalid;
+    check(edvr::pluginRegistryConfigureDrawInterests(
+              kTargetSharp | kIntroCurve, legacyFilters, 1) &&
+              edvr::pluginRegistryDrawInterestMask() == 0,
+          "invalid runtime profile clears legacy shader interest and observer demand");
+    edvr::g_runtimeProfile = vrProfile;
+    edvr::bindingSetShader(edvr::BindSlot::Vs, reinterpret_cast<void*>(5), kLegacyVs);
+    check(edvr::pluginRegistryConfigureDrawInterests(
+              kTargetSharp | kIntroCurve, legacyFilters, 1) &&
+              edvr::pluginRegistryDrawInterestMask() == (kTargetSharp | kIntroCurve),
+          "VR configure reseeds current shader pair without requiring a new bind");
+    edvr::bindingForgetAll();
+    check(edvr::pluginRegistryShaderCandidates() == 0 &&
+              edvr::pluginRegistryDrawInterestMask() == (kTargetSharp | kIntroCurve),
+          "ClearState removes plugin candidates while unknown legacy pair keeps fallback");
+    edvr::bindingSetShader(edvr::BindSlot::Vs, reinterpret_cast<void*>(6), kLegacyVs);
+    check(edvr::pluginRegistryDrawInterestMask() == (kTargetSharp | kIntroCurve),
+          "canonical shader repair republishes the matching legacy interest");
+    check(edvr::pluginRegistryConfigureDrawInterests(0, nullptr, 0) &&
+              edvr::pluginRegistryDrawInterestMask() == 0,
+          "disabling legacy config interest clears the cached mask");
+
+    // Exercise plugin seeding independently after the legacy observer has been
+    // removed and the canonical shadow changes quietly.
+    edvr::bindingSetShader(edvr::BindSlot::Vs, reinterpret_cast<void*>(7), kVs);
+    edvr::bindingSetShader(edvr::BindSlot::Ps, reinterpret_cast<void*>(8), kPs);
     registryState.legacyWants = true;
     check(edvr::pluginRegistryWantsDraws(&registryState),
           "named legacy subscriber opens the gate independently of the plugin");
     registryState.legacyWants = false;
     bool on = true;
     edvr::pluginRegistryConfigure(&on);
+    registryState.wants = false;
+    edvr::pluginRegistryRefreshShaderCandidates();
+    check(edvr::pluginRegistryShaderCandidates() == 0,
+          "refresh recomputes active plugin interest instead of using a stale mask");
+    registryState.wants = true;
+    edvr::pluginRegistryRefreshShaderCandidates();
     check(edvr::pluginRegistryWantsDraws(&registryState),
           "plugin subscription opens the gate independently of legacy consumers");
     check(edvr::pluginRegistryShaderCandidates() ==
@@ -365,6 +455,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     replayMatrix();
+    costBudgetMetadata();
     disabledAndCacheCases();
     registryLifecycle();
     std::printf("PASS: plugin dispatch (%u checks)\n", checks);

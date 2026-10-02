@@ -143,9 +143,48 @@ W_STRIP_CALL = "stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward
 W_TICK = ("        tkIntroCurve.run([&] {\n            const bool sceneFrame = g_state->eyeDrawsLastFrame >= kSceneEyeDraws;\n"
           "            introCurveTick(g_state->ownerCtx, sceneFrame);\n            if (sceneFrame) introCurveNoteRetired();\n        });\n")
 W_RETIRE_TEXT = "in all (the movie's, the splash's and the splash dim's re-issues of either)"
-LADDER_EYE_ORDER = "Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>,\n    Site<SiteId::kSunglareNomination, SiteKind::Observe>,\n    Site<SiteId::kEyeCensusSubmitted, SiteKind::Observe>,\n    Site<SiteId::kUiCrispProbe, SiteKind::Observe>,\n    Site<SiteId::kObjectProbe, SiteKind::Observe>,\n    Site<SiteId::kEyeCensusSkip, SiteKind::Claim>,\n    Site<SiteId::kEyeRangeSkip, SiteKind::Claim>,\n    InterestGatedClaim<SiteId::kNightVisionClaim>,\n    Site<SiteId::kRemlokHideSkip, SiteKind::Claim>,\n    Site<SiteId::kRemlokScissorClaim, SiteKind::Claim>,\n    Site<SiteId::kHoloClaim, SiteKind::Claim>,\n    Site<SiteId::kTargetSharpClaim, SiteKind::Claim>,\n    Site<SiteId::kScrimClaim, SiteKind::Claim>,\n    Site<SiteId::kEyeBackdropComposite, SiteKind::Claim>"
-LADDER_AFTER_INTRO_PANEL = "Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>"
-LADDER_INTRO_AWAY = "Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n    Site<SiteId::kSunglareNomination, SiteKind::Observe>,\n    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>"
+LADDER_INTRO_RUNG = ("InterestGated<SiteId::kIntroCurveObserve, SiteKind::Observe,\n"
+                     "                  draw_interest::InterestId::IntroCurveObserve>")
+LADDER_EYE_ORDER = (
+    "Site<SiteId::kEyeDepthAndCount, SiteKind::Observe>,\n"
+    "    Site<SiteId::kEyeUiDepthProbe, SiteKind::Observe>,\n"
+    "    Site<SiteId::kEyeHoloDepthProbe, SiteKind::Observe>,\n"
+    "    Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n"
+    "    " + LADDER_INTRO_RUNG + ",\n"
+    "    Site<SiteId::kSunglareNomination, SiteKind::Observe>,\n"
+    "    Site<SiteId::kEyeCensusSubmitted, SiteKind::Observe>,\n"
+    "    Site<SiteId::kUiCrispProbe, SiteKind::Observe>,\n"
+    "    Site<SiteId::kObjectProbe, SiteKind::Observe>,\n"
+    "    Site<SiteId::kEyeCensusSkip, SiteKind::Claim>,\n"
+    "    Site<SiteId::kEyeRangeSkip, SiteKind::Claim>,\n"
+    "    ShaderCandidateGatedClaim<SiteId::kNightVisionClaim>,\n"
+    "    Site<SiteId::kRemlokHideSkip, SiteKind::Claim>,\n"
+    "    Site<SiteId::kRemlokScissorClaim, SiteKind::Claim>,\n"
+    "    Site<SiteId::kHoloClaim, SiteKind::Claim>,\n"
+    "    InterestGated<SiteId::kTargetSharpClaim, SiteKind::Claim,\n"
+    "                  draw_interest::InterestId::TargetSharp>,\n"
+    "    Site<SiteId::kScrimClaim, SiteKind::Claim>,\n"
+    "    Site<SiteId::kEyeBackdropComposite, SiteKind::Claim>,\n"
+    "    InterestGated<SiteId::kFssPanelClaim, SiteKind::Claim,\n"
+    "                  draw_interest::InterestId::FssPanel>,\n"
+    "    InterestGated<SiteId::kFssRevealClaim, SiteKind::Claim,\n"
+    "                  draw_interest::InterestId::FssReveal>,\n"
+    "    InterestGated<SiteId::kFssDumpClaim, SiteKind::Claim,\n"
+    "                  draw_interest::InterestId::FssDump>,\n"
+    "    Site<SiteId::kResolveBindClaim, SiteKind::Claim>,\n"
+    "    Site<SiteId::kSunglareSkip, SiteKind::Claim>,\n"
+    "    Site<SiteId::kSunglareSteadyClaim, SiteKind::Claim>,\n"
+    "    Site<SiteId::kGlareClampClaim, SiteKind::Claim>,\n"
+    "    Site<SiteId::kHeadOffsetObserve, SiteKind::Observe>,\n"
+    "    InterestGated<SiteId::kPanelCurveObserve, SiteKind::Observe,\n"
+    "                  draw_interest::InterestId::PanelCurveObserve>,\n"
+    "    Site<SiteId::kEyeNoDistanceNone, SiteKind::Exit>,\n"
+    "    Site<SiteId::kPanelEligibilityNone, SiteKind::Exit>,\n"
+    "    Site<SiteId::kPanelDistanceClaim, SiteKind::Claim>,\n"
+    "    Site<SiteId::kPanelTailNone, SiteKind::Exit>>")
+LADDER_AFTER_INTRO_PANEL = ("Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n    " + LADDER_INTRO_RUNG)
+LADDER_INTRO_AWAY = ("Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n"
+                     "    Site<SiteId::kSunglareNomination, SiteKind::Observe>,\n    " + LADDER_INTRO_RUNG)
 
 
 def wiring(name, pin, edits, why):
@@ -298,16 +337,16 @@ MUTANTS = [
     wiring("iw-recognition-without-wants", "recognition", [("if (kind == 'X' && count == 6 && introCurveWants())", "if (kind == 'X' && count == 6)")],
            "the recogniser is asked at curvature 0 too"),
     wiring_ladder("iw-recognition-below-the-backdrop", "recognition", LADDER_EYE_ORDER,
-                  LADDER_EYE_ORDER.replace("    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>,\n", "").replace(
+                  LADDER_EYE_ORDER.replace("    " + LADDER_INTRO_RUNG + ",\n", "").replace(
                       "    Site<SiteId::kEyeBackdropComposite, SiteKind::Claim>",
-                      "    Site<SiteId::kEyeBackdropComposite, SiteKind::Claim>,\n    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>"),
+                      "    Site<SiteId::kEyeBackdropComposite, SiteKind::Claim>,\n    " + LADDER_INTRO_RUNG),
                   "the recognizer is after the terminal backdrop claim in the canonical eye sequence"),
     wiring("iw-recognition-always-armed", "recognition",
            [("s->introCurveThisDraw = introCurveOnComposite(self, kind, count, instances);\n",
              "introCurveOnComposite(self, kind, count, instances);\n        s->introCurveThisDraw = true;\n")],
            "the flag is set whatever the recogniser said"),
     wiring_ladder("iw-recognition-above-the-movie", "after-movie", LADDER_AFTER_INTRO_PANEL,
-                  "Site<SiteId::kIntroCurveObserve, SiteKind::Observe>,\n    Site<SiteId::kIntroPanelClaim, SiteKind::Claim>",
+                  LADDER_INTRO_RUNG + ",\n    Site<SiteId::kIntroPanelClaim, SiteKind::Claim>",
                   "the recognizer precedes the movie claim, so movie-owned draws reach it"),
     wiring_ladder("iw-recognition-away-from-the-movie", "after-movie", LADDER_AFTER_INTRO_PANEL, LADDER_INTRO_AWAY,
                   "the recognizer is no longer the next rung after the movie claim"),

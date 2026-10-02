@@ -37,6 +37,9 @@ SITE_KINDS = {
     66: 2, 67: 3, 68: 3, 69: 3, 70: 1, 71: 1, 72: 3,
     73: 3, 74: 3, 75: 3, 76: 3,
 }
+NOT_ELIGIBLE_SITES = {
+    5, 6, 44, 50, 54, 57, 58, 59, 65,
+}
 TERMINAL_VERDICTS = {
     1: 2, 5: 10, 6: 2, 22: 18, 23: 2, 24: 2, 25: 16, 26: 15,
     43: 7, 48: 2, 49: 2, 50: 6, 51: 2, 52: 3, 53: 4, 54: 5,
@@ -271,8 +274,8 @@ def validate_trace(data, expected_log=None, expected_build_stamp=None):
                 raise TraceError(event_label + " Claimed outcome requires a Claim site")
             if outcome == 4 and site_kind != 3:
                 raise TraceError(event_label + " Exited outcome requires an Exit site")
-            if outcome == 5 and site_kind != 2:
-                raise TraceError(event_label + " NotEligible outcome requires a Claim site")
+            if outcome == 5 and site_id not in NOT_ELIGIBLE_SITES:
+                raise TraceError(event_label + " NotEligible outcome is not allowed for this site")
             if outcome in (3, 4):
                 if flow != 1:
                     raise TraceError(event_label + " terminal outcome must stop the ladder")
@@ -601,6 +604,40 @@ def self_test():
     except Exception as exc:
         print("draw-ladder VR trace fixture rejected: %s" % exc)
         return 1
+
+    gated_observers = json.loads(json.dumps(vr))
+    gated_draw = gated_observers["draws"][0]
+    gated_draw["sites"] = []
+    gated_sites = COMMON + EYE[:EYE.index(67) + 1]
+    for site_id in gated_sites:
+        kind = SITE_KINDS[site_id]
+        outcome = 5 if site_id in NOT_ELIGIBLE_SITES else (1 if kind == 1 else 2)
+        flow = 1 if site_id == 67 else 0
+        verdict = 0 if site_id == 67 else -1
+        if site_id == 67:
+            outcome = 4
+        gated_draw["sites"].append({
+            "id": site_id, "kind": kind, "outcome": outcome,
+            "flow": flow, "subsite": 0, "verdict": verdict,
+        })
+    gated_draw["winnerSiteId"] = 67
+    gated_draw["verdict"] = 0
+    gated_draw["forwardFacts"] = None
+    try:
+        summary = validate_trace(gated_observers)
+        if summary["inferredUnvisitedSiteCount"] != len(COMMON + EYE) - len(gated_sites):
+            raise TraceError("gated observer trace suffix was inferred incorrectly")
+    except Exception as exc:
+        print("draw-ladder typed NotEligible observer fixture rejected: %s" % exc)
+        return 1
+    mandatory_observer_gated = json.loads(json.dumps(gated_observers))
+    mandatory_observer_gated["draws"][0]["sites"][9]["outcome"] = 5
+    try:
+        validate_trace(mandatory_observer_gated)
+        print("draw-ladder reader accepted NotEligible for a mandatory observer")
+        return 1
+    except TraceError:
+        pass
 
     generated = json.loads(json.dumps(vr))
     generated_action = {

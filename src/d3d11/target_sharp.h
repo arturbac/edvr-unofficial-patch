@@ -44,6 +44,8 @@
 // down for the session and lets the game draw its own shader.
 #pragma once
 
+#include "draw_interest.h"
+
 #include <cstdint>
 
 struct ID3D11DeviceContext;
@@ -55,6 +57,9 @@ class Config;
 // Reads experimental.target_indicator (stock | sharp) and the shader pin
 // advanced.target_indicator_vs. Install and reload; live.
 void targetSharpConfigure(Config& cfg);
+bool targetSharpDrawInterestConfigured() noexcept;
+std::size_t targetSharpDrawInterestFilters(draw_interest::ShaderFilter* out,
+                                           std::size_t capacity) noexcept;
 
 // False in stock mode and once stood down, which keeps the draw path free.
 //

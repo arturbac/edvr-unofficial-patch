@@ -405,6 +405,20 @@ void targetSharpConfigure(Config& cfg) {
     }
 }
 
+bool targetSharpDrawInterestConfigured() noexcept {
+    return detail::g_targetSharpSharp;
+}
+
+std::size_t targetSharpDrawInterestFilters(draw_interest::ShaderFilter* out,
+                                           std::size_t capacity) noexcept {
+    if (!detail::g_targetSharpSharp) return 0;
+    if (out && capacity) {
+        out[0] = {draw_interest::InterestId::TargetSharp,
+                  draw_interest::HashFilter::Vertex, g_vsHash, 0};
+    }
+    return 1;
+}
+
 bool targetSharpOnEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                           uint32_t instances) {
     if (!targetSharpWantsDraws()) return false;

@@ -51,6 +51,8 @@
 // hash.
 #pragma once
 
+#include "draw_interest.h"
+
 #include <cstdint>
 
 struct ID3D11DeviceContext;
@@ -60,6 +62,9 @@ namespace edvr {
 class Config;
 
 void fssRevealConfigure(Config& cfg);
+bool fssRevealDrawInterestConfigured() noexcept;
+std::size_t fssRevealDrawInterestFilters(draw_interest::ShaderFilter* out,
+                                        std::size_t capacity) noexcept;
 
 // One bool for the draw path's early-out set and the body-frame gate.
 //

@@ -610,6 +610,21 @@ void fssDumpConfigure(Config& cfg) {
     }
 }
 
+bool fssDumpDrawInterestConfigured() noexcept {
+    return detail::g_fssDumpFrame != 0 || detail::g_fssDumpSeriesWant != 0;
+}
+
+std::size_t fssDumpDrawInterestFilters(draw_interest::ShaderFilter* out,
+                                      std::size_t capacity) noexcept {
+    if (!fssDumpDrawInterestConfigured()) return 0;
+    constexpr uint64_t hashes[] = {kRingQuadHash, kCompositeHash, kTonemapHash};
+    for (std::size_t i = 0; out && i < 3 && i < capacity; ++i) {
+        out[i] = {draw_interest::InterestId::FssDump,
+                  draw_interest::HashFilter::Vertex, hashes[i], 0};
+    }
+    return 3;
+}
+
 bool fssDumpOnEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                       uint32_t instances) {
     if (!fssDumpWantsDraws() || !ctx) return false;

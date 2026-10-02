@@ -33,6 +33,8 @@
 // that window.
 #pragma once
 
+#include "draw_interest.h"
+
 #include <cstdint>
 
 struct ID3D11DeviceContext;
@@ -44,6 +46,9 @@ class Config;
 // fix.fss_panel_distance, resolved against fix.panel_distance. Install and
 // reload paths; live.
 void fssPanelConfigure(Config& cfg);
+bool fssPanelDrawInterestConfigured() noexcept;
+std::size_t fssPanelDrawInterestFilters(draw_interest::ShaderFilter* out,
+                                       std::size_t capacity) noexcept;
 
 // One bool for the draw path's early-out set.
 //

@@ -8,10 +8,14 @@
 
 namespace edvr {
 namespace detail { std::atomic<uint64_t> g_pluginShaderCandidates{0}; }
+namespace detail {
+std::atomic<draw_interest::InterestMask> g_legacyDrawInterestMask{0};
+}
 namespace {
 constexpr uint32_t kMaxPlugins = plugins::kPluginCount;
 constexpr uint32_t kMaxLegacySubscribers = 64;
 constexpr uint32_t kMaxShaderClaims = 64;
+constexpr size_t kMaxLegacyShaderFilters = 32;
 static_assert(plugins::kPluginCount == plugins::kPluginIndexCount,
               "plugin manifest count and index enum must agree");
 
@@ -38,8 +42,20 @@ uint64_t g_psHash = 0;
 constexpr char kNightVisionClaimId[] = "night-vision";
 plugins::dispatch::ShaderClaimKey g_shaderClaims[kMaxShaderClaims]{};
 uint32_t g_shaderClaimCount = 0;
+draw_interest::InterestMask g_configuredLegacyInterests = 0;
+draw_interest::ShaderFilter g_legacyShaderFilters[kMaxLegacyShaderFilters]{};
+size_t g_legacyShaderFilterCount = 0;
 
 void rebuildCandidates();
+
+bool legacyInterestNeedsShaderObserver() {
+    for (size_t i = 0; i < g_legacyShaderFilterCount; ++i) {
+        if (draw_interest::contains(g_configuredLegacyInterests,
+                                    g_legacyShaderFilters[i].id))
+            return true;
+    }
+    return false;
+}
 
 void observeCanonicalShaderPair() {
     pluginRegistryOnShaderBind(bindingShaderHash(BindSlot::Vs),
@@ -47,7 +63,8 @@ void observeCanonicalShaderPair() {
 }
 
 void updateBindingObserver() {
-    const bool wantsObservation = g_pluginsConfigured && g_activePluginMask != 0;
+    const bool wantsObservation = g_pluginsConfigured &&
+        (g_activePluginMask != 0 || legacyInterestNeedsShaderObserver());
     bindingShadowSetShaderObserver(wantsObservation ? observeCanonicalShaderPair : nullptr);
     if (wantsObservation) {
         // Configuration can change while setters are quiet. Seed from the
@@ -59,6 +76,10 @@ void updateBindingObserver() {
     } else {
         g_vsHash = g_psHash = 0;
         detail::g_pluginShaderCandidates.store(0, std::memory_order_relaxed);
+        detail::g_legacyDrawInterestMask.store(
+            draw_interest::buildCandidateMask(g_configuredLegacyInterests, 0, 0,
+                g_legacyShaderFilters, g_legacyShaderFilterCount),
+            std::memory_order_relaxed);
     }
 }
 
@@ -83,6 +104,10 @@ void rebuildCandidates() {
         g_vsHash, g_psHash, g_activePluginMask, g_shaderClaims,
         g_shaderClaimCount);
     detail::g_pluginShaderCandidates.store(candidates, std::memory_order_relaxed);
+    detail::g_legacyDrawInterestMask.store(
+        draw_interest::buildCandidateMask(g_configuredLegacyInterests, g_vsHash,
+            g_psHash, g_legacyShaderFilters, g_legacyShaderFilterCount),
+        std::memory_order_relaxed);
     if (!g_notedShaderCandidate &&
         !(before & pluginBit(plugins::kPluginCockpitVisuals)) &&
         (candidates & pluginBit(plugins::kPluginCockpitVisuals))) {
@@ -226,6 +251,10 @@ void pluginRegistryShutdown() {
     g_pluginsConfigured = false;
     g_vsHash = g_psHash = 0;
     detail::g_pluginShaderCandidates.store(0, std::memory_order_relaxed);
+    g_configuredLegacyInterests = 0;
+    g_legacyShaderFilterCount = 0;
+    std::memset(g_legacyShaderFilters, 0, sizeof(g_legacyShaderFilters));
+    detail::g_legacyDrawInterestMask.store(0, std::memory_order_relaxed);
 }
 
 void pluginRegistryOnShaderBind(uint64_t vsHash, uint64_t psHash) {
@@ -235,7 +264,41 @@ void pluginRegistryOnShaderBind(uint64_t vsHash, uint64_t psHash) {
     rebuildCandidates();
 }
 
-void pluginRegistryRefreshShaderCandidates() { rebuildCandidates(); }
+void pluginRegistryRefreshShaderCandidates() {
+    rebuildActivePluginMask();
+    updateBindingObserver();
+}
+
+bool pluginRegistryConfigureDrawInterests(
+    draw_interest::InterestMask configuredMask,
+    const draw_interest::ShaderFilter* filters, size_t filterCount) noexcept {
+    constexpr draw_interest::InterestMask kValidInterestBits =
+        (draw_interest::InterestMask{1} << draw_interest::kInterestCount) - 1;
+    bool accepted = true;
+    if ((configuredMask & ~kValidInterestBits) != 0 ||
+        filterCount > kMaxLegacyShaderFilters || (filterCount != 0 && !filters)) {
+        // Malformed metadata must fail open to the legacy predicates: preserve
+        // configured interest but disable only the optimization filters.
+        accepted = false;
+        filterCount = 0;
+        filters = nullptr;
+        configuredMask &= kValidInterestBits;
+    }
+    if (!runtimeVrProfile()) {
+        configuredMask = 0;
+        filterCount = 0;
+    }
+
+    g_configuredLegacyInterests = configuredMask;
+    g_legacyShaderFilterCount = filterCount;
+    if (filterCount) std::memcpy(g_legacyShaderFilters, filters,
+                                 filterCount * sizeof(g_legacyShaderFilters[0]));
+    if (filterCount < kMaxLegacyShaderFilters)
+        std::memset(g_legacyShaderFilters + filterCount, 0,
+                    (kMaxLegacyShaderFilters - filterCount) * sizeof(g_legacyShaderFilters[0]));
+    updateBindingObserver();
+    return accepted;
+}
 
 void pluginRegistryReportActivity() {
     if (g_pendingShaderCandidateReport) {

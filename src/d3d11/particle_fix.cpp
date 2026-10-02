@@ -720,6 +720,36 @@ void particleConfigure(Config& cfg) {
     }
 }
 
+bool particleSubstituteDrawInterestConfigured() noexcept {
+    return detail::g_particleMode == Mode::kSteady;
+}
+
+std::size_t particleSubstituteDrawInterestFilters(
+    draw_interest::ShaderFilter* out, std::size_t capacity) noexcept {
+    if (!particleSubstituteDrawInterestConfigured()) return 0;
+    constexpr uint64_t hashes[] = {detail::kParticleVariantVs[0],
+                                   detail::kParticleVariantVs[1]};
+    for (std::size_t i = 0; out && i < 2 && i < capacity; ++i) {
+        out[i] = {draw_interest::InterestId::ParticleSubstitute,
+                  draw_interest::HashFilter::Vertex, hashes[i], 0};
+    }
+    return 2;
+}
+
+bool witchspaceStarsDrawInterestConfigured() noexcept {
+    return g_hideWitchspaceStars;
+}
+
+std::size_t witchspaceStarsDrawInterestFilters(
+    draw_interest::ShaderFilter* out, std::size_t capacity) noexcept {
+    if (!g_hideWitchspaceStars) return 0;
+    if (out && capacity) {
+        out[0] = {draw_interest::InterestId::WitchspaceStars,
+                  draw_interest::HashFilter::Vertex, kWitchspaceStarsVs, 0};
+    }
+    return 1;
+}
+
 bool particleWantsDraws() {
     return g_probe || detail::g_particleMode == Mode::kSteady;
 }

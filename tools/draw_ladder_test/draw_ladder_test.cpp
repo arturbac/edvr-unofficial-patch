@@ -4,11 +4,14 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <windows.h>
 #include <vector>
 
 namespace ladder = edvr::draw_ladder;
+namespace draw_interest = edvr::draw_interest;
 
 struct SiteEvent final {
     ladder::SiteId id;
@@ -61,11 +64,14 @@ struct Scenario final {
 struct ModelVisitor final {
     Scenario scenario;
     std::vector<ladder::SiteId> visited;
+    std::array<unsigned, 128> handlerCalls{};
     unsigned handlers = 0;
 
     template <class SiteType>
     ladder::SiteResult visit() {
         ++handlers;
+        const auto index = static_cast<std::uint16_t>(SiteType::id);
+        if (index < handlerCalls.size()) ++handlerCalls[index];
         visited.push_back(SiteType::id);
         return handle(SiteType::id, SiteType::kind);
     }
@@ -97,22 +103,231 @@ struct ModelVisitor final {
 struct CandidateInterest final {
     bool pluginDispatchEnabled = true;
     bool candidate = true;
-    unsigned queries = 0;
+    draw_interest::InterestMask publishedInterests =
+        (draw_interest::InterestMask{1} << draw_interest::kInterestCount) - 1;
+    draw_interest::InterestMask cachedInterests = 0;
+    bool legacyMaskLoaded = false;
+    unsigned legacyQueries = 0;
+    unsigned legacyMaskLoads = 0;
+    unsigned candidateQueries = 0;
     unsigned candidateLoads = 0;
 
     template <class SiteType>
     bool eligible() noexcept {
-        ++queries;
-        if (!pluginDispatchEnabled) return false;
-        ++candidateLoads;
-        return candidate;
+        if constexpr (SiteType::shaderCandidateGated) {
+            ++candidateQueries;
+            if (!pluginDispatchEnabled) return false;
+            ++candidateLoads;
+            return candidate;
+        } else {
+            ++legacyQueries;
+            if (!legacyMaskLoaded) {
+                cachedInterests = publishedInterests;
+                legacyMaskLoaded = true;
+                ++legacyMaskLoads;
+            }
+            return draw_interest::contains(cachedInterests, SiteType::interestId);
+        }
     }
 };
+
+bool check(bool condition, const char* label);
 
 template <class... Sites, class TracePolicy>
 ladder::Flow runSequence(ladder::Sequence<Sites...> sequence, ModelVisitor& visitor,
                          CandidateInterest& interest, TracePolicy& trace) {
     return ladder::visitOrdered(sequence, visitor, interest, trace);
+}
+
+std::size_t traceSiteIndex(const TraceCapture& trace, ladder::SiteId id) {
+    for (std::size_t i = 0; i < trace.sites.size(); ++i)
+        if (trace.sites[i].id == id) return i;
+    return trace.sites.size();
+}
+
+bool typedInterestChecks() {
+    struct GateCase final {
+        ladder::SiteId site;
+        draw_interest::InterestId interest;
+        ladder::SiteKind kind;
+    };
+    constexpr GateCase cases[] = {
+        {ladder::SiteId::kParticleSubstitute, draw_interest::InterestId::ParticleSubstitute,
+         ladder::SiteKind::Claim},
+        {ladder::SiteId::kWitchspaceStarsSkip, draw_interest::InterestId::WitchspaceStars,
+         ladder::SiteKind::Claim},
+        {ladder::SiteId::kTargetSharpClaim, draw_interest::InterestId::TargetSharp,
+         ladder::SiteKind::Claim},
+        {ladder::SiteId::kFssPanelClaim, draw_interest::InterestId::FssPanel,
+         ladder::SiteKind::Claim},
+        {ladder::SiteId::kFssRevealClaim, draw_interest::InterestId::FssReveal,
+         ladder::SiteKind::Claim},
+        {ladder::SiteId::kFssDumpClaim, draw_interest::InterestId::FssDump,
+         ladder::SiteKind::Claim},
+        {ladder::SiteId::kIntroCurveObserve, draw_interest::InterestId::IntroCurveObserve,
+         ladder::SiteKind::Observe},
+        {ladder::SiteId::kPanelCurveObserve, draw_interest::InterestId::PanelCurveObserve,
+         ladder::SiteKind::Observe},
+    };
+    bool ok = true;
+    for (const GateCase& gate : cases) {
+        Scenario scenario;
+        scenario.route = ladder::RouteId::kVrEye;
+        scenario.verdict = static_cast<std::int16_t>(ladder::VerdictOrdinal::kHolo);
+        if (gate.kind == ladder::SiteKind::Claim) scenario.claimAt = gate.site;
+        else scenario.exitAt = ladder::SiteId::kEyeNoDistanceNone;
+
+        ModelVisitor visitor{scenario};
+        CandidateInterest interest;
+        interest.publishedInterests = draw_interest::bit(gate.interest);
+        TraceCapture trace;
+        ladder::Flow flow = runSequence(ladder::CommonSequence{}, visitor, interest, trace);
+        if (flow == ladder::Flow::Continue)
+            flow = runSequence(ladder::VrEyeSequence{}, visitor, interest, trace);
+
+        const std::size_t gateIndex = traceSiteIndex(trace, gate.site);
+        const bool reachesExpectedTerminal = gate.kind == ladder::SiteKind::Claim
+            ? flow == ladder::Flow::Stop && visitor.visited.back() == gate.site
+            : flow == ladder::Flow::Stop &&
+                  visitor.visited.back() == ladder::SiteId::kEyeNoDistanceNone;
+        ok &= check(reachesExpectedTerminal && visitor.handlerCalls[static_cast<std::uint16_t>(gate.site)] == 1,
+                    "enabled typed interest reaches its actual shared-selector handler once");
+        ok &= check(gateIndex < trace.sites.size() && trace.sites[gateIndex].kind == gate.kind &&
+                    trace.sites[gateIndex].result.outcome ==
+                        (gate.kind == ladder::SiteKind::Claim ? ladder::SiteOutcome::Claimed
+                                                              : ladder::SiteOutcome::Observed),
+                    "enabled typed interest traces the stable site kind and outcome");
+        ok &= check(interest.legacyMaskLoads == 1,
+                    "multiple typed gates share one lazy per-draw interest snapshot");
+        unsigned reachedInterestSites = 0;
+        for (const SiteEvent& event : trace.sites) {
+            for (const GateCase& candidate : cases) {
+                if (event.id == candidate.site) ++reachedInterestSites;
+            }
+        }
+        ok &= check(interest.legacyQueries == reachedInterestSites,
+                    "each reached optional site performs exactly one cached-bit check");
+        ok &= check(visitor.handlerCalls[static_cast<std::uint16_t>(ladder::SiteId::kParticleProbe)] == 1,
+                    "mandatory particle observation still runs when its substitute is not selected");
+        if (gate.site != ladder::SiteId::kParticleSubstitute &&
+            gate.site != ladder::SiteId::kWitchspaceStarsSkip) {
+            const std::size_t particleProbe = traceSiteIndex(trace, ladder::SiteId::kParticleProbe);
+            const std::size_t stateSnapshot = traceSiteIndex(trace, ladder::SiteId::kStateSnapshot);
+            const std::size_t routeSelected = traceSiteIndex(trace, ladder::SiteId::kRouteSelected);
+            const std::size_t eyeDepth = traceSiteIndex(trace, ladder::SiteId::kEyeDepthAndCount);
+            const std::size_t eyeUiDepth = traceSiteIndex(trace, ladder::SiteId::kEyeUiDepthProbe);
+            const std::size_t eyeHoloDepth = traceSiteIndex(trace, ladder::SiteId::kEyeHoloDepthProbe);
+            ok &= check(particleProbe < stateSnapshot && stateSnapshot < routeSelected &&
+                        routeSelected < eyeDepth && eyeDepth < eyeUiDepth &&
+                        eyeUiDepth < eyeHoloDepth && eyeHoloDepth < gateIndex,
+                        "mandatory common and eye observations preserve order around optional sites");
+        }
+        const std::size_t introPanel = traceSiteIndex(trace, ladder::SiteId::kIntroPanelClaim);
+        const std::size_t introCurve = traceSiteIndex(trace, ladder::SiteId::kIntroCurveObserve);
+        const std::size_t sunglare = traceSiteIndex(trace, ladder::SiteId::kSunglareNomination);
+        const std::size_t census = traceSiteIndex(trace, ladder::SiteId::kEyeCensusSubmitted);
+        const std::size_t crisp = traceSiteIndex(trace, ladder::SiteId::kUiCrispProbe);
+        const std::size_t object = traceSiteIndex(trace, ladder::SiteId::kObjectProbe);
+        if (gate.site != ladder::SiteId::kParticleSubstitute &&
+            gate.site != ladder::SiteId::kWitchspaceStarsSkip) {
+            bool censusOrder = introPanel < introCurve;
+            if (gate.site == ladder::SiteId::kIntroCurveObserve) {
+                censusOrder &= introCurve == gateIndex && gateIndex < sunglare &&
+                               sunglare < census && census < crisp && crisp < object;
+            } else {
+                censusOrder &= introCurve < sunglare && sunglare < census &&
+                               census < crisp && crisp < object && object < gateIndex;
+            }
+            ok &= check(censusOrder,
+                        "mandatory census and quality observers retain their canonical order");
+        }
+
+        bool inactiveHandlersSkipped = true;
+        for (const GateCase& other : cases) {
+            if (other.site == gate.site) continue;
+            const unsigned calls = visitor.handlerCalls[static_cast<std::uint16_t>(other.site)];
+            if (calls != 0) inactiveHandlersSkipped = false;
+            const std::size_t otherIndex = traceSiteIndex(trace, other.site);
+            if (otherIndex < trace.sites.size()) {
+                ok &= check(trace.sites[otherIndex].result.outcome == ladder::SiteOutcome::NotEligible &&
+                            trace.sites[otherIndex].kind == other.kind &&
+                            trace.sites[otherIndex].result.flow == ladder::Flow::Continue,
+                            "reached inactive site is trace-only and retains its stable kind");
+            }
+        }
+        ok &= check(inactiveHandlersSkipped,
+                    "inactive optional-site handlers are not executed");
+
+        bool foundNotEligible = false;
+        for (const auto& event : trace.sites) {
+            if (event.id == gate.site) continue;
+            for (const GateCase& other : cases) {
+                if (event.id == other.site && event.result.outcome == ladder::SiteOutcome::NotEligible) {
+                    foundNotEligible = true;
+                    ok &= check(event.kind == other.kind && event.result.flow == ladder::Flow::Continue,
+                                "inactive trace event preserves typed kind and nonterminal flow");
+                }
+            }
+        }
+        // At least the earlier common optional sites are always reached before
+        // every later gate; the selected key itself is eligible, never NotEligible.
+        if (gate.site != ladder::SiteId::kParticleSubstitute)
+            ok &= check(foundNotEligible, "disabled reached interest emits a trace-only NotEligible event");
+    }
+
+    // Refresh the published mask between otherwise identical selector runs.
+    // This models the per-draw snapshot boundary; registry tests separately pin
+    // configure-time reseeding against an unchanged shader shadow.
+    Scenario toggle;
+    toggle.route = ladder::RouteId::kVrEye;
+    toggle.claimAt = ladder::SiteId::kTargetSharpClaim;
+    ModelVisitor disabledVisitor{toggle};
+    CandidateInterest disabled;
+    disabled.publishedInterests = 0;
+    TraceCapture disabledTrace;
+    (void)runSequence(ladder::CommonSequence{}, disabledVisitor, disabled, disabledTrace);
+    (void)runSequence(ladder::VrEyeSequence{}, disabledVisitor, disabled, disabledTrace);
+    ok &= check(disabledVisitor.handlerCalls[static_cast<std::uint16_t>(toggle.claimAt)] == 0,
+                "published-off snapshot suppresses target-sharp predicate");
+
+    ModelVisitor enabledVisitor{toggle};
+    CandidateInterest enabled;
+    enabled.publishedInterests = draw_interest::bit(draw_interest::InterestId::TargetSharp);
+    TraceCapture enabledTrace;
+    (void)runSequence(ladder::CommonSequence{}, enabledVisitor, enabled, enabledTrace);
+    const auto enabledFlow = runSequence(ladder::VrEyeSequence{}, enabledVisitor, enabled,
+                                         enabledTrace);
+    ok &= check(enabledFlow == ladder::Flow::Stop &&
+                enabledVisitor.handlerCalls[static_cast<std::uint16_t>(toggle.claimAt)] == 1,
+                "refreshed published snapshot enables the same selector site without changing ladder inputs");
+    ok &= check(traceSiteIndex(disabledTrace, toggle.claimAt) < disabledTrace.sites.size() &&
+                disabledTrace.sites[traceSiteIndex(disabledTrace, toggle.claimAt)].result.outcome ==
+                    ladder::SiteOutcome::NotEligible &&
+                enabledTrace.sites[traceSiteIndex(enabledTrace, toggle.claimAt)].result.outcome ==
+                    ladder::SiteOutcome::Claimed,
+                "interest refresh changes the typed trace outcome at the same site");
+
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        const bool gateOff = mode != 0;
+        Scenario earlyExit;
+        earlyExit.foreignOwner = !gateOff;
+        earlyExit.drawGateOff = gateOff;
+        ModelVisitor earlyVisitor{earlyExit};
+        CandidateInterest earlyInterest;
+        earlyInterest.publishedInterests = 0;
+        TraceCapture earlyTrace;
+        const auto earlyFlow = runSequence(ladder::CommonSequence{}, earlyVisitor,
+                                           earlyInterest, earlyTrace);
+        const ladder::SiteId terminal = gateOff ? ladder::SiteId::kDrawGateDisabledNone
+                                                 : ladder::SiteId::kForeignContextNone;
+        ok &= check(earlyFlow == ladder::Flow::Stop && earlyVisitor.visited.back() == terminal &&
+                    earlyInterest.legacyMaskLoads == 0 && earlyInterest.legacyQueries == 0 &&
+                    earlyInterest.candidateQueries == 0 && earlyInterest.candidateLoads == 0 &&
+                    earlyVisitor.handlerCalls[static_cast<std::uint16_t>(
+                        ladder::SiteId::kParticleSubstitute)] == 0,
+                    "terminal common exits precede every interest and candidate query");
+    }
+    return ok;
 }
 
 // Frozen ordered reference for the branch/site identities before the shared
@@ -242,6 +457,61 @@ bool check(bool condition, const char* label) {
     return false;
 }
 
+bool interestMaskChecks() {
+    using namespace draw_interest;
+    constexpr auto target = InterestId::TargetSharp;
+    constexpr auto witchspace = InterestId::WitchspaceStars;
+    constexpr auto fssPanel = InterestId::FssPanel;
+    static_assert(static_cast<std::uint8_t>(InterestId::TargetSharp) == 0);
+    static_assert(static_cast<std::uint8_t>(InterestId::PanelCurveObserve) == 7);
+    static_assert(bit(InterestId::Count) == 0);
+
+    const InterestMask configured = bit(target) | bit(witchspace) | bit(fssPanel);
+    const ShaderFilter filters[] = {
+        {target, HashFilter::Pair, 0x1111, 0x2222},
+        {target, HashFilter::Pair, 0x3333, 0x4444},
+        {witchspace, HashFilter::Vertex, 0x5555, 0},
+    };
+    bool ok = true;
+    ok &= check(buildCandidateMask(0, 0x1111, 0x2222, filters, 3) == 0,
+                "configuration-off clears shader-filtered interest");
+    ok &= check(buildCandidateMask(configured, 0x1111, 0x2222, nullptr, 0) == configured,
+                "configured interests without filter rows remain eligible");
+    ok &= check(buildCandidateMask(configured, 0x1111, 0x2222, filters, 3) ==
+                    (bit(target) | bit(fssPanel)),
+                "matching variants and unfiltered configured interests are retained");
+    ok &= check(buildCandidateMask(configured, 0x3333, 0x4444, filters, 3) ==
+                    (bit(target) | bit(fssPanel)),
+                "shader variants are combined as an any-match set");
+    ok &= check(buildCandidateMask(configured, 0x9999, 0x8888, filters, 3) == bit(fssPanel),
+                "known mismatch suppresses only interests with complete filter coverage");
+    ok &= check(buildCandidateMask(configured, 0, 0x8888, filters, 3) == configured,
+                "unknown observed vertex hash conservatively retains configured interests");
+    ok &= check(buildCandidateMask(configured, 0x5555, 0, filters, 3) == configured,
+                "unknown observed pixel hash conservatively retains configured interests");
+    ok &= check(!contains(bit(target), witchspace) && contains(bit(target), target),
+                "typed mask membership does not alias adjacent interests");
+    return ok;
+}
+
+bool productionRouteOrderCheck() {
+    std::ifstream input("src/d3d11/vscreen.cpp");
+    if (!input) return check(false, "read production draw-ladder route source");
+    const std::string source((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+    const std::size_t function = source.find("LadderDecision beginPanelOverride");
+    const std::size_t common = source.find(
+        "visitOrdered(draw_ladder::CommonSequence{}", function);
+    const std::size_t offscreen = source.find(
+        "visitOrdered(draw_ladder::OffscreenSequence{}", common);
+    const std::size_t eye = source.find(
+        "visitOrdered(draw_ladder::EyeSequence{}", offscreen);
+    return check(function != std::string::npos && common != std::string::npos &&
+                 offscreen != std::string::npos && eye != std::string::npos &&
+                 function < common && common < offscreen && offscreen < eye,
+                 "production executes Common before the mutually-exclusive Offscreen/Eye route ladders");
+}
+
 template <class SequenceType>
 bool bypassRouteChecks(ladder::RouteId route, ladder::SiteId site,
                        SequenceType sequence, const char* label) {
@@ -254,7 +524,8 @@ bool bypassRouteChecks(ladder::RouteId route, ladder::SiteId site,
     TraceCapture trace;
     const auto flow = runSequence(sequence, visitor, interest, trace);
     return check(flow == ladder::Flow::Stop && visitor.visited.size() == 1 &&
-                 visitor.visited[0] == site && interest.queries == 0 &&
+                 visitor.visited[0] == site && interest.legacyQueries == 0 &&
+                 interest.legacyMaskLoads == 0 && interest.candidateQueries == 0 &&
                  interest.candidateLoads == 0 && trace.sites.size() == 1 &&
                  trace.sites[0].result.outcome == ladder::SiteOutcome::Exited &&
                  trace.sites[0].result.verdict ==
@@ -528,7 +799,8 @@ bool writeTerminalCase(ladder::RouteId route, ladder::SequenceId sequence,
         : frozenWalkRanges(scenario, referenceTail, referenceTailCount, nullptr, 0);
     const bool correct = flow == ladder::Flow::Stop && same(visitor.visited, expected) &&
         !visitor.visited.empty() && visitor.visited.back() == terminal &&
-        policy.token.valid() && interest.queries <= 1 && interest.candidateLoads <= 1;
+        policy.token.valid() && interest.legacyMaskLoads <= 1 &&
+        interest.candidateQueries <= 1 && interest.candidateLoads <= 1;
     if (route == ladder::RouteId::kFlatRuntimeBypass) {
         if (kind == 'A') {
             appendTestIssue<ladder::ActionId::kAutoDraw>(policy,
@@ -664,8 +936,8 @@ bool traceWriterChecks(const char* rootArg) {
     CandidateInterest interest;
     const auto selectorFlow = ladder::visitOrdered(ladder::FlatRuntimeBypassSequence{},
                                                    writer, interest, policy);
-    ok &= check(selectorFlow == ladder::Flow::Stop && interest.queries == 0 &&
-                interest.candidateLoads == 0,
+    ok &= check(selectorFlow == ladder::Flow::Stop && interest.legacyMaskLoads == 0 &&
+                interest.candidateQueries == 0 && interest.candidateLoads == 0,
                 "real writer records selector-driven flat bypass without VR interest reads");
     ladder::recordAction<trace::TracePolicy, ladder::ActionId::kOriginalDraw>(policy, [&] {
         ladder::ActionRecord action;
@@ -713,6 +985,9 @@ bool traceWriterChecks(const char* rootArg) {
     vrNoDistance.exitAt = ladder::SiteId::kEyeNoDistanceNone;
     ModelVisitor vrVisitor{vrNoDistance};
     CandidateInterest vrInterest;
+    // Exercise the writer/reader contract for reached optional observation
+    // sites: they remain ordered trace events but their predicates stay cold.
+    vrInterest.publishedInterests = 0;
     const auto commonFlow = ladder::visitOrdered(ladder::CommonSequence{}, vrVisitor,
                                                   vrInterest, vrPolicy);
     const auto eyeFlow = commonFlow == ladder::Flow::Continue
@@ -721,6 +996,12 @@ bool traceWriterChecks(const char* rootArg) {
     ok &= check(eyeFlow == ladder::Flow::Stop &&
                 vrVisitor.visited.back() == ladder::SiteId::kEyeNoDistanceNone,
                 "real VR selector reaches a distinct no-distance exit");
+    ok &= check(vrInterest.legacyMaskLoads == 1 &&
+                vrVisitor.handlerCalls[static_cast<std::uint16_t>(
+                    ladder::SiteId::kIntroCurveObserve)] == 0 &&
+                vrVisitor.handlerCalls[static_cast<std::uint16_t>(
+                    ladder::SiteId::kPanelCurveObserve)] == 0,
+                "real writer fixture records masked observers without running their handlers");
     ladder::recordAction<trace::TracePolicy, ladder::ActionId::kDrawEnd>(vrPolicy, [] {
         ladder::ActionRecord action;
         action.phase = ladder::ActionPhase::End;
@@ -1038,6 +1319,9 @@ bool traceWriterChecks(const char* rootArg) {
 
 int selfTest(const char* traceDir) {
     bool ok = true;
+    ok &= interestMaskChecks();
+    ok &= typedInterestChecks();
+    ok &= productionRouteOrderCheck();
     static_assert(ladder::CommonSequence::size == sizeof(kFrozenCommon) / sizeof(kFrozenCommon[0]));
     static_assert(ladder::OffscreenSequence::size == sizeof(kFrozenOffscreen) / sizeof(kFrozenOffscreen[0]));
     static_assert(ladder::EyeSequence::size == sizeof(kFrozenEye) / sizeof(kFrozenEye[0]));
@@ -1156,7 +1440,8 @@ static_assert(static_cast<std::int16_t>(ladder::VerdictOrdinal::kScrim) == 17);
     ok &= check(flatVisitor.visited.size() == 1 &&
                 flatVisitor.visited[0] == ladder::SiteId::kFlatRuntimeBypass,
                 "flat route does not enter the VR classifier sequence");
-    ok &= check(flatInterest.queries == 0 && flatInterest.candidateLoads == 0,
+    ok &= check(flatInterest.legacyMaskLoads == 0 && flatInterest.candidateQueries == 0 &&
+                flatInterest.candidateLoads == 0,
                 "flat bypass performs no candidate eligibility or mask load");
     ok &= check(flatTrace.sites.size() == 1 &&
                 flatTrace.sites[0].result.outcome == ladder::SiteOutcome::Exited &&
@@ -1237,7 +1522,8 @@ static_assert(static_cast<std::int16_t>(ladder::VerdictOrdinal::kScrim) == 17);
     ok &= check(vrNightTrace.sites[7].result.subsite ==
                 static_cast<std::uint16_t>(ladder::RouteId::kVrEye),
                 "route site records VR route id");
-    ok &= check(vrNightInterest.queries == 1 && vrNightInterest.candidateLoads == 1,
+    ok &= check(vrNightInterest.legacyMaskLoads == 1 &&
+                vrNightInterest.candidateQueries == 1 && vrNightInterest.candidateLoads == 1,
                 "candidate eligibility is read once at its ordered rung");
 
     Scenario vrConflict;
@@ -1255,7 +1541,8 @@ static_assert(static_cast<std::int16_t>(ladder::VerdictOrdinal::kScrim) == 17);
                 "VR claim order matches frozen reference");
     ok &= check(vrVisitor.visited.back() == ladder::SiteId::kHoloClaim,
                 "claim conflict selects earliest matching rung");
-    ok &= check(vrInterest.queries == 1 && vrInterest.candidateLoads == 1,
+    ok &= check(vrInterest.legacyMaskLoads == 1 &&
+                vrInterest.candidateQueries == 1 && vrInterest.candidateLoads == 1,
                 "VR reaches the cached candidate gate only once");
 
     Scenario earlyClaim;
@@ -1269,8 +1556,10 @@ static_assert(static_cast<std::int16_t>(ladder::VerdictOrdinal::kScrim) == 17);
                 ladder::Flow::Continue, "early-claim route common prelude continues");
     ok &= check(runSequence(ladder::VrEyeSequence{}, earlyVisitor, earlyInterest, earlyTrace) ==
                 ladder::Flow::Stop, "early eye claim terminates ladder");
-    ok &= check(earlyInterest.queries == 0 && earlyInterest.candidateLoads == 0,
-                "earlier claim avoids the candidate eligibility query");
+    ok &= check(earlyInterest.legacyMaskLoads == 1 &&
+                earlyInterest.legacyQueries >= 1 &&
+                earlyInterest.candidateQueries == 0 && earlyInterest.candidateLoads == 0,
+                "intro claim follows the common-interest rung but avoids the later shader candidate query");
 
     Scenario profileOff;
     profileOff.claimAt = ladder::SiteId::kHoloClaim;
@@ -1283,8 +1572,9 @@ static_assert(static_cast<std::int16_t>(ladder::VerdictOrdinal::kScrim) == 17);
                 ladder::Flow::Continue, "profile-off route common prelude continues");
     ok &= check(runSequence(ladder::VrEyeSequence{}, profileVisitor, profileInterest, profileTrace) ==
                 ladder::Flow::Stop, "profile-off later legacy claim remains available");
-    ok &= check(profileInterest.queries == 1 && profileInterest.candidateLoads == 0,
-                "profile guard prevents candidate cache load");
+    ok &= check(profileInterest.legacyMaskLoads == 1 &&
+                profileInterest.candidateQueries == 1 && profileInterest.candidateLoads == 0,
+                "profile guard prevents candidate cache load while legacy mask loads once");
     bool foundNotEligible = false;
     for (const auto& event : profileTrace.sites) {
         if (event.id == ladder::SiteId::kNightVisionClaim) {
@@ -1388,9 +1678,12 @@ static_assert(static_cast<std::int16_t>(ladder::VerdictOrdinal::kScrim) == 17);
     ladder::NoTrace noTrace;
     (void)runSequence(ladder::CommonSequence{}, noTraceVisitor, noTraceInterest, noTrace);
     CandidateInterest noTraceEyeInterest;
+    noTraceEyeInterest.publishedInterests = 0;
     (void)runSequence(ladder::VrEyeSequence{}, noTraceVisitor, noTraceEyeInterest,
                       noTraceProbe);
-    ok &= check(noTraceProbe.callbacks == 0 && payloadBuilds == 0,
+    ok &= check(noTraceProbe.callbacks == 0 && payloadBuilds == 0 &&
+                noTraceVisitor.handlerCalls[static_cast<std::uint16_t>(ladder::SiteId::kIntroCurveObserve)] == 0 &&
+                noTraceVisitor.handlerCalls[static_cast<std::uint16_t>(ladder::SiteId::kPanelCurveObserve)] == 0,
                 "disabled trace erases per-rung callbacks and action payload construction");
 
     ok &= traceWriterChecks(traceDir);

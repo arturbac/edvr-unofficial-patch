@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <tuple>
 #include <type_traits>
+#include "draw_interest.h"
 
 // Stable identities for the ordered draw classifier. These are intentionally
 // independent of DrawVerdict: a verdict says what was selected, while a site
@@ -227,47 +229,30 @@ struct Site final {
     static constexpr SiteId id = Id;
     static constexpr SiteKind kind = Kind;
     static constexpr bool interestGated = false;
+    static constexpr bool shaderCandidateGated = false;
+};
+
+template <SiteId Id, SiteKind Kind, draw_interest::InterestId Interest>
+struct InterestGated final {
+    static constexpr SiteId id = Id;
+    static constexpr SiteKind kind = Kind;
+    static constexpr bool interestGated = true;
+    static constexpr bool shaderCandidateGated = false;
+    static constexpr draw_interest::InterestId interestId = Interest;
 };
 
 template <SiteId Id>
-struct InterestGatedClaim final {
+struct ShaderCandidateGatedClaim final {
     static constexpr SiteId id = Id;
     static constexpr SiteKind kind = SiteKind::Claim;
     static constexpr bool interestGated = true;
-};
-
-// Fixed mask provider for already-published eligibility bits and test cases.
-// Production may use a lazy typed provider when reading a candidate at its
-// ordered site is required to preserve earlier exits. Neither caches outcomes.
-struct InterestMask final {
-    std::uint64_t words[2]{};
-
-    static constexpr InterestMask all() noexcept {
-        return InterestMask{{~std::uint64_t{0}, ~std::uint64_t{0}}};
-    }
-
-    constexpr bool contains(SiteId id) const noexcept {
-        const auto value = static_cast<std::uint16_t>(id);
-        return value < 128 && (words[value / 64] & (std::uint64_t{1} << (value % 64))) != 0;
-    }
-
-    template <class SiteType>
-    constexpr bool eligible() const noexcept {
-        return contains(SiteType::id);
-    }
-
-    constexpr void set(SiteId id, bool enabled = true) noexcept {
-        const auto value = static_cast<std::uint16_t>(id);
-        if (value >= 128) return;
-        const std::uint64_t bit = std::uint64_t{1} << (value % 64);
-        if (enabled) words[value / 64] |= bit;
-        else words[value / 64] &= ~bit;
-    }
+    static constexpr bool shaderCandidateGated = true;
 };
 
 template <class... Sites>
 struct Sequence final {
     static constexpr std::uint16_t size = static_cast<std::uint16_t>(sizeof...(Sites));
+    using Types = std::tuple<Sites...>;
 };
 
 struct SiteResult final {
@@ -357,13 +342,18 @@ struct NoTrace final {
 
 // Canonical sequences shared by the production visitor and its focused rig.
 // Runtime route selection chooses one branch sequence after kCommonSequence.
+using FirstLegacyInterestSite =
+    InterestGated<SiteId::kParticleSubstitute, SiteKind::Claim,
+                  draw_interest::InterestId::ParticleSubstitute>;
+
 using CommonSequence = Sequence<
     Site<SiteId::kFssChromeSkip, SiteKind::Claim>,
     Site<SiteId::kForeignContextNone, SiteKind::Exit>,
     Site<SiteId::kDrawGateDisabledNone, SiteKind::Exit>,
     Site<SiteId::kParticleProbe, SiteKind::Observe>,
-    Site<SiteId::kParticleSubstitute, SiteKind::Claim>,
-    Site<SiteId::kWitchspaceStarsSkip, SiteKind::Claim>,
+    FirstLegacyInterestSite,
+    InterestGated<SiteId::kWitchspaceStarsSkip, SiteKind::Claim,
+                  draw_interest::InterestId::WitchspaceStars>,
     Site<SiteId::kStateSnapshot, SiteKind::Observe>,
     Site<SiteId::kRouteSelected, SiteKind::Observe>>;
 
@@ -384,29 +374,35 @@ using EyeSequence = Sequence<
     Site<SiteId::kEyeUiDepthProbe, SiteKind::Observe>,
     Site<SiteId::kEyeHoloDepthProbe, SiteKind::Observe>,
     Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,
-    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>,
+    InterestGated<SiteId::kIntroCurveObserve, SiteKind::Observe,
+                  draw_interest::InterestId::IntroCurveObserve>,
     Site<SiteId::kSunglareNomination, SiteKind::Observe>,
     Site<SiteId::kEyeCensusSubmitted, SiteKind::Observe>,
     Site<SiteId::kUiCrispProbe, SiteKind::Observe>,
     Site<SiteId::kObjectProbe, SiteKind::Observe>,
     Site<SiteId::kEyeCensusSkip, SiteKind::Claim>,
     Site<SiteId::kEyeRangeSkip, SiteKind::Claim>,
-    InterestGatedClaim<SiteId::kNightVisionClaim>,
+    ShaderCandidateGatedClaim<SiteId::kNightVisionClaim>,
     Site<SiteId::kRemlokHideSkip, SiteKind::Claim>,
     Site<SiteId::kRemlokScissorClaim, SiteKind::Claim>,
     Site<SiteId::kHoloClaim, SiteKind::Claim>,
-    Site<SiteId::kTargetSharpClaim, SiteKind::Claim>,
+    InterestGated<SiteId::kTargetSharpClaim, SiteKind::Claim,
+                  draw_interest::InterestId::TargetSharp>,
     Site<SiteId::kScrimClaim, SiteKind::Claim>,
     Site<SiteId::kEyeBackdropComposite, SiteKind::Claim>,
-    Site<SiteId::kFssPanelClaim, SiteKind::Claim>,
-    Site<SiteId::kFssRevealClaim, SiteKind::Claim>,
-    Site<SiteId::kFssDumpClaim, SiteKind::Claim>,
+    InterestGated<SiteId::kFssPanelClaim, SiteKind::Claim,
+                  draw_interest::InterestId::FssPanel>,
+    InterestGated<SiteId::kFssRevealClaim, SiteKind::Claim,
+                  draw_interest::InterestId::FssReveal>,
+    InterestGated<SiteId::kFssDumpClaim, SiteKind::Claim,
+                  draw_interest::InterestId::FssDump>,
     Site<SiteId::kResolveBindClaim, SiteKind::Claim>,
     Site<SiteId::kSunglareSkip, SiteKind::Claim>,
     Site<SiteId::kSunglareSteadyClaim, SiteKind::Claim>,
     Site<SiteId::kGlareClampClaim, SiteKind::Claim>,
     Site<SiteId::kHeadOffsetObserve, SiteKind::Observe>,
-    Site<SiteId::kPanelCurveObserve, SiteKind::Observe>,
+    InterestGated<SiteId::kPanelCurveObserve, SiteKind::Observe,
+                  draw_interest::InterestId::PanelCurveObserve>,
     Site<SiteId::kEyeNoDistanceNone, SiteKind::Exit>,
     Site<SiteId::kPanelEligibilityNone, SiteKind::Exit>,
     Site<SiteId::kPanelDistanceClaim, SiteKind::Claim>,
@@ -440,5 +436,14 @@ static_assert(DrawInstancedIndirectBypassSequence::size == 1,
               "indirect bypass site count changed");
 static_assert(InternalWorldBypassSequence::size == 1,
               "internal/world bypass site count changed");
+static_assert(CommonSequence::size > 4 &&
+              std::is_same_v<std::tuple_element_t<4, CommonSequence::Types>,
+                             FirstLegacyInterestSite>,
+              "the first legacy interest snapshot must be the Common ParticleSubstitute rung");
+static_assert(!std::tuple_element_t<0, CommonSequence::Types>::interestGated &&
+              !std::tuple_element_t<1, CommonSequence::Types>::interestGated &&
+              !std::tuple_element_t<2, CommonSequence::Types>::interestGated &&
+              !std::tuple_element_t<3, CommonSequence::Types>::interestGated,
+              "mandatory common claims/exits/observations precede the first interest snapshot");
 
 } // namespace edvr::draw_ladder

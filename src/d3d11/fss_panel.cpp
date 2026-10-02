@@ -142,6 +142,21 @@ void fssPanelConfigure(Config& cfg) {
     if (g_factor != wasFactor) g_compileTried = false;
 }
 
+bool fssPanelDrawInterestConfigured() noexcept {
+    return detail::g_fssPanelEnabled;
+}
+
+std::size_t fssPanelDrawInterestFilters(draw_interest::ShaderFilter* out,
+                                       std::size_t capacity) noexcept {
+    if (!detail::g_fssPanelEnabled) return 0;
+    constexpr uint64_t hashes[] = {kColorHash, kPrepassHash};
+    for (std::size_t i = 0; out && i < 2 && i < capacity; ++i) {
+        out[i] = {draw_interest::InterestId::FssPanel,
+                  draw_interest::HashFilter::Vertex, hashes[i], 0};
+    }
+    return 2;
+}
+
 bool fssPanelOnEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                        uint32_t instances) {
     if (!detail::g_fssPanelEnabled || kind != 'X' || count != 6 || instances != 1 || !ctx) {

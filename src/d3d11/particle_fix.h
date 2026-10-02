@@ -20,6 +20,8 @@
 
 #include <cstdint>
 
+#include "draw_interest.h"
+
 struct ID3D11DeviceContext;
 
 namespace edvr {
@@ -29,6 +31,12 @@ class Config;
 // Reads fix.particle_billboard (stock | steady) and
 // advanced.particle_probe. Both live on save.
 void particleConfigure(Config& cfg);
+bool particleSubstituteDrawInterestConfigured() noexcept;
+std::size_t particleSubstituteDrawInterestFilters(
+    draw_interest::ShaderFilter* out, std::size_t capacity) noexcept;
+bool witchspaceStarsDrawInterestConfigured() noexcept;
+std::size_t witchspaceStarsDrawInterestFilters(
+    draw_interest::ShaderFilter* out, std::size_t capacity) noexcept;
 
 // Whether the substitution is on -- the draw chain asks before matching.
 //

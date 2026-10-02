@@ -170,6 +170,20 @@ void fssRevealNoteUpdate(void* resource, const void* data) {
     });
 }
 
+bool fssRevealDrawInterestConfigured() noexcept {
+    return detail::g_fssRevealSteady || detail::g_fssRevealLockstep;
+}
+
+std::size_t fssRevealDrawInterestFilters(draw_interest::ShaderFilter* out,
+                                        std::size_t capacity) noexcept {
+    if (!fssRevealDrawInterestConfigured()) return 0;
+    if (out && capacity) {
+        out[0] = {draw_interest::InterestId::FssReveal,
+                  draw_interest::HashFilter::Vertex, kCompositeHash, 0};
+    }
+    return 1;
+}
+
 bool fssRevealOnEyeDraw(ID3D11DeviceContext* ctx, char kind, uint32_t count,
                         uint32_t instances) {
     if ((!detail::g_fssRevealSteady && !detail::g_fssRevealLockstep) || kind != 'N' ||

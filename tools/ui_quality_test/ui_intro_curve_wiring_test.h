@@ -60,6 +60,12 @@ const char* const kRetire =
     "composite draw(s)\",static_cast<unsignedlonglong>(drawn),static_cast<unsignedlonglong>(introCurveInfo().armed));}";
 // The intro claim and splash recognizer have separate handlers. Runtime order is pinned by EyeSequence below.
 const char* const kMovieClaimEnd = "if(kind=='X'&&count==6&&introPanelWants())";
+const char* const kIntroCurveRung =
+    "InterestGated<SiteId::kIntroCurveObserve, SiteKind::Observe,\n"
+    "                  draw_interest::InterestId::IntroCurveObserve>";
+const char* const kSequenceClaims = "Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n    "
+    "InterestGated<SiteId::kIntroCurveObserve, SiteKind::Observe,\n"
+    "                  draw_interest::InterestId::IntroCurveObserve>";
 
 // The strip's site: from its first statement to the game's own issue, squeezed (empty when either end is not found).
 std::string stripBlock(const std::string& fwd) {
@@ -89,6 +95,7 @@ std::vector<WirePin> wiringPins(const std::string& text, const std::string& ladd
         return compact.substr(at, next == std::string::npos ? std::string::npos : next - at);
     };
     const std::string introCurveSite = siteBody(bpo, "kIntroCurveObserve");
+    const std::string introPanelSite = siteBody(bpo, "kIntroPanelClaim");
 
     // The splash's flag: its own, cleared at the top of every beginPanelOverride (before anything can set it), set in one place only, and put away
     // by the thunk after forwardWithVerdict -- the draw and the dim have used it by then -- on every way out of that call.
@@ -101,15 +108,15 @@ std::vector<WirePin> wiringPins(const std::string& text, const std::string& ladd
     // The recognition: shape first, then introCurveWants() (one load at curvature 0), in the eye branch and before the eye-side verdicts it composes
     // with are returned.
     pins.push_back({"recognition",
-                    has(bpo, kSet) &&
-                        inOrder(ladderText, {"using EyeSequence = Sequence<", "Site<SiteId::kIntroPanelClaim", "Site<SiteId::kIntroCurveObserve", "Site<SiteId::kEyeBackdropComposite"}),
+                    has(introCurveSite, kSet) && has(ladderText, kIntroCurveRung) &&
+                        inOrder(ladderText, {"using EyeSequence = Sequence<", "Site<SiteId::kIntroPanelClaim",
+                                             kIntroCurveRung, "Site<SiteId::kEyeBackdropComposite"}),
                     "intro curve wiring [recognition]: the recogniser is asked in the eye-draw branch only for a six-index X draw and only behind introCurveWants(), before the "
                     "eye-side kBackdrop is returned (a flag, so it composes with the verdict)"});
     // The recognition sits right after the movie's claim: a draw the movie claims never reaches the recogniser, so its stock pair is not learned (and
     // logged as flat) once the movie has a placement of its own; only its settle frames, which the movie does not claim, are asked.
     pins.push_back({"after-movie",
-                    has(bpo, kMovieClaimEnd) && has(ladderText,
-                        "Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>"),
+                    has(introPanelSite, kMovieClaimEnd) && has(ladderText, kSequenceClaims),
                     "intro curve wiring [after-movie]: the recognition sits right after the movie's claim (its `return DrawVerdict::kIntroPanel;` block), so a draw the movie "
                     "claims never reaches the recogniser"});
     // The on-foot curve's recognition does not claim the intro composite; the term sits behind panelCurveWants().
@@ -202,7 +209,6 @@ const char* const kRawEnd = R"x(      if (g_state->introCurveThisDraw) {
           introCurveEndDraw();
       }
 )x";
-const char* const kSequenceClaims = "Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>";
 const char* const kRawBegin = "        forwardVerdictBegin(self, v);\n";
 const char* const kRawObserved = R"x(    const bool originalIssued=observedDraw(alteredClass == AlteredDrawClass::Verdict
                                                ? AlteredDraw(alteredClass, alteredFixOf(v)) : AlteredDraw(alteredClass));
@@ -285,45 +291,92 @@ void testIntroCurveControls(const std::string& text, const std::string& ladderTe
     }
 
     const std::string beforeBackdrop =
-        "Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n"
-        "    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>,\n"
+        "Site<SiteId::kEyeDepthAndCount, SiteKind::Observe>,\n"
+        "    Site<SiteId::kEyeUiDepthProbe, SiteKind::Observe>,\n"
+        "    Site<SiteId::kEyeHoloDepthProbe, SiteKind::Observe>,\n"
+        "    Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n"
+        "    InterestGated<SiteId::kIntroCurveObserve, SiteKind::Observe,\n"
+        "                  draw_interest::InterestId::IntroCurveObserve>,\n"
         "    Site<SiteId::kSunglareNomination, SiteKind::Observe>,\n"
         "    Site<SiteId::kEyeCensusSubmitted, SiteKind::Observe>,\n"
         "    Site<SiteId::kUiCrispProbe, SiteKind::Observe>,\n"
         "    Site<SiteId::kObjectProbe, SiteKind::Observe>,\n"
         "    Site<SiteId::kEyeCensusSkip, SiteKind::Claim>,\n"
         "    Site<SiteId::kEyeRangeSkip, SiteKind::Claim>,\n"
-        "    InterestGatedClaim<SiteId::kNightVisionClaim>,\n"
+        "    ShaderCandidateGatedClaim<SiteId::kNightVisionClaim>,\n"
         "    Site<SiteId::kRemlokHideSkip, SiteKind::Claim>,\n"
         "    Site<SiteId::kRemlokScissorClaim, SiteKind::Claim>,\n"
         "    Site<SiteId::kHoloClaim, SiteKind::Claim>,\n"
-        "    Site<SiteId::kTargetSharpClaim, SiteKind::Claim>,\n"
-        "    Site<SiteId::kScrimClaim, SiteKind::Claim>,\n"
-        "    Site<SiteId::kEyeBackdropComposite, SiteKind::Claim>";
-    const std::string belowBackdrop =
-        "Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n"
-        "    Site<SiteId::kSunglareNomination, SiteKind::Observe>,\n"
-        "    Site<SiteId::kEyeCensusSubmitted, SiteKind::Observe>,\n"
-        "    Site<SiteId::kUiCrispProbe, SiteKind::Observe>,\n"
-        "    Site<SiteId::kObjectProbe, SiteKind::Observe>,\n"
-        "    Site<SiteId::kEyeCensusSkip, SiteKind::Claim>,\n"
-        "    Site<SiteId::kEyeRangeSkip, SiteKind::Claim>,\n"
-        "    InterestGatedClaim<SiteId::kNightVisionClaim>,\n"
-        "    Site<SiteId::kRemlokHideSkip, SiteKind::Claim>,\n"
-        "    Site<SiteId::kRemlokScissorClaim, SiteKind::Claim>,\n"
-        "    Site<SiteId::kHoloClaim, SiteKind::Claim>,\n"
-        "    Site<SiteId::kTargetSharpClaim, SiteKind::Claim>,\n"
+        "    InterestGated<SiteId::kTargetSharpClaim, SiteKind::Claim,\n"
+        "                  draw_interest::InterestId::TargetSharp>,\n"
         "    Site<SiteId::kScrimClaim, SiteKind::Claim>,\n"
         "    Site<SiteId::kEyeBackdropComposite, SiteKind::Claim>,\n"
-        "    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>";
+        "    InterestGated<SiteId::kFssPanelClaim, SiteKind::Claim,\n"
+        "                  draw_interest::InterestId::FssPanel>,\n"
+        "    InterestGated<SiteId::kFssRevealClaim, SiteKind::Claim,\n"
+        "                  draw_interest::InterestId::FssReveal>,\n"
+        "    InterestGated<SiteId::kFssDumpClaim, SiteKind::Claim,\n"
+        "                  draw_interest::InterestId::FssDump>,\n"
+        "    Site<SiteId::kResolveBindClaim, SiteKind::Claim>,\n"
+        "    Site<SiteId::kSunglareSkip, SiteKind::Claim>,\n"
+        "    Site<SiteId::kSunglareSteadyClaim, SiteKind::Claim>,\n"
+        "    Site<SiteId::kGlareClampClaim, SiteKind::Claim>,\n"
+        "    Site<SiteId::kHeadOffsetObserve, SiteKind::Observe>,\n"
+        "    InterestGated<SiteId::kPanelCurveObserve, SiteKind::Observe,\n"
+        "                  draw_interest::InterestId::PanelCurveObserve>,\n"
+        "    Site<SiteId::kEyeNoDistanceNone, SiteKind::Exit>,\n"
+        "    Site<SiteId::kPanelEligibilityNone, SiteKind::Exit>,\n"
+        "    Site<SiteId::kPanelDistanceClaim, SiteKind::Claim>,\n"
+        "    Site<SiteId::kPanelTailNone, SiteKind::Exit>>";
+    const std::string belowBackdrop =
+        "Site<SiteId::kEyeDepthAndCount, SiteKind::Observe>,\n"
+        "    Site<SiteId::kEyeUiDepthProbe, SiteKind::Observe>,\n"
+        "    Site<SiteId::kEyeHoloDepthProbe, SiteKind::Observe>,\n"
+        "    Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n"
+        "    Site<SiteId::kSunglareNomination, SiteKind::Observe>,\n"
+        "    Site<SiteId::kEyeCensusSubmitted, SiteKind::Observe>,\n"
+        "    Site<SiteId::kUiCrispProbe, SiteKind::Observe>,\n"
+        "    Site<SiteId::kObjectProbe, SiteKind::Observe>,\n"
+        "    Site<SiteId::kEyeCensusSkip, SiteKind::Claim>,\n"
+        "    Site<SiteId::kEyeRangeSkip, SiteKind::Claim>,\n"
+        "    ShaderCandidateGatedClaim<SiteId::kNightVisionClaim>,\n"
+        "    Site<SiteId::kRemlokHideSkip, SiteKind::Claim>,\n"
+        "    Site<SiteId::kRemlokScissorClaim, SiteKind::Claim>,\n"
+        "    Site<SiteId::kHoloClaim, SiteKind::Claim>,\n"
+        "    InterestGated<SiteId::kTargetSharpClaim, SiteKind::Claim,\n"
+        "                  draw_interest::InterestId::TargetSharp>,\n"
+        "    Site<SiteId::kScrimClaim, SiteKind::Claim>,\n"
+        "    Site<SiteId::kEyeBackdropComposite, SiteKind::Claim>,\n"
+        "    InterestGated<SiteId::kIntroCurveObserve, SiteKind::Observe,\n"
+        "                  draw_interest::InterestId::IntroCurveObserve>,\n"
+        "    InterestGated<SiteId::kFssPanelClaim, SiteKind::Claim,\n"
+        "                  draw_interest::InterestId::FssPanel>,\n"
+        "    InterestGated<SiteId::kFssRevealClaim, SiteKind::Claim,\n"
+        "                  draw_interest::InterestId::FssReveal>,\n"
+        "    InterestGated<SiteId::kFssDumpClaim, SiteKind::Claim,\n"
+        "                  draw_interest::InterestId::FssDump>,\n"
+        "    Site<SiteId::kResolveBindClaim, SiteKind::Claim>,\n"
+        "    Site<SiteId::kSunglareSkip, SiteKind::Claim>,\n"
+        "    Site<SiteId::kSunglareSteadyClaim, SiteKind::Claim>,\n"
+        "    Site<SiteId::kGlareClampClaim, SiteKind::Claim>,\n"
+        "    Site<SiteId::kHeadOffsetObserve, SiteKind::Observe>,\n"
+        "    InterestGated<SiteId::kPanelCurveObserve, SiteKind::Observe,\n"
+        "                  draw_interest::InterestId::PanelCurveObserve>,\n"
+        "    Site<SiteId::kEyeNoDistanceNone, SiteKind::Exit>,\n"
+        "    Site<SiteId::kPanelEligibilityNone, SiteKind::Exit>,\n"
+        "    Site<SiteId::kPanelDistanceClaim, SiteKind::Claim>,\n"
+        "    Site<SiteId::kPanelTailNone, SiteKind::Exit>>";
     const std::string awayFromMovie =
         "Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n"
         "    Site<SiteId::kSunglareNomination, SiteKind::Observe>,\n"
-        "    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>";
+        "    InterestGated<SiteId::kIntroCurveObserve, SiteKind::Observe,\n"
+        "                  draw_interest::InterestId::IntroCurveObserve>";
     const std::vector<Flip> sequenceFlips = {
         {"recognizer runs after the backdrop claim", {{beforeBackdrop, belowBackdrop}}, "recognition"},
         {"recognizer runs before the movie claim", {{kSequenceClaims,
-            "Site<SiteId::kIntroCurveObserve, SiteKind::Observe>,\n    Site<SiteId::kIntroPanelClaim, SiteKind::Claim>"}}, "after-movie"},
+            "InterestGated<SiteId::kIntroCurveObserve, SiteKind::Observe,\n"
+            "                  draw_interest::InterestId::IntroCurveObserve>,\n"
+            "    Site<SiteId::kIntroPanelClaim, SiteKind::Claim>"}}, "after-movie"},
         {"recognizer is not the movie claim's next rung", {{kSequenceClaims, awayFromMovie}}, "after-movie"},
     };
     for (const Flip& f : sequenceFlips) {

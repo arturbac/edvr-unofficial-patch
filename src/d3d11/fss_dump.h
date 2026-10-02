@@ -19,6 +19,8 @@
 // raw pixels in edvr_logs\dumps\. Empty is off and the only shipped state.
 #pragma once
 
+#include "draw_interest.h"
+
 #include <cstdint>
 
 struct ID3D11DeviceContext;
@@ -28,6 +30,9 @@ namespace edvr {
 class Config;
 
 void fssDumpConfigure(Config& cfg);
+bool fssDumpDrawInterestConfigured() noexcept;
+std::size_t fssDumpDrawInterestFilters(draw_interest::ShaderFilter* out,
+                                      std::size_t capacity) noexcept;
 
 // One bool for the draw path's early-out set and the body-frame gate.
 //
