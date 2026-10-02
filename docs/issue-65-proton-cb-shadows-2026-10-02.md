@@ -8,7 +8,7 @@
   CPU reads of the pointer `Map(WRITE_DISCARD)` returns, which DXVK places in
   write-combined, uncached memory by default. A workaround exists (below). The fix is
   implemented on `codex/issue-65-map-bounce` for Sean's Epic flat test. Full build,
-  core rig and 12 mutants pass; clean-version install pending. No reply posted.
+  core rig and 12 mutants pass; game and Proton flights pending. No reply posted.
 - **Report:** issue 65, flat v0.18.0 (build 6ABED11D), GE-Proton 11-6 (DXVK), Mesa 26.2.2
   RADV, RX 7900 XTX, Ryzen 9 9950X, 9000x2160, EDVR -> EDHM -> DXVK through
   `advanced.real_dll`, `temporal_aa = on`. `cb shadows` 25-28 ms per clocked frame
@@ -326,6 +326,7 @@ production/WARP/installer validation passed and wrote the full-build receipt.
 The source-pin test now expects the two additional shadow scopes. The runner's
 process-tree timeout check requires an unsandboxed build; its sandboxed failure
 was reproduced and the unchanged check passed outside the sandbox. Current
-main's F10 shader capture was included in the validated source. The clean-version
-Epic install is pending. No game flight or Proton measurement has been performed
-on this implementation.
+main's F10 shader capture was included in the validated source. Epic testing uses
+the flat profile, existing DLSS settings, and the default `auto` key. Promote the
+clean DLLs with the matching receipt and preserve the live INI when installing.
+No game flight or Proton measurement has been performed on this implementation.

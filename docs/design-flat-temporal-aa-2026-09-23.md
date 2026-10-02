@@ -33,8 +33,8 @@
 - **Ruled-out pointer:** the kinematic arc's Status records rejected motion
   estimates and the nonexistent engine velocity buffer. Reuse engine-record
   motion; do not revive estimation or the retired deferred UI replay.
-- **Next:** section 85's 15 trace frames isolate the image-source camera gate;
-  inspect PS 07B3F82100F29401 bytes. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
+- **Next:** section 85's supplied PS files omit 07B3F82100F29401; the bounded
+  F10 capture is BUILT, NOT FLOWN. Collect and inspect its bytes. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
   resolution, TAA at 1.25, game AA, VR at 0.85. HDR flew (81); FSR, TAA at
   R = D and ReShade still to fly. Then open items above (older: Status detail).
   Existing evidence does not justify ignoring the alternate projection.
@@ -8797,3 +8797,44 @@ it exists. Current F10's named stage probes omit this PS and generic-inert
 classification does not trigger unknown-pair saving, so another unchanged
 F10 run cannot be relied on to supply it. If absent, add a bounded named
 creation-cache capture for this PS before scheduling the next flight.
+
+### Supplied pixel shaders and targeted capture (2026-10-02)
+
+`ps_all.zip`: 40 DXBC files, 141116 bytes. Every filename matches the
+actual EDVR FNV64 hash; no file, including a mislabeled one, hashes to
+07B3F82100F29401. `ps_1F64463B15189104.zip` contains the same verified
+1F64463B15189104 file included in ps_all. It is the separate documented
+CE24A73943632F55/1F64463B15189104 scene pair: depth/G-buffer inputs t0..t3,
+discard and two render-target outputs, CB2[46].x and CB2[0].x. It does not
+qualify the missing image-source pass. The HDR copy PS DFCBA0EC70B03C9B
+is present; the existing exempted source PS FCFAD73924BF45B9 is absent.
+
+Diagnostic change: the existing bounded F10 arm in flatRuntimePresent
+requests PS 07B3F82100F29401 through captureFlatProbeShader. No admission
+rule or config changes. This runs once per manual arm, after the audit
+ends stand-down and initializes the projection runtime. The helper looks
+up exact creation bytes by stage/hash, writes the named DXBC through
+dumpShaderBlob and logs succeeded/failed/missing with the requested hash.
+Thus a missing cache entry or a failed write is distinguishable from the
+request never executing; generic-inert classification in the prior log
+already establishes that this pair's bytes were retained then.
+
+Validation: full absolute-path `build.bat --jobs 2` passed every gate,
+including production FSR/DLSS DLLs, rigs and installer resource checks.
+Receipt status full-pass, stamp v0.18.0-26-gb5df4ff4-dirty. Re-read the
+F10 block and capture helper: one request for this PS, no new shader entry
+point or duplicated census. No rendering change or flight qualification.
+
+Two default-parallelism builds failed the heartbeat rig's combined H5
+assertions. An isolated run passed. A temporary diagnostic copy under
+32-way load reproduced H5.whole failures with seen=1, bad=0 and torn=0;
+reader counts remained millions. This establishes sample-count starvation
+for those reproductions. Lower parallelism ran all gates successfully;
+no heartbeat source/test change or gate bypass was made.
+
+Next flight uses the diagnostic build: cockpit, F10 once, then obtain
+edvr_logs/shaders/ps_07B3F82100F29401.dxbc. Check the version and
+`flat producer shader:` line for stage=ps hash=07B3F82100F29401. A succeeded
+line confirms a saved or already-existing file; missing/failed names the
+failure, and no line means the diagnostic arm did not run. Do not extend
+camera-independent admission before inspecting the actual pixel shader.
