@@ -33,8 +33,8 @@
 - **Ruled-out pointer:** the kinematic arc's Status records rejected motion
   estimates and the nonexistent engine velocity buffer. Reuse engine-record
   motion; do not revive estimation or the retired deferred UI replay.
-- **Next:** section 85's supplied PS files omit 07B3F82100F29401; the bounded
-  F10 capture is BUILT, NOT FLOWN. Collect and inspect its bytes. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
+- **Next:** section 85: collect PS 07B3F82100F29401 and a Full F10 audit of
+  the additional no-output-copy report. The capture is BUILT, NOT FLOWN. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
   resolution, TAA at 1.25, game AA, VR at 0.85. HDR flew (81); FSR, TAA at
   R = D and ReShade still to fly. Then open items above (older: Status detail).
   Existing evidence does not justify ignoring the alternate projection.
@@ -8838,3 +8838,50 @@ edvr_logs/shaders/ps_07B3F82100F29401.dxbc. Check the version and
 line confirms a saved or already-existing file; missing/failed names the
 failure, and no line means the diagnostic arm did not run. Do not extend
 camera-independent admission before inspecting the actual pixel shader.
+
+### Additional flat AA report: output chain undiscovered (2026-10-02)
+
+Evidence: `edvr-logs-20261002-230831.zip`, graphics log
+`edvr_gfx_20261002_220635.log` (18234 lines). Literal v0.18.0, build
+6ABED11D, linked 2026-10-01 21:31:09 UTC: the same release as the first
+supporter, before the targeted capture. HEAD's release-prefix acceptance
+again does not prove exact HEAD. Relevant flat model/camera/HDR route code
+is unchanged from the tag. Flat profile, Odyssey-64, output 1440x900 fmt28,
+captured game AA off and SS1.0. No measured scene/render size or adapter
+identity; no VR runtime log, traces or shader dumps in this bundle.
+
+The live menu changes requests between DLSS, FSR and off. Every reported
+runtime window has treated=0 and temporal calls=0; 742 copy-structure
+windows have copies=admitted=0 and no source VS/PS identity. Stand-down
+enters for no-known-output-copy at 22:06:44. At 23:08:10 it has persisted
+3300 s, with 2171 probes and 188043 frames skipped. HDR route and image
+continuation counters stay zero. This differs from the earlier recognized
+HDR/source chain that fails conflicting-hdr-target-or-camera.
+
+The passive discovery final at 22:08:36.995 (frame6661, request=off) has
+1488 useful frames, 1487 depth/output frames, 967654 draws, 930519 depth
+draws, 7692 copies and 23587 dispatches; unknown lists/foreign-thread calls
+and frame-dropped-observation counters are zero. Its selector refuses
+relevant-observations-truncated: world-retained=224/224, 13 dropped world
+draw observations, handoff=12/32. Camera-buffer availability is 607/11.
+This proves live rendering was observed and identifies a passive capacity
+limit, but cannot establish the active runtime's exact missing-copy cause.
+There are no later passive samples. Earlier samples also refuse missing
+HDR writes/camera or tone; their zero identities are not a draw witness.
+
+ruled out: the menu failing to forward the AA selection, because live
+discovery requests explicitly show FSR, DLSS and off.
+ruled out: no rendering observed throughout the capture, because the
+passive final records substantial depth/output draw work.
+
+Open: unfamiliar final-copy/post chain, incomplete Probe recovery, or
+Full-work observation capacity. No manual F10 audit occurred: all details
+are not-manually-armed, audit-pairs=0 and saved bytecode=0. This bundle
+does not establish the earlier PS07 image-source rejection in this user.
+Next: keep settings, select the intended AA mode in the cockpit, close F8,
+press F10, then again after about 2 s; wait at least 5 s and collect the
+log, both trace dumps and saved shaders. Full work with a recognized chain
+would implicate recovery; persistent refusal plus draw/overflow witnesses
+would distinguish an unfamiliar chain from capacity. Use the diagnostic
+build's literal stamp and verify successful trace writes. No rendering
+code, config or installation changed for this comparison.
