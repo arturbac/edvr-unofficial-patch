@@ -33,8 +33,8 @@
 - **Ruled-out pointer:** the kinematic arc's Status records rejected motion
   estimates and the nonexistent engine velocity buffer. Reuse engine-record
   motion; do not revive estimation or the retired deferred UI replay.
-- **Next:** section 85: third user's rc.4 no-tone capture needs current build.
-  First two users confirm working; user2 log-confirmed. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
+- **Next:** section 85: all three supporters confirm working after updating.
+  User2 also log-confirmed. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
   resolution, TAA at 1.25, game AA, VR at 0.85. HDR flew (81); FSR reported
   working (85). TAA at R = D and ReShade still to fly. Then open items above.
   Existing evidence does not justify ignoring the alternate projection.
@@ -9105,10 +9105,16 @@ and frame selection attempts/refusals accumulate.
 ruled out: a demonstrated backend/driver failure in this capture, because
 the backend has zero calls and fails before dispatch at no-known-tone-pass.
 
-Next: update to the fully validated flat build v0.18.0-31-g5c70e1c8-dirty
+Recommendation: update to the fully validated flat build v0.18.0-31-g5c70e1c8-dirty
 (source 0b59f0d4), retaining the user's settings and EDHM chain. Its auto HDR
 and structural-copy routing supersedes this old tone-only prerequisite;
 the exact filter fix is included. Do not promise a complete cure from an
 obsolete capture. If still inactive on that literal build, arm F10 in the
 cockpit, wait at least 5s and return a current log with the new route/ingress
 witnesses. No rendering code, config or installation changed for review.
+
+Outcome (2026-10-02): Sean reports that updating fixed it for this user as
+well. This closes the third support case by user confirmation; no updated
+flight log was supplied. The old capture establishes the rc.4 selector
+refusal, but does not identify which newer routing change resolved it.
+All three supporters now report working. No further flight requested.
