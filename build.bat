@@ -2994,6 +2994,19 @@ if errorlevel 1 ( echo [edvr] ERROR: ui composite census test build failed & exi
 python "tools\ui_composite_census_test\mutants.py" --self-test || exit /b 1
 exit /b 0
 
+:rig_flat_map_bounce_test
+ echo [edvr] === flat_map_bounce_test.exe ===
+ REM Pure cached-map core and fake driver: seeded programs, C1-C8, no D3D device.
+ if not exist "%OBJ%\flatmapbounce" mkdir "%OBJ%\flatmapbounce"
+ cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /I"src\d3d11" ^
+     /Fo"%OBJ%\flatmapbounce\\" /Fe"%OBJ%\flatmapbounce\flat_map_bounce_test.exe" ^
+     "tools\flat_map_bounce_test\flat_map_bounce_test.cpp" /link /INCREMENTAL:NO
+ if errorlevel 1 ( echo [edvr] ERROR: flat map bounce test build failed & exit /b 1 )
+ "%OBJ%\flatmapbounce\flat_map_bounce_test.exe" --dry-run || exit /b 1
+ "%OBJ%\flatmapbounce\flat_map_bounce_test.exe" --self-test "%ROOT%" || exit /b 1
+ python "tools\flat_map_bounce_test\mutants.py" --self-test || exit /b 1
+ exit /b 0
+
 :rig_panel_curve_test
 echo [edvr] === panel_curve_test.exe ===
 REM The curved screen's strip (src\d3d11\panel_curve.cpp; fix.panel_curvature) compiled for real with the real Config, Log and fault
