@@ -2052,6 +2052,9 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             captureFlatProbeShader('p',0xDD371C57C9093BB8ull);
             captureFlatProbeShader('v',kHdrCopyVs);
             captureFlatProbeShader('p',kHdrCopyPs);
+            // The gameplay HDR source rejected in the FSR conflict audit.
+            // Its creation bytes identify whether camera-free admission is safe.
+            captureFlatProbeShader('p',0x07B3F82100F29401ull);
             // Exact unknown scene pairs observed in build 0150638a. These
             // creation-cache probes run once per manual F10 arm, never per draw.
             constexpr uint64_t unknownVs[]={0xA1B7CFCD0BE7493Eull,0xCE24A73943632F55ull,
