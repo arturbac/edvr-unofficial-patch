@@ -4,11 +4,13 @@
 
 *Written 2026-10-02. Update whenever this doc changes.*
 
-- **State:** cause CONFIRMED by the reporter (comment of 2026-10-02 11:45 UTC): EDVR's
+- **State:** cause CONFIRMED by arturbac (comment of 2026-10-02 11:45 UTC): EDVR's
   CPU reads of the pointer `Map(WRITE_DISCARD)` returns, which DXVK places in
   write-combined, uncached memory by default. A workaround exists (below). The fix is
-  implemented on `codex/issue-65-map-bounce` for Sean's Epic flat test. Full build,
-  core rig and 12 mutants pass; game and Proton flights pending. No reply posted.
+  on main in `31f8aee7`. Full build, core rig, 12 mutants and Windows flights pass;
+  Proton qualification of this implementation remains pending.
+- **Attribution:** [arturbac][arturbac] supplied the diagnosis, staging approach,
+  working patch and Proton A/B tests in [issue #65][issue65] and [PR #66][pr66].
 - **Report:** issue 65, flat v0.18.0 (build 6ABED11D), GE-Proton 11-6 (DXVK), Mesa 26.2.2
   RADV, RX 7900 XTX, Ryzen 9 9950X, 9000x2160, EDVR -> EDHM -> DXVK through
   `advanced.real_dll`, `temporal_aa = on`. `cb shadows` 25-28 ms per clocked frame
@@ -56,9 +58,33 @@
 - **Temporary validation key:** `advanced.flat_cb_map_cache = auto|on|off`; default
   `auto` measures mapped reads, `on` forces caching and enables verification,
   `off` keeps direct mappings. Removal requires Sean's approval when the arc closes.
-- **Next flight:** Epic flat, existing DLSS settings, key default `auto`; expect OFF
-  on native NVIDIA, zero trips and mismatches, and a `flat map bounce 5s:` line.
-  Then force `on` for the longer validation flight described in section 6.
+- **Next flight:** Proton qualification of main's cache, comparing `auto`, `on`
+  and `off` after restarting; collect decisions, counters and frame timings.
+
+## Contribution and attribution (2026-10-02)
+
+[arturbac][arturbac] identified the expensive constant-buffer shadow copies in
+[issue #65][issue65]. Their PDB build, perf profiling and AMD LBR call records
+traced the cost to CPU reads of DXVK's write-combined mappings. Their
+[confirmation and staging proposal][diagnosis65] established the workaround and
+proposed returning cached memory at `Map(WRITE_DISCARD)`, then writing it back
+at `Unmap`.
+
+They supplied the working staging implementation and Proton A/B validation in
+[PR #66][pr66]: about 26 ms to 0.35 ms per frame for CB shadows and about 30
+fps to 80-90 fps in the reported scene. The adaptive map-cache implementation
+on main builds on that diagnosis and staging approach, adding adaptive
+selection, lifetime guards and validation. Credit for the original diagnosis,
+approach, PR implementation and Proton measurements belongs to arturbac.
+
+The original implementation and merge commit messages omitted this attribution.
+This entry, the README and the release-note acknowledgment correct that
+omission.
+
+[arturbac]: https://github.com/arturbac
+[issue65]: https://github.com/characterecho-sean/edvr-unofficial-patch/issues/65
+[diagnosis65]: https://github.com/characterecho-sean/edvr-unofficial-patch/issues/65#issuecomment-5951666303
+[pr66]: https://github.com/characterecho-sean/edvr-unofficial-patch/pull/66
 
 ## RVA map (the v0.18.0 release DLL)
 
@@ -329,4 +355,5 @@ was reproduced and the unchanged check passed outside the sandbox. Current
 main's F10 shader capture was included in the validated source. Epic testing uses
 the flat profile, existing DLSS settings, and the default `auto` key. Promote the
 clean DLLs with the matching receipt and preserve the live INI when installing.
-No game flight or Proton measurement has been performed on this implementation.
+Subsequent native Windows flights passed in auto-OFF and forced-ON modes.
+Proton measurement of this implementation remains pending.
