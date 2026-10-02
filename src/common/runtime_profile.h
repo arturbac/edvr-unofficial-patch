@@ -114,6 +114,8 @@ inline bool runtimeProfileAllowsKey(const char* key) {
         std::strcmp(key, "fix.render_sharpness") == 0 ||
         std::strcmp(key, "experimental.temporal_aa_jitter") == 0 ||
         std::strcmp(key, "experimental.temporal_aa_partial") == 0 ||
+        // Engine motion's draw substitution switch (flat_runtime.cpp, read at every Present; on by default).
+        std::strcmp(key, "experimental.temporal_aa_engine_motion") == 0 ||
         // The HDR route's key (flat_hdr_route.h, design doc section 81; auto by default); developer tier, no flat panel row.
         std::strcmp(key, "experimental.temporal_aa_before_post") == 0);
 }
