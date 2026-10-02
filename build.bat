@@ -499,7 +499,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\oculus_route.cpp" ^
     "src\d3d11\menu_keys.cpp" ^
     "src\d3d11\menu_panel.cpp" "src\d3d11\perf_monitor.cpp" "src\d3d11\native_perf_history.cpp" "src\d3d11\native_benchmark_collector.cpp" ^
-    "src\d3d11\stall_watch.cpp" ^
+    "src\d3d11\stall_watch.cpp" "src\d3d11\vram_tick.cpp" ^
     "src\d3d11\native_menu.cpp" ^
     "src\d3d11\native_temporal.cpp" "src\d3d11\flat_temporal.cpp" "src\d3d11\flat_compute_capture.cpp" "src\d3d11\flat_compute_readback.cpp" ^
     "src\d3d11\flat_runtime.cpp" "src\d3d11\flat_mono_resolve.cpp" "src\d3d11\flat_projection_scope.cpp" "src\d3d11\flat_projection_runtime.cpp" ^
@@ -1182,6 +1182,55 @@ if "%EDVR_RIG_STEP%"=="build" exit /b 0
 "%OBJ%\stallsampler\stall_sampler_test.exe" --dry-run || exit /b 1
 "%OBJ%\stallsampler\stall_sampler_test.exe" --self-test "%ROOT%" || exit /b 1
 python "tools\stall_sampler_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
+:rig_vram_watch_test
+echo [edvr] === vram_watch_test.exe ===
+REM Build gate for the graphics memory watch (src\common\vram_watch.h, src\common\vram_query.h, src\d3d11\vram_tick.cpp,
+REM docs\headset-lock-vdxr-2026-10-02.md, instrument 1): the policy (a line every 30 s, every 5 s from 90% of the OS's
+REM budget for the process, one at each crossing of the budget, a cap on the two cadences that a crossing is exempt from),
+REM the lines' text, the machine the Present hook drives on a fake clock and a fake adapter (the OS is asked once a second,
+REM the armed line, the unavailable line once for a stack without IDXGIAdapter3, a failed read said once), the DXGI read
+REM against fake adapters and one real WARP adapter from System32's d3d11, and by source text that hookedPresent ticks the
+REM watch once, unconditionally (so the flat profile has it too) after the stall sampler's beat. It links nothing of the DLLs.
+REM tools\vram_watch_test\mutants.py --self-test holds the mutation list to the sources as they are; --run builds the rig
+REM against each edit and needs the MSVC toolchain.
+if not exist "%OBJ%\vramwatch" mkdir "%OBJ%\vramwatch"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\common" ^
+    /Fo"%OBJ%\vramwatch"\ /Fe"%OBJ%\vramwatch\vram_watch_test.exe" ^
+    "tools\vram_watch_test\vram_watch_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: vram_watch_test build failed & exit /b 1 )
+"%OBJ%\vramwatch\vram_watch_test.exe" --dry-run || exit /b 1
+"%OBJ%\vramwatch\vram_watch_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\vram_watch_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
+:rig_slow_regime_test
+echo [edvr] === slow_regime_test.exe ===
+REM Build gate for the runtime's vendor instruments (src\openxr\vendor_events.h, end_frame_episodes.h, slow_regime.h,
+REM src\common\slow_test.h, docs\headset-lock-vdxr-2026-10-02.md, instruments 2 to 4 and the test trigger): the vendor's events
+REM decoded, one line each, bounded (200 lines, undecoded types named once, the last session state kept past the cap), and
+REM SessionState's observer seeing every event without changing how one is handled; every xrEndFrame of 3 display periods or
+REM more as an episode (the first call on its own line, ended by 8 normal calls, p50 and max from a histogram, the rate limit
+REM and the end line a long episode always gets); a frame rate under 40% of the display's held for 5 s as a regime with the
+REM owner that holds it (the vendor's xrEndFrame, the pose wait, the swapchain calls, EDVR's copy, EDVR's work, the game),
+REM its still_slow line every 30 s and its end line; FrameBoundary's hook, on a real boundary with a fake runtime, for every
+REM xrEndFrame on every path (synchronous, no-render, cleared, loading, deferred pacing, drain) and the test hold inside the
+REM timed region and nowhere else; the test trigger's schedule; and by source text the host's glue. It links nothing of the
+REM DLLs. tools\slow_regime_test\mutants.py --self-test holds the mutation list to the sources as they are; --run builds the
+REM rig against each edit and needs the MSVC toolchain.
+if not exist "%OBJ%\slowregime" mkdir "%OBJ%\slowregime"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\common" /I"src\openxr" /I"third_party\openxr\include" ^
+    /Fo"%OBJ%\slowregime"\ /Fe"%OBJ%\slowregime\slow_regime_test.exe" ^
+    "tools\slow_regime_test\slow_regime_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: slow_regime_test build failed & exit /b 1 )
+"%OBJ%\slowregime\slow_regime_test.exe" --dry-run || exit /b 1
+"%OBJ%\slowregime\slow_regime_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\slow_regime_test\mutants.py" --self-test || exit /b 1
 exit /b 0
 
 :rig_flat_temporal_test
