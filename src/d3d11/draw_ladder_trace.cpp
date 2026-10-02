@@ -1,0 +1,626 @@
+#include "draw_ladder_trace.h"
+
+#ifndef EDVR_VERSION_STRING
+#define EDVR_VERSION_STRING "unversioned test build"
+#endif
+
+#include <windows.h>
+#include <strsafe.h>
+
+#include <algorithm>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <cwchar>
+#include <new>
+
+namespace edvr::draw_ladder_trace {
+namespace {
+
+constexpr std::uint32_t kIdentitySlots = kMaxDraws * 6;
+constexpr std::size_t kPathChars = 1024;
+constexpr std::size_t kNameChars = 260;
+
+struct SiteEvent final {
+    std::uint16_t id = 0;
+    std::uint16_t subsite = 0;
+    std::uint8_t kind = 0;
+    std::uint8_t outcome = 0;
+    std::uint8_t flow = 0;
+    std::uint8_t reserved = 0;
+    std::int16_t verdict = -1;
+};
+
+struct DrawRecord final {
+    DrawFacts facts{};
+    SiteEvent sites[kMaxSiteEventsPerDraw]{};
+    draw_ladder::ActionRecord actions[kMaxActionEventsPerDraw]{};
+    std::uint16_t actionIds[kMaxActionEventsPerDraw]{};
+    ForwardFacts forwardFacts{};
+    std::uint16_t siteCount = 0;
+    std::uint16_t actionCount = 0;
+    std::int16_t winnerSiteId = -1;
+    std::int16_t verdictOrdinal = -1;
+    bool finalized = false;
+    bool hasForwardFacts = false;
+};
+
+DrawRecord* g_records = nullptr;
+std::uintptr_t* g_identities = nullptr;
+std::uint32_t g_drawCount = 0;
+std::uint32_t g_identityCount = 0;
+std::uint32_t g_generation = 1;
+FrameFacts g_frame{};
+std::atomic<bool> g_enabled{false};
+std::atomic<Status> g_status{Status::Disabled};
+bool g_isCapturing = false;
+bool g_wasOverflowed = false;
+bool g_lastWriteSucceeded = false;
+std::atomic<bool> g_armPending{false};
+wchar_t g_directory[kPathChars]{};
+wchar_t g_logFileName[kNameChars]{};
+wchar_t g_logStem[kNameChars]{};
+
+void setCopy(wchar_t* destination, std::size_t capacity,
+             const wchar_t* source) noexcept {
+    if (!destination || capacity == 0) return;
+    destination[0] = L'\0';
+    if (!source || !source[0]) return;
+    wcsncpy_s(destination, capacity, source, _TRUNCATE);
+}
+
+void rejectInvalidToken() noexcept {
+    if (g_isCapturing) g_wasOverflowed = true;
+}
+
+bool setLogPath(const wchar_t* logFilePath) noexcept {
+    g_logFileName[0] = L'\0';
+    g_logStem[0] = L'\0';
+    g_directory[0] = L'\0';
+    if (!logFilePath || !logFilePath[0]) return false;
+    const wchar_t* slash = wcsrchr(logFilePath, L'\\');
+    if (!slash || slash == logFilePath || !slash[1]) return false;
+    const std::size_t directoryLength = static_cast<std::size_t>(slash - logFilePath);
+    if (directoryLength >= kPathChars ||
+        FAILED(StringCchCopyNW(g_directory, kPathChars, logFilePath,
+                               directoryLength))) return false;
+    setCopy(g_logFileName, kNameChars, slash + 1);
+    const std::size_t fileLength = wcslen(g_logFileName);
+    if (fileLength <= 4 || _wcsicmp(g_logFileName + fileLength - 4, L".log") != 0 ||
+        _wcsnicmp(g_logFileName, L"edvr_gfx_", 9) != 0) return false;
+    setCopy(g_logStem, kNameChars, g_logFileName);
+    wchar_t* extension = wcsrchr(g_logStem, L'.');
+    if (extension) *extension = L'\0';
+    const DWORD attributes = GetFileAttributesW(logFilePath);
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::uint32_t moduleBuildStamp() noexcept {
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&moduleBuildStamp), &module) ||
+        !module) return 0;
+    const auto* base = reinterpret_cast<const std::uint8_t*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
+    return nt->FileHeader.TimeDateStamp;
+}
+
+struct Writer final {
+    explicit Writer(HANDLE h) noexcept : file(h) {}
+    HANDLE file;
+    char buffer[64 * 1024]{};
+    std::size_t used = 0;
+    bool failed = false;
+};
+
+bool flush(Writer& writer) noexcept {
+    if (writer.failed) return false;
+    std::size_t offset = 0;
+    while (offset < writer.used) {
+        const DWORD part = static_cast<DWORD>(std::min<std::size_t>(
+            writer.used - offset, 0x7fffffffu));
+        DWORD written = 0;
+        if (!WriteFile(writer.file, writer.buffer + offset, part, &written, nullptr) ||
+            written == 0) {
+            writer.failed = true;
+            return false;
+        }
+        offset += written;
+    }
+    writer.used = 0;
+    return true;
+}
+
+bool writeBytes(Writer& writer, const char* bytes, std::size_t length) noexcept {
+    if (writer.failed) return false;
+    while (length != 0) {
+        const std::size_t room = sizeof(writer.buffer) - writer.used;
+        if (room == 0 && !flush(writer)) return false;
+        const std::size_t count = std::min(length, sizeof(writer.buffer) - writer.used);
+        std::memcpy(writer.buffer + writer.used, bytes, count);
+        writer.used += count;
+        bytes += count;
+        length -= count;
+    }
+    return true;
+}
+
+bool writeText(Writer& writer, const char* text) noexcept {
+    return writeBytes(writer, text, std::strlen(text));
+}
+
+bool writeFmt(Writer& writer, const char* format, ...) noexcept {
+    char scratch[1024];
+    va_list args;
+    va_start(args, format);
+    const int n = _vsnprintf_s(scratch, sizeof(scratch), _TRUNCATE, format, args);
+    va_end(args);
+    return n >= 0 && writeBytes(writer, scratch, static_cast<std::size_t>(n));
+}
+
+bool writeDrawArgs(Writer& writer, const DrawArgs& args) noexcept {
+    return writeFmt(writer, "{\"start\":%u,\"base\":%ld,\"startInstance\":%u}",
+                    args.start, static_cast<long>(args.base), args.startInstance);
+}
+
+const char* triName(TriState value) noexcept {
+    switch (value) {
+    case TriState::No: return "no";
+    case TriState::Yes: return "yes";
+    default: return "unknown";
+    }
+}
+
+const char* commandName(std::uint8_t kind) noexcept {
+    switch (kind) {
+    case 'D': return "draw";
+    case 'I': return "draw-indexed";
+    case 'N': return "draw-instanced";
+    case 'X': return "draw-indexed-instanced";
+    case 'A': return "draw-auto";
+    case 'Z': return "draw-indexed-instanced-indirect";
+    case 'Y': return "draw-instanced-indirect";
+    default: return "unknown";
+    }
+}
+
+std::uint32_t resourceOrdinal(std::uintptr_t identity) noexcept {
+    if (identity == 0 || g_identityCount == 0) return 0;
+    const auto* found = std::lower_bound(g_identities,
+                                         g_identities + g_identityCount,
+                                         identity);
+    if (found == g_identities + g_identityCount || *found != identity) return 0;
+    return static_cast<std::uint32_t>(found - g_identities) + 1;
+}
+
+void normalizeResourceIdentities() noexcept {
+    g_identityCount = 0;
+    for (std::uint32_t i = 0; i < g_drawCount; ++i) {
+        const DrawFacts& f = g_records[i].facts;
+        const std::uintptr_t values[6] = {
+            f.vsIdentity, f.psIdentity, f.rtv0Identity, f.dsv0Identity,
+            f.argumentBufferKnown ? f.argumentBufferIdentity : 0, 0};
+        for (std::uintptr_t value : values) {
+            if (value == 0) continue;
+            if (g_identityCount >= kIdentitySlots) {
+                g_wasOverflowed = true;
+                continue;
+            }
+            g_identities[g_identityCount++] = value;
+        }
+    }
+    std::sort(g_identities, g_identities + g_identityCount);
+    g_identityCount = static_cast<std::uint32_t>(
+        std::unique(g_identities, g_identities + g_identityCount) - g_identities);
+}
+
+bool writeTrace(Writer& writer, std::uint32_t completedFrameNo) noexcept {
+    normalizeResourceIdentities();
+    const std::uint32_t stamp = moduleBuildStamp();
+    bool ok = writeText(writer,
+        "{\"format\":\"edvr.draw-ladder-trace\",\"schemaVersion\":1,"
+        "\"buildVersion\":\"");
+    ok = ok && writeText(writer, EDVR_VERSION_STRING);
+    ok = ok && writeFmt(writer,
+        "\",\"buildStamp\":\"%08X\",\"logFile\":\"%S\",\"semantics\":{",
+        stamp, g_logFileName);
+    ok = ok && writeText(writer,
+        "\"equivalence\":\"observed-selector-and-action-order\","
+        "\"predicateEquivalence\":false,"
+        "\"predicateNote\":\"Recorded facts do not re-evaluate hidden resource predicates; no extra D3D queries or constant-buffer reads were performed.\","
+        "\"identityNote\":\"Resource identities are per-capture ordinals; raw pointers are never serialized.\","
+        "\"flagBits\":{\"frame\":{\"pluginDispatch\":1,\"runtimeFlat\":2,\"drawGateSubscribed\":4},"
+        "\"draw\":{\"pluginDispatchEnabled\":1,\"distanceEnabled\":2,\"fssHealOn\":4,\"quadSkipArmed\":8},"
+        "\"action\":{\"generatedDrawArgsUnavailable\":8192,\"gpuDrawArgsUnavailable\":16384,\"issueCountUnknown\":32768},"
+        "\"forwardFacts\":{\"owner\":1,\"verdict\":2,\"verdictForwards\":4,\"familyAvailable\":8,"
+        "\"initialUiTake\":16,\"afterUiTake\":32,\"worldReissue\":64,"
+        "\"curveThisDraw\":128,\"introCurveThisDraw\":256,\"uiDepth\":512,"
+        "\"holoDepth\":1024,\"composite\":2048,\"crispPending\":4096,\"issueBlocked\":8192}}},");
+    ok = ok && writeFmt(writer,
+        "\"frame\":{\"frameNo\":%u,\"completedFrameNo\":%u,"
+        "\"configEpoch\":%u,\"eyeDrawsThisFrame\":%u,"
+        "\"eyeDrawsLastFrame\":%u,\"sceneDrawsThisFrame\":%u,"
+        "\"stateFlags\":%u,\"sceneCounters\":[%u,%u,%u,%u]},\"draws\":[",
+        g_frame.frameNo, completedFrameNo,
+        g_frame.configEpoch, g_frame.eyeDrawsThisFrame,
+        g_frame.eyeDrawsLastFrame, g_frame.sceneDrawsThisFrame,
+        g_frame.stateFlags, g_frame.sceneCounters[0], g_frame.sceneCounters[1],
+        g_frame.sceneCounters[2], g_frame.sceneCounters[3]);
+    if (!ok) return false;
+
+    for (std::uint32_t i = 0; i < g_drawCount; ++i) {
+        const DrawRecord& r = g_records[i];
+        const DrawFacts& f = r.facts;
+        if (i && !writeText(writer, ",")) return false;
+        ok = writeFmt(writer,
+            "{\"index\":%u,\"eyeDrawIndex\":%u,\"kind\":%u,"
+            "\"command\":\"%s\",\"count\":%u,\"instances\":%u,\"args\":",
+            i, f.eyeDrawIndex, static_cast<unsigned>(f.kind), commandName(f.kind),
+            f.count, f.instances);
+        ok = ok && writeDrawArgs(writer, f.args);
+        ok = ok && writeFmt(writer,
+            ",\"vsHash\":\"%016llX\",\"psHash\":\"%016llX\","
+            "\"resources\":{\"vs\":%u,\"ps\":%u,\"rtv0\":%u,\"dsv0\":%u,\"argumentBuffer\":%u},"
+            "\"argumentBufferKnown\":%s,\"argumentByteOffset\":%u,"
+            "\"drawParametersKnown\":%s,"
+            "\"rtv0Generation\":%u,\"dsv0Generation\":%u,"
+            "\"rtv0Width\":%u,\"rtv0Height\":%u,\"route\":%u,"
+            "\"sequence\":%u,\"candidateMask\":\"%016llX\",\"flags\":%u,"
+            "\"sites\":[",
+            static_cast<unsigned long long>(f.vsHash),
+            static_cast<unsigned long long>(f.psHash),
+            resourceOrdinal(f.vsIdentity), resourceOrdinal(f.psIdentity),
+            resourceOrdinal(f.rtv0Identity), resourceOrdinal(f.dsv0Identity),
+            resourceOrdinal(f.argumentBufferKnown ? f.argumentBufferIdentity : 0),
+            f.argumentBufferKnown ? "true" : "false", f.argumentByteOffset,
+            f.drawParametersKnown ? "true" : "false",
+            f.rtv0Generation, f.dsv0Generation, f.rtv0Width, f.rtv0Height,
+            static_cast<unsigned>(f.route), static_cast<unsigned>(f.sequence),
+            static_cast<unsigned long long>(f.candidateMask), f.flags);
+        if (!ok) return false;
+        for (std::uint16_t j = 0; j < r.siteCount; ++j) {
+            const SiteEvent& e = r.sites[j];
+            if (j && !writeText(writer, ",")) return false;
+            if (!writeFmt(writer,
+                "{\"id\":%u,\"kind\":%u,\"outcome\":%u,\"flow\":%u,"
+                "\"subsite\":%u,\"verdict\":%d}",
+                e.id, e.kind, e.outcome, e.flow, e.subsite, e.verdict)) return false;
+        }
+        ok = writeFmt(writer,
+            "],\"winnerSiteId\":%d,\"verdict\":%d,\"forwardFacts\":",
+            r.winnerSiteId, r.verdictOrdinal);
+        if (!ok) return false;
+        if (!r.hasForwardFacts) {
+            if (!writeText(writer, "null,\"actions\":[")) return false;
+        } else {
+            const ForwardFacts& d = r.forwardFacts;
+            ok = writeFmt(writer,
+                "{\"presentMask\":%u,\"verdictOrdinal\":%d,"
+                "\"family\":%u,\"familyAvailable\":\"%s\","
+                "\"owner\":\"%s\",\"verdictForwards\":\"%s\","
+                "\"initialUiTake\":\"%s\",\"afterUiTake\":\"%s\","
+                "\"worldReissue\":\"%s\",\"curveThisDraw\":\"%s\","
+                "\"introCurveThisDraw\":\"%s\",\"uiDepth\":\"%s\","
+                "\"holoDepth\":\"%s\",\"composite\":\"%s\","
+                "\"crispPending\":\"%s\",\"issueBlocked\":\"%s\"},"
+                "\"actions\":[",
+                d.presentMask, d.verdictOrdinal, d.family,
+                triName(d.familyAvailable), triName(d.owner),
+                triName(d.verdictForwards),
+                triName(d.initialUiTake), triName(d.afterUiTake),
+                triName(d.worldReissue), triName(d.curveThisDraw),
+                triName(d.introCurveThisDraw), triName(d.uiDepth),
+                triName(d.holoDepth), triName(d.composite),
+                triName(d.crispPending), triName(d.issueBlocked));
+            if (!ok) return false;
+        }
+        for (std::uint16_t j = 0; j < r.actionCount; ++j) {
+            const draw_ladder::ActionRecord& a = r.actions[j];
+            if (j && !writeText(writer, ",")) return false;
+            if (!writeFmt(writer,
+                "{\"id\":%u,\"phase\":%u,\"outcome\":%u,\"call\":%u,"
+                "\"flags\":%u,\"issueCount\":%u,\"issueCountKnown\":%s,\"count\":%u,"
+                "\"instances\":%u,\"start\":%u,\"startInstance\":%u,"
+                "\"baseVertex\":%ld}",
+                static_cast<unsigned>(r.actionIds[j]),
+                static_cast<unsigned>(a.phase), static_cast<unsigned>(a.outcome),
+                static_cast<unsigned>(a.call), static_cast<unsigned>(a.flags),
+                static_cast<unsigned>(a.issueCount),
+                (a.flags & draw_ladder::kActionIssueCountUnknown) ? "false" : "true",
+                a.count, a.instances,
+                a.start, a.startInstance, static_cast<long>(a.baseVertex))) return false;
+        }
+        if (!writeText(writer, "]}")) return false;
+    }
+    if (!writeFmt(writer,
+        "],\"footer\":{\"complete\":%s,\"truncated\":%s,"
+        "\"overflow\":%s,\"drawCount\":%u}}",
+        (!g_wasOverflowed && completedFrameNo == g_frame.frameNo) ? "true" : "false",
+        g_wasOverflowed ? "true" : "false",
+        g_wasOverflowed ? "true" : "false", g_drawCount)) return false;
+    return true;
+}
+
+bool validToken(Token token) noexcept {
+    return g_isCapturing && token.generation == g_generation &&
+           token.drawIndex < g_drawCount && token.drawIndex < kMaxDraws;
+}
+
+}  // namespace
+
+namespace detail {
+std::atomic<bool> g_captureActive{false};
+}  // namespace detail
+
+void configure(bool enabled, const wchar_t* logFilePath) noexcept {
+    // Config reloads can run while a one-frame capture is in progress. The
+    // caller must defer them until the next owner boundary after frameEnd;
+    // never free the active fixed-capacity arrays mid-capture.
+    if (g_isCapturing) return;
+    const bool wasEnabled = g_enabled.load(std::memory_order_acquire);
+    if (!enabled && !wasEnabled && !g_records && !g_identities) return;
+    if (enabled && wasEnabled && logFilePath && logFilePath[0]) {
+        wchar_t oldPath[kPathChars]{};
+        if (SUCCEEDED(StringCchCopyW(oldPath, kPathChars, g_directory)) &&
+            SUCCEEDED(StringCchCatW(oldPath, kPathChars, L"\\")) &&
+            SUCCEEDED(StringCchCatW(oldPath, kPathChars, g_logFileName)) &&
+            _wcsicmp(oldPath, logFilePath) == 0) return;
+    }
+    detail::g_captureActive.store(false, std::memory_order_relaxed);
+    g_armPending.store(false, std::memory_order_relaxed);
+    g_isCapturing = false;
+    g_enabled.store(false, std::memory_order_relaxed);
+    g_status.store(enabled ? Status::PathInvalid : Status::Disabled,
+                   std::memory_order_relaxed);
+    g_wasOverflowed = false;
+    g_lastWriteSucceeded = false;
+    if (g_records) { delete[] g_records; g_records = nullptr; }
+    if (g_identities) { delete[] g_identities; g_identities = nullptr; }
+    g_directory[0] = L'\0';
+    g_logFileName[0] = L'\0';
+    g_logStem[0] = L'\0';
+    if (!enabled) return;
+    if (!setLogPath(logFilePath)) return;
+
+    // This is the only allocation site. It runs during cold initialization,
+    // never from a hook or from an armed draw.
+    g_records = new (std::nothrow) DrawRecord[kMaxDraws];
+    g_identities = new (std::nothrow) std::uintptr_t[kIdentitySlots];
+    if (!g_records || !g_identities) {
+        if (g_records) { delete[] g_records; g_records = nullptr; }
+        if (g_identities) { delete[] g_identities; g_identities = nullptr; }
+        g_directory[0] = L'\0';
+        g_logFileName[0] = L'\0';
+        g_logStem[0] = L'\0';
+        g_status.store(Status::AllocationFailed, std::memory_order_relaxed);
+        return;
+    }
+    g_enabled.store(true, std::memory_order_release);
+    g_status.store(Status::Ready, std::memory_order_relaxed);
+}
+
+ShutdownResult shutdown() noexcept {
+    // The caller has already removed the draw hooks and quiesced callbacks.
+    // Snapshot the visible state before clearing it so a cold lifecycle
+    // breadcrumb can report an armed/partial capture as discarded.
+    const ShutdownResult result{
+        status(),
+        g_armPending.load(std::memory_order_relaxed),
+        g_isCapturing,
+    };
+
+    detail::g_captureActive.store(false, std::memory_order_relaxed);
+    g_armPending.store(false, std::memory_order_relaxed);
+    g_enabled.store(false, std::memory_order_release);
+    g_isCapturing = false;
+    g_wasOverflowed = false;
+    g_lastWriteSucceeded = false;
+    g_drawCount = 0;
+    g_identityCount = 0;
+    g_frame = FrameFacts{};
+    if (g_records) {
+        delete[] g_records;
+        g_records = nullptr;
+    }
+    if (g_identities) {
+        delete[] g_identities;
+        g_identities = nullptr;
+    }
+    g_directory[0] = L'\0';
+    g_logFileName[0] = L'\0';
+    g_logStem[0] = L'\0';
+    ++g_generation;
+    if (g_generation == 0) ++g_generation;
+    g_status.store(Status::Disabled, std::memory_order_release);
+    return result;
+}
+
+void armManual() noexcept {
+    if (!g_enabled.load(std::memory_order_acquire) ||
+        detail::g_captureActive.load(std::memory_order_relaxed)) return;
+    bool expected = false;
+    // status() derives Armed from g_armPending. Publishing a separate Armed
+    // value here could race the owner thread consuming the arm and leave a
+    // stale Armed breadcrumb after capture has started or completed.
+    g_armPending.compare_exchange_strong(expected, true,
+                                         std::memory_order_relaxed);
+}
+
+void frameBegin(const FrameFacts& facts) noexcept {
+    if (!g_enabled.load(std::memory_order_relaxed) || g_isCapturing ||
+        !g_armPending.exchange(false, std::memory_order_relaxed)) return;
+    g_frame = facts;
+    g_drawCount = 0;
+    g_identityCount = 0;
+    g_wasOverflowed = false;
+    g_isCapturing = true;
+    g_status.store(Status::Capturing, std::memory_order_relaxed);
+    ++g_generation;
+    if (g_generation == 0) ++g_generation;
+    detail::g_captureActive.store(true, std::memory_order_relaxed);
+}
+
+Token beginDraw(const DrawFacts& facts) noexcept {
+    // The call is reachable only through the single outer draw-level guard;
+    // same-thread owner-frame boundaries cannot change capture state here.
+    if (!g_isCapturing) return {};
+    if (g_drawCount >= kMaxDraws) {
+        g_wasOverflowed = true;
+        return {};
+    }
+    const std::uint32_t index = g_drawCount++;
+    DrawRecord& record = g_records[index];
+    record = DrawRecord{};
+    record.facts = facts;
+    return {index, g_generation};
+}
+
+void appendSite(Token token, std::uint16_t id, std::uint8_t kind,
+                std::uint8_t outcome, std::uint8_t flow,
+                std::uint16_t subsite, std::int16_t siteVerdict) noexcept {
+    if (!validToken(token)) { rejectInvalidToken(); return; }
+    DrawRecord& record = g_records[token.drawIndex];
+    if (record.finalized) { rejectInvalidToken(); return; }
+    if (record.siteCount >= kMaxSiteEventsPerDraw) {
+        g_wasOverflowed = true;
+        return;
+    }
+    SiteEvent& event = record.sites[record.siteCount++];
+    event.id = id;
+    event.kind = kind;
+    event.outcome = outcome;
+    event.flow = flow;
+    event.subsite = subsite;
+    event.verdict = siteVerdict;
+}
+
+void appendAction(Token token, std::uint16_t id,
+                  const draw_ladder::ActionRecord& action) noexcept {
+    if (!validToken(token)) { rejectInvalidToken(); return; }
+    DrawRecord& record = g_records[token.drawIndex];
+    if (record.finalized) { rejectInvalidToken(); return; }
+    if (record.actionCount >= kMaxActionEventsPerDraw) {
+        g_wasOverflowed = true;
+        return;
+    }
+    // Keep the stable ActionId beside the shared pointer-free action facts.
+    record.actions[record.actionCount] = action;
+    // ActionRecord intentionally carries the call facts; ActionId is separate.
+    record.actionIds[record.actionCount] = id;
+    ++record.actionCount;
+}
+
+void updateCandidates(Token token, std::uint64_t mask) noexcept {
+    if (!validToken(token)) { rejectInvalidToken(); return; }
+    DrawRecord& record = g_records[token.drawIndex];
+    if (record.finalized) { rejectInvalidToken(); return; }
+    record.facts.candidateMask = mask;
+}
+
+void updateRoute(Token token, draw_ladder::RouteId route,
+                 draw_ladder::SequenceId sequence) noexcept {
+    if (!validToken(token)) { rejectInvalidToken(); return; }
+    DrawRecord& record = g_records[token.drawIndex];
+    if (record.finalized) { rejectInvalidToken(); return; }
+    record.facts.route = route;
+    record.facts.sequence = sequence;
+}
+
+void recordForwardFacts(Token token, const ForwardFacts& facts) noexcept {
+    if (!validToken(token)) { rejectInvalidToken(); return; }
+    DrawRecord& record = g_records[token.drawIndex];
+    if (record.finalized || record.hasForwardFacts) { rejectInvalidToken(); return; }
+    record.forwardFacts = facts;
+    record.hasForwardFacts = true;
+}
+
+void finishDraw(Token token, std::int16_t winnerSiteId,
+                std::int16_t verdictOrdinal) noexcept {
+    if (!validToken(token)) { rejectInvalidToken(); return; }
+    DrawRecord& record = g_records[token.drawIndex];
+    if (record.finalized) { rejectInvalidToken(); return; }
+    record.winnerSiteId = winnerSiteId;
+    record.verdictOrdinal = verdictOrdinal;
+    record.finalized = true;
+}
+
+void frameEnd(std::uint32_t completedFrameNo) noexcept {
+    if (!g_isCapturing) return;
+    detail::g_captureActive.store(false, std::memory_order_relaxed);
+    g_isCapturing = false;
+    if (completedFrameNo != g_frame.frameNo) g_wasOverflowed = true;
+    for (std::uint32_t i = 0; i < g_drawCount; ++i) {
+        if (!g_records[i].finalized) g_wasOverflowed = true;
+    }
+
+    wchar_t sidecar[kPathChars]{};
+    wchar_t leaf[kNameChars]{};
+    _snwprintf_s(leaf, kNameChars, _TRUNCATE, L"%s.draw-ladder-%u.json",
+                 g_logStem, completedFrameNo);
+    if (FAILED(StringCchCopyW(sidecar, kPathChars, g_directory)) ||
+        FAILED(StringCchCatW(sidecar, kPathChars, L"\\")) ||
+        FAILED(StringCchCatW(sidecar, kPathChars, leaf))) {
+        g_lastWriteSucceeded = false;
+    } else {
+        HANDLE file = CreateFileW(sidecar, GENERIC_WRITE, FILE_SHARE_READ,
+                                  nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+                                  nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            g_lastWriteSucceeded = false;
+        } else {
+            Writer writer(file);
+            g_lastWriteSucceeded = writeTrace(writer, completedFrameNo) &&
+                                   flush(writer);
+            if (!CloseHandle(file)) g_lastWriteSucceeded = false;
+            if (!g_lastWriteSucceeded) DeleteFileW(sidecar);
+        }
+    }
+    if (!g_lastWriteSucceeded) {
+        g_status.store(Status::WriteFailed, std::memory_order_relaxed);
+    } else if (g_wasOverflowed) {
+        g_status.store(Status::InvalidCapture, std::memory_order_relaxed);
+    } else {
+        g_status.store(Status::CompleteWritten, std::memory_order_relaxed);
+    }
+    g_drawCount = 0;
+    g_identityCount = 0;
+    ++g_generation;
+    if (g_generation == 0) ++g_generation;
+}
+
+void invalidateActiveCapture() noexcept {
+    if (g_isCapturing) g_wasOverflowed = true;
+}
+
+bool configured() noexcept { return g_enabled.load(std::memory_order_acquire); }
+bool capturing() noexcept {
+    return detail::g_captureActive.load(std::memory_order_relaxed);
+}
+bool overflowed() noexcept { return g_wasOverflowed; }
+Status status() noexcept {
+    if (detail::g_captureActive.load(std::memory_order_relaxed))
+        return Status::Capturing;
+    if (g_armPending.load(std::memory_order_relaxed)) return Status::Armed;
+    return g_status.load(std::memory_order_relaxed);
+}
+const char* statusName(Status value) noexcept {
+    switch (value) {
+    case Status::Disabled: return "disabled";
+    case Status::PathInvalid: return "path-invalid";
+    case Status::AllocationFailed: return "allocation-failed";
+    case Status::Ready: return "ready";
+    case Status::Armed: return "armed";
+    case Status::Capturing: return "capturing";
+    case Status::CompleteWritten: return "complete-written";
+    case Status::InvalidCapture: return "invalid-capture";
+    case Status::WriteFailed: return "write-failed";
+    }
+    return "unknown";
+}
+
+}  // namespace edvr::draw_ladder_trace

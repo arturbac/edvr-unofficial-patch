@@ -8,6 +8,7 @@
   "coreOwnedConfigKeys": [
     "advanced.app_gpu_timing",
     "advanced.d3d11_fixes",
+    "advanced.draw_replay",
     "advanced.eye_render_size",
     "advanced.real_dll",
     "d3d11.focus_on_launch",

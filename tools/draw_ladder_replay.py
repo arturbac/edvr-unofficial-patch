@@ -1,0 +1,846 @@
+#!/usr/bin/env python3
+"""Read and validate one EDVR draw-ladder sidecar; never edits flight logs."""
+
+from __future__ import print_function
+
+import argparse
+import json
+import os
+import re
+import sys
+
+FORMAT = "edvr.draw-ladder-trace"
+SCHEMA_VERSION = 1
+MAX_TRACE_BYTES = 256 * 1024 * 1024
+MAX_DRAWS = 65536
+MAX_SITE_EVENTS = 48
+MAX_ACTION_EVENTS = 32
+SITE_KIND = {1, 2, 3}
+SITE_OUTCOME = {1, 2, 3, 4, 5}
+SITE_FLOW = {0, 1}
+ACTION_PHASE = {1, 2, 3, 4, 5, 6}
+ACTION_OUTCOME = {1, 2, 3}
+DRAW_CALL = {1, 2, 3, 4, 5, 6, 7}
+DRAW_COMMANDS = {
+    ord("D"): "draw", ord("I"): "draw-indexed", ord("N"): "draw-instanced",
+    ord("X"): "draw-indexed-instanced", ord("A"): "draw-auto",
+    ord("Z"): "draw-indexed-instanced-indirect",
+    ord("Y"): "draw-instanced-indirect",
+}
+SITE_KINDS = {
+    1: 2, 2: 3, 3: 3, 4: 1, 5: 2, 6: 2, 7: 1, 8: 1,
+    20: 1, 21: 1, 22: 2, 23: 2, 24: 2, 25: 2, 26: 2,
+    27: 1, 28: 3, 40: 1, 41: 1, 42: 1, 43: 2, 44: 1,
+    45: 1, 46: 1, 47: 1, 48: 2, 49: 2, 50: 2, 51: 2,
+    52: 2, 53: 2, 54: 2, 55: 2, 56: 2, 57: 2, 58: 2,
+    59: 2, 60: 2, 61: 2, 62: 2, 63: 2, 64: 1, 65: 1,
+    66: 2, 67: 3, 68: 3, 69: 3, 70: 1, 71: 1, 72: 3,
+    73: 3, 74: 3, 75: 3, 76: 3,
+}
+TERMINAL_VERDICTS = {
+    1: 2, 5: 10, 6: 2, 22: 18, 23: 2, 24: 2, 25: 16, 26: 15,
+    43: 7, 48: 2, 49: 2, 50: 6, 51: 2, 52: 3, 53: 4, 54: 5,
+    55: 17, 56: 18, 57: 11, 58: 12, 59: 13, 60: 14, 61: 2,
+    62: 9, 63: 8, 66: 1,
+    2: 0, 3: 0, 28: 0, 67: 0, 68: 0, 69: 0,
+    72: 0, 73: 0, 74: 0, 75: 0, 76: 0,
+}
+
+# This table describes only the canonical site order for validating recorded
+# visit order and inferring the short-circuited suffix. Arbitration itself is
+# intentionally delegated to the production C++ selector/rig.
+COMMON = [1, 2, 3, 4, 5, 6, 7, 8]
+OFFSCREEN = [70, 22, 20, 21, 23, 24, 25, 26, 27, 28]
+EYE = [40, 41, 42, 43, 44, 45, 71, 46, 47, 48, 49, 50, 51, 52, 53,
+       54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 67, 68, 66, 69]
+FLAT_BYPASS = [72]
+AUTO_BYPASS = [73]
+DRAW_INDEXED_INSTANCED_INDIRECT_BYPASS = [74]
+DRAW_INSTANCED_INDIRECT_BYPASS = [75]
+INTERNAL_WORLD_BYPASS = [76]
+SEQUENCES = {
+    (1, 1): COMMON,
+    (2, 1): COMMON,
+    (3, 1): COMMON,
+    (4, 2): COMMON + OFFSCREEN,
+    (6, 4): COMMON + EYE,
+    (7, 5): FLAT_BYPASS,
+    (8, 6): AUTO_BYPASS,
+    (9, 7): DRAW_INDEXED_INSTANCED_INDIRECT_BYPASS,
+    (10, 8): DRAW_INSTANCED_INDIRECT_BYPASS,
+    (11, 9): INTERNAL_WORLD_BYPASS,
+}
+TRI_STATES = {"unknown", "no", "yes"}
+FORWARD_TRI_FIELDS = {
+    "owner": 1 << 0,
+    "verdictForwards": 1 << 2,
+    "familyAvailable": 1 << 3,
+    "initialUiTake": 1 << 4,
+    "afterUiTake": 1 << 5,
+    "worldReissue": 1 << 6,
+    "curveThisDraw": 1 << 7,
+    "introCurveThisDraw": 1 << 8,
+    "uiDepth": 1 << 9,
+    "holoDepth": 1 << 10,
+    "composite": 1 << 11,
+    "crispPending": 1 << 12,
+    "issueBlocked": 1 << 13,
+}
+FLAG_BITS = {
+    "frame": {"pluginDispatch": 1, "runtimeFlat": 2, "drawGateSubscribed": 4},
+                   "draw": {"pluginDispatchEnabled": 1, "distanceEnabled": 2,
+             "fssHealOn": 4, "quadSkipArmed": 8},
+    "action": {"generatedDrawArgsUnavailable": 0x2000,
+               "gpuDrawArgsUnavailable": 0x4000,
+               "issueCountUnknown": 0x8000},
+    "forwardFacts": {
+        "owner": 1 << 0, "verdict": 1 << 1, "verdictForwards": 1 << 2,
+        "familyAvailable": 1 << 3, "initialUiTake": 1 << 4,
+        "afterUiTake": 1 << 5, "worldReissue": 1 << 6,
+        "curveThisDraw": 1 << 7, "introCurveThisDraw": 1 << 8,
+        "uiDepth": 1 << 9, "holoDepth": 1 << 10, "composite": 1 << 11,
+        "crispPending": 1 << 12, "issueBlocked": 1 << 13,
+    },
+}
+
+
+class TraceError(ValueError):
+    pass
+
+
+def _integer(value, label, low=0, high=0xffffffff):
+    if type(value) is not int or value < low or value > high:
+        raise TraceError("%s must be an integer in %d..%d" % (label, low, high))
+    return value
+
+
+def validate_trace(data, expected_log=None, expected_build_stamp=None):
+    if not isinstance(data, dict):
+        raise TraceError("sidecar root must be an object")
+    if data.get("format") != FORMAT:
+        raise TraceError("unknown trace format")
+    if type(data.get("schemaVersion")) is not int or data["schemaVersion"] != SCHEMA_VERSION:
+        raise TraceError("unsupported schemaVersion")
+    version = data.get("buildVersion")
+    if not isinstance(version, str) or not version or len(version) > 128:
+        raise TraceError("buildVersion is missing or invalid")
+    stamp = data.get("buildStamp")
+    if not isinstance(stamp, str) or not re.match(r"^[0-9A-Fa-f]{8}$", stamp):
+        raise TraceError("buildStamp must be eight hexadecimal digits")
+    log_name = data.get("logFile")
+    if (not isinstance(log_name, str) or not log_name or
+            os.path.basename(log_name) != log_name or
+            "/" in log_name or "\\" in log_name):
+        raise TraceError("logFile must be a basename")
+    if expected_log is not None and log_name.lower() != os.path.basename(expected_log).lower():
+        raise TraceError("sidecar belongs to a different graphics log")
+    if expected_build_stamp is not None and stamp.upper() != expected_build_stamp.upper():
+        raise TraceError("sidecar build stamp does not match the graphics log")
+
+    semantics = data.get("semantics")
+    if (not isinstance(semantics, dict) or
+            semantics.get("equivalence") != "observed-selector-and-action-order" or
+            semantics.get("predicateEquivalence") is not False):
+        raise TraceError("sidecar must state action/selector scope and predicate limitation")
+    flag_bits = semantics.get("flagBits")
+    if not isinstance(flag_bits, dict) or set(flag_bits) != set(FLAG_BITS):
+        raise TraceError("sidecar flagBits metadata is missing or incomplete")
+    for group, expected in FLAG_BITS.items():
+        actual = flag_bits.get(group)
+        if (not isinstance(actual, dict) or set(actual) != set(expected) or
+                any(type(actual.get(name)) is not int or actual[name] != bit
+                    for name, bit in expected.items())):
+            raise TraceError("sidecar flagBits.%s does not match schema" % group)
+
+    frame = data.get("frame")
+    if not isinstance(frame, dict):
+        raise TraceError("frame metadata is missing")
+    frame_no = _integer(frame.get("frameNo"), "frame.frameNo")
+    completed = _integer(frame.get("completedFrameNo"), "frame.completedFrameNo")
+    if frame_no != completed:
+        raise TraceError("capture does not cover one complete owner frame")
+    for key in ("configEpoch", "eyeDrawsThisFrame", "eyeDrawsLastFrame",
+                "sceneDrawsThisFrame", "stateFlags"):
+        _integer(frame.get(key), "frame." + key)
+    counters = frame.get("sceneCounters")
+    if not isinstance(counters, list) or len(counters) != 4:
+        raise TraceError("frame.sceneCounters must contain four counters")
+    for i, value in enumerate(counters):
+        _integer(value, "frame.sceneCounters[%d]" % i)
+
+    draws = data.get("draws")
+    if not isinstance(draws, list) or len(draws) > MAX_DRAWS:
+        raise TraceError("draws must be a bounded array")
+    route_counts = {}
+    total_sites = 0
+    total_actions = 0
+    inferred_unvisited = 0
+    for index, draw in enumerate(draws):
+        label = "draws[%d]" % index
+        if not isinstance(draw, dict):
+            raise TraceError(label + " must be an object")
+        if _integer(draw.get("index"), label + ".index") != index:
+            raise TraceError(label + " index is not contiguous")
+        for key in ("eyeDrawIndex", "count", "instances", "rtv0Generation",
+                    "dsv0Generation", "rtv0Width", "rtv0Height", "flags"):
+            _integer(draw.get(key), label + "." + key)
+        kind = _integer(draw.get("kind"), label + ".kind", 0, 255)
+        if kind not in (ord("D"), ord("I"), ord("N"), ord("X"),
+                        ord("A"), ord("Z"), ord("Y")):
+            raise TraceError(label + " has an unknown draw kind")
+        if draw.get("command") != DRAW_COMMANDS[kind]:
+            raise TraceError(label + " command name does not match its kind")
+        args = draw.get("args")
+        if not isinstance(args, dict):
+            raise TraceError(label + ".args is missing")
+        _integer(args.get("start"), label + ".args.start")
+        _integer(args.get("base"), label + ".args.base", -0x80000000, 0x7fffffff)
+        _integer(args.get("startInstance"), label + ".args.startInstance")
+        for key in ("vsHash", "psHash", "candidateMask"):
+            value = draw.get(key)
+            if not isinstance(value, str) or not re.match(r"^[0-9A-Fa-f]{16}$", value):
+                raise TraceError(label + "." + key + " must be sixteen hex digits")
+        resources = draw.get("resources")
+        if not isinstance(resources, dict):
+            raise TraceError(label + ".resources is missing")
+        for key in ("vs", "ps", "rtv0", "dsv0", "argumentBuffer"):
+            _integer(resources.get(key), label + ".resources." + key, 0, 6 * MAX_DRAWS)
+        argument_buffer_known = draw.get("argumentBufferKnown")
+        draw_parameters_known = draw.get("drawParametersKnown")
+        if type(argument_buffer_known) is not bool or type(draw_parameters_known) is not bool:
+            raise TraceError(label + " must state argument and draw-parameter availability")
+        argument_offset = _integer(draw.get("argumentByteOffset"),
+                                   label + ".argumentByteOffset")
+        if kind in (ord("Y"), ord("Z")):
+            if not argument_buffer_known or draw_parameters_known:
+                raise TraceError(label + " indirect command availability is inconsistent")
+        elif argument_buffer_known or resources["argumentBuffer"] != 0 or argument_offset != 0:
+            raise TraceError(label + " has an argument buffer on a non-indirect command")
+        if kind == ord("A"):
+            if draw_parameters_known:
+                raise TraceError(label + " DrawAuto parameters must be marked unavailable")
+        elif kind in (ord("D"), ord("I"), ord("N"), ord("X")) and not draw_parameters_known:
+            raise TraceError(label + " direct command parameters must be recorded")
+        route = _integer(draw.get("route"), label + ".route", 1, 11)
+        sequence = _integer(draw.get("sequence"), label + ".sequence", 1, 9)
+        ordered = SEQUENCES.get((route, sequence))
+        if ordered is None:
+            raise TraceError(label + " has an unsupported route/sequence pair")
+        expected_route = {
+            ord("A"): (8, 6), ord("Z"): (9, 7), ord("Y"): (10, 8),
+        }.get(kind)
+        if expected_route and route != 7 and (route, sequence) != expected_route:
+            raise TraceError(label + " bypass command does not match its route")
+        if kind in (ord("D"), ord("I"), ord("N"), ord("X")) and route in (8, 9, 10):
+            raise TraceError(label + " classifier command uses a bypass route")
+        if (kind in (ord("A"), ord("Y"), ord("Z"))) and draw_parameters_known:
+            raise TraceError(label + " GPU-derived draw parameters must be unavailable")
+        route_counts[route] = route_counts.get(route, 0) + 1
+
+        sites = draw.get("sites")
+        if not isinstance(sites, list) or len(sites) > MAX_SITE_EVENTS:
+            raise TraceError(label + ".sites exceeds the fixed event capacity")
+        total_sites += len(sites)
+        seen = set()
+        last_position = -1
+        stopped = False
+        terminal_id = -1
+        terminal_verdict = -1
+        for event_index, event in enumerate(sites):
+            event_label = "%s.sites[%d]" % (label, event_index)
+            if not isinstance(event, dict):
+                raise TraceError(event_label + " must be an object")
+            site_id = _integer(event.get("id"), event_label + ".id", 1, 76)
+            if site_id not in ordered or site_id in seen:
+                raise TraceError(event_label + " is not a unique member of its route sequence")
+            pos = ordered.index(site_id)
+            if pos != event_index:
+                raise TraceError(label + " reached sites are not a contiguous canonical prefix")
+            if stopped:
+                raise TraceError(label + " contains a visit after a terminal site")
+            seen.add(site_id)
+            last_position = pos
+            site_kind = _integer(event.get("kind"), event_label + ".kind", 1, 3)
+            if SITE_KINDS.get(site_id) != site_kind:
+                raise TraceError(event_label + " kind disagrees with stable site metadata")
+            outcome = _integer(event.get("outcome"), event_label + ".outcome", 1, 5)
+            flow = _integer(event.get("flow"), event_label + ".flow", 0, 1)
+            _integer(event.get("subsite"), event_label + ".subsite", 0, 65535)
+            verdict = _integer(event.get("verdict"), event_label + ".verdict", -1, 18)
+            if outcome == 3 and site_kind != 2:
+                raise TraceError(event_label + " Claimed outcome requires a Claim site")
+            if outcome == 4 and site_kind != 3:
+                raise TraceError(event_label + " Exited outcome requires an Exit site")
+            if outcome == 5 and site_kind != 2:
+                raise TraceError(event_label + " NotEligible outcome requires a Claim site")
+            if outcome in (3, 4):
+                if flow != 1:
+                    raise TraceError(event_label + " terminal outcome must stop the ladder")
+                if site_id not in TERMINAL_VERDICTS:
+                    raise TraceError(event_label + " has no stable terminal verdict mapping")
+                if verdict != TERMINAL_VERDICTS[site_id]:
+                    raise TraceError(event_label + " verdict does not match its terminal site")
+                stopped = True
+                terminal_id = site_id
+                terminal_verdict = verdict
+            else:
+                if flow != 0:
+                    raise TraceError(event_label + " nonterminal outcome cannot stop the ladder")
+                if verdict != -1:
+                    raise TraceError(event_label + " nonterminal site must use verdict -1")
+        if not sites or not stopped:
+            raise TraceError(label + " is missing its terminal claim/exit event")
+        inferred_unvisited += len(ordered) - last_position - 1
+
+        winner = _integer(draw.get("winnerSiteId"), label + ".winnerSiteId", -1, 32767)
+        verdict = _integer(draw.get("verdict"), label + ".verdict", -1, 18)
+        terminal_outcome = sites[-1]["outcome"]
+        # Despite the legacy field name, winnerSiteId is the terminal stop
+        # site for both claims and exits. Keeping exit identity distinguishes
+        # the several None/Skip reasons in recorded traces.
+        if terminal_id != winner:
+            raise TraceError(label + " terminal site does not match winnerSiteId")
+        if terminal_id not in TERMINAL_VERDICTS:
+            raise TraceError(label + " terminal site has no stable verdict mapping")
+        if terminal_verdict != TERMINAL_VERDICTS[terminal_id]:
+            raise TraceError(label + " terminal site verdict does not match its stable mapping")
+        if terminal_verdict != verdict:
+            raise TraceError(label + " final verdict differs from terminal site result")
+
+        if "forwardFacts" not in draw:
+            raise TraceError(label + " must explicitly mark forwardFacts present or null")
+        facts = draw["forwardFacts"]
+        if facts is not None:
+            if not isinstance(facts, dict):
+                raise TraceError(label + ".forwardFacts must be an object or null")
+            present = _integer(facts.get("presentMask"), label + ".forwardFacts.presentMask", 0, (1 << 14) - 1)
+            facts_verdict = _integer(facts.get("verdictOrdinal"), label + ".forwardFacts.verdictOrdinal", -1, 18)
+            _integer(facts.get("family"), label + ".forwardFacts.family", 0, 65535)
+            verdict_bit = FLAG_BITS["forwardFacts"]["verdict"]
+            if bool(present & verdict_bit) != (facts_verdict != -1):
+                raise TraceError(label + ".forwardFacts verdict availability disagrees with mask")
+            if present & verdict_bit and facts_verdict != verdict:
+                raise TraceError(label + ".forwardFacts verdict differs from final draw verdict")
+            for field, bit in FORWARD_TRI_FIELDS.items():
+                value = facts.get(field)
+                if value not in TRI_STATES:
+                    raise TraceError(label + ".forwardFacts." + field + " is invalid")
+                if bool(present & bit) != (value != "unknown"):
+                    raise TraceError(label + ".forwardFacts." + field + " availability disagrees with mask")
+
+        actions = draw.get("actions")
+        if not isinstance(actions, list) or len(actions) > MAX_ACTION_EVENTS:
+            raise TraceError(label + ".actions exceeds the fixed event capacity")
+        total_actions += len(actions)
+        for action_index, action in enumerate(actions):
+            action_label = "%s.actions[%d]" % (label, action_index)
+            if not isinstance(action, dict):
+                raise TraceError(action_label + " must be an object")
+            action_id = _integer(action.get("id"), action_label + ".id", 1, 20)
+            phase = _integer(action.get("phase"), action_label + ".phase", 1, 6)
+            _integer(action.get("outcome"), action_label + ".outcome", 1, 3)
+            call = _integer(action.get("call"), action_label + ".call", 1, 7)
+            _integer(action.get("flags"), action_label + ".flags", 0, 65535)
+            _integer(action.get("issueCount"), action_label + ".issueCount", 0, 65535)
+            issue_count_known = action.get("issueCountKnown")
+            if (type(issue_count_known) is not bool or
+                    issue_count_known != (action["flags"] & FLAG_BITS["action"]["issueCountUnknown"] == 0)):
+                raise TraceError(action_label + ".issueCountKnown disagrees with action flags")
+            if not issue_count_known and action["issueCount"] != 0:
+                raise TraceError(action_label + " unknown issueCount must be zero")
+            gpu_args_unavailable = bool(
+                action["flags"] & FLAG_BITS["action"]["gpuDrawArgsUnavailable"])
+            if gpu_args_unavailable != (action["phase"] == 2 and call in (5, 6, 7)):
+                raise TraceError(action_label + " GPU-argument availability disagrees with call kind")
+            for key in ("count", "instances", "start", "startInstance"):
+                _integer(action.get(key), action_label + "." + key)
+            _integer(action.get("baseVertex"), action_label + ".baseVertex",
+                     -0x80000000, 0x7fffffff)
+            generated_args_unavailable = bool(
+                action["flags"] & FLAG_BITS["action"]["generatedDrawArgsUnavailable"])
+            generated_action_requires_flag = (
+                (action_id == 6 and phase == 2) or
+                (action_id == 4 and phase == 2 and not issue_count_known))
+            if generated_action_requires_flag and not generated_args_unavailable:
+                raise TraceError(action_label +
+                                 " helper-generated draw arguments must be marked unavailable")
+            if generated_args_unavailable:
+                if (phase != 2 or issue_count_known or action_id not in (4, 6, 7, 12) or
+                        call != 4 or any(action[key] != 0 for key in
+                                         ("count", "instances", "start", "startInstance", "baseVertex"))):
+                    raise TraceError(action_label +
+                                     " generated draw arguments must be explicitly unavailable and zeroed")
+
+        if len(actions) < 2:
+            raise TraceError(label + " is missing draw begin/end action records")
+        begin, end = actions[0], actions[-1]
+        if (begin["id"], begin["phase"], begin["outcome"]) != (1, 1, 2):
+            raise TraceError(label + " draw begin action is missing or malformed")
+        if (end["id"], end["phase"], end["outcome"]) != (17, 3, 2):
+            raise TraceError(label + " draw end action is missing or malformed")
+        if any(action["id"] in (1, 17) for action in actions[1:-1]):
+            raise TraceError(label + " draw begin/end action is out of order")
+        bypass_original = None
+        if route == 7:
+            bypass_original = {
+                ord("D"): (2, 1), ord("I"): (2, 2), ord("N"): (2, 3),
+                ord("X"): (2, 4), ord("A"): (18, 5), ord("Z"): (19, 6),
+                ord("Y"): (20, 7),
+            }[kind]
+        elif route == 8:
+            bypass_original = (18, 5)
+        elif route == 9:
+            bypass_original = (19, 6)
+        elif route == 10:
+            bypass_original = (20, 7)
+        elif route == 11:
+            bypass_original = (2, None)
+        if bypass_original:
+            if len(actions) != 3:
+                raise TraceError(label + " bypass route must contain only begin, original, end")
+            original = actions[1]
+            if (original["id"], original["phase"]) != (bypass_original[0], 2):
+                raise TraceError(label + " bypass original action is missing or malformed")
+            if bypass_original[1] is not None and original["call"] != bypass_original[1]:
+                raise TraceError(label + " bypass original action call kind is wrong")
+            if original["outcome"] == 2:
+                if not original["issueCountKnown"] or original["issueCount"] != 1:
+                    raise TraceError(label + " applied bypass original must record one known issue")
+            elif original["outcome"] == 3:
+                terminal_subsite = sites[-1]["subsite"]
+                if (route not in (8, 9, 10) or terminal_subsite != 1 or
+                        not original["issueCountKnown"] or original["issueCount"] != 0):
+                    raise TraceError(label + " declined bypass original lacks a blocked-route marker")
+            else:
+                raise TraceError(label + " bypass original outcome must be applied or declined")
+            expected_command_action = {ord("A"): 18, ord("Z"): 19,
+                                       ord("Y"): 20}.get(kind)
+            if expected_command_action and original["id"] != expected_command_action:
+                raise TraceError(label + " bypass action ID does not match command")
+        if facts is not None and facts.get("issueBlocked") == "yes":
+            blocked = [action for action in actions
+                       if action["id"] == 3 and action["phase"] == 2]
+            if (len(blocked) != 1 or blocked[0]["outcome"] != 3 or
+                    blocked[0]["issueCount"] != 0 or not blocked[0]["issueCountKnown"]):
+                raise TraceError(label + " issueBlocked fact lacks its declined swallow action")
+
+    footer = data.get("footer")
+    if not isinstance(footer, dict):
+        raise TraceError("capture footer is missing; sidecar may be truncated")
+    if footer.get("complete") is not True or footer.get("truncated") is not False or footer.get("overflow") is not False:
+        raise TraceError("capture is incomplete, truncated, or overflowed")
+    if _integer(footer.get("drawCount"), "footer.drawCount") != len(draws):
+        raise TraceError("footer drawCount does not match recorded draws")
+
+    if route_counts and all(route == 7 for route in route_counts):
+        scope = "flat bypass/actions; no VR classifier parity"
+    elif route_counts and all(route == 8 for route in route_counts):
+        scope = "DrawAuto bypass/actions; GPU-derived counts unavailable; no VR classifier parity"
+    elif route_counts and all(route in (9, 10) for route in route_counts):
+        scope = "indirect-draw bypass/actions; GPU argument contents unavailable; no VR classifier parity"
+    elif route_counts and all(route == 11 for route in route_counts):
+        scope = "internal/world bypass actions; nested originals remain in parent draw; no classifier parity"
+    elif (6 in route_counts or 4 in route_counts) and any(route >= 7 for route in route_counts):
+        scope = "observed VR selector/action order plus non-classifier bypass samples; predicate equivalence not established"
+    elif 6 in route_counts or 4 in route_counts:
+        scope = "observed VR selector/action order; predicate equivalence not established"
+    else:
+        scope = "observed early-route/action order; predicate equivalence not established"
+    return {
+        "frameNo": frame_no,
+        "drawCount": len(draws),
+        "siteCount": total_sites,
+        "actionCount": total_actions,
+        "inferredUnvisitedSiteCount": inferred_unvisited,
+        "routeCounts": route_counts,
+        "scope": scope,
+        "buildVersion": version,
+        "buildStamp": stamp.upper(),
+        "logFile": log_name,
+    }
+
+
+def read_trace(path, expected_log=None, expected_build_stamp=None):
+    size = os.path.getsize(path)
+    if size > MAX_TRACE_BYTES:
+        raise TraceError("sidecar exceeds the %d-byte reader limit" % MAX_TRACE_BYTES)
+    with open(path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    summary = validate_trace(data, expected_log, expected_build_stamp)
+    return data, summary
+
+
+def discover_sidecars(log_path):
+    """Find only strict basename-derived siblings; never follow JSON paths."""
+    directory = os.path.dirname(os.path.abspath(log_path))
+    stem = os.path.splitext(os.path.basename(log_path))[0]
+    rx = re.compile(r"^%s\.draw-ladder-(\d+)\.json$" % re.escape(stem), re.IGNORECASE)
+    found = []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    for name in names:
+        match = rx.match(name)
+        if match:
+            found.append((int(match.group(1)), os.path.join(directory, name)))
+    return [path for _, path in sorted(found)]
+
+
+def format_summary(summary, sidecar_path=None):
+    routes = ", ".join("%s:%d" % (route, count)
+                       for route, count in sorted(summary["routeCounts"].items())) or "none"
+    lines = ["DRAW-LADDER TRACE: frame %d, %d draw(s), %d site event(s), %d action event(s)" %
+             (summary["frameNo"], summary["drawCount"], summary["siteCount"],
+              summary["actionCount"]),
+             "  build %s (%s), routes %s" %
+             (summary["buildVersion"], summary["buildStamp"], routes),
+             "  coverage: %s" % summary["scope"],
+             "  inferred nonvisited suffix sites: %d (from route sequence after terminal; NotEligible is a reached event)" %
+             summary["inferredUnvisitedSiteCount"],
+             "  recorded selector/action order is observed; predicate equivalence is not established (production replay uses the C++ selector rig)."]
+    if sidecar_path:
+        lines.insert(0, "[edvr] draw-ladder sidecar: %s" % sidecar_path)
+    return "\n".join(lines)
+
+
+def _fixture():
+    return {
+        "format": FORMAT, "schemaVersion": 1, "buildVersion": "fixture",
+        "buildStamp": "1234ABCD", "logFile": "edvr_gfx_20261001_010203.log",
+        "semantics": {"equivalence": "observed-selector-and-action-order",
+                      "predicateEquivalence": False,
+                      "predicateNote": "hidden predicates are not reevaluated",
+                      "identityNote": "opaque ordinals", "flagBits": FLAG_BITS},
+        "frame": {"frameNo": 12, "completedFrameNo": 12, "configEpoch": 1,
+                  "eyeDrawsThisFrame": 1, "eyeDrawsLastFrame": 0,
+                  "sceneDrawsThisFrame": 1, "stateFlags": 0,
+                  "sceneCounters": [0, 0, 0, 0]},
+        "draws": [{"index": 0, "eyeDrawIndex": 1, "kind": ord("X"),
+                   "command": "draw-indexed-instanced",
+                   "count": 240, "instances": 1,
+                   "args": {"start": 0, "base": 0, "startInstance": 0},
+                   "vsHash": "FCF7BD2896751D96", "psHash": "F786D34B5E118D5E",
+                   "resources": {"vs": 1, "ps": 2, "rtv0": 3, "dsv0": 4,
+                                 "argumentBuffer": 0},
+                   "argumentBufferKnown": False, "argumentByteOffset": 0,
+                   "drawParametersKnown": True,
+                   "rtv0Generation": 1, "dsv0Generation": 1,
+                   "rtv0Width": 2400, "rtv0Height": 2400,
+                   "route": 7, "sequence": 5, "candidateMask": "0000000000000000",
+                   "flags": 0,
+                   "sites": [{"id": 72, "kind": 3, "outcome": 4, "flow": 1,
+                              "subsite": 0, "verdict": 0}],
+                   "winnerSiteId": 72, "verdict": 0,
+                   "forwardFacts": None,
+                   "actions": [
+                       {"id": 1, "phase": 1, "outcome": 2, "call": 4,
+                        "flags": 0, "issueCount": 0, "issueCountKnown": True,
+                        "count": 240, "instances": 1, "start": 0,
+                        "startInstance": 0, "baseVertex": 0},
+                       {"id": 2, "phase": 2, "outcome": 2, "call": 4,
+                        "flags": 0, "issueCount": 1, "issueCountKnown": True,
+                        "count": 240, "instances": 1, "start": 0,
+                        "startInstance": 0, "baseVertex": 0},
+                       {"id": 17, "phase": 3, "outcome": 2, "call": 4,
+                        "flags": 0, "issueCount": 0, "issueCountKnown": True,
+                        "count": 240, "instances": 1, "start": 0,
+                        "startInstance": 0, "baseVertex": 0}] }],
+        "footer": {"complete": True, "truncated": False, "overflow": False,
+                   "drawCount": 1},
+    }
+
+
+def self_test():
+    base = _fixture()
+    try:
+        summary = validate_trace(base, "edvr_gfx_20261001_010203.log", "1234abcd")
+        if summary["scope"] != "flat bypass/actions; no VR classifier parity":
+            raise TraceError("flat capture was mislabelled")
+    except Exception as exc:
+        print("draw-ladder trace fixture rejected: %s" % exc)
+        return 1
+
+    no_op = json.loads(json.dumps(base))
+    no_op["draws"][0]["instances"] = 0
+    try:
+        validate_trace(no_op)
+    except Exception as exc:
+        print("draw-ladder reader rejected a legal zero-instance direct draw: %s" % exc)
+        return 1
+
+    vr = json.loads(json.dumps(base))
+    d = vr["draws"][0]
+    d["route"] = 6
+    d["sequence"] = 4
+    d["sites"] = []
+    for site_id in [1, 2, 3, 4, 5, 6, 7, 8, 40, 41, 42, 43]:
+        kind = SITE_KINDS[site_id]
+        outcome = 3 if site_id == 43 else (1 if kind == 1 else 2)
+        d["sites"].append({
+            "id": site_id, "kind": kind, "outcome": outcome,
+            "flow": 1 if site_id == 43 else 0,
+            "subsite": 6 if site_id == 8 else 0,
+            "verdict": 7 if site_id == 43 else -1,
+        })
+    d["winnerSiteId"] = 43
+    d["verdict"] = 7
+    mask = (1 << 14) - 1
+    d["forwardFacts"] = {
+        "presentMask": mask, "verdictOrdinal": 7, "family": 3,
+        "familyAvailable": "yes", "owner": "yes", "verdictForwards": "yes",
+        "initialUiTake": "no", "afterUiTake": "yes", "worldReissue": "no",
+        "curveThisDraw": "yes", "introCurveThisDraw": "no", "uiDepth": "yes",
+        "holoDepth": "no", "composite": "no", "crispPending": "no",
+        "issueBlocked": "no",
+    }
+    try:
+        summary = validate_trace(vr)
+        if summary["scope"].startswith("flat") or summary["inferredUnvisitedSiteCount"] == 0:
+            raise TraceError("VR trace scope or short-circuited suffix was not reported")
+    except Exception as exc:
+        print("draw-ladder VR trace fixture rejected: %s" % exc)
+        return 1
+
+    generated = json.loads(json.dumps(vr))
+    generated_action = {
+        "id": 6, "phase": 2, "outcome": 2, "call": 4,
+        "flags": (FLAG_BITS["action"]["generatedDrawArgsUnavailable"] |
+                  FLAG_BITS["action"]["issueCountUnknown"]),
+        "issueCount": 0, "issueCountKnown": False,
+        "count": 0, "instances": 0, "start": 0, "startInstance": 0,
+        "baseVertex": 0,
+    }
+    generated["draws"][0]["actions"].insert(1, generated_action)
+    exact_replace_issue = {
+        "id": 4, "phase": 2, "outcome": 2, "call": 4,
+        "flags": 0, "issueCount": 1, "issueCountKnown": True,
+        "count": 240, "instances": 1, "start": 0, "startInstance": 0,
+        "baseVertex": 0,
+    }
+    generated["draws"][0]["actions"].insert(2, exact_replace_issue)
+    try:
+        validate_trace(generated)
+    except Exception as exc:
+        print("draw-ladder generated-helper fixture rejected: %s" % exc)
+        return 1
+    missing_generated_flag = json.loads(json.dumps(generated))
+    missing_generated_flag["draws"][0]["actions"][1]["flags"] = FLAG_BITS["action"]["issueCountUnknown"]
+    try:
+        validate_trace(missing_generated_flag)
+        print("draw-ladder reader accepted generated helper args without the unavailable flag")
+        return 1
+    except TraceError:
+        pass
+    misleading_generated_args = json.loads(json.dumps(generated))
+    misleading_generated_args["draws"][0]["actions"][1]["count"] = 240
+    try:
+        validate_trace(misleading_generated_args)
+        print("draw-ladder reader accepted fabricated generated helper args")
+        return 1
+    except TraceError:
+        pass
+
+    bypass_cases = [
+        (ord("A"), 7, 5, 72, 5, 18, False, "flat bypass/actions"),
+        (ord("Z"), 7, 5, 72, 6, 19, True, "flat bypass/actions"),
+        (ord("Y"), 7, 5, 72, 7, 20, True, "flat bypass/actions"),
+        (ord("A"), 8, 6, 73, 5, 18, False, "DrawAuto"),
+        (ord("Z"), 9, 7, 74, 6, 19, True, "indirect-draw"),
+        (ord("Y"), 10, 8, 75, 7, 20, True, "indirect-draw"),
+        (ord("X"), 11, 9, 76, 4, 2, False, "internal/world bypass"),
+    ]
+    for kind, route, sequence, site_id, call, action_id, has_buffer, scope_text in bypass_cases:
+        bypass = json.loads(json.dumps(base))
+        draw = bypass["draws"][0]
+        draw["kind"] = kind
+        draw["command"] = DRAW_COMMANDS[kind]
+        draw["count"] = 0
+        draw["instances"] = 1 if kind == ord("X") else 0
+        draw["drawParametersKnown"] = kind == ord("X")
+        draw["argumentBufferKnown"] = has_buffer
+        draw["argumentByteOffset"] = 64 if has_buffer else 0
+        draw["resources"]["argumentBuffer"] = 5 if has_buffer else 0
+        draw["route"] = route
+        draw["sequence"] = sequence
+        draw["sites"] = [{"id": site_id, "kind": 3, "outcome": 4,
+                          "flow": 1, "subsite": 0, "verdict": 0}]
+        draw["winnerSiteId"] = site_id
+        draw["verdict"] = 0
+        call_args = {"flags": 0, "issueCount": 0, "issueCountKnown": True,
+                      "count": 0, "instances": 1, "start": 0,
+                      "startInstance": 0, "baseVertex": 0}
+        action_flags = (FLAG_BITS["action"]["gpuDrawArgsUnavailable"]
+                        if call in (5, 6, 7) else 0)
+        draw["actions"] = [
+            dict({"id": 1, "phase": 1, "outcome": 2, "call": call}, **call_args),
+            {"id": action_id, "phase": 2, "outcome": 2, "call": call,
+             "flags": action_flags, "issueCount": 1, "issueCountKnown": True,
+             "count": 0, "instances": 1 if kind == ord("X") else 0,
+             "start": 0, "startInstance": 0,
+             "baseVertex": 0},
+            dict({"id": 17, "phase": 3, "outcome": 2, "call": call}, **call_args),
+        ]
+        try:
+            summary = validate_trace(bypass)
+            if scope_text not in summary["scope"]:
+                raise TraceError("bypass coverage label is %r" % summary["scope"])
+        except Exception as exc:
+            print("draw-ladder bypass fixture rejected for kind %r: %s" % (kind, exc))
+            return 1
+        if route in (8, 9, 10):
+            blocked = json.loads(json.dumps(bypass))
+            blocked_draw = blocked["draws"][0]
+            blocked_draw["sites"][0]["subsite"] = 1
+            blocked_action = blocked_draw["actions"][1]
+            blocked_action["outcome"] = 3
+            blocked_action["issueCount"] = 0
+            try:
+                validate_trace(blocked)
+            except Exception as exc:
+                print("draw-ladder blocked bypass fixture rejected for kind %r: %s" %
+                      (kind, exc))
+                return 1
+            bad_block_count = json.loads(json.dumps(blocked))
+            bad_block_count["draws"][0]["actions"][1]["issueCount"] = 1
+            try:
+                validate_trace(bad_block_count)
+                print("draw-ladder reader accepted a declined bypass with a nonzero issue count")
+                return 1
+            except TraceError:
+                pass
+            bad_block_marker = json.loads(json.dumps(blocked))
+            bad_block_marker["draws"][0]["sites"][0]["subsite"] = 0
+            try:
+                validate_trace(bad_block_marker)
+                print("draw-ladder reader accepted a declined bypass without its block marker")
+                return 1
+            except TraceError:
+                pass
+
+    def reverse_vr_sites(data):
+        draw = data["draws"][0]
+        draw["route"] = 6
+        draw["sequence"] = 4
+        ids = [1, 2, 3, 4, 5, 6, 7, 8, 40, 41, 42, 43]
+        draw["sites"] = []
+        for site_id in ids:
+            kind = SITE_KINDS[site_id]
+            outcome = 3 if site_id == 43 else (1 if kind == 1 else 2)
+            draw["sites"].append({
+                "id": site_id, "kind": kind, "outcome": outcome,
+                "flow": 1 if site_id == 43 else 0,
+                "subsite": 6 if site_id == 8 else 0,
+                "verdict": 7 if site_id == 43 else -1,
+            })
+        draw["winnerSiteId"] = 43
+        draw["verdict"] = 7
+        draw["sites"].reverse()
+
+    def remove_reached_vr_site(data):
+        reverse_vr_sites(data)
+        data["draws"][0]["sites"].reverse()
+        del data["draws"][0]["sites"][10]
+
+    def wrong_vr_site_verdict(data):
+        reverse_vr_sites(data)
+        draw = data["draws"][0]
+        draw["sites"].reverse()
+        draw["sites"][-1]["verdict"] = 6
+
+    def wrong_vr_forward_verdict(data):
+        reverse_vr_sites(data)
+        draw = data["draws"][0]
+        draw["sites"].reverse()
+        draw["forwardFacts"] = json.loads(json.dumps(vr["draws"][0]["forwardFacts"]))
+        draw["forwardFacts"]["verdictOrdinal"] = 6
+
+    def remove_bypass_original(data):
+        del data["draws"][0]["actions"][1]
+
+    def reorder_bypass_actions(data):
+        actions = data["draws"][0]["actions"]
+        actions[1], actions[2] = actions[2], actions[1]
+
+    mutations = [
+        ("schema", lambda d: d.update(schemaVersion=2)),
+        ("overflow", lambda d: d["footer"].update(overflow=True)),
+        ("missing footer", lambda d: d.pop("footer")),
+        ("unknown site", lambda d: d["draws"][0]["sites"][0].update(id=73)),
+        ("terminal mismatch", lambda d: d["draws"][0].update(winnerSiteId=71)),
+        ("exit verdict mismatch", lambda d: d["draws"][0].update(verdict=1)),
+        ("unknown terminal verdict", lambda d: d["draws"][0]["sites"][0].update(verdict=999)),
+        ("exit terminal mismatch", lambda d: d["draws"][0].update(winnerSiteId=-1)),
+        ("unsafe log basename", lambda d: d.update(logFile="..\\other.log")),
+        ("wrong build", lambda d: d.update(buildStamp="00000000")),
+        ("predicate parity claim", lambda d: d["semantics"].update(predicateEquivalence=True)),
+        ("unknown action count mismatch",
+         lambda d: d["draws"][0]["actions"][1].update(flags=0x8000)),
+        ("wrong-site verdict", wrong_vr_site_verdict),
+        ("forward verdict mismatch", wrong_vr_forward_verdict),
+        ("missing terminal", lambda d: d["draws"][0].update(sites=[])),
+        ("invalid order", reverse_vr_sites),
+        ("missing reached site", remove_reached_vr_site),
+        ("missing action", remove_bypass_original),
+        ("reordered action", reorder_bypass_actions),
+        ("site overflow", lambda d: d["draws"][0].update(sites=d["draws"][0]["sites"] * 49)),
+        ("forward availability mismatch",
+         lambda d: d["draws"][0].update(forwardFacts=dict(
+             presentMask=1, verdictOrdinal=-1, family=0, familyAvailable="unknown",
+             owner="unknown", verdictForwards="yes", initialUiTake="unknown",
+             afterUiTake="unknown", worldReissue="unknown", curveThisDraw="unknown",
+             introCurveThisDraw="unknown", uiDepth="unknown", holoDepth="unknown",
+             composite="unknown", crispPending="unknown", issueBlocked="unknown"))),
+    ]
+    for name, change in mutations:
+        candidate = json.loads(json.dumps(base))
+        change(candidate)
+        try:
+            validate_trace(candidate, "edvr_gfx_20261001_010203.log", "1234ABCD")
+        except TraceError:
+            continue
+        print("draw-ladder trace self-test accepted invalid %s" % name)
+        return 1
+    print("draw-ladder-replay self-test: ok")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Validate and summarize EDVR draw-ladder traces.")
+    parser.add_argument("--file", help="read one exact draw-ladder sidecar")
+    parser.add_argument("--expected-log", help="require this associated graphics-log basename")
+    parser.add_argument("--expected-build-stamp", help="require the associated PE build stamp")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="validate and report only; writes nothing")
+    parser.add_argument("--expect-invalid", action="store_true",
+                        help="succeed only if this sidecar is rejected (requires --dry-run)")
+    parser.add_argument("--self-test", action="store_true", help="run fixture checks and exit")
+    args = parser.parse_args(argv)
+    if args.self_test:
+        return self_test()
+    if not args.file:
+        parser.error("--file is required unless --self-test is used")
+    if args.expect_invalid and not args.dry_run:
+        parser.error("--expect-invalid requires --dry-run")
+    try:
+        _, summary = read_trace(args.file, args.expected_log, args.expected_build_stamp)
+    except OSError as exc:
+        print("[edvr] draw-ladder trace I/O failed: %s" % exc)
+        return 1
+    except (ValueError, TraceError) as exc:
+        if args.expect_invalid:
+            print("[edvr] expected rejection confirmed: %s" % exc)
+            return 0
+        print("[edvr] draw-ladder trace rejected: %s" % exc)
+        return 1
+    if args.expect_invalid:
+        print("[edvr] expected rejection failed: sidecar is valid")
+        return 1
+    print(format_summary(summary, os.path.abspath(args.file)))
+    if args.dry_run:
+        print("  dry-run: no files or directories were written")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

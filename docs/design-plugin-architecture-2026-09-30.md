@@ -4,8 +4,8 @@
 
 - **State (2026-10-01):** implementation in progress on
   `codex/plugin-architecture`; do not merge to main until Sean is ready to ship.
-  Three Luna 6 agents own the catalog/config ownership, night-vision pilot,
-  and build/boundary gates. This is the first Phase 1 slice, not completion
+  Three Luna 6 agents now own the ordered ladder/rigs, armed trace codec,
+  and production integration. This is Phase 1 work, not completion
   of all five phases. The review and remaining gates are in section 11.
   This design extends draft PR #46 (Devin Nemec, "generic OpenXR addon and
   plugin architecture") as its add-on tier (section 6).
@@ -45,13 +45,14 @@
   completed and payload identity passed: Pimax Crystal Super / Pimax OpenXR, 90 Hz,
   4032x3898 per eye. The carrier draw-hook mean is promising; on-foot DLSS
   is close to baseline. Single buckets and an unlogged scene boundary do
-  not pass the repeatable improvement gate. Night vision engaged, but Sean
-  reports slight blur; the first baseline omitted NV, so regression status
-  is unresolved. Steam now has verified baseline `14a7ff70` for a focused
-  NV comparison. No rendering fix follows from the blur report alone.
+  not pass the repeatable improvement gate. Both builds engaged NV with
+  identical settings; Sean confirms the slight blur is the same on baseline.
+  Ruled out: migration introduced NV blur, because the verified baseline
+  comparison reproduces it. Steam currently has baseline `14a7ff70`.
   Complete the Phase 1 core ladder/replay before further group migration;
   shader-pair candidates stay cached, shape/state stay draw-time predicates.
-  The scoped NV replay is not whole-ladder recorded replay (section 11).
+  The selector/codec matrix and optimized classifier compile pass; trace-only
+  helper counters are removed. Full validation passes all 121 jobs (section 11).
 - **Ruled out while designing:** loading every DLL found in a folder (DLL
   planting; the installer's receipts already know what it installed), a
   stable ABI for first-party plugins (they ship with the core; freezing
@@ -598,3 +599,77 @@ the same scene/settings). Current diagnostics do not discriminate them.
 The sanctioned installer restored and verified baseline `14a7ff70`, keeping
 the live INI, for one 30-second cockpit DLSS+NV comparison. Keep the shader
 and rendering behavior unchanged until this comparison supplies evidence.
+
+Focused NV comparison completed: `edvr_gfx_20261001_193846.log` matches
+baseline `14a7ff70`, v0.18.0 / `6ABED2A4`. DLSS engaged at 4032x3898;
+stock-appearance, pulse-stability-on NV engaged at 2016x1949 at
+19:40:23.779. Sean reports the same blur on baseline and candidate.
+Ruled out: plugin migration introduced NV blur, because the verified
+unchanged baseline reproduces it in the matched comparison. No NV rendering
+change is included. Elite has exited; scoped checks can resume.
+
+Next Phase 1 slice: compile-time ordered claim/observation descriptors must
+drive production evaluation, avoiding per-draw function-pointer fan-out.
+Parallel owners are the shared ladder/rig/build wiring, bounded armed trace
+storage/codec/reader, and single-owner vScreen integration. Preserve all
+routes and composed forwarding actions. Flat retains its existing VR-ladder
+bypass; Auto and indirect commands get distinct bypass records, with GPU
+argument contents explicitly unavailable. Production capture covers owner
+immediate-context hook commands; foreign-context exit ordering has synthetic
+coverage. An explicit core `advanced.draw_replay` switch defaults
+off; a manual census request may arm one next complete frame, while
+automatic censuses never do. This ordering/action replay does not prove
+resource/constant-buffer classifier equivalence by itself; module rigs and
+the remaining performance gate still apply.
+
+The guarded local ladder rig passed a 41-draw terminal matrix (682 site
+events, 91 actions), including every terminal claim/exit, flat Auto and
+indirect commands, zero-instance draws and internal-world bypasses. It
+rejects invalid tokens, post-finalize writes, duplicate forwarding facts,
+config reloads during capture, site/action overflow and unfinished draws;
+reader dry-run snapshots are unchanged. These are synthetic selector/codec
+checks, not evidence of resource-classifier equivalence or improved flight
+performance. Production compilation and independent integration review
+passed; the full build remains required.
+
+Optimized production inspection caught retained typed-rung calls; explicit
+inlining removes them. The current unarmed classifier has zero calls to
+`visit*`/`visitOrdered` and no stack-cookie check, as on baseline. Its stack
+frame is 288 bytes versus 272 on unchanged `14a7ff70`, and emitted code is
+approximately 192 bytes larger. This is compile evidence, not a flight
+performance result. A separate helper audit found trace-only issue counters
+in the unarmed path; they are removed, with exact single-issue trace events
+using literal counts. Optimized helper inspection shows no remaining trace
+counter increments. The mechanical ladder/codec snapshot gets full
+validation before the disabled-interest and census work; it does not need
+a separate headset flight.
+
+Lifecycle review found replay storage configured before failed or dormant
+hook installs, with no shutdown release. Configuration now follows a
+successful hook commit. Cold shutdown follows hook removal, discards any
+armed or partial capture with an explicit breadcrumb, invalidates tokens and
+releases storage without writing a completed-frame claim. The guarded rig
+passes partial-capture, armed-only and repeated-shutdown checks.
+
+Focused contract validation passes: UI quality 3,215 checks and its WARP
+seed test 385,610 checks; composite census 51 checks and 50 mutations;
+on-foot maps 80 checks and 53 mutations; world-route mutation self-test
+96 cases. The standalone replay fixture initially lacked a build version
+because its wrapper did not inherit the full build's version environment;
+the strict reader rejected it. Correcting that test environment makes the
+writer/reader roundtrip pass without relaxing identity validation. Full
+validation runs with four jobs; Steam remains on baseline. Its first attempt
+stopped on four flat-substitution source pins. Ruled out: missing production
+clear/copy events, because each hook contains its one expected event; the
+binary-text parser crossed CRLF-closed handlers into later LF-closed hooks.
+Normalizing line endings fixes the scoped checks, and an adjacent-hook
+fixture catches the failure. The guarded flat collector rig passes.
+
+The retry passes the complete validation build: 115 pooled jobs plus six
+quiet jobs, both production profiles, self-contained installers, 232-key
+configuration contract, and package checks. Log:
+`build/plugin-architecture-ladder-build-2.log`; full-build receipt input hash
+`2959b46eb8fef6b69e2a8d9ea138fdc3ce93b52211275026556e5108f59064d8`.
+This validates the mechanical ladder/replay slice. Disabled-feature
+interest, per-plugin cost attribution and the Phase 1 performance flight
+remain outstanding; Steam is unchanged on baseline `14a7ff70`.

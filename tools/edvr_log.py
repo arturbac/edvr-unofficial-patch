@@ -19,6 +19,7 @@
     python tools/edvr_log.py --target frontier --terrain-checkerboard --expect-build HEAD
     python tools/edvr_log.py --target frontier --route-curve --expect-build HEAD
     python tools/edvr_log.py --target steam --freezes --expect-build HEAD
+    python tools/edvr_log.py --target steam --draw-replay --expect-build HEAD
     python tools/edvr_log.py --list
 
 This is the sanctioned replacement for `Get-Content <some path> -Tail 200 |
@@ -388,6 +389,44 @@ def version_line(text):
         if m:
             return line.strip(), m.group("ver"), None
     return None, None, None
+
+
+def print_draw_ladder_report(log_path, version, stamp):
+    """Read only sidecars whose basename is derived from this graphics log."""
+    import draw_ladder_replay
+
+    match = LOG_RE.match(os.path.basename(log_path))
+    if not match or match.group("tag").lower() != "gfx":
+        print("[edvr] --draw-replay requires a named edvr_gfx_*.log file.")
+        return 1
+
+    sidecars = draw_ladder_replay.discover_sidecars(log_path)
+    if not sidecars:
+        print("[edvr] no draw-ladder sidecar beside %s" % os.path.basename(log_path))
+        return 3
+    ok = True
+    # Bound output on sessions with many manual captures; filenames are still
+    # derived from the already-selected graphics log, never from JSON data.
+    for sidecar in sidecars[:16]:
+        try:
+            _, summary = draw_ladder_replay.read_trace(
+                sidecar, os.path.basename(log_path), stamp)
+            if version and summary["buildVersion"] != version:
+                raise draw_ladder_replay.TraceError(
+                    "sidecar version does not match the graphics log")
+            print(draw_ladder_replay.format_summary(summary, sidecar))
+        except draw_ladder_replay.TraceError as exc:
+            print("[edvr] BUILD MISMATCH or invalid draw-ladder sidecar: %s" % exc)
+            if "build stamp" in str(exc) or "version does not match" in str(exc):
+                return 2
+            ok = False
+        except (OSError, ValueError) as exc:
+            print("[edvr] draw-ladder sidecar rejected: %s" % exc)
+            ok = False
+    if len(sidecars) > 16:
+        print("[edvr] %d additional capture(s) omitted from this bounded report" %
+              (len(sidecars) - 16))
+    return 0 if ok else 1
 
 
 def describe_cmd(ref, root):
@@ -7684,6 +7723,9 @@ def main(argv=None):
                     help="list the logs found and stop")
     ap.add_argument("--version", action="store_true",
                     help="print the log's version line and stop")
+    ap.add_argument("--draw-replay", action="store_true",
+                    help="read the selected graphics log's derived draw-ladder sidecars; "
+                         "validates observed selector/action order, not hidden predicate parity")
     ap.add_argument("--expect-build", default=None,
                     help="a git ref (HEAD) or literal version; exit 2 if the "
                          "log was not written by that build")
@@ -7812,6 +7854,10 @@ def main(argv=None):
               "its runtime log itself; drop --tag %s." % args.tag)
         return 1
 
+    if args.draw_replay and args.tag.lower() != "gfx":
+        print("[edvr] --draw-replay reads sidecars associated with a graphics log; use --tag gfx.")
+        return 1
+
     native_dirs = None
     if args.file:
         path = os.path.abspath(args.file)
@@ -7878,6 +7924,9 @@ def main(argv=None):
 
     if args.version:
         return 0
+
+    if args.draw_replay:
+        return print_draw_ladder_report(path, ver, stamp)
 
     if args.vscreen_fit:
         return print_vscreen_fit(text)
@@ -8252,6 +8301,9 @@ def self_test():
         ok = False
     if not self_test_terrain_checkerboard():
         ok = False
+    import draw_ladder_replay
+    if draw_ladder_replay.self_test() != 0:
+        ok = False
 
     print("self-test: %s" % ("ok" if ok else "FAILED"))
     return 0 if ok else 1
@@ -8463,7 +8515,8 @@ def self_test_flat_upscale():
     else:
         fail("src\\common\\vr_supersample_notice.h is not where the self-test looks for it (%s)" % header)
     if os.path.isfile(vscreen):
-        if adopt_prefix.replace("%ux%u", "%ux%u") not in read_text(vscreen).replace("\"\n                \"", ""):
+        adoption_source = re.sub(r'"\r?\n[ \t]*"', "", read_text(vscreen))
+        if adopt_prefix not in adoption_source:
             fail("src\\d3d11\\vscreen.cpp's adoption line is not the text this reader parses")
     notice = ("[09:30:12.100] " + (notice_prefix % (2112, 2304, 75, 2816, 3072)) + "Elite's Supersampling is below 1 (an upscaler in the chain reads the same). EDVR's DLSS then upscales an "
               "image that is already upscaled, which softens the world and the holograms. Set Elite's Supersampling to 1 and raise HMD Image Quality instead: EDVR's DLSS upscales from that. "

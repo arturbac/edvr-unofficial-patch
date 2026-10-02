@@ -252,6 +252,7 @@ python "tools\check_config_contract.py" --self-test || exit /b 1
 python "tools\check_config_contract.py" --quiet --emit "%GEN%\config_contract_gen.h"
 if errorlevel 1 ( echo [edvr] ERROR: contract header generation failed & exit /b 1 )
 python "tools\plugin_catalog.py" --self-test || exit /b 1
+python "tools\draw_ladder_replay.py" --self-test || exit /b 1
 python "tools\plugin_catalog.py" --emit-cpp "%GEN%\plugin_manifest.inc" --dry-run || exit /b 1
 python "tools\plugin_catalog.py" --emit-cpp "%GEN%\plugin_manifest.inc"
 if errorlevel 1 ( echo [edvr] ERROR: plugin catalog validation or generation failed & exit /b 1 )
@@ -537,7 +538,7 @@ cl.exe %CFLAGS% %NGXFLAGS% %FSRFLAGS% /Fo"%OBJ%\d3d11"\ ^
     "src\d3d11\binding_shadow.cpp" "src\d3d11\head_offset_gate.cpp" ^
     "src\d3d11\vr_runtime.cpp" ^
     "src\d3d11\journal_watch.cpp" "src\d3d11\terrain_checkerboard.cpp" ^
-    "src\d3d11\elite_binds.cpp" "src\d3d11\draw_census.cpp" ^
+    "src\d3d11\elite_binds.cpp" "src\d3d11\draw_census.cpp" "src\d3d11\draw_ladder_trace.cpp" ^
     "src\d3d11\object_probe.cpp" ^
     "src\d3d11\pixel_probe.cpp" ^
     "src\d3d11\object_record_writer_probe.cpp" "src\d3d11\object_record_writer_hook.cpp" ^
@@ -701,7 +702,7 @@ set "RUN_JOBS_ARGS="
 if defined EDVR_JOBS set "RUN_JOBS_ARGS=--jobs %EDVR_JOBS%"
 python tools\run_jobs.py --self-test || exit /b 1
 python tools\run_jobs.py --script "%ROOT%\build.bat" --times "%BUILD%\rig_times.json" ^
-    --exe-dir "%BUILD%" --quiet native_timing_test,gpu_timing_test,gpu_census_test,vtable_test,stall_sampler_test ^
+    --exe-dir "%BUILD%" --quiet native_timing_test,gpu_timing_test,gpu_census_test,vtable_test,stall_sampler_test,draw_ladder_test ^
     --after openxr_module_test=openxr_exports_test ^
     %RUN_JOBS_ARGS% || exit /b 1
 
@@ -1434,6 +1435,106 @@ if errorlevel 1 ( echo [edvr] ERROR: plugin dispatch rig build failed & exit /b 
     echo [edvr] ERROR: plugin dispatch verdict replay failed
     exit /b 1
 )
+exit /b 0
+
+:rig_draw_ladder_test
+echo [edvr] === draw_ladder_test.exe ===
+if exist "%BUILD%\draw_ladder_trace_test" (
+    echo [edvr] ERROR: stale draw ladder trace fixture directory; inspect and remove it before rerunning
+    exit /b 1
+)
+if not exist "%OBJ%\drawladder" mkdir "%OBJ%\drawladder"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /DEDVR_VERSION_STRING=\"%EDVR_VER%\" ^
+    /Fo"%OBJ%\drawladder\\" ^
+    /Fe"%BUILD%\draw_ladder_test.exe" "tools\draw_ladder_test\draw_ladder_test.cpp" ^
+    "src\d3d11\draw_ladder_trace.cpp" /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: draw ladder rig build failed & exit /b 1 )
+"%BUILD%\draw_ladder_test.exe" --self-test "%BUILD%\draw_ladder_trace_test" || (
+    echo [edvr] ERROR: ordered draw ladder replay failed
+    exit /b 1
+)
+dir /s /b "%BUILD%\draw_ladder_trace_test" > "%BUILD%\draw_ladder_trace_files_before.txt"
+python "%ROOT%\tools\draw_ladder_replay.py" --file ^
+    "%BUILD%\draw_ladder_trace_test\valid\edvr_gfx_trace_fixture.draw-ladder-12.json" ^
+    --expected-log edvr_gfx_trace_fixture.log --dry-run || exit /b 1
+python "%ROOT%\tools\draw_ladder_replay.py" --file ^
+    "%BUILD%\draw_ladder_trace_test\valid\edvr_gfx_trace_fixture.draw-ladder-14.json" ^
+    --expected-log edvr_gfx_trace_fixture.log --dry-run || exit /b 1
+python "%ROOT%\tools\draw_ladder_replay.py" --file ^
+    "%BUILD%\draw_ladder_trace_test\terminalmatrix\edvr_gfx_terminal_matrix.draw-ladder-15.json" ^
+    --expected-log edvr_gfx_terminal_matrix.log --dry-run || exit /b 1
+python "%ROOT%\tools\draw_ladder_replay.py" --file ^
+    "%BUILD%\draw_ladder_trace_test\generatedinvalid\edvr_gfx_generated_invalid.draw-ladder-16.json" ^
+    --expected-log edvr_gfx_generated_invalid.log --dry-run --expect-invalid || exit /b 1
+python "%ROOT%\tools\draw_ladder_replay.py" --file ^
+    "%BUILD%\draw_ladder_trace_test\invalidtoken\edvr_gfx_invalid_token.draw-ladder-24.json" ^
+    --expected-log edvr_gfx_invalid_token.log --dry-run --expect-invalid || exit /b 1
+python "%ROOT%\tools\draw_ladder_replay.py" --file ^
+    "%BUILD%\draw_ladder_trace_test\postfinalized\edvr_gfx_postfinalized.draw-ladder-25.json" ^
+    --expected-log edvr_gfx_postfinalized.log --dry-run --expect-invalid || exit /b 1
+python "%ROOT%\tools\draw_ladder_replay.py" --file ^
+    "%BUILD%\draw_ladder_trace_test\duplicatefacts\edvr_gfx_duplicate_facts.draw-ladder-26.json" ^
+    --expected-log edvr_gfx_duplicate_facts.log --dry-run --expect-invalid || exit /b 1
+python "%ROOT%\tools\draw_ladder_replay.py" --file ^
+    "%BUILD%\draw_ladder_trace_test\reloadinvalid\edvr_gfx_reload_invalid.draw-ladder-27.json" ^
+    --expected-log edvr_gfx_reload_invalid.log --dry-run --expect-invalid || exit /b 1
+python "%ROOT%\tools\draw_ladder_replay.py" --file ^
+    "%BUILD%\draw_ladder_trace_test\siteoverflow\edvr_gfx_site.draw-ladder-20.json" ^
+    --expected-log edvr_gfx_site.log --dry-run --expect-invalid || exit /b 1
+python "%ROOT%\tools\draw_ladder_replay.py" --file ^
+    "%BUILD%\draw_ladder_trace_test\actionoverflow\edvr_gfx_action.draw-ladder-21.json" ^
+    --expected-log edvr_gfx_action.log --dry-run --expect-invalid || exit /b 1
+python "%ROOT%\tools\draw_ladder_replay.py" --file ^
+    "%BUILD%\draw_ladder_trace_test\unfinished\edvr_gfx_unfinished.draw-ladder-22.json" ^
+    --expected-log edvr_gfx_unfinished.log --dry-run --expect-invalid || exit /b 1
+dir /s /b "%BUILD%\draw_ladder_trace_test" > "%BUILD%\draw_ladder_trace_files_after.txt"
+fc /b "%BUILD%\draw_ladder_trace_files_before.txt" ^
+    "%BUILD%\draw_ladder_trace_files_after.txt" >nul || (
+    echo [edvr] ERROR: draw ladder reader dry-run changed scratch directory entries
+    exit /b 1
+)
+del /q "%BUILD%\draw_ladder_trace_files_before.txt" "%BUILD%\draw_ladder_trace_files_after.txt"
+del /q "%BUILD%\draw_ladder_trace_test\valid\edvr_gfx_trace_fixture.log" ^
+    "%BUILD%\draw_ladder_trace_test\valid\edvr_gfx_newer_decoy.log" ^
+    "%BUILD%\draw_ladder_trace_test\valid\edvr_gfx_trace_fixture.draw-ladder-12.json" ^
+    "%BUILD%\draw_ladder_trace_test\valid\edvr_gfx_trace_fixture.draw-ladder-14.json" ^
+    "%BUILD%\draw_ladder_trace_test\terminalmatrix\edvr_gfx_terminal_matrix.log" ^
+    "%BUILD%\draw_ladder_trace_test\terminalmatrix\edvr_gfx_terminal_matrix.draw-ladder-15.json" ^
+    "%BUILD%\draw_ladder_trace_test\generatedinvalid\edvr_gfx_generated_invalid.log" ^
+    "%BUILD%\draw_ladder_trace_test\generatedinvalid\edvr_gfx_generated_invalid.draw-ladder-16.json" ^
+    "%BUILD%\draw_ladder_trace_test\invalidtoken\edvr_gfx_invalid_token.log" ^
+    "%BUILD%\draw_ladder_trace_test\invalidtoken\edvr_gfx_invalid_token.draw-ladder-24.json" ^
+    "%BUILD%\draw_ladder_trace_test\postfinalized\edvr_gfx_postfinalized.log" ^
+    "%BUILD%\draw_ladder_trace_test\postfinalized\edvr_gfx_postfinalized.draw-ladder-25.json" ^
+    "%BUILD%\draw_ladder_trace_test\duplicatefacts\edvr_gfx_duplicate_facts.log" ^
+    "%BUILD%\draw_ladder_trace_test\duplicatefacts\edvr_gfx_duplicate_facts.draw-ladder-26.json" ^
+    "%BUILD%\draw_ladder_trace_test\reloadinvalid\edvr_gfx_reload_invalid.log" ^
+    "%BUILD%\draw_ladder_trace_test\reloadinvalid\edvr_gfx_reload_invalid.draw-ladder-27.json" ^
+    "%BUILD%\draw_ladder_trace_test\siteoverflow\edvr_gfx_site.log" ^
+    "%BUILD%\draw_ladder_trace_test\siteoverflow\edvr_gfx_site.draw-ladder-20.json" ^
+    "%BUILD%\draw_ladder_trace_test\actionoverflow\edvr_gfx_action.log" ^
+    "%BUILD%\draw_ladder_trace_test\actionoverflow\edvr_gfx_action.draw-ladder-21.json" ^
+    "%BUILD%\draw_ladder_trace_test\unfinished\edvr_gfx_unfinished.log" ^
+    "%BUILD%\draw_ladder_trace_test\unfinished\edvr_gfx_unfinished.draw-ladder-22.json" ^
+    "%BUILD%\draw_ladder_trace_test\drawoverflow\edvr_gfx_draws.log" ^
+    "%BUILD%\draw_ladder_trace_test\shutdown\edvr_gfx_shutdown.log" ^
+    "%BUILD%\draw_ladder_trace_test\armedshutdown\edvr_gfx_armed_shutdown.log"
+if exist "%BUILD%\draw_ladder_trace_test\disabled" rmdir "%BUILD%\draw_ladder_trace_test\disabled"
+if exist "%BUILD%\draw_ladder_trace_test\valid" rmdir "%BUILD%\draw_ladder_trace_test\valid"
+if exist "%BUILD%\draw_ladder_trace_test\terminalmatrix" rmdir "%BUILD%\draw_ladder_trace_test\terminalmatrix"
+if exist "%BUILD%\draw_ladder_trace_test\generatedinvalid" rmdir "%BUILD%\draw_ladder_trace_test\generatedinvalid"
+if exist "%BUILD%\draw_ladder_trace_test\invalidtoken" rmdir "%BUILD%\draw_ladder_trace_test\invalidtoken"
+if exist "%BUILD%\draw_ladder_trace_test\postfinalized" rmdir "%BUILD%\draw_ladder_trace_test\postfinalized"
+if exist "%BUILD%\draw_ladder_trace_test\duplicatefacts" rmdir "%BUILD%\draw_ladder_trace_test\duplicatefacts"
+if exist "%BUILD%\draw_ladder_trace_test\reloadinvalid" rmdir "%BUILD%\draw_ladder_trace_test\reloadinvalid"
+if exist "%BUILD%\draw_ladder_trace_test\siteoverflow" rmdir "%BUILD%\draw_ladder_trace_test\siteoverflow"
+if exist "%BUILD%\draw_ladder_trace_test\actionoverflow" rmdir "%BUILD%\draw_ladder_trace_test\actionoverflow"
+if exist "%BUILD%\draw_ladder_trace_test\unfinished" rmdir "%BUILD%\draw_ladder_trace_test\unfinished"
+if exist "%BUILD%\draw_ladder_trace_test\drawoverflow" rmdir "%BUILD%\draw_ladder_trace_test\drawoverflow"
+if exist "%BUILD%\draw_ladder_trace_test\shutdown" rmdir "%BUILD%\draw_ladder_trace_test\shutdown"
+if exist "%BUILD%\draw_ladder_trace_test\armedshutdown" rmdir "%BUILD%\draw_ladder_trace_test\armedshutdown"
+if exist "%BUILD%\draw_ladder_trace_test" rmdir "%BUILD%\draw_ladder_trace_test"
 exit /b 0
 
 :rig_journal_unload_test

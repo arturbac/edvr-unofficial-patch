@@ -92,7 +92,7 @@ RIGS = {
         "libs": ["d3dcompiler.lib"],
         "include_gen": True,
         # the other files `ui_quality_test --wiring` scans, copied unedited beside the edited vscreen.cpp
-        "reads": ["src/d3d11/ui_layer.cpp", "src/d3d11/native_temporal.cpp", "src/d3d11/native_sharpen.cpp"],
+        "reads": ["src/d3d11/ui_layer.cpp", "src/d3d11/native_temporal.cpp", "src/d3d11/native_sharpen.cpp", "src/d3d11/draw_ladder.h"],
     },
 }
 WIRING_EXE = {}   # the wiring rig, built once by its control and run in every mutation's tree
@@ -104,35 +104,35 @@ COMPILE = "compile: "
 
 
 class Mutant:
-    def __init__(self, name, rig, expect, edits, why):
+    def __init__(self, name, rig, expect, edits, why, header_edits=None):
         self.name = name
         self.rig = rig                                  # a key of RIGS
         self.expect = expect                            # text a failing check's label must contain; "compile: <text>": the build must fail with <text>
         self.edits = list(edits)                        # (old, new) pairs, applied in order
+        self.header_edits = list(header_edits or [])    # optional edits to the canonical ladder header for wiring mutations
         self.why = why
         self.compile_error = expect.startswith(COMPILE)  # caught by a static check: the edited source must not compile
         self.text = expect[len(COMPILE):] if self.compile_error else expect
 
 
-def M(name, rig, expect, edits, why):
-    return Mutant(name, rig, expect, edits, why)
+def M(name, rig, expect, edits, why, header_edits=None):
+    return Mutant(name, rig, expect, edits, why, header_edits)
 
 
 # ---- wiring: the raw text of vscreen.cpp's blocks the mutations move or delete (the self-test finds each exactly once) ------------------
-W_CLEAR = "    s->curveThisDraw = false;\n    s->introCurveThisDraw = false;\n"
-W_SET = "    if (kind == 'X' && count == 6 && introCurveWants()) {\n        s->introCurveThisDraw = introCurveOnComposite(self, kind, count, instances);\n    }\n"
-W_END = "    if (g_state->introCurveThisDraw) {\n        g_state->introCurveThisDraw = false;\n        introCurveEndDraw();\n    }\n"
-W_AFTER_BACKDROP = "        return DrawVerdict::kBackdrop;\n    }\n\n    // The FSS panel composite pair"
-W_BEGIN = "    if (v != DrawVerdict::kNone) forwardVerdictBegin(self, v);\n"
+W_CLEAR = "            s->curveThisDraw = false;\n            s->introCurveThisDraw = false;\n"
+W_SET = "            if (s->rtv0Eye && kind == 'X' && count == 6 && introCurveWants())\n                s->introCurveThisDraw = introCurveOnComposite(self, kind, count, instances);\n"
+W_END = "      if (g_state->introCurveThisDraw) {\n          g_state->introCurveThisDraw = false;\n          introCurveEndDraw();\n      }\n"
+W_BEGIN = "        forwardVerdictBegin(self, v);\n"
 W_OBSERVED = ("    const bool originalIssued=observedDraw(alteredClass == AlteredDrawClass::Verdict\n"
               "                                               ? AlteredDraw(alteredClass, alteredFixOf(v)) : AlteredDraw(alteredClass));\n")
 W_STRIP_START = "    float stripGain = 0.0f;\n"
-W_GUARD = ("    if (panelCurveWants() && srv0IsPanelSized(s, kind, count) &&\n"
-           "        !(kind == 'X' && count == 6 && bindingShaderHash(BindSlot::Vs) == kIntroCompositeVsHash)) {\n")
+W_GUARD = ("            if (panelCurveWants() && srv0IsPanelSized(s, kind, count) &&\n"
+           "                !(kind == 'X' && count == 6 && bindingShaderHash(BindSlot::Vs) == kIntroCompositeVsHash))\n")
 W_GATE = '    {"legacy.intro-curve", &drawGate_intro_curve, false},\n'
-W_DIM = ("            if (!(stripIssued && panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced))) {\n"
-         "                draw(AlteredDrawClass::None);\n            }\n")
-W_DIM_CALL = "panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced))) {"
+W_DIM = ("            const bool stripDim = stripIssued && panelCurveSurfaceDraw(\n"
+         "                self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced);\n")
+W_DIM_CALL = "panelCurveSurfaceDraw(\n                self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced);"
 W_REVERSE_DECL = "    bool stripReverseU = false;\n"
 W_MOVIE_ARMED = "            if (introPanelStripArmed()) {\n"
 W_MOVIE_REVERSE = "                stripReverseU = introPanelStripReverseU();\n"
@@ -143,13 +143,19 @@ W_STRIP_CALL = "stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward
 W_TICK = ("        tkIntroCurve.run([&] {\n            const bool sceneFrame = g_state->eyeDrawsLastFrame >= kSceneEyeDraws;\n"
           "            introCurveTick(g_state->ownerCtx, sceneFrame);\n            if (sceneFrame) introCurveNoteRetired();\n        });\n")
 W_RETIRE_TEXT = "in all (the movie's, the splash's and the splash dim's re-issues of either)"
-W_MOVIE_COMMENT = "    // The intro movie's panel (intro_panel.h). First thing in the eye\n"
-W_CENSUS_LINE = "    // The census line for this draw, recorded while its bindings are certainly\n"
+LADDER_EYE_ORDER = "Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>,\n    Site<SiteId::kSunglareNomination, SiteKind::Observe>,\n    Site<SiteId::kEyeCensusSubmitted, SiteKind::Observe>,\n    Site<SiteId::kUiCrispProbe, SiteKind::Observe>,\n    Site<SiteId::kObjectProbe, SiteKind::Observe>,\n    Site<SiteId::kEyeCensusSkip, SiteKind::Claim>,\n    Site<SiteId::kEyeRangeSkip, SiteKind::Claim>,\n    InterestGatedClaim<SiteId::kNightVisionClaim>,\n    Site<SiteId::kRemlokHideSkip, SiteKind::Claim>,\n    Site<SiteId::kRemlokScissorClaim, SiteKind::Claim>,\n    Site<SiteId::kHoloClaim, SiteKind::Claim>,\n    Site<SiteId::kTargetSharpClaim, SiteKind::Claim>,\n    Site<SiteId::kScrimClaim, SiteKind::Claim>,\n    Site<SiteId::kEyeBackdropComposite, SiteKind::Claim>"
+LADDER_AFTER_INTRO_PANEL = "Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>"
+LADDER_INTRO_AWAY = "Site<SiteId::kIntroPanelClaim, SiteKind::Claim>,\n    Site<SiteId::kSunglareNomination, SiteKind::Observe>,\n    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>"
 
 
 def wiring(name, pin, edits, why):
     """One mutation of the wiring rig: the rig must fail on the check the named pin makes."""
     return M(name, "wiring", "intro curve wiring [%s]" % pin, edits, why)
+
+
+def wiring_ladder(name, pin, old, new, why):
+    """Mutate canonical typed ordering; ladder order is no longer encoded by visitor source text."""
+    return M(name, "wiring", "intro curve wiring [%s]" % pin, [], why, [(old, new)])
 
 
 # ---- anchors: the sources, verbatim (the self-test finds each exactly once) -----------------------------------------------------------
@@ -286,33 +292,36 @@ MUTANTS = [
     wiring("iw-flag-never-cleared", "flag-lifetime", [(W_CLEAR, "    s->curveThisDraw = false;\n")], "the splash's flag is not cleared at the top of beginPanelOverride"),
     wiring("iw-flag-thunk-leaves-it", "flag-lifetime", [(W_END, "")], "the thunk never puts the numbers and the flag away"),
     wiring("iw-flag-put-away-before-the-draw", "flag-lifetime",
-           [(W_END, ""), ("    const DrawVerdict v = beginPanelOverride(self, 'X', perInstance, instances, args);\n",
-                          "    const DrawVerdict v = beginPanelOverride(self, 'X', perInstance, instances, args);\n" + W_END)],
+           [(W_END, ""), ("      const LadderDecision decision = beginPanelOverride(trace, self, 'X', perInstance, instances, args);\n",
+                          "      const LadderDecision decision = beginPanelOverride(trace, self, 'X', perInstance, instances, args);\n" + W_END)],
            "the numbers are put away before the draw and the dim have used them"),
-    wiring("iw-recognition-without-wants", "recognition", [("if (kind == 'X' && count == 6 && introCurveWants()) {", "if (kind == 'X' && count == 6) {")],
+    wiring("iw-recognition-without-wants", "recognition", [("if (kind == 'X' && count == 6 && introCurveWants())", "if (kind == 'X' && count == 6)")],
            "the recogniser is asked at curvature 0 too"),
-    wiring("iw-recognition-below-the-backdrop", "recognition",
-           [(W_SET, ""), (W_AFTER_BACKDROP, "        return DrawVerdict::kBackdrop;\n    }\n" + W_SET + "\n    // The FSS panel composite pair")],
-           "the recognition sits below the eye-side backdrop claim, which returns first"),
+    wiring_ladder("iw-recognition-below-the-backdrop", "recognition", LADDER_EYE_ORDER,
+                  LADDER_EYE_ORDER.replace("    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>,\n", "").replace(
+                      "    Site<SiteId::kEyeBackdropComposite, SiteKind::Claim>",
+                      "    Site<SiteId::kEyeBackdropComposite, SiteKind::Claim>,\n    Site<SiteId::kIntroCurveObserve, SiteKind::Observe>"),
+                  "the recognizer is after the terminal backdrop claim in the canonical eye sequence"),
     wiring("iw-recognition-always-armed", "recognition",
            [("s->introCurveThisDraw = introCurveOnComposite(self, kind, count, instances);\n",
              "introCurveOnComposite(self, kind, count, instances);\n        s->introCurveThisDraw = true;\n")],
            "the flag is set whatever the recogniser said"),
-    wiring("iw-recognition-above-the-movie", "after-movie", [(W_SET, ""), (W_MOVIE_COMMENT, W_SET + "\n" + W_MOVIE_COMMENT)],
-           "the recognition sits above the movie's claim: the movie's own draws reach the recogniser and their stock pairs are learned (and logged) as flat"),
-    wiring("iw-recognition-away-from-the-movie", "after-movie", [(W_SET, ""), (W_CENSUS_LINE, W_SET + "\n" + W_CENSUS_LINE)],
-           "the recognition sits a block below the movie's claim, no longer right after it"),
-    wiring("iw-guard-gone", "guard", [(W_GUARD, "    if (panelCurveWants() && srv0IsPanelSized(s, kind, count)) {\n")], "the on-foot recognition claims the intro composite again"),
+    wiring_ladder("iw-recognition-above-the-movie", "after-movie", LADDER_AFTER_INTRO_PANEL,
+                  "Site<SiteId::kIntroCurveObserve, SiteKind::Observe>,\n    Site<SiteId::kIntroPanelClaim, SiteKind::Claim>",
+                  "the recognizer precedes the movie claim, so movie-owned draws reach it"),
+    wiring_ladder("iw-recognition-away-from-the-movie", "after-movie", LADDER_AFTER_INTRO_PANEL, LADDER_INTRO_AWAY,
+                  "the recognizer is no longer the next rung after the movie claim"),
+    wiring("iw-guard-gone", "guard", [(W_GUARD, "            if (panelCurveWants() && srv0IsPanelSized(s, kind, count))\n")], "the on-foot recognition claims the intro composite again"),
     wiring("iw-guard-before-the-gate", "guard",
-           [(W_GUARD, "    if (!(kind == 'X' && count == 6 && bindingShaderHash(BindSlot::Vs) == kIntroCompositeVsHash) && panelCurveWants() && srv0IsPanelSized(s, kind, count)) {\n")],
+           [(W_GUARD, "            if (!(kind == 'X' && count == 6 && bindingShaderHash(BindSlot::Vs) == kIntroCompositeVsHash) &&\n                panelCurveWants() && srv0IsPanelSized(s, kind, count))\n")],
            "the guard is read before panelCurveWants(): curvature 0 reads something new"),
     wiring("iw-gate-unlisted", "gate", [(W_GATE, "")],
            "the draw gate does not list the recogniser"),
-    wiring("iw-site-before-the-verdict-begin", "strip-site", [(W_BEGIN, ""), (W_OBSERVED, W_BEGIN + W_OBSERVED)],
+    wiring("iw-site-before-the-verdict-begin", "strip-site", [(W_BEGIN, "")],
            "the verdict's Begin runs after the strip: kBackdrop's slot swap is not in place for it"),
     wiring("iw-site-after-the-game-draw", "strip-site", [(W_OBSERVED, ""), (W_STRIP_START, W_OBSERVED + W_STRIP_START)],
            "the strip is drawn after the game's own issue"),
-    wiring("iw-site-dim-is-flat", "strip-site", [(W_DIM, "            draw(AlteredDrawClass::None);\n")], "the splash dim does not follow the strip"),
+    wiring("iw-site-dim-is-flat", "strip-site", [(W_DIM, "            const bool stripDim = false;\n")], "the splash dim does not follow the strip"),
     wiring("iw-site-third-call", "strip-site", [(W_END, W_END + "    panelCurveSurfaceDraw(self, 1.0f, 1, false, g_state->realDrawIndexedInstanced);\n")],
            "a third place draws the strip"),
     wiring("iw-site-dim-drops-reverse", "strip-site", [(W_DIM_CALL, "panelCurveSurfaceDraw(self, stripGain, stripToward, g_state->realDrawIndexedInstanced))) {")],
@@ -321,17 +330,17 @@ MUTANTS = [
            "the splash dim's re-issue of the strip passes a constant u direction"),
     wiring("iw-site-reverse-starts-true", "strip-site", [(W_REVERSE_DECL, "    bool stripReverseU = true;\n")], "an unarmed draw's u direction starts as against x"),
     wiring("iw-unarmed-early-return-first", "unarmed-text",
-           [(W_REFUSAL, "        if (stripIssued) return true;   // the strip was issued in its place: nothing more, and something was\n"
-                        "        if (owner && uiLayerIssueBlocked()) return false;\n")],
-           "observedDraw answers for the strip before its own refusal"),
-    wiring("iw-unarmed-no-early-return", "unarmed-text", [("        if (stripIssued) return true;   // the strip was issued in its place: nothing more, and something was\n", "")],
+           [("if (owner && uiLayerIssueBlocked()) {\n            ladderTraceAction<TracePolicy, draw_ladder::ActionId::kSwallowOriginal>(\n                trace, draw_ladder::ActionPhase::Issue, draw_ladder::ActionOutcome::Declined,\n                kind, count, instances, args);\n            return false;\n        }\n        if (stripIssued) {\n            ladderTraceAction<TracePolicy, draw_ladder::ActionId::kSwallowOriginal>(\n                trace, draw_ladder::ActionPhase::Issue, draw_ladder::ActionOutcome::Applied,\n                kind, count, instances, args);\n            return true;   // the strip was issued in its place: nothing more, and something was\n        }",
+             "if (stripIssued) {\n            ladderTraceAction<TracePolicy, draw_ladder::ActionId::kSwallowOriginal>(\n                trace, draw_ladder::ActionPhase::Issue, draw_ladder::ActionOutcome::Applied,\n                kind, count, instances, args);\n            return true;   // the strip was issued in its place: nothing more, and something was\n        }\n        if (owner && uiLayerIssueBlocked()) {\n            ladderTraceAction<TracePolicy, draw_ladder::ActionId::kSwallowOriginal>(\n                trace, draw_ladder::ActionPhase::Issue, draw_ladder::ActionOutcome::Declined,\n                kind, count, instances, args);\n            return false;\n        }")],
+           "the strip early-return now precedes the layer's refusal"),
+    wiring("iw-unarmed-no-early-return", "unarmed-text", [("if (stripIssued) {", "if (false) {")],
            "the game's own draw is issued a second time over the strip"),
     wiring("iw-unarmed-original-issued", "unarmed-text",
            [("const bool originalIssued=observedDraw(alteredClass", "const bool originalIssued = stripIssued || observedDraw(alteredClass")],
            "originalIssued is no longer observedDraw's answer"),
     wiring("iw-unarmed-dim-ungated", "unarmed-text",
-           [("if (!(stripIssued && panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced))) {",
-             "if (!(panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced))) {")],
+           [("const bool stripDim = stripIssued && panelCurveSurfaceDraw(\n                self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced);",
+             "const bool stripDim = panelCurveSurfaceDraw(\n                self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced);")],
            "the dim draws the strip even when the main draw's strip did not draw"),
     wiring("iw-candidate-asks-first", "candidate",
            [(W_CANDIDATE, "if (panelCurveSurfaceWanted() && (v == DrawVerdict::kIntroPanel || g_state->introCurveThisDraw) && owner) {")],
@@ -501,9 +510,8 @@ def run_rig_exe(tc, run_cmd, cwd):
     return "fail", " | ".join(labels)
 
 
-def build_and_run_wiring(tc, tree, edited_text):
-    """The wiring rig: ui_quality_test built ONCE (by the control, in its own tree, from the real sources, the way build.bat builds it) and run
-    with --wiring in `tree`, whose src/d3d11 holds `edited_text` as vscreen.cpp beside unedited copies of the other files the scans read."""
+def build_and_run_wiring(tc, tree, edited_text, edited_ladder=None):
+    """The wiring rig runs against an edited vScreen and/or canonical ladder copy in `tree`."""
     spec = RIGS["wiring"]
     tree.mkdir(parents=True, exist_ok=True)
     exe = WIRING_EXE.get("exe")
@@ -518,21 +526,28 @@ def build_and_run_wiring(tc, tree, edited_text):
             errors = [l.strip() for l in (done.stdout + done.stderr).splitlines() if "error" in l]
             return "nocompile", " | ".join(errors[:8])[:1500]
         WIRING_EXE["exe"] = exe
+    ladder_rel = "src/d3d11/draw_ladder.h"
     for rel in spec["reads"]:
+        if rel == ladder_rel and edited_ladder is not None:
+            continue
         dest = tree / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / rel, dest)
     target = tree / spec["target"].relative_to(ROOT)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(edited_text, encoding="utf-8", newline="\n")
+    if edited_ladder is not None:
+        ladder = tree / ladder_rel
+        ladder.parent.mkdir(parents=True, exist_ok=True)
+        ladder.write_text(edited_ladder, encoding="utf-8", newline="\n")
     return run_rig_exe(tc, [str(exe), "--wiring"], tree)
 
 
-def build_and_run(tc, rig_key, tree, edited_text):
+def build_and_run(tc, rig_key, tree, edited_text, edited_ladder=None):
     """('nocompile'|'pass'|'fail'|'crash'|'timeout', detail): the rig built in `tree` with `edited_text` in place of its mutable file (the
     unedited text for the control) and run. A 'fail' detail is the failing labels, joined with ' | '."""
     if rig_key == "wiring":
-        return build_and_run_wiring(tc, tree, edited_text)
+        return build_and_run_wiring(tc, tree, edited_text, edited_ladder)
     spec = RIGS[rig_key]
     tree.mkdir(parents=True, exist_ok=True)
     exe = tree / "rig.exe"
@@ -606,6 +621,7 @@ def run_all(only=None, rig=None, jobs=None, keep=False, dry_run=False, out=sys.s
     tc = Toolchain()
     work = Path(tempfile.mkdtemp(prefix="vr_world_route_mutants_"))
     sources = {key: read_source(spec["target"]) for key, spec in RIGS.items()}
+    ladder_source = read_source(SRC / "draw_ladder.h")
     try:
         used = sorted({m.rig for m in mutants})
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(used))) as pool:
@@ -619,9 +635,10 @@ def run_all(only=None, rig=None, jobs=None, keep=False, dry_run=False, out=sys.s
         def one(m):
             try:
                 text = apply_edits(sources[m.rig], m.edits, m.name)
+                ladder = apply_edits(ladder_source, m.header_edits, m.name + " ladder") if m.header_edits else None
             except ValueError as error:
                 return m, "badedit", str(error)
-            outcome, detail = build_and_run(tc, m.rig, work / m.name, text)
+            outcome, detail = build_and_run(tc, m.rig, work / m.name, text, ladder)
             return m, outcome, detail
 
         results = []
@@ -675,6 +692,7 @@ def self_test():
 
     # every mutation against the file it edits as it is now, and against its rig
     sources = {key: read_source(spec["target"]) for key, spec in RIGS.items()}
+    ladder_source = read_source(SRC / "draw_ladder.h")
     rigs = {key: read_source(spec["rig"]) + "".join(read_source(p) for p in spec.get("labels", [])) for key, spec in RIGS.items()}
     names = [m.name for m in MUTANTS]
     check(len(names) == len(set(names)), "mutation names are unique")
@@ -691,7 +709,8 @@ def self_test():
             continue
         try:
             mutated = apply_edits(sources[m.rig], m.edits, m.name)
-            check(mutated != sources[m.rig], "%s changes the source" % m.name)
+            mutated_ladder = apply_edits(ladder_source, m.header_edits, m.name + " ladder") if m.header_edits else None
+            check(mutated != sources[m.rig] or (mutated_ladder is not None and mutated_ladder != ladder_source), "%s changes the source" % m.name)
         except ValueError as error:
             failures.append(str(error))
         if m.compile_error:   # the source's own static_assert message (the production file says it, not the rig)
