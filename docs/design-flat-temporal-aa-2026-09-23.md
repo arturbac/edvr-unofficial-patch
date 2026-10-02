@@ -5,7 +5,7 @@
 - **State:** merged to main at `dacb7a56` (2026-09-25) after Sean's go-ahead;
   the caveats below remain the open qualification record. Latest analyzed Epic
   build `d0898e1b`. The chronology (26-77) is verbatim in Status detail below;
-  the evidence is in sections 1-84.
+  the evidence is in sections 1-85.
 - Established or qualified: camera ownership/jitter (26-28); F8 and menu
   treatment (34-37); cockpit projection and smoother DLSS edges (40-43); PS91
   motion ownership and rigid BFE shell motion (49-51); on-foot weapon camera
@@ -33,8 +33,8 @@
 - **Ruled-out pointer:** the kinematic arc's Status records rejected motion
   estimates and the nonexistent engine velocity buffer. Reuse engine-record
   motion; do not revive estimation or the retired deferred UI replay.
-- **Next:** section 85's F10 flight still refuses an image source; retrieve
-  its existing traces/bytecode. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
+- **Next:** section 85's 15 trace frames isolate the image-source camera gate;
+  inspect PS 07B3F82100F29401 bytes. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
   resolution, TAA at 1.25, game AA, VR at 0.85. HDR flew (81); FSR, TAA at
   R = D and ReShade still to fly. Then open items above (older: Status detail).
   Existing evidence does not justify ignoring the alternate projection.
@@ -8757,3 +8757,43 @@ ZIP. The source bundler accepts same-session files within 180 s and below
 version/path/timestamps are unverified. Obtain the existing edvr_logs/traces
 files and ps_07B3F82100F29401.dxbc if present under edvr_logs/shaders. Replay
 the Full trace and inspect the pixel shader before changing admission.
+
+### Trace replay: the exact source exemption is sufficient (2026-10-02)
+
+`flat_trace_all.zip` provides flat_trace_55758, _56705, _58750, _59615 and
+_60521.bin: 3 complete frames each, 15 total, matching the logged F10 dumps.
+The current unchanged flat_temporal_test rig was compiled with build.bat's
+recipe. All 15 --trace-check results match the live contract hashes;
+--trace-chain finds one 3440x1440 HDR candidate, an unambiguous known
+consumer and zero late writes, refused for conflicting-hdr-target-or-camera.
+The relevant source/model is unchanged from the supporter's v0.18.0.
+
+Focused replay confirms the first bad copied source in every frame: the
+single scene-sized format-9 CFA91824129ECBBC/07B3F82100F29401 draw, same
+depth/DSV, full viewport, no camera and no image-source-verified flag. The
+copy is rejected 0 accepted / 1 refused. Three other format-9 writes per
+frame are half-sized with no DSV; they are not the copied source.
+
+An offline counterfactual changes only this source's PS identity to the
+already admitted FCFAD73924BF45B9 and sets the verified-source flag. All
+15 frames then accept the HDR copy (1 accepted / 0 refused) and select
+observed-mono-input-candidate with five motion-source records. Setting the
+verified bit alone does not help: exact-pair admission is required too.
+This proves sufficiency at selection, conditional on the actual PS being
+camera-independent and passing the live verifier. It does not test FSR
+dispatch or raster-phase qualification, and does not authorize a blind
+exemption. No production source or installed files changed.
+
+ruled out: ambiguous HDR ownership or late HDR writes as the captured
+failure, because all 15 chain replays have one candidate, ambiguity=0 and
+late-writes=0. The exact source camera requirement is the admission blocker.
+
+The archive contains no shader bytes. A local historical VS capture hashes
+to CFA91824129ECBBC and disassembles to position/UV forwarding, no CB reads;
+the exact PS is absent from the project trees and local Epic shader folder.
+The older AO journal's summary is not a substitute for its disassembly.
+Next evidence: ps_07B3F82100F29401.dxbc from the supporter's shader folder if
+it exists. Current F10's named stage probes omit this PS and generic-inert
+classification does not trigger unknown-pair saving, so another unchanged
+F10 run cannot be relied on to supply it. If absent, add a bounded named
+creation-cache capture for this PS before scheduling the next flight.
