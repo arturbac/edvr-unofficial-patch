@@ -4,9 +4,8 @@
 
 - **State (2026-10-02):** implementation in progress on
   `codex/plugin-architecture`; do not merge to main until Sean is ready to ship.
-  Three Luna 6 agents now own cost attribution, production integration,
-  and test gates. This is Phase 1 work, not completion
-  of all five phases. The review and remaining gates are in section 11.
+  Luna 6 agents review baseline segmentation and remaining implementation gates.
+  This is Phase 1 of five; the review and remaining gates are in section 11.
   This design extends draft PR #46 (Devin Nemec, "generic OpenXR addon and
   plugin architecture") as its add-on tier (section 6).
 - **Goal (Sean):** every fix and performance item belongs to one plugin,
@@ -48,7 +47,8 @@
   not pass the repeatable improvement gate. Both builds engaged NV with
   identical settings; Sean confirms the slight blur is the same on baseline.
   Ruled out: migration introduced NV blur, because the verified baseline
-  comparison reproduces it. Steam currently has baseline `14a7ff70`.
+  comparison reproduces it. The longer performance baseline is captured;
+  Steam now has verified candidate `ee2628da` for the matching flight.
   Continue Phase 1 disabled-interest and cost work before group migration;
   shader-pair candidates stay cached, shape/state stay draw-time predicates.
   Ladder/replay and disabled-interest snapshots pass all 121 jobs; trace-only
@@ -836,3 +836,31 @@ installers and 232-key config/package contracts. Receipt created
 This validates the partial collector; it does not complete all-module CPU/API
 coverage or pass the Phase 1 performance flight gate. Steam remains on
 `14a7ff70`; repeatable baseline/candidate windows are still required.
+
+### Performance comparison baseline, 2026-10-02
+
+The longer Steam baseline is `edvr_gfx_20261002_044730.log`, verified by
+`edvr_log.py --expect-build 14a7ff70 --version`; its paired native log is
+`edvr_openxr_20261002_044731_538_29788.log`. Pimax Crystal Super / Pimax
+OpenXR remains at 90 Hz, 4032x3898 output and 2016x1949 DLSS input per eye.
+The loaded DLSS library version is not logged. Night vision was off.
+
+The log records off at 04:48:06, DLSS at 04:51:29, the on-foot hangar marker
+at 04:53:41, and off again at 04:54:56. Thus the hangar starts within the
+existing DLSS span. Carrier attribution comes from Sean's flight sequence;
+there is no explicit carrier marker. Exclude startup, AA transition windows
+and the window crossing the hangar marker. Possible movement before that
+marker remains a comparison limitation. The clean carrier-off aggregate
+windows span 0.335-0.351 ms/frame; candidate data is still pending.
+These are sampled, scaled hook means, not percentiles or complete EDVR CPU.
+The existing weapon-reissue subtraction limitation remains unchanged.
+
+Clean-version promotion of the validated source passed as
+`v0.18.0-5-gee2628da`. Steam candidate installation and independent
+`install_edvr.py --all --ini --verify-only` passed. Staged DLLs match the
+promoted outputs; personal INI bytes differ only by `draw_replay = on`
+under `[advanced]`. The requested candidate sequence matches the logged
+baseline order, with 90 seconds per scene/mode, followed by a separate
+60-second NV sample and one manual replay capture. Builds and GPU rigs stay
+idle during the comparison. Phase 1 performance and full replay gates remain
+open; no further group migration is accepted yet.
