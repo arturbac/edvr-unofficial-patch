@@ -4,11 +4,10 @@
 
 *Written 2026-10-02. Update whenever this doc changes.*
 
-- **State:** cause CONFIRMED by arturbac (comment of 2026-10-02 11:45 UTC): EDVR's
-  CPU reads of the pointer `Map(WRITE_DISCARD)` returns, which DXVK places in
-  write-combined, uncached memory by default. A workaround exists (below). The fix is
-  on main in `31f8aee7`. Full build, core rig, 12 mutants and Windows flights pass;
-  Proton qualification of this implementation remains pending.
+- **State:** arturbac confirmed costly reads of DXVK's write-combined mapped
+  memory. The adaptive cache is on main (`31f8aee7`). Full build, core rig, 12
+  mutants and native Windows flights passed. Proton qualification remains
+  pending.
 - **Attribution:** [arturbac][arturbac] supplied the diagnosis, staging approach,
   working patch and Proton A/B tests in [issue #65][issue65] and [PR #66][pr66].
 - **Report:** issue 65, flat v0.18.0 (build 6ABED11D), GE-Proton 11-6 (DXVK), Mesa 26.2.2
