@@ -40,19 +40,18 @@
   4.1), the installer skips it and Elite stays on its stock VR path. Four
   changes first (section 10); no F8, AA, flash fix or Explorer Cam without
   the runtime; the first build needs a flight on a stock runtime.
-- **Next:** build and review the Phase 1 pilot, then Steam baseline/candidate
-  flights before moving further groups. Baseline is unchanged `14a7ff70`.
-  Its full build passed; Steam install and payload verification passed.
-  Baseline refly is complete: Pimax Crystal Super / Pimax OpenXR, 90 Hz,
-  4032x3898 per eye. Earlier 4508x4358 samples are excluded. Carrier then
-  on-foot hangar, AA off then DLSS; night vision was not toggled. Log and
-  installed payload identity match the baseline. The pilot's full build passes
-  all gates, including 427 dispatch checks and the updated subscription and
-  transport-only fixtures. Commit/push and clean-version promotion precede
-  Steam candidate installation; then repeat the four samples and night vision.
-  Cached dispatch means shader-pair candidates, not final verdicts; shape
-  and state remain draw-time predicates. A scoped night-vision reference
-  replay cannot substitute for whole-ladder recorded replay (section 11).
+- **Next:** the pilot `3f8dceec` is committed and pushed on its branch;
+  full validation and clean-version promotion passed. Steam candidate flight
+  completed and payload identity passed: Pimax Crystal Super / Pimax OpenXR, 90 Hz,
+  4032x3898 per eye. The carrier draw-hook mean is promising; on-foot DLSS
+  is close to baseline. Single buckets and an unlogged scene boundary do
+  not pass the repeatable improvement gate. Night vision engaged, but Sean
+  reports slight blur; the first baseline omitted NV, so regression status
+  is unresolved. Steam now has verified baseline `14a7ff70` for a focused
+  NV comparison. No rendering fix follows from the blur report alone.
+  Complete the Phase 1 core ladder/replay before further group migration;
+  shader-pair candidates stay cached, shape/state stay draw-time predicates.
+  The scoped NV replay is not whole-ladder recorded replay (section 11).
 - **Ruled out while designing:** loading every DLL found in a folder (DLL
   planting; the installer's receipts already know what it installed), a
   stable ABI for first-party plugins (they ship with the core; freezing
@@ -545,3 +544,57 @@ The candidate's four timed cases must keep game night vision off to match
 this baseline; exercise ship-cockpit night vision afterward as a separate
 pilot check. Full-ladder replay, the rest of the phases and shipping remain
 outstanding.
+
+### Candidate flight, 2026-10-01
+
+Full validation passed all gates (120 runner jobs), including 427 dispatch
+checks, production DLLs and both self-contained installer profiles. The
+validated source was committed and pushed as `3f8dceec`; clean-version
+DLL-only promotion passed. Steam installation and verification preserved
+the live INI. Main is unmerged.
+
+Candidate log `edvr_gfx_20261001_192343.log` matches
+`v0.18.0-1-g3f8dceec` / `6ABEF27A`, linked 2026-10-01 23:53:30 UTC.
+Runtime, headset, 90 Hz, 4032x3898 output, 2016x1949 submitted input and
+DLSS preset K match baseline. The loaded DLSS DLL version is still unlogged.
+Sean flew on-foot hangar DLSS then off, carrier off then DLSS, then NV.
+
+| Scene / AA | Candidate window end | Mean / max ms | Interpretation |
+|---|---|---|---|
+| On foot, DLSS | 19:25:52.354 | 0.439 / 5.568 | Baseline 0.422 / 5.485; near equal, not improvement |
+| Off, uncertain scene boundary | 19:26:33.008 | 0.196 / 0.397 | May straddle hangar-to-carrier; exclude scene-specific comparison |
+| Likely carrier, off | 19:26:53.030 | 0.248 / 0.742 | Scene assignment inferred from Sean's sequence; one bucket |
+| Carrier, DLSS | 19:27:33.058 | 1.012 / 3.450 | Mean below baseline 1.207-1.465; one bucket |
+
+The table uses the same sampled direct draw-hook metric as baseline, with
+112 or 113 sampled frames per bucket. Exclude the off bucket ending
+19:26:12.355 and DLSS bucket ending 19:27:13.057 because they straddle AA
+toggles (19:25:56.490 and 19:27:03.036-19:27:03.500). The bucket ending
+19:27:53.057 straddles NV engagement at 19:27:37.567. There is no later pure
+NV draw-hook report. The log does not identify the exact hangar-to-carrier
+boundary. No clean scene-specific hangar-off bucket or repeatable CPU
+improvement is established; the Phase 1 performance gate stays open.
+
+Broader application benchmark p50 CPU/GPU: on-foot DLSS window 9 completed
+30 s, 2.184/8.603 ms; off window 11 covered 30 s but was scope-changed,
+1.814/5.655; carrier DLSS window 13 completed 30 s before NV,
+5.090/10.609. NV window 14 was scope-changed after 29.907 s,
+4.606/10.346. These include game work and cannot prove isolated EDVR CPU
+improvement or GPU non-regression.
+
+NV correctness evidence: the VR profile registered the cockpit plugin,
+observed the shader pair and evaluated its live claim. Pixel-shader
+creation succeeded; stock-appearance, pulse-stability-on NV engaged at
+2016x1949. The later GPU census records 0.47 wrapped NV draws/frame and
+0.025 ms. No NV failure or absorbed fault is logged. Against baseline,
+the shader header and begin/end/exterior-mask bodies are unchanged; the
+hashes, X/240/1 shape and rung before RemLok are preserved. This proves
+execution and static parity, not visual equivalence or shutdown.
+
+Sean reports slight NV blur, possibly pre-existing, and no other visual
+issues. No baseline NV sample exists. Hypotheses: existing NV/DLSS behavior
+(same blur on baseline), or migration regression (candidate-only blur in
+the same scene/settings). Current diagnostics do not discriminate them.
+The sanctioned installer restored and verified baseline `14a7ff70`, keeping
+the live INI, for one 30-second cockpit DLSS+NV comparison. Keep the shader
+and rendering behavior unchanged until this comparison supplies evidence.
