@@ -74,6 +74,92 @@ std::atomic<uint64_t> mapBouncePresentEpoch{1};
 std::atomic<bool> foreignWork{false};
 std::atomic<bool> projectionAuditRequested{false};
 template<class T> using Ptr = Microsoft::WRL::ComPtr<T>;
+// F10-only ingress audit. Keep the counters outside State: a draw on a foreign
+// thread must still explain why the runtime did not see it. All draw-side work
+// before the bounded witnesses is an atomic load and, while armed, one add.
+struct DrawIngressAudit {
+    std::atomic<bool> active{false};
+    std::atomic<uint64_t> entered{0}, inactive{0}, inactiveLiveOff{0}, inactiveInternal{0};
+    std::atomic<uint64_t> wrongThread{0}, wrongContext{0};
+    std::atomic<uint64_t> paused{0}, accepted{0}, relevant{0};
+    std::atomic<uint32_t> inactiveWitnesses{0}, wrongThreadWitnesses{0}, wrongContextWitnesses{0};
+    std::atomic<uint32_t> firstAcceptedWitness{0}, relevantWitnesses{0};
+    uint32_t framesLeft = 0; // Present-owner only
+};
+DrawIngressAudit drawIngressAudit;
+void reportDrawIngress(const char* event, bool finish = true) {
+    auto& a = drawIngressAudit;
+    if (finish) {
+        if (!a.active.exchange(false, std::memory_order_acq_rel)) return;
+    } else if (!a.active.load(std::memory_order_acquire)) return;
+    const auto wrongThread = a.wrongThread.load(std::memory_order_relaxed);
+    const auto wrongContext = a.wrongContext.load(std::memory_order_relaxed);
+    const auto relevant = a.relevant.load(std::memory_order_relaxed);
+    Log::get().note("flat draw ingress audit: event=%s entered=%llu inactive=%llu inactive-live-off=%llu inactive-internal=%llu wrong-thread=%llu wrong-context=%llu paused=%llu accepted=%llu relevant=%llu inactive-witnesses=%u wrong-thread-witnesses=%u wrong-context-witnesses=%u wrong-thread-suppressed=%llu wrong-context-suppressed=%llu first-accepted-witness=%u relevant-witnesses=%u relevant-suppressed=%llu; F10-only, counts include early exits before frame reduction",
+        event,
+        (unsigned long long)a.entered.load(std::memory_order_relaxed),
+        (unsigned long long)a.inactive.load(std::memory_order_relaxed),
+        (unsigned long long)a.inactiveLiveOff.load(std::memory_order_relaxed),
+        (unsigned long long)a.inactiveInternal.load(std::memory_order_relaxed),
+        (unsigned long long)wrongThread, (unsigned long long)wrongContext,
+        (unsigned long long)a.paused.load(std::memory_order_relaxed),
+        (unsigned long long)a.accepted.load(std::memory_order_relaxed),
+        (unsigned long long)relevant,
+        std::min(1u, a.inactiveWitnesses.load(std::memory_order_relaxed)),
+        std::min(1u, a.wrongThreadWitnesses.load(std::memory_order_relaxed)),
+        std::min(2u, a.wrongContextWitnesses.load(std::memory_order_relaxed)),
+        (unsigned long long)(wrongThread > 1 ? wrongThread - 1 : 0),
+        (unsigned long long)(wrongContext > 2 ? wrongContext - 2 : 0),
+        std::min(1u, a.firstAcceptedWitness.load(std::memory_order_relaxed)),
+        std::min(3u, a.relevantWitnesses.load(std::memory_order_relaxed)),
+        (unsigned long long)(relevant > 3 ? relevant - 3 : 0));
+    if (finish) a.framesLeft = 0;
+}
+void armDrawIngress() {
+    auto& a = drawIngressAudit;
+    reportDrawIngress("rearmed");
+    a.entered.store(0, std::memory_order_relaxed);
+    a.inactive.store(0, std::memory_order_relaxed);
+    a.inactiveLiveOff.store(0, std::memory_order_relaxed);
+    a.inactiveInternal.store(0, std::memory_order_relaxed);
+    a.wrongThread.store(0, std::memory_order_relaxed);
+    a.wrongContext.store(0, std::memory_order_relaxed);
+    a.paused.store(0, std::memory_order_relaxed);
+    a.accepted.store(0, std::memory_order_relaxed);
+    a.relevant.store(0, std::memory_order_relaxed);
+    a.inactiveWitnesses.store(0, std::memory_order_relaxed);
+    a.wrongThreadWitnesses.store(0, std::memory_order_relaxed);
+    a.wrongContextWitnesses.store(0, std::memory_order_relaxed);
+    a.firstAcceptedWitness.store(0, std::memory_order_relaxed);
+    a.relevantWitnesses.store(0, std::memory_order_relaxed);
+    a.framesLeft = 900;
+    a.active.store(true, std::memory_order_release);
+    Log::get().note("flat draw ingress audit: event=armed frames=900; F10 scope entries and guard reasons are counted even when no draw reaches the reducer");
+}
+void drawIngressIdentity(ID3D11DeviceContext* context, const char* reason, DWORD ownerThread,
+                         ID3D11DeviceContext* runtimeContext, uint64_t frame, uint32_t work,
+                         bool live, bool internal,
+                         std::atomic<uint32_t>& witnessCount, uint32_t limit) {
+    if (witnessCount.fetch_add(1, std::memory_order_relaxed) >= limit) return;
+    Ptr<IUnknown> selfIdentity, runtimeIdentity, selfDeviceIdentity, runtimeDeviceIdentity;
+    Ptr<ID3D11Device> selfDevice, runtimeDevice;
+    if (context) {
+        context->QueryInterface(IID_PPV_ARGS(&selfIdentity));
+        context->GetDevice(&selfDevice);
+        if (selfDevice) selfDevice->QueryInterface(IID_PPV_ARGS(&selfDeviceIdentity));
+    }
+    if (runtimeContext) {
+        runtimeContext->QueryInterface(IID_PPV_ARGS(&runtimeIdentity));
+        runtimeContext->GetDevice(&runtimeDevice);
+        if (runtimeDevice) runtimeDevice->QueryInterface(IID_PPV_ARGS(&runtimeDeviceIdentity));
+    }
+    Log::get().note("flat draw ingress witness: reason=%s frame=%llu self=%p runtime-context=%p draw-thread=%lu owner-thread=%lu work=%u live=%u internal=%u self-IUnknown=%p runtime-IUnknown=%p self-device=%p runtime-device=%p self-device-IUnknown=%p runtime-device-IUnknown=%p; COM identities distinguish pointer aliases from different contexts/devices; null runtime fields on a foreign thread are deliberately not queried",
+        reason, (unsigned long long)frame, context, runtimeContext,
+        (unsigned long)GetCurrentThreadId(), (unsigned long)ownerThread, work,
+        live ? 1u : 0u, internal ? 1u : 0u,
+        selfIdentity.Get(), runtimeIdentity.Get(), selfDevice.Get(), runtimeDevice.Get(),
+        selfDeviceIdentity.Get(), runtimeDeviceIdentity.Get());
+}
 // The camera table (flat_camera_table.h): the constant buffers bound to VS b1 that can carry the camera rows, and
 // the draw path's kept answer from them. An entry is read through a const pointer here and changed only through
 // the table's own operations, each of which invalidates that kept answer: nothing below assigns to one.
@@ -649,7 +735,6 @@ void reportProjection(State& s, const char* event) {
 // This HDR copy is distinct from the final-output copy admitted by the resolver.
 constexpr uint64_t kHdrCopyVs=0xCFA91824129ECBBCull;
 constexpr uint64_t kHdrCopyPs=0xDFCBA0EC70B03C9Bull;
-constexpr uint64_t kImageFilterPs=0xFCFAD73924BF45B9ull;
 constexpr uint64_t kMenuCopyVs=0xDEF19B035D5EDEDCull;
 constexpr uint64_t kMenuCopyPs=0xDED8796049C7BB4Aull;
 bool verifyMenuHdrCopy(ID3D11DeviceContext* ctx,FlatRuntimeDraw& draw) {
@@ -686,13 +771,13 @@ bool verifyMenuHdrCopy(ID3D11DeviceContext* ctx,FlatRuntimeDraw& draw) {
 }
 bool verifyCameraIndependentImageSource(ID3D11DeviceContext* ctx,const FlatRuntimeDraw& draw) {
     const auto& k=draw.key;
-    if(k.format!=9 || k.vs!=kHdrCopyVs || k.ps!=kImageFilterPs)return false;
+    if(k.format!=9 || !flatRuntimeCameraIndependentImageSourcePair(k.vs,k.ps))return false;
     FlatComputeInternalScope guard;
     Ptr<ID3D11VertexShader> vs;Ptr<ID3D11PixelShader> ps;
     Ptr<ID3D11RenderTargetView> rt;Ptr<ID3D11DepthStencilView> ds;
     ctx->VSGetShader(&vs,nullptr,nullptr);ctx->PSGetShader(&ps,nullptr,nullptr);
     ctx->OMGetRenderTargets(1,&rt,&ds);
-    if(lookupShaderHash(vs.Get())!=kHdrCopyVs || lookupShaderHash(ps.Get())!=kImageFilterPs ||
+    if(lookupShaderHash(vs.Get())!=k.vs || lookupShaderHash(ps.Get())!=k.ps ||
        !rt || !ds || rt.Get()!=k.rtv || ds.Get()!=k.dsv)return false;
     Ptr<ID3D11Resource> color,depth;rt->GetResource(&color);ds->GetResource(&depth);
     if(color.Get()!=k.color || depth.Get()!=k.depth)return false;
@@ -1727,6 +1812,7 @@ bool flatRuntimeSceneSizes(uint32_t* renderWidth, uint32_t* renderHeight, uint32
 }
 
 void flatRuntimeResize() {
+    reportDrawIngress("resize-or-stop");
     g_flatRuntimeLive.store(false, std::memory_order_release);
     nativeScale.store(false, std::memory_order_release);
     // The swap chain or the device went: engine motion's bound state (the game's render targets among it, held by
@@ -1978,6 +2064,9 @@ static FlatMonoFrame copyAdmit(State& s, const FlatRuntimeDraw& d, const FlatMon
 void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT flags) {
     if (!runtimeFlatProfile() || !swap || (flags & DXGI_PRESENT_TEST)) return;
     auto& s = state(); if (s.thread && !owner()) return;
+    if (drawIngressAudit.active.load(std::memory_order_acquire) &&
+        drawIngressAudit.framesLeft && --drawIngressAudit.framesLeft == 0)
+        reportDrawIngress("complete");
     // The flat HDR route's crash-safe breadcrumbs (flat_hdr_crumbs.h): "frame-end begin" now (the real Present has just
     // returned `hr`), "frame-end end" on every path out of this function, and the gate closed until the route admits
     // another frame. The next frame's preflight, with its resource creations, runs inside it.
@@ -2161,6 +2250,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         reportProjection(s,"complete");
     }
     if(projectionAuditRequested.exchange(false,std::memory_order_acq_rel)) {
+        armDrawIngress();
         // A diagnostic asks for everything, refused frames included: the stand-down ends.
         endStandDown(s, frame, "an F10 audit asked for everything");
         witnessRearm();   // the camera-write witness walks stacks again, bounded (flat_witness_bound.h)
@@ -2302,6 +2392,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     s.cameras.newFrame();
     const auto now = GetTickCount64();
     if (now - s.lastReport >= 5000) {
+        reportDrawIngress("progress", false);
         reportMapBounce(frame,now,true);
         reportPhaseCensus(s,"5s");
         if(s.projectionFrames)reportProjection(s,"progress");
@@ -2711,15 +2802,53 @@ static bool coverageShadersMatch(ID3D11DeviceContext* context, const FlatContrac
 }
 
 FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_t instances,
-                                           char kind, uint32_t count, uint32_t start,
-                                           int32_t base, uint32_t startInstance) {
-    if (!flatRuntimeActive()) return;
-    auto& s = state(); if (!owner() || context != s.context.Get()) { foreignWork.store(true, std::memory_order_release); return; }
+                                            char kind, uint32_t count, uint32_t start,
+                                            int32_t base, uint32_t startInstance) {
+    auto& ingress = drawIngressAudit;
+    const bool auditing = ingress.active.load(std::memory_order_relaxed);
+    if (auditing) ingress.entered.fetch_add(1, std::memory_order_relaxed);
+    if (!flatRuntimeActive()) {
+        if (auditing) {
+            ingress.inactive.fetch_add(1, std::memory_order_relaxed);
+            const bool live = g_flatRuntimeLive.load(std::memory_order_relaxed);
+            const bool internal = g_flatComputeInternal;
+            if (!live) ingress.inactiveLiveOff.fetch_add(1, std::memory_order_relaxed);
+            if (internal) ingress.inactiveInternal.fetch_add(1, std::memory_order_relaxed);
+            drawIngressIdentity(context, "inactive", 0, nullptr, 0, 0, live, internal,
+                                ingress.inactiveWitnesses, 1);
+        }
+        return;
+    }
+    auto& s = state();
+    if (!owner()) {
+        if (auditing) {
+            ingress.wrongThread.fetch_add(1, std::memory_order_relaxed);
+            // Present may resize and release its context on another thread.
+            // Query only the live draw argument here, not State's COM pointer.
+            drawIngressIdentity(context, "wrong-thread", s.thread, nullptr, 0, 0, true, false,
+                                ingress.wrongThreadWitnesses, 1);
+        }
+        foreignWork.store(true, std::memory_order_release);
+        return;
+    }
+    if (context != s.context.Get()) {
+        if (auditing) {
+            ingress.wrongContext.fetch_add(1, std::memory_order_relaxed);
+            drawIngressIdentity(context, "wrong-context", s.thread, s.context.Get(), s.prefix.frame,
+                                static_cast<uint32_t>(s.work), true, false,
+                                ingress.wrongContextWitnesses, 2);
+        }
+        foreignWork.store(true, std::memory_order_release);
+        return;
+    }
     // The census's whole-frame GPU span opens at the frame's first game draw, watched or not.
     if (!s.gpuFrameTried) gpuFrameOpen(s, context);
     // A Paused frame (flat_standdown.h) watches nothing: the scope is a no-op, ctx stays
     // null and the destructor returns at its first line.
+    if (s.work == FlatWork::Paused && auditing)
+        ingress.paused.fetch_add(1, std::memory_order_relaxed);
     if (s.work == FlatWork::Paused) return;
+    if (auditing) ingress.accepted.fetch_add(1, std::memory_order_relaxed);
     flatcpu::Scope shell(flatcpu::kOther);   // the scope's own time; the named families below are carved out of it
     ctx = context; FlatRuntimeDraw d{}; auto& k = d.key;
     // Lazy substitution (engine_velocity.h): engine motion's state may still be bound from the producer draw before this
@@ -2735,6 +2864,46 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     k.color = rt.resource; k.rtv = bindingGet(BindSlot::Rtv0); k.width = rt.a; k.height = rt.b; k.format = rt.fmt;
     k.depth = ds.resource; k.dsv = bindingGet(BindSlot::Dsv0); k.depthWidth = ds.a; k.depthHeight = ds.b; k.depthFormat = ds.fmt;
     k.vs = bindingShaderHash(BindSlot::Vs); k.ps = bindingShaderHash(BindSlot::Ps);
+    if (auditing) {
+        const bool relevant = (k.vs == flat_mono_detail::kCopyVs &&
+                               k.ps == flat_mono_detail::kCopyPs) ||
+                              (s.prefix.output && k.color == s.prefix.output);
+        if (relevant) ingress.relevant.fetch_add(1, std::memory_order_relaxed);
+        const bool firstAccepted = ingress.firstAcceptedWitness.load(std::memory_order_relaxed) == 0 &&
+            ingress.firstAcceptedWitness.exchange(1, std::memory_order_relaxed) == 0;
+        const bool sampleRelevant = relevant &&
+            ingress.relevantWitnesses.fetch_add(1, std::memory_order_relaxed) < 3;
+        if (firstAccepted || sampleRelevant) {
+            FlatComputeInternalScope guard;
+            Ptr<ID3D11VertexShader> actualVs;
+            Ptr<ID3D11PixelShader> actualPs;
+            Ptr<ID3D11RenderTargetView> actualRtv;
+            Ptr<ID3D11DepthStencilView> actualDsv;
+            Ptr<ID3D11Resource> actualColor;
+            Ptr<IUnknown> actualColorIdentity, outputIdentity;
+            D3D11_VIEWPORT actualVp{};
+            UINT actualVpCount = 1;
+            context->VSGetShader(&actualVs, nullptr, nullptr);
+            context->PSGetShader(&actualPs, nullptr, nullptr);
+            context->OMGetRenderTargets(1, &actualRtv, &actualDsv);
+            if (actualRtv) actualRtv->GetResource(&actualColor);
+            if (actualColor) actualColor->QueryInterface(IID_PPV_ARGS(&actualColorIdentity));
+            if (s.output) s.output->QueryInterface(IID_PPV_ARGS(&outputIdentity));
+            context->RSGetViewports(&actualVpCount, &actualVp);
+            Log::get().note("flat draw ingress binding witness: frame=%llu kind=%s cached-VS=%016llX cached-PS=%016llX cached-RTV=%p cached-color=%p output=%p cached-viewport-count=%u cached-viewport=(%.1f,%.1f,%.1f,%.1f,%.2f,%.2f) actual-VS=%016llX actual-PS=%016llX actual-RTV=%p actual-color=%p actual-color-IUnknown=%p output-IUnknown=%p actual-DSV=%p actual-viewport-count=%u actual-viewport=(%.1f,%.1f,%.1f,%.1f,%.2f,%.2f); F10 bounded",
+                (unsigned long long)s.prefix.frame, relevant ? "relevant" : "first-accepted",
+                (unsigned long long)k.vs, (unsigned long long)k.ps, k.rtv, k.color,
+                s.prefix.output, s.viewportCount,
+                s.viewport.TopLeftX, s.viewport.TopLeftY, s.viewport.Width, s.viewport.Height,
+                s.viewport.MinDepth, s.viewport.MaxDepth,
+                (unsigned long long)lookupShaderHash(actualVs.Get()),
+                (unsigned long long)lookupShaderHash(actualPs.Get()),
+                actualRtv.Get(), actualColor.Get(), actualColorIdentity.Get(), outputIdentity.Get(),
+                actualDsv.Get(), actualVpCount,
+                actualVp.TopLeftX, actualVp.TopLeftY, actualVp.Width, actualVp.Height,
+                actualVp.MinDepth, actualVp.MaxDepth);
+        }
+    }
     // Partial temporal AA's current-draw identities (see refuseDraw): the
     // pair a per-draw reason refuses, named in the coverage census. Cheap
     // POD stores, done for every draw so qualifyProjection (State& only) can

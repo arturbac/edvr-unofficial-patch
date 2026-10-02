@@ -34,6 +34,12 @@ struct FlatRuntimeDraw {
     bool imageSourceCameraIndependentVerified = false;
     uint32_t instances = 1;
 };
+// Exact bytecode-qualified image filters, with a position/UV passthrough VS.
+// Live shader verification and resource/frame provenance remain mandatory.
+inline bool flatRuntimeCameraIndependentImageSourcePair(uint64_t vs, uint64_t ps) {
+    return vs == 0xCFA91824129ECBBCull &&
+        (ps == 0xFCFAD73924BF45B9ull || ps == 0x07B3F82100F29401ull);
+}
 enum class FlatRuntimeConflict : uint32_t {
     None, Viewport, MissingDepth, DepthMismatch, CameraChange,
     CameraProvenance, ExplicitWrite, ImageCopySource, MenuCopySource, SelectorLayout,
@@ -243,7 +249,6 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
     auto* t = flatRuntimeTarget(p, k.color); if (!t) return out;
     constexpr uint64_t kHdrImageCopyVs = 0xCFA91824129ECBBCull;
     constexpr uint64_t kHdrImageCopyPs = 0xDFCBA0EC70B03C9Bull;
-    constexpr uint64_t kImageSourcePs = 0xFCFAD73924BF45B9ull;
     constexpr uint64_t kMenuCopyVs = 0xDEF19B035D5EDEDCull;
     constexpr uint64_t kMenuCopyPs = 0xDED8796049C7BB4Aull;
     if (k.format == 26 && k.vs == kMenuCopyVs && k.ps == kMenuCopyPs) {
@@ -300,7 +305,7 @@ inline FlatMonoFrame flatRuntimeObserve(FlatRuntimePrefix& p, const FlatRuntimeD
         return out;
     }
     const bool imageCameraIndependent = k.format == 9 &&
-        k.vs == kHdrImageCopyVs && k.ps == kImageSourcePs &&
+        flatRuntimeCameraIndependentImageSourcePair(k.vs, k.ps) &&
         d.imageSourceCameraIndependentVerified;
     const bool imageCopy = k.format == 26 && k.vs == kHdrImageCopyVs && k.ps == kHdrImageCopyPs;
     if (imageCopy) {
