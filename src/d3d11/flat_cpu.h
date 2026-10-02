@@ -452,12 +452,22 @@ inline void percentiles(float* a, unsigned n, double* p50, double* p95) noexcept
 
 // Whether the census clocks anything. Under Proton an on-foot frame makes about 200,000 scopes,
 // and clocking one costs that frame about 21 ms (2026-10-02): a hitch at a random frame in every
-// block of kRenderPeriod, p95 present 37 ms against 16.7 ms at 60 Hz. So the clocks are off unless
-// EDVR_FLAT_CPU_CLOCKS=1 is in the environment; the line still prints the present and GPU figures.
+// block of kRenderPeriod, p95 present 37 ms against 16.7 ms at 60 Hz. The policy: on under Windows,
+// as it always was; off under Wine (Proton), the only place the hitch is measured. ntdll exporting
+// wine_get_version is how Wine is told apart. EDVR_FLAT_CPU_CLOCKS=1 or =0 decides it either way.
+// With the clocks off the line still prints the present and GPU figures.
+inline bool clocksPolicy(bool underWine, const char* env) noexcept {
+    if (env && env[0] == '1') return true;
+    if (env && env[0] == '0') return false;
+    return !underWine;
+}
 inline bool clocksWanted() noexcept {
     static const bool on = [] {
         char v[4] = {};
-        return GetEnvironmentVariableA("EDVR_FLAT_CPU_CLOCKS", v, sizeof v) > 0 && v[0] == '1';
+        const bool set = GetEnvironmentVariableA("EDVR_FLAT_CPU_CLOCKS", v, sizeof v) > 0;
+        const HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        const bool underWine = ntdll && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+        return clocksPolicy(underWine, set ? v : nullptr);
     }();
     return on;
 }
@@ -553,8 +563,9 @@ public:
     bool take(int64_t nowTicks, bool standingDown, WindowReport& out) noexcept {
         if (!primed_ || freq_ <= 0) return false;
         if (nowTicks - windowStart_ < freq_ * kWindowMs / 1000) return false;
-        if (!floorsMeasured_) {
-            // The end of the first window: the CPU is in the state the flight runs in.
+        if (!floorsMeasured_ && clocks_) {
+            // The end of the first window: the CPU is in the state the flight runs in. With the clocks off
+            // nothing is clocked, so nothing needs a floor, and calibrating would clock scopes on this thread.
             floor_ = calibrate(freq_);
             emFloor_ = emcpu::calibrate(freq_);
             floorsMeasured_ = true;
@@ -764,10 +775,14 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
 
     char total[32] = "-";
     if (anyClocked) std::snprintf(total, sizeof(total), "%.3f ms", totalMs / clocked);
-    tk.add("", "flat cpu 5s: frames=%u (stood down %u%s) present p50 %.2f ms (p95 %.2f); render thread clocked on %u of %u frames, "
-               "one in %u (its figures are per clocked frame); EDVR per frame total %s",
-           r.frames, r.pausedFrames, r.standingDown ? ", stood down now" : "", r.presentP50Ms, r.presentP95Ms,
-           r.renderClockedFrames, r.frames, r.renderPeriod, total);
+    if (r.clocksOff)
+        tk.add("", "flat cpu 5s: frames=%u (stood down %u%s) present p50 %.2f ms (p95 %.2f); clocks off, no thread clocked",
+               r.frames, r.pausedFrames, r.standingDown ? ", stood down now" : "", r.presentP50Ms, r.presentP95Ms);
+    else
+        tk.add("", "flat cpu 5s: frames=%u (stood down %u%s) present p50 %.2f ms (p95 %.2f); render thread clocked on %u of %u frames, "
+                   "one in %u (its figures are per clocked frame); EDVR per frame total %s",
+               r.frames, r.pausedFrames, r.standingDown ? ", stood down now" : "", r.presentP50Ms, r.presentP95Ms,
+               r.renderClockedFrames, r.frames, r.renderPeriod, total);
     if (anyClocked) {
         for (unsigned f = 0; f < kFamilies; ++f) {
             callsText(calls, sizeof(calls), static_cast<double>(r.renderCalls[f]) / clocked);
@@ -784,7 +799,9 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
 
     // The game's other threads: per SAMPLED frame, thread-ms summed, because the rest of the
     // window they were not clocked. "-" is a window with no sampled frame, never a zero.
-    if (!r.sampledFrames) {
+    if (r.clocksOff) {
+        tk.add("; ", "other threads: clocks off");
+    } else if (!r.sampledFrames) {
         tk.add("; ", "other threads: not clocked in this window (one frame in %u is, and none was)", r.samplePeriod);
     } else {
         const double sampled = static_cast<double>(r.sampledFrames);

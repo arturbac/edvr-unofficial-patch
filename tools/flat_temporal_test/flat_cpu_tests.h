@@ -880,6 +880,14 @@ inline int flatCpuTests() {
         flatcpu::Lines lines;
         flatcpu::formatWindow(r, &lines);
         expect(has(joined(lines), "render thread: clocks off (EDVR_FLAT_CPU_CLOCKS=1 turns them on)"), "the line says the clocks are off");
+        expect(!r.floor.measured && !r.emFloor.measured, "the first window's close calibrates no floor: nothing clocked needs one");
+        expect(!has(joined(lines), "one in ") && !has(joined(lines), "one frame in 16") && !has(joined(lines), "one frame in 32"),
+               "and the line claims no clocking schedule");
+        expect(has(joined(lines), "other threads: clocks off"), "the other threads' part says so too");
+        // The policy: on under Windows, off under Wine, the variable deciding it either way.
+        expect(flatcpu::clocksPolicy(false, nullptr) && !flatcpu::clocksPolicy(true, nullptr), "on under Windows, off under Wine");
+        expect(flatcpu::clocksPolicy(true, "1") && !flatcpu::clocksPolicy(false, "0"), "EDVR_FLAT_CPU_CLOCKS=1/0 overrides both");
+        expect(flatcpu::clocksPolicy(false, "x") && !flatcpu::clocksPolicy(true, "x"), "any other value leaves the default");
     }
 
     fake(0);
