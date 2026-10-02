@@ -4,9 +4,13 @@
 
 *Written 2026-10-01. Update whenever this doc changes.*
 
-- **State:** BUILT in three commits on branch `claude/stall-diagnostics` (cut from
-  main 2b734be2), full build green, NOT merged, NOT installed, NOT FLOWN. Diagnostics
-  only: nothing here changes what the game draws or how the headset runs.
+- **State:** SHIPPED in v0.18.0 (merged 1c42ebdf). First field log 2026-10-02, a Quest 3
+  user on Virtual Desktop: 15 FREEZE lines, the sampler naming the game, the NVIDIA
+  driver and NGX. No issue 63 log with it yet; the test plan below has not been run.
+  Diagnostics only: nothing here changes what the game draws or how the headset runs.
+- **Blind spot (2026-10-02):** a sustained slow regime under the 250 ms and 150 ms lines
+  is invisible: that user's game ran at exactly 10 fps for a minute and `--freezes`
+  printed PASS. See `docs\headset-lock-vdxr-2026-10-02.md`.
 - **Why:** issue 63, 1-2 s freezes in VR on Index + SteamVR with EDHM chained. The rc.5
   flight showed EDVR's own work under 2 ms in every freeze, SteamVR answering, the GPU
   idle, and the render thread stopping at a different point of the game's frame each
