@@ -7,8 +7,8 @@
 - **State:** cause CONFIRMED by the reporter (comment of 2026-10-02 11:45 UTC): EDVR's
   CPU reads of the pointer `Map(WRITE_DISCARD)` returns, which DXVK places in
   write-combined, uncached memory by default. A workaround exists (below). The fix is
-  DESIGNED (section "Fix design" below), NOT BUILT; Sean is handing it to an
-  implementer. No reply posted.
+  implemented on `codex/issue-65-map-bounce` for Sean's Epic flat test. Full build,
+  core rig and 12 mutants pass; clean-version install pending. No reply posted.
 - **Report:** issue 65, flat v0.18.0 (build 6ABED11D), GE-Proton 11-6 (DXVK), Mesa 26.2.2
   RADV, RX 7900 XTX, Ryzen 9 9950X, 9000x2160, EDVR -> EDHM -> DXVK through
   `advanced.real_dll`, `temporal_aa = on`. `cb shadows` 25-28 ms per clocked frame
@@ -53,6 +53,12 @@
   into the real mapping at Unmap, so every EDVR reader, discovery's included, reads
   cached memory. Native NVIDIA keeps the v0.18.0 path. Later: the trace ring, the
   `track()` negative cache, a demand-driven shadow.
+- **Temporary validation key:** `advanced.flat_cb_map_cache = auto|on|off`; default
+  `auto` measures mapped reads, `on` forces caching and enables verification,
+  `off` keeps direct mappings. Removal requires Sean's approval when the arc closes.
+- **Next flight:** Epic flat, existing DLSS settings, key default `auto`; expect OFF
+  on native NVIDIA, zero trips and mismatches, and a `flat map bounce 5s:` line.
+  Then force `on` for the longer validation flight described in section 6.
 
 ## RVA map (the v0.18.0 release DLL)
 
@@ -75,7 +81,7 @@ The reporter's own PDB build agreed on the top two.
 Environment note: DXVK's built-in profile for Elite sets `dxgi.customVendorId = 10de`,
 so EDVR sees the reporter's AMD card as NVIDIA.
 
-## Fix design: the map bounce (2026-10-02, NOT BUILT)
+## Fix design: the map bounce (2026-10-02, implemented; flights pending)
 
 Designed read-only against origin/main d7131071; every file cited is unchanged since
 v0.18.0, so its line numbers hold. Nothing built or flown. For the implementer: follow
@@ -296,3 +302,30 @@ key on/off. Their local copy-at-Unmap patch is the same idea; ask for the diff.
 - An Unmap the hooks never see would lose writes: the Present watchdog and the trips
   detect it, and key off is the way back. No fence added: the game relied on the same API
   contract for its own stores.
+
+### 8. Implementation and local validation (2026-10-02)
+
+Implemented the header-only cached mapping core, projection seed/copy callbacks,
+Map/Unmap hooks, independent Present epoch, temporary flat-profile key, and the
+`--map-bounce` log verdict. The arena and its held resource/context references
+survive runtime resets. An unsafe event permanently stops new bounces; a valid
+open mapping remains available for its matching late Unmap. A repeated Map drops
+the old record without writing a potentially stale driver pointer.
+
+Native auto-OFF skips slot scans when none are open and measures only the first
+32 qualifying bank copies. The unchanged-row metric requires an additional
+512 KB cached baseline arena; copies touch only the tracked width. Registration
+logs are capped at 64, and the census includes map types, width buckets, sampled
+versus total bank bytes, nonzero CB offsets, and explicit trip reasons.
+
+Local checks: core C1-C8, 1,200 seeded six-resource programs, actual foreign-thread
+Unmap, and all 12 fault mutants passed their checks. The log reader self-test and
+configuration contract pass. Independent review found no writeback or lifetime
+blocker; its telemetry population finding was corrected before building. Full
+production/WARP/installer validation passed and wrote the full-build receipt.
+The source-pin test now expects the two additional shadow scopes. The runner's
+process-tree timeout check requires an unsandboxed build; its sandboxed failure
+was reproduced and the unchanged check passed outside the sandbox. Current
+main's F10 shader capture was included in the validated source. The clean-version
+Epic install is pending. No game flight or Proton measurement has been performed
+on this implementation.

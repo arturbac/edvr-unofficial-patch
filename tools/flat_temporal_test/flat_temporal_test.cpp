@@ -2492,7 +2492,7 @@ void testFlatCpuWiring() {
         {&runtimeCpp, "flatcpu::kResource", 4, "Written, Map, Unmap and Update time their lookups"},
         {&runtimeCpp, "flatcpu::kCoverage", 1, "coverage classification"},
         {&runtimeCpp, "flatcpu::kProjection", 3, "qualifyProjection, the private binding and its restore"},
-        {&runtimeCpp, "flatcpu::kShadows", 5, "the constant-buffer shadow observers"},
+        {&runtimeCpp, "flatcpu::kShadows", 7, "the constant-buffer shadow observers and map-cache install/flush"},
         {&runtimeCpp, "flatcpu::kWitness", 1, "the camera witness"},
         {&runtimeCpp, "flatcpu::kEngineDraw", 4, "engine motion's draw wrapper: naming, its begin (BeforeDraw), its end, and the flush of what it kept bound"},
         {&runtimeCpp, "flatcpu::kResolve", 2, "the treatment at the copy draw and at the HDR route's trigger"},

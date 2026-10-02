@@ -18,6 +18,7 @@
     python tools/edvr_log.py --target frontier --ui-composites --expect-build HEAD
     python tools/edvr_log.py --target frontier --terrain-checkerboard --expect-build HEAD
     python tools/edvr_log.py --target frontier --route-curve --expect-build HEAD
+    python tools/edvr_log.py --target steam --map-bounce --expect-build HEAD
     python tools/edvr_log.py --target steam --freezes --expect-build HEAD
     python tools/edvr_log.py --list
 
@@ -203,6 +204,12 @@ STOP), OWNS (its sentence names the curve the next window shows) and FAULT. Like
 --maps-sharp its exit code carries the verdict: 0 for PASS or WARN, 1 for STOP, 3 when
 the log has no route line. A log from before the curved route has no curve tokens:
 that is a WARN which says so, never a PASS.
+
+--map-bounce reads issue 65's `flat map bounce 5s:` windows and one-shot decision.
+A missing line means the instrument never ran; pending windows warn, and fail-safe
+trips or verification mismatches stop. It checks verification coverage and measured
+bank-read speed when bounce is off. Exit 0 for PASS or WARN, 1 for STOP, 3 when the
+instrument never ran.
 
 --freezes reads one flight's freeze diagnostics (issue 63). A frame or runtime cycle of
 250 ms or more is a freeze and always gets a line, so the report lays them out from both
@@ -5920,6 +5927,139 @@ def print_route_curve(text, path=None):
     return 1 if stops else 0
 
 
+MAP_BOUNCE_PREFIX = "flat map bounce 5s:"
+MAP_BOUNCE_DECISION_PREFIX = "flat map bounce: decision"
+MAP_BOUNCE_PENDING_PREFIX = "flat map bounce: pending"
+MAP_BOUNCE_FIELDS = ("state", "key", "maps", "bounced", "flushes", "trips",
+                     "bank-sample-bytes",
+                     "verify-samples", "verify-mismatches", "bank-ns-per-kb")
+
+
+def _map_bounce_fields(line):
+    """Read the key=value tokens from one map-bounce summary/decision line."""
+    return dict(re.findall(r"(?<!\S)([a-z][a-z0-9-]*)=([^\s,;]+)", line))
+
+
+def parse_map_bounce(text):
+    """Return summary lines, malformed summary lines, and decisions for issue 65."""
+    summaries, malformed, decisions, pending = [], [], [], []
+    for line_no, line in enumerate(text.splitlines(), 1):
+        if MAP_BOUNCE_PREFIX in line:
+            fields = _map_bounce_fields(line)
+            missing = [key for key in MAP_BOUNCE_FIELDS if key not in fields]
+            integer_fields = MAP_BOUNCE_FIELDS[2:-1]
+            bad_numbers = [key for key in integer_fields if key in fields and
+                           (not re.fullmatch(r"\d{1,20}", fields[key]) or
+                            int(fields[key]) > 18446744073709551615)]
+            if ("bank-ns-per-kb" in fields and
+                    (len(fields["bank-ns-per-kb"]) > 64 or
+                     not re.fullmatch(r"\d+(?:\.\d*)?|\.\d+", fields["bank-ns-per-kb"]) or
+                     not math.isfinite(float(fields["bank-ns-per-kb"])))):
+                bad_numbers.append("bank-ns-per-kb")
+            if (missing or bad_numbers or
+                    fields.get("state") not in ("pending", "on", "off", "tripped") or
+                    fields.get("key") not in ("auto", "on", "off")):
+                malformed.append({"line": line_no, "text": line,
+                                  "missing": missing, "bad_numbers": bad_numbers,
+                                  "fields": fields})
+            else:
+                for key in ("maps", "bounced", "flushes", "trips",
+                            "bank-sample-bytes", "verify-samples", "verify-mismatches"):
+                    fields[key] = int(fields[key])
+                fields["bank-ns-per-kb"] = float(fields["bank-ns-per-kb"])
+                fields["line"] = line_no
+                summaries.append(fields)
+        elif MAP_BOUNCE_DECISION_PREFIX in line:
+            fields = _map_bounce_fields(line)
+            result = re.search(r"threshold\s*(?:=\s*)?([^\s,;]+)\s*->\s*(ON|OFF)\b", line)
+            if result:
+                fields["result"] = result.group(2)
+                fields["threshold"] = result.group(1)
+            fields["line"] = line_no
+            fields["text"] = line
+            decisions.append(fields)
+        elif MAP_BOUNCE_PENDING_PREFIX in line:
+            pending.append({"line": line_no, "text": line})
+    return {"summaries": summaries, "malformed": malformed,
+            "decisions": decisions, "pending": pending}
+
+
+def print_map_bounce(text, path=None):
+    """Report issue 65 map-bounce instrumentation and verdict."""
+    p = parse_map_bounce(text)
+    windows, decisions = p["summaries"], p["decisions"]
+    if not windows and not p["malformed"] and not decisions and not p["pending"]:
+        print("[edvr] map-bounce: NEVER RAN; no `flat map bounce 5s:` summary or decision line in this log. Enable the instrument and fly a full summary window.")
+        print("map-bounce verdict: NEVER RAN")
+        return 3
+
+    latest = windows[-1] if windows else None
+    print("[edvr] map-bounce: %sbuild %s; %d summary window(s), %d decision line(s), %d malformed summary line(s)" %
+          (os.path.basename(path) + ", " if path else "",
+           version_line(text)[1] or "(no version line)", len(windows),
+           len(decisions), len(p["malformed"])))
+    if decisions:
+        for d in decisions[-3:]:
+            print("  DECISION %s" % d["text"].strip())
+    if latest:
+        print("  latest window: state=%s key=%s maps=%d bounced=%d flushes=%d bank-ns-per-kb=%.3f verify-samples=%d mismatches=%d trips=%d" %
+              (latest["state"], latest["key"], latest["maps"], latest["bounced"],
+               latest["flushes"], latest["bank-ns-per-kb"],
+               latest["verify-samples"], latest["verify-mismatches"], latest["trips"]))
+
+    findings = []
+    if p["malformed"]:
+        findings.append(("WARN", "FORMAT", "%d summary line(s) have missing or malformed fields; first at line %d" %
+                         (len(p["malformed"]), p["malformed"][0]["line"])))
+        for record in p["malformed"]:
+            safety = record["fields"]
+            for field, tag in (("trips", "TRIPS"), ("verify-mismatches", "VERIFY")):
+                raw = safety.get(field)
+                if raw is None or not re.fullmatch(r"\d{1,20}", raw) or int(raw) > 0:
+                    findings.append(("STOP", tag, "unsafe or unreadable %s in malformed summary at line %d" %
+                                     (field, record["line"])))
+    if not windows:
+        findings.append(("WARN", "INSTRUMENT", "no valid 5 s summary proves the instrument ran"))
+    else:
+        states = [w["state"] for w in windows]
+        trips = max(w["trips"] for w in windows)  # C++ reports the cumulative trip count.
+        mismatches = sum(w["verify-mismatches"] for w in windows)
+        if "tripped" in states or trips:
+            findings.append(("STOP", "TRIPS", "fail-safe tripped (%d recorded trip(s))" % trips))
+        if mismatches:
+            findings.append(("STOP", "VERIFY", "%d verification mismatch(es) recorded" % mismatches))
+        if latest["state"] == "pending":
+            findings.append(("WARN", "PENDING", "the latest adaptive decision is still pending"))
+        if latest["state"] == "off":
+            measured = [w["bank-ns-per-kb"] for w in windows if w["bank-sample-bytes"] > 0 and w["bank-ns-per-kb"] > 0]
+            if latest["key"] == "auto":
+                if decisions and decisions[-1].get("result") == "OFF" and measured:
+                    findings.append(("PASS", "OFF", "adaptive decision selected OFF after sampled bank reads"))
+                else:
+                    findings.append(("WARN", "OFF", "adaptive OFF lacks both an OFF decision and sampled bank-read timing"))
+            elif latest["bank-ns-per-kb"] > 1024.0:
+                findings.append(("WARN", "SLOW OFF", "bank reads are slow at %.1f ns/KB while bouncing is off" % latest["bank-ns-per-kb"]))
+        elif latest["state"] == "on":
+            if latest["bounced"]:
+                findings.append(("PASS", "ACTIVE", "map bounce is active; %d maps bounced in the latest window" % latest["bounced"]))
+            else:
+                findings.append(("WARN", "ACTIVE", "state says on but no map bounce was counted in the latest window"))
+        # Forced-on mode verifies every 16th flush, across window boundaries.
+        if latest["key"] == "on":
+            expected = sum(w["flushes"] for w in windows) // 16
+            observed = sum(w["verify-samples"] for w in windows)
+            if observed < expected:
+                findings.append(("WARN", "VERIFY COVERAGE", "%d forced-on flushes imply at least %d verification samples; saw %d" %
+                                 (sum(w["flushes"] for w in windows), expected, observed)))
+    for status, tag, msg in findings:
+        print("  %-4s  %s: %s" % (status, tag, msg))
+    stops = sum(1 for status, _, _ in findings if status == "STOP")
+    warns = sum(1 for status, _, _ in findings if status == "WARN")
+    verdict = "STOP" if stops else "WARN" if warns else "PASS"
+    print("map-bounce verdict: %s (%d STOP, %d WARN)" % (verdict, stops, warns))
+    return 1 if stops else 0
+
+
 def self_test_route_curve():
     """--route-curve on logs built from the route's own formatter output: the 5 s lines of tools\\camera_census_fixture.log (which
     tools\\vr_world_route_test holds to the formatter) with only their curve tokens, eye-takes, owned-frames and state swapped, the flat OWNS line of
@@ -9329,6 +9469,8 @@ def main(argv=None):
                          "verdict (strips drawn against eye takes, pending, stood-down, a stale "
                          "build, the OWNS sentence, a fault); exit 0 for PASS or WARN, 1 for "
                          "STOP, 3 when the log has no route line")
+    ap.add_argument("--map-bounce", action="store_true",
+                    help="report issue 65's flat constant-buffer Map bounce: 5 s summaries, adaptive decision, verification and fail-safe trips; PASS / WARN / STOP, exit 3 when the instrument never ran")
     ap.add_argument("--freezes", action="store_true",
                     help="report a flight's freeze diagnostics (issue 63): the graphics log's "
                          "FREEZE lines (a frame of 250 ms or more, never rate limited) joined "
@@ -9474,6 +9616,8 @@ def main(argv=None):
         return print_maps_sharp(text)
     if args.route_curve:
         return print_route_curve(text, path)
+    if args.map_bounce:
+        return print_map_bounce(text, path)
     if args.freezes:
         return print_freezes(path, text, ver, want, args, native_dirs)
     if args.tally == "periodic":
@@ -9496,6 +9640,97 @@ def main(argv=None):
         for l in lines:
             print(l)
     return 0
+
+
+def self_test_map_bounce():
+    """Exercise map-bounce verdicts and malformed records through the CLI."""
+    import contextlib
+    import io
+    import shutil
+
+    ok = True
+    version = "0.18.0-1-g0123456"
+    header = "[10:00:00.000] version %s (build 01234567)\n" % version
+    def summary(state="off", key="auto", maps=10, bounced=0, flushes=0,
+                trips=0, samples=0, mismatches=0, bank=900, sample_bytes=8192):
+        # Same token order and spelling as reportMapBounce in flat_runtime.cpp.
+        return ("[10:00:05.000] flat map bounce 5s: state=%s key=%s maps=%s tracked=8 other-buffer=1 texture=1 bounced=%s "
+                "declined-not-discard=0 declined-foreign-context=0 declined-foreign-thread=0 declined-internal=0 "
+                "declined-paused=0 declined-untracked=0 declined-open-full=0 declined-width=0 failed=0 flushes=%s "
+                "flush-bytes=4096 flush-ns-per-kb=200.0 bank-bytes=8192 bank-sample-bytes=%s bank-ns-per-kb=%s abandoned=0 "
+                "open-at-present=0 trips=%s verify-samples=%s verify-mismatches=%s unchanged-rows=0 rows-checked=0 "
+                "width-le64=0 width-le256=0 width-le1k=0 width-le4k=0 width-le8k=0 width-le64k=0 "
+                "tracked-read=0 tracked-write=0 tracked-read-write=0 tracked-discard=0 tracked-no-overwrite=0 cb-first-nonzero=0\n" %
+                (state, key, maps, bounced, flushes, sample_bytes, bank, trips, samples, mismatches))
+
+    fixtures = (
+        ("fast adaptive OFF", summary() + "[10:00:01.000] flat map bounce: decision at frame 10, batch rates 2.000/2.000/2.000/2.000 B/ns, threshold=1.0 -> OFF, key=auto\n", 0, "map-bounce verdict: PASS", "PASS  OFF"),
+        ("adaptive OFF after sampling window", summary() + summary(sample_bytes=0, bank=0) + "[10:00:01.000] flat map bounce: decision at frame 10, batch rates 2.000/2.000/2.000/2.000 B/ns, threshold=1.0 -> OFF, key=auto\n", 0, "map-bounce verdict: PASS", "PASS  OFF"),
+        ("adaptive OFF without sample bytes", summary(sample_bytes=0, bank=0) + "[10:00:01.000] flat map bounce: decision at frame 10, batch rates 2.000/2.000/2.000/2.000 B/ns, threshold=1.0 -> OFF, key=auto\n", 0, "map-bounce verdict: WARN", "WARN  OFF"),
+        ("active bounce", summary("on", bounced=8, flushes=8, samples=8, bank=1800), 0, "map-bounce verdict: PASS", "PASS  ACTIVE"),
+        ("pending decision", summary("pending", bank=1800), 0, "map-bounce verdict: WARN", "WARN  PENDING"),
+        ("fail-safe trip", summary("tripped", trips=1, bank=1800), 1, "map-bounce verdict: STOP", "STOP  TRIPS"),
+        ("verification mismatch", summary("on", bounced=3, flushes=3, trips=0, samples=3, mismatches=1, bank=1800), 1, "map-bounce verdict: STOP", "STOP  VERIFY"),
+        ("slow bank reads while forced off", summary("off", key="off", bank=2048), 0, "map-bounce verdict: WARN", "WARN  SLOW OFF"),
+        ("missing instrument", "[10:00:00.000] nothing to report\n", 3, "map-bounce verdict: NEVER RAN", "NEVER RAN"),
+        ("missing safety fields", header + "[10:00:05.000] flat map bounce 5s: state=off key=auto maps=10\n", 1, "map-bounce verdict: STOP", "STOP  TRIPS"),
+        ("fractional counter is malformed", header + summary(maps="1.5"), 0, "map-bounce verdict: WARN", "WARN  FORMAT"),
+        ("oversized integer is malformed", header + summary(maps="9" * 5000), 0, "map-bounce verdict: WARN", "WARN  FORMAT"),
+        ("negative bank time is malformed", header + summary(bank="-1"), 0, "map-bounce verdict: WARN", "WARN  FORMAT"),
+        ("verification missing after 16 flushes", header + summary("on", key="on", bounced=16, flushes=16, bank=1800), 0, "map-bounce verdict: WARN", "WARN  VERIFY COVERAGE"),
+        ("malformed tail with trip", header + summary() + summary(maps="bad", trips=1), 1, "map-bounce verdict: STOP", "STOP  TRIPS"),
+        ("malformed tail with mismatch", header + summary() + summary(maps="bad", mismatches=1), 1, "map-bounce verdict: STOP", "STOP  VERIFY"),
+        ("auto off without measured decision", header + summary(), 0, "map-bounce verdict: WARN", "WARN  OFF"),
+        ("on with no bounce count", header + summary("on", bounced=0, flushes=0, bank=1800), 0, "map-bounce verdict: WARN", "WARN  ACTIVE"),
+    )
+    tmp = tempfile.mkdtemp(prefix="edvr_map_bounce_test_")
+    try:
+        for i, (name, body, wanted_rc, verdict, detail) in enumerate(fixtures):
+            path = os.path.join(tmp, "%02d.log" % i)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(header + body if "version " not in body else body)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                rc = main(["--file", path, "--map-bounce", "--expect-build", version])
+            got = output.getvalue()
+            if rc != wanted_rc or verdict not in got or detail not in got:
+                print("map-bounce %s: rc=%d wanted %d, expected %r and %r:\n%s" %
+                      (name, rc, wanted_rc, verdict, detail, got))
+                ok = False
+
+        mismatch = os.path.join(tmp, "mismatch.log")
+        with open(mismatch, "w", encoding="utf-8") as f:
+            f.write(header + summary())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            rc = main(["--file", mismatch, "--map-bounce", "--expect-build",
+                       "0.18.0-2-g7654321"])
+        if rc != 2 or "BUILD MISMATCH" not in output.getvalue() or "map-bounce verdict" in output.getvalue():
+            print("map-bounce expected-build mismatch did not stop before report (rc=%d):\n%s" % (rc, output.getvalue()))
+            ok = False
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            try:
+                main(["--help"])
+            except SystemExit as e:
+                if e.code not in (0, None):
+                    print("map-bounce --help exited %r" % (e.code,)); ok = False
+        help_text = " ".join(output.getvalue().split())
+        if "--map-bounce" not in help_text or "adaptive decision" not in help_text:
+            print("--help does not describe --map-bounce")
+            ok = False
+        if "flat map bounce 5s:" not in (__doc__ or ""):
+            print("module help does not describe the map-bounce log prefix")
+            ok = False
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        print("map-bounce: self-test stopped at an exception")
+        ok = False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return ok
 
 
 def self_test():
@@ -9826,6 +10061,8 @@ def self_test():
     if not self_test_flat_upscale():
         ok = False
     if not self_test_route_curve():
+        ok = False
+    if not self_test_map_bounce():
         ok = False
     if not self_test_slow_regime():
         ok = False

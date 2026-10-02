@@ -106,6 +106,7 @@ inline bool runtimeProfileAllowsKey(const char* key) {
         return true;
     return runtimeFlatProfile() && (std::strcmp(key, "advanced.d3d11_fixes") == 0 ||
         std::strcmp(key, "advanced.flat_camera_producer_probe") == 0 ||
+        std::strcmp(key, "advanced.flat_cb_map_cache") == 0 ||
         std::strcmp(key, "hotkey.menu") == 0 ||
         std::strcmp(key, "fix.temporal_aa_model") == 0 ||
         std::strcmp(key, "hotkey.dump_draws") == 0 ||

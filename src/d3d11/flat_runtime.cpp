@@ -4,6 +4,7 @@
 #include "flat_copy_structure.h"
 #include "flat_hdr_crumbs.h"
 #include "flat_context_isolation.h"
+#include "flat_context_state.h"
 #include "flat_mono_resolve.h"
 #include "flat_projection_recipes.h"
 #include "flat_shader_classifier.h"
@@ -46,9 +47,30 @@
 #include <memory>
 
 namespace edvr {
+void FlatMapBounceD3DDriver::retain(uintptr_t resource, uintptr_t context) {
+    reinterpret_cast<ID3D11Resource*>(resource)->AddRef();
+    reinterpret_cast<ID3D11DeviceContext*>(context)->AddRef();
+}
+void FlatMapBounceD3DDriver::release(uintptr_t resource, uintptr_t context) {
+    reinterpret_cast<ID3D11DeviceContext*>(context)->Release();
+    reinterpret_cast<ID3D11Resource*>(resource)->Release();
+}
+uint64_t FlatMapBounceD3DDriver::clockTicks() {
+    LARGE_INTEGER value{}; QueryPerformanceCounter(&value);
+    return static_cast<uint64_t>(value.QuadPart);
+}
+uint64_t FlatMapBounceD3DDriver::ticksPerSecond() {
+    static const uint64_t frequency = [] { LARGE_INTEGER value{}; QueryPerformanceFrequency(&value);
+        return static_cast<uint64_t>(value.QuadPart); }();
+    return frequency;
+}
+bool FlatMapBounceD3DDriver::verify(void* real, const void* cached, size_t bytes) {
+    return std::memcmp(real, cached, bytes) == 0;
+}
 std::atomic<bool> g_flatRuntimeLive{false};
 namespace {
 std::atomic<bool> nativeScale{false};
+std::atomic<uint64_t> mapBouncePresentEpoch{1};
 std::atomic<bool> foreignWork{false};
 std::atomic<bool> projectionAuditRequested{false};
 template<class T> using Ptr = Microsoft::WRL::ComPtr<T>;
@@ -286,6 +308,115 @@ struct State {
 // Driver objects retire on the owner Present; never release under loader lock.
 State& state() { static State* p = new State; return *p; }
 bool owner() { return state().thread == GetCurrentThreadId(); }
+FlatMapBounce& mapBounce() {
+    static FlatMapBounceD3DDriver* driver = new FlatMapBounceD3DDriver;
+    static FlatMapBounce* bounce = new FlatMapBounce(*driver);
+    return *bounce;
+}
+struct MapBounceWindow {
+    std::atomic<uint64_t> maps{0}, tracked{0}, otherBuffer{0}, texture{0};
+    std::atomic<uint64_t> notDiscard{0}, foreignContext{0}, foreignThread{0};
+    std::atomic<uint64_t> internal{0}, paused{0}, untracked{0}, failed{0};
+    std::atomic<uint64_t> bankBytes{0}, bankTicks{0};
+    std::atomic<uint64_t> bankSamples{0}, totalBankBytes{0};
+    std::atomic<uint64_t> widthBuckets[6]{};
+    std::atomic<uint64_t> trackedTypes[6]{};
+};
+MapBounceWindow& mapBounceWindow() { static MapBounceWindow* window = new MapBounceWindow; return *window; }
+const char* bounceKeyName(flatmap::Mode mode) {
+    return mode == flatmap::Mode::On ? "on" : mode == flatmap::Mode::Off ? "off" : "auto";
+}
+const char* bounceStateName(flatmap::State state) {
+    switch (state) {
+    case flatmap::State::On: return "on";
+    case flatmap::State::Off: return "off";
+    case flatmap::State::Tripped: return "tripped";
+    default: return "pending";
+    }
+}
+void reportMapBounce(uint64_t frame, uint64_t now, bool periodic) {
+    auto& bounce = mapBounce();
+    auto& w = mapBounceWindow();
+    static flatmap::Counters previous{};
+    static uint64_t lastMaps=0,lastTracked=0,lastOther=0,lastTexture=0;
+    static uint64_t lastNotDiscard=0,lastForeignCtx=0,lastForeignThread=0;
+    static uint64_t lastInternal=0,lastPaused=0,lastUntracked=0,lastFailed=0;
+    static uint64_t lastBankBytes=0,lastBankTicks=0,lastTotalBankBytes=0;
+    static uint64_t lastWidth[6]{},lastTypes[6]{};
+    static uint64_t lastCbFirst=0;
+    static flatmap::Trip lastTrip=flatmap::Trip::None;
+    static bool decided=false,pendingNoted=false;
+    static uint64_t began=0;
+    if (!began) began=now;
+    if (!decided && bounce.samples() == 32) {
+        decided=true;
+        const auto* r=bounce.rates();
+        Log::get().note("flat map bounce: decision at frame %llu, batch rates %.3f/%.3f/%.3f/%.3f B/ns, threshold=1.0 -> %s, key=%s",
+            (unsigned long long)frame,r[0],r[1],r[2],r[3],
+            bounce.decision()==flatmap::State::On?"ON":"OFF",bounceKeyName(bounce.mode()));
+    }
+    if (!pendingNoted && !decided && now-began>=30000 && bounce.decision()==flatmap::State::Pending) {
+        pendingNoted=true;
+        Log::get().note("flat map bounce: pending %u/32 qualifying copies at frame %llu",
+            bounce.samples(),(unsigned long long)frame);
+    }
+    if (bounce.tripReason()!=lastTrip) {
+        lastTrip=bounce.tripReason();
+        const char* reason=lastTrip==flatmap::Trip::Remap?"remap":
+            lastTrip==flatmap::Trip::Present?"open-at-present":
+            lastTrip==flatmap::Trip::Context?"context-mismatch":
+            lastTrip==flatmap::Trip::Verify?"verify-mismatch":"none";
+        Log::get().note("flat map bounce: tripped reason=%s frame=%llu; new maps pass through",
+            reason,(unsigned long long)frame);
+    }
+    if (!periodic) return;
+    const auto c=bounce.counters();
+    const uint64_t maps=w.maps.load(),tracked=w.tracked.load(),other=w.otherBuffer.load(),texture=w.texture.load();
+    const uint64_t nd=w.notDiscard.load(),fc=w.foreignContext.load(),ft=w.foreignThread.load();
+    const uint64_t in=w.internal.load(),pa=w.paused.load(),un=w.untracked.load(),failed=w.failed.load();
+    const uint64_t bb=w.bankBytes.load(),bt=w.bankTicks.load();
+    const uint64_t totalBankBytes=w.totalBankBytes.load();
+    const uint64_t cbFirst=g_flatCbFirstNonzero.load();
+    uint64_t bucket[6]{},type[6]{};
+    for (unsigned i=0;i<6;++i) {
+        const uint64_t b=w.widthBuckets[i].load(),t=w.trackedTypes[i].load();
+        bucket[i]=b-lastWidth[i];type[i]=t-lastTypes[i];
+        lastWidth[i]=b;lastTypes[i]=t;
+    }
+    const uint64_t flushBytes=c.flushBytes-previous.flushBytes,flushTicks=c.flushTicks-previous.flushTicks;
+    const uint64_t bankBytes=bb-lastBankBytes,bankTicks=bt-lastBankTicks;
+    const double nsPerKb=!bankBytes ? 0.0 :
+        double(bankTicks)*1e9*1024.0/(double(bankBytes)*double(FlatMapBounceD3DDriver{}.ticksPerSecond()));
+    const double flushNsPerKb=!flushBytes ? 0.0 :
+        double(flushTicks)*1e9*1024.0/(double(flushBytes)*double(FlatMapBounceD3DDriver{}.ticksPerSecond()));
+    Log::get().note("flat map bounce 5s: state=%s key=%s maps=%llu tracked=%llu other-buffer=%llu texture=%llu bounced=%llu declined-not-discard=%llu declined-foreign-context=%llu declined-foreign-thread=%llu declined-internal=%llu declined-paused=%llu declined-untracked=%llu declined-open-full=%llu declined-width=%llu failed=%llu flushes=%llu flush-bytes=%llu flush-ns-per-kb=%.1f bank-bytes=%llu bank-sample-bytes=%llu bank-ns-per-kb=%.1f abandoned=%llu open-at-present=%llu trips=%llu verify-samples=%llu verify-mismatches=%llu unchanged-rows=%llu rows-checked=%llu width-le64=%llu width-le256=%llu width-le1k=%llu width-le4k=%llu width-le8k=%llu width-le64k=%llu tracked-read=%llu tracked-write=%llu tracked-read-write=%llu tracked-discard=%llu tracked-no-overwrite=%llu cb-first-nonzero=%llu",
+        bounceStateName(bounce.decision()),bounceKeyName(bounce.mode()),
+        (unsigned long long)(maps-lastMaps),(unsigned long long)(tracked-lastTracked),
+        (unsigned long long)(other-lastOther),
+        (unsigned long long)(texture-lastTexture),
+        (unsigned long long)(c.bounced-previous.bounced),(unsigned long long)(nd-lastNotDiscard),
+        (unsigned long long)(fc-lastForeignCtx),(unsigned long long)(ft-lastForeignThread),
+        (unsigned long long)(in-lastInternal),(unsigned long long)(pa-lastPaused),
+        (unsigned long long)(un-lastUntracked),(unsigned long long)(c.full-previous.full),
+        (unsigned long long)(c.width-previous.width),(unsigned long long)(failed-lastFailed),
+        (unsigned long long)(c.flushes-previous.flushes),(unsigned long long)flushBytes,flushNsPerKb,
+        (unsigned long long)(totalBankBytes-lastTotalBankBytes),
+        (unsigned long long)bankBytes,nsPerKb,(unsigned long long)(c.abandoned-previous.abandoned),
+        (unsigned long long)(c.openAtPresent-previous.openAtPresent),(unsigned long long)c.trips,
+        (unsigned long long)(c.verifySamples-previous.verifySamples),(unsigned long long)c.verifyMismatches,
+        (unsigned long long)(c.unchangedRows-previous.unchangedRows),
+        (unsigned long long)(c.rowsChecked-previous.rowsChecked),
+        (unsigned long long)bucket[0],(unsigned long long)bucket[1],(unsigned long long)bucket[2],
+        (unsigned long long)bucket[3],(unsigned long long)bucket[4],(unsigned long long)bucket[5],
+        (unsigned long long)type[1],(unsigned long long)type[2],
+        (unsigned long long)type[3],
+        (unsigned long long)type[4],(unsigned long long)type[5],
+        (unsigned long long)(cbFirst-lastCbFirst));
+    previous=c;lastMaps=maps;lastTracked=tracked;lastOther=other;lastTexture=texture;
+    lastNotDiscard=nd;lastForeignCtx=fc;lastForeignThread=ft;lastInternal=in;
+    lastPaused=pa;lastUntracked=un;lastFailed=failed;lastBankBytes=bb;lastBankTicks=bt;
+    lastTotalBankBytes=totalBankBytes;lastCbFirst=cbFirst;
+}
 bool nonzeroPhase(const State& s) { return s.phase.currentX!=0 || s.phase.currentY!=0; }
 void reportProjectionFailure(const State& s, const FlatProjectionRecipes& recipes,
     uint64_t vs, uint64_t ps, uint64_t cs) {
@@ -1630,6 +1761,9 @@ void flatRuntimeResize() {
 }
 void flatRuntimeBeforePresent() {
     g_flatRuntimeLive.store(false, std::memory_order_release);
+    // Open mappings survive a stand-down or resize. Watch them at every frame
+    // boundary, even when the projection runtime no longer exists.
+    mapBounce().present(mapBouncePresentEpoch.fetch_add(1,std::memory_order_acq_rel)+1);
     // The flat HDR route's crash-safe breadcrumbs (flat_hdr_crumbs.h): engine motion's state going back and the census span
     // closing are the last work before the real Present, for a frame the resolver has had.
     HdrCrumbSpan routeBeforePresent(hdrCrumbPresentSide(), "before-present");
@@ -1899,6 +2033,17 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     engineVelocityConfigure(enabled && !enginePausedThen);
     // No temporal mode selected: the census stops (its gates close, a scope costs a load and a compare).
     if (!enabled) { s.census.idle(); if (s.device || s.output || s.cameras.count()) flatRuntimeResize(); return; }
+    static bool bounceKeyRead=false;
+    if (!bounceKeyRead) {
+        bounceKeyRead=true;
+        const std::string key=Config::get().getString("advanced.flat_cb_map_cache","auto");
+        const flatmap::Mode mode=_stricmp(key.c_str(),"on")==0 ? flatmap::Mode::On :
+            _stricmp(key.c_str(),"off")==0 ? flatmap::Mode::Off : flatmap::Mode::Auto;
+        if (_stricmp(key.c_str(),"auto")!=0 && _stricmp(key.c_str(),"on")!=0 &&
+            _stricmp(key.c_str(),"off")!=0)
+            Log::get().note("flat map bounce: invalid advanced.flat_cb_map_cache=%s; using auto",key.c_str());
+        mapBounce().setMode(mode);
+    }
     FlatComputeInternalScope guard;
     Ptr<ID3D11Device> actualDevice; swap->GetDevice(IID_PPV_ARGS(&actualDevice));
     if (s.device && actualDevice.Get() != s.device.Get()) { flatRuntimeResize(); s.thread = GetCurrentThreadId(); }
@@ -2001,6 +2146,11 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // a resume creates it fresh here, as after a resize.
     if(wanted && !s.projection && s.work == FlatWork::Full) {
         s.projection.reset(new(std::nothrow) FlatProjectionRuntime);
+        if (s.projection) s.projection->setBounceSampleHooks(
+            &flatRuntimeMapBounceSamplePending,&flatRuntimeMapBounceObserveCopy);
+        if (s.projection) s.projection->setBounceTelemetryHooks(
+            &flatRuntimeMapBounceTrackedMap,&flatRuntimeMapBounceBankWrite,
+            &flatRuntimeMapBounceRegistered);
         s.context.As(&s.projectionContext);
         if(!s.projection || !s.projectionContext || !s.projection->initialize(s.context.Get())) {
             s.projection.reset();s.projectionContext.Reset();
@@ -2022,6 +2172,11 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             reportUnknownProjection(s,"manual-rearm");
         if(!s.projection) {
             s.projection.reset(new(std::nothrow) FlatProjectionRuntime);
+            if (s.projection) s.projection->setBounceSampleHooks(
+                &flatRuntimeMapBounceSamplePending,&flatRuntimeMapBounceObserveCopy);
+            if (s.projection) s.projection->setBounceTelemetryHooks(
+                &flatRuntimeMapBounceTrackedMap,&flatRuntimeMapBounceBankWrite,
+                &flatRuntimeMapBounceRegistered);
             s.context.As(&s.projectionContext);
             if(s.projection && !s.projection->initialize(s.context.Get()))s.projection.reset();
         }
@@ -2052,6 +2207,9 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
             captureFlatProbeShader('p',0xDD371C57C9093BB8ull);
             captureFlatProbeShader('v',kHdrCopyVs);
             captureFlatProbeShader('p',kHdrCopyPs);
+            // The gameplay HDR source rejected in the FSR conflict audit.
+            // Its creation bytes identify whether camera-free admission is safe.
+            captureFlatProbeShader('p',0x07B3F82100F29401ull);
             // Exact unknown scene pairs observed in build 0150638a. These
             // creation-cache probes run once per manual F10 arm, never per draw.
             constexpr uint64_t unknownVs[]={0xA1B7CFCD0BE7493Eull,0xCE24A73943632F55ull,
@@ -2144,6 +2302,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     s.cameras.newFrame();
     const auto now = GetTickCount64();
     if (now - s.lastReport >= 5000) {
+        reportMapBounce(frame,now,true);
         reportPhaseCensus(s,"5s");
         if(s.projectionFrames)reportProjection(s,"progress");
         else reportUnknownProjection(s,"5s");
@@ -2293,6 +2452,7 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         s.covRefusedPairsUsed = 0;
         s.lastReport = now;
     }
+    reportMapBounce(frame,now,false);
     // The frame that starts now is watched unless it is a Paused one (flat_standdown.h).
     s.frameLive = s.work != FlatWork::Paused;
     g_flatRuntimeLive.store(true, std::memory_order_release);
@@ -2428,6 +2588,90 @@ void flatRuntimeWritten(ID3D11Resource* res) {
     if (!owner() || state().work == FlatWork::Paused) return;
     flatcpu::Scope lookup(flatcpu::kResource);   // prefix target and source lookup, camera lookup
     resourceWritten(state(), res);
+}
+void flatRuntimeMapBouncePreMap(ID3D11Resource* resource) {
+    mapBounce().preMap(reinterpret_cast<uintptr_t>(resource));
+}
+void flatRuntimeMapBounceNoteMap(ID3D11DeviceContext* context, ID3D11Resource* resource, UINT sub,
+                                 D3D11_MAP type, bool internal, bool success) {
+    auto& w=mapBounceWindow();
+    ++w.maps;
+    if (internal) { ++w.internal; return; }
+    if (!success || sub!=0) { ++w.failed; return; }
+    // READ maps bypass flatRuntimeMap's write observer. This read-only lookup
+    // recovers their tracked-CB map type without a descriptor or driver call.
+    if (type==D3D11_MAP_READ && owner() && state().projection &&
+        state().projection->containsTracked(resource))
+        flatRuntimeMapBounceTrackedMap(type);
+    if (type!=D3D11_MAP_WRITE_DISCARD) { ++w.notDiscard; return; }
+    if (context!=state().context.Get()) { ++w.foreignContext; return; }
+    if (!owner()) { ++w.foreignThread; return; }
+    if (state().work!=FlatWork::Full || !state().jitterWanted || !state().projection) {
+        ++w.paused; return;
+    }
+}
+void* flatRuntimeMapBounceInstall(ID3D11DeviceContext* context, ID3D11Resource* resource,
+                                  UINT sub, D3D11_MAP type, void* real) {
+    auto& bounce=mapBounce();
+    if (bounce.decision()!=flatmap::State::On || !flatRuntimeActive() || !real || sub!=0 ||
+        type!=D3D11_MAP_WRITE_DISCARD || context!=state().context.Get() ||
+        !owner() || state().work!=FlatWork::Full || !state().jitterWanted ||
+        !state().projection) return real;
+    const auto source=state().projection->bounceSource(resource);
+    if (!source.eligible) {
+        ++mapBounceWindow().untracked;
+        return real;
+    }
+    flatmap::MapRequest request{};
+    request.resource=reinterpret_cast<uintptr_t>(resource);
+    request.context=reinterpret_cast<uintptr_t>(context);
+    request.real=real; request.width=source.width;
+    request.frame=mapBouncePresentEpoch.load(std::memory_order_acquire);
+    request.discard=true; request.eligible=true; request.success=true;
+    request.seed=source.seed; request.seedValid=source.seedValid;
+    flatcpu::Scope shadows(flatcpu::kShadows);
+    return bounce.install(request);
+}
+FlatMapBounce::Lease flatRuntimeMapBounceBeginUnmap(ID3D11DeviceContext* context,
+                                                     ID3D11Resource* resource) {
+    flatcpu::Scope shadows(flatcpu::kShadows);
+    return mapBounce().beginUnmap(reinterpret_cast<uintptr_t>(resource),
+                                  reinterpret_cast<uintptr_t>(context));
+}
+bool flatRuntimeMapBounceSamplePending(uint32_t width) {
+    return width>=256 && mapBounceWindow().bankSamples.load()<32;
+}
+void flatRuntimeMapBounceObserveCopy(uint32_t width, uint64_t ticks) {
+    mapBounce().observeCopy(width,ticks);
+    auto& w=mapBounceWindow();
+    w.bankBytes+=width; w.bankTicks+=ticks; ++w.bankSamples;
+}
+void flatRuntimeMapBounceTrackedMap(D3D11_MAP type) {
+    auto& w=mapBounceWindow();
+    const unsigned index=static_cast<unsigned>(type);
+    if (index<6) ++w.trackedTypes[index];
+}
+void flatRuntimeMapBounceBankWrite(uint32_t width) {
+    auto& w=mapBounceWindow();
+    w.totalBankBytes+=width;
+    const unsigned bucket=width<=64?0:width<=256?1:width<=1024?2:
+        width<=4096?3:width<=8192?4:5;
+    ++w.widthBuckets[bucket];
+}
+void flatRuntimeMapBounceRegistered(const D3D11_BUFFER_DESC& desc) {
+    static unsigned lines=0;
+    if (lines>=64) return;
+    ++lines;
+    Log::get().note("flat map bounce: tracked CB %u/64 width=%u usage=%u cpu-access=0x%x bind=0x%x",
+        lines,desc.ByteWidth,static_cast<unsigned>(desc.Usage),
+        desc.CPUAccessFlags,desc.BindFlags);
+}
+void flatRuntimeMapBounceNoteKind(ID3D11Resource* resource, bool buffer) {
+    auto& w=mapBounceWindow();
+    if (!buffer) { ++w.texture; return; }
+    if (owner() && state().projection && state().projection->containsTracked(resource))
+        ++w.tracked;
+    else ++w.otherBuffer;
 }
 void flatRuntimeMap(ID3D11Resource* res, D3D11_MAP type, void* bytes) {
     if (!owner() || type == D3D11_MAP_READ || state().work == FlatWork::Paused) return;
