@@ -33,8 +33,8 @@
 - **Ruled-out pointer:** the kinematic arc's Status records rejected motion
   estimates and the nonexistent engine velocity buffer. Reuse engine-record
   motion; do not revive estimation or the retired deferred UI replay.
-- **Next:** section 85 needs F10 to distinguish Probe recovery from a real
-  HDR conflict. Then section 83: SS 0.75/0.85 with bloom/DoF on/off, mismatched
+- **Next:** section 85's F10 flight still refuses an image source; retrieve
+  its existing traces/bytecode. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
   resolution, TAA at 1.25, game AA, VR at 0.85. HDR flew (81); FSR, TAA at
   R = D and ReShade still to fly. Then open items above (older: Status detail).
   Existing evidence does not justify ignoring the alternate projection.
@@ -8717,3 +8717,43 @@ still refuses, replay the traces for the first conflicting draw and its
 depth/viewport/camera provenance before changing admission. Verify the
 version again and check both trace dumps have frames/events and no SHORT
 WRITE. No rendering code, config, or installed files changed for this review.
+
+### Second capture: Full work also refuses the source (2026-10-02)
+
+`edvr-logs-20261002-202354.zip`, graphics log
+`edvr_gfx_20261002_202027.log`: same v0.18.0 / 6ABED11D binary. FSR selected
+at 20:22:10.241. Multiple F10 arms restore Full and complete 900-frame
+audits; treated remains 0. At 20:22:59.078, image-copy-source conflicts
+number 570 in 5 s. Copy provenance completes two samples per arm, with no
+missing source/destination records or actual-shader mismatch.
+
+ruled out: Probe-only recovery failure as the sole cause, because Full
+work after repeated F10 arms still treats zero frames with the same conflict.
+
+The failed prerequisite is now identified. At 20:22:55.384 (frame 60522),
+the format-9 source has exactly one write: VS CFA91824129ECBBC / PS
+07B3F82100F29401, scene-sized depth/DSV, b1=null and camera-present=0.
+Its image-source-bad=1, hdr-bad=1, bad-cause=image-copy-source. The HDR
+destination is otherwise unmarked before the copy; cached/actual copy
+shader hashes match. Frame 60612 repeats the same evidence. The conflict
+witness has an empty reference and this source draw as current, rather
+than two disagreeing cameras or depths.
+
+`flat_runtime_model.h` exempts only PS FCFAD73924BF45B9 on this VS (and
+only after bridge verification). Therefore this source fails the first
+format-9 write's cameraCurrent requirement, and the later HDR copy fails
+the source bad-state checks. The log classifies the pair generic-inert,
+but that proves the VS has no CB/projection; it is not proof the PS reads
+no camera. `ambient-occlusion.md`'s earlier disassembly identifies this PS
+as a depth-aware upsample of half-resolution colour. Inspect exact bytes
+before extending the camera-independent exemption; retain depth/DSV,
+extent, viewport and current-frame source checks.
+
+Existing evidence to retrieve, no new flight: the log records successful
+trace dumps, including traces/flat_trace_60521.bin (3 frames, 7277 events,
+3667768 bytes, no SHORT WRITE). None of the traces or shaders are in this
+ZIP. The source bundler accepts same-session files within 180 s and below
+64 MiB/file, so this trace is below its size cap; the installed bundler's
+version/path/timestamps are unverified. Obtain the existing edvr_logs/traces
+files and ps_07B3F82100F29401.dxbc if present under edvr_logs/shaders. Replay
+the Full trace and inspect the pixel shader before changing admission.
