@@ -192,6 +192,13 @@ SR_ADD = "    bucket_.add(f);\n"
 SR_BOUNDARY = "    if (f.nowMs >= bucketStartMs_ + kSlowBucketMs) {\n"
 SR_PERIODSECS = "  r.windowS = static_cast<double>(s.spanMs) / 1000.0;\n"
 SR_RECOVERED = "regime_, \"recovered\"));\n"
+SR_CTXRULE = "  r.context = s.loading * 2 >= s.frames ? SlowContext::Loading : s.empty * 2 >= s.frames ? SlowContext::NoLayers : SlowContext::Scene;\n"
+SR_CTXTALLY = "    if (f.background) ++loading;\n    else if (f.noLayers) ++empty;\n"
+SR_CTXMERGE = "    loading += o.loading;\n    empty += o.empty;\n"
+SR_CTXCOUNTS = "  r.loadingFrames = s.loading;\n  r.emptyFrames = s.empty;\n"
+SR_CTXLINE = "      \"context=%s,loading_frames=%llu,empty_frames=%llu,\"\n"
+SR_CTXARGS = "      r.frameMs, slowContextKey(r.context), static_cast<unsigned long long>(r.loadingFrames), static_cast<unsigned long long>(r.emptyFrames),\n"
+SR_CTXKEY = "    case SlowContext::NoLayers: return \"no_layers\";\n"
 # slow_test.h
 ST_START = "constexpr uint64_t kSlowTestStartMs = 90000;\n"
 ST_FOR = "constexpr uint64_t kSlowTestForMs = 40000;\n"
@@ -227,6 +234,7 @@ H_WALL = "      stereo.renderCaptured(frameViews,frameSpace,captured,layer,obser
 H_MEASURE = "    const bool measure=counterNow(&dispatchBegan);\n"
 H_VRAM = "    {const char* why=nullptr;vramAdapter.Attach(vramAdapterOf(graphics.device(),&why));vramWhy=why?why:\"\";}\n"
 H_COPY = "    const double copy=scene?transferWall.producerDispatch+submitSample.receiveMs:0.0;\n"
+H_NOLAYERS = "    frame.noLayers=!info.layers&&!info.background; // an empty end (clear, drain): the context field tells a load from a slow scene\n"
 H_WAITFIELD = "    frame.vendorWaitMs=boundary.waitBlockMs()+boundary.pacerBlockMs();\n"
 H_LAG = "XR_SUCCEEDED(host.api.convertTime(host.instance,&counter,&now))"
 P_SLOWTICK = "    freezeTestTick();\n    slowTestTick();\n"
@@ -379,6 +387,26 @@ MUTANTS = [
     M("slow-summary-renamed", "S10", "regime", [(SR_SUMHEAD, "\"native_slow_regime_totals,%s%s%sregimes=%u,open=%u,")], "the summary has another name"),
     M("frames-not-counted", "S10", "regime", [(SR_FRAMESSEEN, "")], "the frames seen are never counted"),
     M("slow-seconds-not-counted", "S10", "regime", [(SR_SLOWSEC, "")], "the slow seconds are never counted"),
+    # ---- S11: the context a game-owned regime is read by ---------------------------------------------------------------------------------------------
+    M("context-strictly-more-than-half", "S11", "regime", [(SR_CTXRULE, "  r.context = s.loading * 2 > s.frames ? SlowContext::Loading : s.empty * 2 > s.frames ? SlowContext::NoLayers : SlowContext::Scene;\n")],
+      "exactly half of the frames is not enough to call a window a load"),
+    M("context-by-a-third", "S11", "regime", [(SR_CTXRULE, "  r.context = s.loading * 3 >= s.frames ? SlowContext::Loading : s.empty * 3 >= s.frames ? SlowContext::NoLayers : SlowContext::Scene;\n")],
+      "a third of the frames is enough to call a window a load"),
+    M("context-empty-first", "S11", "regime", [(SR_CTXRULE, "  r.context = s.empty * 2 >= s.frames ? SlowContext::NoLayers : s.loading * 2 >= s.frames ? SlowContext::Loading : SlowContext::Scene;\n")],
+      "empty ends are checked before the runtime's loading frames"),
+    M("context-never-loading", "S11", "regime", [(SR_CTXRULE, "  r.context = s.empty * 2 >= s.frames ? SlowContext::NoLayers : SlowContext::Scene;\n")], "a window of loading frames is not called one"),
+    M("context-never-no-layers", "S11", "regime", [(SR_CTXRULE, "  r.context = s.loading * 2 >= s.frames ? SlowContext::Loading : SlowContext::Scene;\n")], "a window of ends with no layers is called scene"),
+    M("context-always-scene", "S11", "regime", [(SR_CTXRULE, "  r.context = SlowContext::Scene;\n")], "every window is the game's scenes"),
+    M("context-loading-also-empty", "S11", "regime", [(SR_CTXTALLY, "    if (f.background) ++loading;\n    if (f.noLayers) ++empty;\n")], "a loading frame is counted as an empty end too"),
+    M("context-loading-not-counted", "S11", "regime", [(SR_CTXTALLY, "    if (f.noLayers) ++empty;\n")], "the runtime's loading frames are never counted"),
+    M("context-empty-not-counted", "S11", "regime", [(SR_CTXTALLY, "    if (f.background) ++loading;\n")], "the ends with no layers are never counted"),
+    M("context-counts-not-merged", "S11", "regime", [(SR_CTXMERGE, "")], "the regime's sums lose the loading and empty counts of every second folded into them"),
+    M("context-counts-swapped", "S11", "regime", [(SR_CTXCOUNTS, "  r.loadingFrames = s.empty;\n  r.emptyFrames = s.loading;\n")], "the report's loading and empty counts are each other's"),
+    M("context-counts-dropped", "S11", "regime", [(SR_CTXCOUNTS, "")], "the report carries no counts"),
+    M("context-line-renamed", ("S9", "S11"), "regime", [(SR_CTXLINE, "      \"ctx=%s,loading_frames=%llu,empty_frames=%llu,\"\n")], "the line's field is not called context"),
+    M("context-line-args-swapped", "S11", "regime", [(SR_CTXARGS, "      r.frameMs, slowContextKey(r.context), static_cast<unsigned long long>(r.emptyFrames), static_cast<unsigned long long>(r.loadingFrames),\n")],
+      "the line writes the empty count where the loading count belongs"),
+    M("context-key-renamed", "S11", "regime", [(SR_CTXKEY, "    case SlowContext::NoLayers: return \"empty\";\n")], "the no_layers context has another key"),
     # ---- T1: the schedule ------------------------------------------------------------------------------------------------------------------------------
     M("hold-from-sixty", "T1", "schedule", [(ST_START, "constexpr uint64_t kSlowTestStartMs = 60000;\n")], "the hold begins 60 s in"),
     M("hold-for-ten", "T1", "schedule", [(ST_FOR, "constexpr uint64_t kSlowTestForMs = 10000;\n")], "the hold lasts 10 s"),
@@ -400,6 +428,9 @@ MUTANTS = [
     M("glue-copy-double-counted", "G1", "host", [(H_COPY, "    const double copy=scene?transferWall.producerDispatch+transferWall.producerAcquire+transferWall.producerFlush+submitSample.receiveMs:0.0;\n")],
       "the copy adds nested phases to the phase that holds them"),
     M("glue-overlap-unnamed", "G1", "host", [(H_OVERLAP, "")], "the overlapped finish does not say so"),
+    M("glue-no-layers-unfed", "G1", "host", [(H_NOLAYERS, "")], "the ends with no layers are never told to the slow regime"),
+    M("glue-no-layers-any-call", "G1", "host", [(H_NOLAYERS, "    frame.noLayers=!info.layers||!info.background; // an empty end (clear, drain): the context field tells a load from a slow scene\n")],
+      "every call without a loading frame's flags is an empty end"),
     M("glue-close-unfinished", "G1", "host", [(H_FINISH, "")], "an open episode and regime are not ended at close"),
     M("glue-no-periodic-summary", "G1", "host", [(H_PERIODIC, "}\n")], "the summaries are never written while the session runs"),
     M("glue-wall-only-while-open", "G1", "host", [(H_WALL, "      stereo.renderCaptured(frameViews,frameSpace,captured,layer,observer,submitStats.full()?nullptr:&wall,framePlacement);")],
@@ -535,8 +566,10 @@ def make_tree(dest, mutated=None):
 
 
 def make_root(dest, mutated):
-    """A repository root holding the glue sources the rig reads as text, `mutated` replacing one of them."""
-    for key in PIN_KEYS:
+    """A repository root holding the sources the rig reads as text, `mutated` replacing one of them. The rig reads eight: the glue's own (PIN_KEYS) and
+    the two headers it also compiles (frame_boundary.h and session_state.h, whose hooks the G1 pins look for): a root without all eight fails G1.read
+    on every mutation and proves nothing about any pin."""
+    for key in PIN_KEYS + ("boundary", "session"):
         target = dest / FILES[key].relative_to(ROOT)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(mutated.get(key, read_source(FILES[key])), encoding="utf-8", newline="\n")

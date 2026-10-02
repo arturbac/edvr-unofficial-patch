@@ -25,6 +25,11 @@
 // follows; kSlowEndSeconds (2) normal buckets in a row end it with an end line that says how long it lasted and
 // carries the whole regime's means. A regime open at session close ends there.
 //
+// CONTEXT. The owner says whose time it was, not what the frames were. Every line also carries `context=` (scene, loading,
+// no_layers or none) and the counts behind it, `loading_frames=` (frames the runtime made itself while the game loaded) and
+// `empty_frames=` (ends with no layers for the vendor), so a regime the game's own frame holds can be told apart: a load
+// (loading, no_layers) from a GPU- or CPU-bound stretch of scenes. The reader sets its SLOW verdict only for a vendor or EDVR owner.
+//
 // SHARES, NOT A PARTITION. Each owner's figure is the mean wall time per frame that frame spent inside that owner's
 // code, measured where the runtime calls it. With frame_end_overlap the game and the xrEndFrame run side by side, so
 // the figures can add to more than the frame; `game` is the part of the frame no other owner accounts for, and is
@@ -94,11 +99,32 @@ inline const char* slowEventKey(SlowEvent e) {
   return "none";
 }
 
+// What kind of frames the window held, which the owner alone does not say: a "game" regime is a different thing when the
+// runtime was making its own loading frames (a load) than when the game was submitting scenes (a GPU- or CPU-bound stretch).
+// The reader (tools\edvr_log.py --freezes) sets SLOW only for a vendor or EDVR owner and reports a game-owned regime as a load
+// (INFO) or a slow stretch of the game's scenes (WARN).
+//   scene      at least half of the frames were the game's own, with layers for the vendor
+//   loading    at least half were frames the runtime made itself while the game was loading (FrameBoundary::background)
+//   no_layers  at least half ended with nothing for the vendor to show (the game submitted none)
+//   none       the window held no frame
+enum class SlowContext { None, Scene, Loading, NoLayers };
+
+inline const char* slowContextKey(SlowContext c) {
+  switch (c) {
+    case SlowContext::Scene: return "scene";
+    case SlowContext::Loading: return "loading";
+    case SlowContext::NoLayers: return "no_layers";
+    case SlowContext::None: break;
+  }
+  return "none";
+}
+
 struct SlowFrame {
   uint64_t nowMs = 0;        // a millisecond clock that only moves forward, read when xrEndFrame returned
   double refHz = 0;          // the display rate to judge by, when the vendor reported one (0 = it did not)
   double periodMs = 0;       // the vendor's last predicted display period: the display rate when refHz is 0
   bool background = false;   // a loading frame the runtime made itself (counted as a frame, its owners are not known)
+  bool noLayers = false;     // the call ended with no layers for the vendor, and was not a loading frame
   double vendorWaitMs = 0, vendorEndMs = 0, vendorSwapMs = 0, copyMs = 0, edvrMs = 0;
 };
 
@@ -106,9 +132,12 @@ struct SlowFrame {
 struct SlowSums {
   uint64_t frames = 0;
   uint64_t spanMs = 0;
+  uint64_t loading = 0, empty = 0;   // the frames that were the runtime's own loading frames, and the ones that ended with no layers
   double wait = 0, end = 0, swap = 0, copy = 0, edvr = 0, endMax = 0;
   void add(const SlowFrame& f) {
     ++frames;
+    if (f.background) ++loading;
+    else if (f.noLayers) ++empty;
     wait += f.vendorWaitMs;
     end += f.vendorEndMs;
     swap += f.vendorSwapMs;
@@ -119,6 +148,8 @@ struct SlowSums {
   void merge(const SlowSums& o) {
     frames += o.frames;
     spanMs += o.spanMs;
+    loading += o.loading;
+    empty += o.empty;
     wait += o.wait;
     end += o.end;
     swap += o.swap;
@@ -142,6 +173,8 @@ struct SlowReport {
   double ownerMs = 0, ownerShare = 0, vendorShare = 0;
   SlowOwner largest = SlowOwner::None;   // when no owner reaches the share: the largest, for the line to name
   double largestShare = 0;
+  SlowContext context = SlowContext::None;
+  uint64_t loadingFrames = 0, emptyFrames = 0;   // of `frames`: the runtime's loading frames, and the ends with no layers
 };
 
 inline SlowReport slowReport(SlowEvent event, const SlowSums& s, double refHz, double durationS, unsigned regime, const char* reason) {
@@ -152,11 +185,15 @@ inline SlowReport slowReport(SlowEvent event, const SlowSums& s, double refHz, d
   r.durationS = durationS;
   r.windowS = static_cast<double>(s.spanMs) / 1000.0;
   r.frames = s.frames;
+  r.loadingFrames = s.loading;
+  r.emptyFrames = s.empty;
   r.refHz = refHz;
   if (!s.frames || !s.spanMs) {
     r.owner = SlowOwner::NoFrames;
     return r;
   }
+  // At least half decides, a loading frame first: a load is what the runtime was doing when most of the window was its own.
+  r.context = s.loading * 2 >= s.frames ? SlowContext::Loading : s.empty * 2 >= s.frames ? SlowContext::NoLayers : SlowContext::Scene;
   const double n = static_cast<double>(s.frames);
   r.fps = n * 1000.0 / static_cast<double>(s.spanMs);
   r.fraction = refHz > 0 ? r.fps / refHz : 0;
@@ -205,10 +242,12 @@ inline size_t formatSlowLine(char* buf, size_t cap, const SlowReport& r, const V
   const int n = std::snprintf(
       buf, cap,
       "native_slow_regime,event=%s,%sregime=%u,duration_s=%.1f,window_s=%.1f,frames=%llu,fps=%.2f,display_hz=%.2f,fraction=%.3f,threshold=%.2f,frame_ms=%.2f,"
+      "context=%s,loading_frames=%llu,empty_frames=%llu,"
       "held_by=%s,held_share=%.3f,vendor_share=%.3f,vendor_end_frame_ms=%.2f,vendor_wait_frame_ms=%.2f,vendor_swapchain_ms=%.2f,edvr_copy_ms=%.2f,"
       "edvr_work_ms=%.2f,game_ms=%.2f,end_frame_max_ms=%.2f,%s,units=wall_ms,summary=%s",
       slowEventKey(r.event), reason, r.regime, r.durationS, r.windowS, static_cast<unsigned long long>(r.frames), r.fps, r.refHz, r.fraction, kSlowFraction,
-      r.frameMs, slowOwnerKey(r.owner), r.ownerShare, r.vendorShare, r.vendorEndMs, r.vendorWaitMs, r.vendorSwapMs, r.copyMs, r.edvrMs, r.gameMs, r.endMaxMs,
+      r.frameMs, slowContextKey(r.context), static_cast<unsigned long long>(r.loadingFrames), static_cast<unsigned long long>(r.emptyFrames),
+      slowOwnerKey(r.owner), r.ownerShare, r.vendorShare, r.vendorEndMs, r.vendorWaitMs, r.vendorSwapMs, r.copyMs, r.edvrMs, r.gameMs, r.endMaxMs,
       figures, summary);
   if (n < 0) {
     buf[0] = 0;

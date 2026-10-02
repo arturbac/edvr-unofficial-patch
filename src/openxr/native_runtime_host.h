@@ -2065,6 +2065,7 @@ class NativeRuntimeHost : public SystemSource, public FrameSink, public Composit
     if(endFrameLines.endLen)nativeTracePuts(endFrameLines.end);
     SlowFrame frame;
     frame.nowMs=nowMs;frame.refHz=instrumentDisplayHz;frame.periodMs=periodMs;frame.background=info.background;
+    frame.noLayers=!info.layers&&!info.background; // an empty end (clear, drain): the context field tells a load from a slow scene
     frame.vendorWaitMs=boundary.waitBlockMs()+boundary.pacerBlockMs();
     frame.vendorEndMs=info.ms;
     frame.vendorSwapMs=acquire+wait+release;

@@ -50,6 +50,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -785,6 +786,9 @@ struct SlowRig {
   SlowRegime regime;
   std::vector<SlowReport> reports;
   uint64_t now = 1000000;
+  // Marks a frame as the runtime's loading frame or an empty end, by its index since the rig began (null: every frame is a scene frame).
+  std::function<void(SlowFrame&, uint64_t)> tag;
+  uint64_t index = 0;
   void frame(double hz, double end, double wait = 0, double swap = 0, double copy = 0, double edvr = 0, double period = 13.889) {
     SlowFrame f;
     f.nowMs = now;
@@ -795,6 +799,8 @@ struct SlowRig {
     f.vendorSwapMs = swap;
     f.copyMs = copy;
     f.edvrMs = edvr;
+    if (tag) tag(f, index);
+    ++index;
     regime.observe(f, [&](const SlowReport& r) { reports.push_back(r); });
   }
   // `seconds` of frames at `fps` (evenly spaced), the same owner figures in each.
@@ -1013,6 +1019,79 @@ void finishCases() {
   check(calls == 1, "S8.once: and only once");
 }
 
+// ---- S11: what the frames were (the context a game-owned regime is read by) ------------------------------------------------
+void contextCases() {
+  // Five slow seconds at 10 fps (50 frames, held by no one but the game), frames tagged by `tag`: the SLOW report's context.
+  auto slowWindow = [](std::function<void(SlowFrame&, uint64_t)> tag) {
+    SlowRig r;
+    r.tag = tag;
+    r.run(5, 10, 72.0, 5.0);
+    r.frame(72.0, 5.0);
+    return r;
+  };
+  const SlowRig scene = slowWindow(nullptr);
+  const SlowReport& s0 = reportAt(scene.reports, 0);
+  check(scene.reports.size() == 1 && s0.owner == SlowOwner::Game && s0.context == SlowContext::Scene && s0.loadingFrames == 0 && s0.emptyFrames == 0,
+        "S11.scene: frames the game submitted are the scene context, with no loading or empty frame counted");
+  const SlowRig loading = slowWindow([](SlowFrame& f, uint64_t) { f.background = true; });
+  const SlowReport& l0 = reportAt(loading.reports, 0);
+  check(l0.context == SlowContext::Loading && l0.loadingFrames == 50 && l0.emptyFrames == 0 && l0.owner == SlowOwner::Game,
+        "S11.loading: a window of the runtime's own loading frames is the loading context, still held by the game's own frame");
+  const SlowRig empty = slowWindow([](SlowFrame& f, uint64_t) { f.noLayers = true; });
+  const SlowReport& e0 = reportAt(empty.reports, 0);
+  check(e0.context == SlowContext::NoLayers && e0.emptyFrames == 50 && e0.loadingFrames == 0, "S11.no-layers: a window of ends with no layers is the no_layers context");
+  const SlowRig both = slowWindow([](SlowFrame& f, uint64_t) { f.background = f.noLayers = true; });
+  const SlowReport& b0 = reportAt(both.reports, 0);
+  check(b0.loadingFrames == 50 && b0.emptyFrames == 0 && b0.context == SlowContext::Loading, "S11.once: a loading frame is counted as one, never also as an empty end");
+  const SlowRig half = slowWindow([](SlowFrame& f, uint64_t i) { f.background = i < 50 && i % 2 == 0; });
+  const SlowRig under = slowWindow([](SlowFrame& f, uint64_t i) { f.background = i < 48 && i % 2 == 0; });
+  check(reportAt(half.reports, 0).loadingFrames == 25 && reportAt(half.reports, 0).context == SlowContext::Loading && reportAt(under.reports, 0).loadingFrames == 24 &&
+            reportAt(under.reports, 0).context == SlowContext::Scene,
+        "S11.half: half the window's frames (25 of 50) make it a load, one fewer does not");
+  const SlowRig emptyHalf = slowWindow([](SlowFrame& f, uint64_t i) { f.noLayers = i < 25; });
+  const SlowRig emptyUnder = slowWindow([](SlowFrame& f, uint64_t i) { f.noLayers = i < 24; });
+  check(reportAt(emptyHalf.reports, 0).context == SlowContext::NoLayers && reportAt(emptyUnder.reports, 0).context == SlowContext::Scene,
+        "S11.empty-half: the same at half for the ends with no layers (25 of 50, not 24)");
+  const SlowRig mixed = slowWindow([](SlowFrame& f, uint64_t i) {
+    f.background = i < 25;
+    f.noLayers = i >= 25 && i < 50;
+  });
+  check(reportAt(mixed.reports, 0).context == SlowContext::Loading && reportAt(mixed.reports, 0).loadingFrames == 25 && reportAt(mixed.reports, 0).emptyFrames == 25,
+        "S11.first: when both reach half, loading is what it is called");
+  SlowRig regime;
+  regime.tag = [](SlowFrame& f, uint64_t i) { f.background = i < 50; };   // the first five seconds are loading frames, the next thirty-five the game's scenes
+  regime.run(40, 10, 72.0, 5.0);
+  regime.run(3, 72, 72.0, 5.0);
+  const SlowReport* end = nullptr;
+  for (const SlowReport& rep : regime.reports)
+    if (rep.event == SlowEvent::End) end = &rep;
+  check(reportAt(regime.reports, 0).event == SlowEvent::Slow && reportAt(regime.reports, 0).context == SlowContext::Loading && end && end->frames == 400 && end->loadingFrames == 50 &&
+            end->emptyFrames == 0 && end->context == SlowContext::Scene,
+        "S11.regime: the SLOW report reads the first five seconds (a load), the end report the whole regime (50 loading frames of 400: scenes)");
+  SlowRig folded;
+  folded.tag = [](SlowFrame& f, uint64_t i) { f.noLayers = i >= 50 && i < 122; };   // the one normal second between two slow stretches is all empty ends
+  folded.run(5, 10, 72.0, 5.0);
+  folded.run(1, 72, 72.0, 5.0);
+  folded.run(5, 10, 72.0, 5.0);
+  folded.run(2, 72, 72.0, 5.0);
+  folded.frame(72.0, 5.0);
+  const SlowReport& f0 = reportAt(folded.reports, folded.reports.size() ? folded.reports.size() - 1 : 0);
+  check(f0.event == SlowEvent::End && f0.frames == 5 * 10 + 72 + 5 * 10 && f0.emptyFrames == 72 && f0.context == SlowContext::Scene,
+        "S11.fold: a normal second folded into the regime brings its empty frames with it (72 of 172: the regime's scenes still outweigh them)");
+  SlowSums nobody;
+  nobody.spanMs = 5000;
+  const SlowReport n0 = slowReport(SlowEvent::Slow, nobody, 72.0, 5.0, 1, nullptr);
+  check(n0.context == SlowContext::None && n0.loadingFrames == 0 && n0.emptyFrames == 0, "S11.none: a window with no frame has no context");
+  char line[1200];
+  formatSlowLine(line, sizeof(line), reportAt(loading.reports, 0), nullptr);
+  check(contains(line, ",frame_ms=100.00,context=loading,loading_frames=50,empty_frames=0,held_by=game,"), "S11.line: the line carries the context and its counts right after the frame time");
+  formatSlowLine(line, sizeof(line), n0, nullptr);
+  check(contains(line, ",context=none,loading_frames=0,empty_frames=0,held_by=no_frames,"), "S11.line: a window with no frame says context=none");
+  check(std::string(slowContextKey(SlowContext::Scene)) == "scene" && std::string(slowContextKey(SlowContext::Loading)) == "loading" &&
+            std::string(slowContextKey(SlowContext::NoLayers)) == "no_layers" && std::string(slowContextKey(SlowContext::None)) == "none",
+        "S11.keys: the four contexts' keys");
+}
+
 VramFigures sampleFigures() {
   VramFigures f;
   f.local.valid = f.nonLocal.valid = true;
@@ -1032,6 +1111,7 @@ void lineCases() {
   formatSlowLine(line, sizeof(line), reportAt(r.reports, 0), &figures);
   check(std::string(line) ==
             "native_slow_regime,event=SLOW,regime=1,duration_s=5.0,window_s=5.0,frames=50,fps=10.00,display_hz=72.00,fraction=0.139,threshold=0.40,frame_ms=100.00,"
+            "context=scene,loading_frames=0,empty_frames=0,"
             "held_by=vendor_end_frame,held_share=0.831,vendor_share=0.831,vendor_end_frame_ms=83.10,vendor_wait_frame_ms=0.00,vendor_swapchain_ms=0.04,edvr_copy_ms=0.40,"
             "edvr_work_ms=0.30,game_ms=16.16,end_frame_max_ms=83.10,vram_local_used_mb=7421,vram_local_budget_mb=10863,vram_local_pct=68.3,vram_nonlocal_used_mb=316,"
             "vram_nonlocal_budget_mb=16311,vram_nonlocal_pct=1.9,units=wall_ms,summary=held by the vendor runtime's xrEndFrame: 83.1 ms of every 100.0 ms frame (83%)",
@@ -1072,6 +1152,8 @@ void lineCases() {
   widest.frames = 18446744073709551615ull;
   widest.fps = widest.refHz = widest.fraction = widest.frameMs = widest.vendorEndMs = widest.vendorWaitMs = widest.vendorSwapMs = widest.copyMs = widest.edvrMs = widest.gameMs =
       widest.endMaxMs = 123456789.123;
+  widest.context = SlowContext::NoLayers;
+  widest.loadingFrames = widest.emptyFrames = 18446744073709551615ull;
   widest.owner = SlowOwner::VendorSwapchain;
   widest.ownerMs = 123456789.123;
   widest.ownerShare = widest.vendorShare = 99999.999;
@@ -1197,6 +1279,8 @@ void sourcePins(const std::string& root) {
             at(host, "frame.vendorSwapMs=acquire+wait+release;", returned) != none && at(host, "frame.copyMs=copy+draw;", returned) != none &&
             at(host, "const double copy=scene?transferWall.producerDispatch+submitSample.receiveMs:0.0;", returned) != none,
         "G1.host: each owner's figure is taken where the runtime measures it: the pose wait and the pacer's block, the end call, the swapchain calls, the copy");
+  check(at(host, "frame.background=info.background;", returned) != none && at(host, "frame.noLayers=!info.layers&&!info.background;", returned) != none,
+        "G1.host: the context's two counts are fed from the call's own flags: a loading frame is the boundary's background, an empty end has no layers and is not one");
   check(at(host, "finishingOverlapped=true; // endFrameReturned names the path\n    const auto r=boundary.finishPair()") != none &&
             at(host, "call.overlapped=finishingOverlapped&&!info.background;") != none,
         "G1.host: the overlapped finish says so, so the episode line can name its path");
@@ -1263,6 +1347,7 @@ int main(int argc, char** argv) {
   ownerCases();
   gapCases();
   finishCases();
+  contextCases();
   lineCases();
   armedCases();
   scheduleCases();
