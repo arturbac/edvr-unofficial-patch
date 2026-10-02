@@ -1207,6 +1207,32 @@ if errorlevel 1 ( echo [edvr] ERROR: vram_watch_test build failed & exit /b 1 )
 python "tools\vram_watch_test\mutants.py" --self-test || exit /b 1
 exit /b 0
 
+:rig_slow_regime_test
+echo [edvr] === slow_regime_test.exe ===
+REM Build gate for the runtime's vendor instruments (src\openxr\vendor_events.h, end_frame_episodes.h, slow_regime.h,
+REM src\common\slow_test.h, docs\headset-lock-vdxr-2026-10-02.md, instruments 2 to 4 and the test trigger): the vendor's events
+REM decoded, one line each, bounded (200 lines, undecoded types named once, the last session state kept past the cap), and
+REM SessionState's observer seeing every event without changing how one is handled; every xrEndFrame of 3 display periods or
+REM more as an episode (the first call on its own line, ended by 8 normal calls, p50 and max from a histogram, the rate limit
+REM and the end line a long episode always gets); a frame rate under 40% of the display's held for 5 s as a regime with the
+REM owner that holds it (the vendor's xrEndFrame, the pose wait, the swapchain calls, EDVR's copy, EDVR's work, the game),
+REM its still_slow line every 30 s and its end line; FrameBoundary's hook, on a real boundary with a fake runtime, for every
+REM xrEndFrame on every path (synchronous, no-render, cleared, loading, deferred pacing, drain) and the test hold inside the
+REM timed region and nowhere else; the test trigger's schedule; and by source text the host's glue. It links nothing of the
+REM DLLs. tools\slow_regime_test\mutants.py --self-test holds the mutation list to the sources as they are; --run builds the
+REM rig against each edit and needs the MSVC toolchain.
+if not exist "%OBJ%\slowregime" mkdir "%OBJ%\slowregime"
+cl.exe /nologo /O2 /MT /std:c++17 /EHsc /W4 /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+    /D_CRT_SECURE_NO_WARNINGS /I"src\common" /I"src\openxr" /I"third_party\openxr\include" ^
+    /Fo"%OBJ%\slowregime"\ /Fe"%OBJ%\slowregime\slow_regime_test.exe" ^
+    "tools\slow_regime_test\slow_regime_test.cpp" ^
+    /link /INCREMENTAL:NO
+if errorlevel 1 ( echo [edvr] ERROR: slow_regime_test build failed & exit /b 1 )
+"%OBJ%\slowregime\slow_regime_test.exe" --dry-run || exit /b 1
+"%OBJ%\slowregime\slow_regime_test.exe" --self-test "%ROOT%" || exit /b 1
+python "tools\slow_regime_test\mutants.py" --self-test || exit /b 1
+exit /b 0
+
 :rig_flat_temporal_test
 echo [edvr] === flat_temporal_test.exe ===
 if not exist "%OBJ%\flattemporaltest" mkdir "%OBJ%\flattemporaltest"
