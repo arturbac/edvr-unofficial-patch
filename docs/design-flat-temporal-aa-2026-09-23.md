@@ -33,11 +33,11 @@
 - **Ruled-out pointer:** the kinematic arc's Status records rejected motion
   estimates and the nonexistent engine velocity buffer. Reuse engine-record
   motion; do not revive estimation or the retired deferred UI replay.
-- **Next:** fly section 83's plan (SS 0.75 and 0.85 with bloom and DoF on and
-  off, a mismatched resolution, TAA at 1.25, game AA, VR at 0.85). The HDR route
-  flew (section 81; FSR, TAA at R = D, ReShade still to fly). Then the open
-  items above (older: Status detail). Existing
-  evidence does not justify ignoring the alternate projection.
+- **Next:** section 85 needs F10 to distinguish Probe recovery from a real
+  HDR conflict. Then section 83: SS 0.75/0.85 with bloom/DoF on/off, mismatched
+  resolution, TAA at 1.25, game AA, VR at 0.85. HDR flew (81); FSR, TAA at
+  R = D and ReShade still to fly. Then open items above (older: Status detail).
+  Existing evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
   PS91/BFE or stale-resize hypotheses. The menu hangar-floor P1 defect remains
   open. VR still needs regression tests; the concourse NPC observation on
@@ -8659,3 +8659,61 @@ checkerboard: ... ON`, one toast in the headset and the hint on the Status page;
 the option off in Elite's graphics options and Apply: within about 6 s the log says
 OFF and the hint is gone; turn it on again and the toast comes again. Read with the
 command above; the distant hills' shimmer is Sean's eye.
+
+## 85. RX 9070 XT: FSR works in the menu, remains stood down in game (2026-10-02)
+
+Evidence: `edvr-logs-20261002-190903.zip`, graphics log
+`edvr_gfx_20261002_190718.log`. Flat profile, RX 9070 XT, FSR 3.1.2,
+3440x1440 render and output, SS 1.0, game AA/bloom/DoF off. No VR runtime
+loaded. Version v0.18.0, PE link stamp 6ABED11D (2026-10-01 21:31:09 UTC).
+`edvr_log.py --expect-build HEAD --version` accepts the release tag as a
+substring of HEAD's description; that does not prove exact HEAD. The tag's
+flat runtime, camera, HDR and copy-selection code matches this checkout.
+
+Timeline from `edvr_log.py --flat-upscale` and targeted `--grep`:
+
+- Startup/loading: no-3d-scene; stand-down entered 19:07:25.464.
+- 19:07:38.982: a probe selected and resumed. FSR initialized and made its
+  context. The next two windows treated 975 and 296 HDR frames (1271 total).
+  Only two engine-source-not-ready and one incomplete-jitter-frame refusals.
+- Loading/transition: stand-down entered 19:07:50.261 after 6666 frames over
+  5 s refused for no-3d-scene. This reason remains the entry reason.
+- From 19:08:03.776, every HDR probe finds a 3440x1440 target and consumer,
+  but selects conflicting-hdr-target-or-camera; admitted/backend/treated
+  stay zero. HDR image continuation refused rises to 35, accepted stays 0.
+  At 19:08:50.261, the last probe explicitly names the HDR conflict.
+- F8 at 19:08:50.858 says no-known-tone-pass. That copy/discovery warning
+  does not establish the HDR conflict's cause. No manual F10 audit occurred:
+  details=not-manually-armed, audit-pairs=0, bytecode-stages-saved=0.
+
+ruled out: FSR backend initialization or unsupported AMD hardware as the
+cause of this stand-down, because the same session resolves 1271 HDR frames.
+ruled out: supersampling below 1 as this report's cause, because R = E = D.
+
+Open hypotheses: a Probe recovery artifact, or a real viewport/depth/write/
+camera mismatch in the gameplay HDR image continuation. `flat_runtime.cpp`
+applyWork pauses camera injection and projection shadows in Probe, but
+flatRuntimeMap/Unmap/Update still capture runtime camera rows. Thus zero
+camera-refresh calls does not prove missing camera data. `flat_camera_table.h`
+newFrame invalidates rows until fresh writes; `flat_runtime_model.h` imageCopy
+requires current matching source/HDR provenance. Its rejection sets
+ImageCopySource/hdrBad, which `flat_hdr_route.h` flatSelectHdrPrefix returns
+as ConflictingHdr. The bundle does not identify which prerequisite failed.
+Late passive discovery also drops contract/edge observations; do not treat
+its truncation as the earlier conflict's explanation.
+
+Instrumentation limit: reportConflict runs on copy treatment, not at the
+HDR trigger; Probe returns before that reporting path. Thus no detailed
+conflict witness in this bundle is not evidence of no conflict.
+
+Next flight, unchanged settings/build: in the cockpit while F8 reports FSR
+inactive, close F8, press F10 and note whether FSR resumes. After about 2 s,
+press F10 again, wait at least 5 s, then bundle logs with the installer.
+F10 ends stand-down, restores Full work, arms the 900-frame audit and dumps
+the trace ring; the installer includes traces/shaders. The second arm keeps
+a trace of Full work as well as the first arm's prior probes. If Full treats
+while Probe did not, investigate probe camera provenance/recovery. If Full
+still refuses, replay the traces for the first conflicting draw and its
+depth/viewport/camera provenance before changing admission. Verify the
+version again and check both trace dumps have frames/events and no SHORT
+WRITE. No rendering code, config, or installed files changed for this review.

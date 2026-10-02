@@ -10822,7 +10822,7 @@ def self_test_vscreen_fit():
     # ---- the census verdict reads the render size from the log, never assumes it ----
     census_path = os.path.join(here, CENSUS_FIXTURE)
     if os.path.isfile(census_path):
-        census = read_text(census_path)
+        census = read_text(census_path).replace("\r\n", "\n")  # a CRLF checkout (issue 64)
         apply_line = "[00:00:01.000] vScreen resolution: 1920x1080 -> 3504x1971 at 6 site(s). This writes to game CODE\n"
         blind = census.replace("hdr=5040x2835", "hdr=0x0").replace(" px in 5040x2835,", " px in 0x0,")
         if blind == census:
@@ -10902,7 +10902,7 @@ def self_test_camera_census():
     if not os.path.isfile(fixture):
         fail("the fixture %s is missing beside this script" % CENSUS_FIXTURE)
         return False
-    text = read_text(fixture)
+    text = read_text(fixture).replace("\r\n", "\n")  # a CRLF checkout (issue 64)
 
     # ---- the parser ----
     c = parse_camera_census(text)
