@@ -2231,6 +2231,13 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         Log::get().note("flat engine motion: experimental.temporal_aa_engine_motion=%s at frame=%llu",
             engineMotionWanted ? "on" : "off", (unsigned long long)frame);
     s.engineMotionWanted = engineMotionWanted;
+    // The per-draw reducer's lean path (flat_runtime_model.h): read live, same idiom. Off makes every draw's
+    // contract record up front again; the reducer's state is the same either way, only its cost differs.
+    const bool perDrawLean=Config::get().getBool("experimental.flat_per_draw_lean",true);
+    if (perDrawLean == g_flatRuntimeEagerRecord)
+        Log::get().note("flat per-draw lean: experimental.flat_per_draw_lean=%s at frame=%llu",
+            perDrawLean ? "on" : "off", (unsigned long long)frame);
+    g_flatRuntimeEagerRecord = !perDrawLean;
     // Local refusal's observation exit: a positively qualified handoff on a
     // completely covered frame (the same coverage trio phase.finish used
     // above) requalifies the contract and resumes warm-up. Empty, failed,
@@ -2933,7 +2940,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
             flatcpu::Scope rows(flatcpu::kCameraRows);   // camera table lookup, rows copy and hash: a fresh lookup
             kept = &s.cameras.refresh(k.b1, b1Binding, s.prefix.frame);
         }
-        if (kept->have) { std::memcpy(d.camera, kept->rows, sizeof(d.camera)); k.camera = d.camera; k.cameraHash = kept->hash; k.writeEpoch = kept->epoch; k.writeSeq = kept->sequence; }
+        if (kept->have) { std::memcpy(d.camera, kept->rows, sizeof(d.camera)); k.camera = d.camera; k.cameraHash = kept->hash; d.cameraHashTrusted = true; k.writeEpoch = kept->epoch; k.writeSeq = kept->sequence; }
     }
     d.supported = engineVelocityPoolFamilyPair(k.vs, k.ps); d.instances = instances;
     // A draw that is not a pool-family draw cannot be a substituted producer: it sees the game's state, and so does
