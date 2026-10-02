@@ -11,6 +11,7 @@
 
 #include <d3d11.h>
 
+#include <atomic>   // g_renderBelowEye
 #include <cctype>   // toupper, in the census-skip spec parser
 #include <cmath>
 #include <cstdio>   // _snprintf_s, for the sizes list in the starvation line
@@ -24,6 +25,7 @@
 #include "../common/log.h"
 #include "../common/proxy.h"  // breadcrumbHeartbeat, the steady-state trail
 #include "../common/timing.h"
+#include "../common/vr_supersample_notice.h"   // Elite's Supersampling below 1, read from the measured render size
 #include "../common/vtable_hook.h"
 #include "backdrop_fix.h"
 #include "billboard_fix.h"
@@ -61,14 +63,18 @@
 #include "ui_depth.h"
 #include "ui_layer.h"
 #include "ui_layer_math.h"
+#include "vr_world_route.h"  // VrWorldInternalScope: the world route's own D3D calls step past these hooks
 #include "ui_surfaces.h"  // uiAtlasNoteWrite: the glyph atlas instrument's write count
-#include "celestial_motion.h"
 #include "engine_velocity.h"
+#include "vr_world_route.h"
+#include "vr_camera_census.h"
+#include "vscreen_footprint.h"   // fix.vscreen_res_width = auto's footprint instrument (the on-foot screen's width in the eye)
 #include "map_wait.h"         // the game's time inside Map, for the native timing line
 #include "flat_runtime.h"
 #include "flat_temporal.h"   // bounded, flat-profile-only scene discovery
 #include "../common/runtime_profile.h"
 #include "intro_panel.h"
+#include "intro_curve.h"     // the splash's recogniser: which composite draws are the game's own world-space panel
 #include "intro_skip.h"
 #include "intro_upscale.h"
 #include "intro_probe.h"
@@ -697,6 +703,12 @@ struct State {
     // at the top of every beginPanelOverride, so it can never outlive the draw
     // that set it.
     bool     curveThisDraw = false;
+
+    // Set by beginPanelOverride when intro_curve.h recognised this draw as the splash's (or a menu loop's) game-placed world-space composite, to
+    // be drawn as the surface strip, consumed by forwardWithVerdict and put away by the thunk. A flag for curveThisDraw's reason and NOT curveThisDraw
+    // itself: that one is the on-foot screen's, and its branch returns before the verdict's Begin and the splash dim. Cleared at the top of every
+    // beginPanelOverride, so it can never outlive the draw that set it.
+    bool     introCurveThisDraw = false;
 
     void*    compositeCb = nullptr;
     uint8_t  shadow[512] = {};
@@ -1496,6 +1508,13 @@ thread_local bool t_uiDepthThisDraw = false;
 // it composes independently of whether the family reissue above also
 // claims this draw.
 thread_local bool t_holoDepthThisDraw = false;
+// This eye draw samples a learned interface surface -- a composite (ui_depth's
+// test, published by uiDepthOnEyeDraw) -- for the layer's census of the
+// composites it leaves in the scene (ui_scene_composites.h). Set by
+// beginPanelOverride, consumed and cleared by forwardWithVerdict's scope, the
+// same take-and-clear the two flags above have, so it is only ever the draw's
+// own.
+thread_local bool t_compositeThisDraw = false;
 
 enum class DrawVerdict {
     kNone, kPanel, kSkip, kRemlok, kHolo,
@@ -1687,7 +1706,10 @@ bool drawGateSubscribed(State* s) {
         scrimWantsDraws() || quadProbeWants() || loaderPanelWants() ||
         introProbeWants() || introPanelWants() ||
         wakePulseWantsDraws() || nightVisionWantsDraws() ||
-        witchspaceStarsHidden() || depthProbeWanted();
+        witchspaceStarsHidden() || depthProbeWanted() ||
+        vscreenFootprintWanted() ||   // the footprint instrument (vscreen_footprint.h): it reads the 2D screen's composite
+        introCurveWants();            // the splash's surface strip (intro_curve.h): it acts in the eye branch, below this gate -- and panelCurveWants()
+                                      // above is the ON-FOOT strip's flag, which stands down on its own while this one does not
 }
 
 // The bound target's resolve, for the wake pulse, memoised on Rtv0's binding
@@ -1909,7 +1931,9 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // Cleared before anything can set it, on every draw, so a substitution
     // can never be attributed to a draw that did not ask for one.
     s->curveThisDraw = false;
+    s->introCurveThisDraw = false;
     t_uiDepthThisDraw = false;
+    t_compositeThisDraw = false;
     // Counting eye draws is not part of the panel distance fix, even though it
     // happens here.
     //
@@ -2328,8 +2352,11 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     // or a named family drawn straight into the eye, writes its depth. A
     // flag and not a verdict, so it composes with whatever claims the draw
     // below; forwardWithVerdict's scope consumes it.
-    if (uiDepthWantsDraws()) t_uiDepthThisDraw = uiDepthOnEyeDraw(self,
-        {kind,count,instances,args.start,args.base,args.startInstance});
+    if (uiDepthWantsDraws()) {
+        t_uiDepthThisDraw = uiDepthOnEyeDraw(self,
+            {kind,count,instances,args.start,args.base,args.startInstance});
+        t_compositeThisDraw = uiDepthDrawSampledSurface();
+    }
     // The generic hologram/icon depth pass (ui_depth.h): its own family
     // list, checked independently of the classification above.
     if (uiDepthHologramWantsDraws()) t_holoDepthThisDraw = uiDepthHologramOnEyeDraw(self);
@@ -2352,6 +2379,17 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
                                   srv.b)) {
             return DrawVerdict::kIntroPanel;
         }
+    }
+
+    // The splash's composite, and the main menu's loops: the same six-index draw through the movie's vertex shader with the GAME's own world-space
+    // placement (intro_curve.h). Recognised by shape, the VS and a one-shot copy of the game's constants, and drawn as the bent surface strip in
+    // forwardWithVerdict when fix.panel_curvature asks for it. Right AFTER the movie's claim above, so a draw the movie claims -- its placement is
+    // EDVR's own (intro_panel.h), drawn as its own strip -- is never asked; only the few settle frames before the movie has a placement of its
+    // own reach this, and its stock constants read screen-space and flat then, said once. It claims nothing: a flag, not a verdict, so it
+    // composes with kBackdrop's slot swap and the splash dim (and NOT curveThisDraw, which is the on-foot screen's and returns before both).
+    // Shape first, then introCurveWants(), which is one load at curvature 0 -- and then nothing below it runs.
+    if (kind == 'X' && count == 6 && introCurveWants()) {
+        s->introCurveThisDraw = introCurveOnComposite(self, kind, count, instances);
     }
 
     // Nominate the scene camera for the world shader: a big eye-target
@@ -2628,7 +2666,13 @@ DrawVerdict beginPanelOverride(ID3D11DeviceContext* self, char kind, UINT count,
     //
     // It sets a flag instead of returning a verdict because it has to compose
     // with the distance fix, which returns kPanel for this very draw.
-    if (panelCurveWants() && srv0IsPanelSized(s, kind, count)) {
+    //
+    // NOT the intro composite (kIntroCompositeVsHash, intro_curve.h). The movie's and the splash's six-index composite samples a surface of the
+    // panel's size under a stock vscreen_res (1920x1080, the front end's own), this recognition is by size alone, and a substitution for it finds
+    // no SIZE in vertex slots 1..3 and stands the WHOLE on-foot curve down for the session. Those two surfaces are the surface strip's
+    // (introCurveThisDraw, forwardWithVerdict). The new term sits behind panelCurveWants(), so at curvature 0 nothing new is read.
+    if (panelCurveWants() && srv0IsPanelSized(s, kind, count) &&
+        !(kind == 'X' && count == 6 && bindingShaderHash(BindSlot::Vs) == kIntroCompositeVsHash)) {
         s->curveThisDraw = true;
     }
 
@@ -2830,6 +2874,7 @@ void STDMETHODCALLTYPE hookedClearRtv(ID3D11DeviceContext* self,
         flatRuntimeSubstitution(self, FlatSubstEvent::kClear);   // a clear is not a substituted producer draw: the game's state first
         ResourceInfo info{}; if (bindingResolve(rtv, &info)) flatRuntimeWritten(static_cast<ID3D11Resource*>(info.resource));
     }
+    if (g_vrWorldWatchWrites) vrWorldRouteNoteRtvClear(rtv);
     if (flatTemporalCapturing()) flatTemporalClearColor(rtv);
     // The census's record of this clear, before the probes and before
     // the void fix touches the colour: the line carries what the GAME
@@ -3158,7 +3203,6 @@ void STDMETHODCALLTYPE hookedExecuteCommandList(ID3D11DeviceContext* self,
     if (!privateExecution) {
         graphicsBridgeNoteUnknownExecution();
         motionResourceWritten(nullptr);
-        celestialMotionConstantsUnknownWrite(nullptr);
         glitchFrameInvalidatePool(nullptr);
     }
     s->realExecuteCommandList(self, list, restoreContextState);
@@ -3245,13 +3289,6 @@ HRESULT STDMETHODCALLTYPE hookedMap(ID3D11DeviceContext* self, ID3D11Resource* r
     // The reveal sync's shadow of the scene block, same tee, its own gate.
     if (mapData && fssRevealWantsDraws()) {
         fssRevealNoteMap(res, mapped->pData);
-    }
-    // Terrain-constants CPU shadow: capture the mapped pointer so the Unmap
-    // tee can memcpy the game's write without a GPU copy at draw time.
-    // Guarded by celestialMotionAnyWatched() (celestial_motion.h): with no
-    // slot watched, the callee's own loop cannot match this resource either.
-    if (mapData0 && type != D3D11_MAP_READ && celestialMotionAnyWatched()) {
-        celestialMotionConstantsMapped(res, mapped->pData);
     }
     // Only the one buffer we care about, so this is a pointer compare on a very
     // hot path and nothing more.
@@ -3373,9 +3410,6 @@ void STDMETHODCALLTYPE hookedUnmap(ID3D11DeviceContext* self, ID3D11Resource* re
         return;
     }
     motionResourceWritten(res);
-    // Guarded the same way as hookedMap's Map-time tee: with no slot
-    // watched, the callee's own loop cannot match this resource either.
-    if (celestialMotionAnyWatched()) celestialMotionConstantsUnmapped(res);
     // glitchFrameInvalidatePool's own and only test is "installed at all"
     // (glitch_frame.h) -- unlike glitchFrameWantsPool, it does not also ask
     // State::observing, so glitchFrameObserving() would be the wrong,
@@ -3683,13 +3717,89 @@ __declspec(noinline) void crispHudTonemapReissue(ID3D11DeviceContext* self, char
     }
 }
 
+// The VR world route's re-issue (ui_layer.h): the 2D screen's composite, decided in the route's mode -- the layer
+// did NOT take it -- issued once more into the eye's layer right after the game's own issue, with the route's
+// mipped copy of the resolved screen at PS slot 0 and a trilinear sampler like the game's; every other binding is
+// the game's, still bound from its draw. A Begin that declines leaves the game's state untouched (counted by
+// reason, named once) and the eye to the eye route. The route's own D3D calls step past these hooks
+// (VrWorldInternalScope). NOINLINE for the reason pureDrawReissue is: two draws a frame, and only while the route
+// owns the world.
+// The VR camera census (vr_camera_census.h; the key is read only there): at the 2D screen's composite draw, which is one
+// an eye, tell the census the eye, so it can read that eye's view constants (b1 rows 270..273) back and log what EDVR
+// advertised for it. Observes only: the census copies and maps under the flat compute scope and never writes a binding.
+// NOINLINE and reached only with the census key on (the caller tests the flag); two draws a frame, and only the first
+// few on-foot frames spend anything (the census's own budget).
+__declspec(noinline) void cameraCensusEyeDraw(ID3D11DeviceContext* self) {
+    if (bindingShaderHash(BindSlot::Vs) != 0x5C36AF051B98B9F1ull || bindingShaderHash(BindSlot::Ps) != 0xCFE84157BC76E921ull) return;
+    ResourceInfo info{};
+    if (!bindingResolve(bindingGet(BindSlot::Rtv0), &info) || !info.isTexture2D) return;
+    const int eye = uiDepthEyeOfTarget(info.resource, info.a, info.b, info.fmt);
+    if (eye < 0 || eye > 1) return;
+    vrCameraCensusEyeDraw(self, static_cast<uint32_t>(eye));
+}
+
+// The footprint instrument (vscreen_footprint.h; fix.vscreen_res_width = auto): at the 2D screen's composite, after the game's
+// own issue, tell it the draw's arguments and the panel distance its constants carry. Observes only: its copies and Map run
+// under the flat compute scope and never write a binding. NOINLINE and reached only while the instrument is armed (the
+// caller tests the flag, and only for an eye-target draw); the instrument itself spends one tick count and a compare on every
+// composite it does not sample.
+__declspec(noinline) void footprintEyeDraw(ID3D11DeviceContext* self, float applied, INT baseVertex, UINT startInstance) {
+    if (bindingShaderHash(BindSlot::Vs) != 0x5C36AF051B98B9F1ull || bindingShaderHash(BindSlot::Ps) != 0xCFE84157BC76E921ull) return;
+    vscreenFootprintCompositeDraw(self, applied, static_cast<int>(baseVertex), static_cast<unsigned>(startInstance));
+}
+
+__declspec(noinline) void worldScreenReissue(ID3D11DeviceContext* self, char kind, UINT count,
+                                             UINT instances, const DrawArgs& args) {
+    if (uiLayerIssueBlocked()) return;
+    VrWorldInternalScope internal;
+    if (uiLayerWorldReissueBegin(self)) {
+        GpuCensusScope census(self, GpuCensusSection::FrameWorldLayer);
+        pureDrawReissue(self, kind, count, instances, args);
+        uiLayerWorldReissueEnd(self);
+    }
+}
+
+// The same re-issue for a CURVED screen (fix.panel_curvature above 0). The game's draw was swallowed by the curve substitution
+// (panelCurveSubstitute drew the strip into the eye), so what is repeated into the eye's layer is that strip, by the very helper that
+// bound it for the game's draw (panel_curve.h panelCurveReissue): the layer's bend and placement are the game's by construction, at any
+// curvature and any panel distance (the distance override's constants are still bound: the caller is inside beginPanelOverride's
+// bracket). Ready is asked BEFORE the layer's bracket is opened, so a draw that cannot be made never opens one; a draw that faults
+// after it closes the bracket without taking the eye (uiLayerWorldReissueEnd(.., false)) and the eye route serves it.
+__declspec(noinline) void worldScreenReissueCurved(ID3D11DeviceContext* self) {
+    if (uiLayerIssueBlocked()) return;
+    VrWorldInternalScope internal;
+    if (!panelCurveReissueReady()) return;
+    if (uiLayerWorldReissueBegin(self)) {
+        GpuCensusScope census(self, GpuCensusSection::FrameWorldLayer);
+        const bool drawn = panelCurveReissue(self, g_state->realDrawIndexedInstanced);
+        uiLayerWorldReissueEnd(self, drawn);
+    }
+}
+
+// What the tail of the game's own issue does for a FLAT screen composite and a swallowed (curved) draw never reached, done for the
+// curved one right after the substitution: (1) the footprint instrument (vscreen_footprint.h; fix.vscreen_res_width = auto) reads the
+// quad the game bound -- the substitution has put the game's vertex buffer back -- so the screen's footprint is measured flat, which is
+// what the fit's m is defined at (the middle of the panel; vscreen_fit.h); (2) while the route owns the frame, screen motion's
+// recognition (its per-eye motion pass was skipped for the frame, as the flat tail skips it) and the route's re-issue of the strip.
+__declspec(noinline) void curvedScreenSwallowed(ID3D11DeviceContext* self, DrawVerdict v, UINT count, UINT instances,
+                                                const DrawArgs& args, bool routeOwns) {
+    if (self != g_state->ownerCtx) return;
+    if (g_state->rtv0Eye && count && instances && vscreenFootprintWanted())
+        footprintEyeDraw(self, v == DrawVerdict::kPanel ? g_state->distanceScale : 1.0f, args.base, args.startInstance);
+    if (!routeOwns) return;
+    if (screenMotionLive()) screenMotionRecognize();
+    worldScreenReissueCurved(self);
+}
+
 // fix.ui_quality (ui_layer.h): which piece of the interface an owner draw is.
 // Asked only while the layer is live. A draw into anything that is not an
 // eye target is none -- the GUI's own draws into its surfaces are the
 // surfaces' content, not the eye's UI. Into an eye target that is not 8-bit
 // UNORM (the lit HDR target -- thousands of scene draws a frame) only the
 // hash compares run, to name the cockpit families the crisp take takes (the
-// three named shaders and the take's eight holograms, one family); the
+// holo panels' two vertex shaders -- the stock one and the one Disable GUI
+// effects switches in -- the flight HUD, the target sprite and the take's
+// eight holograms, one family); the
 // full rules run for the post-tonemap target alone, where a frame has a few
 // dozen draws. The 2D screen's composite is recognised exactly as the panel
 // distance and the curved screen recognise it (srv0IsPanelSized); the rest
@@ -3794,11 +3904,13 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     struct UiDepthScope {
         ID3D11DeviceContext* ctx;
         bool                 on;
-        bool                 holoOn;   // the generic hologram/icon pass's own classification
+        bool                 holoOn;      // the generic hologram/icon pass's own classification
+        bool                 composite;   // this eye draw samples a learned interface surface (the layer's census)
         explicit UiDepthScope(ID3D11DeviceContext* c)
-            : ctx(c), on(t_uiDepthThisDraw), holoOn(t_holoDepthThisDraw) {
+            : ctx(c), on(t_uiDepthThisDraw), holoOn(t_holoDepthThisDraw), composite(t_compositeThisDraw) {
             t_uiDepthThisDraw = false;
             t_holoDepthThisDraw = false;
+            t_compositeThisDraw = false;
         }
         ~UiDepthScope() {
             if (on) uiDepthEnd(ctx);
@@ -3830,20 +3942,51 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
             if (on) uiLayerSeedDrawOutcome(original, substituted, redirected, known);
         }
     } seedOutcome{owner && uiLayerSeedDiagnostics()};
+    // The VR world route's pending re-issue of THIS draw (ui_layer.h): held for this call and no longer, so a draw
+    // that goes no further (swallowed, or never issued) cannot leave it for the next one.
+    struct WorldReissueScope {
+        bool on = false;
+        ~WorldReissueScope() {
+            if (on) uiLayerWorldReissueAbandon();
+        }
+    } worldReissue;
+    // Set below, before the game's own issue, when the surface strip drew the intro movie's or the splash's composite in the place of the game's
+    // flat quad (intro_curve.h, panel_curve.h panelCurveSurfaceDraw): the game's own draw is then not issued a second time.
+    bool stripIssued = false;
     // The game's own draw, and only it: the class says which kind of altered draw it is
     // (gpu_census.h), so the thunk's real-draw call can be timed as that section. Every
     // other issue through `draw` below passes None and is timed by its own section.
     auto observedDraw = [&](AlteredDraw altered) {
         if (owner && uiLayerIssueBlocked()) return false;
+        if (stripIssued) return true;   // the strip was issued in its place: nothing more, and something was
         const bool issued = draw(altered);
         if (seedOutcome.on) seedOutcome.original = seedOutcome.original || issued;
         return issued;
     };
+    // The layer's census of the interface composites it leaves in the scene
+    // (ui_scene_composites.h): set where the family rule has run for an eye
+    // draw that samples a learned interface surface, settled below once the
+    // after-UI retry has had its say.
+    bool compositeCounted = false;
+    UiLayerFamily compositeFamily = UiLayerFamily::kNone;
     if (owner && uiLayerLive() && g_state->rtv0Eye && v != DrawVerdict::kQuadSkip) {
         const UiLayerFamily uiFamily = uiLayerFamilyOf(g_state, kind, count);
+        compositeCounted = uiDepthScope.composite;
+        compositeFamily = uiFamily;
         if (uiFamily != UiLayerFamily::kNone) {
             uiLayer = uiLayerDecide(self, static_cast<int>(uiFamily), uiLayerVerdictForwards(v),
                                     g_state->curveThisDraw);
+            // The VR world route does not TAKE the 2D screen's composite: the game's draw is issued as it always
+            // was and re-issued into the layer right after it (worldScreenReissue below).
+            worldReissue.on = uiLayerWorldReissuePending();
+            // The on-foot maps gate (ui_layer.h; experimental.on_foot_maps_sharp). While the layer TAKES the 2D screen's composite
+            // the per-eye screen-motion calls at the tail of the game's draw stand aside (uiLayerRedirecting), and with them the
+            // recognition that keeps naming the world's source: naming stops two frames after the last recognised composite, and
+            // the panel would never come back to the eye route. It is made here instead, before the draw's own issue, so the
+            // curved screen's substitution (which returns before that tail) is covered too. With the key off uiLayerMapsOn()
+            // is false and this is one load of it, and only for a taken 2D screen composite.
+            if (uiLayer && uiFamily == UiLayerFamily::kScreen && uiLayerMapsOn() && screenMotionLive() && screenMotionRecognize())
+                uiLayerMapsNoteRecognised();
         }
     } else if (owner && uiLayerLive() && v != DrawVerdict::kQuadSkip) {
         // The two composites into a target vScreen does not call an eye's:
@@ -3875,6 +4018,25 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         const bool afterPanelSized = srv0IsPanelSized(g_state, kind, count);
         uiLayer = uiLayerNoteOther(self, count, uiLayerVerdictForwards(v), g_state->curveThisDraw,
                                    afterExcluded, afterPanelSized, instances, static_cast<uint32_t>(v), kind);
+        // A draw the retry took is the layer's, not the route's to re-issue (the held screen's exclusion never
+        // lets it take a 2D screen composite; this keeps "taken AND re-issued" impossible by construction).
+        if (uiLayer && worldReissue.on) {
+            worldReissue.on = false;
+            uiLayerWorldReissueAbandon();
+        }
+    }
+    // The census of composites left in the scene, settled after BOTH takes (the
+    // family's and the after-UI retry's): a composite is counted once, taken
+    // into the layer or left in the game's frame, and a left one is named by its
+    // shaders and the family the rule gave it (none when it named nothing -- the
+    // case this exists for). The shaders' hashes are read for the left ones only.
+    if (compositeCounted) {
+        if (uiLayer) {
+            uiLayerNoteCompositeTaken();
+        } else {
+            uiLayerNoteCompositeLeft(bindingShaderHash(BindSlot::Vs), bindingShaderHash(BindSlot::Ps),
+                                     static_cast<int>(compositeFamily));
+        }
     }
     // The sub-draw probe, which also SWALLOWS the game's draw -- it re-issues
     // the surviving index ranges itself. Before the curve substitution
@@ -3895,7 +4057,7 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         // Altered only when the layer redirected it: a declined substitution issues the
         // game's own draw untouched, which is not an altered draw.
         const bool issued = !swallowed &&
-            observedDraw(classifyAlteredDraw(owner, true, false, false, layered));
+            observedDraw(classifyAlteredDraw(owner, true, false, layered));
         if (layered) {
             uiLayerEnd(self);
             if (issued) uiLayerSecondIssues(self, kind, count, instances, args);
@@ -3917,7 +4079,9 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         g_state->curveThisDraw = false;
         const bool layered = uiLayer && uiLayerBegin(self);
         if (seedOutcome.on && layered) seedOutcome.redirected = true;
-        const bool swallowed = panelCurveSubstitute(self, g_state->realDrawIndexedInstanced);
+        // The strip's own motion pass is the per-eye one the game's tail ends with, which the flat screen skips while the VR
+        // world route owns the frame (worldReissue.on: the route's re-issue below makes the eye layer-only); so does this.
+        const bool swallowed = panelCurveSubstitute(self, g_state->realDrawIndexedInstanced, !worldReissue.on);
         if (seedOutcome.on) {
             seedOutcome.substituted = swallowed;
             // A successful substitute issues its mesh and can issue the
@@ -3925,17 +4089,17 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
             seedOutcome.known = !swallowed;
         }
         if (layered) uiLayerEnd(self);
-        if (swallowed) return;
+        if (swallowed) {
+            // The route's frame (worldReissue.on) re-issues the strip into the layer here, before the verdict's state is undone by
+            // the caller (endPanelOverride): the placement the second issue needs is still bound. Not a taken draw: taken and
+            // re-issued are exclusive (uiLayerDecide's plan is never made for a take).
+            curvedScreenSwallowed(self, v, count, instances, args, worldReissue.on);
+            return;
+        }
     }
     // One compare for the ordinary draw; the switch for the one with a
     // verdict (forwardVerdictBegin says why this is the same ladder).
     if (v != DrawVerdict::kNone) forwardVerdictBegin(self, v);
-    // celestialMotionLive() first: with fix.temporal_aa off the terrain
-    // history is configured off, and this Begin is a cross-TU call that only
-    // ever returns false -- once per eye-pass draw. The inline predicate is a
-    // NECESSARY condition Begin re-tests, so the verdict cannot change.
-    const bool terrainOriginal=owner && celestialMotionLive() &&
-        celestialMotionBeginOriginal(self,bindingShaderHash(BindSlot::Vs));
     if (effectCaptureScope.ctx) objectProbePanelDrawBegin(self);
     // The layer's bracket goes innermost: after the verdict's own Begin (a
     // RemLok scissor, a slot swap) so the layer maps the state the draw is
@@ -3944,12 +4108,46 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     if (seedOutcome.on && layered) seedOutcome.redirected = true;
     // Which kind of altered draw the game's own draw is now (gpu_census.h): a pool-family
     // draw runs with EDVR's slot target and shaders bound (engineVelocityBeforeDraw ran
-    // for this verdict-free draw just before), a terrain original with its motion target
-    // and pixel shader, a layered UI draw into EDVR's layer, any other verdict inside its
-    // fix's state change. A handful of loads and compares on a draw that is none of them.
+    // for this verdict-free draw just before), a layered UI draw into EDVR's layer, any
+    // other verdict inside its fix's state change. A handful of loads and compares on a
+    // draw that is none of them.
     // A Verdict-class draw also carries the fix that wraps it (alteredFixOf): the census names each.
     const AlteredDrawClass alteredClass = classifyAlteredDraw(owner, v == DrawVerdict::kNone,
-                                                              engineVelocityDrawSubstituted(), terrainOriginal, layered);
+                                                              engineVelocityDrawSubstituted(), layered);
+    // THE SURFACE STRIP (docs\intro-video.md, 2026-10-01). With fix.panel_curvature above 0 the intro movie's composite (EDVR places its quad;
+    // intro_panel.h) and the splash's (the game's own placement; intro_curve.h) are drawn as the bent strip IN THE PLACE of the game's flat quad.
+    // Here and not in the on-foot branch above, which returns before the verdict's Begin: kBackdrop's slot swap is in place by now, and the splash
+    // dim below follows the strip. The candidate test is two cheap tests, so an ordinary draw pays nothing and at curvature 0 nothing runs; the
+    // same refusal observedDraw makes comes first; and a strip that cannot be drawn leaves stripIssued false, so the game's own draw is issued
+    // below exactly as it always was -- flat, never missing.
+    // THE THIRD NUMBER is which way the strip's u runs (docs\intro-video.md, the mirror fix): the intro composite's placement runs its +x to the viewer's
+    // LEFT, and the strip, built by the on-foot generator, ran u with x and came out mirrored, so each caller says it from its own placement -- the movie's
+    // from the matrix EDVR built (introPanelStripReverseU), the splash's from the game's constants (introCurveReverseU) -- and never from the other's.
+    float stripGain = 0.0f;
+    int stripToward = 0;
+    bool stripReverseU = false;
+    if ((v == DrawVerdict::kIntroPanel || g_state->introCurveThisDraw) && owner && panelCurveSurfaceWanted()) {
+        if (v == DrawVerdict::kIntroPanel) {
+            // The movie: its quad is EDVR's, at the splash's half-width, with +z' toward the viewer.
+            if (introPanelStripArmed()) {
+                stripGain = introPanelStripGain();
+                stripToward = 1;
+                stripReverseU = introPanelStripReverseU();
+            }
+        } else {
+            // The splash: the half-width, the direction and the u direction the game's own constants gave.
+            stripGain = introCurveGain();
+            stripToward = introCurveToward();
+            stripReverseU = introCurveReverseU();
+        }
+        if (stripToward != 0 && !uiLayerIssueBlocked()) {
+            stripIssued = panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced);
+            if (seedOutcome.on && stripIssued) {
+                seedOutcome.substituted = true;
+                seedOutcome.known = false;   // the strip's mesh is not the game's draw: its original count is not the strip's
+            }
+        }
+    }
     const bool originalIssued=observedDraw(alteredClass == AlteredDrawClass::Verdict
                                                ? AlteredDraw(alteredClass, alteredFixOf(v)) : AlteredDraw(alteredClass));
     if (layered) {
@@ -3965,12 +4163,17 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
     if (originalIssued && uiLayerCrispPending()) {
         crispHudTonemapReissue(self, kind, count, instances, args);
     }
+    // The VR world route: the 2D screen composite the layer did not take, issued above exactly as the game
+    // always did, is issued once more into the eye's layer from the mipped, resolved screen (ui_layer.h). Before
+    // the verdict's state is undone below: the placement state the second issue needs is still bound.
+    if (worldReissue.on && originalIssued) {
+        worldScreenReissue(self, kind, count, instances, args);
+    }
     // A draw the UI layer took is not in the eye's colour at all, so the
     // interface depth below does not re-issue it: its depth and its
     // reactive mask exist to tell the upscaler about pixels the upscaler no
     // longer sees.
     if (effectCaptureScope.ctx) objectProbePanelDrawEnd(self);
-    if(terrainOriginal)celestialMotionEnd(self);
     if (owner && uiLayerIssueBlocked()) {
         // Begin failed with untrusted shader state: close existing brackets,
         // but issue neither the stock fallback nor any depth/motion replay.
@@ -4028,12 +4231,6 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         GpuCensusScope census(self, GpuCensusSection::FramePlanet);
         pureDrawReissue(self,kind,count,instances,args);uiDepthPlanetEnd(self);
     }
-    if (!terrainOriginal && owner && celestialMotionLive() &&
-        celestialMotionBegin(self, bindingShaderHash(BindSlot::Vs))) {
-        GpuCensusScope census(self, GpuCensusSection::FrameTerrain);
-        draw(AlteredDrawClass::None);   // a reissue into EDVR's own target: timed as FrameTerrain, not as an altered draw
-        celestialMotionEnd(self);
-    }
     if (v != DrawVerdict::kNone) {
         if (v == DrawVerdict::kBackdrop) backdropEnd(self);
         // The splash screen's dim under the loader's dialogs (splash_dim.h):
@@ -4044,7 +4241,11 @@ void forwardWithVerdict(ID3D11DeviceContext* self, DrawVerdict v,
         // re-issue needs is still bound either way.
         if ((v == DrawVerdict::kBackdrop || v == DrawVerdict::kIntroPanel) &&
             splashDimBegin(self)) {
-            draw(AlteredDrawClass::None);
+            // The dim is the same draw through the dark shader, so it follows the strip when the strip drew this one: the game's flat quad
+            // would dim a rectangle over a screen whose edges have come nearer. A strip that fails here leaves the game's own draw.
+            if (!(stripIssued && panelCurveSurfaceDraw(self, stripGain, stripToward, stripReverseU, g_state->realDrawIndexedInstanced))) {
+                draw(AlteredDrawClass::None);
+            }
             splashDimEnd(self);
         }
         // Every other verdict's End, in the ladder's old order
@@ -4069,8 +4270,9 @@ void STDMETHODCALLTYPE hookedCopyResource(ID3D11DeviceContext* self,
     noteStaleForward(kSlotCopyResource, reinterpret_cast<const void*>(g_state->realCopyResource),
                      "CopyResource");
     uiAtlasNoteWrite(dst, 2);
+    if (g_vrWorldWatchWrites && !foreignContext(self)) vrWorldRouteNoteWrite(dst);   // a write into H after the resolve is the latch's
     if(foreignContext(self))engineVelocityResourceUnknown(dst);
-    if (!foreignContext(self)) {motionResourceWritten(dst);celestialMotionConstantsUnknownWrite(dst);glitchFrameInvalidatePool(dst);if(fssResActive())fssResNoteCopyMaybeMismatched(dst,src);if(uiLayerWatching())uiLayerNoteCopy(dst,src);}
+    if (!foreignContext(self)) {motionResourceWritten(dst);glitchFrameInvalidatePool(dst);if(fssResActive())fssResNoteCopyMaybeMismatched(dst,src);if(uiLayerWatching())uiLayerNoteCopy(dst,src);}
     if (!foreignContext(self) && flatRuntimeActive()) { flatRuntimeSubstitution(self, FlatSubstEvent::kCopy); flatRuntimeWritten(dst); }
     if (!foreignContext(self) && flatTemporalCapturing()) flatTemporalTransfer(dst, src, 'R');
     if (drawCensusArmed()) {
@@ -4140,6 +4342,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
         g_state->realDrawIndexedInstancedIndirect(self, args, off);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDrawIndexedInstancedIndirect(self, args, off); return; }
     if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawIndexedIndirect, self, static_cast<int>(self->GetType()));
@@ -4152,6 +4355,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstancedIndirect(
         depthProbeNoteIndirectDraw(self, bindingGet(BindSlot::Dsv0));
         engineVelocityBeforeDraw(self, g_state->rtv0Eye);
         pixelProbeBefore(g_state, self);
+        if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     }
     g_state->realDrawIndexedInstancedIndirect(self, args, off);
     // Indirect: the GPU-side argument buffer means count/instances are not
@@ -4167,6 +4371,7 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
         g_state->realDrawInstancedIndirect(self, args, off);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDrawInstancedIndirect(self, args, off); return; }
     if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawIndirect, self, static_cast<int>(self->GetType()));
@@ -4179,6 +4384,7 @@ void STDMETHODCALLTYPE hookedDrawInstancedIndirect(ID3D11DeviceContext* self,
         depthProbeNoteIndirectDraw(self, bindingGet(BindSlot::Dsv0));
         engineVelocityBeforeDraw(self, g_state->rtv0Eye);
         pixelProbeBefore(g_state, self);
+        if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     }
     g_state->realDrawInstancedIndirect(self, args, off);
     if (!foreignContext(self)) pixelProbeAfterEye(g_state, self, 0, 0, true);
@@ -4206,6 +4412,7 @@ void STDMETHODCALLTYPE hookedCopySubresourceRegion(
     noteStaleForward(kSlotCopySubresourceRegion, reinterpret_cast<const void*>(g_state->realCopySubresourceRegion),
                      "CopySubresourceRegion");
     uiAtlasNoteWrite(dst, 2);
+    if (g_vrWorldWatchWrites && !foreignContext(self)) vrWorldRouteNoteWrite(dst);
     if(foreignContext(self))engineVelocityResourceUnknown(dst);
     if (!foreignContext(self)) {
         // Buffer boxes are byte ranges. Keep the destination offset: a
@@ -4213,7 +4420,6 @@ void STDMETHODCALLTYPE hookedCopySubresourceRegion(
         if(box && box->right>=box->left)
             motionResourceWritten(dst,dstX,uint64_t(dstX)+box->right-box->left);
         else motionResourceWritten(dst);
-        celestialMotionConstantsUnknownWrite(dst);
         glitchFrameInvalidatePool(dst);
         if (fssResActive()) fssResNoteCopyMaybeMismatched(dst, src);
         if (uiLayerWatching()) uiLayerNoteCopy(dst, src);
@@ -4244,11 +4450,11 @@ void STDMETHODCALLTYPE hookedUpdateSubresource(ID3D11DeviceContext* self,
     noteStaleForward(kSlotUpdateSubresource, reinterpret_cast<const void*>(g_state->realUpdateSubresource),
                      "UpdateSubresource");
     uiAtlasNoteWrite(dst, 0);
+    if (g_vrWorldWatchWrites && !foreignContext(self)) vrWorldRouteNoteWrite(dst);
     if(foreignContext(self))engineVelocityResourceUnknown(dst);
     if (!foreignContext(self)) {
         if(box && box->right>=box->left)motionResourceWritten(dst,box->left,box->right);
         else motionResourceWritten(dst);
-        celestialMotionConstantsWritten(dst, data, box);
         glitchFrameInvalidatePool(dst);
     }
     if (drawCensusArmed()) {
@@ -4430,6 +4636,7 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
         g_state->realDraw(self, count, start);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDraw(self, count, start); return; }   // the world route's own draw (vr_world_route.h)
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::Draw, self, static_cast<int>(self->GetType()));
     DrawClock clock;
@@ -4442,6 +4649,7 @@ void STDMETHODCALLTYPE hookedDraw(ID3D11DeviceContext* self, UINT count, UINT st
     const DrawVerdict v = beginPanelOverride(self, 'D', count, 1, args);
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
+    if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);   // the VR world route's detector; at the tone, its resolve
     forwardWithVerdict(self, v, 'D', count, 1, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
@@ -4461,9 +4669,11 @@ void STDMETHODCALLTYPE hookedDrawAuto(ID3D11DeviceContext* self) {
         g_state->realDrawAuto(self);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDrawAuto(self); return; }
     if (self == g_state->ownerCtx && uiLayerIssueBlocked()) return;
     gpuFrameCommand(self);
     if(self==g_state->ownerCtx)engineVelocityBeforeDraw(self,g_state->rtv0Eye);
+    if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     g_state->realDrawAuto(self);
 }
 void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
@@ -4475,6 +4685,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
         g_state->realDrawIndexed(self, count, startIndex, baseVertex);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDrawIndexed(self, count, startIndex, baseVertex); return; }
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawIndexed, self, static_cast<int>(self->GetType()));
     DrawClock clock;
@@ -4488,6 +4699,7 @@ void STDMETHODCALLTYPE hookedDrawIndexed(ID3D11DeviceContext* self, UINT count,
     const DrawVerdict v = beginPanelOverride(self, 'I', count, 1, args);
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
+    if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     forwardWithVerdict(self, v, 'I', count, 1, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
@@ -4511,6 +4723,7 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
         g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDrawInstanced(self, perInstance, instances, startVertex, startInstance); return; }
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawInstanced, self, static_cast<int>(self->GetType()));
     noteStaleForward(kSlotDrawInstanced, reinterpret_cast<const void*>(g_state->realDrawInstanced),
@@ -4524,6 +4737,7 @@ void STDMETHODCALLTYPE hookedDrawInstanced(ID3D11DeviceContext* self, UINT perIn
     const DrawVerdict v = beginPanelOverride(self, 'N', perInstance, instances, args);
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
+    if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);   // the tone is a DrawInstanced triangle: the route's trigger
     // The draw's instance window, for the glare telemetry: the trains
     // share one record buffer at different offsets, and which train a
     // draw carries is only knowable from (start, count).
@@ -4560,6 +4774,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
                                           baseVertex, startInstance);
         return;
     }
+    if (g_vrWorldInternal) { g_state->realDrawIndexedInstanced(self, perInstance, instances, startIndex, baseVertex, startInstance); return; }
     gpuFrameCommand(self);
     if (vrCensusEnabled()) vrCensusNote(VrCensusEvent::DrawIndexedInstanced, self, static_cast<int>(self->GetType()));
     noteStaleForward(kSlotDrawIndexedInstanced, reinterpret_cast<const void*>(g_state->realDrawIndexedInstanced),
@@ -4591,6 +4806,7 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     // verdict, which refreshes rtv0Eye; a draw a verdict claims is left alone.
     if (v == DrawVerdict::kNone && self == g_state->ownerCtx) engineVelocityBeforeDraw(self, g_state->rtv0Eye);
     if (self == g_state->ownerCtx) pixelProbeBefore(g_state, self);
+    if (g_vrWorldWants && self == g_state->ownerCtx) vrWorldRouteDraw(self);
     forwardWithVerdict(self, v, 'X', perInstance, instances, args, [&](AlteredDraw altered) {
         const int64_t r0 = clock.on ? qpcNow() : 0;
         {
@@ -4648,12 +4864,25 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
                 }
                 if(scene)scene->Release();
             }
+            // The VR camera census (vr_camera_census.h): at the 2D screen's composite, once an eye. g_vrWorldWants is true
+            // whenever the census is wanted, so with the key off this is one load of a false bool.
+            if (g_vrWorldWants && vrCameraCensusWanted()) cameraCensusEyeDraw(self);
+            // fix.vscreen_res_width = auto's footprint instrument: the same composite, the same moment. Armed only in the VR
+            // profile with the key auto; with the distance override applied to THIS draw its constants carry the scaled distance.
+            if (eyeGeometry && vscreenFootprintWanted())
+                footprintEyeDraw(self, v == DrawVerdict::kPanel ? g_state->distanceScale : 1.0f, baseVertex, startInstance);
+            // The VR world route re-issues this 2D screen composite into the eye's layer right after the game's
+            // own issue (ui_layer.h), and the door runs layer-only for the eye: the per-eye motion reissues below
+            // are unused while the route owns it (0.24 ms), so they are skipped -- but the RECOGNITION still runs.
+            // It is what keeps naming the world's source camera and depth for the next frames (the engine slot
+            // source and the weapon map depend on it), and it only ever ran inside screenMotionDraw.
+            if (screenMotionLive() && uiLayerWorldReissuePending()) screenMotionRecognize();
             // screenMotionLive() is the first term of both (screen_motion.h);
             // with fix.temporal_aa off these were two calls per draw that only
             // ever returned. Neither runs for a draw the UI layer took
             // (ui_layer.h): its pixels are not in the pass's input, and the
             // bound target and viewport are the layer's.
-            if (screenMotionLive() && !uiLayerRedirecting()) {
+            if (screenMotionLive() && !uiLayerRedirecting() && !uiLayerWorldReissuePending()) {
                 // The census (issue #38) times screen_motion.cpp's own GPU
                 // work now, not this call site: most calls into either
                 // function return above, at screenMotionLive()'s own flags
@@ -4666,6 +4895,12 @@ void STDMETHODCALLTYPE hookedDrawIndexedInstanced(ID3D11DeviceContext* self,
     });
     if (v == DrawVerdict::kPanel) endPanelOverride(self);
     if (v == DrawVerdict::kIntroPanel) introPanelEndDraw(self);
+    // The splash's numbers are put away after the draw and the dim have used them (forwardWithVerdict), and the flag with them, on every way out of
+    // that call: it cannot outlive the draw that set it.
+    if (g_state->introCurveThisDraw) {
+        g_state->introCurveThisDraw = false;
+        introCurveEndDraw();
+    }
     if (self == g_state->ownerCtx) pixelProbeAfterEye(g_state, self, perInstance, instances, false);
 }
 
@@ -5194,6 +5429,19 @@ bool vScreenIsEyeSized(uint32_t w, uint32_t h) {
     return false;
 }
 
+// Elite's Supersampling below 1.0 as the sizes measure it (vr_supersample_notice.h): the measured render size and the eye's
+// in one word, 0 until the world is found rendered under kBelowPercent of the eye's width and height. Written once a
+// session on the frame thread where the render size is adopted, read by the menu on its own tick.
+static std::atomic<uint64_t> g_renderBelowEye{0};
+bool vScreenRenderBelowEye(uint32_t* renderW, uint32_t* renderH, uint32_t* eyeW, uint32_t* eyeH) {
+    return vrss::unpack(g_renderBelowEye.load(std::memory_order_acquire), renderW, renderH, eyeW, eyeH);
+}
+
+uint32_t vScreenEyeDrawsThisFrame() {
+    const State* s = g_state;
+    return s ? s->eyeDrawsThisFrame : 0;
+}
+
 void vScreenRefreshConfig() {
     State* s = g_state;
     if (!s) return;
@@ -5431,8 +5679,10 @@ EDVR_BOUNDARY_TICK(tkPixelProbe, "pixel_probe");
 EDVR_BOUNDARY_TICK(tkWakePulse, "wake_pulse");
 EDVR_BOUNDARY_TICK(tkUiDepth, "ui_depth");
 EDVR_BOUNDARY_TICK(tkUiLayer, "ui_layer");
+EDVR_BOUNDARY_TICK(tkVrWorldRoute, "vr_world_route");
+EDVR_BOUNDARY_TICK(tkVrCameraCensus, "vr_camera_census");
+EDVR_BOUNDARY_TICK(tkVScreenFootprint, "vscreen_footprint");
 EDVR_BOUNDARY_TICK(tkScreenMotion, "screen_motion");
-EDVR_BOUNDARY_TICK(tkCelestialMotion, "celestial_motion");
 EDVR_BOUNDARY_TICK(tkEngineVelocity, "engine_velocity");
 EDVR_BOUNDARY_TICK(tkSharpenTick, "sharpen_tick");
 EDVR_BOUNDARY_TICK(tkTemporalTick, "temporal_tick");
@@ -5441,6 +5691,7 @@ EDVR_BOUNDARY_TICK(tkDepthProbe, "depth_probe");
 EDVR_BOUNDARY_TICK(tkGpuCensus, "gpu_census");
 EDVR_BOUNDARY_TICK(tkSceneArrived, "scene_arrived");
 EDVR_BOUNDARY_TICK(tkIntroPanel, "intro_panel");
+EDVR_BOUNDARY_TICK(tkIntroCurve, "intro_curve");
 EDVR_BOUNDARY_TICK(tkIntroSkip, "intro_skip");
 EDVR_BOUNDARY_TICK(tkLoaderPanel, "loader_panel");
 EDVR_BOUNDARY_TICK(tkIntroProbe, "intro_probe");
@@ -5450,6 +5701,20 @@ EDVR_BOUNDARY_TICK(tkFssReveal, "fss_reveal");
 EDVR_BOUNDARY_TICK(tkFssDump, "fss_dump");
 EDVR_BOUNDARY_TICK(tkFssPacing, "fss_pacing");
 EDVR_BOUNDARY_TICK(tkRemlok, "remlok");
+
+// The one line the surface strip adds when the intro ends, said once, at the first rendered scene: how many strip draws the intro had in all
+// (panel_curve.h counts every one it drew: the movie's, the splash's, and the splash dim's re-issues of either) and how many composite draws the
+// splash recogniser handed over to it (intro_curve.h). It is what tells "never ran" -- nothing, or 0 and 0 with the strip asked for -- from "ran
+// and invisible": draws counted, nothing seen. Nothing at curvature 0 unless something was drawn.
+void introCurveNoteRetired() {
+    static bool said = false;
+    if (said) return;
+    said = true;
+    const uint64_t drawn = panelCurveSurfaceInfo().drawn;
+    if (drawn == 0 && !panelCurveSurfaceWanted()) return;
+    Log::get().note("intro curve: %llu strip draw(s) in all (the movie's, the splash's and the splash dim's re-issues of either); the splash recogniser handed over %llu composite draw(s)",
+                    static_cast<unsigned long long>(drawn), static_cast<unsigned long long>(introCurveInfo().armed));
+}
 }  // namespace
 
 void vScreenFrameBoundary() {
@@ -5471,8 +5736,21 @@ void vScreenFrameBoundary() {
         // cross-check and learning, the key's 30-second totals, and the end
         // of this frame's watch for draws after the UI.
         tkUiLayer.run([&] { uiLayerFrameBoundary(g_state->ownerCtx); });
+        // The VR world route (docs section 82) reads the world-screen gate the layer's boundary just computed, accounts the
+        // frame that ended, steps its ownership machine and arms its detector; the camera census runs after it. With
+        // experimental.temporal_aa_on_foot_world off and the census off each returns at its first test.
+        tkVrWorldRoute.run([&] { vrWorldRouteFrameBoundary(); });
+        tkVrCameraCensus.run([&] { vrCameraCensusFrameBoundary(); });
+        // fix.vscreen_res_width = auto's footprint instrument (vscreen_footprint.h): maps a sample whose copy has had time to
+        // run, and every 30 s prints its line and stores the on-foot head-on floor (p10) for the next launch's width. The gate it is
+        // handed is the one the route reads: the layer's world-screen gate while the layer is live, else the journal's word.
+        // Unarmed (the flat profile, an explicit width) it is one config read a second and returns.
+        tkVScreenFootprint.run([&] {
+            const bool onFoot = uiLayerLiveForWorldRoute() ? uiLayerWorldScreenHeld()
+                                                           : (journalOnFootKnown() && journalOnFoot());
+            vscreenFootprintFrameBoundary(g_state->ownerCtx, onFoot);
+        });
         tkScreenMotion.run([&] { screenMotionFrameBoundary(g_state->ownerCtx); });
-        tkCelestialMotion.run([&] { celestialMotionFrameBoundary(g_state->ownerCtx); });
         tkEngineVelocity.run([&] { engineVelocityFrameBoundary(g_state->ownerCtx); });
         // The sharpening's warm compile and missing-hook note, once a frame,
         // unconditionally -- not nested under any other feature's gate.
@@ -5496,6 +5774,14 @@ void vScreenFrameBoundary() {
         tkIntroPanel.run([&] {
             introPanelTick(g_state->ownerCtx,
                            g_state->eyeDrawsLastFrame >= kSceneEyeDraws);
+        });
+        // The splash's recogniser (intro_curve.h), on the same boundary and the same scene signal as the movie's: it counts the frame, reads the
+        // copies that have settled and retires itself at the first rendered scene. At curvature 0 that is a frame counter and one load. Its one
+        // line, what the strip drew over the intro, is said from here once.
+        tkIntroCurve.run([&] {
+            const bool sceneFrame = g_state->eyeDrawsLastFrame >= kSceneEyeDraws;
+            introCurveTick(g_state->ownerCtx, sceneFrame);
+            if (sceneFrame) introCurveNoteRetired();
         });
         // The same boundary closes the skip's verdict: refused, drawn, or
         // neither, said once when the scene arrives.
@@ -5909,6 +6195,17 @@ void vScreenFrameBoundary() {
                 "report this log.",
                 s->renderW, s->renderH, s->eyeW, s->eyeH, pct, best, s->eyeDrawsMax,
                 Config::get().iniName());
+            // ELITE'S SUPERSAMPLING BELOW 1.0 (design section 83, the VR warning): the measurement above IS the detection, from
+            // the render sizes and never from Elite's settings file. A world drawn under the eye's width and height is scaled
+            // up by the game before EDVR sees it, so EDVR's DLSS upscales an upscaled image and the holograms suffer with it.
+            // Said once here, in the log; the menu reads it for the headset (vScreenRenderBelowEye). Never in a flat session:
+            // it has no eye texture, so this branch is not reached with one.
+            if (vrss::below(s->renderW, s->renderH, s->eyeW, s->eyeH)) {
+                g_renderBelowEye.store(vrss::pack(s->renderW, s->renderH, s->eyeW, s->eyeH), std::memory_order_release);
+                char notice[1000];
+                vrss::formatLog(notice, sizeof(notice), s->renderW, s->renderH, s->eyeW, s->eyeH);
+                Log::get().note("%s", notice);
+            }
         } else if (best > kSceneEyeDraws) {
             // THE SAME EVIDENCE, WITHOUT THE CORROBORATION, so it buys less.
             //
@@ -6785,6 +7082,7 @@ void shutdownVScreenFixes() {
 
     g_state->distanceEnabled = false;
     panelCurveShutdown();
+    vscreenFootprintShutdown();
     particleShutdown();
     objectProbeShutdown();
     pixelProbeShutdown();
@@ -6801,7 +7099,6 @@ void shutdownVScreenFixes() {
     uiLayerShutdown();
     screenMotionShutdown();
     nightVisionShutdown();
-    celestialMotionShutdown();
     scrimShutdown();
     quadProbeShutdown();
     wakePulseShutdown();
@@ -6819,6 +7116,7 @@ void shutdownVScreenFixes() {
     // that ended without a rendered scene ever arriving -- quitting from the
     // menu -- freed nothing at all.
     introPanelShutdown();
+    introCurveShutdown();
     introUpscaleShutdown();
     introSkipShutdown();
     temporalPassShutdown();

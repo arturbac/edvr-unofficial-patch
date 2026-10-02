@@ -6,7 +6,9 @@
 // users (AA on, bloom and DoF on, everything off), a non-Custom preset, missing files, the
 // wrapping, and the watcher's re-read on change. The files are real files in a temporary
 // directory, so the folder reading is the code the DLL runs; the panel's wiring is pinned by the
-// source scan in flat_temporal_test.cpp.
+// source scan in flat_temporal_test.cpp. The hold on a changed cause (FlatWarnHold) is driven here
+// too: the flight it was made for, replayed at the log's own stamps, and the controls that make
+// the replay a test (a wait of 0 ms, 1500 ms or none, and four defective copies of the rule).
 
 #include <windows.h>
 
@@ -17,6 +19,7 @@
 #include <vector>
 #include "../../src/d3d11/flat_elite_settings.h"
 #include "../../src/d3d11/flat_hdr_route.h"   // flatHdrSupersamplingAdvice: the key and sizes that decide the extra paragraph
+#include "../../src/d3d11/flat_standdown.h"   // kFlatStandDownProbeMs: the hold is measured against the probe cadence
 
 namespace elite_settings_test {
 
@@ -76,6 +79,221 @@ inline int ruler(const char* text, void*) { return static_cast<int>(std::strlen(
 constexpr int kPanelWidthPx = 806;   // the flat card less its padding, at the default size
 
 }  // namespace elite_settings_test
+
+// The hold on a changed cause (FlatWarnHold): the panel's side of it, the real helper under the waits the controls vary, four
+// copies of the rule with one defect each, and the scenarios that must pass the real helper and fail every one of those.
+namespace warn_hold_test {
+
+using namespace edvr;
+
+// A log stamp as milliseconds of the day. The last argument is decimal: write 50, not 050 (octal).
+constexpr uint64_t stamp(int h, int m, int s, int ms) {
+    return ((static_cast<uint64_t>(h) * 60 + static_cast<uint64_t>(m)) * 60 + static_cast<uint64_t>(s)) * 1000 +
+           static_cast<uint64_t>(ms);
+}
+
+// What flatWarningTick keeps and does with the hold, in its order: the hold is asked first, every tick; then the comparison; then
+// the switch (shown, changed, hidden: the three lines the log's reader counts). `held` counts the ticks on which a hold began.
+template <class Hold>
+struct Panel {
+    Hold hold;
+    bool active = false;
+    std::string key;
+    int shown = 0, changed = 0, hidden = 0, held = 0;
+    std::vector<uint64_t> changedAt;
+    void tick(bool refusing, const std::string& computed, uint64_t now) {
+        if (!hold.admit(refusing, active, key, computed, now)) {
+            if (hold.began()) ++held;
+            return;
+        }
+        if (refusing == active && computed == key) return;
+        if (!active) ++shown;
+        else if (!refusing) ++hidden;
+        else { ++changed; changedAt.push_back(now); }
+        active = refusing;
+        key = computed;
+    }
+};
+
+// The real helper, called as menu.cpp calls it: five arguments, the constant's wait.
+struct ProductionHold {
+    FlatWarnHold h;
+    bool admit(bool refusing, bool active, const std::string& shown, const std::string& computed, uint64_t now) {
+        return h.admit(refusing, active, shown, computed, now);
+    }
+    bool began() const { return h.began(); }
+    bool pending() const { return h.pending(); }
+    const std::string& pendingKey() const { return h.pendingKey(); }
+    uint64_t sinceMs() const { return h.sinceMs(); }
+};
+// The same helper with another wait, for the controls: 0 ms is the panel as it was before the hold, 1500 ms is one stand-down
+// probe interval, UINT64_MAX is a hold that never expires.
+template <uint64_t Ms>
+struct WaitHold : ProductionHold {
+    bool admit(bool refusing, bool active, const std::string& shown, const std::string& computed, uint64_t now) {
+        return h.admit(refusing, active, shown, computed, now, Ms);
+    }
+};
+
+// The rule written out again with one defect at a time (this rig has no mutants.py, so its controls live in it, as the source
+// pins' do): StaleAfterReturn leaves a wait standing when the cause comes back to the one on show, ThirdKeyKeepsClock lets a third
+// cause inherit the second one's clock, ShowAndHideHeld makes a show and a hide wait like any change, and ShowAndHideKeepPending
+// leaves a waiting change standing across a show or a hide.
+enum class Defect { StaleAfterReturn, ThirdKeyKeepsClock, ShowAndHideHeld, ShowAndHideKeepPending };
+template <Defect D>
+struct DefectiveHold {
+    bool pending_ = false, began_ = false;
+    std::string pendingKey_;
+    uint64_t since_ = 0;
+    bool admit(bool refusing, bool active, const std::string& shown, const std::string& computed, uint64_t now) {
+        began_ = false;
+        if constexpr (D != Defect::ShowAndHideHeld) {
+            if (!refusing || !active) {
+                if constexpr (D != Defect::ShowAndHideKeepPending) pending_ = false;
+                return true;
+            }
+        }
+        if (computed == shown) {
+            if constexpr (D != Defect::StaleAfterReturn) pending_ = false;
+            return true;
+        }
+        if (!pending_ || computed != pendingKey_) {
+            if constexpr (D == Defect::ThirdKeyKeepsClock) {
+                if (!pending_) since_ = now;
+            } else {
+                since_ = now;
+            }
+            pending_ = true;
+            pendingKey_ = computed;
+            began_ = true;
+        }
+        if (now - since_ < kFlatWarnHoldMs) return false;
+        pending_ = false;
+        return true;
+    }
+    bool began() const { return began_; }
+    bool pending() const { return pending_; }
+    const std::string& pendingKey() const { return pendingKey_; }
+    uint64_t sinceMs() const { return since_; }
+};
+
+// ---- the flight (edvr_gfx_20261001_103559.log: Epic, DLSS, the route's key auto, a 3840x2160 screen) --------------------------
+// The computed cause across the stand-down that entered at 10:38:16.516 with Elite rendering 1440x810: the loading screen's
+// 256x256 that the stand-down's probes saw twice (it stood for 1521 ms and 1509 ms, one probe interval each), the resume at
+// 10:38:36.172, and the panel's hide a millisecond later. The stamps are the log's: its four `changed` lines are the four flips of
+// the computed cause, with no hold at all.
+constexpr uint64_t kEntered = stamp(10, 38, 16, 516);   // the stand-down enters and the warning is shown
+constexpr uint64_t kLow1 = stamp(10, 38, 19, 529);      // the computed cause moves to 256x256 ...
+constexpr uint64_t kUp1 = stamp(10, 38, 21, 50);        // ... and back to 1440x810 (1521 ms later)
+constexpr uint64_t kLow2 = stamp(10, 38, 24, 85);       // ... to 256x256 again ...
+constexpr uint64_t kUp2 = stamp(10, 38, 25, 594);       // ... and back (1509 ms later)
+constexpr uint64_t kResumed = stamp(10, 38, 36, 172);   // the stand-down resumes; the panel hides at kResumed + 1
+
+struct Replay {
+    int shown = 0, changed = 0, hidden = 0, held = 0;
+    std::vector<uint64_t> changedAt;
+    bool stayed = true;   // the key on show was the 1440x810 one at every tick
+};
+
+// The panel ticking every `step` ms over the flight (1 ms is the finest the log's stamps allow; 16 ms is a 60 fps frame).
+template <class Hold>
+Replay replayFlight(const std::string& k1440, const std::string& k256, uint64_t step) {
+    Panel<Hold> p;
+    Replay r;
+    for (uint64_t t = kEntered; t <= kResumed; t += step) {
+        const bool low = (t >= kLow1 && t < kUp1) || (t >= kLow2 && t < kUp2);
+        p.tick(true, low ? k256 : k1440, t);
+        if (p.active && p.key != k1440) r.stayed = false;
+    }
+    p.tick(false, std::string(), kResumed + 1);
+    r.shown = p.shown;
+    r.changed = p.changed;
+    r.hidden = p.hidden;
+    r.held = p.held;
+    r.changedAt = p.changedAt;
+    return r;
+}
+
+// Each scenario returns nullptr when the rule holds, else the first thing that did not. S is on show; X, Y are other causes.
+
+// A change that persists is adopted at 2000 ms and not before: 1999 ms holds, 2000 ms adopts.
+template <class Hold>
+const char* persists(const std::string& S, const std::string& X) {
+    Panel<Hold> p;
+    const uint64_t T = 10000;
+    p.tick(true, S, T - 1);
+    for (uint64_t t = T; t < T + 2000; ++t) {
+        p.tick(true, X, t);
+        if (p.key != S || p.changed) return "a change replaced the one on show before it had persisted 2000 ms";
+    }
+    p.tick(true, X, T + 2000);
+    if (p.key != X || p.changed != 1 || p.changedAt[0] != T + 2000) return "a change that persisted 2000 ms was not adopted at 2000 ms";
+    return nullptr;
+}
+
+// A change that flips back before 2000 ms is dropped, and the next flip starts a new wait.
+template <class Hold>
+const char* flipBack(const std::string& S, const std::string& X) {
+    Panel<Hold> p;
+    const uint64_t T = 70000;
+    p.tick(true, S, T - 1);
+    for (uint64_t t = T; t < T + 1500; ++t) p.tick(true, X, t);
+    if (!p.hold.pending() || p.key != S) return "a change was not waiting after 1500 ms";
+    for (uint64_t t = T + 1500; t < T + 1600; ++t) p.tick(true, S, t);
+    if (p.hold.pending() || p.changed) return "a change that came back to the one on show before its wait was up was not dropped";
+    for (uint64_t t = T + 1600; t < T + 3600; ++t) {
+        p.tick(true, X, t);
+        if (p.key != S || p.changed) return "a change that flipped back and came again was adopted before 2000 ms of its new wait";
+    }
+    p.tick(true, X, T + 3600);
+    if (p.key != X || p.changed != 1 || p.changedAt[0] != T + 3600) return "the restarted wait was not 2000 ms";
+    return nullptr;
+}
+
+// A third cause starts its own 2000 ms, from the tick it appears; the second one is never adopted.
+template <class Hold>
+const char* thirdKey(const std::string& S, const std::string& X, const std::string& Y) {
+    Panel<Hold> p;
+    const uint64_t T = 90000;
+    p.tick(true, S, T - 1);
+    for (uint64_t t = T; t < T + 1500; ++t) p.tick(true, X, t);
+    for (uint64_t t = T + 1500; t < T + 3500; ++t) {
+        p.tick(true, Y, t);
+        if (p.key != S || p.changed) return "a third cause was adopted before 2000 ms of its own wait";
+        if (t == T + 1500 && (p.hold.pendingKey() != Y || p.hold.sinceMs() != T + 1500))
+            return "the wait did not restart, from the tick it appeared, on a third cause";
+    }
+    p.tick(true, Y, T + 3500);
+    if (p.key != Y || p.changed != 1 || p.changedAt[0] != T + 3500 || p.held != 2)
+        return "the third cause was not adopted at its own 2000 ms as the only change (two waits begun)";
+    return nullptr;
+}
+
+// A show and a hide are immediate, and either clears a waiting change.
+template <class Hold>
+const char* showHide(const std::string& S, const std::string& X) {
+    Panel<Hold> p;
+    const uint64_t T = 50000;
+    p.tick(true, S, T);
+    if (!p.active || p.shown != 1 || p.key != S) return "a show did not take effect on the tick that wanted it";
+    p.tick(false, std::string(), T + 40);
+    if (p.active || p.hidden != 1) return "a hide did not take effect on the tick that wanted it";
+    p.tick(true, S, T + 80);
+    if (!p.active || p.shown != 2) return "a second show was not immediate";
+    p.tick(true, X, T + 100);
+    p.tick(false, std::string(), T + 1500);
+    if (p.active || p.hidden != 2 || p.hold.pending()) return "a hide did not take effect at once, or left a change waiting";
+    p.tick(true, S, T + 1600);
+    for (uint64_t t = T + 1700; t < T + 3700; ++t) {
+        p.tick(true, X, t);
+        if (p.key != S || p.changed) return "a change that was waiting before a hide was adopted early: its clock was not cleared";
+    }
+    p.tick(true, X, T + 3700);
+    if (p.key != X || p.changed != 1) return "the change after a hide and a show was not adopted at 2000 ms";
+    return nullptr;
+}
+
+}  // namespace warn_hold_test
 
 inline int flatEliteSettingsTests() {
     using namespace edvr;
@@ -211,10 +429,10 @@ inline int flatEliteSettingsTests() {
                "the warning key moves with the mode, the preset and the three fields");
     }
 
-    // ---- the HDR route is active (section 81): Bloom and Depth of field are not what a refusal is about -----------
-    // The route resolves before both, so their advice goes; the Anti-aliasing advice stays (the game's own AA after
-    // the tone double-filters, and a game TAA's jitter fights EDVR's). Every other word is unchanged, which the
-    // route-off rows above pin.
+    // ---- the route's key is auto (sections 81 and 83): Bloom and Depth of field are not what a refusal is about -----------
+    // The route resolves before both and the copy's admission by structure does not care about either, so their advice goes;
+    // the Anti-aliasing advice stays (a filter after the tone pass is what keeps a frame refused, and a game TAA's jitter
+    // fights EDVR's). Every other word is unchanged, which the key-off rows above pin.
     {
         EliteGraphics user1, user2, all, preset;
         for (EliteGraphics* g : {&user1, &user2, &all, &preset}) {
@@ -229,152 +447,250 @@ inline int flatEliteSettingsTests() {
         preset.custom = false; std::strcpy(preset.preset, "Ultra");
         const int wide = 100000;
         FlatSettingsWarning w;
-        auto hdrWords = [&](const char* mode, const EliteGraphics& g) {
-            flatComposeSettingsWarning(mode, g, wide, &elite_settings_test::ruler, nullptr, &w, true);
+        FlatWarningCause admission;
+        admission.structureAdmission = true;
+        auto admitWords = [&](const char* mode, const EliteGraphics& g) {
+            flatComposeSettingsWarning(mode, g, wide, &elite_settings_test::ruler, nullptr, &w, admission);
         };
-        hdrWords("DLSS", user1);
+        admitWords("DLSS", user1);
         expect(w.count == 2 && std::strcmp(w.line[1], "Turn off in Elite's graphics options: Anti-aliasing") == 0,
-               "HDR route active, user 1 (AA on): Anti-aliasing is still named");
-        hdrWords("DLAA", user2);
+               "key auto, user 1 (AA on): Anti-aliasing is still named");
+        admitWords("DLAA", user2);
         expect(w.count == 2 && std::strstr(w.line[1], "Bloom") == nullptr && std::strstr(w.line[1], "Depth of field") == nullptr &&
                std::strstr(w.line[1], "Please send your logs") != nullptr,
-               "HDR route active, user 2 (only bloom and DoF on): neither is named, the logs are asked for");
-        hdrWords("TAA", all);
+               "key auto, user 2 (only bloom and DoF on): neither is named, the logs are asked for");
+        admitWords("TAA", all);
         expect(w.count == 2 && std::strcmp(w.line[1], "Turn off in Elite's graphics options: Anti-aliasing") == 0,
-               "HDR route active, all three on: only Anti-aliasing is named");
-        hdrWords("DLSS", preset);
+               "key auto, all three on: only Anti-aliasing is named");
+        admitWords("DLSS", preset);
         expect(w.count == 2 && std::strstr(w.line[1], "Ultra graphics preset may turn on Anti-aliasing.") != nullptr &&
                std::strstr(w.line[1], "Bloom") == nullptr && std::strstr(w.line[1], "Depth of field") == nullptr,
-               "HDR route active, another preset: only Anti-aliasing is said to be turned on");
+               "key auto, another preset: only Anti-aliasing is said to be turned on");
         words("TAA", all, wide, &w);
         expect(w.count == 2 && std::strcmp(w.line[1], "Turn off in Elite's graphics options: Anti-aliasing, Bloom, Depth of field") == 0,
-               "HDR route not active: the words are exactly what they were (all three named)");
-        expect(flatSettingsWarningKey("DLSS", user1, false) != flatSettingsWarningKey("DLSS", user1, true) &&
-               flatSettingsWarningKey("DLSS", user1) == flatSettingsWarningKey("DLSS", user1, false),
-               "the warning key moves with the route, so the panel rebuilds when it flips");
+               "key off: the words are exactly what they were (all three named)");
+        FlatWarningCause none;
+        expect(flatSettingsWarningKey("DLSS", user1, none) != flatSettingsWarningKey("DLSS", user1, admission) &&
+               flatSettingsWarningKey("DLSS", user1) == flatSettingsWarningKey("DLSS", user1, none),
+               "the warning key moves with the key, so the panel rebuilds when it flips");
     }
 
-    // ---- supersampling below 1.0 (section 81): the warning's third paragraph ------------------------------------------
-    // Frames are refused, the route's key is auto, and the route leaves them to the copy route only because the game
-    // renders below the output (Elite's supersampling under 1.0): the warning says so after the advice it already gives,
-    // which stays. The measured render and output sizes decide it, never Elite's settings file, and every other
-    // combination leaves the words exactly as they were.
+    // ---- the render size (section 83): what the refusal is, in the user's terms ----------------------------------------
+    // The scene's size is not a uniform scale of the output between half and twice (Elite's resolution is not the screen's
+    // shape): the warning says "Elite renders 2176x1224 on a 2560x1600 screen" and what to set, and nothing about the post
+    // chain. EDVR's TAA above the output is the post-chain refusal's third paragraph. The runtime's measured sizes decide
+    // both, never Elite's settings file.
     {
-        EliteGraphics user1, user2, sean, all, preset;
-        for (EliteGraphics* g : {&user1, &user2, &sean, &all, &preset}) {
+        EliteGraphics rc5, sean, preset;
+        for (EliteGraphics* g : {&rc5, &sean, &preset}) {
             g->folderFound = g->presetKnown = g->custom = g->fileRead = true;
             std::strcpy(g->preset, "Custom");
             std::strcpy(g->file, "Custom.4.4.fxcfg");
         }
-        user1.aaMode = 4; user1.bloomQuality = 0; user1.dofEnabled = 0;
-        user2.aaMode = 0; user2.bloomQuality = 3; user2.dofEnabled = 2;
+        rc5.aaMode = 0; rc5.bloomQuality = 3; rc5.dofEnabled = 2;
         sean.aaMode = 0; sean.bloomQuality = 0; sean.dofEnabled = 0;
-        all.aaMode = 4; all.bloomQuality = 1; all.dofEnabled = 1;
         preset.aaMode = preset.bloomQuality = preset.dofEnabled = 0;
         preset.custom = false; std::strcpy(preset.preset, "Ultra");
         const int wide = 100000;
-        FlatSettingsWarning plain, with;
-        const std::string ssWords = kFlatSupersamplingWords;
-        expect(ssWords == "Supersampling is below 1.0. At 1.0 or above, EDVR anti-aliases before bloom and depth of field, so they "
-                        "no longer block it. Raising it costs GPU time.",
-               "the extra paragraph's words: supersampling, what 1.0 or above gives, what it costs");
+        FlatSettingsWarning w;
+        const EliteGraphics* users[] = {&rc5, &sean, &preset};
 
-        // The words: one paragraph after the advice, for every advice the warning gives.
-        bool after = true, unchanged = true;
-        const EliteGraphics* users[] = {&user1, &user2, &sean, &all, &preset};
+        // The rc.5 user's rig: Elite's resolution 2560x1440 on a 2560x1600 screen at supersampling 0.85, so R = 2176x1224.
+        FlatWarningCause shape = flatWarningCause(true, true, false, true, true, 2176, 1224, 2560, 1600);
+        expect(shape.renderSize && shape.structureAdmission && !shape.taaAbove && shape.renderW == 2176 && shape.outputH == 1600,
+               "a render-size refusal with measured sizes is a render-size cause");
         for (const EliteGraphics* g : users) {
-            flatComposeSettingsWarning("DLSS", *g, wide, &elite_settings_test::ruler, nullptr, &plain, false, false);
-            flatComposeSettingsWarning("DLSS", *g, wide, &elite_settings_test::ruler, nullptr, &with, false, true);
-            after = after && plain.count == 2 && with.count == 3 && ssWords == with.line[2];
-            unchanged = unchanged && std::strcmp(plain.line[0], with.line[0]) == 0 && std::strcmp(plain.line[1], with.line[1]) == 0;
+            flatComposeSettingsWarning("DLSS", *g, wide, &elite_settings_test::ruler, nullptr, &w, shape);
+            expect(w.count == 2 &&
+                   std::strcmp(w.line[0], "DLSS is not active: Elite renders 2176x1224 on a 2560x1600 screen.") == 0 &&
+                   std::strcmp(w.line[1], "Set Elite's resolution to your screen's, 2560x1600, and change the render size with its "
+                                          "supersampling.") == 0,
+                   "the shape is off: the render size, the screen's, and what to set; the same for every Elite setting");
         }
-        expect(after, "the supersampling paragraph is the third line after the two the warning always has");
-        expect(unchanged, "and the bloom, depth-of-field and game-AA advice before it is not touched by it");
-        flatComposeSettingsWarning("DLAA", user2, wide, &elite_settings_test::ruler, nullptr, &with, false, true);
-        expect(with.count == 3 && std::strcmp(with.line[1], "Turn off in Elite's graphics options: Bloom, Depth of field") == 0,
-               "user 2 (bloom and DoF on): both still named, then the supersampling words");
-        // The route being active is nothing for it to say: the route is treating the frames, so supersampling is not in the way.
-        flatComposeSettingsWarning("DLAA", user2, wide, &elite_settings_test::ruler, nullptr, &with, true, true);
-        expect(with.count == 2 && std::strstr(with.line[1], "Supersampling") == nullptr,
-               "with the route active the paragraph never appears, whatever the flag says");
-        // At the panel's width it wraps onto the card: every variant fits the lines (ten at worst, twelve allowed), each line fits the width, and
+        // The size is out of the half-to-twice band but the shape is right: say which way.
+        flatComposeSettingsWarning("DLSS", sean, wide, &elite_settings_test::ruler, nullptr, &w,
+                                   flatWarningCause(true, true, false, true, true, 1200, 750, 2560, 1600));
+        expect(w.count == 2 && std::strcmp(w.line[0], "DLSS is not active: Elite renders 1200x750 on a 2560x1600 screen.") == 0 &&
+               std::strcmp(w.line[1], "That is under half the screen's size. Raise Elite's supersampling.") == 0,
+               "uniform but under half the screen's size: raise the supersampling");
+        flatComposeSettingsWarning("TAA", sean, wide, &elite_settings_test::ruler, nullptr, &w,
+                                   flatWarningCause(true, true, false, true, true, 5760, 3600, 2560, 1600));
+        expect(w.count == 2 && std::strcmp(w.line[0], "TAA is not active: Elite renders 5760x3600 on a 2560x1600 screen.") == 0 &&
+               std::strcmp(w.line[1], "That is over twice the screen's size. Lower Elite's supersampling.") == 0,
+               "uniform but over twice the screen's size: lower the supersampling");
+        // Sizes unknown (nothing measured yet): the refusal is not called a render-size one, the words are the post chain's.
+        const FlatWarningCause unknownSizes = flatWarningCause(true, true, false, true, false, 0, 0, 0, 0);
+        expect(!unknownSizes.renderSize, "a render-size reason without measured sizes says nothing about sizes");
+
+        // EDVR's TAA above the output: a third paragraph after the two the post-chain warning always has.
+        const FlatWarningCause taa = flatWarningCause(true, true, true, false, true, 3840, 2160, 2560, 1440);
+        expect(taa.taaAbove && !taa.renderSize && taa.structureAdmission, "TAA above the output with the key auto is a TAA cause");
+        flatComposeSettingsWarning("TAA", sean, wide, &elite_settings_test::ruler, nullptr, &w, taa);
+        expect(w.count == 3 && std::strcmp(w.line[2], kFlatTaaAboveWords) == 0 &&
+               std::strcmp(w.line[0], "TAA is not active: Elite's post-processing is not recognised.") == 0,
+               "the TAA paragraph is the third line, after the post chain's two");
+        expect(std::string(kFlatTaaAboveWords) == "Above 1.0 supersampling, EDVR's TAA works only on a post chain it knows. Set "
+                                                  "Elite's supersampling to 1.0 or lower, or choose DLSS or FSR.",
+               "the TAA paragraph's words");
+        // Only with the key auto (the structure is what DLSS and FSR do not depend on), never alongside a render-size refusal, never
+        // for another mode's label (the runtime publishes the mode), never when frames are not refused.
+        expect(!flatWarningCause(true, false, true, false, true, 3840, 2160, 2560, 1440).taaAbove &&
+               !flatWarningCause(true, true, true, true, true, 3840, 2160, 2560, 1440).taaAbove &&
+               !flatWarningCause(false, true, true, false, true, 3840, 2160, 2560, 1440).taaAbove &&
+               !flatWarningCause(true, true, false, false, true, 3840, 2160, 2560, 1440).taaAbove,
+               "the TAA paragraph needs key auto, a post-chain refusal, TAA above the output and measured sizes");
+        expect(!flatWarningCause(false, true, true, true, true, 2176, 1224, 2560, 1600).renderSize &&
+               !flatWarningCause(false, true, true, true, true, 2176, 1224, 2560, 1600).structureAdmission,
+               "frames not refused: no condition holds, whatever the runtime published");
+
+        // At the panel's width it wraps onto the card: every variant fits the lines it has (twelve allowed), each line fits the width, and
         // the flat page's three rows and a blank line still leave the card room (menu.cpp static_asserts the same sum).
         bool fits = true;
-        for (const EliteGraphics* g : users) {
-            flatComposeSettingsWarning("TAA", *g, elite_settings_test::kPanelWidthPx, &elite_settings_test::ruler, nullptr, &with, false, true);
-            fits = fits && with.count >= 4 && with.count <= 10 && with.count <= FlatSettingsWarning::kMaxLines;
-            for (int i = 0; i < with.count; ++i)
-                if (elite_settings_test::ruler(with.line[i], nullptr) > elite_settings_test::kPanelWidthPx) fits = false;
-            std::string joined;
-            for (int i = 0; i < with.count; ++i) joined += (i ? " " : "") + std::string(with.line[i]);
-            fits = fits && joined.find(ssWords) != std::string::npos;   // the wrapped lines read as the words, none dropped
-        }
-        expect(fits, "wrapped to the panel's width every variant fits the lines it has, and the paragraph is whole");
+        const FlatWarningCause causes[] = {shape, taa, flatWarningCause(true, true, false, true, true, 1200, 750, 2560, 1600),
+                                           flatWarningCause(true, false, false, false, true, 0, 0, 0, 0)};
+        for (const EliteGraphics* g : users)
+            for (const FlatWarningCause& c : causes) {
+                flatComposeSettingsWarning("TAA", *g, elite_settings_test::kPanelWidthPx, &elite_settings_test::ruler, nullptr, &w, c);
+                fits = fits && w.count >= 2 && w.count <= FlatSettingsWarning::kMaxLines;
+                for (int i = 0; i < w.count; ++i)
+                    if (elite_settings_test::ruler(w.line[i], nullptr) > elite_settings_test::kPanelWidthPx) fits = false;
+            }
+        expect(fits, "wrapped to the panel's width every variant fits the lines it has");
         expect(3 + 1 + FlatSettingsWarning::kMaxLines <= 16, "the flat page's rows, a blank line and a full warning fit the card's 16 lines");
 
-        // The key moves with the paragraph, so the panel and the log update live when supersampling crosses 1.0; with the
-        // route active the flag changes nothing (there is no paragraph to add).
-        expect(flatSettingsWarningKey("DLSS", user2, false, true) != flatSettingsWarningKey("DLSS", user2, false, false) &&
-               flatSettingsWarningKey("DLSS", user2, true, true) == flatSettingsWarningKey("DLSS", user2, true, false) &&
-               flatSettingsWarningKey("DLSS", user2, false, false) == flatSettingsWarningKey("DLSS", user2) &&
-               flatSettingsWarningKey("DLSS", user2, false, true) != flatSettingsWarningKey("DLSS", user2, true, false),
-               "the warning key moves with the supersampling paragraph and with nothing else it does not show");
+        // The key moves with every condition and with the sizes the words name, so the panel and the log update live as Elite's
+        // resolution or supersampling changes; with no cause it is what it was.
+        expect(flatSettingsWarningKey("DLSS", sean, shape) != flatSettingsWarningKey("DLSS", sean, FlatWarningCause{}) &&
+               flatSettingsWarningKey("DLSS", sean, shape) !=
+                   flatSettingsWarningKey("DLSS", sean, flatWarningCause(true, true, false, true, true, 2176, 1224, 2560, 1440)) &&
+               flatSettingsWarningKey("DLSS", sean, taa) != flatSettingsWarningKey("DLSS", sean, FlatWarningCause{true, false, false}) &&
+               flatSettingsWarningKey("DLSS", sean, FlatWarningCause{true, false, false, 3840, 2160, 2560, 1440}) ==
+                   flatSettingsWarningKey("DLSS", sean, FlatWarningCause{true, false, false}),
+               "the warning key moves with the sizes the words name and with nothing else it does not show");
 
-        // The whole truth table, from what the runtime measures and publishes to the words: key x sizes x refusing x route.
-        // The paragraph appears for exactly one row family: refused, key auto, route not treating, R below D.
-        struct Size { uint32_t rw, rh; const char* name; };
-        const Size sizes[] = {{3072, 1728, "R < D"}, {3840, 2160, "R = D"}, {4800, 2700, "R > D"}};
-        bool table = true;
-        int shown = 0;
-        for (const FlatHdrKey key : {FlatHdrKey::Off, FlatHdrKey::Auto})
-            for (const Size& size : sizes)
-                for (int refusing = 0; refusing < 2; ++refusing)
-                    for (int route = 0; route < 2; ++route) {
-                        const bool published = flatHdrSupersamplingAdvice(key, route != 0, size.rw, size.rh, 3840, 2160);
-                        const FlatWarningFlags f = flatWarningFlags(refusing != 0, route != 0, published);
-                        bool present = false;
-                        if (f.refusing) {   // the panel composes nothing when frames are not refused
-                            flatComposeSettingsWarning("DLSS", user2, wide, &elite_settings_test::ruler, nullptr, &with,
-                                                       f.hdrRoute, f.supersamplingBelowOne);
-                            present = with.count == 3 && ssWords == with.line[2];
-                        }
-                        const bool want = refusing != 0 && key == FlatHdrKey::Auto && route == 0 && size.rw < 3840;
-                        if (present != want || f.supersamplingBelowOne != (want && f.refusing)) table = false;
-                        if (present) ++shown;
-                    }
-        expect(table && shown == 1,
-               "present for refused + R < D + key auto and nowhere else: not with the key off, at R = D or above, with the "
-               "route treating, or when frames are not refused");
-
-        // The log line carries every paragraph the panel does, names the measured sizes with the extra one, and is
-        // otherwise exactly what it was.
+        // The log line carries every paragraph the panel does (joined, so a list with no final period does not run into the next),
+        // names the measured sizes where the words do, and is otherwise exactly what it was.
         char line[900];
         FlatSettingsWarning logged;
-        const FlatWarningFlags on = flatWarningFlags(true, false, true);
-        flatComposeSettingsWarning("DLSS", user2, 0, nullptr, nullptr, &logged, on.hdrRoute, on.supersamplingBelowOne);
-        flatFormatSettingsWarningLog(line, sizeof(line), false, "DLSS", "no-known-tone-pass", true, on, 3072, 1728, 3840, 2160, logged);
-        const std::string onText = line;
-        expect(onText == "flat settings warning: shown (mode=DLSS, frames refused for no-known-tone-pass, work stood down, "
-                         "supersampling below 1.0 (render 3072x1728, output 3840x2160)): DLSS is not active: Elite's "
-                         "post-processing is not recognised. Turn off in Elite's graphics options: Bloom, Depth of field " +
-                             ssWords,
-               "the log line for a refused frame below the output: the conditions, the sizes, all three paragraphs");
-        const FlatWarningFlags off = flatWarningFlags(true, false, false);
-        flatComposeSettingsWarning("DLSS", user2, 0, nullptr, nullptr, &logged, off.hdrRoute, off.supersamplingBelowOne);
-        flatFormatSettingsWarningLog(line, sizeof(line), true, "DLSS", "no-known-tone-pass", true, off, 0, 0, 0, 0, logged);
+        flatComposeSettingsWarning("DLSS", rc5, 0, nullptr, nullptr, &logged, shape);
+        flatFormatSettingsWarningLog(line, sizeof(line), false, "DLSS", "render-size-does-not-fit-output", true, shape, logged);
+        expect(std::string(line) == "flat settings warning: shown (mode=DLSS, frames refused for render-size-does-not-fit-output, work "
+                                    "stood down, structure admission on, render 2176x1224 on output 2560x1600): DLSS is not active: "
+                                    "Elite renders 2176x1224 on a 2560x1600 screen. | Set Elite's resolution to your screen's, "
+                                    "2560x1600, and change the render size with its supersampling.",
+               "the log line for a render-size refusal: the conditions, the sizes, both paragraphs");
+        flatComposeSettingsWarning("TAA", rc5, 0, nullptr, nullptr, &logged, taa);
+        flatFormatSettingsWarningLog(line, sizeof(line), true, "TAA", "no-known-tone-pass", true, taa, logged);
+        expect(std::string(line) == "flat settings warning: changed (mode=TAA, frames refused for no-known-tone-pass, work stood down, "
+                                    "structure admission on, TAA above the output (render 3840x2160, output 2560x1440)): TAA is not "
+                                    "active: Elite's post-processing is not recognised. | Please send your logs (F10 in the cockpit, "
+                                    "then the installer's log bundle). | " + std::string(kFlatTaaAboveWords),
+               "the log line for TAA above the output: the conditions, the sizes, all three paragraphs");
+        FlatWarningCause off;
+        flatComposeSettingsWarning("DLSS", rc5, 0, nullptr, nullptr, &logged, off);
+        flatFormatSettingsWarningLog(line, sizeof(line), true, "DLSS", "no-known-tone-pass", true, off, logged);
         expect(std::string(line) == "flat settings warning: changed (mode=DLSS, frames refused for no-known-tone-pass, work stood "
-                                    "down): DLSS is not active: Elite's post-processing is not recognised. Turn off in Elite's "
+                                    "down): DLSS is not active: Elite's post-processing is not recognised. | Turn off in Elite's "
                                     "graphics options: Bloom, Depth of field",
-               "without the paragraph the log line is what it always was");
-        const FlatWarningFlags routeOn = flatWarningFlags(true, true, true);
-        flatComposeSettingsWarning("DLSS", user1, 0, nullptr, nullptr, &logged, routeOn.hdrRoute, routeOn.supersamplingBelowOne);
-        flatFormatSettingsWarningLog(line, sizeof(line), false, "DLSS", "no-hdr-consumer", false, routeOn, 3072, 1728, 3840, 2160, logged);
-        expect(std::string(line).find("HDR route active") != std::string::npos &&
-                   std::string(line).find("supersampling") == std::string::npos &&
-                   std::string(line).find("Supersampling") == std::string::npos,
-               "with the route active the log line says so and names no supersampling");
-        expect(!flatWarningFlags(false, false, true).supersamplingBelowOne && !flatWarningFlags(false, true, true).hdrRoute,
-               "frames not refused: no condition holds, whatever the runtime published");
+               "with the key off the log line is what it always was, but for the separator between paragraphs");
+    }
+
+    // ---- the hold on a changed cause (FlatWarnHold) ------------------------------------------------------------------------
+    // The flat F8 warning flipped five times in nine seconds in the flight of 2026-10-01 (10:38:16.516 to 10:38:25.594): the computed
+    // cause moved between "Elite renders 1440x810 on a 3840x2160 screen" and a loading screen's 256x256 at the stand-down's probe
+    // frames, one probe interval (1521 ms, 1509 ms) apart. A cause that differs from the one on show is adopted only after it has
+    // been the computed one on every tick for 2000 ms; a show and a hide stay immediate. The replay is the log's own sequence at
+    // the log's own stamps. Each scenario below passes the real helper and fails the controls that break the rule it pins.
+    {
+        using namespace warn_hold_test;
+        EliteGraphics sean;
+        sean.folderFound = sean.presetKnown = sean.custom = sean.fileRead = true;
+        std::strcpy(sean.preset, "Custom");
+        std::strcpy(sean.file, "Custom.4.4.fxcfg");
+        sean.aaMode = 0; sean.bloomQuality = 0; sean.dofEnabled = 0;
+        // The keys are the panel's own: the cause the runtime publishes for a render-size refusal (route's key auto), DLSS selected.
+        auto keyOf = [&](uint32_t w, uint32_t h) {
+            return flatSettingsWarningKey("DLSS", sean, flatWarningCause(true, true, false, true, true, w, h, 3840, 2160));
+        };
+        const std::string k1440 = keyOf(1440, 810), k256 = keyOf(256, 256), k1024 = keyOf(1024, 576);
+        expect(k1440 != k256 && k256 != k1024 && k1440 != k1024, "the three causes the hold is driven with are three different keys");
+        expect(kFlatWarnHoldMs == 2000 && kFlatWarnHoldMs > kFlatStandDownProbeMs && kFlatWarnHoldMs < 2 * kFlatStandDownProbeMs,
+               "the hold is 2000 ms: more than one stand-down probe interval (a transient is one), under two (a second probe confirms)");
+        auto passes = [&](const char* failed, const char* what) {
+            expect(failed == nullptr, (std::string(what) + (failed ? std::string(" -- ") + failed : std::string())).c_str());
+        };
+        auto catches = [&](const char* failed, const char* what) {
+            expect(failed != nullptr, (std::string("(control) ") + what).c_str());
+        };
+        const auto clean = [](const Replay& r) { return r.shown == 1 && r.changed == 0 && r.hidden == 1 && r.stayed; };
+
+        // (a) The replay: zero adoptions, whatever the frame time, and the key on show never leaves 1440x810.
+        for (const uint64_t step : {1ull, 7ull, 16ull, 33ull}) {
+            const Replay r = replayFlight<ProductionHold>(k1440, k256, step);
+            const std::string at = " (ticks every " + std::to_string(step) + " ms)";
+            expect(clean(r), ("the flight replayed: shown once, zero changes, the key on show never leaves 1440x810, hidden once" + at).c_str());
+            expect(r.held == 2, ("the flight replayed: a hold begins at each 256x256 the probes saw, and no other" + at).c_str());
+        }
+        // The controls. With no hold the replay IS the log: one shown, the four changes at the log's own stamps, one hidden. A hold of
+        // 0 ms or of one probe interval lets the real transients through, so the replay discriminates the 2000 ms.
+        const Replay none = replayFlight<WaitHold<0>>(k1440, k256, 1);
+        expect(none.shown == 1 && none.hidden == 1 && none.changed == 4 && !none.stayed &&
+                   none.changedAt == std::vector<uint64_t>({kLow1, kUp1, kLow2, kUp2}),
+               "(control) with no hold the replay reproduces the log: one shown, four changes at 19.529, 21.050, 24.085 and 25.594, one hidden");
+        const Replay probe = replayFlight<WaitHold<1500>>(k1440, k256, 1);
+        expect(!clean(probe) && probe.changed == 4, "(control) a hold of 1500 ms, one probe interval, lets both transients through");
+        expect(!clean(replayFlight<DefectiveHold<Defect::StaleAfterReturn>>(k1440, k256, 1)),
+               "(control) a wait left standing when the cause returns is adopted by the next transient: the flight catches it");
+        expect(!clean(replayFlight<DefectiveHold<Defect::ShowAndHideHeld>>(k1440, k256, 1)),
+               "(control) a hold that also delays the hide is caught by the flight");
+
+        // (b) A change that persists is adopted at 2000 ms, not before; the controls that move the wait are caught.
+        passes(persists<ProductionHold>(k1440, k256), "a change that persists 1999 ms holds and at 2000 ms is adopted");
+        catches(persists<WaitHold<0>>(k1440, k256), "no hold at all is caught: 1999 ms must hold");
+        catches(persists<WaitHold<1500>>(k1440, k256), "a hold of 1500 ms is caught: 1999 ms must hold");
+        catches(persists<WaitHold<1999>>(k1440, k256), "a hold of 1999 ms is caught: 1999 ms must hold");
+        catches(persists<WaitHold<2001>>(k1440, k256), "a hold of 2001 ms is caught: 2000 ms must adopt");
+        catches(persists<WaitHold<UINT64_MAX>>(k1440, k256), "a hold that never expires is caught: 2000 ms must adopt");
+        // (c) A change that flips back before 2000 ms is dropped; the next flip starts a new clock.
+        passes(flipBack<ProductionHold>(k1440, k256), "a change that returns to the one on show before 2000 ms is dropped and the next flip restarts the clock");
+        catches(flipBack<DefectiveHold<Defect::StaleAfterReturn>>(k1440, k256), "a wait left standing when the cause returns is caught");
+        catches(flipBack<WaitHold<1500>>(k1440, k256), "a hold of 1500 ms is caught by the restarted clock");
+        // (d) A third cause restarts the clock.
+        passes(thirdKey<ProductionHold>(k1440, k256, k1024), "a third cause starts its own 2000 ms from the tick it appears, and the second is never adopted");
+        catches(thirdKey<DefectiveHold<Defect::ThirdKeyKeepsClock>>(k1440, k256, k1024), "a third cause that inherits the second's clock is caught");
+        // (e) Show and hide are immediate and clear a waiting change.
+        passes(showHide<ProductionHold>(k1440, k256), "a show and a hide are immediate and a hide clears the waiting change");
+        catches(showHide<DefectiveHold<Defect::ShowAndHideHeld>>(k1440, k256), "a show or a hide that waits is caught");
+        catches(showHide<DefectiveHold<Defect::ShowAndHideKeepPending>>(k1440, k256), "a hide that leaves a change waiting is caught");
+
+        // The held line (menu.cpp says it once when a hold begins): what is on show and what is waiting, in the sizes the key carries.
+        // It never begins with shown, changed or hidden, the three words tools\edvr_log.py's F8 reader parses after the prefix.
+        const FlatWarningCause c1440 = flatWarningCause(true, true, false, true, true, 1440, 810, 3840, 2160);
+        const FlatWarningCause c256 = flatWarningCause(true, true, false, true, true, 256, 256, 3840, 2160);
+        const FlatWarningCause taa = flatWarningCause(true, true, true, false, true, 3840, 2160, 2560, 1440);
+        const FlatWarningCause chain = flatWarningCause(true, true, false, false, true, 0, 0, 0, 0);
+        char held[360];   // menu.cpp's buffer for it
+        const int n = flatFormatWarnHeldLog(held, sizeof(held), c1440, c256);
+        expect(n > 0 && std::string(held) ==
+                   "flat settings warning: a change of cause is held for 2000 ms before it replaces the one on show (on show: render "
+                   "1440x810 on output 3840x2160; computed now: render 256x256 on output 3840x2160)",
+               "the held line names the cause on show and the one waiting, with the sizes the key carries");
+        const std::string heldLine(held);
+        const char* parsed[] = {"flat settings warning: shown", "flat settings warning: changed", "flat settings warning: hidden"};
+        bool clear = true;
+        for (const char* prefix : parsed) clear = clear && heldLine.rfind(prefix, 0) != 0;
+        expect(clear && heldLine.rfind("flat settings warning: ", 0) == 0,
+               "the held line is a flat settings warning line that is none of shown, changed or hidden: the log's reader does not count it");
+        expect(flatFormatWarnHeldLog(held, sizeof(held), c1440, taa) > 0 &&
+                   std::string(held).find("(on show: render 1440x810 on output 3840x2160; computed now: TAA above the output, render "
+                                          "3840x2160 on output 2560x1440)") != std::string::npos,
+               "the held line names a TAA-above-the-output cause by its sizes");
+        expect(flatFormatWarnHeldLog(held, sizeof(held), chain, chain) > 0 &&
+                   std::string(held).find("(on show: the post chain, no sizes; computed now: the post chain, no sizes; the mode, an "
+                                          "Elite setting or the route's key differs)") != std::string::npos,
+               "when the sizes read the same the held line says the mode, a setting or the key is what moved");
+        const int longest = flatFormatWarnHeldLog(held, sizeof(held), taa, taa);
+        expect(longest > 0 && longest < static_cast<int>(sizeof(held)), "the longest held line fits menu.cpp's buffer untruncated");
     }
 
     // ---- real files ------------------------------------------------------------------------

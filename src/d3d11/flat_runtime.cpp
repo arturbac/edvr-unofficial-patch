@@ -1,6 +1,9 @@
 #include "flat_runtime.h"
 #include "flat_runtime_model.h"
 #include "flat_hdr_route.h"
+#include "flat_copy_structure.h"
+#include "flat_hdr_crumbs.h"
+#include "flat_context_isolation.h"
 #include "flat_mono_resolve.h"
 #include "flat_projection_recipes.h"
 #include "flat_shader_classifier.h"
@@ -246,12 +249,22 @@ struct State {
     bool hdrKeyRead = false;
     FlatHdrFrame hdr{};              // this frame's detector state, reset at the Present that starts the frame
     FlatHdrWindow hdrWindow{};       // the 5 s window of the census token
+    FlatHdrSteps hdrStepsSeen{};     // the resolver's cumulative step counts at the last window (the window prints the difference)
     FlatHdrLatch hdrLatch{};         // three treated frames with late writes turn the route off until the key flips
     FlatMonoFrame hdrSelected{};     // the selection at this frame's trigger (kept here: the draw scope is built per draw)
     bool hdrTreated = false;         // this frame's treatment was the route's: the copy stage must not treat it again
-    bool hdrEligible = false;        // the route applies to this session's frames (published with the refusal, for F8)
     bool hdrFirstTriggerLogged = false, hdrLateLogged = false;
     uint32_t hdrFlightLines = 0;     // bounded per-session log lines about the route's own decisions
+
+    // --- The final copy's admission by structure (flat_copy_structure.h, design section 83) ------------------------
+    // Where the whitelist refuses a copy for its tone pass and the HDR route does not serve the frame (R < D, EDVR's TAA
+    // above D, a latched route), the copy is admitted by what it is. Active with the route's key auto; with it off the
+    // copy route is the whitelist alone, as before, and the admission only names what it sees (no scene, a render size
+    // that does not fit). Nothing here touches a D3D object.
+    FlatCopyWindow copyWindow{};     // the 5 s window of the census line
+    bool copyFirstLogged = false;    // the once-a-session first admission line
+    uint32_t copyDeclineLines = 0;   // bounded per-session decline lines, each cause once
+    const char* copyDeclineSeen[12]{};
 
     // --- CPU and GPU census (flat_cpu.h) ------------------------------------------
     // What EDVR's own flat work costs, by family, printed every 5 s while a temporal
@@ -267,6 +280,8 @@ struct State {
     int gpuFrameOpen = -1, gpuResolveOpen = -1;   // the timer holding this frame's open span
     bool gpuFrameTried = false;                   // this frame already tried to open its span
     bool censusHooked = false;                    // the resolver's span hooks are installed
+    bool isolationRead = false;                   // advanced.flat_context_isolation is handed to the resolver (once, before its first call)
+    bool crumbGateRead = false;                   // the HDR route's breadcrumbs gate has been set from the DXMT markers (once, first)
 };
 // Driver objects retire on the owner Present; never release under loader lock.
 State& state() { static State* p = new State; return *p; }
@@ -1358,7 +1373,17 @@ bool depthView(ID3D11Texture2D* depth) {
     v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; v.Texture2D.MipLevels = 1;
     v.Format = static_cast<DXGI_FORMAT>(flatRuntimeDepthReadFormat(d.Format));
     if (v.Format == DXGI_FORMAT_UNKNOWN) return false;
-    if (d.SampleDesc.Count != 1 || !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE) || FAILED(s.device->CreateShaderResourceView(depth, &v, &s.depthView))) return false;
+    if (d.SampleDesc.Count != 1 || !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) return false;
+    // The flat HDR route's crumbs (flat_hdr_crumbs.h) name the one resource the runtime itself makes for the treatment,
+    // the first time: the shader view over the scene depth, with its format, size and result.
+    HRESULT hr;
+    {
+        HdrCrumbSpan span(hdrCrumbLive(), "create-depth-srv", "fmt=%s(%u) size=%ux%u", hdrCrumbFormat(static_cast<uint32_t>(v.Format)),
+                          static_cast<unsigned>(v.Format), d.Width, d.Height);
+        hr = s.device->CreateShaderResourceView(depth, &v, &s.depthView);
+        span.result("hr=0x%08X", static_cast<unsigned>(hr));
+    }
+    if (FAILED(hr)) return false;
     s.sceneDepth = depth; return true;
 }
 
@@ -1438,21 +1463,26 @@ void resolveSpanEnd(ID3D11DeviceContext* ctx) noexcept {
 // (flat_standdown.h, warningActive) --, bit 1 the work is stood down (always with bit 0
 // now), bits 8..15 the stand-down's current reason.
 std::atomic<uint32_t> g_refusalPublished{0};
+// The scene's and the output's sizes as the copy stage last saw them (the admission's scene facts, section 83), in one
+// word, 16 bits each (flatHdrPackSizes), refreshed at every final copy that has a scene; 0 when no frame has shown one
+// since a resize (the swap chain or device went) last cleared it. Written on the draw thread, read by the panel thread
+// (flatRuntimeSceneSizes): the F8 words name the render size when it does not fit the output, and EDVR's TAA above it.
+std::atomic<uint64_t> g_sceneSizes{0};
 void publishRefusal(const State& s, bool warn) {
     uint32_t v = 0;
-    // Bit 2 (value 4): the HDR route is what treats this session's frames, so the F8 words drop the Bloom and Depth
-    // of field advice (flatRuntimeHdrRouteActive).
-    if (warn && s.standDown.warningActive())
-        v = 1u | (s.standDown.standing ? 2u : 0u) | (s.hdrEligible ? 4u : 0u) |
+    // Bit 2 (value 4): the route's key is auto, so the copy is admitted by structure and Bloom and Depth of field never
+    // cause a refusal: the F8 words drop that advice (flatRuntimeStructureAdmission). Bit 3 (value 8): EDVR's TAA with the
+    // scene rendering above the output, where neither route resolves a chain the whitelist does not know (the HDR route
+    // evaluates at R, the display-grid TAA at D): the F8 words say so (flatRuntimeTaaAboveOutput).
+    if (warn && s.standDown.warningActive()) {
+        uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
+        const bool known = flatHdrUnpackSizes(g_sceneSizes.load(std::memory_order_acquire), &rw, &rh, &ow, &oh);
+        const bool taaAbove = known && s.engine == FlatMonoResolveMode::Taa && rw > ow && rh > oh;
+        v = 1u | (s.standDown.standing ? 2u : 0u) | (s.hdrKey == FlatHdrKey::Auto ? 4u : 0u) | (taaAbove ? 8u : 0u) |
             (static_cast<uint32_t>(s.standDown.reason()) << 8);
+    }
     g_refusalPublished.store(v, std::memory_order_release);
 }
-// The F8 warning's supersampling line (design section 81): with the route's key auto, the route's last selection found
-// the game rendering below the output on both axes (Elite's supersampling under 1.0), so it leaves the frames to the
-// copy route. The four measured sizes (render width and height, output width and height) in one word, 16 bits each
-// (flatHdrPackSizes); 0 when that is not the case, which is also what the key off, a selection at R >= D and a resize
-// publish. Written on the draw thread, read by the panel thread (flatRuntimeHdrRouteBelowOutput).
-std::atomic<uint64_t> g_hdrBelowOutput{0};
 
 // --- Stand-down: what each mode does (flat_standdown.h) --------------------------
 // The one place the pieces are paused and resumed, called at every Present with the
@@ -1522,15 +1552,24 @@ void standDownFrame(State& s, uint64_t frame) {
     s.frameSeen = FlatFrameSeen::None;
     s.frameReason = FlatMonoReason::NoOutputCopy;
     const FlatStandDownEvent event = s.standDown.frameEnded(seen, reason, watched, now);
-    char text[1200];
+    char text[1200], sizes[160];
+    // The render size's own words (section 83) ride the lines that name render-size-does-not-fit-output: the sizes the copy stage
+    // last measured, "Elite renders 2176x1224 on a 2560x1600 screen". Null for a session with none, and the lines are then what
+    // they always were.
+    uint32_t rw = 0, rh = 0, ow = 0, oh = 0;
+    const char* renderSize = nullptr;
+    if (flatHdrUnpackSizes(g_sceneSizes.load(std::memory_order_acquire), &rw, &rh, &ow, &oh)) {
+        flatRenderSizeWords(sizes, sizeof(sizes), rw, rh, ow, oh);
+        renderSize = sizes;
+    }
     if (event == FlatStandDownEvent::Entered) {
-        flatStandDownFormatEntered(text, sizeof(text), frame, s.standDown);
+        flatStandDownFormatEntered(text, sizeof(text), frame, s.standDown, renderSize);
         Log::get().note("%s", text);
     } else if (event == FlatStandDownEvent::Resumed) {
         flatStandDownFormatResumed(text, sizeof(text), frame, s.standDown, nullptr);
         Log::get().note("%s", text);
     } else if (s.standDown.reportDue(now)) {
-        flatStandDownFormatStill(text, sizeof(text), frame, s.standDown, now);
+        flatStandDownFormatStill(text, sizeof(text), frame, s.standDown, now, renderSize);
         Log::get().note("%s", text);
     }
     applyWork(s, s.standDown.nextFrame(now));
@@ -1545,12 +1584,14 @@ bool flatRuntimeStructuralRefusal(const char** reasonName, bool* standingDown) {
     if (standingDown) *standingDown = (v & 2u) != 0;
     return true;
 }
-bool flatRuntimeHdrRouteActive() {
+bool flatRuntimeStructureAdmission() {
     return (g_refusalPublished.load(std::memory_order_acquire) & 5u) == 5u;
 }
-bool flatRuntimeHdrRouteBelowOutput(uint32_t* renderWidth, uint32_t* renderHeight, uint32_t* outputWidth,
-                                    uint32_t* outputHeight) {
-    return flatHdrUnpackSizes(g_hdrBelowOutput.load(std::memory_order_acquire), renderWidth, renderHeight, outputWidth,
+bool flatRuntimeTaaAboveOutput() {
+    return (g_refusalPublished.load(std::memory_order_acquire) & 9u) == 9u;
+}
+bool flatRuntimeSceneSizes(uint32_t* renderWidth, uint32_t* renderHeight, uint32_t* outputWidth, uint32_t* outputHeight) {
+    return flatHdrUnpackSizes(g_sceneSizes.load(std::memory_order_acquire), renderWidth, renderHeight, outputWidth,
                               outputHeight);
 }
 
@@ -1583,12 +1624,15 @@ void flatRuntimeResize() {
     s.observing = false; s.covFrameLocallyRefused = false;
     // The HDR route's per-frame detector state names resources of the old device; the key, the latch and the
     // census window are the session's and stay.
-    flatHdrBeginFrame(s.hdr, 0, 0); s.hdrTreated = false; s.hdrEligible = false;
-    g_hdrBelowOutput.store(0, std::memory_order_release);
+    flatHdrBeginFrame(s.hdr, 0, 0); s.hdrTreated = false;
+    g_sceneSizes.store(0, std::memory_order_release);
     s.prefix = FlatRuntimePrefix{}; s.context.Reset(); s.device.Reset(); s.thread = 0; s.viewportCount = 0;
 }
 void flatRuntimeBeforePresent() {
     g_flatRuntimeLive.store(false, std::memory_order_release);
+    // The flat HDR route's crash-safe breadcrumbs (flat_hdr_crumbs.h): engine motion's state going back and the census span
+    // closing are the last work before the real Present, for a frame the resolver has had.
+    HdrCrumbSpan routeBeforePresent(hdrCrumbPresentSide(), "before-present");
     // The frame is ending: the game's state goes back where engine motion's is still bound, before the real Present
     // and every EDVR pass that follows it (the lazy form, engine_velocity.h).
     if (owner()) flatRuntimeSubstitution(state().context.Get(), FlatSubstEvent::kPresent);
@@ -1661,21 +1705,35 @@ void flatTraceDumpToLogDir(State& s, uint64_t frame) {
 // route flew, design section 81, and the shipped edvr.ini says the same: config_test holds the two to one answer).
 // A change wakes the stand-down (a user who sets it to auto to escape a refusal gets the route at once), rearms the
 // latch when it goes off, and starts history afresh: the backends' feature keys carry the route, so the next frame
-// remakes what it needs. The F8 supersampling line is the key's too: it goes with the key off and comes back from the
-// next selection with it auto.
+// remakes what it needs. The key is also the final copy's admission by structure (section 83): auto admits a copy the
+// whitelist refused for its tone pass wherever the route does not serve the frame (render below the output, EDVR's TAA
+// above it); off is the whitelist alone, as before the route existed.
 static void hdrReadKey(State& s, uint64_t frame) {
     const FlatHdrKey key = flatHdrKeyFromText(Config::get().getString("experimental.temporal_aa_before_post", "auto").c_str());
     if (s.hdrKeyRead && key == s.hdrKey) return;
     const bool first = !s.hdrKeyRead;
     s.hdrKey = key; s.hdrKeyRead = true;
-    g_hdrBelowOutput.store(0, std::memory_order_release);
-    if (key == FlatHdrKey::Off) { s.hdrLatch.reset(); s.hdrEligible = false; }
+    if (key == FlatHdrKey::Off) s.hdrLatch.reset();
+    // The crash-safe trail's first line (flat_hdr_crumbs.h): proof, in edvr_breadcrumbs.txt itself, that this build has the
+    // crumbs and that the route is on, so a trail without an "admitted" after it is a session that ended before the route
+    // took a frame, and a file without it came from a build that has none or from a device that is not DXMT's (the gate: this
+    // writes nothing, and the log says nothing, off DXMT). The log says so too, for whoever reads it first.
+    if (key == FlatHdrKey::Auto && hdrCrumbArmed(flatHdrKeyName(key)))
+        Log::get().note("flat hdr route: crash-safe trail on: edvr_breadcrumbs.txt gets a line before and after every step of the first "
+                        "%u frames that reach the resolver, at most %u lines a session; if the process ends inside the treatment, the last "
+                        "'gfx: hdr-treat' line there names the step",
+            static_cast<unsigned>(kHdrCrumbFrames), static_cast<unsigned>(kHdrCrumbCap));
     Log::get().note("flat hdr route: experimental.temporal_aa_before_post=%s%s at frame=%llu: %s",
         flatHdrKeyName(key), first ? " (read at startup)" : " (changed)", static_cast<unsigned long long>(frame),
         key == FlatHdrKey::Auto
             ? "the route resolves the game's HDR scene target before its bloom, depth of field and tone where the "
-              "render size is at least the output's and the target is R11G11B10F; every other frame keeps the copy route"
-            : "the trigger detector only observes (a census line every 5 s); the copy route treats every frame as before");
+              "render size is at least the output's and the target is R11G11B10F; every other frame keeps the copy route, "
+              "which admits the game's final copy by its structure (an R-sized R8G8B8A8 image made after the scene HDR's "
+              "first consumer, uniformly scaled to the output) when no whitelisted tone pass wrote it, so bloom, depth of "
+              "field and the tone variant do not matter below the output either"
+            : "the trigger detector only observes (a census line every 5 s); the copy route treats every frame as before, "
+              "by the whitelist alone (a frame with no scene, or a render size that does not fit the output, is still named "
+              "as such)");
     if (!first) {
         endStandDown(s, frame, "experimental.temporal_aa_before_post changed");
         s.phase.resetHistory(); reset();
@@ -1699,7 +1757,6 @@ static void hdrFrameEnd(State& s, uint64_t frame) {
             if (s.hdrTreated && s.hdrLatch.treatedFrame(true)) {
                 flatHdrFormatLatched(text, sizeof(text), frame, s.hdr, s.hdrLatch.frames);
                 Log::get().note("%s", text);
-                s.hdrEligible = false;
             }
         } else if (s.hdrTreated) {
             s.hdrLatch.treatedFrame(false);
@@ -1707,9 +1764,11 @@ static void hdrFrameEnd(State& s, uint64_t frame) {
     } else if (verdict == FlatHdrFrameVerdict::NoTrigger) {
         s.hdrWindow.lastVerdict = flatMonoReasonName(FlatMonoReason::NoHdrConsumer);
         // A frame that reached the game's output copy, had an HDR target and gave the route no consumer is refused for
-        // the shape of its chain. A frame that never reached a copy stays "no final copy" (a loading screen).
+        // the shape of its chain. A frame that never reached a copy stays "no final copy" (a loading screen), and a frame
+        // the copy stage found no scene in (no-3d-scene: startup, a loading screen, an HDR target with a handful of draws)
+        // stays that, which never warns (section 83).
         if (s.hdrKey == FlatHdrKey::Auto && !s.hdrLatch.tripped && s.frameSeen != FlatFrameSeen::None &&
-            s.frameSeen <= FlatFrameSeen::Structural) {
+            s.frameSeen <= FlatFrameSeen::Structural && s.frameReason != FlatMonoReason::NoScene) {
             s.frameSeen = FlatFrameSeen::Structural; s.frameReason = FlatMonoReason::NoHdrConsumer;
         }
     }
@@ -1729,29 +1788,13 @@ static void hdrSelectAtTrigger(State& s) {
         Log::get().note("%s; selection: %s", text, sel.selected() ? "the route could resolve this frame" : flatMonoReasonName(sel.reason));
     }
     if (autoKey && !s.hdrLatch.tripped) {
-        // Whether the route is what treats this session's frames (the F8 words follow it): a selected frame the mode's route
-        // evaluates at the render size for, not one below the output (upscaling keeps the copy route and its whitelist,
-        // decision (c)) and not EDVR's TAA above it. A transient refusal (no camera yet, say) leaves the last answer.
+        // The route speaks for the frame's stand-down verdict only where it will resolve the frame (flatHdrTriggerSeen: a
+        // selected frame the mode's route evaluates at the render size for, not one below the output and not EDVR's TAA above
+        // it; those are the copy's, by its whitelist or by its structure). Its refusals add nothing: merged as themselves they
+        // outrank the copy stage's structural one, and at R < D every frame the copy route refuses would read as transient, so
+        // the stand-down and the F8 warning would never start.
         const FlatFrameSeen routeSeen = flatHdrTriggerSeen(sel, s.engine);
-        if (sel.selected())
-            s.hdrEligible = routeSeen == FlatFrameSeen::Treatable;
-        else if (sel.reason == FlatMonoReason::HdrExtent)
-            s.hdrEligible = false;
-        // The route speaks for the frame's stand-down verdict only where it will resolve the frame (flatHdrTriggerSeen).
-        // Its refusals add nothing: merged as themselves they outrank the copy stage's structural one, and at R < D every
-        // frame the copy route refuses would read as transient, so the stand-down and the F8 warning would never start.
         if (routeSeen == FlatFrameSeen::Treatable) { s.frameSeen = FlatFrameSeen::Treatable; s.frameReason = sel.reason; }
-        // The F8 warning's supersampling line, from the route's own measurement at this trigger: the render (H's extent)
-        // and the output (the swap chain's) sizes of a selection that refused for R < D; cleared by a selection at R >= D
-        // and by a refusal for the extent that is not R < D (past twice the output, off its aspect).
-        if (sel.selected())
-            g_hdrBelowOutput.store(0, std::memory_order_release);
-        else if (sel.reason == FlatMonoReason::HdrExtent)
-            g_hdrBelowOutput.store(flatHdrSupersamplingAdvice(s.hdrKey, s.hdrEligible, sel.renderWidth, sel.renderHeight,
-                                                              sel.outputWidth, sel.outputHeight)
-                                       ? flatHdrPackSizes(sel.renderWidth, sel.renderHeight, sel.outputWidth, sel.outputHeight)
-                                       : 0,
-                                   std::memory_order_release);
     }
     {
         flatcpu::Scope trace(flatcpu::kTrace);
@@ -1759,10 +1802,52 @@ static void hdrSelectAtTrigger(State& s) {
                          static_cast<uint32_t>(sel.reason));
     }
 }
+// At the final copy draw, in the draw scope: the admission by structure over what the reducer said (flat_copy_structure.h,
+// section 83). What the whitelist selected comes back unchanged. The census token, the once-a-session first admission and
+// the decline lines (each cause once, a dozen a session) are here, and the sizes it measured are published for the panel.
+static FlatMonoFrame copyAdmit(State& s, const FlatRuntimeDraw& d, const FlatMonoFrame& whitelist) {
+    FlatCopyPolicy policy;
+    policy.structure = s.hdrKey == FlatHdrKey::Auto;
+    policy.mode = s.engine;
+    policy.routeLatched = s.hdrLatch.tripped;
+    FlatCopyDiag diag;
+    const FlatMonoFrame out = flatCopyAdmit(s.prefix, s.hdr, d, whitelist, policy, &diag);
+    if (whitelist.selected()) s.copyWindow.noteWhitelist(); else s.copyWindow.note(diag);
+    // The scene's size for the panel, from every final copy that has a scene: the admission's own facts where it looked, the
+    // prefix model's where it did not (a frame the whitelist selected, or refused for another reason), so the F8 words never
+    // read sizes older than the refusal they name.
+    uint32_t sceneW = diag.sceneWidth, sceneH = diag.sceneHeight;
+    if (!sceneW) {
+        const FlatSceneFacts facts = flatSceneFacts(s.prefix, s.prefix.width, s.prefix.height);
+        sceneW = facts.width; sceneH = facts.height;
+    }
+    if (sceneW)
+        g_sceneSizes.store(flatHdrPackSizes(sceneW, sceneH, s.prefix.width, s.prefix.height), std::memory_order_release);
+    char text[1000];
+    if (diag.outcome == FlatCopyOutcome::Admitted && !s.copyFirstLogged) {
+        s.copyFirstLogged = true;
+        const auto route = flatResolveRoute(s.engine, out.renderWidth, out.renderHeight, out.outputWidth, out.outputHeight);
+        flatCopyFormatFirstAdmission(text, sizeof(text), s.prefix.frame, diag, route.name);
+        Log::get().note("%s", text);
+    } else if (diag.outcome == FlatCopyOutcome::Declined && s.copyDeclineLines < 12) {
+        bool seen = false;
+        for (uint32_t i = 0; i < s.copyDeclineLines && !seen; ++i) seen = std::strcmp(s.copyDeclineSeen[i], diag.why) == 0;
+        if (!seen) {
+            s.copyDeclineSeen[s.copyDeclineLines++] = diag.why;
+            flatCopyFormatDeclined(text, sizeof(text), s.prefix.frame, diag);
+            Log::get().note("%s", text);
+        }
+    }
+    return out;
+}
 
 void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT flags) {
     if (!runtimeFlatProfile() || !swap || (flags & DXGI_PRESENT_TEST)) return;
     auto& s = state(); if (s.thread && !owner()) return;
+    // The flat HDR route's crash-safe breadcrumbs (flat_hdr_crumbs.h): "frame-end begin" now (the real Present has just
+    // returned `hr`), "frame-end end" on every path out of this function, and the gate closed until the route admits
+    // another frame. The next frame's preflight, with its resource creations, runs inside it.
+    HdrCrumbFrameEnd routeFrameEnd(hr);
     s.thread = GetCurrentThreadId();
     // The Present edge: the frame window the camera injector may inject in
     // closes here and reopens only once the next frame's phase is chosen, so a
@@ -1827,6 +1912,13 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         engineConfiguredPaused = s.enginePaused;
         engineVelocityConfigure(enabled && !s.enginePaused);
     };
+    // The HDR route's breadcrumbs are DXMT's alone (flat_hdr_crumbs.h, THE GATE): the markers decide, once, here, with the device
+    // in hand and before the key's first read arms the trail. Only the detection decides: advanced.flat_context_isolation is not
+    // asked, so forcing the capture on a Windows device writes no crumb. The 5 s line's step counts below do not depend on it.
+    if (!s.crumbGateRead) {
+        s.crumbGateRead = true;
+        hdrCrumbEnable(flatCrumbsWantedFor(flatDetectDxmt(s.device.Get(), s.context.Get())));
+    }
     // The HDR route (flat_hdr_route.h): the frame that just ended is accounted, then the key is read for the frame that
     // starts now. Before the stand-down reads the frame's verdict, which the route may have added to.
     hdrFrameEnd(s, frame);
@@ -1838,6 +1930,12 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
     // the GPU spans that finished are read (never waited for), and every 5 s the window is
     // printed, zeros included. Instrument only: nothing below reads any of it.
     if (!s.censusHooked) { flatMonoResolveSetSpanHooks(&resolveSpanBegin, &resolveSpanEnd); s.censusHooked = true; }
+    // advanced.flat_context_isolation (auto, swap, capture): how the resolver isolates the game's state from its own work. Read
+    // once, here, before anything of the resolver's has run: the device is known and no frame has reached it (flat_context_isolation.h).
+    if (!s.isolationRead) {
+        s.isolationRead = true;
+        flatMonoResolveSetIsolation(flatContextIsolationFromText(Config::get().getString("advanced.flat_context_isolation", "auto").c_str()));
+    }
     {
         static const int64_t censusFreq = flatcpu::qpcFrequency();
         const int64_t censusNow = EDVR_FLATCPU_NOW();
@@ -2057,6 +2155,17 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         // flat runtime line's last= and accepted counts say why.
         Log::get().note("flat menu HDR copy: accepted=%llu refused=%llu static-scene-frames=%llu; source requires current scene/depth/camera provenance",
             (unsigned long long)s.menuCopiesAccepted,(unsigned long long)s.menuCopiesRefused,(unsigned long long)s.staticSceneFrames);
+        // The steady-detail rule (always on: the resolver is handed steadyDetail = true at both treatment call sites), every window while a
+        // temporal mode runs, zeros included: the resolves whose prep ran the depth check against last frame's depth (ran) and the ones
+        // that could not (skipped: a reset frame is neither). "depth-check=0/0" is no frame reaching the resolver in the window; ran=0 with
+        // skipped above 0 is the check never having had a depth to check against. The token reads "on" in every build's log (the log
+        // reader parses it, and older logs carried "off" for a rig that had set the retired key off).
+        {
+            const FlatMonoRefusalCensus steady=flatMonoResolveTakeRefusalCensus();
+            Log::get().note("flat steady detail 5s: steady-detail=on depth-check=%llu/%llu; a stale-slot pixel takes the camera term only where "
+                            "last frame's depth confirms it (ran/skipped resolves this window)",
+                (unsigned long long)steady.checked,(unsigned long long)steady.skipped);
+        }
         // The census of unkeyed pairs, every window while a temporal mode runs (empty
         // included: an absent line is what "this block never ran" looks like). A pair
         // named here draws in a known pool family with no keyed pixel shader, so its
@@ -2098,11 +2207,31 @@ void flatRuntimePresent(IDXGISwapChain* swap, uint64_t frame, HRESULT hr, UINT f
         // "the detector never ran" looks like. With the key off it is the flight's observation; with it auto, the state.
         {
             char hdrText[1024];
+            // The resolver's step counts are cumulative; the window prints what they gained since the last one.
+            {
+                const FlatMonoResolveStats rs = flatMonoResolveStats();
+                FlatHdrSteps& seen = s.hdrStepsSeen; FlatHdrSteps& gained = s.hdrWindow.steps;
+                gained.captured = rs.hdrCaptured - seen.captured; seen.captured = rs.hdrCaptured;
+                gained.copied = rs.hdrCopied - seen.copied; seen.copied = rs.hdrCopied;
+                gained.prepped = rs.hdrPrepped - seen.prepped; seen.prepped = rs.hdrPrepped;
+                gained.backend = rs.hdrBackend - seen.backend; seen.backend = rs.hdrBackend;
+                gained.finished = rs.hdrFinished - seen.finished; seen.finished = rs.hdrFinished;
+                gained.restored = rs.hdrRestored - seen.restored; seen.restored = rs.hdrRestored;
+            }
             flatHdrFormatWindow(hdrText, sizeof(hdrText), s.hdrKey,
                 s.hdrKey == FlatHdrKey::Auto ? (s.hdrLatch.tripped ? FlatHdrState::Latched : FlatHdrState::Active)
                                              : FlatHdrState::Observing, s.hdrWindow);
             Log::get().note("%s", hdrText);
             s.hdrWindow.reset();
+        }
+        // The final copy's admission by structure (flat_copy_structure.h, section 83), every window while a temporal mode runs,
+        // zeros included: an absent line is what "the admission never ran" looks like, and `whitelist=N admitted=0` is it running
+        // over frames that all had a known tone pass (or, with the route's key off, `key-off=N` for the frames it left alone).
+        {
+            char copyText[1200];
+            flatCopyFormatWindow(copyText, sizeof(copyText), s.hdrKey == FlatHdrKey::Auto, s.copyWindow);
+            Log::get().note("%s", copyText);
+            s.copyWindow.reset();
         }
         // Part B coverage census: always printed, even when every field is
         // zero -- that is how "code never ran" (line absent) differs from
@@ -2419,7 +2548,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     // Gate 1 consolidation: the copy draw's selection is produced as the
     // frame contract (identical decision), and every draw is recorded into
     // the trace ring for the reducer replay.
-    const FlatMonoFrame selected = [&]() -> FlatMonoFrame {
+    FlatMonoFrame selected = [&]() -> FlatMonoFrame {
         flatcpu::Scope reduce(flatcpu::kReduce);   // the reducer: the online prefix model and the selector
         return copy
             ? flatRuntimeObserveContract(s.prefix, d, s.traceContract)
@@ -2444,6 +2573,9 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
         flatcpu::Scope trace(flatcpu::kTrace);
         flatTraceRecord(s.traceRing, d, foreignWork.load(std::memory_order_acquire), hdrSrvKnown ? hdrSrv : nullptr);
     }
+    // The final copy's admission by structure (flat_copy_structure.h, section 83): after the reducer and the detector, which
+    // it reads, and before anything below uses the verdict. What the whitelist selected stays what it was.
+    if (copy) { flatcpu::Scope reduce(flatcpu::kReduce); selected = copyAdmit(s, d, selected); }
     if(cameraProbeAttempt)for(uint32_t i=0;i<s.prefix.targetsUsed;++i)if(s.prefix.targets[i].resource==k.color){
         const auto& witness=s.prefix.targets[i].firstBad;
         Log::get().note("flat camera probe observer: attempt=%u frame=%llu draw-seq=%u first-bad=%s first-bad-seq=%u caused-first-camera-conflict=%u",
@@ -2680,6 +2812,7 @@ FlatRuntimeDrawScope::FlatRuntimeDrawScope(ID3D11DeviceContext* context, uint32_
     // other frame, and the shader is then bit-identical to what it was before the field.
     f.staticScene=flatFrameThroughMenuCopy(s.prefix,selected.hdr);
     if(f.staticScene)++s.staticSceneFrames;
+    f.steadyDetail=true;   // the depth-validated steady detail: always on, no key (the 3D menu's blanket rule above is separate and wins where it applies)
     // Metadata is frozen from the qualified handoff for a future frame's
     // preflight. It cannot authorize jitter in this already rendered frame.
     Ptr<ID3D11Texture2D> colorTexture;
@@ -2897,6 +3030,17 @@ bool FlatRuntimeDrawScope::recover(const char* temporalReason) {
 // its own, and counts as the refusal it is; if even that fails H is still the game's and the frame is declined.
 void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvSlot) {
     auto& s = state();
+    // Crash-safe breadcrumbs (flat_hdr_crumbs.h, edvr_breadcrumbs.txt): the route took this frame. The first frames that
+    // reach the resolver write a crumb before and after every step from here to the frame's Present, so a session that
+    // ends inside the treatment names the step; after the third, this is one compare. They change nothing the route does.
+    hdrCrumbAdmit(s.prefix.frame, flatMonoResolveModeName(s.engine));
+    ++s.hdrWindow.steps.admitted;
+    // The frame reaches the resolver at most once, whichever call takes it (the census counts it once, the crumbs number it).
+    bool reachedCounted = false;
+    const auto reach = [&](const char* step) {
+        if (!reachedCounted) { reachedCounted = true; ++s.hdrWindow.steps.reached; }
+        hdrCrumbReach(s.prefix.frame, flatMonoResolveModeName(s.engine), step);
+    };
     const auto decline = [&](const char* why) {
         s.hdrWindow.lastVerdict = why; ++s.hdrWindow.declined;
         if (s.hdrFlightLines < 12) {
@@ -2904,6 +3048,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
             Log::get().note("flat hdr route: declined at frame=%llu seq=%u: %s (the copy route serves this frame)",
                 (unsigned long long)s.prefix.frame, s.hdr.trigger.sequence, why);
         }
+        hdrCrumbDeclined(why);
     };
     if (s.hdrLatch.tripped) { decline("latched-off"); return; }
     if (s.observing) { decline("returned-to-observation"); return; }
@@ -2928,6 +3073,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
     s.reason = "hdr-route";
     // The spatial recovery, into H: the jitter resampled away, no history, no SDK. True when H now holds it.
     const auto recoverHdr = [&](const char* temporalReason, const FlatMonoResolveFrame& frame) {
+        reach("spatial-recovery");   // the frame is the resolver's from here
         failPhase(s, temporalReason);
         FlatMonoResolveFrame sf{}; sf.color = frame.color; sf.hdr = true; sf.mode = frame.mode;
         sf.renderWidth = frame.renderWidth; sf.renderHeight = frame.renderHeight;
@@ -2956,6 +3102,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
     f.configuredDlssPreset = s.preset;
     f.staticScene = flatFrameThroughMenuCopy(s.prefix, selected.hdr);
     if (f.staticScene) ++s.staticSceneFrames;
+    f.steadyDetail = true;   // the depth-validated steady detail: always on, no key (the 3D menu's blanket rule above is separate and wins where it applies)
     // The plan, frozen from the qualified trigger for the next frame's preflight, as the copy route freezes its own.
     Ptr<ID3D11Texture2D> colorTexture;
     if (s.projection && SUCCEEDED(hdrResource.As(&colorTexture))) {
@@ -3036,6 +3183,7 @@ void FlatRuntimeDrawScope::treatHdr(const FlatMonoFrame& selected, uint32_t srvS
             }
         }
     }
+    reach("resolve");   // the frame is the resolver's from here
     if (!flatMonoResolve(s.device.Get(), ctx, f, &outputView, &s.reason)) {
         const char* temporalReason = s.reason;
         // The backend (or the route's own guard) refused before H was written. Recover the jitter into H, or decline.

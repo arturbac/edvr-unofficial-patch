@@ -27,6 +27,9 @@ State, Open and Ruled-out bullets are verbatim in "Status detail".*
     window). Sean's call: recentre once the movie plays or the splash is
     visible; BUILT (14ec395's follow-up), NOT FLOWN. Entry "2026-09-17:
     the intro/splash "forward"..." (flight brief).
+  - 2026-10-01, the movie and the splash follow `fix.panel_curvature` (no
+    new key): FLOWN, both MIRRORED (u ran with x); fix BUILT, NOT FLOWN.
+    Entries "...follow..." and "...mirrored, and why" (leg: 0.3, then 0).
 - **Open:** whether the movie reaches the headset earlier once the
   warm-up flies, or the game just absorbs the stall (section 9, first
   2026-09-15 entry); ident-open -> first-composite latency, never
@@ -41,8 +44,8 @@ State, Open and Ruled-out bullets are verbatim in "Status detail".*
   `advanced.intro_probe = 1`, reading `intro probe: watching the movie's
   open`, `intro probe: the game opened <file> at +X.XXX s after the
   device`, and `intro video lock: holding` against the device line --
-  plus section 9 (first 2026-09-15 entry) for the warm-up and the two
-  2026-09-17 entries' flight briefs.
+  plus section 9 (first 2026-09-15 entry) for the warm-up, the two
+  2026-09-17 entries' flight briefs and the 2026-10-01 curve leg.
 - **Environment:** The placement fix was measured on a Frontier
   install, game build 330683, Pimax via OpenComposite, eye 5424x5356;
   placement is VS cb2 (80 bytes). The skip's flights are Steam, no
@@ -1146,7 +1149,9 @@ still stands).
 pairs to shrink `VR_InitInternal`'s ~443 ms shader stretch; an EDVR
 holding layer during the ~2.2 s between `runtime_startup` and the first
 Submit (the first pre-game `xrEndFrame` layer on third-party runtimes).
-Both wait on the warm-up's own measurement landing first.
+Both wait on the warm-up's own measurement landing first. (The first of the two
+was built 2026-10-01: the four compiles are now build-time bytecode, see
+docs/startup-delay-2026-09-12.md, last entry.)
 
 ## 2026-09-17: a skipped intro left the panel armed, and the on-foot HUD passed for the movie
 
@@ -1299,3 +1304,281 @@ gfx line's timestamp. The real test is subjective: does the movie or
 splash now face you. Try it with the headset settled AND unsettled
 (mid-adjustment) at launch, across a few relaunches, to see whether the
 spread the ten flights showed is actually gone.
+
+## 2026-10-01: the movie and the splash follow `fix.panel_curvature` (BUILT, NOT FLOWN)
+
+Sean asked whether the intro movie and the splash screen could respect
+the panel curve. His decision, relayed 2026-10-01: no new key. Both
+always follow `fix.panel_curvature`. At 0 they are what they were, byte
+for byte, and rigs hold that; above 0 they are drawn as the same bent
+strip the on-foot screen is (arc length kept: `theta = pi c x`, `x' =
+sin(theta) / (pi c)`, depth `(1 - cos theta) / (pi c)` times the
+half-width, `advanced.panel_curvature_segments` columns). The later
+build that makes the curve default-on and retires keys is not done here
+and is no harder for this one.
+
+**What draws them, and who fills the placement.** One composite does
+all of it: `DrawIndexedInstanced(6, 1)`, VS `EF103A7CB4A8369A`, PS
+`DED8796049C7BB4A`, a unit quad from an 80-byte vertex buffer, placed
+entirely by VS b2 (`xy * cb2[0].xy`, then `x*cb2[1] + y*cb2[2] +
+z*cb2[3] + cb2[4]`; the quad's z is 0, so `cb2[3]` moves nothing
+today). Whoever writes those 80 bytes decides what can bend:
+
+| surface | placement | here |
+|---|---|---|
+| movie, `fix.intro_video = screen` (default) | EDVR's own (`buildWorldCb`), `cb2[3]` zero | bent: the z column is written, above 0 only |
+| splash still; the menu's loops until a scene renders | the game's world-space constants (measured 2026-08-28: `cb2[0]` = (4.44444, 2.5), `cb2[3]` a unit column whose `w` has the opposite sign to `cb2[4].w`: +z' is toward the viewer) | bent once EDVR has read them, flat until then |
+| movie in `stock` / `head` mode | the game's SCREEN-space constants (`cb2[3]` = 0, w = 1) | flat: nothing to bend through |
+| loader dialogs | the game's own curved mesh, 5760 or 360 indices | out of scope |
+
+**What was built.**
+
+- *One surface strip* (`panel_curve.cpp`, `panelCurveSurfaceDraw`): the
+  on-foot generator with the caller's gain (the half-width, 4.44444 m)
+  and the direction +z' toward the viewer, which is the splash's own
+  measured convention and the one the movie's column is written to. It
+  has its own stand-down and counters; the on-foot strip, its gain and
+  its fault budget are never touched. It is drawn with the game's
+  rasterizer state but with back-face culling off: nobody recorded this
+  composite's index order or cull mode, a wrong guess makes the screen
+  vanish, and a connected surface that faces you loses nothing to it.
+  The gate is curvature above 0, never `panelCurveWants()`, which is
+  also true for the identity test at 0 and would swap a placement.
+- *The movie* (`intro_panel.cpp`): above 0 `buildWorldCb` writes
+  `cb2[3]` = the view-space image of the seated +z axis (unit length,
+  from the panel toward you). There is no test for a bent edge being
+  behind the eye, on purpose: the clipper handles geometry behind the
+  eye, the centre test already turns a panel that is wholly behind
+  into a stock fallback with a line, and an edge test would pop the
+  whole bend off at about 20 degrees of head yaw at 3.35 m (found by
+  the first rig, pose A).
+- *The splash* (`intro_curve.cpp`, with the arithmetic in
+  `intro_curve_math.h`): the constants are on the GPU, so the first time
+  a (VS b2 buffer, sampled surface) pair is seen its 80 bytes are copied
+  to a staging buffer and read four frames later, which is the movie's
+  own pattern. A pair that reads as a world-space panel (finite, not
+  screen-space, `cb2[3]` of unit-ish length, `w` terms opposite in sign,
+  half-width plausible) is drawn as the strip with the half-width it
+  read; anything else stays as the game drew it and the log gives the
+  reason and the 20 floats. Until a pair is read its draws are the
+  game's own: a few frames flat, never a missing screen. We do not
+  know that the cut from the movie gives the game's constants buffer
+  and surface new identities, so a pair that reads flat is read again
+  every 60 frames it is drawn (it stays flat meanwhile), and a pair not
+  drawn for 180 frames is forgotten; a world verdict is for the life
+  of its pair, a known limit. The module retires at the first rendered
+  scene, as the movie's panel does.
+- *The wiring* (`vscreen.cpp`): a flag, not a verdict, so it composes
+  with the backdrop swap and the splash dim (the on-foot branch returns
+  before both, so it was not reused). The strip replaces the game's own
+  issue after the verdict's Begin, the dim's re-issue draws the strip
+  too, and a strip that cannot be drawn leaves the game's draw. The
+  recogniser sits after the movie's claim, so the movie's own draws never
+  reach it. Per frame `introCurveTick`, at shutdown `introCurveShutdown`,
+  and one line at the first rendered scene counting what the strip drew.
+- *A guard that was missing* (found by reading, not flown): the on-foot
+  curve recognised a draw by the size of its source alone. With
+  `vscreen_res` stock the intro composite's source is the same 1920x1080
+  as the panel, the substitution found no SIZE in the vertex buffers and
+  stood the whole on-foot curve down for the session. The recognition now
+  refuses a draw whose vertex shader is the intro composite's; nothing
+  changes at curvature 0.
+
+**Pinned** (all in the build's gates; each pin is held to mutations
+that must trip it, so a pin that cannot fail does not stay):
+
+- `tools\intro_curve_test`: the movie's placement, the real
+  `intro_panel.cpp` on WARP. 56 scenarios, 8125 checks. At curvature 0
+  the 45 scenarios taken from the code as it was hold its draws,
+  buffers and constants byte for byte; at 0.3 the curved goldens are
+  bit-exact against independent double arithmetic (both eyes, a Quest-
+  like vertical frustum, head yaws up to 40 degrees, a 1 m floor at
+  curvature 1.0, so the absence of an edge test is itself pinned).
+  133 mutants.
+- `tools\panel_curve_test`: the strip, real `panel_curve.cpp`: 13
+  cases, 3835 checks, 132 mutants (the on-foot ones unchanged; C12 and
+  C13 are the surface strip: bytes, direction, gain, cull-off state and
+  its cache, stand-down, counters).
+- `tools\intro_curve_math_test`: the reading of the 80 bytes, against
+  the two real captures and the movie's stock constants: 11 cases,
+  75903 checks, 115 mutants.
+- `tools\intro_curve_module_test`: the recogniser on WARP with the real
+  strip: the two captures, the stock constants, decoys in the nearby
+  slots, new surface or buffer learned afresh, shared identity across
+  the cut (the first armed draw lands at exactly `ceil(S / 60) * 60 +
+  4` for a write at frame S), expiry, retirement, faults, every
+  reference given back. 16 cases, 571 checks, 177 mutants.
+- `tools\ui_quality_test`, 14 wiring pins on `vscreen.cpp` (source
+  scans, each with in-rig controls that must trip it) held by 40
+  end-to-end mutations of the real file (`tools\vr_world_route_test\
+  mutants.py --run --rig wiring`). The pin that matters most: at
+  curvature 0 every call and its order is today's.
+
+**Not known, and said so.** (1) The composite's index order and the
+quad's UV orientation: cull-off makes the first irrelevant; the second
+is assumed to be the on-foot quad's (the 2026-08-28 quad probe's first
+vertex reads (u, v) = (0, 1), which fits; the other three were never
+read), so an upside-down or mirrored picture is the sign. (2) Whether
+EDVR's placement of the movie equals the game's placement of the splash
+at the cut (the recentre is built, not flown): a jump of the bend at
+the cut is the sign. (3) Whether the main menu's loops read as
+world-space panels: the log says per composite. (4) The shader reads
+`cb2[3]` for the z column exactly as `intro-composite-vs.asm` says; no
+flight has had a non-zero one. (5) The splash's constants are rewritten
+as the head moves: only the half-width and the direction are kept from
+the read, the columns come through the game's own buffer every draw.
+(6) The edges of a bent screen are far off the view axis and clipped by
+the frustum; how much of the bend shows at 0.3 and 3.35 m is for the
+eye to judge.
+
+ruled out (by reading, not flown): reusing the on-foot substitution for
+these draws, because its branch returns before the verdict's Begin (the
+backdrop swap) and before the splash dim, and its gain recipe reads the
+on-foot SIZE record, which these draws do not carry. ruled out: a
+behind-the-eye test for the bent edges, because the clipper already
+handles them and the test pops the bend off at about 20 degrees of yaw.
+
+**Environment** the strip depends on: the native OpenXR runtime (the
+movie's lock needs the vr half's head pose and tangents; under the
+Oculus native SDK that half never loads and none of this runs); any
+headset, because the strip is drawn into the eye texture by the game's
+own matrices; no DLSS, which starts at the first scene; fixed-size
+tables: 16 (constants buffer, surface) pairs in the splash module, one
+cull-off state per distinct rasterizer state of the game (4 kept).
+
+**Next flight (one session, two launches):** Steam or Frontier, default
+`fix.intro_video = screen`, `fix.panel_curvature = 0.3`, then 0. Read
+`python tools\edvr_log.py --target steam --expect-build HEAD --grep
+"intro video curve|splash curve|intro curve|SURFACE strip|intro video
+size"` first. At 0.3 watch the movie, the splash, the loading dialogs
+over it and the cut into the menu. PASS: a bent screen like the on-foot
+one, upright, edges toward you; the dim follows the bend; no jump or
+flat frame at the movie-to-splash cut; the log has `panel curvature:
+built a 64-column SURFACE strip`, `intro video curve: the movie is drawn
+as a 64-column strip`, `splash curve: ... reads as a world-space
+panel` and, at the first scene, `intro curve: N strip draw(s) in all`
+with N above 0. Two `splash curve: ... stays as the game drew it,
+because ... screen-space` lines early on are the movie's own stock
+constants in its settle frames: expected. FAIL, and what each means: no
+screen (the strip drew and the state refused it: read the stand-down
+lines), flat with the "armed" lines present (the vertex shader ignored
+`cb2[3]`), edges away from you (the direction), upside down or mirrored
+(the UV), the splash flat while the movie bent (the module's retirement
+line says 0 world-space: read its flat reasons), N = 0 with the lines
+present (never reached the draw). At 0 none of those lines appears, the
+`intro video size:` retirement line has no "armed" clause, and the intro
+looks as it did.
+
+## 2026-10-01 (flight): the movie and the splash came out mirrored, and why (FIXED, NOT FLOWN)
+
+Flown the same day: Frontier, build v0.18.0-rc.5-62-g73e02a7b (main
+73e02a7b), `fix.panel_curvature = 0.3`, log `edvr_gfx_20261001_125905.log`
+(the build matches HEAD of that merge). Sean: "looks good except the
+image is left-right flipped (mirrored)"; asked which surface, the answer
+was both, the movie and the splash, and neither upside down. The log says
+what drew: `intro video curve` at 12:59:11 (panel frame 3111, 1670 armed
+draws), eight splash composites read as world-space panels from 12:59:20
+(1886 armed draws), 4726 strip draws in all. So the strip, the bend, the
+direction and the cull choice were right, and one thing was wrong: which
+way u runs.
+
+**Root cause.** One generator builds both strips (`fillStrip`), columns
+left to right in local x, bottom row first, and gives column i the
+texture coordinate u = (x + 1) / 2: u runs WITH x. That is the on-foot
+composite's quad to the byte (the identity test, C7), and the on-foot
+placement maps +x to the viewer's right, so the on-foot screen is the
+right way round. The intro composite's placement maps +x to the viewer's
+LEFT:
+
+| composite | placement's +x on the screen | u in the vertex data | picture |
+|---|---|---|---|
+| on-foot, the game's quad or our strip | right | with x | right way round |
+| intro, the game's flat draw | left (movie stock cb2[1].x = -1/2712, splash -0.7807 and -0.7803 in both 2026-08-28 captures and both eyes) | against x (inferred: the game's own draw is right) | right way round |
+| intro, our strip as flown | left | with x | MIRRORED |
+
+The same fact had cost the first flight of the world-locked movie
+(16948cda, 2026-08-28: "I built the basis as +x to +x, which mirrors
+it"); the strip took the on-foot quad's convention for a composite whose
+convention was readable in its own constants. Of the game's real vertex
+data one number has been read: the 2026-08-28 quad probe printed the
+movie composite's first vertex as z = 0, u = 0, v = 1 and never its x and
+y, so it cannot say which side u = 0 sits on. Under the placement above
+that vertex is the bottom-right corner, which agrees, and nothing read
+contradicts it. v is right (up stayed up): both placements map +y to up
+and the strip's v is the on-foot one.
+
+**The fix** does not copy the game's vertex data and does not flip u
+blindly: the strip's u follows the placement it is drawn through. u runs
+against x when the placement's +x runs left, with x when it runs right
+(the on-foot case, unchanged to the byte). The reading is one number
+from the 20 floats of VS b2, `cb2[1].x * cb2[4].w - cb2[4].x * cb2[1].w`
+(`introPlacementXDir`, `intro_curve_math.h`): the sign of d(NDC x) /
+d(local x) at the panel's centre. With a the view-space direction of
+the panel's +x and p the position of its centre it is m00 * (a x p).y,
+the head-frame vertical component of a world-vertical vector, so it does
+not move with head yaw, even through 180 degrees (the first capture has
+the panel behind the viewer and reads the same), and holds until the
+head is rolled a quarter turn. Negative is left. Both captures, both
+eyes, and the movie's stock constants all read left. It answers unknown
+(and the pair stays as the game drew it) when the two terms nearly
+cancel. The movie takes its flag from the world constants it binds, the
+splash from the constants it copied; `panelCurveSurfaceDraw` takes it as
+an argument and keys its strip on it. Nothing changes at curvature 0.
+
+**Proved** (all in the build's gates; each pin is held to mutations that
+must trip it):
+
+- `tools\surface_strip_render_test` (new) draws the production strip on
+  WARP through a vertex shader that is `docs\shaders\intro-composite-vs.asm`
+  written back as HLSL, with an explicit cull-back rasterizer state (the
+  game's) and an 8x8 texture with a different colour in each quadrant,
+  and reads the picture back at 25 % and 75 % of what was drawn. The
+  movie (production `introPanelOnComposite`, both eyes, head turned 0
+  and +-10 degrees, curvature 0.05, 0.3 and 0.6), the splash (production
+  recogniser on the 2026-08-28 capture, both eyes) and the on-foot strip
+  (a standard +x-right transform) all come out with left staying left and
+  up staying up. The same movie and splash draws with the flag forced the
+  other way come out mirrored (asserted), and a placement whose +x runs
+  right (the capture with its x column negated, the movie with a
+  reflected pose) is read as running right and drawn with u along x,
+  upright. 199 checks, 20 mutants.
+- `tools\intro_curve_math_test`: the rule against both captures, both
+  eyes, the stock constants, a 3500-pose family of either handedness (no
+  wrong answer, none unknown), a panel turned edge-on (4014 known, 2142
+  unknown, no wrong answer), the margin to 4e-9, non-finite floats.
+  96615 checks, 145 mutants.
+- `tools\panel_curve_test`: the strip's bytes with and without the flag,
+  one build per change of it, the on-foot bytes unchanged: 4950 checks,
+  144 mutants. `tools\intro_curve_test`: every curved movie scenario
+  reads left and sets the flag, the flag is gone after the draw, a head
+  rolled a quarter turn gives a flat movie rather than a wrong one, a
+  right-running placement is not reversed: 10413 checks, 145 mutants.
+  `tools\intro_curve_module_test`: each pair keeps its own direction, all
+  four real vectors arm reversed, an edge-on pair arms when a later
+  reading is good: 657 checks, 190 mutants. The vscreen wiring pins carry
+  the new argument at both strip sites and never mix the movie's flag
+  with the splash's: 257 checks, 50 end-to-end mutations of the real file.
+
+**Not known, and said so.** The game's quad vertex data beyond the first
+vertex; the derivation does not need it. The strip's picture against the
+game's own flat picture: the render rig draws through the disassembled
+vertex shader and its own texture, so whether the two agree is for the
+flight to say, as is whether a second thing about the picture is off.
+
+ruled out: the strip's column order or index winding as the cause,
+because the winding only decides which faces are culled (the surface
+strip is drawn with the cull off, and the whole picture was there) and the
+order of the columns changes nothing about which texel lands where; only
+u and x do. ruled out: either surface's placement as the cause, because
+both mirrored together and both placements are the game's own convention
+(the movie's was flight-verified in 16948cda). ruled out: the on-foot
+strip's u for the intro composite, because the intro placement runs +x
+left (this entry). Rejected without flying: a blind flip of u for the
+surface strip, because it would break any placement that runs right.
+
+**Next flight:** the unchanged leg (0.3, then 0, the same grep) with one
+more thing to read: the ident and the splash have lettering, so mirrored
+text is unmistakable. PASS adds: not mirrored and not upside down, in the
+movie and the splash; the SURFACE strip line says `u running against x`,
+the movie's line and the splash learn lines say that +x runs to the
+viewer's left.

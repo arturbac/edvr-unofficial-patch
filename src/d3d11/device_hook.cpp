@@ -65,10 +65,12 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "static_prop_gate.h"
 #include "temporal_pass.h"   // temporalPassArmEyeDump: the eye dump key's job
 #include "flat_runtime.h"
+#include "flat_hdr_crumbs.h"   // the flat HDR route's crash-safe breadcrumbs: the real Present's pair
 #include "format_support_log.h"   // the device capability log: the two hooks' reports and its closing tick
 #include "flat_temporal.h"   // flat profile discovery at owned Present
 #include "flat_shader_capture.h"
 #include "perf_monitor.h"
+#include "stall_watch.h"     // stallWatchBeat: the stall sampler's heartbeat, once per owned Present
 #include "frame_ticks.h"     // g_frameTicks: what the Present hook's own work cost, by name
 #include "boundary_tick.h"   // one fault budget per frame-boundary tick
 #include "vscreen.h"
@@ -76,7 +78,6 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 #include "pose_reader_watch.h"
 #include "transition_flash_eye_base.h"
 #include "vscreen_res.h"
-#include "celestial_motion.h"
 
 namespace edvr {
 namespace {
@@ -1016,11 +1017,6 @@ HRESULT STDMETHODCALLTYPE hookedDevCreate(ID3D11Device* self, const void* first,
                 g_createBufferBytes.fetch_add(static_cast<const D3D11_BUFFER_DESC*>(first)->ByteWidth,
                                               std::memory_order_relaxed);
             }
-            // A destroyed buffer's address can be reused by a fresh one; a
-            // watched slot would otherwise inherit that buffer's stale shadow.
-            // Guarded the same way as the Map/Unmap tees (celestial_motion.h):
-            // with no slot watched, no new buffer's address can match one.
-            if (out && *out && celestialMotionAnyWatched()) celestialMotionConstantsUnknownWrite(static_cast<ID3D11Buffer*>(*out));
         }
     }
     return hr;
@@ -1723,9 +1719,21 @@ HRESULT STDMETHODCALLTYPE hookedPresent(IDXGISwapChain* self, UINT syncInterval,
         flatTemporalBeforePresent(self, g_state->frameCounter, flags);
     if (runtimeFlatProfile()) flatRuntimeBeforePresent();
     if (runtimeFlatProfile()) menuFlatBeforePresent(self, flags);
+    // The flat HDR route's crash-safe breadcrumbs (flat_hdr_crumbs.h): for the first frames that reach the resolver, the
+    // real Present is bracketed, its result and the device's removed reason written. Both crumbs fall outside the clock
+    // reads below, which time the call alone. The gate is one relaxed load.
+    const bool routeCrumbs = hdrCrumbPresentSide();
+    if (routeCrumbs) hdrCrumbWrite("present", "begin");
     const int64_t presentT0 = qpcNow();
     const HRESULT hr = g_state->realPresent(self, syncInterval, flags);
     const int64_t presentT1 = qpcNow();
+    // The stall sampler's heartbeat (stall_watch.h): the render thread has just presented. A relaxed store and a
+    // compare; the first call starts the watchdog thread, or says that advanced.freeze_location turned it off.
+    // frameCounter is the frame this Present ended, the number the long-frame lines call "frame".
+    stallWatchBeat(presentT1, g_state->frameCounter);
+    if (routeCrumbs)
+        hdrCrumbWrite("present", "end", "hr=0x%08X removed=0x%08X", static_cast<unsigned>(hr),
+                      static_cast<unsigned>(g_state->device->GetDeviceRemovedReason()));
     // The hook's own work before the real call is a tick; the real call is not
     // EDVR's, so it is timed apart and kept out of the slowest three.
     g_frameTicks.markAt("present_pre", presentT0);

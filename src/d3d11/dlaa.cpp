@@ -14,6 +14,7 @@
 #include <dxgi.h>
 
 #include "../common/log.h"
+#include "flat_hdr_crumbs.h"   // the flat HDR route's crash-safe breadcrumbs around the feature's steps
 #include "perf_monitor.h"   // the feature's creation is an event with a duration
 #include "gpu_timing.h"
 #include "gpu_adapter_name.h"  // adapterName -- shared with fsr3_engine.cpp
@@ -58,12 +59,20 @@ struct DlaaRoleStats {
     double   sum = 0.0;
     double   maxMs = 0.0;
 };
-DlaaRoleStats g_roleStats[kDlaaRoles][2];
+// Indexed by upscaler slot (dlaa.h, kUpscalerSlots): the eyes' two and the VR world route's third. Only the full-frame role
+// ever counts on the world's slot; the centre and periphery roles are the eyes' (dlaaEvaluateFovea, dlaaEvaluatePeriphery
+// refuse slot 2), so their third column stays empty.
+DlaaRoleStats g_roleStats[kDlaaRoles][kUpscalerSlots];
+
+// Whether a role has this slot at all: the full frame on every slot, the other two on the eyes' only.
+bool roleHasSlot(DlaaRole role, int slot) {
+    return role == DlaaRole::Full ? upscalerSlotHasFullFrame(slot) : upscalerSlotHasFoveatedRoles(slot);
+}
 
 // The measured price for one role and eye, for the totals line. False when
 // that role/eye combination has not evaluated yet.
 bool roleTotals(DlaaRole role, int eye, uint32_t* evaluations, double* avgMs, double* maxMs) {
-    if (eye < 0 || eye > 1) return false;
+    if (!roleHasSlot(role, eye)) return false;
     const DlaaRoleStats& rs = g_roleStats[static_cast<int>(role)][eye];
     if (rs.count == 0) return false;
     if (evaluations) *evaluations = rs.count;
@@ -182,22 +191,26 @@ const char* qualityName(NVSDK_NGX_PerfQuality_Value q) {
         default:                                           return "?";
     }
 }
-EyeFeature g_feature[2];
+// The full-frame features, one per upscaler slot (dlaa.h, kUpscalerSlots): the eyes' two, which dlaaWarm makes on the loading
+// screen, and the VR world route's third (slot 2), made lazily by the first evaluation on it and released with the others.
+EyeFeature g_feature[kUpscalerSlots];
 // The fovea features, kept apart from the full-frame ones: created with
 // output sub-rectangles enabled and their own history, so switching the
-// fovea on or off never disturbs the full-frame path's accumulation.
-EyeFeature g_fovea[2];
+// fovea on or off never disturbs the full-frame path's accumulation. The eyes'
+// only (kUpscalerEyeSlots): the VR world's slot has no fovea.
+EyeFeature g_fovea[kUpscalerEyeSlots];
 // The steady periphery's features (docs/performance.md feature 6): DLAA on
 // a reduced copy of the frame, a third slot with its own history, so the
-// fovea, the periphery and the full frame never share an accumulation.
-EyeFeature g_periph[2];
+// fovea, the periphery and the full frame never share an accumulation. The
+// eyes' only, as the fovea's are.
+EyeFeature g_periph[kUpscalerEyeSlots];
 
 // The GPU-price ring, the resolve's discipline: never awaited.
 struct QuerySlot {
     GpuTimer     timer;
     bool         inUse = false;
     DlaaRole     role = DlaaRole::Full;   // which feature this sample prices
-    int          eye = 0;                 // 0 left, 1 right
+    int          eye = 0;                 // the upscaler slot: 0 left, 1 right, 2 the VR world route's (full frame only)
 };
 constexpr int kQueryRing = 8;
 QuerySlot g_qring[kQueryRing];
@@ -219,7 +232,7 @@ void pollTimingRing(ID3D11DeviceContext* ctx) {
         ++g_timeCount;
         g_timeSum += ms;
         if (ms > g_timeMax) g_timeMax = ms;
-        if (q.eye == 0 || q.eye == 1) {
+        if (roleHasSlot(q.role, q.eye)) {
             DlaaRoleStats& rs = g_roleStats[static_cast<int>(q.role)][q.eye];
             ++rs.count;
             rs.sum += ms;
@@ -332,8 +345,9 @@ void logDlssModesOnce(uint32_t outW, uint32_t outH, const DlssModeRange modes[kD
     Log::get().note("dlss: modes for %ux%u: %s", outW, outH, line);
 }
 
-// The full-frame feature for one eye: made when it is missing or its key
-// (the sizes, the preset generation) has moved, left alone otherwise. The
+// The full-frame feature for one upscaler slot (an eye's, or the VR world route's third): made when it is missing or its key
+// (the sizes, the preset generation, the route's bit) has moved, left alone otherwise. Each slot keeps its own key, its own
+// handle and so its own history; the preset generation is shared, so dlaaSetPreset remakes every slot's feature. The
 // ONE block dlaaEvaluate and dlaaWarm share, so what the warm-up makes on
 // the loading screen is exactly what the first evaluation would have made,
 // and that evaluation finds it and skips the create (or recreates on a
@@ -343,6 +357,10 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
                    uint32_t outW, uint32_t outH, const char** reason, double* createMs,
                    bool hdr = false) {
     if (createMs) *createMs = 0.0;
+    if (!upscalerSlotHasFullFrame(eye)) {
+        if (reason) *reason = "an upscaler slot out of range";
+        return false;
+    }
     EyeFeature& f = g_feature[eye];
     if (!f.handle || f.w != w || f.h != h || f.outW != outW || f.outH != outH ||
         f.presetGen != g_presetGen || f.hdr != hdr) {
@@ -362,6 +380,9 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
         float sharpness = 0.0f;
         bool optKnown = false;
         NVSDK_NGX_Result optErr = NVSDK_NGX_Result_Success;
+        // The flat HDR route's crumbs (flat_hdr_crumbs.h): the runtime's own questions about render sizes, then the
+        // feature's creation and (in dlaaEvaluate) its evaluation, each bracketed where only the route's bit writes.
+        HdrCrumbSpan query(hdr, "backend-query", "in=%ux%u out=%ux%u", w, h, outW, outH);
         if (outW == w && outH == h) {
             optErr = NGX_DLSS_GET_OPTIMAL_SETTINGS(g_caps, w, h, quality, &optW, &optH, &maxW,
                                                    &maxH, &minW, &minH, &sharpness);
@@ -425,6 +446,8 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
                 return false;
             }
         }
+        query.result("ok=%u ngx=0x%08X", optKnown ? 1u : 0u, static_cast<unsigned>(optErr));
+        query.close();
         if (!optKnown && !g_optimalFailNoted) {
             g_optimalFailNoted = true;
             Log::get().note(
@@ -447,6 +470,8 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
         // An event with a duration for the monitor's drop attribution: the
         // feature's creation is the mod's own heaviest one-off on the render
         // thread, and it recurs at every size change.
+        HdrCrumbSpan create(hdr, "backend-create", "ngx feature in=%ux%u out=%ux%u quality=%d flags=0x%X", w, h, outW, outH,
+                            static_cast<int>(quality), static_cast<unsigned>(cp.InFeatureCreateFlags));
         const int64_t createT0 = qpcNow();
         const NVSDK_NGX_Result cr =
             NGX_D3D11_CREATE_DLSS_EXT(ctx, &f.handle, g_params, &cp);
@@ -454,6 +479,8 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
                               ? static_cast<double>(qpcNow() - createT0) * 1000.0 /
                                     static_cast<double>(qpcFrequency())
                               : 0.0;
+        create.result("ngx=0x%08X handle=%u", static_cast<unsigned>(cr), f.handle ? 1u : 0u);
+        create.close();   // after the duration above is taken: the crumb's own write is not part of the creation's time
         perfMonitorNoteEvent(kEvNgx, ms);
         if (createMs) *createMs = ms;
         if (NVSDK_NGX_FAILED(cr) || !f.handle) {
@@ -472,9 +499,9 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
         f.presetGen = g_presetGen;
         f.hdr = hdr;
         if (hdr)
-            Log::get().note("dlss: the feature for eye %d was created for the flat HDR route: HDR input and "
+            Log::get().note("dlss: the feature for %s was created for the flat HDR route: HDR input and "
                             "automatic exposure (IsHDR | AutoExposure with MVLowRes | DepthInverted); the "
-                            "history starts here.", eye);
+                            "history starts here.", upscalerSlotLabel(eye));
         // Build point 5, 2026-09-23: a create success resets the shared
         // reason, so a caller that reads it later (dlaaAvailable's *reason,
         // which just echoes g_reason once NGX has initialised) is not shown
@@ -484,16 +511,16 @@ bool ensureFeature(ID3D11DeviceContext* ctx, int eye, uint32_t w, uint32_t h,
         g_reason = "available";
         if (outW == w && outH == h) {
             Log::get().note(
-                "dlaa: the feature is created for eye %d at %ux%u, DLAA, preset %s (the "
+                "dlaa: the feature is created for %s at %ux%u, DLAA, preset %s (the "
                 "runtime's optimal render size for this output %ux%u, which DLAA ignores); "
                 "the history starts here (made in %.0f ms).",
-                eye, w, h, presetName(presetFor(quality)), optW, optH, ms);
+                upscalerSlotLabel(eye), w, h, presetName(presetFor(quality)), optW, optH, ms);
         } else {
             Log::get().note(
-                "dlss: the feature is created for eye %d, %ux%u in and %ux%u out (%.0f%% "
+                "dlss: the feature is created for %s, %ux%u in and %ux%u out (%.0f%% "
                 "per axis), the %s mode, preset %s, whose own render size is %ux%u and whose "
                 "range the runtime names as %ux%u..%ux%u; the history starts here (made in %.0f ms).",
-                eye, w, h, outW, outH,
+                upscalerSlotLabel(eye), w, h, outW, outH,
                 100.0 * static_cast<double>(w) / static_cast<double>(outW),
                 qualityName(quality), presetName(presetFor(quality)), optW, optH, minW, minH, maxW, maxH, ms);
         }
@@ -677,8 +704,12 @@ bool dlaaEvaluate(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour,
     if (reason) *reason = "this build has no DLSS SDK in it";
     return false;
 #else
+    if (!upscalerSlotHasFullFrame(eye)) {
+        if (reason) *reason = "an upscaler slot out of range";
+        return false;
+    }
     if (!g_available || !g_params || !g_caps || !ctx || !colour || !depth || !motion || !output ||
-        eye < 0 || eye > 1 || !w || !h) {
+        !w || !h) {
         if (reason) *reason = g_available ? "a missing input" : g_reason;
         return false;
     }
@@ -724,7 +755,10 @@ bool dlaaEvaluate(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colour,
     const int qs = dev ? acquireQuerySlot(dev, ctx) : -1;
     if (dev) dev->Release();
     if (qs >= 0) { g_qring[qs].role = DlaaRole::Full; g_qring[qs].eye = eye; }
+    HdrCrumbSpan evaluate(hdr, "backend-evaluate", "ngx in=%ux%u out=%ux%u reset=%u", w, h, outW, outH, reset ? 1u : 0u);
     const NVSDK_NGX_Result er = NGX_D3D11_EVALUATE_DLSS_EXT(ctx, f.handle, g_params, &ep);
+    evaluate.result("ngx=0x%08X", static_cast<unsigned>(er));
+    evaluate.close();
     if (qs >= 0) g_qring[qs].timer.end(ctx); // Poll consumes failed End samples too.
     if (NVSDK_NGX_FAILED(er)) {
         ID3D11Device* failedDevice = nullptr;
@@ -913,8 +947,9 @@ bool dlssEvaluateFovea(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* colou
     if (reason) *reason = "this build has no DLSS SDK in it";
     return false;
 #else
-    if (eye < 0 || eye > 1) {
-        if (reason) *reason = "a missing input";
+    if (!upscalerSlotHasFoveatedRoles(eye)) {
+        // The VR world's slot (2) is a real slot with no fovea; anything else is no slot at all.
+        if (reason) *reason = upscalerSlotHasFullFrame(eye) ? "this upscaler slot has no fovea" : "a missing input";
         return false;
     }
     return evaluateCrop(g_fovea[eye], "fovea", eye, ctx, colour, depth, motion, output, inW, inH,
@@ -950,8 +985,8 @@ bool dlaaEvaluatePeriphery(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* c
     if (reason) *reason = "this build has no DLSS SDK in it";
     return false;
 #else
-    if (eye < 0 || eye > 1) {
-        if (reason) *reason = "a missing input";
+    if (!upscalerSlotHasFoveatedRoles(eye)) {
+        if (reason) *reason = upscalerSlotHasFullFrame(eye) ? "this upscaler slot has no periphery" : "a missing input";
         return false;
     }
     return evaluateCrop(g_periph[eye], "periphery", eye, ctx, colour, depth, motion, output, w, h,

@@ -40,9 +40,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 #include "holo_families.h"  // the crisp take's eight hologram VS hashes: kHoloGeneric's match list
+#include "holo_material.h"  // the cockpit holo panels' second vertex shader (Disable GUI effects)
 
 namespace edvr {
 
@@ -587,7 +589,8 @@ enum class UiLayerFamily : uint8_t {
     kLoader,     // the loading screen's composite (vs 4EF6DDB075A927FA)
     kSurface,    // any other eye draw sampling a learned interface surface
     kGuiDirect,  // a GUI-family draw (vector/text/icon) straight into an eye
-    kHolo,       // cockpit holo panels (vs 81216C77F90DEDD6)
+    kHolo,       // cockpit holo panels (vs 81216C77F90DEDD6; with Elite's Disable
+                 // GUI effects on, vs 1989E6D3B405FDE0: uiVsIsHoloPanel)
     kFlightHud,  // flight HUD (vs B7790CBFC6554097)
     kSprite,     // target-time sprite (vs E508648660A352B2)
     kHoloGeneric,  // the crisp take's eight (holo_families.h kHoloFamiliesTake:
@@ -723,6 +726,13 @@ inline bool uiLayerFollowReader(bool chainOpen, const void* identity, const void
 constexpr uint64_t kUiVsPanel = 0xA888D51024D9798Eull;   // menu / modal panel composite
 constexpr uint64_t kUiVsLoader = 0x4EF6DDB075A927FAull;  // loading screen composite
 constexpr uint64_t kUiVsHolo = 0x81216C77F90DEDD6ull;
+// The same cockpit panels with Elite's "Disable GUI effects" on: another vertex shader (and pixel
+// shader, holo_material.h) with the stock one's draw state and a smaller output signature. Without
+// this the HDR take never named them -- it keys the cockpit families by vertex shader alone -- and
+// they stayed in the scene, upscaled with it (docs/ui-layer-2026-09-23.md, "2026-10-01: Disable GUI
+// effects", user 5 on rc.5: soft panels, ghosting text; the pair in 3 of 3 field logs with the
+// setting on and 0 of 11 with it off).
+constexpr uint64_t kUiVsHoloGuiFxOff = kHoloGuiFxOffVs;
 constexpr uint64_t kUiVsFlightHud = 0xB7790CBFC6554097ull;
 constexpr uint64_t kUiVsSprite = 0xE508648660A352B2ull;
 constexpr uint64_t kUiVsGuiVector = 0x666EF0C4C616F67Eull, kUiVsGuiText = 0x1012E00B3CB44469ull,
@@ -752,6 +762,11 @@ inline bool uiKnownPs(const uint64_t* list, size_t n, uint64_t ps) {
         if (list[i] == ps) return true;
     return false;
 }
+
+// The cockpit holo panels' vertex shaders: the stock one's, and the one the game draws them with
+// while Disable GUI effects is on. The ONE place that says so: both of uiLayerFamilyFor's
+// branches ask it, so a panel the HDR take names is named on the post-tonemap target too.
+constexpr bool uiVsIsHoloPanel(uint64_t vs) { return vs == kUiVsHolo || vs == kUiVsHoloGuiFxOff; }
 
 struct UiFamilyFacts {
     int targetKind = 0;           // uiLayerTargetKind: 0 no eye target, 1 not 8-bit UNORM, 2 post-tonemap
@@ -806,8 +821,13 @@ inline UiLayerFamily uiLayerFamilyFor(const UiFamilyFacts& f, UiFamilyWhy* why =
         // considered separately: their original screen-depth address must be
         // repaired and all dependencies prepared before redirecting. Unknown
         // sphere variants and the shared world/cockpit corona remain stock.
-        // World-marker brackets remain in the original scene.
-        out = f.vs == kUiVsHolo        ? UiLayerFamily::kHolo
+        // World-marker brackets remain in the original scene. The cockpit holo
+        // panels are two vertex shaders (uiVsIsHoloPanel): the stock one and the
+        // one the game switches in with Disable GUI effects on. An unnamed pair
+        // gets no decision and no refusal line (2026-10-01: soft, ghosting panels
+        // for a user with the setting on), which is why ui_scene_composites.h
+        // counts the composites left in the scene.
+        out = uiVsIsHoloPanel(f.vs)    ? UiLayerFamily::kHolo
               : f.vs == kUiVsFlightHud ? UiLayerFamily::kFlightHud
               : f.vs == kUiVsSprite    ? UiLayerFamily::kSprite
               : (uiHoloGenericHash(f.vs) ||
@@ -822,11 +842,11 @@ inline UiLayerFamily uiLayerFamilyFor(const UiFamilyFacts& f, UiFamilyWhy* why =
         out = UiLayerFamily::kScreen;
     } else if (f.learnedSurface) {
         w = UiFamilyWhy::kLearnedSurface;
-        out = f.vs == kUiVsPanel    ? UiLayerFamily::kPanel
-              : f.vs == kUiVsLoader ? UiLayerFamily::kLoader
-              : f.vs == kUiVsHolo   ? UiLayerFamily::kHolo
-              : f.vs == kUiVsSprite ? UiLayerFamily::kSprite
-                                    : UiLayerFamily::kSurface;
+        out = f.vs == kUiVsPanel       ? UiLayerFamily::kPanel
+              : f.vs == kUiVsLoader    ? UiLayerFamily::kLoader
+              : uiVsIsHoloPanel(f.vs)  ? UiLayerFamily::kHolo
+              : f.vs == kUiVsSprite    ? UiLayerFamily::kSprite
+                                       : UiLayerFamily::kSurface;
     } else if (f.vs == kUiVsPanel && uiKnownPs(kUiPanelPs, sizeof(kUiPanelPs) / sizeof(kUiPanelPs[0]), f.ps)) {
         w = UiFamilyWhy::kShaderPair;
         out = UiLayerFamily::kPanel;
@@ -1031,6 +1051,13 @@ struct UiLayerDrawFacts {
     bool verdictForwards = true;  // the draw is forwarded as-is by its verdict
     bool worldScreen = false;     // the 2D screen shows the world: the journal says on
                                   // foot, or the screen's own depth is busy
+    // The VR world route owns the world for this frame (vr_world_route.h: it resolved the world
+    // once and the eye shift is off), so the screen composite is the layer's to RE-ISSUE instead
+    // of the temporal pass's to treat: the world-screen refusal does not apply, and every later
+    // test applies to the screen draw as to any opaque, no-depth eye draw. Always false with
+    // experimental.temporal_aa_on_foot_world off (design doc section 82; ui_layer.cpp sets it
+    // for the 2D screen family alone, from vrWorldRouteLayerMayTake()).
+    bool worldRoute = false;
     bool eyeTarget = false;       // an eye-sized 2D colour target
     bool ldrView = false;         // ... viewed as 8-bit UNORM (post-tonemap)
     int eye = -1;                 // 0 left, 1 right, -1 unknown
@@ -1063,8 +1090,10 @@ inline UiLayerDecision uiLayerDecide(const UiLayerDrawFacts& f) {
     if (f.family == UiLayerFamily::kNone) return UiLayerDecision::kNotUi;
     if (!f.verdictForwards) return UiLayerDecision::kVerdict;
     // Before every other test, so the reason is the same whatever else holds
-    // (armed or not, late or not): the screen that shows the world stays.
-    if (f.worldScreen && f.family == UiLayerFamily::kScreen) return UiLayerDecision::kWorldScreen;
+    // (armed or not, late or not): the screen that shows the world stays --
+    // unless the VR world route owns the frame, which re-issues it into the
+    // layer (and then every test below applies to it as to any eye draw).
+    if (f.worldScreen && f.family == UiLayerFamily::kScreen && !f.worldRoute) return UiLayerDecision::kWorldScreen;
     if (!f.eyeTarget) return UiLayerDecision::kNotEyeTarget;
     // The lit HDR target, before exposure and the tonemap: refused as stock,
     // unless the HDR HUD take owns this family (the cockpit HUD families: the
@@ -1093,6 +1122,202 @@ inline UiLayerDecision uiLayerDecide(const UiLayerDrawFacts& f) {
     if (f.crispHdr && f.blend == UiBlendShape::kMultiply) return UiLayerDecision::kBlendRefused;
     if (!f.layerReady) return UiLayerDecision::kLayerFailed;
     return UiLayerDecision::kRedirect;
+}
+
+// ------------------------------------------------------ the VR world route --
+//
+// What the layer does for the VR on-foot world route (docs/design-flat-temporal-aa-2026-09-23.md, section 82;
+// vr_world_route.h). On a frame the route owns, the game's 2D screen composite -- one sample of the screen
+// texture into each eye image -- is NOT taken: it lands in its eye image exactly as it always did (the game's own
+// post pass copies that image on, and a refused re-issue must leave the eye whole for the eye route to serve). The
+// layer draws it a SECOND time, after the game's draw, into the eye's layer from the route's mipped copy of the
+// resolved screen; the door then runs layer-only for that eye (native_temporal.cpp) and the layer's opaque screen
+// over a black frame is the eye. All of it pure here, so the rig drives the code the DLL runs; with the key off
+// nothing below is ever true (the route never owns a frame) and every function answers as it did before it existed.
+
+// The route's mode for a draw: the 2D screen's composite, while the screen shows the world, on a frame the route
+// owns. A screen that is not the world (a menu) is taken as it always was, whatever the route says.
+inline bool uiLayerWorldRouteMode(UiLayerFamily family, bool worldScreen, bool worldRoute) {
+    return family == UiLayerFamily::kScreen && worldScreen && worldRoute;
+}
+
+// Which tally a decided draw goes to. A draw in the route's mode that passed every test is not "redirected into
+// the layer" (the layer took nothing from the game's frame): it is counted as a re-issue, by the caller, when the
+// re-issue ran. Every other decision is counted as it always was -- kWorldScreen included, on the frames the route
+// does not own -- and a route-mode draw the tests refused is counted as that refusal.
+enum class UiWorldCount : uint8_t { kDecided, kReissue };
+inline UiWorldCount uiLayerWorldCount(UiLayerDecision d, bool routeMode) {
+    return routeMode && d == UiLayerDecision::kRedirect ? UiWorldCount::kReissue : UiWorldCount::kDecided;
+}
+
+// Why the route's re-issue did not happen, beyond the decision's own tests (those are UiLayerDecision values).
+enum class UiWorldRefuse : uint8_t {
+    kNone = 0,
+    // (There is no "curved" reason: a curved screen is re-issued through the strip the game's draw is substituted with,
+    // panel_curve.h panelCurveReissue, so the plan accepts it as it does a flat one.)
+    kDepthState,     // the screen draw tests or writes depth or stencil (the re-issue binds no depth target)
+    kNotOpaque,      // the screen draw blends: the layer-only eye is the layer over black, and only an opaque draw is
+                     // the eye that way
+    kNoSource,       // the draw's PS slot 0 is not a 2D texture
+    kMipsNull,       // the mipped screen was not available (vr_world_mips.h says why, once)
+    kNoSampler,      // the draw binds no sampler at PS slot 0
+    kSamplerNull,    // the trilinear sampler like the game's could not be made
+    kStateChanged,   // the draw's bindings were not the decided draw's at the moment of the re-issue
+    kBeginRefused,   // the layer refused the issue (a blend that changed since the decision, or a fault)
+    kFault,          // a fault while binding the re-issue
+    kCount
+};
+inline const char* uiWorldRefuseName(UiWorldRefuse r) {
+    switch (r) {
+        case UiWorldRefuse::kDepthState: return "the screen draw tests or writes depth or stencil (the re-issue binds none)";
+        case UiWorldRefuse::kNotOpaque:
+            return "the screen draw blends (only an opaque draw is the whole eye over a black frame)";
+        case UiWorldRefuse::kNoSource: return "the draw's texture at PS slot 0 is not a 2D texture";
+        case UiWorldRefuse::kMipsNull: return "the mipped screen was not available";
+        case UiWorldRefuse::kNoSampler: return "the draw binds no sampler at PS slot 0";
+        case UiWorldRefuse::kSamplerNull: return "the trilinear sampler could not be made";
+        case UiWorldRefuse::kStateChanged: return "the draw's bindings changed between its decision and the re-issue";
+        case UiWorldRefuse::kBeginRefused: return "the layer refused the issue (a changed blend, or a fault)";
+        case UiWorldRefuse::kFault: return "a fault while binding the re-issue";
+        default: return "?";
+    }
+}
+
+// The same reasons as short keys, for the 30 s line (the long texts above are the first-eight lines': Log's line
+// holds 1200 characters, and ten long reasons beside fourteen decisions would not fit).
+inline const char* uiWorldRefuseKey(UiWorldRefuse r) {
+    switch (r) {
+        case UiWorldRefuse::kDepthState: return "depth-state";
+        case UiWorldRefuse::kNotOpaque: return "blending-draw";
+        case UiWorldRefuse::kNoSource: return "no-source-texture";
+        case UiWorldRefuse::kMipsNull: return "no-mipped-screen";
+        case UiWorldRefuse::kNoSampler: return "no-sampler";
+        case UiWorldRefuse::kSamplerNull: return "sampler-not-made";
+        case UiWorldRefuse::kStateChanged: return "bindings-changed";
+        case UiWorldRefuse::kBeginRefused: return "layer-refused-issue";
+        case UiWorldRefuse::kFault: return "fault";
+        default: return "?";
+    }
+}
+inline const char* uiLayerDecisionKey(UiLayerDecision d) {
+    switch (d) {
+        case UiLayerDecision::kRedirect: return "redirect";
+        case UiLayerDecision::kNotUi: return "not-ui";
+        case UiLayerDecision::kVerdict: return "verdict";
+        case UiLayerDecision::kWorldScreen: return "world-screen";
+        case UiLayerDecision::kNotEyeTarget: return "not-eye-target";
+        case UiLayerDecision::kHdrTarget: return "hdr-target";
+        case UiLayerDecision::kNoEye: return "no-eye";
+        case UiLayerDecision::kTargetSize: return "target-size";
+        case UiLayerDecision::kLate: return "late";
+        case UiLayerDecision::kToneLate: return "tone-late";
+        case UiLayerDecision::kNotArmed: return "not-armed";
+        case UiLayerDecision::kMrt: return "mrt";
+        case UiLayerDecision::kDepthStencilTest: return "depth-stencil-test";
+        case UiLayerDecision::kSubstitutedWrite: return "substituted-write";
+        case UiLayerDecision::kBlendRefused: return "blend-refused";
+        case UiLayerDecision::kLayerFailed: return "layer-failed";
+        default: return "?";
+    }
+}
+
+// One id space for the log's dedupe: the route's own reasons are their enum value, a refusal by the decision's
+// tests is kUiWorldDecisionBase + the decision.
+constexpr uint16_t kUiWorldDecisionBase = 32;
+inline uint16_t uiWorldReasonId(UiWorldRefuse r) { return static_cast<uint16_t>(r); }
+inline uint16_t uiWorldReasonId(UiLayerDecision d) {
+    return static_cast<uint16_t>(kUiWorldDecisionBase + static_cast<uint16_t>(d));
+}
+inline const char* uiWorldReasonName(uint16_t id) {
+    if (id >= kUiWorldDecisionBase) return uiLayerDecisionName(static_cast<UiLayerDecision>(id - kUiWorldDecisionBase));
+    return uiWorldRefuseName(static_cast<UiWorldRefuse>(id));
+}
+
+// "vr world route: layer did not take the screen draw for eye N: <reason>" -- the first kUiWorldReasonLines
+// DISTINCT reasons of a session, once each (the counters say how often; a line per frame would flood the log).
+constexpr uint32_t kUiWorldReasonLines = 8;
+struct UiWorldReasonLog {
+    uint16_t seen[kUiWorldReasonLines] = {};
+    uint32_t n = 0;
+    // True the first time `id` is offered while fewer than kUiWorldReasonLines distinct reasons have been logged.
+    bool first(uint16_t id) {
+        for (uint32_t i = 0; i < n; ++i) {
+            if (seen[i] == id) return false;
+        }
+        if (n >= kUiWorldReasonLines) return false;
+        seen[n++] = id;
+        return true;
+    }
+};
+inline int uiWorldFormatRefusal(char* out, size_t size, int eye, uint16_t id) {
+    if (eye < 0 || eye > 1) {
+        return std::snprintf(out, size, "vr world route: layer did not take the screen draw for an unknown eye: %s",
+                             uiWorldReasonName(id));
+    }
+    return std::snprintf(out, size, "vr world route: layer did not take the screen draw for eye %d: %s", eye,
+                         uiWorldReasonName(id));
+}
+
+// Is the layer live for the route? The exact condition under which the layer's own gate (the world-screen
+// reading) runs today: fix.ui_quality on, a temporal mode on, the jitter switches as shipped, and the layer not
+// stood down -- ui_layer.cpp's refreshLive() evaluates it through this, and the route must not run without it. The
+// reason is the one line the route's log gives for a layer that is not; null when the layer is live.
+inline bool uiLayerLiveFor(float target, bool temporal, bool jitterAsShipped, bool stoodDown) {
+    return target > 0.0f && temporal && jitterAsShipped && !stoodDown;
+}
+inline const char* uiLayerNotLiveReasonFor(float target, bool temporal, bool jitterAsShipped, bool stoodDown) {
+    if (!(target > 0.0f)) return "fix.ui_quality is off";
+    if (!temporal) return "no temporal mode is on (fix.temporal_aa is off)";
+    if (!jitterAsShipped) return "the eye jitter is not as shipped (advanced.temporal_aa_jitter_sign or _lag is set)";
+    if (stoodDown) return "the layer stood down for the session";
+    return nullptr;
+}
+
+// Can the door go layer-only for this eye: is the composite that has to produce the eye certain to run? Decided in
+// treat() BEFORE the door commits to a black frame, so a composite that could not run leaves the eye to the eye
+// route (the game's own image through the pass, in the same call) instead of handing the headset a black eye.
+enum class UiWorldDoorGap : uint8_t {
+    kNone = 0,
+    kNotLive,          // the layer is off or stood down
+    kNoLayer,          // no layer was made for the eye
+    kNoContent,        // the layer holds no draw of this frame (the re-issue did not land)
+    kAlreadyDone,      // the composite already ran for this sequence
+    kRuntimeDisabled,  // the graphics runtime is shutting down
+    kCannotComposite,  // the frame's format, the GPU's typed stores or the shader refuse a composite
+    kAspect,           // the frame's shape is not the layer's (the door's size is changing)
+    kCount
+};
+struct UiWorldDoorFacts {
+    bool live = false;
+    bool layerMade = false;
+    bool holdsContent = false;
+    bool alreadyComposited = false;
+    bool runtimeDisabled = false;
+    bool canComposite = false;
+    bool aspectMatches = false;
+};
+inline UiWorldDoorGap uiWorldDoorGap(const UiWorldDoorFacts& f) {
+    if (!f.live) return UiWorldDoorGap::kNotLive;
+    if (!f.layerMade) return UiWorldDoorGap::kNoLayer;
+    if (!f.holdsContent) return UiWorldDoorGap::kNoContent;
+    if (f.alreadyComposited) return UiWorldDoorGap::kAlreadyDone;
+    if (f.runtimeDisabled) return UiWorldDoorGap::kRuntimeDisabled;
+    if (!f.canComposite) return UiWorldDoorGap::kCannotComposite;
+    if (!f.aspectMatches) return UiWorldDoorGap::kAspect;
+    return UiWorldDoorGap::kNone;
+}
+inline const char* uiWorldDoorGapName(UiWorldDoorGap g) {
+    switch (g) {
+        case UiWorldDoorGap::kNotLive: return "the UI layer is not live";
+        case UiWorldDoorGap::kNoLayer: return "the eye has no layer";
+        case UiWorldDoorGap::kNoContent: return "the layer holds nothing of this frame (the screen re-issue did not land)";
+        case UiWorldDoorGap::kAlreadyDone: return "the layer was already composited for this frame";
+        case UiWorldDoorGap::kRuntimeDisabled: return "the graphics runtime is shutting down";
+        case UiWorldDoorGap::kCannotComposite:
+            return "the composite cannot run over the door's frame (its format, the GPU's typed stores or the shader)";
+        case UiWorldDoorGap::kAspect: return "the door's frame is not the shape of the layer (its size is changing)";
+        default: return "none";
+    }
 }
 
 // Armed for eye e at frame `sequence`: the door ran for that eye in the

@@ -14,6 +14,7 @@
 #include "../../src/d3d11/temporal_pass.h"
 #include "../../src/d3d11/ui_layer.h"
 #include "../../src/d3d11/ui_surfaces.h"
+#include "../../src/d3d11/vr_camera_census.h"
 #include "../../src/d3d11/dlss_floor.h"
 #include "../../src/openxr/native_temporal_client.h"
 #include "../../src/common/system_d3d11.h"
@@ -34,13 +35,14 @@ Call note;std::vector<Call> calls;bool passSucceeds=true;
 // CreateTexture2D -- where fix.ui_quality's surfaces ask for the
 // recommendation. The stub asks from there, exactly as the create hook
 // would; MSVC's std::mutex throws on a re-lock from its own thread.
-unsigned reentries=0,reentryThrows=0;uint32_t reentryRecW=0,reentryRecH=0;bool reentryJitter=true,reentryWarm=true;
+unsigned reentries=0,reentryThrows=0;uint32_t reentryRecW=0,reentryRecH=0;bool reentryJitter=true,reentryWarm=true,reentryGeometry=true;
 float reentryUp=0,reentryDown=0;
 void askFromInsideTreat(){
   ++reentries;
   try{uint32_t w=0,h=0;if(edvr::nativeTemporalRecommended(&w,&h)){reentryRecW=w;reentryRecH=h;}
       edvr::nativeTemporalVerticalTangents(&reentryUp,&reentryDown);
       uint64_t sq=0;float x=0,y=0;uint32_t a=0,b=0;reentryJitter=edvr::nativeTemporalDrawJitter(0,&sq,&x,&y,&a,&b);
+      float fr[4]{},sh[2]{};reentryGeometry=edvr::nativeTemporalEyeGeometry(0,&sq,fr,sh);
       ID3D11Device* dv=nullptr;unsigned long th=0;reentryWarm=edvr::nativeTemporalWarmTarget(&dv,&th);}
   catch(...){++reentryThrows;}
 }
@@ -64,8 +66,11 @@ extern "C" void edvrEyeCaptureUntreated(void*,int,const float*){++dumps;}
 // frame. Recorded here, asserted below.
 unsigned uiLayerNotes=0;uint64_t uiLayerNoteSeq=0;uint32_t uiLayerNoteEye=9;const void* uiLayerNoteOut=nullptr;
 unsigned uiLayerSubmits=0;const void* uiLayerSubmitted[2]{};
+// The VR world route's scene reset (src/d3d11/vr_world_route.cpp, docs section 82): skipEye tells it a withheld frame.
+unsigned worldRouteSceneResets=0;
 namespace edvr{void uiLayerNoteTemporal(uint64_t seq,uint32_t eye,const void* out){++uiLayerNotes;uiLayerNoteSeq=seq;uiLayerNoteEye=eye;uiLayerNoteOut=out;}
-void uiLayerNoteSubmitted(uint64_t,uint32_t eye,const void* submitted){++uiLayerSubmits;if(eye<2)uiLayerSubmitted[eye]=submitted;}}
+void uiLayerNoteSubmitted(uint64_t,uint32_t eye,const void* submitted){++uiLayerSubmits;if(eye<2)uiLayerSubmitted[eye]=submitted;}
+void vrWorldRouteNoteSceneReset(){++worldRouteSceneResets;}}
 // The served floor's NGX query (dlaa.cpp), shaped the way the flights'
 // modes lines read (edvr_gfx_20260923_153446.log line 435): quality,
 // balanced and performance take half the output up to the output, ultra
@@ -81,6 +86,20 @@ namespace edvr{bool dlssModeRanges(ID3D11Device*,uint32_t outW,uint32_t outH,Dls
   const unsigned optW[3]={(outW*2+1)/3,(outW*58+50)/100,hw},optH[3]={(outH*2+1)/3,(outH*58+50)/100,hh};
   for(int k=0;k<3;++k){auto& m=modes[k];m.ok=true;m.optW=optW[k];m.optH=optH[k];m.minW=hw;m.minH=hh;m.maxW=outW;m.maxH=outH;}
   auto& u=modes[3];u.ok=true;u.optW=u.minW=u.maxW=(outW+1)/3;u.optH=u.minH=u.maxH=(outH+1)/3;return true;}}
+// The VR world route's surface as native_temporal.cpp sees it (src/d3d11/vr_world_route.h), the UI layer's preflight
+// for a layer-only eye (src/d3d11/ui_layer.cpp) and the raw clear the black frame uses (src/d3d11/vscreen.cpp), each a
+// stub the cases at the end of run() drive. At their defaults -- the route owns nothing and took no eye -- every case
+// before that block is the key-off behaviour the route must leave exactly as it was.
+bool routeOwns=false;bool routeTookEye[2]={false,false};uint64_t routeTookSeq=0;int gapAnswer=0;
+unsigned gapCalls=0,rawClears=0;ID3D11Texture2D* gapFrame=nullptr;
+namespace edvr{
+bool vrWorldRouteOwnsNextFrame(){return routeOwns;}
+// The layer's one predicate for a layer-only eye (src/d3d11/ui_layer.h): the route's re-issued world, or a map's or menu's 2D screen
+// the layer took under experimental.on_foot_maps_sharp. The door cannot tell which, so one stub answers for both.
+bool uiLayerDoorLayerOnly(uint32_t eye,uint64_t seq){return eye<2&&routeTookEye[eye]&&seq!=0&&routeTookSeq==seq;}
+int uiLayerWorldDoorGap(uint64_t,uint32_t,ID3D11Texture2D* frame){++gapCalls;gapFrame=frame;return gapAnswer;}
+void vScreenClearRenderTargetViewRaw(ID3D11DeviceContext* c,ID3D11RenderTargetView* v,const float colour[4]){++rawClears;c->ClearRenderTargetView(v,colour);}
+}
 struct Device {
   ComPtr<ID3D11Device> device;ComPtr<ID3D11DeviceContext> context;
   Device(){auto create=edvr::systemD3D11CreateDevice();require(create!=nullptr,"system D3D11");
@@ -125,7 +144,7 @@ void run(){
   check(reentries>=2&&reentryThrows==0,"asked from inside treat (as the create hook asks), nothing re-locks the channel's mutex");
   check(reentryRecW==480&&reentryRecH==360,"...and the recommendation is the frame's, read without the lock");
   check(closeFloat(reentryUp,.9f)&&closeFloat(reentryDown,1.1f),"...and so is its vertical frustum (the panel rule's field of view)");
-  check(!reentryJitter&&!reentryWarm,"...and the readers that take the lock answer no there instead of throwing");
+  check(!reentryJitter&&!reentryWarm&&!reentryGeometry,"...and the readers that take the lock (the eye geometry the VR camera census reads included) answer no there instead of throwing");
   {uint32_t rw=0,rh=0;check(edvr::nativeTemporalRecommended(&rw,&rh)&&rw==480&&rh==360,"the recommendation outside treat");}
   {uint32_t aw=1,ah=1;check(!edvr::nativeTemporalAsked(&aw,&ah),"no ask when the host does not say (the recommendation is the answer)");}
   check(calls.back().flags&1,"first history reset");check(!calls.back().head,"first frame has no invented head pair");
@@ -147,6 +166,17 @@ void run(){
    check(edvr::nativeTemporalDrawJitter(0,&ds,&djx,&djy,&dw,&dh)&&ds==2&&closeFloat(djx,c.jx)&&closeFloat(djy,c.jy)&&dw==320&&dh==240,
          "draw-time jitter is the pixel jitter the pass receives, for the frame being drawn");
    check(!edvr::nativeTemporalDrawJitter(2,&ds,&djx,&djy,&dw,&dh),"draw-time jitter refuses an eye that does not exist");}
+  // The VR camera census reads what EDVR advertised for an eye at its composite draw (vr_camera_census.h): the frame's
+  // sequence, the frustum the host gave (frame()'s, {left, right, down, up}) and the tangent shift the jitter moved it by.
+  {uint64_t es=0;float fr[4]{},sh[2]{};
+   check(edvr::nativeTemporalEyeGeometry(0,&es,fr,sh)&&es==2&&closeFloat(fr[0],-1.2f)&&closeFloat(fr[1],.7f)&&closeFloat(fr[2],-.9f)&&
+         closeFloat(fr[3],1.1f)&&closeFloat(sh[0],p.tangentShift[0][0])&&closeFloat(sh[1],p.tangentShift[0][1])&&
+         (std::fabs(sh[0])>0||std::fabs(sh[1])>0),
+         "the eye geometry is the frustum the host was given and the tangent shift the frame carried, for eye 0 of the frame being drawn");
+   check(edvr::nativeTemporalEyeGeometry(1,&es,fr,sh)&&closeFloat(fr[0],-.8f)&&closeFloat(fr[1],1.4f)&&closeFloat(sh[0],p.tangentShift[1][0])&&closeFloat(sh[1],p.tangentShift[1][1]),
+         "...and eye 1's own");
+   check(!edvr::nativeTemporalEyeGeometry(2,&es,fr,sh),"the eye geometry refuses an eye that does not exist");
+   check(edvr::nativeTemporalEyeGeometry(0,nullptr,nullptr,nullptr),"a caller may ask for any subset of the answer");}
   check(uiLayerNotes>=3&&uiLayerNoteSeq==2&&uiLayerNoteEye==0&&uiLayerNoteOut==source.Get(),"each treated eye is noted to the UI layer with the pass's output");
   check(uiLayerSubmits>=3&&uiLayerSubmitted[0]==source.Get()&&uiLayerSubmitted[1]==source.Get(),"the game's submitted texture is noted per eye for the UI layer's eye check");
   check(std::fabs(c.jx)>.01f||std::fabs(c.jy)>.01f,"known-size jitter engaged");
@@ -159,6 +189,7 @@ void run(){
   f=frame(11,5);f.referenceGeneration=2;begin(t,f);check(treat(t,5,0,source.Get())==S_OK&&(calls.back().flags&1),"reference change reset");
   check(t.invalidate(t.context)==S_OK,"CPU invalidation");check(treat(t,5,0,source.Get())==E_INVALIDARG,"invalidated frame cannot treat");check(t.beginFrame(t.context,&f,&p)==E_INVALIDARG,"invalidated sequence cannot reopen");
   {uint32_t rw=0,rh=0;float u=0,dn=0;check(!edvr::nativeTemporalRecommended(&rw,&rh)&&!edvr::nativeTemporalVerticalTangents(&u,&dn)&&!edvr::nativeTemporalAsked(&rw,&rh)&&!edvr::nativeTemporalTrueVerticalTangents(&u,&dn),"no recommendation, frustum, ask or true frustum once the channel is invalidated");}
+  {uint64_t es=0;float fr[4]{},sh[2]{};check(!edvr::nativeTemporalEyeGeometry(0,&es,fr,sh),"no eye geometry once the channel is invalidated");}
   f=frame(11,6);p=begin(t,f);auto larger=d.texture(640,480);check(treat(t,6,0,larger.Get())==S_OK,"resize treatment");c=calls.back();
   check(c.flags&1,"resize reset");check(closeFloat(c.jx,-p.tangentShift[0][0]*640/1.9f),"resize converts jitter to actual pixels");
   Device other;auto foreign=other.texture();check(treat(t,6,1,foreign.Get())==E_INVALIDARG,"wrong device rejected");
@@ -210,8 +241,11 @@ void run(){
   auto omitted=acquire(d,17);f=frame(17,1);begin(omitted,f);
   check(treat(omitted,1,0,source.Get())==S_OK,"omission baseline");
   f=frame(17,2);begin(omitted,f);const auto count=calls.size();
+  const unsigned resetsBefore=worldRouteSceneResets;
   check(omitted.skipEye(omitted.context,2,0,1,edvr::jumpVerdictPacked())==S_OK&&calls.size()==count,"withheld pixels never enter history");
+  check(worldRouteSceneResets==resetsBefore+1,"a withheld eye tells the VR world route once (a scene reset: boarding, disembarking, a jump, a glitch frame)");
   check(omitted.skipEye(omitted.context,2,0,1,0)==E_INVALIDARG&&treat(omitted,2,0,source.Get())==E_INVALIDARG,"omitted eye cannot be consumed twice");
+  check(worldRouteSceneResets==resetsBefore+1,"a refused skipEye is not a scene reset");
   edvr::noteJumpVerdict(2);f=frame(17,3);f.head[3]=.2f;begin(omitted,f);
   check(treat(omitted,3,0,source.Get())==S_OK&&!(calls.back().flags&1)&&closeFloat(calls.back().translation[0],.2f),"stayed verdict preserves real previous pose across omitted frame");
   f=frame(17,4);begin(omitted,f);omitted.skipEye(omitted.context,4,0,1,edvr::jumpVerdictPacked());
@@ -271,6 +305,162 @@ void run(){
     ask(fsr,19,4074,4076,1833,1834,4074,4076,"fsr keeps the door's output (AMD's ranges are not NVIDIA's)");
     check(rangeQueries==q,"...and asks NGX nothing");
     check(fsr.close(fsr.context)==S_OK,"fsr channel close");
+  }
+
+  // ---- the VR world route: the eye shift and the layer-only door (design doc section 82) ----------------------------
+  // With experimental.temporal_aa_on_foot_world off the route owns nothing and took no eye, which is every case above.
+  // Here it owns the next frame, or took an eye's screen draw into the UI layer, and the door answers for it.
+  {
+    const auto shifted=[](const EdvrNativeTemporalProjection& p){
+      return p.tangentShift[0][0]!=0||p.tangentShift[0][1]!=0||p.tangentShift[1][0]!=0||p.tangentShift[1][1]!=0;};
+    const auto unshifted=[&](uint64_t gen,const char* mode,const char* why){
+      auto t=acquire(d,gen,mode);auto fr=frame(gen,1);auto p0=begin(t,fr);(void)p0;
+      treat(t,1,0,source.Get());treat(t,1,1,source.Get());fr=frame(gen,2);const auto p=begin(t,fr);
+      check(!shifted(p),why);check(t.close(t.context)==S_OK,"close");};
+    // 1. The eye shift: advertised every frame, except the frame after a boundary that left the route owning the world.
+    {
+      auto st=acquire(d,20);routeOwns=false;uint64_t q=1;
+      auto fr=frame(20,q);begin(st,fr);check(treat(st,q,0,source.Get())==S_OK&&treat(st,q,1,source.Get())==S_OK,"shift baseline pair");
+      fr=frame(20,++q);auto sp=begin(st,fr);
+      check(shifted(sp),"the route owns nothing: the eye shift is advertised, exactly as it always was");
+      treat(st,q,0,source.Get());treat(st,q,1,source.Get());
+      routeOwns=true;fr=frame(20,++q);sp=begin(st,fr);
+      check(!shifted(sp)&&sp.tangentShift[0][0]==0&&sp.tangentShift[0][1]==0&&sp.tangentShift[1][0]==0&&sp.tangentShift[1][1]==0,
+            "the route owns the next frame: no eye shift for either eye");
+      {uint64_t sq=0;float jx=9,jy=9;uint32_t w=0,h=0;
+       check(edvr::nativeTemporalDrawJitter(0,&sq,&jx,&jy,&w,&h)&&sq==q&&jx==0&&jy==0&&edvr::nativeTemporalDrawJitter(1,&sq,&jx,&jy,&w,&h)&&jx==0&&jy==0,
+             "...so the layer's jitter cancel follows to zero by construction (the draw-time jitter is zero for both eyes)");}
+      const auto callsAt=calls.size();
+      check(treat(st,q,0,source.Get())==S_OK&&calls.size()==callsAt+1&&calls.back().jx==0&&calls.back().jy==0,
+            "...and the eye route, serving an eye the route did not take on such a frame, treats it with no shift");
+      treat(st,q,1,source.Get());
+      routeOwns=false;fr=frame(20,++q);sp=begin(st,fr);
+      check(shifted(sp),"the route released the world: the eye shift is back, the very next frame");
+      routeOwns=true;fr=frame(20,++q);sp=begin(st,fr);check(!shifted(sp),"...and it goes off again the moment the route owns the next frame");
+      routeOwns=false;check(st.close(st.context)==S_OK,"shift channel close");
+    }
+    routeOwns=true;
+    unshifted(24,"off","fix.temporal_aa off: no shift whether or not the route owns the world");
+    routeOwns=false;
+    unshifted(25,"off","fix.temporal_aa off: no shift (the route owns nothing)");
+
+    // 2. The layer-only door.
+    const auto outOf=[&](EdvrNativeTemporalTable& t,uint64_t seq,unsigned eye,ID3D11Texture2D* src){
+      struct R{HRESULT hr=E_FAIL;ComPtr<ID3D11Texture2D> tex;float box[4]{};};R r;ID3D11Texture2D* raw=nullptr;
+      r.hr=t.treatEye(t.context,seq,eye,src,nullptr,&raw,r.box);r.tex.Attach(raw);return r;};
+    const auto descOf=[](ID3D11Texture2D* tex){D3D11_TEXTURE2D_DESC dd{};tex->GetDesc(&dd);return dd;};
+    const auto pixel=[&](ID3D11Texture2D* tex,unsigned x,unsigned y){
+      D3D11_TEXTURE2D_DESC dd=descOf(tex);if(x>=dd.Width||y>=dd.Height)return 0xDEADBEEFu;   // a pixel that is not there reads as a failure, not a fault
+      dd.Usage=D3D11_USAGE_STAGING;dd.BindFlags=0;dd.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+      ComPtr<ID3D11Texture2D> st;require(SUCCEEDED(d.device->CreateTexture2D(&dd,nullptr,&st)),"staging");
+      d.context->CopyResource(st.Get(),tex);D3D11_MAPPED_SUBRESOURCE m{};require(SUCCEEDED(d.context->Map(st.Get(),0,D3D11_MAP_READ,0,&m)),"map");
+      const auto* p=static_cast<const unsigned char*>(m.pData)+y*m.RowPitch+x*4;unsigned v=p[0]|(p[1]<<8)|(p[2]<<16)|(unsigned(p[3])<<24);
+      d.context->Unmap(st.Get(),0);return v;};
+    const auto refs=[](ID3D11Texture2D* t){const auto n=t->AddRef();t->Release();return n-1;};
+    uint64_t q=0;routeOwns=true;
+    auto lo=acquire(d,21,"dlss");   // 320x240 into the door's 480x360
+    ComPtr<ID3D11Texture2D> blank;
+    {
+      // frame 1: the eye route -- history is established, nothing is taken
+      auto fr=frame(21,++q);begin(lo,fr);
+      routeTookEye[0]=routeTookEye[1]=false;routeTookSeq=0;
+      check(treat(lo,q,0,source.Get())==S_OK&&treat(lo,q,1,source.Get())==S_OK,"layer-only setup: eye route frame");
+      const auto contFlagsAfter=calls.back().flags;(void)contFlagsAfter;
+      // frame 2: the route took both eyes' screen draws
+      fr=frame(21,++q);begin(lo,fr);routeTookEye[0]=routeTookEye[1]=true;routeTookSeq=q;gapAnswer=0;gapCalls=0;rawClears=0;
+      const auto callsBefore=calls.size();const auto notesAt=uiLayerNotes;
+      auto o0=outOf(lo,q,0,source.Get());
+      check(o0.hr==S_OK&&o0.tex&&o0.tex.Get()!=source.Get(),"layer-only: S_OK with a frame of its own (never null, never S_FALSE)");
+      check(calls.size()==callsBefore,"...and no upscaler runs for the eye (no motion prep, no pass call)");
+      check(o0.box[0]==0&&o0.box[1]==0&&o0.box[2]==1&&o0.box[3]==1,"...the full output bounds, as the pass returns them");
+      const auto dd=o0.tex?descOf(o0.tex.Get()):D3D11_TEXTURE2D_DESC{};
+      check(dd.Width==480&&dd.Height==360&&dd.Format==DXGI_FORMAT_R8G8B8A8_UNORM&&(dd.BindFlags&D3D11_BIND_SHADER_RESOURCE)&&dd.ArraySize==1&&dd.MipLevels==1,
+            "...of the size the upscaler's output would have had (the door's 480x360, not the input's 320x240), in the source's own format");
+      check(uiLayerNotes==notesAt+1&&uiLayerNoteEye==0&&uiLayerNoteSeq==q&&uiLayerNoteOut==o0.tex.Get(),
+            "...noted to the UI layer as the pass's output (so the layer arms for the next frame)");
+      check(gapCalls==1&&gapFrame==o0.tex.Get(),"...after the layer's own preflight, asked about that very frame");
+      check(o0.tex&&pixel(o0.tex.Get(),0,0)==0xFF000000u&&pixel(o0.tex.Get(),479,359)==0xFF000000u&&pixel(o0.tex.Get(),240,180)==0xFF000000u,
+            "...black, alpha one, cleared once when it was made");
+      auto again=outOf(lo,q,0,source.Get());
+      check(again.hr==E_INVALIDARG&&!again.tex,"...and an eye cannot be treated twice in a frame (layer-only marks it treated)");
+      auto o1=outOf(lo,q,1,source.Get());
+      check(o1.hr==S_OK&&o1.tex.Get()==o0.tex.Get()&&rawClears==1,"...the other eye shares the one black frame, which was cleared exactly once");
+      blank=o0.tex;
+      // frame 3: again -- the same frame, never made or cleared again
+      fr=frame(21,++q);begin(lo,fr);routeTookSeq=q;
+      auto n0=outOf(lo,q,0,source.Get()),n1=outOf(lo,q,1,source.Get());
+      check(n0.hr==S_OK&&n1.hr==S_OK&&n0.tex.Get()==blank.Get()&&n1.tex.Get()==blank.Get()&&rawClears==1,
+            "the next layer-only frame hands on the same black frame: made once per size, cleared once, read by everyone after");
+      // frame 4: the route let go of the eye -- the eye route serves it, and finds its history broken
+      fr=frame(21,++q);begin(lo,fr);routeTookEye[0]=routeTookEye[1]=false;routeTookSeq=0;
+      const auto c4=calls.size();
+      check(treat(lo,q,0,source.Get())==S_OK&&calls.size()==c4+1&&(calls.back().flags&1),
+            "the eye route after layer-only frames resets the eye's history (the layer-only frames left the continuity alone)");
+      treat(lo,q,1,source.Get());
+      // frame 5: no layer-only frame in between: the history is continuous (the contrast that gives frame 4 its teeth)
+      fr=frame(21,++q);begin(lo,fr);
+      check(treat(lo,q,0,source.Get())==S_OK&&!(calls.back().flags&1),"...whereas two eye-route frames in a row keep it");
+      treat(lo,q,1,source.Get());
+      // the layer declines (a preflight gap): the same call goes on through the pass, the game's own eye
+      fr=frame(21,++q);begin(lo,fr);routeTookEye[0]=routeTookEye[1]=true;routeTookSeq=q;gapAnswer=3;
+      const auto c6=calls.size();const auto notes6=uiLayerNotes;
+      auto d0=outOf(lo,q,0,source.Get());
+      check(d0.hr==S_OK&&calls.size()==c6+1&&d0.tex.Get()==source.Get()&&uiLayerNotes==notes6+1&&uiLayerNoteOut==source.Get(),
+            "a layer that cannot certainly composite: the eye is served by the pass in the SAME call (the game's own eye, noted as the pass's output), never a black frame");
+      gapAnswer=0;
+      // a format the composite does not run over: the black frame cannot be made, the eye route serves it
+      fr=frame(21,++q);begin(lo,fr);routeTookSeq=q;
+      D3D11_TEXTURE2D_DESC fd{};fd.Width=320;fd.Height=240;fd.MipLevels=fd.ArraySize=fd.SampleDesc.Count=1;fd.Format=DXGI_FORMAT_R16G16B16A16_FLOAT;fd.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+      ComPtr<ID3D11Texture2D> half;require(SUCCEEDED(d.device->CreateTexture2D(&fd,nullptr,&half)),"half-float texture");
+      const auto c7=calls.size();
+      auto h0=outOf(lo,q,0,half.Get());
+      check(h0.hr==S_OK&&calls.size()==c7+1&&h0.tex.Get()==half.Get(),"a frame the layer's composite does not run over: the black frame is not made, the pass serves the eye");
+      // the route took eye 1 only: eye 0 is the eye route's
+      fr=frame(21,++q);begin(lo,fr);routeTookEye[0]=false;routeTookEye[1]=true;routeTookSeq=q;
+      const auto c8=calls.size();
+      auto m0=outOf(lo,q,0,source.Get()),m1=outOf(lo,q,1,source.Get());
+      check(m0.hr==S_OK&&m0.tex.Get()==source.Get()&&m1.hr==S_OK&&m1.tex.Get()==blank.Get()&&calls.size()==c8+1,
+            "one eye taken and one not: each is served by its own route in the same frame");
+      // a stale take (another sequence) is not this frame's
+      fr=frame(21,++q);begin(lo,fr);routeTookEye[0]=routeTookEye[1]=true;routeTookSeq=q-1;
+      const auto c9=calls.size();
+      auto s0=outOf(lo,q,0,source.Get());
+      check(s0.hr==S_OK&&calls.size()==c9+1&&s0.tex.Get()==source.Get(),"an eye the route took in an earlier sequence is the eye route's in this one");
+      treat(lo,q,1,source.Get());
+    }
+    check(refs(blank.Get())>=2,"the channel holds the black frame while it is open");
+    check(lo.close(lo.context)==S_OK,"layer-only channel close");
+    check(refs(blank.Get())==1,"...and closing releases every reference it held (the two eyes' shared frame included)");
+    blank.Reset();
+    routeTookEye[0]=routeTookEye[1]=false;routeTookSeq=0;routeOwns=false;
+
+    // The door's output is the pass's, wherever the pass would have put it: DLAA at the input's size; under the served
+    // floor at the size the pass is asked for.
+    {
+      auto dl=acquire(d,22,"dlaa");uint64_t s=0;auto fr=frame(22,++s);begin(dl,fr);treat(dl,s,0,source.Get());treat(dl,s,1,source.Get());
+      fr=frame(22,++s);begin(dl,fr);routeTookEye[0]=true;routeTookSeq=s;
+      auto o=outOf(dl,s,0,source.Get());const auto dd=o.tex?descOf(o.tex.Get()):D3D11_TEXTURE2D_DESC{};
+      check(o.hr==S_OK&&o.tex.Get()!=source.Get()&&dd.Width==320&&dd.Height==240,"DLAA: the layer-only frame is the input's size (no upscale)");
+      routeTookEye[0]=false;routeTookSeq=0;check(dl.close(dl.context)==S_OK,"dlaa channel close");
+    }
+    {
+      // 239x179 into a 480x360 door is under half: no mode serves it, and the pass is asked for less (twice the input).
+      auto fl=acquire(d,23,"dlss");uint64_t s=0;auto under=d.texture(239,179);
+      auto fr=frame(23,++s);begin(fl,fr);check(treat(fl,s,0,under.Get())==S_OK&&!calls.empty(),"floor control: the eye route");
+      const auto askW=calls.back().outW,askH=calls.back().outH;
+      check(askW!=480||askH!=360,"floor control: the pass is asked for a cut size, not the door's (the case is not vacuous)");
+      treat(fl,s,1,under.Get());
+      fr=frame(23,++s);begin(fl,fr);routeTookEye[0]=true;routeTookSeq=s;
+      auto o=outOf(fl,s,0,under.Get());const auto dd=o.tex?descOf(o.tex.Get()):D3D11_TEXTURE2D_DESC{};
+      check(o.hr==S_OK&&dd.Width==askW&&dd.Height==askH,"under the served floor the layer-only frame is exactly the size the pass is asked for (the layer never re-sizes between the two routes)");
+      routeTookEye[0]=false;routeTookSeq=0;check(fl.close(fl.context)==S_OK,"floor channel close");
+    }
+    // The pass stood down, or AA is off: the route cannot take an eye's frame at all -- the ordinary passthrough answers.
+    {
+      auto off=acquire(d,26,"off");auto fr=frame(26,1);begin(off,fr);routeTookEye[0]=true;routeTookSeq=1;
+      auto o=outOf(off,1,0,source.Get());check(o.hr==S_FALSE&&!o.tex,"fix.temporal_aa off: a layer-only claim changes nothing (the ordinary passthrough)");
+      routeTookEye[0]=false;routeTookSeq=0;check(off.close(off.context)==S_OK,"off channel close");
+    }
   }
 }
 int wmain(int argc,wchar_t** argv){SetErrorMode(3);if(argc==2&&!wcscmp(argv[1],L"--dry-run")){std::puts("native_temporal_test: dry-run (no device or files)");return 0;}

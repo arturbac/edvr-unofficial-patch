@@ -29,6 +29,8 @@
 #include "flat_query_cut_tests.h"
 #include "flat_wrapper_note_tests.h"
 #include "flat_hdr_route_tests.h"
+#include "flat_copy_structure_tests.h"
+#include "flat_hdr_crumbs_tests.h"
 
 #include <cstdio>
 #include <algorithm>
@@ -2056,8 +2058,8 @@ void testStaticSceneWiring() {
          "the flat runtime counts the frames it hands the resolver with the policy on"},
         {&runtimeCpp, "static-scene-frames=%llu",
          "the menu HDR copy line carries the static-scene-frames field"},
-        {&resolveCpp, "constants.flags[3]=f.staticScene?1u:0u;",
-         "the resolver hands the frame's staticScene to the shader as flags.w"},
+        {&resolveCpp, "constants.flags[3]=f.staticScene?1u:(depthCheck?2u:0u);",
+         "the resolver hands the frame's staticScene to the shader as flags.w (1), the steady-detail depth check's frame as 2 behind it, else 0"},
     };
     for (const Link& link : links) {
         const size_t at = link.text->find(link.needle);
@@ -2340,8 +2342,9 @@ void testFlatWarningWiring() {
     const std::string runtimeCpp = slurp("src/d3d11/flat_runtime.cpp");
     const std::string bundleCpp = slurp("src/installer/logbundle.cpp");
     const std::string standdownH = slurp("src/d3d11/flat_standdown.h");
-    check(!menuCpp.empty() && !runtimeCpp.empty() && !bundleCpp.empty() && !standdownH.empty(),
-          "the menu, runtime, stand-down policy and log bundler sources are readable from the repo root");
+    const std::string settingsH = slurp("src/d3d11/flat_elite_settings.h");
+    check(!menuCpp.empty() && !runtimeCpp.empty() && !bundleCpp.empty() && !standdownH.empty() && !settingsH.empty(),
+          "the menu, runtime, stand-down policy, settings header and log bundler sources are readable from the repo root");
     auto count = [](const std::string& text, const std::string& needle) {
         unsigned n = 0;
         for (size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1)) ++n;
@@ -2351,12 +2354,30 @@ void testFlatWarningWiring() {
     const Pin pins[] = {
         {&menuCpp, "const bool refusing = flatRuntimeStructuralRefusal(&reason, &standing) &&", 1,
          "the warning follows the runtime's structural-refusal state and nothing else"},
+        // The hold on a changed cause (flat_elite_settings.h, FlatWarnHold; the rule and its controls are in flat_elite_settings_tests.h).
+        {&menuCpp, "if (!s.flatWarnHold.admit(refusing, s.flatWarnActive, s.flatWarnKey, key, now)) {", 1,
+         "a cause that differs from the one on show waits out its hold: the helper is asked once a tick with the shown key, the computed "
+         "one and the tick's own time"},
+        {&menuCpp, "if (refusing == s.flatWarnActive && key == s.flatWarnKey) return;", 1,
+         "and a tick with nothing to change still leaves before the switch"},
+        {&menuCpp, "if (s.flatWarnHold.began() && s.flatWarnHeldLogged < kFlatWarnHeldLogMax) {", 1,
+         "a hold that begins is logged once, within its own bound"},
+        {&menuCpp, "flatFormatWarnHeldLog(held, sizeof(held), s.flatWarnCause, cause);", 1,
+         "the line names the cause on show and the one waiting"},
+        {&menuCpp, "Log::get().note(\"%s\", held);", 1, "and is written to the log: it is the one trace that the hold ran"},
+        {&menuCpp, "char held[360];", 1, "in a buffer the longest such line fits (the rig formats the longest one against 360)"},
+        {&menuCpp, "constexpr int kFlatWarnHeldLogMax = 8;", 1, "at most eight times a session, apart from the panel's own 24"},
+        {&menuCpp, "flat settings warning: further held changes are not logged this session", 1,
+         "and the bound says so (a line that is not shown, changed or hidden, the three the log's reader counts)"},
+        {&settingsH, "constexpr uint64_t kFlatWarnHoldMs = 2000;", 1,
+         "the hold is 2000 ms: more than one stand-down probe interval, under two"},
         {&menuCpp, "temporalModeEnabled(Config::get().requestedTemporalMode());", 1,
          "and only while a temporal mode is selected"},
         {&menuCpp, "if (runtimeFlatProfile() && s.flatWarnActive) {", 1, "the panel draws the warning only while it is active"},
         {&menuCpp, "if (c.lineCount < kMenuMaxLines) c.lines[c.lineCount++].style = kMenuNote;", 2,
          "the warning, and the wrapper note after it, are note lines below the rows"},
-        {&menuCpp, "FlatWarnRuler ruler{c.capPx * 8 / 7};", 2, "wrapped with the panel's own ruler at the note face's em (both)"},
+        {&menuCpp, "FlatWarnRuler ruler{c.capPx * 8 / 7};", 2,
+         "wrapped with the panel's own ruler at the note face's em (the flat warning and the wrapper note: no VR note takes a line)"},
         {&menuCpp, "flatWarningTick(now);", 1, "the flat tick runs the warning"},
         {&menuCpp, "s.flatSettingsForce = true;", 1, "Elite's files are looked at when the panel opens"},
         {&menuCpp, "s.flatSettings.setFolder(flatEliteGraphicsFolder());", 1, "from %LOCALAPPDATA%, resolved once"},
@@ -2371,8 +2392,9 @@ void testFlatWarningWiring() {
         // The gate itself: the stand-down, for a reason that found an output copy, and no clock.
         {&standdownH, "bool warningActive() const { return standing && flatMonoReasonWarrantsWarning(standReason); }", 1,
          "the warning is on while stood down for a reason that found an output copy"},
-        {&standdownH, "return flatMonoReasonStructural(reason) && reason != FlatMonoReason::NoOutputCopy;", 1,
-         "and never for no-known-output-copy: a startup or loading frame has no final copy"},
+        {&standdownH, "return flatMonoReasonStructural(reason) && reason != FlatMonoReason::NoOutputCopy &&\n"
+                      "           reason != FlatMonoReason::NoScene;", 1,
+         "and never for no-known-output-copy or no-3d-scene: a startup or loading frame has no final copy, or no scene"},
         {&standdownH, "standReason = runReason;", 1, "a stand-down starts with the reason that entered it"},
         {&standdownH, "standReason = reason;", 1, "and follows each probe frame's own finding"},
     };
@@ -2382,6 +2404,38 @@ void testFlatWarningWiring() {
         for (size_t at = without.find(pin.needle); at != std::string::npos; at = without.find(pin.needle))
             without.erase(at, std::strlen(pin.needle));
         check(count(without, pin.needle) == 0, "warning wiring control: a source with the line removed no longer contains it");
+    }
+    // ORDER of the hold on a changed cause. It is asked after the key is computed and before the comparison that leaves the tick:
+    // asked on every tick, so a cause that comes back to the one on show drops the change that was waiting, and a held change
+    // returns before the switch, so it neither replaces what is on show nor is logged as changed. Two controls: the same text with
+    // the hold asked after the early return, and with the held branch falling through to the switch, must fail the check.
+    {
+        const char* keyLine = "const std::string key = refusing ? flatSettingsWarningKey(";
+        const char* askLine = "if (!s.flatWarnHold.admit(refusing, s.flatWarnActive, s.flatWarnKey, key, now)) {";
+        const char* sameLine = "if (refusing == s.flatWarnActive && key == s.flatWarnKey) return;";
+        const char* switchLine = "s.flatWarnActive = refusing;";
+        const auto holdOrderOk = [&](const std::string& text) {
+            const size_t key = text.find(keyLine), ask = text.find(askLine), same = text.find(sameLine), sw = text.find(switchLine);
+            if (key == std::string::npos || ask == std::string::npos || same == std::string::npos || sw == std::string::npos)
+                return false;
+            if (!(key < ask && ask < same && same < sw)) return false;
+            return text.substr(ask, same - ask).find("\n        return;\n    }\n") != std::string::npos;
+        };
+        check(holdOrderOk(menuCpp),
+              "the hold is asked after the key is computed and before the comparison that leaves the tick, and a held change returns before the switch");
+        std::string late = menuCpp;
+        const size_t ask = late.find(askLine), same = late.find(sameLine);
+        if (ask != std::string::npos && same != std::string::npos && ask < same) {
+            const std::string block = late.substr(ask, same - ask);
+            late.erase(ask, same - ask);
+            late.insert(late.find(sameLine) + std::strlen(sameLine), "\n    " + block);
+        }
+        check(late != menuCpp && !holdOrderOk(late), "(control) the order check fails with the hold asked after the early return");
+        std::string falls = menuCpp;
+        const std::string heldReturn = "\n        return;\n    }\n    if (refusing == s.flatWarnActive && key == s.flatWarnKey) return;";
+        const size_t tail = falls.find(heldReturn);
+        if (tail != std::string::npos) falls.erase(tail, std::strlen("\n        return;"));
+        check(falls != menuCpp && !holdOrderOk(falls), "(control) the order check fails with the held branch falling through to the switch");
     }
     check(count(bundleCpp, "Frontier Developments") == 1,
           "the log bundler no longer spells the folder itself (its comment names it once)");
@@ -2431,7 +2485,7 @@ void testFlatCpuWiring() {
     const Pin pins[] = {
         // Every family the census names has its scope at the entry points that family stands for.
         {&runtimeCpp, "flatcpu::Scope shell(flatcpu::kOther);", 3, "the draw scope (both halves) and the dispatch scope time their own shells"},
-        {&runtimeCpp, "flatcpu::kReduce", 1, "contract reduction times the reducer"},
+        {&runtimeCpp, "flatcpu::kReduce", 2, "contract reduction times the reducer and the final copy's admission by structure"},
         {&runtimeCpp, "flatcpu::kCopyChecks", 2, "the exact-shader verifications and the F10 captures are timed"},
         {&runtimeCpp, "flatcpu::kCameraRows", 2, "the camera lookup and hash, and capture()"},
         {&runtimeCpp, "flatcpu::kTrace", 5, "every trace-ring copy is timed: capture, dispatch, write, record and the HDR route's resolve marker"},
@@ -2905,9 +2959,26 @@ int main(int argc, char** argv) {
         return hdr_route_test::traceChain(argv[2]);
     if (argc == 5 && std::strcmp(argv[1], "--trace-trim") == 0)
         return hdr_route_test::traceTrim(argv[2], argv[3], argv[4]);
+    // The final copy's admission by structure (flat_copy_structure_tests.h): what it makes of each frame of a trace.
+    if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--trace-structure") == 0)
+        return copy_structure_test::traceStructure(argv[2], argc == 4 && std::strcmp(argv[3], "pretend") == 0);
+    // --write-fixture <path> [--dry-run]: regenerate tools\flat_upscale_fixture.log from the formatters. Anything that writes a file
+    // takes --dry-run, and --dry-run writes nothing at all.
+    if ((argc == 3 || argc == 4) && std::strcmp(argv[1], "--write-fixture") == 0) {
+        const std::string text = copy_structure_test::flatUpscaleFixtureText();
+        if (argc == 4 && std::strcmp(argv[3], "--dry-run") == 0) {
+            std::printf("flat_temporal_test: --dry-run: would write %zu bytes to %s; wrote nothing\n", text.size(), argv[2]);
+            return 0;
+        }
+        std::ofstream out(argv[2], std::ios::binary | std::ios::trunc);
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        std::printf("flat_temporal_test: wrote %zu bytes to %s\n", text.size(), argv[2]);
+        return out ? 0 : 1;
+    }
     if (argc != 2 || std::strcmp(argv[1], "--self-test") != 0) {
         std::puts("usage: flat_temporal_test --self-test | --classify-dir <dir> | --trace-check <file> | --trace-migrate <dir> | "
-                  "--trace-rekey <file|dir> | --trace-chain <file> | --trace-trim <in> <out> <frame[,frame...]>");
+                  "--trace-rekey <file|dir> | --trace-chain <file> | --trace-structure <file> | "
+                  "--trace-trim <in> <out> <frame[,frame...]>");
         return 2;
     }
     failures += flatProjectionViewportTests();
@@ -2962,6 +3033,9 @@ int main(int argc, char** argv) {
     failures += flatQueryCutTests();
     testFlatQueryCutWiring();
     failures += flatHdrRouteTests();
+    failures += flatCopyStructureTests();
+    failures += flatHdrCrumbTests();
+    failures += flatHdrCrumbWiringTests();
     if (failures) return 1;
     std::puts("flat temporal collector policy: PASS");
     return 0;
