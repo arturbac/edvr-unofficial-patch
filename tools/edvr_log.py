@@ -230,10 +230,13 @@ windows, and printed as RECONSTRUCTED), END-FRAME EPISODES (the xrEndFrame calls
 periods or more), VENDOR EVENTS (the vendor's xrPollEvent events), VRAM (the graphics memory
 against the OS's budget) and SLOW TEST (a log written with advanced.slow_test_ms: its
 deliberate hold must be a regime held by xrEndFrame with its whole chain). A log that holds a
-slow regime gets a SLOW verdict that names it and its owner, never PASS or WARN. Like
---route-curve its exit code carries the verdict: 0 for PASS or WARN, 1 for STOP, 2 for a wrong
-build (the runtime log is checked too), 3 when the log holds none of the freeze lines and no
-slow regime (a build from before the freeze logging), 4 for a slow regime (and no STOP).
+slow regime the vendor runtime, EDVR's copy or EDVR's own work holds gets a SLOW verdict that
+names it and its owner, never PASS or WARN; a regime the game's own frame holds is INFO when
+the runtime says its frames were a load and WARN when they were the game's scenes, and one with
+no named owner is a WARN: none of those sets SLOW. Like --route-curve its exit code carries
+the verdict: 0 for PASS or WARN, 1 for STOP, 2 for a wrong build (the runtime log is checked
+too), 3 when the log holds none of the freeze lines and no slow regime (a build from before the
+freeze logging), 4 for a slow regime the vendor runtime or EDVR holds (and no STOP).
 
 Exit 0 when a log was read, 1 when none was found (or --camera-census found no
 census line, or --vscreen-fit no auto-fit line, or --flat-upscale no flat line, or
@@ -6271,7 +6274,8 @@ def self_test_route_curve():
 #
 # The exit code carries the verdict, as --route-curve's does: 0 for PASS or WARN, 1 for STOP, 3 when the log holds none of the freeze lines and no slow
 # regime (a build from before the freeze logging; main() answers 2 for a wrong build before this runs, and this answers 2 for a runtime log of another
-# build), 4 when it holds a slow regime (the headset-lock arc, below: the verdict is SLOW, never PASS or WARN; a STOP still outranks it). A line
+# build), 4 when it holds a slow regime the vendor runtime or EDVR holds (the headset-lock arc, below: the verdict is SLOW, never PASS or WARN; a STOP
+# still outranks it; a regime the game's own frame holds sets neither). A line
 # that opens like one of these and matches none of the formats is counted and named, never dropped, because a reader that drifted from the C++ would
 # otherwise look like a quiet flight. self_test_freezes builds its logs from the exact lines the C++ writes.
 
@@ -6542,6 +6546,11 @@ FZ_OWNER_TEXT = {               # slow_regime.h slowOwnerText, key for key
     "none": "no single owner",
 }
 FZ_OWNER_ORDER = ("vendor_end_frame", "vendor_wait_frame", "vendor_swapchain", "edvr_copy", "edvr_work", "game")
+# Who may set SLOW. A regime the vendor runtime, EDVR's copy of the eyes or EDVR's own work holds is a finding about the runtime or EDVR. One the game's own
+# frame holds is the game's: a load (INFO) when the runtime's frames were its own loading frames or ends with no layers (slow_regime.h `context=`), a slow
+# stretch of the game's scenes (WARN) otherwise. A regime with no named owner (none, no_frames, unknown) is a WARN: nothing says whose it is.
+FZ_SLOW_OWNERS = ("vendor_end_frame", "vendor_wait_frame", "vendor_swapchain", "edvr_copy", "edvr_work")
+FZ_LOAD_CONTEXTS = ("loading", "no_layers")
 FZ_VRAM_REASON_RE = re.compile(r"^vram: reason=(?P<reason>\w+)\b")
 FZ_VRAM_KV_RE = re.compile(r"\b(?P<k>(?:local|nonlocal)_(?:used_mb|budget_mb|pct))=(?P<v>[0-9.]+|-)")
 FZ_VRAM_ADAPTER_RE = re.compile(r"; adapter (?P<name>.+?); this process's")
@@ -6642,6 +6651,7 @@ def _fz_arc_rt_line(fz, msg, t):
                                          "window_s": float(f["window_s"]), "frames": int(f["frames"]), "fps": float(f["fps"]), "hz": float(f["display_hz"]),
                                          "fraction": float(f["fraction"]), "frame_ms": float(f["frame_ms"]), "owner": f["held_by"],
                                          "share": float(f["held_share"]), "vendor_share": float(f["vendor_share"]), "vram": _fz_vram_fields(f),
+                                         "context": f.get("context"), "loading_frames": _fz_int(f, "loading_frames"), "empty_frames": _fz_int(f, "empty_frames"),
                                          "summary": msg.partition(",summary=")[2]})
         elif name == "native_slow_regime_summary":
             fz["slow_summaries"].append({"t": t, "f": f, "regimes": int(f["regimes"])})
@@ -7154,6 +7164,24 @@ def _fz_legacy_gpu(fz, begin, stop, clk):
             % (w["window"], clk(w["t"]), w["copy"][1], w["copy"][3], base))
 
 
+def _fz_regime_class(g):
+    """(status, words) of one regime, by who holds it. SLOW (status "SLOW") only when the vendor runtime, EDVR's copy or EDVR's own work holds most of each
+    frame: a finding about the runtime or EDVR. The game's own frame is INFO (status "note") when the runtime says the frames were a load (its own loading
+    frames, or ends with no layers: the `context=` of a native_slow_regime line), WARN when they were the game's scenes (a GPU- or CPU-bound stretch) or the
+    line has no context; no named owner (none, no_frames, unknown) is a WARN. Neither sets SLOW, and neither exits 4."""
+    owner = g["owner"]
+    if owner in FZ_SLOW_OWNERS:
+        return "SLOW", "held by %s" % ("EDVR" if owner.startswith("edvr_") else "the vendor runtime")
+    if owner == "game":
+        ctx = g.get("context")
+        if ctx in FZ_LOAD_CONTEXTS:
+            return "note", "the game's own frame during a load (the runtime's frames were %s)" % ("its own loading frames" if ctx == "loading" else "ends with no layers")
+        if ctx == "scene":
+            return "WARN", "the game's own frame while it submitted scenes: a GPU- or CPU-bound stretch of the game"
+        return "WARN", "the game's own frame (the line does not say whether it was a load)"
+    return "WARN", {"none": "no single owner holds 35% of a frame", "no_frames": "no frame reached xrEndFrame", "unknown": "no owner could be named"}.get(owner, "no named owner")
+
+
 def _fz_slow_regimes_native(fz, clk):
     """The regimes the build wrote itself, one per `regime=N` of its native_slow_regime lines: SLOW is written once the frame rate has been under 40% for 5 s
     (its duration_s says how far back the regime began), still_slow every 30 s after, end when the rate recovered (or the session closed) with the whole
@@ -7173,6 +7201,9 @@ def _fz_slow_regimes_native(fz, clk):
         detail = ["rate: %.2f fps against the display's %.2f Hz (%.1f%% of it; a regime is under %.0f%%), frames of %.1f ms"
                   % (last["fps"], last["hz"], 100.0 * last["fraction"], 100.0 * FZ_SLOW_FRACTION, last["frame_ms"]),
                   "owner: %s" % last["summary"],
+                  ("context: %s (%s loading frame(s) and %s end(s) with no layers of %d frames)"
+                   % (last["context"], "?" if last["loading_frames"] is None else last["loading_frames"], "?" if last["empty_frames"] is None else last["empty_frames"],
+                      last["frames"])) if last["context"] else "context: the line has none (a build from before it)",
                   "a frame went (mean ms over %s): xrEndFrame %s (longest %s), pose wait %s, swapchain calls %s, EDVR copy %s, EDVR work %s, the game %s"
                   % ("the whole regime" if end else "its last window", f.get("vendor_end_frame_ms", "-"), f.get("end_frame_max_ms", "-"),
                      f.get("vendor_wait_frame_ms", "-"), f.get("vendor_swapchain_ms", "-"), f.get("edvr_copy_ms", "-"), f.get("edvr_work_ms", "-"),
@@ -7189,7 +7220,7 @@ def _fz_slow_regimes_native(fz, clk):
         out.append({"src": "native", "n": n, "start": start, "end": stop, "duration": stop - start, "open": end is None,
                     "reason": end["f"].get("reason") if end else None, "fps": last["fps"], "hz": last["hz"], "fraction": last["fraction"],
                     "frame_ms": last["frame_ms"], "owner": last["owner"], "share": last["share"], "held": last["summary"], "lines": lines, "detail": detail,
-                    "deliberate": False})
+                    "context": last["context"], "deliberate": False})
     return out
 
 
@@ -7236,9 +7267,11 @@ def _fz_slow_regimes_legacy(fz, rt_read, clk):
             continue
         rate_seq = _fz_rate([(m["t"], m["seq"]) for m in ms_])
         rate_frame = _fz_rate([(m["t"], m["frame"]) for m in ms_])
-        counted = [r[0] for r in (rate_seq, rate_frame) if r is not None]
+        # The runtime's sequence is what the detector counts (a frame that reached xrEndFrame). The graphics frame counter counts the game's Presents, which
+        # run at hundreds a second in a menu while the runtime's frames go at the display's rate, so it speaks only when no sequence does.
+        counted = [rate_seq[0]] if rate_seq is not None else [rate_frame[0]] if rate_frame is not None else []
         if counted:
-            fps = _fz_median(counted)
+            fps = counted[0]
             if fps >= FZ_SLOW_FRACTION * hz:
                 continue                                    # long frames now and then, the rate between them fine: a hitchy run, not a regime
         elif ws_:
@@ -7274,7 +7307,7 @@ def _fz_slow_regimes_legacy(fz, rt_read, clk):
                           "those of the vScreen totals windows, good to about 20 s")
         out.append({"src": "reconstructed", "n": len(out) + 1, "start": begin, "end": stop, "duration": stop - begin, "open": False, "reason": None,
                     "fps": fps, "hz": hz, "fraction": fps / hz, "frame_ms": frame_ms, "owner": own["key"], "share": own["share"], "held": own["held"],
-                    "lines": [], "detail": detail, "deliberate": False})
+                    "lines": [], "detail": detail, "context": None, "deliberate": False})
     return out
 
 
@@ -7288,6 +7321,7 @@ def _fz_slow_regimes(fz, rt_read):
         began = next((x for x in fz["slowtests"] if x["kind"] == "began"), None)
         for g in regimes:
             g["deliberate"] = began is not None and began["t"] - 2.0 <= g["start"] <= began["t"] + FZ_SLOW_TEST_PAD_S
+            g["class"] = _fz_regime_class(g)
         fz["regimes"] = regimes
     return fz["regimes"]
 
@@ -7299,8 +7333,10 @@ def _fz_regime_sentence(g, clk, verdict=False):
     if verdict:
         return "%s to %s local (%.0f s) at %.1f fps of the display's %g Hz, %s%s" % (clk(g["start"]), clk(g["end"]), g["duration"], g["fps"], round(g["hz"], 2),
                                                                                        g["held"], tags)
-    return "%s to %s local (%.1f s), %.2f fps against the display's %g Hz (%.0f%%), %s%s" % (
-        clk(g["start"]), clk(g["end"]), g["duration"], g["fps"], round(g["hz"], 2), 100.0 * g["fraction"], g["held"], tags)
+    status, words = g["class"]
+    return "%s to %s local (%.1f s), %.2f fps against the display's %g Hz (%.0f%%), %s%s%s" % (
+        clk(g["start"]), clk(g["end"]), g["duration"], g["fps"], round(g["hz"], 2), 100.0 * g["fraction"], g["held"], tags,
+        "" if status == "SLOW" else "; not a SLOW: %s" % words)
 
 
 def _fz_event_text(e):
@@ -7319,16 +7355,21 @@ def _fz_event_text(e):
 def _fz_print_slow(fz, regimes, clk):
     if not regimes:
         return
-    print("SLOW REGIME%s (%d found: the frame rate under %.0f%% of the display's for %.0f s or more; a state the session was in, not one frame):"
+    print("SLOW REGIME%s (%d found: the frame rate under %.0f%% of the display's for %.0f s or more; a state the session was in, not one frame; SLOW is set only by a "
+          "regime the vendor runtime or EDVR holds, a load the game's frame holds is INFO, a slow stretch of its scenes or no named owner a WARN):"
           % ("S" if len(regimes) > 1 else "", len(regimes), 100.0 * FZ_SLOW_FRACTION, FZ_SLOW_MIN_S))
     for g in regimes:
-        print("  #%d  %s to %s local  (%.1f s%s)  %s%s" % (
+        status, words = g["class"]
+        print("  #%d  %s to %s local  (%.1f s%s)  [%s] %s%s" % (
             g["n"], clk(g["start"]), clk(g["end"]), g["duration"],
             ", ended: %s" % g["reason"] if g["reason"] else ", still going when the log stopped" if g["open"] else "",
+            {"SLOW": "SLOW", "WARN": "WARN", "note": "INFO"}[status],
             "the build's own detector" if g["src"] == "native" else "RECONSTRUCTED from the older lines: this build has no slow-regime detector",
             "; DELIBERATE: the slow test's hold (advanced.slow_test_ms)" if g["deliberate"] else ""))
         for line in g["detail"]:
             print("      %s" % line)
+        if status != "SLOW":
+            print("      not a SLOW: %s" % words)
         near = [e for e in fz["xr_events"] if not e["suppressed"] and g["start"] - FZ_SLOW_EVENT_PAD_S <= e["t"] <= g["end"] + FZ_SLOW_EVENT_PAD_S]
         if near:
             print("      vendor events within %.0f s of it (%d): %s%s" % (FZ_SLOW_EVENT_PAD_S, len(near), "; ".join(
@@ -7426,8 +7467,9 @@ def _fz_print_slowtest(fz, clk):
 
 
 def _fz_arc_findings(fz, rt_read, clk):
-    """[(key, status, text)] for the headset-lock arc: SLOW REGIME (a SLOW status, never PASS, for a log that holds one), INSTRUMENT notes, END-FRAME EPISODES,
-    VENDOR EVENTS, VRAM and SLOW TEST. A log with none of the arc's lines gets notes only, so an older flight's verdict is what it was."""
+    """[(key, status, text)] for the headset-lock arc: SLOW REGIME (a row per regime, its status by who holds it: SLOW, never PASS, for the vendor runtime, EDVR's
+    copy or EDVR's own work; INFO (note) for the game's own frame in a load; WARN for the game's scenes or no named owner), INSTRUMENT notes, END-FRAME
+    EPISODES, VENDOR EVENTS, VRAM and SLOW TEST. A log with none of the arc's lines gets notes only, so an older flight's verdict is what it was."""
     out = []
 
     def add(key, status, text):
@@ -7436,7 +7478,7 @@ def _fz_arc_findings(fz, rt_read, clk):
     regimes = _fz_slow_regimes(fz, rt_read)
     native = fz["slow_armed"] is not None or bool(fz["slow_lines"])
     for g in regimes:
-        add("SLOW REGIME", "SLOW", _fz_regime_sentence(g, clk))
+        add("SLOW REGIME", g["class"][0], _fz_regime_sentence(g, clk))
     summ = fz["slow_summaries"][-1] if fz["slow_summaries"] else None
     if native and summ is not None and summ["f"].get("reason") == "session_close":     # a periodic summary is older than the lines after it
         numbers = {l["regime"] for l in fz["slow_lines"]}
@@ -7753,8 +7795,9 @@ def freezes_judge(fz, rows, pairs, rt_read, clk):
 def print_freezes(gfx_path, gfx_text, gfx_ver, want, args, native_dirs):
     """--freezes: one flight's freeze diagnostics in one report. Returns the exit code: 0 (PASS or WARN), 1 (STOP), 2 (the runtime log is of another
     build than --expect-build named; main() has checked the graphics log's), 3 (the log holds none of the freeze lines and no slow regime), 4 (SLOW: the
-    log holds a slow regime, the frame rate under 40% of the display's for 5 s or more, found by the build's own detector or put back together from the
-    older lines; no STOP)."""
+    log holds a slow regime, the frame rate under 40% of the display's for 5 s or more, that the vendor runtime, EDVR's copy or EDVR's own work holds, found
+    by the build's own detector or put back together from the older lines; no STOP). A regime the game's own frame holds (INFO for a load, WARN for its
+    scenes) or that has no named owner (WARN) does not set it."""
     rt_path, rt_text, rc = open_runtime_log(gfx_path, gfx_ver, want, args.runtime_file, native_dirs,
                                             lacking="native_long_cycle lines and the runtime's counts are unavailable")
     if rc is not None:
@@ -7816,16 +7859,21 @@ def print_freezes(gfx_path, gfx_text, gfx_ver, want, args, native_dirs):
     stops = sum(1 for f in findings if f[1] == "STOP")
     warns = sum(1 for f in findings if f[1] == "WARN")
     slows = sum(1 for f in findings if f[1] == "SLOW")
-    # A log that holds a slow regime never gets PASS or WARN, and its verdict says when, how slow and who held it. With a STOP the word stays STOP (the
-    # instrument failed), the regime still named.
+    # A log that holds a regime the vendor runtime, EDVR's copy or EDVR's own work held never gets PASS or WARN, and its verdict says when, how slow and who held
+    # it. With a STOP the word stays STOP (the instrument failed), the regime still named. A regime the game's own frame holds (a load, or its scenes at a
+    # low rate) or that has no named owner is a row of its own (INFO or WARN) and does not set SLOW or exit 4; the verdict still says how many there were.
     word = "STOP" if stops else "SLOW" if slows else "WARN" if warns else "PASS"
-    held = ": %s" % "; ".join(_fz_regime_sentence(g, clk, True) for g in regimes[:3]) + ("; and %d more" % (len(regimes) - 3) if len(regimes) > 3 else "") if slows else ""
+    slow_regs = [g for g in regimes if g["class"][0] == "SLOW"]
+    other_regs = [g for g in regimes if g["class"][0] != "SLOW"]
+    held = (": %s" % "; ".join(_fz_regime_sentence(g, clk, True) for g in slow_regs[:3]) + ("; and %d more" % (len(slow_regs) - 3) if len(slow_regs) > 3 else "")) if slows else ""
+    if other_regs:
+        held += " [+%d slow stretch(es) the game's own frame or no named owner held, listed above: not a SLOW]" % len(other_regs)
     print("freezes verdict: %s (%d STOP, %d WARN%s)%s. STOP: a frame of 250 ms or more that got no line, a runtime cycle of 250 ms or more the graphics half "
           "did not write, or a sample that held the render thread over %d us. WARN: the counts missing, a FREEZE line without its LONG FRAME line, an armed "
-          "sampler that named no owner, a sample over %d us, or a line this reader could not read.%s"
+          "sampler that named no owner, a sample over %d us, a slow stretch the game's scenes or no named owner held, or a line this reader could not read.%s"
           % (word, stops, warns, ", %d SLOW" % slows if slows else "", held, FREEZE_SUSPEND_STOP_US, FREEZE_SUSPEND_WARN_US,
-             " SLOW: the frame rate stayed under %.0f%% of the display's for %.0f s or more, and the call or code named held most of each frame." % (100.0 * FZ_SLOW_FRACTION, FZ_SLOW_MIN_S)
-             if slows else ""))
+             " SLOW: the frame rate stayed under %.0f%% of the display's for %.0f s or more, and the vendor runtime, EDVR's copy or EDVR's own work held most of each frame."
+             % (100.0 * FZ_SLOW_FRACTION, FZ_SLOW_MIN_S) if slows else ""))
     return 1 if stops else 4 if slows else 0
 
 
@@ -8514,10 +8562,11 @@ def self_test_freezes():
 def self_test_slow_regime():
     """--freezes on the headset-lock arc's lines (docs/headset-lock-vdxr-2026-10-02.md): logs built from the exact lines the C++ writes (vram_watch.h,
     vendor_events.h, end_frame_episodes.h, slow_regime.h, perf_monitor.cpp's slow test, native_runtime_host.h's hold) and from a v0.18.0 flight's older
-    lines, every case asserting the printed sections, the finding rows, the verdict and the exit code through main(). A log that holds a slow regime never
-    gets a PASS or WARN verdict, whether the build detected it itself or this reader put it back together from LONG FRAME, native_long_cycle, FREEZE and
-    vScreen totals lines. The pins tie each phrase the reader keys on to the source that writes it, and the run asserts that --freezes opens nothing for
-    writing. Returns ok."""
+    lines, every case asserting the printed sections, the finding rows, the verdict and the exit code through main(). A log that holds a slow regime the vendor
+    runtime, EDVR's copy or EDVR's own work holds never gets a PASS or WARN verdict, whether the build detected it itself or this reader put it back together
+    from LONG FRAME, native_long_cycle, FREEZE and vScreen totals lines; a regime the game's own frame holds (INFO in a load, WARN in its scenes) or with no
+    named owner sets neither SLOW nor exit 4, and the cases pin both sides, with a game-owned fixture. The pins tie each phrase the reader keys on to the
+    source that writes it, and the run asserts that --freezes opens nothing for writing. Returns ok."""
     import builtins
     import contextlib
     import io
@@ -8533,6 +8582,9 @@ def self_test_slow_regime():
     for rel, needles in (
             (("src", "openxr", "slow_regime.h"), (
                 '"native_slow_regime,event=%s,%sregime=%u,duration_s=%.1f,window_s=%.1f,frames=%llu,fps=%.2f,display_hz=%.2f,fraction=%.3f,threshold=%.2f,frame_ms=%.2f,"',
+                '"context=%s,loading_frames=%llu,empty_frames=%llu,"', 'enum class SlowContext { None, Scene, Loading, NoLayers };',
+                'case SlowContext::Scene: return "scene";', 'case SlowContext::Loading: return "loading";', 'case SlowContext::NoLayers: return "no_layers";',
+                'r.context = s.loading * 2 >= s.frames ? SlowContext::Loading : s.empty * 2 >= s.frames ? SlowContext::NoLayers : SlowContext::Scene;',
                 '"held_by=%s,held_share=%.3f,vendor_share=%.3f,vendor_end_frame_ms=%.2f,vendor_wait_frame_ms=%.2f,vendor_swapchain_ms=%.2f,edvr_copy_ms=%.2f,"',
                 '"edvr_work_ms=%.2f,game_ms=%.2f,end_frame_max_ms=%.2f,%s,units=wall_ms,summary=%s"',
                 '"native_slow_regime,armed=1,threshold_fraction=%.2f,of=display_rate,hold_s=%u,end_s=%u,still_slow_s=%u,owner_share=%.2f,frames=xrEndFrame_returns,"',
@@ -8708,15 +8760,19 @@ def self_test_slow_regime():
     VRAM_FIG = "vram_local_used_mb=7421,vram_local_budget_mb=10863,vram_local_pct=68.3,vram_nonlocal_used_mb=316,vram_nonlocal_budget_mb=16311,vram_nonlocal_pct=1.9"
 
     def slow(event, regime, duration, window, frames, owner="vendor_end_frame", share=0.831, fps=9.97, hz=72.0, frame_ms=100.3, end_ms=83.10, wait_ms=0.0, swap_ms=0.04,
-             copy_ms=0.40, work_ms=0.30, game_ms=16.16, mx=84.74, figures=VRAM_FIG, summary=None, reason=None):
+             copy_ms=0.40, work_ms=0.30, game_ms=16.16, mx=84.74, figures=VRAM_FIG, summary=None, reason=None, context="scene", loading=0, empty=0, with_context=True):
+        """One native_slow_regime line. context/loading/empty are the `context=`, `loading_frames=` and `empty_frames=` fields (slow_regime.h), which a build from
+        before them does not write: with_context=False leaves them out."""
         if summary is None:
             summary = {"vendor_end_frame": "held by the vendor runtime's xrEndFrame: %.1f ms of every %.1f ms frame (%.0f%%)" % (end_ms, frame_ms, 100 * share),
                        "game": "held by the game's own frame: %.1f ms of every %.1f ms frame (%.0f%%)" % (game_ms, frame_ms, 100 * share),
+                       "edvr_copy": "held by EDVR's copy of the eyes: %.1f ms of every %.1f ms frame (%.0f%%)" % (copy_ms, frame_ms, 100 * share),
                        "none": "no single owner; the largest is the game's own frame at 31%% of a %.1f ms frame" % frame_ms,
                        "no_frames": "held by nothing: no frame reached xrEndFrame in this window"}[owner]
-        return ("native_slow_regime,event=%s,%sregime=%d,duration_s=%.1f,window_s=%.1f,frames=%d,fps=%.2f,display_hz=%.2f,fraction=%.3f,threshold=0.40,frame_ms=%.2f,held_by=%s,"
+        ctx = "context=%s,loading_frames=%d,empty_frames=%d," % (context, loading, empty) if with_context else ""
+        return ("native_slow_regime,event=%s,%sregime=%d,duration_s=%.1f,window_s=%.1f,frames=%d,fps=%.2f,display_hz=%.2f,fraction=%.3f,threshold=0.40,frame_ms=%.2f,%sheld_by=%s,"
                 "held_share=%.3f,vendor_share=%.3f,vendor_end_frame_ms=%.2f,vendor_wait_frame_ms=%.2f,vendor_swapchain_ms=%.2f,edvr_copy_ms=%.2f,edvr_work_ms=%.2f,game_ms=%.2f,"
-                "end_frame_max_ms=%.2f,%s,units=wall_ms,summary=%s" % (event, "reason=%s," % reason if reason else "", regime, duration, window, frames, fps, hz, fps / hz, frame_ms,
+                "end_frame_max_ms=%.2f,%s,units=wall_ms,summary=%s" % (event, "reason=%s," % reason if reason else "", regime, duration, window, frames, fps, hz, fps / hz, frame_ms, ctx,
                                                                        owner, share, (end_ms + wait_ms + swap_ms) / frame_ms, end_ms, wait_ms, swap_ms, copy_ms, work_ms, game_ms, mx,
                                                                        figures, summary))
 
@@ -8724,10 +8780,12 @@ def self_test_slow_regime():
         return ("native_slow_regime_summary,reason=%s,regimes=%d,open=%d,frames=%d,seconds=%d,slow_seconds=%d,threshold=0.40" % (reason, regimes, open_, frames, seconds, slow_seconds))
 
     def native_flight(owner="vendor_end_frame", end=True, vram_mode="available", arms=("xr", "ep", "slow"), regimes=1, events=True, episodes=True, summary_regimes=None,
-                      extra_rt=(), extra_gfx=(), still=True, share=0.831, crash=False, end_ms=83.10):
+                      extra_rt=(), extra_gfx=(), still=True, share=0.831, crash=False, end_ms=83.10, context="scene", loading=0, empty=0, with_context=True, summary=None):
         """A new-build flight: the three armed lines, the vendor's session events, one regime from RS for 57.1 s with its SLOW, still_slow and end lines (and the
         episode instrument's start and end line), the VRAM watch's lines, the summaries at the close. crash=True is a session that stopped inside the regime:
-        no end lines and no close. end_ms is the mean xrEndFrame the regime's lines carry. Returns (graphics lines, runtime lines)."""
+        no end lines and no close. end_ms is the mean xrEndFrame the regime's lines carry; context, loading and empty the `context=`, `loading_frames=` and
+        `empty_frames=` fields of its lines (with_context=False: a build from before them). Returns (graphics lines, runtime lines)."""
+        ctx = dict(context=context, loading=loading, empty=empty, with_context=with_context, summary=summary)
         fig = VRAM_FIG if vram_mode == "available" else "vram=unavailable"
         end = end and not crash
         gfx = list(gopen)
@@ -8753,11 +8811,11 @@ def self_test_slow_regime():
                 rt.append(r(RS + 1.0, state_event(6, "FOCUSED", "VISIBLE", "1.250")))
             if episodes:
                 rt.append(r(RS + 0.2, episode(1, 96600, 83.1)))
-            rt.append(r(RS + 5.0, slow("SLOW", 1, 5.0, 5.0, 50, owner=owner, share=share, figures=fig, end_ms=end_ms)))
+            rt.append(r(RS + 5.0, slow("SLOW", 1, 5.0, 5.0, 50, owner=owner, share=share, figures=fig, end_ms=end_ms, **ctx)))
             if still:
-                rt.append(r(RS + 35.0, slow("still_slow", 1, 35.0, 30.0, 298, owner=owner, share=share, figures=fig, end_ms=end_ms)))
+                rt.append(r(RS + 35.0, slow("still_slow", 1, 35.0, 30.0, 298, owner=owner, share=share, figures=fig, end_ms=end_ms, **ctx)))
             if end:
-                rt.append(r(RS + 59.1, slow("end", 1, 57.1, 57.1, 567, owner=owner, share=share, figures=fig, reason="recovered", end_ms=end_ms)))
+                rt.append(r(RS + 59.1, slow("end", 1, 57.1, 57.1, 567, owner=owner, share=share, figures=fig, reason="recovered", end_ms=end_ms, **ctx)))
                 if episodes:
                     rt.append(r(RS + 57.3, episode_end(1, 575, 567, 57000.0, 83.5, 84.7388, 96600, 97175)))
         rt += list(extra_rt)
@@ -8777,11 +8835,16 @@ def self_test_slow_regime():
     def seq_at(t):
         return 96600 + int(round((t - RS) * 9.93))
 
-    def legacy_flight(runtime=True, hitches=False, marks_end=57.138):
+    def legacy_flight(runtime=True, hitches=False, marks_end=57.138, gfx_fps=None):
         """A flight from before the arc: LONG FRAME lines of 100 ms every 5 s (the limiter), the runtime's native_long_cycle lines four a second until its cap, the
-        vScreen windows, a FREEZE at the end of the regime and an unrelated one 6.2 s later; or, with hitches, long frames now and then at a steady 72 fps."""
+        vScreen windows, a FREEZE at the end of the regime and an unrelated one 6.2 s later; or, with hitches, long frames now and then at a steady 72 fps.
+        gfx_fps makes the graphics frame counter rise that fast instead of with the runtime's sequence (a game Presenting at hundreds of frames a second in a
+        menu while the runtime's frames crawl)."""
         gfx = list(gopen)
         rt = list(rt_head)
+
+        def frame_at(t):
+            return seq_at(t) + 5832 if gfx_fps is None else 102431 + int(round((t - RS) * gfx_fps))
         if hitches:
             for k in range(13):
                 t = RS + 5.0 * k
@@ -8794,7 +8857,7 @@ def self_test_slow_regime():
         else:
             for k in range(11):
                 t = RS + 5.0 * k
-                gfx.append(g(t, long_frame(100.2, seq_at(t), seq_at(t) + 5832)))
+                gfx.append(g(t, long_frame(100.2, seq_at(t), frame_at(t))))
             t = 0.0
             while RS + t < RS + 35.5:
                 for j in range(4):
@@ -8803,7 +8866,8 @@ def self_test_slow_regime():
                 t += 1.0
             gfx += [g(RS + 14.552, vscreen(519, 20094)), g(RS + 34.614, vscreen(200, 20062)), g(RS + 54.677, vscreen(200, 20063))]
             end_t = RS + marks_end
-            gfx += [g(end_t, long_frame(254.6, 97167, 102999)), g(end_t, freeze(254.6, 102999, 97167, 14)),
+            end_frame = 102999 if gfx_fps is None else frame_at(end_t)
+            gfx += [g(end_t, long_frame(254.6, 97167, end_frame)), g(end_t, freeze(254.6, end_frame, 97167, 14)),
                     g(end_t + 6.2, long_frame(539.8, 0, 103057)), g(end_t + 6.2, freeze(539.8, 103057, 0, 15))]
             rt += [r(RS + 38.7, phases_line(49, 95547, 95802, 1.6682 / 100.0)), r(RS + 38.7, phases_line(50, 96730, 96985, 82.7130)),
                    r(RS - 18.1, producer_gpu(48, 0.0367, 0.0408, 0.3625, 0.5921)), r(RS + 41.9, producer_gpu(49, 0.0362, 0.0409, 0.2263, 0.3707)),
@@ -8910,10 +8974,12 @@ def self_test_slow_regime():
         # ---- a new-build flight with a slow regime: SLOW, never PASS, the owner named ----
         n1 = run(native_flight(), "--expect-build", VERSION)
         case("a new-build flight with a regime held by the vendor's xrEndFrame", n1, 4, "SLOW",
-             "SLOW REGIME (1 found: the frame rate under 40% of the display's for 5 s or more; a state the session was in, not one frame):",
-             "  #1  11:14:38.100 to 11:15:35.200 local  (57.1 s, ended: recovered)  the build's own detector",
+             "SLOW REGIME (1 found: the frame rate under 40% of the display's for 5 s or more; a state the session was in, not one frame; SLOW is set only by a regime "
+             "the vendor runtime or EDVR holds, a load the game's frame holds is INFO, a slow stretch of its scenes or no named owner a WARN):",
+             "  #1  11:14:38.100 to 11:15:35.200 local  (57.1 s, ended: recovered)  [SLOW] the build's own detector",
              "rate: 9.97 fps against the display's 72.00 Hz (13.8% of it; a regime is under 40%), frames of 100.3 ms",
              "owner: held by the vendor runtime's xrEndFrame: 83.1 ms of every 100.3 ms frame (83%)",
+             "context: scene (0 loading frame(s) and 0 end(s) with no layers of 567 frames)",
              "a frame went (mean ms over the whole regime): xrEndFrame 83.10 (longest 84.74), pose wait 0.00, swapchain calls 0.04, EDVR copy 0.40, EDVR work 0.30, the game 16.16",
              "graphics memory at the SLOW line (11:14:43.100): local 7421 of 10863 MB (68.3%), non-local 316 of 16311 MB (1.9%)",
              "lines: SLOW 11:14:43.100; still_slow 11:15:13.100; end 11:15:37.200",
@@ -8937,16 +9003,63 @@ def self_test_slow_regime():
         if not rows or not rows[0].startswith("  SLOW  SLOW REGIME:"):
             fail("the SLOW REGIME row should come first among the finding rows: %r" % rows[:2])
         case("the same flight, a session that stopped inside the regime", run(native_flight(crash=True)), 4, "SLOW",
-             "  #1  11:14:38.100 to 11:15:13.100 local  (35.0 s, still going when the log stopped)  the build's own detector",
+             "  #1  11:14:38.100 to 11:15:13.100 local  (35.0 s, still going when the log stopped)  [SLOW] the build's own detector",
              "(still going when the log stopped)", "  note  END-FRAME EPISODES: episode 1 started and has no end line: the session ended inside it",
              absent=never_pass + ("ended: recovered",))
         case("no still_slow line: the regime's own end line carries the whole of it", run(native_flight(still=False)), 4, "SLOW", "lines: SLOW 11:14:43.100; end 11:15:37.200")
-        case("an owner that holds under 35% of the frame is not named", run(native_flight(owner="none", share=0.31)), 4, "SLOW",
+        # ---- who holds it decides whether it is a SLOW: the vendor runtime and EDVR set it, the game's own frame and no named owner do not ----
+        for owner, sentence in (("edvr_copy", "held by EDVR's copy of the eyes"),
+                                ("edvr_work", "held by EDVR's own work in the runtime"), ("vendor_wait_frame", "held by the vendor runtime's xrWaitFrame and xrBeginFrame (the pose wait)"),
+                                ("vendor_swapchain", "held by the vendor runtime's swapchain calls (xrAcquire, xrWait, xrReleaseSwapchainImage)")):
+            case("a regime EDVR's or the vendor's own calls hold is a SLOW: %s" % owner,
+                 run(native_flight(owner=owner, share=0.60, episodes=False, summary="%s: 60.0 ms of every 100.3 ms frame (60%%)" % sentence)), 4, "SLOW",
+                 "  #1  11:14:38.100 to 11:15:35.200 local  (57.1 s, ended: recovered)  [SLOW] the build's own detector", "  SLOW  SLOW REGIME: 11:14:38.100 to 11:15:35.200 local (57.1 s)",
+                 "%s: 60.0 ms of every 100.3 ms frame (60%%)" % sentence, absent=never_pass + ("not a SLOW",))
+        case("an owner that holds under 35% of the frame is not named, and is a WARN, not a SLOW", run(native_flight(owner="none", share=0.31)), 0, "WARN",
              "owner: no single owner; the largest is the game's own frame at 31% of a 100.3 ms frame",
-             "(14%), no single owner; the largest is the game's own frame at 31% of a 100.3 ms frame", absent=never_pass)
-        case("a regime the game's own frame holds is SLOW too, and says so", run(native_flight(owner="game", share=0.72)), 4, "SLOW",
-             "held by the game's own frame: 16.2 ms of every 100.3 ms frame (72%)", absent=never_pass)
-        case("no frame reached xrEndFrame: the owner is nothing", run(native_flight(owner="no_frames")), 4, "SLOW", "owner: held by nothing: no frame reached xrEndFrame in this window")
+             "  #1  11:14:38.100 to 11:15:35.200 local  (57.1 s, ended: recovered)  [WARN] the build's own detector", "      not a SLOW: no single owner holds 35% of a frame",
+             "  WARN  SLOW REGIME: 11:14:38.100 to 11:15:35.200 local (57.1 s), 9.97 fps against the display's 72 Hz (14%), no single owner; the largest is the game's own frame at "
+             "31% of a 100.3 ms frame; not a SLOW: no single owner holds 35% of a frame",
+             "freezes verdict: WARN (0 STOP, 1 WARN) [+1 slow stretch(es) the game's own frame or no named owner held, listed above: not a SLOW]",
+             absent=("  SLOW  ", "freezes verdict: SLOW", "freezes verdict: PASS"))
+        case("a regime the game's own frame holds while it submits scenes is a WARN: a GPU- or CPU-bound stretch, not a SLOW",
+             run(native_flight(owner="game", share=0.72, episodes=False, context="scene")), 0, "WARN",
+             "  #1  11:14:38.100 to 11:15:35.200 local  (57.1 s, ended: recovered)  [WARN] the build's own detector", "context: scene (0 loading frame(s) and 0 end(s) with no layers of 567 frames)",
+             "      not a SLOW: the game's own frame while it submitted scenes: a GPU- or CPU-bound stretch of the game",
+             "  WARN  SLOW REGIME: 11:14:38.100 to 11:15:35.200 local (57.1 s), 9.97 fps against the display's 72 Hz (14%), held by the game's own frame: 16.2 ms of every 100.3 ms "
+             "frame (72%); not a SLOW: the game's own frame while it submitted scenes: a GPU- or CPU-bound stretch of the game",
+             "freezes verdict: WARN (0 STOP, 1 WARN) [+1 slow stretch(es) the game's own frame or no named owner held, listed above: not a SLOW]",
+             absent=("  SLOW  ", "freezes verdict: SLOW", "freezes verdict: PASS"))
+        case("a regime the game's own frame holds during a load is INFO: it sets neither SLOW nor WARN, and the verdict says it was there",
+             run(native_flight(owner="game", share=0.72, episodes=False, context="loading", loading=567)), 0, "PASS",
+             "  #1  11:14:38.100 to 11:15:35.200 local  (57.1 s, ended: recovered)  [INFO] the build's own detector",
+             "context: loading (567 loading frame(s) and 0 end(s) with no layers of 567 frames)",
+             "      not a SLOW: the game's own frame during a load (the runtime's frames were its own loading frames)",
+             "  note  SLOW REGIME: 11:14:38.100 to 11:15:35.200 local (57.1 s), 9.97 fps against the display's 72 Hz (14%), held by the game's own frame: 16.2 ms of every 100.3 ms "
+             "frame (72%); not a SLOW: the game's own frame during a load (the runtime's frames were its own loading frames)",
+             "freezes verdict: PASS (0 STOP, 0 WARN) [+1 slow stretch(es) the game's own frame or no named owner held, listed above: not a SLOW]",
+             absent=("  SLOW  ", "  WARN  ", "freezes verdict: SLOW", "freezes verdict: WARN"))
+        case("the same during ends with no layers: a load too", run(native_flight(owner="game", share=0.72, episodes=False, context="no_layers", empty=567)), 0, "PASS",
+             "[INFO] the build's own detector", "context: no_layers (0 loading frame(s) and 567 end(s) with no layers of 567 frames)",
+             "      not a SLOW: the game's own frame during a load (the runtime's frames were ends with no layers)", absent=("  SLOW  ", "  WARN  ", "freezes verdict: SLOW"))
+        case("a game-owned regime from a build that writes no context is a WARN: nothing says it was a load",
+             run(native_flight(owner="game", share=0.72, episodes=False, with_context=False)), 0, "WARN",
+             "[WARN] the build's own detector", "context: the line has none (a build from before it)",
+             "      not a SLOW: the game's own frame (the line does not say whether it was a load)", absent=("  SLOW  ", "freezes verdict: SLOW"))
+        case("no frame reached xrEndFrame: the owner is nothing, and a WARN", run(native_flight(owner="no_frames")), 0, "WARN",
+             "owner: held by nothing: no frame reached xrEndFrame in this window", "[WARN] the build's own detector", "      not a SLOW: no frame reached xrEndFrame",
+             absent=("  SLOW  ", "freezes verdict: SLOW"))
+        # A vendor regime and a load in one session: SLOW, naming the vendor's only, with the load a row and a count of its own.
+        both = native_flight(extra_rt=[r(RS + 125.0, slow("SLOW", 2, 5.0, 5.0, 50, owner="game", share=0.72, context="loading", loading=50)),
+                                       r(RS + 143.0, slow("end", 2, 15.0, 15.0, 150, owner="game", share=0.72, context="loading", loading=150, reason="recovered"))], summary_regimes=2)
+        case("a vendor regime and a load in one session: SLOW names the vendor's regime only, and says the other was there", run(both), 4, "SLOW",
+             "SLOW REGIMES (2 found:", "  #1  11:14:38.100 to 11:15:35.200 local  (57.1 s, ended: recovered)  [SLOW] the build's own detector",
+             rx(r"^  #2  11:16:38\.100 to 11:16:53\.100 local  \(15\.0 s, ended: recovered\)  \[INFO\] the build's own detector$"),
+             "  SLOW  SLOW REGIME: 11:14:38.100 to 11:15:35.200 local (57.1 s), 9.97 fps against the display's 72 Hz (14%), held by the vendor runtime's xrEndFrame",
+             "  note  SLOW REGIME: 11:16:38.100 to 11:16:53.100 local (15.0 s), 9.97 fps against the display's 72 Hz (14%), held by the game's own frame",
+             "freezes verdict: SLOW (0 STOP, 0 WARN, 1 SLOW): 11:14:38.100 to 11:15:35.200 local (57 s) at 10.0 fps of the display's 72 Hz, held by the vendor runtime's xrEndFrame: "
+             "83.1 ms of every 100.3 ms frame (83%) [+1 slow stretch(es) the game's own frame or no named owner held, listed above: not a SLOW]. STOP:",
+             absent=never_pass)
 
         # ---- a new-build flight with no regime: the detector's own PASS ----
         quiet = native_flight(regimes=0, episodes=False)
@@ -9058,7 +9171,7 @@ def self_test_slow_regime():
         legacy = run(legacy_flight(), "--expect-build", VERSION)
         case("a v0.18.0 flight: the regime is rebuilt from LONG FRAME, native_long_cycle, FREEZE and vScreen totals lines, held by the vendor's xrEndFrame", legacy, 4, "SLOW",
              "SLOW REGIME (1 found:",
-             "  #1  11:14:38.100 to 11:15:35.238 local  (57.1 s)  RECONSTRUCTED from the older lines: this build has no slow-regime detector",
+             "  #1  11:14:38.100 to 11:15:35.238 local  (57.1 s)  [SLOW] RECONSTRUCTED from the older lines: this build has no slow-regime detector",
              rx(r"^      rate: 9\.9[0-9] fps against the display's 72 Hz \(13\.[0-9]% of it; a regime is under 40%\), frames of 100\.[0-9] ms$"),
              rx(r"^      owner: held by the vendor runtime's xrEndFrame: 82\.7 ms of every 100\.[0-9] ms frame \(82%\)$"),
              "(p50 of each phase in native_submit_phases window 50: sequences 96730-96985, ended 11:15:16.800; 256 of its 256 frames are inside the run): xrEndFrame 82.7 ms = 6.0 display "
@@ -9072,15 +9185,26 @@ def self_test_slow_regime():
              "FREEZES (2 FREEZE line(s);", absent=never_pass + ("  PASS  SLOW REGIME", "DELIBERATE", "SLOW TEST", "VENDOR EVENTS (", "END-FRAME EPISODES ("))
         if "11:15:41" in legacy[1].split("freezes verdict")[1].split(". STOP")[0]:
             fail("the FREEZE 6.2 s after the regime's end is its own freeze, not the regime's:\n%s" % legacy[1])
-        case("the same flight with the graphics log alone: the regime stands, the owner is unknown", run((legacy_flight()[0], None)), 4, "SLOW",
-             "RECONSTRUCTED from the older lines", "owner: owner unknown: no runtime log was read, so no native_submit_phases window says which call held the frames",
-             "  WARN  INSTRUMENT: no runtime log was read", absent=never_pass[:1])
+        case("the same flight with the graphics log alone: the regime stands, the owner is unknown, so it is a WARN and not a SLOW", run((legacy_flight()[0], None)), 0, "WARN",
+             "  #1  11:14:38.100 to 11:15:35.238 local  (57.1 s)  [WARN] RECONSTRUCTED from the older lines",
+             "owner: owner unknown: no runtime log was read, so no native_submit_phases window says which call held the frames", "      not a SLOW: no owner could be named",
+             "  WARN  SLOW REGIME: 11:14:38.100 to 11:15:35.238 local (57.1 s)", "; not a SLOW: no owner could be named", "  WARN  INSTRUMENT: no runtime log was read",
+             "freezes verdict: WARN (0 STOP, 2 WARN) [+1 slow stretch(es) the game's own frame or no named owner held, listed above: not a SLOW]",
+             absent=("  SLOW  ", "freezes verdict: SLOW"))
+        case("a runtime log with no native_submit_phases window over the run: the owner is unknown too, a WARN",
+             run((legacy_flight()[0], [l for l in legacy_flight()[1] if "native_submit_phases" not in l])), 0, "WARN",
+             "owner: owner unknown: the runtime log has no native_submit_phases window covering the run", "[WARN] RECONSTRUCTED from the older lines", absent=("  SLOW  ", "freezes verdict: SLOW"))
+        case("a menu Presenting at 300 frames a second while the runtime's frames crawl is still a regime: the runtime's sequence is the rate, not the Presents",
+             run(legacy_flight(gfx_fps=300.0)), 4, "SLOW",
+             rx(r"^      rate: 9\.9[0-9] fps against the display's 72 Hz"),
+             rx(r"^      frame rate from: runtime sequence 96600 to 97167 over 57\.1 s = 9\.9[0-9] fps; graphics frames 102431 to 119572 over 57\.1 s = (299\.99|300\.00) fps$"),
+             "[SLOW] RECONSTRUCTED from the older lines")
         case("long frames now and then at a steady 72 fps are hitches, not a regime", run(legacy_flight(hitches=True)), 0, None,
              "  note  SLOW REGIME: this build has no slow-regime detector, and its older lines (LONG FRAME, native_long_cycle, FREEZE, vScreen totals) hold no run of 5 s or more with "
              "the frame rate under 40% of the display's; that cannot prove there was none", absent=("SLOW REGIME (", "  SLOW  ", "freezes verdict: SLOW"))
         windows_only = (list(gopen) + [g(RS + 20.0 * k, vscreen(160, 20000)) for k in range(3)] + [g(CLOSE, counts_line())] + [g(RS - 100.0, long_frame(61.0, 5, 6))], None)
-        case("three vScreen windows at 8 fps and nothing else: a regime from the windows alone", run(windows_only), 4, "SLOW",
-             "RECONSTRUCTED from the older lines", "evidence: 3 vScreen totals window(s) under 40% of the display's rate (8, 8, 8 fps)",
+        case("three vScreen windows at 8 fps and nothing else: a regime from the windows alone, with no owner to name, so a WARN", run(windows_only), 0, "WARN",
+             "[WARN] RECONSTRUCTED from the older lines", "evidence: 3 vScreen totals window(s) under 40% of the display's rate (8, 8, 8 fps)",
              "frame rate from: the median of the vScreen windows' own rates", "bounds: no LONG FRAME, native_long_cycle or FREEZE line is in the run",
              "good to about 20 s")
         case("a v0.18.0 flight and a wrong --expect-build is still the build mismatch", run(legacy_flight(), "--expect-build", "0.18.1-9-g1234567"), 2, None, "BUILD MISMATCH",
@@ -9220,12 +9344,14 @@ def main(argv=None):
                          "native_slow_regime lines, or put back together from a v0.18.0 log's "
                          "LONG FRAME, native_long_cycle, FREEZE and vScreen totals lines), "
                          "END-FRAME EPISODES, VENDOR EVENTS, VRAM and SLOW TEST "
-                         "(advanced.slow_test_ms). A log that holds a slow regime gets a SLOW "
-                         "verdict, never PASS or WARN. Pairs the runtime log like --tally "
+                         "(advanced.slow_test_ms). A log that holds a slow regime the vendor "
+                         "runtime, EDVR's copy or EDVR's own work holds gets a SLOW verdict, never "
+                         "PASS or WARN; one the game's own frame holds is INFO (a load) or WARN "
+                         "(its scenes) and never sets SLOW. Pairs the runtime log like --tally "
                          "periodic (--runtime-file names one). Exit 0 for PASS or WARN, 1 for "
                          "STOP, 2 for a wrong build, 3 when the log holds none of the freeze "
                          "lines (a build from before the freeze logging), 4 for a slow regime "
-                         "(and no STOP)")
+                         "the vendor runtime or EDVR holds (and no STOP)")
     ap.add_argument("--window-ms", type=float, default=100.0,
                     help="with --tally periodic, a long frame coincides with a "
                          "periodic event when the event's end time is inside "

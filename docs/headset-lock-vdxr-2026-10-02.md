@@ -44,21 +44,21 @@
   interacting with VDXR. Nothing logged separates them.
 - **Blind spot: CLOSED for the next flight (detection only; the cause stays open).** 100 ms
   frames sit under the 250 ms FREEZE line and the 150 ms stall sampler, so v0.18.0's
-  `--freezes` printed PASS. The new build writes a SLOW line naming the owner and
-  `--freezes` says SLOW (exit 4), never PASS; for a v0.18.0 log it reconstructs the
-  regime: on the user's bundle 11:14:38.1 to 11:15:35.2, 9.9 fps of 72 Hz, held by the
-  vendor runtime's `xrEndFrame` (82.7 ms of each 100.6 ms frame).
-- **Instruments built (section below; diagnostics only):** `vram:` lines (DXGI), the
-  vendor's events, every `xrEndFrame` of 3 display periods or more, and sustained slow
-  frames with the owner and the VRAM figures, each with an armed line at startup; test
-  trigger `advanced.slow_test_ms` (0 = off).
-- **Next:** from the user, the previous session's log pair (does its last
-  `xr_end_frame` read about 83 ms too?); the VD version and settings (codec, bitrate,
-  Synchronous Spacewarp), what the headset showed, and whether restarting VD's stream
-  recovers it; then one flight with the new build (test plan: `docs\freeze-diagnostics-
-  2026-10-01.md`), and `nvidia-smi` logging memory, clocks and encoder load once a second.
-  If it recurs on foot, an A/B with `experimental.temporal_aa_on_foot_world = off` and
-  `experimental.on_foot_maps_sharp = off`.
+  `--freezes` printed PASS. The new build writes a SLOW line naming the owner; `--freezes`
+  says SLOW (exit 4), never PASS, when the vendor runtime or EDVR holds the frames, and
+  INFO (a load) or WARN (the game's scenes, or no named owner) when the game does. For a
+  v0.18.0 log it reconstructs: the user's bundle reads 11:14:38.1 to 11:15:35.2, 9.9 fps
+  of 72 Hz, held by the vendor runtime's `xrEndFrame` (82.7 ms of each 100.6 ms frame).
+  Census: no regime in Sean's 12 newest Frontier logs (section below).
+- **Instruments built (section below; diagnostics only):** `vram:` lines, the vendor's
+  events, every `xrEndFrame` of 3 periods or more, sustained slow frames with the owner,
+  the VRAM figures and a `context=`; each with an armed line; test key `advanced.slow_test_ms`.
+- **Next:** from the user, the previous session's log pair (does its last `xr_end_frame`
+  read about 83 ms too?); the VD version and settings (codec, bitrate, Synchronous
+  Spacewarp), what the headset showed, and whether restarting VD's stream recovers it;
+  then one flight with the new build (test plan: `docs\freeze-diagnostics-2026-10-01.md`),
+  and `nvidia-smi` logging once a second. If it recurs on foot, an A/B with
+  `experimental.temporal_aa_on_foot_world = off` and `experimental.on_foot_maps_sharp = off`.
 
 ## The instruments (2026-10-02)
 
@@ -99,7 +99,10 @@ the vendor, except the test hold. Each line is written by the half named; the re
    (83%)`; `still_slow` every 30 s; `end` 2 normal seconds after (`reason=recovered`, or
    `session_close`). Owners: vendor_end_frame, vendor_wait_frame (pose wait and the
    deferred pacer's block), vendor_swapchain, edvr_copy, edvr_work, game (the residual);
-   named only at 35% of a frame or more.
+   named only at 35% of a frame or more. Each line also says what the frames were:
+   `context=scene|loading|no_layers|none,loading_frames=N,empty_frames=N` (at least half of
+   the window's frames decide; `loading` is a frame the runtime made itself while the game
+   loaded, `no_layers` an end with nothing for the vendor to show).
 5. **Test trigger** `advanced.slow_test_ms` (0 to 500, default 0, read once at the first
    frame). 90 s into the session the d3d11 half asks (frame_flag layout v36,
    `requestEndFrameHold`) for every xrEndFrame to be held that many ms longer, inside the
@@ -128,6 +131,27 @@ its own. The method: marks (LONG FRAME and `native_long_cycle` lines of 3 period
 FREEZE lines) within 5.5 s of each other and slow `vScreen totals` windows are one run; a
 run of 5 s or more whose frame rate, the rise of the runtime sequence over its time, is
 under 40% of the display's is a regime.
+
+**Who may set SLOW (2026-10-02).** `--freezes` sets SLOW, and exit 4, only for a regime the
+vendor runtime (vendor_end_frame, vendor_wait_frame, vendor_swapchain), EDVR's copy or
+EDVR's own work holds. A regime the game's own frame holds is INFO when the runtime says its
+frames were a load (`context=loading` or `no_layers`) and WARN when they were the game's
+scenes (a GPU- or CPU-bound stretch) or the line carries no `context=`; one with no named
+owner (none, no_frames, or unknown in a reconstruction) is a WARN. The verdict line counts
+the others (`[+N slow stretch(es) ...: not a SLOW]`), so a game-owned regime is never hidden
+behind a bare PASS. The reconstruction takes the rate from the runtime's sequence: the game
+Presents up to 560 a second in menus while the runtime's frames stay at the display's rate.
+
+**Census of normal sessions (2026-10-02).** `--freezes` over the 12 newest logs of Sean's
+Frontier install (2026-10-01 09:20 to 16:27, builds v0.18.0-rc.5-37 to v0.18.0-4-gab90305c,
+90 Hz): 0 regimes of any owner, so none from a session-start load, hyperspace or a station
+load. The lowest average frame rate over any stretch of 5 s or more (the runtime sequence
+between the log's lines) was 40.2 fps, 45% of the display's, for 5.1 s at 11:28:40 in the
+11:24 session; the next were 51.7 and 53.3 fps. Those events show as isolated freezes (2 to 6
+FREEZE lines a session) and as runs of long frames whose average rate stayed at 62 to 88 fps.
+Five of the twelve (rc.5-37 to rc.5-51) predate the freeze logging and exit 3 with no regime.
+The native detector counts 1 s buckets, so it can only be stricter than that average by a
+stretch that is slow in every second, which none was.
 
 **Not done.** Which of (A) a backed-up stream, (B) memory pressure or (C) deferred pacing
 holds VDXR is still open: the new lines separate them in the next flight (the VRAM figures

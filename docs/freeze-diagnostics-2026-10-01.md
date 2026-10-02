@@ -10,8 +10,8 @@
 - **Blind spot (2026-10-02), closed for the next flight:** a sustained slow regime under
   the 250 ms and 150 ms lines was invisible (a Quest 3 game at 10 fps for a minute,
   `--freezes` PASS). Built on branch `claude/slow-regime-tools`, not flown: VRAM, vendor
-  events, long xrEndFrame episodes, a slow-regime detector; `--freezes` says SLOW (exit 4).
-  See `docs\headset-lock-vdxr-2026-10-02.md`; steps 8-12 below fly it.
+  events, long xrEndFrame episodes, a slow-regime detector; `--freezes` says SLOW (exit 4)
+  for a vendor or EDVR hold, not a game load. See `docs\headset-lock-vdxr-2026-10-02.md`.
 - **Why:** issue 63, 1-2 s freezes in VR on Index + SteamVR with EDHM chained. The rc.5
   flight showed EDVR's own work under 2 ms in every freeze, SteamVR answering, the GPU
   idle, and the render thread stopping at a different point of the game's frame each
@@ -181,9 +181,10 @@ vendor.
    - at 90 s: graphics `slow test: the hold begins now`; runtime
      `native_end_frame_hold,test=1,state=began,ms=80` and at once
      `native_end_frame_episode,episode=1,...,ms=9x.xxxx,periods=6.x,...`.
-   - about 5 s later `native_slow_regime,event=SLOW,regime=1,...,held_by=vendor_end_frame,
-     ...,vram_local_used_mb=...,summary=held by the vendor runtime's xrEndFrame: ...`;
-     about 30 s after that `event=still_slow`.
+   - about 5 s later `native_slow_regime,event=SLOW,regime=1,...,context=scene,
+     loading_frames=0,empty_frames=0,held_by=vendor_end_frame,...,vram_local_used_mb=...,
+     summary=held by the vendor runtime's xrEndFrame: ...`; about 30 s after that
+     `event=still_slow`.
    - at 130 s: `slow test: the hold ended`, `native_end_frame_hold,...,state=ended,
      held_calls=N`, `native_end_frame_episode_end,episode=1,...`, and about 2 s later
      `native_slow_regime,event=end,...,reason=recovered`.
