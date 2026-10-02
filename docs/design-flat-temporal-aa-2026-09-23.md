@@ -33,10 +33,10 @@
 - **Ruled-out pointer:** the kinematic arc's Status records rejected motion
   estimates and the nonexistent engine velocity buffer. Reuse engine-record
   motion; do not revive estimation or the retired deferred UI replay.
-- **Next:** section 85: fly the exact PS07 admission fix and user2's F10
-  draw-entry audit. Both BUILT, NOT FLOWN; full gates pass. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
-  resolution, TAA at 1.25, game AA, VR at 0.85. HDR flew (81); FSR, TAA at
-  R = D and ReShade still to fly. Then open items above (older: Status detail).
+- **Next:** section 85: both users confirm working; user2's DLSS treatment
+  is log-confirmed. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
+  resolution, TAA at 1.25, game AA, VR at 0.85. HDR flew (81); FSR reported
+  working (85). TAA at R = D and ReShade still to fly. Then open items above.
   Existing evidence does not justify ignoring the alternate projection.
   Preserve high-G motion and strict depth ownership; do not repeat qualified
   PS91/BFE or stale-resize hypotheses. The menu hangar-floor P1 defect remains
@@ -9025,3 +9025,52 @@ Next user2 flight: select AA in the cockpit, close F8, F10 once, wait at
 least 5s and capture the new ingress summary/witness lines; a second F10
 reports the prior arm before rearming. No need to infer a repair from the
 passive source/tone or compute probes while runtime scopes are excluded.
+
+### Both supporters report working; user2 DLSS is log-confirmed (2026-10-02)
+
+Sean reports user1's FSR issue fixed, then user2 confirms working too.
+User1's new-build success is human confirmation; no additional successful
+flight log was supplied for that user. The exact shader, model replay and
+validated fix remain the qualification evidence above.
+
+User2 `edvr-logs-20261003-001741.zip` contains two distinct sessions:
+000825 is the old -26-gb5df4ff4-dirty build and remains idle through its
+startup/menu capture; 001112 is the relevant -31-g5c70e1c8-dirty build,
+stamp 6ABFE356, linked 2026-10-02 17:01:10 UTC. This is the validated
+pre-commit artifact whose source was committed as 0b59f0d4; HEAD's literal
+version mismatch is expected, not evidence of a stale fix. The successful
+log is edvr_gfx_20261003_001112.log (6508 lines).
+
+Environment: flat EDHM chain, NVIDIA GeForce RTX 3060 (12,113 MiB), output
+1440x900. Live FSR selection briefly returns to DLSS; NGX initializes at
+00:11:53.944 and creates the flat HDR DLSS feature at 00:11:54.258. A
+separate DLAA feature is created at output size. Driver and DLSS runtime
+version are not supplied. Conflicting game AA snapshots (AAMode=4 and =0)
+do not identify the final live game AA mode. No VR runtime is in this log.
+
+At 00:17:39.686 cumulative runtime treatment is 18398, refused 2526, renderer
+calls 18398 and backend-failure 0. Longest treated streak 16115. In the last
+window, 147 scene HDR frames complete every route stage with zero declines;
+the other 92 frames have no 3D scene. HDR is 1440x900, consumer target 720x450,
+trigger VS DFED8E1C9E191BEC/PS 143AAE0597E2F7BF. Earlier full windows treat
+every HDR frame (e.g. 267/267 at 00:17:34). Source image continuation counters
+remain accepted 0/refused 0, so PS07's special path is not demonstrated here.
+
+At 00:17:39.685 the active F10 arm has 3527079 entries, 3526426 accepted,
+653 inactive-internal; live-off, wrong-thread, wrong-context and Paused all 0.
+The output witness at 00:17:16.687 matches cached and actual VS/PS/RTV for
+20F383BBAC05C031/DED8796049C7BB4A; actual colour and output canonical
+IUnknown both 000002879C5C4780, viewport 1440x900. Thus the current draw gate
+and output identity work. The internal exclusions are EDVR's own scope,
+not an observed current game-context failure. Trace dumps are empty
+(16B, frames 0/events 0); no trace or shader binaries are bundled.
+
+ruled out: an ongoing thread/context gate or stale output/shader identity
+failure in this successful session, because the new audit admits millions
+of entries and the live output witness agrees with the cached state.
+Outcome CLOSED for both reported AA failures on the tested build. User2's
+earlier entry-path failure is not causally isolated: the new build/launch
+works, no runtime guard was relaxed, and the source-exemption subroute is
+unused. Do not attribute that older failure to PS07 from this confirmation.
+No further rendering change or test flight requested. F10 ingress remains
+a bounded manual diagnostic, with no temporary config key to retire.
