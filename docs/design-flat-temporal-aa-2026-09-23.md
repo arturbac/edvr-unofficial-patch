@@ -33,8 +33,8 @@
 - **Ruled-out pointer:** the kinematic arc's Status records rejected motion
   estimates and the nonexistent engine velocity buffer. Reuse engine-record
   motion; do not revive estimation or the retired deferred UI replay.
-- **Next:** section 85: both users confirm working; user2's DLSS treatment
-  is log-confirmed. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
+- **Next:** section 85: third user's rc.4 no-tone capture needs current build.
+  First two users confirm working; user2 log-confirmed. Then 83: SS 0.75/0.85, bloom/DoF, mismatched
   resolution, TAA at 1.25, game AA, VR at 0.85. HDR flew (81); FSR reported
   working (85). TAA at R = D and ReShade still to fly. Then open items above.
   Existing evidence does not justify ignoring the alternate projection.
@@ -9074,3 +9074,41 @@ works, no runtime guard was relaxed, and the source-exemption subroute is
 unused. Do not attribute that older failure to PS07 from this confirmation.
 No further rendering change or test flight requested. F10 ingress remains
 a bounded manual diagnostic, with no temporary config key to retire.
+
+### Third supporter: rc.4 no-tone-pass refusal (2026-10-02)
+
+`edvr-logs-20261002-213417.zip`, edvr_gfx_20261002_212356.log (4790 lines):
+literal v0.18.0-rc.4, stamp 6ABC3FAC, linked 2026-09-29 22:46:04 UTC.
+Installation record also says rc.4. Exact HEAD version check mismatches;
+this predates section 83 structural-copy admission and section 85's exact
+image-source fix and ingress audit. It is not evidence of those failing.
+
+Flat EDHM chain, output 2560x1440, GPU not identified. The flat INI sets
+temporal_aa=on (TAA), model k, real_dll=d3d11_edhm.dll. No explicit
+experimental.temporal_aa_before_post key, so no preserved off value blocks
+the newer build's default auto route. Live F8 briefly selects DLSS at
+21:27:59.511, returns to on at 21:28:00.630, and finishes in TAA.
+Captured game AA snapshots disagree (AAMode=4 versus =0); final active game
+AA and render/scene extent are not established. Output size is measured.
+
+At 21:34:17.270, treated=0, refused=30046, last=no-known-tone-pass. The final
+5s refusal count is 271. Renderer calls/init/backend-failures all 0: the AA
+request is enabled, and the runtime attempts frame selection, but the old
+selector never finds the required tone pass, so the backend is not called.
+This differs from user2's idle draw-entry failure and does not identify
+user1's exact PS07 image-source conflict. Automatic unknown projection
+capture sees 11 pairs; manual audit pairs 0. No traces or shader binaries
+are bundled.
+
+ruled out: AA left off as the final request, because the live mode is on
+and frame selection attempts/refusals accumulate.
+ruled out: a demonstrated backend/driver failure in this capture, because
+the backend has zero calls and fails before dispatch at no-known-tone-pass.
+
+Next: update to the fully validated flat build v0.18.0-31-g5c70e1c8-dirty
+(source 0b59f0d4), retaining the user's settings and EDHM chain. Its auto HDR
+and structural-copy routing supersedes this old tone-only prerequisite;
+the exact filter fix is included. Do not promise a complete cure from an
+obsolete capture. If still inactive on that literal build, arm F10 in the
+cockpit, wait at least 5s and return a current log with the new route/ingress
+witnesses. No rendering code, config or installation changed for review.
