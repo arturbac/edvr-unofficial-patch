@@ -380,7 +380,7 @@ struct State {
     // the whole frame, first game draw to Present, and the resolver's dispatches plus
     // backend call. A timer is owned until its sample is read; with none free the
     // frame is skipped and counted.
-    flatcpu::Census census;
+    flatcpu::Census census{flatcpu::kRenderPeriod, flatcpu::clocksWanted()};
     static constexpr int kGpuFrameTimers = 4, kGpuResolveTimers = 2;
     GpuTimer gpuFrameTimer[kGpuFrameTimers];
     GpuTimer gpuResolveTimer[kGpuResolveTimers];

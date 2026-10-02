@@ -431,6 +431,7 @@ struct WindowReport {
     double gpuFrameP50 = 0, gpuFrameP95 = 0, gpuResolveP50 = 0, gpuResolveP95 = 0;
     uint64_t gpuSkipped = 0, gpuInvalid = 0;
     bool standingDown = false;   // the work is stood down as the window closes
+    bool clocksOff = false;      // the census was built with its clocks off (clocksWanted())
     Floor floor;
     emcpu::Floor emFloor;
 };
@@ -449,14 +450,28 @@ inline void percentiles(float* a, unsigned n, double* p50, double* p95) noexcept
     *p50 = static_cast<double>(a[i50]);
 }
 
+// Whether the census clocks anything. Under Proton an on-foot frame makes about 200,000 scopes,
+// and clocking one costs that frame about 21 ms (2026-10-02): a hitch at a random frame in every
+// block of kRenderPeriod, p95 present 37 ms against 16.7 ms at 60 Hz. So the clocks are off unless
+// EDVR_FLAT_CPU_CLOCKS=1 is in the environment; the line still prints the present and GPU figures.
+inline bool clocksWanted() noexcept {
+    static const bool on = [] {
+        char v[4] = {};
+        return GetEnvironmentVariableA("EDVR_FLAT_CPU_CLOCKS", v, sizeof v) > 0 && v[0] == '1';
+    }();
+    return on;
+}
+
 class Census {
 public:
     static constexpr unsigned kMaxSamples = 2048;
 
     // `renderPeriod` 1 clocks the render thread on every frame, as the census did until 2026-09-30:
     // what the rig compares a sampled window with.
-    explicit Census(unsigned renderPeriod = kRenderPeriod) noexcept
-        : renderPeriod_(renderPeriod ? renderPeriod : 1u), schedule_(renderPeriod ? renderPeriod : 1u, kSamplePeriod) {}
+    // `clocks` false: no thread is clocked on any frame (clocksWanted()).
+    explicit Census(unsigned renderPeriod = kRenderPeriod, bool clocks = true) noexcept
+        : renderPeriod_(renderPeriod ? renderPeriod : 1u), schedule_(renderPeriod ? renderPeriod : 1u, kSamplePeriod),
+          clocks_(clocks) {}
 
     // Once per Present, on the render thread. `paused`: the frame that just ended was a stood-down
     // Paused one. Decides the next frame's clocking and writes the gates (this instrument's and
@@ -577,6 +592,7 @@ public:
         out.gpuSkipped = gpuSkipped_;
         out.gpuInvalid = gpuInvalid_;
         out.standingDown = standingDown;
+        out.clocksOff = !clocks_;
         out.floor = floor_;
         out.emFloor = emFloor_;
         resetWindow();
@@ -587,7 +603,9 @@ public:
 
 private:
     void decideNextFrame() noexcept {
-        if (samplingOk_) {
+        if (!clocks_) {
+            renderNow_ = sampledNow_ = false;
+        } else if (samplingOk_) {
             const ClockSchedule::Frame next = schedule_.next();
             renderNow_ = next.render;
             sampledNow_ = next.all;
@@ -619,6 +637,7 @@ private:
     int64_t freq_ = 0, lastTick_ = 0, windowStart_ = 0;
     uint32_t renderTid_ = 0;
     unsigned renderPeriod_;
+    bool clocks_ = true;
     Floor floor_;
     emcpu::Floor emFloor_;
     ClockSchedule schedule_;
@@ -757,7 +776,10 @@ inline void formatWindow(const WindowReport& r, Lines* out) {
         callsText(calls, sizeof(calls), static_cast<double>(emRenderCalls) / clocked);
         tk.add(" + ", "engine motion hooks %.3f ms (calls %s)", emRenderMs / clocked, calls);
     } else {
-        tk.add(" = ", "render thread: not clocked in this window (one frame in %u is, and none was)", r.renderPeriod);
+        if (r.clocksOff)
+            tk.add(" = ", "render thread: clocks off (EDVR_FLAT_CPU_CLOCKS=1 turns them on)");
+        else
+            tk.add(" = ", "render thread: not clocked in this window (one frame in %u is, and none was)", r.renderPeriod);
     }
 
     // The game's other threads: per SAMPLED frame, thread-ms summed, because the rest of the
